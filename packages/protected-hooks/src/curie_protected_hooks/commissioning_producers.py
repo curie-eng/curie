@@ -29,6 +29,9 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import NoReturn, Protocol
 
+from .commissioning_bootstrap import CommissioningBootstrap
+from .commissioning_provisioner import BROKER_PRINCIPALS
+
 # ADR 0236, decision step 1. The signed channel binds the same tuple.
 OBSERVATION_FACTS = (
     "permit",
@@ -44,19 +47,12 @@ OBSERVATION_FACTS = (
     "cni",
     "artifact",
 )
-# Design decision 7: every commissioning and production broker principal. The
-# provisioner (the checked party) and the observer (the checker) are not in it.
-ACL_PRINCIPALS = (
-    "issuer",
-    "control",
-    "candidate_enqueue",
-    "candidate_worker",
-    "enqueue",
-    "worker",
-    "verifier",
-)
+# Design decision 7: every commissioning and production broker principal, the
+# same tuple G records rules for. The provisioner (the checked party) and the ACL
+# observer (the checker) are not in it.
+ACL_PRINCIPALS = BROKER_PRINCIPALS
 _DIGEST = re.compile(r"[0-9a-f]{64}")
-_USERNAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+_USERNAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,255}")
 _PHASE = re.compile(r"[a-z][a-z0-9-]{0,62}")
 
 
@@ -129,25 +125,47 @@ class AclPrincipalState:
         return f"AclPrincipalState(<{len(self.password_hashes)} hashes>, {self.enabled})"
 
 
-class AclBaseline:
-    """The administrator-recorded installation baseline: username and state per principal.
+def _usernames(bootstrap: CommissioningBootstrap) -> dict[str, str]:
+    """Each principal's ACL username is its credential reference ID in B."""
+    b = bootstrap.as_dict()
+    refs = {
+        **b["production_credentials"],
+        "issuer": b["issuer_identity"],
+        "control": b["control_identity"],
+        "candidate_enqueue": b["candidate_credentials"]["enqueue"],
+        "candidate_worker": b["candidate_credentials"]["worker"],
+    }
+    return {name: refs[name]["id"] for name in ACL_PRINCIPALS}
 
-    The installation bootstrap records it before any campaign and only that step
-    updates it; the provisioner never writes it.
+
+class AclBaseline:
+    """The administrator-recorded installation baseline, bound to that installation's B.
+
+    The installation bootstrap records each principal's state before any campaign,
+    and only that step updates it; the provisioner never writes it. Usernames are
+    never supplied here: they are the credential references of the bootstrap B whose
+    digest the guard's premeasured tuple binds, so a baseline cannot name other
+    users or another installation.
     """
 
-    def __init__(self, principals: Mapping[str, tuple[str, AclPrincipalState]]) -> None:
-        _require(isinstance(principals, Mapping) and set(principals) == set(ACL_PRINCIPALS))
-        rows = {}
-        for name in ACL_PRINCIPALS:
-            row = principals[name]
-            _require(type(row) is tuple and len(row) == 2)
-            username, state = row
-            _require(type(username) is str and _USERNAME.fullmatch(username) is not None)
-            _require(type(state) is AclPrincipalState)
-            rows[name] = (username, state)
-        _require(len({username for username, _ in rows.values()}) == len(rows))
-        self.principals: Mapping[str, tuple[str, AclPrincipalState]] = rows
+    def __init__(
+        self, bootstrap: CommissioningBootstrap, states: Mapping[str, AclPrincipalState]
+    ) -> None:
+        try:
+            _require(type(bootstrap) is CommissioningBootstrap)
+            _require(isinstance(states, Mapping) and set(states) == set(ACL_PRINCIPALS))
+            _require(all(type(states[name]) is AclPrincipalState for name in ACL_PRINCIPALS))
+            usernames = _usernames(bootstrap)
+            _require(all(_USERNAME.fullmatch(u) is not None for u in usernames.values()))
+            _require(len(set(usernames.values())) == len(usernames))
+        except ProducerRefused:
+            raise
+        except Exception:  # noqa: BLE001
+            _refuse()
+        self.bootstrap_digest = bootstrap.digest
+        self.principals: Mapping[str, tuple[str, AclPrincipalState]] = {
+            name: (usernames[name], states[name]) for name in ACL_PRINCIPALS
+        }
 
 
 class PhaseExpectation:
@@ -190,8 +208,9 @@ def parse_getuser_reply(reply: object) -> AclPrincipalState:
         fields = dict(pairs)
         _require(len(fields) == len(pairs) and {"flags", "passwords"} <= fields.keys())
         flags, passwords = fields["flags"], fields["passwords"]
-        _require(type(flags) is list and type(passwords) is list)
-        assert isinstance(flags, list) and isinstance(passwords, list)
+        # RESP3 sends ``flags`` as a set and ``passwords`` as an array.
+        _require(type(flags) in (list, set, frozenset) and type(passwords) is list)
+        assert isinstance(flags, (list, set, frozenset)) and isinstance(passwords, list)
         names = {_text(flag) for flag in flags}
         _require(("on" in names) != ("off" in names))
         hashes = [_digest(_text(item)) for item in passwords]
@@ -206,9 +225,27 @@ def parse_getuser_reply(reply: object) -> AclPrincipalState:
 class AclPrincipalStateProducer:
     """Design decision 7 as a producer: refuses on any drift from the expected state."""
 
-    def __init__(self, *, reader: AclUserReader, baseline: AclBaseline) -> None:
+    def __init__(
+        self,
+        *,
+        reader: AclUserReader,
+        baseline: AclBaseline,
+        observer_username: str,
+        provisioner_username: str,
+    ) -> None:
         _require(type(baseline) is AclBaseline and callable(getattr(reader, "getuser", None)))
+        checked = {username for username, _ in baseline.principals.values()}
+        for name in (observer_username, provisioner_username):
+            _require(type(name) is str and _USERNAME.fullmatch(name) is not None)
+            _require(name not in checked)
+        # The checked parties never read or report their own evidence.
+        _require(observer_username != provisioner_username)
         self._reader, self._baseline = reader, baseline
+        self.observer_username = observer_username
+
+    @property
+    def baseline(self) -> AclBaseline:
+        return self._baseline
 
     async def require(self, phase: PhaseExpectation) -> None:
         """Observe every principal now; equal hash sets and phase-expected enabled state."""

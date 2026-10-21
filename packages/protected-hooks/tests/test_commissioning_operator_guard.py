@@ -11,6 +11,7 @@ import asyncio
 import hashlib
 
 import pytest
+from curie_protected_hooks.commissioning_bootstrap import parse_commissioning_bootstrap
 from curie_protected_hooks.commissioning_operator_guard import (
     ChannelCampaignGuard,
     OperatorGuardRefused,
@@ -26,19 +27,31 @@ from curie_protected_hooks.commissioning_producers import (
     ReobservationSet,
     parse_getuser_reply,
 )
+from curie_protected_hooks.commissioning_provisioner import BROKER_PRINCIPALS
 
+from .test_commissioning_bootstrap import bootstrap_value, encoded
+
+B = parse_commissioning_bootstrap(encoded(bootstrap_value()))
 DIGESTS = {name: hashlib.sha256(name.encode()).hexdigest() for name in OBSERVATION_FACTS}
+DIGESTS["bootstrap"] = B.digest
 OTHER = hashlib.sha256(b"drifted").hexdigest()
-USERS = {name: "user-" + name.replace("_", "-") for name in ACL_PRINCIPALS}
+_b = B.as_dict()
+USERS = {
+    **{name: ref["id"] for name, ref in _b["production_credentials"].items()},
+    "issuer": _b["issuer_identity"]["id"],
+    "control": _b["control_identity"]["id"],
+    "candidate_enqueue": _b["candidate_credentials"]["enqueue"]["id"],
+    "candidate_worker": _b["candidate_credentials"]["worker"]["id"],
+}
+OBSERVER, PROVISIONER = "commissioning/example-acl-observer", "commissioning/example-provisioner"
 
 
 def hashes(name: str) -> frozenset[str]:
     return frozenset({hashlib.sha256(("credential-" + name).encode()).hexdigest()})
 
 
-BASELINE = AclBaseline(
-    {name: (USERS[name], AclPrincipalState(hashes(name), True)) for name in ACL_PRINCIPALS}
-)
+STATES = {name: AclPrincipalState(hashes(name), True) for name in ACL_PRINCIPALS}
+BASELINE = AclBaseline(B, STATES)
 CAMPAIGN = PhaseExpectation("campaign", {})
 
 
@@ -93,6 +106,12 @@ class Transport:
             raise RuntimeError("stale or foreign reply")
 
 
+def observer(reader, *, baseline=BASELINE, name=OBSERVER, provisioner=PROVISIONER):
+    return AclPrincipalStateProducer(
+        reader=reader, baseline=baseline, observer_username=name, provisioner_username=provisioner
+    )
+
+
 def build(*, values=None, reader=None, transport=None, phase=None, deadline_s=5.0):
     producers = {name: Fact(name, (values or {}).get(name)) for name in OBSERVATION_FACTS}
     reader = reader or Reader()
@@ -100,7 +119,7 @@ def build(*, values=None, reader=None, transport=None, phase=None, deadline_s=5.
     guard = ChannelCampaignGuard(
         premeasured=DIGESTS,
         control=ReobservationSet(tuple(producers.values())),
-        acl=AclPrincipalStateProducer(reader=reader, baseline=BASELINE),
+        acl=observer(reader),
         phase=phase or (lambda: CAMPAIGN),
         transport=transport,
         deadline_s=deadline_s,
@@ -177,9 +196,13 @@ def test_a_timed_out_call_refuses():
         async def require(self, facts) -> None:
             await asyncio.sleep(1)
 
-    guard, _, _, _ = build(transport=Slow(), deadline_s=0.05)
+    guard, producers, _, transport = build(transport=Slow(), deadline_s=0.05)
     with pytest.raises(OperatorGuardRefused):
         asyncio.run(guard.require_current())
+    transport.__class__ = Transport  # the channel would answer now; the guard stays fenced
+    with pytest.raises(OperatorGuardRefused):
+        asyncio.run(guard.require_current())
+    assert producers["permit"].calls == 1 and guard.calls == 0
 
 
 def _state(reader: Reader, name: str, **change) -> None:
@@ -289,21 +312,18 @@ def test_construction_refuses_an_incomplete_or_foreign_binding():
     with pytest.raises(ProducerRefused):
         ReobservationSet((*good.values(), Fact("cni")))
     with pytest.raises(ProducerRefused):
-        AclBaseline({name: BASELINE.principals[name] for name in ACL_PRINCIPALS[1:]})
+        AclBaseline(B, {name: STATES[name] for name in ACL_PRINCIPALS[1:]})
     with pytest.raises(ProducerRefused):
-        AclBaseline(
-            {
-                name: (USERS["worker"], AclPrincipalState(hashes(name), True))
-                for name in ACL_PRINCIPALS
-            }
-        )
+        AclBaseline(B, {**STATES, "provisioner": STATES["worker"]})
+    with pytest.raises(ProducerRefused):
+        AclBaseline(bootstrap_value(), STATES)  # type: ignore[arg-type]
     with pytest.raises(ProducerRefused):
         PhaseExpectation("activated", {"provisioner": False})
     with pytest.raises(OperatorGuardRefused):
         ChannelCampaignGuard(
             premeasured={**DIGESTS, "extra": OTHER},
             control=ReobservationSet(tuple(good.values())),
-            acl=AclPrincipalStateProducer(reader=Reader(), baseline=BASELINE),
+            acl=observer(Reader()),
             phase=lambda: CAMPAIGN,
             transport=Transport(),
         )
@@ -336,3 +356,53 @@ def test_the_reobservation_set_itself_refuses_a_malformed_digest(value):
     producers = tuple(Fact(n, value if n == "artifact" else None) for n in OBSERVATION_FACTS)
     with pytest.raises(ProducerRefused):
         asyncio.run(ReobservationSet(producers).reobserve())
+
+
+def test_the_acl_principals_are_the_provisioners_broker_principals():
+    # One tuple: a principal added to G cannot be skipped by the state check.
+    assert ACL_PRINCIPALS is BROKER_PRINCIPALS
+
+
+def test_the_baseline_usernames_are_bs_credential_references():
+    assert {name: row[0] for name, row in BASELINE.principals.items()} == USERS
+    assert BASELINE.bootstrap_digest == B.digest
+
+
+def test_a_baseline_for_another_installation_cannot_redirect_the_check():
+    other = bootstrap_value()
+    other["runtime_generation"] = str(int(other["runtime_generation"]) + 1)
+    foreign = AclBaseline(parse_commissioning_bootstrap(encoded(other)), STATES)
+    with pytest.raises(OperatorGuardRefused):
+        ChannelCampaignGuard(
+            premeasured=DIGESTS,
+            control=ReobservationSet(tuple(Fact(n) for n in OBSERVATION_FACTS)),
+            acl=observer(Reader(), baseline=foreign),
+            phase=lambda: CAMPAIGN,
+            transport=Transport(),
+        )
+
+
+@pytest.mark.parametrize(
+    "name, provisioner",
+    [
+        *((USERS[p], PROVISIONER) for p in ACL_PRINCIPALS),
+        *((OBSERVER, USERS[p]) for p in ACL_PRINCIPALS),
+        (OBSERVER, OBSERVER),
+        ("", PROVISIONER),
+        (OBSERVER, ""),
+        (OBSERVER.encode(), PROVISIONER),
+    ],
+)
+def test_the_observer_must_be_its_own_principal(name, provisioner):
+    # The checked parties never read their own evidence (design decision 7).
+    with pytest.raises(ProducerRefused):
+        observer(Reader(), name=name, provisioner=provisioner)
+
+
+def test_resp3_flags_as_a_set_parse_like_a_list():
+    # Valkey replies with ``flags`` as a RESP3 set; ``passwords`` stays an array.
+    expected = AclPrincipalState(frozenset({"a" * 64}), False)
+    for flags in ({b"off"}, frozenset({"off", "allchannels"}), [b"off"]):
+        assert parse_getuser_reply({"flags": flags, "passwords": ["a" * 64]}) == expected
+    with pytest.raises(ProducerRefused):
+        parse_getuser_reply({"flags": ["on"], "passwords": {"a" * 64}})

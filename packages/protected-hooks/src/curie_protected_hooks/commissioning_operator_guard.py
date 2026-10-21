@@ -78,6 +78,8 @@ class ChannelCampaignGuard:
             _require(type(deadline_s) in (int, float) and 0 < deadline_s <= 120)
             expected = {name: premeasured[name] for name in OBSERVATION_FACTS}
             _require(all(type(v) is str and len(v) == 64 for v in expected.values()))
+            # The ACL baseline belongs to the installation whose bootstrap B is measured.
+            _require(acl.baseline.bootstrap_digest == expected["bootstrap"])
         except OperatorGuardRefused:
             raise
         except Exception:  # noqa: BLE001

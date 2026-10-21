@@ -20,6 +20,37 @@ from .test_commissioning_observation_channel import DIGESTS, Store, api, pair, s
 OTHER = "f" * 64
 
 
+def _ref(name):
+    return {"id": "example/" + name, "generation": "1"}
+
+
+def bootstrap():
+    """An anonymous B; the guard's ACL baseline must belong to it."""
+    parse = importlib.import_module("curie_protected_hooks.commissioning_bootstrap")
+    value = {
+        "schema_version": 1,
+        "record_type": "commissioning_bootstrap",
+        "runtime_id": "66666666-6666-4666-8666-666666666666",
+        "runtime_generation": "1",
+        "execution_config_digest": "7" * 64,
+        "entry_points": {"production": "composition/p", "commissioning": "composition/c"},
+        "production_credentials": {n: _ref(n) for n in ("enqueue", "worker", "verifier")},
+        "candidate_credentials": {"enqueue": _ref("c-enqueue"), "worker": _ref("c-worker")},
+        **{n + "_identity": _ref(n) for n in ("issuer", "control", "mediator", "gateway")},
+        "source_scope": [
+            {
+                "source_id": "77777777-7777-4777-8777-777777777777",
+                "generation": "1",
+                "policy_fingerprint": "8" * 64,
+            }
+        ],
+        "target_scope": ["fixture/example-readonly"],
+        "max_permit_ms": "1000",
+    }
+    raw = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("ascii")
+    return parse.parse_commissioning_bootstrap(raw)
+
+
 def product():
     return (
         importlib.import_module("curie_protected_hooks.commissioning_operator_guard"),
@@ -28,12 +59,12 @@ def product():
 
 
 class Fact:
-    def __init__(self, fact, value=None):
-        self.fact, self.value, self.calls = fact, value, 0
+    def __init__(self, fact, facts, value=None):
+        self.fact, self.facts, self.value, self.calls = fact, facts, value, 0
 
     async def observe(self):
         self.calls += 1
-        return DIGESTS[self.fact] if self.value is None else self.value(self.calls)
+        return self.facts[self.fact] if self.value is None else self.value(self.calls)
 
 
 class Reader:
@@ -46,21 +77,27 @@ class Reader:
 
 def compose(store, *, provisioner=None, timeout_s=2.0):
     guard_m, producers = product()
-    control = {name: Fact(name) for name in producers.OBSERVATION_FACTS}
+    b = bootstrap()
+    facts = DIGESTS | {"bootstrap": b.digest}
+    control = {name: Fact(name, facts) for name in producers.OBSERVATION_FACTS}
     remote = {
-        name: Fact(name, (provisioner or {}).get(name)) for name in producers.OBSERVATION_FACTS
+        name: Fact(name, facts, (provisioner or {}).get(name))
+        for name in producers.OBSERVATION_FACTS
     }
     reobservation = producers.ReobservationSet(tuple(remote.values()))
     requester, responder, _, key = pair(store, observed=None, timeout_s=timeout_s)
-    responder._reobserve = reobservation.reobserve
+    responder._reobserve, responder._facts = reobservation.reobserve, facts
     state = producers.AclPrincipalState(frozenset({"a" * 64}), True)
-    baseline = producers.AclBaseline(
-        {name: ("user-" + name, state) for name in producers.ACL_PRINCIPALS}
-    )
+    baseline = producers.AclBaseline(b, {name: state for name in producers.ACL_PRINCIPALS})
     guard = guard_m.ChannelCampaignGuard(
-        premeasured=DIGESTS,
+        premeasured=facts,
         control=producers.ReobservationSet(tuple(control.values())),
-        acl=producers.AclPrincipalStateProducer(reader=Reader(), baseline=baseline),
+        acl=producers.AclPrincipalStateProducer(
+            reader=Reader(),
+            baseline=baseline,
+            observer_username="example/acl-observer",
+            provisioner_username="example/provisioner",
+        ),
         phase=lambda: producers.PhaseExpectation("campaign", {}),
         transport=requester,
         deadline_s=timeout_s + 1,
