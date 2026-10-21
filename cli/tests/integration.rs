@@ -5,6 +5,7 @@
 mod support;
 
 mod actions_cli;
+mod agent_schedules_cli;
 mod agent_update_body;
 mod api_deploy;
 mod api_emit_parity;

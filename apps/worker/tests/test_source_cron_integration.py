@@ -193,7 +193,7 @@ class Campaign:
 def campaign(worker_db: Any) -> Iterator[Campaign]:
     """@spec PROTECTED-HOOK-SOURCE-2/10."""
     support, clone, url = worker_db
-    clone.at("selfimp_skills_0001")
+    clone.at("selfimp_sched_0001")
     actual = Campaign(support, url)
     try:
         yield actual

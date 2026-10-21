@@ -10,6 +10,18 @@
       "version": "1.0"
     },
     {
+      "result": "AgentOverridesOutput",
+      "kind": "CliOutput",
+      "schema": "overrides.schema.json",
+      "version": "3.2"
+    },
+    {
+      "result": "AgentScheduleOutput",
+      "kind": "CliOutput",
+      "schema": "schedules.schema.json",
+      "version": "3.1"
+    },
+    {
       "result": "AllTargetsDeployOutput",
       "kind": "CliOutput",
       "schema": "deploy.schema.json",
@@ -313,7 +325,7 @@
       "result": "OverridesOutput",
       "kind": "CliOutput",
       "schema": "overrides.schema.json",
-      "version": "3.1"
+      "version": "3.2"
     },
     {
       "result": "PreflightOutput",
@@ -439,7 +451,7 @@
       "result": "SchedulesOutput",
       "kind": "CliOutput",
       "schema": "schedules.schema.json",
-      "version": "3.0"
+      "version": "3.1"
     },
     {
       "result": "HookFireOutput",

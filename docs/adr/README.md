@@ -256,4 +256,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0234 | [Factory-owned pull requests accept authorized feedback without a mention](0234-factory-owned-pull-requests-accept-authorized-feedback-without-a-mention.md) | Accepted |
 | 0236 | [The commissioning operator splits provisioner and control processes](0236-the-commissioning-operator-splits-provisioner-and-control-processes.md) | Accepted |
 | 0237 | [Learned skills are a mutable, Markdown-only skill source](0237-learned-skills-are-a-mutable-markdown-skill-source.md) | Accepted |
+| 0238 | [Agent-created schedules run under operator-delegated authority](0238-agent-created-schedules-run-under-operator-delegated-authority.md) | Accepted |
 <!-- END GENERATED: adr-index -->

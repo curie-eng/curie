@@ -1117,6 +1117,7 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
             runner_resources,
             clear_runner_resources,
             memory_writes,
+            agent_schedules,
             learned_skills,
             conn,
             dry_run,
@@ -1162,6 +1163,7 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                     execution_deadline,
                     runner_resources,
                     commands::on_off_flag(memory_writes.as_deref()),
+                    commands::on_off_flag(agent_schedules.as_deref()),
                     commands::on_off_flag(learned_skills.as_deref()),
                 )
                 .await?,
@@ -1404,9 +1406,11 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
             agent,
             pause,
             resume,
+            agent_schedule,
             conn,
             dry_run,
         } => {
+            let verb = agent_schedule.into_verb()?;
             let (api_url, api_key, _cluster_api_pf) = commands::resolve_cluster_conn(
                 conn.api_url,
                 conn.api_key,
@@ -1415,17 +1419,29 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                 dry_run,
             )
             .await?;
-            emit(
-                commands::schedules(commands::SchedulesOpts {
-                    api_url,
-                    api_key,
-                    agent,
-                    pause,
-                    resume,
-                    dry_run,
-                })
-                .await?,
-            )
+            match verb {
+                Some(verb) => emit_boxed(
+                    commands::agent_schedule(commands::AgentScheduleOpts {
+                        api_url,
+                        api_key,
+                        agent,
+                        verb,
+                        dry_run,
+                    })
+                    .await?,
+                ),
+                None => emit(
+                    commands::schedules(commands::SchedulesOpts {
+                        api_url,
+                        api_key,
+                        agent,
+                        pause,
+                        resume,
+                        dry_run,
+                    })
+                    .await?,
+                ),
+            }
         }
         ClusterAction::Hook { action, conn } => {
             let dry_run = match &action {

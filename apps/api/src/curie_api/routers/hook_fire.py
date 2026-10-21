@@ -3,6 +3,11 @@
 A fire still claims a ``hook_runs`` row and still skips when that hook already
 has a run in flight. The queued turn is the same shape the scheduler enqueues,
 so the worker settles the row when the turn ends.
+
+An agent schedule (ADR 0238) fires by its ``agent-schedule:<id>`` name: its
+prompt, to its stored destination binding exactly (kind, address and adapter),
+with a run snapshot beside the manual row. A manual row never consumes or
+completes a one-shot; only scheduler rows do.
 """
 
 from __future__ import annotations
@@ -32,6 +37,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
+from curie_api.crud import agent_schedules as agent_store
 from curie_api.routers.schedules import read_triggers, resolve_agent
 from curie_api.schemas.schedules import HookFireOut, HookRunReason, ScheduleOutcome
 
@@ -74,6 +80,13 @@ _BINDINGS_SQL = """
 SELECT kind, address, endpoint, adapter
 FROM {schema}.agent_channels
 WHERE agent_id = :agent_id AND address = :address
+"""
+
+_DESTINATION_SQL = """
+SELECT kind, address, endpoint, adapter
+FROM {schema}.agent_channels
+WHERE agent_id = :agent_id AND kind = :kind AND address = :address
+  AND adapter IS NOT DISTINCT FROM :adapter
 """
 
 _LOCK_SQL = """
@@ -209,6 +222,41 @@ async def _require_ordinary_source(
         raise HTTPException(503, "authority_unavailable" if presence.policy else "pending_history")
 
 
+async def _schedule_handle(
+    session: AsyncSession, agent_id: uuid.UUID, schedule_id: uuid.UUID
+) -> ReplyHandle | None:
+    """The reply route of an agent schedule's stored destination: that exact
+    binding (adapter included), never another of the agent's bindings."""
+
+    schedule = await agent_store.get(session, agent_id, schedule_id)
+    if schedule is None:
+        return None
+    binding = (
+        (
+            await session.execute(
+                _sql(_DESTINATION_SQL),
+                {
+                    "agent_id": agent_id,
+                    "kind": schedule.destination_kind,
+                    "address": schedule.destination_address,
+                    "adapter": schedule.destination_adapter,
+                },
+            )
+        )
+        .mappings()
+        .first()
+    )
+    if binding is None:
+        return None
+    return ReplyHandle(
+        kind=binding["kind"],
+        channel=binding["address"],
+        placeholder=None,
+        endpoint=binding["endpoint"],
+        adapter=binding["adapter"],
+    )
+
+
 async def _insert(
     session: AsyncSession,
     *,
@@ -277,17 +325,36 @@ async def fire_hook(
         )
         if deployment is None or deployment["bundle_ref"] is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "agent has no in-force bundle")
-        try:
-            data = await store.get(str(deployment["bundle_ref"]))
-            declared = await run_in_threadpool(read_triggers, data)
-        except Exception as exc:
-            raise HTTPException(
-                status.HTTP_409_CONFLICT, "stored bundle could not be read"
-            ) from exc
-        trigger = _cron(declared, name)
-        if trigger is None:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "hook is not declared")
-        prompt = trigger.get("prompt")
+        schedule_id = agent_store.parse_name(name)
+        trigger: dict[str, Any] = {}
+        if name.startswith(agent_store.NAME_PREFIX):
+            schedule = (
+                None
+                if schedule_id is None
+                else await agent_store.get(session, selected.id, schedule_id)
+            )
+            if schedule is None:
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "schedule not found")
+            if schedule.state == agent_store.CANCELLED:
+                raise HTTPException(status.HTTP_409_CONFLICT, "schedule is cancelled")
+            if not selected.agent_schedules:
+                raise HTTPException(
+                    status.HTTP_403_FORBIDDEN, "agent schedules are off for this agent"
+                )
+            prompt: Any = schedule.prompt
+        else:
+            try:
+                data = await store.get(str(deployment["bundle_ref"]))
+                declared = await run_in_threadpool(read_triggers, data)
+            except Exception as exc:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT, "stored bundle could not be read"
+                ) from exc
+            found = _cron(declared, name)
+            if found is None:
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "hook is not declared")
+            trigger = found
+            prompt = trigger.get("prompt")
         if not isinstance(prompt, str) or not prompt.strip():
             raise HTTPException(status.HTTP_404_NOT_FOUND, "hook is not declared")
 
@@ -303,6 +370,11 @@ async def fire_hook(
         elif _budget_spent(deployment["max_usd_per_day"], deployment["max_output_tokens_per_run"]):
             terminal = "blocked"
             reason = "budget_exhausted"
+        elif schedule_id is not None:
+            handle = await _schedule_handle(session, selected.id, schedule_id)
+            if handle is None:
+                terminal = "failed"
+                reason = "target_unbound"
         else:
             address = trigger.get("target")
             if isinstance(address, str) and address.strip():
@@ -354,6 +426,13 @@ async def fire_hook(
                 outcome=terminal,
                 reason=reason,
             )
+            if schedule_id is not None:
+                # Under the admission lock _insert took: the configuration as
+                # it stands now is what this run fires.
+                current = await agent_store.get(session, selected.id, schedule_id)
+                if current is not None:
+                    prompt = current.prompt
+                    session.add(agent_store.snapshot(current, row["id"]))
         record = _record(agent_id=selected.id, agent=selected.name, name=name, row=row)
         if outcome is not None:
             return record

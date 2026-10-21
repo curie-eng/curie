@@ -56,11 +56,13 @@ def graph_payload() -> dict[str, Any]:
         ("0101", False),
         ("0102", False),
         ("0103", False),
-        # The learned-skills expand (selfimp_skills_0001) is the minimum: this
-        # image reads its tables, so 0108 and selfimp_safety_0001 are refused.
+        # The agent-schedules expand (selfimp_sched_0001) is the minimum: this
+        # image reads its columns, so 0108, selfimp_safety_0001 and
+        # selfimp_skills_0001 are refused.
         ("0108", False),
         ("selfimp_safety_0001", False),
-        ("selfimp_skills_0001", True),
+        ("selfimp_skills_0001", False),
+        ("selfimp_sched_0001", True),
         ("0000", True),
         ("future-expand", True),
     ],

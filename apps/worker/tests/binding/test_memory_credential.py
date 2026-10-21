@@ -160,12 +160,24 @@ def test_turn_token_claims_and_bounded_expiry() -> None:
     assert claims["memory"] == "write"
     assert claims["sender"] == "U0SENDER1"
     assert claims["turn"] == "evt-0001"
-    # The conversation the turn belongs to rides along (learned skills stamp
-    # it as provenance); learned skills off leaves the skills claim null.
+    # The conversation the turn belongs to rides along (agent schedules and
+    # learned skills stamp it as provenance); learned skills off leaves the
+    # skills claim null. Agent schedules (ADR 0238) add the schedules and
+    # scheduled claims.
     assert claims["conversation"] == _THREAD
     assert claims["skills"] is None
     assert set(claims) == {
-        "agent", "scope", "exp", "binding", "memory", "sender", "turn", "conversation", "skills",
+        "agent",
+        "scope",
+        "exp",
+        "binding",
+        "memory",
+        "sender",
+        "turn",
+        "conversation",
+        "schedules",
+        "scheduled",
+        "skills",
     }
     # Review M2: the credential ends with the turn. exp is at most now plus the
     # turn's remaining budget (rounded up to a whole second), with no grace
@@ -243,8 +255,20 @@ def test_learned_skills_alone_mints_a_skills_writer_that_reads_memory() -> None:
     assert claims["conversation"] == "slack:C0123:1700000000.000100"
     assert claims["sender"] == "U0SENDER1"
     assert claims["turn"] == "evt-0002"
+    # Agent schedules off leaves the schedules claim null (ADR 0238).
+    assert claims["schedules"] is None
     assert set(claims) == {
-        "agent", "scope", "exp", "binding", "memory", "sender", "turn", "conversation", "skills",
+        "agent",
+        "scope",
+        "exp",
+        "binding",
+        "memory",
+        "sender",
+        "turn",
+        "conversation",
+        "schedules",
+        "scheduled",
+        "skills",
     }
 
 

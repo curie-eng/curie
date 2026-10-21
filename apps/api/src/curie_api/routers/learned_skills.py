@@ -126,7 +126,9 @@ async def _writer(
     sender = principal.sender
     if not sender:
         raise _forbidden("this credential names no sender")
-    if sender == NO_PERSON or sender.startswith("cron:"):
+    # An approval continuation of a scheduled run names the approver as its
+    # sender, so the signed ``scheduled`` claim (ADR 0238) marks it instead.
+    if principal.scheduled is True or sender == NO_PERSON or sender.startswith("cron:"):
         raise _forbidden(SCHEDULED)
     if not principal.turn or not principal.conversation:
         raise _forbidden("this credential names no turn or conversation")

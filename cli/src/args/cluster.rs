@@ -921,6 +921,11 @@ pub(crate) enum ClusterAction {
         /// channel memory stays readable. Takes effect at the next sandbox boot.
         #[arg(long, value_name = "on|off", value_parser = ["on", "off"])]
         memory_writes: Option<String>,
+        /// Let the agent create and manage its own schedules on or off
+        /// (`agent_schedules`, ADR 0238). Off stops creating and changing them;
+        /// stored schedules and history stay.
+        #[arg(long, value_name = "on|off", value_parser = ["on", "off"])]
+        agent_schedules: Option<String>,
         /// Turn the agent's learned skills on or off (ADR 0237). Off stops
         /// loading and editing them; stored skills and history stay.
         #[arg(long, value_name = "on|off", value_parser = ["on", "off"])]
@@ -1138,7 +1143,8 @@ pub(crate) enum ClusterAction {
             long,
             value_name = "HOOK",
             conflicts_with = "resume",
-            requires = "agent"
+            requires = "agent",
+            group = "schedule_verb"
         )]
         pause: Option<String>,
         /// Resume one named cron hook on the selected agent.
@@ -1146,9 +1152,12 @@ pub(crate) enum ClusterAction {
             long,
             value_name = "HOOK",
             conflicts_with = "pause",
-            requires = "agent"
+            requires = "agent",
+            group = "schedule_verb"
         )]
         resume: Option<String>,
+        #[command(flatten)]
+        agent_schedule: AgentScheduleArgs,
         #[command(flatten)]
         conn: ClusterConn,
         /// Print what would be requested and exit without making a request.

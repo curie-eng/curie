@@ -23,6 +23,111 @@ pub(crate) use dev::*;
 pub(crate) use local::*;
 pub(crate) use skill::*;
 
+/// The agent-schedule verbs and policy setters (ADR 0238) flattened into each
+/// tier's `schedules`. They all need `--agent`, conflict with each other and
+/// with `--pause`/`--resume` through the `schedule_verb` group (`--pause` and
+/// `--resume` join it where they are declared).
+#[derive(Args, Debug, Clone, Default)]
+#[command(group = clap::ArgGroup::new("schedule_verb").multiple(false).requires("agent"))]
+pub(crate) struct AgentScheduleArgs {
+    /// Show one agent schedule (`GET /agents/{id}/schedules/{id}`).
+    #[arg(long, value_name = "ID", group = "schedule_verb")]
+    show: Option<String>,
+    /// Cancel one agent schedule.
+    #[arg(long, value_name = "ID", group = "schedule_verb")]
+    cancel: Option<String>,
+    /// List one agent schedule's revisions.
+    #[arg(long, value_name = "ID", group = "schedule_verb")]
+    history: Option<String>,
+    /// Change one agent schedule; pass at least one of --prompt, --cron,
+    /// --run-at, --timezone, and --expected-revision.
+    #[arg(
+        long,
+        value_name = "ID",
+        group = "schedule_verb",
+        requires = "expected_revision"
+    )]
+    update: Option<String>,
+    /// Restore an earlier revision of one agent schedule (omit --to-revision
+    /// to undo the last change); needs --expected-revision.
+    #[arg(
+        long,
+        value_name = "ID",
+        group = "schedule_verb",
+        requires = "expected_revision"
+    )]
+    revert: Option<String>,
+    /// New prompt for --update.
+    #[arg(long, requires = "update")]
+    prompt: Option<String>,
+    /// New cron expression for --update.
+    #[arg(long, requires = "update")]
+    cron: Option<String>,
+    /// New one-shot time (RFC 3339, or local time in the schedule zone) for --update.
+    #[arg(long, requires = "update")]
+    run_at: Option<String>,
+    /// New IANA time zone for --update.
+    #[arg(long, requires = "update")]
+    timezone: Option<String>,
+    /// Revision to restore with --revert.
+    #[arg(long, requires = "revert")]
+    to_revision: Option<u32>,
+    /// The revision the caller last saw; the change is refused if it moved.
+    #[arg(long)]
+    expected_revision: Option<u32>,
+    /// Set the agent's default schedule time zone (IANA name).
+    #[arg(long, value_name = "ZONE", group = "schedule_verb")]
+    set_timezone: Option<String>,
+    /// Set the most active schedules the agent may hold (1-100).
+    #[arg(long, value_name = "N", group = "schedule_verb", value_parser = clap::value_parser!(u32).range(1..=100))]
+    set_max_active: Option<u32>,
+    /// Set the shortest gap between fires of one schedule (1-1440 minutes).
+    #[arg(long, value_name = "MINUTES", group = "schedule_verb", value_parser = clap::value_parser!(u32).range(1..=1440))]
+    set_min_interval_minutes: Option<u32>,
+}
+
+impl AgentScheduleArgs {
+    /// The verb asked for, if any. Clap has already ensured at most one.
+    pub(crate) fn into_verb(self) -> Result<Option<commands::AgentScheduleVerb>> {
+        use commands::AgentScheduleVerb as V;
+        let verb = if let Some(id) = self.show {
+            V::Show(id)
+        } else if let Some(id) = self.cancel {
+            V::Cancel(id)
+        } else if let Some(id) = self.history {
+            V::History(id)
+        } else if let Some(id) = self.update {
+            V::Update {
+                id,
+                prompt: self.prompt,
+                cron: self.cron,
+                run_at: self.run_at,
+                timezone: self.timezone,
+                expected_revision: self.expected_revision.unwrap_or_default(),
+            }
+        } else if let Some(id) = self.revert {
+            V::Revert {
+                id,
+                to_revision: self.to_revision,
+                expected_revision: self.expected_revision.unwrap_or_default(),
+            }
+        } else if let Some(zone) = self.set_timezone {
+            V::SetTimezone(zone)
+        } else if let Some(max) = self.set_max_active {
+            V::SetMaxActive(max)
+        } else if let Some(minutes) = self.set_min_interval_minutes {
+            V::SetMinIntervalMinutes(minutes)
+        } else if self.expected_revision.is_some() {
+            return Err(curie::exit::usage(
+                "--expected-revision only applies to --update and --revert",
+            ));
+        } else {
+            return Ok(None);
+        };
+        Ok(Some(verb))
+    }
+}
+
 /// Per-tier defaults for the flags shared by the agent-target verbs. The only
 /// thing that differs between `local` and `cluster` is where the platform API
 /// listens, so that is the single const each tier supplies.

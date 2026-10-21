@@ -7,6 +7,8 @@ Status: Accepted
 Partially superseded by [ADR 0190](0190-automated-hook-sources-cannot-widen-their-tool-access.md)
 for ordinary-tool authorization of operator-restricted hooks only.
 
+Amended by [ADR 0238](0238-agent-created-schedules-run-under-operator-delegated-authority.md) for agent-created schedules, a mutable second schedule source.
+
 Decides the semantics a bundle-declared background turn runs with, and is the
 decision the per-agent cron scheduler (issue
 [#268](https://github.com/curie-eng/curie/issues/268), part of Epic

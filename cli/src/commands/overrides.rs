@@ -378,6 +378,72 @@ impl crate::ui::CliOutput for OverridesOutput {
     }
 }
 
+/// Output of `<tier> overrides <agent>` at the CLI: [`OverridesOutput`] plus
+/// the agent's ADR 0238 schedule settings as the API stored them. The settings
+/// are `None` only on a dry run, which has no stored row to read.
+#[derive(Debug)]
+pub struct AgentOverridesOutput {
+    pub overrides: OverridesOutput,
+    pub schedule_policy: Option<crate::api::AgentSchedulePolicy>,
+}
+
+/// The schedule settings clause of the `<tier> overrides` summary line.
+pub fn schedule_policy_summary(policy: &crate::api::AgentSchedulePolicy) -> String {
+    format!(
+        "agent schedules {}, schedule timezone {}, schedule max active {}, schedule min interval {} min",
+        if policy.agent_schedules { "on" } else { "off" },
+        policy.schedule_timezone,
+        policy.schedule_max_active,
+        policy.schedule_min_interval_minutes
+    )
+}
+
+impl crate::ui::CliOutput for AgentOverridesOutput {
+    fn to_json(&self) -> serde_json::Value {
+        let mut value = self.overrides.to_json();
+        if let (Some(policy), Some(object)) = (&self.schedule_policy, value.as_object_mut()) {
+            if let Ok(serde_json::Value::Object(fields)) = serde_json::to_value(policy) {
+                object.extend(fields);
+            }
+        }
+        value
+    }
+
+    fn render(&self, ui: &crate::ui::Ui) {
+        match (&self.overrides, &self.schedule_policy) {
+            (
+                OverridesOutput::Done {
+                    agent,
+                    model,
+                    reviewer_model,
+                    thinking,
+                    execution_deadline_seconds,
+                    runner_resources,
+                    memory_writes,
+                    learned_skills,
+                    changed,
+                },
+                Some(policy),
+            ) => ui.payload(&format!(
+                "{}, {}",
+                overrides_summary(
+                    agent,
+                    model,
+                    reviewer_model,
+                    thinking,
+                    execution_deadline_seconds,
+                    runner_resources,
+                    *memory_writes,
+                    *learned_skills,
+                    *changed,
+                ),
+                schedule_policy_summary(policy)
+            )),
+            (overrides, _) => overrides.render(ui),
+        }
+    }
+}
+
 /// `curie <tier> overrides <agent>` sets or clears model, reviewer and thinking overrides.
 ///
 /// With no change flags this INSPECTS: one `GET`-resolved agent, no write. With
@@ -417,19 +483,21 @@ pub async fn overrides(
         runner_resources,
         None,
         None,
+        None,
     )
     .await
+    .map(|output| output.overrides)
 }
 
-/// An `on|off` switch flag (`--memory-writes`, `--learned-skills`) as the
+/// An `on|off` switch flag (`--memory-writes`, `--agent-schedules`, `--learned-skills`) as the
 /// boolean the API stores, or `None` when the flag was not passed. Clap has
 /// already refused any other value.
 pub fn on_off_flag(value: Option<&str>) -> Option<bool> {
     value.map(|v| v == "on")
 }
 
-/// [`overrides`] plus the `memory_writes` (#1461) and `learned_skills`
-/// (ADR 0237) switches.
+/// [`overrides`] plus the `memory_writes` (#1461), `agent_schedules`
+/// (ADR 0238) and `learned_skills` (ADR 0237) switches.
 ///
 /// Each switch is a NOT NULL boolean rather than a nullable override, so it
 /// has no clear: `Some(b)` sends a JSON boolean under its own key, `None`
@@ -444,10 +512,11 @@ pub fn on_off_flag(value: Option<&str>) -> Option<bool> {
 ///   execution_deadline: the intent for the execution deadline.
 ///   runner_resources: the intent for the runner resources override.
 ///   memory_writes: the new memory-writes switch, if one was asked for.
+///   agent_schedules: the new agent-schedules switch, if one was asked for.
 ///   learned_skills: the new learned-skills switch, if one was asked for.
 ///
 /// Returns:
-///   The stored overrides and switches, or the dry-run plan.
+///   The stored overrides, switches and schedule settings, or the dry-run plan.
 #[allow(clippy::too_many_arguments)] // One intent per override flag.
 pub async fn overrides_with_switches(
     opts: AgentActionOpts,
@@ -457,8 +526,9 @@ pub async fn overrides_with_switches(
     execution_deadline: OverrideChange,
     runner_resources: OverrideChange,
     memory_writes: Option<bool>,
+    agent_schedules: Option<bool>,
     learned_skills: Option<bool>,
-) -> Result<OverridesOutput> {
+) -> Result<AgentOverridesOutput> {
     let ui = crate::ui::ui();
     let mut body = overrides_patch_body(
         &model,
@@ -469,6 +539,10 @@ pub async fn overrides_with_switches(
     );
     if let Some(on) = memory_writes {
         body.get_or_insert_with(AgentUpdate::default).memory_writes = Some(on);
+    }
+    if let Some(on) = agent_schedules {
+        body.get_or_insert_with(AgentUpdate::default)
+            .agent_schedules = Some(on);
     }
     if let Some(on) = learned_skills {
         body.get_or_insert_with(AgentUpdate::default).learned_skills = Some(on);
@@ -486,25 +560,29 @@ pub async fn overrides_with_switches(
                 opts.api_url, opts.agent
             ),
         };
-        return Ok(OverridesOutput::DryRun(crate::ui::DryRunPlan {
-            lines: vec![plan],
-        }));
+        return Ok(AgentOverridesOutput {
+            overrides: OverridesOutput::DryRun(crate::ui::DryRunPlan { lines: vec![plan] }),
+            schedule_policy: None,
+        });
     }
     let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
     let agent = client.find_agent(&opts.agent).await?;
     let Some(body) = body else {
         // Inspect: find_agent already carries every override, so there is nothing
         // further to fetch and nothing to write.
-        return Ok(OverridesOutput::Done {
-            agent: agent.name,
-            model: agent.model,
-            reviewer_model: agent.reviewer_model,
-            thinking: agent.thinking,
-            execution_deadline_seconds: agent.execution_deadline_seconds,
-            runner_resources: agent.runner_resources,
-            memory_writes: agent.memory_writes,
-            learned_skills: agent.learned_skills,
-            changed: false,
+        return Ok(AgentOverridesOutput {
+            schedule_policy: Some(agent.schedule_policy()),
+            overrides: OverridesOutput::Done {
+                agent: agent.name,
+                model: agent.model,
+                reviewer_model: agent.reviewer_model,
+                thinking: agent.thinking,
+                execution_deadline_seconds: agent.execution_deadline_seconds,
+                runner_resources: agent.runner_resources,
+                memory_writes: agent.memory_writes,
+                learned_skills: agent.learned_skills,
+                changed: false,
+            },
         });
     };
     let cl = ui.checklist();
@@ -519,16 +597,19 @@ pub async fn overrides_with_switches(
             return Err(err);
         }
     };
-    Ok(OverridesOutput::Done {
-        agent: saved.name,
-        model: saved.model,
-        reviewer_model: saved.reviewer_model,
-        thinking: saved.thinking,
-        execution_deadline_seconds: saved.execution_deadline_seconds,
-        runner_resources: saved.runner_resources,
-        memory_writes: saved.memory_writes,
-        learned_skills: saved.learned_skills,
-        changed: true,
+    Ok(AgentOverridesOutput {
+        schedule_policy: Some(saved.schedule_policy()),
+        overrides: OverridesOutput::Done {
+            agent: saved.name,
+            model: saved.model,
+            reviewer_model: saved.reviewer_model,
+            thinking: saved.thinking,
+            execution_deadline_seconds: saved.execution_deadline_seconds,
+            runner_resources: saved.runner_resources,
+            memory_writes: saved.memory_writes,
+            learned_skills: saved.learned_skills,
+            changed: true,
+        },
     })
 }
 

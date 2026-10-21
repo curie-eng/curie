@@ -323,6 +323,12 @@ class Agent(Base):
     # agent (#1461, ADR-0167). Operator-owned; off by default. When on, the
     # worker hands the runner the binding-scoped channel memory URL.
     memory_writes: Mapped[bool] = mapped_column(default=False, server_default="false")
+    # Whether the agent may create and change its own schedules (ADR 0238), and
+    # the limits it is held to. Operator-owned; off by default.
+    agent_schedules: Mapped[bool] = mapped_column(default=False, server_default="false")
+    schedule_timezone: Mapped[str] = mapped_column(Text, default="UTC", server_default="UTC")
+    schedule_max_active: Mapped[int] = mapped_column(default=20, server_default="20")
+    schedule_min_interval_minutes: Mapped[int] = mapped_column(default=15, server_default="15")
     # Whether the agent loads and may edit its learned skills (ADR 0237).
     # Operator-owned; off by default, like ``memory_writes``.
     learned_skills: Mapped[bool] = mapped_column(default=False, server_default="false")
@@ -3620,6 +3626,121 @@ class IdentityLink(Base):
         DateTime(timezone=True), server_default=func.now()
     )
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+
+
+class AgentSchedule(Base):
+    """One schedule an agent (or its operator) created (ADR 0238).
+
+    Exactly one of ``cron`` (recurring) and ``run_at`` (one-shot) is set.
+    ``revision`` is the configuration revision: it moves only when the prompt,
+    cron, run_at or timezone change, or on revert. Stored ``state`` is active,
+    cancelled or done; paused is read from ``schedule_controls``."""
+
+    __tablename__ = "agent_schedules"
+    __table_args__ = (
+        CheckConstraint("(cron IS NULL) <> (run_at IS NULL)", name="agent_schedules_one_kind_ck"),
+        CheckConstraint(
+            "state IN ('active', 'cancelled', 'done')", name="agent_schedules_state_ck"
+        ),
+        CheckConstraint(
+            "created_source IN ('agent', 'operator')", name="agent_schedules_source_ck"
+        ),
+        CheckConstraint("revision >= 1", name="agent_schedules_revision_ck"),
+        UniqueConstraint("agent_id", "idempotency_key", name="uq_agent_schedules_idempotency_key"),
+        Index("ix_agent_schedules_agent_state", "agent_id", "state"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE")
+    )
+    revision: Mapped[int]
+    state: Mapped[str] = mapped_column(Text)
+    prompt: Mapped[str] = mapped_column(Text)
+    cron: Mapped[str | None] = mapped_column(Text, default=None)
+    run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    timezone: Mapped[str] = mapped_column(Text)
+    destination_kind: Mapped[str] = mapped_column(Text)
+    destination_address: Mapped[str] = mapped_column(Text)
+    destination_adapter: Mapped[str | None] = mapped_column(Text, default=None)
+    created_by: Mapped[str] = mapped_column(Text)
+    created_source: Mapped[str] = mapped_column(Text)
+    created_conversation: Mapped[str | None] = mapped_column(Text, default=None)
+    created_turn: Mapped[str | None] = mapped_column(Text, default=None)
+    idempotency_key: Mapped[str] = mapped_column(Text)
+    effective_from: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_by: Mapped[str | None] = mapped_column(Text, default=None)
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    cancelled_by: Mapped[str | None] = mapped_column(Text, default=None)
+    fired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+
+
+class AgentScheduleRevision(Base):
+    """One insert-only entry in a schedule's change log (ADR 0238). Several
+    entries share a ``revision``: pause, resume, cancel and completion are
+    logged without moving it. ``state`` is the read-back state after it."""
+
+    __tablename__ = "agent_schedule_revisions"
+    __table_args__ = (
+        CheckConstraint(
+            "action IN ('create', 'update', 'pause', 'resume', 'cancel', 'revert', 'complete')",
+            name="agent_schedule_revisions_action_ck",
+        ),
+        CheckConstraint(
+            "state IN ('active', 'paused', 'cancelled', 'done')",
+            name="agent_schedule_revisions_state_ck",
+        ),
+        CheckConstraint(
+            "source IN ('agent', 'operator', 'scheduler')",
+            name="agent_schedule_revisions_source_ck",
+        ),
+    )
+
+    schedule_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agent_schedules.id", ondelete="CASCADE"), primary_key=True
+    )
+    seq: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
+    revision: Mapped[int]
+    action: Mapped[str] = mapped_column(Text)
+    state: Mapped[str] = mapped_column(Text)
+    prompt: Mapped[str] = mapped_column(Text)
+    cron: Mapped[str | None] = mapped_column(Text, default=None)
+    run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    timezone: Mapped[str] = mapped_column(Text)
+    author: Mapped[str] = mapped_column(Text)
+    source: Mapped[str] = mapped_column(Text)
+    conversation: Mapped[str | None] = mapped_column(Text, default=None)
+    turn: Mapped[str | None] = mapped_column(Text, default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class AgentScheduleRun(Base):
+    """What one hook run of an agent schedule fired (ADR 0238): an immutable
+    snapshot keyed by its ``hook_runs`` row, read by the start guard."""
+
+    __tablename__ = "agent_schedule_runs"
+    __table_args__ = (Index("ix_agent_schedule_runs_schedule", "schedule_id", "revision"),)
+
+    hook_run_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.hook_runs.id", ondelete="CASCADE"), primary_key=True
+    )
+    schedule_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agent_schedules.id", ondelete="CASCADE")
+    )
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE")
+    )
+    revision: Mapped[int]
+    prompt: Mapped[str] = mapped_column(Text)
+    cron: Mapped[str | None] = mapped_column(Text, default=None)
+    run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    timezone: Mapped[str] = mapped_column(Text)
+    destination_kind: Mapped[str] = mapped_column(Text)
+    destination_address: Mapped[str] = mapped_column(Text)
+    destination_adapter: Mapped[str | None] = mapped_column(Text, default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class LearnedSkill(Base):

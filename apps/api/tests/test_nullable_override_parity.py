@@ -86,6 +86,7 @@ KNOWN_BODY_MODULES = frozenset(
         "curie_api.hook_source_policy_schemas",
         "curie_api.identity.slack",
         "curie_api.schemas.actions",
+        "curie_api.schemas.agent_schedules",
         "curie_api.schemas.agents",
         "curie_api.schemas.approvals",
         "curie_api.schemas.channel_identities",

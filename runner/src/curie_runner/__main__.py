@@ -32,6 +32,15 @@ from .adapter import (
     build_structured_resume,
     hidden_restore_tools,
 )
+from .agent_schedules import (
+    AgentSchedulesClient,
+    AgentSchedulesConfig,
+    agent_schedules_url,
+    schedules_guidance,
+)
+from .agent_schedules import (
+    load_for_session as load_schedules_for_session,
+)
 from .approval import (
     APPROVAL_SERVER_NAME,
     ApprovalGate,
@@ -67,6 +76,7 @@ from .connectors import (
 )
 from .executor import EXECUTOR_MODE, RUNNER_MODE_ENV
 from .fake import FakeModelSession
+from .harness.claude.agent_schedule_tools import build_agent_schedules_server
 from .harness.claude.approval import (
     build_approval_hook,
     build_approval_server,
@@ -101,7 +111,9 @@ from .learned_skills import (
     LearnedSkillsClient,
     MaterializedPlugin,
     learned_skills_url,
-    load_for_session,
+)
+from .learned_skills import (
+    load_for_session as load_learned_skills_for_session,
 )
 from .mcp_tool_capability import (
     ConnectorAvailability,
@@ -157,6 +169,8 @@ from .state import (
 from .subprocess_env import lock_process_environ
 from .tool_access import TurnToolAccess, front_can_use_tool, front_pre_tool_use_hooks
 from .tool_names import (
+    AGENT_SCHEDULE_READ_ONLY_TOOL_NAMES,
+    AGENT_SCHEDULES_SERVER_NAME,
     LEARNED_SKILL_READ_ONLY_TOOL_NAMES,
     LEARNED_SKILLS_SERVER_NAME,
     STATE_SERVER_NAME,
@@ -650,6 +664,7 @@ def _compose_system_prompt(
     progress_preamble: str | None = None,
     facts_preamble: str | None = None,
     guidance_preamble: str | None = None,
+    schedules_preamble: str | None = None,
     learned_skills_preamble: str | None = None,
 ) -> str | None:
     """Compose durable memory, mounted-workspace facts, bundle instructions, and model identity.
@@ -683,6 +698,7 @@ def _compose_system_prompt(
             memory_preamble,
             facts_preamble,
             guidance_preamble,
+            schedules_preamble,
             learned_skills_preamble,
             workspace_preamble,
             tool_manifest_preamble,
@@ -772,6 +788,7 @@ def build_runner(
     history_capacity_exceeded: bool = False,
     memory_facts_preamble: str | None = None,
     memory_guidance: str | None = None,
+    agent_schedules: AgentSchedulesConfig | None = None,
     learned_skills: MaterializedPlugin | None = None,
 ) -> SessionRunner:
     """Wire a SessionRunner backed by the active harness's model session.
@@ -914,9 +931,18 @@ def build_runner(
         and memory_token is not None
         and not fake_model
     )
-    # Learned skills (ADR 0237) mount on the real-model path only. Their tools
-    # read the author and the write credential from the same per-turn holder,
-    # so it exists whenever either set of tools is mounted.
+    # Agent schedules (ADR 0238) and learned skills (ADR 0237) mount on the
+    # real-model path only. Their tools read the author and the write
+    # credential from the same per-turn holder, so it exists whenever any of
+    # these sets of tools is mounted.
+    schedules_url = agent_schedules_url(os.environ.get(BootEnv.env_key("state_url"), ""))
+    schedules = (
+        agent_schedules
+        if agent_schedules is not None and not fake_model and schedules_url is not None
+        else None
+    )
+    if schedules is not None:
+        logger.info("agent schedules tools mounted session=%s", config.session.session_id)
     learned_url = learned_skills_url(os.environ.get(BootEnv.env_key("state_url"), ""))
     learned = (
         learned_skills
@@ -929,7 +955,11 @@ def build_runner(
             config.session.session_id,
             ",".join(learned.loaded),
         )
-    memory_turn = MemoryTurn() if memory_tools_mounted or learned is not None else None
+    memory_turn = (
+        MemoryTurn()
+        if memory_tools_mounted or schedules is not None or learned is not None
+        else None
+    )
 
     def turn_write_token() -> str | None:
         # ADR-0188: the tools write with the turn's own credential, carried on
@@ -960,6 +990,9 @@ def build_runner(
             else WRITES_OFF_NOTICE
             if channel_memory_readable and not config.memory_writes_on
             else None
+        ),
+        schedules_preamble=(
+            schedules_guidance(schedules.timezone) if schedules is not None else None
         ),
         learned_skills_preamble=LEARNED_SKILLS_GUIDANCE if learned is not None else None,
     )
@@ -1087,6 +1120,7 @@ def build_runner(
             repo_path=config.repo_path,
         )
         approval_gate.memory_tools_mounted = memory_tools_mounted
+        approval_gate.agent_schedules_mounted = schedules is not None
         approval_gate.learned_skills_mounted = learned is not None
     workspace_cwd = str(mounted_workspace) if mounted_workspace is not None else None
     derived_mcp_servers = derive_mcp_servers(
@@ -1134,6 +1168,7 @@ def build_runner(
         # The learned list/read tools are in the classifier's platform set.
         return TurnToolAccess(
             _readonly_tools(harness, observed, approval_gate)
+            | (AGENT_SCHEDULE_READ_ONLY_TOOL_NAMES if schedules is not None else frozenset())
             | (LEARNED_SKILL_READ_ONLY_TOOL_NAMES if learned is not None else frozenset()),
             requires_approval=(
                 approval_gate.requires_approval if approval_gate is not None else None
@@ -1263,6 +1298,20 @@ def build_runner(
                     else ()
                 ),
                 issue_tool=(build_issue_tool(*issue_read) if issue_read is not None else None),
+            ),
+            **(
+                {
+                    AGENT_SCHEDULES_SERVER_NAME: build_agent_schedules_server(
+                        client=AgentSchedulesClient(
+                            schedules_url,
+                            os.environ.get(MEMORY_TOKEN_ENV),
+                            turn_write_token,
+                        ),
+                        turn=memory_turn,
+                    )
+                }
+                if schedules is not None and schedules_url is not None and memory_turn is not None
+                else {}
             ),
             **(
                 {STATE_SERVER_NAME: build_state_server(state_client)}
@@ -1699,6 +1748,7 @@ class _BootFetches:
     # build_runner parameters they feed.
     memory_facts_preamble: str | None = None
     memory_guidance: str | None = None
+    agent_schedules: AgentSchedulesConfig | None = None
     learned_skills: MaterializedPlugin | None = None
 
 
@@ -1715,6 +1765,7 @@ async def _load_boot_fetches(
     memory: tuple[MemoryStore, str | None] | None = None
     history: tuple[TranscriptStore, ConversationReplay, bool] | None = None
     facts: tuple[str | None, str | None] = (None, None)
+    schedules: AgentSchedulesConfig | None = None
     learned: MaterializedPlugin | None = None
     capability: McpToolCapabilityProbe | None = None
     derived = derive_mcp_servers(
@@ -1743,9 +1794,13 @@ async def _load_boot_fetches(
         nonlocal facts
         facts = await _load_memory_facts(config)
 
+    async def load_schedules() -> None:
+        nonlocal schedules
+        schedules = await load_schedules_for_session(os.environ, fake_model)
+
     async def load_learned() -> None:
         nonlocal learned
-        learned = await load_for_session(
+        learned = await load_learned_skills_for_session(
             os.environ, bundle_plugin_dir=config.session.plugin_dir, fake_model=fake_model
         )
 
@@ -1761,6 +1816,7 @@ async def _load_boot_fetches(
         tg.start_soon(load_memory)
         tg.start_soon(load_history)
         tg.start_soon(load_facts)
+        tg.start_soon(load_schedules)
         tg.start_soon(load_learned)
         if not fake_model:
             tg.start_soon(probe)
@@ -1780,6 +1836,7 @@ async def _load_boot_fetches(
         history_capacity_exceeded=history[2],
         memory_facts_preamble=facts[0],
         memory_guidance=facts[1],
+        agent_schedules=schedules,
         learned_skills=learned,
     )
 
@@ -1945,6 +2002,7 @@ def _serve() -> None:
         history_capacity_exceeded=fetches.history_capacity_exceeded,
         memory_facts_preamble=fetches.memory_facts_preamble,
         memory_guidance=fetches.memory_guidance,
+        agent_schedules=fetches.agent_schedules,
         learned_skills=fetches.learned_skills,
     )
 

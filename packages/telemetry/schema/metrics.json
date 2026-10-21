@@ -452,6 +452,11 @@
           "/agents/{agent_id}/memory/{index}",
           "/agents/{agent_id}/memory/{index}/provenance",
           "/agents/{agent_id}/resume",
+          "/agents/{agent_id}/schedules",
+          "/agents/{agent_id}/schedules/{schedule_id}",
+          "/agents/{agent_id}/schedules/{schedule_id}/cancel",
+          "/agents/{agent_id}/schedules/{schedule_id}/revert",
+          "/agents/{agent_id}/schedules/{schedule_id}/revisions",
           "/agents/{agent_id}/state",
           "/agents/{agent_id}/state/bindings/{kind}/{address}",
           "/agents/{agent_id}/state/bindings/{kind}/{address}/{namespace}",
@@ -606,7 +611,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 1336,
+      "cardinality_bound": 1376,
       "description": "Active HTTP server requests.",
       "monotonic": false,
       "type": "up_down_counter",
@@ -646,6 +651,11 @@
           "/agents/{agent_id}/memory/{index}",
           "/agents/{agent_id}/memory/{index}/provenance",
           "/agents/{agent_id}/resume",
+          "/agents/{agent_id}/schedules",
+          "/agents/{agent_id}/schedules/{schedule_id}",
+          "/agents/{agent_id}/schedules/{schedule_id}/cancel",
+          "/agents/{agent_id}/schedules/{schedule_id}/revert",
+          "/agents/{agent_id}/schedules/{schedule_id}/revisions",
           "/agents/{agent_id}/state",
           "/agents/{agent_id}/state/bindings/{kind}/{address}",
           "/agents/{agent_id}/state/bindings/{kind}/{address}/{namespace}",
@@ -807,7 +817,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 6680,
+      "cardinality_bound": 6880,
       "description": "HTTP server requests.",
       "monotonic": true,
       "type": "counter",
@@ -847,6 +857,11 @@
           "/agents/{agent_id}/memory/{index}",
           "/agents/{agent_id}/memory/{index}/provenance",
           "/agents/{agent_id}/resume",
+          "/agents/{agent_id}/schedules",
+          "/agents/{agent_id}/schedules/{schedule_id}",
+          "/agents/{agent_id}/schedules/{schedule_id}/cancel",
+          "/agents/{agent_id}/schedules/{schedule_id}/revert",
+          "/agents/{agent_id}/schedules/{schedule_id}/revisions",
           "/agents/{agent_id}/state",
           "/agents/{agent_id}/state/bindings/{kind}/{address}",
           "/agents/{agent_id}/state/bindings/{kind}/{address}/{namespace}",
@@ -1008,7 +1023,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 6680,
+      "cardinality_bound": 6880,
       "description": "HTTP server request duration.",
       "monotonic": false,
       "type": "histogram",

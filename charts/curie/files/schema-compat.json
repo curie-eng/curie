@@ -867,12 +867,20 @@
     {
       "kind": "expand",
       "parents": [
+        "selfimp_skills_0001"
+      ],
+      "revision": "selfimp_sched_0001",
+      "sha256": "f418dbfe876ab1fbc3939f8f243567f4249dfc8b3562f67f6631cd10a07c059a"
+    },
+    {
+      "kind": "expand",
+      "parents": [
         "selfimp_safety_0001"
       ],
       "revision": "selfimp_skills_0001",
       "sha256": "7ef9de9769021c26b8570d15259cb3219ed5a7991c1920f96bca76e6c5b869b2"
     }
   ],
-  "schema_head": "selfimp_skills_0001",
-  "schema_min": "selfimp_skills_0001"
+  "schema_head": "selfimp_sched_0001",
+  "schema_min": "selfimp_sched_0001"
 }

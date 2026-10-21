@@ -330,20 +330,33 @@ pub(super) async fn run(action: LocalAction) -> Result<()> {
             agent,
             pause,
             resume,
+            agent_schedule,
             api_url,
             api_key,
             dry_run,
-        } => emit(
-            commands::schedules(commands::SchedulesOpts {
-                api_url,
-                api_key,
-                agent,
-                pause,
-                resume,
-                dry_run,
-            })
-            .await?,
-        ),
+        } => match agent_schedule.into_verb()? {
+            Some(verb) => emit_boxed(
+                commands::agent_schedule(commands::AgentScheduleOpts {
+                    api_url,
+                    api_key,
+                    agent,
+                    verb,
+                    dry_run,
+                })
+                .await?,
+            ),
+            None => emit(
+                commands::schedules(commands::SchedulesOpts {
+                    api_url,
+                    api_key,
+                    agent,
+                    pause,
+                    resume,
+                    dry_run,
+                })
+                .await?,
+            ),
+        },
         LocalAction::Hook { action } => match action {
             LocalHookAction::Fire {
                 agent,
@@ -548,6 +561,7 @@ pub(super) async fn run(action: LocalAction) -> Result<()> {
             runner_resources,
             clear_runner_resources,
             memory_writes,
+            agent_schedules,
             learned_skills,
             api_url,
             api_key,
@@ -576,6 +590,7 @@ pub(super) async fn run(action: LocalAction) -> Result<()> {
                     clear_runner_resources,
                 )?,
                 commands::on_off_flag(memory_writes.as_deref()),
+                commands::on_off_flag(agent_schedules.as_deref()),
                 commands::on_off_flag(learned_skills.as_deref()),
             )
             .await?,

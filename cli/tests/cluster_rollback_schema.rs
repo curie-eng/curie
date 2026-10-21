@@ -187,8 +187,8 @@ fn v091_source_upgrades_through_the_packaged_chart_graph() {
             .expect("packaged chart schema compatibility metadata parses");
 
     assert_eq!(source.schema_head, "0044");
-    assert_eq!(target.schema_min, "selfimp_skills_0001");
-    assert_eq!(target.schema_head, "selfimp_skills_0001");
+    assert_eq!(target.schema_min, "selfimp_sched_0001");
+    assert_eq!(target.schema_head, "selfimp_sched_0001");
 
     let pending =
         pending_revisions(Some("0044"), &target).expect("0044 reaches the packaged chart head");
@@ -268,7 +268,8 @@ fn v091_source_upgrades_through_the_packaged_chart_graph() {
             "0106",
             "0108",
             "selfimp_safety_0001",
-            "selfimp_skills_0001"
+            "selfimp_skills_0001",
+            "selfimp_sched_0001"
         ]
     );
     let contracts: Vec<&str> = pending
@@ -299,7 +300,7 @@ fn v091_source_upgrades_through_the_packaged_chart_graph() {
     );
     assert_eq!(decision.action, "apply");
     assert_eq!(decision.source_head.as_deref(), Some("0044"));
-    assert_eq!(decision.target_min, "selfimp_skills_0001");
+    assert_eq!(decision.target_min, "selfimp_sched_0001");
 }
 
 // @spec PROTECTED-HOOK-SOURCE-10
@@ -312,7 +313,7 @@ fn released_v0101_upgrades_through_the_new_feature_train_revision() {
             .expect("packaged chart schema compatibility metadata parses");
 
     assert_eq!(source.schema_head, "0058");
-    assert_eq!(target.schema_head, "selfimp_skills_0001");
+    assert_eq!(target.schema_head, "selfimp_sched_0001");
     let pending = pending_revisions(Some(&source.schema_head), &target)
         .expect("released 0.10.1 reaches the new head");
     assert_eq!(
@@ -377,7 +378,8 @@ fn released_v0101_upgrades_through_the_new_feature_train_revision() {
             "0106",
             "0108",
             "selfimp_safety_0001",
-            "selfimp_skills_0001"
+            "selfimp_skills_0001",
+            "selfimp_sched_0001"
         ]
     );
 
@@ -398,7 +400,7 @@ fn released_v0101_upgrades_through_the_new_feature_train_revision() {
         Some(&source.schema_head),
     );
     assert_eq!(decision.action, "apply");
-    assert_eq!(decision.target_min, "selfimp_skills_0001");
+    assert_eq!(decision.target_min, "selfimp_sched_0001");
 }
 
 /// @spec PROTECTED-HOOK-SOURCE-1
@@ -421,7 +423,7 @@ fn released_v0102_upgrades_through_the_feature_train_revisions() {
             .expect("packaged chart schema compatibility metadata parses");
 
     assert_eq!(source.schema_head, "0062");
-    assert_eq!(target.schema_head, "selfimp_skills_0001");
+    assert_eq!(target.schema_head, "selfimp_sched_0001");
     let pending = pending_revisions(Some(&source.schema_head), &target)
         .expect("released 0.10.2 reaches the new head");
     assert_eq!(
@@ -482,7 +484,8 @@ fn released_v0102_upgrades_through_the_feature_train_revisions() {
             "0106",
             "0108",
             "selfimp_safety_0001",
-            "selfimp_skills_0001"
+            "selfimp_skills_0001",
+            "selfimp_sched_0001"
         ]
     );
     let contracts: Vec<&str> = pending
@@ -527,7 +530,7 @@ fn released_v0103_upgrades_through_the_renumbered_feature_train() {
             .expect("packaged chart schema compatibility metadata parses");
 
     assert_eq!(source.schema_head, "0063");
-    assert_eq!(target.schema_head, "selfimp_skills_0001");
+    assert_eq!(target.schema_head, "selfimp_sched_0001");
     let pending = pending_revisions(Some(&source.schema_head), &target)
         .expect("released 0.10.3 reaches the new head");
     assert_eq!(
@@ -587,7 +590,8 @@ fn released_v0103_upgrades_through_the_renumbered_feature_train() {
             "0106",
             "0108",
             "selfimp_safety_0001",
-            "selfimp_skills_0001"
+            "selfimp_skills_0001",
+            "selfimp_sched_0001"
         ]
     );
     let contracts: Vec<&str> = pending

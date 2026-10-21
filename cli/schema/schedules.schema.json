@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/schedules/v3.json",
+  "$id": "https://schemas.curietech.ai/cli/schedules/v3.1.json",
   "title": "curie <tier> schedules --json",
-  "description": "The agent-facing payload of `curie <tier> schedules`: the dry-run plan, or cron hooks on each in-force deployment. `last_fire_at`, `last_outcome`, and `last_reason` describe the newest scheduled run. The `last_manual_*` fields describe the newest manual fire independently. An absent history group or open outcome is null.",
+  "description": "The agent-facing payload of `curie <tier> schedules`: the dry-run plan, or cron hooks on each in-force deployment. `last_fire_at`, `last_outcome`, and `last_reason` describe the newest scheduled run. The `last_manual_*` fields describe the newest manual fire independently. An absent history group or open outcome is null. `agent_schedules` (ADR 0238) lists the schedules agents and operators created, as the API sent them. The agent-schedule verbs print one schedule, `{revisions}` for `--history`, or `{agent, policy}` for a policy setter, where `policy` is the agent's schedule settings as the API stored them.",
   "$defs": {
     "dryRun": {
       "type": "object",
@@ -117,6 +117,34 @@
       },
       "required": ["agent", "name", "paused"]
     },
+    "agentSchedule": {
+      "type": "object",
+      "required": ["id", "state"],
+      "properties": {
+        "id": { "type": "string" },
+        "state": { "type": "string" }
+      }
+    },
+    "agentScheduleRevisions": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "revisions": {
+          "type": "array",
+          "items": { "type": "object" }
+        }
+      },
+      "required": ["revisions"]
+    },
+    "agentSchedulePolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "agent": { "type": "string" },
+        "policy": { "type": "object" }
+      },
+      "required": ["agent", "policy"]
+    },
     "agent": {
       "type": "object",
       "additionalProperties": false,
@@ -156,6 +184,15 @@
       "$ref": "#/$defs/control"
     },
     {
+      "$ref": "#/$defs/agentSchedule"
+    },
+    {
+      "$ref": "#/$defs/agentScheduleRevisions"
+    },
+    {
+      "$ref": "#/$defs/agentSchedulePolicy"
+    },
+    {
       "type": "object",
       "additionalProperties": false,
       "properties": {
@@ -163,6 +200,12 @@
           "type": "array",
           "items": {
             "$ref": "#/$defs/agent"
+          }
+        },
+        "agent_schedules": {
+          "type": "array",
+          "items": {
+            "type": "object"
           }
         }
       },

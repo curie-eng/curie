@@ -1102,6 +1102,11 @@
       },
       "AgentOut": {
         "properties": {
+          "agent_schedules": {
+            "default": false,
+            "title": "Agent Schedules",
+            "type": "boolean"
+          },
           "approval_required_tools": {
             "anyOf": [
               {
@@ -1281,6 +1286,21 @@
             ],
             "title": "Runner Resources"
           },
+          "schedule_max_active": {
+            "default": 20,
+            "title": "Schedule Max Active",
+            "type": "integer"
+          },
+          "schedule_min_interval_minutes": {
+            "default": 15,
+            "title": "Schedule Min Interval Minutes",
+            "type": "integer"
+          },
+          "schedule_timezone": {
+            "default": "UTC",
+            "title": "Schedule Timezone",
+            "type": "string"
+          },
           "secrets": {
             "anyOf": [
               {
@@ -1342,6 +1362,667 @@
         "title": "AgentOut",
         "type": "object"
       },
+      "AgentScheduleCancel": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_revision": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Revision"
+          }
+        },
+        "title": "AgentScheduleCancel",
+        "type": "object"
+      },
+      "AgentScheduleCreate": {
+        "additionalProperties": false,
+        "description": "Exactly one of ``cron`` and ``run_at``. ``run_at`` with an offset is that\ninstant; without one it is wall time in ``timezone`` (the agent's zone when\nomitted). ``destination`` and ``idempotency_key`` are for the operator: a\nsandbox schedule replies on its turn's binding and is keyed by its turn.",
+        "properties": {
+          "cron": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cron"
+          },
+          "destination": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AgentScheduleDestination"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "idempotency_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Idempotency Key"
+          },
+          "prompt": {
+            "title": "Prompt",
+            "type": "string"
+          },
+          "run_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run At"
+          },
+          "timezone": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Timezone"
+          }
+        },
+        "required": [
+          "prompt"
+        ],
+        "title": "AgentScheduleCreate",
+        "type": "object"
+      },
+      "AgentScheduleDestination": {
+        "additionalProperties": false,
+        "description": "The binding an operator-created schedule replies on. ``adapter`` omitted\nresolves like a turn's binding: the one row, or the default Slack identity.",
+        "properties": {
+          "adapter": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Adapter"
+          },
+          "address": {
+            "title": "Address",
+            "type": "string"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "address"
+        ],
+        "title": "AgentScheduleDestination",
+        "type": "object"
+      },
+      "AgentScheduleDestinationOut": {
+        "description": "The binding an agent schedule replies on, stored at create.",
+        "properties": {
+          "adapter": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Adapter"
+          },
+          "address": {
+            "title": "Address",
+            "type": "string"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "address",
+          "adapter"
+        ],
+        "title": "AgentScheduleDestinationOut",
+        "type": "object"
+      },
+      "AgentScheduleList": {
+        "description": "The agent's schedule switch and limits, and its schedules.",
+        "properties": {
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "max_active": {
+            "title": "Max Active",
+            "type": "integer"
+          },
+          "min_interval_minutes": {
+            "title": "Min Interval Minutes",
+            "type": "integer"
+          },
+          "schedules": {
+            "items": {
+              "$ref": "#/components/schemas/AgentScheduleOut"
+            },
+            "title": "Schedules",
+            "type": "array"
+          },
+          "timezone": {
+            "title": "Timezone",
+            "type": "string"
+          }
+        },
+        "required": [
+          "enabled",
+          "timezone",
+          "max_active",
+          "min_interval_minutes",
+          "schedules"
+        ],
+        "title": "AgentScheduleList",
+        "type": "object"
+      },
+      "AgentScheduleOut": {
+        "description": "One agent-created schedule (ADR 0238). ``conversation`` and ``turn`` are\nshown to the platform caller only; a sandbox response leaves them unset.",
+        "properties": {
+          "agent": {
+            "title": "Agent",
+            "type": "string"
+          },
+          "agent_id": {
+            "format": "uuid",
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "consecutive_failures": {
+            "title": "Consecutive Failures",
+            "type": "integer"
+          },
+          "conversation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Conversation"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "created_by": {
+            "title": "Created By",
+            "type": "string"
+          },
+          "created_source": {
+            "enum": [
+              "agent",
+              "operator"
+            ],
+            "title": "Created Source",
+            "type": "string"
+          },
+          "cron": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cron"
+          },
+          "destination": {
+            "$ref": "#/components/schemas/AgentScheduleDestinationOut"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "last_fire_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Fire At"
+          },
+          "last_outcome": {
+            "anyOf": [
+              {
+                "enum": [
+                  "ran",
+                  "deferred",
+                  "skipped",
+                  "blocked",
+                  "reclaimed",
+                  "failed"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Outcome"
+          },
+          "last_reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "turn_error",
+                  "target_unbound",
+                  "approval_gate_targetless",
+                  "agent_killed",
+                  "budget_exhausted",
+                  "run_in_flight",
+                  "catch_up_expired",
+                  "deferred_expired",
+                  "reply_undeliverable",
+                  "prior_side_effect",
+                  "deployment_missing",
+                  "hook_paused",
+                  "live_session",
+                  "enqueue_failed",
+                  "claim_expired",
+                  "daily_budget",
+                  "schedule_changed"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Reason"
+          },
+          "next_run_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Run At"
+          },
+          "next_run_local": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Run Local"
+          },
+          "paused": {
+            "title": "Paused",
+            "type": "boolean"
+          },
+          "prompt": {
+            "title": "Prompt",
+            "type": "string"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "integer"
+          },
+          "run_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run At"
+          },
+          "state": {
+            "enum": [
+              "active",
+              "paused",
+              "cancelled",
+              "done"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "timezone": {
+            "title": "Timezone",
+            "type": "string"
+          },
+          "turn": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Turn"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          },
+          "updated_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated By"
+          }
+        },
+        "required": [
+          "id",
+          "agent",
+          "agent_id",
+          "revision",
+          "state",
+          "cron",
+          "run_at",
+          "timezone",
+          "prompt",
+          "created_by",
+          "created_source",
+          "destination",
+          "next_run_at",
+          "next_run_local",
+          "paused",
+          "consecutive_failures",
+          "last_fire_at",
+          "last_outcome",
+          "last_reason",
+          "created_at",
+          "updated_at",
+          "updated_by"
+        ],
+        "title": "AgentScheduleOut",
+        "type": "object"
+      },
+      "AgentScheduleRevert": {
+        "additionalProperties": false,
+        "description": "Restore revision ``to_revision``'s configuration as a new revision;\nomitted is the revision before the current one.",
+        "properties": {
+          "expected_revision": {
+            "title": "Expected Revision",
+            "type": "integer"
+          },
+          "to_revision": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "To Revision"
+          }
+        },
+        "required": [
+          "expected_revision"
+        ],
+        "title": "AgentScheduleRevert",
+        "type": "object"
+      },
+      "AgentScheduleRevisionOut": {
+        "properties": {
+          "action": {
+            "enum": [
+              "create",
+              "update",
+              "pause",
+              "resume",
+              "cancel",
+              "revert",
+              "complete"
+            ],
+            "title": "Action",
+            "type": "string"
+          },
+          "author": {
+            "title": "Author",
+            "type": "string"
+          },
+          "conversation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Conversation"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "cron": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cron"
+          },
+          "prompt": {
+            "title": "Prompt",
+            "type": "string"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "integer"
+          },
+          "run_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run At"
+          },
+          "seq": {
+            "title": "Seq",
+            "type": "integer"
+          },
+          "source": {
+            "enum": [
+              "agent",
+              "operator",
+              "scheduler"
+            ],
+            "title": "Source",
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "active",
+              "paused",
+              "cancelled",
+              "done"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "timezone": {
+            "title": "Timezone",
+            "type": "string"
+          },
+          "turn": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Turn"
+          }
+        },
+        "required": [
+          "seq",
+          "revision",
+          "action",
+          "state",
+          "prompt",
+          "cron",
+          "run_at",
+          "timezone",
+          "author",
+          "source",
+          "conversation",
+          "turn",
+          "created_at"
+        ],
+        "title": "AgentScheduleRevisionOut",
+        "type": "object"
+      },
+      "AgentScheduleRevisions": {
+        "properties": {
+          "revisions": {
+            "items": {
+              "$ref": "#/components/schemas/AgentScheduleRevisionOut"
+            },
+            "title": "Revisions",
+            "type": "array"
+          }
+        },
+        "required": [
+          "revisions"
+        ],
+        "title": "AgentScheduleRevisions",
+        "type": "object"
+      },
+      "AgentScheduleUpdate": {
+        "additionalProperties": false,
+        "description": "A compare-and-set change. A prompt, cron, run_at or timezone change moves\nthe revision; ``paused`` is logged without moving it. ``cron`` and\n``run_at`` are exclusive: giving one replaces the other.",
+        "properties": {
+          "cron": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cron"
+          },
+          "expected_revision": {
+            "title": "Expected Revision",
+            "type": "integer"
+          },
+          "paused": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Paused"
+          },
+          "prompt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prompt"
+          },
+          "run_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run At"
+          },
+          "timezone": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Timezone"
+          }
+        },
+        "required": [
+          "expected_revision"
+        ],
+        "title": "AgentScheduleUpdate",
+        "type": "object"
+      },
       "AgentSchedulesOut": {
         "description": "The scheduled hooks of one agent's in-force deployment.",
         "properties": {
@@ -1385,6 +2066,17 @@
       "AgentUpdate": {
         "description": "Partial update of mutable agent fields. An omitted field is unchanged.\n\nFor the two nullable operator overrides -- `model` and `thinking` -- omitted\nand explicit JSON null are DIFFERENT requests, and the router tells them\napart with `model_fields_set` (#1310). Omitted leaves the current value;\nexplicit null clears the override back to the platform default. Reading\n`None` alone cannot distinguish the two, which is why setting one of these\nused to be a one-way door.\n\nThe repo binding stopped being identity in ADR-0091: one repository builds\nmany agents now, so binding is a routing fact, not a name.",
         "properties": {
+          "agent_schedules": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Schedules"
+          },
           "approval_required_tools": {
             "anyOf": [
               {
@@ -1568,6 +2260,43 @@
               }
             ],
             "title": "Runner Resources"
+          },
+          "schedule_max_active": {
+            "anyOf": [
+              {
+                "maximum": 100.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Schedule Max Active"
+          },
+          "schedule_min_interval_minutes": {
+            "anyOf": [
+              {
+                "maximum": 1440.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Schedule Min Interval Minutes"
+          },
+          "schedule_timezone": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Schedule Timezone"
           },
           "secrets": {
             "anyOf": [
@@ -6186,7 +6915,8 @@
                   "live_session",
                   "enqueue_failed",
                   "claim_expired",
-                  "daily_budget"
+                  "daily_budget",
+                  "schedule_changed"
                 ],
                 "type": "string"
               },
@@ -11023,7 +11753,8 @@
                   "live_session",
                   "enqueue_failed",
                   "claim_expired",
-                  "daily_budget"
+                  "daily_budget",
+                  "schedule_changed"
                 ],
                 "type": "string"
               },
@@ -11071,7 +11802,8 @@
                   "live_session",
                   "enqueue_failed",
                   "claim_expired",
-                  "daily_budget"
+                  "daily_budget",
+                  "schedule_changed"
                 ],
                 "type": "string"
               },
@@ -11118,8 +11850,15 @@
         "type": "object"
       },
       "ScheduleListOut": {
-        "description": "Every in-force cron hook the platform can see.",
+        "description": "Every in-force cron hook the platform can see, and every active agent\nschedule (ADR 0238).",
         "properties": {
+          "agent_schedules": {
+            "items": {
+              "$ref": "#/components/schemas/AgentScheduleOut"
+            },
+            "title": "Agent Schedules",
+            "type": "array"
+          },
           "schedules": {
             "items": {
               "$ref": "#/components/schemas/AgentSchedulesOut"
@@ -11129,7 +11868,8 @@
           }
         },
         "required": [
-          "schedules"
+          "schedules",
+          "agent_schedules"
         ],
         "title": "ScheduleListOut",
         "type": "object"
@@ -18620,6 +19360,529 @@
         "summary": "Resume Agent",
         "tags": [
           "control"
+        ]
+      }
+    },
+    "/agents/{agent_id}/schedules": {
+      "get": {
+        "description": "The agent's schedule switch, limits and schedules (active and paused;\n``all`` adds cancelled and done). A sandbox credential sees none while\nthe toggle is off.",
+        "operationId": "list_agent_schedules_agents__agent_id__schedules_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "all",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "All",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentScheduleList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Agent Schedules",
+        "tags": [
+          "agent-schedules"
+        ]
+      },
+      "post": {
+        "operationId": "create_agent_schedule_agents__agent_id__schedules_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AgentScheduleCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentScheduleOut"
+                }
+              }
+            },
+            "description": "Idempotent replay"
+          },
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentScheduleOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Agent Schedule",
+        "tags": [
+          "agent-schedules"
+        ]
+      }
+    },
+    "/agents/{agent_id}/schedules/{schedule_id}": {
+      "get": {
+        "operationId": "get_agent_schedule_agents__agent_id__schedules__schedule_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "schedule_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Schedule Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentScheduleOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Agent Schedule",
+        "tags": [
+          "agent-schedules"
+        ]
+      },
+      "patch": {
+        "operationId": "update_agent_schedule_agents__agent_id__schedules__schedule_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "schedule_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Schedule Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AgentScheduleUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentScheduleOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Agent Schedule",
+        "tags": [
+          "agent-schedules"
+        ]
+      }
+    },
+    "/agents/{agent_id}/schedules/{schedule_id}/cancel": {
+      "post": {
+        "description": "Tombstone the schedule and settle its deferred runs. A scheduled run\nmay cancel. An active, paused or done schedule cancels the same way;\ncancelling a done one-shot revokes its run's pending approval\ncontinuation, which the worker resumes for a done schedule but never for\na cancelled one. Cancelling a cancelled schedule is a no-op.",
+        "operationId": "cancel_agent_schedule_agents__agent_id__schedules__schedule_id__cancel_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "schedule_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Schedule Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AgentScheduleCancel"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentScheduleOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Cancel Agent Schedule",
+        "tags": [
+          "agent-schedules"
+        ]
+      }
+    },
+    "/agents/{agent_id}/schedules/{schedule_id}/revert": {
+      "post": {
+        "description": "Restore an earlier revision's configuration as a new revision. The\noperator, or a person through the agent; never a scheduled run.",
+        "operationId": "revert_agent_schedule_agents__agent_id__schedules__schedule_id__revert_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "schedule_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Schedule Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AgentScheduleRevert"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentScheduleOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Revert Agent Schedule",
+        "tags": [
+          "agent-schedules"
+        ]
+      }
+    },
+    "/agents/{agent_id}/schedules/{schedule_id}/revisions": {
+      "get": {
+        "description": "The schedule's change log, oldest first. Platform key only.",
+        "operationId": "list_agent_schedule_revisions_agents__agent_id__schedules__schedule_id__revisions_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "schedule_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Schedule Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentScheduleRevisions"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Agent Schedule Revisions",
+        "tags": [
+          "agent-schedules"
         ]
       }
     },
