@@ -58,6 +58,20 @@ import yaml
 ROOT = Path(__file__).resolve().parents[3]
 PREFIX = "test-4626"
 NAMESPACE = "test-4626-dry-run"
+# Every release state, so a dry run that left a pending or failed release is
+# still seen. Helm 4 removed `list --all`; these state flags exist in Helm 3
+# and Helm 4 alike, and a bare `list` shows only deployed releases.
+RELEASE_LIST = (
+    "list",
+    "--deployed",
+    "--failed",
+    "--pending",
+    "--superseded",
+    "--uninstalled",
+    "--uninstalling",
+    "-o",
+    "json",
+)
 RELEASE = "test-4626"
 FULLNAME = "test-4626"
 RECORDED_MODEL = "acme-recorded-model"
@@ -917,17 +931,7 @@ class Installation:
         return values
 
     def releases(self) -> list[dict[str, Any]]:
-        version = self.helm("version", "--template", "{{.Version}}").stdout.strip()
-        major = re.match(r"v([34])\.", version)
-        if major is None:
-            raise InfrastructureError("unsupported Helm release inventory version")
-        # Preserve every status, including pending and retained uninstalled records.
-        # Helm 3 requires --all; Helm 4 includes all statuses by default and
-        # removes that flag. See both authoritative command contracts:
-        # https://helm.sh/docs/v3/helm/helm_list/
-        # https://helm.sh/docs/helm/helm_list/
-        all_statuses = ("--all",) if major[1] == "3" else ()
-        listed = json.loads(self.helm("list", *all_statuses, "-o", "json").stdout or "[]")
+        listed = json.loads(self.helm(*RELEASE_LIST).stdout or "[]")
         if not isinstance(listed, list):
             raise InfrastructureError("Helm did not return a release list")
         return [entry for entry in listed if isinstance(entry, dict)]
@@ -1123,6 +1127,36 @@ def _assert_same_lines(
     same = _unmasked(_human_lines(human)) == _unmasked(plan)
     assert same, "human and JSON dry runs must carry the same lines:\n" + _shown(human, secrets)
     return plan
+
+
+def test_release_listing_parses_on_the_installed_helm(tmp_path: Path) -> None:
+    """The listing that proves a dry run installed nothing parses on this helm.
+
+    An unreachable context makes helm fail after flag parsing, so a refusal
+    other than an unknown flag shows the arguments themselves are accepted.
+    """
+    helm = shutil.which("helm")
+    if helm is None:
+        pytest.skip("helm is not installed")
+    kubeconfig = tmp_path / "kubeconfig"
+    kubeconfig.write_text("")
+    env = {
+        "PATH": os.environ["PATH"],
+        "HOME": str(tmp_path),
+        "KUBECONFIG": str(kubeconfig),
+        "HELM_DRIVER": "secret",
+    }
+    result = subprocess.run(
+        [helm, "--kube-context", f"{PREFIX}-absent", "--namespace", NAMESPACE, *RELEASE_LIST],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert "unknown flag" not in result.stderr, result.stderr
+    assert "unknown shorthand flag" not in result.stderr, result.stderr
+    assert result.returncode != 0, "helm listed releases without a reachable cluster"
 
 
 def test_offline_plan_does_not_claim_unobserved_live_actions(install: Installation) -> None:
