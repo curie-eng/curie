@@ -7549,6 +7549,115 @@ fn repository_runner_upgrade_resume_after_apply_with_full_values_file_passes_can
     assert_ownership_released(&fixture);
 }
 
+/// A resume after a durable Apply whose full `--values-file` drops every
+/// repository `runner` block still serves rebuilt receipt B and its template:
+/// the file's overlay cannot unapply them. Canary must inspect the served
+/// catalog template and fail when it is missing or stale.
+#[test]
+fn repository_runner_upgrade_resume_with_runners_removed_from_values_file_still_checks_served_templates(
+) {
+    let helm = Command::new("sh")
+        .args(["-c", "command -v helm"])
+        .output()
+        .unwrap();
+    assert!(
+        helm.status.success(),
+        "real Helm required to parse operator values"
+    );
+    let helm = String::from_utf8(helm.stdout).unwrap();
+    for fault in ["missing", "stale"] {
+        let before = repository_runner_upgrade_values();
+        let fixture = repository_runner_upgrade_fixture(&before);
+        let installed = repository_runner_installed_values(&fixture);
+        let file = fixture.0.path().join("operator-values.json");
+        fs::write(&file, installed.to_string()).unwrap();
+        let values_file = file.to_str().unwrap();
+
+        let first = fixture.run_with_env(
+            "healthy",
+            "0.9.0",
+            "charts/curie",
+            &["--values-file", values_file],
+            &[
+                ("VALUES_FILES_REAL_HELM", helm.trim()),
+                ("CURIE_UPGRADE_TEST_INTERRUPT_AFTER", "apply"),
+            ],
+        );
+        assert!(!first.status.success(), "{}", visible(&first));
+        assert!(
+            visible(&first).contains("interrupted after durable phase apply"),
+            "{}",
+            visible(&first)
+        );
+        assert_eq!(
+            repository_runner_build_calls(&fixture).len(),
+            1,
+            "{:?}",
+            fixture.argv()
+        );
+        assert_eq!(fixture.helm_upgrades().len(), 1, "{:?}", fixture.argv());
+        assert!(
+            record_completed(&fixture.last_record(), "apply"),
+            "{}",
+            fixture.last_record()
+        );
+        let built_image = format!(
+            "{REPOSITORY_RUNNER_IMAGE}@{}",
+            repository_runner_digest('6')
+        );
+        let served = repository_runner_installed_values(&fixture);
+        assert_eq!(
+            served.pointer("/factory/bindings/0/repos/0/runner/image"),
+            Some(&Value::from(built_image.clone())),
+            "Helm must serve the rebuilt receipt B after the first run: {served}"
+        );
+
+        let mut stripped = installed.clone();
+        for binding in stripped["factory"]["bindings"].as_array_mut().unwrap() {
+            for repo in binding["repos"].as_array_mut().unwrap() {
+                let repo = repo.as_object_mut().unwrap();
+                if repo.remove("runner").is_some() {
+                    repo.insert("docker".into(), serde_json::json!({"enabled": false}));
+                }
+            }
+        }
+        assert!(!stripped.to_string().contains("\"runner\""), "{stripped}");
+        fs::write(&file, stripped.to_string()).unwrap();
+
+        let resumed = fixture.run_with_env(
+            "healthy",
+            "0.9.0",
+            "charts/curie",
+            &["--values-file", values_file],
+            &[
+                ("VALUES_FILES_REAL_HELM", helm.trim()),
+                ("UPGRADE_REPO_RUNNER_TEMPLATE_FAULT", fault),
+            ],
+        );
+        let text = visible(&resumed);
+        assert!(!resumed.status.success(), "{fault}: {text}");
+        let body = json(&resumed);
+        assert_eq!(body["status"], "failed", "{fault}: {body}");
+        assert_eq!(body["phase"], "canary", "{fault}: {body}");
+        assert_eq!(
+            repository_runner_build_calls(&fixture).len(),
+            1,
+            "no rebuild after Helm served B: {:?}",
+            fixture.argv()
+        );
+        assert_eq!(
+            fixture.helm_upgrades().len(),
+            1,
+            "a durable Apply must not be reapplied: {:?}",
+            fixture.argv()
+        );
+        assert!(text.contains(CATALOG_RUNNER_REPO), "{fault}: {text}");
+        assert!(text.contains(&built_image), "{fault}: {text}");
+        assert!(!record_completed(&fixture.last_record(), "commit"));
+        assert_ownership_released(&fixture);
+    }
+}
+
 /// The chart schema accepts any digest-pinned repository for a catalog-only
 /// receipt, including a mirrored name. The rebuild still pushes to the
 /// builder's own `<registry>/curie-repo-runner` under the recorded registry.
