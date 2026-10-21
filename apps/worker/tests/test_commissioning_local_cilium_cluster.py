@@ -84,12 +84,16 @@ def docker(*args: str) -> str:
 
 
 def cilium_reads() -> list[dict[str, Any]]:
-    """ADR 0238 clause 5 reads of the CNI's own configuration, beyond the kit's."""
+    """ADR 0238 clause 5 reads of the CNI and dataplane workloads, beyond the kit's."""
+    configs = ["cilium-config", "kube-proxy"]
     return fixture.role(
         "Role",
         "curie-measuring-cilium",
         "kube-system",
-        [fixture.rule([""], ["configmaps"], ["get"], resourceNames=["cilium-config"])],
+        [
+            fixture.rule([""], ["configmaps"], ["get"], resourceNames=configs),
+            fixture.rule(["apps"], ["replicasets"], ["list"]),
+        ],
     )
 
 
@@ -288,6 +292,19 @@ def layout(nodes: list[str], system_set: frozenset[Subject], cloud: Destination)
     )
 
 
+def kube_proxy_present() -> bool:
+    found = kubectl("get", "daemonset", "-n", "kube-system", "kube-proxy", "--ignore-not-found")
+    return bool(found.strip())
+
+
+def kube_proxy_mode(identity: Any) -> str | None:
+    proxy = identity.document["kube_proxy"] if identity else None
+    if proxy is None:
+        return None
+    lines = proxy["config"]["data"].get("config.conf", "").splitlines()
+    return next((line for line in lines if line.startswith("mode:")), "mode: <unset>")
+
+
 class NoKit:
     """Fails the test if the producer starts a behavioral case."""
 
@@ -297,13 +314,13 @@ class NoKit:
         raise AssertionError("the kit ran against a non-enforcing configuration")
 
 
-def patch_config(data: dict[str, Any]) -> None:
+def patch_config(data: dict[str, Any], name: str = "cilium-config") -> None:
     kubectl(
         "patch",
         "configmap",
         "-n",
         "kube-system",
-        "cilium-config",
+        name,
         "--type",
         "merge",
         "-p",
@@ -311,13 +328,13 @@ def patch_config(data: dict[str, Any]) -> None:
     )
 
 
-def remove_config_key(key: str) -> None:
+def remove_config_key(key: str, name: str = "cilium-config") -> None:
     kubectl(
         "patch",
         "configmap",
         "-n",
         "kube-system",
-        "cilium-config",
+        name,
         "--type",
         "json",
         "-p",
@@ -371,6 +388,13 @@ def test_local_cilium_network_producer_on_a_local_cluster() -> None:
             changed = await call("config_changed")
             remove_config_key("curie-d8-identity-probe")
             back = await call("config_restored")
+            proxy = kube_proxy_present()
+            if proxy:
+                patch_config({"curie-d8-identity-probe": "1"}, "kube-proxy")
+            proxy_changed = await call("kube_proxy_config_changed") if proxy else None
+            if proxy:
+                remove_config_key("curie-d8-identity-probe", "kube-proxy")
+            proxy_back = await call("kube_proxy_config_restored") if proxy else back
             patch_config({"policy-audit-mode": "true"})
             try:
                 audit = await LocalCiliumNetworkProducer(
@@ -382,6 +406,7 @@ def test_local_cilium_network_producer_on_a_local_cluster() -> None:
             return {
                 "measurement": measurement,
                 "digests": (first, second, added, restored, changed, back, audit_call),
+                "proxy": (proxy_changed, proxy_back),
                 "audit": audit,
             }
         finally:
@@ -407,6 +432,7 @@ def test_local_cilium_network_producer_on_a_local_cluster() -> None:
                     "entries": summary,
                     "fact_calls": calls,
                     "audit_mode_refusal": outcome["audit"].refusal,
+                    "kube_proxy_mode": kube_proxy_mode(result.identity),
                     "kit_evidence": list(result.kit.evidence),
                     "leftovers": list(result.kit.leftovers),
                 },
@@ -421,4 +447,11 @@ def test_local_cilium_network_producer_on_a_local_cluster() -> None:
     first, second, added, restored, changed, back, audit_call = outcome["digests"]
     assert first is not None and first == second == restored == back
     assert added is None and changed is None and audit_call is None
+    assert outcome["proxy"] == (None, first)
     assert (outcome["audit"].entries, outcome["audit"].refusal) == ((), "cni_unavailable")
+    identity = result.identity
+    assert identity is not None
+    assert identity.document["version"]["gitVersion"].startswith("v1.")
+    assert identity.document["operator_set"]["uid"] in {
+        pod["owner"] for pod in identity.document["pods"]["operator"]
+    }

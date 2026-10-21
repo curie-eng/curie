@@ -35,6 +35,19 @@ RS_UID = "44444444-4444-4444-8444-444444444444"
 AGENT = "quay.io/cilium/cilium@sha256:" + "a" * 64
 ENVOY = "quay.io/cilium/cilium-envoy@sha256:" + "b" * 64
 OPERATOR = "quay.io/cilium/operator-generic@sha256:" + "c" * 64
+PROXY_UID = "55555555-5555-4555-8555-555555555555"
+OLD_RS_UID = "66666666-6666-4666-8666-666666666666"
+PROXY_IMAGE = "registry.k8s.io/kube-proxy:v1.35.1"
+PROXY_ID = "registry.k8s.io/kube-proxy@sha256:" + "e" * 64
+REVISION = "deployment.kubernetes.io/revision"
+VERSION = "/version"
+PROXY_DS = "/apis/apps/v1/namespaces/kube-system/daemonsets/kube-proxy"
+PROXY_PODS = "/api/v1/namespaces/kube-system/pods?labelSelector=k8s-app%3Dkube-proxy"
+PROXY_CONFIG = "/api/v1/namespaces/kube-system/configmaps/kube-proxy"
+OPERATOR_DEPLOYMENT = "/apis/apps/v1/namespaces/kube-system/deployments/cilium-operator"
+OPERATOR_RS = (
+    "/apis/apps/v1/namespaces/kube-system/replicasets?labelSelector=io.cilium%2Fapp%3Doperator"
+)
 
 
 def _node(name: str) -> dict[str, Any]:
@@ -100,9 +113,47 @@ def _pod(name: str, node: str, owner_kind: str, owner_uid: str, image: str) -> d
     }
 
 
+def _replicaset(uid: str, revision: str) -> dict[str, Any]:
+    return {
+        "metadata": {
+            "uid": uid,
+            "annotations": {REVISION: revision},
+            "ownerReferences": [{"kind": "Deployment", "uid": OP_UID, "controller": True}],
+        }
+    }
+
+
+def _operator() -> dict[str, Any]:
+    deployment = _workload(
+        "Deployment", OP_UID, OPERATOR, replicas=1, readyReplicas=1, updatedReplicas=1
+    )
+    deployment["metadata"]["annotations"] = {REVISION: "2"}
+    return deployment
+
+
+def _proxy_daemonset() -> dict[str, Any]:
+    # kube-proxy's template names a tag; its pods report the digest they run.
+    proxy = _daemonset(PROXY_UID, PROXY_ID)
+    proxy["spec"]["template"]["spec"]["containers"][0]["image"] = PROXY_IMAGE
+    return proxy
+
+
 def installation() -> dict[str, Any]:
     return {
         "nodes": [_node(name) for name in NODES],
+        VERSION: {"gitVersion": "v1.35.1", "platform": "linux/arm64", "major": "1"},
+        PROXY_DS: _proxy_daemonset(),
+        PROXY_PODS: {
+            "items": [
+                _pod("proxy-" + str(i), node, "DaemonSet", PROXY_UID, PROXY_ID)
+                for i, node in enumerate(NODES)
+            ]
+        },
+        PROXY_CONFIG: {
+            "metadata": {"uid": "proxy-cfg"},
+            "data": {"config.conf": 'mode: ""\nclusterCIDR: 10.244.0.0/16\n'},
+        },
+        OPERATOR_RS: {"items": [_replicaset(RS_UID, "2"), _replicaset(OLD_RS_UID, "1")]},
         "/api/v1/namespaces/kube-system/configmaps/cilium-config": {
             "metadata": {"uid": "cfg"},
             "data": {"enable-policy": "default", "enable-ipv4": "true", "enable-ipv6": "false"},
@@ -111,9 +162,7 @@ def installation() -> dict[str, Any]:
         "/apis/apps/v1/namespaces/kube-system/daemonsets/cilium-envoy": _daemonset(
             ENVOY_UID, ENVOY
         ),
-        "/apis/apps/v1/namespaces/kube-system/deployments/cilium-operator": _workload(
-            "Deployment", OP_UID, OPERATOR, replicas=1, readyReplicas=1, updatedReplicas=1
-        ),
+        OPERATOR_DEPLOYMENT: _operator(),
         "/api/v1/namespaces/kube-system/pods?labelSelector=k8s-app%3Dcilium": {
             "items": [
                 _pod("agent-" + str(i), node, "DaemonSet", DS_UID, AGENT)
@@ -280,6 +329,91 @@ def test_an_engine_that_is_not_fully_rolled_out_refuses(
     ],
 )
 def test_any_engine_change_changes_the_identity(change: Callable[[dict[str, Any]], None]) -> None:
+    state = installation()
+    change(state)
+    assert observe(state).digest != observe(installation()).digest
+
+
+def _without_proxy(state: dict[str, Any]) -> None:
+    for path in (PROXY_DS, PROXY_PODS, PROXY_CONFIG):
+        state.pop(path)
+    state[PROXY_PODS] = {"items": []}
+
+
+def _proxy_pods(state: dict[str, Any]) -> list[dict[str, Any]]:
+    return state[PROXY_PODS]["items"]  # type: ignore[no-any-return]
+
+
+def _operator_pods(state: dict[str, Any]) -> list[dict[str, Any]]:
+    path = "/api/v1/namespaces/kube-system/pods?labelSelector=io.cilium%2Fapp%3Doperator"
+    return state[path]["items"]  # type: ignore[no-any-return]
+
+
+def test_an_installation_without_kube_proxy_has_its_own_identity() -> None:
+    state = installation()
+    _without_proxy(state)
+    identity = observe(state)
+    assert identity.document["kube_proxy"] is None
+    assert identity.digest != observe(installation()).digest
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        # The API server's version is part of the identity; it must be readable.
+        lambda s: s.pop(VERSION),
+        lambda s: s[VERSION].pop("gitVersion"),
+        # A kube-proxy dataplane that is present must be fully rolled out and configured.
+        lambda s: s[PROXY_DS]["status"].update({"numberReady": 1}),
+        lambda s: _proxy_pods(s).pop(),
+        lambda s: _proxy_pods(s).clear(),
+        lambda s: _proxy_pods(s)[0]["status"]["containerStatuses"][0].update({"imageID": "x"}),
+        lambda s: s.pop(PROXY_CONFIG),
+        # A kube-proxy pod without a DaemonSet is a dataplane nobody declared.
+        lambda s: s.pop(PROXY_DS),
+        # Operator pods belong to the Deployment's current ReplicaSet only.
+        lambda s: _operator_pods(s)[0]["metadata"]["ownerReferences"][0].update(
+            {"uid": OLD_RS_UID}
+        ),
+        lambda s: s[OPERATOR_RS]["items"][0]["metadata"]["ownerReferences"][0].update(
+            {"uid": "other"}
+        ),
+        lambda s: s[OPERATOR_RS]["items"][0]["metadata"]["annotations"].update({REVISION: "1"}),
+        lambda s: s[OPERATOR_RS]["items"].append(
+            _replicaset("77777777-7777-4777-8777-777777777777", "2")
+        ),
+        lambda s: s.pop(OPERATOR_RS),
+    ],
+)
+def test_version_kube_proxy_and_operator_lineage_refuse_when_unbindable(
+    change: Callable[[dict[str, Any]], None],
+) -> None:
+    refused(change)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda s: s[VERSION].update({"gitVersion": "v1.35.2"}),
+        lambda s: s[VERSION].update({"platform": "linux/amd64"}),
+        lambda s: s[PROXY_CONFIG]["data"].update({"config.conf": 'mode: "ipvs"\n'}),
+        lambda s: _proxy_pods(s)[1]["status"]["containerStatuses"][0].update(
+            {"imageID": "registry.k8s.io/kube-proxy@sha256:" + "f" * 64}
+        ),
+        lambda s: s[PROXY_DS]["spec"]["template"]["spec"]["containers"][0].update(
+            {"image": "registry.k8s.io/kube-proxy:v1.35.2"}
+        ),
+        # A rollout to a new ReplicaSet changes the operator's lineage.
+        lambda s: (
+            s[OPERATOR_RS]["items"].__setitem__(0, _replicaset(OLD_RS_UID, "2"))
+            or s[OPERATOR_RS]["items"].__setitem__(1, _replicaset(RS_UID, "1"))
+            or _operator_pods(s)[0]["metadata"]["ownerReferences"][0].update({"uid": OLD_RS_UID})
+        ),
+    ],
+)
+def test_version_kube_proxy_and_operator_lineage_are_in_the_identity(
+    change: Callable[[dict[str, Any]], None],
+) -> None:
     state = installation()
     change(state)
     assert observe(state).digest != observe(installation()).digest

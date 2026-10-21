@@ -8,7 +8,12 @@ against:
 - the agent and Envoy DaemonSets and the operator, rolled out, with the image
   digest and restart count of every pod;
 - the complete agent configuration, which must enforce policy, outside audit
-  mode, including Kubernetes NetworkPolicy objects.
+  mode, including Kubernetes NetworkPolicy objects;
+- the operator's lineage: its pods belong to the Deployment's current
+  ReplicaSet;
+- the API server version and platform;
+- the kube-proxy dataplane: its DaemonSet, the digest every pod runs and its
+  configuration, or that it is absent.
 
 These reads bind and invalidate a measurement. They never count as an
 enforcement observation and can only refuse: ``pass`` comes from the probe
@@ -49,8 +54,14 @@ _WORKLOADS = {
     "operator": (_APPS + "deployments/cilium-operator", "io.cilium%2Fapp%3Doperator", "ReplicaSet"),
 }
 _PODS = _SYSTEM + "pods?labelSelector="
+_VERSION = "/version"
+_PROXY = _APPS + "daemonsets/kube-proxy"
+_PROXY_PODS = _PODS + "k8s-app%3Dkube-proxy"
+_PROXY_CONFIG = _SYSTEM + "configmaps/kube-proxy"
+_OPERATOR_SETS = _APPS + "replicasets?labelSelector=io.cilium%2Fapp%3Doperator"
+_REVISION = "deployment.kubernetes.io/revision"
 _PATHS = frozenset(
-    {_CONFIG}
+    {_CONFIG, _VERSION, _PROXY, _PROXY_PODS, _PROXY_CONFIG, _OPERATOR_SETS}
     | {path for path, _selector, _kind in _WORKLOADS.values()}
     | {_PODS + selector for _path, selector, _kind in _WORKLOADS.values()}
 )
@@ -131,7 +142,9 @@ def _families(config: dict[str, Any] | None) -> tuple[dict[str, Any], tuple[str,
     return {"uid": config["metadata"]["uid"], "data": data}, families
 
 
-def _rolled_out(name: str, value: dict[str, Any] | None, nodes: int) -> dict[str, Any]:
+def _rolled_out(
+    name: str, value: dict[str, Any] | None, nodes: int, *, pinned: bool = True
+) -> dict[str, Any]:
     require(value is not None)
     assert value is not None
     meta, status = _live(value)["metadata"], value["status"]
@@ -146,12 +159,14 @@ def _rolled_out(name: str, value: dict[str, Any] | None, nodes: int) -> dict[str
         require(all(status.get(k) == wanted for k in ("readyReplicas", "updatedReplicas")))
     template = value["spec"]["template"]["spec"]
     images = [c["image"] for c in [*template.get("initContainers", []), *template["containers"]]]
-    require(all(type(i) is str and _DIGEST_IMAGE.fullmatch(i) is not None for i in images))
+    require(all(type(i) is str for i in images))
+    # Cilium's templates pin digests. kube-proxy's names a tag; its pods' digests bind it.
+    require(not pinned or all(_DIGEST_IMAGE.fullmatch(i) is not None for i in images))
     return {"name": name, "uid": meta["uid"], "generation": meta["generation"], "images": images}
 
 
 def _pods(
-    listed: dict[str, Any] | None, kind: str, owner: str | None, nodes: Sequence[str]
+    listed: dict[str, Any] | None, kind: str, owner: str, nodes: Sequence[str]
 ) -> list[dict[str, Any]]:
     require(listed is not None)
     assert listed is not None
@@ -161,7 +176,7 @@ def _pods(
         meta = _live(pod)["metadata"]
         owners = [r for r in meta.get("ownerReferences", []) if r.get("controller") is True]
         require(len(owners) == 1 and owners[0]["kind"] == kind)
-        require(owner is None or owners[0]["uid"] == owner)
+        require(owners[0]["uid"] == owner)
         require(pod["status"]["phase"] == "Running" and pod["spec"]["nodeName"] in nodes)
         ready = [c for c in pod["status"]["conditions"] if c["type"] == "Ready"]
         require(len(ready) == 1 and ready[0]["status"] == "True")
@@ -182,6 +197,54 @@ def _pods(
     return sorted(pods, key=lambda item: (str(item["node"]), str(item["uid"])))
 
 
+def _version(value: dict[str, Any] | None) -> dict[str, Any]:
+    require(value is not None)
+    assert value is not None
+    found = {key: value.get(key) for key in ("gitVersion", "gitCommit", "platform")}
+    require(type(found["gitVersion"]) is str and type(found["platform"]) is str)
+    return found
+
+
+def _operator_set(listed: dict[str, Any] | None, deployment: dict[str, Any]) -> dict[str, Any]:
+    """The Deployment's one current ReplicaSet; operator pods of any other refuse."""
+    require(listed is not None)
+    assert listed is not None
+    require(not listed.get("metadata", {}).get("continue"))
+    revision = deployment["metadata"]["annotations"][_REVISION]
+    current = []
+    for item in listed["items"]:
+        meta = _live(item)["metadata"]
+        owners = [r for r in meta.get("ownerReferences", []) if r.get("controller") is True]
+        require(len(owners) == 1 and owners[0]["kind"] == "Deployment")
+        require(owners[0]["uid"] == deployment["metadata"]["uid"])
+        if meta.get("annotations", {}).get(_REVISION) == revision:
+            current.append(meta["uid"])
+    require(len(current) == 1)
+    return {"uid": current[0], "revision": revision}
+
+
+async def _kube_proxy(reader: CiliumReader, names: Sequence[str]) -> dict[str, Any] | None:
+    """kube-proxy's dataplane, or ``None`` when neither it nor any of its pods exists."""
+    daemonset = await reader.read(_PROXY)
+    pods = await reader.read(_PROXY_PODS)
+    if daemonset is None:
+        require(pods is not None and not pods["items"])
+        return None
+    workload = _rolled_out("kube-proxy", daemonset, len(names), pinned=False)
+    found = _pods(pods, "DaemonSet", workload["uid"], names)
+    require([item["node"] for item in found] == list(names))
+    config = await reader.read(_PROXY_CONFIG)
+    require(config is not None)
+    assert config is not None
+    data = _live(config)["data"]
+    require(type(data) is dict and all(type(v) is str for v in data.values()))
+    return {
+        "workload": workload,
+        "pods": found,
+        "config": {"uid": config["metadata"]["uid"], "data": data},
+    }
+
+
 async def observe_cilium(
     reader: CiliumReader,
     *,
@@ -193,23 +256,34 @@ async def observe_cilium(
         nodes = _nodes(await reader.list_items("nodes"), profile, eligible_nodes)
         names = [item["name"] for item in nodes]
         config, families = _families(await reader.read(_CONFIG))
-        workloads, pods = [], {}
+        version = _version(await reader.read(_VERSION))
+        workloads, pods, operator_set = [], {}, None
         for name, (path, selector, kind) in _WORKLOADS.items():
-            workload = _rolled_out(name, await reader.read(path), len(names))
+            value = await reader.read(path)
+            workload = _rolled_out(name, value, len(names))
             workloads.append(workload)
-            owner = workload["uid"] if kind == "DaemonSet" else None
+            if kind == "DaemonSet":
+                owner = workload["uid"]
+            else:
+                assert value is not None
+                operator_set = _operator_set(await reader.read(_OPERATOR_SETS), value)
+                owner = operator_set["uid"]
             found = _pods(await reader.read(_PODS + selector), kind, owner, names)
             if kind == "DaemonSet":
                 # Exactly one agent and one proxy on every node.
                 require([item["node"] for item in found] == names)
             pods[name] = found
+        kube_proxy = await _kube_proxy(reader, names)
     except (KeyError, TypeError, AttributeError, IndexError):
         refuse()
     document = {
         "profile": profile,
         "nodes": nodes,
         "config": config,
+        "version": version,
         "workloads": workloads,
+        "operator_set": operator_set,
         "pods": pods,
+        "kube_proxy": kube_proxy,
     }
     return CiliumIdentity(families, sha256_canonical(document), document)

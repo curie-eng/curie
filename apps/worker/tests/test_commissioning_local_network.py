@@ -42,8 +42,13 @@ from curie_worker.managed_cni_probe_kit import (
 sys.path.insert(0, str(Path(__file__).parent))
 from test_commissioning_local_cilium import (  # noqa: E402
     NODES,
+    OPERATOR_RS,
     PROFILE,
     PROT,
+    PROXY_CONFIG,
+    PROXY_DS,
+    REVISION,
+    VERSION,
     FakeReader,
     _agents,
     _config,
@@ -340,6 +345,12 @@ def test_the_network_fact_refuses_after_a_refused_measurement() -> None:
         lambda c: _agents(c.state)[1]["metadata"].update({"uid": "uid-replaced"}),
         lambda c: _config(c.state).update({"enable-policy": "never"}),
         lambda c: c.state["nodes"].append(c.state["nodes"][0] | {"metadata": {"name": "new"}}),
+        lambda c: c.state[VERSION].update({"gitVersion": "v1.35.2"}),
+        lambda c: c.state[PROXY_CONFIG]["data"].update({"config.conf": 'mode: "ipvs"\n'}),
+        lambda c: c.state[PROXY_DS]["metadata"].update({"uid": "proxy-replaced"}),
+        lambda c: c.state[OPERATOR_RS]["items"][0]["metadata"]["annotations"].update(
+            {REVISION: "3"}
+        ),
         lambda c: c.policies["networkpolicies:" + PROT].append(FakeCluster.policy("allow", "2")),
         lambda c: c.policies["networkpolicies:" + PROT][0]["metadata"].update(
             {"resourceVersion": "7"}
