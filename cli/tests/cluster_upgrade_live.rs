@@ -189,6 +189,7 @@ impl Fixture {
         current_dir: &Path,
         release_channel: bool,
         extra: &[&str],
+        extra_env: &[(&str, &str)],
     ) -> Output {
         let mut command = Command::new(env!("CARGO_BIN_EXE_curie"));
         command
@@ -210,7 +211,8 @@ impl Fixture {
             .env("PATH", format!("{}:/usr/bin:/bin", self.0.path().display()))
             .env("UPGRADE_DRIVER_ROOT", self.0.path())
             .env("UPGRADE_DRIVER_SCENARIO", scenario)
-            .env("XDG_CACHE_HOME", self.cache_home());
+            .env("XDG_CACHE_HOME", self.cache_home())
+            .envs(extra_env.iter().copied());
         if release_channel {
             command.env("CURIE_TEST_ARTIFACT_CHANNEL", "release");
         } else {
@@ -709,7 +711,7 @@ fn release_channel_default_uses_target_chart_cache_outside_checkout() {
     .unwrap();
 
     let output =
-        fixture.run_without_chart_with("release-cache-prior", TO, fixture.0.path(), true, &[]);
+        fixture.run_without_chart_with("release-cache-prior", TO, fixture.0.path(), true, &[], &[]);
     assert!(
         output.status.success(),
         "preseeded target archive must complete the recording fixture: {} / {}",
@@ -765,7 +767,7 @@ fn dev_channel_default_uses_local_chart_from_checkout() {
     let fixture = Fixture::new(None);
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     let output =
-        fixture.run_without_chart_with("schema-compatible", "0.9.0", repo_root, false, &[]);
+        fixture.run_without_chart_with("schema-compatible", "0.9.0", repo_root, false, &[], &[]);
     assert!(
         output.status.success(),
         "dev default must complete from the source checkout: {} / {}",
@@ -794,8 +796,14 @@ fn dev_channel_default_uses_local_chart_from_checkout() {
 #[test]
 fn dev_channel_without_local_default_refuses_before_helm() {
     let fixture = Fixture::new(None);
-    let output =
-        fixture.run_without_chart_with("schema-compatible", "0.9.0", fixture.0.path(), false, &[]);
+    let output = fixture.run_without_chart_with(
+        "schema-compatible",
+        "0.9.0",
+        fixture.0.path(),
+        false,
+        &[],
+        &[],
+    );
     assert!(
         !output.status.success(),
         "dev without charts/curie must refuse: {} / {}",
@@ -909,6 +917,7 @@ fn release_channel_dry_run_plans_target_cache_and_url_without_fetching() {
         fixture.0.path(),
         true,
         &["--dry-run"],
+        &[],
     );
     assert!(
         output.status.success(),
@@ -973,6 +982,59 @@ fn release_channel_dry_run_plans_target_cache_and_url_without_fetching() {
     );
 }
 
+#[test]
+fn cold_release_stock_layer_dry_run_defers_target_runner() {
+    let registry = stock_registry(true);
+    let fixture = stock_fixture();
+    let retained = fs::read(fixture.0.path().join("retained.json")).unwrap();
+    let output = fixture.run_without_chart_with(
+        "schema-compatible",
+        "0.9.0",
+        fixture.0.path(),
+        true,
+        &["--dry-run"],
+        &[("CURIE_TEST_SRE_BOT_REGISTRY_ENDPOINT", &registry.base_url)],
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", visible(&output));
+    let body = json(&output);
+    let conditional = plan_line(&body, "runner layers conditional rebind:");
+    for fact in [
+        "dark-factory",
+        "0.9.0",
+        "pending",
+        "target runner",
+        "chart download",
+    ] {
+        assert!(conditional.contains(fact), "{conditional}");
+    }
+    assert!(!conditional.contains("acme-bot"), "{conditional}");
+    let owner = plan_line(&body, "runner layers:");
+    assert!(owner.contains("acme-bot"), "{owner}");
+    assert!(!owner.contains("dark-factory"), "{owner}");
+    let text = visible(&output);
+    assert!(text.contains(&retirement("acme-bot")), "{text}");
+    assert!(!text.contains(&retirement("dark-factory")), "{text}");
+    for forbidden in [
+        "stock runner layer cannot be rebound",
+        "agentSandbox.runner.digest",
+        "--allow-stock-layer-clear",
+        "refusal at validate",
+        "runner layers rebound:",
+    ] {
+        assert!(!text.contains(forbidden), "{text}");
+    }
+    assert!(registry.recorded().is_empty(), "{:?}", registry.recorded());
+    assert!(!fixture.cache_home().exists());
+    assert!(fixture.consumed_charts().is_empty(), "{:?}", fixture.argv());
+    assert!(!fixture.issued(&["helm", "show", "values"]));
+    assert!(!fixture.issued(&["helm", "pull"]));
+    assert!(mutating_calls(&fixture).is_empty(), "{:?}", fixture.argv());
+    assert_eq!(
+        fs::read(fixture.0.path().join("retained.json")).unwrap(),
+        retained
+    );
+}
+
 /// #2593 -- a cached release archive is available during dry-run, so the
 /// local metadata pin and target schema validation must both execute. Neither
 /// command nor the plan may carry the Helm version flag for a local archive.
@@ -993,6 +1055,7 @@ fn release_channel_cached_dry_run_checks_target_without_version_flag() {
         fixture.0.path(),
         true,
         &["--dry-run"],
+        &[],
     );
     assert!(
         output.status.success(),
@@ -1051,13 +1114,16 @@ fn release_channel_cached_dry_run_checks_target_without_version_flag() {
 /// keeping chart inspection pending and the release cache absent.
 #[test]
 fn release_channel_cold_dry_run_still_reports_config_conflict() {
-    let fixture = Fixture::new(Some(&conflict_values("999").to_string()));
+    let mut values = conflict_values("999");
+    values["agentSandbox"] = serde_json::json!({"runnerImages": {"dark-factory": STOCK_OLD}});
+    let fixture = Fixture::new(Some(&values.to_string()));
     let output = fixture.run_without_chart_with(
         "schema-compatible",
         "0.9.0",
         fixture.0.path(),
         true,
         &["--dry-run"],
+        &[],
     );
     assert!(
         !output.status.success(),
@@ -1090,6 +1156,8 @@ fn release_channel_cold_dry_run_still_reports_config_conflict() {
     );
     assert!(!fixture.cache_home().exists());
     assert!(fixture.helm_upgrades().is_empty());
+    assert!(mutating_calls(&fixture).is_empty(), "{:?}", fixture.argv());
+    assert!(!visible(&output).contains("--allow-stock-layer-clear"));
 }
 
 /// #2593 -- an explicit operand never inherits the release resolver's pending
@@ -4179,8 +4247,14 @@ fn dry_run_without_connector_caller_pair_refuses_without_mutating() {
 fn cold_release_dry_run_without_connector_caller_pair_refuses_without_fetching() {
     let fixture = Fixture::new(None);
     fixture.set_retained(&serde_json::json!({}));
-    let output =
-        fixture.run_without_chart_with("healthy", "0.9.0", fixture.0.path(), true, &["--dry-run"]);
+    let output = fixture.run_without_chart_with(
+        "healthy",
+        "0.9.0",
+        fixture.0.path(),
+        true,
+        &["--dry-run"],
+        &[],
+    );
     assert_connector_caller_refusal(&fixture, &output);
     assert!(mutating_calls(&fixture).is_empty(), "{:?}", fixture.argv());
     assert!(
@@ -5057,6 +5131,43 @@ fn dry_run_shows_the_stock_layer_refusal() {
         "{:?}",
         fixture.argv()
     );
+}
+
+#[test]
+fn observed_target_runner_unknown_or_mismatched_still_refuses() {
+    let registry = stock_registry(true);
+    for (target, reason) in [
+        (None, "target runner is unknown"),
+        (Some("sha256:aaaa"), "built on"),
+    ] {
+        for dry_run in [false, true] {
+            let fixture = stock_fixture();
+            fixture.set_chart_values(&match target {
+                None => serde_json::json!({}),
+                Some(digest) => serde_json::json!({"agentSandbox": {"runner": {
+                    "image": "ghcr.io/curie-eng/curie-runner", "digest": digest
+                }}}),
+            });
+            let extra = if dry_run { &["--dry-run"][..] } else { &[] };
+            let output = run_stock(&fixture, "healthy", &registry.base_url, extra);
+            assert!(!output.status.success(), "{}", visible(&output));
+            let text = visible(&output);
+            for detail in [
+                "stock runner layer cannot be rebound",
+                reason,
+                "--allow-stock-layer-clear",
+            ] {
+                assert!(text.contains(detail), "{text}");
+            }
+            assert!(!text.contains("conditional rebind"), "{text}");
+            assert!(fixture.issued(&["helm", "show", "values"]));
+            if dry_run {
+                assert!(mutating_calls(&fixture).is_empty(), "{:?}", fixture.argv());
+            } else {
+                assert_stock_layer_refusal_writes_only_ownership(&fixture);
+            }
+        }
+    }
 }
 
 /// #4344 AC4: explicit consent retains the old clearing behavior for both

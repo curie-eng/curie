@@ -18,7 +18,11 @@ Codes:
 * ``delta_bound_unsupported``: a delta bound in an argument schema (magnitude is
   bounded by absolute ranges only);
 * ``kind_not_automatic``: ``automatic`` true on ``prevent`` or ``tune``
-  (AUTOMATED-REMEDIATION-24).
+  (AUTOMATED-REMEDIATION-24);
+* ``verifier_not_independent``: a verifier reading through the acting
+  ``connector`` (AUTOMATED-REMEDIATION-17). This is the document half; the
+  credential half needs the agent's in-force version and lives in
+  ``remediation_verifier.independence_refusal``, at write and at admission.
 
 A ``tune`` action has its own closed shape (AUTOMATED-REMEDIATION-25): the rule
 owner's ``connector`` and ``tool``, ``rules`` (the closed set of rule
@@ -29,8 +33,8 @@ tunable fields to an argument schema, ``retire`` declaring ``duplicate_of``).
 It has no ``arguments``, ``target``, ``reversibility``, ``precondition`` or
 ``verifier``.
 
-@spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-10 @spec AUTOMATED-REMEDIATION-24
-@spec AUTOMATED-REMEDIATION-25
+@spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-10 @spec AUTOMATED-REMEDIATION-17
+@spec AUTOMATED-REMEDIATION-24 @spec AUTOMATED-REMEDIATION-25
 """
 
 from __future__ import annotations
@@ -448,7 +452,8 @@ def _validate_action(action: Any, path: str) -> str:
     (AUTOMATED-REMEDIATION-25), and any other or unknown kind the
     ``remediate``/``prevent`` set.
 
-    @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-24 @spec AUTOMATED-REMEDIATION-25.
+    @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-17 @spec AUTOMATED-REMEDIATION-24
+    @spec AUTOMATED-REMEDIATION-25.
     """
     tune = isinstance(action, dict) and _member(action.get("kind"), frozenset({"tune"}))
     action = _closed(action, path, _TUNE_ACTION_KEYS if tune else _ACTION_KEYS)
@@ -509,6 +514,13 @@ def _validate_action(action: Any, path: str) -> str:
             "precondition_and_verifier_required",
             path,
             f"a {kind} action declares both a precondition and a verifier",
+        )
+    verifier = action.get("verifier")
+    if verifier is not None and verifier["connector"] == action["connector"]:
+        raise _refuse(
+            "verifier_not_independent",
+            f"{path}/verifier/connector",
+            "the verifier must read through its own connector, not the acting connector",
         )
     if automatic and kind in NEVER_AUTOMATIC_KINDS:
         raise _refuse(

@@ -17,13 +17,19 @@ A listed publication matches the issue when:
    ``[\\w/.-]`` and not followed by ``[\\w-]``.
 
 A publication whose ownership the code host could not verify
-(``owner_verified`` False) is never evidence: it is dropped from the listing
-before matching. The verdict, in order: more than one open match is
-``ambiguous``; exactly one is ``open``; a completed (merged or closed) match
-whose completion time is unknown, or that the label event did not strictly follow (an unknown event
-time included), is ``completed``, the replay of the trigger that already ran;
-otherwise ``clear``, which includes a verified label add after every completion
-(an intentional rerun). Any `ForgeError` propagates; callers defer on it.
+(``owner_verified`` False) is never evidence of the factory's own work. The
+verdict, in order, from verified publications: more than one open match is
+``ambiguous``; exactly one is ``open``. Then, on Bitbucket Cloud only, whose
+token cannot read its own account so nothing it lists is ever verified (#4747),
+any unverified open match is ``unconfirmed``: admission fails closed and asks
+the operator whether that pull request is the factory's, rather than trust a
+lookalike branch or open a duplicate. Every other code host ignores
+unverified publications. Then a verified completed (merged or closed) match
+whose completion time is unknown, or that the label event did not strictly
+follow (an unknown event time included), is ``completed``, the replay of the
+trigger that already ran; otherwise ``clear``, which includes a verified label
+add after every completion (an intentional rerun). An unverified completed
+match is ignored everywhere. Any `ForgeError` propagates; callers defer on it.
 """
 
 from __future__ import annotations
@@ -41,6 +47,7 @@ from .config import Settings
 from .forges.hosts import code_host_for, forge_code_host
 from .forges.ports import CodeHost, Tracker
 from .forges.types import (
+    BITBUCKET_CLOUD,
     GITHUB,
     FactoryPublication,
     PullRequestState,
@@ -56,19 +63,20 @@ EXISTING_PUBLICATION_MARKER = "curie-factory-existing-publication"
 
 _MARKER_TAG = "curie-factory-issue"
 
-Verdict = Literal["clear", "open", "ambiguous", "completed"]
+Verdict = Literal["clear", "open", "ambiguous", "unconfirmed", "completed"]
 
 # Verdicts that refuse a new run or a new pull request and are reported.
-REFUSING: frozenset[str] = frozenset({"open", "ambiguous"})
+REFUSING: frozenset[str] = frozenset({"open", "ambiguous", "unconfirmed"})
 
 
 @dataclass(frozen=True)
 class Rediscovery:
     """What the code host says about the issue's earlier publications.
 
-    ``publications`` are the matching ones the verdict rests on: the open
-    matches for ``open`` and ``ambiguous``, the suppressing
-    completed ones for ``completed``, none for ``clear``.
+    ``publications`` are the matching ones the verdict rests on: the verified
+    open matches for ``open`` and ``ambiguous``, the unverified open matches
+    on Bitbucket Cloud for ``unconfirmed``, the suppressing verified completed
+    ones for ``completed``, none for ``clear``.
     """
 
     verdict: Verdict
@@ -138,26 +146,34 @@ async def rediscover(
     ``exclude_branch`` drops the caller's own publication branch.
     """
 
-    all_listed = await code_host.list_factory_publications(repository)
-    listed = [publication for publication in all_listed if publication.owner_verified]
-    if len(listed) != len(all_listed):
-        logger.info(
-            "factory rediscovery: could not verify ownership on the code host for %s, "
-            "so unverified publications were ignored",
-            repository.path,
-        )
+    listed = await code_host.list_factory_publications(repository)
     references = await tracker.publication_references(issue, repository)
     marker = issue_marker(issue)
-    matched = [
+    every_match = [
         publication
         for publication in listed
         if publication.head_ref != exclude_branch and _matches(publication, marker, references)
     ]
+    matched = [p for p in every_match if p.owner_verified]
     opened = [p for p in matched if p.state is PullRequestState.OPEN]
     if len(opened) > 1:
         return Rediscovery("ambiguous", tuple(opened))
     if opened:
         return Rediscovery("open", tuple(opened))
+    if repository.kind == BITBUCKET_CLOUD:
+        # Never proof of ownership, but never a reason to open a second pull
+        # request either: the operator confirms which it is (#4747).
+        unconfirmed = [
+            p for p in every_match if not p.owner_verified and p.state is PullRequestState.OPEN
+        ]
+        if unconfirmed:
+            return Rediscovery("unconfirmed", tuple(unconfirmed))
+    elif any(not p.owner_verified for p in listed):
+        logger.info(
+            "factory rediscovery: could not verify ownership on the code host for %s, "
+            "so unverified publications were ignored",
+            repository.path,
+        )
     completed = [
         p for p in matched if p.state is not PullRequestState.OPEN and _suppresses(p, event_at)
     ]
@@ -170,6 +186,18 @@ def _report_body(found: Rediscovery) -> str:
     # Only the adapter-validated URL is echoed, inside angle brackets on its
     # own numbered line; titles and bodies never are.
     links = "\n".join(f"{index}. <{p.url}>" for index, p in enumerate(found.publications, 1))
+    if found.verdict == "unconfirmed":
+        return (
+            "Curie did not start a run for this issue: an open pull request from a "
+            "factory publication branch names it, and Bitbucket Cloud does not let "
+            "Curie verify who opened it. Please confirm whether it is the factory's "
+            "pull request. To confirm it is, remove the trigger label from this issue "
+            "and review or merge the pull request as usual: Curie stops trying to "
+            "start the issue. Curie does not count a merged or declined pull request "
+            "here, so an issue that keeps the label would run again. If it is not the "
+            "factory's, close it: Curie admits the issue on a later intake pass while "
+            f"it keeps the label.\n\n{links}"
+        )
     if found.verdict == "open":
         return (
             "Curie did not start another run for this issue: its factory pull request is "
@@ -185,8 +213,10 @@ def _report_body(found: Rediscovery) -> str:
 async def report(tracker: Tracker, issue: TrackerIssueRef, found: Rediscovery) -> None:
     """Keep one marked status comment on the issue naming what refused it.
 
-    Written for ``open`` and ``ambiguous``; ``completed`` is
-    only logged and ``clear`` writes nothing. A `ForgeError` propagates.
+    Written for ``open``, ``ambiguous`` and ``unconfirmed`` (which asks the
+    operator to confirm the pull request is the factory's), all under one
+    marker, so repeated passes keep one comment; ``completed`` is only logged
+    and ``clear`` writes nothing. A `ForgeError` propagates.
     """
 
     if found.verdict == "completed":

@@ -27,7 +27,9 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import http.client
 import json
+import logging
 import os
 import time
 import urllib.error
@@ -35,6 +37,8 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 def partition_value(group_key: str) -> str:
@@ -139,7 +143,16 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(400)
             self.end_headers()
             return
-        status = forward(body, signature, delivery, timestamp)
+        # @spec SIGNER-DIAGNOSTICS-1: exception text may contain credentials.
+        try:
+            status = forward(body, signature, delivery, timestamp)
+        except (urllib.error.URLError, OSError, http.client.HTTPException):
+            logger.warning("hook ingress forwarding failed (reason=transport_error)")
+            self.send_response(502)
+            self.end_headers()
+            return
+        if not 200 <= status < 300:
+            logger.warning("hook ingress rejected delivery (status=%d)", status)
         self.send_response(200 if 200 <= status < 300 else 502)
         self.end_headers()
 

@@ -40,6 +40,7 @@ from curie_runner import __main__ as boot
 from curie_runner.__main__ import build_runner
 from curie_runner.approval import APPROVAL_SERVER_NAME
 from curie_runner.mcp_tool_capability import McpToolCapabilityProbe
+from runner_boot_session import initialized_session
 
 MEMORY_TOKEN = "mem-tok"
 AGENT_NS = "/agents/A/state/memory"
@@ -502,7 +503,7 @@ def _boot_options(
                 monkeypatch.delenv("CURIE_MEMORY_TOKEN", raising=False)
             config = RunnerConfig.from_env(env)
             runner = await _fetch_and_build(config, monkeypatch)
-            session = runner._factory()
+            session = await initialized_session(runner)
             captured["options"] = session.options
 
     anyio.run(go)
@@ -1338,7 +1339,7 @@ def _gated_boot(
             runner = build_runner(config, fake_model=fake_model, mcp_capability=_PROBE)
             captured["gate"] = runner._approval_gate
             if not fake_model:
-                captured["options"] = runner._factory().options
+                captured["options"] = (await initialized_session(runner)).options
 
     anyio.run(go)
     gate = captured["gate"]

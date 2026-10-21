@@ -2340,6 +2340,10 @@ sys.exit(result.returncode)
         if std::env::var(CHILD).as_deref() == Ok(name) {
             return child_scenario();
         }
+        if executable("docker").is_err() && std::env::var_os("CI_REQUIRE_DOCKER_TESTS").is_none() {
+            eprintln!("skipping {name}: docker executable is unavailable");
+            return Ok(());
+        }
         let _pacing = CLUSTER_PACING
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
