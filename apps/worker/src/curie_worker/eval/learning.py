@@ -429,7 +429,13 @@ def _summary(rows: Sequence[Mapping[str, Any]], thresholds: Mapping[str, Any]) -
     distractors = [row for row in eligible if row["distractor"]]
     falsewrites = sum(bool(row["mutations"]) for row in distractors)
     falsewrite_rate = falsewrites / len(distractors) if distractors else None
-    duplicates = sum(row["correction_duplicates"] for row in eligible)
+    # Only the F8 "correct" decision measures correction duplicates; seed rows never count.
+    corrections = [
+        row
+        for row in eligible
+        if str(row["fixture_id"]).startswith("F8-") and row["decision_id"] == "correct"
+    ]
+    duplicates = sum(row["correction_duplicates"] for row in corrections)
     gates: dict[str, Any] = {}
     for name in ("precision", "recall"):
         values = [row[name] for row in metrics.values()]
@@ -448,8 +454,7 @@ def _summary(rows: Sequence[Mapping[str, Any]], thresholds: Mapping[str, Any]) -
         "status": "PASS" if falsewrite_pass else "FAIL",
         "value": falsewrite_rate,
     }
-    # A correction row is an evaluated F8 decision; with none the gate has no evidence.
-    if not any(str(row["fixture_id"]).startswith("F8-") for row in eligible):
+    if not corrections:
         gates["correction_duplicates"] = {"status": "NOT_AVAILABLE", "value": None}
     else:
         gates["correction_duplicates"] = {
@@ -819,6 +824,98 @@ def _check_cases(report: _Report) -> None:
         _require(present == set(CASE_IDS), f"repetition {repetition} lacks primary scenarios")
 
 
+CONSENT_DECISIONS = ("consent-offer", "consent-refusal", "consent-approval")
+NONCE_RE = re.compile(r"[a-z]+-[0-9a-f]{6}")
+
+
+def _fixture_decisions(fixture: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """The fixture's labeled decisions, plus the F1 consent control's three messages
+    as first-class decisions (offer, refusal, approval). The consent control has no
+    rubric of its own, so its decisions are judged with the case's first rubric."""
+
+    specs = [dict(d) for d in fixture["decisions"]]
+    consent = next(
+        (
+            c
+            for c in fixture.get("controls", [])
+            if isinstance(c, dict) and c.get("id") == "consent"
+        ),
+        None,
+    )
+    if consent is None:
+        return specs
+    subject = str(consent.get("subject") or fixture.get("subject"))
+    forbids = consent.get("forbid_persistence_attempts") or [False] * len(CONSENT_DECISIONS)
+    for index, (decision_id, text, expected, forbid) in enumerate(
+        zip(CONSENT_DECISIONS, consent["messages"], consent["expected"], forbids, strict=True)
+    ):
+        unchanged = [
+            {"name": "unchanged_other_stores", "class": kind, "target": "*", "value": True}
+            for kind in DURABLE
+            if kind != expected
+        ]
+        writes = (
+            [
+                {"name": "active_count", "class": expected, "target": subject, "value": 1},
+                {"name": "created_count", "class": expected, "target": subject, "value": 1},
+            ]
+            if expected in DURABLE
+            else []
+        )
+        specs.append(
+            {
+                "id": decision_id,
+                "consent_message": index,
+                "text": text,
+                "expected": expected,
+                "predicates": writes + unchanged,
+                "rubric": fixture["decisions"][0]["rubric"],
+                "forbid_persistence_attempts": forbid is True,
+            }
+        )
+    return specs
+
+
+def _decision_rubric(spec: Mapping[str, Any]) -> str:
+    return str(spec.get("rubric") or "Judge the learning outcome.")
+
+
+def _decision_request(fixture: Mapping[str, Any], spec: Mapping[str, Any]) -> str:
+    """The rendered user message a decision scores."""
+
+    if "text" in spec:
+        return str(spec["text"])
+    return str(fixture["messages"][int(spec["message"])])
+
+
+def _expected_meaning(spec: Mapping[str, Any]) -> str:
+    """What the decision must mean: its expected class, the rendered fixture
+    predicates (which carry the taught steps, values and targets) and the rubric."""
+
+    return (
+        f"Expected class: {spec['expected']}. "
+        f"Expected stored outcome: {json.dumps(spec['predicates'], sort_keys=True)}. "
+        f"Rubric: {_decision_rubric(spec)}"
+    )
+
+
+def _required_decisions(
+    report: _Report, capabilities: Mapping[str, bool]
+) -> set[tuple[int, str, str]]:
+    """Every fixture-derived decision of every executed case. Consent decisions are
+    executed only when every capability the fixture requires is available."""
+
+    required: set[tuple[int, str, str]] = set()
+    for (repetition, case_id), case in report.cases.items():
+        fixture = report.corpus[case["fixture_id"]]
+        runnable = all(capabilities.get(str(k), False) for k in fixture.get("requires", []))
+        for spec in _fixture_decisions(fixture):
+            if "consent_message" in spec and not runnable:
+                continue
+            required.add((repetition, case_id, str(spec["id"])))
+    return required
+
+
 def _check_decisions(report: _Report, capabilities: Mapping[str, bool]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     seen: set[tuple[int, str, str]] = set()
@@ -838,7 +935,7 @@ def _check_decisions(report: _Report, capabilities: Mapping[str, bool]) -> list[
         seen.add(identity)
         covered.add((int(row["repetition"]), case_id))
         fixture = report.corpus[case["fixture_id"]]
-        spec = next((d for d in fixture["decisions"] if d["id"] == decision_id), None)
+        spec = next((d for d in _fixture_decisions(fixture) if d["id"] == decision_id), None)
         _require(spec is not None, f"{decision_id} is not a fixture decision")
         assert spec is not None
         expected = row.get("expected")
@@ -900,6 +997,8 @@ def _check_decisions(report: _Report, capabilities: Mapping[str, bool]) -> list[
             _require(observation.get("semantic", "PASS") == "PASS", f"{case_id} semantic")
         rows.append(row)
     _require(covered == set(report.cases), "every executed scenario needs a scored decision")
+    missing = sorted(_required_decisions(report, capabilities) - seen)
+    _require(not missing, f"fixture-derived decisions are missing: {missing[:3]}")
     return rows
 
 
@@ -938,8 +1037,10 @@ def _check_judge_bindings(report: _Report, rows: list[dict[str, Any]]) -> None:
     """Every judged decision binds one recorded judge generation whose completion
     parses to the recorded semantic verdict."""
 
-    from .learning_judge import parse_judge_verdict
+    from .learning_judge import JudgeSpec, _prompt, parse_judge_verdict
 
+    used: set[str] = set()
+    live = report.data.get("data_origin") == "live-campaign"
     generations = {
         str(_obj(g, "generation").get("id")): _obj(g, "generation")
         for g in _lst(report.data.get("generations"), "generations")
@@ -951,7 +1052,33 @@ def _check_judge_bindings(report: _Report, rows: list[dict[str, Any]]) -> None:
             continue
         label = f"{row['case_id']} {row['decision_id']}"
         ref = _obj(row.get("judge_ref"), f"{label} judge reference")
-        generation = generations.get(_text(ref.get("generation_id"), f"{label} judge id"))
+        _require(
+            ref.get("case_id") == row["case_id"] and ref.get("decision_id") == row["decision_id"],
+            f"{label} judge reference is bound to another decision",
+        )
+        identity = _text(ref.get("generation_id"), f"{label} judge id")
+        _require(identity not in used, f"{label} shares a judge generation")
+        used.add(identity)
+        evidence = _obj(ref.get("evidence"), f"{label} judge evidence")
+        refs = _obj(evidence.get("refs"), f"{label} judge evidence refs")
+        for key in ("request:teaching", "expected:meaning"):
+            _text(refs.get(key), f"{label} judge evidence {key}")
+        _require(evidence.get("output") == observation.get("output"), f"{label} judge output")
+        if live:
+            # Rebuild the exact prompt from the recorded evidence and pinned rubric.
+            fixture = report.corpus[str(row["fixture_id"])]
+            spec = next(d for d in _fixture_decisions(fixture) if d["id"] == row["decision_id"])
+            substitutions = _obj(observation.get("substitutions"), "substitutions")
+            rubric = _substitute(
+                _decision_rubric(spec),
+                _obj(substitutions.get("values"), "values"),
+                _obj(substitutions.get("literals"), "literals"),
+            )
+            prompt = _prompt(
+                JudgeSpec(rubric=rubric, evidence=evidence, deterministic=ScoreResult(passed=True))
+            )
+            _require(_sha(prompt.encode()) == ref.get("prompt_sha256"), f"{label} judge prompt")
+        generation = generations.get(identity)
         _require(generation is not None, f"{label} judge generation is unrecorded")
         assert generation is not None
         _require(generation.get("purpose") == "judge", f"{label} judge generation purpose")
@@ -1044,6 +1171,57 @@ def _check_metrics(report: _Report, rows: list[dict[str, Any]]) -> list[str]:
     return failures
 
 
+def _usage_time(value: object) -> datetime:
+    return _utc(_text(value, "poll time"), "poll time")
+
+
+def _check_actor_settlement(operation: Mapping[str, Any], baseline: Decimal) -> None:
+    """A settled actor charge needs two equal usage polls at least 10 s apart that
+    explain it; anything less stays unresolved at its full reservation."""
+
+    identity = str(operation["id"])
+    polls = _lst(operation.get("usage_polls"), f"{identity} usage polls")
+    _require(len(polls) >= 2, f"{identity} settled without a second usage poll")
+    last, previous = _obj(polls[-1], "usage poll"), _obj(polls[-2], "usage poll")
+    stable = _decimal(last.get("usage_usd"), "poll usage")
+    _require(stable == _decimal(previous.get("usage_usd"), "poll usage"), f"{identity} unstable")
+    gap = _usage_time(last.get("polled_at")) - _usage_time(previous.get("polled_at"))
+    _require(gap >= timedelta(seconds=STABLE_POLL_GAP_SECONDS), f"{identity} polls too close")
+    settled = _decimal(operation.get("settled_usd"), "settled")
+    _require(Decimal(0) < settled <= stable - baseline, f"{identity} charge is not observed usage")
+
+
+def _check_worker_and_schedules(report: _Report) -> None:
+    worker = _obj(report.data.get("worker"), "worker")
+    attempts = worker.get("max_attempts")
+    _require(_is_int(attempts) and attempts == 1, "the private worker must make one attempt")
+    rows: set[tuple[int, str, str]] = set()
+    for raw in _lst(report.data.get("schedule_reservations"), "schedule reservations"):
+        row = _obj(raw, "schedule reservation")
+        identity = (
+            _int(row.get("repetition"), "reservation repetition", 1),
+            _text(row.get("case_id"), "reservation case"),
+            _text(row.get("schedule_id"), "reservation schedule"),
+        )
+        _require(identity not in rows, f"duplicate schedule reservation {identity}")
+        _require(
+            row.get("disposition") in ("reserved", "cancelled"),
+            f"schedule {identity[2]} was neither reserved nor cancelled",
+        )
+        rows.add(identity)
+    for raw in _lst(report.data.get("decisions"), "decisions"):
+        decision = _obj(raw, "decision")
+        for mutation in _lst(decision.get("mutations"), "mutations"):
+            if _obj(mutation, "mutation").get("kind") != "schedule":
+                continue
+            identity = (
+                int(decision["repetition"]),
+                str(decision["case_id"]),
+                str(mutation["item_id"]),
+            )
+            _require(identity in rows, f"schedule {identity[2]} has no reservation record")
+
+
 def _check_generations_and_accounting(report: _Report) -> None:
     data = report.data
     models = _obj(data.get("models"), "models")
@@ -1076,6 +1254,10 @@ def _check_generations_and_accounting(report: _Report) -> None:
             _require(
                 not operation.get("generation_id") and not operation.get("record_id"),
                 f"released {identity} is bound to a generation",
+            )
+        if status == "settled" and identity.startswith("actor-"):
+            _check_actor_settlement(
+                operation, _decimal(accounting.get("baseline_usage_usd"), "baseline usage")
             )
         settled += amount
         operations[identity] = operation
@@ -1152,6 +1334,9 @@ def _check_collector_and_cleanup(report: _Report) -> None:
         collector.get("bind_errors") == 0 and _is_int(collector.get("bind_errors")),
         "stub bind errors",
     )
+    if "recovered_bind_retries" in collector:
+        # Informational: a stub bind failure whose single retry succeeded.
+        _int(collector["recovered_bind_retries"], "recovered bind retries", 0)
     _delivery_windows(report)
     synthetic = _obj(collector.get("synthetic_transport_receipt"), "synthetic receipt")
     _require(synthetic.get("synthetic") is True, "synthetic receipt label")
@@ -1370,6 +1555,11 @@ def _check_negative(report: _Report) -> list[str]:
         _require(all(_obj(f, "fact").get("id") != fact_id for f in after_facts), "fact remains")
         no_recall = before["required_value"] not in str(after.get("output", ""))
         _require(after.get("no_recall") is no_recall, "no-recall is not recomputable")
+        output = str(after.get("output", ""))
+        fabricated = bool(NONCE_RE.search(output)) or before["required_value"] in output
+        _require(
+            after.get("no_fabrication") is not fabricated, "no-fabrication is not recomputable"
+        )
         _require(row["retention_before"] in ("PASS", "FAIL", "ERROR", "NOT_AVAILABLE"), "enum")
         _require(row["retention_after"] in ("PASS", "FAIL", "ERROR", "NOT_AVAILABLE"), "enum")
         _require(row["retention_before"] == before["retention"], "retention before")
@@ -1720,6 +1910,7 @@ def _report_checks(report: _Report) -> list[str]:
     failures = _check_metrics(report, rows)
     failures += _verdict_failures(report, rows)
     _check_generations_and_accounting(report)
+    _check_worker_and_schedules(report)
     _check_judge_bindings(report, rows)
     _check_collector_and_cleanup(report)
     failures += _check_procedures(report, capabilities["skill"])
@@ -1787,6 +1978,14 @@ ACTOR_PROMPT_TOKENS_BOUND = 60000
 JUDGE_PROMPT_CHARS_PER_TOKEN = 2
 RESERVE_MARGIN = Decimal("1.25")
 SETTLE_SECONDS = 60
+# An actor turn settles only on two equal shared-key usage polls this far apart.
+STABLE_POLL_GAP_SECONDS = 10
+STABLE_POLL_SLEEP_SECONDS = 12
+STABLE_SETTLE_SECONDS = 120
+# A message child binds the Slack stub on port B before it enqueues anything.
+STUB_BIND_ERROR = "binding the Slack stub on"
+STUB_PORT_WAIT_SECONDS = 180
+STUB_PORT_POLL_SECONDS = 5
 NORMAL_POLL_SECONDS = 60
 DELIVERY_TOLERANCE_SECONDS = 240
 SCHEDULE_LEAD_MINUTES = 12
@@ -1908,7 +2107,7 @@ class _Ledger:
         self._db.execute(
             "CREATE TABLE IF NOT EXISTS operations (id TEXT PRIMARY KEY, purpose TEXT, "
             "reserve TEXT, settled TEXT, status TEXT, generation_id TEXT, scope TEXT, "
-            "record_id TEXT)"
+            "record_id TEXT, usage_polls TEXT)"
         )
         self._db.commit()
         self.budget = budget
@@ -1968,8 +2167,18 @@ class _Ledger:
         self.sequence += 1
         identity = f"{purpose}-operation-{self.sequence}"
         self._db.execute(
-            "INSERT INTO operations VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (identity, purpose, str(reserve), "0", "reserved", "", json.dumps(dict(scope)), ""),
+            "INSERT INTO operations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                identity,
+                purpose,
+                str(reserve),
+                "0",
+                "reserved",
+                "",
+                json.dumps(dict(scope)),
+                "",
+                "",
+            ),
         )
         self._db.commit()
         return identity
@@ -2013,8 +2222,56 @@ class _Ledger:
         self._db.commit()
         return str(settled)
 
+    def fits(self, reserve: Decimal) -> bool:
+        """Whether one more reservation fits the budget, without closing admission."""
+
+        unresolved = self._sum("reserve", "reserved")
+        return (
+            self.closed is None
+            and self.charged() + unresolved + reserve + SHUTDOWN_RESERVE <= self.budget
+        )
+
+    def settle_stable(self, identity: str, before: Decimal, *, record: str) -> str:
+        """Settle an actor turn only when shared-key usage moved above ``before`` and
+        then read equal on two polls at least STABLE_POLL_GAP_SECONDS apart; otherwise
+        the full reservation stays charged as unresolved."""
+
+        polls: list[dict[str, str]] = []
+        deadline = time.monotonic() + STABLE_SETTLE_SECONDS
+        stable: Decimal | None = None
+        previous: Decimal | None = None
+        while True:
+            usage = self.provider.usage()
+            self.observe(usage)
+            polls.append({"polled_at": _now(), "usage_usd": str(usage)})
+            if previous is not None and usage == previous and usage > before:
+                stable = usage
+                break
+            if time.monotonic() > deadline:
+                break
+            previous = usage
+            time.sleep(STABLE_POLL_SLEEP_SECONDS)
+        if stable is not None:
+            settled, status = stable - before, "settled"
+        else:
+            row = self._db.execute(
+                "SELECT reserve FROM operations WHERE id = ?", (identity,)
+            ).fetchone()
+            settled, status = Decimal(row[0]), "unresolved"
+            self.notes.append(
+                f"{_now()} {identity} usage never stabilized; reservation stays charged"
+            )
+        self._db.execute(
+            "UPDATE operations SET settled = ?, status = ?, record_id = ?, usage_polls = ? "
+            "WHERE id = ?",
+            (str(settled), status, record, json.dumps(polls), identity),
+        )
+        self._db.commit()
+        return str(settled)
+
     def release(self, identity: str, reason: str) -> None:
-        """Release a reservation whose work provably did not run (a cancelled fire)."""
+        """Release a reservation whose work provably did not run: a cancelled fire, or
+        a message child that failed binding its stub before enqueueing anything."""
 
         self._db.execute(
             "UPDATE operations SET settled = '0', status = 'released' WHERE id = ?", (identity,)
@@ -2036,9 +2293,9 @@ class _Ledger:
             )
             self._db.commit()
 
-    def operations(self) -> list[dict[str, str | None]]:
+    def operations(self) -> list[dict[str, Any]]:
         rows = self._db.execute(
-            "SELECT id, generation_id, reserve, settled, status, record_id, purpose "
+            "SELECT id, generation_id, reserve, settled, status, record_id, purpose, usage_polls "
             "FROM operations ORDER BY rowid"
         ).fetchall()
         return [
@@ -2051,6 +2308,7 @@ class _Ledger:
                 "settled_usd": r[3],
                 "charged_usd": r[3],
                 "status": r[4],
+                **({"usage_polls": json.loads(r[7])} if r[7] else {}),
             }
             for r in rows
         ]
@@ -2260,6 +2518,9 @@ class _Stack:
             "SLACK_API_BASE_URL": f"http://{self.stub_host}:{self.stub_port}/api/",
             "CURIE_DOCKER_NETWORK": f"{self.project}_runner",
             "OTEL_EXPORTER_OTLP_ENDPOINT": f"http://127.0.0.1:{self.ports['otel-collector'][4318]}",
+            # One attempt per ordinary turn: a reservation covers one session, and
+            # the kernel would otherwise retry a failed turn up to three times.
+            "CURIE_MAX_ATTEMPTS": "1",
         }
         lines += ["  curie-worker:", "    environment:"]
         lines += [f"      {key}: {json.dumps(value)}" for key, value in worker.items()]
@@ -2589,6 +2850,7 @@ class _Campaign:
         self.stub_port = 0
         self.threads: set[str] = set()
         self.bind_errors = 0
+        self.recovered_bind_retries = 0
         self.live_children = 0
         self.prices: dict[str, dict[str, Decimal]] = {}
         self.agent_caps: dict[str, dict[str, Any]] = {}
@@ -2596,6 +2858,9 @@ class _Campaign:
         self.bound_fires: dict[tuple[str, str], str] = {}
         self.open_fires: set[str] = set()
         self.substitutions: dict[str, Any] = {}
+        self.schedule_reservations: list[dict[str, Any]] = []
+        self.quiesce_actions: list[dict[str, Any]] = []
+        self.worker: dict[str, Any] = {}
         self.paid_started = False
         self.setup_retries: list[dict[str, Any]] = []
         self.channels: tuple[str, str] = CHANNELS
@@ -2703,17 +2968,19 @@ class _Campaign:
         }
         if extra:
             record.update(extra)
-        self.invocations.append(record)
-        return (
-            code,
-            parsed,
-            invocation_id,
-            result_ref,
-            self.scrub(
-                stderr.decode("utf-8", errors="replace")
-                + ("" if parsed is not None else "\n" + stdout.decode("utf-8", errors="replace"))
-            ),
+        error = self.scrub(
+            stderr.decode("utf-8", errors="replace")
+            + ("" if parsed is not None else "\n" + stdout.decode("utf-8", errors="replace"))
         )
+        if code != 0:
+            # Why the child failed, scrubbed of every secret, so a turn that did not
+            # finalize shows its cause in the report.
+            cause = error.strip()
+            if isinstance(parsed, dict) and parsed.get("error") is not None:
+                cause = f"{cause} {self.scrub(json.dumps(parsed['error']))}".strip()
+            record["error"] = _bounded(cause[-2000:]) or "no error output"
+        self.invocations.append(record)
+        return code, parsed, invocation_id, result_ref, error
 
     def must(self, args: Sequence[str], scope: Mapping[str, Any], **kw: Any) -> Any:
         code, parsed, _, _, stderr = self.cli(args, scope, **kw)
@@ -2856,6 +3123,7 @@ class _Campaign:
             return None
         operation = unbound.pop(0)
         self.bound_fires[(agent, schedule_id)] = operation
+        self.reservation_row(scope, schedule_id, "reserved")
         return operation
 
     def release_fire(self, operation: str | None, reason: str) -> None:
@@ -3097,6 +3365,34 @@ class _Campaign:
                     for binding in bindings or []:
                         if binding.get("HostIp") not in ("127.0.0.1", ""):
                             raise _Stop("a started container published beyond loopback")
+        self.worker = {"max_attempts": self.worker_max_attempts()}
+        if self.worker["max_attempts"] != 1:
+            raise _Stop("the private worker does not run ordinary turns with one attempt")
+
+    def worker_max_attempts(self) -> int | None:
+        """Read CURIE_MAX_ATTEMPTS from the started worker container's configuration,
+        keeping only that one value (nothing credential-bearing leaves the inspect)."""
+
+        assert self.stack is not None
+        for identity in list(self.ownership.containers):
+            service = _docker_lines(
+                "container",
+                "inspect",
+                "--format",
+                '{{index .Config.Labels "com.docker.compose.service"}}',
+                identity,
+            )
+            if service != ["curie-worker"]:
+                continue
+            lines = _docker_lines(
+                "container", "inspect", "--format", "{{json .Config.Env}}", identity
+            )
+            for item in json.loads(lines[0]) if lines else []:
+                name, _, value = str(item).partition("=")
+                if name == "CURIE_MAX_ATTEMPTS":
+                    return int(value) if value.isdigit() else None
+            return None
+        return None
 
     def down(self, repetition: int) -> None:
         if self.stack is None:
@@ -3340,6 +3636,22 @@ class _Campaign:
                 self.threads.add(thread)
                 return thread
 
+    def stub_port_free(self) -> bool:
+        """Probe port B on the host and interface the message child's stub binds."""
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                probe.bind((_stub_bind_host(), self.stub_port))
+            except OSError:
+                return False
+        return True
+
+    def wait_for_stub_port(self) -> None:
+        deadline = time.monotonic() + STUB_PORT_WAIT_SECONDS
+        while not self.stub_port_free() and time.monotonic() < deadline:
+            time.sleep(STUB_PORT_POLL_SECONDS)
+
     def message(
         self, scope: Mapping[str, Any], text: str, channel: str, thread: str
     ) -> dict[str, Any]:
@@ -3347,37 +3659,62 @@ class _Campaign:
         bare = {k: scope[k] for k in ("repetition", "case_id", "agent_id")}
         if thread.startswith(EVAL_ISOLATE_PREFIX):
             raise _Stop("an ordinary thread must not use the eval isolation prefix")
-        operation = self.ledger.admit("actor", self.actor_reserve(), bare)
-        self.paid_started = True
-        before = self.ledger.last_usage
-        self.live_children += 1
-        try:
-            code, parsed, invocation, result_ref, stderr = self.cli(
-                [
-                    "local",
-                    "message",
-                    text,
-                    "--agent",
-                    str(scope["agent_id"]),
-                    "--channel",
-                    channel,
-                    "--thread",
-                    thread,
-                    "--timeout-secs",
-                    "300",
-                ],
-                bare,
-                cwd=self.o.output_dir,
-                timeout=420,
-            )
-        finally:
-            self.live_children -= 1
-        if code != 0 and ("address already in use" in stderr.lower() or " bind" in stderr):
-            self.bind_errors += 1
+        argv = [
+            "local",
+            "message",
+            text,
+            "--agent",
+            str(scope["agent_id"]),
+            "--channel",
+            channel,
+            "--thread",
+            thread,
+            "--timeout-secs",
+            "300",
+        ]
+        for attempt in (1, 2):
+            self.wait_for_stub_port()
+            operation = self.ledger.admit("actor", self.actor_reserve(), bare)
+            self.paid_started = True
+            before = self.ledger.last_usage
+            self.live_children += 1
+            try:
+                code, parsed, invocation, result_ref, stderr = self.cli(
+                    argv, bare, cwd=self.o.output_dir, timeout=420
+                )
+            finally:
+                self.live_children -= 1
+            said = stderr
+            if isinstance(parsed, dict) and parsed.get("error") is not None:
+                said += json.dumps(parsed["error"])
+            if code == 0 or STUB_BIND_ERROR not in said:
+                break
+            # The child failed binding its stub on B before it enqueued anything:
+            # a proven pre-dispatch failure, so no paid work exists to charge.
+            self.ledger.release(operation, "the message child could not bind the Slack stub")
+            if attempt == 2:
+                # Only an unrecovered failure (the retry failed too) is a bind error.
+                self.bind_errors += 1
+                self.failures.append(
+                    f"{scope['case_id']} ERROR: the message child could not bind the Slack "
+                    "stub on port B twice"
+                )
+                return {
+                    "invocation_id": invocation,
+                    "result_ref": result_ref,
+                    "exit_code": code,
+                    "reply": "",
+                    "thread": thread,
+                    "channel": channel,
+                    "finalized": False,
+                    "bind_failed": True,
+                    "generation": None,
+                }
+        if attempt == 2:
+            self.recovered_bind_retries += 1
         # The provider gives the harness no per-turn generation id for runner
         # traffic, so the row is labeled by its configured route, not an invented id.
-        generation = operation
-        settled = self.ledger.settle(operation, before, None, record=operation)
+        settled = self.ledger.settle_stable(operation, before, record=operation)
         self.generations.append(
             {
                 "id": operation,
@@ -3402,6 +3739,7 @@ class _Campaign:
         result = parsed if isinstance(parsed, dict) else {}
         if code != 0 or result.get("finalized") is not True:
             self.failures.append(f"{scope['case_id']} turn did not finalize: {stderr[-300:]}")
+        self.sweep_schedules(scope)
         return {
             "invocation_id": invocation,
             "result_ref": result_ref,
@@ -3410,8 +3748,55 @@ class _Campaign:
             "thread": thread,
             "channel": channel,
             "finalized": result.get("finalized") is True,
-            "generation": generation,
+            "generation": operation,
         }
+
+    def sweep_schedules(self, scope: Mapping[str, Any]) -> None:
+        """After every actor turn, no active schedule may stay unreserved: bind it to a
+        pending reservation, else reserve it if that fits, else cancel it at once
+        through the operator CLI and record an off-target write and a quiesce action."""
+
+        if not self.available("schedule"):
+            return
+        assert self.ledger is not None
+        bare = {k: scope[k] for k in ("repetition", "case_id", "agent_id")}
+        agent = str(scope["agent_id"])
+        listed = _obj(self.must(["local", "schedules", "--agent", agent], bare), "schedules")
+        for raw in _lst(listed.get("agent_schedules"), "agent_schedules"):
+            row = _obj(raw, "schedule")
+            schedule_id = str(row.get("id"))
+            if row.get("state") != "active" or (agent, schedule_id) in self.bound_fires:
+                continue
+            if self.bind_fire(scope, schedule_id) is not None:
+                continue
+            reserve = self.actor_reserve()
+            if self.ledger.fits(reserve):
+                operation = self.ledger.admit(
+                    "schedule", reserve, {**bare, "why": "unexpected schedule"}
+                )
+                self.open_fires.add(operation)
+                self.bound_fires[(agent, schedule_id)] = operation
+                self.reservation_row(scope, schedule_id, "reserved")
+                continue
+            self.must(["local", "schedules", "--agent", agent, "--cancel", schedule_id], bare)
+            self.reservation_row(scope, schedule_id, "cancelled")
+            self.quiesce_actions.append(
+                {**bare, "schedule_id": schedule_id, "action": "operator-cancel"}
+            )
+            self.failures.append(
+                f"{scope['case_id']} off-target schedule {schedule_id} had no reservation "
+                "room and was cancelled"
+            )
+
+    def reservation_row(self, scope: Mapping[str, Any], schedule_id: str, disposition: str) -> None:
+        self.schedule_reservations.append(
+            {
+                "repetition": scope["repetition"],
+                "case_id": scope["case_id"],
+                "schedule_id": schedule_id,
+                "disposition": disposition,
+            }
+        )
 
     def transcript(
         self, scope: Mapping[str, Any], agent_id: str, channel: str, thread: str, text: str
@@ -3526,8 +3911,11 @@ class _Campaign:
         action: str | None = None
         predicted: list[str] = list(durable)
         judge_ref: dict[str, Any] | None = None
+        request = _decision_request(fixture, spec)
         if expected in DURABLE and not self.available(expected):
             status, detail = "NOT_AVAILABLE", "expected capability is absent"
+        elif sent.get("bind_failed"):
+            status, detail = "ERROR", "the message child could not bind the Slack stub on port B"
         elif not kept:
             status, detail = "NOT_AVAILABLE", "every predicate needs an absent field"
         elif transcript_error is not None:
@@ -3554,13 +3942,15 @@ class _Campaign:
                     "reply:final": output,
                     "state:mutations": mutations,
                     "state:after": {k: v for k, v in after[0].items() if v},
+                    "request:teaching": request,
+                    "expected:meaning": _expected_meaning(spec),
                 },
             }
             key = f"{scope['case_id']}:{spec['id']}"
             scorer = LearningJudgeScorer(
                 {
                     key: JudgeSpec(
-                        rubric=str(spec.get("rubric") or "Judge the learning outcome."),
+                        rubric=_decision_rubric(spec),
                         evidence=evidence,
                         deterministic=result,
                     )
@@ -3571,7 +3961,7 @@ class _Campaign:
             judged = scorer.score(
                 EvalCase(
                     id=key,
-                    input=str(fixture["messages"][int(spec["message"])]),
+                    input=request,
                     grader=Grader(kind=GraderKind.CONTAINS, expected="unused"),
                 ),
                 output,
@@ -3583,6 +3973,9 @@ class _Campaign:
                 prompt_text, completion, generation_id, _, sequence = self.last_verdict
                 judge_ref = {
                     "generation_id": generation_id,
+                    "case_id": scope["case_id"],
+                    "decision_id": spec["id"],
+                    "evidence": copy.deepcopy(evidence),
                     "call_sequence": sequence,
                     "prompt_sha256": _sha(prompt_text.encode()),
                     "completion_sha256": _sha(completion.encode()),
@@ -3700,6 +4093,28 @@ class _Campaign:
             )
         return sent, after
 
+    def consent(self, scope: dict[str, Any], fixture: Mapping[str, Any], agent_id: str) -> None:
+        """Run the fixture's consent conversation (offer, refusal, approval) in its own
+        thread as three labeled decisions; the first two forbid persistence attempts."""
+
+        specs = [spec for spec in _fixture_decisions(fixture) if "consent_message" in spec]
+        if not specs or not all(self.available(str(k)) for k in fixture.get("requires", [])):
+            return
+        thread = self.new_thread()
+        for spec in specs:
+            text = str(spec["text"])
+            before = self.snapshot(scope)
+            if self.available("schedule") and spec["expected"] == "schedule":
+                self.reserve_fire(scope, f"{spec['id']} expects a schedule")
+            sent = self.message(scope, text, self.channels[0], thread)
+            after = self.snapshot(scope)
+            try:
+                transcript, turn = self.transcript(scope, agent_id, self.channels[0], thread, text)
+            except _Stop as exc:
+                transcript, turn = {"error": str(exc)}, []
+                self.failures.append(f"{scope['case_id']} {spec['id']} transcript: {exc}")
+            self.score_decision(scope, fixture, spec, before, after, sent, transcript, turn)
+
     def scenario(self, repetition: int, raw: Mapping[str, Any]) -> None:
         family = int(str(raw["id"])[1])
         if family == 4:
@@ -3722,6 +4137,7 @@ class _Campaign:
         after: tuple[dict[str, Any], Any] = ({}, None)
         for index in range(len(fixture["messages"])):
             _, after = self.teach(scope, fixture, agent_id, thread, index)
+        self.consent(scope, fixture, agent_id)
         control = {
             1: self.control_procedure,
             3: self.control_fact,
@@ -3991,7 +4407,7 @@ class _Campaign:
                 },
                 "retention": "PASS" if present and value in output else "FAIL",
                 "no_recall": value not in output,
-                "no_fabrication": value not in output,
+                "no_fabrication": not NONCE_RE.search(output) and value not in output,
                 "guidance_sha256": self.guidance_sha,
                 "bundle_sha256": self.bundle_sha,
             },
@@ -4703,12 +5119,16 @@ class _Campaign:
             "collector": {
                 "port_b": self.stub_port,
                 "bind_errors": self.bind_errors,
+                "recovered_bind_retries": self.recovered_bind_retries,
                 "delivery_windows": [w for w in self.windows if w["closed_at"]],
                 "synthetic_transport_receipt": self.synthetic,
             },
             "runner_turn_bound": "native runner default, not overridden by this harness",
             "setup_retries": self.setup_retries,
             "agent_caps": self.agent_caps,
+            "worker": self.worker,
+            "schedule_reservations": self.schedule_reservations,
+            "quiesce_actions": self.quiesce_actions,
         }
         path = self.o.output_dir / "report.json"
         path.write_bytes(_json_bytes(report))

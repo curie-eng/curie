@@ -794,8 +794,13 @@ def _metrics(rows: Sequence[DecisionResult], thresholds: Thresholds) -> dict[str
         if rate is None
         else {"status": "PASS" if rate <= thresholds.falsewrite else "FAIL", "value": rate}
     )
-    duplicates = sum(row.correction_duplicates for row in eligible)
-    corrections = [row for row in eligible if row.case_id.startswith(_CORRECTION_FAMILY)]
+    # Only the F8 "correct" decision measures correction duplicates; seed rows never count.
+    corrections = [
+        row
+        for row in eligible
+        if row.case_id.startswith(_CORRECTION_FAMILY) and row.decision_id == "correct"
+    ]
+    duplicates = sum(row.correction_duplicates for row in corrections)
     gates["correction_duplicates"] = (
         {"status": CaseStatus.NOT_AVAILABLE.value, "value": None}
         if not corrections
