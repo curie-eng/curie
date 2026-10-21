@@ -544,6 +544,10 @@
       "description": "The connector action executor switch (ACTION-EXECUTOR-1), rendered into both the API and the worker. A boolean, so a quoted \"false\" cannot turn it on.",
       "properties": {
         "enabled": {"type": "boolean"},
+        "connectorReadsWithoutReconciler": {
+          "type": "boolean",
+          "description": "The executor's own connector reads with worker.connectorReconciler off (#4800): the worker Role gains only a single-object get on Deployments. Requires enabled; refused with the reconciler on. A boolean, so a quoted \"true\" cannot turn it on."
+        },
         "maxConcurrentSandboxes": {
           "type": "integer",
           "minimum": 1,
