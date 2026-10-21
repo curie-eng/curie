@@ -1,0 +1,453 @@
+{
+  "schema": "daemon-lifecycle/v1",
+  "result": "passed",
+  "nonce": "0123abcd",
+  "provenance": {
+    "candidate": "0123456789abcdef0123456789abcdef01234567",
+    "catalog_builder": "curie::repo_runner::catalog_dockerfile",
+    "images": {
+      "daemon": {
+        "ref": "localhost:5000/fd-0123abcd/daemon@sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "manifest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "config": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      },
+      "platform": {
+        "ref": "localhost:5000/fd-0123abcd/platform@sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "manifest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+        "config": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      },
+      "catalog": {
+        "ref": "localhost:5000/fd-0123abcd/catalog@sha256:3333333333333333333333333333333333333333333333333333333333333333",
+        "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+        "manifest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+        "config": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      },
+      "runner": {
+        "ref": "localhost:5000/fd-0123abcd/runner@sha256:4444444444444444444444444444444444444444444444444444444444444444",
+        "digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+        "manifest": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+        "config": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      },
+      "api": {
+        "ref": "localhost:5000/fd-0123abcd/api@sha256:5555555555555555555555555555555555555555555555555555555555555555",
+        "digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+        "manifest": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+        "config": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      },
+      "worker": {
+        "ref": "localhost:5000/fd-0123abcd/worker@sha256:6666666666666666666666666666666666666666666666666666666666666666",
+        "digest": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+        "manifest": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+        "config": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      }
+    }
+  },
+  "timings": {
+    "build_seconds": 210.5,
+    "install_seconds": 95.25
+  },
+  "turns": {
+    "success": {
+      "issue": 1,
+      "thread": "thread-1",
+      "claim": "factory-e2e-aaaa0001",
+      "runner": {
+        "pod": "runner-factory-e2e-aaaa0001",
+        "pod_uid": "00000000-0000-0000-0000-000000001001",
+        "image_id": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+        "docker_env": true
+      },
+      "daemon": {
+        "pod": "daemon-factory-e2e-aaaa0001",
+        "pod_uid": "00000000-0000-0000-0000-000000001002",
+        "image_id": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "docker_id": "ABCD:EFGH:IJKL:MNOP:1",
+        "docker_name": "daemon-factory-e2e-aaaa0001"
+      },
+      "runner_docker": {
+        "ran": true,
+        "id": "ABCD:EFGH:IJKL:MNOP:1",
+        "name": "daemon-factory-e2e-aaaa0001",
+        "container_nonce": "0123abcd"
+      },
+      "objects": [
+        {
+          "kind": "Pod",
+          "role": "daemon",
+          "name": "daemon-factory-e2e-aaaa0001",
+          "namespace": "fd-proof-d-0123abcd",
+          "uid": "00000000-0000-0000-0000-000000001003",
+          "claim_label": "factory-e2e-aaaa0001"
+        },
+        {
+          "kind": "Service",
+          "role": "service",
+          "name": "factory-e2e-aaaa0001",
+          "namespace": "fd-proof-d-0123abcd",
+          "uid": "00000000-0000-0000-0000-000000001004",
+          "claim_label": "factory-e2e-aaaa0001"
+        },
+        {
+          "kind": "NetworkPolicy",
+          "role": "ingress",
+          "name": "factory-e2e-aaaa0001",
+          "namespace": "fd-proof-d-0123abcd",
+          "uid": "00000000-0000-0000-0000-000000001005",
+          "claim_label": "factory-e2e-aaaa0001"
+        },
+        {
+          "kind": "Secret",
+          "role": "server-secret",
+          "name": "factory-e2e-aaaa0001-server",
+          "namespace": "fd-proof-d-0123abcd",
+          "uid": "00000000-0000-0000-0000-000000001006",
+          "claim_label": "factory-e2e-aaaa0001"
+        },
+        {
+          "kind": "Secret",
+          "role": "client-secret",
+          "name": "factory-e2e-aaaa0001-tokens",
+          "namespace": "fd-proof-0123abcd",
+          "uid": "00000000-0000-0000-0000-000000001007",
+          "claim_label": "factory-e2e-aaaa0001"
+        }
+      ],
+      "fault": "release",
+      "settle_seconds": 13.5,
+      "objects_absent": true,
+      "request_state": "completed"
+    },
+    "daemon_death": {
+      "issue": 2,
+      "thread": "thread-2",
+      "claim": "factory-e2e-aaaa0002",
+      "runner": {
+        "pod": "runner-factory-e2e-aaaa0002",
+        "pod_uid": "00000000-0000-0000-0000-000000001008",
+        "image_id": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+        "docker_env": true
+      },
+      "daemon": {
+        "pod": "daemon-factory-e2e-aaaa0002",
+        "pod_uid": "00000000-0000-0000-0000-000000001009",
+        "image_id": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "docker_id": "ABCD:EFGH:IJKL:MNOP:2",
+        "docker_name": "daemon-factory-e2e-aaaa0002"
+      },
+      "runner_docker": {
+        "ran": true,
+        "id": "ABCD:EFGH:IJKL:MNOP:2",
+        "name": "daemon-factory-e2e-aaaa0002",
+        "container_nonce": "0123abcd"
+      },
+      "objects": [
+        {
+          "kind": "Pod",
+          "role": "daemon",
+          "name": "daemon-factory-e2e-aaaa0002",
+          "namespace": "fd-proof-d-0123abcd",
+          "uid": "00000000-0000-0000-0000-00000000100a",
+          "claim_label": "factory-e2e-aaaa0002"
+        },
+        {
+          "kind": "Service",
+          "role": "service",
+          "name": "factory-e2e-aaaa0002",
+          "namespace": "fd-proof-d-0123abcd",
+          "uid": "00000000-0000-0000-0000-00000000100b",
+          "claim_label": "factory-e2e-aaaa0002"
+        },
+        {
+          "kind": "NetworkPolicy",
+          "role": "ingress",
+          "name": "factory-e2e-aaaa0002",
+          "namespace": "fd-proof-d-0123abcd",
+          "uid": "00000000-0000-0000-0000-00000000100c",
+          "claim_label": "factory-e2e-aaaa0002"
+        },
+        {
+          "kind": "Secret",
+          "role": "server-secret",
+          "name": "factory-e2e-aaaa0002-server",
+          "namespace": "fd-proof-d-0123abcd",
+          "uid": "00000000-0000-0000-0000-00000000100d",
+          "claim_label": "factory-e2e-aaaa0002"
+        },
+        {
+          "kind": "Secret",
+          "role": "client-secret",
+          "name": "factory-e2e-aaaa0002-tokens",
+          "namespace": "fd-proof-0123abcd",
+          "uid": "00000000-0000-0000-0000-00000000100e",
+          "claim_label": "factory-e2e-aaaa0002"
+        }
+      ],
+      "fault": "daemon_pod_deleted",
+      "settle_seconds": 14.5,
+      "objects_absent": true,
+      "request_state": "completed"
+    },
+    "retained_next": {
+      "issue": 2,
+      "thread": "thread-2",
+      "claim": "factory-e2e-aaaa0003",
+      "runner": {
+        "pod": "runner-factory-e2e-aaaa0003",
+        "pod_uid": "00000000-0000-0000-0000-00000000100f",
+        "image_id": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+        "docker_env": true
+      },
+      "daemon": {
+        "pod": "daemon-factory-e2e-aaaa0003",
+        "pod_uid": "00000000-0000-0000-0000-000000001010",
+        "image_id": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "docker_id": "ABCD:EFGH:IJKL:MNOP:3",
+        "docker_name": "daemon-factory-e2e-aaaa0003"
+      },
+      "runner_docker": {
+        "ran": true,
+        "id": "ABCD:EFGH:IJKL:MNOP:3",
+        "name": "daemon-factory-e2e-aaaa0003",
+        "container_nonce": "0123abcd"
+      },
+      "objects": [
+        {
+          "kind": "Pod",
+          "role": "daemon",
+          "name": "daemon-factory-e2e-aaaa0003",
+          "namespace": "fd-proof-d-0123abcd",
+          "uid": "00000000-0000-0000-0000-000000001011",
+          "claim_label": "factory-e2e-aaaa0003"
+        },
+        {
+          "kind": "Service",
+          "role": "service",
+          "name": "factory-e2e-aaaa0003",
+          "namespace": "fd-proof-d-0123abcd",
+          "uid": "00000000-0000-0000-0000-000000001012",
+          "claim_label": "factory-e2e-aaaa0003"
+        },
+        {
+          "kind": "NetworkPolicy",
+          "role": "ingress",
+          "name": "factory-e2e-aaaa0003",
+          "namespace": "fd-proof-d-0123abcd",
+          "uid": "00000000-0000-0000-0000-000000001013",
+          "claim_label": "factory-e2e-aaaa0003"
+        },
+        {
+          "kind": "Secret",
+          "role": "server-secret",
+          "name": "factory-e2e-aaaa0003-server",
+          "namespace": "fd-proof-d-0123abcd",
+          "uid": "00000000-0000-0000-0000-000000001014",
+          "claim_label": "factory-e2e-aaaa0003"
+        },
+        {
+          "kind": "Secret",
+          "role": "client-secret",
+          "name": "factory-e2e-aaaa0003-tokens",
+          "namespace": "fd-proof-0123abcd",
+          "uid": "00000000-0000-0000-0000-000000001015",
+          "claim_label": "factory-e2e-aaaa0003"
+        }
+      ],
+      "fault": "release",
+      "settle_seconds": 15.5,
+      "objects_absent": true,
+      "request_state": "completed"
+    },
+    "cancel": {
+      "issue": 3,
+      "thread": "thread-3",
+      "claim": "factory-e2e-aaaa0004",
+      "runner": {
+        "pod": "runner-factory-e2e-aaaa0004",
+        "pod_uid": "00000000-0000-0000-0000-000000001016",
+        "image_id": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+        "docker_env": true
+      },
+      "daemon": {
+        "pod": "daemon-factory-e2e-aaaa0004",
+        "pod_uid": "00000000-0000-0000-0000-000000001017",
+        "image_id": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "docker_id": "ABCD:EFGH:IJKL:MNOP:4",
+        "docker_name": "daemon-factory-e2e-aaaa0004"
+      },
+      "runner_docker": {
+        "ran": true,
+        "id": "ABCD:EFGH:IJKL:MNOP:4",
+        "name": "daemon-factory-e2e-aaaa0004",
+        "container_nonce": "0123abcd"
+      },
+      "objects": [
+        {
+          "kind": "Pod",
+          "role": "daemon",
+          "name": "daemon-factory-e2e-aaaa0004",
+          "namespace": "fd-proof-d-0123abcd",
+          "uid": "00000000-0000-0000-0000-000000001018",
+          "claim_label": "factory-e2e-aaaa0004"
+        },
+        {
+          "kind": "Service",
+          "role": "service",
+          "name": "factory-e2e-aaaa0004",
+          "namespace": "fd-proof-d-0123abcd",
+          "uid": "00000000-0000-0000-0000-000000001019",
+          "claim_label": "factory-e2e-aaaa0004"
+        },
+        {
+          "kind": "NetworkPolicy",
+          "role": "ingress",
+          "name": "factory-e2e-aaaa0004",
+          "namespace": "fd-proof-d-0123abcd",
+          "uid": "00000000-0000-0000-0000-00000000101a",
+          "claim_label": "factory-e2e-aaaa0004"
+        },
+        {
+          "kind": "Secret",
+          "role": "server-secret",
+          "name": "factory-e2e-aaaa0004-server",
+          "namespace": "fd-proof-d-0123abcd",
+          "uid": "00000000-0000-0000-0000-00000000101b",
+          "claim_label": "factory-e2e-aaaa0004"
+        },
+        {
+          "kind": "Secret",
+          "role": "client-secret",
+          "name": "factory-e2e-aaaa0004-tokens",
+          "namespace": "fd-proof-0123abcd",
+          "uid": "00000000-0000-0000-0000-00000000101c",
+          "claim_label": "factory-e2e-aaaa0004"
+        }
+      ],
+      "fault": "cancel",
+      "settle_seconds": 16.5,
+      "objects_absent": true,
+      "request_state": "cancelled"
+    },
+    "worker_loss": {
+      "issue": 4,
+      "thread": "thread-4",
+      "claim": "factory-e2e-aaaa0005",
+      "runner": {
+        "pod": "runner-factory-e2e-aaaa0005",
+        "pod_uid": "00000000-0000-0000-0000-00000000101d",
+        "image_id": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+        "docker_env": true
+      },
+      "daemon": {
+        "pod": "daemon-factory-e2e-aaaa0005",
+        "pod_uid": "00000000-0000-0000-0000-00000000101e",
+        "image_id": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "docker_id": "ABCD:EFGH:IJKL:MNOP:5",
+        "docker_name": "daemon-factory-e2e-aaaa0005"
+      },
+      "runner_docker": {
+        "ran": true,
+        "id": "ABCD:EFGH:IJKL:MNOP:5",
+        "name": "daemon-factory-e2e-aaaa0005",
+        "container_nonce": "0123abcd"
+      },
+      "objects": [
+        {
+          "kind": "Pod",
+          "role": "daemon",
+          "name": "daemon-factory-e2e-aaaa0005",
+          "namespace": "fd-proof-d-0123abcd",
+          "uid": "00000000-0000-0000-0000-00000000101f",
+          "claim_label": "factory-e2e-aaaa0005"
+        },
+        {
+          "kind": "Service",
+          "role": "service",
+          "name": "factory-e2e-aaaa0005",
+          "namespace": "fd-proof-d-0123abcd",
+          "uid": "00000000-0000-0000-0000-000000001020",
+          "claim_label": "factory-e2e-aaaa0005"
+        },
+        {
+          "kind": "NetworkPolicy",
+          "role": "ingress",
+          "name": "factory-e2e-aaaa0005",
+          "namespace": "fd-proof-d-0123abcd",
+          "uid": "00000000-0000-0000-0000-000000001021",
+          "claim_label": "factory-e2e-aaaa0005"
+        },
+        {
+          "kind": "Secret",
+          "role": "server-secret",
+          "name": "factory-e2e-aaaa0005-server",
+          "namespace": "fd-proof-d-0123abcd",
+          "uid": "00000000-0000-0000-0000-000000001022",
+          "claim_label": "factory-e2e-aaaa0005"
+        },
+        {
+          "kind": "Secret",
+          "role": "client-secret",
+          "name": "factory-e2e-aaaa0005-tokens",
+          "namespace": "fd-proof-0123abcd",
+          "uid": "00000000-0000-0000-0000-000000001023",
+          "claim_label": "factory-e2e-aaaa0005"
+        }
+      ],
+      "fault": "worker_pod_deleted",
+      "settle_seconds": 17.5,
+      "objects_absent": true,
+      "request_state": "completed"
+    }
+  },
+  "tls": {
+    "claim": "factory-e2e-aaaa0001",
+    "independent_client_refused": true
+  },
+  "orphan": {
+    "claim": "factory-e2e-bbbb0001",
+    "age_gate_seconds": 180,
+    "kept_while_young": true,
+    "objects": [
+      {
+        "kind": "Service",
+        "role": "service",
+        "name": "factory-e2e-bbbb0001",
+        "namespace": "fd-proof-d-0123abcd",
+        "uid": "00000000-0000-0000-0000-000000001024",
+        "claim_label": "factory-e2e-bbbb0001"
+      },
+      {
+        "kind": "NetworkPolicy",
+        "role": "ingress",
+        "name": "factory-e2e-bbbb0001",
+        "namespace": "fd-proof-d-0123abcd",
+        "uid": "00000000-0000-0000-0000-000000001025",
+        "claim_label": "factory-e2e-bbbb0001"
+      }
+    ],
+    "settle_seconds": 40.0,
+    "objects_absent": true
+  },
+  "control": {
+    "issue": 5,
+    "thread": "thread-5",
+    "claim": "factory-e2e-cccc0001",
+    "runner": {
+      "pod": "runner-factory-e2e-cccc0001",
+      "pod_uid": "00000000-0000-0000-0000-000000001026",
+      "image_id": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+      "docker_env": false
+    },
+    "daemon_objects": 0,
+    "client_docker_files": false,
+    "completed": true
+  },
+  "cleanup": {
+    "helm_uninstalled": true,
+    "release_objects_absent": true,
+    "fixture_cleanup_complete": true,
+    "namespaces_absent": true,
+    "docker_assets_absent": true
+  }
+}
