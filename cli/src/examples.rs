@@ -819,6 +819,19 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
     Ok(SreBotInstallResult::Installed(Box::new(deployed)))
 }
 
+/// Install only the factory-owned authoring skill; execution assets and image
+/// resolution are deliberately outside this local preparation path.
+pub fn install_factory_preparation(
+    options: crate::agent_skills::InstallOptions,
+) -> Result<Box<dyn CliOutput>> {
+    const PREFIX: &str = "preparation/skills/prepare-factory-ticket/";
+    let files: Vec<(&str, &[u8])> = DARK_FACTORY_BUNDLE_FILES
+        .iter()
+        .filter_map(|(name, bytes)| name.strip_prefix(PREFIX).map(|relative| (relative, *bytes)))
+        .collect();
+    crate::agent_skills::install("prepare-factory-ticket", &files, options)
+}
+
 /// Every tracked file of `examples/dark-factory`, embedded so a released
 /// binary can render the factory bundle without a source checkout (#3619).
 pub const DARK_FACTORY_BUNDLE_FILES: &[(&str, &[u8])] = &[
@@ -877,6 +890,34 @@ pub const DARK_FACTORY_BUNDLE_FILES: &[(&str, &[u8])] = &[
     (
         "skills/implement-issue/SKILL.md",
         include_bytes!("../../examples/dark-factory/skills/implement-issue/SKILL.md"),
+    ),
+    (
+        "preparation/evals/README.md",
+        include_bytes!("../../examples/dark-factory/preparation/evals/README.md"),
+    ),
+    (
+        "preparation/evals/publication-cases.json",
+        include_bytes!("../../examples/dark-factory/preparation/evals/publication-cases.json"),
+    ),
+    (
+        "preparation/pilot/README.md",
+        include_bytes!("../../examples/dark-factory/preparation/pilot/README.md"),
+    ),
+    (
+        "preparation/pilot/outcomes.csv",
+        include_bytes!("../../examples/dark-factory/preparation/pilot/outcomes.csv"),
+    ),
+    (
+        "preparation/README.md",
+        include_bytes!("../../examples/dark-factory/preparation/README.md"),
+    ),
+    (
+        "preparation/skills/prepare-factory-ticket/SKILL.md",
+        include_bytes!("../../examples/dark-factory/preparation/skills/prepare-factory-ticket/SKILL.md"),
+    ),
+    (
+        "preparation/skills/prepare-factory-ticket/references/specification.md",
+        include_bytes!("../../examples/dark-factory/preparation/skills/prepare-factory-ticket/references/specification.md"),
     ),
     (
         "verification/contract.md",
@@ -4794,14 +4835,16 @@ mod dark_factory_render_tests {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/dark-factory")
     }
 
-    /// Every file under the example, relative to its root, excluding the lock
-    /// a local build writes.
+    /// Every file under the example, excluding generated lock and cache files.
     fn source_files() -> Vec<(String, PathBuf)> {
         fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
             for entry in std::fs::read_dir(dir).expect("read example dir") {
                 let path = entry.expect("dir entry").path();
                 if path.is_dir() {
-                    if path.file_name().and_then(|n| n.to_str()) == Some("__pycache__") {
+                    if matches!(
+                        path.file_name().and_then(|n| n.to_str()),
+                        Some("__pycache__" | ".ruff_cache")
+                    ) {
                         continue;
                     }
                     walk(root, &path, out);

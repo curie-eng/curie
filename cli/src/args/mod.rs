@@ -1047,7 +1047,7 @@ pub(crate) enum Command {
         #[arg(long, global = true, value_name = "NAME")]
         context: Option<String>,
     },
-    /// Bring up Curie and the dark factory without a webhook or a tunnel.
+    /// Prepare work locally or bring up Curie and the dark factory.
     Factory {
         #[command(subcommand)]
         action: FactoryAction,
@@ -1386,128 +1386,154 @@ pub(crate) enum Command {
 
 #[derive(Subcommand)]
 pub(crate) enum FactoryAction {
+    /// Prepare factory work in your existing coding agent.
+    Prepare {
+        #[command(subcommand)]
+        action: FactoryPrepareAction,
+    },
     /// Create a cluster when none is targeted, install Curie, register the
     /// GitHub App, and on the second run deploy the published dark factory.
     /// Never opens a browser and never runs gh.
-    Quickstart {
-        /// GitHub repositories the factory serves, as a comma separated
-        /// owner/name list (repeatable). The first is the agent's git-flow
-        /// repository, and each is bound to the one agent.
-        #[arg(
-            id = "repo",
-            long = "repo",
-            value_name = "OWNER/NAME",
-            required = true,
-            value_delimiter = ','
-        )]
-        repos: Vec<String>,
-        /// Numeric GitHub App ID. Pair with --private-key-file. Without both,
-        /// the command prints the registration link and exits after cluster up.
-        #[arg(long, value_name = "ID", requires = "private_key_file")]
-        app_id: Option<String>,
-        /// PEM private key downloaded from the App. The path is passed through;
-        /// the key contents never enter argv.
-        #[arg(long, value_name = "PATH", requires = "app_id")]
-        private_key_file: Option<PathBuf>,
-        /// Kubernetes context. An explicit name is used with no prompt. When
-        /// omitted, a current kind context proceeds with no prompt, and no
-        /// current context creates a kind cluster. Any other current context
-        /// requires confirmation in a terminal and is refused without one.
-        /// Pass this flag to proceed without a prompt.
-        #[arg(long, value_name = "NAME")]
-        context: Option<String>,
-        /// Kubernetes namespace. Default: curie.
-        #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
-        namespace: String,
-        /// Helm release name. Default: curie.
-        #[arg(long, default_value = "curie")]
-        release: String,
-        /// Print the registration link for this GitHub organization instead of
-        /// a personal account.
-        #[arg(long, value_name = "ORG")]
-        org: Option<String>,
-        /// Kind cluster name used only when no kube context is targeted.
-        #[arg(long, default_value = curie::factory_quickstart::DEFAULT_KIND_NAME)]
-        kind_name: String,
-        /// Model id installed by cluster up. Defaults to Claude Sonnet for
-        /// Anthropic credentials, or GLM Flash for OpenRouter credentials.
-        #[arg(long)]
-        model: Option<String>,
-        /// Per run execution deadline in seconds for the deployed agent.
-        #[arg(long, default_value_t = curie::factory_quickstart::DEFAULT_DEADLINE_SECONDS)]
-        execution_deadline: u32,
-        /// Daily USD budget for the deployed agent.
-        #[arg(long, default_value_t = curie::factory_quickstart::DEFAULT_BUDGET_USD)]
-        budget: f64,
-        /// Agent to deploy. On a release that already records factory intake
-        /// and with no App flags, the agent is added to that install: no
-        /// cluster up, App registration, or intake.
-        #[arg(long, default_value = curie::factory_quickstart::DEFAULT_AGENT)]
-        agent: String,
-        /// Trigger label for this agent's GitHub bindings. Default: none, so
-        /// the install label serves them.
-        #[arg(long, value_name = "LABEL")]
-        label: Option<String>,
-        /// Operator bundle to deploy as given, with its locked runner image or
-        /// the platform runner. Default: the published dark factory bundle.
+    Quickstart(Box<FactoryQuickstartArgs>),
+}
+
+#[derive(Args)]
+pub(crate) struct FactoryQuickstartArgs {
+    /// GitHub repositories the factory serves, as a comma separated
+    /// owner/name list (repeatable). The first is the agent's git-flow
+    /// repository, and each is bound to the one agent.
+    #[arg(
+        id = "repo",
+        long = "repo",
+        value_name = "OWNER/NAME",
+        required = true,
+        value_delimiter = ','
+    )]
+    pub(crate) repos: Vec<String>,
+    /// Numeric GitHub App ID. Pair with --private-key-file. Without both,
+    /// the command prints the registration link and exits after cluster up.
+    #[arg(long, value_name = "ID", requires = "private_key_file")]
+    pub(crate) app_id: Option<String>,
+    /// PEM private key downloaded from the App. The path is passed through;
+    /// the key contents never enter argv.
+    #[arg(long, value_name = "PATH", requires = "app_id")]
+    pub(crate) private_key_file: Option<PathBuf>,
+    /// Kubernetes context. An explicit name is used with no prompt. When
+    /// omitted, a current kind context proceeds with no prompt, and no
+    /// current context creates a kind cluster. Any other current context
+    /// requires confirmation in a terminal and is refused without one.
+    /// Pass this flag to proceed without a prompt.
+    #[arg(long, value_name = "NAME")]
+    pub(crate) context: Option<String>,
+    /// Kubernetes namespace. Default: curie.
+    #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
+    pub(crate) namespace: String,
+    /// Helm release name. Default: curie.
+    #[arg(long, default_value = "curie")]
+    pub(crate) release: String,
+    /// Print the registration link for this GitHub organization instead of
+    /// a personal account.
+    #[arg(long, value_name = "ORG")]
+    pub(crate) org: Option<String>,
+    /// Kind cluster name used only when no kube context is targeted.
+    #[arg(long, default_value = curie::factory_quickstart::DEFAULT_KIND_NAME)]
+    pub(crate) kind_name: String,
+    /// Model id installed by cluster up. Defaults to Claude Sonnet for
+    /// Anthropic credentials, or GLM Flash for OpenRouter credentials.
+    #[arg(long)]
+    pub(crate) model: Option<String>,
+    /// Per run execution deadline in seconds for the deployed agent.
+    #[arg(long, default_value_t = curie::factory_quickstart::DEFAULT_DEADLINE_SECONDS)]
+    pub(crate) execution_deadline: u32,
+    /// Daily USD budget for the deployed agent.
+    #[arg(long, default_value_t = curie::factory_quickstart::DEFAULT_BUDGET_USD)]
+    pub(crate) budget: f64,
+    /// Agent to deploy. On a release that already records factory intake
+    /// and with no App flags, the agent is added to that install: no
+    /// cluster up, App registration, or intake.
+    #[arg(long, default_value = curie::factory_quickstart::DEFAULT_AGENT)]
+    pub(crate) agent: String,
+    /// Trigger label for this agent's GitHub bindings. Default: none, so
+    /// the install label serves them.
+    #[arg(long, value_name = "LABEL")]
+    pub(crate) label: Option<String>,
+    /// Operator bundle to deploy as given, with its locked runner image or
+    /// the platform runner. Default: the published dark factory bundle.
+    #[arg(long, value_name = "DIR")]
+    pub(crate) plugin_dir: Option<PathBuf>,
+    /// Helm chart. Default: the version pinned chart on release builds;
+    /// local charts/curie on dev builds.
+    #[arg(long)]
+    pub(crate) chart: Option<String>,
+    /// Install published sha images for a full 40 character lowercase hex
+    /// commit, including an unreleased commit from next. Only full commit
+    /// tags are published. Example: --candidate
+    /// 0123456789abcdef0123456789abcdef01234567.
+    #[arg(long, value_name = "COMMIT", value_parser = curie::factory_quickstart::parse_candidate_commit)]
+    pub(crate) candidate: Option<String>,
+    /// Print the steps and exit without creating a cluster or applying anything.
+    #[arg(long)]
+    pub(crate) dry_run: bool,
+    /// Code host the factory publishes to: github, gitlab with --tracker
+    /// gitlab, or bitbucket-cloud or bitbucket-dc with --tracker jira-cloud.
+    #[arg(long, value_enum, value_name = "KIND", default_value = "github")]
+    pub(crate) code_host: curie::factory_quickstart::CodeHostKind,
+    /// Tracker the factory takes issues from: github, gitlab, or jira-cloud
+    /// with --code-host github, bitbucket-cloud or bitbucket-dc.
+    #[arg(long, value_enum, value_name = "KIND", default_value = "github")]
+    pub(crate) tracker: curie::factory_quickstart::TrackerKind,
+    /// Base URL of a non-GitHub forge. Refused for github.
+    #[arg(long, value_name = "URL")]
+    pub(crate) forge_url: Option<String>,
+    /// File holding a non-GitHub forge's access token. The path is passed
+    /// through; the token never enters argv. Refused for github.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) token_file: Option<PathBuf>,
+    /// CA bundle for a non-GitHub forge with a private certificate.
+    /// Refused for github.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) ca_file: Option<PathBuf>,
+    /// Account whose reviews a non-GitHub forge counts (repeatable).
+    /// Refused for github.
+    #[arg(long = "review-account", value_name = "ACCOUNT")]
+    pub(crate) review_accounts: Vec<String>,
+    /// Email of the account a Jira token authenticates as. Refused for
+    /// github.
+    #[arg(long, value_name = "EMAIL")]
+    pub(crate) forge_username: Option<String>,
+    /// Jira accountId allowed to start work (repeatable). Refused for
+    /// github.
+    #[arg(long = "start-account", value_name = "ACCOUNT")]
+    pub(crate) start_accounts: Vec<String>,
+    /// Jira groupId whose members may start work. Refused for github.
+    #[arg(long, value_name = "GROUP")]
+    pub(crate) start_group: Option<String>,
+    /// Jira Cloud site or API gateway URL beside a Bitbucket code host,
+    /// whose own URL is --forge-url. Refused for any other pairing.
+    #[arg(long, value_name = "URL")]
+    pub(crate) tracker_url: Option<String>,
+    /// File holding the Jira API token beside a Bitbucket code host,
+    /// whose own token is --token-file. Refused for any other pairing.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) tracker_token_file: Option<PathBuf>,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum FactoryPrepareAction {
+    /// Install the bundled preparation skill offline, without a running Curie service.
+    Install {
+        /// Coding agent that will discover the skill.
+        #[arg(long, value_enum, value_name = "CLIENT")]
+        agent: curie::agent_skills::AgentClient,
+        /// Install in your personal skill directory for use across repositories.
+        #[arg(long, conflicts_with = "dir")]
+        global: bool,
+        /// Install in exactly this existing directory. Default: current repository root or cwd.
         #[arg(long, value_name = "DIR")]
-        plugin_dir: Option<PathBuf>,
-        /// Helm chart. Default: the version pinned chart on release builds;
-        /// local charts/curie on dev builds.
-        #[arg(long)]
-        chart: Option<String>,
-        /// Install published sha images for a full 40 character lowercase hex
-        /// commit, including an unreleased commit from next. Only full commit
-        /// tags are published. Example: --candidate
-        /// 0123456789abcdef0123456789abcdef01234567.
-        #[arg(long, value_name = "COMMIT", value_parser = curie::factory_quickstart::parse_candidate_commit)]
-        candidate: Option<String>,
-        /// Print the steps and exit without creating a cluster or applying anything.
+        dir: Option<PathBuf>,
+        /// Show the destination and client instructions without writing files.
         #[arg(long)]
         dry_run: bool,
-        /// Code host the factory publishes to: github, gitlab with --tracker
-        /// gitlab, or bitbucket-cloud or bitbucket-dc with --tracker
-        /// jira-cloud.
-        #[arg(long, value_enum, value_name = "KIND", default_value = "github")]
-        code_host: curie::factory_quickstart::CodeHostKind,
-        /// Tracker the factory takes issues from: github, gitlab, or
-        /// jira-cloud with --code-host github, bitbucket-cloud or bitbucket-dc.
-        #[arg(long, value_enum, value_name = "KIND", default_value = "github")]
-        tracker: curie::factory_quickstart::TrackerKind,
-        /// Base URL of a non-GitHub forge. Refused for github.
-        #[arg(long, value_name = "URL")]
-        forge_url: Option<String>,
-        /// File holding a non-GitHub forge's access token. The path is passed
-        /// through; the token never enters argv. Refused for github.
-        #[arg(long, value_name = "PATH")]
-        token_file: Option<PathBuf>,
-        /// CA bundle for a non-GitHub forge with a private certificate.
-        /// Refused for github.
-        #[arg(long, value_name = "PATH")]
-        ca_file: Option<PathBuf>,
-        /// Account whose reviews a non-GitHub forge counts (repeatable).
-        /// Refused for github.
-        #[arg(long = "review-account", value_name = "ACCOUNT")]
-        review_accounts: Vec<String>,
-        /// Email of the account a Jira token authenticates as. Refused for
-        /// github.
-        #[arg(long, value_name = "EMAIL")]
-        forge_username: Option<String>,
-        /// Jira accountId allowed to start work (repeatable). Refused for
-        /// github.
-        #[arg(long = "start-account", value_name = "ACCOUNT")]
-        start_accounts: Vec<String>,
-        /// Jira groupId whose members may start work. Refused for github.
-        #[arg(long, value_name = "GROUP")]
-        start_group: Option<String>,
-        /// Jira Cloud site or API gateway URL beside a Bitbucket code host,
-        /// whose own URL is --forge-url. Refused for any other pairing.
-        #[arg(long, value_name = "URL")]
-        tracker_url: Option<String>,
-        /// File holding the Jira API token beside a Bitbucket code host,
-        /// whose own token is --token-file. Refused for any other pairing.
-        #[arg(long, value_name = "PATH")]
-        tracker_token_file: Option<PathBuf>,
     },
 }
 

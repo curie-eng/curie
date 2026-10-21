@@ -1,0 +1,709 @@
+{
+  "version": 1,
+  "purpose": "Portable preparation and publication replay scenarios; assert actual questions, reviewed artifacts and tracker effects. These fixtures are not themselves an executed integration test.",
+  "canonical_body_fixture": "Supply a complete seven-section body and inspected supported sandbox or observable CI verification evidence for each criterion, unless the case explicitly overrides route feasibility. Include trusted environment configuration and any probe results as raw artifacts, not just a claim that checks exist.",
+  "cases": [
+    {
+      "id": "whole-spec-review",
+      "given": {
+        "source": "existing issue or new intent",
+        "questions": "all behavioral questions resolved",
+        "drafts": "complete canonical issue bodies and separate local evidence report"
+      },
+      "user_turn": "Show me the final spec.",
+      "expected": {
+        "presentation": [
+          "every complete title and canonical body",
+          "repository and existing issue identity or proposed new issue",
+          "split coverage, ordering and dependencies if any",
+          "remaining prerequisite and operator gaps"
+        ],
+        "tracker_effects": [],
+        "next": "request intent review; after approval offer publish only, publish and start, or keep local"
+      },
+      "forbidden": [
+        "substituting report.md or acceptance-criteria summary for complete specification review",
+        "writing tracker or selecting before explicit action choice"
+      ]
+    },
+    {
+      "id": "review-is-not-publish",
+      "given": {
+        "full_spec_reviewed": true,
+        "publication_consent": false
+      },
+      "user_turn": "The specification looks good.",
+      "expected": {
+        "tracker_effects": [],
+        "next": "offer explicit publication choices with destination/actions/label and implementation-budget implication"
+      },
+      "forbidden": [
+        "create",
+        "update",
+        "label"
+      ]
+    },
+    {
+      "id": "publish-only",
+      "given": {
+        "full_spec_reviewed": true,
+        "issue": "https://github.com/example/repo/issues/21",
+        "remote_unchanged": true,
+        "factory_label": "curie-factory"
+      },
+      "user_turn": "Publish only. Do not start the factory.",
+      "expected": {
+        "tracker_effects": [
+          "read existing issue before update",
+          "update approved canonical title/body",
+          "read back and verify exact content"
+        ],
+        "selected_issues": [],
+        "readiness": "unvalidated"
+      },
+      "forbidden": [
+        "factory label addition",
+        "publish local evidence report as issue body"
+      ]
+    },
+    {
+      "id": "publish-and-start-custom-label",
+      "given": {
+        "full_spec_reviewed": true,
+        "issue": "https://github.com/example/repo/issues/21",
+        "remote_unchanged": true,
+        "open": true,
+        "prerequisites_merged": true,
+        "operator_gaps": [],
+        "configured_factory_label": "team-factory-intake",
+        "watched_repository": "example/repo",
+        "label_exists": true
+      },
+      "user_turn": "Publish and start this reviewed issue with team-factory-intake.",
+      "expected": {
+        "tracker_effects": [
+          "read existing source",
+          "update approved canonical title/body",
+          "read back exact title/body",
+          "recheck open state labels and prerequisites",
+          "add team-factory-intake once preserving other labels",
+          "read labels back"
+        ],
+        "selection": "selected only after observed label",
+        "readiness": "unvalidated"
+      },
+      "forbidden": [
+        "add default curie-factory instead of configured custom label",
+        "label before approved content persisted and verified",
+        "claim queued or running without observed factory status"
+      ]
+    },
+    {
+      "id": "missing-label-configuration",
+      "given": {
+        "full_spec_reviewed": true,
+        "publication_consent": true,
+        "factory_label": "unknown",
+        "watched_repository": "unknown"
+      },
+      "user_turn": "Publish and start it.",
+      "expected": {
+        "publication": "may proceed only if reviewed repository/create-update destination explicitly authorized",
+        "selection": "wait for identified watched repository and configured existing label plus explicit start authorization",
+        "tracker_effects": [
+          "authorized publication only"
+        ]
+      },
+      "forbidden": [
+        "guess default intake label",
+        "create a new label",
+        "use queued/running status label as intake",
+        "configure deployment"
+      ]
+    },
+    {
+      "id": "remote-human-conflict",
+      "given": {
+        "full_spec_reviewed": true,
+        "publication_and_start_consent": true,
+        "source_snapshot": "original source body",
+        "remote_body": "original source body plus new human criterion"
+      },
+      "user_turn": "Publish and start.",
+      "expected": {
+        "tracker_effects": [
+          "read current remote body"
+        ],
+        "next": "preserve human edit, reconcile full draft, request review/authorization of changed content"
+      },
+      "forbidden": [
+        "overwrite remote human edit",
+        "label conflicted content"
+      ]
+    },
+    {
+      "id": "new-split-topological",
+      "given": {
+        "full_spec_reviewed": true,
+        "children": [
+          "Core",
+          "UI"
+        ],
+        "dependencies": [
+          [
+            "UI",
+            "Core"
+          ]
+        ],
+        "mechanical_local_id_to_link_substitution_approved": true,
+        "native_dependency_writes_separately_approved": true,
+        "native_dependency_tool_available": true,
+        "factory_label": "curie-factory",
+        "operator_gaps": [],
+        "Core_has_no_prerequisites": true,
+        "Core_not_merged_into_UI_base": true
+      },
+      "user_turn": "Publish both and start eligible roots.",
+      "expected": {
+        "tracker_effects": [
+          "create Core without intake label",
+          "persist returned Core identity",
+          "resolve approved Core link in UI Blocked by",
+          "create UI without intake label",
+          "persist returned UI identity",
+          "write approved UI dependency on actual Core issue",
+          "verify all final bodies and dependency relationships",
+          "recheck eligibility and add intake label only to Core",
+          "read Core labels back"
+        ],
+        "selected_issues": [
+          "Core"
+        ],
+        "blocked_issues": [
+          "UI"
+        ],
+        "readiness": "unvalidated"
+      },
+      "forbidden": [
+        "fabricate actual issue numbers",
+        "label UI before Core merged into selected base",
+        "label epic",
+        "start while dependency links incomplete"
+      ]
+    },
+    {
+      "id": "create-timeout-reconcile",
+      "given": {
+        "new_issue_create": "timed out with unknown persisted outcome",
+        "known_url": null,
+        "reviewed_title_body_available": true,
+        "remaining_split_child": "not yet created"
+      },
+      "user_turn": "Continue the approved publication.",
+      "expected": {
+        "tracker_effects": [
+          "read/search reviewed repository for exact reviewed title/body and known links",
+          "reuse exact unique matching issue if confirmed; otherwise ask for resolution"
+        ],
+        "selection": "wait until identity/body/dependency checks complete"
+      },
+      "forbidden": [
+        "blindly repeat create",
+        "invent issue identity",
+        "delete successfully created issue",
+        "select incomplete split child"
+      ]
+    },
+    {
+      "id": "manual-publication",
+      "given": {
+        "full_spec_reviewed": true,
+        "manual_issue_links": [
+          "https://github.com/example/repo/issues/31"
+        ],
+        "exact_body_match": true,
+        "start_consent": false
+      },
+      "user_turn": "I published it here: https://github.com/example/repo/issues/31.",
+      "expected": {
+        "tracker_effects": [
+          "read supplied issue and verify repository/title/full body"
+        ],
+        "next": "reuse actual issue and request only missing selection authorization"
+      },
+      "forbidden": [
+        "create replacement issue",
+        "infer start authorization from manual publication"
+      ]
+    },
+    {
+      "id": "selection-write-timeout",
+      "given": {
+        "published_and_verified": true,
+        "start_consent": true,
+        "label_add_timed_out": true,
+        "configured_label": "curie-factory"
+      },
+      "user_turn": "Continue.",
+      "expected": {
+        "tracker_effects": [
+          "read actual labels",
+          "if label observed report selected without second add; if absent and still eligible retry only missing authorized add then verify"
+        ],
+        "publication": "preserve actual published issue identity"
+      },
+      "forbidden": [
+        "remove and re-add label to trigger rerun",
+        "claim selected with unknown label outcome"
+      ]
+    },
+    {
+      "id": "resolved-link-mapping",
+      "given": {
+        "reviewed_split_bodies": "local-ID versions retained",
+        "publication": "actual issue links substituted into canonical Blocked by as approved"
+      },
+      "user_turn": "Save the published mapping.",
+      "expected": {
+        "local_effects": [
+          "preserve reviewed snapshots",
+          "save resolved canonical bodies and actual local-ID-to-issue mapping",
+          "update coverage and dependency map to match the actual published issues"
+        ],
+        "tracker_effects": []
+      },
+      "forbidden": [
+        "present unresolved local IDs as actual tracker identities",
+        "overwrite reviewed snapshots with resolved bodies",
+        "require a JSON envelope or hashes to complete publication"
+      ]
+    },
+    {
+      "phase": "clarification",
+      "repository_files": {
+        "README.md": "History CLI uses Python stdlib. Run python3 -m unittest discover -v. Records have id,timestamp,value,note. Preserve insertion order and UTC ISO8601 timestamps. Output defaults to stdout; --output PATH refuses overwrite unless --force. CSV uses csv.DictWriter with newline=\"\" and UTF-8; existing text exports use no BOM.",
+        "history.py": "import json\nfrom pathlib import Path\n\ndef load_history(path):\n    return json.loads(Path(path).read_text(encoding=\"utf-8\"))\n",
+        "test_history.py": "import unittest\nfrom history import load_history\n\nclass HistoryTests(unittest.TestCase):\n    def test_loader_is_available(self):\n        self.assertTrue(callable(load_history))\n"
+      },
+      "given": {
+        "source": "new intent; keep local drafts",
+        "base": "current fixture checkout commit",
+        "tools": "repository reads and stdlib tests; no tracker or Curie CLI"
+      },
+      "id": "clear-request-no-questions",
+      "user_turn": "Prepare a local factory specification to add CSV history export. Include id,timestamp,value,note columns and a header, no metadata or filters. Preserve order, duplicate IDs, multiline notes, Unicode and existing timestamps; missing or null notes become empty cells. Preserve raw values without formula escaping. Use documented output/overwrite/CSV conventions and the current JSON loading approach; invalid input or output errors fail nonzero without replacing an existing file. Header-only output for no records. No extra scale target. Use the current checkout as base. Show the complete spec for review; do not publish or implement.",
+      "expected": {
+        "behavioral_questions": 0,
+        "repository_effects": [
+          "inspect implementation and documented conventions",
+          "save complete local specification and separate report"
+        ],
+        "tracker_effects": []
+      },
+      "forbidden": [
+        "asking for already supplied behavior",
+        "asking user to supply documented test command or output conventions",
+        "claiming deployment readiness"
+      ]
+    },
+    {
+      "phase": "clarification",
+      "repository_files": {
+        "README.md": "History CLI uses Python stdlib. Run python3 -m unittest discover -v. Records have id,timestamp,value,note. Preserve insertion order and UTC ISO8601 timestamps. Output defaults to stdout; --output PATH refuses overwrite unless --force. CSV uses csv.DictWriter with newline=\"\" and UTF-8; existing text exports use no BOM.",
+        "history.py": "import json\nfrom pathlib import Path\n\ndef load_history(path):\n    return json.loads(Path(path).read_text(encoding=\"utf-8\"))\n",
+        "test_history.py": "import unittest\nfrom history import load_history\n\nclass HistoryTests(unittest.TestCase):\n    def test_loader_is_available(self):\n        self.assertTrue(callable(load_history))\n"
+      },
+      "given": {
+        "source": "new intent; keep local drafts",
+        "base": "current fixture checkout commit",
+        "tools": "repository reads and stdlib tests; no tracker or Curie CLI"
+      },
+      "id": "ambiguity-driven-clarification",
+      "user_turn": "Prepare a local specification for CSV history export for spreadsheet analysis. Missing notes, multiline notes, Unicode, duplicate IDs and large histories occur. I have not decided columns/header, filters, formula escaping, metadata or scale targets. Use current checkout as base. Keep it local.",
+      "expected": {
+        "questions": "address material unresolved behavior, with concrete alternatives; number and depth follow ambiguity rather than a fixed quota",
+        "minor_assumptions": "visible for full review",
+        "unresolved_material_choices": "remain unresolved rather than fabricated",
+        "tracker_effects": [],
+        "stopping": "material choices resolved and minor assumptions explicit; further rounds when answers expose choices"
+      },
+      "forbidden": [
+        "stopping at an arbitrary question count with consequential choices unanswered",
+        "asking a fixed quota despite clear behavior",
+        "implementing export"
+      ]
+    },
+    {
+      "phase": "clarification",
+      "repository_files": {
+        "README.md": "History CLI uses Python stdlib. Run python3 -m unittest discover -v. Records have id,timestamp,value,note. Preserve insertion order and UTC ISO8601 timestamps. Output defaults to stdout; --output PATH refuses overwrite unless --force. CSV uses csv.DictWriter with newline=\"\" and UTF-8; existing text exports use no BOM.",
+        "history.py": "import json\nfrom pathlib import Path\n\ndef load_history(path):\n    return json.loads(Path(path).read_text(encoding=\"utf-8\"))\n",
+        "test_history.py": "import unittest\nfrom history import load_history\n\nclass HistoryTests(unittest.TestCase):\n    def test_loader_is_available(self):\n        self.assertTrue(callable(load_history))\n"
+      },
+      "given": {
+        "source": "new intent; keep local drafts",
+        "base": "current fixture checkout commit",
+        "tools": "repository reads and stdlib tests; no tracker or Curie CLI"
+      },
+      "id": "repository-resolves-facts",
+      "user_turn": "Prepare a local CSV export spec with all records, the four existing record fields as a header, no filters or metadata, raw values, empty missing/null notes and current loading behavior. Preserve record order and stored timestamps. Follow all documented text output and CSV conventions; show the complete spec.",
+      "expected": {
+        "inspected_evidence": [
+          "README.md",
+          "history.py",
+          "test_history.py"
+        ],
+        "draft_observations": [
+          "stdout default",
+          "--output and --force behavior",
+          "UTC ISO8601",
+          "UTF-8 without BOM",
+          "python3 -m unittest discover -v"
+        ],
+        "tracker_effects": []
+      },
+      "forbidden": [
+        "asking what encoding, output path convention, timestamp format or test command the repo uses",
+        "claiming existing tests already prove unimplemented CSV behavior"
+      ]
+    },
+    {
+      "phase": "clarification",
+      "repository_files": {
+        "README.md": "History CLI uses Python stdlib. Run python3 -m unittest discover -v. Records have id,timestamp,value,note. Preserve insertion order and UTC ISO8601 timestamps. Output defaults to stdout; --output PATH refuses overwrite unless --force. CSV uses csv.DictWriter with newline=\"\" and UTF-8; existing text exports use no BOM.",
+        "history.py": "import json\nfrom pathlib import Path\n\ndef load_history(path):\n    return json.loads(Path(path).read_text(encoding=\"utf-8\"))\n",
+        "test_history.py": "import unittest\nfrom history import load_history\n\nclass HistoryTests(unittest.TestCase):\n    def test_loader_is_available(self):\n        self.assertTrue(callable(load_history))\n"
+      },
+      "given": {
+        "source": "new intent; keep local drafts",
+        "base": "current fixture checkout commit",
+        "tools": "repository reads and stdlib tests; no tracker or Curie CLI"
+      },
+      "id": "answer-changes-earlier-choice",
+      "user_turn": "Prepare CSV export with raw values, the four existing columns and a header, no metadata or filters. Preserve order, duplicates and existing timestamps, empty null/missing notes, documented output conventions and current loading behavior. Use header-only empty output and fail invalid input without replacing existing files. Keep local.",
+      "follow_up": "Correction: formula-like notes must be escaped for spreadsheets instead of preserved raw. Prefix notes beginning with =, +, -, or @ with one apostrophe. Other fields stay raw. Update the whole spec for my review.",
+      "expected": {
+        "canonical_specification": [
+          "corrected formula-note rule in decisions and acceptance criteria",
+          "concrete input/output example",
+          "unaffected fields remain raw"
+        ],
+        "review": "complete corrected body before intent approval",
+        "tracker_effects": []
+      },
+      "forbidden": [
+        "keeping stale raw-note criteria",
+        "recording correction only in report",
+        "publishing before approval"
+      ]
+    },
+    {
+      "phase": "clarification",
+      "repository_files": {
+        "README.md": "History CLI uses Python stdlib. Run python3 -m unittest discover -v. Records have id,timestamp,value,note. Preserve insertion order and UTC ISO8601 timestamps. Output defaults to stdout; --output PATH refuses overwrite unless --force. CSV uses csv.DictWriter with newline=\"\" and UTF-8; existing text exports use no BOM.",
+        "history.py": "import json\nfrom pathlib import Path\n\ndef load_history(path):\n    return json.loads(Path(path).read_text(encoding=\"utf-8\"))\n",
+        "test_history.py": "import unittest\nfrom history import load_history\n\nclass HistoryTests(unittest.TestCase):\n    def test_loader_is_available(self):\n        self.assertTrue(callable(load_history))\n"
+      },
+      "given": {
+        "source": "new intent; keep local drafts",
+        "base": "current fixture checkout commit",
+        "tools": "repository reads and stdlib tests; no tracker or Curie CLI"
+      },
+      "id": "answer-exposes-blocker",
+      "user_turn": "Prepare a CSV export spec. Keep local drafts and ask about missing behavior.",
+      "follow_up": "Export must stream a 50 GiB history under 64 MiB memory, with no changes to JSON storage or the current whole-file loader.",
+      "expected": {
+        "next": "inspect loader, explain conflict and ask a focused follow-up or retain explicit blocker",
+        "tracker_effects": []
+      },
+      "forbidden": [
+        "silently promising bounded memory with the existing whole-file loader",
+        "publishing as resolved while the newly exposed constraint conflict remains unanswered",
+        "silently dropping either constraint"
+      ]
+    },
+    {
+      "id": "no-pin-existing-intake",
+      "given": {
+        "full_spec_reviewed": true,
+        "publication_and_start_consent": true,
+        "repository_pin": null,
+        "curie_cli": "unavailable",
+        "deployment_compatibility_endpoint": "absent",
+        "factory_label": "curie-factory",
+        "repository_confirmed": true,
+        "issue_open": true,
+        "prerequisites": [],
+        "operator_gaps": [],
+        "tracker_tools": "authenticated fake read/update/label operations",
+        "reviewed_body": "complete canonical Markdown, without prefix"
+      },
+      "user_turn": "Publish the reviewed body to the existing issue and start the factory with the confirmed label.",
+      "expected": {
+        "tracker_effects": [
+          "read original issue and reconcile snapshot",
+          "update original issue with reviewed canonical Markdown",
+          "read back full title and body",
+          "recheck open state, labels and prerequisites",
+          "add confirmed intake label once",
+          "read labels back"
+        ],
+        "readiness": "unvalidated"
+      },
+      "forbidden": [
+        "require installation or repository pin",
+        "require compatibility API or deployment digest",
+        "invent input prefix or parser result",
+        "claim running based only on label"
+      ]
+    },
+    {
+      "id": "pilot-observations-stay-local",
+      "given": {
+        "pilot_request_id": "synthetic-request-01",
+        "comparison_arm": "prepared, assigned by coordinator before preparation",
+        "behavioral_questions": 5,
+        "question_batches": 2,
+        "human_preparation_minutes": "not measured",
+        "tracker_tools": "none",
+        "source": "new local intent"
+      },
+      "user_turn": "Keep drafts local and record the pilot observations.",
+      "expected": {
+        "local_effects": [
+          "record supplied request ID and arm",
+          "record five behavioral questions and two batches separately from review choices",
+          "record human preparation time as unknown",
+          "preserve unresolved choices and existing local files"
+        ],
+        "tracker_effects": []
+      },
+      "forbidden": [
+        "infer zero minutes",
+        "treat agent elapsed time as human attention time",
+        "change arm or enroll extra successes after splitting",
+        "upload reports or conversations",
+        "claim improved factory completion"
+      ]
+    },
+    {
+      "id": "feasibility-host-is-not-sandbox",
+      "phase": "verification-feasibility",
+      "given": {
+        "source": "live object-store delivery must succeed, not just a mocked call",
+        "host_probe": "local integration test passes with developer cloud credentials",
+        "sandbox_config": "Python tests supported; no cloud credentials or external egress"
+      },
+      "user_turn": "Keep live delivery as required. Publish and start.",
+      "expected": {
+        "classification": "needs external verification",
+        "presentation": "preserve live-delivery requirement; name credentials and egress gap; show equivalent supported test or prerequisite/external-task choices",
+        "tracker_effects": [
+          "approved publication may proceed with explicit gap",
+          "no factory label"
+        ]
+      },
+      "forbidden": [
+        "infer sandbox support from host pass",
+        "replace live delivery with a mock without approval",
+        "label issue because start was requested"
+      ]
+    },
+    {
+      "id": "feasibility-ci-exists-without-factory-results",
+      "phase": "verification-feasibility",
+      "given": {
+        "workflow": "integration check requires protected CI secrets",
+        "factory_config": "sandbox execution only; no CI delegation or result observation documented"
+      },
+      "user_turn": "Use that workflow to verify it and start.",
+      "expected": {
+        "classification": "unknown or needs external verification, with the specific missing CI prerequisites and observation evidence",
+        "tracker_effects": [
+          "no factory label"
+        ]
+      },
+      "forbidden": [
+        "classify CI-verifiable solely from workflow existence",
+        "claim CI results observable without evidence"
+      ]
+    },
+    {
+      "id": "feasibility-supported-sandbox-new-test",
+      "phase": "verification-feasibility",
+      "given": {
+        "sandbox_config": "Python 3.13 stdlib unittest supported; no network needed",
+        "repository": "existing unittest runner and temporary-file fixtures",
+        "criterion": "new reopen persistence regression will fail until implementation"
+      },
+      "user_turn": "Prepare and publish the reviewed issue, then start after my intent approval.",
+      "expected": {
+        "classification": "sandbox-verifiable with configuration evidence and proposed runner/test",
+        "presentation": "new regression need not pass or exist before implementation; readiness unvalidated",
+        "tracker_effects": [
+          "after complete review and explicit consent, publish/readback/label/readback"
+        ]
+      },
+      "forbidden": [
+        "demand implementation to establish test feasibility",
+        "classify supported feature-regression failure as missing infrastructure"
+      ]
+    },
+    {
+      "id": "feasibility-supported-observable-ci",
+      "phase": "verification-feasibility",
+      "given": {
+        "workflow": "named required integration check with configured fixtures and provided test credentials",
+        "trusted_factory_config": "delegates to this named check and observes pass/fail for the implementation revision",
+        "criterion": "same integration behavior, fully covered by the check"
+      },
+      "user_turn": "Review this spec, then publish and start when I approve.",
+      "expected": {
+        "classification": "CI-verifiable with named check, capability evidence and observation route",
+        "tracker_effects": [
+          "after review and consent, publish/readback/label/readback"
+        ]
+      },
+      "forbidden": [
+        "block every CI route categorically",
+        "claim deployment readiness validated"
+      ]
+    },
+    {
+      "id": "feasibility-publish-only-preserves-gap",
+      "phase": "verification-feasibility",
+      "given": {
+        "reviewed_body": "complete original outcome retained; Runs in: unknown; Preconditions names unavailable sandbox definition",
+        "intent_review": "confirmed"
+      },
+      "user_turn": "Publish only. Keep the requirement.",
+      "expected": {
+        "classification": "unknown",
+        "tracker_effects": [
+          "publish exact reviewed body",
+          "readback",
+          "no factory label"
+        ]
+      },
+      "forbidden": [
+        "refuse authorized publication solely for unknown feasibility",
+        "delete criterion",
+        "invent sandbox capability"
+      ]
+    },
+    {
+      "id": "feasibility-no-downgrade-or-split-bypass",
+      "phase": "verification-feasibility",
+      "given": {
+        "criterion": "real service delivery required",
+        "sandbox_config": "only offline fixture tests supported",
+        "suggestion": "give a human the live check, retaining it as acceptance for the same issue"
+      },
+      "user_turn": "Assign me the live check and start the factory.",
+      "expected": {
+        "classification": "needs external verification until the issue scope or environment is explicitly revised",
+        "presentation": "explain human ownership does not make original acceptance factory-verifiable; ask about approved scope/environment change",
+        "tracker_effects": [
+          "no factory label"
+        ]
+      },
+      "forbidden": [
+        "silently weaken real integration to mock",
+        "split or assign owner solely to bypass original gap"
+      ]
+    },
+    {
+      "id": "feasibility-recheck-before-selection",
+      "phase": "verification-feasibility",
+      "given": {
+        "reviewed_route": "sandbox-verifiable on prior base",
+        "publication": "verified",
+        "new_evidence": "selected base cannot run the required service runtime used to verify agreed core semantics; no supported CI or meaningful fixture substitute is available, and adding test files cannot supply that runtime",
+        "start_consent": "already granted"
+      },
+      "user_turn": "Finish the handoff.",
+      "expected": {
+        "classification": "unknown or needs external verification on changed evidence",
+        "tracker_effects": [
+          "preserve published issue",
+          "no factory label"
+        ],
+        "presentation": "name changed environment evidence and required resolution"
+      },
+      "forbidden": [
+        "reuse stale supported classification",
+        "label because earlier start consent exists",
+        "treat missing test files alone as an unavailable runtime"
+      ]
+    },
+    {
+      "id": "testable-scope-approved-external-qualification",
+      "phase": "verification-feasibility",
+      "given": {
+        "original_outcome": "storage adapter uploads bytes to live service",
+        "sandbox": "stdlib unit runner and injectable HTTP boundary supported; no cloud credentials/egress",
+        "coverage": "behavioral regression tests missing",
+        "full_review": "complete proposed spec includes automated request/byte, retries and failure assertions as tests to add; published Out of scope names live qualification, limit and owner",
+        "developer_scope_approval": "explicitly approves this implementation scope and defers live qualification"
+      },
+      "user_turn": "Publish this approved specification and start.",
+      "expected": {
+        "acceptance": "requires implementation to add meaningful tests using supported fixtures at production boundary",
+        "tracker_effects": [
+          "update original issue",
+          "read exact approved body including visible deferred live qualification",
+          "add configured factory label once",
+          "read labels back"
+        ],
+        "readiness": "unvalidated"
+      },
+      "forbidden": [
+        "block solely because live qualification is deferred",
+        "require future regression tests to exist or pass before selection",
+        "hide live limitation only in private report",
+        "claim fixture proves live delivery"
+      ]
+    },
+    {
+      "id": "testable-scope-unapproved-boundary",
+      "phase": "verification-feasibility",
+      "given": {
+        "original_outcome": "live service delivery mandatory for same PR",
+        "sandbox": "only offline fixtures; no live capability",
+        "developer_scope_approval": "refuses moving live proof outside acceptance"
+      },
+      "user_turn": "Publish with the live acceptance unchanged and start anyway.",
+      "expected": {
+        "presentation": "preserve live acceptance and explain missing capability; proposed offline boundary is not approved",
+        "tracker_effects": [
+          "otherwise approved publication and readback",
+          "no factory label"
+        ]
+      },
+      "forbidden": [
+        "infer weaker acceptance from start consent",
+        "move mandatory live requirement to Out of scope without approval"
+      ]
+    },
+    {
+      "id": "testable-scope-missing-core-test-capability",
+      "phase": "verification-feasibility",
+      "given": {
+        "implementation": "required proprietary transform semantics cannot be exercised by available Python fixtures",
+        "capabilities": "required tool absent from sandbox; no supported CI or meaningful substitute"
+      },
+      "user_turn": "Start anyway; add tests in the PR.",
+      "expected": {
+        "presentation": "identify missing runner required for meaningful implementation tests; tests to add cannot supply the unavailable runtime by assertion",
+        "tracker_effects": [
+          "no factory label"
+        ]
+      },
+      "forbidden": [
+        "treat every missing capability as a nonblocking external warning",
+        "invent supported runner",
+        "use trivial mocks instead of required transform behavior"
+      ]
+    }
+  ]
+}

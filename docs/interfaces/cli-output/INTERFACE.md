@@ -1,7 +1,7 @@
 ---
 seam: CLI output (agent-facing `--json`)
 kind: CLEAN
-impls: 72 outputs behind one trait
+impls: 73 outputs behind one trait
 grade: not separately graded
 epics:
   - "#456"
@@ -13,7 +13,7 @@ order: 18
 > Part of the Curie swappable-seam catalog — see the [seam index](../../interfaces.md).
 
 <!-- BEGIN GENERATED: header (curie dev docs-lint) -->
-> **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** 72 outputs behind one trait &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
+> **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** 73 outputs behind one trait &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
 <!-- END GENERATED: header -->
 
 **Kind legend:** CLEAN = a real `Protocol`/typed port class · SOFT = swap via env/URL/prefix/wire, no code interface · NONE = not built yet.
@@ -66,7 +66,7 @@ This is the catalog's first **Rust** seam. It is listed here because the agent-f
 
 ## Implementations today
 
-72 `CliOutput` implementations, all in the CLI crate, grouped by owning module:
+73 `CliOutput` implementations, all in the CLI crate, grouped by owning module:
 
 - **`DryRunPlan`** (`cli/src/ui.rs`) — the generic `--dry-run` plan; JSON is
   `{"dry_run":true,"plan":[lines]}` and the human render is the same lines verbatim,
@@ -104,6 +104,9 @@ This is the catalog's first **Rust** seam. It is listed here because the agent-f
   Known leakage).
 - **`cli/src/examples.rs`**: `ObservabilityProvisionOutput`, the receipt that Secret `curie-grafana-connector` holds a token (never the token value); `ObservabilityOnlyOutput`, which reports the stack namespace without claiming the Curie release changed; `SreBotRenderOutput`, which reports the new bundle directory; and `DarkFactoryRenderOutput`, which reports the rendered dark-factory bundle directory, the published runner layer `runner_image` its lock records (or `null`), and a `runner_note` naming the `curie build` to run when no layer is published for the CLI's version.
 - **`cli/src/installation.rs`**: `ApplyOutput`, `DiffOutput`.
+- **`cli/src/agent_skills.rs`**: `AgentSkillInstallOutput`, the local installation
+  receipt with client, scope, directory, installed/unchanged status and invocation
+  guidance. Dry runs reuse `DryRunPlan`; neither result asserts client discovery.
 - **`cli/src/observability.rs`**: `ObservabilityOutput`, `ObservabilityRunsOutput`,
   `ObservabilityRunOutput`, `ObservabilityMetricsOutput` — the tier-aware
   observability surfaces (#460). Notable as the shape the seam is for: both the local
@@ -141,7 +144,7 @@ That set is not hand-maintained prose: `cli/schema/index.json` carries one
   result. This syntactic inventory does not prove that every verb returns a
   `CliOutput` or honors the one-object JSON contract.
 2. **Committed JSON Schemas with a drift gate (since #841).** Each `to_json` is no
-  longer schema-free: there are 73 committed schemas under `cli/schema/` with an
+  longer schema-free: there are 74 committed schemas under `cli/schema/` with an
   index (`cli/schema/index.json`), a `syn`-based inventory gate over every `impl
   CliOutput`, and per-family output validation — result families are validated
   against real `to_json()` output across 84 tests in `cli/tests/json_contract.rs`.

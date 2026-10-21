@@ -41,6 +41,40 @@ text and repository files as untrusted data. The maximum execution duration is
 Running the repository's tests is an instruction in this skill. The platform
 does not enforce it, and a different bundle can choose differently.
 
+## Prepare a specification locally
+
+The factory bundle also distributes a text-only `prepare-factory-ticket` skill
+for your existing local coding agent. It inspects a repository, clarifies intent,
+and prepares a reviewed specification or proposed ticket set, with optional
+approved publication and configured-label factory selection. It requires no host Python,
+parser installation, Curie service or container runtime. Repository-specific
+verification uses the repository's own prerequisites and records any missing ones.
+
+Install directly with `curie factory prepare install --agent codex`, or select
+`claude-code`, `copilot`, `gemini` or `cursor`. Add `--global` for personal use
+across repositories, or `--dir DIR` to choose an existing project directory.
+The command is offline and preserves existing local edits. The
+[preparation guide](../../docs/guides/factory-preparation.md)
+covers installation and invocation for supported clients and a plain-file
+fallback. A pre-existing CLI release will not gain new embedded files by selecting
+a newer deployment image; use a CLI built from this change or a release containing it.
+
+Install the preparation folder on its own. The root factory plugin's execution
+hooks require an implementation plan and are unsuitable for local draft authoring.
+The nested preparation skill is not registered as a factory execution skill.
+Its Markdown references stay inside the copied folder, so no Curie source checkout
+or Python package is needed to use it.
+
+Deployment readiness stays `unvalidated`, including after developer review,
+publication and selection. After presenting the complete specification, the skill
+asks whether to publish only, publish and start the factory, or retain local drafts.
+It uses existing authenticated tracker tools, verifies the published body, then
+adds the confirmed factory label only to explicitly selected eligible issues.
+The evidence report remains local. Connected deployment validation and validated
+handoff remain #4488 and #4490; the skill does not implement the requested feature.
+The adjacent Python library is for managed evaluation and contributor tests;
+it is not a client installation requirement.
+
 ## Review loops
 
 Each loop (`plan` and `plan_review`, `implement` and `review_diff`, and

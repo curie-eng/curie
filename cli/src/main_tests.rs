@@ -2518,8 +2518,8 @@ fn quickstart_multi_repo_clap_splits_a_comma_list() {
         let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
         match try_parse_from(argv).expect("parses").command {
             Some(Command::Factory {
-                action: FactoryAction::Quickstart { repos, .. },
-            }) => repos,
+                action: FactoryAction::Quickstart(options),
+            }) => options.repos,
             _ => panic!("not factory quickstart"),
         }
     }
