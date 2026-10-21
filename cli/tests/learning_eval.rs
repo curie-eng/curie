@@ -50,10 +50,9 @@ impl Fixture {
     }
 
     fn command(&self, candidate: &Path) -> Command {
-        let path = std::env::join_paths(
-            std::iter::once(self.tools.clone())
-                .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())),
-        )
+        let path = std::env::join_paths(std::iter::once(self.tools.clone()).chain(
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+        ))
         .expect("test PATH");
         let mut command = Command::new(candidate);
         command
@@ -79,7 +78,13 @@ impl Fixture {
 
     fn dry_run(&self, extra: &[&str]) -> Output {
         self.command(&binary())
-            .args(["--json", "dev", "learning-eval", "--dry-run", "--output-dir"])
+            .args([
+                "--json",
+                "dev",
+                "learning-eval",
+                "--dry-run",
+                "--output-dir",
+            ])
             .arg(self.output_dir())
             .args(extra)
             .output()
@@ -187,12 +192,21 @@ fn learning_eval_dry_run_needs_no_reachable_docker_daemon() {
     let fixture = Fixture::new();
     let output = fixture
         .command(&binary())
-        .args(["--json", "dev", "learning-eval", "--dry-run", "--output-dir"])
+        .args([
+            "--json",
+            "dev",
+            "learning-eval",
+            "--dry-run",
+            "--output-dir",
+        ])
         .arg(fixture.output_dir())
         .env_remove("DOCKER_CONTEXT")
         .env(
             "DOCKER_HOST",
-            format!("unix://{}", fixture.temp.path().join("absent.sock").display()),
+            format!(
+                "unix://{}",
+                fixture.temp.path().join("absent.sock").display()
+            ),
         )
         .output()
         .expect("dry run without a Docker daemon");
@@ -261,22 +275,39 @@ fn learning_eval_current_executable_pin_survives_a_utf8_copy_and_poisoned_path()
     fs::copy(binary(), &copied).expect("copy actual candidate executable");
     let output = fixture
         .command(&copied)
-        .args(["--json", "dev", "learning-eval", "--dry-run", "--output-dir"])
+        .args([
+            "--json",
+            "dev",
+            "learning-eval",
+            "--dry-run",
+            "--output-dir",
+        ])
         .arg(fixture.output_dir())
         .output()
         .expect("copied candidate dispatch");
     assert!(output.status.success());
-    assert!(one_object(&output).to_string().contains(copied.to_str().unwrap()));
+    assert!(one_object(&output)
+        .to_string()
+        .contains(copied.to_str().unwrap()));
     fixture.assert_no_path_fallback();
 }
 
 #[test]
 fn learning_eval_rejects_non_utf8_output_and_report_paths_without_lossy_conversion() {
     let fixture = Fixture::new();
-    let invalid = fixture.temp.path().join(OsString::from_vec(b"result-\xff".to_vec()));
+    let invalid = fixture
+        .temp
+        .path()
+        .join(OsString::from_vec(b"result-\xff".to_vec()));
     let output = fixture
         .command(&binary())
-        .args(["--json", "dev", "learning-eval", "--dry-run", "--output-dir"])
+        .args([
+            "--json",
+            "dev",
+            "learning-eval",
+            "--dry-run",
+            "--output-dir",
+        ])
         .arg(&invalid)
         .output()
         .expect("non-UTF-8 output path");
@@ -296,14 +327,26 @@ fn learning_eval_rejects_non_utf8_output_and_report_paths_without_lossy_conversi
 #[test]
 fn learning_eval_rejects_non_utf8_current_executable_path() {
     let fixture = Fixture::new();
-    let copied = fixture.temp.path().join(OsString::from_vec(b"curie-\xff".to_vec()));
+    let copied = fixture
+        .temp
+        .path()
+        .join(OsString::from_vec(b"curie-\xff".to_vec()));
     fs::copy(binary(), &copied).expect("copy candidate to non-UTF-8 path");
     let output = fixture
         .command(&copied)
-        .args(["--json", "dev", "learning-eval", "--dry-run", "--output-dir"])
+        .args([
+            "--json",
+            "dev",
+            "learning-eval",
+            "--dry-run",
+            "--output-dir",
+        ])
         .arg(fixture.output_dir())
         .output()
         .expect("non-UTF-8 executable dispatch");
-    assert!(!output.status.success(), "non-UTF-8 executable path accepted");
+    assert!(
+        !output.status.success(),
+        "non-UTF-8 executable path accepted"
+    );
     fixture.assert_no_path_fallback();
 }
