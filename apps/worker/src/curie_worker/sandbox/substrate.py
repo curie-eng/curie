@@ -312,21 +312,21 @@ class SandboxSubstrate:
         """Revoke the boot credential, delete the claim, then retire its daemon.
 
         Every claim delete uses this. The daemon (ADR 0217) is retired even when
-        the claim delete raised, within the same ``request_timeout_seconds``
-        budget, and the claim's error is the one raised. ``daemon=False`` is a
-        caller that retires the daemon itself.
+        the claim delete raised, with its own ``request_timeout_seconds`` budget
+        so a delete that timed out cannot starve it, and the claim's error is the
+        one raised. ``daemon=False`` is a caller that retires the daemon itself.
         """
 
-        deadline = time.monotonic() + request_timeout_seconds
         try:
             self._report_boot_credential(claim_name=name, handle=handle, env=env)
             self._k8s.delete_claim(name, request_timeout_seconds=request_timeout_seconds)
         except Exception:
             if daemon:
+                deadline = time.monotonic() + request_timeout_seconds
                 self._retire_daemon_quietly(name, handle, deadline)
             raise
         if daemon:
-            self._retire_daemon(name, handle, deadline)
+            self._retire_daemon(name, handle, time.monotonic() + request_timeout_seconds)
 
     def _daemon_configs(self) -> dict[str, ToolDaemonConfig]:
         """The configured tool daemons by namespace; none on the Docker substrate."""
