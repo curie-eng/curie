@@ -271,6 +271,7 @@ def test_create_claim_seeds_private_worker_inputs_without_host_binds(
         pool="acme-input-probe",
         env=inputs.env,
         labels={OWNER_LABEL: inputs.owner},
+        deadline=time.monotonic() + 300,
     )
     inspected = json.loads(_docker("inspect", inputs.claim))[0]
     assert inspected["State"]["Running"] is True

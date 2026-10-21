@@ -1108,6 +1108,30 @@ def test_suspend_retires_the_daemon_even_when_the_mode_change_fails(
     _assert_retired(fake_k8s, redis_client, key_prefix, claim)
 
 
+def test_a_suspend_patch_that_spends_the_budget_still_retires_the_daemon(
+    fake_k8s: FakeSandboxClient,
+    docker_substrate: SandboxSubstrate,
+    redis_client: redis.Redis,
+    key_prefix: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slow but successful mode patch must not starve the daemon retirement."""
+
+    _handle, claim = _docker_route(docker_substrate)
+    skew = [0.0]
+    real = time.monotonic
+    monkeypatch.setattr(time, "monotonic", lambda: real() + skew[0])
+    patch = fake_k8s.set_sandbox_mode
+
+    def slow(name: str, mode: str) -> None:
+        patch(name, mode)
+        skew[0] += 60.0  # well past the control request budget
+
+    monkeypatch.setattr(fake_k8s, "set_sandbox_mode", slow)
+    docker_substrate.suspend("T-ret", history_ref="h-1")
+    _assert_retired(fake_k8s, redis_client, key_prefix, claim)
+
+
 def test_policy_change_eviction_retires_the_old_daemon(
     fake_k8s: FakeSandboxClient,
     affinity: AffinityStore,
@@ -1819,6 +1843,13 @@ FAULTS: dict[str, Callable[[FakeSandboxClient, redis.Redis, str, str], object]] 
         claim, KubeTransientError("port-forward failed")
     ),
     "credential-missing": lambda k8s, r, p, claim: r.delete(_credential_key(p, claim)),
+    # DOCKER_HOST names the Service; the runner reaches it through the policy.
+    "service-deleted": lambda k8s, r, p, claim: k8s.daemon_objects.pop(
+        (DAEMON_NS, "Service", claim)
+    ),
+    "policy-deleted": lambda k8s, r, p, claim: k8s.daemon_objects.pop(
+        (DAEMON_NS, "NetworkPolicy", claim)
+    ),
     "wrong-ca": lambda k8s, r, p, claim: _wrong_ca(r, p, claim),
 }
 
