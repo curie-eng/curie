@@ -766,6 +766,7 @@ def frozen_report(tmp_path: Path) -> dict[str, Any]:
         "generations": [],
         # Synthetic test data: recorded private worker attempt cap and schedule reservations.
         "worker": {"max_attempts": 1},
+        "controls": [],
         "schedule_reservations": [],
         "calibration": {"version": 1, "rows": [], "deterministic_controls": []},
         "accounting": {
@@ -955,6 +956,7 @@ def frozen_report(tmp_path: Path) -> dict[str, Any]:
             {
                 "id": operation_id,
                 "generation_id": f"gen-placeholder-actor-{index}",
+                "invocation_id": invocation_id,
                 "reserve_usd": "0.02",
                 "settled_usd": "0.01",
                 "status": "settled",
@@ -978,6 +980,26 @@ def frozen_report(tmp_path: Path) -> dict[str, Any]:
                 _extra_decision(report, base, decision_id, extra_kind, decision_cases[0]["rubric"])
         if family == 8:
             _extra_decision(report, base, "correct", "skill", decision_cases[1]["rubric"])
+        # Synthetic test data: fixture-derived control records with bound evidence.
+        control_ids = {
+            2: ("instruction-correction", "conflicting-request"),
+            5: ("revise-and-cancel",),
+            8: ("revert",),
+        }
+        for control_id in control_ids.get(family, ()):
+            report["controls"].append(
+                {
+                    **scope,
+                    "fixture_id": case_id,
+                    "control_id": control_id,
+                    "status": "PASS",
+                    "evidence_ref": _evidence(
+                        report,
+                        "control-observation",
+                        {**scope, "control_id": control_id, "status": "PASS"},
+                    ),
+                }
+            )
         if kind == "schedule":
             report["schedule_reservations"].append(
                 {
@@ -1246,6 +1268,9 @@ def _duplicate_repetition(report: dict[str, Any], repetition: int = 2) -> None:
         remap(
             [row for row in original["accounting"]["operations"] if row["id"] in actor_operations]
         )
+    )
+    report["controls"].extend(
+        remap([row for row in original["controls"] if row["repetition"] == 1])
     )
     report["schedule_reservations"].extend(
         remap([row for row in original["schedule_reservations"] if row["repetition"] == 1])
@@ -2441,4 +2466,82 @@ def test_report_missing_an_f1_consent_decision_fails(
     ]
     assert len(report["decisions"]) == before - 1
     _derive(report)
+    _check(tmp_path, report, passed=False)
+
+
+def _actor_operation(report: dict[str, Any]) -> dict[str, Any]:
+    return next(
+        row for row in report["accounting"]["operations"] if row["id"].startswith("actor-operation")
+    )
+
+
+@pytest.mark.parametrize("damage", ["nonzero-exit", "not-finalized"])
+def test_unfinalized_turn_cannot_settle_below_its_reservation(
+    tmp_path: Path, frozen_report: dict[str, Any], damage: str
+) -> None:
+    _check(tmp_path, frozen_report, passed=True)
+    report = copy.deepcopy(frozen_report)
+    operation = _actor_operation(report)
+    invocation = next(
+        row for row in report["invocations"] if row["invocation_id"] == operation["invocation_id"]
+    )
+    if damage == "nonzero-exit":
+        invocation["exit_code"] = 1
+    else:
+        case = next(
+            row for row in report["cases"] if row["invocation_id"] == invocation["invocation_id"]
+        )
+        _value(report, case["reply_ref"])["result"]["finalized"] = False
+    _rehash(report)
+    _check(tmp_path, report, passed=False)
+    # The same operation held unresolved at its full reservation is honest and passes.
+    operation.pop("settled_usd")
+    operation.pop("usage_polls")
+    operation.update(status="unresolved", charged_usd=operation["reserve_usd"])
+    _rehash(report)
+    _check(tmp_path, report, passed=True)
+
+
+@pytest.mark.parametrize("fixture_id", ["F1-P1", "F6-P2", "F7-P3"])
+def test_passing_durable_or_judged_decision_cannot_drop_semantic_or_judge_reference(
+    tmp_path: Path, frozen_report: dict[str, Any], fixture_id: str
+) -> None:
+    _check(tmp_path, frozen_report, passed=True)
+    no_semantic = copy.deepcopy(frozen_report)
+    row = next(item for item in no_semantic["decisions"] if item["fixture_id"] == fixture_id)
+    del _value(no_semantic, row["evidence_ref"])["semantic"]
+    _rehash(no_semantic)
+    _check(tmp_path, no_semantic, passed=False)
+    no_judge = copy.deepcopy(frozen_report)
+    row = next(item for item in no_judge["decisions"] if item["fixture_id"] == fixture_id)
+    del row["judge_ref"]
+    _check(tmp_path, no_judge, passed=False)
+
+
+@pytest.mark.parametrize(
+    "control_id", ["instruction-correction", "conflicting-request", "revise-and-cancel", "revert"]
+)
+def test_report_missing_a_fixture_derived_control_record_fails(
+    tmp_path: Path, frozen_report: dict[str, Any], control_id: str
+) -> None:
+    _check(tmp_path, frozen_report, passed=True)
+    report = copy.deepcopy(frozen_report)
+    before = len(report["controls"])
+    report["controls"] = [row for row in report["controls"] if row["control_id"] != control_id]
+    assert len(report["controls"]) < before
+    _check(tmp_path, report, passed=False)
+
+
+@pytest.mark.parametrize("damage", ["no-ref", "dangling-ref"])
+def test_control_claiming_pass_without_bound_evidence_fails(
+    tmp_path: Path, frozen_report: dict[str, Any], damage: str
+) -> None:
+    _check(tmp_path, frozen_report, passed=True)
+    report = copy.deepcopy(frozen_report)
+    control = report["controls"][0]
+    assert control["status"] == "PASS"
+    if damage == "no-ref":
+        del control["evidence_ref"]
+    else:
+        control["evidence_ref"] = "control-observation-missing"
     _check(tmp_path, report, passed=False)
