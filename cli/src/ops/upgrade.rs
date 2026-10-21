@@ -4067,7 +4067,11 @@ impl LiveHost {
         // operator's values file over the installed values, so a file still
         // carrying an old receipt would replace the one Helm serves. Check
         // the receipts Helm applied instead, and fail closed if unreadable.
-        if self.apply_skipped_at_start && !repository_runner_entries(&overlay).is_empty() {
+        // The rule does not depend on the overlay: a values file that dropped
+        // every runner still leaves the served release carrying catalog
+        // templates, so the served document is always the naming and receipt
+        // source here.
+        if self.apply_skipped_at_start {
             match self.served_user_values() {
                 Ok(served) => overlay = served,
                 Err(error) => {
