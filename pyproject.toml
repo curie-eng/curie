@@ -162,6 +162,7 @@ forbidden_modules = [
     "curie_protected_hooks.commissioning_campaign_records",
     "curie_protected_hooks.commissioning_encoding",
     "curie_protected_hooks.commissioning_journal",
+    "curie_protected_hooks.commissioning_launch_control",
     "curie_protected_hooks.commissioning_local_ownership",
     "curie_protected_hooks.commissioning_operator_guard",
     "curie_protected_hooks.commissioning_operator_protocol",
@@ -173,6 +174,29 @@ forbidden_modules = [
     "curie_protected_hooks.commissioning_verifier",
     "curie_protected_hooks.commissioning_worker",
     "curie_protected_hooks.qualification_publication",
+]
+
+# @spec PROTECTED-COMMISSIONING-8: the commissioning launch authorizer is the
+# second closed authorizer of the shared launch mechanics. It and its registry
+# live in `curie_worker` beside the mechanics, import no commissioning record,
+# and are reached from production composition only through the mechanics'
+# closed class admission and authorizer-owned registry; those two edges are the
+# reviewed exception.
+[[tool.importlinter.contracts]]
+name = "Production composition reaches the commissioning launch path only through the closed seam"
+type = "forbidden"
+source_modules = [
+    "curie_api",
+    "curie_worker.__main__",
+    "curie_worker.protected_entry",
+    "curie_worker.protected_lane",
+    "curie_worker.protected_launch_client",
+    "curie_worker.protected_launch_server",
+]
+forbidden_modules = ["curie_worker.commissioning_launch", "curie_worker.commissioning_registry"]
+ignore_imports = [
+    "curie_worker.protected_launch_mechanics -> curie_worker.commissioning_launch",
+    "curie_worker.protected_launch_mechanics -> curie_worker.commissioning_registry",
 ]
 
 # @spec PROTECTED-COMMISSIONING-2/4: the commissioning ingress and worker are

@@ -1,0 +1,514 @@
+"""Commissioning authorizer and mediator over the shared launch mechanics.
+
+@spec PROTECTED-COMMISSIONING-8. Actual mechanics, registry, HTTPS mTLS and
+Kubernetes client; only the external Kubernetes API, the runner and the
+campaign broker control are synthetic. The broker control is proved against a
+real Valkey in protected-hooks; Kubernetes create, ambiguous create and NotFound
+are additionally observed on a disposable cluster (see the PR evidence).
+"""
+
+from __future__ import annotations
+
+import ast
+import asyncio
+import hashlib
+import inspect
+import json
+import time
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+from uuid import uuid4
+
+import httpx
+import pytest
+from aiohttp import web
+from cryptography import x509
+from cryptography.hazmat.primitives import serialization
+from curie_worker import commissioning_launch as launch
+from curie_worker.commissioning_registry import GuardCreateWitness, object_names
+from curie_worker.protected_kubernetes_projection import parse_projection
+from curie_worker.protected_launch_kubernetes import (
+    KubernetesLaunchAPI,
+    KubernetesTLS,
+    LaunchControlUnavailable,
+)
+from curie_worker.protected_launch_mechanics import LaunchAuthorizer, ProtectedLaunchMechanics
+from curie_worker.protected_launch_records import canonical_json
+from curie_worker.protected_launch_server import ServerConfig, public_key_identity
+
+from .protected_launch_endpoint_helpers import certificates, context, endpoint
+from .test_protected_kubernetes_projection import projection_value
+from .test_protected_launch_server_integration import ExternalWorkload
+
+OWNER = "worker/example"
+GUARD = {
+    "control_id": "22222222-2222-4222-8222-222222222222",
+    "revision": "1",
+    "config_sha256": "c" * 64,
+}
+PERMIT = "a" * 64
+ROUTE = "/v1/commissioning/launches"
+
+
+@dataclass(frozen=True)
+class Plan:
+    launch_id: str
+    launch_request_digest: str
+    projection_digest: str
+    launch_reservation_id: str
+
+
+class FakeControl:
+    """Synthetic campaign control; records ownership in the external event order."""
+
+    permit_digest = PERMIT
+    worker_principal_id = OWNER
+    guard_identity = GUARD
+
+    def __init__(self, events: list[Any], expires_at_ms: int) -> None:
+        self.events, self.expires_at_ms = events, expires_at_ms
+        self.ownership: dict[str, tuple[str, str | None]] = {}
+        self.plans = 0
+
+    async def plan(self, raw: bytes) -> Plan:
+        self.plans += 1
+        value = json.loads(raw)
+        return Plan(
+            value["launch_id"],
+            hashlib.sha256(raw).hexdigest(),
+            value["projection_digest"],
+            value["launch_reservation_id"],
+        )
+
+    async def own(self, plan: Plan, *, namespace: str, pod_name: str) -> None:
+        assert plan.launch_id not in self.ownership
+        self.events.append(("OWN", namespace, pod_name))
+        self.ownership[plan.launch_id] = ("creating", None)
+
+    async def advance(self, launch_id: str, state: str, pod_uid: str | None) -> None:
+        current, uid = self.ownership[launch_id]
+        assert current != "retired" and (uid is None or uid == pod_uid)
+        if (current, uid) != (state, pod_uid):
+            self.events.append(("ADVANCE", state, pod_uid))
+            self.ownership[launch_id] = (state, pod_uid)
+
+    async def unsettled(self) -> tuple[str, ...]:
+        return tuple(k for k, (s, _) in self.ownership.items() if s != "retired")
+
+
+class Assignments:
+    async def assign(self, plan: Plan, *, expires_at_ms: int) -> launch.CampaignRunnerAssignment:
+        return launch.CampaignRunnerAssignment(
+            "commissioning-" + plan.launch_id,
+            "https://api.example.test/history/" + plan.launch_id,
+            "synthetic-history-credential",
+            "synthetic-gateway-credential",
+            ("credential/example-history", "1"),
+            ("credential/example-model", "1"),
+        )
+
+
+class Witness:
+    """A stand-in for the guard-owned witness of what it admitted per create."""
+
+    def __init__(self, uid: Any, *, operation: str | None = None) -> None:
+        self.uid, self.operation, self.calls, self.returned = uid, operation, [], []
+
+    async def admitted(self, **binding: str) -> GuardCreateWitness | None:
+        self.calls.append(binding)
+        value = self.uid() if callable(self.uid) else self.uid
+        self.returned.append(value)
+        if value is None:
+            return None
+        return GuardCreateWitness(
+            binding["kind"],
+            value,
+            self.operation or binding["create_operation_id"],
+            GUARD["control_id"],
+            GUARD["revision"],
+            GUARD["config_sha256"],
+        )
+
+
+class Cluster(ExternalWorkload):
+    """The synthetic external API, with a lost create response or a squatted name."""
+
+    async def kubernetes(self, request: web.Request) -> web.StreamResponse:
+        if request.method == "POST" and request.path.endswith("/pods"):
+            if self.fault_mode == "ambiguous-create":
+                await super().kubernetes(request)
+                return web.Response(status=504)
+            if self.fault_mode == "squatted":
+                return web.json_response({"kind": "Status", "reason": "AlreadyExists"}, status=409)
+        return await super().kubernetes(request)
+
+
+def measured() -> launch.MeasuredLaunch:
+    value = projection_value()
+    platform = {
+        **value["platform"],
+        "oci_digest": value["image"]["digest"],
+        "pinned_image_reference": value["image"]["reference"],
+        "observed_image_id": value["image"]["reference"],
+        "image_config_id": None,
+    }
+    return launch.MeasuredLaunch(parse_projection(canonical_json(value)), platform, 300)
+
+
+def request_bytes(launch_id: str | None = None) -> bytes:
+    return canonical_json(
+        {
+            "launch_id": launch_id or str(uuid4()),
+            "launch_reservation_id": str(uuid4()),
+            "projection_digest": measured().projection.digest,
+        }
+    )
+
+
+def pin(root: Path, role: str) -> str:
+    cert = x509.load_pem_x509_certificate((root / (role + ".pem")).read_bytes())
+    return public_key_identity(cert.public_bytes(serialization.Encoding.DER))
+
+
+@asynccontextmanager
+async def mediator(tmp_path: Path, cluster: Cluster, **options: Any) -> Any:
+    root = certificates(tmp_path / "tls")
+    registry = tmp_path / "registry"
+    registry.mkdir(mode=0o700, exist_ok=True)
+    expires = options.pop("expires_at_ms", int(time.time() * 1000) + 2 * 3600 * 1000)
+    control = options.pop("control", None) or FakeControl(cluster.events, expires)
+    runner_app = web.Application()
+    runner_app.router.add_route("*", "/{tail:.*}", cluster.runner)
+    runner_owner = web.AppRunner(runner_app, access_log=None)
+    await runner_owner.setup()
+    try:
+        await web.TCPSite(runner_owner, "127.0.0.1", 8080).start()
+        async with endpoint(root, cluster.kubernetes) as origin:
+            server = launch.CommissioningLaunchServer(
+                ServerConfig(
+                    str(registry),
+                    "127.0.0.1",
+                    8081,
+                    str(root / "ca.pem"),
+                    str(root / "server.pem"),
+                    str(root / "server.key"),
+                    pin(root, "server"),
+                    "http",
+                    "svc.cluster.local",
+                    None,
+                ),
+                control=control,
+                worker=launch.CandidateWorker(OWNER, pin(root, "worker")),
+                measured=measured(),
+                assignments=Assignments(),
+                kubernetes=KubernetesLaunchAPI(
+                    KubernetesTLS(
+                        origin,
+                        str(root / "ca.pem"),
+                        str(root / "worker.pem"),
+                        str(root / "worker.key"),
+                        "synthetic-kubernetes",
+                    ),
+                    authority_domain_id="55555555-5555-4555-8555-555555555555",
+                ),
+                **options,
+            )
+            cluster.server = server
+            owner = web.AppRunner(server.application, access_log=None, handler_cancellation=True)
+            await owner.setup()
+            site = web.TCPSite(owner, "127.0.0.1", 0, ssl_context=server._tls)
+            await site.start()
+            url = "https://127.0.0.1:" + str(site._server.sockets[0].getsockname()[1])
+            try:
+                yield server, control, url, root
+            finally:
+                await owner.cleanup()
+    finally:
+        await runner_owner.cleanup()
+
+
+async def settled(server: Any, launch_id: str) -> None:
+    live = server._live[launch_id]
+    if live.job is not None:
+        await asyncio.wait_for(asyncio.gather(live.job, return_exceptions=True), 30)
+
+
+def test_the_commissioning_authorizer_is_admitted_by_exact_class(tmp_path):
+    root = certificates(tmp_path / "tls")
+    kubernetes = KubernetesLaunchAPI(
+        KubernetesTLS(
+            "https://127.0.0.1:6443",
+            str(root / "ca.pem"),
+            str(root / "worker.pem"),
+            str(root / "worker.key"),
+            "synthetic-control",
+        ),
+        authority_domain_id="55555555-5555-4555-8555-555555555555",
+    )
+    registry = tmp_path / "registry"
+    registry.mkdir(mode=0o700)
+
+    def mechanics(authorizer: Any) -> ProtectedLaunchMechanics:
+        return ProtectedLaunchMechanics(
+            authorizer,
+            kubernetes=kubernetes,
+            registry_root=str(registry),
+            runner_scheme="http",
+            runner_dns_suffix="svc.cluster.local",
+            runner_ca_file=None,
+        )
+
+    accepted = mechanics(launch.CommissioningLaunchAuthorizer(PERMIT))
+    assert type(accepted.registry).__name__ == "CommissioningLaunchRegistry"
+    assert accepted.registry.permit_digest == PERMIT
+    asyncio.run(accepted.close(None))  # type: ignore[arg-type]
+
+    class Forged(LaunchAuthorizer):
+        __module__ = "curie_worker.commissioning_launch"
+        __qualname__ = "CommissioningLaunchAuthorizer"
+
+    with pytest.raises(LaunchControlUnavailable):
+        mechanics(Forged())
+    with pytest.raises(TypeError):
+
+        class _Derived(launch.CommissioningLaunchAuthorizer):  # type: ignore[misc]
+            pass
+
+
+def test_the_commissioning_authorizer_constructs_no_production_type():
+    tree = ast.parse(inspect.getsource(launch))
+    docstrings = {
+        id(node.body[0].value)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef)
+        and node.body
+        and isinstance(node.body[0], ast.Expr)
+        and isinstance(node.body[0].value, ast.Constant)
+    }
+    used: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            used.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            used.add(node.attr)
+        elif isinstance(node, ast.alias):
+            used.add(node.name)
+        elif isinstance(node, ast.ImportFrom):
+            used.add(node.module or "")
+        elif isinstance(node, ast.Constant) and type(node.value) is str:
+            if id(node) not in docstrings:
+                used.add(node.value)
+    forbidden = {
+        "LaunchReceipt",
+        "LaunchRequest",
+        "LaunchOwnership",
+        "LaunchSuccess",
+        "LaunchPendingSuccess",
+        "ProductionLaunchAuthorizer",
+        "Dispatchable",
+        "parse_qualification",
+        "parse_readiness",
+    }
+    assert not used & forbidden
+    assert not [name for name in used if "protected:control:" in name]
+    assert not [name for name in used if name.startswith("curie_protected_hooks")]
+
+
+def test_turn_operations_refuse_in_this_slice():
+    authorizer = launch.CommissioningLaunchAuthorizer(PERMIT)
+
+    async def scenario() -> None:
+        for call in (
+            authorizer.reverify(None),  # type: ignore[arg-type]
+            authorizer.accept_reverification(None, None),  # type: ignore[arg-type]
+            authorizer.require_unsettled(None),  # type: ignore[arg-type]
+        ):
+            with pytest.raises(launch._Refusal):
+                await call
+        with pytest.raises(launch._Refusal):
+            authorizer.validate_start(None, None)  # type: ignore[arg-type]
+
+    asyncio.run(scenario())
+
+
+def test_create_records_ownership_before_any_create_then_binds_and_retires(tmp_path):
+    async def scenario() -> None:
+        cluster = Cluster()
+        async with mediator(tmp_path, cluster) as (server, control, url, root):
+            raw = request_bytes()
+            launch_id = json.loads(raw)["launch_id"]
+            cluster.launch_id = launch_id
+            async with httpx.AsyncClient(verify=context(root), trust_env=False) as http:
+                created = await http.post(url + ROUTE, content=raw)
+                assert created.status_code == 202, created.json()
+                capability = created.json()["control_capability"]
+                await settled(server, launch_id)
+                pod, service, secret = object_names(launch_id)
+                kinds = [e for e in cluster.events if e[0] in {"OWN", "POST"}]
+                assert kinds[0] == ("OWN", "acme-runtime", pod)
+                assert [e[1].rsplit("/", 1)[1] for e in kinds[1:]] == [
+                    "secrets",
+                    "services",
+                    "pods",
+                ]
+                pod_uid = cluster.objects[("pods", pod)]["metadata"]["uid"]
+                assert ("ADVANCE", "bound", pod_uid) in cluster.events
+                # A retried create replays the live launch and never owns twice.
+                again = await http.post(url + ROUTE, content=raw)
+                assert again.status_code == 200 and again.json()["launch_id"] == launch_id
+                headers = {launch.CAPABILITY_HEADER: capability}
+                observed = await http.get(url + ROUTE + "/" + launch_id, headers=headers)
+                assert observed.status_code == 200
+                body = observed.json()
+                assert body["state"] == "idle"
+                assert body["receipt"]["workload"]["pod_uid"] == pod_uid
+                assert (await http.get(url + ROUTE + "/" + launch_id)).status_code == 403
+                start = await http.post(url + ROUTE + "/" + launch_id + "/start", headers=headers)
+                assert start.status_code == 404
+                retired = await http.post(
+                    url + ROUTE + "/" + launch_id + "/retire", headers=headers
+                )
+                assert retired.status_code == 200, retired.json()
+                assert retired.json()["state"] == "retired"
+            assert control.ownership[launch_id] == ("retired", pod_uid)
+            assert not [k for k in cluster.objects if k[0] in {"pods", "services", "secrets"}]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("role", ["unknown", "expiring-after-permit"])
+def test_candidate_mtls_refuses_before_any_reservation(tmp_path, role):
+    async def scenario() -> None:
+        cluster = Cluster()
+        options: dict[str, Any] = {}
+        if role == "expiring-after-permit":
+            # The fixture certificate expires in one hour; this permit earlier.
+            options["expires_at_ms"] = int(time.time() * 1000) + 1800 * 1000
+        async with mediator(tmp_path, cluster, **options) as (_, control, url, root):
+            client = "unknown" if role == "unknown" else "worker"
+            async with httpx.AsyncClient(verify=context(root, client), trust_env=False) as http:
+                response = await http.post(url + ROUTE, content=request_bytes())
+            assert response.status_code == 403 and response.json()["code"] == "unauthorized"
+            assert control.plans == 0 and control.ownership == {}
+            assert not [e for e in cluster.events if e[0] == "POST"]
+
+    asyncio.run(scenario())
+
+
+def test_an_ambiguous_create_is_never_adopted_without_a_witness(tmp_path):
+    async def scenario() -> None:
+        cluster = Cluster()
+        cluster.fault_mode = "ambiguous-create"
+        async with mediator(tmp_path, cluster) as (server, control, url, root):
+            raw = request_bytes()
+            launch_id = json.loads(raw)["launch_id"]
+            cluster.launch_id = launch_id
+            async with httpx.AsyncClient(verify=context(root), trust_env=False) as http:
+                created = await http.post(url + ROUTE, content=raw)
+                assert created.status_code == 202
+                await settled(server, launch_id)
+                # A retire request on an uncertain launch stays uncertain.
+                headers = {launch.CAPABILITY_HEADER: created.json()["control_capability"]}
+                retire = await http.post(url + ROUTE + "/" + launch_id + "/retire", headers=headers)
+                assert retire.status_code == 202 and retire.json()["state"] == "uncertain"
+            pod = object_names(launch_id)[0]
+            row = server._registry.get(OWNER, launch_id)
+            assert row.state == "uncertain" and row.objects.pod_uid is None
+            # The same-name Pod exists and is never deleted on a name match.
+            assert ("pods", pod) in cluster.objects
+            assert not [e for e in cluster.events if e[0] == "DELETE" and "/pods/" in e[1]]
+            assert control.ownership[launch_id] == ("uncertain", None)
+
+    asyncio.run(scenario())
+
+
+def test_an_ambiguous_create_resolves_through_the_guard_witness(tmp_path):
+    async def scenario() -> None:
+        cluster = Cluster()
+        cluster.fault_mode = "ambiguous-create"
+        names: dict[str, str] = {}
+        witness = Witness(
+            lambda: (
+                cluster.objects[("pods", names["pod"])]["metadata"]["uid"]
+                if ("pods", names["pod"]) in cluster.objects
+                else None
+            )
+        )
+        async with mediator(tmp_path, cluster, witness=witness) as (server, control, url, root):
+            raw = request_bytes()
+            launch_id = json.loads(raw)["launch_id"]
+            names["pod"] = object_names(launch_id)[0]
+            cluster.launch_id = launch_id
+            async with httpx.AsyncClient(verify=context(root), trust_env=False) as http:
+                assert (await http.post(url + ROUTE, content=raw)).status_code == 202
+            await settled(server, launch_id)
+            uid = witness.returned[0]
+            assert server._registry.get(OWNER, launch_id).state == "retired"
+            assert control.ownership[launch_id] == ("retired", uid)
+            assert witness.calls[0] == {
+                "kind": "pod",
+                "namespace": "acme-runtime",
+                "name": names["pod"],
+                "create_operation_id": json.loads(raw)["launch_reservation_id"],
+            }
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "witnessed", [None, "foreign", "operation"], ids=["no-witness", "other-uid", "other-operation"]
+)
+def test_a_squatted_name_is_never_adopted(tmp_path, witnessed):
+    async def scenario() -> None:
+        cluster = Cluster()
+        cluster.fault_mode = "squatted"
+        raw = request_bytes()
+        launch_id = json.loads(raw)["launch_id"]
+        pod = object_names(launch_id)[0]
+        foreign = str(uuid4())
+        cluster.objects[("pods", pod)] = {
+            "metadata": {
+                "namespace": "acme-runtime",
+                "name": pod,
+                "uid": foreign,
+                "resourceVersion": "1",
+                "finalizers": ["curietech.ai/protected-launch"],
+            }
+        }
+        options: dict[str, Any] = {}
+        if witnessed == "foreign":
+            options["witness"] = Witness(str(uuid4()))
+        elif witnessed == "operation":
+            # The squatting Pod's own UID, witnessed for another create operation.
+            options["witness"] = Witness(foreign, operation=str(uuid4()))
+        async with mediator(tmp_path, cluster, **options) as (server, control, url, root):
+            cluster.launch_id = launch_id
+            async with httpx.AsyncClient(verify=context(root), trust_env=False) as http:
+                assert (await http.post(url + ROUTE, content=raw)).status_code == 202
+            await settled(server, launch_id)
+            row = server._registry.get(OWNER, launch_id)
+            assert row.state == "uncertain" and row.objects.pod_uid is None
+            assert cluster.objects[("pods", pod)]["metadata"]["uid"] == foreign
+            assert not [e for e in cluster.events if e[0] in {"DELETE", "PATCH"} and pod in e[1]]
+            assert control.ownership[launch_id] == ("uncertain", None)
+
+    asyncio.run(scenario())
+
+
+def test_restart_settles_durable_ownership_without_a_local_row(tmp_path):
+    async def scenario() -> None:
+        cluster = Cluster()
+        control = FakeControl(cluster.events, int(time.time() * 1000) + 2 * 3600 * 1000)
+        orphan = str(uuid4())
+        control.ownership[orphan] = ("creating", None)
+        async with mediator(tmp_path, cluster, control=control) as (server, *_):
+            await server.start_cleanup()
+            for _ in range(60):
+                if control.ownership[orphan][0] == "uncertain":
+                    break
+                await asyncio.sleep(0.05)
+        assert control.ownership[orphan] == ("uncertain", None)
+
+    asyncio.run(scenario())
