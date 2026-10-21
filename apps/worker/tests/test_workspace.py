@@ -2517,6 +2517,116 @@ def test_prepare_batches_skip_worktree_for_many_escaping_links(
     assert len(_workspace_warnings(caplog)) == 1
 
 
+def test_unreachable_clone_reports_git_step_status_and_fatal_line(
+    workspace: Any, tmp_path: Path
+) -> None:
+    """Real git against a closed local port names clone, status 128, and fatal:."""
+
+    origin = "https://127.0.0.1:1"
+    clone_url = f"{origin}/acme-corp/acme-bot.git"
+
+    class _ClosedPortCredentials:
+        def redeem(self, deployment_id: uuid.UUID, conversation_id: str) -> Any:
+            assert conversation_id == "1700000000.000100"
+            return workspace.WorkspaceCredential(
+                repo_full_name="acme-corp/acme-bot",
+                clone_url=clone_url,
+                authorization_header=GIT_CREDENTIAL,
+                origin=origin,
+                header_form="authorization_basic",
+            )
+
+    preparer = workspace.WorkspacePreparer(
+        credentials=_ClosedPortCredentials(),
+        commands=workspace.SubprocessCommands(),
+        objects=_StreamingObjectStore(),
+        scratch_root=tmp_path / "clone-scratch",
+        limits=_limits(workspace, clone_timeout_seconds=20),
+    )
+    with pytest.raises(workspace.WorkspacePreparationError) as caught:
+        _prepare(preparer)
+    message = str(caught.value)
+    assert caught.value.stage == "clone"
+    assert message.startswith(
+        "workspace clone failed: git refused the server-derived repository checkout "
+        "(git clone exited 128: "
+    )
+    assert "fatal:" in message
+    diagnostic = message.split("exited 128: ", 1)[1].removesuffix(")")
+    assert len(diagnostic) <= 240
+
+
+def test_clone_diagnostic_omits_credentials_from_the_exception_and_log(
+    workspace: Any,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    caplog.set_level("DEBUG")
+    secret = "redeemed-credential-value"
+    token = "ghp_" + ("Ab12" * 8)
+    git_bin = tmp_path / "bin"
+    git_bin.mkdir()
+    git = git_bin / "git"
+    git.write_text(
+        "#!/bin/sh\n"
+        f"echo 'note: {secret} must not be kept' >&2\n"
+        "echo 'error: kept-marker' >&2\n"
+        "echo 'fatal: Authorization: Basic "
+        + secret
+        + " "
+        + token
+        + " https://user:"
+        + secret
+        + "@example.test/acme "
+        + ("x" * 300)
+        + " TAILMARKER' >&2\n"
+        "exit 7\n",
+        encoding="utf-8",
+    )
+    git.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{git_bin}{os.pathsep}{os.environ['PATH']}")
+    preparer, _, _ = _preparer(workspace, tmp_path, commands=workspace.SubprocessCommands())
+    with pytest.raises(workspace.WorkspacePreparationError) as caught:
+        _prepare(preparer)
+    message = str(caught.value)
+    assert "(git clone exited 7: " in message
+    assert "fatal:" in message
+    assert "error: kept-marker" in message
+    assert "note:" not in message
+    assert secret not in message
+    assert token not in message
+    assert secret not in caplog.text
+    assert token not in caplog.text
+    diagnostic = message.split("exited 7: ", 1)[1].removesuffix(")")
+    assert len(diagnostic) <= 240
+    assert "https://example.test/acme" in message
+    assert len(diagnostic) <= 240
+    assert "TAILMARKER" not in diagnostic
+
+
+def test_clone_budget_timeout_stays_a_total_budget_timeout(
+    workspace: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ticks = {"count": 0}
+
+    def monotonic() -> float:
+        ticks["count"] += 1
+        # The limiter budgets first. The clone's own budget is the next read.
+        if ticks["count"] <= 2:
+            return 10.0
+        return 10.0 + 151.0
+
+    monkeypatch.setattr(workspace.time, "monotonic", monotonic)
+    preparer, commands, _ = _preparer(workspace, tmp_path, clock=lambda: 0.0)
+    with pytest.raises(workspace.WorkspaceStageTimeout) as caught:
+        _prepare(preparer)
+    assert caught.value.stage == "total"
+    assert str(caught.value) == "workspace total failed: exceeded the 150s budget"
+    assert "git refused" not in str(caught.value)
+    assert not any("clone" in call.get("argv", []) for call in commands.calls)
+
+
 def test_prepare_keeps_internal_checkout_link(
     workspace: Any, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
