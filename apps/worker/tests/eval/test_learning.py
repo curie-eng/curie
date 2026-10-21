@@ -983,6 +983,7 @@ def frozen_report(tmp_path: Path) -> dict[str, Any]:
         # Synthetic test data: fixture-derived control records with bound evidence.
         control_ids = {
             2: ("instruction-correction", "conflicting-request"),
+            3: ("fact-correction",),
             5: ("revise-and-cancel",),
             8: ("revert",),
         }
@@ -996,7 +997,15 @@ def frozen_report(tmp_path: Path) -> dict[str, Any]:
                     "evidence_ref": _evidence(
                         report,
                         "control-observation",
-                        {**scope, "control_id": control_id, "status": "PASS"},
+                        {
+                            **scope,
+                            "control_id": control_id,
+                            "status": "PASS",
+                            # Synthetic test data: one check that recomputes to PASS.
+                            "checks": [
+                                {"kind": "contains", "reply": "violet-a1b2c1", "expected": "violet"}
+                            ],
+                        },
                     ),
                 }
             )
@@ -2494,12 +2503,19 @@ def test_unfinalized_turn_cannot_settle_below_its_reservation(
         _value(report, case["reply_ref"])["result"]["finalized"] = False
     _rehash(report)
     _check(tmp_path, report, passed=False)
-    # The same operation held unresolved at its full reservation is honest and passes.
-    operation.pop("settled_usd")
+    # Held unresolved at its full reservation, the accounting is honest: the report still
+    # fails, but because the primary turn did not finalize, not because of settlement.
     operation.pop("usage_polls")
-    operation.update(status="unresolved", charged_usd=operation["reserve_usd"])
+    operation.update(
+        status="unresolved",
+        settled_usd=operation["reserve_usd"],
+        charged_usd=operation["reserve_usd"],
+    )
     _rehash(report)
-    _check(tmp_path, report, passed=True)
+    result = verify_report(_write(tmp_path / "report.json", report))
+    assert result.passed is False
+    assert "settle" not in result.detail
+    assert "finaliz" in result.detail or "turn failed" in result.detail
 
 
 @pytest.mark.parametrize("fixture_id", ["F1-P1", "F6-P2", "F7-P3"])
@@ -2519,7 +2535,14 @@ def test_passing_durable_or_judged_decision_cannot_drop_semantic_or_judge_refere
 
 
 @pytest.mark.parametrize(
-    "control_id", ["instruction-correction", "conflicting-request", "revise-and-cancel", "revert"]
+    "control_id",
+    [
+        "instruction-correction",
+        "conflicting-request",
+        "fact-correction",
+        "revise-and-cancel",
+        "revert",
+    ],
 )
 def test_report_missing_a_fixture_derived_control_record_fails(
     tmp_path: Path, frozen_report: dict[str, Any], control_id: str
