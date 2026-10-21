@@ -150,6 +150,9 @@ REASONS = frozenset(
         "node_probe_unavailable",
         "node_capable_pod",
         "separate_authority_domain_required",
+        # Case 5 workload_replaced: the original TCP sequence state cannot be
+        # reproduced from user space, so a non-delivery cannot be claimed as a pass.
+        "sequence_state_unavailable",
     }
 )
 # Clause 1, channel digests. The CNI digest is built from the fact (later slice).

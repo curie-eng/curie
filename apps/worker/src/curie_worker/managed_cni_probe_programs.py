@@ -386,29 +386,37 @@ _SPOOF_FLAGS = frozenset({0x02, 0x10, 0x18})
 _NONCE = re.compile(r"[0-9a-f]{16,64}")
 
 
-def _validate_spoof_argument(argument: Mapping[str, Any]) -> None:
-    """Fence the raw-socket sender: well-formed packets only, no free-form crafting.
+def _ip(value: Any) -> str:
+    require(type(value) is str)
+    assert isinstance(value, str)
+    try:
+        ipaddress.ip_address(value)
+    except ValueError:
+        refuse()
+    return value
 
-    The source must differ from the destination (a forged source), ports are in
-    range, flags are from the fixed set, and the per-packet repeat and interval are
-    capped to the producer constants. The destination being one of the kit's own
-    listeners is enforced by the caller, which only ever targets owned twins.
+
+def _validate_spoof_argument(argument: Mapping[str, Any]) -> None:
+    """Fence the raw-socket sender at render: it may only forge the one source the
+    case chose and target the one owned listener the case names.
+
+    Every packet must carry exactly the declared ``source`` (the non-owned forged
+    address) and ``destination`` (the kit's own listener); any other source or
+    destination is refused here, not deferred to the caller. Ports are in range,
+    flags are from the fixed set, and the per-packet repeat and interval are capped.
     """
     packets = argument.get("packets")
     require(isinstance(packets, list) and 0 < len(packets) <= 8)
+    source, destination = _ip(argument.get("source")), _ip(argument.get("destination"))
+    require(source != destination)  # the forged source is never the destination itself
     repeat, interval = argument.get("repeat", 1), argument.get("interval_ms", 0)
     require(type(repeat) is int and 1 <= repeat <= 5)
     require(type(interval) is int and 0 <= interval <= 1000)
     assert isinstance(packets, list)
     for item in packets:
         require(isinstance(item, dict))
-        for addr in (item.get("src"), item.get("addr")):
-            require(type(addr) is str)
-            try:
-                ipaddress.ip_address(addr)
-            except ValueError:
-                refuse()
-        require(item["src"] != item["addr"])  # a forged source, never the destination itself
+        # Exactly the declared forged source and the one owned destination.
+        require(_ip(item.get("src")) == source and _ip(item.get("addr")) == destination)
         require(type(item.get("port")) is int and 0 < item["port"] < 65536)
         require(item.get("proto") in ("tcp", "udp"))
         require(type(item.get("nonce")) is str and bool(_NONCE.fullmatch(item["nonce"])))

@@ -124,8 +124,20 @@ class ModelCluster:
         self.node_local_reaches = True
         # Node-local traffic arrives from a tunnel/overlay address, not a node IP.
         self.node_local_tunnel = False
+        # The kubelet-probe pod's readiness probe never executes (no Ready condition).
+        self.kubelet_readiness_absent = False
         # The post-change liveness control (ret-control) cannot reach the listener.
         self.drop_liveness = False
+        # A sender writes no result line (case 4: a missing sender record).
+        self.sender_result_missing = False
+        # The raw-socket injector cannot send (case 5 workload_replaced).
+        self.spoof_send_fails = False
+        # The retained sender sends no heartbeat after the policy change (case 5).
+        self.retained_no_post = False
+        # Confirming address absence takes longer than the 30 s freshness bound.
+        self.slow_absence = False
+        # Templates created, as (namespace, template), to assert placement (case 5/8).
+        self.created_templates: list[tuple[str, str]] = []
         # Any ordinary identity allowed node-capable rights, by (identity, resource).
         self.extra_pods: list[dict[str, Any]] = []
 
@@ -177,11 +189,16 @@ class ModelCluster:
         self.pods[(namespace, name)] = pod
         self.ip_owner[ip] = (namespace, name)
         self.logs[(namespace, name)] = []
+        template = pod["metadata"]["labels"].get("curietech.ai/managed-cni-probe-template", "")
+        self.created_templates.append((namespace, template))
         kind = pod["program"]
         if kind == "listener":
             self.logs[(namespace, name)].append({"ev": "ready", "t": self._ms()})
         elif kind == "idle":
             self.logs[(namespace, name)].append({"ev": "ready", "t": self._ms()})
+            # The readiness probe runs unless told otherwise, leaving a Ready condition.
+            if not self.kubelet_readiness_absent:
+                pod["status"]["conditions"] = [{"type": "Ready", "status": "False"}]
             self._kubelet(pod)
         elif kind == "spoof":
             self._spoof_send(pod)
@@ -208,7 +225,10 @@ class ModelCluster:
                     {"ev": item["proto"] if item["proto"] in ("tcp", "udp") else "tcp",
                      "peer": item["src"], "port": item["port"], "nonce": nonce, "t": self._ms()}
                 )
-            packets.append([nonce, "sent" if ":" not in item["src"] else "unsupported_family"])
+            if self.spoof_send_fails:
+                packets.append([nonce, "error:Blocked"])
+            else:
+                packets.append([nonce, "sent" if ":" not in item["src"] else "unsupported_family"])
         self.now += 0.2
         self.logs[(sender["metadata"]["namespace"], sender["metadata"]["name"])].append(
             {"ev": "result", "packets": packets, "t": self._ms()}
@@ -251,6 +271,9 @@ class ModelCluster:
         for i, nonce in enumerate(state["nonces"]):
             at = established + i * interval
             if at > self._ms():
+                break
+            # Model a sender that stops once the allowance is removed: no post heartbeat.
+            if self.retained_no_post and self.ret_deny_ms is not None and at > self.ret_deny_ms:
                 break
             sent.append([nonce, at, "ok"])
             # Enforcing cuts the flow at the policy change; a conntrack engine that
@@ -333,6 +356,9 @@ class ModelCluster:
             "argument"
         ].get("nonce_only"):
             self.busy_until[node] = self.now + 5.0
+        if self.sender_result_missing:
+            # Model a sender whose result line never appears: no record to parse.
+            return
         self.logs[(sender["metadata"]["namespace"], sender["metadata"]["name"])].append(
             {"ev": "result", "start": start, "end": self._ms(), "attempts": results}
         )
@@ -424,8 +450,10 @@ class ModelCluster:
             return True
         if any("hostPath" in v for v in spec.get("volumes", []) or []):
             return True
-        if any(c.get("securityContext", {}).get("privileged") for c in spec.get("containers", [])):
-            return True
+        for group in ("containers", "initContainers", "ephemeralContainers"):
+            containers = spec.get(group, []) or []
+            if any(c.get("securityContext", {}).get("privileged") for c in containers):
+                return True
         return any(
             t.get("key") == "curietech.ai/eligible-node" for t in spec.get("tolerations", []) or []
         )
@@ -449,6 +477,10 @@ class ModelCluster:
                 },
             ]
         if collection == "pods":
+            if self.slow_absence:
+                # Confirming absence takes longer than the 30 s freshness bound.
+                self.now += 31.0
+                self.slow_absence = False
             return [
                 {
                     "metadata": {"name": pod["metadata"]["name"],
@@ -501,11 +533,21 @@ def outcomes(measurement: Measurement) -> dict[tuple[int, str, str, str, str], t
     return {item.key: (item.outcome, item.reason) for item in measurement.entries}
 
 
-def test_enforcing_two_node_cluster_passes_every_required_entry() -> None:
+def test_enforcing_two_node_cluster_passes_every_entry_it_can_measure() -> None:
     cluster = ModelCluster()
     measurement = measure(cluster)
-    assert measurement.refusal is None, outcomes(measurement)
-    assert accepts(measurement.entries, required_entries(LAYOUT))
+    result = outcomes(measurement)
+    # Every entry passes except case 5 workload_replaced, which is unavailable by
+    # design: the original TCP sequence state cannot be reproduced from user space,
+    # so the campaign refuses on it (an enforcing CNI never leaks, so no fail).
+    assert measurement.refusal == "sequence_state_unavailable", result
+    assert result[(5, "workload_replaced", "ipv4", "same_node", "retained_peer")] == (
+        "unavailable",
+        "sequence_state_unavailable",
+    )
+    others = {k: v for k, v in result.items() if k[:2] != (5, "workload_replaced")}
+    assert all(outcome == "pass" for outcome, _ in others.values()), others
+    assert not accepts(measurement.entries, required_entries(LAYOUT))
     assert cluster.pods == {}  # every probe pod was deleted by UID
 
 
@@ -557,7 +599,11 @@ def test_reviews_skip_the_system_set_and_the_measuring_identity() -> None:
         ("system:masters", "pods"),
         ("system:serviceaccount:control:measuring", "pods"),
     }
-    assert measure(cluster).refusal is None
+    # The system set and the measuring identity are not ordinary identities, so no
+    # review fails; the only non-pass is the by-design workload_replaced entry.
+    result = outcomes(measure(cluster))
+    assert not [key for key, (outcome, _) in result.items() if outcome == "fail"], result
+    assert result[(2, "rbac_refusal", "none", "none", "none")] == ("pass", "reviews_denied")
 
 
 def test_a_policy_change_during_the_campaign_fails_case_eight() -> None:
@@ -619,7 +665,10 @@ def test_a_destination_nobody_can_reach_is_unavailable_not_pass() -> None:
 
 def test_each_target_is_forged_separately_and_each_must_be_refused() -> None:
     cluster = ModelCluster()
-    assert measure(cluster).refusal is None
+    assert outcomes(measure(cluster))[(2, "guard_refusal", "none", "none", "none")] == (
+        "pass",
+        "guard_refused",
+    )
     # Case 2 forges the broker and mediator selector labels; case 7's node-capable
     # dry-runs carry no role label and are not these forgeries.
     roles = sorted(labels[ROLE] for labels in cluster.forgeries if ROLE in labels)
@@ -672,9 +721,11 @@ def test_an_enforcing_cluster_passes_every_timing_case() -> None:
         "denied",
     )
     assert result[(5, "policy_changed", "ipv4", "same_node", "retained_peer")] == ("pass", "denied")
+    # workload_replaced cannot be a pass from user space (no original sequence state):
+    # a non-leaking engine yields unavailable, never pass.
     assert result[(5, "workload_replaced", "ipv4", "same_node", "retained_peer")] == (
-        "pass",
-        "denied",
+        "unavailable",
+        "sequence_state_unavailable",
     )
     assert result[(7, "node_origin", "ipv4", "same_node", "node")] == ("pass", "reaches")
     assert result[(7, "rbac_node_capability", "none", "none", "none")] == ("pass", "reviews_denied")
@@ -772,10 +823,13 @@ def test_admission_that_admits_a_node_capable_pod_fails_case_seven() -> None:
 def test_node_local_blocked_is_a_recorded_fact_not_a_refusal() -> None:
     cluster = ModelCluster()
     cluster.node_local_reaches = False
-    measurement = measure(cluster)
-    assert measurement.refusal is None
-    result = outcomes(measurement)
+    result = outcomes(measure(cluster))
+    # node_origin blocked is a recorded pass, not a refusal source; it does not
+    # drive the campaign refusal (that is the by-design workload_replaced entry).
     assert result[(7, "node_origin", "ipv4", "same_node", "node")] == ("pass", "blocked")
+    assert (7, "node_origin", "ipv4", "same_node", "node") not in {
+        key for key, (outcome, _) in result.items() if outcome != "pass"
+    }
 
 
 def test_node_capable_rights_when_node_local_reaches_force_a_separate_domain() -> None:
@@ -805,3 +859,111 @@ def test_nodes_proxy_allowed_fails_rbac_node_capability() -> None:
     cluster.allowed_reviews = {("alice", "nodes")}
     result = outcomes(measure(cluster))
     assert result[(7, "rbac_node_capability", "none", "none", "none")] == ("fail", "review_allowed")
+
+
+def _run_for(cluster: ModelCluster):  # type: ignore[no-untyped-def]
+    from curie_worker.managed_cni_cases import _Run
+
+    return _Run(cluster, LAYOUT, cluster.clock, cluster.sleep)
+
+
+def test_address_reuse_with_no_sender_record_is_unavailable_not_pass() -> None:
+    # Item 3: address_reuse parses the reusing pod's own client result; a missing
+    # sender record cannot read as a clean denial. Called directly so the missing
+    # record does not gate an earlier case.
+    from curie_worker.managed_cni_cases import _twins
+    from curie_worker.managed_cni_timing import _address_reuse
+
+    cluster = ModelCluster()
+    cluster.sender_result_missing = True
+    run = _run_for(cluster)
+
+    async def go() -> Any:
+        twins = await _twins(run)
+        return await _address_reuse(run, twin=twins["broker"], broker=BROKER, family="ipv4")
+
+    entry = asyncio.run(go())
+    assert (entry.outcome, entry.reason) == ("unavailable", "phase_timeout")
+
+
+def test_running_node_capability_sees_a_privileged_init_container() -> None:
+    cluster = ModelCluster()
+    cluster.extra_pods = [
+        {
+            "metadata": {"name": "intruder", "namespace": "kube-system"},
+            "spec": {
+                "nodeName": "n1",
+                "containers": [{}],
+                "initContainers": [{"securityContext": {"privileged": True}}],
+            },
+            "status": {},
+        }
+    ]
+    assert outcomes(measure(cluster))[(7, "running_node_capability", "none", "none", "none")] == (
+        "fail",
+        "node_capable_pod",
+    )
+
+
+def test_case_five_listeners_land_in_the_probe_namespace() -> None:
+    # Item 8: the retained listener uses the probe_listener template in probe-a, not
+    # the protected-namespace twin template.
+    cluster = ModelCluster()
+    measure(cluster)
+    assert ("probe-a", "probe_listener") in cluster.created_templates
+    assert ("probe-a", "twin") not in cluster.created_templates
+
+
+def test_spoof_terminated_refuses_a_stale_address() -> None:
+    # Item 9: an address confirmed absent more than 30 s earlier no longer measures a
+    # recently terminated one.
+    cluster = ModelCluster()
+    cluster.slow_absence = True
+    result = outcomes(measure(cluster))
+    assert result[(3, "spoof_terminated", "ipv4", "same_node", "raw_socket")] == (
+        "unavailable",
+        "address_reassigned",
+    )
+
+
+def test_policy_changed_with_no_post_heartbeat_is_unavailable() -> None:
+    # Item 2: without a heartbeat sent past the bound, retention cannot be judged.
+    cluster = ModelCluster()
+    cluster.retained_no_post = True
+    result = outcomes(measure(cluster))
+    assert result[(5, "policy_changed", "ipv4", "same_node", "retained_peer")] == (
+        "unavailable",
+        "phase_timeout",
+    )
+
+
+def test_node_origin_without_a_readiness_result_is_unavailable() -> None:
+    # Item 4: the kubelet-probe pod exists but its readiness probe never ran, so a
+    # silent twin cannot be read as blocked.
+    cluster = ModelCluster()
+    cluster.kubelet_readiness_absent = True
+    result = outcomes(measure(cluster))
+    assert result[(7, "node_origin", "ipv4", "same_node", "node")] == (
+        "unavailable",
+        "node_probe_unavailable",
+    )
+
+
+def test_an_injector_that_never_sent_makes_workload_replaced_unavailable() -> None:
+    # Item 1: the spoof injector's result is parsed; if it did not send, the entry is
+    # unavailable rather than a vacuous pass. Called directly so it does not gate case 3.
+    from curie_worker.managed_cni_cases import _twins
+    from curie_worker.managed_cni_timing import _workload_replaced
+
+    cluster = ModelCluster()
+    cluster.spoof_send_fails = True
+    run = _run_for(cluster)
+
+    async def go() -> Any:
+        twins = await _twins(run)
+        return await _workload_replaced(
+            run, twin=twins["broker"], broker=BROKER, family="ipv4", placement="same_node"
+        )
+
+    entry = asyncio.run(go())
+    assert (entry.outcome, entry.reason) == ("unavailable", "transport_unavailable")

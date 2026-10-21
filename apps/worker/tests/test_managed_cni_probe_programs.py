@@ -159,6 +159,8 @@ VALID_ARGUMENT: dict[str, Any] = {
     "probe_host": "10.0.0.5",
     "probe_port": 16379,
     "attempts": [],
+    "source": "10.0.0.1",
+    "destination": "10.0.0.2",
     "packets": [{"src": "10.0.0.1", "addr": "10.0.0.2", "port": 16379, "proto": "tcp",
                  "nonce": "ab" * 16}],
     "repeat": 1,
@@ -252,10 +254,12 @@ def test_template_refuses_what_it_does_not_allow(changes: dict[str, Any]) -> Non
         probe_pod(**arguments)
 
 
-def _spoof_pod(packets: Any, **extra: Any) -> dict[str, Any]:
+def _spoof_pod(packets: Any, *, source: str = "10.0.0.1", destination: str = "10.0.0.2",
+               **extra: Any) -> dict[str, Any]:
     return probe_pod(
         template="spoofing", name="p", namespace="probe-a", node="n", campaign="c1",
-        role_labels={}, argument={"packets": packets, "repeat": 1, "interval_ms": 0, **extra},
+        role_labels={}, argument={"source": source, "destination": destination, "packets": packets,
+                                  "repeat": 1, "interval_ms": 0, **extra},
     )
 
 
@@ -266,7 +270,6 @@ def test_spoofing_template_renders_only_well_formed_packets() -> None:
     )
     bad_cases: list[Any] = [
         [],  # no packets
-        [dict(ok[0], src=ok[0]["addr"])],  # source equal to destination
         [dict(ok[0], addr="not-an-ip")],  # destination not an address
         [dict(ok[0], proto="icmp")],  # protocol not tcp/udp
         [dict(ok[0], flags=0x04)],  # a flag outside the fixed set (RST)
@@ -283,6 +286,19 @@ def test_spoofing_template_renders_only_well_formed_packets() -> None:
         _spoof_pod(ok, interval_ms=2000)
     with pytest.raises(ProbeKitRefused):
         _spoof_pod(ok * 9)
+
+
+def test_spoofing_rejects_any_destination_or_source_but_the_declared_pair() -> None:
+    ok = {"src": "10.0.0.1", "addr": "10.0.0.2", "port": 16379, "proto": "tcp", "nonce": "a" * 32}
+    # A packet to a destination other than the declared owned listener is refused.
+    with pytest.raises(ProbeKitRefused):
+        _spoof_pod([dict(ok, addr="10.0.0.99")])
+    # A packet forging a source other than the declared non-owned address is refused.
+    with pytest.raises(ProbeKitRefused):
+        _spoof_pod([dict(ok, src="10.0.0.42")])
+    # The declared source may not equal the declared destination.
+    with pytest.raises(ProbeKitRefused):
+        _spoof_pod([ok], source="10.0.0.2")
 
 
 def test_probe_kit_digest_is_stable() -> None:

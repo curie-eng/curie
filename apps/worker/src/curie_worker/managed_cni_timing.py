@@ -305,7 +305,7 @@ async def _spoof_target(
                 return ("unavailable", "address_reassigned"), record
             sender = await _start_sender(
                 run, template="spoofing", namespace=layout.probe_namespace, node=node, labels={},
-                argument={"packets": packets,
+                argument={"destination": twin_address, "source": forged, "packets": packets,
                           "repeat": PRODUCER_CONSTANTS["denial_tcp_attempts"],
                           "interval_ms": PRODUCER_CONSTANTS["attempt_interval_ms"]},
             )
@@ -847,20 +847,29 @@ async def _workload_replaced(
     start_ms = int(run.clock() * 1000)
     data_nonce, syn_nonce = _nonce(), _nonce()
     run.nonces.update([data_nonce, syn_nonce])
-    try:
-        await _start_sender(
-            run, template="spoofing", namespace=layout.probe_namespace, node=node, labels={},
-            argument={"packets": [
-                # A data segment in the original four-tuple (last sequence state),
+    injector = await _start_sender(
+        run, template="spoofing", namespace=layout.probe_namespace, node=node, labels={},
+        argument={
+            "destination": hold_ip,
+            "source": laddr,
+            "packets": [
+                # A data segment in the original four-tuple (resumes the flow),
                 {"src": laddr, "addr": hold_ip, "port": broker.port, "proto": "tcp",
                  "nonce": data_nonce, "sport": lport, "flags": 0x10, "with_payload": True},
                 # plus a fresh SYN from the original source port.
                 {"src": laddr, "addr": hold_ip, "port": broker.port, "proto": "tcp",
                  "nonce": syn_nonce, "sport": lport, "flags": 0x02},
-            ], "repeat": PRODUCER_CONSTANTS["denial_tcp_attempts"],
-               "interval_ms": PRODUCER_CONSTANTS["attempt_interval_ms"]},
-        )
-    except ProbeKitRefused:
+            ],
+            "repeat": PRODUCER_CONSTANTS["denial_tcp_attempts"],
+            "interval_ms": PRODUCER_CONSTANTS["attempt_interval_ms"],
+        },
+    )
+    # The injection must actually have left the raw socket, or we exercised nothing.
+    spoof = None if injector is None else parse_spoof_log(
+        await run.cluster.pod_log(injector.namespace, injector.name)
+    )
+    if spoof is None or not spoof.sent:
+        evidence["injector"] = _pod_evidence(injector)
         return _entry(run, key, verdict=("unavailable", "transport_unavailable"), evidence=evidence)
     end_ms = int(run.clock() * 1000) + PRODUCER_CONSTANTS["retained_bound_ms"] + PRODUCER_CONSTANTS[
         "listener_window_ms"
@@ -869,24 +878,22 @@ async def _workload_replaced(
         run, hold, nonces=[data_nonce, syn_nonce], peers=[laddr], start_ms=start_ms, end_ms=end_ms
     )
     control_ok = await _allowed_control(run, broker, hold, node, family)
-    verdict = judge_retained(
-        RetainedEvidence(
-            established=established,
-            listener_ready=window.ready,
-            on_requested_node=reuser[0].node == node,
-            family_address=True,
-            post_trigger_deliveries=deliveries,
-            sockets_sampled=window.sampled,
-            window_covered=window.covered,
-            overflow_moved=window.moved,
-            trigger_confirmed=True,
-            control_succeeded=control_ok,
-            reuse_provoked=True,
-        )
-    )
     evidence.update({"sender_address": laddr, "source_port": lport, "reuse_provoked": True,
-                     "deliveries": deliveries, "control_succeeded": control_ok})
-    return _entry(run, key, verdict=verdict, evidence=evidence)
+                     "injector": _pod_evidence(injector), "deliveries": deliveries,
+                     "control_succeeded": control_ok})
+    if deliveries:
+        # Connection tracking let the resumed four-tuple through: a real leak.
+        return _entry(run, key, verdict=("fail", "retained_flow"), evidence=evidence)
+    if not (established and control_ok):
+        return _entry(run, key, verdict=("unavailable", "control_failed"), evidence=evidence)
+    if not (window.ready and window.sampled and window.covered):
+        return _entry(run, key, verdict=("unavailable", "listener_incomplete"), evidence=evidence)
+    # Nothing was delivered, but the producer cannot reproduce the original TCP
+    # sequence state from user space, so a non-delivery does not prove refusal of a
+    # faithfully-resumed flow. It is unavailable, never a pass (ADR 0238 explicit
+    # outcome). Only a producer with raw sequence state, or E5, can pass this.
+    return _entry(run, key, verdict=("unavailable", "sequence_state_unavailable"),
+                  evidence=evidence)
 
 
 async def _provoke_reuse(
@@ -992,6 +999,14 @@ async def _node_origin(
                       evidence=evidence)
     if kubelet is None:
         # The kubelet-probe pod never started, so no node-local traffic was driven.
+        return _entry(run, key, verdict=("unavailable", "node_probe_unavailable"),
+                      evidence=evidence)
+    # The readiness probe must actually have executed (a Ready condition is present,
+    # True or False). Without it, a silent twin cannot be read as "blocked".
+    kubelet_pod = await run.cluster.read_pod(kubelet.namespace, kubelet.name)
+    conditions = (kubelet_pod or {}).get("status", {}).get("conditions", [])
+    if not any(c.get("type") == "Ready" for c in conditions):
+        evidence["readiness"] = "absent"
         return _entry(run, key, verdict=("unavailable", "node_probe_unavailable"),
                       evidence=evidence)
     end_ms = int(run.clock() * 1000) + PRODUCER_CONSTANTS["listener_window_ms"]
