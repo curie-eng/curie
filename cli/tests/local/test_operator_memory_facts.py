@@ -13,6 +13,7 @@ import subprocess
 import threading
 import urllib.error
 import urllib.request
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -77,14 +78,85 @@ def _state_path(agent_id: str, key: str | None = None, channel: tuple[str, str] 
     return "/" + "/".join(quote(segment, safe="") for segment in segments)
 
 
-def _fact(statement: str, author: str, day: str) -> dict[str, str]:
-    # The canonical producer is runner/src/curie_runner/memory_facts.py::_fact_value.
+def _fact(
+    statement: str, author: str, day: str, *, kind: str = "fact", title: str | None = None
+) -> dict[str, Any]:
+    # The typed canonical value (ADR 0239, Contract r4). The platform key keeps
+    # the body's provenance fields; a sandbox write has them stamped instead.
     return {
+        "kind": kind,
+        "title": title or statement[:80],
         "statement": statement,
         "author": author,
         "stated_at": f"2026-10-{day}T03:04:05.123456+00:00",
         "session_id": "session-example-1",
+        "conversation": None,
+        "archived": False,
     }
+
+
+def _listed(fact_id: str, channel: tuple[str, str] | None, value: dict[str, Any], version: int):
+    """The `curie <tier> --json memory` fact object for a stored canonical value."""
+    return {
+        "id": fact_id,
+        "scope": "agent" if channel is None else "channel",
+        "channel": None if channel is None else {"kind": channel[0], "address": channel[1]},
+        "kind": value["kind"],
+        "title": value["title"],
+        "statement": value["statement"],
+        "author": value["author"],
+        "stated_at": value["stated_at"],
+        "conversation": value["conversation"],
+        "archived": value["archived"],
+        "version": version,
+    }
+
+
+def _compose_container(api: Stack, service: str) -> str:
+    project = api.env["COMPOSE_PROJECT_NAME"]
+    found = _run(
+        [
+            "docker", "ps", "-q",
+            "--filter", f"label=com.docker.compose.project={project}",
+            "--filter", f"label=com.docker.compose.service={service}",
+        ],
+        env=api.env,
+    )
+    ids = found.stdout.split()
+    if found.returncode or len(ids) != 1:
+        raise RuntimeError(f"expected one {service} container in {project}: {found.stderr}")
+    return ids[0]
+
+
+def seed_corrupt_row(
+    api: Stack, agent_id: str, key: str, value: Any, channel: tuple[str, str] | None = None
+) -> None:
+    """Write a preexisting malformed canonical row straight into Postgres.
+
+    The API now refuses a malformed canonical value, so historical corruption
+    can only predate it. This stands in for that history through the real
+    database, never through a second accepted write shape.
+    """
+    pair = None if channel is None else f"{channel[0]}:{channel[1]}".replace("'", "''")
+    scope = "NULL" if pair is None else f"'{pair}'"
+    payload = json.dumps(value)
+    if "$curie$" in payload:
+        raise ValueError("seed value collides with the SQL quote tag")
+    sql = (
+        "INSERT INTO curie.workflow_state_entries "
+        "(id, agent_id, binding_scope, namespace, key, value, version) VALUES "
+        f"(gen_random_uuid(), '{uuid.UUID(agent_id)}', {scope}, 'memory', "
+        f"'{key.replace(chr(39), chr(39) * 2)}', $curie${payload}$curie$::jsonb, 1);"
+    )
+    result = subprocess.run(
+        [
+            "docker", "exec", "-i", _compose_container(api, "postgres"),
+            "psql", "-v", "ON_ERROR_STOP=1", "-U", "postgres", "-d", "postgres",
+        ],
+        input=sql, env=api.env, text=True, capture_output=True, timeout=60, check=False,
+    )
+    if result.returncode:
+        raise RuntimeError(f"seeding a corrupt row failed: {result.stderr}")
 
 
 @dataclass
@@ -165,17 +237,9 @@ def memory_case(stack: Stack, tmp_path: pathlib.Path) -> MemoryCase:
     ]
     expected_facts = []
     for name, fact_id, channel, value in seeds:
-        _need_http(stack, paths[name], "PUT", {"value": value})
-        expected_facts.append(
-            {
-                "id": fact_id,
-                "scope": "agent" if channel is None else "channel",
-                "channel": None if channel is None else {"kind": channel[0], "address": channel[1]},
-                "statement": value["statement"],
-                "author": value["author"],
-                "stated_at": value["stated_at"],
-            }
-        )
+        stored = _need_http(stack, paths[name], "PUT", {"value": value})
+        assert stored["version"] == 1, stored
+        expected_facts.append(_listed(fact_id, channel, value, stored["version"]))
     for name in ("other", "noncanonical"):
         _need_http(stack, paths[name], "PUT", {"value": {"statement": "not a canonical fact"}})
     for name in ("acme-empty", "acme-malformed"):
@@ -187,11 +251,16 @@ def memory_case(stack: Stack, tmp_path: pathlib.Path) -> MemoryCase:
             status=201,
         )
         if name == "acme-malformed":
-            _need_http(
+            # The API refuses to store this shape now (Contract r4: 422).
+            refused, _ = _http(
                 stack,
                 _state_path(created["id"], FACT),
                 "PUT",
                 {"value": {"statement": "missing stored provenance"}},
+            )
+            assert refused == 422, refused
+            seed_corrupt_row(
+                stack, created["id"], FACT, {"statement": "missing stored provenance"}
             )
     guidance_file = tmp_path / "guidance.md"
     guidance_file.write_text("Save explicit preferences and their attribution.")
@@ -325,14 +394,19 @@ def test_operator_memory_facts(memory_case: MemoryCase, tier: str) -> None:
     assert len(initial["facts"]) == len(case.expected_facts), initial
     for expected in case.expected_facts:
         assert initial["facts"].count(expected) == 1, initial
-    assert case.schema["$id"] == "https://schemas.curietech.ai/cli/memory/v2.2.json"
-    assert _need_http(case.api, f"/agents/{case.agent_id}")["memory_writes"] is False
+    assert case.schema["$id"].startswith("https://schemas.curietech.ai/cli/memory/v3")
+    stored_agent = _need_http(case.api, f"/agents/{case.agent_id}")
+    assert stored_agent["memory_writes"] is False
+    assert stored_agent["agent_wide_learning"] is False
 
     human = _cli(case, tier)
     assert human.returncode == 0, human.stderr
     for fact in case.expected_facts:
         for value in (fact["id"], fact["statement"], fact["author"], fact["stated_at"][:10]):
             assert value in human.stdout, human.stdout
+        line = next(row for row in human.stdout.splitlines() if fact["statement"] in row)
+        assert "fact" in line.replace(fact["id"], ""), line
+        assert "archived" not in line.lower(), line
     assert "(agent)" in human.stdout, human.stdout
     assert SLACK[1] in human.stdout and WEBHOOK[1] in human.stdout
     assert "not a canonical fact" not in human.stdout
@@ -441,3 +515,16 @@ def test_operator_memory_facts(memory_case: MemoryCase, tier: str) -> None:
     remaining = _json_cli(case, tier)
     assert remaining["facts"] == [] and remaining["entries"] == later["entries"]
     _refused(case, tier, agent=case.malformed_agent, evidence=FACT)
+    # A corrupt historical head stays removable with CAS (plan: behavior sites).
+    malformed = _need_http(case.api, "/agents")
+    malformed_id = next(a["id"] for a in malformed if a["name"] == case.malformed_agent)
+    corrupt_path = _state_path(malformed_id, FACT)
+    assert _need_http(case.api, corrupt_path)["version"] == 1
+    assert _json_cli(case, tier, "--delete", FACT, agent=case.malformed_agent) == {
+        "agent": case.malformed_agent, "id": FACT, "scope": "agent", "channel": None,
+        "deleted": True,
+    }
+    assert _http(case.api, corrupt_path)[0] == 404
+    assert _json_cli(case, tier, agent=case.malformed_agent) == {
+        "agent": case.malformed_agent, "entries": [], "facts": [],
+    }

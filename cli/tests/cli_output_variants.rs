@@ -35,8 +35,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use curie::api::{
-    ApprovalRecord, ChannelBinding, HookFireRecord, MemoryEntry, MetricPoint, MetricSeries,
-    MetricsSummary, ScheduleList, Version,
+    ApprovalRecord, ChannelBinding, HookFireRecord, MemoryDetail, MemoryEntry, MemoryRecord,
+    MemoryRevision, MetricPoint, MetricSeries, MetricsSummary, ScheduleList, Version,
 };
 use curie::channel_token::ChannelTokenOutput;
 use curie::commands::{
@@ -171,6 +171,23 @@ fn memory_entry() -> MemoryEntry {
         "version": 1,
     }))
     .expect("MemoryEntry mirror deserializes from its own wire shape")
+}
+
+fn memory_record() -> MemoryRecord {
+    serde_json::from_value(serde_json::json!({
+        "id": "fact-0123456789abcdef0123456789abcdef",
+        "scope": "agent",
+        "kind": "fact",
+        "title": "Reply length",
+        "statement": "prefer terse",
+        "author": "U0EXAMPLE1",
+        "stated_at": "2026-10-01T03:04:05Z",
+        "conversation": null,
+        "archived": true,
+        "version": 2,
+        "updated_at": "2026-10-02T03:04:05Z",
+    }))
+    .expect("MemoryRecord mirror deserializes from its own wire shape")
 }
 
 fn approval_record() -> ApprovalRecord {
@@ -384,6 +401,7 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                 execution_deadline_seconds: Some(90),
                 runner_resources: None,
                 memory_writes: true,
+                agent_wide_learning: false,
                 learned_skills: true,
                 changed: true,
             },
@@ -521,6 +539,32 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                 fresh_session_required: true,
                 message_verb: "local".to_string(),
             },
+            "Record" => MemoryOutput::Record(memory_record()),
+            "Detail" => MemoryOutput::Detail(MemoryDetail {
+                entry: Some(memory_record()),
+                deleted: false,
+                version: 2,
+                history: vec![MemoryRevision {
+                    version: 2,
+                    operation: "archive".to_string(),
+                    actor: "operator".to_string(),
+                    source: "operator".to_string(),
+                    conversation: None,
+                    created_at: "2026-10-02T03:04:05Z".to_string(),
+                    reverted_to_version: None,
+                    snapshot: Some(serde_json::json!({
+                        "kind": "fact",
+                        "title": "Reply length",
+                        "statement": "prefer terse",
+                        "author": "U0EXAMPLE1",
+                        "stated_at": "2026-10-01T03:04:05Z",
+                        "session_id": "session-example-1",
+                        "conversation": null,
+                        "archived": true,
+                    })),
+                }],
+                history_before: None,
+            }),
         ],
     );
     m.insert(

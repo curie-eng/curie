@@ -56,13 +56,15 @@ def graph_payload() -> dict[str, Any]:
         ("0101", False),
         ("0102", False),
         ("0103", False),
-        # The agent-schedules expand (selfimp_sched_0001) is the minimum: this
-        # image reads its columns, so 0108, selfimp_safety_0001 and
-        # selfimp_skills_0001 are refused.
+        # The Agent ORM reads the learned skills toggle (selfimp_skills_0001), the
+        # agent schedule columns (selfimp_sched_0001) and the twin memory toggle
+        # (selfimp_memory_0001), so the train join, the schedule safety head, the
+        # learned skills head and the agent schedules head are below the minimum.
         ("0108", False),
         ("selfimp_safety_0001", False),
         ("selfimp_skills_0001", False),
-        ("selfimp_sched_0001", True),
+        ("selfimp_sched_0001", False),
+        ("selfimp_memory_0001", True),
         ("0000", True),
         ("future-expand", True),
     ],

@@ -859,6 +859,14 @@
     {
       "kind": "expand",
       "parents": [
+        "selfimp_sched_0001"
+      ],
+      "revision": "selfimp_memory_0001",
+      "sha256": "4950d185734dbba28f1eea7f6ec0a3dcd49193ce26bcb92b8161903da49f098a"
+    },
+    {
+      "kind": "expand",
+      "parents": [
         "0108"
       ],
       "revision": "selfimp_safety_0001",
@@ -881,6 +889,6 @@
       "sha256": "7ef9de9769021c26b8570d15259cb3219ed5a7991c1920f96bca76e6c5b869b2"
     }
   ],
-  "schema_head": "selfimp_sched_0001",
-  "schema_min": "selfimp_sched_0001"
+  "schema_head": "selfimp_memory_0001",
+  "schema_min": "selfimp_memory_0001"
 }

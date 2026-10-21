@@ -568,8 +568,8 @@ print(json.dumps(graph))
     fn candidate_window_tracks_the_catalog_without_changing_released_windows() {
         // @spec DEPLOY-NOTICE-RELEASE-1.
         let candidate = source_candidate_window();
-        assert_eq!(candidate.schema_min, "selfimp_sched_0001");
-        assert_eq!(candidate.schema_head, "selfimp_sched_0001");
+        assert_eq!(candidate.schema_min, "selfimp_memory_0001");
+        assert_eq!(candidate.schema_head, "selfimp_memory_0001");
         assert_eq!(
             candidate.schema_head.as_str(),
             catalog().revisions.last().unwrap()
@@ -581,16 +581,18 @@ print(json.dumps(graph))
         for below in [
             "0082", "0083", "0084", "0085", "0086", "0087", "0088", "0089", "0090", "0091a",
             "0092a", "0093a", "0094", "0095", "0096", "0097", "0098", "0099", "0100", "0093",
-            "0101", "0102", "0103",
+            "0101", "0102", "0103", "0105", "0106", "0107", "0108",
         ] {
             assert!(!live_in_window(below, &current), "{below}");
         }
-        // Learned skills adds agents.learned_skills (ADR 0237) and agent schedules
-        // add agents columns (ADR 0238); the Agent ORM reads both.
+        // learned skills adds agents.learned_skills, which the Agent ORM reads (ADR 0237),
+        // agent schedules add agents columns it reads (ADR 0238), and twin memory adds
+        // the learning toggle it also reads (ADR 0239).
         assert!(!live_in_window("0108", &current));
         assert!(!live_in_window("selfimp_safety_0001", &current));
         assert!(!live_in_window("selfimp_skills_0001", &current));
-        assert!(live_in_window("selfimp_sched_0001", &current));
+        assert!(!live_in_window("selfimp_sched_0001", &current));
+        assert!(live_in_window("selfimp_memory_0001", &current));
         assert!(!live_in_window("0075", &current));
         assert!(!live_in_window("0076", &current));
         let retained = window_for("0.12.0").expect("published foundation remains catalogued");

@@ -348,7 +348,7 @@ fn route(method: &str, path: &str) -> Response {
         ("POST", "/agents") => Response::json(
             201,
             &format!(
-                r##"{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#local-dev"}}],"created_at":"2026-07-05T00:00:00Z","memory":false}}"##
+                r##"{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#local-dev"}}],"created_at":"2026-07-05T00:00:00Z","memory":false,"agent_wide_learning":false}}"##
             ),
         ),
         ("POST", p) if p == format!("/agents/{AGENT_ID}/versions") => Response::json(
@@ -374,7 +374,7 @@ fn route(method: &str, path: &str) -> Response {
         ("PATCH", p) if p == format!("/agents/{AGENT_ID}") => Response::json(
             200,
             &format!(
-                r##"{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#local-dev"}}],"created_at":"2026-07-05T00:00:00Z","memory":false}}"##
+                r##"{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#local-dev"}}],"created_at":"2026-07-05T00:00:00Z","memory":false,"agent_wide_learning":false}}"##
             ),
         ),
         other => panic!("unexpected request: {other:?}"),
@@ -452,7 +452,7 @@ async fn reuses_an_existing_agent_instead_of_creating() {
         ("GET", "/agents") => Response::json(
             200,
             &format!(
-                r##"[{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"created_at":"2026-07-05T00:00:00Z","memory":false}}]"##
+                r##"[{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"created_at":"2026-07-05T00:00:00Z","memory":false,"agent_wide_learning":false}}]"##
             ),
         ),
         other => panic!("unexpected request: {other:?}"),
@@ -499,6 +499,7 @@ async fn create_agent_sends_the_initial_tracker_binding_without_slack() {
                         "repo_full_name": body["repo_full_name"],
                         "created_at": "2026-07-05T00:00:00Z",
                         "memory": false,
+                        "agent_wide_learning": false,
                     })
                     .to_string(),
                 )
@@ -626,7 +627,7 @@ fn agent_json_channels(id: &str, name: &str, channels: &[&str], repo: Option<&st
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        r#"{{"id":"{id}","name":"{name}","channels":[{bindings}],"created_at":"2026-07-05T00:00:00Z","memory":false{bound}}}"#
+        r#"{{"id":"{id}","name":"{name}","channels":[{bindings}],"created_at":"2026-07-05T00:00:00Z","memory":false,"agent_wide_learning":false{bound}}}"#
     )
 }
 
@@ -1553,7 +1554,7 @@ fn agent_json_routes(id: &str, name: &str, routes: &[(&str, &str)]) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        r#"{{"id":"{id}","name":"{name}","channels":[{bindings}],"created_at":"2026-07-05T00:00:00Z","memory":false}}"#
+        r#"{{"id":"{id}","name":"{name}","channels":[{bindings}],"created_at":"2026-07-05T00:00:00Z","memory":false,"agent_wide_learning":false}}"#
     )
 }
 

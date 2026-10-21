@@ -13,7 +13,7 @@
       "result": "AgentOverridesOutput",
       "kind": "CliOutput",
       "schema": "overrides.schema.json",
-      "version": "3.2"
+      "version": "6.0"
     },
     {
       "result": "AgentScheduleOutput",
@@ -253,13 +253,13 @@
       "result": "MemoryGuidanceOutput",
       "kind": "CliOutput",
       "schema": "memory.schema.json",
-      "version": "2.2"
+      "version": "3.0"
     },
     {
       "result": "MemoryOutput",
       "kind": "CliOutput",
       "schema": "memory.schema.json",
-      "version": "2.2"
+      "version": "3.0"
     },
     {
       "result": "MessageDryRunOutput",
@@ -325,7 +325,7 @@
       "result": "OverridesOutput",
       "kind": "CliOutput",
       "schema": "overrides.schema.json",
-      "version": "3.2"
+      "version": "6.0"
     },
     {
       "result": "PreflightOutput",

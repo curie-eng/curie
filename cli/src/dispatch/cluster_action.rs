@@ -1117,6 +1117,7 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
             runner_resources,
             clear_runner_resources,
             memory_writes,
+            agent_wide_learning,
             agent_schedules,
             learned_skills,
             conn,
@@ -1162,9 +1163,12 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                     thinking,
                     execution_deadline,
                     runner_resources,
-                    commands::on_off_flag(memory_writes.as_deref()),
-                    commands::on_off_flag(agent_schedules.as_deref()),
-                    commands::on_off_flag(learned_skills.as_deref()),
+                    commands::AgentSwitches {
+                        memory_writes: commands::on_off_flag(memory_writes.as_deref()),
+                        agent_wide_learning: commands::on_off_flag(agent_wide_learning.as_deref()),
+                        agent_schedules: commands::on_off_flag(agent_schedules.as_deref()),
+                        learned_skills: commands::on_off_flag(learned_skills.as_deref()),
+                    },
                 )
                 .await?,
             )
@@ -1584,6 +1588,7 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
             delete,
             channel,
             guidance,
+            lifecycle,
         } => {
             let ClusterAgentTarget {
                 agent,
@@ -1604,11 +1609,16 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                 agent,
                 dry_run,
             };
-            match (guidance.action(), add, delete) {
-                (Some(action), _, _) => emit_memory_guidance(opts, action).await,
-                (None, None, Some(id)) => emit(commands::memory_delete(opts, id, channel).await?),
-                (None, None, None) => emit(commands::memory(opts, channel).await?),
-                (None, Some(content), _) => {
+            match (guidance.action(), add, delete, lifecycle.action()) {
+                (Some(action), _, _, _) => emit_memory_guidance(opts, action).await,
+                (None, None, None, Some(action)) => {
+                    emit(commands::memory_lifecycle(opts, action, channel).await?)
+                }
+                (None, None, Some(id), _) => {
+                    emit(commands::memory_delete(opts, id, channel).await?)
+                }
+                (None, None, None, None) => emit(commands::memory(opts, channel).await?),
+                (None, Some(content), _, _) => {
                     emit(commands::memory_add(opts, content, "cluster").await?)
                 }
             }

@@ -8,6 +8,10 @@ worker now tells the API when a turn ends, on the internal route
 ``/v1/internal`` routes), and the API refuses a write made with a closed turn's
 credential even before it expires. Reads are unaffected.
 
+ADR 0239: write credentials also carry the signed ``conversation`` claim, the
+agent's stored ``memory_writes`` must be on, and fact values carry the typed
+shape (``kind``, ``title``).
+
 Runs against the real app, Postgres and Valkey the conftest provisions.
 """
 
@@ -46,6 +50,8 @@ def _agent(client: Any, auth_headers: dict[str, str], channel: str = CHANNEL) ->
     )
     assert resp.status_code == 201, resp.text
     aid: str = resp.json()["id"]
+    writes = client.patch(f"/agents/{aid}", json={"memory_writes": True}, headers=auth_headers)
+    assert writes.status_code == 200, writes.text
     return aid
 
 
@@ -59,7 +65,13 @@ def _writer(aid: str, turn: str, channel: str = CHANNEL) -> dict[str, str]:
         agent=aid,
         scope="state",
         exp=_FAR_FUTURE,
-        claims={"binding": f"slack:{channel}", "memory": "write", "sender": SENDER, "turn": turn},
+        claims={
+            "binding": f"slack:{channel}",
+            "memory": "write",
+            "sender": SENDER,
+            "turn": turn,
+            "conversation": f"slack:{channel}:1700000000.000001",
+        },
     )
     return {"X-API-Key": token}
 
@@ -75,10 +87,14 @@ def _agent_memory(aid: str) -> str:
 def _fact(statement: str = "the deploy window is Tuesday") -> dict[str, Any]:
     return {
         "value": {
+            "kind": "fact",
+            "title": "Deploy window",
             "statement": statement,
             "author": SENDER,
             "stated_at": "2026-10-01T00:00:00+00:00",
             "session_id": "sess-1",
+            "conversation": None,
+            "archived": False,
         }
     }
 
@@ -131,10 +147,14 @@ def test_closed_turn_credential_cannot_write_before_expiry(
         put = client.put(f"{memory}/{OTHER_FACT}", json=_fact("planted"), headers=writer)
         assert put.status_code == 403, put.text
         assert TURN_ENDED in _detail(put)
-        overwrite = client.put(f"{memory}/{FACT}", json=_fact("rewritten"), headers=writer)
+        overwrite = client.put(
+            f"{memory}/{FACT}",
+            json={**_fact("rewritten"), "expected_version": 1},
+            headers=writer,
+        )
         assert overwrite.status_code == 403, overwrite.text
         assert TURN_ENDED in _detail(overwrite)
-        deleted = client.delete(f"{memory}/{FACT}", headers=writer)
+        deleted = client.delete(f"{memory}/{FACT}", params={"expected_version": 1}, headers=writer)
         assert deleted.status_code == 403, deleted.text
         assert TURN_ENDED in _detail(deleted)
 

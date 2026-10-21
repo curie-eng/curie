@@ -1107,6 +1107,11 @@
             "title": "Agent Schedules",
             "type": "boolean"
           },
+          "agent_wide_learning": {
+            "default": false,
+            "title": "Agent Wide Learning",
+            "type": "boolean"
+          },
           "approval_required_tools": {
             "anyOf": [
               {
@@ -2076,6 +2081,17 @@
               }
             ],
             "title": "Agent Schedules"
+          },
+          "agent_wide_learning": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Wide Learning"
           },
           "approval_required_tools": {
             "anyOf": [
@@ -7832,6 +7848,103 @@
         "title": "LoopDeclaration",
         "type": "object"
       },
+      "MemoryContextOut": {
+        "description": "The bounded boot context (``GET .../_memory/context``).\n\nAt most 20 active instructions (full records, empty unless agent-wide\nlearning is on) and at most 50 active fact titles, newest updated first,\nfrom agent memory plus the caller's own channel. No fact statement appears\nanywhere in it.",
+        "properties": {
+          "agent_wide_learning": {
+            "title": "Agent Wide Learning",
+            "type": "boolean"
+          },
+          "guidance": {
+            "$ref": "#/components/schemas/MemoryGuidanceOut"
+          },
+          "index": {
+            "items": {
+              "$ref": "#/components/schemas/MemoryIndexItemOut"
+            },
+            "title": "Index",
+            "type": "array"
+          },
+          "instructions": {
+            "items": {
+              "$ref": "#/components/schemas/MemoryRecordOut"
+            },
+            "title": "Instructions",
+            "type": "array"
+          },
+          "memory_writes": {
+            "title": "Memory Writes",
+            "type": "boolean"
+          },
+          "omitted": {
+            "$ref": "#/components/schemas/MemoryOmittedOut"
+          },
+          "totals": {
+            "$ref": "#/components/schemas/MemoryTotalsOut"
+          }
+        },
+        "required": [
+          "agent_wide_learning",
+          "memory_writes",
+          "guidance",
+          "instructions",
+          "index",
+          "totals",
+          "omitted"
+        ],
+        "title": "MemoryContextOut",
+        "type": "object"
+      },
+      "MemoryDetailOut": {
+        "description": "An entry with a page of its history (``GET .../_memory/entries/{id}``,\n``POST .../_memory/revert``).\n\n``entry`` is null and ``deleted`` true when the head was forgotten or\nreverted to absence; ``version`` is then the deletion's version, the one a\nrevert must name as ``expected_version``. ``history`` is at most the 10\nnewest revisions older than the requested ``before_version``;\n``history_before`` is the value to pass back for the next older page, null\nwhen there is none.",
+        "properties": {
+          "deleted": {
+            "title": "Deleted",
+            "type": "boolean"
+          },
+          "entry": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MemoryRecordOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "history": {
+            "items": {
+              "$ref": "#/components/schemas/MemoryRevisionOut"
+            },
+            "title": "History",
+            "type": "array"
+          },
+          "history_before": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "History Before"
+          },
+          "version": {
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "entry",
+          "deleted",
+          "version",
+          "history",
+          "history_before"
+        ],
+        "title": "MemoryDetailOut",
+        "type": "object"
+      },
       "MemoryEntryCreate": {
         "description": "Append one operator-authored memory record (#1904).\n\nProvenance is stamped by the server. Extra body fields, including a\ncaller-supplied provenance object, are ignored rather than trusted.",
         "properties": {
@@ -7908,12 +8021,13 @@
         "type": "object"
       },
       "MemoryGuidanceOut": {
-        "description": "The agent's effective memory guidance and where it comes from (#1461).\n\n``source`` is ``operator`` when guidance is stored for the agent, else\n``default`` and ``text`` is the platform default.",
+        "description": "The agent's effective memory guidance and where it comes from (#1461).\n\n``source`` is ``operator`` when guidance is stored for the agent; else\n``learning_default`` when the agent is opted in to agent-wide learning and\n``text`` is the learning default (ADR 0239); else ``default`` and ``text``\nis the platform default.",
         "properties": {
           "source": {
             "enum": [
               "default",
-              "operator"
+              "operator",
+              "learning_default"
             ],
             "title": "Source",
             "type": "string"
@@ -7928,6 +8042,110 @@
           "source"
         ],
         "title": "MemoryGuidanceOut",
+        "type": "object"
+      },
+      "MemoryIndexItemOut": {
+        "description": "One active fact in the boot index: its title, never its statement.",
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "scope": {
+            "enum": [
+              "agent",
+              "channel"
+            ],
+            "title": "Scope",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "scope",
+          "title",
+          "version"
+        ],
+        "title": "MemoryIndexItemOut",
+        "type": "object"
+      },
+      "MemoryLifecycleIn": {
+        "description": "Archive or restore one entry under compare-and-set.\n\n``channel_kind``/``channel_address`` name the binding for a platform-key\ncaller with ``scope=\"channel\"``. A sandbox caller's channel is the binding\nits credential is signed for, and naming one is refused.",
+        "properties": {
+          "channel_address": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Channel Address"
+          },
+          "channel_kind": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Channel Kind"
+          },
+          "expected_version": {
+            "minimum": 0.0,
+            "title": "Expected Version",
+            "type": "integer"
+          },
+          "id": {
+            "pattern": "^fact-[0-9a-f]{32}$",
+            "title": "Id",
+            "type": "string"
+          },
+          "scope": {
+            "enum": [
+              "agent",
+              "channel"
+            ],
+            "title": "Scope",
+            "type": "string"
+          }
+        },
+        "required": [
+          "scope",
+          "id",
+          "expected_version"
+        ],
+        "title": "MemoryLifecycleIn",
+        "type": "object"
+      },
+      "MemoryOmittedOut": {
+        "description": "Active entries the bounded context left out.",
+        "properties": {
+          "facts": {
+            "title": "Facts",
+            "type": "integer"
+          },
+          "instructions": {
+            "title": "Instructions",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "instructions",
+          "facts"
+        ],
+        "title": "MemoryOmittedOut",
         "type": "object"
       },
       "MemoryProvenanceOut": {
@@ -7969,6 +8187,289 @@
           }
         },
         "title": "MemoryProvenanceOut",
+        "type": "object"
+      },
+      "MemoryRecordOut": {
+        "description": "One canonical memory entry (a fact or a standing instruction).\n\n``author`` and ``stated_at`` are null only for an entry stored before ADR\n0239 that never named them; the migration does not invent provenance.\n``conversation`` is the signed source conversation of the last sandbox\nwrite, null for operator writes and migrated entries.",
+        "properties": {
+          "archived": {
+            "title": "Archived",
+            "type": "boolean"
+          },
+          "author": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Author"
+          },
+          "conversation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Conversation"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "fact",
+              "instruction"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "scope": {
+            "enum": [
+              "agent",
+              "channel"
+            ],
+            "title": "Scope",
+            "type": "string"
+          },
+          "stated_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stated At"
+          },
+          "statement": {
+            "title": "Statement",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "scope",
+          "kind",
+          "title",
+          "statement",
+          "author",
+          "stated_at",
+          "conversation",
+          "archived",
+          "version",
+          "updated_at"
+        ],
+        "title": "MemoryRecordOut",
+        "type": "object"
+      },
+      "MemoryRevertIn": {
+        "description": "Revert one entry to an earlier version; ``to_version`` 0 is absence.",
+        "properties": {
+          "channel_address": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Channel Address"
+          },
+          "channel_kind": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Channel Kind"
+          },
+          "expected_version": {
+            "minimum": 0.0,
+            "title": "Expected Version",
+            "type": "integer"
+          },
+          "id": {
+            "pattern": "^fact-[0-9a-f]{32}$",
+            "title": "Id",
+            "type": "string"
+          },
+          "scope": {
+            "enum": [
+              "agent",
+              "channel"
+            ],
+            "title": "Scope",
+            "type": "string"
+          },
+          "to_version": {
+            "minimum": 0.0,
+            "title": "To Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "scope",
+          "id",
+          "expected_version",
+          "to_version"
+        ],
+        "title": "MemoryRevertIn",
+        "type": "object"
+      },
+      "MemoryRevisionOut": {
+        "description": "One immutable revision. ``snapshot`` is the resulting canonical value,\nnull for a deletion (a forget, or a revert to absence).",
+        "properties": {
+          "actor": {
+            "title": "Actor",
+            "type": "string"
+          },
+          "conversation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Conversation"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "operation": {
+            "enum": [
+              "baseline",
+              "create",
+              "update",
+              "delete",
+              "archive",
+              "restore",
+              "revert"
+            ],
+            "title": "Operation",
+            "type": "string"
+          },
+          "reverted_to_version": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reverted To Version"
+          },
+          "snapshot": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Snapshot"
+          },
+          "source": {
+            "title": "Source",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "version",
+          "operation",
+          "actor",
+          "source",
+          "conversation",
+          "created_at",
+          "reverted_to_version",
+          "snapshot"
+        ],
+        "title": "MemoryRevisionOut",
+        "type": "object"
+      },
+      "MemorySearchOut": {
+        "description": "A page of literal search results over active and archived entries.",
+        "properties": {
+          "entries": {
+            "items": {
+              "$ref": "#/components/schemas/MemoryRecordOut"
+            },
+            "title": "Entries",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          }
+        },
+        "required": [
+          "entries",
+          "next_cursor"
+        ],
+        "title": "MemorySearchOut",
+        "type": "object"
+      },
+      "MemoryTotalsOut": {
+        "description": "Counts over both visible scopes: active instructions, active facts, and\narchived entries of either kind.",
+        "properties": {
+          "archived": {
+            "title": "Archived",
+            "type": "integer"
+          },
+          "facts": {
+            "title": "Facts",
+            "type": "integer"
+          },
+          "instructions": {
+            "title": "Instructions",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "instructions",
+          "facts",
+          "archived"
+        ],
+        "title": "MemoryTotalsOut",
         "type": "object"
       },
       "MemoryTraceBackOut": {
@@ -12311,7 +12812,7 @@
         "type": "object"
       },
       "StateEntryPut": {
-        "description": "Write a durable state entry (#23). ``expected_version`` opts into\ncompare-and-set: the write is rejected with 409 unless it matches the stored\nversion (omit it for a blind upsert). ``value`` is any JSON value (object,\narray, or scalar); an array value is what ``append`` grows.",
+        "description": "Write a durable state entry (#23). ``expected_version`` opts into\ncompare-and-set: the write is rejected with 409 unless it matches the stored\nversion (omit it for a blind upsert). ``value`` is any JSON value (object,\narray, or scalar); an array value is what ``append`` grows.\n\nOn a canonical memory key (``memory`` / ``fact-<32 hex>``, ADR 0239) the\nvalue must be the typed entry shape, a create sends no ``expected_version``\n(or 0), and an update must send the head's version (428 when omitted).",
         "properties": {
           "expected_version": {
             "anyOf": [
@@ -18633,7 +19134,7 @@
         ]
       },
       "get": {
-        "description": "The agent's effective memory guidance and its source (#1461).",
+        "description": "The agent's effective memory guidance and its source (#1461, ADR 0239).",
         "operationId": "get_memory_guidance_agents__agent_id__memory_guidance_get",
         "parameters": [
           {
@@ -19944,6 +20445,584 @@
           }
         },
         "summary": "List Namespaces",
+        "tags": [
+          "state"
+        ]
+      }
+    },
+    "/agents/{agent_id}/state/_memory/archive": {
+      "post": {
+        "description": "Archive one entry under compare-and-set: it leaves the boot context but\nstays readable, searchable and counted. Already archived at the current\nversion: unchanged, with no new revision.",
+        "operationId": "archive_memory_agents__agent_id__state__memory_archive_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MemoryLifecycleIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryRecordOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Archive Memory",
+        "tags": [
+          "state"
+        ]
+      }
+    },
+    "/agents/{agent_id}/state/_memory/context": {
+      "get": {
+        "description": "The bounded boot memory (ADR 0239): the learning toggle, the effective\nguidance, at most 20 active standing instructions and the titles of at most\n50 active facts from agent memory plus the caller's own channel, with\ntotals and omitted counts. No fact statement is ever in it.\n\nA sandbox credential sees its own binding (none when it names none). The\nplatform key sees agent memory, plus one binding when it names both\n``channel_kind`` and ``channel_address``.",
+        "operationId": "memory_context_agents__agent_id__state__memory_context_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "channel_kind",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Channel Kind"
+            }
+          },
+          {
+            "in": "query",
+            "name": "channel_address",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Channel Address"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryContextOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Memory Context",
+        "tags": [
+          "state"
+        ]
+      }
+    },
+    "/agents/{agent_id}/state/_memory/entries/{fact_id}": {
+      "get": {
+        "description": "One entry, live or deleted, with its newest 10 revisions older than\n``before_version`` (each with its snapshot). A deleted head answers with\n``deleted`` true and the deletion's version, so it can be reverted; an\nidentity never created is 404.",
+        "operationId": "memory_entry_agents__agent_id__state__memory_entries__fact_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "fact_id",
+            "required": true,
+            "schema": {
+              "pattern": "^fact-[0-9a-f]{32}$",
+              "title": "Fact Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "scope",
+            "required": true,
+            "schema": {
+              "enum": [
+                "agent",
+                "channel"
+              ],
+              "title": "Scope",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "before_version",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Before Version"
+            }
+          },
+          {
+            "in": "query",
+            "name": "channel_kind",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Channel Kind"
+            }
+          },
+          {
+            "in": "query",
+            "name": "channel_address",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Channel Address"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryDetailOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Memory Entry",
+        "tags": [
+          "state"
+        ]
+      }
+    },
+    "/agents/{agent_id}/state/_memory/restore": {
+      "post": {
+        "description": "Restore an archived entry under compare-and-set.",
+        "operationId": "restore_memory_agents__agent_id__state__memory_restore_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MemoryLifecycleIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryRecordOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Restore Memory",
+        "tags": [
+          "state"
+        ]
+      }
+    },
+    "/agents/{agent_id}/state/_memory/revert": {
+      "post": {
+        "description": "Revert one entry to an earlier version as a new version (``to_version``\n0 removes the head). Works on a deleted entry, which it restores under the\nsame id. A stale ``expected_version`` is 409 and changes nothing.",
+        "operationId": "revert_memory_agents__agent_id__state__memory_revert_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MemoryRevertIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryDetailOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Revert Memory",
+        "tags": [
+          "state"
+        ]
+      }
+    },
+    "/agents/{agent_id}/state/_memory/search": {
+      "get": {
+        "description": "Literal, case-insensitive search of one scope's titles and statements,\nactive and archived entries alike, with full records. A miss is an empty\npage; ``next_cursor`` continues a longer result.",
+        "operationId": "memory_search_agents__agent_id__state__memory_search_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "scope",
+            "required": true,
+            "schema": {
+              "enum": [
+                "agent",
+                "channel"
+              ],
+              "title": "Scope",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "q",
+            "required": true,
+            "schema": {
+              "maxLength": 500,
+              "minLength": 1,
+              "title": "Q",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "maximum": 50,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "channel_kind",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Channel Kind"
+            }
+          },
+          {
+            "in": "query",
+            "name": "channel_address",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Channel Address"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemorySearchOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Memory Search",
         "tags": [
           "state"
         ]

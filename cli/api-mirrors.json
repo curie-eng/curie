@@ -283,6 +283,21 @@
       "omissions": []
     },
     {
+      "struct": "MemoryRecord",
+      "schema": "MemoryRecordOut",
+      "omissions": []
+    },
+    {
+      "struct": "MemoryRevision",
+      "schema": "MemoryRevisionOut",
+      "omissions": []
+    },
+    {
+      "struct": "MemoryDetail",
+      "schema": "MemoryDetailOut",
+      "omissions": []
+    },
+    {
       "struct": "Bundle",
       "schema": "BundleOut",
       "omissions": [
@@ -718,6 +733,16 @@
       "omissions": []
     },
     {
+      "struct": "MemoryLifecycleIn",
+      "schema": "MemoryLifecycleIn",
+      "omissions": []
+    },
+    {
+      "struct": "MemoryRevertIn",
+      "schema": "MemoryRevertIn",
+      "omissions": []
+    },
+    {
       "struct": "ApprovalResolve",
       "schema": "ApprovalResolve",
       "omissions": []
@@ -896,6 +921,24 @@
       "path": "/agents/{agent_id}/memory/guidance"
     },
     {
+      "function": "archive_memory_entry",
+      "struct": "MemoryLifecycleIn",
+      "method": "post",
+      "path": "/agents/{agent_id}/state/_memory/archive"
+    },
+    {
+      "function": "restore_memory_entry",
+      "struct": "MemoryLifecycleIn",
+      "method": "post",
+      "path": "/agents/{agent_id}/state/_memory/restore"
+    },
+    {
+      "function": "revert_memory_entry",
+      "struct": "MemoryRevertIn",
+      "method": "post",
+      "path": "/agents/{agent_id}/state/_memory/revert"
+    },
+    {
       "function": "resolve_approval",
       "struct": "ApprovalResolve",
       "method": "post",
@@ -1015,6 +1058,7 @@
         {"field": "runner_resources", "why": "Runner resources belong to the overrides command."},
         {"field": "memory", "why": "The shared memory setting is unrelated to hook configuration."},
         {"field": "memory_writes", "why": "The memory tools switch belongs to the overrides command."},
+        {"field": "agent_wide_learning", "why": "The agent-wide learning opt-in belongs to the overrides command."},
         {"field": "learned_skills", "why": "The learned skills switch belongs to the overrides command."},
         {"field": "publication_policy", "why": "Publication policy has its own operator command."},
         {"field": "publication_policy_version", "why": "Publication policy has its own operator command."},

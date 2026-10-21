@@ -224,6 +224,25 @@ def test_app_scoped_token_is_refused_on_reserved_namespaces(
         assert client.delete(f"/agents/{aid}/state/{ns}/k", headers=headers).status_code == 403
 
 
+# ADR 0239: a canonical fact value is typed, and a sandbox write needs the
+# agent's stored memory_writes on and a signed conversation claim.
+_TYPED_FACT = {
+    "kind": "fact",
+    "title": "x",
+    "statement": "x",
+    "author": "U0000001",
+    "stated_at": "2026-10-01T00:00:00Z",
+    "session_id": "s",
+    "conversation": None,
+    "archived": False,
+}
+
+
+def _memory_writes_on(client: Any, auth_headers: dict[str, str], aid: str) -> None:
+    resp = client.patch(f"/agents/{aid}", json={"memory_writes": True}, headers=auth_headers)
+    assert resp.status_code == 200, resp.text
+
+
 def test_app_scoped_token_is_refused_on_binding_scoped_memory(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
@@ -234,6 +253,7 @@ def test_app_scoped_token_is_refused_on_binding_scoped_memory(
     # reaches it (ADR-0188: a sandbox writes channel memory only with a write
     # credential whose binding claim names the channel).
     aid = _agent(client, auth_headers)
+    _memory_writes_on(client, auth_headers, aid)
     app = mint(get_settings().api_key, agent=aid, scope="state.app", exp=_FAR_FUTURE)
     writer = mint(
         get_settings().api_key,
@@ -245,13 +265,14 @@ def test_app_scoped_token_is_refused_on_binding_scoped_memory(
             "memory": "write",
             "sender": "U0000001",
             "turn": "evt-1461",
+            "conversation": "slack:C000000S01:1700000000.000001",
         },
     )
     base = f"/agents/{aid}/state/bindings/slack/C000000S01/memory"
     fact = f"{base}/fact-{'a' * 32}"
     headers = {"X-API-Key": app}
 
-    put = client.put(fact, json={"value": {"statement": "x"}}, headers=headers)
+    put = client.put(fact, json={"value": _TYPED_FACT}, headers=headers)
     assert put.status_code == 403, put.text
     assert "reserved" in put.text
     assert client.get(fact, headers=headers).status_code == 403
@@ -262,7 +283,7 @@ def test_app_scoped_token_is_refused_on_binding_scoped_memory(
     )
     assert client.delete(fact, headers=headers).status_code == 403
 
-    ok = client.put(fact, json={"value": {"statement": "x"}}, headers={"X-API-Key": writer})
+    ok = client.put(fact, json={"value": _TYPED_FACT}, headers={"X-API-Key": writer})
     assert ok.status_code == 200, ok.text
     assert client.get(fact, headers={"X-API-Key": writer}).status_code == 200
 
@@ -333,6 +354,7 @@ def test_sandbox_state_token_reads_reserved_namespaces_and_writes_only_fact_keys
     # a sandbox writes only fact keys, and only with the per-turn write
     # credential. A write to ``memory/k`` is now 403.
     aid = _agent(client, auth_headers)
+    _memory_writes_on(client, auth_headers, aid)
     api_key = get_settings().api_key
     reader = mint(
         api_key,
@@ -351,6 +373,7 @@ def test_sandbox_state_token_reads_reserved_namespaces_and_writes_only_fact_keys
             "memory": "write",
             "sender": "U0000001",
             "turn": "evt-reserved",
+            "conversation": "slack:C000000S01:1700000000.000001",
         },
     )
     seeded = client.put(
@@ -375,7 +398,7 @@ def test_sandbox_state_token_reads_reserved_namespaces_and_writes_only_fact_keys
 
     # Fact-key writes with the write credential.
     fact = f"/agents/{aid}/state/memory/fact-{'b' * 32}"
-    w = client.put(fact, json={"value": {"statement": "x"}}, headers={"X-API-Key": writer})
+    w = client.put(fact, json={"value": _TYPED_FACT}, headers={"X-API-Key": writer})
     assert w.status_code == 200, w.text
 
     # Any other memory key is refused, even with the write credential.

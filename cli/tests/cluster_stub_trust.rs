@@ -295,6 +295,7 @@ def serve_http(client):
                 "id": "agent-ops",
                 "name": "ops",
                 "memory": False,
+                "agent_wide_learning": False,
                 "channels": [{"kind": "slack", "address": "C0EXAMPLE1", "adapter": adapter}],
             }]).encode("utf-8")
         else:

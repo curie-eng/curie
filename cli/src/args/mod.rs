@@ -1893,6 +1893,79 @@ impl EvalSamplingArgs {
     }
 }
 
+/// The reversible memory lifecycle flags shared by `local memory` and
+/// `cluster memory` (ADR 0239). Each acts on one canonical entry, in agent
+/// memory or the `--channel` selected binding, and none combines with add,
+/// delete, a guidance flag, or another lifecycle flag. None takes an expected
+/// version from argv: every mutation reads the current one first.
+#[derive(clap::Args, Debug, Default, Clone)]
+pub(crate) struct MemoryLifecycleArgs {
+    /// Archive this entry so boot no longer loads it; it stays readable and
+    /// restorable (`POST /agents/{id}/state/_memory/archive`).
+    #[arg(
+        long,
+        value_name = "FACT_ID",
+        conflicts_with_all = ["add", "delete", "guidance", "guidance_from", "reset_guidance", "restore", "revert", "history"]
+    )]
+    pub(crate) archive: Option<String>,
+    /// Restore this archived entry (`POST /agents/{id}/state/_memory/restore`).
+    #[arg(
+        long,
+        value_name = "FACT_ID",
+        conflicts_with_all = ["add", "delete", "guidance", "guidance_from", "reset_guidance", "archive", "revert", "history"]
+    )]
+    pub(crate) restore: Option<String>,
+    /// Revert this entry to the revision named by --to-version as a new
+    /// version (`POST /agents/{id}/state/_memory/revert`).
+    #[arg(
+        long,
+        value_name = "FACT_ID",
+        requires = "to_version",
+        conflicts_with_all = ["add", "delete", "guidance", "guidance_from", "reset_guidance", "archive", "restore", "history"]
+    )]
+    pub(crate) revert: Option<String>,
+    /// The revision --revert restores; 0 removes the entry, as before it was
+    /// created. Clap treats a requirement as met when a conflicting flag is
+    /// present, so the conflicts are listed here too: `--archive X
+    /// --to-version 1` is refused rather than silently ignoring the version.
+    #[arg(
+        long,
+        value_name = "N",
+        requires = "revert",
+        conflicts_with_all = ["add", "delete", "guidance", "guidance_from", "reset_guidance", "archive", "restore", "history"]
+    )]
+    pub(crate) to_version: Option<u64>,
+    /// Show this entry with its newest revisions
+    /// (`GET /agents/{id}/state/_memory/entries/{fact_id}`).
+    #[arg(
+        long,
+        value_name = "FACT_ID",
+        conflicts_with_all = ["add", "delete", "guidance", "guidance_from", "reset_guidance", "archive", "restore", "revert"]
+    )]
+    pub(crate) history: Option<String>,
+}
+
+impl MemoryLifecycleArgs {
+    /// The one lifecycle operation asked for, or `None` for the other memory
+    /// operations. Clap has already refused a combination.
+    pub(crate) fn action(&self) -> Option<commands::MemoryLifecycleAction> {
+        if let Some(id) = &self.archive {
+            Some(commands::MemoryLifecycleAction::Archive(id.clone()))
+        } else if let Some(id) = &self.restore {
+            Some(commands::MemoryLifecycleAction::Restore(id.clone()))
+        } else if let (Some(id), Some(to_version)) = (&self.revert, self.to_version) {
+            Some(commands::MemoryLifecycleAction::Revert {
+                id: id.clone(),
+                to_version,
+            })
+        } else {
+            self.history
+                .as_ref()
+                .map(|id| commands::MemoryLifecycleAction::History(id.clone()))
+        }
+    }
+}
+
 /// The memory-guidance flags shared by `local memory` and `cluster memory`
 /// (#1461). `--guidance-from` and `--reset-guidance` are two different writes,
 /// and none of them combines with add, delete, or channel selection.

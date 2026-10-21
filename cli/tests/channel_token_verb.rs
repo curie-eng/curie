@@ -35,7 +35,7 @@ fn sample_token(exp: i64) -> String {
 
 fn agent_json() -> String {
     format!(
-        r#"{{"id":"{AGENT_ID}","name":"{AGENT_NAME}","channels":[{{"kind":"email","address":"{INBOX}"}}],"created_at":"2026-07-05T00:00:00Z","memory":false}}"#
+        r#"{{"id":"{AGENT_ID}","name":"{AGENT_NAME}","channels":[{{"kind":"email","address":"{INBOX}"}}],"created_at":"2026-07-05T00:00:00Z","memory":false,"agent_wide_learning":false}}"#
     )
 }
 
@@ -455,7 +455,7 @@ fn mint_discovers_an_override_fullname_before_minting_and_patches_its_secret() {
 /// again, since the binding is the one place that identity is recorded.
 fn agent_json_with_adapter(adapter: &str) -> String {
     format!(
-        r#"{{"id":"{AGENT_ID}","name":"{AGENT_NAME}","channels":[{{"kind":"email","address":"{INBOX}","adapter":"{adapter}"}}],"created_at":"2026-07-05T00:00:00Z","memory":false}}"#
+        r#"{{"id":"{AGENT_ID}","name":"{AGENT_NAME}","channels":[{{"kind":"email","address":"{INBOX}","adapter":"{adapter}"}}],"created_at":"2026-07-05T00:00:00Z","memory":false,"agent_wide_learning":false}}"#
     )
 }
 
@@ -502,7 +502,7 @@ fn mint_omits_the_default_slack_identity() {
     let token = sample_token(EXP);
     let stub = ClusterStub::new(serde_json::json!({"mailAdapter": {"deploy": true}}));
     let agent = format!(
-        r#"{{"id":"{AGENT_ID}","name":"{AGENT_NAME}","channels":[{{"kind":"slack","address":"C0EXAMPLE1","adapter":"default"}}],"created_at":"2026-07-05T00:00:00Z","memory":false}}"#
+        r#"{{"id":"{AGENT_ID}","name":"{AGENT_NAME}","channels":[{{"kind":"slack","address":"C0EXAMPLE1","adapter":"default"}}],"created_at":"2026-07-05T00:00:00Z","memory":false,"agent_wide_learning":false}}"#
     );
     let server = serve(move |req| match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/agents") => Response::json(200, &format!("[{agent}]")),

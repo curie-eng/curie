@@ -69,6 +69,8 @@ pub struct AgentUpdate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_schedules: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_wide_learning: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_required_tools: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_routes: Option<BTreeMap<String, ApprovalRouteBindingWrite>>,
@@ -172,6 +174,34 @@ pub struct MemoryEntryCreate {
 #[derive(Debug, Clone, Serialize)]
 pub struct MemoryGuidanceIn {
     pub text: String,
+}
+
+/// `POST /agents/{id}/state/_memory/archive` and `.../restore`
+/// (`MemoryLifecycleIn`, ADR 0239). `expected_version` is the version the CLI
+/// just read; the channel pair is sent only for channel scope.
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryLifecycleIn {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_kind: Option<String>,
+    pub expected_version: u64,
+    pub id: String,
+    pub scope: String,
+}
+
+/// `POST /agents/{id}/state/_memory/revert` (`MemoryRevertIn`, ADR 0239).
+/// `to_version` 0 means the entry's absence before it was created.
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryRevertIn {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_kind: Option<String>,
+    pub expected_version: u64,
+    pub id: String,
+    pub scope: String,
+    pub to_version: u64,
 }
 
 /// `POST /approvals/{id}/resolve` (`ApprovalResolve`).

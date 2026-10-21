@@ -1960,7 +1960,7 @@ export const commandManifest = {
           ]
         },
         {
-          "about": "List an agent's individual facts and memory log. `--channel KIND=ADDRESS` selects one bound channel; `--delete FACT_ID` removes one fact. `--add <content>` seeds an operator-authored record; a fresh session is required before it is injected at boot. `--guidance` shows the guidance the agent gets beside its memory tools, `--guidance-from <file>` replaces it and `--reset-guidance` restores the platform default",
+          "about": "List an agent's individual facts and memory log. `--channel KIND=ADDRESS` selects one bound channel; `--delete FACT_ID` removes one fact. `--archive`, `--restore`, `--revert FACT_ID --to-version N` and `--history` act on one entry under its current version (ADR 0239); a fresh session is required before a change reaches boot memory. `--add <content>` seeds an operator-authored record; a fresh session is required before it is injected at boot. `--guidance` shows the guidance the agent gets beside its memory tools, `--guidance-from <file>` replaces it and `--reset-guidance` restores the platform default",
           "args": [
             {
               "global": false,
@@ -2053,6 +2053,46 @@ export const commandManifest = {
                 "true",
                 "false"
               ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Archive this entry so boot no longer loads it; it stays readable and restorable (`POST /agents/{id}/state/_memory/archive`)",
+              "id": "archive",
+              "long": "archive",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Restore this archived entry (`POST /agents/{id}/state/_memory/restore`)",
+              "id": "restore",
+              "long": "restore",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Revert this entry to the revision named by --to-version as a new version (`POST /agents/{id}/state/_memory/revert`)",
+              "id": "revert",
+              "long": "revert",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "The revision --revert restores; 0 removes the entry, as before it was created. Clap treats a requirement as met when a conflicting flag is present, so the conflicts are listed here too: `--archive X --to-version 1` is refused rather than silently ignoring the version",
+              "id": "to_version",
+              "long": "to-version",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Show this entry with its newest revisions (`GET /agents/{id}/state/_memory/entries/{fact_id}`)",
+              "id": "history",
+              "long": "history",
+              "positional": false,
               "required": false
             }
           ],
@@ -3571,6 +3611,18 @@ export const commandManifest = {
               "help": "Turn the agent's remember/update/forget memory tools on or off (`memory_writes`, #1461). Off stops saving only: stored agent and channel memory stays readable. Takes effect at the next sandbox boot",
               "id": "memory_writes",
               "long": "memory-writes",
+              "positional": false,
+              "possible_values": [
+                "on",
+                "off"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Opt the agent in to agent-wide learning, or out (`agent_wide_learning`, ADR 0239). On selects the learning default guidance and lets standing instructions load and be saved; it never turns memory writes on. Off keeps the existing default guidance byte for byte. Takes effect at the next sandbox boot",
+              "id": "agent_wide_learning",
+              "long": "agent-wide-learning",
               "positional": false,
               "possible_values": [
                 "on",
@@ -6712,6 +6764,18 @@ export const commandManifest = {
             },
             {
               "global": false,
+              "help": "Opt the agent in to agent-wide learning, or out (`agent_wide_learning`, ADR 0239). On selects the learning default guidance and lets standing instructions load and be saved; it never turns memory writes on. Off keeps the existing default guidance byte for byte. Takes effect at the next sandbox boot",
+              "id": "agent_wide_learning",
+              "long": "agent-wide-learning",
+              "positional": false,
+              "possible_values": [
+                "on",
+                "off"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
               "help": "Let the agent create and manage its own schedules on or off (`agent_schedules`, ADR 0238). Off stops creating and changing them; stored schedules and history stay",
               "id": "agent_schedules",
               "long": "agent-schedules",
@@ -8168,7 +8232,7 @@ export const commandManifest = {
           ]
         },
         {
-          "about": "List an agent's individual facts and memory log. `--channel KIND=ADDRESS` selects one bound channel; `--delete FACT_ID` removes one fact. `--add <content>` seeds an operator-authored record; a fresh session is required before it is injected at boot. `--guidance` shows the guidance the agent gets beside its memory tools, `--guidance-from <file>` replaces it and `--reset-guidance` restores the platform default",
+          "about": "List an agent's individual facts and memory log. `--channel KIND=ADDRESS` selects one bound channel; `--delete FACT_ID` removes one fact. `--archive`, `--restore`, `--revert FACT_ID --to-version N` and `--history` act on one entry under its current version (ADR 0239); a fresh session is required before a change reaches boot memory. `--add <content>` seeds an operator-authored record; a fresh session is required before it is injected at boot. `--guidance` shows the guidance the agent gets beside its memory tools, `--guidance-from <file>` replaces it and `--reset-guidance` restores the platform default",
           "args": [
             {
               "global": false,
@@ -8283,6 +8347,46 @@ export const commandManifest = {
                 "true",
                 "false"
               ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Archive this entry so boot no longer loads it; it stays readable and restorable (`POST /agents/{id}/state/_memory/archive`)",
+              "id": "archive",
+              "long": "archive",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Restore this archived entry (`POST /agents/{id}/state/_memory/restore`)",
+              "id": "restore",
+              "long": "restore",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Revert this entry to the revision named by --to-version as a new version (`POST /agents/{id}/state/_memory/revert`)",
+              "id": "revert",
+              "long": "revert",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "The revision --revert restores; 0 removes the entry, as before it was created. Clap treats a requirement as met when a conflicting flag is present, so the conflicts are listed here too: `--archive X --to-version 1` is refused rather than silently ignoring the version",
+              "id": "to_version",
+              "long": "to-version",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Show this entry with its newest revisions (`GET /agents/{id}/state/_memory/entries/{fact_id}`)",
+              "id": "history",
+              "long": "history",
+              "positional": false,
               "required": false
             }
           ],

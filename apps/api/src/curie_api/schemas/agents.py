@@ -621,6 +621,9 @@ class AgentUpdate(BaseModel):
     # it unchanged; the column is NOT NULL, so like `memory` there is no
     # default for a null to clear back to.
     memory_writes: bool | None = None
+    # Agent-wide learning (ADR 0239). Omitted (None) leaves it unchanged, the
+    # same plain-None rule as ``memory_writes``.
+    agent_wide_learning: bool | None = None
     # Agent-created schedules (ADR 0238): the switch, the default zone and the
     # limits. Same plain-None rule as `memory_writes`; the switch is strict,
     # so "yes" is not a boolean.
@@ -699,6 +702,8 @@ class AgentOut(BaseModel):
     memory: bool
     # Whether the runner mounts its remember/update/forget tools (#1461).
     memory_writes: bool = False
+    # Whether the agent is opted in to agent-wide learning (ADR 0239).
+    agent_wide_learning: bool = False
     # Agent-created schedules (ADR 0238): the switch, default zone and limits.
     agent_schedules: bool = False
     schedule_timezone: str = "UTC"

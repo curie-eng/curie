@@ -121,6 +121,7 @@ fn platform_server_with_matrix(
                     "channels": [{"kind": "slack", "address": CHANNEL}],
                     "created_at": "2026-08-19T00:00:00Z",
                     "memory": false,
+                    "agent_wide_learning": false,
                 }])
                 .to_string(),
             ),

@@ -54,6 +54,20 @@ HISTORY_TOOL = "mcp__curie-slack__read_channel_history"
 THREAD_TOOL = "mcp__curie-slack__read_thread_replies"
 MESSAGE_TOOL = "mcp__curie-slack__read_channel_message"
 LIVE_NAMES = frozenset({HISTORY_TOOL, THREAD_TOOL, MESSAGE_TOOL})
+# Every memory tool a writes-on boot mounts (ADR 0239): the widest exact set the
+# platform exemption can be handed.
+MEMORY_LIVE_NAMES = frozenset(
+    f"mcp__curie__{name}"
+    for name in (
+        "read_memory",
+        "remember",
+        "update",
+        "forget",
+        "archive_memory",
+        "restore_memory",
+        "revert_memory",
+    )
+)
 
 CAPABILITY_HEADER = "X-Curie-Channel-Read"
 NO_CAP = "channel_read.no_capability"
@@ -561,7 +575,7 @@ def test_policy_governs_the_mounted_tools(
     for name in LIVE_NAMES:
         assert not is_platform_owned_tool(name, state_server_mounted=True)
         assert not is_platform_owned_tool(
-            name, state_server_mounted=True, memory_tools_mounted=True
+            name, state_server_mounted=True, memory_tool_names=MEMORY_LIVE_NAMES
         )
 
 

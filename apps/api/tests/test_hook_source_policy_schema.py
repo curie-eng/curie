@@ -241,7 +241,8 @@ def test_source_policy_additive_upgrade_preserves_existing_agent(
     assert len(before) == len(after) == 1
     # Deploy notifications and the reviewer model, then tenant scope and bot
     # identity (#2911), then the learned skills switch (selfimp_skills_0001, ADR 0237),
-    # then the agent schedule settings (selfimp_sched_0001, ADR 0238).
+    # then the agent schedule settings (selfimp_sched_0001, ADR 0238) and the
+    # agent-wide learning toggle (selfimp_memory_0001, ADR 0239).
     added = {
         "deploy_notifications": False,
         "reviewer_model": None,
@@ -256,6 +257,7 @@ def test_source_policy_additive_upgrade_preserves_existing_agent(
         "schedule_timezone": "UTC",
         "schedule_max_active": 20,
         "schedule_min_interval_minutes": 15,
+        "agent_wide_learning": False,
     }
     assert not set(added) & set(before[0])
     assert set(after[0]) == set(before[0]) | set(added)

@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/overrides/v3.2.json",
+  "$id": "https://schemas.curietech.ai/cli/overrides/v6.json",
   "title": "curie <tier> overrides --json",
-  "description": "The agent-facing payload of `curie <tier> overrides <agent>`: the dry-run plan, or the agent's nullable operator overrides as the API stored them. `model`, `thinking`, `execution_deadline_seconds`, and `runner_resources` are null when the platform default applies; `reviewer_model` is null when the credential's default applies. `memory_writes` is the agent's memory-tools switch, always a boolean. `learned_skills` is the agent's learned-skills switch (ADR 0237), a boolean present whenever the agent was read. `agent_schedules`, `schedule_timezone`, `schedule_max_active`, and `schedule_min_interval_minutes` are the agent's stored ADR 0238 schedule settings. `changed` is false for an inspect (no change flags passed) and true when this invocation wrote, so a consumer can tell \"this is what it is\" from \"this is what it now is\" without diffing.",
+  "description": "The agent-facing payload of `curie <tier> overrides <agent>`: the dry-run plan, or the agent's nullable operator overrides as the API stored them. `model`, `thinking`, `execution_deadline_seconds`, and `runner_resources` are null when the platform default applies; `reviewer_model` is null when the credential's default applies. `memory_writes` is the agent's memory-tools switch, always a boolean. `agent_wide_learning` is the agent's independent agent-wide learning opt-in (ADR 0239), always a boolean. `learned_skills` is the agent's learned-skills switch (ADR 0237), always a boolean. `agent_schedules`, `schedule_timezone`, `schedule_max_active`, and `schedule_min_interval_minutes` are the agent's stored ADR 0238 schedule settings. `changed` is false for an inspect (no change flags passed) and true when this invocation wrote, so a consumer can tell \"this is what it is\" from \"this is what it now is\" without diffing.",
   "$defs": {
     "dryRun": {
       "type": "object",
@@ -70,6 +70,9 @@
         "memory_writes": {
           "type": "boolean"
         },
+        "agent_wide_learning": {
+          "type": "boolean"
+        },
         "learned_skills": {
           "type": "boolean"
         },
@@ -97,6 +100,8 @@
         "reviewer_model",
         "thinking",
         "memory_writes",
+        "agent_wide_learning",
+        "learned_skills",
         "changed"
       ]
     }

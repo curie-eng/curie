@@ -35,7 +35,7 @@ fn channels_path() -> String {
 /// Slack surface, in the `ChannelBindingOut` shape the API returns.
 fn agent_json() -> String {
     format!(
-        r#"{{"id":"{AGENT_ID}","name":"{AGENT_NAME}","channels":[{{"kind":"github","address":"{REPO}","adapter":null,"allowed_callers":null,"trigger_label":"{FAST}"}},{{"kind":"github","address":"{OTHER_REPO}","adapter":null,"allowed_callers":null,"trigger_label":null}},{{"kind":"slack","address":"C0EXAMPLE1","adapter":"default","allowed_callers":null,"trigger_label":null}}],"created_at":"2026-10-11T00:00:00Z","memory":false}}"#
+        r#"{{"id":"{AGENT_ID}","name":"{AGENT_NAME}","channels":[{{"kind":"github","address":"{REPO}","adapter":null,"allowed_callers":null,"trigger_label":"{FAST}"}},{{"kind":"github","address":"{OTHER_REPO}","adapter":null,"allowed_callers":null,"trigger_label":null}},{{"kind":"slack","address":"C0EXAMPLE1","adapter":"default","allowed_callers":null,"trigger_label":null}}],"created_at":"2026-10-11T00:00:00Z","memory":false,"agent_wide_learning":false}}"#
     )
 }
 
