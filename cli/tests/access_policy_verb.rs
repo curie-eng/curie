@@ -226,3 +226,53 @@ fn a_dry_run_makes_no_request() {
     assert_eq!(value["dry_run"], true);
     assert!(server.recorded().is_empty());
 }
+
+#[test]
+fn cluster_policy_preserves_the_selected_key_with_a_local_install_present() {
+    let config = tempfile::tempdir().expect("private config");
+    let credentials = config.path().join("local/curie.json");
+    std::fs::create_dir_all(credentials.parent().unwrap()).unwrap();
+    std::fs::write(
+        &credentials,
+        serde_json::json!({
+            "api_key": "unrelated-local-install-placeholder",
+            "postgres_password": "local-password-placeholder",
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    // A cluster port-forward uses loopback too. Even the legacy dev sentinel
+    // is the selected cluster key, never an invitation to load local authority.
+    for selected in ["curie-dev-key", "explicit-cluster-placeholder"] {
+        let server = api(empty());
+        let output = Command::new(bin())
+            .args([
+                "cluster",
+                "access-policy",
+                AGENT_NAME,
+                "--api-url",
+                &server.base_url,
+                "--api-key",
+                selected,
+                "--invocation-team",
+                REQUESTERS,
+                "--json",
+            ])
+            .env("CURIE_CONFIG_DIR", config.path())
+            .env_remove("CURIE_API_URL")
+            .env_remove("CURIE_API_KEY")
+            .env_remove("COMPOSE_PROJECT_NAME")
+            .env_remove("COMPOSE_FILE")
+            .env("KUBECONFIG", "/nonexistent/curie-test-kubeconfig")
+            .output()
+            .expect("run cluster access-policy");
+        assert!(output.status.success(), "{output:?}");
+        let requests = server.recorded();
+        assert_eq!(requests.len(), 3);
+        assert!(requests
+            .iter()
+            .all(|req| req.header("x-api-key") == Some(selected)));
+        assert_eq!(puts(&server).len(), 1);
+    }
+}

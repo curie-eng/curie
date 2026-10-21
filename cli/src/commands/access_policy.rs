@@ -177,7 +177,7 @@ pub async fn agent_access_policy(
         }
         return Ok(AccessPolicyOutput::DryRun(crate::ui::DryRunPlan { lines }));
     }
-    let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
+    let client = ApiClient::with_resolved_key(&opts.api_url, &opts.api_key)?;
     let agent = client.find_agent(&opts.agent).await?;
     let stored = client.get_agent_access_policy(&agent.id).await?;
     if change.is_show() {
