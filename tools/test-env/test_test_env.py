@@ -5,6 +5,8 @@ from __future__ import annotations
 import importlib.util
 import ipaddress
 import json
+import os
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -152,3 +154,40 @@ def test_exhausted_subnet_pool_is_transient() -> None:
 def test_malformed_subnet_inventory_fails_closed() -> None:
     with pytest.raises(ValueError):
         load_helper().private_network_subnets("curie-test-env-example", ["invalid-subnet"])
+
+
+def test_ignored_signal_during_cleanup_process_creation_stays_ignored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Cleanup runs under ignored SIGINT and SIGTERM. A signal that lands while the
+    # cleanup command is being created must not abort cleanup as an interrupt.
+    module = load_helper()
+    real_popen = subprocess.Popen
+
+    def signalled_popen(*args: object, **kwargs: object) -> subprocess.Popen[str]:
+        os.kill(os.getpid(), signal.SIGTERM)
+        return real_popen(*args, **kwargs)  # type: ignore[call-overload]
+
+    monkeypatch.setattr(module.subprocess, "Popen", signalled_popen)
+    with module.signal_handlers(signal.SIG_IGN):
+        result = module.run_process([sys.executable, "-c", "print('reaped')"], ROOT)
+        assert signal.getsignal(signal.SIGTERM) is signal.SIG_IGN
+    assert result.returncode == 0
+    assert result.stdout.strip() == "reaped"
+
+
+def test_handled_signal_during_process_creation_still_interrupts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = load_helper()
+    real_popen = subprocess.Popen
+
+    def signalled_popen(*args: object, **kwargs: object) -> subprocess.Popen[str]:
+        os.kill(os.getpid(), signal.SIGTERM)
+        return real_popen(*args, **kwargs)  # type: ignore[call-overload]
+
+    monkeypatch.setattr(module.subprocess, "Popen", signalled_popen)
+    with module.signal_handlers(module.interrupt):
+        with pytest.raises(module.Interrupted) as raised:
+            module.run_process([sys.executable, "-c", "import time; time.sleep(30)"], ROOT)
+    assert raised.value.signum == signal.SIGTERM

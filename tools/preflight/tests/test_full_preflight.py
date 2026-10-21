@@ -776,7 +776,7 @@ def test_private_services_shared_worktree_lock_refuses_detached_checkout(
     with (scratch / f"{project}.lock").open("w") as owner:
         fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
         helper = load_helper()
-        with pytest.raises(helper.TransientError):
+        with pytest.raises(helper.TransientError, match="Another full preflight owns"):
             with helper.private_services(checkout, worktree):
                 pytest.fail("A second invocation acquired the existing owner's project")
 
