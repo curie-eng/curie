@@ -47,6 +47,7 @@ from .managed_cni_cases import (
 )
 from .managed_cni_probe_kit import (
     PRODUCER_CONSTANTS,
+    SUB_CASES,
     Measurement,
     ObservationEntry,
     PolicySet,
@@ -58,11 +59,42 @@ from .managed_cni_probe_kit import (
 )
 
 LOCAL_PRODUCER_KIND = "local-cilium-v1"
+# Sub-cases this producer does not measure even within its own cases: a local
+# Docker-driver install has no instance metadata service.
 NOT_APPLICABLE_SUB_CASES = frozenset({"instance_metadata"})
+# The local Cilium network fact measures cases 1, 6 and 8 only. Case 2 belongs to
+# the hostile fact and case 7 joins when local case 7 is wired; both arrive with
+# the peer slice.
+LOCAL_NETWORK_CASES = (1, 6, 8)
+# Allowlist, not a denylist: exactly the sub-cases of those cases the fact
+# measures today. Everything else the shared kit returns -- cases 2, 3, 4, 5, 7
+# and any future kit case -- is dropped before the digest and before the verdict,
+# so a later kit case cannot leak into the local fact or its refusal.
+_LOCAL_SUB_CASES = frozenset(
+    (case, sub_case)
+    for case in LOCAL_NETWORK_CASES
+    for sub_case in SUB_CASES[case]
+    if sub_case not in NOT_APPLICABLE_SUB_CASES
+)
 # ADR 0236 fact name -> probe kit channel and the cases this producer measures
-# for it. Case 7 joins the network fact with its slice; the hostile and
-# retained-peer facts follow with the peer slice.
+# for it. The hostile and retained-peer facts follow with the peer slice.
 FACTS = {"network": ("network", (1, 6, 8))}
+
+
+def _in_local_scope(case: int, sub_case: str) -> bool:
+    return (case, sub_case) in _LOCAL_SUB_CASES
+
+
+def _keep_entry(item: ObservationEntry) -> bool:
+    """Keep only this producer's cases. Cases 2, 3, 4, 5, 7 and any future kit case
+    are dropped unconditionally. Instance metadata is not measured on a local
+    install, so an ``unavailable``/``destination_unknown`` entry is dropped, but a
+    real observation is kept so a metadata leak still fails the measurement."""
+    if _in_local_scope(item.case, item.sub_case):
+        return True
+    if item.case == 6 and item.sub_case == "instance_metadata":
+        return (item.outcome, item.reason) != ("unavailable", "destination_unknown")
+    return False
 # Kit refusals that stop before the remaining cases; the local filter keeps them.
 _EARLY = ("enforcement_absent", "non_vacuity_unavailable")
 
@@ -80,15 +112,7 @@ class _Kit(Protocol):
 
 def local_required_entries(layout: ProbeLayout) -> frozenset[EntryKey]:
     return frozenset(
-        key for key in required_entries(layout) if key[1] not in NOT_APPLICABLE_SUB_CASES
-    )
-
-
-def _not_applicable(item: ObservationEntry) -> bool:
-    # Dropped only when nothing was observed; any observation is kept and judged.
-    return item.sub_case in NOT_APPLICABLE_SUB_CASES and (item.outcome, item.reason) == (
-        "unavailable",
-        "destination_unknown",
+        key for key in required_entries(layout) if _in_local_scope(key[0], key[1])
     )
 
 
@@ -156,7 +180,9 @@ class LocalCiliumNetworkProducer:
             return LocalResult(Measurement((), "policy_set_unavailable"), before, None, None)
         kit = await self._kit.measure()
         report = self._kit.last
-        entries = tuple(item for item in kit.entries if not _not_applicable(item))
+        # Keep only this producer's own cases; drop every other kit case (including
+        # future ones) before the digest and the verdict.
+        entries = tuple(item for item in kit.entries if _keep_entry(item))
         try:
             after: CiliumIdentity | None = await self._identity()
         except ProbeKitRefused:

@@ -153,6 +153,21 @@ def test_a_sampling_gap_inside_a_tick_is_reported(monkeypatch: pytest.MonkeyPatc
     assert [doc["sockets"] for doc in ticks] == [True, False, True]
 
 
+# An argument valid for every template: the spoofing template reads ``packets``,
+# the kubelet probe reads ``probe_host``/``probe_port``, the rest ignore the extras.
+VALID_ARGUMENT: dict[str, Any] = {
+    "probe_host": "10.0.0.5",
+    "probe_port": 16379,
+    "attempts": [],
+    "source": "10.0.0.1",
+    "destination": "10.0.0.2",
+    "packets": [{"src": "10.0.0.1", "addr": "10.0.0.2", "port": 16379, "proto": "tcp",
+                 "nonce": "ab" * 16}],
+    "repeat": 1,
+    "interval_ms": 0,
+}
+
+
 @pytest.mark.parametrize("template", sorted(TEMPLATES))
 def test_every_template_is_unprivileged_and_tokenless(template: str) -> None:
     pod = probe_pod(
@@ -162,7 +177,7 @@ def test_every_template_is_unprivileged_and_tokenless(template: str) -> None:
         node="node-a",
         campaign="c1",
         role_labels={"curietech.ai/role": "x"},
-        argument={"attempts": []},
+        argument=VALID_ARGUMENT,
     )
     spec = pod["spec"]
     assert spec["automountServiceAccountToken"] is False
@@ -170,23 +185,58 @@ def test_every_template_is_unprivileged_and_tokenless(template: str) -> None:
     assert "volumes" not in spec
     (container,) = spec["containers"]
     assert container["image"] == PROBE_IMAGE and "@sha256:" in PROBE_IMAGE
-    assert container["securityContext"] == {
-        "privileged": False,
-        "allowPrivilegeEscalation": False,
-        "readOnlyRootFilesystem": True,
-        "capabilities": {"drop": ["ALL"]},
-    }
+    security = container["securityContext"]
+    assert (security["privileged"], security["allowPrivilegeEscalation"]) == (False, False)
+    assert security["readOnlyRootFilesystem"] is True
+    # The spoofing template adds NET_RAW and nothing else; every other template
+    # drops all capabilities (clause 2).
+    expected = {"drop": ["ALL"]} | ({"add": ["NET_RAW"]} if template == "spoofing" else {})
+    assert security["capabilities"] == expected
     assert "volumeMounts" not in container and "envFrom" not in container
     assert spec["nodeName"] == "node-a"
     assert pod["metadata"]["labels"]["curietech.ai/managed-cni-probe-template"] == template
 
 
+def test_spoofing_is_the_only_template_that_adds_a_capability() -> None:
+    adders = [
+        template
+        for template in TEMPLATES
+        if probe_pod(
+            template=template,
+            name="p",
+            namespace="probe-a",
+            node="n",
+            campaign="c1",
+            role_labels={},
+            argument=VALID_ARGUMENT,
+        )["spec"]["containers"][0]["securityContext"]["capabilities"].get("add")
+    ]
+    assert adders == ["spoofing"]
+
+
+def test_kubelet_probe_carries_a_tcp_readiness_probe_to_the_twin() -> None:
+    pod = probe_pod(
+        template="kubelet_probe",
+        name="p",
+        namespace="probe-a",
+        node="n",
+        campaign="c1",
+        role_labels={},
+        argument={"probe_host": "10.0.0.9", "probe_port": 16379},
+    )
+    (container,) = pod["spec"]["containers"]
+    assert container["readinessProbe"]["tcpSocket"] == {"host": "10.0.0.9", "port": 16379}
+
+
 @pytest.mark.parametrize(
     "changes",
     [
-        {"template": "spoofing"},
+        {"template": "unknown_template"},
         {"node": "Node_A"},
         {"role_labels": {"curietech.ai/managed-cni-probe-template": "twin"}},
+        # A kubelet probe without a valid target host and port is refused.
+        {"template": "kubelet_probe", "argument": {"probe_host": "10.0.0.5", "probe_port": 0}},
+        {"template": "kubelet_probe", "argument": {}},
     ],
 )
 def test_template_refuses_what_it_does_not_allow(changes: dict[str, Any]) -> None:
@@ -202,6 +252,53 @@ def test_template_refuses_what_it_does_not_allow(changes: dict[str, Any]) -> Non
     arguments.update(changes)
     with pytest.raises(ProbeKitRefused):
         probe_pod(**arguments)
+
+
+def _spoof_pod(packets: Any, *, source: str = "10.0.0.1", destination: str = "10.0.0.2",
+               **extra: Any) -> dict[str, Any]:
+    return probe_pod(
+        template="spoofing", name="p", namespace="probe-a", node="n", campaign="c1",
+        role_labels={}, argument={"source": source, "destination": destination, "packets": packets,
+                                  "repeat": 1, "interval_ms": 0, **extra},
+    )
+
+
+def test_spoofing_template_renders_only_well_formed_packets() -> None:
+    ok = [{"src": "10.0.0.1", "addr": "10.0.0.2", "port": 16379, "proto": "tcp", "nonce": "a" * 32}]
+    assert _spoof_pod(ok)["metadata"]["labels"]["curietech.ai/managed-cni-probe-template"] == (
+        "spoofing"
+    )
+    bad_cases: list[Any] = [
+        [],  # no packets
+        [dict(ok[0], addr="not-an-ip")],  # destination not an address
+        [dict(ok[0], proto="icmp")],  # protocol not tcp/udp
+        [dict(ok[0], flags=0x04)],  # a flag outside the fixed set (RST)
+        [dict(ok[0], port=0)],  # port out of range
+        [dict(ok[0], nonce="nothex!")],  # nonce not a hex token
+    ]
+    for packets in bad_cases:
+        with pytest.raises(ProbeKitRefused):
+            _spoof_pod(packets)
+    # Repeat and interval are capped, and at most eight packets.
+    with pytest.raises(ProbeKitRefused):
+        _spoof_pod(ok, repeat=6)
+    with pytest.raises(ProbeKitRefused):
+        _spoof_pod(ok, interval_ms=2000)
+    with pytest.raises(ProbeKitRefused):
+        _spoof_pod(ok * 9)
+
+
+def test_spoofing_rejects_any_destination_or_source_but_the_declared_pair() -> None:
+    ok = {"src": "10.0.0.1", "addr": "10.0.0.2", "port": 16379, "proto": "tcp", "nonce": "a" * 32}
+    # A packet to a destination other than the declared owned listener is refused.
+    with pytest.raises(ProbeKitRefused):
+        _spoof_pod([dict(ok, addr="10.0.0.99")])
+    # A packet forging a source other than the declared non-owned address is refused.
+    with pytest.raises(ProbeKitRefused):
+        _spoof_pod([dict(ok, src="10.0.0.42")])
+    # The declared source may not equal the declared destination.
+    with pytest.raises(ProbeKitRefused):
+        _spoof_pod([ok], source="10.0.0.2")
 
 
 def test_probe_kit_digest_is_stable() -> None:
