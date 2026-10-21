@@ -15,6 +15,10 @@ path = "src/main.rs"
 name = "integration"
 path = "tests/integration.rs"
 
+[[test]]
+name = "dev_test_env"
+path = "tests/dev_test_env.rs"
+
 [dependencies]
 curie-aci-protocol = { path = "../packages/aci-protocol/generated/rust" }
 anstream = "1"

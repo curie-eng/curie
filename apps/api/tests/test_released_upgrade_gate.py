@@ -202,12 +202,12 @@ def sibling_postgres(
     tmp_path: Path,
 ) -> Any:
     project = f"curie2751sibling{uuid.uuid4().hex[:8]}"
-    preflight = _load_script(
-        "released_upgrade_preflight_networks",
-        REPO_ROOT / "tools" / "preflight" / "preflight.py",
+    test_env = _load_script(
+        "released_upgrade_test_env_networks",
+        REPO_ROOT / "tools" / "test-env" / "test_env.py",
     )
-    occupied = preflight.docker_network_subnets(REPO_ROOT, dict(os.environ))
-    subnet, _ = preflight.private_network_subnets(project, occupied)
+    occupied = test_env.docker_network_subnets(REPO_ROOT, dict(os.environ))
+    subnet, _ = test_env.private_network_subnets(project, occupied)
     override = tmp_path / "sibling.yaml"
     override.write_text(
         "services:\n"
