@@ -136,6 +136,11 @@
       "reason": "A preflight setup error with recovery instructions, unrelated to plugin_format."
     },
     {
+      "struct": "TestEnvOutput",
+      "file": "cli/src/commands/dev.rs",
+      "reason": "The isolated test environment result read from the source-owned test-env helper, unrelated to plugin_format."
+    },
+    {
       "struct": "CheckReport",
       "file": "cli/src/commands/init.rs",
       "reason": "Mirrors the frozen curie_runner.check report contract (parse_check_report), a different local contract entirely -- unrelated to plugin_format and out of scope for #701."

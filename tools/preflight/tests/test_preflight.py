@@ -16,6 +16,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[3]
 TOOL = ROOT / "tools/preflight/preflight.py"
+TEST_ENV = ROOT / "tools/test-env/test_env.py"
 COMMIT_STEP = "Check the PR's commit messages"
 ALWAYS = {
     ("action-pins", "Require third party action SHA pins and version comments"),
@@ -170,6 +171,15 @@ def load_tool() -> ModuleType:
     return module
 
 
+def load_helper() -> ModuleType:
+    spec = importlib.util.spec_from_file_location("curie_preflight_test_env_subject", TEST_ENV)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 @pytest.mark.parametrize(
     ("body", "needs_stack"),
     [
@@ -239,7 +249,7 @@ def test_private_services_handoff_protected_source_resources() -> None:
         "CURIE_PRIMARY_SOURCE_RESOURCES": "0",
         "CURIE_SETTLEMENT_TEST_REDIS_URL": "redis://unowned.example.com:1/0",
     }
-    result = load_tool().private_service_environment(
+    result = load_helper().private_service_environment(
         environment, postgres=35432, valkey=36379, s3=39000, otel=34318
     )
     assert result["CURIE_PRIMARY_SOURCE_RESOURCES"] == "1"
@@ -347,6 +357,8 @@ def test_fast_accepts_legitimate_assistant_identifier_in_commit_message(repo: Pa
 def manual_repo(repo: Path) -> Path:
     (repo / "tools/preflight").mkdir(parents=True)
     shutil.copy2(TOOL, repo / "tools/preflight/preflight.py")
+    (repo / "tools/test-env").mkdir(parents=True)
+    shutil.copy2(TEST_ENV, repo / "tools/test-env/test_env.py")
     workflow = repo / ".github/workflows/preflight-identity.yaml"
     workflow.write_text(
         "name: Example action pin\n"
@@ -447,6 +459,8 @@ def prepare_hook(repo: Path, tmp_path: Path) -> tuple[Path, Path]:
     shutil.copy2(ROOT / ".githooks/pre-push", repo / ".githooks/pre-push")
     (repo / "tools/preflight").mkdir(parents=True)
     shutil.copy2(TOOL, repo / "tools/preflight/preflight.py")
+    (repo / "tools/test-env").mkdir(parents=True)
+    shutil.copy2(TEST_ENV, repo / "tools/test-env/test_env.py")
     git(repo, "add", ".")
     git(repo, "commit", "-qm", "Add tracked preflight tooling")
     remote = tmp_path / "remote.git"
