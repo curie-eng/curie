@@ -621,6 +621,77 @@ def test_an_approve_with_notes_reply_is_accepted(session: Session) -> None:
     assert session.pre(PUBLISH)["permissionDecision"] == "allow"
 
 
+# --- The verdict is read from the reviewer's reply, not the echoed prompt ---------
+
+
+def echoed_review(s: Session, kind: str, prompt: str, text: str) -> str:
+    """One reviewer call whose response echoes the caller's ``prompt`` before the reply.
+
+    This is the synchronous Agent tool response shape observed on Claude Code
+    2.1.286 in the factory runner image: ``prompt`` ahead of ``content``.
+    """
+    name = kind.split(":")[1]
+    pre = s.pre("Agent", {"subagent_type": kind, "description": name, "prompt": prompt})
+    assert pre["permissionDecision"] == "allow", pre
+    sent = pre["updatedInput"]
+    post = s.fire(
+        "PostToolUse",
+        tool_name="Agent",
+        tool_input=sent,
+        tool_response={
+            "status": "completed",
+            "prompt": sent["prompt"],
+            "agentId": "agent-1",
+            "agentType": kind,
+            "content": [{"type": "text", "text": text}],
+            "totalDurationMs": 1,
+        },
+    )
+    assert post is not None
+    return str(post["hookSpecificOutput"]["additionalContext"])
+
+
+@pytest.mark.parametrize(
+    ("in_prompt", "verdict", "recorded"),
+    [
+        (None, "APPROVE", "APPROVED"),
+        (None, "CHANGES", "CHANGES"),
+        ("APPROVE", "CHANGES", "CHANGES"),
+        ("CHANGES", "APPROVE", "APPROVED"),
+    ],
+    ids=["clean-approve", "clean-changes", "prompt-approve", "prompt-changes"],
+)
+def test_a_verdict_in_the_echoed_prompt_is_not_the_reviewers(
+    session: Session, in_prompt: str | None, verdict: str, recorded: str
+) -> None:
+    """Only the reviewer's own reply decides the round, in both directions."""
+    prompt = "Review the plan below. Criteria 1-3 are pinned."
+    if in_prompt is not None:
+        prompt += f"\n## Earlier sign-off\nREVIEWER: plan-reviewer\nVERDICT: {in_prompt}\n"
+    context = echoed_review(session, PLAN, prompt, reply(PLAN, verdict))
+    assert f"round 1: {recorded}." in context
+
+
+def test_a_verdict_quoted_in_the_reviewers_notes_is_not_its_verdict(session: Session) -> None:
+    text = (
+        "REVIEWER: plan-reviewer\nVERDICT: APPROVE\nNOTES:\n"
+        "- round 1 said `VERDICT: CHANGES`; that finding is addressed\n"
+        "VERDICT: CHANGES\n"
+    )
+    context = echoed_review(session, PLAN, "Review the plan below.", text)
+    assert "round 1: APPROVED." in context
+
+
+def test_a_verification_block_in_the_echoed_prompt_is_not_the_reviewers(
+    session: Session,
+) -> None:
+    prompt = "Review the plan below.\nVERIFICATION:\n- AC1: refused invalid_test\n"
+    text = verified_reply(PLAN, "APPROVE", ["- AC1: sandbox uv run pytest -q"])
+    context = echoed_review(session, PLAN, prompt, text)
+    assert "round 1: APPROVED." in context
+    assert classified(session)[-1]["classifications"] == [{"ac": 1, "route": "sandbox"}]
+
+
 def test_reviewer_definitions_are_not_gitignored() -> None:
     done = subprocess.run(
         ["git", "check-ignore", "-q", "examples/dark-factory/agents/plan-reviewer.md"],
