@@ -25,6 +25,7 @@ from curie_protected_hooks.commissioning_local_bootstrap import (
     AdministratorBootstrap,
     ProvisionerGrant,
     credential_secret_name,
+    credentials_namespace,
     read_baseline,
 )
 from curie_protected_hooks.commissioning_local_broker import (
@@ -70,10 +71,14 @@ class Installed:
 @pytest.fixture(scope="module")
 def installed(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Installed]:
     """Cleanup is registered before the profile exists, and checks absence."""
-    root: Path = tmp_path_factory.mktemp("commissioning-local") / "run"
+    base: Path = tmp_path_factory.mktemp("commissioning-local")
+    root = base / "run"
     owner = fresh_owner()
     ledger = OwnershipLedger.create(root, owner=owner)
-    cluster = LocalCluster(ledger)
+    # The administrator's kubeconfig and baseline live apart from the provisioner's files.
+    administrator = base / "administrator"
+    administrator.mkdir(mode=0o700)
+    cluster = LocalCluster(ledger, kubeconfig=administrator / "kubeconfig")
     namespace = owner + "-protected"
     broker: LocalBroker | None = None
     try:
@@ -82,9 +87,13 @@ def installed(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Installed]:
         principals = broker_principals(
             recipes, profile(), provisioner_id="commissioning/example-provisioner"
         )
-        baseline_dir = root.parent / "admin"
+        baseline_dir = administrator / "baseline"
         admin = AdministratorBootstrap(
-            cluster, namespace=namespace, principals=principals, baseline_dir=baseline_dir
+            cluster,
+            namespace=namespace,
+            principals=principals,
+            baseline_dir=baseline_dir,
+            provisioner_dir=root,
         )
         admin.issue()
         grant = admin.grant()
@@ -144,8 +153,10 @@ def test_owned_objects_match_the_ledger_and_the_pinned_image(installed: Installe
     keys = set(installed.cluster.objects())
     ns = installed.namespace
     rbac = "rbac.authorization.k8s.io/v1"
+    held = credentials_namespace(ns)
     assert keys == {
         f"v1/Namespace//{ns}",
+        f"v1/Namespace//{held}",
         f"v1/ServiceAccount/{ns}/{PROVISIONER_ACCOUNT}",
         f"{rbac}/Role/{ns}/{PROVISIONER_ACCOUNT}",
         f"{rbac}/RoleBinding/{ns}/{PROVISIONER_ACCOUNT}",
@@ -153,7 +164,7 @@ def test_owned_objects_match_the_ledger_and_the_pinned_image(installed: Installe
         f"v1/Secret/{ns}/{INSTALLER_SECRET}",
         f"v1/Service/{ns}/{BROKER_NAME}",
         f"v1/Pod/{ns}/{BROKER_NAME}",
-        *(f"v1/Secret/{ns}/{credential_secret_name(name)}" for name in installed.users),
+        *(f"v1/Secret/{held}/{credential_secret_name(name)}" for name in installed.users),
     }
     for key in keys:
         live = installed.cluster.read(key)
@@ -174,7 +185,12 @@ def test_each_credential_is_in_its_own_secret_and_nowhere_else(installed: Instal
     decoded = "".join(base64.b64decode(v).decode() for v in tls["data"].values())
     for name, user in installed.users.items():
         assert user.password not in decoded
-        own = get(installed, "secret/" + credential_secret_name(name))
+        own = json.loads(
+            installed.cluster.kubectl(
+                "get", "secret/" + credential_secret_name(name),
+                "--namespace", credentials_namespace(installed.namespace), "--output", "json",
+            )
+        )  # fmt: skip
         assert base64.b64decode(own["data"]["password"]).decode() == user.password
     pod = json.dumps(get(installed, "pod/" + BROKER_NAME)["spec"])
     assert all(user.password not in pod for user in installed.users.values())
@@ -192,30 +208,94 @@ def test_the_provisioner_side_never_holds_the_observer_or_publisher_password(
         assert installed.users[name].password not in held, name
 
 
-def test_the_provisioner_identity_is_refused_other_principals_secrets(
+def test_the_provisioner_identity_has_no_path_to_other_credentials(
     installed: Installed,
 ) -> None:
-    """Design decisions 7 and 8 in Kubernetes: the API server refuses the provisioner's
-    identity every credential Secret, and lets it read only its own broker TLS Secret."""
-    commands, runner = installed.provisioner.commands, installed.provisioner.runner
+    """Design decisions 7 and 8 in Kubernetes. The credential Secrets live in a
+    namespace where the provisioner's identity holds no right at all, so it can
+    neither read them nor start a Pod that mounts them; a Pod in its own
+    namespace cannot mount another namespace's Secret."""
+    from curie_protected_hooks.commissioning_local_installation import InstallationRefused
 
-    def readable(*args: str) -> bool:
-        argv = commands.kubectl_argv(*args, "--namespace", installed.namespace, "--output", "json")
-        return runner.probe(argv, timeout=60) == 0
+    provisioner, held = installed.provisioner, credentials_namespace(installed.namespace)
+
+    def allowed(*args: str) -> bool:
+        argv = provisioner.commands.kubectl_argv(*args, "--output", "json")
+        return provisioner.runner.probe(argv, timeout=60) == 0
 
     for name in installed.users:
-        assert not readable("get", "secret/" + credential_secret_name(name)), name
-    assert not readable("get", "secret/" + INSTALLER_SECRET)
-    assert not readable("get", "secrets")
-    assert readable("get", "secret/" + BROKER_NAME + "-tls")
-    assert readable("get", "pods")
-    # The same reads succeed with the administrator's identity, so the refusal is RBAC.
-    admin = installed.cluster
-    observer = credential_secret_name("observer")
-    argv = admin.commands.kubectl_argv(
-        "get", "secret/" + observer, "--namespace", installed.namespace, "--output", "json"
-    )
-    assert admin.runner.probe(argv, timeout=60) == 0
+        assert not allowed("get", "secret/" + credential_secret_name(name), "--namespace", held)
+        assert not allowed(
+            "get", "secret/" + credential_secret_name(name), "--namespace", installed.namespace
+        )
+    assert not allowed("get", "secrets", "--namespace", held)
+    assert not allowed("get", "pods", "--namespace", held)
+    assert not allowed("get", "secrets", "--namespace", installed.namespace)
+    assert allowed("get", "secret/" + BROKER_NAME + "-tls", "--namespace", installed.namespace)
+    assert allowed("get", "pods", "--namespace", installed.namespace)
+    # The administrator's identity reads the same Secret, so the refusals are RBAC.
+    assert installed.cluster.runner.probe(
+        installed.cluster.commands.kubectl_argv(
+            "get", "secret/" + credential_secret_name("observer"), "--namespace", held,
+            "--output", "json",
+        ),
+        timeout=60,
+    ) == 0  # fmt: skip
+    for name in ("observer", "qualification_publisher"):
+        secret = credential_secret_name(name)
+        reader = _reader_pod(installed, "read-" + name.replace("_", "-"), secret)
+        # In the credentials namespace the API server refuses the Pod outright.
+        with pytest.raises(InstallationRefused):
+            provisioner.create({**reader, "metadata": {**reader["metadata"], "namespace": held}})
+        # In its own namespace the Pod is admitted but the Secret is not there: it never runs.
+        provisioner.create(reader)
+        argv = provisioner.commands.kubectl_argv(
+            "wait", "--for=jsonpath={.status.phase}=Succeeded", "pod/" + reader["metadata"]["name"],
+            "--namespace", installed.namespace, "--timeout", "30s",
+        )  # fmt: skip
+        assert provisioner.runner.probe(argv, timeout=60) != 0
+        live = get(installed, "pod/" + reader["metadata"]["name"])
+        assert live["status"]["phase"] == "Pending"
+        logs = provisioner.commands.kubectl_argv(
+            "logs", "pod/" + reader["metadata"]["name"], "--namespace", installed.namespace
+        )
+        assert provisioner.runner.probe(logs, timeout=60) != 0
+
+
+def _reader_pod(installed: Installed, name: str, secret: str) -> dict[str, Any]:
+    """A restricted Pod that would print a credential if it could mount it."""
+    return {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": name,
+            "namespace": installed.namespace,
+            "labels": {OWNER_LABEL: installed.cluster.owner},
+        },
+        "spec": {
+            "restartPolicy": "Never",
+            "automountServiceAccountToken": False,
+            "securityContext": {
+                "runAsNonRoot": True,
+                "runAsUser": 999,
+                "seccompProfile": {"type": "RuntimeDefault"},
+            },
+            "containers": [
+                {
+                    "name": "read",
+                    "image": IMAGE,
+                    "command": ["cat", "/credential/password"],
+                    "securityContext": {
+                        "allowPrivilegeEscalation": False,
+                        "readOnlyRootFilesystem": True,
+                        "capabilities": {"drop": ["ALL"]},
+                    },
+                    "volumeMounts": [{"name": "credential", "mountPath": "/credential"}],
+                }
+            ],
+            "volumes": [{"name": "credential", "secret": {"secretName": secret}}],
+        },
+    }
 
 
 def test_the_baseline_is_what_the_observer_reads_and_holds_no_password(

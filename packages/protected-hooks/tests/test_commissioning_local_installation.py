@@ -85,8 +85,9 @@ class FakeRunner:
         raise AssertionError(argv)
 
 
-def write_admin_kubeconfig(root: Path, owner: str = OWNER) -> None:
-    """What minikube writes: the profile's cluster with a client certificate user."""
+def write_admin_kubeconfig(root: Path, owner: str = OWNER) -> Path:
+    """What minikube writes, in the administrator's own private directory."""
+    root.mkdir(mode=0o700, exist_ok=True)
     (root / "kubeconfig").write_text(
         "apiVersion: v1\nkind: Config\nclusters:\n"
         f"- name: {owner}\n  cluster:\n    server: https://127.0.0.1:50123\n"
@@ -96,6 +97,7 @@ def write_admin_kubeconfig(root: Path, owner: str = OWNER) -> None:
         f"contexts:\n- name: {owner}\n  context:\n    cluster: {owner}\n    user: {owner}\n"
         f"current-context: {owner}\n"
     )
+    return root / "kubeconfig"
 
 
 def installation(tmp_path: Path) -> tuple[Any, FakeRunner]:

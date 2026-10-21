@@ -141,19 +141,9 @@ def test_principals_refuse_rules_carrying_state_or_passwords() -> None:
 
 def test_the_provisioner_never_holds_another_principals_password(tmp_path: Path) -> None:
     """Design decisions 7 and 8: only the administrator bootstrap issues credentials."""
-    from curie_protected_hooks.commissioning_local_installation import LocalCluster
-    from curie_protected_hooks.commissioning_local_ownership import OwnershipLedger
-
-    from .test_commissioning_local_installation import FakeRunner, write_admin_kubeconfig
-
     boot = bootstrap()
-    ledger = OwnershipLedger.create(tmp_path / "run", owner=OWNER)
-    write_admin_kubeconfig(ledger.root)
-    runner = FakeRunner(ledger)
-    cluster = LocalCluster(ledger, runner=runner)
-    admin = boot.AdministratorBootstrap(
-        cluster, namespace=NAMESPACE, principals=principals(), baseline_dir=tmp_path / "admin"
-    )
+    ledger, runner, cluster = admin_cluster(tmp_path)
+    admin = bootstrap_for(cluster, ledger, tmp_path)
     admin.issue()
     issued = admin.credentials()
     grant = admin.grant()
@@ -178,6 +168,12 @@ def test_the_provisioner_never_holds_another_principals_password(tmp_path: Path)
         for key, value in runner.objects.items()
         if key.startswith("v1/Secret/")
     }
+    credential_keys = {
+        key.split("/")[-1]
+        for key in runner.objects
+        if key.startswith(f"v1/Secret/{boot.credentials_namespace(NAMESPACE)}/")
+    }
+    assert credential_keys == {boot.credential_secret_name(name) for name in issued}
     for name, user in issued.items():
         data = secrets_created[boot.credential_secret_name(name)]["data"]
         assert base64.b64decode(data["password"]).decode() == user.password
@@ -549,6 +545,30 @@ def test_port_forward_without_a_ready_line_refuses_and_is_stopped() -> None:
         api._start_forward([sys.executable, "-c", script], dict(os.environ))
 
 
+def admin_cluster(tmp_path: Path) -> tuple[Any, Any, Any]:
+    """The administrator's cluster view, its admin kubeconfig in its own directory."""
+    from curie_protected_hooks.commissioning_local_installation import LocalCluster
+    from curie_protected_hooks.commissioning_local_ownership import OwnershipLedger
+
+    from .test_commissioning_local_installation import FakeRunner, write_admin_kubeconfig
+
+    tmp_path.mkdir(exist_ok=True)
+    ledger = OwnershipLedger.create(tmp_path / "run", owner=OWNER)
+    runner = FakeRunner(ledger)
+    kubeconfig = write_admin_kubeconfig(tmp_path / "administrator")
+    return ledger, runner, LocalCluster(ledger, runner=runner, kubeconfig=kubeconfig)
+
+
+def bootstrap_for(cluster: Any, ledger: Any, tmp_path: Path) -> Any:
+    return bootstrap().AdministratorBootstrap(
+        cluster,
+        namespace=NAMESPACE,
+        principals=principals(),
+        baseline_dir=tmp_path / "administrator" / "baseline",
+        provisioner_dir=ledger.root,
+    )
+
+
 def _broker_with_a_live_forward(tmp_path: Path) -> tuple[Any, Any, Any]:
     """A broker whose forward is a real process with nothing behind its port."""
     import socket
@@ -590,11 +610,10 @@ def test_a_failed_campaign_start_closes_the_forward(tmp_path: Path) -> None:
 
 
 def test_a_failed_enrollment_closes_the_forward(tmp_path: Path) -> None:
-    api, cluster, broker = _broker_with_a_live_forward(tmp_path)
+    api, _, broker = _broker_with_a_live_forward(tmp_path)
     process = broker._forward
-    admin = bootstrap().AdministratorBootstrap(
-        cluster, namespace=NAMESPACE, principals=principals(), baseline_dir=tmp_path / "admin"
-    )
+    ledger, _, cluster = admin_cluster(tmp_path / "admin-side")
+    admin = bootstrap_for(cluster, ledger, tmp_path / "admin-side")
     admin.issue()
     with pytest.raises(bootstrap().BootstrapRefused):
         admin.enroll(broker)
@@ -629,21 +648,9 @@ def test_the_provisioner_identity_cannot_read_other_credentials() -> None:
 
 
 def test_the_minted_kubeconfig_is_a_token_identity_for_the_same_cluster(tmp_path: Path) -> None:
-    from curie_protected_hooks.commissioning_local_installation import LocalCluster
-    from curie_protected_hooks.commissioning_local_ownership import OwnershipLedger
-
-    from .test_commissioning_local_installation import FakeRunner, write_admin_kubeconfig
-
     boot = bootstrap()
-    ledger = OwnershipLedger.create(tmp_path / "run", owner=OWNER)
-    write_admin_kubeconfig(ledger.root)
-    runner = FakeRunner(ledger)
-    admin = boot.AdministratorBootstrap(
-        LocalCluster(ledger, runner=runner),
-        namespace=NAMESPACE,
-        principals=principals(),
-        baseline_dir=tmp_path / "admin",
-    )
+    ledger, runner, cluster = admin_cluster(tmp_path)
+    admin = bootstrap_for(cluster, ledger, tmp_path)
     admin.issue()
     grant = admin.grant()
     assert grant.kubeconfig == ledger.root / boot.PROVISIONER_KUBECONFIG
@@ -666,9 +673,33 @@ def test_the_minted_kubeconfig_is_a_token_identity_for_the_same_cluster(tmp_path
     token = next(argv for argv, _ in runner.calls if argv[5:7] == ["create", "token"])
     assert token[7:] == [boot.PROVISIONER_ACCOUNT, "--namespace", NAMESPACE, "--duration", "24h"]
     created = [key for key in runner.objects]
-    assert created[:4] == [
+    assert created[:5] == [
         f"v1/Namespace//{NAMESPACE}",
+        f"v1/Namespace//{boot.credentials_namespace(NAMESPACE)}",
         f"v1/ServiceAccount/{NAMESPACE}/{boot.PROVISIONER_ACCOUNT}",
         f"rbac.authorization.k8s.io/v1/Role/{NAMESPACE}/{boot.PROVISIONER_ACCOUNT}",
         f"rbac.authorization.k8s.io/v1/RoleBinding/{NAMESPACE}/{boot.PROVISIONER_ACCOUNT}",
     ]
+
+
+def test_the_provisioner_kubeconfig_never_lands_beside_the_admin_one(tmp_path: Path) -> None:
+    boot = bootstrap()
+    ledger, _, cluster = admin_cluster(tmp_path)
+    with pytest.raises(boot.BootstrapRefused):
+        boot.AdministratorBootstrap(
+            cluster,
+            namespace=NAMESPACE,
+            principals=principals(),
+            baseline_dir=tmp_path / "baseline",
+            provisioner_dir=cluster.kubeconfig.parent,
+        )
+    from curie_protected_hooks.commissioning_local_installation import (
+        InstallationRefused,
+        LocalCluster,
+    )
+
+    open_dir = tmp_path / "shared"
+    open_dir.mkdir(mode=0o755)
+    open_dir.chmod(0o755)
+    with pytest.raises(InstallationRefused):
+        LocalCluster(ledger, kubeconfig=open_dir / "kubeconfig")

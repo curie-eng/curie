@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import subprocess
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
@@ -171,6 +172,19 @@ def _resource(key: str) -> tuple[str, str, str]:
     return resource + "/" + name, namespace, api_version
 
 
+def _private_directory(path: Path) -> bool:
+    """A real directory of the current user, closed to group and others."""
+    try:
+        status = os.lstat(path)
+    except OSError:
+        return False
+    return (
+        stat.S_ISDIR(status.st_mode)
+        and status.st_uid == os.getuid()
+        and status.st_mode & 0o077 == 0
+    )
+
+
 def _namespace_args(namespace: str) -> tuple[str, ...]:
     return ("--namespace", namespace) if namespace else ()
 
@@ -207,23 +221,20 @@ class LocalCluster:
         runner: CommandRunner | None = None,
         kubeconfig: Path | None = None,
     ) -> None:
-        """Bound to the profile's admin kubeconfig, or to a narrower identity's.
+        """Bound to one kubeconfig in a private directory, @spec PROTECTED-COMMISSIONING-5.
 
-        The administrator bootstrap uses the admin kubeconfig minikube writes;
-        the provisioner uses the ServiceAccount kubeconfig the bootstrap mints.
-        @spec PROTECTED-COMMISSIONING-5.
+        The administrator's cluster holds the admin kubeconfig minikube writes,
+        in the administrator's own directory; the provisioner's holds the
+        ServiceAccount kubeconfig the bootstrap mints in the provisioner's
+        directory. Neither is given the other's path.
         """
         _require(type(ledger) is OwnershipLedger and valid_owner(ledger.owner))
         self.ledger = ledger
         self.owner = ledger.owner
         self.kubeconfig = kubeconfig or ledger.root / _KUBECONFIG
-        _require(self.kubeconfig.parent == ledger.root)
+        _require(_private_directory(self.kubeconfig.parent))
         self.commands = ClusterCommands(self.owner, kubeconfig=self.kubeconfig)
         self.runner = runner or SubprocessRunner(self.commands, log=ledger.root / _LOG)
-
-    def admin_kubeconfig(self) -> Path:
-        """The kubeconfig minikube writes for this profile, @spec PROTECTED-COMMISSIONING-5."""
-        return self.ledger.root / _KUBECONFIG
 
     def __repr__(self) -> str:
         """@spec PROTECTED-COMMISSIONING-5."""

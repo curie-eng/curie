@@ -58,6 +58,7 @@ __all__ = [
     "ProvisionerGrant",
     "close_installer",
     "credential_secret_name",
+    "credentials_namespace",
     "enroll_users",
     "issue_credentials",
     "provisioner_rbac",
@@ -90,6 +91,11 @@ def _refuse() -> NoReturn:
 def _require(condition: bool) -> None:
     if not condition:
         _refuse()
+
+
+def credentials_namespace(namespace: str) -> str:
+    """The namespace holding the credential Secrets, @spec PROTECTED-COMMISSIONING-1."""
+    return namespace + "-credentials"
 
 
 def credential_secret_name(principal: str) -> str:
@@ -286,12 +292,21 @@ class AdministratorBootstrap:
         namespace: str,
         principals: Mapping[str, Principal],
         baseline_dir: Path,
+        provisioner_dir: Path,
     ) -> None:
-        """@spec PROTECTED-COMMISSIONING-1."""
+        """The administrator's own cluster view, directories and namespaces.
+
+        ``cluster`` holds the admin kubeconfig. ``provisioner_dir`` is where the
+        provisioner's kubeconfig is written; it must not be the directory of
+        the admin kubeconfig. @spec PROTECTED-COMMISSIONING-1.
+        """
         _require(type(cluster) is LocalCluster)
+        _require(provisioner_dir.resolve() != cluster.kubeconfig.parent.resolve())
         _require(set(principals) == {*GUARD_PRINCIPALS, *INSTALLATION_PRINCIPALS})
         _require(all(type(p) is Principal for p in principals.values()))
         self._cluster, self._namespace = cluster, namespace
+        self._credentials_namespace = credentials_namespace(namespace)
+        self._provisioner_dir = provisioner_dir
         self._principals = dict(principals)
         self._baseline_dir = baseline_dir
         self.__credentials: dict[str, BrokerUser] = {}
@@ -313,6 +328,9 @@ class AdministratorBootstrap:
         owner = self._cluster.owner
         owned = {OWNER_LABEL: owner}
         self._cluster.create(namespace_object(owner, self._namespace))
+        # Every principal's credential lives in a namespace the provisioner has no
+        # right in: no Secret read and no Pod, so no volume can reach it either.
+        self._cluster.create(namespace_object(owner, self._credentials_namespace))
         for item in provisioner_rbac(owner, self._namespace, readable_secrets=PROVISIONER_SECRETS):
             self._cluster.create(item)
         for name, user in credentials.items():
@@ -322,7 +340,7 @@ class AdministratorBootstrap:
                     "kind": "Secret",
                     "metadata": {
                         "name": credential_secret_name(name),
-                        "namespace": self._namespace,
+                        "namespace": self._credentials_namespace,
                         "labels": owned,
                     },
                     "type": "Opaque",
@@ -359,12 +377,12 @@ class AdministratorBootstrap:
         )  # fmt: skip
         _require(bool(token) and " " not in token)
         value = _token_kubeconfig(
-            self._cluster.admin_kubeconfig(),
+            self._cluster.kubeconfig,
             owner=self._cluster.owner,
             namespace=self._namespace,
             token=token,
         )
-        path = self._cluster.ledger.root / PROVISIONER_KUBECONFIG
+        path = self._provisioner_dir / PROVISIONER_KUBECONFIG
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
         with os.fdopen(os.open(path, flags, 0o600), "w", encoding="utf-8") as stream:
             json.dump(value, stream)
