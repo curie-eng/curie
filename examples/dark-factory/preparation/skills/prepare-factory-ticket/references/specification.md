@@ -50,10 +50,10 @@ headings. Use the developer's preferred filenames and preserve existing output.
 - **Source and identity:** existing-ticket identity and retained source intent,
   or new-intent local identity; inspected revision, selected base SHA and relevant
   working-tree differences. If a revision or source is unavailable, say so.
-- **Preparation workflow:** instruction source and canonical format v1; include
-  the CLI release or source revision when known. Keep unknown versions explicitly
-  unknown. Preserve the source snapshot before changing instructions for a draft.
-  These identify local instructions, not deployment compatibility.
+- **Preparation workflow:** installed or resolved preparation version, output
+  format and instruction source, plus the repository pin when present. Record
+  unknown versions honestly. Keep the source snapshot before a reviewed version
+  migration. These identify local instructions, not deployment compatibility.
 - **Readiness:** deployment readiness `unvalidated`; connected validation pending,
   with no invented report ID, manifest digest, timestamp or fingerprint.
   Local format review is manual, not a parser result.
@@ -149,9 +149,9 @@ approval carries forward while its exact content and action remain unchanged.
 
 Publish the complete reviewed canonical Markdown body through the existing
 tracker intake. No deployment prefix, body digest, compatibility API or repository
-pin is required for publication or factory selection. Resolve any conflict with
-the repository's stated requirements before final review. Do not claim that local
-format review proves deployment readiness.
+pin is required for publication or factory selection. If the repository has an
+explicit preparation format pin, resolve any format mismatch before final review.
+Do not claim that local format selection proves deployment readiness.
 
 1. Re-read each existing issue immediately before updating it. Compare its title
    and body with the source snapshot used for review. If it changed, preserve the

@@ -279,6 +279,49 @@
       ]
     },
     {
+      "id": "repository-pin-isolation",
+      "given": {
+        "global_entry_skill": "one discovered installation",
+        "repository_a": "optional schema 2 pin for cached preparation 0.2.0 and format A",
+        "repository_b": "optional schema 2 pin for cached preparation 0.3.0 and format B"
+      },
+      "user_turn": "Prepare this issue in repository B, then continue the separate draft in repository A.",
+      "expected": {
+        "local_effects": [
+          "resolve each current repository binding independently",
+          "load the matching cached instructions and reference for each draft",
+          "retain each draft preparation version, format and instruction source"
+        ],
+        "tracker_effects": []
+      },
+      "forbidden": [
+        "change either repository pin through global entry upgrade",
+        "reuse repository B instructions or pin in repository A"
+      ]
+    },
+    {
+      "id": "edited-skill-upgrade",
+      "given": {
+        "update_available": true,
+        "managed_file_edited": true,
+        "local_preferences_present": true
+      },
+      "user_turn": "Update the skill.",
+      "expected": {
+        "local_effects": [
+          "updater refuses edited managed file",
+          "preserve both edits and local preferences",
+          "explain manual reconciliation; retain current usable installation"
+        ],
+        "tracker_effects": []
+      },
+      "forbidden": [
+        "overwrite edits",
+        "attempt three-way merge",
+        "modify repository pins"
+      ]
+    },
+    {
       "phase": "clarification",
       "repository_files": {
         "README.md": "History CLI uses Python stdlib. Run python3 -m unittest discover -v. Records have id,timestamp,value,note. Preserve insertion order and UTC ISO8601 timestamps. Output defaults to stdout; --output PATH refuses overwrite unless --force. CSV uses csv.DictWriter with newline=\"\" and UTF-8; existing text exports use no BOM.",

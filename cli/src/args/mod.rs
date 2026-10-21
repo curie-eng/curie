@@ -1520,6 +1520,52 @@ pub(crate) struct FactoryQuickstartArgs {
 
 #[derive(Subcommand)]
 pub(crate) enum FactoryPrepareAction {
+    /// Check, update or roll back an unedited managed preparation skill.
+    Update {
+        #[arg(long, value_enum, value_name = "CLIENT")]
+        agent: curie::agent_skills::AgentClient,
+        #[arg(long, conflicts_with = "dir")]
+        global: bool,
+        #[arg(long, value_name = "DIR")]
+        dir: Option<PathBuf>,
+        /// Local directory containing a self-contained release.json.
+        #[arg(long, conflicts_with_all = ["release_url", "rollback"])]
+        source: Option<PathBuf>,
+        /// Trusted upstream HTTPS release asset URL.
+        #[arg(long, conflicts_with = "rollback")]
+        release_url: Option<String>,
+        /// Report availability without writing files.
+        #[arg(long, conflicts_with = "rollback")]
+        check: bool,
+        /// Restore the previous managed release.
+        #[arg(long)]
+        rollback: bool,
+        /// Show the update decision without writing files.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Resolve an optional repository preparation pin or the installed release.
+    Resolve {
+        #[arg(long, value_enum, value_name = "CLIENT")]
+        agent: curie::agent_skills::AgentClient,
+        #[arg(long, conflicts_with = "dir")]
+        global: bool,
+        #[arg(long, value_name = "DIR")]
+        dir: Option<PathBuf>,
+        /// Repository optionally containing .curie-factory.json.
+        #[arg(long, value_name = "DIR")]
+        repo: PathBuf,
+        #[arg(long, value_name = "DIR")]
+        source: Option<PathBuf>,
+        /// Resolve only existing cached or explicit local release assets.
+        #[arg(long)]
+        offline: bool,
+    },
+    /// Write the bundled preparation release as a self-contained JSON asset.
+    Package {
+        #[arg(long, value_name = "FILE")]
+        out: PathBuf,
+    },
     /// Install the bundled preparation skill offline, without a running Curie service.
     Install {
         /// Coding agent that will discover the skill.

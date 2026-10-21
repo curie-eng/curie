@@ -244,6 +244,12 @@
       "version": "1.0"
     },
     {
+      "result": "ManagedSkillOutput",
+      "kind": "CliOutput",
+      "schema": "managed-skill.schema.json",
+      "version": "1.0"
+    },
+    {
       "result": "MemoryGuidanceOutput",
       "kind": "CliOutput",
       "schema": "memory.schema.json",
