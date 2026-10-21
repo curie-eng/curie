@@ -35,7 +35,16 @@ ROOT = Path(__file__).resolve().parents[4]
 FIXTURES = ROOT / "apps/worker/src/curie_worker/eval/fixtures"
 CASE_IDS = tuple(f"F{family}-P{phrase}" for family in range(1, 9) for phrase in range(1, 4))
 CLASSES = ("skill", "memory-fact", "instruction", "schedule", "clarify", "nothing")
-EXPECTED = ("skill", "instruction", "memory-fact", "schedule", "schedule", "clarify", "nothing", "skill")
+EXPECTED = (
+    "skill",
+    "instruction",
+    "memory-fact",
+    "schedule",
+    "schedule",
+    "clarify",
+    "nothing",
+    "skill",
+)
 ACTOR = "anthropic/claude-haiku-5.5"
 JUDGE = "anthropic/claude-sonnet-5.5"
 THRESHOLDS = {
@@ -69,7 +78,10 @@ def _score(result: ScoreResult, passed: bool) -> None:
         assert result.detail and result.detail.strip()
 
 
-@pytest.mark.parametrize("loader,name", [(load_cases, "learning-cases.json"), (load_calibration, "learning-calibration.json")])
+@pytest.mark.parametrize(
+    "loader,name",
+    [(load_cases, "learning-cases.json"), (load_calibration, "learning-calibration.json")],
+)
 def test_committed_fixtures_are_live_inputs(loader: Callable[..., Any], name: str) -> None:
     rows = loader(FIXTURES / name)
     assert isinstance(rows, tuple)
@@ -93,7 +105,20 @@ def test_calibration_has_two_examples_in_each_required_group() -> None:
 
 
 @pytest.mark.parametrize("loader", [load_cases, load_calibration])
-@pytest.mark.parametrize("kind", ["missing", "directory", "invalid-json", "invalid-utf8", "duplicate-key", "null", "empty", "version", "boolean-version"])
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "missing",
+        "directory",
+        "invalid-json",
+        "invalid-utf8",
+        "duplicate-key",
+        "null",
+        "empty",
+        "version",
+        "boolean-version",
+    ],
+)
 def test_required_fixture_inputs_fail_closed(
     tmp_path: Path, loader: Callable[..., Any], kind: str
 ) -> None:
@@ -115,7 +140,10 @@ def test_required_fixture_inputs_fail_closed(
         loader(path)
 
 
-@pytest.mark.parametrize("loader,name", [(load_cases, "learning-cases.json"), (load_calibration, "learning-calibration.json")])
+@pytest.mark.parametrize(
+    "loader,name",
+    [(load_cases, "learning-cases.json"), (load_calibration, "learning-calibration.json")],
+)
 def test_fixture_reader_propagates_unreadable_input(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, loader: Callable[..., Any], name: str
 ) -> None:
@@ -133,7 +161,17 @@ def test_fixture_reader_propagates_unreadable_input(
         loader(path)
 
 
-@pytest.mark.parametrize("mutation", ["missing-family", "duplicate-case", "missing-paraphrase", "wrong-family", "unknown-predicate", "missing-predicate-argument"])
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing-family",
+        "duplicate-case",
+        "missing-paraphrase",
+        "wrong-family",
+        "unknown-predicate",
+        "missing-predicate-argument",
+    ],
+)
 def test_corpus_reader_rejects_incomplete_or_unscorable_inventory(
     tmp_path: Path, mutation: str
 ) -> None:
@@ -165,13 +203,20 @@ def _module_exit(argv: list[str]) -> int:
         return exc.code
 
 
-@pytest.mark.parametrize("args", [
-    [], ["unknown"], ["run"],
-    ["run", "--curie-bin", "curie", "--output-dir", "output", "--dry-run"],
-    ["run", "--curie-bin", "/does-not-exist", "--output-dir", "output", "--dry-run"],
-    ["verify-report", "report.json"], ["verify-calibration", "report.json"],
-    ["verify-negative", "report.json"], ["verify-cleanup", "report.json"],
-])
+@pytest.mark.parametrize(
+    "args",
+    [
+        [],
+        ["unknown"],
+        ["run"],
+        ["run", "--curie-bin", "curie", "--output-dir", "output", "--dry-run"],
+        ["run", "--curie-bin", "/does-not-exist", "--output-dir", "output", "--dry-run"],
+        ["verify-report", "report.json"],
+        ["verify-calibration", "report.json"],
+        ["verify-negative", "report.json"],
+        ["verify-cleanup", "report.json"],
+    ],
+)
 def test_module_parser_requires_named_command_and_absolute_pinned_executable(
     args: list[str], capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -179,8 +224,22 @@ def test_module_parser_requires_named_command_and_absolute_pinned_executable(
     assert capsys.readouterr().out == ""
 
 
-@pytest.mark.parametrize("validator", [verify_report, verify_calibration, verify_negative, verify_cleanup])
-@pytest.mark.parametrize("data", [None, b"{", b"null", b"{}", b'{"report_version":true}', b'{"report_version":2}', b'{"report_version":1,"report_version":1}', b'{"report_version":1,"seed":"\xff"}'])
+@pytest.mark.parametrize(
+    "validator", [verify_report, verify_calibration, verify_negative, verify_cleanup]
+)
+@pytest.mark.parametrize(
+    "data",
+    [
+        None,
+        b"{",
+        b"null",
+        b"{}",
+        b'{"report_version":true}',
+        b'{"report_version":2}',
+        b'{"report_version":1,"report_version":1}',
+        b'{"report_version":1,"seed":"\xff"}',
+    ],
+)
 def test_public_validators_reject_missing_and_malformed_reports(
     tmp_path: Path, validator: Callable[[Path], ScoreResult], data: bytes | None
 ) -> None:
@@ -190,7 +249,9 @@ def test_public_validators_reject_missing_and_malformed_reports(
     _score(validator(path), False)
 
 
-@pytest.mark.parametrize("validator", [verify_report, verify_calibration, verify_negative, verify_cleanup])
+@pytest.mark.parametrize(
+    "validator", [verify_report, verify_calibration, verify_negative, verify_cleanup]
+)
 def test_public_validators_reject_unreadable_report(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, validator: Callable[[Path], ScoreResult]
 ) -> None:
@@ -209,7 +270,9 @@ def test_public_validators_reject_unreadable_report(
 def _evidence(report: dict[str, Any], kind: str, value: dict[str, Any]) -> str:
     evidence_id = f"{kind}-{len(report['evidence']) + 1}"
     report["evidence"][evidence_id] = {
-        "kind": kind, "sha256": _sha(_json_bytes(value)), "value": value,
+        "kind": kind,
+        "sha256": _sha(_json_bytes(value)),
+        "value": value,
     }
     return evidence_id
 
@@ -228,13 +291,19 @@ def _invocation(
 ) -> tuple[str, str]:
     result_ref = _evidence(report, "cli-result", {**scope, "result": result})
     invocation_id = f"invocation-{len(report['invocations']) + 1}"
-    report["invocations"].append({
-        **scope, "invocation_id": invocation_id,
-        "argv": [report["binary"]["path"], *args], "exit_code": 0,
-        "binary": copy.deepcopy(report["binary"]),
-        "source_root": report["source_root"], "source_tree_sha256": report["source_tree_sha256"],
-        "cwd": report["source_root"], "result_ref": result_ref,
-    })
+    report["invocations"].append(
+        {
+            **scope,
+            "invocation_id": invocation_id,
+            "argv": [report["binary"]["path"], *args],
+            "exit_code": 0,
+            "binary": copy.deepcopy(report["binary"]),
+            "source_root": report["source_root"],
+            "source_tree_sha256": report["source_tree_sha256"],
+            "cwd": report["source_root"],
+            "result_ref": result_ref,
+        }
+    )
     return invocation_id, result_ref
 
 
@@ -243,53 +312,111 @@ def _observation(
 ) -> str:
     fact_id = f"fact-{scope['case_id']}"
     facts = [_fact_row(fact_id, value)] if present else []
-    _, snapshot = _invocation(report, scope, ["--json", "local", "memory", scope["agent_id"]], {
-        "agent": scope["agent_id"], "entries": [], "facts": facts,
-    })
+    _, snapshot = _invocation(
+        report,
+        scope,
+        ["--json", "local", "memory", scope["agent_id"]],
+        {
+            "agent": scope["agent_id"],
+            "entries": [],
+            "facts": facts,
+        },
+    )
     index = len(report["invocations"]) + 1
     thread = f"1800000000.{index:06d}"
-    invocation_id, result_ref = _invocation(report, scope, [
-        "--json", "local", "message", "What is the reference value?",
-        "--agent", scope["agent_id"], "--channel", "C0EXAMPLE2", "--thread", thread,
-    ], {"reply": output, "thread": thread, "finalized": True})
+    invocation_id, result_ref = _invocation(
+        report,
+        scope,
+        [
+            "--json",
+            "local",
+            "message",
+            "What is the reference value?",
+            "--agent",
+            scope["agent_id"],
+            "--channel",
+            "C0EXAMPLE2",
+            "--thread",
+            thread,
+        ],
+        {"reply": output, "thread": thread, "finalized": True},
+    )
     report["invocations"][-1]["cwd"] = report["output_dir"]
-    _, after_snapshot = _invocation(report, scope, ["--json", "local", "memory", scope["agent_id"]], {
-        "agent": scope["agent_id"], "entries": [], "facts": facts,
-    })
-    return _evidence(report, "retention-probe", {
-        **scope, "fact_id": fact_id, "required_value": value, "input": "What is the reference value?",
-        "output": output, "thread": thread, "channel": "C0EXAMPLE2", "teaching_channel": "C0EXAMPLE1",
-        "before_snapshot_ref": snapshot, "snapshot_ref": after_snapshot,
-        "invocation_id": invocation_id, "result_ref": result_ref,
-        "binding_key": f"slack/C0EXAMPLE2/{thread}", "state_caller": "platform",
-        "transcript": {"messages": [{"role": "assistant", "content": output}]},
-        "retention_scorer": {"version": 1, "kind": "exact-value-and-active-fact", "required_value": value},
-        "retention": "PASS" if present and value in output else "FAIL",
-        "no_recall": value not in output, "no_fabrication": value not in output,
-        "guidance_sha256": report["guidance_sha256"], "bundle_sha256": report["bundle_sha256"],
-    })
+    _, after_snapshot = _invocation(
+        report,
+        scope,
+        ["--json", "local", "memory", scope["agent_id"]],
+        {
+            "agent": scope["agent_id"],
+            "entries": [],
+            "facts": facts,
+        },
+    )
+    return _evidence(
+        report,
+        "retention-probe",
+        {
+            **scope,
+            "fact_id": fact_id,
+            "required_value": value,
+            "input": "What is the reference value?",
+            "output": output,
+            "thread": thread,
+            "channel": "C0EXAMPLE2",
+            "teaching_channel": "C0EXAMPLE1",
+            "before_snapshot_ref": snapshot,
+            "snapshot_ref": after_snapshot,
+            "invocation_id": invocation_id,
+            "result_ref": result_ref,
+            "binding_key": f"slack/C0EXAMPLE2/{thread}",
+            "state_caller": "platform",
+            "transcript": {"messages": [{"role": "assistant", "content": output}]},
+            "retention_scorer": {
+                "version": 1,
+                "kind": "exact-value-and-active-fact",
+                "required_value": value,
+            },
+            "retention": "PASS" if present and value in output else "FAIL",
+            "no_recall": value not in output,
+            "no_fabrication": value not in output,
+            "guidance_sha256": report["guidance_sha256"],
+            "bundle_sha256": report["bundle_sha256"],
+        },
+    )
 
 
 def _skill_row(item_id: str) -> dict[str, Any]:
     return {
-        "id": item_id, "slug": "sample-procedure", "revision": 1,
-        "description": "A saved procedure", "author": "U0EXAMPLE1",
+        "id": item_id,
+        "slug": "sample-procedure",
+        "revision": 1,
+        "description": "A saved procedure",
+        "author": "U0EXAMPLE1",
         "updated_at": "2026-01-01T11:00:00Z",
     }
 
 
 def _fact_row(item_id: str, statement: str) -> dict[str, Any]:
     return {
-        "id": item_id, "statement": statement, "scope": "agent", "channel": None,
-        "author": "U0EXAMPLE1", "stated_at": "2026-01-01T11:00:00Z",
+        "id": item_id,
+        "statement": statement,
+        "scope": "agent",
+        "channel": None,
+        "author": "U0EXAMPLE1",
+        "stated_at": "2026-01-01T11:00:00Z",
     }
 
 
 def _schedule_row(item_id: str, *, state: str = "terminal") -> dict[str, Any]:
     return {
-        "id": item_id, "revision": 1, "state": state, "cron": None,
-        "run_at": "2026-01-01T12:00:00Z", "timezone": "Etc/UTC",
-        "prompt": f"Post token-{item_id}", "created_by": "U0EXAMPLE1",
+        "id": item_id,
+        "revision": 1,
+        "state": state,
+        "cron": None,
+        "run_at": "2026-01-01T12:00:00Z",
+        "timezone": "Etc/UTC",
+        "prompt": f"Post token-{item_id}",
+        "created_by": "U0EXAMPLE1",
     }
 
 
@@ -299,58 +426,139 @@ def _add_controls(report: dict[str, Any], repetition: int) -> None:
         scope = {"repetition": repetition, "case_id": case_id, "agent_id": f"agent-{case_id}"}
         task = ("row-ordering", "unit-routing", "check-digit")[phrase - 1]
         skill_id = f"skill-{case_id}"
-        deletion_id, _ = _invocation(report, scope, ["--json", "local", "skills", scope["agent_id"], "delete", skill_id], {"deleted": True, "id": skill_id})
+        deletion_id, _ = _invocation(
+            report,
+            scope,
+            ["--json", "local", "skills", scope["agent_id"], "delete", skill_id],
+            {"deleted": True, "id": skill_id},
+        )
         for arm in ("learned", "removed"):
             probe_ids = []
             for trial in range(10):
-                probe_ids.append(_evidence(report, "procedure-probe", {
-                    **scope, "task_id": task, "arm": arm, "skill_id": skill_id,
-                    "deletion_invocation": deletion_id, "pair_id": f"pair-{trial}",
-                    "thread": f"1800000001.{len(report['evidence']):06d}",
-                    "input": f"transform {arm} input {trial}", "output": "correct" if arm == "learned" else "unknown",
-                    "expected_output": "correct", "success": arm == "learned",
-                    "before": {"skills": [_skill_row(skill_id)] if arm == "learned" else []},
-                    "after": {"skills": [_skill_row(skill_id)] if arm == "learned" else []},
-                    "guidance_sha256": report["guidance_sha256"], "bundle_sha256": report["bundle_sha256"],
-                }))
-            report["procedure_probes"]["rows"].append({
-                **scope, "task_id": task, "arm": arm, "successes": 10 if arm == "learned" else 0,
-                "trials": 10, "probe_ids": probe_ids,
-            })
+                probe_ids.append(
+                    _evidence(
+                        report,
+                        "procedure-probe",
+                        {
+                            **scope,
+                            "task_id": task,
+                            "arm": arm,
+                            "skill_id": skill_id,
+                            "deletion_invocation": deletion_id,
+                            "pair_id": f"pair-{trial}",
+                            "thread": f"1800000001.{len(report['evidence']):06d}",
+                            "input": f"transform {arm} input {trial}",
+                            "output": "correct" if arm == "learned" else "unknown",
+                            "expected_output": "correct",
+                            "success": arm == "learned",
+                            "before": {
+                                "skills": [_skill_row(skill_id)] if arm == "learned" else []
+                            },
+                            "after": {"skills": [_skill_row(skill_id)] if arm == "learned" else []},
+                            "guidance_sha256": report["guidance_sha256"],
+                            "bundle_sha256": report["bundle_sha256"],
+                        },
+                    )
+                )
+            report["procedure_probes"]["rows"].append(
+                {
+                    **scope,
+                    "task_id": task,
+                    "arm": arm,
+                    "successes": 10 if arm == "learned" else 0,
+                    "trials": 10,
+                    "probe_ids": probe_ids,
+                }
+            )
         case_id = f"F3-P{phrase}-R{repetition}"
         scope = {"repetition": repetition, "case_id": case_id, "agent_id": f"agent-{case_id}"}
         fact_id = f"fact-{case_id}"
         value = f"synthetic-value-{phrase}-{repetition}"
         before = _observation(report, scope, value=value, present=True, output=value)
-        deletion_id, deletion_result = _invocation(report, scope, ["--json", "local", "memory", scope["agent_id"], "--delete", fact_id], {"deleted": True, "agent": scope["agent_id"], "id": fact_id, "scope": "agent", "channel": None})
+        deletion_id, deletion_result = _invocation(
+            report,
+            scope,
+            ["--json", "local", "memory", scope["agent_id"], "--delete", fact_id],
+            {
+                "deleted": True,
+                "agent": scope["agent_id"],
+                "id": fact_id,
+                "scope": "agent",
+                "channel": None,
+            },
+        )
         after = _observation(report, scope, value=value, present=False, output="I do not know.")
         deletion = next(row for row in report["invocations"] if row["invocation_id"] == deletion_id)
-        report["memory_negative"]["rows"].append({
-            **scope, "fact_id": fact_id,
-            "deletion_invocation": {"invocation_id": deletion_id, "argv": deletion["argv"], "exit_code": 0, "result_ref": deletion_result},
-            "retention_before": "PASS", "retention_after": "FAIL", "before_evidence": before, "after_evidence": after,
-        })
+        report["memory_negative"]["rows"].append(
+            {
+                **scope,
+                "fact_id": fact_id,
+                "deletion_invocation": {
+                    "invocation_id": deletion_id,
+                    "argv": deletion["argv"],
+                    "exit_code": 0,
+                    "result_ref": deletion_result,
+                },
+                "retention_before": "PASS",
+                "retention_after": "FAIL",
+                "before_evidence": before,
+                "after_evidence": after,
+            }
+        )
         case_id = f"F4-P{phrase}-R{repetition}"
         scope = {"repetition": repetition, "case_id": case_id, "agent_id": f"agent-{case_id}"}
         for due in (True, False):
             schedule_id = f"schedule-{case_id}-{'due' if due else 'cancelled'}"
             receipt = "2026-01-01T12:00:01Z"
             delivery_id = f"delivery-{schedule_id}"
-            schedule_ref = _evidence(report, "schedule-observation", {
-                **scope, "schedule_id": schedule_id, "task_token": f"token-{schedule_id}",
-                "channel": "C0EXAMPLE1", "zone": "Etc/UTC", "kind": "one-shot",
-                "due_at": "2026-01-01T12:00:00Z", "due": due,
-                "state": "terminal" if due else "cancelled", "normal_poll_seconds": 30,
-                "observation_start": "2026-01-01T11:59:00Z", "observation_end": "2026-01-01T12:02:00Z", "tolerance_seconds": 120,
-                "binding_write": {"channel": "C0EXAMPLE1", "endpoint": "http://127.0.0.1:31001"},
-                "collector_receipts": [{"id": delivery_id, "channel": "C0EXAMPLE1", "text": f"token-{schedule_id}", "received_at": receipt, "synthetic": False, "updates": []}] if due else [],
-                "cli_snapshot": {"agent_schedules": [_schedule_row(schedule_id, state="terminal" if due else "cancelled")]},
-            })
-            report["deliveries"]["rows"].append({
-                **scope, "schedule_id": schedule_id, "due": due, "delivery_count": int(due),
-                "receipt_times": [receipt] if due else [], "delivery_ids": [delivery_id] if due else [],
-                "schedule_evidence": schedule_ref,
-            })
+            schedule_ref = _evidence(
+                report,
+                "schedule-observation",
+                {
+                    **scope,
+                    "schedule_id": schedule_id,
+                    "task_token": f"token-{schedule_id}",
+                    "channel": "C0EXAMPLE1",
+                    "zone": "Etc/UTC",
+                    "kind": "one-shot",
+                    "due_at": "2026-01-01T12:00:00Z",
+                    "due": due,
+                    "state": "terminal" if due else "cancelled",
+                    "normal_poll_seconds": 30,
+                    "observation_start": "2026-01-01T11:59:00Z",
+                    "observation_end": "2026-01-01T12:02:00Z",
+                    "tolerance_seconds": 120,
+                    "delivery_route": {"channel": "C0EXAMPLE1", "worker_slack_api_port": 31002},
+                    "collector_receipts": [
+                        {
+                            "id": delivery_id,
+                            "channel": "C0EXAMPLE1",
+                            "text": f"token-{schedule_id}",
+                            "received_at": receipt,
+                            "synthetic": False,
+                            "updates": [],
+                        }
+                    ]
+                    if due
+                    else [],
+                    "cli_snapshot": {
+                        "agent_schedules": [
+                            _schedule_row(schedule_id, state="terminal" if due else "cancelled")
+                        ]
+                    },
+                },
+            )
+            report["deliveries"]["rows"].append(
+                {
+                    **scope,
+                    "schedule_id": schedule_id,
+                    "due": due,
+                    "delivery_count": int(due),
+                    "receipt_times": [receipt] if due else [],
+                    "delivery_ids": [delivery_id] if due else [],
+                    "schedule_evidence": schedule_ref,
+                }
+            )
 
 
 @pytest.fixture
@@ -359,9 +567,15 @@ def candidate_binary() -> Path:
     configured = os.environ.get("CURIE_LEARNING_EVAL_BIN")
     if configured:
         assert Path(configured).is_absolute(), "candidate CLI path must be absolute"
-    candidates = [Path(configured)] if configured else [ROOT / "cli/target/debug/curie", ROOT / "cli/target/release/curie"]
+    candidates = (
+        [Path(configured)]
+        if configured
+        else [ROOT / "cli/target/debug/curie", ROOT / "cli/target/release/curie"]
+    )
     binary = next((path.resolve() for path in candidates if path.is_file()), None)
-    assert binary is not None, "build the candidate CLI or set CURIE_LEARNING_EVAL_BIN to its absolute path"
+    assert binary is not None, (
+        "build the candidate CLI or set CURIE_LEARNING_EVAL_BIN to its absolute path"
+    )
     assert binary.is_absolute() and os.access(binary, os.X_OK)
     return binary
 
@@ -388,53 +602,148 @@ def frozen_report(tmp_path: Path) -> dict[str, Any]:
     artifact.chmod(0o755)
     binary = {"path": str(artifact), "sha256": _sha(artifact_bytes), "version": version}
     paths = [
-        "cli/src/args/dev.rs", "cli/src/dispatch/dev_action.rs", "cli/scripts/learning-eval.sh",
-        "apps/worker/src/curie_worker/eval/learning.py", "apps/worker/src/curie_worker/eval/learning_metrics.py",
-        "apps/worker/src/curie_worker/eval/learning_judge.py", "compose.dev.yaml", "uv.lock", "cli/Cargo.lock",
-        "runner/Dockerfile", "apps/worker/Dockerfile",
+        "cli/src/args/dev.rs",
+        "cli/src/dispatch/dev_action.rs",
+        "cli/scripts/learning-eval.sh",
+        "apps/worker/src/curie_worker/eval/learning.py",
+        "apps/worker/src/curie_worker/eval/learning_metrics.py",
+        "apps/worker/src/curie_worker/eval/learning_judge.py",
+        "compose.dev.yaml",
+        "uv.lock",
+        "cli/Cargo.lock",
+        "runner/Dockerfile",
+        "apps/worker/Dockerfile",
     ]
     paths += [str(path.relative_to(ROOT)) for path in FIXTURES.rglob("*") if path.is_file()]
-    manifest = [{"path": path, "sha256": _sha((ROOT / path).read_bytes())} for path in sorted(paths)]
+    manifest = [
+        {"path": path, "sha256": _sha((ROOT / path).read_bytes())} for path in sorted(paths)
+    ]
     source_sha = _sha(_json_bytes(manifest))
     report: dict[str, Any] = {
-        "report_version": 1, "repetitions": 1, "seed": "fixed-test-observation",
+        "report_version": 1,
+        "repetitions": 1,
+        "seed": "fixed-test-observation",
         "data_origin": "synthetic-consistency-vector",
-        "implementation_verification": "PASS", "acceptance": "PASS", "exit_code": 0,
-        "binary": binary, "source_root": str(ROOT), "source_tree_sha256": source_sha,
+        "implementation_verification": "PASS",
+        "acceptance": "PASS",
+        "exit_code": 0,
+        "binary": binary,
+        "source_root": str(ROOT),
+        "source_tree_sha256": source_sha,
         "source_manifest": manifest,
-        "build_association": {"candidate_commit": "a" * 40, "input_manifest_sha256": source_sha, "binary_sha256": binary["sha256"]},
-        "fixtures": {name: {"path": str(FIXTURES / name), "sha256": _sha((FIXTURES / name).read_bytes())} for name in ("learning-cases.json", "learning-calibration.json")},
-        "bundle_sha256": _sha(_json_bytes([
-            {"path": str(path.relative_to(FIXTURES / "learning-bundle")), "sha256": _sha(path.read_bytes())}
-            for path in sorted((FIXTURES / "learning-bundle").rglob("*")) if path.is_file()
-        ])),
-        "guidance_sha256": _sha(json.loads((FIXTURES / "learning-cases.json").read_bytes())["guidance"]["text"].encode()),
-        "output_dir": str(tmp_path), "thresholds": dict(THRESHOLDS), "custom_thresholds": False,
+        "build_association": {
+            "candidate_commit": "a" * 40,
+            "input_manifest_sha256": source_sha,
+            "binary_sha256": binary["sha256"],
+        },
+        "fixtures": {
+            name: {"path": str(FIXTURES / name), "sha256": _sha((FIXTURES / name).read_bytes())}
+            for name in ("learning-cases.json", "learning-calibration.json")
+        },
+        "bundle_sha256": _sha(
+            _json_bytes(
+                [
+                    {
+                        "path": str(path.relative_to(FIXTURES / "learning-bundle")),
+                        "sha256": _sha(path.read_bytes()),
+                    }
+                    for path in sorted((FIXTURES / "learning-bundle").rglob("*"))
+                    if path.is_file()
+                ]
+            )
+        ),
+        "guidance_sha256": _sha(
+            json.loads((FIXTURES / "learning-cases.json").read_bytes())["guidance"]["text"].encode()
+        ),
+        "output_dir": str(tmp_path),
+        "thresholds": dict(THRESHOLDS),
+        "custom_thresholds": False,
         "models": {"actor": ACTOR, "judge": JUDGE, "resolved_hostname": "openrouter.ai"},
-        "capabilities": {kind: {"available": True, "evidence_ref": "discovery"} for kind in CLASSES[:4]},
-        "evidence": {}, "invocations": [], "cases": [], "decisions": [],
+        "capabilities": {
+            kind: {"available": True, "evidence_ref": "discovery"} for kind in CLASSES[:4]
+        },
+        "evidence": {},
+        "invocations": [],
+        "cases": [],
+        "decisions": [],
         "procedure_probes": {"version": 1, "rows": []},
-        "memory_negative": {"version": 1, "rows": []}, "deliveries": {"version": 1, "rows": []},
-        "generations": [], "calibration": {"version": 1, "rows": [], "deterministic_controls": []},
-        "accounting": {"budget_usd": "5.00", "baseline_usage_usd": "10.00", "end_usage_usd": "10.34", "charged_usd": "0.34", "unresolved_reservations_usd": "0.00", "shutdown_and_inflight_reserve_usd": "0.01", "operations": [], "basis": "conservative-shared-key-upper-bound"},
-        "cleanup": {"verified": True, "ownership_manifest": {"project": "curie-check-example", "daemon_id": "example-daemon", "containers": [], "runners": [], "resolver_containers": [], "volumes": [], "networks": [], "processes": []}, "unrelated_before": [], "unrelated_after": []},
-        "collector": {"port_a": 31001, "port_b": 31002, "bind_errors": 0, "alive_for_primary_children": 24, "synthetic_transport_receipt": {"synthetic": True, "received_at": "2026-01-01T11:58:00Z"}},
+        "memory_negative": {"version": 1, "rows": []},
+        "deliveries": {"version": 1, "rows": []},
+        "generations": [],
+        "calibration": {"version": 1, "rows": [], "deterministic_controls": []},
+        "accounting": {
+            "budget_usd": "5.00",
+            "baseline_usage_usd": "10.00",
+            "end_usage_usd": "10.34",
+            "charged_usd": "0.34",
+            "unresolved_reservations_usd": "0.00",
+            "shutdown_and_inflight_reserve_usd": "0.01",
+            "operations": [],
+            "basis": "conservative-shared-key-upper-bound",
+        },
+        "cleanup": {
+            "verified": True,
+            "ownership_manifest": {
+                "project": "curie-check-example",
+                "daemon_id": "example-daemon",
+                "containers": [],
+                "runners": [],
+                "resolver_containers": [],
+                "volumes": [],
+                "networks": [],
+                "processes": [],
+            },
+            "unrelated_before": [],
+            "unrelated_after": [],
+        },
+        "collector": {
+            "port_b": 31002,
+            "bind_errors": 0,
+            "delivery_windows": [
+                {
+                    "repetition": 1,
+                    "opened_at": "2026-01-01T11:59:00Z",
+                    "closed_at": "2026-01-01T12:02:30Z",
+                    "message_children_alive": 0,
+                }
+            ],
+            "synthetic_transport_receipt": {
+                "synthetic": True,
+                "received_at": "2026-01-01T11:58:00Z",
+            },
+        },
     }
     memory_schema = json.loads((ROOT / "cli/schema/memory.schema.json").read_bytes())
-    memory_schema["$defs"]["fact"]["properties"].update({
-        "kind": {"type": "string", "enum": ["fact", "instruction"]},
-        "archived": {"type": "boolean"},
-    })
-    discovery = _evidence(report, "discovery", {
-        "binary": binary, "source_tree_sha256": source_sha, "exit_code": 0,
-        "memory_schema": memory_schema, "memory_schema_sha256": _sha(_json_bytes(memory_schema)),
-        "skills_list": [], "agent_schedules": [],
-        "overrides": {"memory_writes": True, "learned_skills": True, "agent_schedules": True, "agent_wide_learning": True},
-    })
+    memory_schema["$defs"]["fact"]["properties"].update(
+        {
+            "kind": {"type": "string", "enum": ["fact", "instruction"]},
+            "archived": {"type": "boolean"},
+        }
+    )
+    discovery = _evidence(
+        report,
+        "discovery",
+        {
+            "binary": binary,
+            "source_tree_sha256": source_sha,
+            "exit_code": 0,
+            "memory_schema": memory_schema,
+            "memory_schema_sha256": _sha(_json_bytes(memory_schema)),
+            "skills_list": [],
+            "agent_schedules": [],
+            "overrides": {
+                "memory_writes": True,
+                "learned_skills": True,
+                "agent_schedules": True,
+                "agent_wide_learning": True,
+            },
+        },
+    )
     for capability in report["capabilities"].values():
         capability["evidence_ref"] = discovery
     report["memory_schema"] = {
-        "id": memory_schema["$id"], "sha256": _sha(_json_bytes(memory_schema)),
+        "id": memory_schema["$id"],
+        "sha256": _sha(_json_bytes(memory_schema)),
         "evidence_ref": discovery,
     }
     fixture_cases = {row["id"]: row for row in load_cases(FIXTURES / "learning-cases.json")}
@@ -442,7 +751,23 @@ def frozen_report(tmp_path: Path) -> dict[str, Any]:
         family = int(case_id[1])
         scope = {"repetition": 1, "case_id": f"{case_id}-R1", "agent_id": f"agent-{case_id}-R1"}
         kind = EXPECTED[family - 1]
-        invocation_id, result_ref = _invocation(report, scope, ["--json", "local", "message", f"primary input {case_id}", "--agent", scope["agent_id"], "--channel", "C0EXAMPLE1", "--thread", f"1800000000.{index:06d}"], {"reply": "completed", "thread": f"1800000000.{index:06d}", "finalized": True})
+        invocation_id, result_ref = _invocation(
+            report,
+            scope,
+            [
+                "--json",
+                "local",
+                "message",
+                f"primary input {case_id}",
+                "--agent",
+                scope["agent_id"],
+                "--channel",
+                "C0EXAMPLE1",
+                "--thread",
+                f"1800000000.{index:06d}",
+            ],
+            {"reply": "completed", "thread": f"1800000000.{index:06d}", "finalized": True},
+        )
         report["invocations"][-1]["cwd"] = str(tmp_path)
         state = {"skills": [], "facts": [], "schedules": []}
         after = copy.deepcopy(state)
@@ -456,32 +781,152 @@ def frozen_report(tmp_path: Path) -> dict[str, Any]:
                 item = _fact_row(f"item-{case_id}", "A synthetic retained value.")
                 if kind == "instruction":
                     item.update(kind="instruction", archived=False)
-            after[{"skill": "skills", "memory-fact": "facts", "instruction": "facts", "schedule": "schedules"}[kind]].append(item)
-            mutations = [{"kind": kind, "item_id": item["id"], "operation": "create", "before": None, "after": item}]
-        observation_ref = _evidence(report, "teaching-observation", {**scope, "before": state, "after": after, "transcript": {"messages": []}, "output": "completed", "semantic_action": kind, "deterministic": True, "semantic": "PASS"})
-        report["cases"].append({**scope, "fixture_id": case_id, "primary": True, "invocation_id": invocation_id, "reply_ref": result_ref, "transcript_ref": observation_ref, "actor_generation_id": f"gen-placeholder-actor-{index}", "stub_port": 31002, "stub_bind_succeeded": True})
-        report["decisions"].append({**scope, "fixture_id": case_id, "decision_id": fixture_cases[case_id]["decisions"][0]["id"], "expected": kind, "predicted": [kind], "status": "PASS", "mutations": mutations, "attempts": [], "distractor": family == 7, "correction_duplicates": 0, "evidence_ref": observation_ref, "detail": "serialized observation"})
-        report["generations"].append({"id": f"gen-placeholder-actor-{index}", "model": ACTOR, "usage": {"prompt_tokens": 10, "completion_tokens": 10}, "cost_usd": "0.01", "purpose": "actor", **scope})
+            after[
+                {
+                    "skill": "skills",
+                    "memory-fact": "facts",
+                    "instruction": "facts",
+                    "schedule": "schedules",
+                }[kind]
+            ].append(item)
+            mutations = [
+                {
+                    "kind": kind,
+                    "item_id": item["id"],
+                    "operation": "create",
+                    "before": None,
+                    "after": item,
+                }
+            ]
+        observation_ref = _evidence(
+            report,
+            "teaching-observation",
+            {
+                **scope,
+                "before": state,
+                "after": after,
+                "transcript": {"messages": []},
+                "output": "completed",
+                "semantic_action": kind,
+                "deterministic": True,
+                "semantic": "PASS",
+            },
+        )
+        report["cases"].append(
+            {
+                **scope,
+                "fixture_id": case_id,
+                "primary": True,
+                "invocation_id": invocation_id,
+                "reply_ref": result_ref,
+                "transcript_ref": observation_ref,
+                "actor_generation_id": f"gen-placeholder-actor-{index}",
+                "stub_port": 31002,
+                "stub_bind_succeeded": True,
+            }
+        )
+        report["decisions"].append(
+            {
+                **scope,
+                "fixture_id": case_id,
+                "decision_id": fixture_cases[case_id]["decisions"][0]["id"],
+                "expected": kind,
+                "predicted": [kind],
+                "status": "PASS",
+                "mutations": mutations,
+                "attempts": [],
+                "distractor": family == 7,
+                "correction_duplicates": 0,
+                "evidence_ref": observation_ref,
+                "detail": "serialized observation",
+            }
+        )
+        report["generations"].append(
+            {
+                "id": f"gen-placeholder-actor-{index}",
+                "model": ACTOR,
+                "usage": {"prompt_tokens": 10, "completion_tokens": 10},
+                "cost_usd": "0.01",
+                "purpose": "actor",
+                **scope,
+            }
+        )
         operation_id = f"actor-operation-{index}"
         report["generations"][-1]["ledger_operation_id"] = operation_id
-        report["accounting"]["operations"].append({
-            "id": operation_id, "generation_id": f"gen-placeholder-actor-{index}",
-            "reserve_usd": "0.02", "settled_usd": "0.01", "status": "settled",
-        })
+        report["accounting"]["operations"].append(
+            {
+                "id": operation_id,
+                "generation_id": f"gen-placeholder-actor-{index}",
+                "reserve_usd": "0.02",
+                "settled_usd": "0.01",
+                "status": "settled",
+            }
+        )
     _add_controls(report, 1)
     # Wire shapes: https://openrouter.ai/docs/api/reference/overview and
     # https://openrouter.ai/docs/api/api-reference/generations/get-generation
     # These placeholders exercise parsing and bindings, not provider authenticity.
     for index, example in enumerate(load_calibration(FIXTURES / "learning-calibration.json"), 1):
         group = example["group"]
-        prompt = json.dumps({"rubric": example["rubric"], "evidence": example["evidence"]}, ensure_ascii=False)
-        completion = json.dumps({"verdict": example["expected"], "action": example["action"], "reason": "Supported by evidence.", "evidence_refs": list(example["evidence"]["refs"])})
+        prompt = json.dumps(
+            {"rubric": example["rubric"], "evidence": example["evidence"]}, ensure_ascii=False
+        )
+        completion = json.dumps(
+            {
+                "verdict": example["expected"],
+                "action": example["action"],
+                "reason": "Supported by evidence.",
+                "evidence_refs": list(example["evidence"]["refs"]),
+            }
+        )
         generation_id = f"gen-placeholder-judge-{index}"
         operation_id = f"calibration-operation-{index}"
-        report["calibration"]["rows"].append({"id": example["id"], "group": group, "expected": example["expected"], "verdict": example["expected"], "evidence": copy.deepcopy(example["evidence"]), "deterministic": copy.deepcopy(example["deterministic"]), "prompt": prompt, "prompt_sha256": _sha(prompt.encode()), "call_sequence": index, "completion": completion, "completion_sha256": _sha(completion.encode()), "generation_id": generation_id, "ledger_operation_id": operation_id, "model": JUDGE, "usage": {"prompt_tokens": 20, "completion_tokens": 20}, "source": "provider"})
-        report["generations"].append({"id": generation_id, "model": JUDGE, "usage": {"prompt_tokens": 20, "completion_tokens": 20}, "cost_usd": "0.01", "purpose": "calibration", "prompt_sha256": _sha(prompt.encode()), "call_sequence": index, "completion_sha256": _sha(completion.encode()), "ledger_operation_id": operation_id})
-        report["accounting"]["operations"].append({"id": operation_id, "generation_id": generation_id, "reserve_usd": "0.02", "settled_usd": "0.01", "status": "settled"})
-    report["calibration"]["deterministic_controls"] = [{"id": group, "deterministic": "FAIL", "judge_called": False, "verdict": "FAIL"} for group in ("omitted", "obsolete", "duplicate", "fabricated")]
+        report["calibration"]["rows"].append(
+            {
+                "id": example["id"],
+                "group": group,
+                "expected": example["expected"],
+                "verdict": example["expected"],
+                "evidence": copy.deepcopy(example["evidence"]),
+                "deterministic": copy.deepcopy(example["deterministic"]),
+                "prompt": prompt,
+                "prompt_sha256": _sha(prompt.encode()),
+                "call_sequence": index,
+                "completion": completion,
+                "completion_sha256": _sha(completion.encode()),
+                "generation_id": generation_id,
+                "ledger_operation_id": operation_id,
+                "model": JUDGE,
+                "usage": {"prompt_tokens": 20, "completion_tokens": 20},
+                "source": "provider",
+            }
+        )
+        report["generations"].append(
+            {
+                "id": generation_id,
+                "model": JUDGE,
+                "usage": {"prompt_tokens": 20, "completion_tokens": 20},
+                "cost_usd": "0.01",
+                "purpose": "calibration",
+                "prompt_sha256": _sha(prompt.encode()),
+                "call_sequence": index,
+                "completion_sha256": _sha(completion.encode()),
+                "ledger_operation_id": operation_id,
+            }
+        )
+        report["accounting"]["operations"].append(
+            {
+                "id": operation_id,
+                "generation_id": generation_id,
+                "reserve_usd": "0.02",
+                "settled_usd": "0.01",
+                "status": "settled",
+            }
+        )
+    report["calibration"]["deterministic_controls"] = [
+        {"id": group, "deterministic": "FAIL", "judge_called": False, "verdict": "FAIL"}
+        for group in ("omitted", "obsolete", "duplicate", "fabricated")
+    ]
     _derive(report)
     return report
 
@@ -496,7 +941,10 @@ def _summary(rows: list[dict[str, Any]], thresholds: dict[str, Any]) -> dict[str
         fp = sum(row["expected"] != kind and kind in row["predicted"] for row in eligible)
         fn = sum(row["expected"] == kind and kind not in row["predicted"] for row in eligible)
         metrics[kind] = {
-            "tp": tp, "fp": fp, "fn": fn, "support": tp + fn,
+            "tp": tp,
+            "fp": fp,
+            "fn": fn,
+            "support": tp + fn,
             "precision": tp / (tp + fp) if tp + fp else None,
             "recall": tp / (tp + fn) if tp + fn else None,
             "errors": sum(row["expected"] == kind and row["status"] == "ERROR" for row in eligible),
@@ -515,9 +963,17 @@ def _summary(rows: list[dict[str, Any]], thresholds: dict[str, Any]) -> dict[str
             gates[name] = {"status": "FAIL", "value": None}
         else:
             value = min(values)
-            gates[name] = {"status": "PASS" if Decimal(str(value)) >= Decimal(str(thresholds[name])) else "FAIL", "value": value}
+            gates[name] = {
+                "status": "PASS"
+                if Decimal(str(value)) >= Decimal(str(thresholds[name]))
+                else "FAIL",
+                "value": value,
+            }
     gates["falsewrite"] = {
-        "status": "PASS" if falsewrite_rate is not None and Decimal(str(falsewrite_rate)) <= Decimal(str(thresholds["falsewrite"])) else "FAIL",
+        "status": "PASS"
+        if falsewrite_rate is not None
+        and Decimal(str(falsewrite_rate)) <= Decimal(str(thresholds["falsewrite"]))
+        else "FAIL",
         "value": falsewrite_rate,
     }
     gates["correction_duplicates"] = {
@@ -535,11 +991,17 @@ def _summary(rows: list[dict[str, Any]], thresholds: dict[str, Any]) -> dict[str
         for predicted in row["predicted"]:
             counts[predicted] = counts.get(predicted, 0) + 1
     return {
-        "per_class": metrics, "gates": gates, "confusion": confusion,
+        "per_class": metrics,
+        "gates": gates,
+        "confusion": confusion,
         "distractor": {
-            "evaluated": len(distractors), "falsewrite_count": falsewrites,
+            "evaluated": len(distractors),
+            "falsewrite_count": falsewrites,
             "falsewrite_rate": falsewrite_rate,
-            "attempted_write_rate": sum(bool(row["attempts"]) for row in distractors) / len(distractors) if distractors else None,
+            "attempted_write_rate": sum(bool(row["attempts"]) for row in distractors)
+            / len(distractors)
+            if distractors
+            else None,
         },
         "unavailable_off_target_writes": off_target,
     }
@@ -548,20 +1010,38 @@ def _summary(rows: list[dict[str, Any]], thresholds: dict[str, Any]) -> dict[str
 def _derive(report: dict[str, Any]) -> None:
     report["metrics"] = _summary(report["decisions"], report["thresholds"])
     report["metrics"]["repetitions"] = [
-        {"repetition": repetition, **_summary([row for row in report["decisions"] if row["repetition"] == repetition], report["thresholds"])}
+        {
+            "repetition": repetition,
+            **_summary(
+                [row for row in report["decisions"] if row["repetition"] == repetition],
+                report["thresholds"],
+            ),
+        }
         for repetition in range(1, report["repetitions"] + 1)
     ]
     due = [row for row in report["deliveries"]["rows"] if row["due"]]
     once = sum(row["delivery_count"] == 1 for row in due)
-    report["delivery_metrics"] = {"due_schedules": len(due), "delivered_exactly_once": once, "delivery_rate": once / len(due) if due else None}
+    report["delivery_metrics"] = {
+        "due_schedules": len(due),
+        "delivered_exactly_once": once,
+        "delivery_rate": once / len(due) if due else None,
+    }
     _rehash(report)
 
 
-def _check(tmp_path: Path, report: dict[str, Any], validator: Callable[[Path], ScoreResult] = verify_report, *, passed: bool) -> None:
+def _check(
+    tmp_path: Path,
+    report: dict[str, Any],
+    validator: Callable[[Path], ScoreResult] = verify_report,
+    *,
+    passed: bool,
+) -> None:
     _score(validator(_write(tmp_path / "report.json", report)), passed)
 
 
-def test_frozen_complete_report_is_a_valid_consistency_vector(tmp_path: Path, frozen_report: dict[str, Any]) -> None:
+def test_frozen_complete_report_is_a_valid_consistency_vector(
+    tmp_path: Path, frozen_report: dict[str, Any]
+) -> None:
     _check(tmp_path, frozen_report, passed=True)
 
 
@@ -569,13 +1049,27 @@ def _duplicate_repetition(report: dict[str, Any], repetition: int = 2) -> None:
     """Copy observations with fresh identities while retaining one accounting ledger."""
     original = copy.deepcopy(report)
     replacements = {
-        key: f"r{repetition}-{key}" for key, record in original["evidence"].items()
+        key: f"r{repetition}-{key}"
+        for key, record in original["evidence"].items()
         if record["value"].get("repetition") == 1
     }
-    replacements.update({row["invocation_id"]: f"r{repetition}-{row['invocation_id']}" for row in original["invocations"] if row["repetition"] == 1})
-    replacements.update({row["id"]: f"r{repetition}-{row['id']}" for row in original["generations"] if row["purpose"] == "actor" and row["repetition"] == 1})
+    replacements.update(
+        {
+            row["invocation_id"]: f"r{repetition}-{row['invocation_id']}"
+            for row in original["invocations"]
+            if row["repetition"] == 1
+        }
+    )
+    replacements.update(
+        {
+            row["id"]: f"r{repetition}-{row['id']}"
+            for row in original["generations"]
+            if row["purpose"] == "actor" and row["repetition"] == 1
+        }
+    )
     actor_operations = {
-        row["ledger_operation_id"] for row in original["generations"]
+        row["ledger_operation_id"]
+        for row in original["generations"]
         if row["purpose"] == "actor" and row["repetition"] == 1
     }
     replacements.update({key: f"r{repetition}-{key}" for key in actor_operations})
@@ -593,7 +1087,10 @@ def _duplicate_repetition(report: dict[str, Any], repetition: int = 2) -> None:
         if isinstance(value, list):
             return [remap(item) for item in value]
         if isinstance(value, dict):
-            return {key: repetition if key == "repetition" else remap(item) for key, item in value.items()}
+            return {
+                key: repetition if key == "repetition" else remap(item)
+                for key, item in value.items()
+            }
         return value
 
     for ref in replacements:
@@ -601,21 +1098,37 @@ def _duplicate_repetition(report: dict[str, Any], repetition: int = 2) -> None:
             report["evidence"][replacements[ref]] = remap(original["evidence"][ref])
     for key in ("cases", "decisions", "invocations"):
         report[key].extend(remap([row for row in original[key] if row["repetition"] == 1]))
-    report["generations"].extend(remap([row for row in original["generations"] if row["purpose"] == "actor" and row["repetition"] == 1]))
-    report["accounting"]["operations"].extend(remap([
-        row for row in original["accounting"]["operations"] if row["id"] in actor_operations
-    ]))
+    report["generations"].extend(
+        remap(
+            [
+                row
+                for row in original["generations"]
+                if row["purpose"] == "actor" and row["repetition"] == 1
+            ]
+        )
+    )
+    report["accounting"]["operations"].extend(
+        remap(
+            [row for row in original["accounting"]["operations"] if row["id"] in actor_operations]
+        )
+    )
     for key in ("procedure_probes", "memory_negative", "deliveries"):
-        report[key]["rows"].extend(remap([row for row in original[key]["rows"] if row["repetition"] == 1]))
+        report[key]["rows"].extend(
+            remap([row for row in original[key]["rows"] if row["repetition"] == 1])
+        )
     report["repetitions"] = repetition
-    report["collector"]["alive_for_primary_children"] = 24 * repetition
+    report["collector"]["delivery_windows"].append(
+        {**report["collector"]["delivery_windows"][0], "repetition": repetition}
+    )
     charge = Decimal("0.10") + Decimal("0.24") * repetition
     report["accounting"]["end_usage_usd"] = str(Decimal("10.00") + charge)
     report["accounting"]["charged_usd"] = str(charge)
     _derive(report)
 
 
-def test_n_requires_all_24_instances_in_every_requested_repetition(tmp_path: Path, frozen_report: dict[str, Any]) -> None:
+def test_n_requires_all_24_instances_in_every_requested_repetition(
+    tmp_path: Path, frozen_report: dict[str, Any]
+) -> None:
     _check(tmp_path, frozen_report, passed=True)
     report = copy.deepcopy(frozen_report)
     _duplicate_repetition(report)
@@ -624,11 +1137,17 @@ def test_n_requires_all_24_instances_in_every_requested_repetition(tmp_path: Pat
     _check(tmp_path, report, passed=False)
 
 
-def test_pooled_procedure_improvement_cannot_rescue_a_failed_repetition(tmp_path: Path, frozen_report: dict[str, Any]) -> None:
+def test_pooled_procedure_improvement_cannot_rescue_a_failed_repetition(
+    tmp_path: Path, frozen_report: dict[str, Any]
+) -> None:
     report = copy.deepcopy(frozen_report)
     _duplicate_repetition(report)
     _check(tmp_path, report, passed=True)
-    learned = next(row for row in report["procedure_probes"]["rows"] if row["repetition"] == 2 and row["arm"] == "learned")
+    learned = next(
+        row
+        for row in report["procedure_probes"]["rows"]
+        if row["repetition"] == 2 and row["arm"] == "learned"
+    )
     learned["successes"] = 0
     for ref in learned["probe_ids"]:
         probe = _value(report, ref)
@@ -638,7 +1157,9 @@ def test_pooled_procedure_improvement_cannot_rescue_a_failed_repetition(tmp_path
 
 
 @pytest.mark.parametrize("gate", ["precision", "recall", "falsewrite", "correction_duplicates"])
-def test_report_recomputes_threshold_gate_values_instead_of_trusting_pass(tmp_path: Path, frozen_report: dict[str, Any], gate: str) -> None:
+def test_report_recomputes_threshold_gate_values_instead_of_trusting_pass(
+    tmp_path: Path, frozen_report: dict[str, Any], gate: str
+) -> None:
     _check(tmp_path, frozen_report, passed=True)
     report = copy.deepcopy(frozen_report)
     report["metrics"]["gates"][gate]["value"] = -1
@@ -647,7 +1168,9 @@ def test_report_recomputes_threshold_gate_values_instead_of_trusting_pass(tmp_pa
 
 @pytest.mark.parametrize("kind", ["precision", "recall"])
 @pytest.mark.parametrize("threshold", [0.0, 0.9, 1.0])
-def test_report_honors_inclusive_configured_classification_thresholds(tmp_path: Path, frozen_report: dict[str, Any], kind: str, threshold: float) -> None:
+def test_report_honors_inclusive_configured_classification_thresholds(
+    tmp_path: Path, frozen_report: dict[str, Any], kind: str, threshold: float
+) -> None:
     report = copy.deepcopy(frozen_report)
     report["thresholds"][kind] = threshold
     report["custom_thresholds"] = report["thresholds"] != THRESHOLDS
@@ -655,7 +1178,9 @@ def test_report_honors_inclusive_configured_classification_thresholds(tmp_path: 
     _check(tmp_path, report, passed=True)
 
 
-def test_duplicate_limit_is_inclusive_at_zero_and_at_custom_limit(tmp_path: Path, frozen_report: dict[str, Any]) -> None:
+def test_duplicate_limit_is_inclusive_at_zero_and_at_custom_limit(
+    tmp_path: Path, frozen_report: dict[str, Any]
+) -> None:
     _check(tmp_path, frozen_report, passed=True)
     report = copy.deepcopy(frozen_report)
     correction = report["decisions"][-1]
@@ -669,7 +1194,9 @@ def test_duplicate_limit_is_inclusive_at_zero_and_at_custom_limit(tmp_path: Path
     _check(tmp_path, report, passed=True)
 
 
-def test_pooled_exact_point_eight_recall_cannot_hide_a_failed_repetition(tmp_path: Path, frozen_report: dict[str, Any]) -> None:
+def test_pooled_exact_point_eight_recall_cannot_hide_a_failed_repetition(
+    tmp_path: Path, frozen_report: dict[str, Any]
+) -> None:
     report = copy.deepcopy(frozen_report)
     for repetition in range(2, 6):
         _duplicate_repetition(report, repetition)
@@ -685,8 +1212,13 @@ def test_pooled_exact_point_eight_recall_cannot_hide_a_failed_repetition(tmp_pat
     _check(tmp_path, report, passed=False)
 
 
-@pytest.mark.parametrize("damage", ["changed-binary-bytes", "changed-version", "changed-source-digest", "missing-source-manifest"])
-def test_identity_verification_rechecks_bytes_and_build_association(tmp_path: Path, frozen_report: dict[str, Any], damage: str) -> None:
+@pytest.mark.parametrize(
+    "damage",
+    ["changed-binary-bytes", "changed-version", "changed-source-digest", "missing-source-manifest"],
+)
+def test_identity_verification_rechecks_bytes_and_build_association(
+    tmp_path: Path, frozen_report: dict[str, Any], damage: str
+) -> None:
     _check(tmp_path, frozen_report, passed=True)
     report = copy.deepcopy(frozen_report)
     if damage == "changed-binary-bytes":
@@ -701,8 +1233,20 @@ def test_identity_verification_rechecks_bytes_and_build_association(tmp_path: Pa
     _check(tmp_path, report, passed=False)
 
 
-@pytest.mark.parametrize("damage", ["zero-n", "boolean-n", "duplicate-decision", "wrong-instance-suffix", "cross-repetition-decision", "pooled-only-summary"])
-def test_report_rejects_invalid_repetition_and_decision_identity(tmp_path: Path, frozen_report: dict[str, Any], damage: str) -> None:
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "zero-n",
+        "boolean-n",
+        "duplicate-decision",
+        "wrong-instance-suffix",
+        "cross-repetition-decision",
+        "pooled-only-summary",
+    ],
+)
+def test_report_rejects_invalid_repetition_and_decision_identity(
+    tmp_path: Path, frozen_report: dict[str, Any], damage: str
+) -> None:
     _check(tmp_path, frozen_report, passed=True)
     report = copy.deepcopy(frozen_report)
     if damage == "zero-n":
@@ -723,22 +1267,36 @@ def test_report_rejects_invalid_repetition_and_decision_identity(tmp_path: Path,
 def _current_base(report: dict[str, Any]) -> None:
     absent = {"skill", "instruction", "schedule"}
     for kind in absent:
-        ref = _evidence(report, "capability-absence", {
-            "capability": kind, "exit_code": 0, "binary": report["binary"],
-            "reason": "closed-memory-schema-omits-kind" if kind == "instruction" else "command-or-required-output-absent",
-        })
+        ref = _evidence(
+            report,
+            "capability-absence",
+            {
+                "capability": kind,
+                "exit_code": 0,
+                "binary": report["binary"],
+                "reason": "closed-memory-schema-omits-kind"
+                if kind == "instruction"
+                else "command-or-required-output-absent",
+            },
+        )
         report["capabilities"][kind] = {"available": False, "evidence_ref": ref}
     for row in report["decisions"]:
         if row["expected"] in absent:
             row.update(status="NOT_AVAILABLE", predicted=[], mutations=[])
-            _value(report, row["evidence_ref"])["after"] = {"skills": [], "facts": [], "schedules": []}
+            _value(report, row["evidence_ref"])["after"] = {
+                "skills": [],
+                "facts": [],
+                "schedules": [],
+            }
     for section in ("procedure_probes", "deliveries"):
         report[section]["rows"] = []
     report["acceptance"] = "NOT_AVAILABLE"
     _derive(report)
 
 
-def test_current_base_keeps_all_24_executions_and_null_global_gates(tmp_path: Path, frozen_report: dict[str, Any]) -> None:
+def test_current_base_keeps_all_24_executions_and_null_global_gates(
+    tmp_path: Path, frozen_report: dict[str, Any]
+) -> None:
     report = copy.deepcopy(frozen_report)
     _current_base(report)
     _check(tmp_path, report, passed=True)
@@ -752,7 +1310,9 @@ def test_current_base_keeps_all_24_executions_and_null_global_gates(tmp_path: Pa
 
 
 @pytest.mark.parametrize("prediction", ["nothing", "clarify"])
-def test_expected_unavailable_rows_cannot_acquire_no_write_predictions(tmp_path: Path, frozen_report: dict[str, Any], prediction: str) -> None:
+def test_expected_unavailable_rows_cannot_acquire_no_write_predictions(
+    tmp_path: Path, frozen_report: dict[str, Any], prediction: str
+) -> None:
     report = copy.deepcopy(frozen_report)
     _current_base(report)
     _check(tmp_path, report, passed=True)
@@ -761,8 +1321,19 @@ def test_expected_unavailable_rows_cannot_acquire_no_write_predictions(tmp_path:
     _check(tmp_path, report, passed=False)
 
 
-@pytest.mark.parametrize("damage", ["dropped-actor-input", "lost-distractor", "store-error-as-unavailable", "fabricated-global-value", "empty-without-absence-proof"])
-def test_unavailability_does_not_swallow_executions_reads_or_denominators(tmp_path: Path, frozen_report: dict[str, Any], damage: str) -> None:
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "dropped-actor-input",
+        "lost-distractor",
+        "store-error-as-unavailable",
+        "fabricated-global-value",
+        "empty-without-absence-proof",
+    ],
+)
+def test_unavailability_does_not_swallow_executions_reads_or_denominators(
+    tmp_path: Path, frozen_report: dict[str, Any], damage: str
+) -> None:
     report = copy.deepcopy(frozen_report)
     _current_base(report)
     _check(tmp_path, report, passed=True)
@@ -781,8 +1352,25 @@ def test_unavailability_does_not_swallow_executions_reads_or_denominators(tmp_pa
 
 
 @pytest.mark.parametrize("section", ["procedure_probes", "memory_negative", "deliveries"])
-@pytest.mark.parametrize("damage", ["missing-section", "version", "boolean-version", "missing-row", "duplicate-row", "unknown-field", "missing-field", "boolean-repetition", "cross-agent", "cross-case", "null-reference"])
-def test_versioned_auxiliary_sections_fail_closed(tmp_path: Path, frozen_report: dict[str, Any], section: str, damage: str) -> None:
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "missing-section",
+        "version",
+        "boolean-version",
+        "missing-row",
+        "duplicate-row",
+        "unknown-field",
+        "missing-field",
+        "boolean-repetition",
+        "cross-agent",
+        "cross-case",
+        "null-reference",
+    ],
+)
+def test_versioned_auxiliary_sections_fail_closed(
+    tmp_path: Path, frozen_report: dict[str, Any], section: str, damage: str
+) -> None:
     _check(tmp_path, frozen_report, passed=True)
     report = copy.deepcopy(frozen_report)
     rows = report[section]["rows"]
@@ -805,12 +1393,40 @@ def test_versioned_auxiliary_sections_fail_closed(tmp_path: Path, frozen_report:
     elif damage == "cross-case":
         rows[0]["case_id"] = "F7-P1-R1"
     else:
-        rows[0][{"procedure_probes": "probe_ids", "memory_negative": "before_evidence", "deliveries": "schedule_evidence"}[section]] = None
+        rows[0][
+            {
+                "procedure_probes": "probe_ids",
+                "memory_negative": "before_evidence",
+                "deliveries": "schedule_evidence",
+            }[section]
+        ] = None
     _check(tmp_path, report, passed=False)
 
 
-@pytest.mark.parametrize("damage", ["missing-case", "duplicate-case", "wrong-family", "missing-turn", "unfinalized-turn", "missing-usage", "wrong-model", "wrong-invocation-bin", "wrong-source", "missing-build", "wrong-build", "wrong-fixture-digest", "fabricated-metric", "missing-raw-evidence", "changed-raw-evidence", "missing-transcript"])
-def test_report_recomputes_inventory_identity_and_raw_evidence(tmp_path: Path, frozen_report: dict[str, Any], damage: str) -> None:
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "missing-case",
+        "duplicate-case",
+        "wrong-family",
+        "missing-turn",
+        "unfinalized-turn",
+        "missing-usage",
+        "wrong-model",
+        "wrong-invocation-bin",
+        "wrong-source",
+        "missing-build",
+        "wrong-build",
+        "wrong-fixture-digest",
+        "fabricated-metric",
+        "missing-raw-evidence",
+        "changed-raw-evidence",
+        "missing-transcript",
+    ],
+)
+def test_report_recomputes_inventory_identity_and_raw_evidence(
+    tmp_path: Path, frozen_report: dict[str, Any], damage: str
+) -> None:
     _check(tmp_path, frozen_report, passed=True)
     report = copy.deepcopy(frozen_report)
     row = report["cases"][0]
@@ -851,8 +1467,12 @@ def test_report_recomputes_inventory_identity_and_raw_evidence(tmp_path: Path, f
     _check(tmp_path, report, passed=False)
 
 
-@pytest.mark.parametrize("successes,threshold,passed", [(5, 0.5, False), (6, 0.5, True), (0, 0.0, False), (1, 0.0, True)])
-def test_procedure_gate_uses_exact_strict_per_task_boundary(tmp_path: Path, frozen_report: dict[str, Any], successes: int, threshold: float, passed: bool) -> None:
+@pytest.mark.parametrize(
+    "successes,threshold,passed", [(5, 0.5, False), (6, 0.5, True), (0, 0.0, False), (1, 0.0, True)]
+)
+def test_procedure_gate_uses_exact_strict_per_task_boundary(
+    tmp_path: Path, frozen_report: dict[str, Any], successes: int, threshold: float, passed: bool
+) -> None:
     _check(tmp_path, frozen_report, passed=True)
     report = copy.deepcopy(frozen_report)
     report["thresholds"]["heldout_control_improvement"] = threshold
@@ -867,8 +1487,23 @@ def test_procedure_gate_uses_exact_strict_per_task_boundary(tmp_path: Path, froz
     _check(tmp_path, report, passed=passed)
 
 
-@pytest.mark.parametrize("damage", ["fabricated-success", "boolean-trials", "unequal-trials", "duplicate-probe", "same-thread", "same-input", "wrong-item", "changed-guidance", "changed-bundle"])
-def test_procedure_control_requires_equivalent_fresh_bound_arms(tmp_path: Path, frozen_report: dict[str, Any], damage: str) -> None:
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "fabricated-success",
+        "boolean-trials",
+        "unequal-trials",
+        "duplicate-probe",
+        "same-thread",
+        "same-input",
+        "wrong-item",
+        "changed-guidance",
+        "changed-bundle",
+    ],
+)
+def test_procedure_control_requires_equivalent_fresh_bound_arms(
+    tmp_path: Path, frozen_report: dict[str, Any], damage: str
+) -> None:
     _check(tmp_path, frozen_report, passed=True)
     report = copy.deepcopy(frozen_report)
     learned, removed = report["procedure_probes"]["rows"][:2]
@@ -897,7 +1532,9 @@ def test_procedure_control_requires_equivalent_fresh_bound_arms(tmp_path: Path, 
 
 @pytest.mark.parametrize("before", ["PASS", "FAIL", "ERROR", "NOT_AVAILABLE"])
 @pytest.mark.parametrize("after", ["PASS", "FAIL", "ERROR", "NOT_AVAILABLE"])
-def test_memory_negative_requires_positive_to_failed_retention_flip(tmp_path: Path, frozen_report: dict[str, Any], before: str, after: str) -> None:
+def test_memory_negative_requires_positive_to_failed_retention_flip(
+    tmp_path: Path, frozen_report: dict[str, Any], before: str, after: str
+) -> None:
     _check(tmp_path, frozen_report, verify_negative, passed=True)
     report = copy.deepcopy(frozen_report)
     row = report["memory_negative"]["rows"][0]
@@ -906,8 +1543,32 @@ def test_memory_negative_requires_positive_to_failed_retention_flip(tmp_path: Pa
 
 
 @pytest.mark.parametrize("validator", [verify_negative, verify_report])
-@pytest.mark.parametrize("damage", ["wrong-fact", "wrong-agent", "wrong-delete-argv", "failed-delete", "missing-native-result", "fact-remains", "answer-in-prompt", "answer-recalled", "changed-rubric", "changed-guidance", "changed-bundle", "same-thread", "same-channel", "unsafe-fabrication", "boolean-exit"])
-def test_memory_negative_checks_native_deletion_and_unchanged_retention_scorer(tmp_path: Path, frozen_report: dict[str, Any], validator: Callable[[Path], ScoreResult], damage: str) -> None:
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "wrong-fact",
+        "wrong-agent",
+        "wrong-delete-argv",
+        "failed-delete",
+        "missing-native-result",
+        "fact-remains",
+        "answer-in-prompt",
+        "answer-recalled",
+        "changed-rubric",
+        "changed-guidance",
+        "changed-bundle",
+        "same-thread",
+        "same-channel",
+        "unsafe-fabrication",
+        "boolean-exit",
+    ],
+)
+def test_memory_negative_checks_native_deletion_and_unchanged_retention_scorer(
+    tmp_path: Path,
+    frozen_report: dict[str, Any],
+    validator: Callable[[Path], ScoreResult],
+    damage: str,
+) -> None:
     _check(tmp_path, frozen_report, validator, passed=True)
     report = copy.deepcopy(frozen_report)
     row = report["memory_negative"]["rows"][0]
@@ -924,7 +1585,9 @@ def test_memory_negative_checks_native_deletion_and_unchanged_retention_scorer(t
     elif damage == "missing-native-result":
         del report["evidence"][row["deletion_invocation"]["result_ref"]]
     elif damage == "fact-remains":
-        _value(report, after["snapshot_ref"])["result"]["facts"] = copy.deepcopy(_value(report, before["snapshot_ref"])["result"]["facts"])
+        _value(report, after["snapshot_ref"])["result"]["facts"] = copy.deepcopy(
+            _value(report, before["snapshot_ref"])["result"]["facts"]
+        )
     elif damage == "answer-in-prompt":
         after["input"] += " " + before["required_value"]
     elif damage == "answer-recalled":
@@ -946,13 +1609,17 @@ def test_memory_negative_checks_native_deletion_and_unchanged_retention_scorer(t
 
 
 @pytest.mark.parametrize("count,passed", [(0, False), (1, True), (2, False)])
-def test_delivery_requires_exactly_one_final_post_per_due_schedule(tmp_path: Path, frozen_report: dict[str, Any], count: int, passed: bool) -> None:
+def test_delivery_requires_exactly_one_final_post_per_due_schedule(
+    tmp_path: Path, frozen_report: dict[str, Any], count: int, passed: bool
+) -> None:
     _check(tmp_path, frozen_report, passed=True)
     report = copy.deepcopy(frozen_report)
     row = report["deliveries"]["rows"][0]
     observation = _value(report, row["schedule_evidence"])
     receipt = observation["collector_receipts"][0]
-    observation["collector_receipts"] = [{**receipt, "id": f"post-{index}"} for index in range(count)]
+    observation["collector_receipts"] = [
+        {**receipt, "id": f"post-{index}"} for index in range(count)
+    ]
     row["delivery_count"] = count
     row["delivery_ids"] = [item["id"] for item in observation["collector_receipts"]]
     row["receipt_times"] = [item["received_at"] for item in observation["collector_receipts"]]
@@ -960,15 +1627,42 @@ def test_delivery_requires_exactly_one_final_post_per_due_schedule(tmp_path: Pat
     _check(tmp_path, report, passed=passed)
 
 
-@pytest.mark.parametrize("damage", ["early", "late", "no-two-poll-window", "wrong-channel", "wrong-token", "synthetic", "duplicate-id", "unsorted-times", "invalid-time", "boolean-count", "nonterminal", "cancelled-delivered", "zero-denominator", "fabricated-rate", "wrong-binding-endpoint"])
-def test_delivery_is_recomputed_from_real_clock_state_and_collector_receipts(tmp_path: Path, frozen_report: dict[str, Any], damage: str) -> None:
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "early",
+        "late",
+        "no-two-poll-window",
+        "wrong-channel",
+        "wrong-token",
+        "synthetic",
+        "duplicate-id",
+        "unsorted-times",
+        "invalid-time",
+        "boolean-count",
+        "nonterminal",
+        "cancelled-delivered",
+        "zero-denominator",
+        "fabricated-rate",
+        "wrong-delivery-route",
+        "receipt-outside-window",
+        "children-alive-window",
+    ],
+)
+def test_delivery_is_recomputed_from_real_clock_state_and_collector_receipts(
+    tmp_path: Path, frozen_report: dict[str, Any], damage: str
+) -> None:
     _check(tmp_path, frozen_report, passed=True)
     report = copy.deepcopy(frozen_report)
     row = report["deliveries"]["rows"][0]
     observation = _value(report, row["schedule_evidence"])
     receipt = observation["collector_receipts"][0]
     if damage in {"early", "late", "invalid-time"}:
-        time = {"early": "2026-01-01T11:59:59Z", "late": "2026-01-01T12:03:00Z", "invalid-time": "yesterday"}[damage]
+        time = {
+            "early": "2026-01-01T11:59:59Z",
+            "late": "2026-01-01T12:03:00Z",
+            "invalid-time": "yesterday",
+        }[damage]
         row["receipt_times"][0] = receipt["received_at"] = time
     elif damage == "no-two-poll-window":
         observation["observation_end"] = "2026-01-01T12:00:02Z"
@@ -998,13 +1692,19 @@ def test_delivery_is_recomputed_from_real_clock_state_and_collector_receipts(tmp
         report["deliveries"]["rows"] = []
     elif damage == "fabricated-rate":
         report["delivery_metrics"]["delivery_rate"] = 0.5
+    elif damage == "wrong-delivery-route":
+        observation["delivery_route"]["worker_slack_api_port"] = report["collector"]["port_b"] + 1
+    elif damage == "receipt-outside-window":
+        report["collector"]["delivery_windows"][0]["closed_at"] = "2026-01-01T12:00:00Z"
     else:
-        observation["binding_write"]["endpoint"] = "http://127.0.0.1:31002"
+        report["collector"]["delivery_windows"][0]["message_children_alive"] = 1
     _rehash(report)
     _check(tmp_path, report, passed=False)
 
 
-def test_placeholder_updates_do_not_increment_final_delivery_count(tmp_path: Path, frozen_report: dict[str, Any]) -> None:
+def test_placeholder_updates_do_not_increment_final_delivery_count(
+    tmp_path: Path, frozen_report: dict[str, Any]
+) -> None:
     _check(tmp_path, frozen_report, passed=True)
     report = copy.deepcopy(frozen_report)
     observation = _value(report, report["deliveries"]["rows"][0]["schedule_evidence"])
@@ -1016,8 +1716,30 @@ def test_placeholder_updates_do_not_increment_final_delivery_count(tmp_path: Pat
     _check(tmp_path, report, passed=True)
 
 
-@pytest.mark.parametrize("damage", ["missing-group", "wrong-verdict", "missing-binding", "duplicate-binding", "conflicting-completion", "wrong-prompt-sha", "wrong-completion-sha", "missing-generation", "duplicate-generation", "wrong-model", "missing-usage", "missing-ledger", "synthetic", "deterministic-called-judge", "unclear", "malformed-completion"])
-def test_calibration_binds_all_five_groups_to_unique_provider_observations(tmp_path: Path, frozen_report: dict[str, Any], damage: str) -> None:
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "missing-group",
+        "wrong-verdict",
+        "missing-binding",
+        "duplicate-binding",
+        "conflicting-completion",
+        "wrong-prompt-sha",
+        "wrong-completion-sha",
+        "missing-generation",
+        "duplicate-generation",
+        "wrong-model",
+        "missing-usage",
+        "missing-ledger",
+        "synthetic",
+        "deterministic-called-judge",
+        "unclear",
+        "malformed-completion",
+    ],
+)
+def test_calibration_binds_all_five_groups_to_unique_provider_observations(
+    tmp_path: Path, frozen_report: dict[str, Any], damage: str
+) -> None:
     _check(tmp_path, frozen_report, verify_calibration, passed=True)
     report = copy.deepcopy(frozen_report)
     rows = report["calibration"]["rows"]
@@ -1051,12 +1773,20 @@ def test_calibration_binds_all_five_groups_to_unique_provider_observations(tmp_p
     elif damage == "deterministic-called-judge":
         report["calibration"]["deterministic_controls"][0]["judge_called"] = True
     else:
-        row["completion"] = '{"verdict":"UNCLEAR","action":null,"reason":"uncertain","evidence_refs":[]}' if damage == "unclear" else "{"
-        row["completion_sha256"] = generation["completion_sha256"] = _sha(row["completion"].encode())
+        row["completion"] = (
+            '{"verdict":"UNCLEAR","action":null,"reason":"uncertain","evidence_refs":[]}'
+            if damage == "unclear"
+            else "{"
+        )
+        row["completion_sha256"] = generation["completion_sha256"] = _sha(
+            row["completion"].encode()
+        )
     _check(tmp_path, report, verify_calibration, passed=False)
 
 
-def test_identical_calibration_prompts_remain_distinct_by_sequence(tmp_path: Path, frozen_report: dict[str, Any]) -> None:
+def test_identical_calibration_prompts_remain_distinct_by_sequence(
+    tmp_path: Path, frozen_report: dict[str, Any]
+) -> None:
     _check(tmp_path, frozen_report, verify_calibration, passed=True)
     report = copy.deepcopy(frozen_report)
     first, second = report["calibration"]["rows"][:2]
@@ -1068,8 +1798,24 @@ def test_identical_calibration_prompts_remain_distinct_by_sequence(tmp_path: Pat
     _check(tmp_path, report, verify_calibration, passed=True)
 
 
-@pytest.mark.parametrize("damage", ["unknown-cost", "negative-cost", "unsettled", "counter-reset", "over-budget", "repetition-budget-reset", "no-overshoot-margin", "catalog-cost-as-billed", "shared-spend-subtracted", "wrong-host"])
-def test_accounting_evidence_never_turns_unknown_or_shared_spend_into_free_calls(tmp_path: Path, frozen_report: dict[str, Any], damage: str) -> None:
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "unknown-cost",
+        "negative-cost",
+        "unsettled",
+        "counter-reset",
+        "over-budget",
+        "repetition-budget-reset",
+        "no-overshoot-margin",
+        "catalog-cost-as-billed",
+        "shared-spend-subtracted",
+        "wrong-host",
+    ],
+)
+def test_accounting_evidence_never_turns_unknown_or_shared_spend_into_free_calls(
+    tmp_path: Path, frozen_report: dict[str, Any], damage: str
+) -> None:
     _check(tmp_path, frozen_report, passed=True)
     report = copy.deepcopy(frozen_report)
     accounting = report["accounting"]
@@ -1096,8 +1842,12 @@ def test_accounting_evidence_never_turns_unknown_or_shared_spend_into_free_calls
     _check(tmp_path, report, passed=False)
 
 
-@pytest.mark.parametrize("damage", ["missing-manifest", "missing-daemon", "resolver-unowned", "cleanup-boolean-only"])
-def test_cleanup_refuses_missing_ownership_before_any_absence_claim(tmp_path: Path, frozen_report: dict[str, Any], damage: str) -> None:
+@pytest.mark.parametrize(
+    "damage", ["missing-manifest", "missing-daemon", "resolver-unowned", "cleanup-boolean-only"]
+)
+def test_cleanup_refuses_missing_ownership_before_any_absence_claim(
+    tmp_path: Path, frozen_report: dict[str, Any], damage: str
+) -> None:
     report = copy.deepcopy(frozen_report)
     cleanup = report["cleanup"]
     if damage == "missing-manifest":
@@ -1111,7 +1861,9 @@ def test_cleanup_refuses_missing_ownership_before_any_absence_claim(tmp_path: Pa
     _check(tmp_path, report, verify_cleanup, passed=False)
 
 
-def test_cleanup_cannot_accept_recorded_success_when_daemon_is_unavailable(tmp_path: Path, frozen_report: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+def test_cleanup_cannot_accept_recorded_success_when_daemon_is_unavailable(
+    tmp_path: Path, frozen_report: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
     tools = tmp_path / "unavailable-external-docker"
     tools.mkdir()
     marker = tmp_path / "docker-observed"
@@ -1130,7 +1882,10 @@ def test_cleanup_cannot_accept_recorded_success_when_daemon_is_unavailable(tmp_p
 LIVE_REPORT = os.environ.get("CURIE_LEARNING_EVAL_REPORT")
 
 
-@pytest.mark.skipif(not LIVE_REPORT, reason="opt in by supplying one bounded campaign with CURIE_LEARNING_EVAL_REPORT")
+@pytest.mark.skipif(
+    not LIVE_REPORT,
+    reason="opt in by supplying one bounded campaign with CURIE_LEARNING_EVAL_REPORT",
+)
 class TestRecordedCampaign:
     """An opt-in selects live evidence; missing selected prerequisites are errors."""
 
@@ -1143,25 +1898,46 @@ class TestRecordedCampaign:
         _score(verify_report(path), True)
         return path, report, candidate_binary
 
-    def test_all_four_public_validators_and_actual_cli_dispatch(self, campaign: tuple[Path, dict[str, Any], Path]) -> None:
+    def test_all_four_public_validators_and_actual_cli_dispatch(
+        self, campaign: tuple[Path, dict[str, Any], Path]
+    ) -> None:
         path, _, binary = campaign
-        for name, validator in (("report", verify_report), ("calibration", verify_calibration), ("negative", verify_negative), ("cleanup", verify_cleanup)):
+        for name, validator in (
+            ("report", verify_report),
+            ("calibration", verify_calibration),
+            ("negative", verify_negative),
+            ("cleanup", verify_cleanup),
+        ):
             _score(validator(path), True)
-            completed = subprocess.run([str(binary), "--json", "dev", "learning-eval-verify", name, str(path)], cwd=ROOT, capture_output=True, text=True, timeout=120)
+            completed = subprocess.run(
+                [str(binary), "--json", "dev", "learning-eval-verify", name, str(path)],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
             assert completed.returncode == 0, f"{name} validator failed"
             assert json.loads(completed.stdout)["passed"] is True
 
-    def test_every_repetition_has_all_24_actual_primary_children_and_fresh_agents(self, campaign: tuple[Path, dict[str, Any], Path]) -> None:
+    def test_every_repetition_has_all_24_actual_primary_children_and_fresh_agents(
+        self, campaign: tuple[Path, dict[str, Any], Path]
+    ) -> None:
         _, report, _ = campaign
         identities = set()
         for repetition in range(1, report["repetitions"] + 1):
-            rows = [row for row in report["cases"] if row["repetition"] == repetition and row["primary"]]
+            rows = [
+                row for row in report["cases"] if row["repetition"] == repetition and row["primary"]
+            ]
             assert len(rows) == 24
             assert {row["fixture_id"] for row in rows} == set(CASE_IDS)
             for row in rows:
                 assert row["agent_id"] not in identities
                 identities.add(row["agent_id"])
-                invocation = next(item for item in report["invocations"] if item["invocation_id"] == row["invocation_id"])
+                invocation = next(
+                    item
+                    for item in report["invocations"]
+                    if item["invocation_id"] == row["invocation_id"]
+                )
                 assert invocation["cwd"] == report["output_dir"]
                 assert invocation["argv"][0] == report["binary"]["path"]
                 thread = invocation["argv"][invocation["argv"].index("--thread") + 1]
@@ -1170,19 +1946,32 @@ class TestRecordedCampaign:
                 assert row["stub_port"] == report["collector"]["port_b"]
                 assert row["stub_bind_succeeded"] is True
 
-    def test_collector_liveness_and_synthetic_transport_are_separate_from_delivery(self, campaign: tuple[Path, dict[str, Any], Path]) -> None:
+    def test_collector_liveness_and_synthetic_transport_are_separate_from_delivery(
+        self, campaign: tuple[Path, dict[str, Any], Path]
+    ) -> None:
         _, report, _ = campaign
         collector = report["collector"]
-        assert collector["port_a"] != collector["port_b"]
-        assert collector["alive_for_primary_children"] == 24 * report["repetitions"]
+        assert "port_a" not in collector and "alive_for_primary_children" not in collector
+        for row in report["cases"]:
+            if row["primary"]:
+                assert row["stub_port"] == collector["port_b"]
         assert collector["bind_errors"] == 0
         assert collector["synthetic_transport_receipt"]["synthetic"] is True
         assert collector["synthetic_transport_receipt"]["received_at"]
+        for repetition in range(1, report["repetitions"] + 1):
+            windows = [
+                window
+                for window in collector["delivery_windows"]
+                if window["repetition"] == repetition
+            ]
+            assert any(window["message_children_alive"] == 0 for window in windows)
         for row in report["deliveries"]["rows"]:
             observation = _value(report, row["schedule_evidence"])
             assert all(not receipt["synthetic"] for receipt in observation["collector_receipts"])
 
-    def test_real_cli_lifecycle_uses_one_override_and_one_budget(self, campaign: tuple[Path, dict[str, Any], Path]) -> None:
+    def test_real_cli_lifecycle_uses_one_override_and_one_budget(
+        self, campaign: tuple[Path, dict[str, Any], Path]
+    ) -> None:
         _, report, _ = campaign
         invocations = report["invocations"]
         starts = [row for row in invocations if "local" in row["argv"] and "up" in row["argv"]]
@@ -1199,20 +1988,27 @@ class TestRecordedCampaign:
         assert Decimal(report["accounting"]["budget_usd"]) <= Decimal("5.00")
         assert report["accounting"]["basis"] != "catalog-price-estimate"
 
-    def test_cleanup_queries_actual_daemon_and_rejects_mismatched_daemon(self, campaign: tuple[Path, dict[str, Any], Path], tmp_path: Path) -> None:
+    def test_cleanup_queries_actual_daemon_and_rejects_mismatched_daemon(
+        self, campaign: tuple[Path, dict[str, Any], Path], tmp_path: Path
+    ) -> None:
         path, original, _ = campaign
         _score(verify_cleanup(path), True)
         report = copy.deepcopy(original)
         report["cleanup"]["ownership_manifest"]["daemon_id"] = "different-daemon"
         _check(tmp_path, report, verify_cleanup, passed=False)
 
-    def test_owned_resources_are_actually_absent_and_unrelated_inventory_survives(self, campaign: tuple[Path, dict[str, Any], Path]) -> None:
+    def test_owned_resources_are_actually_absent_and_unrelated_inventory_survives(
+        self, campaign: tuple[Path, dict[str, Any], Path]
+    ) -> None:
         _, report, _ = campaign
         manifest = report["cleanup"]["ownership_manifest"]
 
         def docker(*args: str) -> set[str]:
             result = subprocess.run(
-                ["docker", *args], capture_output=True, text=True, timeout=30,
+                ["docker", *args],
+                capture_output=True,
+                text=True,
+                timeout=30,
             )
             assert result.returncode == 0, "required caller-daemon observation failed"
             return set(result.stdout.splitlines())
@@ -1225,7 +2021,9 @@ class TestRecordedCampaign:
         }
         assert manifest["resolver_containers"], "resolver preflight ownership must be retained"
         for kind in ("containers", "runners", "resolver_containers", "volumes", "networks"):
-            inventory = inventories["containers" if kind in {"runners", "resolver_containers"} else kind]
+            inventory = inventories[
+                "containers" if kind in {"runners", "resolver_containers"} else kind
+            ]
             identity_key = "name" if kind == "volumes" else "id"
             assert all(row[identity_key] not in inventory for row in manifest[kind])
         for kind, before in report["cleanup"]["unrelated_before"].items():
@@ -1234,5 +2032,6 @@ class TestRecordedCampaign:
             stat = Path(f"/proc/{process['pid']}/stat")
             if stat.exists():
                 fields = stat.read_text(encoding="utf-8").rsplit(")", 1)[1].split()
-                assert fields[19] != str(process["start_time_ticks"]), "owned process is still running"
-
+                assert fields[19] != str(process["start_time_ticks"]), (
+                    "owned process is still running"
+                )
