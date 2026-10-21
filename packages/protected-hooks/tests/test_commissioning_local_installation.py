@@ -9,6 +9,7 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import json
+import re
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
@@ -40,12 +41,16 @@ class FakeRunner:
         self.status = 85
         self.cluster_uid: str | None = "cluster-uid"
         self.uid = 0
+        self.tags: dict[str, str] = {}
+        self.digest = "@sha256:" + "c" * 64  # what the registry answers for a pushed tag
 
     def _seen(self) -> list[tuple[str, str, str]]:
         return [(e.kind, e.key, e.state) for e in self.ledger.entries()]
 
     def probe(self, argv: Sequence[str], *, timeout: float) -> int:
         self.calls.append((list(argv), self._seen()))
+        if argv[0] == "docker" and argv[1:3] == ["image", "inspect"]:
+            return 0 if argv[-1] in self.tags else 1
         if argv[0] == "docker" and argv[1] == "inspect":
             return 0 if self.status != 85 else 1
         return self.status if argv[0] == "minikube" else 1
@@ -55,6 +60,15 @@ class FakeRunner:
         self.calls.append((argv, self._seen()))
         if self.fail(argv):
             raise module().InstallationRefused()
+        if argv[0] == "docker":
+            if argv[1] == "build":
+                self.tags[argv[argv.index("-t") + 1]] = "sha256:" + "b" * 64
+                return b""
+            if argv[1:3] == ["image", "inspect"]:
+                return (self.tags[argv[-1]] + "\n").encode()
+            if argv[1:3] == ["image", "rm"]:
+                del self.tags[argv[-1]]
+                return b""
         if argv[0] == "minikube":
             return b""
         verb = argv[5]
@@ -103,7 +117,16 @@ def write_admin_kubeconfig(root: Path, owner: str = OWNER) -> Path:
 def installation(tmp_path: Path) -> tuple[Any, FakeRunner]:
     ledger = ownership().OwnershipLedger.create(tmp_path / "run", owner=OWNER)
     runner = FakeRunner(ledger)
-    return module().LocalCluster(ledger, runner=runner), runner
+    cluster = module().LocalCluster(ledger, runner=runner)
+
+    def registry_digest(repository: str, tag: str) -> str:
+        runner.calls.append((["registry", repository, tag], []))
+        if not re.fullmatch(r"@sha256:[0-9a-f]{64}", runner.digest):
+            raise module().InstallationRefused()
+        return runner.digest[1:]
+
+    cluster._registry_digest = registry_digest
+    return cluster, runner
 
 
 def config_map(name: str = "fixture", owner: str = OWNER) -> dict[str, Any]:
@@ -323,4 +346,53 @@ def test_an_unidentified_profile_is_never_deleted(tmp_path: Path) -> None:
     assert not any(argv[3:4] == ["delete"] for argv, _ in runner.calls)
     runner.status = 85
     cluster.remove_all()
+    assert cluster.ledger.all_removed()
+
+
+def test_publish_image_registers_the_tag_before_building_and_returns_a_digest(
+    tmp_path: Path,
+) -> None:
+    cluster, runner = installation(tmp_path)
+    reference = cluster.publish_image("api", dockerfile=tmp_path / "Dockerfile", context=tmp_path)
+    build, seen = next(c for c in runner.calls if c[0][:2] == ["docker", "build"])
+    tag = build[build.index("-t") + 1]
+    assert tag.startswith(f"localhost:5000/{OWNER}/api:")
+    assert seen == [("image-tag", tag, "intended")]
+    assert reference == f"localhost:5000/{OWNER}/api@sha256:" + "c" * 64
+    pushed = [argv for argv, _ in runner.calls if argv[3:5] == ["image", "push"]]
+    assert pushed == [["minikube", "-p", OWNER, "image", "push", tag]]
+    entry = cluster.ledger.entries()[0]
+    assert entry.state == "created" and entry.identity == {
+        "owner": OWNER,
+        "id": "sha256:" + "b" * 64,
+    }
+    cluster.remove_all()
+    assert runner.tags == {} and cluster.ledger.all_removed()
+
+
+def test_publish_image_refuses_an_ambiguous_digest_and_a_retagged_image(tmp_path: Path) -> None:
+    api = module()
+    cluster, runner = installation(tmp_path)
+    runner.digest = "@sha256:short"
+    with pytest.raises(api.InstallationRefused):
+        cluster.publish_image("api", dockerfile=tmp_path / "Dockerfile", context=tmp_path)
+    (tag,) = runner.tags
+    runner.tags[tag] = "sha256:" + "d" * 64
+    with pytest.raises(api.InstallationRefused):
+        cluster.remove_all()
+    assert tag in runner.tags
+    with pytest.raises(api.InstallationRefused):
+        cluster.publish_image("Bad/Name", dockerfile=tmp_path / "Dockerfile", context=tmp_path)
+
+
+def test_failed_build_is_uncertain_and_cleanup_untags_only_that_tag(tmp_path: Path) -> None:
+    api = module()
+    cluster, runner = installation(tmp_path)
+    runner.fail = lambda argv: argv[:2] == ["docker", "build"]
+    with pytest.raises(api.InstallationRefused):
+        cluster.publish_image("api", dockerfile=tmp_path / "Dockerfile", context=tmp_path)
+    assert [e.state for e in cluster.ledger.entries()] == ["uncertain"]
+    runner.tags["other:tag"] = "sha256:" + "e" * 64
+    cluster.remove_all()
+    assert runner.tags == {"other:tag": "sha256:" + "e" * 64}
     assert cluster.ledger.all_removed()
