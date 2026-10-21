@@ -1,24 +1,29 @@
 """Protected broker of a local installation, @spec PROTECTED-COMMISSIONING-1.
 
-Pure tests cover the users, ACL file, TLS material and objects. One owned TLS
-Valkey container loads the rendered ACL file unchanged and proves each user's
-identity and a refusal per boundary over the same pinned session the
-provisioner uses. The minikube test drives the full install.
+Pure tests cover the principals, TLS material, objects and the provisioner's
+grant. One owned TLS Valkey container starts with the Pod's arguments and only
+the installer password; the administrator bootstrap's enrollment creates every
+user and records the baseline, and the tests prove each user's identity and a
+refusal per boundary over the pinned session the provisioner uses. Nothing
+here hashes a password: the broker derives every hash, and the tests compare
+``ACL GETUSER`` replies with the recorded baseline. The minikube test drives
+the full install.
 """
 
 from __future__ import annotations
 
 import base64
-import hashlib
 import importlib
 import importlib.util
 import json
 import os
+import secrets
 import shutil
 import subprocess
 import time
 import uuid
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -44,6 +49,10 @@ def module() -> Any:
     return importlib.import_module(name)
 
 
+def bootstrap() -> Any:
+    return importlib.import_module("curie_protected_hooks.commissioning_local_bootstrap")
+
+
 def provisioned() -> tuple[Any, MergedRecipes]:
     from curie_protected_hooks.commissioning_provisioner import construct
 
@@ -51,20 +60,19 @@ def provisioned() -> tuple[Any, MergedRecipes]:
     return construct(profile(), acl=recipes), recipes
 
 
-def users() -> dict[str, Any]:
+def principals() -> dict[str, Any]:
     _, recipes = provisioned()
-    return module().broker_users(
-        recipes,
-        profile(),
-        provisioner_id="commissioning/example-provisioner",
+    return module().broker_principals(
+        recipes, profile(), provisioner_id="commissioning/example-provisioner"
     )
 
 
-def test_users_take_bs_credential_ids_and_the_rules_g_hashed() -> None:
+def test_principals_take_the_profiles_ids_and_the_rules_g_hashed() -> None:
     api = module()
     result, recipes = provisioned()
-    made = users()
+    made = principals()
     assert set(made) == {*api.GUARD_PRINCIPALS, "provisioner"}
+    assert all(type(p) is api.Principal and not hasattr(p, "password") for p in made.values())
     api.check_guard_binding(made, result.guard_config)
     guard = json.loads(result.guard_config)["broker_acl"]
     for name in api.GUARD_PRINCIPALS:
@@ -80,22 +88,26 @@ def test_users_take_bs_credential_ids_and_the_rules_g_hashed() -> None:
     for name in CANDIDATES:
         assert made[name].rules == commissioning_acl_template(name)
     assert made["provisioner"].rules == commissioning_acl_rules("provisioner")
-    passwords = [user.password for user in made.values()]
+
+
+def test_issued_credentials_are_fresh_distinct_and_redacted() -> None:
+    issued = bootstrap().issue_credentials(principals())
+    passwords = [user.password for user in issued.values()]
     assert len(set(passwords)) == len(passwords) and all(len(p) >= 40 for p in passwords)
-    assert all(user.password not in repr(user) for user in made.values())
+    assert all(user.password not in repr(user) for user in issued.values())
+    again = bootstrap().issue_credentials(principals())
+    assert not set(passwords) & {user.password for user in again.values()}
 
 
 def test_guard_binding_refuses_other_rules_or_usernames() -> None:
     api = module()
     result, _ = provisioned()
-    made = users()
+    made = principals()
     changed = dict(made)
-    changed["worker"] = api.BrokerUser(
-        made["worker"].username, (*made["worker"].rules, "+keys"), made["worker"].password
-    )
+    changed["worker"] = api.Principal(made["worker"].username, (*made["worker"].rules, "+keys"))
     with pytest.raises(api.BrokerRefused):
         api.check_guard_binding(changed, result.guard_config)
-    changed["worker"] = api.BrokerUser("someone-else", made["worker"].rules, "x")
+    changed["worker"] = api.Principal("someone-else", made["worker"].rules)
     with pytest.raises(api.BrokerRefused):
         api.check_guard_binding(changed, result.guard_config)
 
@@ -103,14 +115,14 @@ def test_guard_binding_refuses_other_rules_or_usernames() -> None:
 @pytest.mark.parametrize(
     "name", ["default", "credential/example-worker", "commissioning/example-observer"]
 )
-def test_users_refuse_default_and_repeated_usernames(name: str) -> None:
+def test_principals_refuse_default_and_repeated_usernames(name: str) -> None:
     api = module()
     _, recipes = provisioned()
     with pytest.raises(api.BrokerRefused):
-        api.broker_users(recipes, profile(), provisioner_id=name)
+        api.broker_principals(recipes, profile(), provisioner_id=name)
 
 
-def test_users_refuse_rules_carrying_state_or_passwords() -> None:
+def test_principals_refuse_rules_carrying_state_or_passwords() -> None:
     api = module()
     _, merged = provisioned()
 
@@ -120,30 +132,53 @@ def test_users_refuse_rules_carrying_state_or_passwords() -> None:
             return (*rules, ">plaintext") if principal == "issuer" else rules
 
     with pytest.raises(api.BrokerRefused) as raised:
-        api.broker_users(Leaky(), profile(), provisioner_id="p/1")
+        api.broker_principals(Leaky(), profile(), provisioner_id="p/1")
     assert "plaintext" not in str(raised.value)
 
 
-def test_acl_file_holds_hashes_only_and_turns_the_default_user_off() -> None:
-    api = module()
-    made = users()
-    raw = api.render_acl_file(made).decode()
-    lines = raw.splitlines()
-    assert lines[0] == "user default off resetkeys resetchannels -@all"
-    assert len(lines) == len(made) + 1
-    for name, user in made.items():
-        assert user.password not in raw
-        digest = hashlib.sha256(user.password.encode()).hexdigest()
-        if name in CANDIDATES:
-            # Design decision 9: no campaign yet, so no lane and no right at all.
-            idle = "resetkeys resetchannels clearselectors -@all"
-            assert f"user {user.username} off #{digest} {idle}" in lines
-        else:
-            assert f"user {user.username} on #{digest} " + " ".join(user.rules) in lines
-    assert "{lane}" not in raw
-    partial = {name: user for name, user in made.items() if name != "observer"}
-    with pytest.raises(api.BrokerRefused):
-        api.render_acl_file(partial)
+def test_the_provisioner_never_holds_another_principals_password(tmp_path: Path) -> None:
+    """Design decisions 7 and 8: only the administrator bootstrap issues credentials."""
+    from curie_protected_hooks.commissioning_local_installation import LocalCluster
+    from curie_protected_hooks.commissioning_local_ownership import OwnershipLedger
+
+    from .test_commissioning_local_installation import FakeRunner
+
+    boot = bootstrap()
+    ledger = OwnershipLedger.create(tmp_path / "run", owner=OWNER)
+    runner = FakeRunner(ledger)
+    cluster = LocalCluster(ledger, runner=runner)
+    admin = boot.AdministratorBootstrap(
+        cluster, namespace=NAMESPACE, principals=principals(), baseline_dir=tmp_path / "admin"
+    )
+    admin.issue()
+    issued = admin.credentials()
+    grant = admin.grant()
+    workload = {"enqueue", "control_reader", "source_writer"} & set(issued)
+    assert set(grant.workload) == workload and "enqueue" in workload
+    assert grant.provisioner == issued["provisioner"]
+    held = repr(vars(cluster)) + json.dumps(
+        {
+            "principals": {n: [p.username, list(p.rules)] for n, p in grant.principals.items()},
+            "provisioner": grant.provisioner.password,
+            "workload": {n: u.password for n, u in grant.workload.items()},
+        }
+    )
+    for name, user in issued.items():
+        held_here = user.password in held
+        assert held_here == (name in {"provisioner", *workload}), name
+    for name in ("observer", "qualification_publisher", "issuer", "control", *CANDIDATES):
+        assert all(issued[name].password != u.password for u in grant.workload.values())
+    # Each credential went straight into its own Secret, never into one shared object.
+    secrets_created = {
+        key.split("/")[-1]: value
+        for key, value in runner.objects.items()
+        if key.startswith("v1/Secret/")
+    }
+    for name, user in issued.items():
+        data = secrets_created[boot.credential_secret_name(name)]["data"]
+        assert base64.b64decode(data["password"]).decode() == user.password
+        assert base64.b64decode(data["username"]).decode() == user.username
+    assert boot.INSTALLER_SECRET in secrets_created
 
 
 def test_material_names_the_service_and_pins_the_leaf() -> None:
@@ -165,14 +200,13 @@ def test_material_names_the_service_and_pins_the_leaf() -> None:
 
 def objects() -> list[dict[str, Any]]:
     api = module()
-    made = users()
     material = api.BrokerMaterial.generate(api.server_name(NAMESPACE))
     return api.broker_objects(
         owner=OWNER,
         namespace=NAMESPACE,
         image=IMAGE,
         material=material,
-        acl_file=api.render_acl_file(made),
+        installer_secret="commissioning-broker-installer",
     )
 
 
@@ -185,6 +219,7 @@ def test_objects_are_owned_and_the_pod_is_locked_down() -> None:
     namespace, secret, service, pod = rendered
     assert namespace["metadata"]["labels"]["pod-security.kubernetes.io/enforce"] == "restricted"
     assert secret["immutable"] is True
+    assert set(secret["data"]) == {"ca.crt", "tls.crt", "tls.key"}
     assert service["spec"]["selector"] == pod["metadata"]["labels"]
     spec = pod["spec"]
     assert spec["restartPolicy"] == "Never"
@@ -194,28 +229,21 @@ def test_objects_are_owned_and_the_pod_is_locked_down() -> None:
     assert container["image"] == IMAGE
     assert container["command"] == ["valkey-server"]
     assert container["args"][:4] == ["--port", "0", "--tls-port", "6379"]
+    assert "--aclfile" not in container["args"]
+    requirepass = container["args"].index("--requirepass")
+    assert container["args"][requirepass + 1] == "$(INSTALLER_PASSWORD)"
+    (env,) = container["env"]
+    assert env == {
+        "name": "INSTALLER_PASSWORD",
+        "valueFrom": {
+            "secretKeyRef": {"name": "commissioning-broker-installer", "key": "password"}
+        },
+    }
     assert container["securityContext"] == {
         "allowPrivilegeEscalation": False,
         "readOnlyRootFilesystem": True,
         "capabilities": {"drop": ["ALL"]},
     }
-
-
-def test_objects_carry_no_plaintext_password() -> None:
-    api = module()
-    made = users()
-    material = api.BrokerMaterial.generate(api.server_name(NAMESPACE))
-    rendered = api.broker_objects(
-        owner=OWNER,
-        namespace=NAMESPACE,
-        image=IMAGE,
-        material=material,
-        acl_file=api.render_acl_file(made),
-    )
-    decoded = json.dumps(rendered) + "".join(
-        base64.b64decode(v).decode() for v in rendered[1]["data"].values()
-    )
-    assert all(user.password not in decoded for user in made.values())
 
 
 @pytest.mark.parametrize(
@@ -226,7 +254,7 @@ def test_objects_refuse_an_unpinned_image(image: str) -> None:
     material = api.BrokerMaterial.generate(api.server_name(NAMESPACE))
     with pytest.raises(Exception, match="refused"):
         api.broker_objects(
-            owner=OWNER, namespace=NAMESPACE, image=image, material=material, acl_file=b"x"
+            owner=OWNER, namespace=NAMESPACE, image=image, material=material, installer_secret="x"
         )
 
 
@@ -235,15 +263,17 @@ def test_objects_refuse_material_for_another_namespace() -> None:
     material = api.BrokerMaterial.generate(api.server_name("elsewhere"))
     with pytest.raises(api.BrokerRefused):
         api.broker_objects(
-            owner=OWNER, namespace=NAMESPACE, image=IMAGE, material=material, acl_file=b"x"
+            owner=OWNER, namespace=NAMESPACE, image=IMAGE, material=material, installer_secret="x"
         )
 
 
 class Valkey:
-    """One owned TLS Valkey container started with the rendered files only."""
+    """One owned TLS Valkey container, enrolled by the administrator bootstrap."""
 
     material: Any
     users: dict[str, Any]
+    installer: Any
+    baseline: dict[str, Any]
     port: int
     run_id: str
 
@@ -256,47 +286,51 @@ def _docker(*args: str) -> str:
 
 @pytest.fixture(scope="module")
 def valkey(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Valkey]:
-    """Same server arguments and files as the Pod, behind a loopback port."""
+    """Same server arguments as the Pod, behind a loopback port, then enrolled."""
     if shutil.which("docker") is None:
-        fail_safely("Docker is required for the local broker ACL file check")
-    api = module()
+        fail_safely("Docker is required for the local broker enrollment check")
+    api, boot = module(), bootstrap()
     fixture = Valkey()
     fixture.material = api.BrokerMaterial.generate(api.server_name(NAMESPACE))
-    fixture.users = users()
+    fixture.users = boot.issue_credentials(principals())
+    fixture.installer = api.BrokerUser("default", (), secrets.token_urlsafe(32))
     private = tmp_path_factory.mktemp("local-broker")
     files = {
         "ca.crt": fixture.material.ca_pem,
         "tls.crt": fixture.material.certificate_pem,
         "tls.key": fixture.material.key_pem,
-        "users.acl": api.render_acl_file(fixture.users).decode(),
     }
     for name, text in files.items():
         (private / name).write_text(text)
         (private / name).chmod(0o600)
     name = "curie-check-local-broker-" + uuid.uuid4().hex[:12]
     pod = objects()[3]["spec"]["containers"][0]
+    args = [fixture.installer.password if a == "$(INSTALLER_PASSWORD)" else a for a in pod["args"]]
     cid = None
     try:
         cid = _docker(
             "run", "-d", "--name", name, "--label", "curie.test.owner=" + name,
             "--user", f"{os.getuid()}:{os.getgid()}", "--memory", "128m", "--cpus", "0.25",
             "-p", "127.0.0.1::6379", "-v", f"{private}:/tls:ro", "--tmpfs", "/data",
-            IMAGE, *pod["command"], *pod["args"],
+            IMAGE, *pod["command"], *args,
         )  # fmt: skip
         fixture.port = int(_docker("port", cid, "6379/tcp").rsplit(":", 1)[1])
+        dial = ("127.0.0.1", fixture.port)
         deadline = time.monotonic() + 30
         while True:
             try:
-                session = api.pinned_session(
-                    fixture.material, ("127.0.0.1", fixture.port), fixture.users["provisioner"]
-                )
-                fixture.run_id = session.info("server")["run_id"]
-                session.close()
+                installer = api.pinned_session(fixture.material, dial, fixture.installer)
+                fixture.run_id = installer.info("server")["run_id"]
                 break
             except Exception:  # noqa: BLE001  Retry until the owned server accepts TLS.
                 if time.monotonic() > deadline:
-                    fail_safely("owned Valkey did not accept the provisioner")
+                    fail_safely("owned Valkey did not accept the installer")
                 time.sleep(0.2)
+        try:
+            fixture.baseline = boot.enroll_users(installer, fixture.users)
+            boot.close_installer(installer)
+        finally:
+            installer.close()
         yield fixture
     finally:
         if cid is not None:
@@ -307,6 +341,18 @@ def session(valkey: Valkey, name: str, **kwargs: Any) -> Any:
     return module().pinned_session(
         valkey.material, ("127.0.0.1", valkey.port), valkey.users[name], **kwargs
     )
+
+
+def test_the_installer_is_closed_after_enrollment(valkey: Valkey) -> None:
+    api = module()
+    with pytest.raises((AuthenticationError, ResponseError)):
+        api.pinned_session(valkey.material, ("127.0.0.1", valkey.port), valkey.installer).ping()
+    observer = session(valkey, "observer")
+    try:
+        state = observer.acl_getuser("default")
+        assert "off" in state["flags"] and state["passwords"] == []
+    finally:
+        observer.close()
 
 
 def test_every_user_authenticates_as_its_own_identity(valkey: Valkey) -> None:
@@ -372,7 +418,9 @@ def test_observer_reads_acl_state_and_nothing_else(valkey: Valkey) -> None:
         for name, user in valkey.users.items():
             state = client.acl_getuser(user.username)
             assert ("off" if name in CANDIDATES else "on") in state["flags"]
-            assert state["passwords"] == [hashlib.sha256(user.password.encode()).hexdigest()]
+            assert len(state["passwords"]) == 1
+            if name in valkey.baseline:
+                assert set(state["passwords"]) == valkey.baseline[name].password_hashes
         with pytest.raises(NoPermissionError):
             client.get("protected:control:selection:x")
         with pytest.raises(NoPermissionError):
@@ -435,9 +483,8 @@ def test_campaign_start_instantiates_the_templates_for_the_permits_lane(valkey: 
             for name in CANDIDATES:
                 state = observer.acl_getuser(valkey.users[name].username)
                 assert "on" in state["flags"]
-                assert state["passwords"] == [
-                    hashlib.sha256(valkey.users[name].password.encode()).hexdigest()
-                ]
+                # Enabling changes no password: the hash set is the recorded baseline.
+                assert set(state["passwords"]) == valkey.baseline[name].password_hashes
         finally:
             observer.close()
         from curie_protected_hooks.commissioning_acl import commissioning_acl_rules
@@ -456,3 +503,34 @@ def test_campaign_start_instantiates_the_templates_for_the_permits_lane(valkey: 
                 "resetkeys", "resetchannels", "clearselectors", "-@all",
             )  # fmt: skip
         provisioner.close()
+
+
+def test_port_forward_output_is_drained_after_the_ready_line() -> None:
+    """kubectl logs a line per forwarded connection; an undrained pipe stalls the forward."""
+    import sys
+
+    api = module()
+    script = (
+        "import sys\n"
+        "print('Forwarding from 127.0.0.1:41234 -> 6379', flush=True)\n"
+        "line = 'Handling connection for 6379\\n'\n"
+        "for _ in range(40000):\n"
+        "    sys.stdout.write(line)\n"
+        "sys.stdout.flush()\n"
+    )
+    process, port = api._start_forward([sys.executable, "-c", script], dict(os.environ))
+    try:
+        assert port == 41234
+        # Over 1 MB follows the ready line; the child finishes only if it is drained.
+        assert process.wait(timeout=20) == 0
+    finally:
+        process.kill()
+
+
+def test_port_forward_without_a_ready_line_refuses_and_is_stopped() -> None:
+    import sys
+
+    api = module()
+    script = "import time; print('error: unable to forward', flush=True); time.sleep(60)"
+    with pytest.raises(api.BrokerRefused):
+        api._start_forward([sys.executable, "-c", script], dict(os.environ))

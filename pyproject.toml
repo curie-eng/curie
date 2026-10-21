@@ -162,6 +162,7 @@ forbidden_modules = [
     "curie_protected_hooks.commissioning_campaign_records",
     "curie_protected_hooks.commissioning_encoding",
     "curie_protected_hooks.commissioning_journal",
+    "curie_protected_hooks.commissioning_local_bootstrap",
     "curie_protected_hooks.commissioning_local_broker",
     "curie_protected_hooks.commissioning_local_installation",
     "curie_protected_hooks.commissioning_local_ownership",

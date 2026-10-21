@@ -9,7 +9,6 @@ confirming absence. It never reads the default kubeconfig or current context.
 from __future__ import annotations
 
 import base64
-import hashlib
 import json
 import os
 import re
@@ -20,11 +19,18 @@ from typing import Any
 
 import pytest
 from curie_protected_hooks.authority_records import _BROKER, _object
+from curie_protected_hooks.commissioning_local_bootstrap import (
+    INSTALLER_SECRET,
+    AdministratorBootstrap,
+    ProvisionerGrant,
+    credential_secret_name,
+    read_baseline,
+)
 from curie_protected_hooks.commissioning_local_broker import (
     BROKER_NAME,
     BrokerUser,
     LocalBroker,
-    broker_users,
+    broker_principals,
     check_guard_binding,
     server_name,
 )
@@ -48,7 +54,11 @@ pytestmark = pytest.mark.skipif(
 class Installed:
     cluster: LocalCluster
     broker: LocalBroker
+    grant: ProvisionerGrant
+    # The administrator's view, used here only to act as each principal.
     users: dict[str, BrokerUser]
+    baseline: dict[str, Any]
+    baseline_dir: Path
     identity: dict[str, Any]
     namespace: str
     recipes: Any
@@ -66,13 +76,24 @@ def installed(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Installed]:
     try:
         cluster.start()
         _, recipes = provisioned()
-        users = broker_users(
-            recipes,
-            profile(),
-            provisioner_id="commissioning/example-provisioner",
+        principals = broker_principals(
+            recipes, profile(), provisioner_id="commissioning/example-provisioner"
         )
-        identity = broker.install(image=IMAGE, users=users)
-        yield Installed(cluster, broker, users, identity, namespace, recipes)
+        broker.install_namespace()
+        baseline_dir = root.parent / "admin"
+        admin = AdministratorBootstrap(
+            cluster, namespace=namespace, principals=principals, baseline_dir=baseline_dir
+        )
+        admin.issue()
+        broker.install(image=IMAGE, installer_secret=INSTALLER_SECRET)
+        baseline = admin.enroll(broker)
+        grant = admin.grant()
+        identity = broker.observe(grant.provisioner)
+        users = dict(admin.credentials())
+        del admin
+        yield Installed(
+            cluster, broker, grant, users, baseline, baseline_dir, identity, namespace, recipes
+        )
     finally:
         broker.close()
         cluster.remove_all()
@@ -101,16 +122,19 @@ def test_identity_is_the_live_pinned_broker(installed: Installed) -> None:
 
     result = construct(profile(broker_identity=identity), acl=installed.recipes)
     assert result.manifest.as_dict()["broker_identity"] == identity
-    check_guard_binding(installed.users, result.guard_config)
+    check_guard_binding(installed.grant.principals, result.guard_config)
 
 
 def test_owned_objects_match_the_ledger_and_the_pinned_image(installed: Installed) -> None:
     keys = set(installed.cluster.objects())
+    ns = installed.namespace
     assert keys == {
-        f"v1/Namespace//{installed.namespace}",
-        f"v1/Secret/{installed.namespace}/{BROKER_NAME}-tls",
-        f"v1/Service/{installed.namespace}/{BROKER_NAME}",
-        f"v1/Pod/{installed.namespace}/{BROKER_NAME}",
+        f"v1/Namespace//{ns}",
+        f"v1/Secret/{ns}/{BROKER_NAME}-tls",
+        f"v1/Secret/{ns}/{INSTALLER_SECRET}",
+        f"v1/Service/{ns}/{BROKER_NAME}",
+        f"v1/Pod/{ns}/{BROKER_NAME}",
+        *(f"v1/Secret/{ns}/{credential_secret_name(name)}" for name in installed.users),
     }
     for key in keys:
         live = installed.cluster.read(key)
@@ -126,12 +150,56 @@ def test_owned_objects_match_the_ledger_and_the_pinned_image(installed: Installe
     assert status["restartCount"] == 0
 
 
-def test_secret_holds_password_hashes_only(installed: Installed) -> None:
-    secret = get(installed, "secret/" + BROKER_NAME + "-tls")
-    decoded = "".join(base64.b64decode(v).decode() for v in secret["data"].values())
-    for user in installed.users.values():
+def test_each_credential_is_in_its_own_secret_and_nowhere_else(installed: Installed) -> None:
+    tls = get(installed, "secret/" + BROKER_NAME + "-tls")
+    decoded = "".join(base64.b64decode(v).decode() for v in tls["data"].values())
+    for name, user in installed.users.items():
         assert user.password not in decoded
-        assert "#" + hashlib.sha256(user.password.encode()).hexdigest() in decoded
+        own = get(installed, "secret/" + credential_secret_name(name))
+        assert base64.b64decode(own["data"]["password"]).decode() == user.password
+    pod = json.dumps(get(installed, "pod/" + BROKER_NAME)["spec"])
+    assert all(user.password not in pod for user in installed.users.values())
+
+
+def test_the_provisioner_side_never_holds_the_observer_or_publisher_password(
+    installed: Installed,
+) -> None:
+    """Design decisions 7 and 8: the checker's and the publisher's secrets stay with the admin."""
+    held = repr(vars(installed.cluster)) + repr(vars(installed.broker))
+    held += repr({n: (u.username, u.password) for n, u in installed.grant.workload.items()})
+    held += installed.grant.provisioner.password
+    held += json.dumps(read_baseline(installed.baseline_dir))
+    for name in ("observer", "qualification_publisher", "issuer", "control", *CANDIDATES):
+        assert installed.users[name].password not in held, name
+
+
+def test_the_baseline_is_what_the_observer_reads_and_holds_no_password(
+    installed: Installed,
+) -> None:
+    recorded = read_baseline(installed.baseline_dir)
+    assert set(recorded) == set(installed.baseline)
+    observer = installed.broker.session(installed.users["observer"])
+    try:
+        for name, state in installed.baseline.items():
+            live = observer.acl_getuser(installed.users[name].username)
+            assert set(live["passwords"]) == state.password_hashes
+            assert sorted(state.password_hashes) == recorded[name]["password_hashes"]
+            assert ("on" in live["flags"]) is state.enabled is recorded[name]["enabled"]
+            assert state.enabled is (name not in CANDIDATES)
+        assert "off" in observer.acl_getuser("default")["flags"]
+    finally:
+        observer.close()
+
+
+def test_the_forward_survives_many_connections(installed: Installed) -> None:
+    """kubectl logs a line per connection; 2,500 lines exceed any pipe buffer."""
+    for _ in range(2500):
+        installed.broker.session(installed.users["provisioner"]).close()
+    client = installed.broker.session(installed.users["provisioner"])
+    try:
+        assert client.info("server")["run_id"] == installed.identity["run_id"]
+    finally:
+        client.close()
 
 
 def test_users_authenticate_and_the_observer_sees_their_state(installed: Installed) -> None:
@@ -149,8 +217,7 @@ def test_users_authenticate_and_the_observer_sees_their_state(installed: Install
             if name in CANDIDATES:
                 continue
             state = observer.acl_getuser(user.username)
-            assert "on" in state["flags"]
-            assert state["passwords"] == [hashlib.sha256(user.password.encode()).hexdigest()]
+            assert "on" in state["flags"] and len(state["passwords"]) == 1
         assert "off" in observer.acl_getuser("default")["flags"]
         with pytest.raises(NoPermissionError):
             observer.get("protected:control:selection:x")
@@ -200,13 +267,13 @@ def test_candidates_are_off_until_a_campaign_then_confined_to_its_lane(
         record = permit()
         lane = derive_commissioning_lane(record)
         foreign = derive_commissioning_lane(permit(campaign_generation="2"))
-        installed.broker.start_campaign(installed.users, record)
+        installed.broker.start_campaign(
+            installed.grant.provisioner, installed.grant.principals, record
+        )
         for name in CANDIDATES:
             state = observer.acl_getuser(installed.users[name].username)
             assert "on" in state["flags"]
-            assert state["passwords"] == [
-                hashlib.sha256(installed.users[name].password.encode()).hexdigest()
-            ]
+            assert set(state["passwords"]) == installed.baseline[name].password_hashes
     finally:
         observer.close()
     enqueue = installed.broker.session(installed.users["candidate_enqueue"])

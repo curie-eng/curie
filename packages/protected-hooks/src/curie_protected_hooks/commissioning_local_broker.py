@@ -1,19 +1,21 @@
 """Protected broker of a local commissioning installation, @spec PROTECTED-COMMISSIONING-1.
 
 The provisioner installs one TLS Valkey Pod in the installation's protected
-namespace. Its users come from one ACL file rendered here: every principal G
-names, the ACL observer of design decision 7 included, with the exact rules G
-hashed, plus the provisioner. The candidate users start off with no rights:
-G holds their design decision 9 templates, which ``enable_candidates``
-instantiates for one permit's lane. The file carries password hashes only;
-the plaintext passwords stay in provisioner memory. The default user is off.
+namespace. It starts with only its default user, holding the administrator's
+one-time installer password; the administrator bootstrap
+(``commissioning_local_bootstrap``) then creates every ACL user with the exact
+rules G hashes and turns the installer off. The candidate users start off
+with no rights: G holds their design decision 9 templates, which
+``enable_candidates`` instantiates for one permit's lane. The provisioner
+holds only usernames and rules (``Principal``) and its own credential.
 
 The broker's CA and server key are generated per installation and the server
 certificate names the in-cluster Service, which is the manifest's
 ``tls_server_name``. The Pod has no controller: a restart would change
-``run_id``, which every pinned session refuses, so nothing restarts it
-silently. The provisioner reaches the broker through a port-forward of its own
-kubeconfig and still checks the server name, SPKI pin and ``run_id``.
+``run_id``, which every pinned session refuses, and would drop every ACL user,
+so nothing restarts it silently. The provisioner reaches the broker through a
+port-forward of its own kubeconfig and still checks the server name, SPKI pin
+and ``run_id``.
 """
 
 from __future__ import annotations
@@ -23,11 +25,11 @@ import hashlib
 import hmac
 import os
 import re
-import secrets
 import select
 import socket
 import ssl
 import subprocess
+import threading
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -72,11 +74,12 @@ __all__ = [
     "BrokerUser",
     "LocalBroker",
     "broker_objects",
-    "broker_users",
     "check_guard_binding",
     "enable_candidates",
     "pinned_session",
-    "render_acl_file",
+    "broker_principals",
+    "CANDIDATE_IDLE",
+    "Principal",
     "server_name",
 ]
 
@@ -87,7 +90,9 @@ VALKEY_VERSION = "8.1.10"
 # The one broker user outside G: the provisioner, the party G and the observer check.
 INSTALLATION_PRINCIPALS = ("provisioner",)
 # Design decision 9: candidates stay off with no rules until a campaign's permit.
-_CANDIDATE_IDLE = ("resetkeys", "resetchannels", "clearselectors", "-@all")
+CANDIDATE_IDLE = ("-@all", "resetkeys", "resetchannels", "clearselectors")
+# Valkey's default user holds the one-time installer password until enrollment ends.
+_INSTALLER_KEY = "password"
 _SECRET = BROKER_NAME + "-tls"
 _APP_LABEL = "app.kubernetes.io/name"
 _VALKEY_UID = 999
@@ -113,8 +118,19 @@ def _require(condition: bool) -> None:
 
 
 @dataclass(frozen=True, slots=True)
+class Principal:
+    """One ACL user as the provisioner knows it: username and rules, no password.
+
+    @spec PROTECTED-COMMISSIONING-1.
+    """
+
+    username: str
+    rules: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class BrokerUser:
-    """One ACL user: the credential ID as username, its rules and password.
+    """One ACL user's credential: the credential ID as username, its rules and password.
 
     @spec PROTECTED-COMMISSIONING-1.
     """
@@ -124,13 +140,13 @@ class BrokerUser:
     password: str = field(repr=False)
 
 
-def broker_users(
+def broker_principals(
     recipes: BrokerAclRecipes,
     profile: ProvisionerProfile,
     *,
     provisioner_id: str,
-) -> dict[str, BrokerUser]:
-    """Every broker user with fresh passwords, @spec PROTECTED-COMMISSIONING-1.
+) -> dict[str, Principal]:
+    """Every broker user's username and rules, @spec PROTECTED-COMMISSIONING-1.
 
     The broker runs before B, G and M exist, because M pins its live
     ``run_id``. G's principals therefore take the credential IDs the profile
@@ -138,7 +154,7 @@ def broker_users(
     into G; ``check_guard_binding`` confirms both once G is built. For the
     candidates those recipes are design decision 9 templates. The provisioner
     takes its merged commissioning recipe. Usernames are pairwise distinct and
-    never ``default``.
+    never ``default``. Passwords are the administrator bootstrap's.
     """
     try:
         _require(type(profile) is ProvisionerProfile)
@@ -157,39 +173,23 @@ def broker_users(
         rules = {name: recipes.rules(name) for name in GUARD_PRINCIPALS}
         rules.update({name: commissioning_acl_rules(name) for name in INSTALLATION_PRINCIPALS})
         _require(len(set(names.values())) == len(names) and "default" not in names.values())
-        users = {}
+        principals = {}
         for name, username in names.items():
             _require(
                 type(username) is str and re.fullmatch(r"[\x21-\x7e]{1,256}", username) is not None
             )
             _rules_digest(rules[name])
-            users[name] = BrokerUser(username, tuple(rules[name]), secrets.token_urlsafe(32))
-        return users
+            principals[name] = Principal(username, tuple(rules[name]))
+        return principals
     except BrokerRefused:
         raise
     except Exception:  # noqa: BLE001  One redacted refusal.
         _refuse()
 
 
-def render_acl_file(users: Mapping[str, BrokerUser]) -> bytes:
-    """The broker's ACL file: password hashes only, default user off.
-
-    Candidate users are off with no command or key until ``start_campaign``
-    instantiates their templates for a permit's lane.
-    @spec PROTECTED-COMMISSIONING-1.
-    """
-    _require(set(users) == {*GUARD_PRINCIPALS, *INSTALLATION_PRINCIPALS})
-    lines = ["user default off resetkeys resetchannels -@all"]
-    for name in (*GUARD_PRINCIPALS, *INSTALLATION_PRINCIPALS):
-        user = users[name]
-        _require(type(user) is BrokerUser)
-        digest = hashlib.sha256(user.password.encode()).hexdigest()
-        state, rules = ("off", _CANDIDATE_IDLE) if name in CANDIDATE_ROLES else ("on", user.rules)
-        lines.append(" ".join(("user", user.username, state, "#" + digest, *rules)))
-    return ("\n".join(lines) + "\n").encode("ascii")
-
-
-def check_guard_binding(users: Mapping[str, BrokerUser], guard_config: bytes) -> None:
+def check_guard_binding(
+    principals: Mapping[str, Principal | BrokerUser], guard_config: bytes
+) -> None:
     """Every G principal's username and rules are the ones G hashed.
 
     @spec PROTECTED-COMMISSIONING-1 PROTECTED-COMMISSIONING-2.
@@ -197,8 +197,8 @@ def check_guard_binding(users: Mapping[str, BrokerUser], guard_config: bytes) ->
     try:
         acl = parse_guard_config(guard_config)["broker_acl"]
         for name in GUARD_PRINCIPALS:
-            _require(acl[name]["credential"]["id"] == users[name].username)
-            _require(acl[name]["rules_sha256"] == _rules_digest(users[name].rules))
+            _require(acl[name]["credential"]["id"] == principals[name].username)
+            _require(acl[name]["rules_sha256"] == _rules_digest(principals[name].rules))
     except BrokerRefused:
         raise
     except Exception:  # noqa: BLE001  One redacted refusal.
@@ -293,8 +293,23 @@ def _b64(value: str | bytes) -> str:
     return base64.b64encode(raw).decode("ascii")
 
 
+def _namespace(owner: str, namespace: str) -> dict[str, Any]:
+    return {
+        "apiVersion": "v1",
+        "kind": "Namespace",
+        "metadata": {
+            "name": namespace,
+            "labels": {
+                OWNER_LABEL: owner,
+                "pod-security.kubernetes.io/enforce": "restricted",
+                "pod-security.kubernetes.io/enforce-version": "latest",
+            },
+        },
+    }
+
+
 def broker_objects(
-    *, owner: str, namespace: str, image: str, material: BrokerMaterial, acl_file: bytes
+    *, owner: str, namespace: str, image: str, material: BrokerMaterial, installer_secret: str
 ) -> list[dict[str, Any]]:
     """Namespace, Secret, Service and Pod, in creation order, @spec PROTECTED-COMMISSIONING-1.
 
@@ -306,16 +321,8 @@ def broker_objects(
     _require(material.server_name == server_name(namespace))
     owned = {OWNER_LABEL: owner}
     selector = {_APP_LABEL: BROKER_NAME, OWNER_LABEL: owner}
-    restricted = {
-        "pod-security.kubernetes.io/enforce": "restricted",
-        "pod-security.kubernetes.io/enforce-version": "latest",
-    }
     return [
-        {
-            "apiVersion": "v1",
-            "kind": "Namespace",
-            "metadata": {"name": namespace, "labels": {**owned, **restricted}},
-        },
+        _namespace(owner, namespace),
         {
             "apiVersion": "v1",
             "kind": "Secret",
@@ -326,7 +333,6 @@ def broker_objects(
                 "ca.crt": _b64(material.ca_pem),
                 "tls.crt": _b64(material.certificate_pem),
                 "tls.key": _b64(material.key_pem),
-                "users.acl": _b64(acl_file),
             },
         },
         {
@@ -372,8 +378,8 @@ def broker_objects(
                             "/tls/ca.crt",
                             "--tls-auth-clients",
                             "no",
-                            "--aclfile",
-                            "/tls/users.acl",
+                            "--requirepass",
+                            "$(INSTALLER_PASSWORD)",
                             "--save",
                             "",
                             "--appendonly",
@@ -381,6 +387,17 @@ def broker_objects(
                             "--dir",
                             "/data",
                         ],  # fmt: skip
+                        "env": [
+                            {
+                                "name": "INSTALLER_PASSWORD",
+                                "valueFrom": {
+                                    "secretKeyRef": {
+                                        "name": installer_secret,
+                                        "key": _INSTALLER_KEY,
+                                    }
+                                },
+                            }
+                        ],
                         "ports": [{"containerPort": BROKER_PORT, "name": "tls"}],
                         "readinessProbe": {
                             "tcpSocket": {"port": BROKER_PORT},
@@ -468,7 +485,9 @@ def pinned_session(
     return client
 
 
-def enable_candidates(session: Redis, users: Mapping[str, BrokerUser], permit: Any) -> None:
+def enable_candidates(
+    session: Redis, principals: Mapping[str, Principal | BrokerUser], permit: Any
+) -> None:
     """Enable the candidates with their templates instantiated for the permit's lane.
 
     Design decision 9: each candidate gets exactly its template for the lane
@@ -479,16 +498,60 @@ def enable_candidates(session: Redis, users: Mapping[str, BrokerUser], permit: A
     try:
         lane = derive_commissioning_lane(permit)
         for name in CANDIDATE_ROLES:
-            _require(users[name].rules == commissioning_acl_template(name))
+            _require(principals[name].rules == commissioning_acl_template(name))
             rules = instantiate_candidate_rules(name, lane)
             reply = session.execute_command(  # type: ignore[no-untyped-call]
-                "ACL", "SETUSER", users[name].username, "on", *rules
+                "ACL", "SETUSER", principals[name].username, "on", *rules
             )
             _require(reply in (b"OK", "OK", True))
     except BrokerRefused:
         raise
     except Exception:  # noqa: BLE001  One redacted refusal.
         _refuse()
+
+
+def _drain(stream: Any) -> None:
+    """Read and discard: kubectl logs one line per forwarded connection."""
+    try:
+        for _ in iter(lambda: stream.read(65536), b""):
+            pass
+    except (OSError, ValueError):
+        pass
+
+
+def _start_forward(
+    argv: list[str], environment: Mapping[str, str]
+) -> tuple[subprocess.Popen[bytes], int]:
+    """Start a port-forward and return it with its loopback port.
+
+    The first line must announce the forward. Every later line is drained on
+    a daemon thread for the life of the process, so the pipe never fills and
+    stalls the forward. Any failure stops the process. @spec PROTECTED-COMMISSIONING-1.
+    """
+    process = subprocess.Popen(  # noqa: S603  argv comes from ClusterCommands' allowlist.
+        argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=dict(environment)
+    )
+    try:
+        assert process.stdout is not None
+        ready, _, _ = select.select([process.stdout], [], [], 30)
+        line = process.stdout.readline() if ready else b""
+        match = _FORWARD.match(line)
+        _require(match is not None)
+        assert match is not None
+        threading.Thread(target=_drain, args=(process.stdout,), daemon=True).start()
+        return process, int(match.group(1))
+    except BaseException:
+        _stop(process)
+        raise
+
+
+def _stop(process: subprocess.Popen[bytes]) -> None:
+    process.terminate()
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=10)
 
 
 class LocalBroker:
@@ -511,12 +574,19 @@ class LocalBroker:
         """@spec PROTECTED-COMMISSIONING-1."""
         return "LocalBroker()"
 
-    def install(self, *, image: str, users: Mapping[str, BrokerUser]) -> dict[str, Any]:
-        """Create the objects, wait for TLS, then observe the live identity.
+    def install_namespace(self) -> None:
+        """The protected namespace, before any credential Secret exists in it.
 
-        Returns the ``BrokerIdentity`` the profile gives M, including the live
-        ``run_id``. The provisioner then builds B, G and M and calls
-        ``check_guard_binding``. @spec PROTECTED-COMMISSIONING-1.
+        @spec PROTECTED-COMMISSIONING-1.
+        """
+        self.cluster.create(_namespace(self.cluster.owner, self.namespace))
+
+    def install(self, *, image: str, installer_secret: str) -> None:
+        """Create the TLS Secret, Service and Pod, wait for TLS, open the forward.
+
+        The broker starts with only its default user, holding the
+        administrator's one-time installer password from ``installer_secret``.
+        A failure after the forward opens closes it. @spec PROTECTED-COMMISSIONING-1.
         """
         material = BrokerMaterial.generate(server_name(self.namespace))
         self._material = material
@@ -525,9 +595,9 @@ class LocalBroker:
             namespace=self.namespace,
             image=image,
             material=material,
-            acl_file=render_acl_file(users),
+            installer_secret=installer_secret,
         )
-        for manifest in objects:
+        for manifest in objects[1:]:
             self.cluster.create(manifest)
         self.cluster.kubectl(
             "wait",
@@ -540,29 +610,51 @@ class LocalBroker:
             timeout=200,
         )
         self._open_forward()
-        session = self.session(users["provisioner"])
+
+    def observe(self, provisioner: BrokerUser) -> dict[str, Any]:
+        """The live ``BrokerIdentity`` M pins, read as the enrolled provisioner.
+
+        @spec PROTECTED-COMMISSIONING-1.
+        """
+        material = self.material
         try:
-            whoami = session.execute_command("ACL", "WHOAMI")  # type: ignore[no-untyped-call]
-            _require(whoami == users["provisioner"].username.encode())
-            info = session.info("server")
-            _require(info.get("valkey_version") == VALKEY_VERSION)
-            run_id = info.get("run_id")
-        finally:
-            session.close()
-        identity = {
-            "instance_id": str(uuid.uuid4()),
-            "endpoint": {"host": material.server_name, "port": BROKER_PORT},
-            "tls_server_name": material.server_name,
-            "tls_spki_sha256": material.spki_sha256,
-            "run_id": run_id,
-            "database": 0,
-        }
-        try:
+            session = self.session(provisioner)
+            try:
+                whoami = session.execute_command("ACL", "WHOAMI")  # type: ignore[no-untyped-call]
+                _require(whoami == provisioner.username.encode())
+                info = session.info("server")
+                _require(info.get("valkey_version") == VALKEY_VERSION)
+                run_id = info.get("run_id")
+            finally:
+                session.close()
+            identity = {
+                "instance_id": str(uuid.uuid4()),
+                "endpoint": {"host": material.server_name, "port": BROKER_PORT},
+                "tls_server_name": material.server_name,
+                "tls_spki_sha256": material.spki_sha256,
+                "run_id": run_id,
+                "database": 0,
+            }
             _object(identity, _BROKER)
-        except Exception:  # noqa: BLE001  One redacted refusal.
+        except Exception:  # noqa: BLE001  One redacted refusal; the forward never outlives it.
+            self.close()
             _refuse()
         self.identity = identity
         return identity
+
+    @property
+    def material(self) -> BrokerMaterial:
+        """The broker's public TLS identity and installation CA, @spec PROTECTED-COMMISSIONING-1."""
+        _require(self._material is not None)
+        assert self._material is not None
+        return self._material
+
+    @property
+    def dial(self) -> tuple[str, int]:
+        """The provisioner's loopback forward to the broker, @spec PROTECTED-COMMISSIONING-1."""
+        _require(self._port is not None)
+        assert self._port is not None
+        return ("127.0.0.1", self._port)
 
     @property
     def ca_pem(self) -> str:
@@ -579,19 +671,9 @@ class LocalBroker:
             "--namespace",
             self.namespace,
         )
-        environment = self.cluster.commands.environment(os.environ)
-        process = subprocess.Popen(  # noqa: S603  argv comes from ClusterCommands' allowlist.
-            argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=environment
+        self._forward, self._port = _start_forward(
+            argv, self.cluster.commands.environment(os.environ)
         )
-        self._forward = process
-        assert process.stdout is not None
-        ready, _, _ = select.select([process.stdout], [], [], 30)
-        line = process.stdout.readline() if ready else b""
-        match = _FORWARD.match(line)
-        if match is None:
-            self.close()
-            _refuse()
-        self._port = int(match.group(1))
 
     def session(self, user: BrokerUser, *, run_id: str | None = None) -> Redis:
         """A pinned session as ``user`` over the port-forward, @spec PROTECTED-COMMISSIONING-1."""
@@ -599,11 +681,13 @@ class LocalBroker:
         assert self._material is not None and self._port is not None
         return pinned_session(self._material, ("127.0.0.1", self._port), user, run_id=run_id)
 
-    def start_campaign(self, users: Mapping[str, BrokerUser], permit: Any) -> None:
+    def start_campaign(
+        self, provisioner: BrokerUser, principals: Mapping[str, Principal], permit: Any
+    ) -> None:
         """``enable_candidates`` on a provisioner session, @spec PROTECTED-COMMISSIONING-1."""
-        session = self.session(users["provisioner"])
+        session = self.session(provisioner)
         try:
-            enable_candidates(session, users, permit)
+            enable_candidates(session, principals, permit)
         finally:
             session.close()
 
@@ -614,9 +698,4 @@ class LocalBroker:
         """
         process, self._forward, self._port = self._forward, None, None
         if process is not None:
-            process.terminate()
-            try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=10)
+            _stop(process)

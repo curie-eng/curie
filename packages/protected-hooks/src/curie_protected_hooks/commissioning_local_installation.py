@@ -217,20 +217,44 @@ class LocalCluster:
         """@spec PROTECTED-COMMISSIONING-5."""
         return self.runner.run(self.commands.kubectl_argv(*args), stdin=stdin, timeout=timeout)
 
-    def start(self) -> None:
-        """Register, then start the profile; bind it to the cluster's own identity.
+    def _profile_absent(self) -> bool:
+        """minikube exits 85 for a profile it does not know, and no node container exists."""
+        known = self.runner.probe(self.commands.minikube_argv("status"), timeout=60)
+        container = self.runner.probe(
+            self.commands.docker_argv("inspect", "--type", "container", self.owner), timeout=60
+        )
+        return known == 85 and container != 0
 
-        The identity is the ``kube-system`` namespace UID, which a different or
-        recreated cluster does not share. @spec PROTECTED-COMMISSIONING-5.
+    def _cluster_uid(self) -> str:
+        raw = self.kubectl("get", "namespace", "kube-system", "--output", "json")
+        uid = json.loads(raw)["metadata"]["uid"]
+        _require(type(uid) is str and bool(uid))
+        return str(uid)
+
+    def start(self) -> None:
+        """Confirm the profile is absent, register it, start it, bind its identity.
+
+        A same-name profile or node container refuses before anything is
+        registered, so no profile is adopted. The identity is the
+        ``kube-system`` namespace UID, which a different or recreated cluster
+        does not share. After an interrupted start the identity is bound when
+        the cluster answers; otherwise the entry stays uncertain and is never
+        deleted. @spec PROTECTED-COMMISSIONING-5.
         """
+        _require(self._profile_absent())
         ticket = self.ledger.intend("minikube-profile", self.owner)
         try:
             self.runner.run(self.commands.minikube_argv("start", *_START), timeout=900)
-            raw = self.kubectl("get", "namespace", "kube-system", "--output", "json")
-            uid = json.loads(raw)["metadata"]["uid"]
-            _require(type(uid) is str and bool(uid))
+            uid = self._cluster_uid()
         except Exception:  # noqa: BLE001  An interrupted start is uncertain, never created.
             self.ledger.uncertain("minikube-profile", self.owner)
+            try:
+                # The name was absent before this start, so a cluster at it is this one.
+                self.ledger.resolve(
+                    "minikube-profile", self.owner, owner=self.owner, uid=self._cluster_uid()
+                )
+            except Exception:  # noqa: BLE001  Unreadable: stays uncertain.
+                pass
             _refuse()
         self.ledger.bind(ticket, owner=self.owner, uid=uid)
 
@@ -284,16 +308,17 @@ class LocalCluster:
             _require(self.read(key) is None)
         self.ledger.removed("kubernetes", key)
 
-    def _remove_profile(self) -> None:
-        self.runner.run(self.commands.minikube_argv("delete"), timeout=300)
-        # minikube exits 85 for a profile it does not know; any other answer is not absence.
-        _require(self.runner.probe(self.commands.minikube_argv("status"), timeout=60) == 85)
-        _require(
-            self.runner.probe(
-                self.commands.docker_argv("inspect", "--type", "container", self.owner), timeout=60
-            )
-            != 0
-        )
+    def _remove_profile(self, state: str, identity: Mapping[str, str]) -> None:
+        """Delete only the profile whose live cluster UID is the bound one.
+
+        An uncertain entry has no bound identity: it is recorded absent when
+        the profile is gone, and otherwise refuses for the operator.
+        """
+        if not self._profile_absent():
+            _require(state == "created")
+            _require(self._cluster_uid() == identity.get("uid"))
+            self.runner.run(self.commands.minikube_argv("delete"), timeout=300)
+        _require(self._profile_absent())
         self.ledger.removed("minikube-profile", self.owner)
 
     def remove_all(self) -> None:
@@ -310,7 +335,7 @@ class LocalCluster:
             if entry.kind == "kubernetes":
                 self._remove_object(entry.key, entry.state, entry.identity)
             elif entry.kind == "minikube-profile":
-                self._remove_profile()
+                self._remove_profile(entry.state, entry.identity)
             else:
                 _refuse()
         _require(self.ledger.all_removed())

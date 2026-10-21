@@ -38,6 +38,7 @@ class FakeRunner:
         self.objects: dict[str, dict[str, Any]] = {}
         self.fail: Callable[[list[str]], bool] = lambda argv: False
         self.status = 85
+        self.cluster_uid: str | None = "cluster-uid"
         self.uid = 0
 
     def _seen(self) -> list[tuple[str, str, str]]:
@@ -45,6 +46,8 @@ class FakeRunner:
 
     def probe(self, argv: Sequence[str], *, timeout: float) -> int:
         self.calls.append((list(argv), self._seen()))
+        if argv[0] == "docker" and argv[1] == "inspect":
+            return 0 if self.status != 85 else 1
         return self.status if argv[0] == "minikube" else 1
 
     def run(self, argv: Sequence[str], *, stdin: bytes | None = None, timeout: float) -> bytes:
@@ -63,7 +66,9 @@ class FakeRunner:
             self.objects[module().object_key(value)] = value
             return json.dumps(value).encode()
         if verb == "get" and argv[6:8] == ["namespace", "kube-system"]:
-            return json.dumps({"metadata": {"uid": "cluster-uid"}}).encode()
+            if self.cluster_uid is None:
+                raise module().InstallationRefused()
+            return json.dumps({"metadata": {"uid": self.cluster_uid}}).encode()
         if verb == "get":
             for key, value in self.objects.items():
                 resource = key.split("/")[-3].lower() + "/" + key.split("/")[-1]
@@ -105,8 +110,10 @@ def test_every_command_is_pinned_to_the_installation_profile(tmp_path: Path) -> 
     for argv, _ in runner.calls:
         if argv[0] == "kubectl":
             assert argv[1:5] == ["--context", OWNER, "--kubeconfig", kubeconfig]
-        else:
+        elif argv[0] == "minikube":
             assert argv[:3] == ["minikube", "-p", OWNER]
+        else:
+            assert argv[:4] == ["docker", "inspect", "--type", "container"]
     assert cluster.commands.environment({"KUBECONFIG": "/home/x/.kube/config"})["KUBECONFIG"] == (
         kubeconfig
     )
@@ -115,9 +122,11 @@ def test_every_command_is_pinned_to_the_installation_profile(tmp_path: Path) -> 
 def test_start_registers_the_profile_before_minikube_runs(tmp_path: Path) -> None:
     cluster, runner = installation(tmp_path)
     cluster.start()
-    argv, seen = runner.calls[0]
-    assert argv[3] == "start" and "--kubernetes-version" in argv
+    argv, seen = next(c for c in runner.calls if c[0][3:4] == ["start"])
+    assert "--kubernetes-version" in argv
     assert seen == [("minikube-profile", OWNER, "intended")]
+    # Absence is checked before anything is registered.
+    assert runner.calls[0][0][3:4] == ["status"] and runner.calls[0][1] == []
     entry = cluster.ledger.entries()[0]
     assert entry.state == "created" and entry.identity == {"owner": OWNER, "uid": "cluster-uid"}
 
@@ -125,6 +134,7 @@ def test_start_registers_the_profile_before_minikube_runs(tmp_path: Path) -> Non
 def test_failed_start_is_uncertain_not_created(tmp_path: Path) -> None:
     cluster, runner = installation(tmp_path)
     runner.fail = lambda argv: argv[0] == "minikube"
+    runner.cluster_uid = None
     with pytest.raises(module().InstallationRefused):
         cluster.start()
     assert [e.state for e in cluster.ledger.entries()] == ["uncertain"]
@@ -242,3 +252,58 @@ def test_real_runner_uses_an_owned_empty_docker_configuration(tmp_path: Path) ->
     assert oct(docker.stat().st_mode & 0o777) == "0o700"
     assert environment["KUBECONFIG"] == str(tmp_path / "run" / "kubeconfig")
     assert not any(k.startswith(("MINIKUBE_HOME", "DOCKER_HOST")) for k in environment)
+
+
+def test_start_refuses_a_profile_that_already_exists(tmp_path: Path) -> None:
+    """Never adopt: a same-name profile, or its node container, refuses before any start."""
+    api = module()
+    cluster, runner = installation(tmp_path)
+    runner.status = 0
+    with pytest.raises(api.InstallationRefused):
+        cluster.start()
+    assert cluster.ledger.entries() == ()
+    assert not any(argv[3:4] == ["start"] for argv, _ in runner.calls)
+
+
+def test_delete_refuses_a_profile_whose_cluster_identity_changed(tmp_path: Path) -> None:
+    api = module()
+    cluster, runner = installation(tmp_path)
+    cluster.start()
+    runner.status = 0
+    runner.cluster_uid = "another-cluster"
+    with pytest.raises(api.InstallationRefused):
+        cluster.remove_all()
+    assert not any(argv[3:4] == ["delete"] for argv, _ in runner.calls)
+    assert not cluster.ledger.all_removed()
+    runner.cluster_uid = "cluster-uid"
+    runner.status = 85
+    cluster.remove_all()
+    assert cluster.ledger.all_removed()
+
+
+def test_an_interrupted_start_binds_the_live_identity_when_readable(tmp_path: Path) -> None:
+    api = module()
+    cluster, runner = installation(tmp_path)
+    runner.fail = lambda argv: argv[3:4] == ["start"]
+    with pytest.raises(api.InstallationRefused):
+        cluster.start()
+    (entry,) = cluster.ledger.entries()
+    assert entry.state == "created" and entry.identity == {"owner": OWNER, "uid": "cluster-uid"}
+
+
+def test_an_unidentified_profile_is_never_deleted(tmp_path: Path) -> None:
+    """An uncertain start whose cluster cannot be read stays for the operator."""
+    api = module()
+    cluster, runner = installation(tmp_path)
+    runner.fail = lambda argv: argv[3:4] == ["start"]
+    runner.cluster_uid = None
+    with pytest.raises(api.InstallationRefused):
+        cluster.start()
+    assert [e.state for e in cluster.ledger.entries()] == ["uncertain"]
+    runner.status = 0
+    with pytest.raises(api.InstallationRefused):
+        cluster.remove_all()
+    assert not any(argv[3:4] == ["delete"] for argv, _ in runner.calls)
+    runner.status = 85
+    cluster.remove_all()
+    assert cluster.ledger.all_removed()
