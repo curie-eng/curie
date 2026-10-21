@@ -849,9 +849,10 @@ def test_a_candidate_rule_change_before_publication_constructs_nothing(monkeypat
     assert connections.events == []
 
 
-def test_a_guard_that_hashes_instantiated_rules_instead_of_the_template_refuses() -> None:
-    """Only the enqueue recipe fits the provisioner's rule bound once instantiated."""
-    role = "candidate_enqueue"
+@pytest.mark.parametrize("role", ["candidate_enqueue", "candidate_worker"])
+def test_a_guard_that_hashes_instantiated_rules_instead_of_the_template_refuses(
+    role: str,
+) -> None:
     from curie_protected_hooks.commissioning_acl import commissioning_acl_rules
 
     sample = permit_value_for_templates()
