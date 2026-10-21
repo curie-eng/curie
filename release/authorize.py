@@ -99,9 +99,9 @@ VERSION_ONLY_PROOF_DEPTH = 10
 # a reviewed branch, restricted to jobs that speak to release confidence: the
 # three language/test jobs, the generated-artifact drift checks, the
 # release-compose validation, every first-party image actually building
-# (the one ci-images job, which includes the worker-local overlay, plus the
-# dispatcher's own import smoke-test), and the behavioral gates (eval falsifiability, the E2E
-# parity ladder, the repository-toolchain proof) that ci.yaml's own
+# (ci-images, including the worker-local overlay, and the example connector
+# builds), and the behavioral gates (image-proofs, eval falsifiability, and the
+# E2E parity ladder) that ci.yaml's own
 # comments describe as catching bug classes no unit test does. Checks
 # from other workflows (CodeQL, the
 # dependency/secret scanners, release.yaml's own jobs) are deliberately
@@ -129,7 +129,7 @@ VERSION_ONLY_PROOF_DEPTH = 10
 # whose images have per-arch blobs pushed by digest and no pullable manifest
 # tag anywhere. The per-run Docker daemon image (`apps/docker-daemon`, ADR
 # 0217) is a `build` matrix row in exactly the same position, so its ci.yaml
-# job, "Docker daemon image (authz plugin + escape test)", is required too.
+# group in "Image proofs (smoke, Docker daemon, toolchain)" is required too.
 #
 # The subset test below cannot see that direction: it asserts every required
 # name is a real job, so ADDING a connector build to ci.yaml and forgetting it
@@ -148,9 +148,7 @@ REQUIRED_CHECK_NAMES = frozenset(
         "Build sre-bot-tempo image (no push)",
         "Build sre-bot-self-upgrade image (no push)",
         "Build github-activity-github image (no push)",
-        "Dispatcher image imports resolve",
-        "Docker daemon image (authz plugin + escape test)",
-        "Repository toolchain proof (runner image)",
+        "Image proofs (smoke, Docker daemon, toolchain)",
         "Eval falsifiability gate (fake model, offline)",
         "E2E parity ladder (skill + local, fake model)",
         "E2E parity ladder (local-release, fake model)",

@@ -80,8 +80,9 @@ for the build assets and a one year immutable `Cache-Control` on
 `location /api/` sets `gzip off` so proxied API responses stay
 byte-identical. Playwright cannot cover any of this, because its suite
 previews the Vite build on `4273` and never runs nginx. The pin is the
-`ui-image-smoke` job in `.github/workflows/ci.yaml`, which builds the real
-image, boots it against a stub API upstream, and asserts those headers.
+UI group of `image-proofs` in `.github/workflows/ci.yaml`, which loads the
+real image built by `ci-images`, boots it against a stub API upstream, and
+asserts those headers.
 Change the nginx template and you update that job, not a Playwright spec.
 
 ## Verify

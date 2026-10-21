@@ -26,7 +26,9 @@ answers 200 ``supported``. Each success receipt must report ``read-only`` as its
 requested, effective and alias policy and name the source generation the probe
 reported. Any other
 answer is refused with HTTP 502 to the source and one warning naming only a
-fixed reason. The default ``ordinary`` mode is unchanged.
+fixed reason. A transport failure or a non-2xx delivery status also answers 502,
+with the fixed transport or status warning both modes share. The default
+``ordinary`` mode is unchanged.
 
 Environment:
   CURIE_HOOK_URL           Full ingest URL, including hook and optional tool_access
@@ -40,6 +42,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import http.client
 import json
 import logging
 import os
@@ -350,6 +353,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(400)
             self.end_headers()
             return
+        # @spec SIGNER-DIAGNOSTICS-1: exception text may contain credentials.
         try:
             status = deliver(body, signature, delivery, timestamp)
         except ProtectedRefusal as refusal:
@@ -358,6 +362,13 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(502)
             self.end_headers()
             return
+        except (urllib.error.URLError, OSError, http.client.HTTPException):
+            logger.warning("hook ingress forwarding failed (reason=transport_error)")
+            self.send_response(502)
+            self.end_headers()
+            return
+        if not 200 <= status < 300:
+            logger.warning("hook ingress rejected delivery (status=%d)", status)
         self.send_response(200 if 200 <= status < 300 else 502)
         self.end_headers()
 

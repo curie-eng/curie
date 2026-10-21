@@ -1091,7 +1091,12 @@ only when the remaining delivery budget is at least 70 seconds plus
 turn waits durably for capacity under its original event identity, with a
 fixed deadline set by `CURIE_CAPACITY_WAIT_BUDGET_S` (24 hours by default).
 The worker acknowledges a parked stream delivery, then wakes the turn through
-the same stream when its retry is due. Waiting does not use a runner attempt or
+the same stream when its retry is due. Each refused retry is due 5000 ms after
+that park, or at the original deadline when less time remains. The delay does
+not grow with earlier refusals. A queued notice that was already delivered is
+not sent again on those retries when no sandbox grant was confirmed and the
+grant outcome is not unknown. A failed notice stays queued for another try.
+A confirmed or unknown grant keeps the existing notice retry. Waiting does not use a runner attempt or
 hold a conversation lock. Its placeholder says queued while waiting and
 receives an expiry message if the deadline passes. An approval resume does not
 wait. It runs the same reclamation pass after its own quota refusal, and when

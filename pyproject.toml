@@ -142,6 +142,20 @@ source_modules = [
 ]
 forbidden_modules = ["curie_protected_hooks.runtime_directory_writer"]
 
+# @spec PROTECTED-COMMISSIONING-1/2: production composition reads no commissioning
+# record. The whole API and worker are sources, so a new production module is
+# covered by default; a later commissioning entry needs a reviewed exception.
+# Later commissioning slices add their record modules to the forbidden list.
+[[tool.importlinter.contracts]]
+name = "Production composition never imports commissioning records"
+type = "forbidden"
+source_modules = ["curie_api", "curie_worker"]
+forbidden_modules = [
+    "curie_protected_hooks.commissioning_bootstrap",
+    "curie_protected_hooks.commissioning_encoding",
+    "curie_protected_hooks.commissioning_records",
+]
+
 [[tool.importlinter.contracts]]
 # Telemetry attribute names are shared schema, not an application or harness
 # integration surface. Keeping this package independent lets every producer and

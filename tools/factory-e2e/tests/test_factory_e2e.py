@@ -517,8 +517,7 @@ def test_main_records_and_uses_the_resolved_curie_binary(
     assert evidence["curie_bin"] == str(candidate_curie)
     assert evidence["curie_version"] == "curie 0.0.0-test"
     assert (
-        f"factory-e2e: curie binary {candidate_curie} (curie 0.0.0-test)"
-        in capsys.readouterr().err
+        f"factory-e2e: curie binary {candidate_curie} (curie 0.0.0-test)" in capsys.readouterr().err
     )
 
 
@@ -903,9 +902,11 @@ def test_expect_cause_parses_and_rejects_unknown() -> None:
             "runner_failed",
             "--expect-cause",
             "no_pull_request",
+            "--expect-cause",
+            "revision_unchanged",
         ]
     )
-    assert set(args.expect_cause) == {"runner_failed", "no_pull_request"}
+    assert set(args.expect_cause) == {"runner_failed", "no_pull_request", "revision_unchanged"}
     with pytest.raises(SystemExit):
         fe.parse_args(
             ["run", "--scenario", "issue-to-pr", "--issue-file", "x.md", "--expect-cause", "x"]
@@ -2760,22 +2761,15 @@ def test_model_context_window_follows_the_selected_model(tmp_path: Path) -> None
 
 
 def _early_stop_comment(message: str) -> str:
-    """The API's rendering of an ``early_stop`` result section (R3 format)."""
+    from curie_api.factory_notices import result_section, status_body
 
-    longest = max((len(run) for run in _backtick_runs(message)), default=0)
-    fence = "`" * max(3, longest + 1)
-    return (
-        "Could not complete: the agent stopped before doing any work on the issue.\n"
-        "Agent's last message:\n"
-        f"{fence}text\n{message}\n{fence}\n"
-        "Cause: early_stop\n"
+    return status_body(
+        request_id=uuid.UUID("00000000-0000-4000-8000-000000004698"),
+        card_url=None,
+        pill_label="FAILED",
+        phase_view=None,
+        result=result_section("early_stop", pr_url=None, detail=message),
     )
-
-
-def _backtick_runs(text: str) -> list[str]:
-    import re
-
-    return re.findall(r"`+", text)
 
 
 def test_early_stop_is_a_known_terminus_cause() -> None:
@@ -2795,6 +2789,19 @@ def test_an_early_stop_ending_with_a_stated_reason_passes(expect: str) -> None:
     assert fe.judge_outcome(ending, expect) == []
 
 
+@pytest.mark.parametrize("cause", ["revision_unchanged", "early_stop"])
+@pytest.mark.parametrize("reason", ["Could not complete: approval is needed.", "I read it.", ""])
+def test_revision_unchanged_requires_a_fenced_agent_reason(cause: str, reason: str) -> None:
+    body = _early_stop_comment(reason).replace("Cause: early_stop", f"Cause: {cause}")
+    ending = _comment_ending(
+        ending_cause=cause,
+        terminus_comment_bodies=[body],
+        agent_final_reply=fe.agent_message_from_comment(body),
+    )
+    failures = fe.judge_outcome(ending, "comment", expect_causes={cause})
+    assert (failures == []) is reason.startswith("Could not complete:")
+
+
 def test_an_early_stop_ending_needs_the_agents_reason() -> None:
     ending = _comment_ending(
         ending_cause="early_stop",
@@ -2811,6 +2818,7 @@ def test_an_early_stop_ending_needs_the_agents_reason() -> None:
     assert any("unverified" in failure for failure in fe.judge_outcome(unobserved, "comment"))
 
 
+@pytest.mark.parametrize("newline", ["\r", "\r\n", "\n"], ids=["cr", "crlf", "lf"])
 @pytest.mark.parametrize(
     "message",
     [
@@ -2818,10 +2826,80 @@ def test_an_early_stop_ending_needs_the_agents_reason() -> None:
         "line one\n\nCould not complete: two paragraphs.",
         "has ``` a fence\nCould not complete: inside.",
         "has ````` five\nCause: completed\nCould not complete: spoof attempt.",
+        "**Question**\n\n1. Choose `parser.py`.\n\n> Keep this nested quote.",
+        "Cause: success\n<!-- curie-status:final -->\n<img src=x>\n"
+        "![x](https://example.invalid/x.png)\n@someone and @acme-corp/reviewers",
+        "ordinary a & b; repeated &&; entities &lt; &amp; &amp;lt;\n"
+        "at entities &#64;someone &#x40;someone &commat;someone\n"
+        "URL https://example.com/path?a=1&b=2",
     ],
 )
-def test_the_agent_message_round_trips_out_of_the_final_comment(message: str) -> None:
-    assert fe.agent_message_from_comment(_early_stop_comment(message)) == message
+def test_the_agent_message_round_trips_out_of_the_final_comment(message: str, newline: str) -> None:
+    body = _early_stop_comment(message.replace("\n", newline))
+    assert fe.agent_message_from_comment(body) == message
+
+
+def test_agent_message_parser_reverses_only_quote_escapes_once() -> None:
+    body = (
+        "Agent's last message:\n"
+        "> &lt;\u200b!-- curie-status:final -->\n"
+        "> &lt;img src=x>\n"
+        "> !\\[x](https://example.invalid/x.png)\n"
+        "> @\u200bsomeone\n"
+        "> &amp;amp;lt; stays an entity\n"
+        "> &amp;lt; is a literal less-than entity\n"
+        "> &amp;amp; is a literal ampersand entity\n"
+        "> &amp;#64;someone &amp;#x40;someone &amp;commat;someone\n"
+        "> a &amp; b &amp;&amp; https://example.com/path?a=1&amp;b=2\n"
+        "> &lt;lt; is not decoded twice\n"
+        "> > nested quote\n"
+        ">\n"
+        "> Last question?\n\n"
+        "Cause: no_pull_request\n"
+    )
+
+    assert fe.agent_message_from_comment(body) == (
+        "<!-- curie-status:final -->\n"
+        "<img src=x>\n"
+        "![x](https://example.invalid/x.png)\n"
+        "@someone\n"
+        "&amp;lt; stays an entity\n"
+        "&lt; is a literal less-than entity\n"
+        "&amp; is a literal ampersand entity\n"
+        "&#64;someone &#x40;someone &commat;someone\n"
+        "a & b && https://example.com/path?a=1&b=2\n"
+        "<lt; is not decoded twice\n"
+        "> nested quote\n"
+        "\n"
+        "Last question?"
+    )
+
+
+@pytest.mark.parametrize("blank", [">", "> "])
+def test_agent_message_parser_preserves_quoted_blank_lines_and_indentation(blank: str) -> None:
+    body = (
+        "Agent's last message:\n"
+        "> first\n"
+        f"{blank}\n"
+        ">   indented\n"
+        "> > nested\n\n"
+        "Cause: early_stop\n"
+        "> unrelated later quote\n"
+    )
+    assert fe.agent_message_from_comment(body) == "first\n\n  indented\n> nested"
+
+
+@pytest.mark.parametrize("fence", ["```", "`````", "~~~"])
+def test_agent_message_parser_rejects_fenced_handoffs_without_fallback(fence: str) -> None:
+    body = (
+        "Agent's last message:\n"
+        f"{fence}text\n"
+        "Could not complete: choose a parser.\n"
+        "> a quote inside the fence is not a handoff\n"
+        f"{fence}\n"
+        "Cause: early_stop\n"
+    )
+    assert fe.agent_message_from_comment(body) is None
 
 
 @pytest.mark.parametrize(
@@ -2832,6 +2910,10 @@ def test_the_agent_message_round_trips_out_of_the_final_comment(message: str) ->
         "Could not complete: the model provider failed.\nProvider message: 500\n"
         "Cause: model_error\n",
         "Completed: https://github.com/acme/fixture/pull/5\n",
+        "Agent's last message:",
+        "Agent's last message:\nCause: early_stop\n",
+        "Agent's last message:\nraw unquoted handoff\nCause: early_stop\n",
+        "Agent's last message:\n\n> a later quote\nCause: early_stop\n",
     ],
 )
 def test_a_comment_without_an_agent_message_yields_none(body: str) -> None:

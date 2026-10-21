@@ -836,6 +836,15 @@ each review account once: on Cloud the `account_id` on a comment or pull
 request that person wrote, on Data Center the user's numeric `id` from
 `/rest/api/latest/users/<slug>`.
 
+After a reinstall or loss of factory storage on Bitbucket Cloud, a still-labelled
+issue whose open factory pull request exists is refused with an operator
+confirmation comment instead of a duplicate pull request, because Cloud cannot
+verify who opened it. Closing or confirming the existing pull request clears
+the block. Confirm it is the factory's by removing the trigger label from the
+issue and reviewing or merging the pull request as usual. Closing it instead
+lets the still-labelled issue be admitted on a later intake pass.
+See [Admitting a labelled GitHub issue](../operations.md#admitting-a-labelled-github-issue) for the full rules.
+
 To ask for a revision, a review account comments on the pull request and
 mentions the Jira tracker's `mention`, the factory account's `accountId`, as
 `@<accountId>`. The factory reads pull request comments on its poll interval

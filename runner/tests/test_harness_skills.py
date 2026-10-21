@@ -19,6 +19,7 @@ from typing import Any
 import anyio
 import pytest
 from curie_runner import build_options, load_plugins
+from runner_boot_session import initialized_session_sync
 
 # Today's settings loading, kept on purpose. With ``skills`` set and
 # ``setting_sources`` left unset, the SDK fills in ``["user", "project"]``.
@@ -136,7 +137,7 @@ def test_the_session_built_at_boot_lists_the_bundle_skills(
     monkeypatch.setattr(boot, "ClaudeAgentSession", _CapturedSession)
 
     runner = build_runner(config)
-    session = runner._factory()  # noqa: SLF001 -- the boot wiring is the subject
+    session = initialized_session_sync(runner)  # noqa: SLF001 -- the boot wiring is the subject
 
     assert isinstance(session, _CapturedSession)
     assert session.options.skills == ["probe:greet", "probe:hello"]

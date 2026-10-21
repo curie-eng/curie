@@ -33,6 +33,7 @@ from aci_protocol import (
 )
 from channel_protocol import work_item_events
 from curie_dispatcher.queue import to_stream_fields
+from curie_worker.approvals import PublicationLineage
 from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.binding import FactoryContext, FactoryWake
 from curie_worker.delivery_lease import DeliveryLease, DeliveryLeaseStore
@@ -47,6 +48,7 @@ from curie_worker.workitem_dispatch import (
     parse_work_item_event_id,
 )
 
+from apps.worker.tests.kernel.test_work_item_early_stop import _revision_lineage
 from apps.worker.tests.queue_fixtures import factory_context
 
 AGENT_ID = uuid.UUID("11111111-1111-4111-8111-111111111111")
@@ -60,8 +62,11 @@ PUBLISH_TOOL = "mcp__curie__publish_changes"
 
 
 class _PublicationApi:
-    async def get_publication_lineage(self, *_args: object) -> None:
-        return None
+    def __init__(self, lineage: PublicationLineage | None = None) -> None:
+        self.lineage = lineage
+
+    async def get_publication_lineage(self, *_args: object) -> PublicationLineage | None:
+        return self.lineage
 
     async def get_publication_precheck_context(
         self,
@@ -353,16 +358,21 @@ def test_a_ci_turn_is_a_factory_work_item_turn(make_harness) -> None:
 
 
 @pytest.mark.parametrize("round_", [2, 3])
+@pytest.mark.parametrize("pr_url", [PR_URL, None, "", " \t "])
 def test_an_unpublished_fix_turn_finishes_the_same_request_as_ci_fix_unpublished(
-    make_harness, round_: int
+    make_harness, round_: int, pr_url: str | None
 ) -> None:
+    """#4752: a recorded pull request does not change CI's unpublished cause or round."""
+
     async def exercise() -> None:
+        request_id = uuid.uuid4()
         async with make_harness(
             binding=_Binding(),
             workspace_factory=_Workspace,
-            publication_creator=_PublicationApi(),
+            publication_creator=_PublicationApi(
+                _revision_lineage(pr_url, f"work-item-{request_id}")
+            ),
         ) as h:
-            request_id = uuid.uuid4()
             work_items = _WorkItems(running=request_id)
             h.kernel._work_items = work_items
             h.runner.default_script = [

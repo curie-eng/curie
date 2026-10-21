@@ -15,6 +15,7 @@ its own channel, to fact keys, and to the sender its per-turn credential names
 (ADR-0188); on ``transcript`` it is held to its own channel's threads (#3767).
 """
 
+import asyncio
 import enum
 import hashlib
 import logging
@@ -170,7 +171,14 @@ async def _check_credential_current(request: Request, agent_id: uuid.UUID, cred:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "sandbox credential is not recognized")
     client: redis.Redis = request.app.state.valkey
     try:
-        released = await client.exists(_released_credential_key(agent_id, cred))
+        for attempt in range(4):
+            try:
+                released = await client.exists(_released_credential_key(agent_id, cred))
+                break
+            except (redis.ConnectionError, redis.TimeoutError) as exc:
+                if type(exc) not in (redis.ConnectionError, redis.TimeoutError) or attempt == 3:
+                    raise
+                await asyncio.sleep(0.2 * 2**attempt)
     except (redis.RedisError, OSError) as exc:
         logger.warning(
             "state: could not check sandbox credential for agent %s (%s)",

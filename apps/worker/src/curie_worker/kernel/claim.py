@@ -344,6 +344,8 @@ async def _route_and_start(
                     publication_visible_outcome_revision = lineage.visible_outcome_revision
                     if lineage.head_sha is None and lineage.visible_outcome_revision > 0:
                         lineage_base_sha = lineage.base_sha
+                if owned_run is not None:
+                    owned_run.recorded_pr_url = lineage.pr_url if lineage is not None else None
     if verified_review is not None and (
         lineage is None
         or lineage.head_sha != verified_review.head_sha

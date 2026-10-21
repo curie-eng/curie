@@ -43,6 +43,7 @@ use crate::support;
 use std::process::{Command, Output};
 
 use serde_json::{json, Value};
+use support::closed_port::ClosedPort;
 use support::{serve, MockServer, Request, Response};
 
 const TEST_API_KEY: &str = "test-platform-key";
@@ -347,11 +348,9 @@ fn assert_valid(schema_file: &str, value: &Value, what: &str) {
     );
 }
 
-fn dead_url() -> String {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a free port");
-    let port = listener.local_addr().expect("local addr").port();
-    drop(listener);
-    format!("http://127.0.0.1:{port}")
+/// A base URL nothing listens on, held closed while the returned guard lives.
+fn dead_url() -> ClosedPort {
+    ClosedPort::new()
 }
 
 fn query_pairs(path: &str) -> Vec<(String, String)> {
@@ -566,7 +565,8 @@ fn an_unknown_nomination_and_an_unreachable_api_are_one_error_object_each() {
             "{what}: {value}"
         );
 
-        let output = run_at(tier, "remediation", &["list"], &dead_url(), None);
+        let dead = dead_url();
+        let output = run_at(tier, "remediation", &["list"], &dead.url(), None);
         let what = format!("{tier} remediation list (no listener)");
         assert_eq!(output.status.code(), Some(3), "{what}:\n{}", text(&output));
         assert_error_object(&one_object(&output, &what), &what);

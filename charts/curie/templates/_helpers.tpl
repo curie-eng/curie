@@ -2554,6 +2554,28 @@ predates it does not carry under --reuse-values (#3505, #3544).
 {{- end -}}
 
 {{/*
+The executor's own connector reads without the reconcile loop (#4800,
+ACTION-EXECUTOR-12 as amended): "true" or "false". On, the worker Role gains a
+single-object `get` on Deployments (and nothing else) and the worker reads the
+acting connector's Deployment and the in-force digest itself, while
+worker.connectorReconciler stays off. It requires the executor, and is refused
+with the reconciler on, where the executor already reads through the
+reconciler's rules. Read through `default dict` for --reuse-values from a
+release that predates the key.
+*/}}
+{{- define "curie.actionExecutorConnectorReads" -}}
+{{- if (get (.Values.actionExecutor | default dict) "connectorReadsWithoutReconciler") -}}
+{{- if ne (include "curie.actionExecutorEnabled" .) "true" -}}
+{{- fail "actionExecutor.connectorReadsWithoutReconciler=true requires actionExecutor.enabled=true: only the executor reads connector Deployments" -}}
+{{- end -}}
+{{- if .Values.worker.connectorReconciler.enabled -}}
+{{- fail "actionExecutor.connectorReadsWithoutReconciler=true is for worker.connectorReconciler.enabled=false: with the reconciler on the executor already reads connector Deployments, so leave it unset" -}}
+{{- end -}}
+true
+{{- else -}}false{{- end -}}
+{{- end -}}
+
+{{/*
 The installation-wide executor sandbox cap (AUTOMATED-REMEDIATION-12, executor
 amendment E9): one value, rendered as the same integer literal into both the
 API (whose claim route enforces it) and the worker (whose executor loop runs up
