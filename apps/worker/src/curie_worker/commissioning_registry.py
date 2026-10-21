@@ -26,6 +26,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import fields
 from typing import Literal, cast
+from urllib.parse import quote
 from uuid import UUID
 
 from .protected_launch_registry import (
@@ -47,7 +48,7 @@ from .protected_launch_registry import (
     _scalar,
 )
 
-State = Literal["preparing", "idle", "retiring", "retired"]
+State = Literal["preparing", "idle", "retiring", "uncertain", "retired"]
 Kind = Literal["pod", "service", "secret"]
 _KINDS = frozenset({"pod", "service", "secret"})
 _MAX_REVISION = 2**63 - 1
@@ -59,9 +60,10 @@ def object_names(launch_id: str) -> tuple[str, str, str]:
 
     The derivation is the production mediator's (``pl-p-``, ``pl-s-``,
     ``pl-c-`` plus the launch UUID hex), because the measured guard admits only
-    those names; the guard is not revised for commissioning. The two never
-    overlap in time: a production launch needs a Qualification, which exists
-    only after the campaign closes. @spec PROTECTED-COMMISSIONING-8.
+    those names; the guard is not revised for commissioning. A production
+    launch needs a Qualification, which exists only after the campaign closes,
+    and ``create`` refuses any launch the production registry in the same root
+    already knows. @spec PROTECTED-COMMISSIONING-8.
     """
     _scalar(launch_id, "uuid")
     suffix = UUID(launch_id).hex
@@ -72,19 +74,57 @@ def object_names(launch_id: str) -> tuple[str, str, str]:
 class CampaignLaunchBinding:
     """Digests and IDs that bind one row to its campaign launch request.
 
-    Construction supplies no proof; the commissioning authorizer verifies the
-    request, consumes the launch reservation and records broker ownership.
+    It carries workload binding W's create operation ID and the guard identity
+    that admits the creates, so an ambiguous create resolves only against a
+    witness of that exact operation from that guard. Construction supplies no
+    proof; the commissioning authorizer verifies the request, consumes the
+    launch reservation and records broker ownership.
     """
 
     permit_digest: str
     launch_request_digest: str
     projection_digest: str
     launch_reservation_id: str
+    create_operation_id: str
+    guard_control_id: str
+    guard_revision: str
+    guard_config_digest: str
 
     def __post_init__(self) -> None:
-        for value in (self.permit_digest, self.launch_request_digest, self.projection_digest):
+        for value in (
+            self.permit_digest,
+            self.launch_request_digest,
+            self.projection_digest,
+            self.guard_config_digest,
+        ):
             _scalar(value, "digest")
-        _scalar(self.launch_reservation_id, "uuid")
+        for value in (self.launch_reservation_id, self.create_operation_id, self.guard_control_id):
+            _scalar(value, "uuid")
+        _scalar(self.guard_revision, "generation")
+
+
+@_closed_record
+class GuardCreateWitness:
+    """The guard's statement of the UID it admitted for one recorded create.
+
+    Construction supplies no proof: the caller obtains it from the guard-owned
+    identity and observes the object at the exact recorded name with this UID.
+    @spec PROTECTED-COMMISSIONING-8.
+    """
+
+    kind: Kind
+    uid: str
+    create_operation_id: str
+    guard_control_id: str
+    guard_revision: str
+    guard_config_digest: str
+
+    def __post_init__(self) -> None:
+        _require(type(self.kind) is str and self.kind in _KINDS)
+        for value in (self.uid, self.create_operation_id, self.guard_control_id):
+            _scalar(value, "uuid")
+        _scalar(self.guard_revision, "generation")
+        _scalar(self.guard_config_digest, "digest")
 
 
 @_closed_record
@@ -113,9 +153,11 @@ CREATE TABLE IF NOT EXISTS launches (
  launch_id TEXT PRIMARY KEY, worker_principal_id TEXT NOT NULL,
  permit_digest TEXT NOT NULL, launch_request_digest TEXT NOT NULL,
  projection_digest TEXT NOT NULL, launch_reservation_id TEXT NOT NULL UNIQUE,
+ create_operation_id TEXT NOT NULL UNIQUE, guard_control_id TEXT NOT NULL,
+ guard_revision TEXT NOT NULL, guard_config_digest TEXT NOT NULL,
  creation_budget_ms INTEGER NOT NULL CHECK(creation_budget_ms BETWEEN 1 AND 120000),
  revision INTEGER NOT NULL CHECK(revision>0), state TEXT NOT NULL
- CHECK(state IN ('preparing','idle','retiring','retired')),
+ CHECK(state IN ('preparing','idle','retiring','uncertain','retired')),
  boot_id TEXT NOT NULL, retirement_outcome TEXT
  CHECK(retirement_outcome IS NULL OR retirement_outcome='cleanup-recorded')
 ) STRICT;
@@ -210,7 +252,7 @@ class CommissioningLaunchRegistry:
                     raise RegistryConflict()
                 db.execute(
                     "UPDATE launches SET state='retiring',revision=revision+1 "
-                    "WHERE state!='retired' AND state!='retiring'"
+                    "WHERE state IN ('preparing','idle')"
                 )
             return instance
         except (RegistryError, sqlite3.Error, OSError, ValueError, TypeError, OverflowError):
@@ -396,19 +438,18 @@ class CommissioningLaunchRegistry:
                 }:
                     raise RegistryRetired()
                 return self._snapshot(db, existing)
+            if self._production_knows(launch_id, (pod, service, secret)):
+                raise RegistryConflict()
             try:
                 db.execute(
-                    "INSERT INTO launches(launch_id,worker_principal_id,permit_digest,"
-                    "launch_request_digest,projection_digest,launch_reservation_id,"
-                    "creation_budget_ms,revision,state,boot_id) "
-                    "VALUES(?,?,?,?,?,?,?,1,'preparing',?)",
+                    "INSERT INTO launches(launch_id,worker_principal_id,"
+                    + ",".join(f.name for f in fields(CampaignLaunchBinding))
+                    + ",creation_budget_ms,revision,state,boot_id) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,1,'preparing',?)",
                     (
                         launch_id,
                         worker_principal_id,
-                        binding.permit_digest,
-                        binding.launch_request_digest,
-                        binding.projection_digest,
-                        binding.launch_reservation_id,
+                        *(getattr(binding, f.name) for f in fields(CampaignLaunchBinding)),
                         creation_budget_ms,
                         self._boot_id,
                     ),
@@ -421,6 +462,38 @@ class CommissioningLaunchRegistry:
             except sqlite3.IntegrityError:
                 raise RegistryConflict() from None
             return self._snapshot(db, self._owned(db, worker_principal_id, launch_id))
+
+    def _production_knows(self, launch_id: str, names: tuple[str, str, str]) -> bool:
+        """Whether the production registry in this root holds this launch or a name.
+
+        An absent production registry knows nothing; an unreadable one refuses.
+        """
+        try:
+            fd = os.open(
+                "registry.sqlite", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=self._root_fd
+            )
+        except FileNotFoundError:
+            return False
+        try:
+            info = os.fstat(fd)
+            _require(
+                stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_uid == os.geteuid()
+            )
+        finally:
+            os.close(fd)
+        db = sqlite3.connect(
+            "file:" + quote(self._root + "/registry.sqlite") + "?mode=ro", uri=True, timeout=0
+        )
+        try:
+            known = db.execute(
+                "SELECT 1 FROM launches WHERE launch_id=? UNION ALL SELECT 1 FROM objects "
+                "WHERE pod_name IN (?,?,?) OR service_name IN (?,?,?) OR secret_name IN (?,?,?) "
+                "LIMIT 1",
+                (launch_id, *names, *names, *names),
+            ).fetchone()
+            return known is not None
+        finally:
+            db.close()
 
     @_safe
     def get(self, worker_principal_id: str, launch_id: str) -> CommissioningLaunchSnapshot:
@@ -465,41 +538,28 @@ class CommissioningLaunchRegistry:
             row = self._cas(db, worker_principal_id, launch_id, expected_revision)
             if state == "retired":
                 raise RegistryConflict()
-            if row["state"] in {"retiring", "retired"}:
+            if row["state"] in {"retiring", "uncertain", "retired"}:
                 raise RegistryRetired()
             if state == "idle":
                 self._current_preparing(row)
             db.execute("UPDATE launches SET state=? WHERE launch_id=?", (state, launch_id))
             return self._bump(db, worker_principal_id, launch_id)
 
-    def _record_uid(
-        self,
-        owner: str,
-        launch_id: str,
-        expected_revision: str,
-        kind: Kind,
-        uid: str,
-        resource_version: str,
-        *,
-        witnessed: bool,
+    @_safe
+    def mark_uncertain(
+        self, worker_principal_id: str, launch_id: str, expected_revision: str
     ) -> CommissioningLaunchSnapshot:
-        _require(type(kind) is str and kind in _KINDS)
-        _scalar(uid, "uuid")
-        _scalar(resource_version, "version")
+        """Record an ambiguous create, distinct from an ordinary retirement.
+
+        Only a guard-witnessed UID moves it on, to ``retiring``; restart keeps it.
+        It blocks acceptance. @spec PROTECTED-COMMISSIONING-7/8.
+        """
         with self._transaction() as db:
-            row = self._cas(db, owner, launch_id, expected_revision)
-            if witnessed:
-                if row["state"] != "retiring":
-                    raise RegistryConflict()
-            else:
-                self._current_preparing(row)
-            obj = db.execute(
-                "SELECT * FROM objects WHERE launch_id=? LIMIT 1", (launch_id,)
-            ).fetchone()
-            if obj[kind + "_uid"] is not None:
+            row = self._cas(db, worker_principal_id, launch_id, expected_revision)
+            if row["state"] not in {"preparing", "idle", "retiring"}:
                 raise RegistryConflict()
-            db.execute(_SET_UID[kind], (uid, resource_version, launch_id))
-            return self._bump(db, owner, launch_id)
+            db.execute("UPDATE launches SET state='uncertain' WHERE launch_id=?", (launch_id,))
+            return self._bump(db, worker_principal_id, launch_id)
 
     @_safe
     def record_object_uid(
@@ -516,15 +576,23 @@ class CommissioningLaunchRegistry:
         A UID observed by name while retiring is a same-name object, not an
         owned one, and is refused here. @spec PROTECTED-COMMISSIONING-8.
         """
-        return self._record_uid(
-            worker_principal_id,
-            launch_id,
-            expected_revision,
-            kind,
-            uid,
-            resource_version,
-            witnessed=False,
-        )
+        _require(type(kind) is str and kind in _KINDS)
+        _scalar(uid, "uuid")
+        _scalar(resource_version, "version")
+        with self._transaction() as db:
+            row = self._cas(db, worker_principal_id, launch_id, expected_revision)
+            self._current_preparing(row)
+            self._set_uid(db, launch_id, kind, uid, resource_version)
+            return self._bump(db, worker_principal_id, launch_id)
+
+    @staticmethod
+    def _set_uid(
+        db: sqlite3.Connection, launch_id: str, kind: str, uid: str, resource_version: str
+    ) -> None:
+        obj = db.execute("SELECT * FROM objects WHERE launch_id=? LIMIT 1", (launch_id,)).fetchone()
+        if obj[kind + "_uid"] is not None:
+            raise RegistryConflict()
+        db.execute(_SET_UID[kind], (uid, resource_version, launch_id))
 
     @_safe
     def record_witnessed_uid(
@@ -532,25 +600,35 @@ class CommissioningLaunchRegistry:
         worker_principal_id: str,
         launch_id: str,
         expected_revision: str,
-        kind: Kind,
-        uid: str,
+        witness: GuardCreateWitness,
         resource_version: str,
     ) -> CommissioningLaunchSnapshot:
-        """Resolve one ambiguous create while retiring, never replacing a known UID.
+        """Resolve one ambiguous create from the guard's witness of its exact operation.
 
-        The caller must hold the guard-owned witness of the UID admitted for the
-        recorded create and the object at the exact recorded name with that UID.
-        This storage API does not authenticate either. @spec PROTECTED-COMMISSIONING-8.
+        Only while ``retiring`` or ``uncertain``, only for an unknown UID, and
+        only for the recorded create operation ID and guard identity; an
+        ``uncertain`` launch becomes ``retiring``. The caller must also observe
+        the object at the exact recorded name with the witnessed UID. This
+        storage API authenticates neither. @spec PROTECTED-COMMISSIONING-7/8.
         """
-        return self._record_uid(
-            worker_principal_id,
-            launch_id,
-            expected_revision,
-            kind,
-            uid,
-            resource_version,
-            witnessed=True,
-        )
+        _require(type(witness) is GuardCreateWitness)
+        witness.__post_init__()
+        _scalar(resource_version, "version")
+        with self._transaction() as db:
+            row = self._cas(db, worker_principal_id, launch_id, expected_revision)
+            if row["state"] not in {"retiring", "uncertain"} or any(
+                row[name] != getattr(witness, name)
+                for name in (
+                    "create_operation_id",
+                    "guard_control_id",
+                    "guard_revision",
+                    "guard_config_digest",
+                )
+            ):
+                raise RegistryConflict()
+            self._set_uid(db, launch_id, witness.kind, witness.uid, resource_version)
+            db.execute("UPDATE launches SET state='retiring' WHERE launch_id=?", (launch_id,))
+            return self._bump(db, worker_principal_id, launch_id)
 
     @_safe
     def record_container_identity(

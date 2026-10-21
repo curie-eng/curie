@@ -27,6 +27,9 @@ OTHER_PERMIT = "b" * 64
 DIGEST = "d" * 64
 NAMESPACE = "protected-runtime"
 CONTAINER = "containerd://" + "c" * 64
+GUARD = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+OTHER_GUARD = "ffffffff-ffff-4fff-8fff-ffffffffffff"
+GUARD_CONFIG = "9" * 64
 
 
 def api() -> Any:
@@ -56,9 +59,26 @@ def binding(**changes: object) -> Any:
         "launch_request_digest": DIGEST,
         "projection_digest": DIGEST,
         "launch_reservation_id": RESERVATION,
+        "create_operation_id": RESERVATION,
+        "guard_control_id": GUARD,
+        "guard_revision": "1",
+        "guard_config_digest": GUARD_CONFIG,
     }
     values.update(changes)
     return api().CampaignLaunchBinding(**values)
+
+
+def witness(kind: str = "pod", uid: str = POD_UID, **changes: object) -> Any:
+    values: dict[str, object] = {
+        "kind": kind,
+        "uid": uid,
+        "create_operation_id": RESERVATION,
+        "guard_control_id": GUARD,
+        "guard_revision": "1",
+        "guard_config_digest": GUARD_CONFIG,
+    }
+    values.update(changes)
+    return api().GuardCreateWitness(**values)
 
 
 def create(registry: Any, **changes: object) -> Any:
@@ -143,7 +163,9 @@ def test_one_launch_reservation_backs_one_launch(root: Path) -> None:
             create(
                 registry,
                 launch_id=OTHER_LAUNCH,
-                binding=binding(launch_reservation_id=OTHER_RESERVATION),
+                binding=binding(
+                    launch_reservation_id=OTHER_RESERVATION, create_operation_id=OTHER_RESERVATION
+                ),
             ).launch_id
             == OTHER_LAUNCH
         )
@@ -193,17 +215,103 @@ def test_uid_is_never_replaced(root: Path) -> None:
             registry.record_object_uid(OWNER, LAUNCH, row.revision, "pod", NODE_UID, "8")
 
 
-def test_witnessed_resolution_only_for_an_unknown_uid_while_retiring(root: Path) -> None:
+def test_an_ambiguous_create_is_uncertain_until_the_guard_witness_resolves_it(root: Path) -> None:
     errors = production()
     with open_registry(root) as registry:
         row = create(registry)
+        # No witness is accepted while the create may still be answered.
         with pytest.raises(errors.RegistryConflict):
-            registry.record_witnessed_uid(OWNER, LAUNCH, row.revision, "pod", POD_UID, "7")
+            registry.record_witnessed_uid(OWNER, LAUNCH, row.revision, witness(), "7")
+        row = registry.mark_uncertain(OWNER, LAUNCH, row.revision)
+        assert row.state == "uncertain"
+        assert registry.enumerate_retiring(limit=64) == ()
+        with pytest.raises(errors.RegistryRetired):
+            registry.transition(OWNER, LAUNCH, row.revision, "retiring")
+        with pytest.raises(errors.RegistryConflict):
+            registry.record_cleanup_receipt(
+                OWNER,
+                LAUNCH,
+                row.revision,
+                production().CleanupReceipt(POD_UID, SERVICE_UID, SECRET_UID),
+            )
+        for other in (
+            witness(create_operation_id=OTHER_RESERVATION),
+            witness(guard_control_id=OTHER_GUARD),
+            witness(guard_revision="2"),
+            witness(guard_config_digest="8" * 64),
+        ):
+            with pytest.raises(errors.RegistryConflict):
+                registry.record_witnessed_uid(OWNER, LAUNCH, row.revision, other, "7")
+        assert registry.get(OWNER, LAUNCH).objects.pod_uid is None
+        row = registry.record_witnessed_uid(OWNER, LAUNCH, row.revision, witness(), "7")
+        assert row.objects.pod_uid == POD_UID and row.state == "retiring"
+        with pytest.raises(errors.RegistryConflict):
+            registry.record_witnessed_uid(OWNER, LAUNCH, row.revision, witness(uid=NODE_UID), "7")
+
+
+def test_a_witness_needs_the_recorded_create_operation_and_guard(root: Path) -> None:
+    errors = production()
+    with open_registry(root) as registry:
+        row = create(registry)
         row = registry.transition(OWNER, LAUNCH, row.revision, "retiring")
-        row = registry.record_witnessed_uid(OWNER, LAUNCH, row.revision, "pod", POD_UID, "7")
-        assert row.objects.pod_uid == POD_UID
+        with pytest.raises((errors.RegistryInvalid, TypeError)):
+            registry.record_witnessed_uid(OWNER, LAUNCH, row.revision, "pod", POD_UID, "7")
         with pytest.raises(errors.RegistryConflict):
-            registry.record_witnessed_uid(OWNER, LAUNCH, row.revision, "pod", NODE_UID, "7")
+            registry.record_witnessed_uid(
+                OWNER, LAUNCH, row.revision, witness(create_operation_id=OTHER_RESERVATION), "7"
+            )
+        row = registry.record_witnessed_uid(
+            OWNER, LAUNCH, row.revision, witness("secret", SECRET_UID), "7"
+        )
+        assert row.objects.secret_uid == SECRET_UID and row.state == "retiring"
+
+
+def test_uncertain_follows_the_campaign_ownership_state_machine(root: Path) -> None:
+    errors = production()
+    with open_registry(root) as registry:
+        row = created(registry)
+        row = registry.record_container_identity(OWNER, LAUNCH, row.revision, CONTAINER, NODE_UID)
+        row = registry.transition(OWNER, LAUNCH, row.revision, "idle")
+        row = registry.mark_uncertain(OWNER, LAUNCH, row.revision)
+        assert row.state == "uncertain"
+        with pytest.raises(errors.RegistryConflict):
+            registry.mark_uncertain(OWNER, LAUNCH, row.revision)
+        with pytest.raises(errors.RegistryRetired):
+            registry.transition(OWNER, LAUNCH, row.revision, "idle")
+    with open_registry(root, boot=NEXT_BOOT) as registry:
+        # Restart keeps uncertainty; it never becomes an ordinary retirement.
+        assert registry.get(OWNER, LAUNCH).state == "uncertain"
+    with open_registry(root, boot=NEXT_BOOT) as registry:
+        row = create(
+            registry,
+            launch_id=OTHER_LAUNCH,
+            binding=binding(
+                launch_reservation_id=OTHER_RESERVATION, create_operation_id=OTHER_RESERVATION
+            ),
+        )
+        row = registry.transition(OWNER, OTHER_LAUNCH, row.revision, "retiring")
+        row = registry.mark_uncertain(OWNER, OTHER_LAUNCH, row.revision)
+        assert row.state == "uncertain"
+
+
+def test_create_refuses_a_launch_the_production_registry_in_the_root_knows(
+    root: Path,
+) -> None:
+    from . import test_protected_launch_registry as prod
+
+    with production().ProtectedLaunchRegistry.open(str(root), boot_id=BOOT) as registry:
+        launch_id = prod.create(registry).launch_id
+    with open_registry(root) as registry, pytest.raises(production().RegistryConflict):
+        create(registry, launch_id=launch_id)
+    with open_registry(root) as registry:
+        assert create(registry).launch_id == LAUNCH
+
+
+def test_create_refuses_an_unreadable_production_registry(root: Path) -> None:
+    (root / "registry.sqlite").write_bytes(b"not a database")
+    (root / "registry.sqlite").chmod(0o600)
+    with open_registry(root) as registry, pytest.raises(production().RegistryError):
+        create(registry)
 
 
 def test_lifecycle_to_retired_needs_termination_and_exact_cleanup(root: Path) -> None:
