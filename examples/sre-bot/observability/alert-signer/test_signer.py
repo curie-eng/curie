@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import http.client
 import importlib.util
 import json
 import logging
@@ -251,6 +252,132 @@ def test_signer_http_authentication_and_forwarding(
             hook="alertmanager.release",
             tool_access=tool_access,
         )
+
+
+@pytest.mark.parametrize("upstream_status", [200, 202, 409, 429, 500])
+def test_forwarding_reports_only_safe_status_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    upstream_status: int,
+) -> None:
+    """@spec SIGNER-DIAGNOSTICS-1."""
+    class Ingress(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+        def do_POST(self) -> None:  # noqa: N802
+            self.rfile.read(int(self.headers["Content-Length"]))
+            self.send_response(upstream_status)
+            self.end_headers()
+            self.wfile.write(b"synthetic-private-response-body")
+
+    monkeypatch.setenv("CURIE_HOOK_SECRET", "synthetic-private-hook-secret")
+    monkeypatch.setenv("CURIE_SIGNER_TOKEN", "synthetic-private-signer-token")
+    raw = b'{"groupKey":"synthetic-private-payload","status":"firing","alerts":[]}'
+    with _http_server(Ingress) as ingress_url:
+        monkeypatch.setenv("CURIE_HOOK_URL", f"{ingress_url}/hooks/acme-agent/alertmanager")
+        with _http_server(signer.Handler) as signer_url, caplog.at_level(logging.WARNING):
+            request = urllib.request.Request(
+                signer_url, data=raw, method="POST",
+                headers={"Authorization": "Bearer synthetic-private-signer-token"},
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    actual = response.status
+            except urllib.error.HTTPError as exc:
+                actual = exc.code
+                assert exc.read() == b""
+            assert actual == (200 if upstream_status < 300 else 502)
+    messages = [record.getMessage() for record in caplog.records if record.name == "alert_signer"]
+    assert messages == ([] if upstream_status < 300 else [
+        f"hook ingress rejected delivery (status={upstream_status})"
+    ])
+    assert "synthetic-private" not in caplog.text
+    assert ingress_url not in caplog.text
+
+
+def test_transport_failure_returns_502_without_exception_details(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """@spec SIGNER-DIAGNOSTICS-1."""
+    class Disconnect(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+        def do_POST(self) -> None:  # noqa: N802
+            self.rfile.read(int(self.headers["Content-Length"]))
+            self.close_connection = True
+
+    monkeypatch.setenv("CURIE_HOOK_SECRET", "synthetic-private-hook-secret")
+    monkeypatch.setenv("CURIE_SIGNER_TOKEN", "synthetic-private-signer-token")
+    with _http_server(Disconnect) as ingress_url:
+        monkeypatch.setenv("CURIE_HOOK_URL", f"{ingress_url}/hooks/acme-agent/alertmanager")
+        with _http_server(signer.Handler) as signer_url, caplog.at_level(logging.WARNING):
+            request = urllib.request.Request(
+                signer_url, data=b'{"groupKey":"synthetic-private-payload","alerts":[]}',
+                method="POST",
+                headers={"Authorization": "Bearer synthetic-private-signer-token"},
+            )
+            with pytest.raises(urllib.error.HTTPError) as error:
+                urllib.request.urlopen(request, timeout=5)
+            assert error.value.code == 502
+            assert error.value.read() == b""
+    messages = [record.getMessage() for record in caplog.records if record.name == "alert_signer"]
+    assert messages == ["hook ingress forwarding failed (reason=transport_error)"]
+    assert "synthetic-private" not in caplog.text
+    assert ingress_url not in caplog.text
+
+
+def test_malformed_upstream_status_returns_502_with_only_safe_transport_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """@spec SIGNER-DIAGNOSTICS-1: protocol parse errors never disclose raw bytes."""
+    class MalformedStatus(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+        def do_POST(self) -> None:  # noqa: N802
+            self.rfile.read(int(self.headers["Content-Length"]))
+            self.wfile.write(
+                b"synthetic-private-upstream-status secret=synthetic-private-hook-secret\r\n\r\n"
+            )
+            self.close_connection = True
+
+    monkeypatch.setenv("CURIE_HOOK_SECRET", "synthetic-private-hook-secret")
+    monkeypatch.setenv("CURIE_SIGNER_TOKEN", "synthetic-private-signer-token")
+    actual: int | None = None
+    with _http_server(MalformedStatus) as ingress_url:
+        monkeypatch.setenv("CURIE_HOOK_URL", f"{ingress_url}/hooks/acme-agent/alertmanager")
+        with _http_server(signer.Handler) as signer_url, caplog.at_level(logging.WARNING):
+            request = urllib.request.Request(
+                signer_url,
+                data=b'{"groupKey":"synthetic-private-payload","alerts":[]}',
+                method="POST",
+                headers={"Authorization": "Bearer synthetic-private-signer-token"},
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    actual = response.status
+            except urllib.error.HTTPError as error:
+                actual = error.code
+                assert error.read() == b""
+            except http.client.HTTPException:
+                # An uncaught upstream parse error closes the downstream socket;
+                # retain the observation so the diagnostic assertions still run.
+                actual = None
+    captured = capsys.readouterr()
+    diagnostics = caplog.text + captured.out + captured.err
+    assert "synthetic-private" not in diagnostics
+    assert ingress_url not in diagnostics
+    assert "Traceback" not in diagnostics
+    assert actual == 502
+    records = [record for record in caplog.records if record.name == "alert_signer"]
+    assert [record.getMessage() for record in records] == [
+        "hook ingress forwarding failed (reason=transport_error)"
+    ]
+    assert all(record.exc_info is None for record in records)
 
 
 # @spec HOOK-SOURCE-POLICY-6: the protected source mode. The fake ingress below
@@ -513,12 +640,15 @@ def test_protected_source_refuses_a_receipt_without_read_only_admission(
 def test_protected_source_reports_an_ingress_refusal_as_502(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A refused delivery carries no receipt to verify; the source still sees 502."""
+    """A refused delivery carries no receipt to verify; the source still sees 502.
+
+    Only the fixed status diagnostic is logged (SIGNER-DIAGNOSTICS-1).
+    """
     api = _Api(receipt=(503, {"detail": "broker_unavailable"}))
     with caplog.at_level(logging.WARNING):
         assert _relay(monkeypatch, api) == 502
     assert len(api.requests) == 2
-    assert _warnings(caplog) == []
+    assert _warnings(caplog) == ["hook ingress rejected delivery (status=503)"]
 
 
 @pytest.mark.parametrize(

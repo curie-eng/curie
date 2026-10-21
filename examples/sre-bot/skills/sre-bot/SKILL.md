@@ -392,6 +392,16 @@ in the default install.
 
 1. **Pick a time window.** If the asker did not give one, default to the last
    1 hour and say so. "Today" means the last 24 hours.
+   Keep each reported value attached to its series labels, sample timestamp and
+   aggregation window. Compare a subset with its total only for the same scope,
+   timestamp and window; join by timestamp, never by array position. At a subset
+   peak, use the total at that peak's timestamp, not the total's independent peak
+   or a range taken from other times. If the matching total is missing or uses
+   another window, report the observed subset and leave the total and percentage
+   unknown; do not interpolate or rescale without supporting evidence. Rolling
+   `increase` values can be fractional estimates, and overlapping windows can
+   include the same events. Do not sum them into a distinct-event count or claim
+   exact event counts from those estimates.
 2. **Start broad, then narrow.** For an open-ended "is anything broken?": check
    firing alerts first, then cluster state (crashlooping, pending, NotReady
    nodes -- cheap instant queries), then error-level logs across services, then

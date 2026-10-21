@@ -32,11 +32,11 @@ CARD = "https://curie.example.com/v1/factory/cards/abc.svg"
 WAITING = "_Waiting for the agent to report progress._"
 
 
-def _view() -> PhaseView:
+def _view(round_label: str | None = "round 1 of 3") -> PhaseView:
     return PhaseView(
         phases=(
             PhaseSlot(id="read_issue", label="Read issue", state="done", round_label=None),
-            PhaseSlot(id="plan", label="Plan", state="current", round_label="round 1 of 3"),
+            PhaseSlot(id="plan", label="Plan", state="current", round_label=round_label),
             PhaseSlot(id="ci", label="Wait for CI", state="pending", round_label=None),
         ),
         loops=(),
@@ -54,7 +54,7 @@ def _view() -> PhaseView:
                 label="Plan",
                 phase_ids=("plan",),
                 state="current",
-                round_label="round 1 of 3",
+                round_label=round_label,
             ),
             StageSlot(
                 id="ci",
@@ -108,6 +108,52 @@ def test_without_a_card_url_the_checklist_is_the_fallback() -> None:
     )
 
 
+@pytest.mark.parametrize("round_label", [None, "round 2 of 3"])
+def test_a_live_phase_keeps_its_progress_and_round_label(round_label: str | None) -> None:
+    body = status_body(
+        request_id=REQUEST,
+        card_url=None,
+        pill_label="RUNNING",
+        phase_view=_view(round_label),
+        result=None,
+    )
+
+    expected = "in progress, round 2 of 3" if round_label else "in progress"
+    assert f"- [ ] **Plan** ({expected})" in body
+    assert "stopped here" not in body
+    assert FINAL_MARKER not in body
+
+
+@pytest.mark.parametrize("round_label", [None, "round 2 of 3"])
+@pytest.mark.parametrize("cause", ["early_stop", "no_pull_request", "model_error"])
+def test_a_final_phase_shows_where_the_run_stopped(cause: str, round_label: str | None) -> None:
+    view = _view(round_label)
+    body = status_body(
+        request_id=REQUEST,
+        card_url=None,
+        pill_label="FAILED",
+        phase_view=view,
+        result=result_section(cause, pr_url=None, detail="The maintainer must choose a parser."),
+    )
+
+    assert "- [ ] **Plan** (stopped here)" in body
+    assert "(in progress" not in body
+    assert "- [x] Read issue" in body
+    assert "- [ ] Wait for CI" in body
+    assert body.count(FINAL_MARKER) == 1
+    assert body.count(marker_for(REQUEST)) == 1
+    live = status_body(
+        request_id=REQUEST,
+        card_url=None,
+        pill_label="RUNNING",
+        phase_view=view,
+        result=None,
+    )
+    assert "**Plan** (in progress" in live
+    if round_label:
+        assert round_label in live
+
+
 def test_without_a_card_url_the_waiting_placeholder_stays() -> None:
     body = status_body(
         request_id=REQUEST, card_url=None, pill_label="QUEUED", phase_view=None, result=None
@@ -157,7 +203,8 @@ def test_final_status_redacts_provider_metadata_in_quotes_and_cause_lines(cause:
     assert f"Cause: {cause}" in body
     assert body.count(FINAL_MARKER) == 1
     if cause in {"early_stop", "no_pull_request"}:
-        assert "Agent's last message:\n```text\n" in body
+        assert "Agent's last message:\n> " in body
+        assert "```text" not in body
 
 
 def test_running_status_redacts_metadata_outside_the_terminal_result() -> None:

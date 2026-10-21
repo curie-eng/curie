@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping, Sequence
+from html import unescape
+from html.entities import html5
 from typing import Any
 
 # ADF -> markdown -----------------------------------------------------------------
@@ -202,8 +204,10 @@ _RULE = re.compile(r"^\s*(?:-\s*){3,}$|^\s*(?:\*\s*){3,}$|^\s*(?:_\s*){3,}$")
 _BULLET = re.compile(r"^(\s*)[-*+]\s+(.*)$")
 _ORDERED = re.compile(r"^(\s*)(\d{1,9})[.)]\s+(.*)$")
 _QUOTE = re.compile(r"^\s*>\s?(.*)$")
+_ENTITY_REFERENCE = re.compile(r"&(?:#[0-9]{1,7}|#[xX][0-9A-Fa-f]{1,6}|[A-Za-z][A-Za-z0-9]{1,31});")
 _SPAN = re.compile(
-    r"(?P<code_fence>`+)(?P<code>.+?)(?P=code_fence)"
+    r"\\(?P<escaped>[!-/:-@\[-`{-~])"
+    r"|(?P<code_fence>`+)(?P<code>.+?)(?P=code_fence)"
     r"|!\[(?P<alt>[^\]]*)\]\((?P<src>[^)\s]+)\)"
     r"|\[(?P<label>[^\]]+)\]\((?P<href>[^)\s]+)\)"
     r"|\*\*(?P<strong>.+?)\*\*"
@@ -288,7 +292,19 @@ def _parse_blocks(lines: list[str]) -> list[dict[str, Any]]:
             while i < len(lines) and (match := _QUOTE.match(lines[i])):
                 quoted.append(match.group(1))
                 i += 1
-            inner = _parse_blocks(quoted)
+            inner: list[dict[str, Any]] = []
+            for child in _parse_blocks(quoted):
+                if child["type"] == "heading":
+                    child = {"type": "paragraph", "content": child.get("content", [])}
+                elif child["type"] == "rule":
+                    child = {
+                        "type": "paragraph",
+                        "content": [{"type": "text", "text": "---"}],
+                    }
+                if child["type"] == "blockquote":
+                    inner.extend(child["content"])
+                else:
+                    inner.append(child)
             if inner:
                 blocks.append({"type": "blockquote", "content": inner})
             continue
@@ -391,7 +407,9 @@ def _parse_inline(text: str, marks: tuple[dict[str, Any], ...] = ()) -> list[dic
         if match.start() > position:
             nodes.append(_text(text[position : match.start()], marks))
         position = match.end()
-        if match.group("code") is not None:
+        if match.group("escaped") is not None:
+            nodes.append(_text(match.group("escaped"), marks))
+        elif match.group("code") is not None:
             nodes.append(_text(match.group("code"), (*marks, {"type": "code"})))
         elif match.group("src") is not None:
             # An image becomes a link to it (decision 15): ADF media needs an upload.
@@ -409,11 +427,23 @@ def _parse_inline(text: str, marks: tuple[dict[str, Any], ...] = ()) -> list[dic
     return _merged(nodes)
 
 
+def _decode_commonmark_entities(text: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        reference = match.group()
+        if reference.startswith("&#"):
+            return unescape(reference)
+        return html5.get(reference[1:], reference)
+
+    return _ENTITY_REFERENCE.sub(replace, text)
+
+
 def _link(href: str) -> dict[str, Any]:
-    return {"type": "link", "attrs": {"href": href}}
+    return {"type": "link", "attrs": {"href": _decode_commonmark_entities(href)}}
 
 
 def _text(text: str, marks: tuple[dict[str, Any], ...]) -> dict[str, Any]:
+    if not any(mark["type"] == "code" for mark in marks):
+        text = _decode_commonmark_entities(text)
     node: dict[str, Any] = {"type": "text", "text": text}
     if marks:
         node["marks"] = list(marks)

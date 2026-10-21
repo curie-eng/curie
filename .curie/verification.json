@@ -1,0 +1,18 @@
+{
+  "checks": [
+    {
+      "id": "api",
+      "paths": ["apps/[!u]*/**", "packages/**", "runner/**", "tests/**", "conftest.py", "pyproject.toml", "uv.lock", ".curie/verification.json"],
+      "command": ["env", "CI_REQUIRE_POSTGRES_TESTS=1", "uv", "run", "pytest", "apps/api/tests", "-x", "-q"],
+      "install": ["uv", "sync", "--locked"],
+      "delegated_to": "Python (ruff + mypy + pytest)"
+    },
+    {
+      "id": "worker",
+      "paths": ["apps/[!u]*/**", "packages/**", "runner/**", "tests/**", "conftest.py", "pyproject.toml", "uv.lock", ".curie/verification.json"],
+      "command": ["env", "CI_REQUIRE_POSTGRES_TESTS=1", "uv", "run", "pytest", "apps/worker/tests", "-x", "-q"],
+      "install": ["uv", "sync", "--locked"],
+      "delegated_to": "Python (ruff + mypy + pytest)"
+    }
+  ]
+}

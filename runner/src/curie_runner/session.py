@@ -19,6 +19,7 @@ Responsibilities layered on the translation:
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import hmac
 import logging
@@ -329,9 +330,16 @@ class SessionRunner:
         attachment_notice: str | None = None,
         channel_kind: str | None = None,
         final_answer: FinalAnswerPolicy | None = None,
+        initializer: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self._final_answer = final_answer
         self._factory = session_factory
+        # Boot work that must finish before the first session exists, such as
+        # the declared verification preflight. It runs inside the shared start
+        # task, which is scheduled at application startup and does not block
+        # the listener from binding (#4777).
+        self._initializer = initializer
+        self._start_task: asyncio.Task[None] | None = None
         # The attachments this boot found, named on the first prompt sent
         # (#3691): the worker boots a sandbox for every turn that carries a
         # file, so that prompt is the message that carried them. Cleared once
@@ -791,15 +799,54 @@ class SessionRunner:
             )
         return result
 
-    async def start(self) -> None:
-        """Create and connect the model session (rehydrating if configured)."""
+    def begin_start(self) -> asyncio.Task[None]:
+        """Schedule the one shared initialization, once, and return its task.
 
+        The server calls this at startup without awaiting it, so the listener
+        answers while a slow preflight runs (#4777). A failure is logged here
+        and re-raised to every caller of ``start``.
+        """
+
+        if self._start_task is None:
+            task = asyncio.create_task(self._initialize())
+            task.add_done_callback(self._log_start_failure)
+            self._start_task = task
+        return self._start_task
+
+    @staticmethod
+    def _log_start_failure(task: asyncio.Task[None]) -> None:
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error("session start failed error_class=%s: %s", type(exc).__name__, exc)
+
+    async def _initialize(self) -> None:
+        if self._initializer is not None:
+            await self._initializer()
         self._advertised_tools = None
         self._session = self._factory()
         await self._session.connect()
         self._started = True
+        logger.info("session started session=%s", self._session_id)
+
+    async def start(self) -> None:
+        """Wait for the shared initialization, scheduling it if needed.
+
+        Runs the initializer, then creates and connects the model session
+        (rehydrating if configured). Every caller awaits the same task, and a
+        cancelled caller (a client disconnect) leaves it running for the rest.
+        """
+
+        await asyncio.shield(self.begin_start())
 
     async def close(self) -> None:
+        task = self._start_task
+        if task is not None and not task.done():
+            # Shutdown during a held preflight: cancelling kills the check's
+            # process group instead of waiting it out (#4777).
+            task.cancel()
+            await asyncio.wait({task})
         if self._session is not None:
             await self._session.close()
         self._tracer.shutdown()
@@ -828,6 +875,8 @@ class SessionRunner:
         if self._channel_read is not None:
             self._channel_read.end()
         async with self._turn_lock:
+            # Never race the boot initialization for the session slot.
+            await self.start()
             if self._session is not None:
                 await self._session.close()
             self._advertised_tools = None
@@ -945,7 +994,10 @@ class SessionRunner:
             # Accepted turn still in connector recovery: no query has been
             # sent, and run_turn checks the flag before sending one.
             return
-        if self._session is not None:
+        # The session object exists before connect() finishes; interrupting the
+        # unconnected SDK client raises and turns POST /v1/interrupt into a 500
+        # (#4777). `_started` is set right after connect in `_initialize`.
+        if self._session is not None and self._started:
             await self._session.interrupt()
 
     async def timeout(self, turn_epoch: str) -> bool:
@@ -958,8 +1010,7 @@ class SessionRunner:
 
         current_epoch = self._turn_epoch
         if (
-            self._session is None
-            or not self._turn_open
+            not self._turn_open
             or self._timeout_requested
             or current_epoch is None
             or not hmac.compare_digest(turn_epoch.encode("utf-8"), current_epoch.encode("utf-8"))
@@ -983,6 +1034,8 @@ class SessionRunner:
             # checks the flag after recovery and emits the timeout terminal.
             timeout_interrupt_settled.set()
             return True
+        # A ready turn always has a session: it is set before the turn's query.
+        assert self._session is not None
         try:
             await self._session.interrupt()
             # A delayed SDK acknowledgement can return after this turn has
@@ -1057,9 +1110,6 @@ class SessionRunner:
         admission_required: bool,
         progress: ProgressCapability | None,
     ) -> AsyncGenerator[str]:
-        if self._session is None:
-            raise RuntimeError("session not started")
-
         async with self._turn_lock:
             start = time.monotonic()
             self._interrupt_requested = False
@@ -1169,6 +1219,11 @@ class SessionRunner:
                                 )
                                 return
                             self._admission_gate = None
+                        # A turn that arrives while boot initialization runs
+                        # waits here, after admission so its epoch stays visible
+                        # (#4777). An initialization failure ends it through the
+                        # runner-error path below, before any model call.
+                        await self.start()
                         access_refusal = self._tool_access_refusal(event)
                         if access_refusal is not None:
                             # @spec RUNNER-TOOL-ACCESS-4 RUNNER-TOOL-ACCESS-5

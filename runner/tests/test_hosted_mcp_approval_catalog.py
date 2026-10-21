@@ -41,6 +41,7 @@ from curie_runner.history import TurnRecord, build_conversation_replay
 from curie_runner.mcp_tool_capability import probe_mcp_tool_capability
 from mcp.server import MCPServer
 from mcp.types import ToolAnnotations
+from runner_boot_session import initialized_session_sync
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import StreamingResponse
@@ -235,7 +236,7 @@ def _hook_denied(result: dict[str, Any]) -> bool:
 def _boot_captured(monkeypatch: pytest.MonkeyPatch, bundle: Path):
     monkeypatch.setattr(boot, "ClaudeAgentSession", _CapturedSession)
     runner = build_runner(_config_for(bundle), fake_model=False)
-    session = runner._factory()
+    session = initialized_session_sync(runner)
     assert isinstance(session, _CapturedSession)
     return runner, session.options
 
