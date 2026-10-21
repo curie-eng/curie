@@ -7,23 +7,28 @@ installation. It accepts only when:
 * every case of ``REQUIRED_CASES`` has exactly one passing observation, made
   for a fresh challenge and bound to this installation's tuple, by this
   installation's own producers or a signed channel reply;
-* the final tuple (permit, manifest, bootstrap, guard, execution
-  configuration, broker ``run_id``, runner image and artifact measurement)
-  equals the premeasured one;
+* the final tuple equals the premeasured one. The verifier observes it
+  itself, through one fresh ``FactProducer`` per ``TUPLE_FACTS`` member
+  (permit, manifest, bootstrap, guard, execution configuration, broker
+  ``run_id`` and artifact measurement), and through the design decision 7
+  observer's reading of each candidate user's rules, which must equal the
+  design decision 9 template G hashes, instantiated for this permit's lane;
 * revocation and the original workload's termination and absence were
   observed, which are the last two cases.
 
 Any missing, unavailable, skipped, timed-out, failed, foreign, stale or
-fake-model observation refuses. Only the pinned SDK primitive cases may be
-satisfied by a reused artifact observation, and only when it is content
-addressed and bound to the unchanged artifact tuple (clause 9). Installation
-observations are never reused.
+fake-model observation refuses, and so does any tuple or candidate rule
+observation that is unavailable. Only the pinned SDK primitive cases may be
+satisfied by reused evidence (clause 9): the record the measurement's
+``enforcement_evidence_ref`` names, recorded before the campaign, content
+addressed by that reference and bound to the unchanged artifact tuple and to
+M's runner image and bundle. Installation observations are never reused.
 
 Python objects cannot be sealed in-process, so the boundary is credential
 custody and object identity: the verifier alone holds the Qualification
 publisher and Readiness credentials and constructs the publishers only in
 ``_publish``, for the exact accepted ``Verdict`` object it returned, after
-re-measuring the tuple. A ``Verdict`` is a report; constructing or copying one
+observing the tuple again. A ``Verdict`` is a report; constructing or copying one
 grants nothing. Clause 6 orders the issuer's acceptance record between
 ``decide`` and ``publish``: ``publish`` takes that record and requires it to
 name this campaign, this verdict's evidence and the manifest's Qualification.
@@ -37,7 +42,7 @@ import hashlib
 import json
 import re
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, NoReturn, Protocol, Self
 from uuid import uuid4
 
@@ -51,9 +56,16 @@ from .authority_records import (
     _reject_number,
     _scalar,
 )
+from .commissioning_acl import commissioning_acl_rules, derive_commissioning_lane
 from .commissioning_bootstrap import CommissioningBootstrap
 from .commissioning_campaign_records import CommissioningAcceptance
-from .commissioning_provisioner import ProvisionerRefused, verify_tuple
+from .commissioning_producers import FactProducer
+from .commissioning_provisioner import (
+    ProvisionerRefused,
+    _rules_digest,
+    parse_guard_config,
+    verify_tuple,
+)
 from .commissioning_records import CommissioningPermit
 from .qualification_publication import QualificationPublisher, ReadinessPublisher
 from .worker_transport import WorkerCredential
@@ -62,14 +74,15 @@ __all__ = [
     "REAL_MODEL_CASES",
     "REQUIRED_CASES",
     "REUSABLE_CASES",
+    "TUPLE_FACTS",
     "ArtifactBinding",
     "CaseObservation",
+    "CandidateRuleReader",
     "CaseProducer",
     "CommissioningVerifier",
     "InstallationTuple",
     "Publication",
     "PublicationInputs",
-    "ReusedArtifactObservation",
     "Verdict",
     "VerifierRefused",
 ]
@@ -107,9 +120,24 @@ REAL_MODEL_CASES = frozenset({"positive-delivery"})
 # Clause 9: pinned SDK primitive observations for the runner image and runtime
 # profile are artifact observations. Every other case observes the installation.
 REUSABLE_CASES = frozenset({"static-skill-loading", "clean-session", "read-only-tool-restriction"})
+# The final tuple, each observed by its own producer as a lowercase SHA-256:
+# the record digests, ``sha256(G)``, the execution digest, the SHA-256 of the
+# broker's ASCII ``run_id`` and the artifact measurement digest.
+TUPLE_FACTS: tuple[str, ...] = (
+    "permit",
+    "manifest",
+    "bootstrap",
+    "guard",
+    "execution_config",
+    "broker_run_id",
+    "artifact",
+)
+# Design decision 9: the candidate principals' rules name the campaign lane.
+CANDIDATE_PRINCIPALS = ("candidate_enqueue", "candidate_worker")
+LANE_PLACEHOLDER = "{lane}"
 _PROVENANCES = frozenset({"installation-producer", "signed-reply"})
 _REUSED = "reused-artifact"
-_ARTIFACT_RECORD = "commissioning_artifact_observation"
+_EVIDENCE_RECORD = "commissioning_artifact_evidence"
 _DIGEST = re.compile(r"[0-9a-f]{64}")
 _ENTRY = re.compile(r"[a-z0-9][a-z0-9._/-]{0,127}")
 _MAX_REUSED_BYTES = 16384
@@ -214,19 +242,36 @@ class InstallationTuple:
             _encode({name: getattr(self, name) for name in self.__dataclass_fields__})
         ).hexdigest()
 
+    def facts(self) -> dict[str, str]:
+        """The digest each ``TUPLE_FACTS`` producer must observe."""
+        return {
+            "permit": self.permit,
+            "manifest": self.manifest,
+            "bootstrap": self.bootstrap,
+            "guard": self.guard,
+            "execution_config": self.execution_config,
+            "broker_run_id": hashlib.sha256(self.broker_run_id.encode("ascii")).hexdigest(),
+            "artifact": self.artifact,
+        }
+
 
 @dataclass(frozen=True, slots=True)
 class ArtifactBinding:
-    """Clause 9's exact artifact tuple: images and image IDs per platform, projection."""
+    """Clause 9's exact artifact tuple.
+
+    M's pinned runner image and bundle, the image digest and observed image ID
+    per platform with its runtime profile, and the launch projection.
+    """
 
     runner_image: str
+    bundle: tuple[tuple[str, str], ...]
     launch_projection: str
     platforms: tuple[tuple[tuple[str, Any], ...], ...]
 
     @classmethod
-    def of(cls, measurement: ArtifactMeasurement) -> Self:
-        _require(type(measurement) is ArtifactMeasurement)
-        a = measurement.as_dict()
+    def of(cls, measurement: ArtifactMeasurement, manifest: Manifest) -> Self:
+        _require(type(measurement) is ArtifactMeasurement and type(manifest) is Manifest)
+        a, m = measurement.as_dict(), manifest.as_dict()
         members = (
             "os",
             "architecture",
@@ -238,13 +283,16 @@ class ArtifactBinding:
         platforms = tuple(
             tuple((name, row[name]) for name in members) for row in a["platform_mappings"]
         )
-        digests = {row["oci_digest"] for row in a["platform_mappings"]}
-        _require(len(digests) == 1)
-        return cls(digests.pop(), a["launch_projection"]["sha256"], platforms)
+        # Every platform runs M's pinned runner image.
+        runner = m["runner_image_digest"]
+        _require(all(row["oci_digest"] == runner for row in a["platform_mappings"]))
+        bundle = tuple(sorted(m["bundle_digest"].items()))
+        return cls(runner, bundle, a["launch_projection"]["sha256"], platforms)
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "runner_image": self.runner_image,
+            "bundle": dict(self.bundle),
             "launch_projection": self.launch_projection,
             "platforms": [dict(row) for row in self.platforms],
         }
@@ -285,12 +333,15 @@ class CaseProducer(Protocol):
     async def observe(self, installation_digest: str, challenge: str) -> CaseObservation: ...
 
 
-@dataclass(frozen=True, slots=True)
-class ReusedArtifactObservation:
-    """An independently recorded, content-addressed artifact observation (clause 9)."""
+class CandidateRuleReader(Protocol):
+    """The design decision 7 ACL observer's reading of one user's rules.
 
-    content_digest: str
-    raw: bytes = field(repr=False)
+    It returns the user's rules as the broker reports them, normalized to the
+    recipe token form ``commissioning_acl_rules`` returns; it raises when the
+    user cannot be read. There is no default implementation.
+    """
+
+    async def rules(self, username: str) -> tuple[str, ...]: ...
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -379,18 +430,21 @@ def _entries_pass(entries: object) -> bool | None:
     return passed
 
 
-def _reused_observation(
-    case: str,
-    reused: ReusedArtifactObservation,
-    binding: ArtifactBinding,
-    tuple_: InstallationTuple,
-) -> CaseObservation | None:
-    """Re-validate a reused artifact observation against the current artifact tuple."""
+def _artifact_evidence(
+    raw: object, measurement: ArtifactMeasurement, binding: ArtifactBinding
+) -> dict[str, str] | None:
+    """Clause 9: the reused evidence record, re-validated; ``None`` when it does not hold.
+
+    The record is the one the measurement's ``enforcement_evidence_ref`` names,
+    so it was recorded before the campaign and is content addressed by a
+    measured value, never by a digest supplied beside it.
+    """
     try:
-        raw = reused.raw
         _require(type(raw) is bytes and 0 < len(raw) <= _MAX_REUSED_BYTES)
-        _require(_hex(reused.content_digest))
-        _require(hashlib.sha256(raw).hexdigest() == reused.content_digest)
+        assert isinstance(raw, bytes)
+        reference = measurement.as_dict()["enforcement_evidence_ref"]
+        _require(type(reference) is str and reference.startswith("sha256:"))
+        _require(hashlib.sha256(raw).hexdigest() == reference.removeprefix("sha256:"))
         value = json.loads(
             raw.decode("ascii"),
             object_pairs_hook=_pairs,
@@ -399,32 +453,48 @@ def _reused_observation(
         )
         _require(type(value) is dict and _encode(value) == raw)
         _require(
-            value.keys()
-            == {
-                "schema_version",
-                "record_type",
-                "case",
-                "artifact_binding",
-                "outcome",
-                "evidence_sha256",
-            }
+            value.keys() == {"schema_version", "record_type", "artifact_binding", "observations"}
         )
         _require(type(value["schema_version"]) is int and value["schema_version"] == 1)
-        _require(value["record_type"] == _ARTIFACT_RECORD and value["case"] == case)
+        _require(value["record_type"] == _EVIDENCE_RECORD)
         _require(value["artifact_binding"] == binding.as_dict())
-        _require(value["outcome"] == "pass" and _hex(value["evidence_sha256"]))
+        observations = value["observations"]
+        _require(type(observations) is dict and bool(observations))
+        _require(set(observations) <= REUSABLE_CASES)
+        evidence: dict[str, str] = {}
+        for case, row in observations.items():
+            _require(type(row) is dict and row.keys() == {"outcome", "evidence_sha256"})
+            _require(row["outcome"] == "pass" and _hex(row["evidence_sha256"]))
+            evidence[case] = row["evidence_sha256"]
+        return evidence
     except (VerifierRefused, AuthorityRecordInvalid, UnicodeDecodeError, ValueError):
         return None
-    return CaseObservation(
-        case=case,
-        installation_digest=tuple_.digest,
-        challenge="",
-        outcome="pass",
-        provenance=_REUSED,
-        model="none",
-        execution_config=tuple_.execution_config,
-        evidence_sha256=reused.content_digest,
-    )
+
+
+def _fact(producer: FactProducer) -> str:
+    return str(producer.fact)
+
+
+def _candidate_rules(
+    permit: CommissioningPermit, guard_config: bytes
+) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """Design decision 9: G hashes each candidate template; instantiate it for this lane."""
+    try:
+        lane = derive_commissioning_lane(permit).prefix
+        broker_acl = parse_guard_config(guard_config)["broker_acl"]
+        instantiated = []
+        for role in CANDIDATE_PRINCIPALS:
+            rules = commissioning_acl_rules(role, permit=permit)
+            _require(all(LANE_PLACEHOLDER not in rule for rule in rules))
+            template = tuple(rule.replace(lane, LANE_PLACEHOLDER) for rule in rules)
+            _require(template != rules)
+            _require(broker_acl[role]["rules_sha256"] == _rules_digest(template))
+            instantiated.append((role, rules))
+        return tuple(instantiated)
+    except VerifierRefused:
+        raise
+    except (ProvisionerRefused, KeyError, TypeError, ValueError):
+        _refuse()
 
 
 class CommissioningVerifier:
@@ -439,8 +509,9 @@ class CommissioningVerifier:
         manifest: Manifest,
         measurement: ArtifactMeasurement,
         producers: Mapping[str, CaseProducer],
-        reused: Mapping[str, ReusedArtifactObservation],
-        remeasure: Callable[[], Awaitable[InstallationTuple]],
+        artifact_evidence: bytes | None,
+        tuple_producers: tuple[FactProducer, ...],
+        candidate_rules: CandidateRuleReader,
         publication: PublicationInputs,
         case_timeout_s: float = 120.0,
     ) -> None:
@@ -451,20 +522,31 @@ class CommissioningVerifier:
             manifest=manifest,
             measurement=measurement,
         )
-        self._binding = ArtifactBinding.of(measurement)
-        _require(isinstance(producers, Mapping) and isinstance(reused, Mapping))
-        _require(set(producers) <= set(REQUIRED_CASES))
+        self._binding = ArtifactBinding.of(measurement, manifest)
+        self._candidates = _candidate_rules(permit, guard_config)
+        credentials = bootstrap.as_dict()["candidate_credentials"]
+        self._usernames = {
+            "candidate_enqueue": credentials["enqueue"]["id"],
+            "candidate_worker": credentials["worker"]["id"],
+        }
+        _require(isinstance(producers, Mapping) and set(producers) <= set(REQUIRED_CASES))
         _require(all(callable(getattr(p, "observe", None)) for p in producers.values()))
-        # Installation observations are never reused, and no case is ambiguous.
-        _require(set(reused) <= REUSABLE_CASES and not set(reused) & set(producers))
-        _require(all(type(r) is ReusedArtifactObservation for r in reused.values()))
-        _require(callable(remeasure) and type(publication) is PublicationInputs)
+        _require(artifact_evidence is None or type(artifact_evidence) is bytes)
+        # Exactly one producer per tuple fact; the verifier, not the caller,
+        # compares what each observes with the premeasured value.
+        _require(type(tuple_producers) is tuple)
+        facts = [getattr(producer, "fact", None) for producer in tuple_producers]
+        _require(sorted(facts, key=str) == sorted(TUPLE_FACTS))
+        _require(all(callable(getattr(p, "observe", None)) for p in tuple_producers))
+        _require(callable(getattr(candidate_rules, "rules", None)))
+        _require(type(publication) is PublicationInputs)
         _require(type(case_timeout_s) in (int, float) and 0 < case_timeout_s <= 900)
         self._bootstrap, self._guard_config = bootstrap, guard_config
-        self._manifest = manifest
+        self._manifest, self._measurement = manifest, measurement
         self._record_id = "sha256:" + measurement.digest
-        self._producers, self._reused = dict(producers), dict(reused)
-        self._remeasure, self._publication = remeasure, publication
+        self._producers, self._evidence = dict(producers), artifact_evidence
+        self._tuple_producers = {_fact(producer): producer for producer in tuple_producers}
+        self._rules, self._publication = candidate_rules, publication
         self._timeout = float(case_timeout_s)
         self._decided = False
         self._accepted: Verdict | None = None
@@ -477,22 +559,31 @@ class CommissioningVerifier:
     def _refused(self, reason: str, observed: list[CaseObservation]) -> Verdict:
         return Verdict("refused", reason, self._tuple.digest, None, tuple(observed))
 
-    async def _current(self) -> bool:
+    async def _current(self) -> str | None:
+        """Observe the tuple and the candidate rules now; the refusal reason, if any."""
         try:
-            current = await self._remeasure()
-        except Exception:  # noqa: BLE001 -- an unavailable remeasurement never matches.
-            return False
-        return type(current) is InstallationTuple and current == self._tuple
+            async with asyncio.timeout(self._timeout):
+                names = tuple(self._tuple_producers)
+                values = await asyncio.gather(
+                    *(self._tuple_producers[name].observe() for name in names)
+                )
+            if dict(zip(names, values, strict=True)) != self._tuple.facts():
+                return "changed-installation"
+        except Exception:  # noqa: BLE001 -- an unavailable observation never matches.
+            return "changed-installation"
+        try:
+            async with asyncio.timeout(self._timeout):
+                for role, expected in self._candidates:
+                    observed = await self._rules.rules(self._usernames[role])
+                    if type(observed) is not tuple or observed != expected:
+                        return "candidate-rules"
+        except Exception:  # noqa: BLE001
+            return "candidate-rules"
+        return None
 
     async def _observe(self, case: str, observed: list[CaseObservation]) -> str | None:
         """Observe one case; the refusal reason, or ``None`` when it passed."""
         tuple_ = self._tuple
-        if case in self._reused:
-            value = _reused_observation(case, self._reused[case], self._binding, tuple_)
-            if value is None:
-                return "reuse:" + case
-            observed.append(value)
-            return None
         challenge = str(uuid4())
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self._timeout
@@ -531,20 +622,43 @@ class CommissioningVerifier:
         observed.append(value)
         return None
 
+    def _reused(self, case: str, evidence: str) -> CaseObservation:
+        return CaseObservation(
+            case=case,
+            installation_digest=self._tuple.digest,
+            challenge="",
+            outcome="pass",
+            provenance=_REUSED,
+            model="none",
+            execution_config=self._tuple.execution_config,
+            evidence_sha256=evidence,
+        )
+
     async def decide(self) -> Verdict:
-        """Observe every case once, in order, then re-measure the tuple."""
+        """Observe every case once, in order, then observe the tuple again."""
         _require(not self._decided)
         self._decided = True
         observed: list[CaseObservation] = []
+        reused: dict[str, str] = {}
+        if self._evidence is not None:
+            parsed = _artifact_evidence(self._evidence, self._measurement, self._binding)
+            # Installation observations are never reused, and no case is ambiguous.
+            if parsed is None or set(parsed) & set(self._producers):
+                return self._refused("reuse", [])
+            reused = parsed
         for case in REQUIRED_CASES:
-            if case not in self._producers and case not in self._reused:
+            if case not in self._producers and case not in reused:
                 return self._refused("missing:" + case, [])
         for case in REQUIRED_CASES:
+            if case in reused:
+                observed.append(self._reused(case, reused[case]))
+                continue
             reason = await self._observe(case, observed)
             if reason is not None:
                 return self._refused(reason, observed)
-        if not await self._current():
-            return self._refused("changed-installation", observed)
+        reason = await self._current()
+        if reason is not None:
+            return self._refused(reason, observed)
         evidence = hashlib.sha256(
             _encode(
                 {
@@ -601,9 +715,10 @@ class CommissioningVerifier:
             raise
 
     async def _publish(self) -> Publication:
-        """The accepted branch: re-measure, connect both writers, then write."""
-        if not await self._current():
-            return Publication("refused", "changed-installation")
+        """The accepted branch: observe the tuple again, connect both writers, then write."""
+        reason = await self._current()
+        if reason is not None:
+            return Publication("refused", reason)
         p = self._publication
         writers: list[QualificationPublisher | ReadinessPublisher] = []
         qualification: Qualification | None = None

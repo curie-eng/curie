@@ -4,7 +4,8 @@ Every producer here is a fake: the tests prove the decision rule and the
 publication gate, never an installation. Missing, unavailable, skipped,
 timed-out, failed, foreign, stale, replayed and fake-model observations each
 refuse, and the Qualification and Readiness publishers are constructed only on
-the accepted branch, after the tuple is re-measured.
+the accepted branch, after the verifier observes the tuple again through its
+own fact producers and candidate rule reader.
 """
 
 from __future__ import annotations
@@ -24,7 +25,8 @@ from typing import Any
 import pytest
 
 from .test_commissioning_bootstrap import encoded
-from .test_commissioning_provisioner import built
+from .test_commissioning_provisioner import PRINCIPALS, built, profile
+from .test_commissioning_provisioner import module as provisioner
 from .test_commissioning_records import permit_value
 
 EVIDENCE = "ab" * 32
@@ -44,11 +46,9 @@ def canonical(value: Any) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
 
 
-def records(**permit_changes: Any) -> dict[str, Any]:
-    """B, G, M and the measurement from the provisioner core, plus a permit bound to them."""
+def permit_for(provisioned: Any, **changes: Any) -> Any:
     from curie_protected_hooks.commissioning_records import parse_commissioning_permit
 
-    provisioned = built()
     m = provisioned.manifest.as_dict()
     p = permit_value()
     for member in (
@@ -61,9 +61,83 @@ def records(**permit_changes: Any) -> dict[str, Any]:
         p[member] = copy.deepcopy(m[member])
     p["manifest_digest"] = provisioned.manifest.digest
     p["bootstrap_digest"] = provisioned.bootstrap.digest
-    p.update(permit_changes)
+    p.update(changes)
+    return parse_commissioning_permit(encoded(p))
+
+
+def lane_prefix(permit: Any) -> str:
+    from curie_protected_hooks.commissioning_acl import derive_commissioning_lane
+
+    return str(derive_commissioning_lane(permit).prefix)
+
+
+def template(role: str, permit: Any) -> tuple[str, ...]:
+    """Design decision 9: the candidate recipe with the lane prefix as ``{lane}``."""
+    from curie_protected_hooks.commissioning_acl import commissioning_acl_rules
+
+    prefix = lane_prefix(permit)
+    return tuple(r.replace(prefix, "{lane}") for r in commissioning_acl_rules(role, permit=permit))
+
+
+class Recipes:
+    """Stand-in rules for installation principals; decision 9 templates for candidates."""
+
+    def __init__(self, candidates: dict[str, tuple[str, ...]] | None = None) -> None:
+        sample = permit_value_for_templates()
+        self.candidates = candidates or {
+            role: template(role, sample) for role in ("candidate_enqueue", "candidate_worker")
+        }
+
+    def rules(self, principal: str) -> tuple[str, ...]:
+        if principal in self.candidates:
+            return self.candidates[principal]
+        assert principal in PRINCIPALS
+        return ("-@all", "resetkeys", "+acl|whoami", "%R~protected:example:" + principal + ":*")
+
+
+def permit_value_for_templates() -> Any:
+    """Any permit gives the same template; a different campaign proves it."""
+    return permit_for(built(), campaign_id="99999999-9999-4999-8999-999999999999")
+
+
+def provision(*, evidence_ref: str | None = None, recipes: Recipes | None = None) -> Any:
+    changes = {} if evidence_ref is None else {"enforcement_evidence_ref": evidence_ref}
+    return provisioner().construct(profile(**changes), acl=recipes or Recipes())
+
+
+def evidence_record(
+    provisioned: Any,
+    *,
+    cases: Any = None,
+    mutate: Callable[[dict[str, Any]], None] | None = None,
+) -> bytes:
+    """Clause 9 evidence: the record the measurement's ``enforcement_evidence_ref`` names."""
+    binding = module().ArtifactBinding.of(provisioned.measurement, provisioned.manifest).as_dict()
+    value: dict[str, Any] = {
+        "schema_version": 1,
+        "record_type": "commissioning_artifact_evidence",
+        "artifact_binding": binding,
+        "observations": {
+            case: {"outcome": "pass", "evidence_sha256": EVIDENCE}
+            for case in (cases if cases is not None else sorted(module().REUSABLE_CASES))
+        },
+    }
+    if mutate is not None:
+        mutate(value)
+    return canonical(value)
+
+
+def records(
+    *, evidence: bytes | None = None, recipes: Recipes | None = None, **permit_changes: Any
+) -> dict[str, Any]:
+    """B, G, M and the measurement from the provisioner core, plus a permit bound to them.
+
+    With ``evidence``, the measurement's ``enforcement_evidence_ref`` names it.
+    """
+    ref = None if evidence is None else "sha256:" + hashlib.sha256(evidence).hexdigest()
+    provisioned = provision(evidence_ref=ref, recipes=recipes)
     return {
-        "permit": parse_commissioning_permit(encoded(p)),
+        "permit": permit_for(provisioned, **permit_changes),
         "bootstrap": provisioned.bootstrap,
         "guard_config": provisioned.guard_config,
         "manifest": provisioned.manifest,
@@ -208,32 +282,82 @@ def publication(r: dict[str, Any], **changes: Any) -> Any:
     return module().PublicationInputs(**values)
 
 
+class Fact:
+    """A fake tuple fact producer: reports ``observed[fact]`` freshly on each call."""
+
+    def __init__(self, harness: Harness, fact: str) -> None:
+        self.harness, self._fact = harness, fact
+        self.calls = 0
+
+    @property
+    def fact(self) -> str:
+        return self._fact
+
+    async def observe(self) -> str:
+        self.calls += 1
+        value = self.harness.observed[self._fact]
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+
+class Rules:
+    """A fake decision 7 observer reading of each candidate user's rules."""
+
+    def __init__(self, harness: Harness) -> None:
+        self.harness = harness
+        self.calls: list[str] = []
+
+    async def rules(self, username: str) -> Any:
+        self.calls.append(username)
+        value = self.harness.candidate_rules[username]
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+
 class Harness:
-    def __init__(self, **permit_changes: Any) -> None:
-        self.records = records(**permit_changes)
+    def __init__(self, *, evidence: bytes | None = None, **permit_changes: Any) -> None:
+        from curie_protected_hooks.commissioning_acl import commissioning_acl_rules
+
+        self.records = records(evidence=evidence, **permit_changes)
+        self.evidence = evidence
         self.tuple = tuple_of(self.records)
         execution = self.records["manifest"].as_dict()["execution_config_digest"]
         self.producers: dict[str, Any] = {
             case: Producer(case, execution) for case in module().REQUIRED_CASES
         }
-        self.reused: dict[str, Any] = {}
-        self.current: Any = self.tuple
-        self.remeasured = 0
+        self.observed: dict[str, Any] = self.tuple.facts()
+        self.facts = tuple(Fact(self, fact) for fact in module().TUPLE_FACTS)
+        credentials = self.records["bootstrap"].as_dict()["candidate_credentials"]
+        permit = self.records["permit"]
+        self.usernames = {
+            "candidate_enqueue": credentials["enqueue"]["id"],
+            "candidate_worker": credentials["worker"]["id"],
+        }
+        # Each candidate user holds its template instantiated for this permit's lane.
+        self.candidate_rules: dict[str, Any] = {
+            self.usernames[role]: commissioning_acl_rules(role, permit=permit)
+            for role in self.usernames
+        }
+        self.reader = Rules(self)
         self.timeout = 2.0
         self.publication = publication(self.records)
 
-    async def remeasure(self) -> Any:
-        self.remeasured += 1
-        if isinstance(self.current, BaseException):
-            raise self.current
-        return self.current
+    @property
+    def observations(self) -> int:
+        """How many times every tuple fact was observed (they move together)."""
+        counts = {fact.calls for fact in self.facts}
+        assert len(counts) == 1
+        return counts.pop()
 
     def verifier(self) -> Any:
         return module().CommissioningVerifier(
             **self.records,
             producers=self.producers,
-            reused=self.reused,
-            remeasure=self.remeasure,
+            artifact_evidence=self.evidence,
+            tuple_producers=self.facts,
+            candidate_rules=self.reader,
             publication=self.publication,
             case_timeout_s=self.timeout,
         )
@@ -348,7 +472,9 @@ def test_every_case_passing_accepts_without_constructing_a_publisher(monkeypatch
         assert digest == h.tuple.digest
         challenges.add(challenge)
     assert len(challenges) == len(h.producers)
-    assert h.remeasured == 1
+    # The verifier observed every tuple fact and both candidate users once.
+    assert h.observations == 1
+    assert sorted(h.reader.calls) == sorted(h.usernames.values())
     # Acceptance alone constructs nothing.
     assert connections.events == []
 
@@ -375,8 +501,9 @@ def test_publish_after_acceptance_constructs_both_publishers_in_order(monkeypatc
         "close-qualification",
         "close-readiness",
     ]
-    # The tuple is re-measured again on the accepted branch, before any write.
-    assert h.remeasured == 2
+    # The tuple is observed again on the accepted branch, before any write.
+    assert h.observations == 2
+    assert len(h.reader.calls) == 4
     r = h.records
     args, options = connections.qualification_connect
     assert args[0] is r["manifest"] or args[0].digest == r["manifest"].digest
@@ -561,42 +688,91 @@ def test_the_first_refusal_stops_observation() -> None:
     order = module().REQUIRED_CASES
     after = order[order.index("broker-restart") + 1 :]
     assert all(not h.producers[case].calls for case in after)
-    # The tuple is never re-measured for a refused campaign.
-    assert h.remeasured == 0
+    # The tuple is never observed for a refused campaign.
+    assert h.observations == 0
 
 
-# --- The final tuple equals the premeasured one ------------------------------
+# --- The verifier observes the final tuple itself ------------------------------
 
 
-TUPLE_CHANGES = {
-    "manifest": "11" * 32,
-    "bootstrap": "22" * 32,
-    "guard": "33" * 32,
-    "execution_config": "44" * 32,
-    "broker_run_id": "c" * 40,
-    "permit": "55" * 32,
-    "artifact": "66" * 32,
-    "runner_image": "sha256:" + "7" * 64,
-}
-
-
-@pytest.mark.parametrize("member", sorted(TUPLE_CHANGES))
-def test_a_changed_final_tuple_refuses(monkeypatch, member: str) -> None:
+@pytest.mark.parametrize(
+    "fact",
+    ["permit", "manifest", "bootstrap", "guard", "execution_config", "broker_run_id", "artifact"],
+)
+def test_a_changed_tuple_fact_refuses(monkeypatch, fact: str) -> None:
     h = Harness()
-    h.current = dataclasses.replace(h.tuple, **{member: TUPLE_CHANGES[member]})
+    h.observed[fact] = "cd" * 32
     refuses_without_publishers(monkeypatch, h, "changed-installation")
 
 
-def test_an_unavailable_remeasurement_refuses(monkeypatch) -> None:
+def test_tuple_facts_name_the_records_by_digest() -> None:
     h = Harness()
-    h.current = RuntimeError("broker unreachable")
+    r = h.records
+    assert module().TUPLE_FACTS == (
+        "permit",
+        "manifest",
+        "bootstrap",
+        "guard",
+        "execution_config",
+        "broker_run_id",
+        "artifact",
+    )
+    assert h.tuple.facts() == {
+        "permit": r["permit"].digest,
+        "manifest": r["manifest"].digest,
+        "bootstrap": r["bootstrap"].digest,
+        "guard": hashlib.sha256(r["guard_config"]).hexdigest(),
+        "execution_config": r["manifest"].as_dict()["execution_config_digest"],
+        "broker_run_id": hashlib.sha256(
+            r["manifest"].as_dict()["broker_identity"]["run_id"].encode()
+        ).hexdigest(),
+        "artifact": r["measurement"].digest,
+    }
+
+
+def test_another_installations_observed_tuple_refuses(monkeypatch) -> None:
+    """The producers observe what is installed; another installation's tuple never matches."""
+    h = Harness()
+    other = tuple_of(records(campaign_id="77777777-7777-4777-8777-777777777777"))
+    h.observed = other.facts()
     refuses_without_publishers(monkeypatch, h, "changed-installation")
 
 
-def test_a_lookalike_remeasurement_refuses(monkeypatch) -> None:
+@pytest.mark.parametrize("value", [RuntimeError("broker unreachable"), "CD" * 32, None, b"x"])
+def test_an_unavailable_or_malformed_tuple_observation_refuses(monkeypatch, value: Any) -> None:
     h = Harness()
-    h.current = dataclasses.asdict(h.tuple)
+    h.observed["guard"] = value
     refuses_without_publishers(monkeypatch, h, "changed-installation")
+
+
+def test_a_tuple_producer_that_never_answers_refuses(monkeypatch) -> None:
+    h = Harness()
+    h.timeout = 0.05
+
+    class Hung(Fact):
+        async def observe(self) -> str:
+            await asyncio.sleep(5)
+            return ""
+
+    h.facts = (*h.facts[:-1], Hung(h, "artifact"))
+    connections = Connections(monkeypatch)
+    refused(run(h.verifier().decide()), "changed-installation")
+    assert connections.events == []
+
+
+@pytest.mark.parametrize("change", ["missing", "duplicate", "extra", "not-a-tuple"])
+def test_exactly_one_producer_per_tuple_fact(change: str) -> None:
+    h = Harness()
+    facts = list(h.facts)
+    if change == "missing":
+        facts.pop()
+    elif change == "duplicate":
+        facts[-1] = Fact(h, "permit")
+    elif change == "extra":
+        facts.append(Fact(h, "control_profile"))
+    h.facts = facts if change == "not-a-tuple" else tuple(facts)  # type: ignore[assignment]
+    with pytest.raises(module().VerifierRefused):
+        h.verifier()
 
 
 def test_a_tuple_change_between_acceptance_and_publication_constructs_nothing(
@@ -609,13 +785,108 @@ def test_a_tuple_change_between_acceptance_and_publication_constructs_nothing(
         verifier = h.verifier()
         verdict = await verifier.decide()
         assert verdict.accepted
-        h.current = dataclasses.replace(h.tuple, broker_run_id="c" * 40)
+        h.observed["broker_run_id"] = hashlib.sha256(b"c" * 40).hexdigest()
         return await verifier.publish(verdict, h.acceptance(verdict))
 
     result = run(scenario())
     assert result.outcome == "refused" and result.reason == "changed-installation"
     assert result.qualification is None and result.readiness is None
     assert connections.events == []
+
+
+# --- Candidate rules: design decision 9 -------------------------------------------
+
+
+def other_lane_rules(role: str) -> tuple[str, ...]:
+    from curie_protected_hooks.commissioning_acl import commissioning_acl_rules
+
+    other = records(campaign_id="77777777-7777-4777-8777-777777777777")["permit"]
+    return tuple(commissioning_acl_rules(role, permit=other))
+
+
+CANDIDATE_ATTACKS: dict[str, Callable[[str, tuple[str, ...]], Any]] = {
+    "other-lane": lambda role, rules: other_lane_rules(role),
+    "extra-rule": lambda role, rules: (*rules, "+keys"),
+    "missing-rule": lambda role, rules: rules[:-1],
+    "reordered": lambda role, rules: tuple(reversed(rules)),
+    "list": lambda role, rules: list(rules),
+    "unavailable": lambda role, rules: RuntimeError("NOPERM"),
+}
+
+
+@pytest.mark.parametrize("role", ["candidate_enqueue", "candidate_worker"])
+@pytest.mark.parametrize("name", sorted(CANDIDATE_ATTACKS))
+def test_candidate_rules_must_equal_the_template_for_this_permits_lane(
+    monkeypatch, role: str, name: str
+) -> None:
+    h = Harness()
+    username = h.usernames[role]
+    h.candidate_rules[username] = CANDIDATE_ATTACKS[name](role, h.candidate_rules[username])
+    refuses_without_publishers(monkeypatch, h, "candidate-rules")
+
+
+@pytest.mark.parametrize("role", ["candidate_enqueue", "candidate_worker"])
+def test_an_uninstantiated_template_refuses(monkeypatch, role: str) -> None:
+    h = Harness()
+    h.candidate_rules[h.usernames[role]] = template(role, h.records["permit"])
+    refuses_without_publishers(monkeypatch, h, "candidate-rules")
+
+
+def test_a_candidate_rule_change_before_publication_constructs_nothing(monkeypatch) -> None:
+    connections = Connections(monkeypatch)
+    h = Harness()
+
+    async def scenario() -> Any:
+        verifier = h.verifier()
+        verdict = await verifier.decide()
+        assert verdict.accepted
+        username = h.usernames["candidate_worker"]
+        h.candidate_rules[username] = other_lane_rules("candidate_worker")
+        return await verifier.publish(verdict, h.acceptance(verdict))
+
+    result = run(scenario())
+    assert result.outcome == "refused" and result.reason == "candidate-rules"
+    assert connections.events == []
+
+
+def test_a_guard_that_hashes_instantiated_rules_instead_of_the_template_refuses() -> None:
+    """Only the enqueue recipe fits the provisioner's rule bound once instantiated."""
+    role = "candidate_enqueue"
+    from curie_protected_hooks.commissioning_acl import commissioning_acl_rules
+
+    sample = permit_value_for_templates()
+    candidates = {r: template(r, sample) for r in ("candidate_enqueue", "candidate_worker")}
+    candidates[role] = tuple(commissioning_acl_rules(role, permit=sample))
+    h = Harness()
+    h.records = records(recipes=Recipes(candidates))
+    with pytest.raises(module().VerifierRefused):
+        h.verifier()
+
+
+def test_a_guard_whose_candidate_rules_are_not_the_recipe_template_refuses() -> None:
+    from .test_commissioning_provisioner import Recipes as StandIn
+
+    h = Harness()
+    h.records = records(recipes=StandIn())  # type: ignore[arg-type]
+    with pytest.raises(module().VerifierRefused):
+        h.verifier()
+
+
+@pytest.mark.parametrize("reader", [None, object(), "rules"])
+def test_a_candidate_rule_reader_is_required(reader: Any) -> None:
+    h = Harness()
+    h.reader = reader
+    with pytest.raises(module().VerifierRefused):
+        h.verifier()
+
+
+def test_the_template_is_the_same_for_every_campaign() -> None:
+    a = records()["permit"]
+    b = records(campaign_id="77777777-7777-4777-8777-777777777777")["permit"]
+    assert lane_prefix(a) != lane_prefix(b)
+    for role in ("candidate_enqueue", "candidate_worker"):
+        assert template(role, a) == template(role, b)
+        assert any("{lane}" in rule for rule in template(role, a))
 
 
 # --- Measuring the installation tuple -----------------------------------------
@@ -695,28 +966,22 @@ def test_lookalike_records_refuse_measurement(member: str) -> None:
 # --- Evidence reuse (clause 9) -------------------------------------------------
 
 
-def artifact_observation(r: dict[str, Any], case: str, /, **changes: Any) -> Any:
-    binding = module().ArtifactBinding.of(r["measurement"]).as_dict()
-    value: dict[str, Any] = {
-        "schema_version": 1,
-        "record_type": "commissioning_artifact_observation",
-        "case": case,
-        "artifact_binding": binding,
-        "outcome": "pass",
-        "evidence_sha256": EVIDENCE,
-    }
-    value.update(changes)
-    raw = canonical(value)
-    return module().ReusedArtifactObservation(
-        content_digest=hashlib.sha256(raw).hexdigest(), raw=raw
-    )
+def reused_harness(**options: Any) -> Harness:
+    """Evidence for ``cases`` named by the measurement's ``enforcement_evidence_ref``."""
+    cases = options.get("cases", sorted(module().REUSABLE_CASES))
+    raw = evidence_record(provision(), **options)
+    h = Harness(evidence=raw)
+    for case in cases:
+        h.producers.pop(case, None)
+    return h
 
 
-def test_artifact_binding_names_image_digests_image_ids_projection_and_runtime_profile() -> None:
+def test_artifact_binding_names_m_images_image_ids_bundle_projection_and_profile() -> None:
     r = records()
-    binding = module().ArtifactBinding.of(r["measurement"]).as_dict()
-    measurement = r["measurement"].as_dict()
-    assert binding["runner_image"] == r["manifest"].as_dict()["runner_image_digest"]
+    binding = module().ArtifactBinding.of(r["measurement"], r["manifest"]).as_dict()
+    measurement, m = r["measurement"].as_dict(), r["manifest"].as_dict()
+    assert binding["runner_image"] == m["runner_image_digest"]
+    assert binding["bundle"] == m["bundle_digest"]
     assert binding["launch_projection"] == measurement["launch_projection"]["sha256"]
     (row,) = measurement["platform_mappings"]
     assert binding["platforms"] == [
@@ -731,38 +996,62 @@ def test_artifact_binding_names_image_digests_image_ids_projection_and_runtime_p
     ]
 
 
-def test_a_reused_sdk_primitive_observation_bound_to_the_unchanged_artifact_accepts() -> None:
-    h = Harness()
-    for case in module().REUSABLE_CASES:
-        del h.producers[case]
-        h.reused[case] = artifact_observation(h.records, case)
+def test_artifact_binding_requires_ms_runner_image_on_every_platform() -> None:
+    from curie_protected_hooks.authority_records import parse_manifest
+
+    r = records()
+    m = r["manifest"].as_dict()
+    m["runner_image_digest"] = "sha256:" + "8" * 64
+    other = parse_manifest(canonical(m))
+    with pytest.raises(module().VerifierRefused):
+        module().ArtifactBinding.of(r["measurement"], other)
+
+
+def test_evidence_named_by_the_measurement_and_bound_to_the_artifact_accepts() -> None:
+    h = reused_harness()
     verdict = h.decide()
     assert verdict.accepted
     reused = {o.case: o for o in verdict.observations if o.provenance == "reused-artifact"}
     assert set(reused) == module().REUSABLE_CASES
-    for case, observation in reused.items():
-        assert observation.evidence_sha256 == h.reused[case].content_digest
+    assert all(o.evidence_sha256 == EVIDENCE for o in reused.values())
+
+
+def test_a_self_hashed_passing_record_is_not_reusable_evidence(monkeypatch) -> None:
+    """A record that hashes itself but is not the measured evidence reference refuses."""
+    h = Harness()
+    for case in module().REUSABLE_CASES:
+        del h.producers[case]
+    # Content addressed only by its own digest; the measurement names other evidence.
+    h.evidence = evidence_record(provision())
+    assert h.records["measurement"].as_dict()["enforcement_evidence_ref"] != (
+        "sha256:" + hashlib.sha256(h.evidence).hexdigest()
+    )
+    refuses_without_publishers(monkeypatch, h, "reuse")
+
+
+def test_evidence_for_another_measurement_refuses(monkeypatch) -> None:
+    h = reused_harness()
+    good = h.evidence
+    assert good is not None
+    h.evidence = good.replace(EVIDENCE.encode(), b"cd" * 32)
+    refuses_without_publishers(monkeypatch, h, "reuse")
 
 
 @pytest.mark.parametrize("case", ["network-violation", "revocation", "credential-violation"])
 def test_installation_observations_are_never_reused(monkeypatch, case: str) -> None:
-    h = Harness()
-    del h.producers[case]
-    h.reused[case] = artifact_observation(h.records, case)
-    with pytest.raises(module().VerifierRefused):
-        h.verifier()
+    h = reused_harness(cases=[case])
+    refuses_without_publishers(monkeypatch, h, "reuse")
 
 
-def test_a_case_with_both_a_producer_and_a_reused_observation_refuses() -> None:
-    h = Harness()
-    h.reused["clean-session"] = artifact_observation(h.records, "clean-session")
-    with pytest.raises(module().VerifierRefused):
-        h.verifier()
+def test_a_case_with_both_a_producer_and_reused_evidence_refuses(monkeypatch) -> None:
+    raw = evidence_record(provision(), cases=["clean-session"])
+    h = Harness(evidence=raw)
+    refuses_without_publishers(monkeypatch, h, "reuse")
 
 
 def mutate_binding(path: tuple[Any, ...], value: Any) -> Callable[[dict[str, Any]], None]:
-    def mutate(binding: dict[str, Any]) -> None:
-        target: Any = binding
+    def mutate(record: dict[str, Any]) -> None:
+        target: Any = record["artifact_binding"]
         for key in path[:-1]:
             target = target[key]
         target[path[-1]] = value
@@ -776,62 +1065,35 @@ REUSE_ATTACKS: dict[str, Callable[[dict[str, Any]], None]] = {
     "runtime-profile": mutate_binding(("platforms", 0, "runtime_profile"), "runtime/other"),
     "projection": mutate_binding(("launch_projection",), "8" * 64),
     "runner-image": mutate_binding(("runner_image",), "sha256:" + "8" * 64),
-    "extra-platform": lambda b: b["platforms"].append(dict(b["platforms"][0], os="windows")),
+    "bundle": mutate_binding(("bundle", "sha256"), "8" * 64),
+    "extra-platform": lambda v: v["artifact_binding"]["platforms"].append(
+        dict(v["artifact_binding"]["platforms"][0], os="windows")
+    ),
+    "not-pass": lambda v: v["observations"]["clean-session"].update(outcome="unavailable"),
+    "skipped": lambda v: v["observations"]["clean-session"].update(outcome="skipped"),
+    "record-type": lambda v: v.update(record_type="commissioning_acceptance"),
+    "schema-version": lambda v: v.update(schema_version=2),
+    "evidence-not-hex": lambda v: v["observations"]["clean-session"].update(
+        evidence_sha256="AB" * 32
+    ),
+    "extra-member": lambda v: v.update(extra=True),
+    "empty": lambda v: v.update(observations={}),
 }
 
 
 @pytest.mark.parametrize("name", sorted(REUSE_ATTACKS))
-def test_a_reused_observation_for_a_changed_artifact_refuses(monkeypatch, name: str) -> None:
-    h = Harness()
-    binding = module().ArtifactBinding.of(h.records["measurement"]).as_dict()
-    REUSE_ATTACKS[name](binding)
-    del h.producers["clean-session"]
-    h.reused["clean-session"] = artifact_observation(
-        h.records, "clean-session", artifact_binding=binding
-    )
-    refuses_without_publishers(monkeypatch, h, "reuse:clean-session")
+def test_measured_evidence_that_does_not_hold_refuses(monkeypatch, name: str) -> None:
+    """The reference names the attacked record, so only the attacked property is under test."""
+    h = reused_harness(cases=["clean-session"], mutate=REUSE_ATTACKS[name])
+    refuses_without_publishers(monkeypatch, h, "reuse")
 
 
-@pytest.mark.parametrize(
-    "changes",
-    [
-        {"outcome": "unavailable"},
-        {"outcome": "skipped"},
-        {"case": "static-skill-loading"},
-        {"record_type": "commissioning_acceptance"},
-        {"schema_version": 2},
-        {"evidence_sha256": "AB" * 32},
-        {"extra": True},
-    ],
-)
-def test_a_reused_observation_that_is_not_a_passing_closed_record_refuses(
-    monkeypatch, changes: dict[str, Any]
-) -> None:
-    h = Harness()
-    del h.producers["clean-session"]
-    h.reused["clean-session"] = artifact_observation(h.records, "clean-session", **changes)
-    refuses_without_publishers(monkeypatch, h, "reuse:clean-session")
-
-
-def test_a_reused_observation_is_content_addressed(monkeypatch) -> None:
-    h = Harness()
-    del h.producers["clean-session"]
-    good = artifact_observation(h.records, "clean-session")
-    h.reused["clean-session"] = module().ReusedArtifactObservation(
-        content_digest="cd" * 32, raw=good.raw
-    )
-    refuses_without_publishers(monkeypatch, h, "reuse:clean-session")
-
-
-def test_a_reused_observation_with_non_canonical_bytes_refuses(monkeypatch) -> None:
-    h = Harness()
-    del h.producers["clean-session"]
-    good = artifact_observation(h.records, "clean-session")
-    raw = json.dumps(json.loads(good.raw), indent=1).encode()
-    h.reused["clean-session"] = module().ReusedArtifactObservation(
-        content_digest=hashlib.sha256(raw).hexdigest(), raw=raw
-    )
-    refuses_without_publishers(monkeypatch, h, "reuse:clean-session")
+def test_non_canonical_evidence_bytes_refuse(monkeypatch) -> None:
+    raw = json.dumps(json.loads(evidence_record(provision())), indent=1).encode()
+    h = Harness(evidence=raw)
+    for case in module().REUSABLE_CASES:
+        del h.producers[case]
+    refuses_without_publishers(monkeypatch, h, "reuse")
 
 
 # --- The publication gate -----------------------------------------------------
