@@ -1401,6 +1401,33 @@ def test_a_failed_claim_delete_still_retires_the_daemon_and_raises_the_claim_err
     assert redis_client.get(_marker_key(key_prefix, claim)) is None
 
 
+def test_a_claim_delete_that_times_out_still_leaves_the_daemon_a_budget(
+    fake_k8s: FakeSandboxClient,
+    docker_substrate: SandboxSubstrate,
+    redis_client: redis.Redis,
+    key_prefix: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A claim delete that spends its whole timeout must not starve daemon cleanup."""
+
+    _handle, claim = _docker_route(docker_substrate)
+    skew = [0.0]
+    real = time.monotonic
+    monkeypatch.setattr(time, "monotonic", lambda: real() + skew[0])
+    boom = KubeTransientError("claim delete timed out")
+
+    def time_out(name: str, *, request_timeout_seconds: float) -> None:
+        skew[0] += request_timeout_seconds + 1.0  # the full budget elapsed
+        raise boom
+
+    monkeypatch.setattr(fake_k8s, "delete_claim", time_out)
+    with pytest.raises(KubeTransientError) as raised:
+        docker_substrate.release("T-ret")
+    assert raised.value is boom
+    assert fake_k8s.daemon_objects_of(claim) == {}
+    assert redis_client.get(_marker_key(key_prefix, claim)) is None
+
+
 def test_a_failed_daemon_delete_is_raised_keeps_the_anchor_and_a_retry_finishes(
     fake_k8s: FakeSandboxClient,
     docker_substrate: SandboxSubstrate,
