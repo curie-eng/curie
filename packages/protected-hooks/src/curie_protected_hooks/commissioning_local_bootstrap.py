@@ -651,21 +651,35 @@ class AdministratorBootstrap:
             },
         )
 
-    def install_worker(self, deployment: Mapping[str, Any]) -> str:
-        """Create the protected worker Deployment from the measured template.
+    def install_worker(self, deployment: Mapping[str, Any], *, worker_image: str) -> str:
+        """Create the protected worker Deployment from the administrator's own rendering.
 
         Protected workloads are installation: the provisioner renders the
         template and writes the worker's runtime Secret, and the administrator
         creates the Deployment in the worker namespace, where the provisioner
-        cannot create Pods. @spec PROTECTED-COMMISSIONING-6.
+        cannot create Pods. The administrator re-renders the Deployment with
+        its own pinned ``worker_image`` and the runtime file set, and refuses
+        any difference, so no provisioner rendering can mount or print the
+        worker's client key. @spec PROTECTED-COMMISSIONING-6.
         """
-        _require(
-            type(deployment) is dict
-            and deployment.get("kind") == "Deployment"
-            and deployment.get("metadata", {}).get("name") == WORKER_NAME
-            and deployment["metadata"].get("namespace") == worker_namespace(self._namespace)
+        # Imported here: the worker module builds on this one.
+        from .commissioning_local_worker import (
+            WorkerRefused,
+            deployment_paths,
+            worker_deployment,
         )
-        return self._cluster.create(deployment)
+
+        try:
+            own = worker_deployment(
+                self._cluster.owner,
+                worker_namespace(self._namespace),
+                worker_image,
+                deployment_paths(deployment),
+            )
+        except WorkerRefused:
+            _refuse()
+        _require(type(deployment) is dict and deployment == own)
+        return self._cluster.create(own)
 
     def enroll(self, broker: LocalBroker) -> dict[str, AclPrincipalState]:
         """Create every ACL user, record the baseline, then turn the installer off.

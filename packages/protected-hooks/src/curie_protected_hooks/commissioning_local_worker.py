@@ -5,8 +5,9 @@ worker at its final pod template, image, mounts and Secret references, with
 the artifact measurement file in its ``measurements`` directory. The worker is
 the unchanged ``python -m curie_worker.protected_entry`` composition; it reads
 only regular files from one runtime directory (it refuses a Secret volume's
-symlink layout), so an init container copies the provisioner's immutable
-Secret into an ``emptyDir`` that the worker mounts read only.
+symlink layout), so an init container copies the named files of the
+provisioner's immutable Secret, and nothing of the volume's own layout, into
+an ``emptyDir`` that the worker mounts read only.
 
 The worker's ``process.json`` pins the launch mediator: its origin, CA,
 server name and certificate SPKI, and the worker's own client certificate.
@@ -24,6 +25,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import re
 from collections.abc import Mapping
 from typing import Any, NoReturn
 
@@ -54,10 +56,12 @@ __all__ = [
     "MEDIATOR_NAME",
     "MEDIATOR_PORT",
     "RUNTIME_DIR",
+    "SOURCE_DIR",
     "WORKER_NAME",
     "LocalWorker",
     "WorkerRefused",
     "worker_files",
+    "worker_deployment",
     "worker_objects",
 ]
 
@@ -65,7 +69,18 @@ __all__ = [
 RUNTIME_DIR = "/run/curie/protected-worker"
 MEDIATOR_PORT = 8443
 _RUNTIME_SECRET = WORKER_NAME + "-runtime"
-_SOURCE = "/run/curie/protected-worker-source"
+SOURCE_DIR = "/run/curie/protected-worker-source"
+_FIXED = (
+    "manifest.json",
+    "execution_config.json",
+    "worker.json",
+    "process.json",
+    "ca.pem",
+    "launch-ca.pem",
+)
+_ADDRESSED = re.compile(r"(measurements|projections)/[0-9a-f]{64}\.json")
+# The administrator's Secret: the worker's own launch client certificate and key.
+_CLIENT = ("launch-client.pem", "launch-client.key")
 
 
 class WorkerRefused(RuntimeError):
@@ -167,37 +182,49 @@ def _key(path: str) -> str:
     return path.replace("/", ".")
 
 
-def worker_objects(
+def _runtime_paths(paths: Any) -> tuple[str, ...]:
+    """The runtime directory's grammar: the fixed files and one of each addressed file."""
+    _require(isinstance(paths, (list, tuple, set, frozenset, Mapping)))
+    chosen = tuple(sorted(paths))
+    _require(all(type(p) is str for p in chosen))
+    addressed = [p for p in chosen if _ADDRESSED.fullmatch(p)]
+    _require(sorted(p.split("/", 1)[0] for p in addressed) == ["measurements", "projections"])
+    _require(sorted(set(chosen) - set(addressed)) == sorted(_FIXED))
+    return chosen
+
+
+def _stage(paths: tuple[str, ...]) -> list[str]:
+    """Copy each named file, so the volume's ``..data`` layout never reaches the worker."""
+    named = sorted((*paths, *_CLIENT))
+    steps = ["set -eu", f"mkdir {RUNTIME_DIR}/measurements {RUNTIME_DIR}/projections"]
+    steps += [f"cp -L {SOURCE_DIR}/{p} {RUNTIME_DIR}/{p}" for p in named]
+    return ["sh", "-c", "; ".join(steps)]
+
+
+def worker_deployment(
     owner: str,
     namespace: str,
     worker_image: str,
-    files: Mapping[str, bytes],
-) -> list[dict[str, Any]]:
-    """The worker runtime Secret and the worker Deployment.
+    paths: Any,
+) -> dict[str, Any]:
+    """The worker Deployment for one runtime file set.
 
     The Deployment restarts the worker; before activation each start refuses,
     and it starts once the records it requires exist (clause 6). The init
-    container copies the provisioner's runtime Secret and the administrator's
-    client-key Secret into an ``emptyDir`` as regular files.
+    container copies the named files of the provisioner's runtime Secret and
+    of the administrator's client-key Secret into an ``emptyDir``. The
+    administrator renders this itself before it creates the worker.
     @spec PROTECTED-COMMISSIONING-6.
     """
     _pinned(worker_image)
-    labels = {OWNER_LABEL: owner}
-    secret = {
-        "apiVersion": "v1",
-        "kind": "Secret",
-        "metadata": {"name": _RUNTIME_SECRET, "namespace": namespace, "labels": labels},
-        "type": "Opaque",
-        "immutable": True,
-        "data": {_key(path): _b64(raw) for path, raw in sorted(files.items())},
-    }
+    chosen = _runtime_paths(paths)
     stage = {
         "name": "stage",
         "image": worker_image,
-        "command": ["sh", "-c", f"cp -RL {_SOURCE}/. {RUNTIME_DIR}/"],
+        "command": _stage(chosen),
         "securityContext": _locked(1000),
         "volumeMounts": [
-            {"name": "source", "mountPath": _SOURCE, "readOnly": True},
+            {"name": "source", "mountPath": SOURCE_DIR, "readOnly": True},
             {"name": "runtime", "mountPath": RUNTIME_DIR},
         ],
     }
@@ -222,11 +249,15 @@ def worker_objects(
                     {
                         "secret": {
                             "name": _RUNTIME_SECRET,
-                            "items": [{"key": _key(path), "path": path} for path in sorted(files)],
+                            "items": [{"key": _key(path), "path": path} for path in chosen],
                         }
                     },
-                    # The administrator's Secret: the worker's own launch client key.
-                    {"secret": {"name": WORKER_CLIENT_SECRET}},
+                    {
+                        "secret": {
+                            "name": WORKER_CLIENT_SECRET,
+                            "items": [{"key": name, "path": name} for name in _CLIENT],
+                        }
+                    },
                 ],
             },
         },
@@ -234,19 +265,50 @@ def worker_objects(
     ]
     spec = _pod_spec(1000, [worker], volumes)
     spec["initContainers"] = [stage]
-    return [
-        secret,
-        {
-            "apiVersion": "apps/v1",
-            "kind": "Deployment",
-            "metadata": _metadata(owner, namespace, WORKER_NAME),
-            "spec": {
-                "replicas": 1,
-                "selector": {"matchLabels": _labels(owner, WORKER_NAME)},
-                "template": {"metadata": {"labels": _labels(owner, WORKER_NAME)}, "spec": spec},
-            },
+    return {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": _metadata(owner, namespace, WORKER_NAME),
+        "spec": {
+            "replicas": 1,
+            "selector": {"matchLabels": _labels(owner, WORKER_NAME)},
+            "template": {"metadata": {"labels": _labels(owner, WORKER_NAME)}, "spec": spec},
         },
-    ]
+    }
+
+
+def deployment_paths(deployment: Any) -> tuple[str, ...]:
+    """The runtime file set a rendered worker Deployment names, @spec PROTECTED-COMMISSIONING-6."""
+    try:
+        volumes = deployment["spec"]["template"]["spec"]["volumes"]
+        (source,) = [v for v in volumes if v["name"] == "source"]
+        items = source["projected"]["sources"][0]["secret"]["items"]
+        return _runtime_paths([item["path"] for item in items])
+    except (KeyError, TypeError, ValueError, IndexError):
+        _refuse()
+
+
+def worker_objects(
+    owner: str,
+    namespace: str,
+    worker_image: str,
+    files: Mapping[str, bytes],
+) -> list[dict[str, Any]]:
+    """The worker runtime Secret and the worker Deployment, @spec PROTECTED-COMMISSIONING-6."""
+    deployment = worker_deployment(owner, namespace, worker_image, files)
+    secret = {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+            "name": _RUNTIME_SECRET,
+            "namespace": namespace,
+            "labels": {OWNER_LABEL: owner},
+        },
+        "type": "Opaque",
+        "immutable": True,
+        "data": {_key(path): _b64(raw) for path, raw in sorted(files.items())},
+    }
+    return [secret, deployment]
 
 
 class LocalWorker:

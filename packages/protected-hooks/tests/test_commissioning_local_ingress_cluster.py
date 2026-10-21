@@ -134,7 +134,7 @@ def installed(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Installed]:
             secrets=ingress.secrets,
         )
         # Protected workloads are installation: the administrator creates the worker.
-        admin.install_worker(template)
+        admin.install_worker(template, worker_image=worker_image)
         del admin
         yield Installed(
             cluster,
@@ -411,18 +411,28 @@ def test_the_worker_files_parse_and_readiness_is_absent_on_the_broker(
         "--namespace", namespace, "--timeout", "240s", timeout=270,
     )  # fmt: skip
     logs = installed.provisioner.kubectl("logs", "pod/" + name, "--namespace", namespace).decode()
+    (listing,) = [line for line in logs.splitlines() if line.startswith("files=")]
+    client = {"launch-client.pem", "launch-client.key"}
+    assert set(json.loads(listing.removeprefix("files="))) == set(installed.worker_files) | client
     assert logs.strip().splitlines()[-1] == (
         "bootstrap=ok process=ok launch=ok broker=ok readiness=absent qualification=absent"
     )
 
 
 _PROBE = """
-import asyncio, ssl, sys
+import asyncio, json, os, ssl, sys
 from curie_worker.protected_entry import load_process_settings, _open_root, _read
 from curie_worker.protected_worker_bootstrap import load_worker_bootstrap
 from curie_protected_hooks.worker_transport import AuthenticatedWorkerClient
 
 async def main(directory):
+    # Exactly the named runtime files, as regular files: no ``..data`` layout.
+    files = sorted(
+        os.path.relpath(os.path.join(d, f), directory)
+        for d, dirs, names in os.walk(directory)
+        for f in names + [x for x in dirs if os.path.islink(os.path.join(d, x))]
+    )
+    print("files=" + json.dumps(files))
     bootstrap = load_worker_bootstrap(directory)
     tls = load_process_settings(directory).launch_tls
     # The mounted client key matches its certificate and the pinned CA loads.

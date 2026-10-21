@@ -834,7 +834,102 @@ def test_the_administrator_installs_only_the_worker_deployment(
         **change,
     }
     with pytest.raises(boot.BootstrapRefused):
-        admin.install_worker(deployment)
+        admin.install_worker(deployment, worker_image=WORKER_IMAGE)
+    assert runner.objects == {}
+
+
+WORKER_IMAGE = "localhost:5000/" + OWNER + "/worker@sha256:" + "b" * 64
+
+
+def worker_template(image: str = WORKER_IMAGE) -> dict[str, Any]:
+    from curie_protected_hooks.commissioning_local_worker import worker_objects
+
+    paths = (
+        "manifest.json",
+        "execution_config.json",
+        "worker.json",
+        "process.json",
+        "ca.pem",
+        "launch-ca.pem",
+        "measurements/" + "1" * 64 + ".json",
+        "projections/" + "2" * 64 + ".json",
+    )
+    _, deployment = worker_objects(
+        OWNER, bootstrap().worker_namespace(NAMESPACE), image, {p: b"{}" for p in paths}
+    )
+    return deployment
+
+
+def test_the_administrator_creates_its_own_rendering_of_the_worker(tmp_path: Path) -> None:
+    ledger, runner, cluster = admin_cluster(tmp_path)
+    admin = bootstrap_for(cluster, ledger, tmp_path)
+    admin.install_worker(worker_template(), worker_image=WORKER_IMAGE)
+    (created,) = [o for o in runner.objects.values() if o["kind"] == "Deployment"]
+    assert created["spec"] == worker_template()["spec"]
+
+
+def _pod(deployment: dict[str, Any]) -> dict[str, Any]:
+    pod: dict[str, Any] = deployment["spec"]["template"]["spec"]
+    return pod
+
+
+def _print_client_key(d: dict[str, Any]) -> None:
+    _pod(d)["containers"][0]["command"] = ["cat", "/run/curie/protected-worker/launch-client.key"]
+
+
+def _other_image(d: dict[str, Any]) -> None:
+    _pod(d)["containers"][0]["image"] = WORKER_IMAGE.replace("b" * 64, "c" * 64)
+
+
+def _env(d: dict[str, Any]) -> None:
+    _pod(d)["containers"][0]["env"].append({"name": "EXTRA", "value": "1"})
+
+
+def _volume(d: dict[str, Any]) -> None:
+    _pod(d)["volumes"].append({"name": "extra", "secret": {"secretName": "other"}})
+
+
+def _mount(d: dict[str, Any]) -> None:
+    _pod(d)["containers"][0]["volumeMounts"].append({"name": "source", "mountPath": "/source"})
+
+
+def _container(d: dict[str, Any]) -> None:
+    _pod(d)["containers"].append(dict(_pod(d)["containers"][0], name="extra"))
+
+
+def _stage(d: dict[str, Any]) -> None:
+    _pod(d)["initContainers"][0]["command"] = ["sh", "-c", "cat /run/curie/*/launch-client.key"]
+
+
+def _extra_path(d: dict[str, Any]) -> None:
+    _pod(d)["volumes"][0]["projected"]["sources"][0]["secret"]["items"].append(
+        {"key": "extra", "path": "extra"}
+    )
+
+
+@pytest.mark.parametrize(
+    "change",
+    [_print_client_key, _other_image, _env, _volume, _mount, _container, _stage, _extra_path],
+)
+def test_the_administrator_refuses_a_changed_worker_rendering(tmp_path: Path, change: Any) -> None:
+    boot = bootstrap()
+    ledger, runner, cluster = admin_cluster(tmp_path)
+    admin = bootstrap_for(cluster, ledger, tmp_path)
+    deployment = worker_template()
+    change(deployment)
+    with pytest.raises(boot.BootstrapRefused):
+        admin.install_worker(deployment, worker_image=WORKER_IMAGE)
+    assert runner.objects == {}
+
+
+def test_the_administrator_renders_with_its_own_image(tmp_path: Path) -> None:
+    """A rendering that matches itself but names another image is still refused."""
+    boot = bootstrap()
+    ledger, runner, cluster = admin_cluster(tmp_path)
+    admin = bootstrap_for(cluster, ledger, tmp_path)
+    other = WORKER_IMAGE.replace("b" * 64, "c" * 64)
+    with pytest.raises(boot.BootstrapRefused):
+        admin.install_worker(worker_template(other), worker_image=WORKER_IMAGE)
     assert runner.objects == {}
 
 

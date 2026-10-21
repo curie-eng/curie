@@ -11,6 +11,8 @@ import hashlib
 import importlib
 import importlib.util
 import json
+import os
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -155,7 +157,6 @@ def test_objects_stage_regular_files_and_run_the_production_entry() -> None:
         "python", "-m", "curie_worker.protected_entry", "--runtime-dir", api.RUNTIME_DIR,
     ]  # fmt: skip
     assert stage["image"] == worker["image"] == WORKER_IMAGE
-    assert "cp -RL" in stage["command"][-1]
     runtime_mounts = [m for m in worker["volumeMounts"] if m["mountPath"] == api.RUNTIME_DIR]
     assert runtime_mounts == [{"name": "runtime", "mountPath": api.RUNTIME_DIR, "readOnly": True}]
     volumes = {v["name"]: v for v in spec["volumes"]}
@@ -164,7 +165,11 @@ def test_objects_stage_regular_files_and_run_the_production_entry() -> None:
 
     runtime_source, client_source = volumes["source"]["projected"]["sources"]
     assert {i["path"] for i in runtime_source["secret"]["items"]} == set(files)
-    assert client_source == {"secret": {"name": WORKER_CLIENT_SECRET}}
+    assert client_source["secret"]["name"] == WORKER_CLIENT_SECRET
+    assert {i["path"] for i in client_source["secret"]["items"]} == {
+        "launch-client.pem",
+        "launch-client.key",
+    }
     for container in (stage, worker):
         assert container["securityContext"]["runAsNonRoot"] is True
         assert container["securityContext"]["readOnlyRootFilesystem"] is True
@@ -179,3 +184,55 @@ def test_unpinned_worker_images_refuse(image: str) -> None:
     _, _, files, _ = rendered()
     with pytest.raises(Exception, match="refused"):
         api.worker_objects(OWNER, NAMESPACE, image, files)
+
+
+def projected_volume(root: Path, files: dict[str, bytes]) -> None:
+    """The kubelet's atomic-writer layout: a timestamped directory, ``..data``, symlinks."""
+    stamp = root / "..2026_10_21_00_00_00.000000000"
+    for path, raw in files.items():
+        target = stamp / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(raw)
+    (root / "..data").symlink_to(stamp.name)
+    for top in {path.split("/", 1)[0] for path in files}:
+        (root / top).symlink_to("..data/" + top)
+
+
+def test_the_stage_copies_exactly_the_runtime_files(tmp_path: Path) -> None:
+    api = module()
+    _, _, files, _ = rendered()
+    client = {"launch-client.pem": b"certificate", "launch-client.key": b"key"}
+    source, runtime = tmp_path / "source", tmp_path / "runtime"
+    source.mkdir()
+    runtime.mkdir()
+    projected_volume(source, {**files, **client})
+    _, deployment = api.worker_objects(OWNER, NAMESPACE, WORKER_IMAGE, files)
+    (stage,) = deployment["spec"]["template"]["spec"]["initContainers"]
+    *shell, script = stage["command"]
+    script = script.replace(api.SOURCE_DIR, str(source)).replace(api.RUNTIME_DIR, str(runtime))
+    subprocess.run([*shell, script], check=True)
+    copied = {
+        str(Path(d, f).relative_to(runtime)): Path(d, f)
+        for d, _, names in os.walk(runtime)
+        for f in names
+    }
+    assert set(copied) == set(files) | set(client)
+    assert not any(p.is_symlink() for p in runtime.rglob("*"))
+    assert all(copied[p].read_bytes() == raw for p, raw in {**files, **client}.items())
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "extra.json",
+        "..data",
+        "measurements/latest.json",
+        "projections/a/b.json",
+        "launch-client.key",
+    ],
+)
+def test_runtime_files_outside_the_grammar_refuse(path: str) -> None:
+    api = module()
+    _, _, files, _ = rendered()
+    with pytest.raises(Exception, match="refused"):
+        api.worker_objects(OWNER, NAMESPACE, WORKER_IMAGE, {**files, path: b"{}"})
