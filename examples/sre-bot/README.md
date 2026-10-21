@@ -469,6 +469,57 @@ A genuine signed alert creates one partitioned investigation. Missing,
 ambiguous, or unauthorized mappings visibly stop coding. Invalid signatures
 and replayed delivery ids do not multiply work.
 
+#### Protected source mode (opt-in)
+
+The commands above install an ordinary source: it signs with the shared agent
+secret, and `tool_access=read-only` in the hook URL is an optional request the
+ordinary path honors without proving runtime enforcement. The signer also has
+a protected mode for a hook an administrator bound to a mandatory read-only
+source policy under
+[ADR 0190](../../docs/adr/0190-automated-hook-sources-cannot-widen-their-tool-access.md)
+and [ADR 0191](../../docs/adr/0191-protected-hook-delivery-authority.md)
+(`HOOK-SOURCE-POLICY-6`). The default stays ordinary, and an installation that
+does not set the mode keeps the behavior above.
+
+In protected mode the `alert-signer-hook` Secret holds `CURIE_HOOK_URL`,
+`CURIE_HOOK_SOURCE_MODE` set to `protected`, and `CURIE_HOOK_SOURCE_SECRET`,
+the hook's scoped key from `GET /agents/{agent_id}/hooks/{hook}/source-policy/secret`.
+It must not hold `CURIE_HOOK_SECRET`. The hook URL must request
+`tool_access=read-only` and must not carry explicit reply query parameters,
+which protected ingress refuses. The signer refuses to start on any other
+combination, so it never falls back to the shared key or to an optional policy.
+
+For each alert the signer then:
+
+1. Posts the signed support probe `POST /hooks/{agent_id}/{hook}/support` with
+   the body `{"tool_access":"read-only"}`. The probe creates no hook claim,
+   queue entry, Slack post or turn. The signer forwards only when the API
+   answers 200 with `supported` and read-only effective policy. A shared or
+   revoked key (401), an unconfigured or closed hook, an unavailable runtime, or
+   an API without the probe is refused before any delivery.
+2. Forwards the delivery signed under the scoped key with `read-only` in the
+   signed context.
+3. Checks the receipt: `requested_tool_access`, `effective_tool_access` and
+   `tool_access` must each be `read-only`, `source_generation` must equal the
+   generation the support probe reported,
+   and `acceptance_status` must be `accepted` or `preparing`. A duplicate is
+   checked the same way.
+
+A refusal answers HTTP 502 to Alertmanager and logs one warning,
+`protected hook delivery refused (reason=<reason>)`, whose reason is a fixed
+token such as `support_source_unconfigured`, `support_unauthenticated` or
+`receipt_not_read_only`; it never contains a credential, URL or payload.
+Alertmanager retries with the same delivery ID and counts the failures in
+`alertmanager_notifications_failed_total`, which is the signal to alert on. A
+receipt refusal means the API answered a delivery the source cannot attest as
+read-only; investigate it rather than relaxing the check.
+
+A supported answer needs the protected delivery lane, a qualified runtime and
+current readiness evidence. Until those exist for an installation the probe
+reports the missing piece and the protected signer delivers nothing, which is
+the intended result: ADR 0190 keeps the automated intake uninstalled wherever
+runtime read-only guarantees are required.
+
 ### Slack Email alert source (opt-in)
 
 When the alert provider delivers email into Slack instead of calling
