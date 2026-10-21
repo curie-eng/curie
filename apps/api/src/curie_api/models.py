@@ -27,6 +27,7 @@ from sqlalchemy import (
     Integer,
     LargeBinary,
     Numeric,
+    SmallInteger,
     String,
     Text,
     UniqueConstraint,
@@ -3617,3 +3618,430 @@ class IdentityLink(Base):
         DateTime(timezone=True), server_default=func.now()
     )
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+
+
+# Shared connector store (ADR 0239, migration 0109). The migration owns the
+# row level security policies, triggers and SECURITY DEFINER refresh functions;
+# these models mirror the tables. text() reads ``:name`` as a bind parameter, so
+# the POSIX classes below escape their colons.
+_SHARED_SPACE_OR_CONTROL = r"[[\:space\:][\:cntrl\:]]"
+_SHARED_CONTROL = r"[[\:cntrl\:]]"
+
+
+class SharedConnectorApplication(Base):
+    """One explicit shared connector application (ADR 0239).
+
+    The spec, pins, policy and custody never change (a trigger refuses it,
+    SQLSTATE 23514). ``policy_generation`` only rises, raised by the
+    membership triggers, and ``enabled`` only goes false. ``lock_guard`` is
+    the one column the application's own database role may update, so it can
+    lock this row FOR SHARE without holding an authority column.
+    """
+
+    __tablename__ = "shared_connector_applications"
+    __table_args__ = (
+        CheckConstraint(
+            "octet_length(installation_id) BETWEEN 1 AND 128 "
+            f"AND installation_id !~ '{_SHARED_SPACE_OR_CONTROL}'",
+            name="shared_connector_applications_installation_ck",
+        ),
+        CheckConstraint(
+            "pin_digest ~ '^[0-9a-f]{64}$'", name="shared_connector_applications_pin_digest_ck"
+        ),
+        CheckConstraint(
+            "custody IN ('platform', 'connector')",
+            name="shared_connector_applications_custody_ck",
+        ),
+        CheckConstraint(
+            "policy_generation >= 1", name="shared_connector_applications_policy_generation_ck"
+        ),
+        CheckConstraint(
+            "enabled = (disabled_at IS NULL)", name="shared_connector_applications_disabled_ck"
+        ),
+        UniqueConstraint("id", "custody", name="shared_connector_applications_custody_key"),
+        UniqueConstraint(
+            "installation_id", "id", name="shared_connector_applications_installation_key"
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    installation_id: Mapped[str] = mapped_column(Text)
+    spec: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    server_image: Mapped[str] = mapped_column(Text)
+    credential_slots: Mapped[list[str]] = mapped_column(JSONB)
+    provider_origins: Mapped[list[str]] = mapped_column(JSONB)
+    snapshot_seal: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
+    policy: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    pin_digest: Mapped[str] = mapped_column(Text)
+    custody: Mapped[str] = mapped_column(Text)
+    policy_generation: Mapped[int] = mapped_column(BigInteger, server_default="1")
+    enabled: Mapped[bool] = mapped_column(server_default=text("true"))
+    disabled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    lock_guard: Mapped[int] = mapped_column(SmallInteger, server_default="0")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class SharedConnectorRecipient(Base):
+    """An X25519 public key that credentials and DSNs are sealed to.
+
+    ``recipient_id`` is the lowercase hex SHA-256 of ``public_key``. The
+    current recipient is the live row with the highest ``ordinal``. Only
+    ``retired_at`` may change, once; any write naming a recipient locks this
+    row FOR SHARE and refuses a retired one (SQLSTATE 23503), which serializes
+    retirement against writers.
+    """
+
+    __tablename__ = "shared_connector_recipients"
+    __table_args__ = (
+        CheckConstraint(
+            "recipient_id ~ '^[0-9a-f]{64}$'", name="shared_connector_recipients_recipient_id_ck"
+        ),
+        CheckConstraint(
+            "recipient_id = encode(sha256(public_key), 'hex')",
+            name="shared_connector_recipients_key_digest_ck",
+        ),
+        CheckConstraint(
+            "algorithm = 'x25519-sealed-box'", name="shared_connector_recipients_algorithm_ck"
+        ),
+        CheckConstraint(
+            "octet_length(public_key) = 32", name="shared_connector_recipients_public_key_ck"
+        ),
+    )
+
+    application_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            f"{SCHEMA}.shared_connector_applications.id",
+            ondelete="CASCADE",
+            name="shared_connector_recipients_application_id_fkey",
+        ),
+        primary_key=True,
+    )
+    recipient_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    algorithm: Mapped[str] = mapped_column(Text)
+    public_key: Mapped[bytes] = mapped_column(LargeBinary)
+    ordinal: Mapped[int] = mapped_column(BigInteger, Identity(always=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    retired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+
+
+class SharedConnectorDatabaseRole(Base):
+    """The application's own database role (ADR 0239 "Custody and least privilege" 3, 4).
+
+    Row level security maps ``current_user`` to the application through
+    ``role_name``, and the refresh functions map ``session_user`` the same way.
+    A bundled role carries the API's hashed name and a DSN sealed to a
+    recipient; a managed role records only the operator's Secret reference.
+    """
+
+    __tablename__ = "shared_connector_database_roles"
+    __table_args__ = (
+        CheckConstraint(
+            "octet_length(role_name) BETWEEN 1 AND 63",
+            name="shared_connector_database_roles_role_name_ck",
+        ),
+        CheckConstraint(
+            "(mode = 'bundled' AND role_name ~ '^curie_sca_[0-9a-f]{40}$') "
+            "OR (mode = 'managed' AND role_name ~ '^[a-z_][a-z0-9_]{0,62}$')",
+            name="shared_connector_database_roles_role_name_mode_ck",
+        ),
+        CheckConstraint(
+            "mode IN ('bundled', 'managed')", name="shared_connector_database_roles_mode_ck"
+        ),
+        CheckConstraint(
+            "status IN ('provisioned', 'pending', 'ready', 'failed')",
+            name="shared_connector_database_roles_status_ck",
+        ),
+        CheckConstraint(
+            "status_reason ~ '^[a-z][a-z0-9_]{0,63}$'",
+            name="shared_connector_database_roles_status_reason_ck",
+        ),
+        CheckConstraint(
+            "dsn_revision >= 1", name="shared_connector_database_roles_dsn_revision_ck"
+        ),
+        CheckConstraint(
+            "(mode = 'bundled' AND sealed_dsn IS NOT NULL AND dsn_recipient_id IS NOT NULL "
+            "AND dsn_secret_name IS NULL AND dsn_secret_key IS NULL) "
+            "OR (mode = 'managed' AND dsn_secret_name IS NOT NULL AND dsn_secret_key IS NOT NULL "
+            "AND sealed_dsn IS NULL AND dsn_recipient_id IS NULL)",
+            name="shared_connector_database_roles_mode_shape_ck",
+        ),
+        ForeignKeyConstraint(
+            ["application_id", "dsn_recipient_id"],
+            [
+                f"{SCHEMA}.shared_connector_recipients.application_id",
+                f"{SCHEMA}.shared_connector_recipients.recipient_id",
+            ],
+            name="shared_connector_database_roles_dsn_recipient_fkey",
+        ),
+        UniqueConstraint("role_name", name="shared_connector_database_roles_role_name_key"),
+    )
+
+    application_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            f"{SCHEMA}.shared_connector_applications.id",
+            ondelete="CASCADE",
+            name="shared_connector_database_roles_application_id_fkey",
+        ),
+        primary_key=True,
+    )
+    role_name: Mapped[str] = mapped_column(Text)
+    mode: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(Text)
+    status_reason: Mapped[str | None] = mapped_column(Text, default=None)
+    sealed_dsn: Mapped[bytes | None] = mapped_column(LargeBinary, default=None)
+    dsn_recipient_id: Mapped[str | None] = mapped_column(Text, default=None)
+    dsn_revision: Mapped[int] = mapped_column(BigInteger, server_default="1")
+    dsn_secret_name: Mapped[str | None] = mapped_column(Text, default=None)
+    dsn_secret_key: Mapped[str | None] = mapped_column(Text, default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class SharedConnectorMembership(Base):
+    """One alias through which one agent reaches a shared application.
+
+    ``tools`` NULL is every policy tool; otherwise a JSON array narrowing them.
+    Any insert, update or delete of these rows, the agent-delete cascade
+    included, raises the application's ``policy_generation`` once by trigger.
+    """
+
+    __tablename__ = "shared_connector_memberships"
+    __table_args__ = (
+        CheckConstraint(
+            "alias ~ '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'",
+            name="shared_connector_memberships_alias_ck",
+        ),
+        CheckConstraint(
+            "tools IS NULL OR jsonb_typeof(tools) = 'array'",
+            name="shared_connector_memberships_tools_ck",
+        ),
+        Index("ix_shared_connector_memberships_agent_id", "agent_id"),
+    )
+
+    application_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            f"{SCHEMA}.shared_connector_applications.id",
+            ondelete="CASCADE",
+            name="shared_connector_memberships_application_id_fkey",
+        ),
+        primary_key=True,
+    )
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            f"{SCHEMA}.agents.id",
+            ondelete="CASCADE",
+            name="shared_connector_memberships_agent_id_fkey",
+        ),
+        primary_key=True,
+    )
+    alias: Mapped[str] = mapped_column(Text, primary_key=True)
+    tools: Mapped[list[str] | None] = mapped_column(JSONB, default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class SharedConnectorBinding(Base):
+    """One agent's provider account in a shared application.
+
+    Platform custody holds ciphertext sealed to a recipient plus its source
+    metadata; connector custody holds neither. There is no plaintext column.
+    At most one enabled binding exists per (application, agent). Identity
+    columns never change, ``credential_revision`` only rises, and ``enabled``
+    only goes false; the application role may update ``lock_guard`` alone.
+    """
+
+    __tablename__ = "shared_connector_bindings"
+    __table_args__ = (
+        CheckConstraint(
+            "octet_length(provider_account) BETWEEN 1 AND 256 "
+            f"AND provider_account !~ '{_SHARED_CONTROL}'",
+            name="shared_connector_bindings_provider_account_ck",
+        ),
+        CheckConstraint(
+            "custody IN ('platform', 'connector')", name="shared_connector_bindings_custody_ck"
+        ),
+        CheckConstraint(
+            "enabled = (disabled_at IS NULL)", name="shared_connector_bindings_disabled_ck"
+        ),
+        CheckConstraint(
+            "credential_revision >= 1", name="shared_connector_bindings_credential_revision_ck"
+        ),
+        CheckConstraint(
+            "octet_length(ciphertext) BETWEEN 49 AND 65536",
+            name="shared_connector_bindings_ciphertext_ck",
+        ),
+        CheckConstraint(
+            "source_kind = 'kubernetes-secret'", name="shared_connector_bindings_source_kind_ck"
+        ),
+        CheckConstraint(
+            "source_fingerprint ~ '^hmac-sha256:[0-9a-f]{64}$'",
+            name="shared_connector_bindings_source_fingerprint_ck",
+        ),
+        CheckConstraint(
+            "(custody = 'platform' AND recipient_id IS NOT NULL AND ciphertext IS NOT NULL "
+            "AND source_kind IS NOT NULL AND source_namespace IS NOT NULL "
+            "AND source_name IS NOT NULL AND source_uid IS NOT NULL "
+            "AND source_resource_version IS NOT NULL AND source_fingerprint IS NOT NULL) "
+            "OR (custody = 'connector' AND recipient_id IS NULL AND ciphertext IS NULL "
+            "AND source_kind IS NULL AND source_namespace IS NULL AND source_name IS NULL "
+            "AND source_uid IS NULL AND source_resource_version IS NULL "
+            "AND source_fingerprint IS NULL AND credential_revision = 1)",
+            name="shared_connector_bindings_custody_shape_ck",
+        ),
+        ForeignKeyConstraint(
+            ["application_id", "custody"],
+            [
+                f"{SCHEMA}.shared_connector_applications.id",
+                f"{SCHEMA}.shared_connector_applications.custody",
+            ],
+            name="shared_connector_bindings_custody_fkey",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["application_id", "recipient_id"],
+            [
+                f"{SCHEMA}.shared_connector_recipients.application_id",
+                f"{SCHEMA}.shared_connector_recipients.recipient_id",
+            ],
+            name="shared_connector_bindings_recipient_fkey",
+        ),
+        UniqueConstraint("id", "application_id", name="shared_connector_bindings_application_key"),
+        Index(
+            "shared_connector_bindings_enabled_agent_key",
+            "application_id",
+            "agent_id",
+            unique=True,
+            postgresql_where=text("enabled"),
+        ),
+        Index("ix_shared_connector_bindings_agent_id", "agent_id"),
+        Index(
+            "ix_shared_connector_bindings_application_recipient",
+            "application_id",
+            "recipient_id",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    application_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            f"{SCHEMA}.shared_connector_applications.id",
+            ondelete="CASCADE",
+            name="shared_connector_bindings_application_id_fkey",
+        ),
+    )
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            f"{SCHEMA}.agents.id",
+            ondelete="CASCADE",
+            name="shared_connector_bindings_agent_id_fkey",
+        ),
+    )
+    provider_account: Mapped[str] = mapped_column(Text)
+    custody: Mapped[str] = mapped_column(Text)
+    enabled: Mapped[bool] = mapped_column(server_default=text("true"))
+    disabled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    credential_revision: Mapped[int] = mapped_column(BigInteger)
+    recipient_id: Mapped[str | None] = mapped_column(Text, default=None)
+    ciphertext: Mapped[bytes | None] = mapped_column(LargeBinary, default=None)
+    source_kind: Mapped[str | None] = mapped_column(Text, default=None)
+    source_namespace: Mapped[str | None] = mapped_column(Text, default=None)
+    source_name: Mapped[str | None] = mapped_column(Text, default=None)
+    source_uid: Mapped[str | None] = mapped_column(Text, default=None)
+    source_resource_version: Mapped[str | None] = mapped_column(Text, default=None)
+    source_fingerprint: Mapped[str | None] = mapped_column(Text, default=None)
+    lock_guard: Mapped[int] = mapped_column(SmallInteger, server_default="0")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class SharedConnectorRefreshIntent(Base):
+    """Durable OAuth refresh state for one grant (ADR 0239 "Static sources" 4, 5).
+
+    The grant ID is unique within the installation and pins its application,
+    binding and client configuration fingerprint. ``epoch`` only rises. The
+    application role changes this row only through the SECURITY DEFINER
+    refresh functions; the explicit reimport reset is the API's own write.
+    """
+
+    __tablename__ = "shared_connector_refresh_intents"
+    __table_args__ = (
+        CheckConstraint(
+            "grant_id ~ '^[A-Za-z0-9._:-]{1,128}$'",
+            name="shared_connector_refresh_intents_grant_id_ck",
+        ),
+        CheckConstraint(
+            "client_config_fingerprint ~ '^sha256:[0-9a-f]{64}$'",
+            name="shared_connector_refresh_intents_fingerprint_ck",
+        ),
+        CheckConstraint(
+            "state IN ('ready', 'refreshing', 'recovery_required')",
+            name="shared_connector_refresh_intents_state_ck",
+        ),
+        CheckConstraint("epoch >= 0", name="shared_connector_refresh_intents_epoch_ck"),
+        CheckConstraint(
+            "octet_length(owner) BETWEEN 1 AND 128",
+            name="shared_connector_refresh_intents_owner_ck",
+        ),
+        CheckConstraint(
+            "recovery_reason IN ('uncertain_outcome', 'lease_expired')",
+            name="shared_connector_refresh_intents_recovery_reason_ck",
+        ),
+        CheckConstraint(
+            "(state = 'ready' AND intent_id IS NULL AND owner IS NULL "
+            "AND lease_expires_at IS NULL AND recovery_reason IS NULL) "
+            "OR (state = 'refreshing' AND intent_id IS NOT NULL AND owner IS NOT NULL "
+            "AND lease_expires_at IS NOT NULL AND recovery_reason IS NULL) "
+            "OR (state = 'recovery_required' AND recovery_reason IS NOT NULL)",
+            name="shared_connector_refresh_intents_state_shape_ck",
+        ),
+        ForeignKeyConstraint(
+            ["binding_id", "application_id"],
+            [
+                f"{SCHEMA}.shared_connector_bindings.id",
+                f"{SCHEMA}.shared_connector_bindings.application_id",
+            ],
+            name="shared_connector_refresh_intents_binding_fkey",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["installation_id", "application_id"],
+            [
+                f"{SCHEMA}.shared_connector_applications.installation_id",
+                f"{SCHEMA}.shared_connector_applications.id",
+            ],
+            name="shared_connector_refresh_intents_application_fkey",
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint("binding_id", name="shared_connector_refresh_intents_binding_id_key"),
+    )
+
+    installation_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    grant_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    application_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    binding_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    client_config_fingerprint: Mapped[str] = mapped_column(Text)
+    state: Mapped[str] = mapped_column(Text, server_default="ready")
+    epoch: Mapped[int] = mapped_column(BigInteger, server_default="0")
+    intent_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), default=None)
+    owner: Mapped[str | None] = mapped_column(Text, default=None)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    recovery_reason: Mapped[str | None] = mapped_column(Text, default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )

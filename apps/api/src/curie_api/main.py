@@ -93,6 +93,7 @@ from .routers import (
     remediation_receipts,
     runs,
     schedules,
+    shared_connectors,
     state,
     thread_attachments,
     turn_progress,
@@ -598,6 +599,9 @@ def create_app() -> FastAPI:
     app.include_router(provider_installations.router)
     app.include_router(channel_identities.router)
     app.include_router(identity.router)
+    # Shared connector applications, operator and worker halves (ADR 0239).
+    app.include_router(shared_connectors.router)
+    app.include_router(shared_connectors.internal_router)
     app.include_router(hooks.router)
 
     @app.middleware("http")

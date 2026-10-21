@@ -10877,6 +10877,1157 @@
         "title": "SettingsPackConfig",
         "type": "object"
       },
+      "SharedAliasIn": {
+        "additionalProperties": false,
+        "properties": {
+          "alias": {
+            "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$",
+            "title": "Alias",
+            "type": "string"
+          },
+          "tools": {
+            "anyOf": [
+              {
+                "items": {
+                  "pattern": "^[A-Za-z0-9_.:-]{1,128}$",
+                  "type": "string"
+                },
+                "maxItems": 256,
+                "minItems": 1,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tools"
+          }
+        },
+        "required": [
+          "alias",
+          "tools"
+        ],
+        "title": "SharedAliasIn",
+        "type": "object"
+      },
+      "SharedAliasOut": {
+        "properties": {
+          "alias": {
+            "title": "Alias",
+            "type": "string"
+          },
+          "tools": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tools"
+          }
+        },
+        "required": [
+          "alias",
+          "tools"
+        ],
+        "title": "SharedAliasOut",
+        "type": "object"
+      },
+      "SharedApplicationDisabled": {
+        "properties": {
+          "acknowledged": {
+            "title": "Acknowledged",
+            "type": "boolean"
+          },
+          "application_id": {
+            "format": "uuid",
+            "title": "Application Id",
+            "type": "string"
+          },
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "application_id",
+          "enabled",
+          "acknowledged"
+        ],
+        "title": "SharedApplicationDisabled",
+        "type": "object"
+      },
+      "SharedApplicationOut": {
+        "properties": {
+          "application_id": {
+            "format": "uuid",
+            "title": "Application Id",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "credential_slots": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Credential Slots",
+            "type": "array"
+          },
+          "custody": {
+            "enum": [
+              "platform",
+              "connector"
+            ],
+            "title": "Custody",
+            "type": "string"
+          },
+          "database": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SharedDatabaseOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "installation_id": {
+            "title": "Installation Id",
+            "type": "string"
+          },
+          "policy": {
+            "$ref": "#/components/schemas/SharedPolicyOut"
+          },
+          "policy_generation": {
+            "title": "Policy Generation",
+            "type": "integer"
+          },
+          "provider_origins": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Provider Origins",
+            "type": "array"
+          },
+          "recipients": {
+            "items": {
+              "$ref": "#/components/schemas/SharedRecipientOut"
+            },
+            "title": "Recipients",
+            "type": "array"
+          },
+          "server_image": {
+            "title": "Server Image",
+            "type": "string"
+          },
+          "snapshot_seal": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SharedSecretRefOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "application_id",
+          "installation_id",
+          "server_image",
+          "credential_slots",
+          "provider_origins",
+          "snapshot_seal",
+          "policy",
+          "custody",
+          "policy_generation",
+          "enabled",
+          "recipients",
+          "database",
+          "created_at"
+        ],
+        "title": "SharedApplicationOut",
+        "type": "object"
+      },
+      "SharedApplicationRegistration": {
+        "additionalProperties": false,
+        "properties": {
+          "application": {
+            "additionalProperties": true,
+            "title": "Application",
+            "type": "object"
+          },
+          "policy": {
+            "$ref": "#/components/schemas/SharedPolicy"
+          }
+        },
+        "required": [
+          "application",
+          "policy"
+        ],
+        "title": "SharedApplicationRegistration",
+        "type": "object"
+      },
+      "SharedBindingCheck": {
+        "additionalProperties": false,
+        "properties": {
+          "source": {
+            "$ref": "#/components/schemas/SharedSourceVersion"
+          }
+        },
+        "required": [
+          "source"
+        ],
+        "title": "SharedBindingCheck",
+        "type": "object"
+      },
+      "SharedBindingCheckOut": {
+        "properties": {
+          "binding_id": {
+            "format": "uuid",
+            "title": "Binding Id",
+            "type": "string"
+          },
+          "credential_revision": {
+            "title": "Credential Revision",
+            "type": "integer"
+          },
+          "recorded_source": {
+            "$ref": "#/components/schemas/SharedSourceVersion"
+          },
+          "status": {
+            "enum": [
+              "current",
+              "source_stale"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "binding_id",
+          "status",
+          "credential_revision",
+          "recorded_source"
+        ],
+        "title": "SharedBindingCheckOut",
+        "type": "object"
+      },
+      "SharedBindingDisabled": {
+        "properties": {
+          "acknowledged": {
+            "title": "Acknowledged",
+            "type": "boolean"
+          },
+          "binding_id": {
+            "format": "uuid",
+            "title": "Binding Id",
+            "type": "string"
+          },
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "binding_id",
+          "enabled",
+          "acknowledged"
+        ],
+        "title": "SharedBindingDisabled",
+        "type": "object"
+      },
+      "SharedBindingImport": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": {
+            "format": "uuid",
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "credential": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SharedCredentialEnvelope"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "provider_account": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Provider Account",
+            "type": "string"
+          },
+          "refresh_grant": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SharedRefreshGrantIn"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "source": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SharedSourceMetadata"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "agent_id",
+          "provider_account"
+        ],
+        "title": "SharedBindingImport",
+        "type": "object"
+      },
+      "SharedBindingOut": {
+        "properties": {
+          "agent_id": {
+            "format": "uuid",
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "application_id": {
+            "format": "uuid",
+            "title": "Application Id",
+            "type": "string"
+          },
+          "binding_id": {
+            "format": "uuid",
+            "title": "Binding Id",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "credential_revision": {
+            "title": "Credential Revision",
+            "type": "integer"
+          },
+          "custody": {
+            "enum": [
+              "platform",
+              "connector"
+            ],
+            "title": "Custody",
+            "type": "string"
+          },
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "provider_account": {
+            "title": "Provider Account",
+            "type": "string"
+          },
+          "recipient_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recipient Id"
+          },
+          "refresh": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SharedRefreshOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "source": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SharedSourceMetadata"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "binding_id",
+          "application_id",
+          "agent_id",
+          "provider_account",
+          "custody",
+          "enabled",
+          "credential_revision",
+          "recipient_id",
+          "source",
+          "refresh",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "SharedBindingOut",
+        "type": "object"
+      },
+      "SharedBindingReimport": {
+        "additionalProperties": false,
+        "properties": {
+          "credential": {
+            "$ref": "#/components/schemas/SharedCredentialEnvelope"
+          },
+          "expected_revision": {
+            "minimum": 1.0,
+            "title": "Expected Revision",
+            "type": "integer"
+          },
+          "source": {
+            "$ref": "#/components/schemas/SharedSourceMetadata"
+          }
+        },
+        "required": [
+          "expected_revision",
+          "credential",
+          "source"
+        ],
+        "title": "SharedBindingReimport",
+        "type": "object"
+      },
+      "SharedBundledDatabaseOut": {
+        "properties": {
+          "application_id": {
+            "format": "uuid",
+            "title": "Application Id",
+            "type": "string"
+          },
+          "dsn_revision": {
+            "title": "Dsn Revision",
+            "type": "integer"
+          },
+          "mode": {
+            "const": "bundled",
+            "title": "Mode",
+            "type": "string"
+          },
+          "recipient_id": {
+            "title": "Recipient Id",
+            "type": "string"
+          },
+          "role_name": {
+            "title": "Role Name",
+            "type": "string"
+          },
+          "sealed_dsn": {
+            "title": "Sealed Dsn",
+            "type": "string"
+          },
+          "status": {
+            "const": "provisioned",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "application_id",
+          "mode",
+          "role_name",
+          "status",
+          "recipient_id",
+          "dsn_revision",
+          "sealed_dsn"
+        ],
+        "title": "SharedBundledDatabaseOut",
+        "type": "object"
+      },
+      "SharedCredentialEnvelope": {
+        "additionalProperties": false,
+        "description": "A credential the CLI sealed to one of the application's recipients.",
+        "properties": {
+          "ciphertext": {
+            "maxLength": 87384,
+            "minLength": 1,
+            "title": "Ciphertext",
+            "type": "string"
+          },
+          "recipient_id": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Recipient Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "recipient_id",
+          "ciphertext"
+        ],
+        "title": "SharedCredentialEnvelope",
+        "type": "object"
+      },
+      "SharedDatabaseOut": {
+        "properties": {
+          "dsn_recipient_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dsn Recipient Id"
+          },
+          "dsn_revision": {
+            "title": "Dsn Revision",
+            "type": "integer"
+          },
+          "dsn_secret": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SharedSecretRefOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "mode": {
+            "enum": [
+              "bundled",
+              "managed"
+            ],
+            "title": "Mode",
+            "type": "string"
+          },
+          "role_name": {
+            "title": "Role Name",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "provisioned",
+              "pending",
+              "ready",
+              "failed"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "status_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status Reason"
+          }
+        },
+        "required": [
+          "mode",
+          "role_name",
+          "status",
+          "status_reason",
+          "dsn_recipient_id",
+          "dsn_revision",
+          "dsn_secret"
+        ],
+        "title": "SharedDatabaseOut",
+        "type": "object"
+      },
+      "SharedDatabaseProvision": {
+        "additionalProperties": false,
+        "description": "``bundled``: the API creates the role. ``managed``: an operator's role.",
+        "properties": {
+          "mode": {
+            "enum": [
+              "bundled",
+              "managed"
+            ],
+            "title": "Mode",
+            "type": "string"
+          },
+          "role_name": {
+            "anyOf": [
+              {
+                "pattern": "^[a-z_][a-z0-9_]{0,62}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Role Name"
+          }
+        },
+        "required": [
+          "mode"
+        ],
+        "title": "SharedDatabaseProvision",
+        "type": "object"
+      },
+      "SharedDatabaseRotate": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_dsn_revision": {
+            "minimum": 1.0,
+            "title": "Expected Dsn Revision",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "expected_dsn_revision"
+        ],
+        "title": "SharedDatabaseRotate",
+        "type": "object"
+      },
+      "SharedDatabaseStatusOut": {
+        "properties": {
+          "application_id": {
+            "format": "uuid",
+            "title": "Application Id",
+            "type": "string"
+          },
+          "dsn_revision": {
+            "title": "Dsn Revision",
+            "type": "integer"
+          },
+          "mode": {
+            "enum": [
+              "bundled",
+              "managed"
+            ],
+            "title": "Mode",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "provisioned",
+              "pending",
+              "ready",
+              "failed"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "status_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status Reason"
+          }
+        },
+        "required": [
+          "application_id",
+          "mode",
+          "status",
+          "status_reason",
+          "dsn_revision"
+        ],
+        "title": "SharedDatabaseStatusOut",
+        "type": "object"
+      },
+      "SharedDatabaseStatusReport": {
+        "additionalProperties": false,
+        "properties": {
+          "dsn_revision": {
+            "minimum": 1.0,
+            "title": "Dsn Revision",
+            "type": "integer"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "pattern": "^[a-z][a-z0-9_]{0,63}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "status": {
+            "enum": [
+              "ready",
+              "failed"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "dsn_revision"
+        ],
+        "title": "SharedDatabaseStatusReport",
+        "type": "object"
+      },
+      "SharedManagedDatabaseOut": {
+        "properties": {
+          "application_id": {
+            "format": "uuid",
+            "title": "Application Id",
+            "type": "string"
+          },
+          "dsn_secret": {
+            "$ref": "#/components/schemas/SharedSecretRefOut"
+          },
+          "mode": {
+            "const": "managed",
+            "title": "Mode",
+            "type": "string"
+          },
+          "role_name": {
+            "title": "Role Name",
+            "type": "string"
+          },
+          "status": {
+            "const": "pending",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "application_id",
+          "mode",
+          "role_name",
+          "status",
+          "dsn_secret"
+        ],
+        "title": "SharedManagedDatabaseOut",
+        "type": "object"
+      },
+      "SharedMembershipOut": {
+        "properties": {
+          "agent_id": {
+            "format": "uuid",
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "aliases": {
+            "items": {
+              "$ref": "#/components/schemas/SharedAliasOut"
+            },
+            "title": "Aliases",
+            "type": "array"
+          },
+          "application_id": {
+            "format": "uuid",
+            "title": "Application Id",
+            "type": "string"
+          },
+          "policy_generation": {
+            "title": "Policy Generation",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "application_id",
+          "agent_id",
+          "aliases",
+          "policy_generation"
+        ],
+        "title": "SharedMembershipOut",
+        "type": "object"
+      },
+      "SharedMembershipReplace": {
+        "additionalProperties": false,
+        "properties": {
+          "aliases": {
+            "items": {
+              "$ref": "#/components/schemas/SharedAliasIn"
+            },
+            "maxItems": 16,
+            "minItems": 1,
+            "title": "Aliases",
+            "type": "array"
+          }
+        },
+        "required": [
+          "aliases"
+        ],
+        "title": "SharedMembershipReplace",
+        "type": "object"
+      },
+      "SharedPolicy": {
+        "additionalProperties": false,
+        "description": "The operator-approved tool set and who holds the credential.",
+        "properties": {
+          "custody": {
+            "default": "platform",
+            "enum": [
+              "platform",
+              "connector"
+            ],
+            "title": "Custody",
+            "type": "string"
+          },
+          "tools": {
+            "items": {
+              "pattern": "^[A-Za-z0-9_.:-]{1,128}$",
+              "type": "string"
+            },
+            "maxItems": 256,
+            "minItems": 1,
+            "title": "Tools",
+            "type": "array"
+          }
+        },
+        "required": [
+          "tools"
+        ],
+        "title": "SharedPolicy",
+        "type": "object"
+      },
+      "SharedPolicyOut": {
+        "properties": {
+          "custody": {
+            "enum": [
+              "platform",
+              "connector"
+            ],
+            "title": "Custody",
+            "type": "string"
+          },
+          "tools": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Tools",
+            "type": "array"
+          }
+        },
+        "required": [
+          "tools",
+          "custody"
+        ],
+        "title": "SharedPolicyOut",
+        "type": "object"
+      },
+      "SharedRecipientOut": {
+        "properties": {
+          "algorithm": {
+            "title": "Algorithm",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "current": {
+            "title": "Current",
+            "type": "boolean"
+          },
+          "recipient_id": {
+            "title": "Recipient Id",
+            "type": "string"
+          },
+          "retired_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Retired At"
+          }
+        },
+        "required": [
+          "recipient_id",
+          "algorithm",
+          "current",
+          "created_at",
+          "retired_at"
+        ],
+        "title": "SharedRecipientOut",
+        "type": "object"
+      },
+      "SharedRecipientPublicKey": {
+        "additionalProperties": false,
+        "properties": {
+          "algorithm": {
+            "const": "x25519-sealed-box",
+            "title": "Algorithm",
+            "type": "string"
+          },
+          "key": {
+            "maxLength": 64,
+            "title": "Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "algorithm",
+          "key"
+        ],
+        "title": "SharedRecipientPublicKey",
+        "type": "object"
+      },
+      "SharedRecipientReadback": {
+        "additionalProperties": false,
+        "properties": {
+          "public_key_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Public Key Sha256",
+            "type": "string"
+          }
+        },
+        "required": [
+          "public_key_sha256"
+        ],
+        "title": "SharedRecipientReadback",
+        "type": "object"
+      },
+      "SharedRecipientRegistered": {
+        "properties": {
+          "application_id": {
+            "format": "uuid",
+            "title": "Application Id",
+            "type": "string"
+          },
+          "current": {
+            "title": "Current",
+            "type": "boolean"
+          },
+          "recipient_id": {
+            "title": "Recipient Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "application_id",
+          "recipient_id",
+          "current"
+        ],
+        "title": "SharedRecipientRegistered",
+        "type": "object"
+      },
+      "SharedRecipientRegistration": {
+        "additionalProperties": false,
+        "description": "Public key material only; any other field (a private key) is refused.",
+        "properties": {
+          "application_id": {
+            "format": "uuid",
+            "title": "Application Id",
+            "type": "string"
+          },
+          "public_key": {
+            "$ref": "#/components/schemas/SharedRecipientPublicKey"
+          },
+          "readback": {
+            "$ref": "#/components/schemas/SharedRecipientReadback"
+          },
+          "recipient_id": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Recipient Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "application_id",
+          "recipient_id",
+          "public_key",
+          "readback"
+        ],
+        "title": "SharedRecipientRegistration",
+        "type": "object"
+      },
+      "SharedRecipientRetired": {
+        "properties": {
+          "application_id": {
+            "format": "uuid",
+            "title": "Application Id",
+            "type": "string"
+          },
+          "recipient_id": {
+            "title": "Recipient Id",
+            "type": "string"
+          },
+          "retired_at": {
+            "format": "date-time",
+            "title": "Retired At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "application_id",
+          "recipient_id",
+          "retired_at"
+        ],
+        "title": "SharedRecipientRetired",
+        "type": "object"
+      },
+      "SharedRefreshGrantIn": {
+        "additionalProperties": false,
+        "properties": {
+          "client_config_fingerprint": {
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Client Config Fingerprint",
+            "type": "string"
+          },
+          "grant_id": {
+            "pattern": "^[A-Za-z0-9._:-]{1,128}$",
+            "title": "Grant Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "grant_id",
+          "client_config_fingerprint"
+        ],
+        "title": "SharedRefreshGrantIn",
+        "type": "object"
+      },
+      "SharedRefreshOut": {
+        "properties": {
+          "client_config_fingerprint": {
+            "title": "Client Config Fingerprint",
+            "type": "string"
+          },
+          "epoch": {
+            "title": "Epoch",
+            "type": "integer"
+          },
+          "grant_id": {
+            "title": "Grant Id",
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "ready",
+              "refreshing",
+              "recovery_required"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "grant_id",
+          "client_config_fingerprint",
+          "state",
+          "epoch"
+        ],
+        "title": "SharedRefreshOut",
+        "type": "object"
+      },
+      "SharedSecretRefOut": {
+        "properties": {
+          "key": {
+            "title": "Key",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "key"
+        ],
+        "title": "SharedSecretRefOut",
+        "type": "object"
+      },
+      "SharedSourceMetadata": {
+        "additionalProperties": false,
+        "description": "Where an imported credential came from; never its material.",
+        "properties": {
+          "fingerprint": {
+            "pattern": "^hmac-sha256:[0-9a-f]{64}$",
+            "title": "Fingerprint",
+            "type": "string"
+          },
+          "kind": {
+            "const": "kubernetes-secret",
+            "title": "Kind",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "namespace": {
+            "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$",
+            "title": "Namespace",
+            "type": "string"
+          },
+          "resource_version": {
+            "title": "Resource Version",
+            "type": "string"
+          },
+          "uid": {
+            "title": "Uid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "namespace",
+          "name",
+          "uid",
+          "resource_version",
+          "fingerprint"
+        ],
+        "title": "SharedSourceMetadata",
+        "type": "object"
+      },
+      "SharedSourceVersion": {
+        "additionalProperties": false,
+        "properties": {
+          "resource_version": {
+            "title": "Resource Version",
+            "type": "string"
+          },
+          "uid": {
+            "title": "Uid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "uid",
+          "resource_version"
+        ],
+        "title": "SharedSourceVersion",
+        "type": "object"
+      },
       "SlackEvidence": {
         "additionalProperties": false,
         "description": "The identity-bearing fields of one Slack delivery, as the dispatcher read them.\n\nStrict, so a string ``\"false\"`` is never taken as the positive statement\n``is_ext_shared_channel: false``; extra fields are refused, so a field this\nmapping does not use cannot be sent as if it were evidence.",
@@ -24210,6 +25361,872 @@
         ]
       }
     },
+    "/shared-connectors/applications": {
+      "post": {
+        "description": "201 for a new application; 200 with the same record for an identical replay.",
+        "operationId": "register_shared_application_shared_connectors_applications_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SharedApplicationRegistration"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SharedApplicationOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Register Shared Application",
+        "tags": [
+          "shared-connectors"
+        ]
+      }
+    },
+    "/shared-connectors/applications/{application_id}": {
+      "get": {
+        "operationId": "get_shared_application_shared_connectors_applications__application_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "application_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Application Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SharedApplicationOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Shared Application",
+        "tags": [
+          "shared-connectors"
+        ]
+      }
+    },
+    "/shared-connectors/applications/{application_id}/bindings": {
+      "post": {
+        "operationId": "import_shared_binding_shared_connectors_applications__application_id__bindings_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "application_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Application Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SharedBindingImport"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SharedBindingOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Import Shared Binding",
+        "tags": [
+          "shared-connectors"
+        ]
+      }
+    },
+    "/shared-connectors/applications/{application_id}/database": {
+      "post": {
+        "operationId": "provision_shared_database_shared_connectors_applications__application_id__database_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "application_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Application Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SharedDatabaseProvision"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/SharedBundledDatabaseOut"
+                    },
+                    {
+                      "$ref": "#/components/schemas/SharedManagedDatabaseOut"
+                    }
+                  ],
+                  "title": "Response Provision Shared Database Shared Connectors Applications  Application Id  Database Post"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Provision Shared Database",
+        "tags": [
+          "shared-connectors"
+        ]
+      }
+    },
+    "/shared-connectors/applications/{application_id}/database/rotate": {
+      "post": {
+        "operationId": "rotate_shared_database_shared_connectors_applications__application_id__database_rotate_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "application_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Application Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SharedDatabaseRotate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SharedBundledDatabaseOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Rotate Shared Database",
+        "tags": [
+          "shared-connectors"
+        ]
+      }
+    },
+    "/shared-connectors/applications/{application_id}/disable": {
+      "post": {
+        "description": "Answers only after the disable commits; later resolves refuse.",
+        "operationId": "disable_shared_application_shared_connectors_applications__application_id__disable_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "application_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Application Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SharedApplicationDisabled"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Disable Shared Application",
+        "tags": [
+          "shared-connectors"
+        ]
+      }
+    },
+    "/shared-connectors/applications/{application_id}/members/{agent_id}": {
+      "delete": {
+        "operationId": "remove_shared_member_shared_connectors_applications__application_id__members__agent_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "application_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Application Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SharedMembershipOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Remove Shared Member",
+        "tags": [
+          "shared-connectors"
+        ]
+      },
+      "put": {
+        "operationId": "replace_shared_members_shared_connectors_applications__application_id__members__agent_id__put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "application_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Application Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SharedMembershipReplace"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SharedMembershipOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Replace Shared Members",
+        "tags": [
+          "shared-connectors"
+        ]
+      }
+    },
+    "/shared-connectors/applications/{application_id}/recipients/{recipient_id}/retire": {
+      "post": {
+        "operationId": "retire_shared_recipient_shared_connectors_applications__application_id__recipients__recipient_id__retire_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "application_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Application Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "recipient_id",
+            "required": true,
+            "schema": {
+              "pattern": "^[0-9a-f]{64}$",
+              "title": "Recipient Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SharedRecipientRetired"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Retire Shared Recipient",
+        "tags": [
+          "shared-connectors"
+        ]
+      }
+    },
+    "/shared-connectors/bindings/{binding_id}": {
+      "get": {
+        "operationId": "get_shared_binding_shared_connectors_bindings__binding_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "binding_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Binding Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SharedBindingOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Shared Binding",
+        "tags": [
+          "shared-connectors"
+        ]
+      }
+    },
+    "/shared-connectors/bindings/{binding_id}/check": {
+      "post": {
+        "operationId": "check_shared_binding_shared_connectors_bindings__binding_id__check_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "binding_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Binding Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SharedBindingCheck"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SharedBindingCheckOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Check Shared Binding",
+        "tags": [
+          "shared-connectors"
+        ]
+      }
+    },
+    "/shared-connectors/bindings/{binding_id}/disable": {
+      "post": {
+        "description": "Answers only after the disable commits; later resolves refuse.",
+        "operationId": "disable_shared_binding_shared_connectors_bindings__binding_id__disable_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "binding_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Binding Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SharedBindingDisabled"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Disable Shared Binding",
+        "tags": [
+          "shared-connectors"
+        ]
+      }
+    },
+    "/shared-connectors/bindings/{binding_id}/reimport": {
+      "post": {
+        "operationId": "reimport_shared_binding_shared_connectors_bindings__binding_id__reimport_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "binding_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Binding Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SharedBindingReimport"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SharedBindingOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Reimport Shared Binding",
+        "tags": [
+          "shared-connectors"
+        ]
+      }
+    },
     "/v1/factory/cards/{token}.svg": {
       "get": {
         "operationId": "factory_status_card_v1_factory_cards__token__svg_get",
@@ -25437,6 +27454,145 @@
         "summary": "Submit Remediation Nominations",
         "tags": [
           "internal-remediation"
+        ]
+      }
+    },
+    "/v1/internal/shared-connectors/applications/{application_id}/database/status": {
+      "put": {
+        "operationId": "report_shared_database_status_v1_internal_shared_connectors_applications__application_id__database_status_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "application_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Application Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SharedDatabaseStatusReport"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SharedDatabaseStatusOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Report Shared Database Status",
+        "tags": [
+          "internal-shared-connectors"
+        ]
+      }
+    },
+    "/v1/internal/shared-connectors/applications/{application_id}/recipients": {
+      "post": {
+        "description": "201 for a new key; 200 for a replay of a live one, current or not.",
+        "operationId": "register_shared_recipient_v1_internal_shared_connectors_applications__application_id__recipients_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "application_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Application Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SharedRecipientRegistration"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SharedRecipientRegistered"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Register Shared Recipient",
+        "tags": [
+          "internal-shared-connectors"
         ]
       }
     },

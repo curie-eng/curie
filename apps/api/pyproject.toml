@@ -20,6 +20,8 @@ dependencies = [
     # GitHub App JWT signing (ADR-0092). Present transitively today; declared
     # because this package imports it directly.
     "pyjwt[crypto]>=2.10",
+    # Seals shared connector DSNs to an application's X25519 recipient (ADR 0239).
+    "pynacl>=1.5",
     "redis>=5.0",
     "plugin-format",
     "aci-protocol",
