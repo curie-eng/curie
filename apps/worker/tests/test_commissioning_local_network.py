@@ -182,11 +182,18 @@ def test_the_local_producer_has_its_own_kind() -> None:
     assert made.producer_kind == LOCAL_PRODUCER_KIND == "local-cilium-v1"
 
 
-def test_the_local_required_set_drops_only_instance_metadata() -> None:
+def test_the_local_required_set_is_an_allowlist_of_cases_one_six_eight() -> None:
     probe_layout = layout()
     assert NOT_APPLICABLE_SUB_CASES == frozenset({"instance_metadata"})
-    dropped = required_entries(probe_layout) - local_required_entries(probe_layout)
-    assert dropped == {(6, "instance_metadata", "ipv4", "none", "runner_policy")}
+    local = local_required_entries(probe_layout)
+    # Exactly cases 1, 6 and 8, and never instance metadata.
+    assert {key[0] for key in local} == {1, 6, 8}
+    assert (6, "instance_metadata", "ipv4", "none", "runner_policy") not in local
+    # Everything the shared kit adds beyond that -- case 2 (hostile), cases 3, 4, 5
+    # and 7, and instance metadata -- is dropped, so a later kit case cannot leak in.
+    dropped = required_entries(probe_layout) - local
+    assert {2, 3, 4, 5, 7} <= {key[0] for key in dropped}
+    assert (6, "instance_metadata", "ipv4", "none", "runner_policy") in dropped
 
 
 def test_a_clean_local_measurement_passes_every_local_entry() -> None:
@@ -317,6 +324,45 @@ def test_the_network_fact_covers_only_network_cases() -> None:
     assert made.last is not None
     entries = made.last.measurement.entries
     assert channel_digest([i for i in entries if i.case != 2], "network") == network(made)
+
+
+def test_other_kit_cases_change_neither_the_fact_digest_nor_the_verdict() -> None:
+    # A kit that also reports cases 2, 3, 4, 5 and 7 produces the same network fact
+    # and the same (clean) verdict as a kit that reports only the local cases: the
+    # shared kit's other cases are inert here.
+    probe_layout = layout()
+    full, _, _ = measured()  # kit_entries reports every case 1..8
+    full_digest = network(full)
+    local_keys = local_required_entries(probe_layout)
+    local_only = [item for item in kit_entries(probe_layout) if item.key in local_keys]
+    lean, _, _ = producer(kit=FakeKit(local_only))
+    assert asyncio.run(lean.measure()).refusal is None
+    assert network(lean) == full_digest
+
+
+def test_a_non_pass_dropped_case_neither_refuses_nor_changes_the_digest() -> None:
+    # An extra non-pass case-7 entry (an unknown case to this producer) is dropped
+    # before the verdict, so it does not refuse the measurement or move the digest.
+    probe_layout = layout()
+    base_digest = network(measured()[0])
+    entries, flipped = [], False
+    for item in kit_entries(probe_layout):
+        if item.case == 7 and not flipped:
+            item, flipped = entry(item.key, "unavailable", "node_probe_unavailable"), True
+        entries.append(item)
+    assert flipped
+    made, _, _ = producer(kit=FakeKit(entries))
+    assert asyncio.run(made.measure()).refusal is None
+    assert network(made) == base_digest
+
+
+def test_a_missing_required_local_sub_case_still_refuses() -> None:
+    # Dropping a required case-1 entry leaves the local required set incomplete.
+    probe_layout = layout()
+    missing = (1, "non_vacuity", "ipv4", "same_node", "foreign_namespace")
+    entries = [item for item in kit_entries(probe_layout) if item.key != missing]
+    made, _, _ = producer(kit=FakeKit(entries))
+    assert asyncio.run(made.measure()).refusal is not None
 
 
 def test_only_the_network_fact_exists_in_this_slice() -> None:
