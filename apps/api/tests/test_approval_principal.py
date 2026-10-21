@@ -322,3 +322,38 @@ def test_api_verifies_shared_test_driver_wire_vector() -> None:
         "C0EXAMPLE1",
         "00000000-0000-4000-8000-000000000153",
     )
+
+
+def test_chat_principal_binds_strict_slack_sender_evidence() -> None:
+    from curie_api.identity.slack import SlackEvidence
+
+    evidence = SlackEvidence(delivery="block_actions", user_id=SUBJECT,
+                             interaction_user_team_id="TEXAMPLE1")
+    token = approval_principal.mint(
+        "example-attester", subject=SUBJECT, kind="chat", scope=approval_principal.APPROVE_SCOPE,
+        exp=160, actor_channel=CHANNEL, approval_id=APPROVAL_ID, slack=evidence,
+    )
+    claims = approval_principal.verify_claims(token, "example-attester",
+        scope=approval_principal.APPROVE_SCOPE, approval_id=APPROVAL_ID, now=100)
+    assert claims is not None and claims.slack == evidence
+    payload = json.loads(sandbox_token.b64url_decode(token.split(".")[1]))
+    payload["slack"]["user_id"] = OTHER_SUBJECT = "U0EXAMPLE2"
+    segment = sandbox_token.b64url(json.dumps(payload).encode())
+    forged = f"apr.{segment}.{sandbox_token.signature('example-attester', f'apr.{segment}')}"
+    assert OTHER_SUBJECT != SUBJECT
+    assert approval_principal.verify_claims(forged, "example-attester",
+        scope=approval_principal.APPROVE_SCOPE, approval_id=APPROVAL_ID, now=100) is None
+
+
+def test_api_verifies_shared_slack_evidence_vector() -> None:
+    vector = json.loads(
+        (Path(__file__).parents[3] / "tests/vectors/approval-principal.json").read_text()
+    )
+    example = vector["chat_slack"]
+    claims = approval_principal.verify_claims(
+        example["token"], vector["secret"], scope=approval_principal.APPROVE_SCOPE,
+        approval_id=example["claims"]["approval_id"], now=vector["issued_at"],
+    )
+    assert claims is not None and claims.slack is not None
+    assert claims.slack.user_id == example["claims"]["sub"]
+    assert claims.slack.interaction_user_team_id == "TEXAMPLE1"

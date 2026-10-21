@@ -15,6 +15,7 @@ from typing import Any
 
 import pytest
 from aci_protocol.service_config import HEARTBEAT_FILE_ENV, STREAM_ENV
+from curie_protected_hooks.schema_serving import load_window
 from curie_test_support.valkey import connect_or_skip
 from curie_worker import run
 from curie_worker.config import WorkerConfig
@@ -53,7 +54,7 @@ def worker_db(worker_templates: Any) -> Iterator[Any]:
     saved = os.environ.get("DATABASE_URL")
     clone = support.IsolatedMigrationDb(base, name, templates)
     try:
-        clone.at("0108")
+        clone.at(load_window().schema_head)
         url = support.render_url(base.set(database=name))
         os.environ["DATABASE_URL"] = url
         support.get_settings.cache_clear()
@@ -74,7 +75,7 @@ def adapter() -> Any:
     return method
 
 
-@pytest.mark.parametrize("revision", ["0108", "future-expand"])
+@pytest.mark.parametrize("revision", [load_window().schema_head, "future-expand"])
 def test_worker_adapter_reads_actual_compatible_schema_without_writes_or_live_backend(
     worker_db: Any, revision: str
 ) -> None:

@@ -1,10 +1,11 @@
-//! A loopback port that refuses connections and cannot be taken by another process.
+//! A loopback port that cannot accept connections or be taken by another process.
 //!
 //! Binding a listener to port 0, recording the port and dropping it leaves a race:
 //! a parallel test process can bind the same port before the request goes out and
 //! answer it. `ClosedPort` keeps a bound but never-listening socket alive, so a
-//! connect is refused because nothing listens, and no other process can bind the
-//! port while the guard lives.
+//! connection cannot be established, and no other process can bind the port
+//! while the guard lives. Linux refuses immediately; Darwin drops the SYN, so
+//! callers must use a connection deadline.
 #![allow(dead_code)]
 
 use std::net::Ipv4Addr;
@@ -18,8 +19,12 @@ pub struct ClosedPort {
 
 impl ClosedPort {
     pub fn new() -> Self {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let socket_type = libc::SOCK_STREAM | libc::SOCK_CLOEXEC;
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let socket_type = libc::SOCK_STREAM;
         // SAFETY: plain socket(2) call with constant arguments; the result is checked.
-        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+        let fd = unsafe { libc::socket(libc::AF_INET, socket_type, 0) };
         if fd < 0 {
             panic!(
                 "create closed-port socket: {}",
@@ -28,6 +33,28 @@ impl ClosedPort {
         }
         // SAFETY: `fd` is a freshly created, valid descriptor that nothing else owns.
         let socket = unsafe { OwnedFd::from_raw_fd(fd) };
+
+        // macOS has no SOCK_CLOEXEC socket type flag. Set the descriptor flag
+        // before bind; OwnedFd closes it if either checked operation fails.
+        // Unlike Linux's socket flag, this fallback is not atomic with exec.
+        // https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/fcntl.2.html
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            // SAFETY: fd is open, and F_GETFD takes no third argument.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert!(
+                flags >= 0,
+                "read socket flags: {}",
+                std::io::Error::last_os_error()
+            );
+            // SAFETY: F_SETFD accepts the descriptor flag bits as an integer.
+            let rc = unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+            assert!(
+                rc >= 0,
+                "set socket flags: {}",
+                std::io::Error::last_os_error()
+            );
+        }
 
         // SO_REUSEADDR stays unset on purpose: with it, Linux lets two
         // non-listening sockets share a port, which would defeat the guard.
@@ -98,7 +125,8 @@ impl Default for ClosedPort {
 mod tests {
     use super::ClosedPort;
     use std::io::ErrorKind;
-    use std::net::{TcpListener, TcpStream};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::time::Duration;
 
     #[test]
     fn port_is_held_and_refuses_connections_while_alive() {
@@ -111,8 +139,31 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::AddrInUse);
         assert_eq!(err.raw_os_error(), Some(libc::EADDRINUSE));
 
-        let err = TcpStream::connect(("127.0.0.1", port)).expect_err("nothing listens");
+        // Positive control: this host can establish a loopback TCP connection.
+        let listening = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        TcpStream::connect_timeout(&listening.local_addr().unwrap(), Duration::from_secs(1))
+            .expect("a listening port accepts connections");
+
+        let target = SocketAddr::from(([127, 0, 0, 1], port));
+        let err = TcpStream::connect_timeout(&target, Duration::from_millis(250))
+            .expect_err("nothing listens");
+        // Darwin drops input for TCPS_CLOSED without sending a reset:
+        // https://github.com/apple-oss-distributions/xnu/blob/main/bsd/netinet/tcp_input.c
+        #[cfg(target_os = "macos")]
+        assert_eq!(err.kind(), ErrorKind::TimedOut);
+        #[cfg(not(target_os = "macos"))]
         assert_eq!(err.kind(), ErrorKind::ConnectionRefused);
+    }
+
+    #[test]
+    fn descriptor_is_close_on_exec() {
+        use std::os::fd::AsRawFd;
+
+        let guard = ClosedPort::new();
+        // SAFETY: the guard owns this open descriptor; F_GETFD takes no third argument.
+        let flags = unsafe { libc::fcntl(guard._socket.as_raw_fd(), libc::F_GETFD) };
+        assert!(flags >= 0);
+        assert_ne!(flags & libc::FD_CLOEXEC, 0);
     }
 
     #[test]

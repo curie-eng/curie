@@ -98,7 +98,7 @@ def _approval(*, author: str = _AUTHOR) -> Approval:
     )
 
 
-def _authorize(approver_set: ApproverSet, actor: str) -> tuple[str, AuthzDecision]:
+def _authorize(approver_set: ApproverSet, actor: str) -> tuple[str | None, AuthzDecision]:
     """The resolve endpoint's exact shape: select a set, then authorize on it."""
 
     select: ApproverSetSelector = _FakeSelector(approver_set)

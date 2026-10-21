@@ -17,7 +17,7 @@ Lock order everywhere is installation row, then identity row (plan r4.2), so
 concurrent reports, PATCHes and installation retargets serialize. The
 concurrency tests drive two real PostgreSQL sessions on separate engines.
 
-Every test here commits; a local fixture truncates the four tables and removes
+Every test here commits; a local fixture truncates the five tables and removes
 the tenants this module creates, before and after each test.
 """
 
@@ -83,7 +83,10 @@ def _cleanup() -> None:
     # test body rather than every fixture.
     _sql(
         "DO $$ BEGIN "
-        "IF to_regclass('curie.identity_links') IS NOT NULL THEN "
+        "IF to_regclass('curie.identity_connect_tokens') IS NOT NULL THEN "
+        "TRUNCATE curie.identity_connect_tokens, curie.identity_links, "
+        "curie.identity_namespaces; "
+        "ELSIF to_regclass('curie.identity_links') IS NOT NULL THEN "
         "TRUNCATE curie.identity_links, curie.identity_namespaces; END IF; "
         "TRUNCATE curie.channel_identities, curie.provider_installations; END $$"
     )

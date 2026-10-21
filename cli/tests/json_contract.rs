@@ -6,6 +6,7 @@
 
 use std::collections::BTreeSet;
 
+use curie::commands::DirectoryOutput;
 use curie::commands::{eval_json, status_json};
 use curie::evals::CaseOutcome;
 use curie::exit;
@@ -23,6 +24,36 @@ fn load_schema(name: &str) -> serde_json::Value {
 
 fn validator(schema: &serde_json::Value) -> jsonschema::Validator {
     jsonschema::validator_for(schema).expect("schema compiles to a validator")
+}
+
+#[test]
+fn directory_output_schema_covers_objects_arrays_and_refuses_invalid_wrappers() {
+    let validator = validator(&load_schema("directory.schema.json"));
+    for (resource, result) in [
+        ("config", serde_json::json!({"version":1})),
+        ("people", serde_json::json!({"items":[],"next_cursor":null})),
+        ("links", serde_json::json!({"items":[],"next_cursor":null})),
+        ("namespaces", serde_json::json!({"id":"namespace"})),
+        ("teams", serde_json::json!([])),
+    ] {
+        let output = DirectoryOutput::Done {
+            tenant_id: "00000000-0000-0000-0000-000000000001".into(),
+            resource: resource.into(),
+            result: result.clone(),
+        }
+        .to_json();
+        assert!(validator.is_valid(&output), "{output}");
+        assert_eq!(output["result"], result);
+        let mut malformed = output.clone();
+        malformed["resource"] = serde_json::json!("unsupported");
+        assert!(!validator.is_valid(&malformed));
+        malformed = output.clone();
+        malformed["result"] = serde_json::json!("unstructured response");
+        assert!(!validator.is_valid(&malformed));
+        malformed = output;
+        malformed.as_object_mut().unwrap().remove("tenant_id");
+        assert!(!validator.is_valid(&malformed));
+    }
 }
 
 #[test]

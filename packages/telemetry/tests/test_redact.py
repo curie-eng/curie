@@ -688,3 +688,33 @@ def test_installed_filter_redacts(
         logger.removeHandler(handler)
 
     assert stream.getvalue() == expected + "\n"
+
+
+def test_sender_connection_path_secret_is_redacted():
+    from curie_telemetry.redact import redact_text
+
+    token = "a" * 43
+    for tail in ("", "/confirm", "?probe=ordinary"):
+        raw = f"GET /identity/connect/{token}{tail} HTTP/1.1"
+        redacted = redact_text(raw)
+        assert token not in redacted
+        assert "/identity/connect/[REDACTED:identity_connect_token]" in redacted
+        assert redact_text(redacted) == redacted
+
+
+def test_directory_projection_credential_is_redacted():
+    from curie_telemetry.redact import redact_text
+
+    token = "dir.syntheticpayload.syntheticsignature"
+    assert token not in redact_text(f"credential {token}")
+
+
+def test_oidc_callback_query_is_private_even_when_login_is_disabled():
+    from curie_telemetry.redact import redact_text
+
+    raw = "GET /api/console/oidc/callback?code=synthetic-code&state=synthetic-state HTTP/1.1"
+    redacted = redact_text(raw)
+    assert "synthetic-code" not in redacted
+    assert "synthetic-state" not in redacted
+    assert "/console/oidc/callback?[REDACTED:oidc_callback_query]" in redacted
+    assert redact_text(redacted) == redacted

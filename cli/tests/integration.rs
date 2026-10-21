@@ -4,6 +4,7 @@
 
 mod support;
 
+mod access_policy_verb;
 mod actions_cli;
 mod agent_update_body;
 mod api_deploy;
