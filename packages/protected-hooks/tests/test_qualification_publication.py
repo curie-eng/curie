@@ -78,31 +78,15 @@ PUBLISHER = {"id": "commissioning/example-qualification-publisher", "generation"
 
 
 class Recipes:
-    """The product recipes the provisioner hashes into G.
-
-    The two worker recipes are stand-ins: each holds one rule longer than the
-    provisioner core's rule bound, which the provisioner refuses. Their rules
-    do not bear on the Qualification publisher's binding.
-    """
+    """The merged recipes the provisioner hashes into G."""
 
     def __init__(self, qualification_id: str) -> None:
-        self.qualification_id = qualification_id
+        from curie_protected_hooks.commissioning_acl import GuardRecipes
+
+        self._recipes = GuardRecipes(qualification_id)
 
     def rules(self, principal: str) -> tuple[str, ...]:
-        from curie_protected_hooks.admission_acl import admission_acl_rules
-        from curie_protected_hooks.commissioning_acl import commissioning_acl_rules
-
-        from .test_commissioning_acl import permit
-
-        if principal in ("enqueue", "verifier"):
-            return admission_acl_rules(principal)
-        if principal in ("worker", "candidate_worker"):
-            return ("-@all", "resetkeys", "%R~protected:example:" + principal + ":*")
-        if principal == "candidate_enqueue":
-            return commissioning_acl_rules(principal, permit=permit())
-        if principal == "qualification_publisher":
-            return commissioning_acl_rules(principal, qualification_id=self.qualification_id)
-        return commissioning_acl_rules(principal)
+        return self._recipes.rules(principal)
 
 
 def provisioned(broker: Any, *, changes: Any = None, **identity: Any) -> Any:

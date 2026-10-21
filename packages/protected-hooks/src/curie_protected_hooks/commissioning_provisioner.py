@@ -40,6 +40,7 @@ from .commissioning_encoding import CommissioningRecordInvalid
 
 __all__ = [
     "BROKER_PRINCIPALS",
+    "GUARD_PRINCIPALS",
     "COMMISSIONING_ENTRY_POINT",
     "ENTRY_POINT_COMPOSITIONS",
     "PRODUCTION_ENTRY_POINT",
@@ -81,6 +82,14 @@ BROKER_PRINCIPALS = (
     "candidate_worker",
     "qualification_publisher",
 )
+# G's principals: every B credential above plus design decision 7's ACL
+# observer. G hashes the observer's rules and binds its credential, which B
+# does not name; the observer is the checker, never one of the checked.
+GUARD_PRINCIPALS = (*BROKER_PRINCIPALS, "observer")
+# Design decision 9: G hashes candidate templates, never a campaign's lane.
+_CANDIDATES = ("candidate_enqueue", "candidate_worker")
+_LANE_PLACEHOLDER = "{lane}"
+_LANE_PREFIX = "protected:commissioning:lane:"
 _GUARD_KIND = "commissioning_guard_config"
 _GUARD_MAX_BYTES = 16384
 _PINNED_IMAGE = re.compile(r"([\x21-\x3f\x41-\x7e]{1,2000})@(sha256:[0-9a-f]{64})")
@@ -128,7 +137,10 @@ class BrokerAclRecipes(Protocol):
     """Seam to the measured broker ACL recipes, @spec PROTECTED-COMMISSIONING-2.
 
     ``rules`` returns one principal's rule tokens, without its enabled state or
-    password. The provisioner hashes them into G; it never widens a role.
+    password, for every name in ``GUARD_PRINCIPALS``. For the two candidate
+    principals it returns the design decision 9 template, with the lane prefix
+    as ``{lane}``. The provisioner hashes them into G; it never widens a role.
+    ``commissioning_acl.GuardRecipes`` is the merged adapter.
     """
 
     def rules(self, principal: str) -> tuple[str, ...]:
@@ -162,6 +174,7 @@ class ProvisionerProfile:
     issuer_identity: dict[str, Any]
     control_identity: dict[str, Any]
     qualification_publisher_identity: dict[str, Any]
+    observer_identity: dict[str, Any]
     mediator_identity: dict[str, Any]
     gateway_identity: dict[str, Any]
     source_scope: list[dict[str, Any]]
@@ -339,11 +352,38 @@ def _principal_credentials(b: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _bootstrap_credential_ids(b: dict[str, Any]) -> set[str]:
+    """Every credential ID B names, the mediator's and gateway's included."""
+    refs = [
+        *_principal_credentials(b).values(),
+        b["mediator_identity"],
+        b["gateway_identity"],
+    ]
+    return {ref["id"] for ref in refs}
+
+
+def _template(name: str, rules: tuple[str, ...]) -> None:
+    """Design decision 9: a candidate entry is its lane template, nothing instantiated."""
+    if name in _CANDIDATES:
+        _require(any(_LANE_PLACEHOLDER in rule for rule in rules))
+        _require(not any(_LANE_PREFIX in rule for rule in rules))
+    else:
+        _require(not any(_LANE_PLACEHOLDER in rule for rule in rules))
+
+
 def _guard(
     profile: ProvisionerProfile, bootstrap: CommissioningBootstrap, acl: BrokerAclRecipes
 ) -> bytes:
     """Step 2: G holds sha256(B) and each principal's hashed rules."""
-    credentials = _principal_credentials(bootstrap.as_dict())
+    b = bootstrap.as_dict()
+    credentials = _principal_credentials(b)
+    _object(profile.observer_identity, _CREDENTIAL)
+    _require(profile.observer_identity["id"] not in _bootstrap_credential_ids(b))
+    credentials["observer"] = profile.observer_identity
+    rules = {name: acl.rules(name) for name in GUARD_PRINCIPALS}
+    for name in GUARD_PRINCIPALS:
+        _rules_digest(rules[name])
+        _template(name, rules[name])
     value = {
         "schema_version": 1,
         "kind": _GUARD_KIND,
@@ -354,9 +394,9 @@ def _guard(
         "broker_acl": {
             name: {
                 "credential": credentials[name],
-                "rules_sha256": _rules_digest(acl.rules(name)),
+                "rules_sha256": _rules_digest(rules[name]),
             }
-            for name in BROKER_PRINCIPALS
+            for name in GUARD_PRINCIPALS
         },
     }
     raw = _encode(value)
@@ -371,7 +411,7 @@ _GUARD_SCHEMA: dict[str, Any] = {
     "rbac_sha256": _SHA256,
     "network_policy_sha256": _SHA256,
     "broker_acl": {
-        name: {"credential": _CREDENTIAL, "rules_sha256": _SHA256} for name in BROKER_PRINCIPALS
+        name: {"credential": _CREDENTIAL, "rules_sha256": _SHA256} for name in GUARD_PRINCIPALS
     },
 }
 
@@ -518,6 +558,9 @@ def verify_tuple(
                 g["broker_acl"][name]["credential"] == credentials[name]
                 for name in BROKER_PRINCIPALS
             )
+        )
+        _require(
+            g["broker_acl"]["observer"]["credential"]["id"] not in _bootstrap_credential_ids(b)
         )
         _require(
             b["entry_points"]

@@ -190,6 +190,94 @@ def test_recipes_are_closed_distinct_and_start_from_reset() -> None:
         assert api.commissioning_acl_rules(role, permit=other) != recipes[role]
 
 
+# --- Design decision 9: candidate templates ------------------------------------------
+
+
+@pytest.mark.parametrize("role", CANDIDATES)
+def test_candidate_templates_carry_the_lane_only_as_the_placeholder(role: str) -> None:
+    api = module()
+    template = api.commissioning_acl_template(role)
+    assert api.LANE_PLACEHOLDER == "{lane}"
+    assert any(api.LANE_PLACEHOLDER in rule for rule in template)
+    assert not any("protected:commissioning:lane:" in rule for rule in template)
+    lane = api.derive_commissioning_lane(permit())
+    rules = api.commissioning_acl_rules(role, permit=permit())
+    assert api.instantiate_candidate_rules(role, lane) == rules
+    # The template is the instantiated recipe with exactly the lane prefix abstracted.
+    assert tuple(rule.replace(lane.prefix, "{lane}") for rule in rules) == template
+
+
+@pytest.mark.parametrize("role", CANDIDATES)
+def test_candidate_template_is_the_same_for_every_campaign(role: str) -> None:
+    api = module()
+    first, other = permit(), permit(campaign_generation="2")
+    assert api.commissioning_acl_rules(role, permit=first) != api.commissioning_acl_rules(
+        role, permit=other
+    )
+    template = api.commissioning_acl_template(role)
+    digest = hashlib.sha256(json.dumps(list(template)).encode()).hexdigest()
+    for record in (first, other):
+        lane = api.derive_commissioning_lane(record)
+        instantiated = api.instantiate_candidate_rules(role, lane)
+        assert tuple(rule.replace(lane.prefix, "{lane}") for rule in instantiated) == template
+    assert hashlib.sha256(json.dumps(list(template)).encode()).hexdigest() == digest
+
+
+@pytest.mark.parametrize("role", CANDIDATES)
+def test_check_accepts_only_the_current_permits_instantiation(role: str) -> None:
+    api = module()
+    current = permit()
+    rules = api.commissioning_acl_rules(role, permit=current)
+    api.check_candidate_rules(role, rules, permit=current)
+    other_lane = api.commissioning_acl_rules(role, permit=permit(campaign_generation="2"))
+    variants = [
+        other_lane,
+        api.commissioning_acl_template(role),
+        (*rules, "+keys"),
+        rules[:-1],
+        (rules[1], rules[0], *rules[2:]),
+        list(rules),
+        tuple(rule.replace("+get", "+set") for rule in rules),
+    ]
+    for variant in variants:
+        with pytest.raises(ValueError):
+            api.check_candidate_rules(role, variant, permit=current)
+    other_role = next(r for r in CANDIDATES if r != role)
+    with pytest.raises(ValueError):
+        api.check_candidate_rules(
+            role, api.commissioning_acl_rules(other_role, permit=current), permit=current
+        )
+
+
+@pytest.mark.parametrize("role", ["observer", "issuer", "worker", "", None])
+def test_templates_exist_only_for_candidates(role: Any) -> None:
+    with pytest.raises(ValueError):
+        module().commissioning_acl_template(role)
+
+
+def test_instantiation_refuses_a_production_or_malformed_lane() -> None:
+    from curie_protected_hooks.authority_records import parse_manifest
+    from curie_protected_hooks.execution_namespace import LaneNamespace
+
+    from .test_authority_records import example_records
+
+    api = module()
+    manifest = parse_manifest(json.dumps(example_records()["manifest"]).encode())
+    production = derive_lane_namespace(manifest)
+    good = api.derive_commissioning_lane(permit())
+    for lane in (
+        production,
+        LaneNamespace("{lane}", good.group, "{lane}:runs", good.dead),
+        LaneNamespace(good.prefix, good.group, good.prefix + ":dead", good.dead),
+        LaneNamespace(good.prefix + ":x", good.group, good.prefix + ":x:runs", good.dead),
+        good.prefix,
+    ):
+        with pytest.raises(ValueError):
+            api.instantiate_candidate_rules("candidate_worker", lane)  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        api.check_candidate_rules("candidate_worker", (), permit=None)  # type: ignore[arg-type]
+
+
 # --- Measured matrix on the pinned Valkey ---------------------------------------------
 
 FOREIGN_PERMIT = {"campaign_id": "77777777-7777-4777-8777-777777777777"}
