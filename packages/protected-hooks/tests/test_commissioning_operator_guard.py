@@ -523,3 +523,12 @@ def test_the_observer_rules_check_accepts_resp2_and_byte_strings():
     guard, _, _, transport = build(reader=reader)
     asyncio.run(guard.require_current())
     assert len(transport.sent) == 1
+
+
+def test_the_premeasured_tuple_is_exposed_as_a_fresh_copy():
+    """Callers bind the guard to their own B, M and permit before relying on it."""
+    guard, *_ = build()
+    measured = guard.premeasured
+    assert measured == DIGESTS and measured["bootstrap"] == B.digest
+    measured["bootstrap"] = OTHER
+    assert guard.premeasured["bootstrap"] == B.digest
