@@ -84,7 +84,11 @@ BROKER_PRINCIPALS = (
 _GUARD_KIND = "commissioning_guard_config"
 _GUARD_MAX_BYTES = 16384
 _PINNED_IMAGE = re.compile(r"([\x21-\x3f\x41-\x7e]{1,2000})@(sha256:[0-9a-f]{64})")
-_RULE = re.compile(r"[\x21-\x7e](?:[\x20-\x7e]{0,510}[\x21-\x7e])?")
+# The longest merged rule is the worker's measured command selector (under 600
+# characters); the caps leave room for that inventory to grow, not for unbounded input.
+_RULE_MAX = 4096
+_RULES_MAX = 16384
+_RULE = re.compile(rf"[\x21-\x7e](?:[\x20-\x7e]{{0,{_RULE_MAX - 2}}}[\x21-\x7e])?")
 # ACL tokens that carry a user's enabled state or password. G hashes rules only.
 _STATE_TOKENS = frozenset({"on", "off", "nopass", "resetpass", "reset"})
 _PASSWORD_PREFIXES = (">", "<", "#", "!")
@@ -241,6 +245,8 @@ def _pinned(reference: Any) -> str:
 
 def _rules_digest(rules: Any) -> str:
     _require(type(rules) is tuple and bool(rules))
+    _require(all(type(rule) is str for rule in rules))
+    _require(sum(len(rule) for rule in rules) <= _RULES_MAX)
     for rule in rules:
         _require(type(rule) is str and _RULE.fullmatch(rule) is not None)
         for token in rule.split():

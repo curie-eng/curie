@@ -341,6 +341,63 @@ def test_guard_refuses_malformed_rule_recipes(value: Any) -> None:
         api.construct(profile(), acl=Recipes(rules))
 
 
+class MergedRecipes:
+    """The merged production and commissioning recipes, one per principal in G."""
+
+    def __init__(self, qualification_id: str) -> None:
+        from curie_protected_hooks.admission_acl import admission_acl_rules
+        from curie_protected_hooks.commissioning_acl import commissioning_acl_rules
+        from curie_protected_hooks.commissioning_records import parse_commissioning_permit
+        from curie_protected_hooks.worker_acl import worker_acl_rules
+
+        from .test_commissioning_records import permit_value
+
+        permit = parse_commissioning_permit(json.dumps(permit_value()).encode())
+        self.recipes = {
+            "enqueue": admission_acl_rules("enqueue"),
+            "worker": worker_acl_rules("worker"),
+            "verifier": admission_acl_rules("verifier"),
+            "issuer": commissioning_acl_rules("issuer"),
+            "control": commissioning_acl_rules("control"),
+            "candidate_enqueue": commissioning_acl_rules("candidate_enqueue", permit=permit),
+            "candidate_worker": commissioning_acl_rules("candidate_worker", permit=permit),
+            "qualification_publisher": commissioning_acl_rules(
+                "qualification_publisher", qualification_id=qualification_id
+            ),
+        }
+
+    def rules(self, principal: str) -> tuple[str, ...]:
+        return self.recipes[principal]
+
+
+def test_guard_accepts_the_merged_recipes() -> None:
+    recipes = MergedRecipes(profile_fields()["qualification_id"])
+    # The production worker and candidate worker carry the long measured command selector.
+    assert max(len(rule) for rules in recipes.recipes.values() for rule in rules) > 512
+    guard = json.loads(module().construct(profile(), acl=recipes).guard_config)
+    for name in PRINCIPALS:
+        assert guard["broker_acl"][name]["rules_sha256"] == sha(
+            canonical(list(recipes.rules(name)))
+        )
+
+
+def test_guard_bounds_each_rule_and_each_principals_rule_set() -> None:
+    api = module()
+    rules = {name: ("-@all", "+acl|whoami") for name in PRINCIPALS}
+    longest = "(+get ~" + "k" * 4088 + ")"
+    assert len(longest) == 4096
+    rules["worker"] = ("-@all", longest)
+    api.construct(profile(), acl=Recipes(rules))
+    rules["worker"] = ("-@all", longest[:-1] + "k)")
+    with pytest.raises(api.ProvisionerRefused):
+        api.construct(profile(), acl=Recipes(rules))
+    rules["worker"] = (longest,) * 4
+    api.construct(profile(), acl=Recipes(rules))
+    rules["worker"] = (longest,) * 4 + ("-@all",)
+    with pytest.raises(api.ProvisionerRefused):
+        api.construct(profile(), acl=Recipes(rules))
+
+
 def test_measurement_file_binds_the_final_manifest_and_parses() -> None:
     from curie_protected_hooks.artifact_measurement import parse_artifact_measurement
 
