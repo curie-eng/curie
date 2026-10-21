@@ -16,7 +16,6 @@ members = [
     "curie-dispatcher",
     "curie-doclint",
     "curie-e2e-connector",
-    "curie-factory-preparation",
     "curie-internal",
     "curie-mail-adapter",
     "curie-protected-hooks",
@@ -908,17 +907,6 @@ requires-dist = [
 ]
 
 [[package]]
-name = "curie-factory-preparation"
-version = "0.1.0"
-source = { editable = "examples/dark-factory/preparation" }
-dependencies = [
-    { name = "pydantic" },
-]
-
-[package.metadata]
-requires-dist = [{ name = "pydantic", specifier = ">=2,<3" }]
-
-[[package]]
 name = "curie-internal"
 version = "0.0.0"
 source = { editable = "packages/curie-internal" }
@@ -1145,7 +1133,6 @@ dependencies = [
 [package.dev-dependencies]
 dev = [
     { name = "curie-doclint" },
-    { name = "curie-factory-preparation" },
     { name = "curie-test-support" },
     { name = "curie-wire-tolerance-gate" },
     { name = "import-linter" },
@@ -1182,7 +1169,6 @@ requires-dist = [
 [package.metadata.requires-dev]
 dev = [
     { name = "curie-doclint", editable = "tools/doclint" },
-    { name = "curie-factory-preparation", editable = "examples/dark-factory/preparation" },
     { name = "curie-test-support", editable = "packages/test-support" },
     { name = "curie-wire-tolerance-gate", editable = "tools/wire-tolerance-gate" },
     { name = "import-linter", specifier = ">=2.0" },

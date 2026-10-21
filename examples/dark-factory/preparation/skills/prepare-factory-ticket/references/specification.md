@@ -19,7 +19,7 @@ Use these seven headings exactly once, at Markdown level 2 or 3:
 | Acceptance criteria | Consecutively numbered observable outcomes, each with a concrete verification route and location. |
 | Out of scope | Explicit boundaries that preserve the agreed intent; exclusions require developer review. |
 
-Heading matching is case insensitive. Empty sections fail structural parsing;
+Review headings without regard to case. Required sections must be substantive;
 `None` is permitted only for Blocked by and Preconditions. Other headings may be
 present but terminate the preceding section. They do not become required fields.
 Fenced or indented examples and HTML comment lines cannot supply structural
@@ -95,31 +95,11 @@ acceptance. Explain shared-file constraints. Record excluded requirements with
 concrete reasons and actual developer review; never silently drop scope. If a
 safe split cannot be established, retain one unresolved draft.
 
-When exact fingerprints can be computed using existing capabilities, a v1 JSON
-envelope contains these fields:
-
-| Field | Value |
-|---|---|
-| `version` | Integer `1`. |
-| `source` | `kind` of `existing-ticket` or `new-intent`, and `identity`. |
-| `requirements` | Records with stable `id` and original `text`. |
-| `children` | Records with stable local `id` and `specification_fingerprint`. |
-| `coverage` | Records with `requirement`, `child` and numbered `criterion`. |
-| `integration` | Named `child`, `criterion` and nonempty verification `check`. |
-| `dependencies` | Records with `child` and `prerequisite`, both local child IDs. |
-| `scope_exclusions` | Records with `requirement`, concrete `reason` and `reviewed: true` only after explicit review; otherwise an empty array. |
-
-IDs begin with an ASCII letter and contain at most 64 ASCII letters, numbers,
-underscores or hyphens. Save a local ID-to-child-file mapping beside the envelope.
-IDs do not resolve to tracker issues during local drafting. Keep external native
-prerequisites visible in each child's Blocked by section.
-
-A child fingerprint is lowercase SHA256 of its exact UTF-8 Markdown bytes.
-Line endings and edits change it. Canonical envelope serialization uses sorted
-object keys and compact JSON. Do not guess hashes or use placeholders in a file
-presented as a complete v1 envelope. If hashing is unavailable, save an explicitly
-incomplete draft mapping and record missing fingerprints; install no tools just
-for this purpose. Any computed hash identifies bytes, not readiness.
+Use a readable table or list mapping original requirements to child IDs and
+numbered acceptance criteria, plus child/prerequisite pairs. Keep stable local
+IDs distinct from real tracker identities and keep external prerequisites in
+each child's Blocked by section. No JSON envelope, hashes or extra tools are
+required. Save the reviewed child bodies alongside the mapping.
 
 Review unknown references, duplicate IDs or edges, cycles, invalid criterion
 references, missing coverage/integration ownership and changed child bytes. This
@@ -186,10 +166,10 @@ format review proves deployment readiness.
    issue links and the exact dependency relationships before creating children.
    Resolve those links in topological order; make no unreviewed semantic changes.
    Preserve the reviewed snapshots and save the exact resolved published bodies
-   separately with their real issue mapping. Link substitutions change body bytes:
-   refresh the corresponding child fingerprints and envelope with existing tools,
-   or explicitly mark the mapping incomplete and any prior envelope stale. Never
-   present pre-substitution fingerprints as identifying the published bodies.
+   separately with their real issue mapping. Update the coverage and dependency
+   map to use the actual published issue identities, preserving local IDs for
+   traceability. Do not present an unresolved local-ID map as the final published
+   mapping.
    Write native tracker dependency edges only if separately included in the
    approved plan and supported by available tools. Retain canonical Blocked by
    relationships even when native edges are unavailable, and report that limitation.

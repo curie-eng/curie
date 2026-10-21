@@ -190,10 +190,9 @@ conversations and credentials do not belong in the report.
 
 A split retains the original requirements and identifies which child criterion
 covers each one, who owns integration proof, dependency ordering and shared-file
-constraints. A dependent child can be complete while still blocked. If exact
-fingerprints cannot be computed with existing tooling, the agent saves an
-incomplete mapping and names the gap rather than inventing a valid envelope or
-requiring a new client runtime.
+constraints. A dependent child can be complete while still blocked. Save a
+readable coverage and dependency map alongside the child drafts; no hashes,
+JSON envelope or new client runtime are required.
 
 ## Publish and start
 
@@ -238,11 +237,13 @@ evaluator result is invented.
 ## Scope of the first release
 
 The local authoring skill can ship before migration of existing factory prompts,
-CI repair policy and labels. The bundle-owned Python library under
-`preparation/src/` preserves the structural contract for managed evaluation and
-contributor tests. It is not loaded into the API or installed on users' computers.
+CI repair policy and labels. The release contains the portable instructions,
+offline installer and optional impact pilot. Format, coverage and dependency
+review is performed by the coding agent and developer; no Python parser or
+runtime admission validator is included.
 [ADR 0222](../adr/0222-coworker-bundles-own-workflow-policy-and-curie-enforces-execution.md)
-sets that ownership boundary; #4589 tracks the minimum isolated evaluation support.
+sets the ownership boundary for future factory policy; #4589 tracks isolated
+evaluation support.
 
 ## Manual upgrades
 

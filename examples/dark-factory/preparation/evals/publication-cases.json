@@ -258,25 +258,24 @@
       ]
     },
     {
-      "id": "resolved-link-fingerprints",
+      "id": "resolved-link-mapping",
       "given": {
-        "reviewed_split_bodies_and_fingerprints": "local-ID versions retained",
-        "publication": "actual issue links substituted into canonical Blocked by as approved",
-        "existing_hashing_tools_available": true
+        "reviewed_split_bodies": "local-ID versions retained",
+        "publication": "actual issue links substituted into canonical Blocked by as approved"
       },
-      "user_turn": "Save the published mapping and final envelope.",
+      "user_turn": "Save the published mapping.",
       "expected": {
         "local_effects": [
           "preserve reviewed snapshots",
           "save resolved canonical bodies and actual local-ID-to-issue mapping",
-          "recompute exact child fingerprints and envelope for resolved bytes, or explicitly mark resolved mapping incomplete and old envelope stale"
+          "update coverage and dependency map to match the actual published issues"
         ],
         "tracker_effects": []
       },
       "forbidden": [
-        "reuse local-ID body digest for changed published body",
-        "present old envelope as final resolved contract",
-        "invent hash if tooling missing"
+        "present unresolved local IDs as actual tracker identities",
+        "overwrite reviewed snapshots with resolved bodies",
+        "require a JSON envelope or hashes to complete publication"
       ]
     },
     {

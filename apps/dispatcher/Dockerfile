@@ -40,7 +40,6 @@ COPY apps/mail-adapter/pyproject.toml apps/mail-adapter/
 COPY apps/e2e-connector/pyproject.toml apps/e2e-connector/
 COPY apps/worker/pyproject.toml apps/worker/
 COPY runner/pyproject.toml runner/
-COPY examples/dark-factory/preparation/pyproject.toml examples/dark-factory/preparation/
 COPY tools/doclint/pyproject.toml tools/doclint/
 COPY tools/wire-tolerance-gate/pyproject.toml tools/wire-tolerance-gate/
 RUN uv sync --frozen --no-dev --no-editable --no-install-workspace --package curie-dispatcher

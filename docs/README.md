@@ -40,7 +40,7 @@ they are not substitutes for a supported quickstart.
 - [Prepare factory specifications](guides/factory-preparation.md): use your local
   coding agent to clarify intent and save a reviewed draft without a new runtime.
 - [Factory specification contract](guides/factory-specification.md): canonical ticket
-  structure and the local ticket-set format.
+  structure and manual coverage and dependency mapping.
 - [Factory outcomes and costs](guides/measuring-factory-outcomes.md): evaluate
   completed work, estimated spend, and human review effort.
 - [Behavior packs](behavior-packs.md): opt-in greetings, capability tips, and

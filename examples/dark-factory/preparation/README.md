@@ -8,24 +8,10 @@ The installer copies only that skill folder and its references, offline.
 It requires no Python interpreter,
 parser installation, container runtime or reachable Curie deployment.
 
-The `src/curie_factory_preparation` library is the factory-owned structural
-contract for managed evaluation and contributor verification. It is not a client
-installation prerequisite. Future deployment evaluation uses the isolated policy
-boundary in ADR 0222; platform applications must not import the library directly.
-No deployed admission path consumes this library in this release.
-
-The library exports `parse_specification` and `parse_ticket_set`. They preserve
-contract version 1, exact UTF-8 body fingerprints and safe `spec_*`/`set_*`
-diagnostics. Structural validity does not establish resolved intent, substantive
-coverage, merged prerequisites, usable verification routes or deployment readiness.
-Ticket-set fingerprints must come from actual canonicalization; the preparation
-skill must never invent a digest or claim a parser/evaluator ran.
-
-Contributor checks run from the Curie source workspace:
-
-```bash
-uv run pytest examples/tests/test_factory_specification.py -q
-```
+Preparation uses the host coding agent to review the specification format,
+coverage and dependencies. This release contains no Python parser, deterministic
+specification validator or ticket-set envelope. The canonical format is documented
+in the packaged skill reference and the [specification guide](../../../docs/guides/factory-specification.md).
 
 The skill presents complete drafts for review, then offers publication only,
 publication with factory selection, or keeping local drafts. Approved publication

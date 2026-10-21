@@ -96,10 +96,8 @@ Obtain developer review of the boundaries and any exclusion or changed intent.
 For a split, preserve original behavior, failures, edge cases and integration
 requirements in a requirement-to-child-criterion coverage map. Save each child's
 complete canonical body and an acyclic dependency map using stable local IDs.
-The reference describes a contract envelope when exact fingerprints can be
-computed with existing tools; otherwise save an explicitly incomplete mapping
-with the missing fingerprints recorded. Never fabricate digests or install a
-tool solely to compute them. A dependent child remains blocked until its
+Use a readable coverage and dependency map; no JSON envelope or fingerprints
+are required. A dependent child remains blocked until its
 prerequisites are merged into its selected base; a DAG does not grant permission
 for parallel execution or selection.
 
