@@ -11,7 +11,6 @@ import hashlib
 import json
 import os
 import re
-import shlex
 import shutil
 import signal
 import sqlite3
@@ -515,25 +514,8 @@ class Fixture:
         version = next(v["name"] for v in spec["versions"] if v["storage"])
         return f"/apis/{spec['group']}/{version}/{spec['names']['plural']}"
 
-    @staticmethod
-    def ctr_prefix() -> list[str]:
-        """The caller's command reaching the node's containerd `ctr`; there is no default."""
-        prefix = shlex.split(os.environ.get("FD_NODE_CTR", ""))
-        require(prefix, "node_ctr_unset")
-        return prefix
-
-    def ctr(self, *argv: str) -> subprocess.CompletedProcess[str]:
-        return run([*self.ctr_prefix(), "-n", "k8s.io", *argv])
-
-    def image_inventory(self) -> dict[str, str]:
-        return {
-            line.split()[0]: line.split()[2]
-            for line in self.ctr("images", "list").stdout.splitlines()[1:]
-            if line.strip()
-        }
-
     def docker_assets(self) -> bool:
-        """Only a ledger holding a non-kube asset needs Docker or node ctr to clean or verify."""
+        """Only a ledger holding a non-kube asset needs Docker to clean or verify."""
         kinds = self.db.execute("SELECT kind FROM assets WHERE kind!='kube-intent' LIMIT 1")
         return kinds.fetchone() is not None
 
@@ -545,7 +527,6 @@ class Fixture:
 
     def setup(self) -> Fixture:
         # Every refusal precedes the first create.
-        self.ctr_prefix()
         ready = [
             n
             for n in self.get("/api/v1/nodes")["items"]
@@ -582,6 +563,12 @@ class Fixture:
         return self
 
     def images(self) -> dict[str, Json]:
+        """Build into a registry this run owns on the Docker engine; the node pulls from it.
+
+        The registry publishes on the engine host's loopback, so the single ready node
+        reaches it as localhost:<port> only when that node is the engine host. Nothing
+        is imported into the node's containerd: no host privilege is needed or used.
+        """
         require(self.arch, "setup_required")
         platform = "linux/" + self.arch
         registry = "fd-registry-" + self.args.nonce
@@ -629,7 +616,7 @@ class Fixture:
             require(re.fullmatch(SHA256, top), "invalid_image_digest")
             ref = tag.rsplit(":", 1)[0] + "@" + top
             self.note(name + "_image", ref)
-            return self.resolve(name, ref, load=name in {"daemon", "runner"})
+            return self.resolve(name, ref)
 
         result = {
             "daemon": build(
@@ -668,20 +655,20 @@ class Fixture:
         )
         return result
 
-    def resolve(self, name: str, ref: str, load: bool) -> Json:
-        """Record manifest/config digests; for load, import an OCI layout of ref into k3s."""
+    def resolve(self, name: str, ref: str) -> Json:
+        """Record the manifest and config digests the registry serves for ref."""
         repository, top = ref.split("@")
         base = f"http://127.0.0.1:{self.port}/v2/" + repository.split("/", 1)[1]
         blob_dir = self.work / (name + "-blobs")
         blob_dir.mkdir()
         blobs: dict[str, Path] = {}
 
-        def fetch(expected: str, manifest: bool) -> Json:
+        def fetch(expected: str) -> Json:
             require(re.fullmatch(SHA256, expected), "invalid_blob_digest")
             path = blobs.setdefault(expected, blob_dir / expected.split(":")[1])
             if not path.exists():
                 request = urllib.request.Request(
-                    base + ("/manifests/" if manifest else "/blobs/") + expected,
+                    base + "/manifests/" + expected,
                     headers={"Accept": MANIFEST_TYPES},
                 )
                 with (
@@ -694,9 +681,9 @@ class Fixture:
                         "sha256:" + hashlib.file_digest(content, "sha256").hexdigest() == expected,
                         "registry_digest_mismatch",
                     )
-            return loads(path.read_bytes()) if manifest else {}
+            return loads(path.read_bytes())
 
-        head = fetch(top, True)
+        head = fetch(top)
         manifest = top
         if "manifests" in head:
             # An index is accepted, but the node platform must be exactly one of its entries.
@@ -708,42 +695,9 @@ class Fixture:
             ]
             require(len(matches) == 1, "image_platform_missing")
             manifest = matches[0]
-        doc = fetch(manifest, True)
+        doc = fetch(manifest)
         config = doc["config"]["digest"]
         result = {"ref": ref, "digest": top, "manifest": manifest, "config": config}
-        if load:
-            for child in [doc["config"], *doc.get("layers", [])]:
-                fetch(child["digest"], False)
-            media = head.get("mediaType") or (
-                "application/vnd.oci.image.index.v1+json"
-                if "manifests" in head
-                else "application/vnd.oci.image.manifest.v1+json"
-            )
-            descriptor = {
-                "mediaType": media,
-                "digest": top,
-                "size": blobs[top].stat().st_size,
-                "annotations": {
-                    "org.opencontainers.image.ref.name": ref,
-                    "io.containerd.image.name": ref,
-                },
-            }
-            layout, root_index = blob_dir / "oci-layout", blob_dir / "index.json"
-            layout.write_text('{"imageLayoutVersion":"1.0.0"}')
-            root_index.write_text(json.dumps({"schemaVersion": 2, "manifests": [descriptor]}))
-            archive = self.work / (name + ".oci.tar")
-            with tarfile.open(archive, "w") as output:
-                output.add(layout, arcname="oci-layout")
-                output.add(root_index, arcname="index.json")
-                for key, path in blobs.items():
-                    output.add(path, arcname="blobs/sha256/" + key.split(":")[1])
-            require(ref not in self.image_inventory(), "import_ref_already_exists")
-            self.asset("import", ref, top)
-            self.ctr("images", "import", "--platform", "linux/" + self.arch, str(archive))
-            require(self.image_inventory().get(ref) == top, "import_not_verified")
-            # Pinned so kubelet image GC cannot reap the ref while the run uses it.
-            self.ctr("images", "label", ref, "io.cri-containerd.pinned=pinned")
-            archive.unlink()
         shutil.rmtree(blob_dir)
         self.note(name + "_digests", result)
         return result
@@ -753,7 +707,7 @@ class Fixture:
         container: Json = {
             "name": name,
             "image": digests["ref"],
-            "imagePullPolicy": "Never",
+            "imagePullPolicy": "IfNotPresent",
             "command": command,
         }
         if restricted:
@@ -783,6 +737,12 @@ class Fixture:
             current = self.get(path)
             phase = current.get("status", {}).get("phase")
             require(phase != "Failed", "probe_failed:" + name)
+            waiting = [
+                s.get("state", {}).get("waiting", {}).get("reason")
+                for s in current.get("status", {}).get("containerStatuses", [])
+            ]
+            # A node that cannot reach the run's registry fails now, not at the wait limit.
+            require(not {"ErrImagePull", "ImagePullBackOff"} & set(waiting), "image_pull_failed")
             return current if phase == "Succeeded" else {}
 
         status = self.wait(finished, 300)["status"]["containerStatuses"][0]
@@ -878,10 +838,8 @@ class Fixture:
             return
         assets = self.db.execute("SELECT kind,name FROM assets").fetchall()
         require(not self.labelled("ps", "-aq"), "owned_container_remains")
-        imported = self.image_inventory() if any(k == "import" for k, _ in assets) else {}
         tags = run(TAGS).stdout.split() if any(k == "tag_intent" for k, _ in assets) else []
         for kind, name in assets:
-            require(kind != "import" or name not in imported, "owned_import_remains")
             require(kind != "tag_intent" or name not in tags, "owned_tag_remains")
         require(not self.labelled("image", "ls", "-q"), "owned_image_remains")
 
@@ -941,12 +899,7 @@ class Fixture:
         for kind, name, identity in self.db.execute(
             "SELECT * FROM assets ORDER BY rowid DESC"
         ).fetchall():
-            if kind == "import":
-                current = self.image_inventory()
-                if name in current:
-                    require(current[name] == identity, "import_identity_changed")
-                    self.ctr("images", "remove", name)
-            elif kind == "tag_intent" and name in run(TAGS).stdout.split():
+            if kind == "tag_intent" and name in run(TAGS).stdout.split():
                 labels = self.labels("image", name)
                 require(
                     labels.get(REQUEST) == identity and labels.get(NONCE) == self.args.nonce,
