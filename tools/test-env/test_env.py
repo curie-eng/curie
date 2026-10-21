@@ -365,6 +365,8 @@ def cleanup_resources(root: Path, environment: dict[str, str], compose: list[str
                 "10",
                 "--remove-orphans",
                 "-v",
+                "--rmi",
+                "local",
                 timeout=min(30, deadline - time.monotonic()),
             )
         except (TransientError, GateFailure):
@@ -388,41 +390,6 @@ def cleanup_resources(root: Path, environment: dict[str, str], compose: list[str
                     pass
         if any(resource_inventory(root, environment, project, deadline=deadline).values()):
             raise TransientError("The owned Compose resources were not removed")
-
-
-def seed_collector_config(root: Path, environment: dict[str, str], image: str) -> None:
-    project = environment["COMPOSE_PROJECT_NAME"]
-    volume = f"{project}_otel_config"
-    seed = f"{project}-collector-seed"
-    label = f"com.docker.compose.project={project}"
-    docker_output(root, environment, "volume", "create", "--label", label, volume)
-    result = run_process(
-        [
-            "docker",
-            "create",
-            "--pull=missing",
-            "--name",
-            seed,
-            "--label",
-            label,
-            "--mount",
-            f"type=volume,src={volume},dst=/etc/otel",
-            image,
-        ],
-        root,
-        environment,
-        timeout=300,
-    )
-    if result.returncode:
-        raise TransientError("Docker could not create the collector config seed container")
-    docker_output(
-        root,
-        environment,
-        "cp",
-        str(root / "otel/collector-config.yaml"),
-        f"{seed}:/etc/otel/collector-config.yaml",
-    )
-    docker_output(root, environment, "rm", "-v", seed)
 
 
 @contextmanager
@@ -516,16 +483,6 @@ def private_services(
                             lines.extend(
                                 (f"  {service}:", "    ports: !override " + json.dumps(bindings))
                             )
-                            if service == "otel-collector":
-                                lines.append(
-                                    "    volumes: !override "
-                                    + json.dumps(
-                                        [
-                                            "test_env_collector_config:/etc/otel:ro",
-                                            "otel_collector_storage:/var/lib/otelcol/storage",
-                                        ]
-                                    )
-                                )
                         lines.append("networks:")
                         for name, network, subnet in zip(
                             ("default", "curie_runner"), report["networks"], subnets, strict=True
@@ -537,15 +494,6 @@ def private_services(
                                     "    ipam:",
                                     "      config:",
                                     f"        - subnet: {subnet}",
-                                )
-                            )
-                        if profile == "full":
-                            lines.extend(
-                                (
-                                    "volumes:",
-                                    "  test_env_collector_config:",
-                                    f"    name: {project}_otel_config",
-                                    "    external: true",
                                 )
                             )
                         override.write_text("\n".join(lines) + "\n")
@@ -583,9 +531,6 @@ def private_services(
                                 network,
                             )
                     if profile == "full":
-                        seed_collector_config(
-                            root, environment, configuration["services"]["otel-collector"]["image"]
-                        )
                         environment["TEST_LANGFUSE_HOST"] = f"http://{address}:{web_port}"
                         environment["LANGFUSE_HOST"] = environment["TEST_LANGFUSE_HOST"]
                         startup = run_process(
