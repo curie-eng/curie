@@ -26,6 +26,7 @@ PRINCIPALS = (
     "control",
     "candidate_enqueue",
     "candidate_worker",
+    "qualification_publisher",
 )
 
 
@@ -139,6 +140,7 @@ def profile_fields(**changes: Any) -> dict[str, Any]:
         "candidate_credentials": copy.deepcopy(b["candidate_credentials"]),
         "issuer_identity": copy.deepcopy(b["issuer_identity"]),
         "control_identity": copy.deepcopy(b["control_identity"]),
+        "qualification_publisher_identity": copy.deepcopy(b["qualification_publisher_identity"]),
         "mediator_identity": copy.deepcopy(b["mediator_identity"]),
         "gateway_identity": copy.deepcopy(b["gateway_identity"]),
         "source_scope": copy.deepcopy(b["source_scope"]),
@@ -211,6 +213,7 @@ def test_bootstrap_carries_the_pinned_inputs_and_nothing_downstream_of_it() -> N
         "candidate_credentials",
         "issuer_identity",
         "control_identity",
+        "qualification_publisher_identity",
         "mediator_identity",
         "gateway_identity",
         "source_scope",
@@ -273,6 +276,7 @@ def test_guard_hashes_each_principals_rules_bound_to_its_credential() -> None:
         **fields["production_credentials"],
         "issuer": fields["issuer_identity"],
         "control": fields["control_identity"],
+        "qualification_publisher": fields["qualification_publisher_identity"],
         "candidate_enqueue": fields["candidate_credentials"]["enqueue"],
         "candidate_worker": fields["candidate_credentials"]["worker"],
     }

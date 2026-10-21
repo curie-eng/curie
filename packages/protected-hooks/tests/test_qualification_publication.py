@@ -1,9 +1,10 @@
-"""Readiness written in its unchanged v1 grammar on the pinned Valkey,
+"""Qualification and Readiness written in their unchanged v1 grammars on the pinned Valkey,
 @spec PROTECTED-COMMISSIONING-6 PROTECTED-HOOK-LANE-2/3.
 
 Each case runs against a real owned TLS Valkey at the pinned image. The
 verifier is installed from the unchanged production recipe under the username
-the manifest's ``credential_refs`` name. The existing readers,
+the manifest's ``credential_refs`` name, and the Qualification publisher of
+design decision 8 from its commissioning recipe. The existing readers,
 ``validate_authority`` and ``worker_verification._retained_authority``, are the
 oracle for the written bytes. A refusal is proved to change no key, value or
 TTL.
@@ -73,30 +74,101 @@ def qualification_value(manifest: Any, generation: str = "1") -> dict[str, Any]:
     return q
 
 
+PUBLISHER = {"id": "commissioning/example-qualification-publisher", "generation": "1"}
+
+
+class Recipes:
+    """The product recipes the provisioner hashes into G.
+
+    The two worker recipes are stand-ins: each holds one rule longer than the
+    provisioner core's rule bound, which the provisioner refuses. Their rules
+    do not bear on the Qualification publisher's binding.
+    """
+
+    def __init__(self, qualification_id: str) -> None:
+        self.qualification_id = qualification_id
+
+    def rules(self, principal: str) -> tuple[str, ...]:
+        from curie_protected_hooks.admission_acl import admission_acl_rules
+        from curie_protected_hooks.commissioning_acl import commissioning_acl_rules
+
+        from .test_commissioning_acl import permit
+
+        if principal in ("enqueue", "verifier"):
+            return admission_acl_rules(principal)
+        if principal in ("worker", "candidate_worker"):
+            return ("-@all", "resetkeys", "%R~protected:example:" + principal + ":*")
+        if principal == "candidate_enqueue":
+            return commissioning_acl_rules(principal, permit=permit())
+        if principal == "qualification_publisher":
+            return commissioning_acl_rules(principal, qualification_id=self.qualification_id)
+        return commissioning_acl_rules(principal)
+
+
+def provisioned(broker: Any, *, changes: Any = None, **identity: Any) -> Any:
+    """B, G and M constructed by the provisioner core for this broker."""
+    from .test_commissioning_provisioner import module as provisioner
+    from .test_commissioning_provisioner import profile, profile_fields
+
+    broker_identity = dict(broker.manifest().as_dict()["broker_identity"], **identity)
+    qualification_id = profile_fields()["qualification_id"]
+    return provisioner().construct(
+        profile(broker_identity=broker_identity, **(changes or {})),
+        acl=Recipes(qualification_id),
+    )
+
+
 class Installation:
-    """Manifest and Qualification seeded by the fixture provisioner, plus a verifier."""
+    """Provisioned B, G and M, the manifest seeded, a verifier and a Qualification publisher."""
 
     def __init__(self, broker: Any) -> None:
         from curie_protected_hooks.admission_acl import admission_acl_rules
-        from curie_protected_hooks.authority_records import parse_qualification
+        from curie_protected_hooks.commissioning_acl import commissioning_acl_rules
 
         self.broker = broker
-        self.manifest = broker.manifest()
+        self.tuple = provisioned(broker)
+        self.manifest = self.tuple.manifest
         m = self.manifest.as_dict()
+        assert self.tuple.bootstrap.as_dict()["qualification_publisher_identity"] == PUBLISHER
         self.verifier = m["credential_refs"]["verifier"]["id"]
         self.password = FixtureSecret(secrets.token_hex(24))
-        broker.command(
-            "ACL",
-            "SETUSER",
-            self.verifier,
-            "reset",
-            "on",
-            ">" + self.password,
-            *admission_acl_rules("verifier"),
-        )
+        self.publisher_password = FixtureSecret(secrets.token_hex(24))
+        for username, password, rules in (
+            (self.verifier, self.password, admission_acl_rules("verifier")),
+            (
+                PUBLISHER["id"],
+                self.publisher_password,
+                commissioning_acl_rules(
+                    "qualification_publisher", qualification_id=m["qualification_id"]
+                ),
+            ),
+        ):
+            broker.command("ACL", "SETUSER", username, "reset", "on", ">" + password, *rules)
         broker.command("SET", "protected:control:manifest:" + self.manifest.digest, canonical(m))
-        self.qualification = parse_qualification(canonical(qualification_value(self.manifest)))
-        broker.command("SET", self.qualification_key, self.qualification.canonical_bytes)
+        self.qualification: Any = None
+
+    def publisher_credential(self, password: Any = None) -> Any:
+        from curie_protected_hooks.worker_transport import WorkerCredential
+
+        return WorkerCredential(PUBLISHER["id"], password or self.publisher_password)
+
+    async def qualify(self, **options: Any) -> Any:
+        publisher = await publication().QualificationPublisher.connect(
+            options.pop("manifest", self.manifest),
+            options.pop("credential", self.publisher_credential()),
+            self.broker.ca_pem,
+            bootstrap=options.pop("bootstrap", self.tuple.bootstrap),
+            guard_config=options.pop("guard_config", self.tuple.guard_config),
+        )
+        try:
+            return await publisher.publish(
+                qualification_generation=options.pop("qualification_generation", "1"),
+                measurement_record_id=options.pop(
+                    "measurement_record_id", "measurement/qualification"
+                ),
+            )
+        finally:
+            await publisher.close()
 
     @property
     def qualification_key(self) -> str:
@@ -124,15 +196,29 @@ class Installation:
         )
 
     def remove(self) -> None:
-        self.broker.command("CLIENT", "KILL", "USER", self.verifier, "SKIPME", "yes")
-        self.broker.command("ACL", "DELUSER", self.verifier)
+        for username in (self.verifier, PUBLISHER["id"]):
+            self.broker.command("CLIENT", "KILL", "USER", username, "SKIPME", "yes")
+            self.broker.command("ACL", "DELUSER", username)
+
+
+@pytest.fixture
+def unqualified(pworker_service):
+    pworker_service.command("FLUSHDB")
+    installed = Installation(pworker_service)
+    try:
+        yield installed
+    finally:
+        installed.remove()
+        pworker_service.command("FLUSHDB")
 
 
 @pytest.fixture
 def installation(pworker_service):
+    """An installation whose Qualification the publisher has written."""
     pworker_service.command("FLUSHDB")
     installed = Installation(pworker_service)
     try:
+        installed.qualification = run(installed.qualify())
         yield installed
     finally:
         installed.remove()
@@ -347,3 +433,114 @@ def test_publisher_is_constructed_only_by_its_factory(installation) -> None:
 def test_readiness_digest_matches_its_canonical_bytes(pworker_service, installation) -> None:
     readiness = run(publish(installation))
     assert readiness.digest == hashlib.sha256(readiness.canonical_bytes).hexdigest()
+
+
+# --- Qualification publisher (design decision 8) ----------------------------------------
+
+
+def test_written_qualification_is_the_unchanged_v1_grammar(pworker_service, unqualified) -> None:
+    from curie_protected_hooks.authority_records import parse_qualification
+
+    qualification = run(unqualified.qualify())
+    raw = pworker_service.command("GET", unqualified.qualification_key)
+    # An independent oracle of the v1 bytes, bound to the manifest.
+    assert raw == canonical(qualification_value(unqualified.manifest))
+    assert raw == qualification.canonical_bytes
+    assert parse_qualification(raw).canonical_bytes == raw
+    assert pworker_service.command("PTTL", unqualified.qualification_key) == -1
+
+
+def test_qualification_is_written_once(pworker_service, unqualified) -> None:
+    run(unqualified.qualify())
+    before = snapshot(pworker_service)
+    # Identical bytes again are a replay, not a second write.
+    run(unqualified.qualify())
+    assert snapshot(pworker_service) == before
+    with refused("exists"):
+        run(unqualified.qualify(measurement_record_id="measurement/other"))
+    assert snapshot(pworker_service) == before
+    # Another generation is another key, still inside the publisher's own family.
+    run(unqualified.qualify(qualification_generation="2"))
+    m = unqualified.manifest.as_dict()
+    assert pworker_service.command(
+        "GET", "protected:control:qualification:" + m["qualification_id"] + ":2"
+    )
+
+
+@pytest.mark.parametrize("generation", ["0", "", "01", 1, None])
+def test_qualification_grammar_is_checked_before_writing(
+    pworker_service, unqualified, generation
+) -> None:
+    before = snapshot(pworker_service)
+    with refused("qualification"):
+        run(unqualified.qualify(qualification_generation=generation))
+    assert snapshot(pworker_service) == before
+
+
+def test_only_the_bootstrap_publisher_writes_qualification(
+    pworker_service, owned_worker, unqualified
+) -> None:
+    from curie_protected_hooks.worker_transport import WorkerCredential
+
+    b = unqualified.tuple.bootstrap.as_dict()
+    # Every other credential B names, production and commissioning, is refused:
+    # the verified party never publishes its own qualification.
+    others = [
+        *(ref["id"] for ref in b["production_credentials"].values()),
+        *(ref["id"] for ref in b["candidate_credentials"].values()),
+        *(b[m]["id"] for m in ("issuer_identity", "control_identity")),
+        *(b[m]["id"] for m in ("mediator_identity", "gateway_identity")),
+    ]
+    for username in others:
+        with refused("principal"):
+            run(unqualified.qualify(credential=WorkerCredential(username, "x" * 48)))
+    with refused("principal"):
+        run(unqualified.qualify(credential=unqualified.credential()))
+    with refused():
+        run(unqualified.qualify(credential=unqualified.publisher_credential("0" * 48)))
+    assert pworker_service.command("GET", unqualified.qualification_key) is None
+    # The broker refuses the Qualification write to every production principal.
+    raw = owned_worker.raw()
+    try:
+        with pytest.raises(NoPermissionError):
+            raw.execute_command("SETNX", unqualified.qualification_key, b"{}")
+    finally:
+        raw.close()
+
+
+def test_qualification_bound_to_another_broker_epoch_refuses(pworker_service, unqualified) -> None:
+    # A consistent B, G and M whose manifest names another broker epoch.
+    other = provisioned(pworker_service, run_id="0" * 40)
+    with refused():
+        run(
+            unqualified.qualify(
+                manifest=other.manifest, bootstrap=other.bootstrap, guard_config=other.guard_config
+            )
+        )
+    assert pworker_service.command("GET", unqualified.qualification_key) is None
+
+
+def test_qualification_requires_the_manifests_own_bootstrap_and_guard(
+    pworker_service, unqualified
+) -> None:
+    """The publisher identity comes only from a B that G and M bind."""
+    # Another installation's B (and so G): one bootstrap member differs.
+    other = provisioned(pworker_service, changes={"max_permit_ms": "2000"})
+    assert other.bootstrap.digest != unqualified.tuple.bootstrap.digest
+    attempts = [
+        dict(bootstrap=other.bootstrap),
+        dict(guard_config=other.guard_config),
+        dict(bootstrap=other.bootstrap, guard_config=other.guard_config),
+        dict(guard_config=unqualified.tuple.guard_config + b" "),
+        dict(bootstrap=unqualified.tuple.bootstrap.as_dict()),
+        dict(bootstrap=unqualified.tuple.bootstrap.canonical_bytes),
+    ]
+    for attempt in attempts:
+        with refused("binding"):
+            run(unqualified.qualify(**attempt))
+    assert pworker_service.command("GET", unqualified.qualification_key) is None
+
+
+def test_qualification_publisher_is_constructed_only_by_its_factory(unqualified) -> None:
+    with refused():
+        publication().QualificationPublisher()

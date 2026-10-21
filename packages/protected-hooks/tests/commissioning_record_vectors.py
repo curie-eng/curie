@@ -88,6 +88,7 @@ def commissioning_records(manifest: dict[str, Any]) -> dict[str, bytes]:
         "candidate_credentials": {"enqueue": _reference("enqueue"), "worker": _reference("worker")},
         "issuer_identity": _reference("issuer"),
         "control_identity": _reference("control"),
+        "qualification_publisher_identity": _reference("qualification-publisher"),
         "mediator_identity": _reference("mediator"),
         "gateway_identity": _reference("gateway"),
         "source_scope": [copy.deepcopy(_SOURCE)],

@@ -79,6 +79,7 @@ BROKER_PRINCIPALS = (
     "control",
     "candidate_enqueue",
     "candidate_worker",
+    "qualification_publisher",
 )
 _GUARD_KIND = "commissioning_guard_config"
 _GUARD_MAX_BYTES = 16384
@@ -156,6 +157,7 @@ class ProvisionerProfile:
     candidate_credentials: dict[str, Any]
     issuer_identity: dict[str, Any]
     control_identity: dict[str, Any]
+    qualification_publisher_identity: dict[str, Any]
     mediator_identity: dict[str, Any]
     gateway_identity: dict[str, Any]
     source_scope: list[dict[str, Any]]
@@ -310,6 +312,7 @@ def _bootstrap(profile: ProvisionerProfile, execution_digest: str) -> Commission
         "candidate_credentials": profile.candidate_credentials,
         "issuer_identity": profile.issuer_identity,
         "control_identity": profile.control_identity,
+        "qualification_publisher_identity": profile.qualification_publisher_identity,
         "mediator_identity": profile.mediator_identity,
         "gateway_identity": profile.gateway_identity,
         "source_scope": profile.source_scope,
@@ -324,6 +327,7 @@ def _principal_credentials(b: dict[str, Any]) -> dict[str, Any]:
         **b["production_credentials"],
         "issuer": b["issuer_identity"],
         "control": b["control_identity"],
+        "qualification_publisher": b["qualification_publisher_identity"],
         "candidate_enqueue": b["candidate_credentials"]["enqueue"],
         "candidate_worker": b["candidate_credentials"]["worker"],
     }

@@ -42,6 +42,7 @@ _FIXED: dict[str, Any] = {
     "candidate_credentials": _CANDIDATES,
     "issuer_identity": _CREDENTIAL,
     "control_identity": _CREDENTIAL,
+    "qualification_publisher_identity": _CREDENTIAL,
     "mediator_identity": _CREDENTIAL,
     "gateway_identity": _CREDENTIAL,
     "max_permit_ms": "generation",
@@ -55,16 +56,25 @@ def _bootstrap_bytes(raw: Any) -> bytes:
         value = _decode(raw, "commissioning_bootstrap", _FIXED, _SCOPES)
         entry = value["entry_points"]
         _require(entry["production"] != entry["commissioning"])
-        production = {ref["id"] for ref in value["production_credentials"].values()}
-        _require(len(production) == 3)
-        # The four commissioning broker principals are distinct from each other
-        # and from every production ID, as the permit binding requires.
-        commissioning = [
-            value["issuer_identity"]["id"],
-            value["control_identity"]["id"],
+        # Every credential ID in B is pairwise distinct: the production trio,
+        # the four commissioning broker principals, the Qualification publisher
+        # (design decision 8) and the launch mediator and provider gateway. So no
+        # commissioning or launch identity can equal a production ID.
+        ids = [
+            *(ref["id"] for ref in value["production_credentials"].values()),
             *(ref["id"] for ref in value["candidate_credentials"].values()),
+            *(
+                value[member]["id"]
+                for member in (
+                    "issuer_identity",
+                    "control_identity",
+                    "qualification_publisher_identity",
+                    "mediator_identity",
+                    "gateway_identity",
+                )
+            ),
         ]
-        _require(len(set(commissioning)) == 4 and production.isdisjoint(commissioning))
+        _require(len(set(ids)) == len(ids))
         return _canonical(value)
     except _REFUSALS:
         raise CommissioningRecordInvalid() from None
