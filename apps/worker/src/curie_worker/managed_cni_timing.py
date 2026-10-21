@@ -1059,15 +1059,17 @@ async def _rbac_node_capability(
 
 def _base_node_pod(run: _Run) -> dict[str, Any]:
     """A guard-admitted probe pod targeting an eligible node with no node-capable
-    field: the non-vacuity control that admission must accept."""
+    field: the non-vacuity control that admission must accept. A sender template is
+    used (not a listener) so it carries no low-port sysctl, which would otherwise be
+    rejected by API validation -- not the guard -- once host network is added."""
     pod = probe_pod(
-        template="twin",
+        template="probe_sender",
         name=f"cni-{run.layout.campaign}-nodecap"[:63].rstrip("-"),
         namespace=run.layout.probe_namespace,
         node=run.layout.eligible_nodes[0],
         campaign=run.layout.campaign,
         role_labels={},
-        argument={"tcp": [], "udp": []},
+        argument={"phases": [], "interval_ms": 0, "timeout_ms": 0},
     )
     return pod
 
@@ -1081,7 +1083,11 @@ def _with_node_capability(pod: dict[str, Any], field: str, value: Any) -> dict[s
         spec["volumes"] = value["volumes"]
         spec["containers"][0]["volumeMounts"] = [{"name": "h", "mountPath": "/host"}]
     elif field == "privileged":
-        spec["containers"][0]["securityContext"]["privileged"] = True
+        # privileged requires allowPrivilegeEscalation!=false, or the API -- not the
+        # guard -- rejects it; the guard must be the one to refuse.
+        container = spec["containers"][0]["securityContext"]
+        container["privileged"] = True
+        container["allowPrivilegeEscalation"] = True
     elif field == "toleration":
         spec["tolerations"] = value
     else:

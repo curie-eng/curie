@@ -274,10 +274,14 @@ def guard() -> list[dict[str, Any]]:
                     # measuring identity may not request node-capable rights, so case 7
                     # admission_node_capability is non-vacuous.
                     {
+                        # Kubernetes drops default-false booleans, so each host flag
+                        # may be absent: guard every read with has().
                         "expression": (
                             f"request.userInfo.username != '{MEASURING_USER}'"
-                            " || (object.spec.hostNetwork != true"
-                            " && object.spec.hostPID != true && object.spec.hostIPC != true)"
+                            " || ((!has(object.spec.hostNetwork)"
+                            " || object.spec.hostNetwork != true)"
+                            " && (!has(object.spec.hostPID) || object.spec.hostPID != true)"
+                            " && (!has(object.spec.hostIPC) || object.spec.hostIPC != true))"
                         ),
                         "message": "no host namespaces",
                     },
@@ -285,6 +289,7 @@ def guard() -> list[dict[str, Any]]:
                         "expression": (
                             f"request.userInfo.username != '{MEASURING_USER}'"
                             " || object.spec.containers.all(c, !has(c.securityContext)"
+                            " || !has(c.securityContext.privileged)"
                             " || c.securityContext.privileged != true)"
                         ),
                         "message": "no privileged container",
