@@ -25,6 +25,8 @@ import asyncio
 import base64
 import copy
 import dataclasses
+import json
+import tracemalloc
 from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime
 from typing import Any
@@ -544,6 +546,152 @@ def test_github_no_identity_at_all_is_unavailable(github: _GitHub) -> None:
 
     with pytest.raises(Unavailable):
         _github_list(github, app=False, token="")
+
+
+class _LazyPulls:
+    """A token-identity GitHub whose pull pages are built from the page number
+    on request, so a long listing is never held by the fake itself."""
+
+    def __init__(
+        self,
+        pages: int,
+        *,
+        own: dict[int, int],
+        next_override: dict[int, str] | None = None,
+        per_page: int = 100,
+        pad: int = 0,
+        bad_last: Any = None,
+    ) -> None:
+        self.pages, self.own, self.per_page, self.pad = pages, own, per_page, pad
+        self.next_override = next_override or {}
+        self.bad_last = bad_last
+        self.served: list[int] = []
+        self.hosts: list[str] = []
+
+    def item(self, page: int, index: int) -> Any:
+        number = page * 1000 + index
+        if index == 0 and self.own.get(page) is not None:
+            return _gh_pull(
+                number,
+                f"curie/publication-{_hex(self.own[page])}",
+                login=TOKEN_USER,
+                kind="User",
+            )
+        if index == 1 and page == self.pages and self.bad_last is not None:
+            return self.bad_last
+        return _gh_pull(
+            number,
+            f"feature/filler-{number}",
+            login=f"dev-{number}",
+            kind="User",
+            body="x" * self.pad,
+        )
+
+    def handle(self, request: httpx.Request) -> httpx.Response:
+        self.hosts.append(request.url.host)
+        if request.url.path == "/user":
+            return httpx.Response(
+                200, json=_gh_user(TOKEN_USER, kind="User", uid=777), request=request
+            )
+        params = dict(parse_qsl(request.url.query.decode()))
+        page = int(params.get("page", "1"))
+        self.served.append(page)
+        items = [self.item(page, i) for i in range(self.per_page)]
+        headers = {}
+        if page in self.next_override:
+            headers["Link"] = f'<{self.next_override[page]}>; rel="next"'
+        elif page < self.pages:
+            base = f"{GH_API}/repositories/{GH_REPO_ID}/pulls?state=all&per_page={self.per_page}"
+            headers["Link"] = f'<{base}&page={page + 1}>; rel="next"'
+        return httpx.Response(200, json=items, headers=headers, request=request)
+
+
+def _lazy_list(fake: _LazyPulls) -> tuple[FactoryPublication, ...]:
+    auth = GitHubAuth(
+        app_id="",
+        private_key="",
+        token="ghp_fixture-operator",
+        api_url=GH_API,
+        timeout_s=5.0,
+        ca_bundle="",
+    )
+
+    async def run() -> tuple[FactoryPublication, ...]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(fake.handle)) as client:
+            host = GitHubCodeHost(
+                client,
+                api_url=GH_API,
+                html_base=GH_HTML,
+                timeout_s=5.0,
+                credentials=GitHubCredentials(auth=auth),
+                page_size=fake.per_page,
+            )
+            return await host.list_factory_publications(GH_REPOSITORY)
+
+    return asyncio.run(run())
+
+
+def test_github_publication_listing_keeps_one_page(github: _GitHub) -> None:
+    """#4892: the listing keeps only matching rows, not every page. Collecting
+    all 250 pages of 100 large items before filtering peaked at about 178 MiB."""
+
+    fake = _LazyPulls(250, own={2: 1, 125: 2, 250: 3}, pad=4096)
+    assert len(json.dumps(fake.item(1, 5))) >= 4096
+
+    tracemalloc.start()
+    try:
+        tracemalloc.reset_peak()
+        listed = _lazy_list(fake)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert sorted(p.ref.number for p in listed) == ["125000", "2000", "250000"]
+    assert fake.served == list(range(1, 251))
+    assert peak < 32 * 1024 * 1024, f"peak {peak / 1024 / 1024:.1f} MiB"
+
+
+def test_github_a_foreign_next_link_fails_the_listing(github: _GitHub) -> None:
+    foreign = "https://elsewhere.invalid/repositories/1/pulls?page=2"
+    fake = _LazyPulls(3, own={1: 1}, per_page=2, next_override={1: foreign})
+
+    with pytest.raises(Unavailable, match="pagination"):
+        _lazy_list(fake)
+
+    assert "elsewhere.invalid" not in fake.hosts
+    assert fake.served == [1]
+
+
+def test_github_the_page_cap_fails_the_listing_as_incomplete(
+    github: _GitHub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(github_code_host_module, "_MAX_PUBLICATION_PAGES", 3)
+    fake = _LazyPulls(5, own={1: 1}, per_page=2)
+
+    with pytest.raises(Unavailable, match="listing_incomplete"):
+        _lazy_list(fake)
+
+
+def test_github_a_listing_of_exactly_the_page_cap_succeeds(
+    github: _GitHub, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(github_code_host_module, "_MAX_PUBLICATION_PAGES", 3)
+    fake = _LazyPulls(3, own={1: 1, 3: 2}, per_page=2)
+
+    listed = _lazy_list(fake)
+
+    assert sorted(p.ref.number for p in listed) == ["1000", "3000"]
+
+
+def test_github_a_malformed_item_on_the_last_page_fails_after_earlier_matches(
+    github: _GitHub,
+) -> None:
+    fake = _LazyPulls(3, own={1: 1}, per_page=2, bad_last="not a pull request")
+
+    with pytest.raises(Unavailable):
+        _lazy_list(fake)
+
+    assert fake.served == [1, 2, 3]
 
 
 # --- GitLab -------------------------------------------------------------------------
