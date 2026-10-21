@@ -722,6 +722,35 @@ def test_pod_status_from_anyone_else_is_refused(user, groups):
     assert not allowed(_status_request(user, groups=groups))
 
 
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda p: p["metadata"]["labels"].update(
+            {cs.LAUNCH_LABEL: "8888bbbb-8888-4888-8888-888888888888"}
+        ),
+        lambda p: p["metadata"]["labels"].update(extra="1"),
+        lambda p: p["metadata"].update(annotations={"k": "v"}),
+        lambda p: p["metadata"].update(finalizers=[]),
+        lambda p: p["metadata"].update(ownerReferences=[{"kind": "ReplicaSet"}]),
+        lambda p: p["spec"].update(nodeName="worker-2"),
+        lambda p: _container(p).update(image="registry.example.com/other@sha256:" + "0" * 64),
+    ],
+)
+@pytest.mark.parametrize("user", ["system:node:" + NODE, BINDER, STATUS_CONTROLLER])
+def test_pod_status_write_that_changes_anything_but_status_is_refused(mutate, user):
+    review = _status_request(user, groups=["system:nodes", "system:authenticated"])
+    mutate(review["request"]["object"])
+    assert not allowed(review)
+
+
+def test_pod_status_bookkeeping_may_change():
+    review = _status_request(BINDER)
+    meta = review["request"]["object"]["metadata"]
+    meta["resourceVersion"] = "43"
+    meta["managedFields"] = []
+    assert allowed(review)
+
+
 def test_pod_status_of_an_unbound_or_foreign_pod_is_refused():
     review = _status_request("system:node:", groups=["system:nodes"], node="")
     assert not allowed(review)

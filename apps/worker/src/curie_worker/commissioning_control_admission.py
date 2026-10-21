@@ -350,6 +350,17 @@ def _pod_status(q: dict[str, Any], policy: GuardPolicy, user: str) -> None:
         or user in principals["pod_binders"]
         or user in principals["pod_status_controllers"]
     )
+    # The status endpoint keeps metadata changes such as labels, and a launch
+    # label moved onto another launch's Service selector would steer its
+    # mediator. Only status and the server's bookkeeping may change.
+    before = _decode(canonical_json(old), _CAP)
+    after = _decode(canonical_json(_dict(q["object"])), _CAP)
+    for pod in (before, after):
+        pod.pop("status", None)
+        meta = _dict(pod.get("metadata"))
+        meta.pop("managedFields", None)
+        meta.pop("resourceVersion", None)
+    _exact(after, before)
 
 
 def _binding(q: dict[str, Any], policy: GuardPolicy, user: str) -> None:
