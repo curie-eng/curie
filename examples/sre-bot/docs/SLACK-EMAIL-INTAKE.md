@@ -137,10 +137,14 @@ does not apply to this intake, and nothing here should be read as if it did.
 - The pinned Kubernetes connector this example uses is an upstream server and is
   not a reversible connector in the sense of
   [Writing a connector the platform can undo](../../../docs/writing-a-reversible-connector.md):
-  the bundle carries no `observe_version` or `restore` for it. A policy written
-  for this bundle could therefore declare only `idempotent` actions, each needing
-  its own qualification drills, and would still need a different connector to
-  verify them.
+  the bundle carries no `observe_version` or `restore` for it, and its replies
+  carry no sealed prior state or version. No action through it can be qualified,
+  idempotent or reversible, because a qualification compares the versions the
+  ledger recorded. The opt-in
+  [remediation scaler connector](../README.md#remediation-scaler-connector-opt-in)
+  is an acting connector that can be qualified, for setting an allowlisted
+  Deployment's replica count; an action through it still needs its own
+  qualification drills and a different connector to verify it.
 
 The Alertmanager source has an opt-in protected mode that realizes
 `HOOK-SOURCE-POLICY-6` of ADR 0190: it requests and signs `read-only` under the
