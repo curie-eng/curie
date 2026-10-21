@@ -15,6 +15,11 @@ users, so that right is transitive. Misuse is detected, not prevented: the ACL
 observer, which holds only ``ACL GETUSER`` and no key or channel, reads each
 principal's password hashes and enabled state for the reobservation check
 (the specification's design decision 7). This module does not run that check.
+
+The Qualification publisher of design decision 8 writes one manifest's
+Qualification keys once with ``SETNX`` and reads back only those keys. It
+holds no script, ACL subcommand or channel and needs no ``ACL WHOAMI``: the
+``HELLO AUTH`` handshake names it, and ``INFO server`` pins the epoch.
 """
 
 from __future__ import annotations
@@ -22,6 +27,7 @@ from __future__ import annotations
 import hashlib
 
 from .admission_records import _encode
+from .authority_records import AuthorityRecordInvalid, _scalar
 from .commissioning_records import CommissioningPermit
 from .execution_namespace import LaneNamespace
 from .worker_acl import _COMMANDS, _HANDSHAKE, _RESET
@@ -75,6 +81,7 @@ _CONTROL = (
 )
 # Design decision 7: the checked provisioner never reads its own evidence.
 _OBSERVER = (*_RESET, *_HANDSHAKE, "+acl|getuser")
+QUALIFICATION = "protected:control:qualification:"
 _CANDIDATE_READS = "+get +type " + _CONTROL_READ + " %R~" + PERMIT + "* %R~" + JOURNAL + "*"
 
 
@@ -97,15 +104,42 @@ def derive_commissioning_lane(permit: CommissioningPermit) -> LaneNamespace:
     return LaneNamespace(prefix, "commissioning-" + digest, prefix + ":runs", prefix + ":dead")
 
 
+def _publisher(qualification_id: str | None) -> tuple[str, ...]:
+    """Design decision 8: one manifest's Qualification keys, write once, nothing else."""
+    try:
+        _scalar(qualification_id, "uuid")
+    except (AuthorityRecordInvalid, ValueError, TypeError):
+        raise ValueError("qualification_id required") from None
+    keys = QUALIFICATION + str(qualification_id) + ":*"
+    return (
+        *_RESET,
+        *_HANDSHAKE,
+        "+info|server",
+        "(+get %R~" + keys + ")",
+        "(+setnx %W~" + keys + ")",
+    )
+
+
 def commissioning_acl_rules(
-    role: str, *, permit: CommissioningPermit | None = None
+    role: str,
+    *,
+    permit: CommissioningPermit | None = None,
+    qualification_id: str | None = None,
 ) -> tuple[str, ...]:
     """The provisioner applies one exact recipe per principal, @spec PROTECTED-COMMISSIONING-1.
 
     Installation principals span campaigns and take no permit. Candidate
-    principals are confined to the lane the permit derives.
+    principals are confined to the lane the permit derives. The Qualification
+    publisher is confined to the manifest's ``qualification_id``, which the
+    provisioner fixes before G.
     """
     if type(role) is str:
+        if role == "qualification_publisher":
+            if permit is not None:
+                raise ValueError("installation principals take no campaign permit")
+            return _publisher(qualification_id)
+        if qualification_id is not None:
+            raise ValueError("only the qualification publisher takes a qualification_id")
         installation = {
             "provisioner": _PROVISIONER,
             "issuer": _ISSUER,

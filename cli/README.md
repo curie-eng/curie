@@ -862,6 +862,7 @@ release binary has no dev scripts.
 |---|---|
 | `curie dev contracts` | `bash scripts/check-contracts.sh` -- check the frozen contracts. |
 | `curie dev chart-check` | Discover the executable assertion scripts under `charts/curie/ci`, the same set helm-ci runs, run every one, report each result, and return aggregate failure after all scripts finish. |
+| `curie dev test-env run [--profile PROFILE] -- COMMAND` | Run a command with private backing services, discovered endpoints, and verified cleanup. |
 | `curie dev verify-fix-pin <CHANGE> <SELECTOR>` | Prove that a fix makes the selected test fail when only its product files are reversed. |
 | `curie dev e2e` | `bash cli/scripts/e2e.sh` -- the scripted CLI end-to-end test. |
 | `curie dev e2e-ladder` | `bash cli/scripts/e2e-ladder.sh` -- the cold-start parity ladder (skill, local, cluster rungs). |
@@ -871,6 +872,27 @@ release binary has no dev scripts.
 | `curie dev restore-drill` | `bash cli/scripts/restore-drill.sh` -- bounded synthetic restore of postgres, bundles, mail SQLite, and Valkey from a disposable compose install onto a distinct target (#2427). `--check-backup` is the completeness guard; `--negative` omits a required component and expects refusal. Not an RPO/RTO claim or a production backup product. |
 | `curie dev upgrade-drill` | `bash cli/scripts/upgrade-drill.sh` -- isolated retained-upgrade drill (#2426): published v0.8.6 CLI/chart/images on a task-owned kind install, candidate CLI upgrade, drain/apply interrupt recovery, leftover-hook non-quiesce, compatible rollback that serves a new turn, and incompatible 0.8.4 schema rollback refused before Helm mutates. `--also-predecessor` adds the published v0.8.7 happy path. Refuses the permanent soak. Live provider/channel rows fail closed when credential references are absent. |
 | `curie dev release-accept` | Read-only evaluator for the seven-day / 200-canary release gate (#2430). `--self-test` proves a synthetic qualifying ledger passes and that independently missing each criterion fails closed. `--ledger PATH` evaluates a private evidence file as a live result; fixture or source proof cannot qualify. Does not start a campaign, rotate credentials, or mutate the soak. |
+
+`curie dev test-env run --profile core|full -- COMMAND` creates a unique Compose
+project. The default `core` starts Postgres, Valkey, and RustFS and initializes
+the S3 buckets. `full` adds ClickHouse, Langfuse web and worker, and the OTel
+Collector, waiting for readiness. Neither starts application services or runs
+application database migrations. The child runs from the caller's directory.
+
+The caller's Docker endpoint is preserved. Ports bind to loopback on the Docker
+host; `CURIE_TEST_ENV_HOST` (default `127.0.0.1`) selects the reachable host used
+in endpoint URLs. Actual mapped ports populate `DATABASE_URL`/`TEST_DATABASE_URL`,
+`VALKEY_*`/`TEST_VALKEY_*`, and `S3_ENDPOINT_URL`/`TEST_S3_ENDPOINT_URL` directly
+in the child's environment, alongside the private Compose files, project, and
+runner network. `full` also supplies private Langfuse and OTel endpoints;
+`core` clears those endpoints.
+
+With `--json`, stdout contains one final report with the project, ports,
+networks, `child_exit_code`, and `cleanup_verified`; service logs and child
+stdout/stderr go to stderr. A child exit of 42 is recorded as
+`child_exit_code: 42` and returns CLI exit 1. Success, child failure, SIGINT,
+and SIGTERM all trigger child process group cleanup and verified removal of
+the run's containers, networks, and volumes. Cleanup failure returns CLI exit 3.
 
 Use `curie dev verify-fix-pin <CHANGE> <SELECTOR>` from a source checkout to
 verify a fix commit or pull request. `<CHANGE>` accepts a committed change

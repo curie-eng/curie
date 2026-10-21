@@ -10352,6 +10352,42 @@ export const commandManifest = {
       "name": "dev",
       "subcommands": [
         {
+          "about": "Run commands with private backing services",
+          "hidden": false,
+          "name": "test-env",
+          "subcommands": [
+            {
+              "about": "Run COMMAND with isolated backing services and verified cleanup",
+              "args": [
+                {
+                  "default_values": [
+                    "core"
+                  ],
+                  "global": false,
+                  "help": "Backing service profile: core or full",
+                  "id": "profile",
+                  "long": "profile",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Command and arguments to run after --",
+                  "id": "command",
+                  "num_args": {
+                    "max": 18446744073709552000,
+                    "min": 1
+                  },
+                  "positional": true,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "run"
+            }
+          ]
+        },
+        {
           "about": "Check the committed change before opening or updating a pull request",
           "args": [
             {

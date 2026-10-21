@@ -334,6 +334,12 @@
       "version": "2.0"
     },
     {
+      "result": "TestEnvOutput",
+      "kind": "CliOutput",
+      "schema": "test-env.schema.json",
+      "version": "1.0"
+    },
+    {
       "result": "PublicationPolicyOutput",
       "kind": "CliOutput",
       "schema": "publication-policy.schema.json",

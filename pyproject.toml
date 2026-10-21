@@ -93,6 +93,8 @@ root_packages = [
     "curie_internal",
     "curie_worker",
     "curie_connector_proxy",
+    "curie_commissioning_ingress",
+    "curie_commissioning_worker",
     "curie_dispatcher",
     "curie_discord_adapter",
     "curie_mail_adapter",
@@ -138,6 +140,8 @@ source_modules = [
     "curie_mail_adapter",
     "curie_connector_proxy",
     "curie_e2e_connector",
+    "curie_commissioning_ingress",
+    "curie_commissioning_worker",
     "curie_protected_hooks.runtime_directory",
 ]
 forbidden_modules = ["curie_protected_hooks.runtime_directory_writer"]
@@ -151,16 +155,52 @@ name = "Production composition never imports commissioning records"
 type = "forbidden"
 source_modules = ["curie_api", "curie_worker"]
 forbidden_modules = [
+    "curie_protected_hooks.commissioning_acceptance_writer",
     "curie_protected_hooks.commissioning_acl",
+    "curie_protected_hooks.commissioning_admissions",
     "curie_protected_hooks.commissioning_bootstrap",
     "curie_protected_hooks.commissioning_campaign_records",
     "curie_protected_hooks.commissioning_encoding",
     "curie_protected_hooks.commissioning_journal",
     "curie_protected_hooks.commissioning_local_ownership",
+    "curie_protected_hooks.commissioning_operator_guard",
+    "curie_protected_hooks.commissioning_operator_protocol",
+    "curie_protected_hooks.commissioning_producers",
     "curie_protected_hooks.commissioning_provisioner",
     "curie_protected_hooks.commissioning_records",
+    "curie_protected_hooks.commissioning_reservations",
     "curie_protected_hooks.commissioning_scripts",
+    "curie_protected_hooks.commissioning_worker",
+    "curie_protected_hooks.qualification_publication",
 ]
+
+# @spec PROTECTED-COMMISSIONING-2/4: the commissioning ingress and worker are
+# separate standalone process compositions, top-level packages beside
+# `curie_api` and `curie_worker` rather than modules of them, so the contract
+# above holds for the whole API and worker with no exception. No ordinary
+# composition imports either. The ingress may import the API's shared signing
+# and file-reading helpers and the worker the worker's stream transport, never
+# the reverse.
+[[tool.importlinter.contracts]]
+name = "Ordinary compositions never import the commissioning compositions"
+type = "forbidden"
+source_modules = [
+    "curie_api",
+    "curie_worker",
+    "curie_dispatcher",
+    "curie_runner",
+    "curie_internal",
+    "curie_protected_hooks",
+    "curie_connector_proxy",
+]
+forbidden_modules = ["curie_commissioning_ingress", "curie_commissioning_worker"]
+
+# The commissioning worker has no path into the API: no worker to API import.
+[[tool.importlinter.contracts]]
+name = "The commissioning worker imports nothing of the API"
+type = "forbidden"
+source_modules = ["curie_commissioning_worker"]
+forbidden_modules = ["curie_api", "curie_commissioning_ingress"]
 
 [[tool.importlinter.contracts]]
 # Telemetry attribute names are shared schema, not an application or harness
@@ -308,6 +348,7 @@ testpaths = [
     # fixture the e2e ladder builds into a bundle; its tests ship beside it.
     "cli/scripts/fixtures/reversible-reference",
     "tools/preflight/tests",
+    "tools/test-env",
     "tools/doclint/tests",
     # @spec PROTECTED-HOOK-LANE-2
     "packages/protected-hooks/tests",

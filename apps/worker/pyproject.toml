@@ -38,4 +38,4 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/curie_worker", "src/curie_connector_proxy"]
+packages = ["src/curie_worker", "src/curie_connector_proxy", "src/curie_commissioning_worker"]
