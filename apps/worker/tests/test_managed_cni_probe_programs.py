@@ -153,6 +153,19 @@ def test_a_sampling_gap_inside_a_tick_is_reported(monkeypatch: pytest.MonkeyPatc
     assert [doc["sockets"] for doc in ticks] == [True, False, True]
 
 
+# An argument valid for every template: the spoofing template reads ``packets``,
+# the kubelet probe reads ``probe_host``/``probe_port``, the rest ignore the extras.
+VALID_ARGUMENT: dict[str, Any] = {
+    "probe_host": "10.0.0.5",
+    "probe_port": 16379,
+    "attempts": [],
+    "packets": [{"src": "10.0.0.1", "addr": "10.0.0.2", "port": 16379, "proto": "tcp",
+                 "nonce": "ab" * 16}],
+    "repeat": 1,
+    "interval_ms": 0,
+}
+
+
 @pytest.mark.parametrize("template", sorted(TEMPLATES))
 def test_every_template_is_unprivileged_and_tokenless(template: str) -> None:
     pod = probe_pod(
@@ -162,8 +175,7 @@ def test_every_template_is_unprivileged_and_tokenless(template: str) -> None:
         node="node-a",
         campaign="c1",
         role_labels={"curietech.ai/role": "x"},
-        # Only the kubelet-probe template reads these; the others ignore them.
-        argument={"probe_host": "10.0.0.5", "probe_port": 16379, "attempts": []},
+        argument=VALID_ARGUMENT,
     )
     spec = pod["spec"]
     assert spec["automountServiceAccountToken"] is False
@@ -194,7 +206,7 @@ def test_spoofing_is_the_only_template_that_adds_a_capability() -> None:
             node="n",
             campaign="c1",
             role_labels={},
-            argument={"probe_host": "10.0.0.5", "probe_port": 16379},
+            argument=VALID_ARGUMENT,
         )["spec"]["containers"][0]["securityContext"]["capabilities"].get("add")
     ]
     assert adders == ["spoofing"]
@@ -238,6 +250,39 @@ def test_template_refuses_what_it_does_not_allow(changes: dict[str, Any]) -> Non
     arguments.update(changes)
     with pytest.raises(ProbeKitRefused):
         probe_pod(**arguments)
+
+
+def _spoof_pod(packets: Any, **extra: Any) -> dict[str, Any]:
+    return probe_pod(
+        template="spoofing", name="p", namespace="probe-a", node="n", campaign="c1",
+        role_labels={}, argument={"packets": packets, "repeat": 1, "interval_ms": 0, **extra},
+    )
+
+
+def test_spoofing_template_renders_only_well_formed_packets() -> None:
+    ok = [{"src": "10.0.0.1", "addr": "10.0.0.2", "port": 16379, "proto": "tcp", "nonce": "a" * 32}]
+    assert _spoof_pod(ok)["metadata"]["labels"]["curietech.ai/managed-cni-probe-template"] == (
+        "spoofing"
+    )
+    bad_cases: list[Any] = [
+        [],  # no packets
+        [dict(ok[0], src=ok[0]["addr"])],  # source equal to destination
+        [dict(ok[0], addr="not-an-ip")],  # destination not an address
+        [dict(ok[0], proto="icmp")],  # protocol not tcp/udp
+        [dict(ok[0], flags=0x04)],  # a flag outside the fixed set (RST)
+        [dict(ok[0], port=0)],  # port out of range
+        [dict(ok[0], nonce="nothex!")],  # nonce not a hex token
+    ]
+    for packets in bad_cases:
+        with pytest.raises(ProbeKitRefused):
+            _spoof_pod(packets)
+    # Repeat and interval are capped, and at most eight packets.
+    with pytest.raises(ProbeKitRefused):
+        _spoof_pod(ok, repeat=6)
+    with pytest.raises(ProbeKitRefused):
+        _spoof_pod(ok, interval_ms=2000)
+    with pytest.raises(ProbeKitRefused):
+        _spoof_pod(ok * 9)
 
 
 def test_probe_kit_digest_is_stable() -> None:

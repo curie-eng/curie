@@ -27,6 +27,7 @@ from curie_worker.managed_cni_cases import (
 from curie_worker.managed_cni_probe_kit import Measurement, accepts
 
 ROLE = "curietech.ai/policy-role"
+PROBE_ROLE = "curietech.ai/managed-cni-probe-role"
 BROKER = Target(
     name="broker",
     role_labels={ROLE: "broker"},
@@ -94,6 +95,8 @@ class ModelCluster:
         self.dropped: set[str] = set()  # addresses the environment drops for every pod
         self.forgeries: list[dict[str, str]] = []
         self.admit_forgery_roles: set[str] = set()
+        # A guard that fails to fence node-capable fields on templated pods (case 7).
+        self.admit_node_capable = False
         self.real_attempts: list[tuple[str, str]] = []
         # Per node, the model time until which a sender's address and window are in use.
         self.busy_until: dict[str, float] = {}
@@ -109,6 +112,9 @@ class ModelCluster:
         self.ret_deny_ms: int | None = None
         self.ret_deny_name: str | None = None
         self.policies: dict[str, dict[str, Any]] = {}
+        # Source roles currently allowed to the probe-namespace "ret-listener"
+        # (case 5), recomputed as probe policies are created and deleted.
+        self.probe_allowed_roles: set[str] = set()
         # A CNI that lets a forged source through even while enforcing (case 3), or
         # a connection-tracking engine that keeps a flow after a policy change
         # (case 5), each a failing cluster.
@@ -116,6 +122,10 @@ class ModelCluster:
         self.retained_leaks = False
         # Case 7: the model's CNI admits node-local (kubelet) traffic to local pods.
         self.node_local_reaches = True
+        # Node-local traffic arrives from a tunnel/overlay address, not a node IP.
+        self.node_local_tunnel = False
+        # The post-change liveness control (ret-control) cannot reach the listener.
+        self.drop_liveness = False
         # Any ordinary identity allowed node-capable rights, by (identity, resource).
         self.extra_pods: list[dict[str, Any]] = []
 
@@ -189,8 +199,11 @@ class ModelCluster:
             nonce = item["nonce"]
             owner = self.ip_owner.get(item["addr"])
             # The CNI drops a forged source address when enforcing; otherwise the
-            # listener records the spoofed packet.
-            if owner is not None and (not self.enforcing or self.spoof_leaks):
+            # listener records it. A four-tuple injection (a flagged segment) also
+            # gets through when connection tracking retains the flow (retained_leaks).
+            injection = "flags" in item
+            leak = not self.enforcing or self.spoof_leaks or (injection and self.retained_leaks)
+            if owner is not None and leak:
                 self.logs[owner].append(
                     {"ev": item["proto"] if item["proto"] in ("tcp", "udp") else "tcp",
                      "peer": item["src"], "port": item["port"], "nonce": nonce, "t": self._ms()}
@@ -205,9 +218,12 @@ class ModelCluster:
         argument = pod["argument"]
         owner = self.ip_owner.get(argument["probe_host"])
         node_ip = self.node_ips.get(pod["spec"]["nodeName"])
-        if owner is not None and node_ip is not None and self.node_local_reaches:
+        # A tunnel/overlay source address is not a node address: the producer cannot
+        # attribute it to a node origin.
+        peer = "10.244.7.7" if self.node_local_tunnel else node_ip
+        if owner is not None and peer is not None and self.node_local_reaches:
             self.logs[owner].append(
-                {"ev": "tcp", "peer": node_ip, "port": argument["probe_port"], "nonce": "",
+                {"ev": "tcp", "peer": peer, "port": argument["probe_port"], "nonce": "",
                  "t": self._ms()}
             )
 
@@ -256,6 +272,11 @@ class ModelCluster:
         if not self.enforcing:
             return True
         labels = sender["metadata"]["labels"]
+        # Case 5 probe-namespace listener: delivery follows the probe policies.
+        if listener["metadata"]["labels"].get(PROBE_ROLE) == "ret-listener":
+            if self.drop_liveness and labels.get(PROBE_ROLE) == "ret-control":
+                return False
+            return labels.get(PROBE_ROLE) in self.probe_allowed_roles
         for target in (BROKER, MEDIATOR):
             if listener["metadata"]["labels"].get(ROLE) == target.role_labels[ROLE]:
                 allowed = labels.get(ROLE) == target.allowed_sender_labels[ROLE]
@@ -347,34 +368,67 @@ class ModelCluster:
             del self.pods[(namespace, name)]
             self.retained.pop((namespace, name), None)
 
+    def _recompute_probe_roles(self) -> None:
+        allowed: set[str] = set()
+        for document in self.policies.values():
+            spec = document["spec"]
+            role = spec.get("podSelector", {}).get("matchLabels", {}).get(PROBE_ROLE)
+            if role != "ret-listener":
+                continue
+            for rule in spec.get("ingress", []):
+                for peer in rule.get("from", []):
+                    source = peer.get("podSelector", {}).get("matchLabels", {}).get(PROBE_ROLE)
+                    if source:
+                        allowed.add(source)
+        self.probe_allowed_roles = allowed
+
     async def create_network_policy(
         self, namespace: str, document: dict[str, Any]
     ) -> dict[str, Any]:
         name = document["metadata"]["name"]
         self.policies[name] = document
         spec = document["spec"]
-        role = spec.get("podSelector", {}).get("matchLabels", {}).get(
-            "curietech.ai/managed-cni-probe-role"
-        )
+        role = spec.get("podSelector", {}).get("matchLabels", {}).get(PROBE_ROLE)
         # An empty-ingress policy on the retained listener removes the allowance.
         if role == "ret-listener" and not spec.get("ingress"):
             self.ret_deny_ms, self.ret_deny_name = self._ms(), name
+        self._recompute_probe_roles()
         return {"metadata": {"uid": f"np-{name}"}}
 
     async def delete_network_policy(self, namespace: str, name: str) -> None:
         self.policies.pop(name, None)
         if name == self.ret_deny_name:
             self.ret_deny_ms, self.ret_deny_name = None, None
+        self._recompute_probe_roles()
 
     async def dry_run_create_pod(
         self, namespace: str, document: dict[str, Any]
     ) -> tuple[int | None, str]:
-        assert "curietech.ai/managed-cni-probe-template" not in document["metadata"]["labels"]
         labels = document["metadata"]["labels"]
         self.forgeries.append(labels)
+        spec = document["spec"]
+        if "curietech.ai/managed-cni-probe-template" in labels:
+            # Case 7: the guard fences node-capable fields even on a templated pod,
+            # but admits an otherwise-identical benign pod (non-vacuity).
+            if self._node_capable_spec(spec) and not self.admit_node_capable:
+                return self.dry_run
+            return (201, "")
+        # Case 2 label forgery: a pod carrying selector labels but no template label.
         if labels.get(ROLE) in self.admit_forgery_roles:
             return (201, "")
         return self.dry_run
+
+    @staticmethod
+    def _node_capable_spec(spec: dict[str, Any]) -> bool:
+        if spec.get("hostNetwork") or spec.get("hostPID") or spec.get("hostIPC"):
+            return True
+        if any("hostPath" in v for v in spec.get("volumes", []) or []):
+            return True
+        if any(c.get("securityContext", {}).get("privileged") for c in spec.get("containers", [])):
+            return True
+        return any(
+            t.get("key") == "curietech.ai/eligible-node" for t in spec.get("tolerations", []) or []
+        )
 
     async def access_review(
         self, user: str, groups: Sequence[str], attributes: ResourceAttributes
@@ -668,6 +722,50 @@ def test_a_retained_flow_after_a_policy_change_fails_case_five() -> None:
     assert result[(5, "policy_changed", "ipv4", "same_node", "retained_peer")] == (
         "fail",
         "retained_flow",
+    )
+
+
+def test_conntrack_resume_after_workload_replace_fails_case_five() -> None:
+    # The four-tuple injection from the spoofing template reaches the hold twin when
+    # connection tracking retains the flow: a leak, not a pass.
+    cluster = ModelCluster()
+    cluster.retained_leaks = True
+    result = outcomes(measure(cluster))
+    assert result[(5, "workload_replaced", "ipv4", "same_node", "retained_peer")] == (
+        "fail",
+        "retained_flow",
+    )
+
+
+def test_a_dead_listener_after_the_policy_change_is_unavailable_not_pass() -> None:
+    # Without the post-change liveness control, a silent listener would read as a
+    # pass; the control makes it unavailable instead.
+    cluster = ModelCluster()
+    cluster.drop_liveness = True
+    result = outcomes(measure(cluster))
+    assert result[(5, "policy_changed", "ipv4", "same_node", "retained_peer")] == (
+        "unavailable",
+        "control_failed",
+    )
+
+
+def test_node_local_traffic_from_a_tunnel_address_is_unavailable() -> None:
+    cluster = ModelCluster()
+    cluster.node_local_tunnel = True
+    result = outcomes(measure(cluster))
+    assert result[(7, "node_origin", "ipv4", "same_node", "node")] == (
+        "unavailable",
+        "node_probe_unavailable",
+    )
+
+
+def test_admission_that_admits_a_node_capable_pod_fails_case_seven() -> None:
+    cluster = ModelCluster()
+    cluster.admit_node_capable = True  # the guard does not fence node-capable fields
+    result = outcomes(measure(cluster))
+    assert result[(7, "admission_node_capability", "none", "none", "none")] == (
+        "fail",
+        "guard_admitted",
     )
 
 

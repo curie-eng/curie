@@ -62,18 +62,29 @@ def nonce(data):
 HOLD = cfg.get("hold", False)
 def serve(c, peer, port):
     # Retained-connection mode (case 5): keep the accepted socket open and log
-    # every segment's nonce, so a flow that keeps passing data after a trigger
-    # is observed. Default mode closes after one recv, unchanged.
+    # every heartbeat's nonce. Heartbeats are newline-framed, so a single recv
+    # that coalesces several TCP segments still yields one event per nonce (an
+    # unframed read would merge them and undercount delivered heartbeats).
+    # Default mode closes after one recv, unchanged.
     c.settimeout(30.0)
+    buffer = b""
     try:
         while True:
             data = c.recv(256)
             if not data:
                 break
-            emit({"ev": "tcp", "peer": peer, "port": port, "nonce": nonce(data)})
+            buffer += data
+            while b"\n" in buffer:
+                line, buffer = buffer.split(b"\n", 1)
+                if line:
+                    emit({"ev": "tcp", "peer": peer, "port": port, "nonce": nonce(line + b"\n")})
     except OSError:
         pass
     finally:
+        if buffer:
+            # An unframed final write (e.g. a one-shot liveness control) is emitted
+            # when the peer closes.
+            emit({"ev": "tcp", "peer": peer, "port": port, "nonce": nonce(buffer)})
         c.close()
 def tcp(port):
     s = bind(socket.SOCK_STREAM, port)
@@ -311,7 +322,7 @@ try:
     emit({"ev": "established", "laddr": out["laddr"], "lport": out["lport"]})
     for nonce in cfg["nonces"]:
         try:
-            s.sendall(nonce.encode("ascii"))
+            s.sendall(nonce.encode("ascii") + b"\n")  # newline-framed for the hold listener
             out["sent"].append([nonce, int(time.time() * 1000), "ok"])
         except OSError:
             out["sent"].append([nonce, int(time.time() * 1000), "error"])
@@ -369,6 +380,47 @@ def probe_kit_digest() -> str:
     ).hexdigest()
 
 
+# The only raw-socket actions the kit renders: a SYN (0x02), a data/ACK segment
+# (0x10/0x18) for the retained four-tuple injection, and plain UDP. Nothing else.
+_SPOOF_FLAGS = frozenset({0x02, 0x10, 0x18})
+_NONCE = re.compile(r"[0-9a-f]{16,64}")
+
+
+def _validate_spoof_argument(argument: Mapping[str, Any]) -> None:
+    """Fence the raw-socket sender: well-formed packets only, no free-form crafting.
+
+    The source must differ from the destination (a forged source), ports are in
+    range, flags are from the fixed set, and the per-packet repeat and interval are
+    capped to the producer constants. The destination being one of the kit's own
+    listeners is enforced by the caller, which only ever targets owned twins.
+    """
+    packets = argument.get("packets")
+    require(isinstance(packets, list) and 0 < len(packets) <= 8)
+    repeat, interval = argument.get("repeat", 1), argument.get("interval_ms", 0)
+    require(type(repeat) is int and 1 <= repeat <= 5)
+    require(type(interval) is int and 0 <= interval <= 1000)
+    assert isinstance(packets, list)
+    for item in packets:
+        require(isinstance(item, dict))
+        for addr in (item.get("src"), item.get("addr")):
+            require(type(addr) is str)
+            try:
+                ipaddress.ip_address(addr)
+            except ValueError:
+                refuse()
+        require(item["src"] != item["addr"])  # a forged source, never the destination itself
+        require(type(item.get("port")) is int and 0 < item["port"] < 65536)
+        require(item.get("proto") in ("tcp", "udp"))
+        require(type(item.get("nonce")) is str and bool(_NONCE.fullmatch(item["nonce"])))
+        if "flags" in item:
+            require(type(item["flags"]) is int and item["flags"] in _SPOOF_FLAGS)
+        if "sport" in item:
+            require(type(item["sport"]) is int and 0 < item["sport"] < 65536)
+        for field in ("seq", "ack"):
+            if field in item:
+                require(type(item[field]) is int and item[field] >= 0)
+
+
 def probe_pod(
     *,
     template: str,
@@ -404,6 +456,7 @@ def probe_pod(
     capabilities: dict[str, Any] = {"drop": ["ALL"]}
     if template in NET_RAW_TEMPLATES:
         capabilities["add"] = ["NET_RAW"]
+        _validate_spoof_argument(argument)
     container: dict[str, Any] = {
         "name": "probe",
         "image": PROBE_IMAGE,

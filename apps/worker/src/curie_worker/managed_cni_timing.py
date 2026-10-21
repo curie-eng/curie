@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import json
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -42,6 +43,7 @@ from .managed_cni_cases import (
     _reviews,
     _Run,
     _sender_argument,
+    _sender_evidence,
     _sender_record,
     _Source,
     node_addresses,
@@ -62,7 +64,6 @@ from .managed_cni_probe_kit import (
     judge_spoof,
 )
 from .managed_cni_probe_programs import (
-    TEMPLATE_LABEL,
     parse_listener_log,
     parse_retained_sender_log,
     parse_spoof_log,
@@ -281,9 +282,11 @@ async def _spoof_target(
     forged = allowed.address(family)
     assert forged is not None
     reassigned = False
+    absent_ms: int | None = None
     if sub_case == "spoof_terminated":
         if not await _terminate(run, allowed):
             return ("unavailable", "phase_timeout"), record
+        absent_ms = int(run.clock() * 1000)
         in_use = await _address_in_use(run, forged)
         reassigned = in_use is not False  # None (unknown) or True both refuse the probe
     nonces = [_nonce() for _ in target.protocols]
@@ -295,6 +298,11 @@ async def _spoof_target(
     try:
         async with run.node_lock(node):
             start_ms = int(run.clock() * 1000)
+            # Clause 4: the forged address must have been confirmed absent under 30 s
+            # earlier, or it no longer measures a recently terminated address.
+            if absent_ms is not None and start_ms - absent_ms > 30_000:
+                record["stale_ms"] = start_ms - absent_ms
+                return ("unavailable", "address_reassigned"), record
             sender = await _start_sender(
                 run, template="spoofing", namespace=layout.probe_namespace, node=node, labels={},
                 argument={"packets": packets,
@@ -491,24 +499,29 @@ async def _address_reuse(
     control_ok = await _allowed_control(run, broker, twin, node, family)
     from .managed_cni_probe_kit import DenialEvidence, judge_denial
 
+    # The reusing pod's own client results close the client-side path too: a
+    # completed handshake or a reply is a fail, not just a listener delivery.
+    record = await _sender_record(run, reuser)
+    results = [] if record is None else [item[4] for item in record.attempts]
     verdict = judge_denial(
         DenialEvidence(
-            sender_ready=True,
+            sender_ready=record is not None and "error" not in results,
             listener_ready=window.ready,
             on_requested_node=reuser.node == node,
-            family_address=True,
+            family_address=reuser.address(family) is not None,
             listener_deliveries=deliveries,
             sockets_sampled=window.sampled,
             window_covered=window.covered,
             overflow_moved=window.moved,
-            client_handshakes=0,
-            client_replies=0,
+            client_handshakes=results.count("connected"),
+            client_replies=results.count("reply") + results.count("refused"),
             control_succeeded=control_ok,
         ),
         delivery_reason="admitted_before_propagation",
     )
     evidence.update({"reused_address": target_ip, "reuser": _pod_evidence(reuser),
-                     "deliveries": deliveries, "control_succeeded": control_ok})
+                     "client": _sender_evidence(record), "deliveries": deliveries,
+                     "control_succeeded": control_ok})
     return _entry(run, key, verdict=verdict, evidence=evidence)
 
 
@@ -635,14 +648,18 @@ async def _policy_changed(
     port = broker.port
     allow = f"cni-{layout.campaign}-ra-{family[-1]}-{placement[0]}"[:63].rstrip("-")
     deny = f"cni-{layout.campaign}-rd-{family[-1]}-{placement[0]}"[:63].rstrip("-")
+    ctl = f"cni-{layout.campaign}-rc-{family[-1]}-{placement[0]}"[:63].rstrip("-")
     change_ms: int | None = None
     sender_log = ""
     listener_log = ""
+    sender_node_ok = False
+    liveness_ok = False
+    probe_ns = layout.probe_namespace
     try:
-        await _create_policy(run, allow, _probe_policy(allow, layout.probe_namespace,
-                                                       "ret-listener", "ret-sender", port))
+        await _create_policy(run, allow, _probe_policy(allow, probe_ns, "ret-listener",
+                                                       "ret-sender", port))
         listener = await _start_listener(
-            run, template="twin", namespace=layout.probe_namespace, node=node,
+            run, template="probe_listener", namespace=probe_ns, node=node,
             labels={_ROLE: "ret-listener"}, argument={"tcp": [port], "udp": [port], "hold": True},
         )
         listener_ip = None if listener is None else listener.address(family)
@@ -651,7 +668,7 @@ async def _policy_changed(
         nonces = _heartbeat_nonces()
         run.nonces.update(nonces)
         launched = await _launch(
-            run, template="retained_sender", namespace=layout.probe_namespace, node=sender_node,
+            run, template="retained_sender", namespace=probe_ns, node=sender_node,
             labels={_ROLE: "ret-sender"},
             argument={"addr": listener_ip, "port": port, "nonces": nonces,
                       "interval_ms": PRODUCER_CONSTANTS["retained_heartbeat_ms"],
@@ -661,28 +678,91 @@ async def _policy_changed(
             return _entry(run, key, verdict=("unavailable", "phase_timeout"), evidence=evidence)
         s_name, s_uid = launched
         deadline = run.clock() + PRODUCER_CONSTANTS["pod_phase_timeout_ms"] / 1000
-        established = await _await_log(
-            run, layout.probe_namespace, s_name, s_uid, "established", deadline
-        )
-        if not established:
+        if not await _await_log(run, probe_ns, s_name, s_uid, "established", deadline):
             return _entry(run, key, verdict=("unavailable", "phase_timeout"), evidence=evidence)
         # A few heartbeats flow while still allowed, then remove the allowance.
         await run.sleep(_PRE_CHANGE_HEARTBEATS * PRODUCER_CONSTANTS["retained_heartbeat_ms"] / 1000)
         change_ms = int(run.clock() * 1000)
         await _delete_policy(run, allow)
-        await _create_policy(run, deny, _probe_policy(deny, layout.probe_namespace,
-                                                      "ret-listener", None, port))
+        await _create_policy(run, deny, _probe_policy(deny, probe_ns, "ret-listener", None, port))
         term_deadline = run.clock() + PRODUCER_CONSTANTS["pod_phase_timeout_ms"] / 1000
-        await _await_terminal(run, layout.probe_namespace, s_name, s_uid, term_deadline)
-        sender_log = await run.cluster.pod_log(layout.probe_namespace, s_name)
+        await _await_terminal(run, probe_ns, s_name, s_uid, term_deadline)
+        sender_log = await run.cluster.pod_log(probe_ns, s_name)
+        sender_pod = await run.cluster.read_pod(probe_ns, s_name)
+        sender_node_ok = (
+            sender_pod is not None and sender_pod["spec"].get("nodeName") == sender_node
+        )
         await run.sleep(PRODUCER_CONSTANTS["listener_window_ms"] / 1000)
         listener_log = await run.cluster.pod_log(listener.namespace, listener.name)
+        # Post-change listener-liveness control: a separately-allowed probe must
+        # still reach the listener, so a pass is never from a dead listener.
+        liveness_ok = await _listener_liveness(run, listener, listener_ip, port, node, ctl)
     except ProbeKitRefused:
         return _entry(run, key, verdict=("unavailable", "transport_unavailable"), evidence=evidence)
     finally:
-        await _delete_policy(run, allow)
-        await _delete_policy(run, deny)
-    return _retained_from_logs(run, key, sender_log, listener_log, change_ms, evidence)
+        for name in (allow, deny, ctl):
+            await _delete_policy(run, name)
+    try:
+        sender = parse_retained_sender_log(sender_log)
+        listener_record = parse_listener_log(listener_log)
+    except ProbeKitRefused:
+        return _entry(run, key, verdict=("unavailable", "phase_timeout"), evidence=evidence)
+    bound = PRODUCER_CONSTANTS["retained_bound_ms"]
+    received = {nonce for _k, _p, _port, nonce, _at in listener_record.events}
+    pre_ok = [n for (n, at, r) in sender.sent if change_ms is not None and at <= change_ms
+              and r == "ok"]
+    post_ok = [n for (n, at, r) in sender.sent if change_ms is not None and at > change_ms + bound
+               and r == "ok"]
+    post_delivered = sum(1 for n in post_ok if n in received)
+    window_start = change_ms or 0
+    window_end = window_start + bound + PRODUCER_CONSTANTS["listener_window_ms"]
+    sampled, covered, moved = listener_record.window(window_start, window_end)
+    evidence.update({"change_ms": change_ms, "pre_delivered": any(n in received for n in pre_ok),
+                     "post_sent": len(post_ok), "post_delivered": post_delivered,
+                     "liveness_ok": liveness_ok})
+    if not post_ok and post_delivered == 0:
+        # The sender sent no heartbeat past the bound, so retention cannot be judged.
+        return _entry(run, key, verdict=("unavailable", "phase_timeout"), evidence=evidence)
+    verdict = judge_retained(
+        RetainedEvidence(
+            established=sender.connected and change_ms is not None
+            and any(n in received for n in pre_ok),
+            listener_ready=listener_record.ready,
+            on_requested_node=sender_node_ok,
+            family_address=sender.local_address is not None,
+            post_trigger_deliveries=post_delivered,
+            sockets_sampled=sampled,
+            window_covered=covered,
+            overflow_moved=moved,
+            trigger_confirmed=change_ms is not None,
+            control_succeeded=liveness_ok,
+            reuse_provoked=True,
+        )
+    )
+    return _entry(run, key, verdict=verdict, evidence=evidence)
+
+
+async def _listener_liveness(
+    run: _Run, listener: _Pod, listener_ip: str, port: int, node: str, policy_name: str
+) -> bool:
+    """A separately-allowed probe reaches the hold listener after the change."""
+    await _create_policy(
+        run, policy_name,
+        _probe_policy(policy_name, run.layout.probe_namespace, "ret-listener", "ret-control", port),
+    )
+    attempts, nonces = _attempts([(listener_ip, port, "tcp")])
+    run.nonces.update(nonces)
+    sender = await _start_sender(
+        run, template="probe_sender", namespace=run.layout.probe_namespace, node=node,
+        labels={_ROLE: "ret-control"}, argument=_sender_argument(attempts) | {"nonce_only": True},
+    )
+    record = await _sender_record(run, sender)
+    if record is None:
+        return False
+    after = parse_listener_log(await run.cluster.pod_log(listener.namespace, listener.name))
+    return after.deliveries(
+        nonces=nonces, peers=[], start_ms=record.start_ms, end_ms=record.end_ms
+    ) > 0
 
 
 def _heartbeat_nonces() -> list[str]:
@@ -691,51 +771,31 @@ def _heartbeat_nonces() -> list[str]:
     return [_nonce() for _ in range(_PRE_CHANGE_HEARTBEATS + span // interval + 1)]
 
 
-def _retained_from_logs(
-    run: _Run, key: EntryKey, sender_log: str, listener_log: str, change_ms: int | None,
-    evidence: dict[str, Any],
-) -> ObservationEntry:
-    try:
-        sender = parse_retained_sender_log(sender_log)
-        listener = parse_listener_log(listener_log)
-    except ProbeKitRefused:
-        return _entry(run, key, verdict=("unavailable", "phase_timeout"), evidence=evidence)
-    bound = PRODUCER_CONSTANTS["retained_bound_ms"]
-    received = {nonce for _kind, _peer, _port, nonce, _at in listener.events}
-    pre = [n for (n, at, result) in sender.sent if change_ms is not None and at <= change_ms
-           and result == "ok"]
-    post = [n for (n, at, result) in sender.sent if change_ms is not None
-            and at > change_ms + bound]
-    post_delivered = sum(1 for n in post if n in received)
-    control_ok = any(n in received for n in pre)
-    verdict = judge_retained(
-        RetainedEvidence(
-            established=sender.connected and change_ms is not None,
-            listener_ready=listener.ready,
-            on_requested_node=True,
-            family_address=sender.local_address is not None,
-            post_trigger_deliveries=post_delivered,
-            sockets_sampled=True,
-            window_covered=True,
-            overflow_moved=False,
-            trigger_confirmed=change_ms is not None,
-            control_succeeded=control_ok,
-            reuse_provoked=True,
-        )
-    )
-    evidence.update({"change_ms": change_ms, "pre_delivered": control_ok,
-                     "post_sent": len(post), "post_delivered": post_delivered})
-    return _entry(run, key, verdict=verdict, evidence=evidence)
+def _established_endpoint(log: str) -> tuple[str, int] | None:
+    """The retained sender's (local address, local port) from its ``established`` line."""
+    for line in log.splitlines():
+        if not line.startswith("{"):
+            continue
+        try:
+            document = json.loads(line)
+        except ValueError:
+            return None
+        if document.get("ev") == "established" and document.get("laddr") and document.get("lport"):
+            return str(document["laddr"]), int(document["lport"])
+    return None
 
 
 async def _workload_replaced(
     run: _Run, *, twin: _Pod, broker: Target, family: str, placement: str
 ) -> ObservationEntry:
-    """Establish an allowed flow, replace the sender, then resume it after reuse.
+    """Establish a real retained connection from an allowed-sender twin, replace the
+    sender, provoke reuse of its address, then inject into the original four-tuple
+    from the spoofing template. If connection tracking lets the flow resume, the
+    hold twin receives data from the reused address and the case fails.
 
-    When the terminated address is not reused within the bound this is
-    ``unavailable`` (``reuse_not_provoked``), the explicit ADR 0238 outcome; it is
-    never a pass.
+    Unprovoked reuse within the bound is ``unavailable`` (``reuse_not_provoked``),
+    the explicit ADR 0238 outcome; it is never a pass. This is distinct from case 4:
+    it resumes the original four-tuple and sequence state, not a fresh connection.
     """
     layout = run.layout
     key: EntryKey = (5, "workload_replaced", family, placement, "retained_peer")
@@ -743,6 +803,9 @@ async def _workload_replaced(
     evidence: dict[str, Any] = {"listener": _pod_evidence(twin)}
     if node is None:
         return _entry(run, key, verdict=("unavailable", "single_eligible_node"), evidence=evidence)
+    if family != "ipv4":
+        # The four-tuple injection needs the IPv4 raw-socket path (clause 2).
+        return _entry(run, key, verdict=("unavailable", "transport_unavailable"), evidence=evidence)
     hold = await _start_listener(
         run, template="twin", namespace=layout.protected_namespace, node=twin.node,
         labels=broker.role_labels, argument={"tcp": [broker.port], "udp": [broker.port],
@@ -751,38 +814,66 @@ async def _workload_replaced(
     hold_ip = None if hold is None else hold.address(family)
     if hold is None or hold_ip is None:
         return _entry(run, key, verdict=("unavailable", "phase_timeout"), evidence=evidence)
-    # Establish an allowed flow from an allowed-sender twin, then replace it.
-    sender = await _start_listener(
-        run, template="twin", namespace=layout.protected_namespace, node=node,
-        labels=broker.allowed_sender_labels, argument={"tcp": [broker.port], "udp": [broker.port]},
+    # Establish a real retained TCP flow from an allowed-sender twin, then replace it.
+    launched = await _launch(
+        run, template="retained_sender", namespace=layout.protected_namespace, node=node,
+        labels=broker.allowed_sender_labels,
+        argument={"addr": hold_ip, "port": broker.port, "nonces": _heartbeat_nonces(),
+                  "interval_ms": PRODUCER_CONSTANTS["retained_heartbeat_ms"],
+                  "timeout_ms": PRODUCER_CONSTANTS["connect_timeout_ms"]},
     )
-    sender_ip = None if sender is None else sender.address(family)
-    if sender is None or sender_ip is None:
+    if launched is None:
         return _entry(run, key, verdict=("unavailable", "phase_timeout"), evidence=evidence)
-    # The flow worked while allowed: an allowed sender reaches the hold twin.
+    s_name, s_uid = launched
+    prot = layout.protected_namespace
+    deadline = run.clock() + PRODUCER_CONSTANTS["pod_phase_timeout_ms"] / 1000
+    if not await _await_log(run, prot, s_name, s_uid, "established", deadline):
+        return _entry(run, key, verdict=("unavailable", "phase_timeout"), evidence=evidence)
+    endpoint = _established_endpoint(await run.cluster.pod_log(prot, s_name))
+    sender_pod = await run.cluster.read_pod(layout.protected_namespace, s_name)
+    if endpoint is None or sender_pod is None:
+        return _entry(run, key, verdict=("unavailable", "phase_timeout"), evidence=evidence)
+    laddr, lport = endpoint
     established = await _allowed_control(run, broker, hold, node, family)
-    if not await _terminate(run, sender):
+    if not await _terminate(run, _Pod(layout.protected_namespace, s_name,
+                                      sender_pod["metadata"]["uid"], node, (laddr,))):
         return _entry(run, key, verdict=("unavailable", "phase_timeout"), evidence=evidence)
-    # Provoke reuse of the terminated sender's address, then resume the flow from
-    # the reusing pod. If connection tracking lets the old flow continue, the hold
-    # twin receives data from the reused address.
-    start_ms = int(run.clock() * 1000)
-    reuser = await _provoke_reuse(run, sender_ip, node, hold, broker, family)
+    # Provoke reuse of the terminated sender's address (case 4 mechanism), then the
+    # reusing pod resumes the ORIGINAL four-tuple from the spoofing template.
+    reuser = await _provoke_reuse(run, laddr, node, hold, broker, family)
     if reuser is None:
-        evidence["reused_address"] = sender_ip
+        evidence["reused_address"] = laddr
         return _entry(run, key, verdict=("unavailable", "reuse_not_provoked"), evidence=evidence)
+    start_ms = int(run.clock() * 1000)
+    data_nonce, syn_nonce = _nonce(), _nonce()
+    run.nonces.update([data_nonce, syn_nonce])
+    try:
+        await _start_sender(
+            run, template="spoofing", namespace=layout.probe_namespace, node=node, labels={},
+            argument={"packets": [
+                # A data segment in the original four-tuple (last sequence state),
+                {"src": laddr, "addr": hold_ip, "port": broker.port, "proto": "tcp",
+                 "nonce": data_nonce, "sport": lport, "flags": 0x10, "with_payload": True},
+                # plus a fresh SYN from the original source port.
+                {"src": laddr, "addr": hold_ip, "port": broker.port, "proto": "tcp",
+                 "nonce": syn_nonce, "sport": lport, "flags": 0x02},
+            ], "repeat": PRODUCER_CONSTANTS["denial_tcp_attempts"],
+               "interval_ms": PRODUCER_CONSTANTS["attempt_interval_ms"]},
+        )
+    except ProbeKitRefused:
+        return _entry(run, key, verdict=("unavailable", "transport_unavailable"), evidence=evidence)
     end_ms = int(run.clock() * 1000) + PRODUCER_CONSTANTS["retained_bound_ms"] + PRODUCER_CONSTANTS[
         "listener_window_ms"
     ]
     deliveries, window = await _listener_deliveries(
-        run, hold, nonces=reuser[1], peers=[sender_ip], start_ms=start_ms, end_ms=end_ms
+        run, hold, nonces=[data_nonce, syn_nonce], peers=[laddr], start_ms=start_ms, end_ms=end_ms
     )
     control_ok = await _allowed_control(run, broker, hold, node, family)
     verdict = judge_retained(
         RetainedEvidence(
             established=established,
             listener_ready=window.ready,
-            on_requested_node=True,
+            on_requested_node=reuser[0].node == node,
             family_address=True,
             post_trigger_deliveries=deliveries,
             sockets_sampled=window.sampled,
@@ -793,7 +884,7 @@ async def _workload_replaced(
             reuse_provoked=True,
         )
     )
-    evidence.update({"sender_address": sender_ip, "reuse_provoked": True,
+    evidence.update({"sender_address": laddr, "source_port": lport, "reuse_provoked": True,
                      "deliveries": deliveries, "control_succeeded": control_ok})
     return _entry(run, key, verdict=verdict, evidence=evidence)
 
@@ -879,10 +970,16 @@ async def _node_origin(
     if twin is None or twin_ip is None:
         return _entry(run, key, verdict=("unavailable", "node_probe_unavailable"),
                       evidence=evidence)
-    node_ips = [_canonical(a) for a in addresses.get(probe_node, ()) if address_family(a) == family]
+    node_ips = {_canonical(a) for a in addresses.get(probe_node, ()) if address_family(a) == family}
+    if not node_ips:
+        return _entry(run, key, verdict=("unavailable", "node_probe_unavailable"),
+                      evidence=evidence)
+    # Let the twin sample at least once before the probe window opens, so the window
+    # has a tick on each side of the kubelet connection.
+    await run.sleep(1.0)
     start_ms = int(run.clock() * 1000)
     try:
-        await _start_listener(
+        kubelet = await _start_listener(
             run,
             template="kubelet_probe",
             namespace=layout.probe_namespace,
@@ -893,14 +990,34 @@ async def _node_origin(
     except ProbeKitRefused:
         return _entry(run, key, verdict=("unavailable", "node_probe_unavailable"),
                       evidence=evidence)
+    if kubelet is None:
+        # The kubelet-probe pod never started, so no node-local traffic was driven.
+        return _entry(run, key, verdict=("unavailable", "node_probe_unavailable"),
+                      evidence=evidence)
     end_ms = int(run.clock() * 1000) + PRODUCER_CONSTANTS["listener_window_ms"]
-    deliveries, _window = await _listener_deliveries(
-        run, twin, nonces=[], peers=node_ips, start_ms=start_ms, end_ms=end_ms
-    )
-    evidence.update({"twin": _pod_evidence(twin), "node": probe_node, "node_addresses": node_ips,
-                     "deliveries": deliveries})
-    return _entry(run, key, verdict=judge_node_origin(observed=bool(node_ips),
-                                                      reached=deliveries > 0), evidence=evidence)
+    record = await _listener_past(run, twin, end_ms)
+    sampled, covered, _moved = record.window(start_ms, end_ms)
+    evidence.update({"node": probe_node, "node_addresses": sorted(node_ips),
+                     "sampled": sampled, "covered": covered, "ticks": len(record.ticks)})
+    if not (sampled and covered):
+        # An incomplete listener window cannot prove the traffic was or was not seen.
+        return _entry(run, key, verdict=("unavailable", "node_probe_unavailable"),
+                      evidence=evidence)
+    in_window = [
+        item for item in record.events if start_ms <= item[4] <= end_ms and item[0] != "tick"
+    ]
+    from_node = [item for item in in_window if item[1] in node_ips]
+    from_other = [item for item in in_window if item[1] not in node_ips]
+    evidence.update({"twin": _pod_evidence(twin), "node": probe_node,
+                     "node_addresses": sorted(node_ips), "from_node": len(from_node),
+                     "from_other": len(from_other)})
+    if from_other:
+        # Traffic arrived from a non-node (e.g. tunnel/overlay) address, so it cannot
+        # be attributed to a node origin: unavailable, never recorded as blocked.
+        return _entry(run, key, verdict=("unavailable", "node_probe_unavailable"),
+                      evidence=evidence)
+    return _entry(run, key, verdict=judge_node_origin(observed=True, reached=bool(from_node)),
+                  evidence=evidence)
 
 
 async def _rbac_node_capability(
@@ -925,7 +1042,9 @@ async def _rbac_node_capability(
     )
 
 
-def _node_capable_pod(run: _Run, field: str, value: Any) -> dict[str, Any]:
+def _base_node_pod(run: _Run) -> dict[str, Any]:
+    """A guard-admitted probe pod targeting an eligible node with no node-capable
+    field: the non-vacuity control that admission must accept."""
     pod = probe_pod(
         template="twin",
         name=f"cni-{run.layout.campaign}-nodecap"[:63].rstrip("-"),
@@ -935,7 +1054,13 @@ def _node_capable_pod(run: _Run, field: str, value: Any) -> dict[str, Any]:
         role_labels={},
         argument={"tcp": [], "udp": []},
     )
-    del pod["metadata"]["labels"][TEMPLATE_LABEL]  # not a guard-admitted template
+    return pod
+
+
+def _with_node_capability(pod: dict[str, Any], field: str, value: Any) -> dict[str, Any]:
+    import copy
+
+    pod = copy.deepcopy(pod)
     spec = pod["spec"]
     if field == "hostPath":
         spec["volumes"] = value["volumes"]
@@ -950,23 +1075,35 @@ def _node_capable_pod(run: _Run, field: str, value: Any) -> dict[str, Any]:
 
 
 async def _admission_node_capability(run: _Run) -> ObservationEntry:
+    """For each node-capable field, admission must admit an otherwise-identical
+    templated base pod (non-vacuity) and refuse the pod with that field added.
+    A guard that refuses the benign base makes the entry unavailable, not pass."""
     key: EntryKey = (7, "admission_node_capability", *NONE)
     cases: list[tuple[str, Any]] = list(NODE_CAPABLE)
     cases.append(
         ("toleration", [{"key": "curietech.ai/eligible-node", "operator": "Exists",
                          "effect": "NoSchedule"}])
     )
+    base = _base_node_pod(run)
     verdicts: list[Verdict] = []
     record = []
     for field, value in cases:
         try:
+            base_status, _ = await run.cluster.dry_run_create_pod(run.layout.probe_namespace, base)
             status, message = await run.cluster.dry_run_create_pod(
-                run.layout.probe_namespace, _node_capable_pod(run, field, value)
+                run.layout.probe_namespace, _with_node_capability(base, field, value)
             )
         except ProbeKitRefused:
-            status, message = None, ""
-        verdicts.append(judge_guard_dry_run(status, message, run.layout.guard_names))
-        record.append({"field": field, "status": status, "message": message[:512]})
+            base_status, status, message = None, None, ""
+        if base_status is None or not (200 <= base_status < 300):
+            # The benign base was not admitted, so a refusal of the offending pod
+            # proves nothing about the node-capable field.
+            verdict: Verdict = ("unavailable", "review_unavailable")
+        else:
+            verdict = judge_guard_dry_run(status, message, run.layout.guard_names)
+        verdicts.append(verdict)
+        record.append({"field": field, "base_status": base_status, "status": status,
+                       "message": message[:512]})
     verdict = _combined(verdicts, ("pass", "guard_refused"))
     return _entry(run, key, verdict=verdict, evidence={"dry_runs": record})
 
@@ -1022,9 +1159,12 @@ def _pod_is_node_capable(spec: Mapping[str, Any]) -> bool:
         return True
     if any("hostPath" in volume for volume in spec.get("volumes", []) or []):
         return True
-    for container in spec.get("containers", []) or []:
-        if container.get("securityContext", {}).get("privileged"):
-            return True
+    # A privileged init or ephemeral container is node-capable too, not just the
+    # main containers.
+    for group in ("containers", "initContainers", "ephemeralContainers"):
+        for container in spec.get(group, []) or []:
+            if container.get("securityContext", {}).get("privileged"):
+                return True
     return False
 
 

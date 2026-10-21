@@ -269,7 +269,43 @@ def guard() -> list[dict[str, Any]]:
                             "'curietech.ai/managed-cni-probe-template' in object.metadata.labels)"
                         ),
                         "message": "only probe templates",
-                    }
+                    },
+                    # The eligible-node fence (clause 6): even a templated pod from the
+                    # measuring identity may not request node-capable rights, so case 7
+                    # admission_node_capability is non-vacuous.
+                    {
+                        "expression": (
+                            f"request.userInfo.username != '{MEASURING_USER}'"
+                            " || (object.spec.hostNetwork != true"
+                            " && object.spec.hostPID != true && object.spec.hostIPC != true)"
+                        ),
+                        "message": "no host namespaces",
+                    },
+                    {
+                        "expression": (
+                            f"request.userInfo.username != '{MEASURING_USER}'"
+                            " || object.spec.containers.all(c, !has(c.securityContext)"
+                            " || c.securityContext.privileged != true)"
+                        ),
+                        "message": "no privileged container",
+                    },
+                    {
+                        "expression": (
+                            f"request.userInfo.username != '{MEASURING_USER}'"
+                            " || !has(object.spec.volumes)"
+                            " || object.spec.volumes.all(v, !has(v.hostPath))"
+                        ),
+                        "message": "no host path",
+                    },
+                    {
+                        "expression": (
+                            f"request.userInfo.username != '{MEASURING_USER}'"
+                            " || !has(object.spec.tolerations)"
+                            " || object.spec.tolerations.all(t, !has(t.key)"
+                            " || t.key != 'curietech.ai/eligible-node')"
+                        ),
+                        "message": "no eligible-node toleration",
+                    },
                 ],
             },
         },
