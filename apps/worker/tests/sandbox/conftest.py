@@ -883,7 +883,11 @@ class FakeSandboxClient:
         from curie_worker.sandbox.types import ClaimNameConflict
 
         self.ops.append(Op("create_claim", self.namespace, "SandboxClaim", name, deadline))
-        if time.monotonic() >= deadline:
+        from curie_worker.sandbox import substrate as substrate_module
+
+        # The substrate's own clock, read at call time, so a test that patches
+        # ``substrate.time`` with a virtual clock sees the same instant here.
+        if substrate_module.time.monotonic() >= deadline:
             raise ClaimTimeoutError(f"claim {name}: the shared claim deadline already passed")
         if self.claim_create_delay_seconds:
             time.sleep(self.claim_create_delay_seconds)

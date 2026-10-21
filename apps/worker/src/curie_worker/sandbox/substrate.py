@@ -46,6 +46,7 @@ from ..binding import (
     boot_token_facts,
 )
 from ..workitem_dispatch import TerminationObservation
+from . import tool_daemon
 from .affinity import AffinityStore
 from .docker import DockerSandboxClient
 from .k8s import KubernetesSandboxClient
@@ -57,6 +58,7 @@ from .types import (
     THREAD_HASH_LABEL,
     TURN_PROGRESS_ELIGIBILITY_ENV,
     CapacityExhaustedError,
+    ClaimNameConflict,
     ClaimTimeoutError,
     KubeTransientError,
     MissingAgentPoolError,
@@ -83,6 +85,7 @@ from .types import (
 
 if TYPE_CHECKING:
     from ..repo_runner_pools import RepoRunnerPool
+    from .daemon_config import ToolDaemonConfig
 
 # The resume overlay writes these into the replacement claim's per-claim env, and
 # the runner reads them out of the same boot contract -- same consumer, so both
@@ -304,11 +307,94 @@ class SandboxSubstrate:
         request_timeout_seconds: float,
         handle: SandboxHandle | None = None,
         env: Mapping[str, str] | None = None,
+        daemon: bool = True,
     ) -> None:
-        """Revoke the boot credential, then delete the claim. Every delete uses this."""
+        """Revoke the boot credential, delete the claim, then retire its daemon.
 
-        self._report_boot_credential(claim_name=name, handle=handle, env=env)
-        self._k8s.delete_claim(name, request_timeout_seconds=request_timeout_seconds)
+        Every claim delete uses this. The daemon (ADR 0217) is retired even when
+        the claim delete raised, within the same ``request_timeout_seconds``
+        budget, and the claim's error is the one raised. ``daemon=False`` is a
+        caller that retires the daemon itself.
+        """
+
+        deadline = time.monotonic() + request_timeout_seconds
+        try:
+            self._report_boot_credential(claim_name=name, handle=handle, env=env)
+            self._k8s.delete_claim(name, request_timeout_seconds=request_timeout_seconds)
+        except Exception:
+            if daemon:
+                self._retire_daemon_quietly(name, handle, deadline)
+            raise
+        if daemon:
+            self._retire_daemon(name, handle, deadline)
+
+    def _daemon_configs(self) -> dict[str, ToolDaemonConfig]:
+        """The configured tool daemons by namespace; none on the Docker substrate."""
+
+        if isinstance(self._k8s, DockerSandboxClient):
+            return {}
+        return {
+            entry.daemon.namespace: entry.daemon
+            for entry in self._config.repo_runner_pools.values()
+            if entry.docker and entry.daemon is not None
+        }
+
+    def _retire_daemon(self, name: str, handle: SandboxHandle | None, deadline: float) -> None:
+        """Delete claim ``name``'s daemon objects, then forget its marker and credential.
+
+        A claim has a daemon when its handle says so or, without one, when the
+        Valkey marker does; an unreadable marker means no explicit call, and
+        the orphan sweep remains the backstop.
+        """
+
+        configs = self._daemon_configs()
+        if not configs:
+            return
+        try:
+            namespace = self._affinity.daemon_namespace(name)
+        except Exception as exc:  # noqa: BLE001 - unknown, the sweep covers it
+            logger.warning("tool daemon marker of %s unreadable (%s)", name, type(exc).__name__)
+            namespace = None
+        if namespace is None and handle is not None and handle.runner_docker:
+            found = repo_runner_entry(handle.workspace_repo, self._config.repo_runner_pools)
+            daemon = None if found is None else found[1].daemon
+            namespace = None if daemon is None else daemon.namespace
+        config = None if namespace is None else configs.get(namespace)
+        if config is None:
+            return
+        tool_daemon.retire(self._k8s, config, name, deadline=deadline)
+        self._affinity.forget_daemon(name)
+
+    def _retire_daemon_quietly(
+        self, name: str, handle: SandboxHandle | None, deadline: float
+    ) -> None:
+        """``_retire_daemon`` beside a primary error the caller re-raises."""
+
+        try:
+            self._retire_daemon(name, handle, deadline)
+        except Exception as exc:  # noqa: BLE001 - the primary error wins
+            logger.warning("tool daemon of claim %s not retired (%s)", name, type(exc).__name__)
+
+    def _retire_claim_quietly(
+        self,
+        name: str,
+        *,
+        handle: SandboxHandle | None = None,
+        env: Mapping[str, str] | None = None,
+        daemon: bool = True,
+    ) -> None:
+        """``_retire_claim`` beside a primary error the caller re-raises."""
+
+        try:
+            self._retire_claim(
+                name,
+                request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S,
+                handle=handle,
+                env=env,
+                daemon=daemon,
+            )
+        except Exception as exc:  # noqa: BLE001 - the primary error wins
+            logger.warning("claim %s not retired (%s)", name, type(exc).__name__)
 
     def _retry_unreported_credentials(self) -> None:
         """Reap retries a report whose claim is already gone."""
@@ -653,11 +739,7 @@ class SandboxSubstrate:
             # The candidate is ready but still unrouted. Refusal retires only
             # that unexposed claim; the old route remains authoritative until
             # the generation CAS below succeeds.
-            self._retire_claim(
-                candidate.claim_name,
-                request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S,
-                handle=candidate,
-            )
+            self._retire_claim_quietly(candidate.claim_name, handle=candidate)
             raise
         record = RouteRecord(handle=candidate, state=RouteState.LIVE)
         if not self._affinity.replace_if_generation(
@@ -704,10 +786,18 @@ class SandboxSubstrate:
                 record = self._affinity.get(thread_key)
                 if record is None:
                     raise NoRouteError(thread_key)
-                self._k8s.set_sandbox_mode(record.handle.sandbox_name, "Suspended")
-                self._affinity.mark_suspended(
-                    thread_key, history_ref, self._config.suspended_route_ttl_seconds
-                )
+                # A suspended route keeps its claim but not its daemon (ADR 0217);
+                # resume provisions a fresh one with the replacement claim.
+                retire_by = time.monotonic() + _CONTROL_REQUEST_TIMEOUT_S
+                try:
+                    self._k8s.set_sandbox_mode(record.handle.sandbox_name, "Suspended")
+                    self._affinity.mark_suspended(
+                        thread_key, history_ref, self._config.suspended_route_ttl_seconds
+                    )
+                except Exception:
+                    self._retire_daemon_quietly(record.handle.claim_name, record.handle, retire_by)
+                    raise
+                self._retire_daemon(record.handle.claim_name, record.handle, retire_by)
             except Exception as exc:  # noqa: BLE001 - existing broad catch retained
                 error = exc
                 if hasattr(span, "set_status"):
@@ -1458,7 +1548,35 @@ class SandboxSubstrate:
                 "templates are retried on the next tick",
                 type(exc).__name__,
             )
+        self._sweep_daemons(keep=observed)
         return deleted, observed
+
+    def _sweep_daemons(self, *, keep: set[str]) -> None:
+        """Retire daemons a crash left without a claim (ADR 0217). Best effort.
+
+        Runs only after a successful claim inventory, so a failed one never
+        reads as "no claims". A daemon is swept once strictly older than the
+        claim timeout, the longest a creator can still be provisioning it.
+        """
+
+        def claim_exists(claim: str) -> bool:
+            view = self._k8s.get_claim(claim, request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S)
+            return view is not None
+
+        for config in self._daemon_configs().values():
+            try:
+                retired = tool_daemon.sweep_orphans(
+                    self._k8s,
+                    config,
+                    keep=keep,
+                    max_age_s=self._config.claim_timeout_seconds,
+                    now=datetime.now(UTC),
+                    claim_exists=claim_exists,
+                )
+                for claim in retired:
+                    self._affinity.forget_daemon(claim)
+            except Exception as exc:  # noqa: BLE001 - a failed sweep retries next tick
+                logger.warning("tool daemon sweep failed (%s)", type(exc).__name__)
 
     # -- internals --------------------------------------------------------------
 
@@ -1578,16 +1696,38 @@ class SandboxSubstrate:
         wanted = (None, False) if entry is None else (entry.digests, entry.docker)
         if (handle.runner_digests, handle.runner_docker) != wanted:
             return False
-        return self._retained_runner_healthy(handle)
+        return self._retained_runner_healthy(handle, entry)
 
-    def _retained_runner_healthy(self, handle: SandboxHandle) -> bool:
+    def _retained_runner_healthy(self, handle: SandboxHandle, entry: RepoRunnerPool | None) -> bool:
         """Whether a retained repository runner may serve another turn.
 
-        Always True for now. The per-run Docker daemon ping from ADR 0217
-        lands here, so a route whose daemon died is replaced, not reused.
+        A Docker-enabled route is reused only after its daemon answers an
+        authenticated ping with the claim's own certificate within
+        ``pingTimeoutSeconds`` (ADR 0217). It fails closed: a missing
+        credential, Pod or answer replaces the route. Other routes issue no
+        daemon call.
         """
 
-        return True
+        if entry is None or entry.daemon is None or not handle.runner_docker:
+            return True
+        daemon = entry.daemon
+        try:
+            files = self._affinity.daemon_credential(handle.claim_name)
+        except Exception as exc:  # noqa: BLE001 - unknown is not healthy
+            logger.warning("tool daemon credential unreadable (%s)", type(exc).__name__)
+            return False
+        if files is None:
+            return False
+        host = tool_daemon.service_host(handle.claim_name, daemon.namespace)
+        return tool_daemon.ping(
+            self._k8s,
+            daemon.namespace,
+            handle.claim_name,
+            daemon.port,
+            host,
+            files,
+            daemon.ping_timeout_seconds,
+        )
 
     def _claim_fresh(
         self,
@@ -1659,25 +1799,60 @@ class SandboxSubstrate:
             if executor_secret_names is not None
             else {}
         )
-        self._k8s.create_claim(
-            name,
-            pool=pool,
-            env=env,
-            labels=labels,
-            runner_resources=runner_resources,
-            agent_name=agent_name,
-            **executor_kwargs,
-        )
+        # One budget for daemon start, claim create, bind, serviceFQDN and the
+        # daemon's first authenticated ping (ADR 0217).
         deadline = time.monotonic() + config.claim_timeout_seconds
+        daemon = runner.daemon if runner is not None and runner.docker else None
+        provisioned: tool_daemon.Provisioned | None = None
+        marked = remembered = created = False
         try:
+            if daemon is not None:
+                # Associated before the first object exists, so even a crash
+                # mid-provision leaves the claim's daemon findable.
+                marked = self._affinity.mark_daemon(name, daemon.namespace)
+                provisioned = tool_daemon.provision(
+                    self._k8s,
+                    daemon,
+                    claim=name,
+                    release_namespace=config.namespace,
+                    egress_class=self._egress_class(workspace_repo, runner),
+                    deadline=deadline,
+                )
+                self._affinity.remember_daemon_credential(
+                    name, provisioned.mount.files, ttl_s=daemon.max_claim_lifetime_seconds
+                )
+                remembered = True
+            # From here this attempt owns the claim name, even when the create
+            # raises after the API server stored it.
+            created = True
+            self._k8s.create_claim(
+                name,
+                pool=pool,
+                env=env,
+                labels=labels,
+                runner_resources=runner_resources,
+                agent_name=agent_name,
+                deadline=deadline,
+                tool_daemon=None if provisioned is None else provisioned.mount,
+                **executor_kwargs,
+            )
             sandbox_name = self._await_bound(name, deadline)
             bound = self._await_service_fqdn(sandbox_name, deadline)
-        except Exception:
-            self._retire_claim(
-                name,
-                request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S,
-                env=env,
-            )
+            if provisioned is not None:
+                tool_daemon.await_ready(self._k8s, provisioned, deadline, _poll_sleeps(config))
+        except Exception as exc:
+            # A 409 means the name is someone else's claim: never retire it.
+            if created and not isinstance(exc, ClaimNameConflict):
+                self._retire_claim_quietly(name, env=env, daemon=False)
+            # Only what this attempt created goes: its objects by uid, and the
+            # marker and credential only if this attempt wrote them.
+            try:
+                if provisioned is None or tool_daemon.rollback(
+                    self._k8s, provisioned.config.namespace, provisioned.created
+                ):
+                    self._affinity.forget_daemon(name, marker=marked, credential=remembered)
+            except Exception as cleanup:  # noqa: BLE001 - the primary error wins
+                logger.warning("tool daemon of %s not forgotten (%s)", name, type(cleanup).__name__)
             raise
 
         credential_agent, credential_id, credential_exp = boot_token_facts(
@@ -1749,11 +1924,7 @@ class SandboxSubstrate:
                     )
                 )
             except Exception:
-                self._retire_claim(
-                    name,
-                    request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S,
-                    handle=handle,
-                )
+                self._retire_claim_quietly(name, handle=handle)
                 raise
             if adoptable:
                 self._retire_claim(
@@ -1772,6 +1943,15 @@ class SandboxSubstrate:
             handle=handle,
         )
         raise NoRouteError(f"could not record a route for {thread_key} after repeated races")
+
+    def _egress_class(self, workspace_repo: str | None, runner: RepoRunnerPool | None) -> str:
+        """The chart's egress class for the daemon Pod: ``public``, or the
+        allowlist of the repository's binding path (``repo-<sha256[:16]>``)."""
+
+        found = repo_runner_entry(workspace_repo, self._config.repo_runner_pools)
+        if runner is None or not runner.egress or found is None:
+            return "public"
+        return "repo-" + hashlib.sha256(found[0].encode()).hexdigest()[:16]
 
     def _evict_stale(self, thread_key: str, record: RouteRecord) -> None:
         """Retire a route whose sandbox is gone: delete its claim (idempotent)

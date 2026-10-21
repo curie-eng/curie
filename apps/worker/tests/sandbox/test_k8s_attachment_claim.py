@@ -39,7 +39,13 @@ class _FakeApi:
         self.created: list[dict[str, Any]] = []
 
     def create_namespaced_custom_object(
-        self, group: str, version: str, namespace: str, plural: str, body: dict[str, Any]
+        self,
+        group: str,
+        version: str,
+        namespace: str,
+        plural: str,
+        body: dict[str, Any],
+        **kwargs: Any,
     ) -> None:
         self.created.append(body)
 

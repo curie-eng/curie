@@ -13,13 +13,18 @@ from __future__ import annotations
 
 import logging
 import re
+import socket
+import threading
 import time
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from typing import Any
 
 from aci_protocol import BootEnv
 from kubernetes import client as k8s_client
 from kubernetes import config as k8s_config
+from kubernetes.stream import portforward
 from urllib3.exceptions import HTTPError as Urllib3HTTPError
 
 from ..attachments import ATTACHMENTS_REF_ENV
@@ -42,12 +47,19 @@ from .resources import prepare_resources_claim
 from .types import (
     MANAGED_BY_LABEL,
     MANAGED_BY_VALUE,
+    ClaimNameConflict,
+    ClaimTimeoutError,
     ClaimView,
+    DaemonObjectKind,
+    DaemonObjectView,
     KubeTransientError,
+    ListableDaemonKind,
     OperatingMode,
     QuotaRejection,
+    SandboxError,
     SandboxTermination,
     SandboxView,
+    ToolDaemonMount,
     filter_agent_child_env,
 )
 
@@ -393,6 +405,45 @@ def _extension_body(kind: str, metadata: dict[str, Any], spec: dict[str, Any]) -
     }
 
 
+def _claim_timeout(deadline: float) -> float:
+    """One claim request's transport bound: the preparation cap, within ``deadline``."""
+
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise ClaimTimeoutError("the claim's deadline passed before its next request")
+    return min(_CLAIM_PREPARATION_TIMEOUT_S, remaining)
+
+
+def _refuse_name_conflict(exc: BaseException, what: str) -> None:
+    """Raise ClaimNameConflict for a 409 on a create at a claim-derived name."""
+
+    if isinstance(exc, k8s_client.ApiException) and exc.status == 409:
+        raise ClaimNameConflict(f"{what} already exists") from exc
+
+
+def _aware(moment: object) -> datetime | None:
+    if not isinstance(moment, datetime):
+        return None
+    return moment.astimezone(UTC) if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
+
+
+def _daemon_view(kind: DaemonObjectKind, obj: Any) -> DaemonObjectView:
+    metadata = obj.metadata
+    return DaemonObjectView(
+        kind=kind,
+        name=str(metadata.name),
+        uid=str(metadata.uid),
+        claim=(metadata.labels or {}).get(CLAIM_LABEL),
+        created_at=_aware(metadata.creation_timestamp),
+        phase=getattr(getattr(obj, "status", None), "phase", None) if kind == "Pod" else None,
+    )
+
+
+# Port-forward connects still outstanding, so a hung API server cannot pile up
+# threads behind repeated pings (each one fails closed instead).
+_PORT_FORWARDS = threading.BoundedSemaphore(8)
+
+
 def _owner_ref(api_version: str, kind: str, name: str, uid: str) -> dict[str, str]:
     """An ownerReference with no ``controller`` or ``blockOwnerDeletion``."""
 
@@ -418,8 +469,10 @@ class KubernetesSandboxClient:
         # and make the pressure deletion envelope false.
         configuration.retries = 0
         api_client = k8s_client.ApiClient(configuration=configuration)
+        self._configuration = configuration
         self._api = k8s_client.CustomObjectsApi(api_client)
         self._core_api = k8s_client.CoreV1Api(api_client)
+        self._networking_api = k8s_client.NetworkingV1Api(api_client)
         self._namespace = namespace
 
     def _resources_pool(
@@ -427,6 +480,7 @@ class KubernetesSandboxClient:
         pool: str,
         agent_name: str | None,
         runner_resources: dict[str, Any],
+        deadline: float,
     ) -> str:
         """Copy the chart template onto a worker-owned pool and return its name.
 
@@ -444,6 +498,7 @@ class KubernetesSandboxClient:
                 self._namespace,
                 "sandboxtemplates",
                 source_name,
+                _request_timeout=_claim_timeout(deadline),
             )
         except k8s_client.ApiException as exc:
             if exc.status == 404:
@@ -460,30 +515,50 @@ class KubernetesSandboxClient:
             owned_template,
             "SandboxTemplate",
             templates[owned_template],
+            deadline,
         )
         self._put_extension(
             "sandboxwarmpools",
             owned_pool,
             "SandboxWarmPool",
             warm_pools[owned_pool],
+            deadline,
         )
         return owned_pool
 
-    def _put_extension(self, plural: str, name: str, kind: str, spec: dict[str, Any]) -> None:
+    def _put_extension(
+        self, plural: str, name: str, kind: str, spec: dict[str, Any], deadline: float
+    ) -> None:
         body = _extension_body(kind, {"name": name}, spec)
         try:
             self._api.get_namespaced_custom_object(
-                EXT_GROUP, EXT_VERSION, self._namespace, plural, name
+                EXT_GROUP,
+                EXT_VERSION,
+                self._namespace,
+                plural,
+                name,
+                _request_timeout=_claim_timeout(deadline),
             )
         except k8s_client.ApiException as exc:
             if exc.status != 404:
                 raise
             self._api.create_namespaced_custom_object(
-                EXT_GROUP, EXT_VERSION, self._namespace, plural, body
+                EXT_GROUP,
+                EXT_VERSION,
+                self._namespace,
+                plural,
+                body,
+                _request_timeout=_claim_timeout(deadline),
             )
             return
         self._api.patch_namespaced_custom_object(
-            EXT_GROUP, EXT_VERSION, self._namespace, plural, name, body
+            EXT_GROUP,
+            EXT_VERSION,
+            self._namespace,
+            plural,
+            name,
+            body,
+            _request_timeout=_claim_timeout(deadline),
         )
 
     def _claim_scoped_pool(
@@ -492,8 +567,10 @@ class KubernetesSandboxClient:
         pool: str,
         tokens: dict[str, str],
         runner_resources: dict[str, Any] | None,
+        deadline: float,
         executor_secret_names: frozenset[str] | None = None,
         executor_withheld: frozenset[str] = frozenset(),
+        tool_daemon: ToolDaemonMount | None = None,
     ) -> ClaimObjectNames:
         """Write the per-claim template, token Secret and pool; return their names.
 
@@ -506,9 +583,9 @@ class KubernetesSandboxClient:
         """
 
         names = claim_object_names(claim)
-        source_name = self._pool_template_name(pool)
+        source_name = self._pool_template_name(pool, deadline)
         source_spec = self._source_template_spec(
-            source_name, request_timeout_seconds=_CLAIM_PREPARATION_TIMEOUT_S
+            source_name, request_timeout_seconds=_claim_timeout(deadline)
         )
         spec = claim_template_spec(
             source_spec,
@@ -518,16 +595,24 @@ class KubernetesSandboxClient:
             claim=claim,
             executor_secret_names=executor_secret_names,
             executor_withheld=executor_withheld,
+            tool_daemon=tool_daemon,
         )
         labels = {MANAGED_BY_LABEL: MANAGED_BY_VALUE, CLAIM_LABEL: claim}
-        created = self._api.create_namespaced_custom_object(
-            EXT_GROUP,
-            EXT_VERSION,
-            self._namespace,
-            "sandboxtemplates",
-            _extension_body("SandboxTemplate", {"name": names.template, "labels": labels}, spec),
-            _request_timeout=_CLAIM_PREPARATION_TIMEOUT_S,
-        )
+        try:
+            created = self._api.create_namespaced_custom_object(
+                EXT_GROUP,
+                EXT_VERSION,
+                self._namespace,
+                "sandboxtemplates",
+                _extension_body(
+                    "SandboxTemplate", {"name": names.template, "labels": labels}, spec
+                ),
+                _request_timeout=_claim_timeout(deadline),
+            )
+        except k8s_client.ApiException as exc:
+            # Raised with no rollback: a template already at this name is not ours.
+            _refuse_name_conflict(exc, f"SandboxTemplate {names.template}")
+            raise
         try:
             # No controller or blockOwnerDeletion: either would need
             # ``finalizers`` RBAC the worker is not granted.
@@ -538,8 +623,9 @@ class KubernetesSandboxClient:
                 created["metadata"]["uid"],
             )
             metadata = {"name": names.secret, "labels": labels, "ownerReferences": [owner]}
-            # Token values are never logged; ``stringData`` is the only place
-            # they are written.
+            # Token values and daemon client files (ADR 0217) are never logged;
+            # ``stringData`` is the only place they are written.
+            files = {} if tool_daemon is None else dict(tool_daemon.files)
             self._core_api.create_namespaced_secret(
                 self._namespace,
                 {
@@ -547,9 +633,9 @@ class KubernetesSandboxClient:
                     "kind": "Secret",
                     "type": "Opaque",
                     "metadata": metadata,
-                    "stringData": dict(tokens),
+                    "stringData": {**tokens, **files},
                 },
-                _request_timeout=_CLAIM_PREPARATION_TIMEOUT_S,
+                _request_timeout=_claim_timeout(deadline),
             )
             self._api.create_namespaced_custom_object(
                 EXT_GROUP,
@@ -561,14 +647,14 @@ class KubernetesSandboxClient:
                     {**metadata, "name": names.pool},
                     {"replicas": 0, "sandboxTemplateRef": {"name": names.template}},
                 ),
-                _request_timeout=_CLAIM_PREPARATION_TIMEOUT_S,
+                _request_timeout=_claim_timeout(deadline),
             )
         except Exception:
             self._rollback_delete("sandboxtemplates", names.template)
             raise
         return names
 
-    def _pool_template_name(self, pool: str) -> str:
+    def _pool_template_name(self, pool: str, deadline: float) -> str:
         """The template ``pool``'s ``sandboxTemplateRef`` names; a missing pool refuses."""
 
         obj = self._get(
@@ -576,7 +662,7 @@ class KubernetesSandboxClient:
             EXT_VERSION,
             "sandboxwarmpools",
             pool,
-            request_timeout_seconds=_CLAIM_PREPARATION_TIMEOUT_S,
+            request_timeout_seconds=_claim_timeout(deadline),
         )
         if obj is None:
             raise ValueError(f"source pool {pool} is missing")
@@ -634,10 +720,13 @@ class KubernetesSandboxClient:
         pool: str,
         env: dict[str, str] | None = None,
         labels: dict[str, str] | None = None,
+        deadline: float,
         runner_resources: dict[str, Any] | None = None,
         agent_name: str | None = None,
         executor_secret_names: frozenset[str] | None = None,
+        tool_daemon: ToolDaemonMount | None = None,
     ) -> None:
+        _claim_timeout(deadline)  # a spent deadline refuses before any write
         env = filter_agent_child_env(env)
         executor = executor_secret_names is not None
         withheld: frozenset[str] = frozenset()
@@ -653,16 +742,25 @@ class KubernetesSandboxClient:
         # chart pool or the per-agent resources pool. An executor claim always
         # takes the per-claim path: claim env cannot remove what the pool
         # template carries, so only its own stripped copy can (ACTION-EXECUTOR-5).
+        # A Docker-enabled claim takes it too: its daemon client files ride the
+        # per-claim Secret, mounted read-only on the runner (ADR 0217).
         tokens, env = split_claim_tokens(env)
         claim_template: str | None = None
-        if tokens or executor:
+        if tokens or executor or tool_daemon is not None:
             claim_names = self._claim_scoped_pool(
-                name, pool, tokens, runner_resources, executor_secret_names, withheld
+                name,
+                pool,
+                tokens,
+                runner_resources,
+                deadline,
+                executor_secret_names,
+                withheld,
+                tool_daemon,
             )
             pool = claim_names.pool
             claim_template = claim_names.template
         elif runner_resources is not None:
-            pool = self._resources_pool(pool, agent_name, runner_resources)
+            pool = self._resources_pool(pool, agent_name, runner_resources, deadline)
         body: dict[str, Any] = {
             "apiVersion": f"{EXT_GROUP}/{EXT_VERSION}",
             "kind": "SandboxClaim",
@@ -735,9 +833,18 @@ class KubernetesSandboxClient:
                     )
             body["spec"]["env"] = entries
         if claim_template is None:
-            self._api.create_namespaced_custom_object(
-                EXT_GROUP, EXT_VERSION, self._namespace, "sandboxclaims", body
-            )
+            try:
+                self._api.create_namespaced_custom_object(
+                    EXT_GROUP,
+                    EXT_VERSION,
+                    self._namespace,
+                    "sandboxclaims",
+                    body,
+                    _request_timeout=_claim_timeout(deadline),
+                )
+            except k8s_client.ApiException as exc:
+                _refuse_name_conflict(exc, f"SandboxClaim {name}")
+                raise
             return
         claim_created = False
         try:
@@ -747,7 +854,7 @@ class KubernetesSandboxClient:
                 self._namespace,
                 "sandboxclaims",
                 body,
-                _request_timeout=_CLAIM_PREPARATION_TIMEOUT_S,
+                _request_timeout=_claim_timeout(deadline),
             )
             claim_created = True
             # Hand the template (and through it the Secret and pool) to the
@@ -764,12 +871,14 @@ class KubernetesSandboxClient:
                 "sandboxtemplates",
                 claim_template,
                 {"metadata": {"ownerReferences": [owner]}},
-                _request_timeout=_CLAIM_PREPARATION_TIMEOUT_S,
+                _request_timeout=_claim_timeout(deadline),
             )
-        except Exception:
+        except Exception as exc:
             if claim_created:
                 self._rollback_delete("sandboxclaims", name)
             self._rollback_delete("sandboxtemplates", claim_template)
+            if not claim_created:
+                _refuse_name_conflict(exc, f"SandboxClaim {name}")
             raise
 
     def get_claim(self, name: str, *, request_timeout_seconds: float) -> ClaimView | None:
@@ -1059,6 +1168,142 @@ class KubernetesSandboxClient:
             name,
             {"spec": {"operatingMode": mode}},
         )
+
+    # -- tool daemon objects (ADR 0217) ----------------------------------------
+
+    def _daemon_api(self, kind: DaemonObjectKind, verb: str) -> Any:
+        api = self._networking_api if kind == "NetworkPolicy" else self._core_api
+        plural = {"Pod": "pod", "Service": "service", "Secret": "secret"}.get(
+            kind, "network_policy"
+        )
+        return getattr(api, f"{verb}_namespaced_{plural}")
+
+    def create_daemon_object(
+        self, namespace: str, manifest: Mapping[str, Any], *, request_timeout_seconds: float
+    ) -> str:
+        kind: DaemonObjectKind = manifest["kind"]
+        try:
+            created = self._daemon_api(kind, "create")(
+                namespace, dict(manifest), _request_timeout=request_timeout_seconds
+            )
+        except k8s_client.ApiException as exc:
+            _refuse_name_conflict(exc, f"{kind} {manifest['metadata']['name']} in {namespace}")
+            raise
+        return str(created.metadata.uid)
+
+    def list_daemon_objects(
+        self,
+        namespace: str,
+        kind: ListableDaemonKind,
+        *,
+        label_selector: str,
+        request_timeout_seconds: float,
+    ) -> list[DaemonObjectView]:
+        result = self._daemon_api(kind, "list")(
+            namespace, label_selector=label_selector, _request_timeout=request_timeout_seconds
+        )
+        return [_daemon_view(kind, item) for item in result.items or []]
+
+    def delete_daemon_object(
+        self,
+        namespace: str,
+        kind: DaemonObjectKind,
+        name: str,
+        *,
+        uid: str,
+        request_timeout_seconds: float,
+    ) -> None:
+        options = k8s_client.V1DeleteOptions(
+            propagation_policy="Background", preconditions=k8s_client.V1Preconditions(uid=uid)
+        )
+        try:
+            self._daemon_api(kind, "delete")(
+                name, namespace, body=options, _request_timeout=request_timeout_seconds
+            )
+        except k8s_client.ApiException as exc:
+            # Absent, or replaced since it was observed (the uid precondition's
+            # 409): either way not ours to delete.
+            if exc.status not in (404, 409):
+                raise
+
+    def get_daemon_pod(
+        self, namespace: str, name: str, *, request_timeout_seconds: float
+    ) -> DaemonObjectView | None:
+        try:
+            pod = self._core_api.read_namespaced_pod(
+                name, namespace, _request_timeout=request_timeout_seconds
+            )
+        except k8s_client.ApiException as exc:
+            if exc.status == 404:
+                return None
+            if exc.status in _TRANSIENT_STATUSES:
+                raise KubeTransientError(f"kube API {exc.status} reading pod {name}") from exc
+            raise
+        except Urllib3HTTPError as exc:
+            raise KubeTransientError(f"kube API transport error reading pod {name}") from exc
+        return _daemon_view("Pod", pod)
+
+    @contextmanager
+    def open_daemon_stream(
+        self, namespace: str, pod: str, port: int, *, timeout_seconds: float
+    ) -> Iterator[socket.socket]:
+        """A byte stream to ``pod:port`` through an API port-forward.
+
+        ``portforward`` patches its ApiClient for the call's duration, so each
+        stream gets a fresh one. Its websocket connect has no timeout, so it
+        runs on a daemon thread waited on for ``timeout_seconds``; a connect
+        that finishes after the caller gave up closes what it produced.
+        """
+
+        if not _PORT_FORWARDS.acquire(blocking=False):
+            raise SandboxError("too many tool daemon port-forwards are still connecting")
+        deadline = time.monotonic() + timeout_seconds
+        api_client = k8s_client.ApiClient(configuration=self._configuration)
+        lock = threading.Lock()
+        done = threading.Event()
+        state: dict[str, Any] = {}
+
+        def connect() -> None:
+            forward: Any = None
+            error: Exception | None = None
+            try:
+                connector = k8s_client.CoreV1Api(api_client).connect_get_namespaced_pod_portforward
+                forward = portforward(connector, pod, namespace, ports=str(port))
+            except Exception as exc:  # noqa: BLE001 - handed to the waiting caller
+                error = exc
+            finally:
+                _PORT_FORWARDS.release()
+            with lock:
+                abandoned = state.setdefault("abandoned", False)
+                state.update(forward=forward, error=error)
+            done.set()
+            if abandoned:
+                if forward is not None:
+                    forward.close()
+                api_client.close()
+
+        threading.Thread(target=connect, name=f"daemon-portforward-{pod}", daemon=True).start()
+        done.wait(timeout_seconds)
+        with lock:
+            connected = "error" in state
+            state.setdefault("abandoned", True)
+        if not connected:
+            raise SandboxError(f"port-forward to {pod} did not connect within {timeout_seconds}s")
+        forward = state["forward"]
+        if forward is None:
+            api_client.close()
+            error = state["error"]
+            raise SandboxError(f"port-forward to {pod} failed ({type(error).__name__})") from error
+        sock: socket.socket | None = None
+        try:
+            sock = socket.socket(fileno=forward.socket(port).detach())
+            sock.settimeout(max(0.001, deadline - time.monotonic()))
+            yield sock
+        finally:
+            if sock is not None:
+                sock.close()
+            forward.close()
+            api_client.close()
 
     # -- helpers --------------------------------------------------------------
 
