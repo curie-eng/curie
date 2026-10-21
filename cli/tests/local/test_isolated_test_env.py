@@ -675,6 +675,15 @@ def test_explicit_full_profile_supplies_a_live_observability_endpoint(trial: Tri
     assert urlsplit(environment["langfuse_host"]).port == report["ports"]["langfuse-web"]
     assert urlsplit(environment["metrics_url"]).port == report["ports"]["otel-metrics"]
     assert set(report["ports"].values()) == actual_ports
+    # The full profile builds its collector image per project; cleanup removes it.
+    images = subprocess.run(
+        [trial.docker, "images", "-q", f"{report['project']}-otel-collector"],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=60,
+    )
+    assert images.stdout.strip() == ""
 
 
 def test_child_exit_42_is_preserved_in_metadata_and_maps_to_cli_failure(trial: Trial):
