@@ -218,7 +218,7 @@ def _orphans(ctx: dict[str, Any], egress: str) -> None:
 def _scenario(fx: ModuleType, args: argparse.Namespace) -> None:
     # Imported here: collection must not need the implementation when gated off.
     import redis
-    from curie_worker.binding import RUNNER_TOKEN_ENV
+    from curie_worker.binding import PLUGIN_DIR_ENV, RUNNER_TOKEN_ENV
     from curie_worker.run import _substrate_config
     from curie_worker.sandbox import (
         AffinityStore,
@@ -289,8 +289,10 @@ def _scenario(fx: ModuleType, args: argparse.Namespace) -> None:
         thread = f"e2e-tool-daemon-{args.nonce}"
 
         def claim() -> Any:
-            token = {RUNNER_TOKEN_ENV: secrets.token_urlsafe(32)}
-            return substrate.claim(thread, env=token, workspace_repo=REPO)
+            # No bundle is staged here, so override the template's unbound /unused
+            # plugin dir with none; the fake-model runner then boots without one.
+            env = {RUNNER_TOKEN_ENV: secrets.token_urlsafe(32), PLUGIN_DIR_ENV: ""}
+            return substrate.claim(thread, env=env, workspace_repo=REPO)
 
         # 1. A Docker-enabled claim whose runner reaches its own daemon.
         first = claim()
