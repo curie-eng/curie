@@ -27,6 +27,8 @@ PRINCIPALS = (
     "candidate_enqueue",
     "candidate_worker",
     "qualification_publisher",
+    "control_reader",
+    "source_writer",
     "observer",
 )
 CANDIDATES = ("candidate_enqueue", "candidate_worker")
@@ -154,6 +156,8 @@ def profile_fields(**changes: Any) -> dict[str, Any]:
         "issuer_identity": copy.deepcopy(b["issuer_identity"]),
         "control_identity": copy.deepcopy(b["control_identity"]),
         "qualification_publisher_identity": copy.deepcopy(b["qualification_publisher_identity"]),
+        "control_reader_identity": copy.deepcopy(b["control_reader_identity"]),
+        "source_writer_identity": copy.deepcopy(b["source_writer_identity"]),
         "observer_identity": copy.deepcopy(OBSERVER),
         "mediator_identity": copy.deepcopy(b["mediator_identity"]),
         "gateway_identity": copy.deepcopy(b["gateway_identity"]),
@@ -298,6 +302,8 @@ def test_guard_hashes_each_principals_rules_bound_to_its_credential() -> None:
         "qualification_publisher": fields["qualification_publisher_identity"],
         "candidate_enqueue": fields["candidate_credentials"]["enqueue"],
         "candidate_worker": fields["candidate_credentials"]["worker"],
+        "control_reader": fields["control_reader_identity"],
+        "source_writer": fields["source_writer_identity"],
         "observer": OBSERVER,
     }
     assert set(guard["broker_acl"]) == set(PRINCIPALS)
@@ -739,3 +745,24 @@ def test_profile_copies_mutable_inputs() -> None:
     rows = json.loads(result.measurement_file[1])["platform_mappings"]
     assert rows == [mapping()]
     assert result.manifest.as_dict()["credential_refs"]["enqueue"]["generation"] == "4"
+
+
+@pytest.mark.parametrize("name", ["control_reader", "source_writer"])
+def test_guard_binds_each_metadata_principal_to_its_unchanged_recipe(name: str) -> None:
+    """Design decision 10: every broker user the installation creates is in G and observed."""
+    from curie_protected_hooks.broker_metadata import metadata_acl_rules
+    from curie_protected_hooks.commissioning_producers import ACL_PRINCIPALS
+
+    api = module()
+    assert name in api.BROKER_PRINCIPALS and name in ACL_PRINCIPALS
+    result = api.construct(profile(), acl=MergedRecipes(profile_fields()["qualification_id"]))
+    member = name + "_identity"
+    entry = json.loads(result.guard_config)["broker_acl"][name]
+    assert entry == {
+        "credential": profile_fields()[member],
+        "rules_sha256": sha(canonical(list(metadata_acl_rules(name)))),
+    }
+    assert result.bootstrap.as_dict()[member] == profile_fields()[member]
+    taken = profile_fields()["production_credentials"]["enqueue"]
+    with pytest.raises(api.ProvisionerRefused):
+        api.construct(profile(**{member: dict(taken)}), acl=Recipes())

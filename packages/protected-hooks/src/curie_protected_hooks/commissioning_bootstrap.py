@@ -43,6 +43,8 @@ _FIXED: dict[str, Any] = {
     "issuer_identity": _CREDENTIAL,
     "control_identity": _CREDENTIAL,
     "qualification_publisher_identity": _CREDENTIAL,
+    "control_reader_identity": _CREDENTIAL,
+    "source_writer_identity": _CREDENTIAL,
     "mediator_identity": _CREDENTIAL,
     "gateway_identity": _CREDENTIAL,
     "max_permit_ms": "generation",
@@ -58,7 +60,8 @@ def _bootstrap_bytes(raw: Any) -> bytes:
         _require(entry["production"] != entry["commissioning"])
         # Every credential ID in B is pairwise distinct: the production trio,
         # the four commissioning broker principals, the Qualification publisher
-        # (design decision 8) and the launch mediator and provider gateway. So no
+        # (design decision 8), the production control reader and source writer
+        # (design decision 10) and the launch mediator and provider gateway. So no
         # commissioning or launch identity can equal a production ID.
         ids = [
             *(ref["id"] for ref in value["production_credentials"].values()),
@@ -69,6 +72,8 @@ def _bootstrap_bytes(raw: Any) -> bytes:
                     "issuer_identity",
                     "control_identity",
                     "qualification_publisher_identity",
+                    "control_reader_identity",
+                    "source_writer_identity",
                     "mediator_identity",
                     "gateway_identity",
                 )
