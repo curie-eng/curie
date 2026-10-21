@@ -448,6 +448,11 @@ A refusal answers HTTP 502 to Alertmanager and logs one warning,
 `protected hook delivery refused (reason=<reason>)`, whose reason is a fixed
 token such as `support_source_unconfigured`, `support_unauthenticated` or
 `receipt_not_read_only`; it never contains a credential, URL or payload.
+Two other failures also answer 502 with one fixed warning. A transport failure
+on the probe or the delivery logs
+`hook ingress forwarding failed (reason=transport_error)`. A delivery the
+ingress answers with a non-2xx status after a supported probe logs
+`hook ingress rejected delivery (status=<status>)`.
 Alertmanager retries with the same delivery ID and counts the failures in
 `alertmanager_notifications_failed_total`, which is the signal to alert on. A
 receipt refusal means the API answered a delivery the source cannot attest as

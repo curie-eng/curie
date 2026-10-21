@@ -26,7 +26,9 @@ answers 200 ``supported``. Each success receipt must report ``read-only`` as its
 requested, effective and alias policy and name the source generation the probe
 reported. Any other
 answer is refused with HTTP 502 to the source and one warning naming only a
-fixed reason. The default ``ordinary`` mode is unchanged.
+fixed reason. A transport failure or a non-2xx delivery status also answers 502,
+with the fixed transport or status warning both modes share. The default
+``ordinary`` mode is unchanged.
 
 Environment:
   CURIE_HOOK_URL           Full ingest URL, including hook and optional tool_access
