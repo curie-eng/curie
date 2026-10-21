@@ -15,7 +15,7 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from enum import StrEnum
-from typing import Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
 
 from aci_protocol import BootEnv
 from aci_protocol.service_config import API_KEY_ENV
@@ -23,7 +23,8 @@ from aci_protocol.slack_identities import SLACK_CREDENTIAL_ENV_PREFIXES
 from curie_internal.keyspace import SANDBOX_KEY_PREFIX_DEFAULT
 from plugin_format import is_reserved_boot_env_name
 
-from ..repo_runner_pools import RepoRunnerPool
+if TYPE_CHECKING:
+    from ..repo_runner_pools import RepoRunnerPool
 
 # Substrate-neutral labels: every backend tags its managed objects with these
 # (the Kubernetes adapter on claims, the Docker adapter on containers), so they
@@ -594,10 +595,21 @@ class RepoRunnerPoolRefused(MissingAgentPoolError):
                 f"{pool} was not rendered (missing_pool); redeploy its runner with {fix}"
             )
         else:
+            rebuild = (
+                f"`curie cluster factory --repo-runner {repo}=<spec> --registry <registry> "
+                "--namespace <namespace> --release <release> --context <context>`"
+            )
+            remedy = (
+                "pin agentSandbox.runner.digest in this installation's release values first, "
+                f"then rebuild and rebind it with {rebuild}"
+                if platform_digest is None
+                else f"rebuild and rebind it on the installed pinned platform runner with {rebuild}"
+            )
             message = (
                 f"repository {repo} runner image was built on platform runner {base}, "
                 f"not this installation's {platform_digest or 'unpinned runner image'} "
-                f"(stale_base); rebuild it with {fix}"
+                f"(stale_base); {remedy}; use a repository runner spec containing its retained "
+                "tools, probes and Dockerfile declaration"
             )
         SandboxError.__init__(self, message)
 

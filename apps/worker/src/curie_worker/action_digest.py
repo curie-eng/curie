@@ -28,8 +28,10 @@ A failure of the LEDGER is a different thing and still propagates.
 
 **One verb.** The only Kubernetes call is the single-object
 ``read_namespaced_deployment``; never a list. The chart grants the worker that
-``get`` only with the executor and the connector reconciler both enabled, which
-is also the only configuration ``run.py`` composes this wrapper in.
+``get`` only with the executor enabled and either the connector reconciler or
+the executor's own connector reads (#4800) on, which is also the only
+configuration ``run.py`` composes this wrapper in
+(``WorkerConfig.executor_reads_connectors``).
 """
 
 from __future__ import annotations

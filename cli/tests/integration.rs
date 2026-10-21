@@ -4,6 +4,7 @@
 
 mod support;
 
+mod access_policy_verb;
 mod actions_cli;
 mod agent_update_body;
 mod api_deploy;
@@ -82,6 +83,7 @@ mod delivery_pin;
 mod deploy_environment;
 mod deploy_transport;
 mod dev_model_credit;
+mod dev_test_env;
 mod docker_no_host_binds;
 mod docker_subpath_preflight;
 mod doctor_api;

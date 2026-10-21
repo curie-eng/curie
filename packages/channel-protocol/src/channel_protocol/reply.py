@@ -25,7 +25,8 @@ Two contracts an adapter must build against:
 ``reply_ref`` is OPAQUE and adapter-minted: Slack's is the placeholder ``ts``,
 email's is the upstream message id. The platform never parses it.
 
-Two wire versions, and a body carries the one it needs (ADR-0130 section 4):
+Three wire versions, and a body carries the one it needs (ADR-0130 section 4,
+ADR-0227):
 
 - **1.0** (``REPLY_WIRE_VERSION``) is every form above. The models are closed,
   so an adapter built against 1.0 refuses any body carrying a field it does not
@@ -43,8 +44,12 @@ Two wire versions, and a body carries the one it needs (ADR-0130 section 4):
   the rendering-free progress payload from ``channel_protocol.progress``: a
   ``ProgressCard`` on ``reply.update`` or ``reply.post``, or a
   ``ProgressMilestone`` on ``reply.post``.
+- **1.2** (``VERBATIM_REPLY_WIRE_VERSION``) is exclusively a text-only
+  ``reply.update`` with ``text_mode: "verbatim"``, nonempty text, and a
+  ``delivery_id``. It carries no message, settlement, navigation or progress.
 
-The version is ``"1.1"`` exactly when the body carries ``delivery_id``, and a
+The version is ``"1.1"`` when the body carries ``delivery_id`` without
+``text_mode``, and ``"1.2"`` exactly when it carries ``text_mode``. A
 body carrying ``progress`` carries ``delivery_id``. ``turn.status`` and
 ``turn.completed`` have no 1.1 field and are 1.0 only. A body that breaks either
 rule is refused at validation, so no producer can put a 1.1 version on a body a
@@ -84,9 +89,10 @@ from pydantic_core import PydanticCustomError
 from .models import OutboundMessage
 from .progress import ProgressCard, ProgressMilestone
 
-ReplyWireVersion = Literal["1.0", "1.1"]
+ReplyWireVersion = Literal["1.0", "1.1", "1.2"]
 REPLY_WIRE_VERSION: Literal["1.0"] = "1.0"
 PROGRESS_REPLY_WIRE_VERSION: Literal["1.1"] = "1.1"
+VERBATIM_REPLY_WIRE_VERSION: Literal["1.2"] = "1.2"
 _STRICT = ConfigDict(extra="forbid")
 
 DeliveryId = Annotated[
@@ -95,10 +101,10 @@ DeliveryId = Annotated[
 ]
 """A UUID in its canonical form, the one ``str(uuid.UUID(...))`` produces."""
 
-# The fields 1.1 added. Absent, each is left out of the serialized body rather
+# The fields newer wires added. Absent, each is left out of the serialized body rather
 # than sent as null: a 1.0-built adapter's closed models refuse an unknown key
 # even when its value is null.
-_PROGRESS_WIRE_FIELDS = ("delivery_id", "progress")
+_OPTIONAL_WIRE_FIELDS = ("delivery_id", "progress", "text_mode")
 _DELIVERY_ID_DESCRIPTION = (
     "Reply wire 1.1. The platform-minted idempotency key of this one post or edit; "
     "a retry of an ambiguous attempt carries the same value. Outbound, and unrelated "
@@ -182,12 +188,11 @@ class _DeliveredEvent(_ReplyEventBase):
                 )
         elif delivery_id is None:
             if progress is not None:
-                raise PydanticCustomError(
-                    "progress_delivery_id", "progress needs a delivery_id"
-                )
+                raise PydanticCustomError("progress_delivery_id", "progress needs a delivery_id")
             raise PydanticCustomError(
                 "reply_wire_version",
-                "a reply wire 1.1 body carries a delivery_id; send a body without one as 1.0",
+                "a reply wire 1.1 or 1.2 body carries a delivery_id; "
+                "send a body without one as 1.0",
             )
         return self
 
@@ -196,8 +201,8 @@ class _DeliveredEvent(_ReplyEventBase):
         self, handler: SerializerFunctionWrapHandler
     ) -> dict[str, Any]:
         body: dict[str, Any] = handler(self)
-        for name in _PROGRESS_WIRE_FIELDS:
-            if getattr(self, name) is None:
+        for name in _OPTIONAL_WIRE_FIELDS:
+            if getattr(self, name, None) is None:
                 body.pop(name, None)
         return body
 
@@ -233,6 +238,10 @@ class ReplyUpdate(_DeliveredEvent):
             "the body then carries no text, message, settled or nav."
         ),
     )
+    text_mode: Literal["verbatim"] | None = Field(
+        default=None,
+        description="Reply wire 1.2. Preserve this text-only answer literally.",
+    )
 
     def _progress_wire(self) -> tuple[str | None, ProgressCard | None]:
         return self.delivery_id, self.progress
@@ -249,6 +258,32 @@ class ReplyUpdate(_DeliveredEvent):
             )
         return self
 
+    @model_validator(mode="after")
+    def _verbatim_is_text_only(self) -> Self:
+        if self.version == VERBATIM_REPLY_WIRE_VERSION:
+            if self.text_mode != "verbatim":
+                raise PydanticCustomError(
+                    "reply_wire_version", "reply wire 1.2 requires text_mode verbatim"
+                )
+            if (
+                self.text is None
+                or self.text == ""
+                or any(
+                    value is not None
+                    for value in (self.message, self.settled, self.nav, self.progress)
+                )
+            ):
+                raise PydanticCustomError(
+                    "verbatim_reply_shape",
+                    "a verbatim update needs nonempty text and no message, settled, "
+                    "nav or progress",
+                )
+        elif self.text_mode is not None:
+            raise PydanticCustomError(
+                "reply_wire_version", "text_mode verbatim requires reply wire 1.2"
+            )
+        return self
+
 
 class ReplyPost(_DeliveredEvent):
     """A NEW platform-owned message, acked with its ref.
@@ -257,6 +292,7 @@ class ReplyPost(_DeliveredEvent):
     milestone. ``message.text`` is the complete plain-text fallback either way.
     """
 
+    version: Literal["1.0", "1.1"]
     event: Literal["reply.post"]
     message: OutboundMessage
     requested_by: str

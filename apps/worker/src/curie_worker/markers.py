@@ -54,13 +54,13 @@ from datetime import UTC, datetime
 from typing import Any, Literal
 
 from aci_protocol.service_config import STREAM_PAYLOAD_FIELD
-from channel_protocol.reply import TurnCompleted
+from channel_protocol.reply import ReplyUpdate, TurnCompleted
 from curie_internal.channel_read_ledger import LEDGER_TTL_S as _CHANNEL_READ_PIN_TTL_S
 from curie_internal.channel_read_ledger import refresh_owner as _refresh_channel_read_owner
 from curie_internal.channel_read_ledger import revoke_by_owner as _revoke_channel_read_by_owner
 from curie_internal.channel_read_ledger import revoke_owner as _revoke_channel_read_owner
 from curie_internal.channel_read_ledger import tombstone_owner as _tombstone_channel_read_owner
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from redis.asyncio import Redis
 
 from .config import WorkerConfig
@@ -160,11 +160,25 @@ _DONE_FIELD = "done"
 # and clearing that one would discard a completion nobody has delivered.
 _GENERATION_FIELD = "gen"
 _CAUSE_FIELD = "cause"
+_ANSWER_GENERATION_PREFIX = "answer-v1:"
+_VERBATIM_GENERATION_PREFIX = "answer-v2:"
+CompletionNamespace = bool | Literal["verbatim"]
+
+
+def _generation_namespace(generation: str) -> CompletionNamespace:
+    if generation.startswith(_VERBATIM_GENERATION_PREFIX):
+        return "verbatim"
+    return generation.startswith(_ANSWER_GENERATION_PREFIX)
+
 
 # Set the done marker and flag the completion record done in ONE round trip.
 # The record is only touched when it still exists, so a sweeper that cleared it
 # concurrently is never resurrected as a payload-less key with no expiry.
+# A supplied generation must still own the record before either write occurs.
 _MARK_DONE_LUA = """
+if ARGV[4] ~= '' and redis.call('HGET', KEYS[2], ARGV[5]) ~= ARGV[4] then
+  return 0
+end
 if ARGV[3] == 'history_capacity' then
   redis.call('SET', KEYS[1], ARGV[3])
 else
@@ -314,11 +328,18 @@ class CompletionRecord(BaseModel):
     event_id: str
     event: TurnCompleted
     route: TargetRoute
+    # Optional for previously stored completions and non-answer lifecycles.
+    # The immutable terminal answer is delivered before turn.completed, so a
+    # partial channel failure replays delivery without running the model again.
+    answer: ReplyUpdate | None = Field(default=None, exclude_if=lambda value: value is None)
+    answer_best_effort: bool = Field(default=False, exclude_if=lambda value: not value)
     created_at: float
     done: bool = False
 
 
 class MalformedCompletionError(RuntimeError):
+    answer_namespace: CompletionNamespace = False
+
     """A stored completion record is missing a field every writer sets.
 
     The outbox is introduced by this train, so there is no pre-upgrade record to
@@ -346,12 +367,59 @@ class StoredCompletion:
     cause: str | None
 
 
+@dataclass(frozen=True)
+class CompletionIndexEntry:
+    event_id: str
+    answer_namespace: CompletionNamespace = False
+
+    def __lt__(self, other: CompletionIndexEntry) -> bool:
+        return (self.event_id, str(self.answer_namespace)) < (
+            other.event_id,
+            str(other.answer_namespace),
+        )
+
+
+def completion_generation(record: CompletionRecord) -> str:
+    prefix = (
+        _VERBATIM_GENERATION_PREFIX
+        if record.answer is not None and record.answer.text_mode == "verbatim"
+        else _ANSWER_GENERATION_PREFIX
+        if record.answer is not None
+        else ""
+    )
+    return prefix + uuid.uuid4().hex
+
+
 class Markers:
     """Idempotency, side-effect and completion markers over Valkey."""
+
+    supports_answer_outbox = True
 
     def __init__(self, redis: Redis, config: WorkerConfig) -> None:
         self._redis = redis
         self._config = config
+        self._completion_sample_offset = 0
+
+    def _completion_storage_key(self, event_id: str, *, answer: CompletionNamespace = False) -> str:
+        key = self._config.completion_key(event_id)
+        if answer == "verbatim":
+            return f"{self._config.key_prefix}:answer-completion-v2:{event_id}"
+        return f"{self._config.key_prefix}:answer-completion-v1:{event_id}" if answer else key
+
+    def _completion_pending_key(self, *, answer: CompletionNamespace = False) -> str:
+        key = self._config.completions_pending_key()
+        if answer == "verbatim":
+            return key + ":answer-v2"
+        return key + ":answer-v1" if answer else key
+
+    def _generation_storage_key(self, event_id: str, generation: str) -> str:
+        return self._completion_storage_key(event_id, answer=_generation_namespace(generation))
+
+    def _generation_pending_key(self, generation: str) -> str:
+        return self._completion_pending_key(answer=_generation_namespace(generation))
+
+    def _completion_namespaces(self) -> tuple[CompletionNamespace, ...]:
+        return (False, True, "verbatim") if self.supports_answer_outbox else (False,)
 
     async def push_steer_memory_turns(
         self, agent_id: uuid.UUID, live_turn: str, turns: Sequence[tuple[uuid.UUID, str]]
@@ -523,12 +591,17 @@ class Markers:
         async with self._redis.pipeline(transaction=False) as pipe:
             pipe.exists(self._config.done_key(event_id))
             pipe.hget(self._config.completion_key(event_id), _DONE_FIELD)
-            marker, flag = await pipe.execute()
+            if self.supports_answer_outbox:
+                for namespace in (True, "verbatim"):
+                    pipe.hget(self._completion_storage_key(event_id, answer=namespace), _DONE_FIELD)
+            marker, *flags = await pipe.execute()
         if marker:
             return True
-        return _as_str(flag) == "1"
+        return any(_as_str(flag) == "1" for flag in flags)
 
-    async def mark_done(self, event_id: str, *, marker_value: DoneMarkerValue) -> None:
+    async def mark_done(
+        self, event_id: str, *, marker_value: DoneMarkerValue, generation: str | None = None
+    ) -> None:
         """Mark the event durably done AND flag its outbox record, in one call.
 
         The two writes are ONE round trip so they cannot diverge: a record
@@ -540,9 +613,10 @@ class Markers:
         This is the form for every turn that owes a completion. Every such
         terminal outcome goes through ``Kernel._complete``, which writes the
         outbox record for THIS event id first, so the record key is always this
-        event's own -- the Lua below is a no-op on the record when the sweeper
-        cleared it concurrently, which is the only case where there is nothing
-        to flag.
+        event's own. A supplied generation refuses settlement if a concurrent
+        writer replaced or cleared its record, before either write occurs.
+        Legacy marker-only calls omit the generation and do not create a
+        missing completion hash.
 
         It also widens the MARKER's own TTL to the outbox retention window, for
         the reason ``is_terminal`` states: the outbox proves this turn finished
@@ -552,15 +626,19 @@ class Markers:
         until the API mirrors the refusal to SQL.
         """
         ttl_s = max(self._config.idempotency_ttl_s, int(self._config.completion_max_retention_s))
-        await self._redis.eval(
+        settled = await self._redis.eval(
             _MARK_DONE_LUA,
             2,
             self._config.done_key(event_id),
-            self._config.completion_key(event_id),
+            self._generation_storage_key(event_id, generation or ""),
             str(ttl_s),
             _DONE_FIELD,
             marker_value,
+            generation or "",
+            _GENERATION_FIELD,
         )
+        if not settled:
+            raise RuntimeError("Completion generation changed before terminal settlement")
 
     def _done_ttl_s(self) -> int:
         return max(self._config.idempotency_ttl_s, int(self._config.completion_max_retention_s))
@@ -619,18 +697,18 @@ class Markers:
         can be compare-and-checked against the record it wrote (a concurrent
         retry that rewrote the record owns a different one).
         """
-        generation = uuid.uuid4().hex
+        generation = completion_generation(record)
         async with self._redis.pipeline(transaction=True) as pipe:
-            pipe.hdel(self._config.completion_key(event_id), _CAUSE_FIELD)
+            pipe.hdel(self._generation_storage_key(event_id, generation), _CAUSE_FIELD)
             pipe.hset(
-                self._config.completion_key(event_id),
+                self._generation_storage_key(event_id, generation),
                 mapping={
                     _RECORD_FIELD: record.model_dump_json(),
                     _DONE_FIELD: "1" if record.done else "0",
                     _GENERATION_FIELD: generation,
                 },
             )
-            pipe.sadd(self._config.completions_pending_key(), event_id)
+            pipe.sadd(self._generation_pending_key(generation), event_id)
             await pipe.execute()
         return generation
 
@@ -671,14 +749,14 @@ class Markers:
         """
         lease_key = self._config.delivery_lease_key(stream, group, entry_id)
         state_key = self._config.delivery_state_key(stream, group, entry_id)
-        record_generation = uuid.uuid4().hex
+        record_generation = completion_generation(record)
         ttl_s = max(self._config.idempotency_ttl_s, int(self._config.completion_max_retention_s))
         settled = await self._redis.eval(
             _SETTLE_FENCED_LUA,
             5,
             self._config.done_key(event_id),
-            self._config.completion_key(event_id),
-            self._config.completions_pending_key(),
+            self._generation_storage_key(event_id, record_generation),
+            self._generation_pending_key(record_generation),
             lease_key,
             state_key,
             str(ttl_s),
@@ -726,8 +804,8 @@ class Markers:
             _SETTLE_FENCED_AND_PUBLISH_LUA,
             7,
             self._config.done_key(event_id),
-            self._config.completion_key(event_id),
-            self._config.completions_pending_key(),
+            self._generation_storage_key(event_id, record_generation),
+            self._generation_pending_key(record_generation),
             lease_key,
             state_key,
             successor_stream,
@@ -773,7 +851,7 @@ class Markers:
         updated = await self._redis.eval(
             _UPDATE_COMPLETION_CAUSE_LUA,
             1,
-            self._config.completion_key(event_id),
+            self._generation_storage_key(event_id, generation),
             _GENERATION_FIELD,
             generation,
             _CAUSE_FIELD,
@@ -782,47 +860,67 @@ class Markers:
         return bool(updated)
 
     async def read_completion(self, event_id: str) -> StoredCompletion | None:
-        """The stored record AS STORED, or None when some emitter cleared it.
+        namespaces = tuple(reversed(self._completion_namespaces()))
+        async with self._redis.pipeline(transaction=False) as pipe:
+            for answer in namespaces:
+                pipe.hgetall(self._completion_storage_key(event_id, answer=answer))
+            hashes = await pipe.execute()
+        for answer, stored in zip(namespaces, hashes, strict=True):
+            if stored:
+                try:
+                    return _parse_stored(event_id, stored)
+                except MalformedCompletionError as exc:
+                    exc.answer_namespace = answer
+                    raise
+        return None
 
-        Raises ``MalformedCompletionError`` when the hash exists but is missing
-        the done flag or the generation. Both are written by
-        ``mark_completion_pending`` on every path, so their absence is
-        corruption, not an older shape to fall back for -- the outbox has no
-        pre-upgrade records. The caller quarantines rather than guessing.
-        """
-        stored: dict[Any, Any] = await self._redis.hgetall(self._config.completion_key(event_id))
-        return _parse_stored(event_id, stored)
+    async def read_completion_entries(
+        self, entries: Sequence[CompletionIndexEntry]
+    ) -> dict[CompletionIndexEntry, StoredCompletion | MalformedCompletionError | None]:
+        if not entries:
+            return {}
+        async with self._redis.pipeline(transaction=False) as pipe:
+            for entry in entries:
+                pipe.hgetall(
+                    self._completion_storage_key(entry.event_id, answer=entry.answer_namespace)
+                )
+            hashes = await pipe.execute()
+        result: dict[CompletionIndexEntry, StoredCompletion | MalformedCompletionError | None] = {}
+        for entry, stored in zip(entries, hashes, strict=True):
+            try:
+                result[entry] = _parse_stored(entry.event_id, stored)
+            except MalformedCompletionError as exc:
+                exc.answer_namespace = entry.answer_namespace
+                result[entry] = exc
+        return result
 
     async def read_completions(
         self, event_ids: Sequence[str]
     ) -> dict[str, StoredCompletion | MalformedCompletionError | None]:
-        """A whole sweep batch's records, read in ONE pipeline.
-
-        The sweeper reads up to ``completion_sweep_batch`` (64) members per pass
-        and used to pay a round trip per member before it could decide anything
-        about any of them; the reads are independent, so they go out together.
-        Not a transaction: these are plain reads, and MULTI would only add a
-        blocking window on the same Valkey that holds the kernel's locks.
-
-        A malformed record is returned AS the exception rather than raised,
-        because one corrupt member must not abort the batch -- the caller
-        quarantines that member and carries on with the rest, exactly as it does
-        on the single-record path.
-        """
-        keys = [self._config.completion_key(event_id) for event_id in event_ids]
-        if not keys:
+        namespaces = tuple(reversed(self._completion_namespaces()))
+        if not event_ids:
             return {}
         async with self._redis.pipeline(transaction=False) as pipe:
-            for key in keys:
-                pipe.hgetall(key)
-            stored_hashes = await pipe.execute()
-        out: dict[str, StoredCompletion | MalformedCompletionError | None] = {}
-        for event_id, stored in zip(event_ids, stored_hashes, strict=True):
-            try:
-                out[event_id] = _parse_stored(event_id, stored)
-            except MalformedCompletionError as exc:
-                out[event_id] = exc
-        return out
+            for event_id in event_ids:
+                for answer in namespaces:
+                    pipe.hgetall(self._completion_storage_key(event_id, answer=answer))
+            hashes = await pipe.execute()
+        result: dict[str, StoredCompletion | MalformedCompletionError | None] = {}
+        width = len(namespaces)
+        for index, event_id in enumerate(event_ids):
+            result[event_id] = None
+            for answer, stored in zip(
+                namespaces, hashes[index * width : (index + 1) * width], strict=True
+            ):
+                if not stored:
+                    continue
+                try:
+                    result[event_id] = _parse_stored(event_id, stored)
+                except MalformedCompletionError as exc:
+                    exc.answer_namespace = answer
+                    result[event_id] = exc
+                break
+        return result
 
     async def clear_completion(self, event_id: str, *, generation: str) -> bool:
         """Drop the payload and its set membership together, in one MULTI.
@@ -843,8 +941,8 @@ class Markers:
         cleared = await self._redis.eval(
             _CLEAR_COMPLETION_LUA,
             2,
-            self._config.completion_key(event_id),
-            self._config.completions_pending_key(),
+            self._generation_storage_key(event_id, generation),
+            self._generation_pending_key(generation),
             generation,
             _GENERATION_FIELD,
             event_id,
@@ -859,8 +957,8 @@ class Markers:
             await self._redis.eval(
                 _DEAD_LETTER_COMPLETION_LUA,
                 3,
-                self._config.completion_key(record.event_id),
-                self._config.completions_pending_key(),
+                self._generation_storage_key(record.event_id, generation),
+                self._generation_pending_key(generation),
                 self._config.dead_letter_stream_name(),
                 generation,
                 _GENERATION_FIELD,
@@ -872,7 +970,9 @@ class Markers:
             )
         )
 
-    async def drop_pending_member(self, event_id: str) -> None:
+    async def drop_pending_member(
+        self, event_id: str, *, answer_namespace: CompletionNamespace = False
+    ) -> None:
         """Drop ONLY the set membership, leaving whatever key state exists.
 
         For the member whose payload is already gone: some emitter confirmed
@@ -884,26 +984,41 @@ class Markers:
         for an operator to inspect, and only the index entry goes, so the sweeper
         stops re-reading a record it has already refused to act on.
         """
-        await self._redis.srem(self._config.completions_pending_key(), event_id)
+        await self._redis.srem(self._completion_pending_key(answer=answer_namespace), event_id)
 
     async def pending_completions(self, limit: int) -> set[str]:
-        """A BOUNDED batch of pending members, never the whole set.
+        # Preserve the raw event-id API used by protected completion repair.
+        return {entry.event_id for entry in await self.pending_completion_entries(limit)}
 
-        ``SRANDMEMBER`` with a count, not ``SMEMBERS``: one sweep pass must cost
-        a bounded number of delivery attempts, because the startup sweep runs
-        against exactly the backlog an outage left behind. Random sampling also
-        keeps one poison record from head-of-lining every later pass -- the
-        sweeper runs on the maintenance cadence, so the remainder is drained by
-        the passes that follow.
-        """
-        # With a count, SRANDMEMBER answers with a list; the client's signature
-        # also covers the countless single-member form, hence the narrowing.
-        members: Any = await self._redis.srandmember(self._config.completions_pending_key(), limit)
-        if not members:
+    async def pending_completion_count(self) -> int:
+        namespaces = self._completion_namespaces()
+        async with self._redis.pipeline(transaction=False) as pipe:
+            for answer in namespaces:
+                pipe.scard(self._completion_pending_key(answer=answer))
+            counts = await pipe.execute()
+        return sum(int(count) for count in counts)
+
+    async def pending_completion_entries(self, limit: int) -> set[CompletionIndexEntry]:
+        if limit <= 0:
             return set()
-        if not isinstance(members, list):
-            members = [members]
-        return {str(_as_str(m)) for m in members}
+        families = self._completion_namespaces()
+        offset = getattr(self, "_completion_sample_offset", 0) % len(families)
+        namespaces = families[offset:] + families[:offset]
+        self._completion_sample_offset = (offset + 1) % len(families)
+        async with self._redis.pipeline(transaction=False) as pipe:
+            for answer in namespaces:
+                pipe.srandmember(self._completion_pending_key(answer=answer), limit)
+            batches = await pipe.execute()
+        entries: set[CompletionIndexEntry] = set()
+        # Rotate every family, including limit=1, so no supported storage
+        # version can starve either a legacy or a verbatim answer backlog.
+        for index in range(limit):
+            for answer, batch in zip(namespaces, batches, strict=True):
+                if batch and index < len(batch):
+                    entries.add(CompletionIndexEntry(str(_as_str(batch[index])), answer))
+                    if len(entries) == limit:
+                        return entries
+        return entries
 
 
 def _parse_stored(event_id: str, stored: dict[Any, Any]) -> StoredCompletion | None:
@@ -915,7 +1030,14 @@ def _parse_stored(event_id: str, stored: dict[Any, Any]) -> StoredCompletion | N
     raw = _as_str(stored.get(_RECORD_FIELD))
     if not raw:
         return None
-    record = CompletionRecord.model_validate(json.loads(raw))
+    try:
+        record = CompletionRecord.model_validate(json.loads(raw))
+    except ValueError as exc:
+        # Keep corrupt or unsupported payloads local to their sampled entry;
+        # never abort unrelated completions or log candidate answer contents.
+        raise MalformedCompletionError(
+            f"completion record {event_id} has an invalid payload"
+        ) from exc
     flag = _as_str(stored.get(_DONE_FIELD))
     generation = _as_str(stored.get(_GENERATION_FIELD))
     if flag is None or generation is None:

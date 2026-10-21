@@ -1,10 +1,11 @@
-"""Reconcile an existing worker adapter credential map. @spec SRE-CREDS-1 SRE-CREDS-8"""
+"""Reconcile an existing worker adapter credential map. @spec SRE-CREDS-1 SRE-CREDS-10"""
 
 from __future__ import annotations
 
 import argparse
 import base64
 import binascii
+import hashlib
 import json
 import os
 import re
@@ -16,6 +17,9 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Never
+
+ROLLOUT_AT = "curietech.ai/adapter-credentials-at"
+ROLLOUT_MARKER = "curietech.ai/adapter-credentials-sha256"
 
 
 class Invalid(Exception):
@@ -195,6 +199,19 @@ def current_map(secret: dict[str, Any], key: str) -> dict[str, str]:
     return mapping
 
 
+def rollout_marker(mapping: dict[str, str]) -> str:
+    """Fingerprint a decoded map independent of formatting. @spec SRE-CREDS-10"""
+    canonical = json.dumps(mapping, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(b"curie-adapter-credentials-v1\x00" + canonical.encode()).hexdigest()
+
+
+def recorded_marker(worker: dict[str, Any]) -> Any:
+    """Read the worker template's rollout marker, if any. @spec SRE-CREDS-10"""
+    metadata = worker["spec"]["template"].get("metadata")
+    annotations = metadata.get("annotations") if isinstance(metadata, dict) else None
+    return annotations.get(ROLLOUT_MARKER) if isinstance(annotations, dict) else None
+
+
 class ServiceAccountRequest:
     """Bounded Kubernetes TLS transport. @spec SRE-CREDS-5 SRE-CREDS-8"""
 
@@ -246,6 +263,8 @@ def main(argv: list[str] | None = None, *, request: Callable[..., Any] | None = 
     parser = SafeParser(add_help=False)
     parser.add_argument("--config")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--prune", action="store_true")
+    parser.add_argument("--repair-rollout", action="store_true")
     try:
         args, extra = parser.parse_known_args(argv)
         if extra or not args.config:
@@ -277,6 +296,28 @@ def main(argv: list[str] | None = None, *, request: Callable[..., Any] | None = 
         """Address only a validated named Secret. @spec SRE-CREDS-2 SRE-CREDS-3"""
         return f"/api/v1/namespaces/{encoded_namespace}/secrets/{urllib.parse.quote(name, safe='')}"
 
+    def roll_worker(marker: str) -> bool:
+        """Advance only the worker template for the desired map. @spec SRE-CREDS-6"""
+        worker_patch = {
+            "metadata": {"resourceVersion": worker["metadata"]["resourceVersion"]},
+            "spec": {
+                "template": {
+                    "metadata": {
+                        "annotations": {
+                            ROLLOUT_AT: datetime.now(UTC).isoformat(),
+                            ROLLOUT_MARKER: marker,
+                        }
+                    }
+                }
+            },
+        }
+        try:
+            client("PATCH", worker_path, worker_patch)
+        except Exception:  # noqa: BLE001 - external client failures must be redacted
+            return False
+        result["workerRolled"] = True
+        return True
+
     try:
         target = checked_identity(client("GET", secret_path(target_name)), target_name, namespace)
         if target.get("immutable") is True:
@@ -284,6 +325,10 @@ def main(argv: list[str] | None = None, *, request: Callable[..., Any] | None = 
         existing = current_map(target, target_key)
     except Exception:  # noqa: BLE001 - external client failures must be redacted
         return fail("target-inspection")
+
+    retired = sorted(existing.keys() - cfg["adapters"].keys())
+    if args.prune:
+        result["retired"] = retired
 
     desired: dict[str, str] = {}
     try:
@@ -297,10 +342,21 @@ def main(argv: list[str] | None = None, *, request: Callable[..., Any] | None = 
     except Exception:  # noqa: BLE001 - external client failures must be redacted
         return fail("source-inspection")
 
-    if not existing.keys() <= desired.keys():
+    if retired and not args.prune:
         return fail("inventory-shrinkage")
+    marker = rollout_marker(desired)
     if desired == existing:
-        result["status"] = "unchanged"
+        if not args.repair_rollout or recorded_marker(worker) == marker:
+            result["status"] = "unchanged"
+            print(json.dumps(result))
+            return 0
+        if args.dry_run:
+            result["status"] = "would-repair"
+            print(json.dumps(result))
+            return 0
+        if not roll_worker(marker):
+            return fail("worker-rollout")
+        result["status"] = "repaired"
         print(json.dumps(result))
         return 0
     result["changed"] = True
@@ -322,19 +378,7 @@ def main(argv: list[str] | None = None, *, request: Callable[..., Any] | None = 
     except Exception:  # noqa: BLE001 - external client failures must be redacted
         return fail("secret-write")
 
-    stamp = datetime.now(UTC).isoformat()
-    worker_patch = {
-        "metadata": {"resourceVersion": worker["metadata"]["resourceVersion"]},
-        "spec": {
-            "template": {
-                "metadata": {"annotations": {"curietech.ai/adapter-credentials-at": stamp}}
-            }
-        },
-    }
-    try:
-        client("PATCH", worker_path, worker_patch)
-        result["workerRolled"] = True
-    except Exception:  # noqa: BLE001 - external client failures must be redacted
+    if not roll_worker(marker):
         return fail("worker-rollout")
     result["status"] = "updated"
     print(json.dumps(result))

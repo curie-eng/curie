@@ -458,9 +458,12 @@ def test_leaseless_budget_cut_publishes_then_marks_done(make_harness) -> None:
             original = markers.mark_done
             seen_at_mark_done: list[list[str]] = []
 
-            async def mark_done(event_id: str, *, marker_value: Any) -> None:
+            async def mark_done(
+                event_id: str, *, marker_value: Any, generation: str | None = None
+            ) -> None:
+                assert generation is not None, "leaseless settle must fence its own record"
                 seen_at_mark_done.append([t.event_id for t in await stream_turns(h)])
-                await original(event_id, marker_value=marker_value)
+                await original(event_id, marker_value=marker_value, generation=generation)
 
             markers.mark_done = mark_done
 

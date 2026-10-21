@@ -13,7 +13,7 @@ import hashlib
 import hmac
 import json
 import time
-from typing import Literal
+from typing import Any, Literal
 
 _PREFIX = "apr"
 _SCOPE = "approval.resolve"
@@ -32,6 +32,7 @@ def _mint_attestation(
     approval_id: str,
     kind: Literal["chat", "test_driver"],
     now: int | None = None,
+    slack: dict[str, Any] | None = None,
 ) -> str:
     """Mint a 60-second attestation bound to one approval and channel."""
 
@@ -45,6 +46,7 @@ def _mint_attestation(
         raise ValueError("chat approval principal approval id must be non-blank")
 
     issued_at = int(time.time()) if now is None else now
+    extra = {"slack": slack} if slack is not None and kind == "chat" else {}
     payload = json.dumps(
         {
             "actor_channel": actor_channel,
@@ -53,6 +55,7 @@ def _mint_attestation(
             "kind": kind,
             "scope": _SCOPE,
             "sub": subject,
+            **extra,
         },
         separators=(",", ":"),
         sort_keys=True,
@@ -72,6 +75,7 @@ def mint_chat_principal(
     actor_channel: str,
     approval_id: str,
     now: int | None = None,
+    slack: dict[str, Any] | None = None,
 ) -> str:
     """Mint a 60-second chat attestation for one approval resolution."""
     return _mint_attestation(
@@ -81,6 +85,7 @@ def mint_chat_principal(
         approval_id=approval_id,
         kind="chat",
         now=now,
+        slack=slack,
     )
 
 

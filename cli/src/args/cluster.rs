@@ -1028,6 +1028,53 @@ pub(crate) enum ClusterAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Show or change which IdP teams may invoke the agent and approve for it
+    /// (`GET`/`PUT /agents/{id}/access-policy`, ADR 0220).
+    ///
+    /// With no team flag this shows the policy. A team is named by its id, as
+    /// `GET /teams` lists it, and must be an IdP group team of the agent's
+    /// tenant. A role left unmentioned keeps its team. The write sends back
+    /// the version it read, so a concurrent change is refused rather than
+    /// overwritten. Each configured role is enforced on every channel.
+    AccessPolicy {
+        /// Agent name or id.
+        agent: String,
+        /// The team whose members may start a turn with the agent.
+        #[arg(long, value_name = "TEAM_ID", conflicts_with = "clear_invocation_team")]
+        invocation_team: Option<String>,
+        /// The team whose members may resolve the agent's approvals.
+        #[arg(long, value_name = "TEAM_ID", conflicts_with = "clear_approver_team")]
+        approver_team: Option<String>,
+        /// Remove the invocation team, so today's caller rules apply.
+        #[arg(long)]
+        clear_invocation_team: bool,
+        /// Remove the approver team, so each route's approvers apply.
+        #[arg(long)]
+        clear_approver_team: bool,
+        #[command(flatten)]
+        conn: ClusterConn,
+        /// Print what would be done and exit without making a request.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Inspect tenant identities or apply IdP configuration, namespace or team JSON.
+    /// Writes use the API's expected-version contract; links and people are read-only.
+    Directory {
+        #[arg(long)]
+        tenant: uuid::Uuid,
+        #[arg(long, value_parser = ["config", "people", "links", "namespaces", "teams"])]
+        resource: String,
+        /// JSON request file. Config uses PUT; namespaces and teams use POST.
+        #[arg(long)]
+        apply: Option<std::path::PathBuf>,
+        /// Continue a bounded people, links or namespaces page.
+        #[arg(long)]
+        after: Option<uuid::Uuid>,
+        #[command(flatten)]
+        conn: ClusterConn,
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Mint or inspect the mail adapter's channel token
     /// (`POST /channels/token`).
     ///

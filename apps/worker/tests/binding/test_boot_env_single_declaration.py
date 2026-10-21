@@ -249,6 +249,8 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # sandbox, and nothing here reaches a boot env.
         "CURIE_CALLER_PROXY_PORT",
         "CURIE_CALLER_PROXY_UPSTREAM_PORT",
+        # ADR 0229: the Host the proxy presents on admitted requests.
+        "CURIE_CALLER_PROXY_UPSTREAM_HOST",
         "CURIE_CALLER_PROXY_PUBLIC_KEYS",
         "CURIE_CALLER_PROXY_ADMITS",
         "CURIE_EVAL_CONSUMER_GROUP",
@@ -305,6 +307,10 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # executor amendment E9): read by the API settings and by WorkerConfig
         # at startup. Never a sandbox boot key.
         "CURIE_ACTION_EXECUTOR_MAX_CONCURRENT_SANDBOXES",
+        # The executor's own connector reads without the reconcile loop (#4800):
+        # read by WorkerConfig at startup to build the Deployment reader. Never a
+        # sandbox boot key.
+        "CURIE_ACTION_EXECUTOR_CONNECTOR_READS",
         # End to end namespace reaper (#3245), read by the worker process only.
         # The test cluster kubeconfig is not among them: the reaper reads it
         # from the connector Secret at sweep time.

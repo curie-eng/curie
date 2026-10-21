@@ -884,3 +884,84 @@ def test_two_gated_calls_in_one_batch_are_refused_without_spending_the_grant() -
             assert [seen["body"] for seen in upstream.seen] == [_MERGE_CALL]
 
     _run(go)
+
+
+def _other_agent_grant() -> str:
+    from curie_worker.connector_grant import mint
+
+    return mint(
+        _GRANT_SEED,
+        agent="someone-else",
+        connector=_CONNECTOR,
+        tool="merge_pull_request",
+        args=_canonical({"n": 1}),
+        exp=int(_VECTOR["exp"]),
+        jti="jti-agent",
+    )
+
+
+@pytest.mark.parametrize(
+    ("grant", "store", "reason"),
+    [
+        pytest.param(lambda: None, MemoryGrantStore, server.GRANT_HEADER_MISSING, id="missing"),
+        pytest.param(lambda: "ccg.not.signed", MemoryGrantStore, server.GRANT_INVALID, id="bad"),
+        pytest.param(_other_agent_grant, MemoryGrantStore, server.GRANT_AGENT_MISMATCH, id="agent"),
+        pytest.param(
+            lambda: _mint_grant("other_tool", {"n": 1}, jti="jti-t"),
+            MemoryGrantStore,
+            server.GRANT_TOOL_MISMATCH,
+            id="tool",
+        ),
+        pytest.param(
+            lambda: _mint_grant("merge_pull_request", {"n": 2}, jti="jti-a"),
+            MemoryGrantStore,
+            server.GRANT_ARGUMENTS_MISMATCH,
+            id="arguments",
+        ),
+        pytest.param(
+            lambda: _mint_grant("merge_pull_request", {"n": 1}, jti="jti-s"),
+            lambda: None,
+            server.GRANT_NO_STORE,
+            id="no-store",
+        ),
+    ],
+)
+def test_a_grant_refusal_logs_which_check_refused_and_never_the_grant(
+    grant: Callable[[], str | None],
+    store: Callable[[], Any],
+    reason: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    presented = grant()
+
+    async def go() -> None:
+        async with _gated(grant_store=store()) as (upstream, proxy):
+            status, _content_type, payload = await _post(
+                proxy, _MERGE_CALL, _caller_headers(presented)
+            )
+            assert status == _REFUSAL["status"]
+            # The client still sees only the frozen refusal body.
+            assert payload == _grant_required_body()
+            assert upstream.seen == []
+
+    with caplog.at_level(logging.INFO, logger="curie_connector_proxy"):
+        _run(go)
+    [line] = [r.getMessage() for r in caplog.records if r.name == "curie_connector_proxy"]
+    assert line.endswith(f"outcome={caller.GRANT_REQUIRED} method=POST path='/mcp' grant={reason}")
+    if presented is not None:
+        assert presented.split(".")[-1] not in caplog.text
+
+
+def test_a_replayed_grant_logs_not_spent(caplog: pytest.LogCaptureFixture) -> None:
+    headers = _caller_headers(_mint_grant("merge_pull_request", {"n": 1}, jti="jti-r"))
+
+    async def go() -> None:
+        async with _gated(grant_store=MemoryGrantStore()) as (_upstream, proxy):
+            assert (await _post(proxy, _MERGE_CALL, headers))[0] == 201
+            assert (await _post(proxy, _MERGE_CALL, headers))[0] == _REFUSAL["status"]
+
+    with caplog.at_level(logging.INFO, logger="curie_connector_proxy"):
+        _run(go)
+    lines = [r.getMessage() for r in caplog.records if "outcome=" in r.getMessage()]
+    assert lines[0].endswith("outcome=admitted method=POST path='/mcp'")
+    assert lines[1].endswith(f"grant={server.GRANT_NOT_SPENT}")

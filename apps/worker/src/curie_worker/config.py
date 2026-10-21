@@ -363,10 +363,10 @@ class WorkerConfig(BaseSettings):
     # would clear until Slack's own two-minute timeout.
     shimmer: Bool = Field(default=True, validation_alias=SHIMMER_ENV)
 
-    # When true, suppress intermediate placeholder edits while streaming so the
-    # placeholder gets exactly one chat.update (the final) -- rate-limit friendly
-    # and flicker-free; pair with the shimmer for liveness. Default false
-    # preserves live-edit streaming.
+    # Suppress nonterminal placeholder notices as well as provisional text.
+    # Assistant TextDelta frames are internal diagnostics in every mode; the
+    # terminal answer is delivered through the completion outbox. The default
+    # still permits the booting caption and other platform lifecycle notices.
     slack_no_edit_streaming: Bool = Field(
         default=False, validation_alias="CURIE_SLACK_NO_EDIT_STREAMING"
     )
@@ -386,7 +386,7 @@ class WorkerConfig(BaseSettings):
     # Any other value refuses boot rather than falling back to a mode nobody
     # chose. It changes only what the person is shown, never what the action
     # ledger records or what the no-retry rule reads.
-    turn_receipt: TurnReceiptMode = Field(default="all", validation_alias="CURIE_TURN_RECEIPT")
+    turn_receipt: TurnReceiptMode = Field(default="off", validation_alias="CURIE_TURN_RECEIPT")
 
     # Whether deliberate progress (ADR 0130) reaches an adapter. Temporary: it
     # exists until the rendering change lands, and the chart does not set it.
@@ -560,6 +560,62 @@ class WorkerConfig(BaseSettings):
                 "the reconciler would manage a parallel set under wrong names"
             )
         return self
+
+    @model_validator(mode="after")
+    def _executor_connector_reads_stand_alone(self) -> WorkerConfig:
+        """Refuse the executor's own connector reads where they cannot apply.
+
+        @spec ACTION-EXECUTOR-12 (as amended, #4800). Without the executor
+        nothing would read; with the reconciler on its reads already apply, so
+        the setting would claim a mode the worker is not in; and the
+        Deployment the executor reads is named from the namespace, release and
+        app name, so with any of them unset every read would miss and every
+        execution would refuse for a reason the operator cannot see.
+        """
+
+        if not self.action_executor_connector_reads:
+            return self
+        if not self.action_executor_enabled:
+            raise ValueError(
+                "CURIE_ACTION_EXECUTOR_CONNECTOR_READS=true requires "
+                "CURIE_ACTION_EXECUTOR_ENABLED=true"
+            )
+        if self.connector_reconcile_enabled:
+            raise ValueError(
+                "CURIE_ACTION_EXECUTOR_CONNECTOR_READS=true is for a worker with the "
+                "connector reconciler off; with CURIE_CONNECTOR_RECONCILE on the "
+                "executor already reads through it, so leave it unset"
+            )
+        missing = [
+            env
+            for env, value in (
+                ("CURIE_NAMESPACE", self.connector_namespace),
+                ("CURIE_RELEASE", self.connector_release),
+                ("CURIE_CONNECTOR_APP_NAME", self.connector_app_name),
+            )
+            if not value.strip()
+        ]
+        if missing:
+            raise ValueError(
+                f"CURIE_ACTION_EXECUTOR_CONNECTOR_READS is on but {', '.join(missing)} "
+                "is unset; the connector Deployment the executor reads is named "
+                "from these, so every read would miss"
+            )
+        return self
+
+    @property
+    def executor_reads_connectors(self) -> bool:
+        """Whether the executor and the digest recorder read connector Deployments.
+
+        @spec ACTION-EXECUTOR-12: with the executor on and either the connector
+        reconciler or the executor's own connector reads on. These are exactly
+        the configurations in which the chart grants the worker ``get`` on
+        Deployments.
+        """
+
+        return self.action_executor_enabled and (
+            self.connector_reconcile_enabled or self.action_executor_connector_reads
+        )
 
     @model_validator(mode="after")
     def _caller_signing_key_is_a_seed(self) -> WorkerConfig:
@@ -1321,6 +1377,15 @@ class WorkerConfig(BaseSettings):
     # executor amendment E9), rendered from the same chart or compose value as
     # the API's. The executor loop runs up to this many executions at once; the
     # API's claim route, not this loop, is the authority over the count.
+    # The executor's own connector reads without the reconcile loop (#4800,
+    # ACTION-EXECUTOR-12 as amended). On, the worker reads the acting
+    # connector's Deployment by name and the in-force digest for the executor
+    # and the digest recorder exactly as it does with the reconciler on, while
+    # the reconcile loop stays off. The chart grants only `get` on Deployments
+    # for it. Off (the default), those reads follow CURIE_CONNECTOR_RECONCILE.
+    action_executor_connector_reads: bool = Field(
+        default=False, validation_alias="CURIE_ACTION_EXECUTOR_CONNECTOR_READS"
+    )
     action_executor_max_concurrent_sandboxes: int = Field(
         default=2, ge=1, validation_alias="CURIE_ACTION_EXECUTOR_MAX_CONCURRENT_SANDBOXES"
     )

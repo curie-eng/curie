@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 import redis
@@ -41,6 +42,9 @@ DIGESTS = (INDEX, AMD64, ARM64)
 REPO = "acme-corp/api"
 POOL = "acme-api-runner"
 BASE_POOL = "curie-runner-pool"
+DAEMON = json.loads(
+    (Path(__file__).resolve().parents[4] / "tests/vectors/daemon-config.json").read_text()
+)["daemon"]
 
 
 def _entry(
@@ -51,7 +55,13 @@ def _entry(
     docker: bool = False,
 ) -> RepoRunnerPool:
     return RepoRunnerPool.model_validate(
-        {"pool": pool, "digests": list(digests), "base": base, "docker": docker}
+        {
+            "pool": pool,
+            "digests": list(digests),
+            "base": base,
+            "docker": docker,
+            **({"daemon": DAEMON} if docker else {}),
+        }
     )
 
 
@@ -202,7 +212,19 @@ def test_stale_base_is_refused_before_any_kubernetes_write(
     message = str(refusal)
     assert REPO in message
     assert "stale_base" in message
-    assert f"curie cluster factory --repo {REPO}" in message
+    command = f"curie cluster factory --repo-runner {REPO}="
+    assert command in message
+    spec = message.split(command, 1)[1].split()[0].rstrip("`.;")
+    assert spec and not spec.startswith("-")
+    assert "--registry " in message
+    registry = message.split("--registry ", 1)[1].split()[0].rstrip("`.;")
+    assert registry and not registry.startswith("-")
+    assert "rebuild" in message.lower()
+    if platform is None:
+        assert "pin " in message.lower()
+        assert message.lower().index("pin ") < message.lower().index("rebuild")
+    else:
+        assert platform in message
     _assert_nothing_written(probing_k8s, affinity, "T-stale")
 
 

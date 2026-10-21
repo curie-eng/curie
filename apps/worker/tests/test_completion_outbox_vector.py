@@ -66,3 +66,31 @@ def test_completion_outbox_health_literals_match_the_frozen_vector() -> None:
     }
     assert "event_id" not in payload
     assert "session" not in json.dumps(payload)
+
+
+def test_non_answer_completion_serializes_the_legacy_protected_shape() -> None:
+    from channel_protocol.reply import REPLY_WIRE_VERSION, ReplyTarget, TurnCompleted
+    from curie_worker.markers import CompletionRecord
+    from curie_worker.reply_sink import TargetRoute
+
+    record = CompletionRecord(
+        event_id="synthetic-event",
+        event=TurnCompleted(
+            version=REPLY_WIRE_VERSION,
+            event="turn.completed",
+            target=ReplyTarget(
+                kind="slack", address="C0EXAMPLE1", conversation_id="1.1", reply_ref=None
+            ),
+            event_id="synthetic-event",
+            outcome="delivered",
+        ),
+        route=TargetRoute(),
+        created_at=1.0,
+    )
+    assert set(record.model_dump(mode="json")) == {
+        "event_id",
+        "event",
+        "route",
+        "created_at",
+        "done",
+    }

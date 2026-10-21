@@ -1796,6 +1796,13 @@ jobs:
             context: examples/sre-bot/connectors/self-upgrade
             dockerfile: examples/sre-bot/connectors/self-upgrade/Dockerfile
             platforms: linux/amd64,linux/arm64
+          # Opt-in and undeclared by default, so release.yaml does not publish
+          # it; an operator who opts in builds it with `curie build`. Built
+          # here so its Dockerfile cannot break unnoticed on either architecture.
+          - name: sre-bot-scaler
+            context: examples/sre-bot/connectors/scaler
+            dockerfile: examples/sre-bot/connectors/scaler/Dockerfile
+            platforms: linux/amd64,linux/arm64
           - name: github-activity-github
             context: examples/github-activity/connectors/github
             dockerfile: examples/github-activity/connectors/github/Dockerfile
@@ -5480,4 +5487,4 @@ jobs:
         with:
           python-version: "3.13"
       - run: uv sync --frozen
-      - run: uv run pytest -q examples/tests/test_turn_canary.py
+      - run: uv run pytest -q examples/tests/test_turn_canary.py examples/tests/test_turn_canary_monitor.py

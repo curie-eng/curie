@@ -1,4 +1,4 @@
-"""@spec STARTABILITY-1 through STARTABILITY-6; see ../../docs/STARTABILITY.md."""
+"""@spec STARTABILITY-1 through STARTABILITY-6, STARTABILITY-9; see ../../docs/STARTABILITY.md."""
 
 from __future__ import annotations
 
@@ -26,6 +26,9 @@ FROM curie.agents a
 JOIN curie.agent_channels c ON c.agent_id = a.id
 ORDER BY a.name, c.kind, c.address
 """
+# @spec STARTABILITY-9; the API's write-side channel-kind shape, pinned by test.
+CHANNEL_KIND = re.compile(r"^[a-z0-9]+(?:[-_][a-z0-9]+)*$")
+EXCLUDED_REASON = "binding kind is excluded from this observation"
 # @spec STARTABILITY-5
 WORKER_VARIABLES = (
     "CURIE_WARM_POOL",
@@ -122,8 +125,9 @@ def judge(
     claim: Callable[[str, Mapping[str, str], str, frozenset[str], frozenset[str]], str],
     reserved: Callable[[str], bool],
     marker: str,
+    excluded_kinds: frozenset[str] = frozenset(),
 ) -> list[dict[str, Any]]:
-    """@spec STARTABILITY-1 STARTABILITY-2 STARTABILITY-3 STARTABILITY-6."""
+    """@spec STARTABILITY-1 STARTABILITY-2 STARTABILITY-3 STARTABILITY-6 STARTABILITY-9."""
     from curie_worker.binding import inject_connector_secrets
     from curie_worker.sandbox.types import agent_warm_pool_name
 
@@ -195,12 +199,18 @@ def judge(
         return None
 
     lines = []
+    judged = []
     for binding in bindings:
+        fields = {key: binding[key] for key in ("agent", "kind", "address", "identity")}
+        if binding["kind"] in excluded_kinds:
+            lines.append({"agent_readiness": "excluded", **fields, "reason": EXCLUDED_REASON})
+            continue
+        judged.append(binding)
         reason = reason_for(binding)
         lines.append(
             {
                 "agent_readiness": "binding",
-                **{key: binding[key] for key in ("agent", "kind", "address", "identity")},
+                **fields,
                 "ready": int(reason is None),
                 "reason": reason or "no configuration obstacle observed in this snapshot",
             }
@@ -208,9 +218,9 @@ def judge(
     lines.append(
         {
             "agent_readiness": "total",
-            "bindings": len(bindings),
-            "not_ready": sum(line["ready"] == 0 for line in lines),
-            "agents": len({binding["agent"] for binding in bindings}),
+            "bindings": len(judged),
+            "not_ready": sum(line.get("ready") == 0 for line in lines),
+            "agents": len({binding["agent"] for binding in judged}),
         }
     )
     return lines
@@ -225,7 +235,7 @@ class StructuredParser(argparse.ArgumentParser):
 
 
 def arguments(argv: list[str] | None) -> tuple[argparse.Namespace, str]:
-    """@spec STARTABILITY-5 STARTABILITY-6."""
+    """@spec STARTABILITY-5 STARTABILITY-6 STARTABILITY-9."""
     parser = StructuredParser(description=__doc__)
     for name in (
         "worker-namespace",
@@ -239,10 +249,16 @@ def arguments(argv: list[str] | None) -> tuple[argparse.Namespace, str]:
         "check-image",
     ):
         parser.add_argument("--" + name, required=True)
+    parser.add_argument("--exclude-binding-kind", action="append", default=[])
     args = parser.parse_args(argv)
+    excluded = args.exclude_binding_kind
+    del args.exclude_binding_kind
     dsn = os.environ.get("DATABASE_URL", "").strip()
     if not all(value.strip() for value in vars(args).values()) or not dsn:
         raise ValueError("missing configuration")
+    if not all(CHANNEL_KIND.match(kind) for kind in excluded):
+        raise ValueError("invalid excluded binding kind")
+    args.excluded_kinds = frozenset(excluded)
     if dsn.startswith("postgresql://"):
         dsn = dsn.replace("postgresql://", "postgresql+asyncpg://", 1)
     if not dsn.startswith("postgresql+asyncpg://"):
@@ -384,6 +400,7 @@ def gather(args: argparse.Namespace, dsn: str) -> list[dict[str, Any]]:
         claim=claim_warm_pool,
         reserved=is_reserved_boot_env_name,
         marker=BootEnv.env_key("connector_secret_keys"),
+        excluded_kinds=args.excluded_kinds,
     )
 
 

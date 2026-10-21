@@ -2,6 +2,19 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "type": "object",
   "definitions": {
+    "daemonQuantity": {
+      "type": "string", "maxLength": 128,
+      "pattern": "^\\+?(?:[0-9]*[1-9][0-9]*(?:\\.[0-9]*)?|[0-9]*\\.[0-9]*[1-9][0-9]*)(?:[eE][+-]?[0-9]{1,3}|[numkMGTPE]|[KMGTPE]i)?$",
+      "not": {"pattern": "\\s"}
+    },
+    "daemonResourceList": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "cpu": {"$ref": "#/definitions/daemonQuantity"},
+        "memory": {"$ref": "#/definitions/daemonQuantity"},
+        "ephemeral-storage": {"$ref": "#/definitions/daemonQuantity"}
+      }
+    },
     "forge": {"properties": {"egress": {"type": "array", "items": {"required": ["cidr", "ports"]}}}},
     "runnerProbe": {
       "type": "object",
@@ -218,6 +231,20 @@
         "ciWaitSeconds": {"type": "integer", "minimum": 1, "maximum": 10800},
         "codeHosts": {"type": "array", "items": {"$ref": "#/definitions/forge"}},
         "trackers": {"type": "array", "items": {"$ref": "#/definitions/forge"}},
+        "docker": {
+          "properties": {
+            "resources": {
+              "type": "object", "additionalProperties": false,
+              "properties": {
+                "requests": {"$ref": "#/definitions/daemonResourceList"},
+                "limits": {"$ref": "#/definitions/daemonResourceList"}
+              }
+            },
+            "storageSizeLimit": {"$ref": "#/definitions/daemonQuantity"},
+            "maxClaimLifetimeSeconds": {"type": "integer", "minimum": 1},
+            "pingTimeoutSeconds": {"type": "integer", "minimum": 1}
+          }
+        },
         "bindings": {"type": "array", "items": {"type": "object", "properties": {"repos": {"type": "array", "items": {
           "type": "object",
           "allOf": [{
@@ -366,7 +393,7 @@
         "turnReceipt": {
           "type": "string",
           "enum": ["all", "failures", "off"],
-          "description": "What the receipt beneath a turn's reply shows (ADR-0180), rendered as CURIE_TURN_RECEIPT: all (every action, the default), failures (only actions that reported failure) or off (none). The worker refuses any other value at startup, so the schema admits only these three."
+          "description": "What the receipt beneath a turn's reply shows (ADR-0180), rendered as CURIE_TURN_RECEIPT: all (every action), failures (only actions that reported failure) or off (none, the default). The worker refuses any other value at startup, so the schema admits only these three."
         },
         "deliveryShutdownReserveSeconds": {
           "type": "integer",
@@ -517,6 +544,10 @@
       "description": "The connector action executor switch (ACTION-EXECUTOR-1), rendered into both the API and the worker. A boolean, so a quoted \"false\" cannot turn it on.",
       "properties": {
         "enabled": {"type": "boolean"},
+        "connectorReadsWithoutReconciler": {
+          "type": "boolean",
+          "description": "The executor's own connector reads with worker.connectorReconciler off (#4800): the worker Role gains only a single-object get on Deployments. Requires enabled; refused with the reconciler on. A boolean, so a quoted \"true\" cannot turn it on."
+        },
         "maxConcurrentSandboxes": {
           "type": "integer",
           "minimum": 1,

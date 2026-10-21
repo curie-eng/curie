@@ -9,9 +9,10 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::api_requests::{
-    ActionUndo, AgentCreate, AgentUpdate, ApprovalPrincipalMint, ApprovalRecover, ApprovalResolve,
-    ChannelBindingWrite, ChannelCallersWrite, ChannelTokenRequest, ConsoleLoginCodeMint,
-    DeploymentCreate, EvalTriggerRequest, MemoryEntryCreate, MemoryGuidanceIn,
+    ActionUndo, AgentAccessPolicyWrite, AgentCreate, AgentUpdate, ApprovalPrincipalMint,
+    ApprovalRecover, ApprovalResolve, ChannelBindingWrite, ChannelCallersWrite,
+    ChannelTokenRequest, ConsoleLoginCodeMint, DeploymentCreate, DirectoryConfigIn,
+    DirectoryNamespaceIn, DirectoryTeamIn, EvalTriggerRequest, MemoryEntryCreate, MemoryGuidanceIn,
     RemediationBreakerClose, RemediationPolicyMutation, RemediationPolicyWrite,
     RemediationQualificationWrite, RemediationVerifierRunStart, ResolveTargetRequest,
     RoutingCheckRequest, VersionCreate,
@@ -277,6 +278,18 @@ impl ChannelBinding {
             .as_deref()
             .filter(|adapter| !(self.kind == "slack" && *adapter == DEFAULT_SLACK_IDENTITY))
     }
+}
+
+/// An agent's invocation and approver teams (`AgentAccessPolicyOut`, ADR 0220).
+/// Version 0 with no `updated_at` means no policy was ever set.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AgentAccessPolicy {
+    pub agent_id: String,
+    pub tenant_id: String,
+    pub invocation_team_id: Option<String>,
+    pub approver_team_id: Option<String>,
+    pub version: u64,
+    pub updated_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2250,6 +2263,77 @@ pub(crate) fn memory_state_url(
 }
 
 impl ApiClient {
+    /// Read a route selected by the directory verb's bounded resource inventory.
+    pub async fn directory_admin_read(&self, path: &str) -> Result<serde_json::Value> {
+        let response = self
+            .http
+            .get(format!("{}{path}", self.base_url))
+            .header("X-API-Key", &self.api_key)
+            .send()
+            .await
+            .context("directory administration request")?;
+        Self::expect_ok(response, "directory administration")
+            .await?
+            .json()
+            .await
+            .context("decoding directory administration response")
+    }
+
+    pub async fn put_directory_config(
+        &self,
+        tenant_id: &str,
+        body: &DirectoryConfigIn,
+    ) -> Result<serde_json::Value> {
+        let response = self
+            .http
+            .put(format!("{}/directory/config/{tenant_id}", self.base_url))
+            .header("X-API-Key", &self.api_key)
+            .json::<DirectoryConfigIn>(body)
+            .send()
+            .await
+            .context("directory configuration request")?;
+        Self::expect_ok(response, "directory configuration")
+            .await?
+            .json()
+            .await
+            .context("decoding directory configuration response")
+    }
+
+    pub async fn create_directory_namespace(
+        &self,
+        body: &DirectoryNamespaceIn,
+    ) -> Result<serde_json::Value> {
+        let response = self
+            .http
+            .post(format!("{}/directory/namespaces", self.base_url))
+            .header("X-API-Key", &self.api_key)
+            .json::<DirectoryNamespaceIn>(body)
+            .send()
+            .await
+            .context("directory namespace request")?;
+        Self::expect_ok(response, "directory namespace")
+            .await?
+            .json()
+            .await
+            .context("decoding directory namespace response")
+    }
+
+    pub async fn create_directory_team(&self, body: &DirectoryTeamIn) -> Result<serde_json::Value> {
+        let response = self
+            .http
+            .post(format!("{}/directory/teams", self.base_url))
+            .header("X-API-Key", &self.api_key)
+            .json::<DirectoryTeamIn>(body)
+            .send()
+            .await
+            .context("directory team request")?;
+        Self::expect_ok(response, "directory team")
+            .await?
+            .json()
+            .await
+            .context("decoding directory team response")
+    }
+
     /// The server caps `/approvals` results at this many rows
     /// (`apps/api/.../routers/approvals.py`: `min(max(limit, 1), 200)`); the CLI
     /// requests exactly the cap so hitting it is how the caller detects possible
@@ -2843,6 +2927,47 @@ impl ApiClient {
             .json()
             .await
             .context("decoding the agent after the caller list write")
+    }
+
+    /// Read an agent's access policy: `GET /agents/{id}/access-policy`
+    /// (ADR 0220). An agent with no policy answers version 0.
+    pub async fn get_agent_access_policy(&self, agent_id: &str) -> Result<AgentAccessPolicy> {
+        let resp = self
+            .http
+            .get(format!("{}/agents/{agent_id}/access-policy", self.base_url))
+            .header("X-API-Key", &self.api_key)
+            .send()
+            .await
+            .context("GET /agents/{id}/access-policy")?;
+        Self::expect_ok(resp, "reading the agent's access policy")
+            .await?
+            .json()
+            .await
+            .context("decoding the agent's access policy")
+    }
+
+    /// Replace an agent's access policy: `PUT /agents/{id}/access-policy`
+    /// (ADR 0220). The API refuses with 409 when `expected_version` is not the
+    /// stored version, and with 422 when a team is not an IdP group team of
+    /// the agent's tenant; it answers the policy as stored.
+    pub async fn put_agent_access_policy(
+        &self,
+        agent_id: &str,
+        body: &AgentAccessPolicyWrite,
+    ) -> Result<AgentAccessPolicy> {
+        let resp = self
+            .http
+            .put(format!("{}/agents/{agent_id}/access-policy", self.base_url))
+            .header("X-API-Key", &self.api_key)
+            .json::<AgentAccessPolicyWrite>(body)
+            .send()
+            .await
+            .context("PUT /agents/{id}/access-policy")?;
+        Self::expect_ok(resp, "setting the agent's access policy")
+            .await?
+            .json()
+            .await
+            .context("decoding the agent's access policy")
     }
 
     /// Mint a scoped `chn` token for one binding (`POST /channels/token`).

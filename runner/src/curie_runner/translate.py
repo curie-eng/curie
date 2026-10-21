@@ -40,10 +40,17 @@ from claude_agent_sdk import (
     ToolUseBlock,
     UserMessage,
 )
+from claude_agent_sdk.types import ServerToolResultBlock, ServerToolUseBlock
 from curie_telemetry.redact import redact_text
 from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
 
 from .approval import APPROVAL_TOOL_NAME, guard_reserved_summary
+from .final_answer import (
+    FINAL_ANSWER_CLASSIFICATION,
+    FinalAnswerValidation,
+    ValidationCall,
+    ValidationResult,
+)
 from .history import ConversationMessage
 from .otel import _GenerationSpan
 from .progress import ProgressActivity
@@ -62,6 +69,7 @@ RESULT_MAX_BYTES = 64_000
 # make a currently non-retryable token retryable.
 PLATFORM_ERROR_CLASSIFICATIONS = frozenset(
     {
+        FINAL_ANSWER_CLASSIFICATION,
         "rate-limit",
         "runner-error",
         "runner-timeout",
@@ -212,6 +220,7 @@ class TurnState:
     # approval and publication requests below are never captured: the calls
     # are refused before they execute, so there is no request to report.
     tool_access: ToolAccess | None = None
+    final_answer: FinalAnswerValidation | None = None
     side_effect_emitted: bool = False
     error_classification: str | None = None
     # Runner-internal latch, not a wire field (#3935): set once credit
@@ -240,7 +249,7 @@ class TurnState:
     # Bundle-authored human sentence (#2565). None means the card uses
     # approval_summary. Never grant provenance.
     approval_display: str | None = None
-    # Assistant text streamed during the turn, accumulated so a DONE result with
+    # Candidate answer since the last top-level tool request, accumulated so a DONE result with
     # an empty ``result`` can still deliver the model's answer. Reasoning models
     # routed through OpenRouter (e.g. z-ai/glm-5.2) emit the answer as a TextBlock
     # but their empty-signature thinking block trips the SDK's result extraction,
@@ -322,6 +331,45 @@ class TurnState:
     channel_read_call_ids: set[str] = field(default_factory=set)
 
 
+def _observe_final_answer(message: object, validation: FinalAnswerValidation) -> None:
+    """Extract SDK shapes at the existing harness boundary, not in policy code."""
+    if isinstance(message, AssistantMessage):
+        nested = message.parent_tool_use_id is not None
+        validation.observe_calls(
+            [
+                ValidationCall(
+                    id=block.id,
+                    name=block.name,
+                    input=block.input,
+                    hosted=isinstance(block, ServerToolUseBlock),
+                )
+                for block in message.content
+                if isinstance(block, (ToolUseBlock, ServerToolUseBlock))
+            ],
+            nested=nested,
+        )
+        # SDK 0.2.163 places hosted results on assistant messages.
+        validation.observe_results(
+            [
+                ValidationResult(call_id=block.tool_use_id, content=block.content, hosted=True)
+                for block in message.content
+                if isinstance(block, ServerToolResultBlock)
+            ],
+            nested=nested,
+        )
+    elif isinstance(message, UserMessage) and isinstance(message.content, list):
+        validation.observe_results(
+            [
+                ValidationResult(
+                    call_id=block.tool_use_id, content=block.content, is_error=block.is_error
+                )
+                for block in message.content
+                if isinstance(block, ToolResultBlock)
+            ],
+            nested=message.parent_tool_use_id is not None,
+        )
+
+
 def translate_message(
     message: object,
     state: TurnState,
@@ -336,6 +384,8 @@ def translate_message(
     ``report_progress`` tool carries; None when no progress tool is mounted.
     """
 
+    if state.final_answer is not None:
+        _observe_final_answer(message, state.final_answer)
     if isinstance(message, AssistantMessage):
         return _translate_assistant(message, state, classifier, gen, activity)
     if isinstance(message, ResultMessage):
@@ -365,6 +415,14 @@ def _translate_assistant(
 ) -> list[OutboundEvent]:
     events: list[OutboundEvent] = []
     nested = message.parent_tool_use_id is not None
+    collecting = any(
+        isinstance(block, (ToolUseBlock, ServerToolUseBlock)) for block in message.content
+    )
+    if not nested and collecting:
+        # A message that requests more evidence is provisional, even when it
+        # also contains text. History and generation diagnostics retain it;
+        # an empty provider result must never promote its preamble to an answer.
+        state.assistant_text = ""
 
     # Assistant usage is per-message. ResultMessage usage is a turn total and
     # must never be copied onto the last generation, where it would double-count
@@ -410,8 +468,10 @@ def _translate_assistant(
     for block in message.content:
         if isinstance(block, TextBlock):
             if block.text and not nested:
-                state.assistant_text += block.text
-                events.append(TextDelta(text=block.text))
+                if not collecting:
+                    state.assistant_text += block.text
+                if state.final_answer is None:
+                    events.append(TextDelta(text=block.text))
         elif isinstance(block, ToolUseBlock):
             events.append(ToolNote(text=f"running tool {block.name}", tool=block.name))
             if activity is not None:

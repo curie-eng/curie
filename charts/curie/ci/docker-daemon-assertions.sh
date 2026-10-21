@@ -51,6 +51,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHART="$(cd "$SCRIPT_DIR/.." && pwd)"
+DAEMON_VECTOR="$CHART/../../tests/vectors/daemon-config.json"
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -62,10 +63,13 @@ CLUSTER_CIDR="198.18.0.0/15"
 
 CHECKER="$TMP/check.py"
 cat >"$CHECKER" <<'PY'
+import copy
 import hashlib
 import json
 import re
 import sys
+from pathlib import Path
+import jsonschema
 import yaml
 
 mode, path = sys.argv[1], sys.argv[2]
@@ -125,6 +129,13 @@ if mode == "absent":
     found = docker_objects()
     if found:
         fail(f"docker-daemon objects rendered without a docker repository: {found}")
+    for doc in docs:
+        for container in doc.get("spec", {}).get("template", {}).get("spec", {}).get("containers", []):
+            for entry in container.get("env", []):
+                if entry["name"] == "CURIE_REPO_RUNNER_POOLS":
+                    pools = json.loads(entry["value"])
+                    if any("daemon" in pool for pool in pools.values()):
+                        fail("a non-Docker worker pool contains daemon configuration")
     print(f"ok: {mode}")
     sys.exit(0)
 
@@ -133,8 +144,8 @@ if mode != "present":
 
 values = json.load(open(args[0]))
 ns, image, port = args[1], args[2], int(args[3])
-if len(args) != 7:
-    fail("usage: present <render> <values.json> <ns> <image> <port> <createNamespace> <rail1> <clusterCidr>")
+if len(args) != 8:
+    fail("usage: present <render> <values.json> <ns> <image> <port> <createNamespace> <rail1> <clusterCidr> <vector>")
 create_ns = args[4] == "true"
 rail1 = args[5] == "true"
 cluster_cidr = args[6]
@@ -148,6 +159,29 @@ if len(factory_agents) != 1:
     fail(f"fixture needs exactly one factory agent, got {factory_agents}")
 classes = (["public"] if public else []) + [egress_class(p) for p in sorted(allowlisted)]
 non_classes = [egress_class(r["path"]) for r in repos if r["path"] not in allowlisted]
+
+vector_path = Path(args[7]).resolve()
+expected_daemon = copy.deepcopy(json.load(open(vector_path))["daemon"])
+expected_daemon.update(namespace=ns, image=image, port=port, selectorLabels=DAEMON_SEL)
+for key in ("resources", "storageSizeLimit", "maxClaimLifetimeSeconds", "pingTimeoutSeconds"):
+    if key in docker_values:
+        expected_daemon[key] = docker_values[key]
+worker = find("Deployment", f"{FULL}-worker")
+worker_env = {entry["name"]: entry.get("value")
+              for container in worker["spec"]["template"]["spec"]["containers"]
+              for entry in container.get("env", [])}
+worker_pools = json.loads(worker_env["CURIE_REPO_RUNNER_POOLS"])
+for repo in repos:
+    if not repo.get("runner"):
+        continue
+    pool = worker_pools[repo["path"]]
+    if repo.get("docker", {}).get("enabled"):
+        if pool.get("daemon") != expected_daemon or type(pool["daemon"]["port"]) is not int:
+            fail("Docker repository did not receive the complete typed daemon configuration")
+    elif "daemon" in pool:
+        fail("non-Docker repository received daemon configuration")
+schema_path = vector_path.parents[2] / "apps/worker/schema/repo-runner-pools.schema.json"
+jsonschema.validate(worker_pools, json.load(open(schema_path)))
 
 # 1. Namespace.
 namespaces = [d for d in docs if d.get("kind") == "Namespace" and d["metadata"]["name"] == ns]
@@ -180,12 +214,18 @@ for rule in role.get("rules", []):
                 triples.add((g, r, v))
 want_triples = set()
 for g, r, verbs in (("", "pods", "create get list delete"), ("", "pods/log", "get"),
+                    ("", "pods/portforward", "create get"),
                     ("", "services", "create get list delete"), ("", "secrets", "create delete"),
                     ("networking.k8s.io", "networkpolicies", "create get list delete")):
+    if r in ("pods/exec", "pods/proxy"):
+        fail(f"Role must not grant {r}")
     for v in verbs.split():
         want_triples.add((g, r, v))
 if triples != want_triples:
     fail(f"Role rules differ: extra {sorted(triples - want_triples)} missing {sorted(want_triples - triples)}")
+for absent in ("pods/exec", "pods/proxy"):
+    if any(resource == absent for _, resource, _ in triples):
+        fail(f"Role must not grant {absent}")
 binding = find("RoleBinding", role_name)
 in_ns(binding, ns)
 if binding["roleRef"] != {"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": role_name}:
@@ -362,8 +402,7 @@ need = {
     "lifecycle and exec probes": ["lifecycle", "livenessProbe", "readinessProbe", "startupProbe", "exec"],
     "mounts": ["volumeMounts", "'/var/lib/docker'", "'/certs", "'..'", "volumeDevices"],
     "command override": ["command"],
-    "args": ["args", "'--userns-remap=default'", "'--authorization-plugin=curie-authz'",
-             "c.args[1] == '--userns-remap=default'", "c.args[2] == '--authorization-plugin=curie-authz'"],
+    "args": ["args", "'--userns-remap=default'", "'--authorization-plugin=curie-authz'"],
     "no capability add": ["c.securityContext.capabilities.add", "size(c.securityContext.capabilities.add) == 0"],
     "service account token": ["automountServiceAccountToken", "== false", "serviceAccountToken", "serviceAccountName"],
     "volumes": ["volumes", "emptyDir", "sizeLimit", "secret"],
@@ -378,6 +417,16 @@ need = {
 }
 for rule, needles in need.items():
     in_one_validation("pods", pods_validations, rule, needles)
+expected_args = [
+    "dockerd", "--userns-remap=default", "--authorization-plugin=curie-authz",
+    f"--host=tcp://0.0.0.0:{port}", "--tlsverify", "--tlscacert=/certs/ca.pem",
+    "--tlscert=/certs/server-cert.pem", "--tlskey=/certs/server-key.pem",
+]
+args_lists = [re.findall(r"'([^']*)'", literal)
+              for expression in pods_validations
+              for literal in re.findall(r"c\.args\s*==\s*(\[[^\]]*\])", expression)]
+if expected_args not in args_lists:
+    fail("daemon admission must require the exact ordered TLS argv on the configured port")
 # Init containers are refused outright, so no validation may admit them
 # conditionally or iterate over them.
 for n in ["!has(object.spec.initContainers) ||", "initContainers.all(", "initContainers.exists("]:
@@ -497,27 +546,29 @@ render -f "$TMP/no-docker-values.json" >"$TMP/no-docker.yaml" || fail "repositor
 python3 "$CHECKER" absent "$TMP/no-docker.yaml" || fail "(a) repositories without docker"
 render -f "$TMP/docker-values.json" --set worker.deploy=false >"$TMP/no-worker.yaml" || fail "worker.deploy=false render"
 python3 "$CHECKER" absent "$TMP/no-worker.yaml" || fail "(a) worker.deploy=false"
+render -f "$TMP/docker-values.json" --set worker.deploy=false --set-string factory.docker.daemonImage= >"$TMP/no-worker-no-image.yaml" || fail "worker.deploy=false with no daemon image"
+python3 "$CHECKER" absent "$TMP/no-worker-no-image.yaml" || fail "(a) disabled worker must skip enabled-daemon validation"
 
 # (b) (c) (f) repository render.
 render -f "$TMP/docker-values.json" >"$TMP/docker.yaml" || fail "docker repository render"
-python3 "$CHECKER" present "$TMP/docker.yaml" "$TMP/docker-expected.json" "$DEFAULT_NS" "$DAEMON_IMAGE" 2376 true true "$CLUSTER_CIDR" \
+python3 "$CHECKER" present "$TMP/docker.yaml" "$TMP/docker-expected.json" "$DEFAULT_NS" "$DAEMON_IMAGE" 2376 true true "$CLUSTER_CIDR" "$DAEMON_VECTOR" \
   || fail "(b)(c)(f) docker repository render"
 
 # (b) only allowlisted repositories: no public policy or class.
 render -f "$TMP/docker-values.json" --set 'factory.bindings[0].repos[1].docker.enabled=false' >"$TMP/allowlist-only.yaml" || fail "allowlist-only render"
-python3 "$CHECKER" present "$TMP/allowlist-only.yaml" "$TMP/allowlist-only-expected.json" "$DEFAULT_NS" "$DAEMON_IMAGE" 2376 true true "$CLUSTER_CIDR" \
+python3 "$CHECKER" present "$TMP/allowlist-only.yaml" "$TMP/allowlist-only-expected.json" "$DEFAULT_NS" "$DAEMON_IMAGE" 2376 true true "$CLUSTER_CIDR" "$DAEMON_VECTOR" \
   || fail "(b) allowlist-only render"
 
 # (b) namespace override, createNamespace=false, port override, quota override.
 render -f "$TMP/docker-values.json" --set-string factory.docker.namespace=acme-docker \
   --set factory.docker.createNamespace=false --set factory.docker.port=2443 \
   --set-string 'factory.docker.quota.hard.pods=3' >"$TMP/override.yaml" || fail "override render"
-python3 "$CHECKER" present "$TMP/override.yaml" "$TMP/override-expected.json" acme-docker "$DAEMON_IMAGE" 2443 false true "$CLUSTER_CIDR" \
+python3 "$CHECKER" present "$TMP/override.yaml" "$TMP/override-expected.json" acme-docker "$DAEMON_IMAGE" 2443 false true "$CLUSTER_CIDR" "$DAEMON_VECTOR" \
   || fail "(b) namespace, createNamespace, port and quota overrides"
 
 # (b) Rail 1 allow follows the Rail 1 condition.
 render -f "$TMP/docker-values.json" --set security.networkPolicy.enabled=false >"$TMP/no-netpol.yaml" || fail "network policy disabled render"
-python3 "$CHECKER" present "$TMP/no-netpol.yaml" "$TMP/docker-expected.json" "$DEFAULT_NS" "$DAEMON_IMAGE" 2376 true false "$CLUSTER_CIDR" \
+python3 "$CHECKER" present "$TMP/no-netpol.yaml" "$TMP/docker-expected.json" "$DEFAULT_NS" "$DAEMON_IMAGE" 2376 true false "$CLUSTER_CIDR" "$DAEMON_VECTOR" \
   || fail "(b) Rail 1 allow rendered with network policy disabled"
 
 # (d) runner admission is byte-identical with and without docker.
@@ -529,6 +580,18 @@ cut_source runner-resources-admission.yaml "$TMP/docker.yaml" >"$TMP/admission-d
 cut_source runner-resources-admission.yaml "$TMP/no-docker.yaml" >"$TMP/admission-plain.yaml"
 [ -s "$TMP/admission-plain.yaml" ] || fail "(d) runner admission absent from the render without docker"
 cmp -s "$TMP/admission-docker.yaml" "$TMP/admission-plain.yaml" || { diff "$TMP/admission-plain.yaml" "$TMP/admission-docker.yaml" >&2 || true; fail "(d) runner admission changed with docker enabled"; }
+for source in runner-prewarm.yaml security-probe.yaml; do
+  cut_source "$source" "$TMP/docker.yaml" >"$TMP/$source-docker"
+  cut_source "$source" "$TMP/no-docker.yaml" >"$TMP/$source-plain"
+  [ -s "$TMP/$source-plain" ] || fail "(d) $source absent without docker"
+  cmp -s "$TMP/$source-docker" "$TMP/$source-plain" || fail "(d) $source changed with docker enabled"
+done
+for source in runner-resources-admission.yaml runner-prewarm.yaml security-probe.yaml; do
+  cut_source "$source" "$TMP/no-worker.yaml" >"$TMP/$source-no-worker"
+  cut_source "$source" "$TMP/no-worker-no-image.yaml" >"$TMP/$source-no-worker-no-image"
+  [ -s "$TMP/$source-no-worker" ] || fail "(d) $source absent with disabled worker"
+  cmp -s "$TMP/$source-no-worker" "$TMP/$source-no-worker-no-image" || fail "(d) $source changed with disabled worker and missing image"
+done
 
 # (e) refusals name the key.
 expect_fail "factory.docker.daemonImage" -f "$TMP/docker-values.json" --set-string factory.docker.daemonImage=

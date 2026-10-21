@@ -85,6 +85,9 @@ FAKE_SANDBOX_TOKEN = "sbx." + "ZXhhbXBsZXNhbmRib3hwYXlsb2Fk." + "FAKEFAKEFAKESIG
 FAKE_CONNECTOR_CALLER_TOKEN = "cct." + "ZXhhbXBsZWNhbGxlcnBheWxvYWQ." + "FAKEFAKEFAKESIG0000"
 FAKE_CHANNEL_READ_TOKEN = "chr." + "ZXhhbXBsZWNoYW5uZWxyZWFkcGF5bG9hZA." + "FAKEFAKEFAKESIG0000"
 FAKE_X_API_KEY_HEADER = "X-API-Key: " + "FAKEFAKEFAKEHEADERVALUE0000"
+FAKE_DIRECTORY_CREDENTIAL = "dir." + "ZXhhbXBsZWRpcmVjdG9yeQ." + "FAKEFAKEFAKESIG0000"
+FAKE_IDENTITY_CONNECT_TOKEN = "FAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKE000"
+FAKE_OIDC_CALLBACK_QUERY = "code=FAKECODE0000&state=FAKESTATE0000"
 _FAKE_DISCORD_BOT_TOKEN = (
     "FAKEFAKEFAKEFAKEFAKE0000." + "FAKE00." + "FAKEFAKEFAKEFAKEFAKEFAKE000"
 )
@@ -125,6 +128,9 @@ SECRET_LITERALS: dict[str, str] = {
     "connector_caller_token": FAKE_CONNECTOR_CALLER_TOKEN,
     "channel_read_token": FAKE_CHANNEL_READ_TOKEN,
     "x_api_key": FAKE_X_API_KEY_HEADER,
+    "directory_credential": FAKE_DIRECTORY_CREDENTIAL,
+    "identity_connect_token": FAKE_IDENTITY_CONNECT_TOKEN,
+    "oidc_callback_query": FAKE_OIDC_CALLBACK_QUERY,
     "discord_bot_authorization": FAKE_DISCORD_BOT_AUTHORIZATION,
     "discord_bot_token_assignment": FAKE_DISCORD_BOT_TOKEN_ASSIGNMENT,
     "discord_bot_token": FAKE_SHAPED_DISCORD_BOT_TOKEN,
@@ -134,6 +140,8 @@ SECRET_LITERALS: dict[str, str] = {
 # Non-secret text that must precede a literal for its rule to apply, for rules
 # whose redacted secret is only part of the matched value.
 _LITERAL_CARRIERS: dict[str, str] = {
+    "identity_connect_token": "/identity/connect/",
+    "oidc_callback_query": "/console/oidc/callback?",
     "discord_webhook_url": FAKE_DISCORD_WEBHOOK_PREFIX,
     "secret_json_field": '{"AWS_SECRET_ACCESS_KEY": "',
     "secret_dict_field": "{'MY_PRIVATE_KEY': '",
@@ -648,9 +656,13 @@ def test_http_redacts_held_secret_split_at_every_offset(
     assert _SPLIT_SECRET not in _assistant_text(frames)
     assert _assistant_text(frames).startswith("Before [REDACTED:")
     assert _assistant_text(frames).endswith(" after.")
-    assert frames[-1]["text"] == _assistant_text(frames)
     if with_tool_note:
+        # Only post-tool text is the final candidate. The secret fragment at
+        # its boundary still needs the full stream's redaction context.
+        assert frames[-1]["text"] == "[REDACTED:held_secret] after."
         assert any(frame["type"] == "tool_note" for frame in frames)
+    else:
+        assert frames[-1]["text"] == _assistant_text(frames)
 
 
 def test_http_reply_keeps_a_paragraph_break_between_text_blocks(
@@ -658,8 +670,8 @@ def test_http_reply_keeps_a_paragraph_break_between_text_blocks(
 ) -> None:
     """#3694: two progress sentences around a tool call must not be glued.
 
-    Covers the stream and the empty-result final, which falls back to the
-    streamed text (#107).
+    The internal stream retains both sentences. An empty-result final now
+    selects only the post-tool candidate, without resurrecting the preamble.
     """
 
     messages: list[object] = [
@@ -671,7 +683,7 @@ def test_http_reply_keeps_a_paragraph_break_between_text_blocks(
     _, frames = _http_reply(_boot_reply_runner(tmp_path, monkeypatch, messages))
 
     assert _assistant_text(frames) == "Staging the files.\n\nAll three files staged."
-    assert frames[-1]["text"] == _assistant_text(frames)
+    assert frames[-1]["text"] == "All three files staged."
     assert frames[-1]["status"] == "done"
 
 
@@ -718,6 +730,25 @@ def _redacted_turn(
     )
     frames = [json.loads(line) for line in lines]
     return _assistant_text(frames), frames[-1]["text"]
+
+
+@pytest.mark.parametrize("notice", ["", "Connector unavailable.\n\n"])
+def test_final_suffix_redacts_cross_boundary_secret_without_restoring_narration(
+    notice: str,
+) -> None:
+    _, final = _redacted_turn(
+        frozenset({_OVERLAP_FIRST, _OVERLAP_SECOND}),
+        ["Provisional " + _OVERLAP_FIRST, "SECRETSUFFIX0000 after."],
+        notice + "SECRETSUFFIX0000 after.",
+    )
+    assert final == notice + "[REDACTED:held_secret] after."
+
+
+def test_final_suffix_retains_only_its_own_paragraph_breaks() -> None:
+    _, final = _redacted_turn(
+        frozenset(), ["Provisional.", "Final one.", "Final two."], "Final one.Final two."
+    )
+    assert final == "Final one.\n\nFinal two."
 
 
 def test_block_break_final_scrubs_a_pattern_cut_by_a_held_prefix() -> None:
@@ -1048,7 +1079,7 @@ def test_http_hides_overlapping_secret_spans_across_buffered_text_deltas(
     assert "FAKEPREFIX" not in raw
     assert "SECRETSUFFIX0000" not in raw
     assert any(frame["type"] == "tool_note" for frame in frames)
-    assert frames[-1]["text"] == text
+    assert frames[-1]["text"] == "[REDACTED:held_secret] after."
     assert frames[-1]["status"] == "done"
 
 

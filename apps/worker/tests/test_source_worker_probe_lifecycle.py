@@ -69,7 +69,8 @@ def test_real_required_table_wait_obeys_deadline_or_cancellation_and_disposes_ba
 ) -> None:
     """@spec PROTECTED-HOOK-SOURCE-2."""
 
-    _, _, url = worker_db
+    support, _, url = worker_db
+    before_revision = support.stamped_revision()
     method = startup.adapter()
 
     async def scenario() -> None:
@@ -100,7 +101,7 @@ def test_real_required_table_wait_obeys_deadline_or_cancellation_and_disposes_ba
                 async with observer.connect() as observed:
                     assert (
                         await observed.scalar(text("SELECT version_num FROM curie.alembic_version"))
-                        == "0108"
+                        == before_revision
                     )
                     assert (
                         await observed.scalar(

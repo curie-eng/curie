@@ -7,9 +7,11 @@ that the harness's declared fields are what the boot path actually consumes.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 from curie_runner import PluginBundleError
+from curie_runner import __main__ as boot
 from curie_runner.__main__ import DEFAULT_HARNESS, _resolve_harness, build_runner
 from curie_runner.config import RunnerConfig
 from curie_runner.harness import registry
@@ -23,6 +25,17 @@ from curie_runner.history import ConversationMessage, ConversationReplay
 from runner_boot_session import initialized_session, initialized_session_sync
 
 _BUDGET = '{"max_output_tokens_per_run": 10000, "max_usd_per_day": 1.0}'
+
+
+@pytest.fixture(autouse=True)
+def _isolated_boot_declarations(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep host image and daemon declarations out of these prompt expectations."""
+
+    monkeypatch.setattr(
+        boot, "TOOL_MANIFEST_PATH", tmp_path / "tool-manifest.json", raising=False
+    )
+    monkeypatch.delenv("DOCKER_HOST", raising=False)
+    monkeypatch.delenv("DOCKER_PUBLISHED_HOST", raising=False)
 
 
 def _config(tmp_path) -> RunnerConfig:

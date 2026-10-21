@@ -139,6 +139,29 @@ def test_reply_text_is_the_latest_update_and_carries_the_event_marker(
     assert f"{EVENT_MARKER} ev-42" in text
 
 
+def test_verbatim_reply_update_is_refused_before_recording_or_provider_send(
+    mail: MailState, adapter: MailAdapter, egress_url: str
+) -> None:
+    seed(mail, adapter)
+    assert adapter.record_text_at("thr-1", "msg-1", "existing answer")[0] == 200
+    before = adapter.state.reply_text("thr-1", "msg-1")
+    event = update("approved exact text")
+    event.update(
+        version="1.2",
+        text_mode="verbatim",
+        delivery_id="01234567-89ab-cdef-0123-456789abcdef",
+    )
+
+    status, body = post_event(egress_url, event)
+
+    assert status == 422
+    assert body == {"detail": "reply wire 1.2 verbatim is not supported"}
+    assert adapter.state.reply_text("thr-1", "msg-1") == before
+    assert mail.replies == []
+    assert mail.thread_calls == 0
+    assert mail.list_calls == 0
+
+
 def test_turn_status_is_ignored(mail: MailState, adapter: MailAdapter, egress_url: str) -> None:
     seed(mail, adapter)
 
@@ -839,7 +862,9 @@ def test_version_one_state_migrates_without_losing_admitted_or_delivered_replies
     # Reconstruct the released v1 database shape, preserving real admitted rows.
     with sqlite3.connect(adapter.config.state_path) as connection:
         connection.execute("ALTER TABLE completion_events DROP COLUMN deleted")
+        connection.execute("ALTER TABLE completion_events DROP COLUMN send_attempted_at")
         connection.execute("DROP TABLE approval_refs")
+        connection.execute("DELETE FROM metadata WHERE key='provider'")
         connection.execute("PRAGMA user_version=1")
     replacement = MailAdapter(adapter.config)
     try:

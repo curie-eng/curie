@@ -25,7 +25,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-import aiohttp
 import httpx
 import pytest
 from aci_protocol import Final, QueuedTurn, ReplyHandle, SessionStatus, TextDelta
@@ -3380,12 +3379,20 @@ def test_stream_minted_ref_survives_a_booting_delivery_failure(make_harness) -> 
             await h.kernel.process_event(event)
 
             assert booting_failures == 1
+            # One message only: the failed booting delivery minted nothing, and
+            # the pending notice (which carries the request text, ADR 0226: no
+            # TextDelta is streamed) is the message that mints the ref.
             assert len(h.sink.text_posts) == 1, h.sink.text_posts
             minted = h.sink.text_posts[0][1]
-            assert approvals.requests[0].reply_placeholder == minted
-            assert len(h.sink.updates) >= 2, h.sink.updates
             assert {ref for _, ref, _ in h.sink.updates} == {minted}
+            assert h.sink.updates[-1][2].startswith("Requesting sign-off")
             assert h.sink.updates[-1][2].endswith(_SHORT_NOTICE)
+            # #2721: the row precedes every delivery, so it may carry no ref;
+            # the minted ref must then be remembered for the resume (#1640).
+            placeholder = approvals.requests[0].reply_placeholder
+            assert placeholder in (None, minted)
+            if placeholder is None:
+                assert await h.card_store.read_notice_ref("appr-1") == minted
 
     asyncio.run(go())
 
@@ -5630,19 +5637,20 @@ def test_resume_reply_best_effort_completes_offline_when_endpoint_is_dead(
     asyncio.run(go())
 
 
-def test_normal_turn_reply_stays_loud_when_endpoint_is_dead(make_harness) -> None:
-    """AC-708-4 (#708): the best-effort swallow is scoped to resume turns. A NORMAL
-    (non ``approval-<uuid>-resolved``) turn hitting the same dead endpoint + no
-    distinct default must STILL fail loudly -- a fresh local turn whose stub crashed
-    mid-turn is a genuine failure that must surface, not silently complete. Extends
-    ``test_no_fallback_when_no_default_is_configured``'s intent to the kernel.
+def test_normal_turn_reply_stays_loud_when_endpoint_is_dead(make_harness, caplog) -> None:
+    """AC-708-4 (#708) under ADR 0226: the best-effort swallow is scoped to
+    resume turns. A NORMAL turn whose answer cannot reach a dead endpoint (no
+    distinct default) must not be silently completed: the answer is NOT
+    swallowed, the completion stays OWED in the outbox (no ``turn.completed``
+    is emitted or cleared), the failure is logged, and the stored answer is
+    replayed once the endpoint returns -- without a second model run.
 
-    The transport error propagates out of ``process_event`` (leaving the entry
-    pending for reclaim), so the turn is NOT marked done -- the inverse of the
-    resume case above."""
+    ADR 0226 decision 3 replaced "raise and leave the entry pending for a full
+    re-run" with "settle done, keep the answer owed, replay it", so the done
+    marker now exists; the owed record is what keeps the failure loud."""
 
     async def go() -> None:
-        async with make_harness() as h:  # no binding -> a plain, non-resume turn
+        async with make_harness(completion_sweep_grace_s=0) as h:
             h.sink.dead_endpoints.add(_CLI_STUB)
             h.runner.default_script = [Final(text="done", status=DONE)]
             ev = _qevent(
@@ -5652,11 +5660,38 @@ def test_normal_turn_reply_stays_loud_when_endpoint_is_dead(make_harness) -> Non
                 endpoint=_CLI_STUB,
             )
 
-            with pytest.raises(aiohttp.ClientError):
+            with caplog.at_level(logging.WARNING):
                 await h.kernel.process_event(ev)
 
-            # Not silently completed: no done marker was written.
-            assert not await h.async_redis.exists(h.config.done_key(ev.event_id))
+            # Not swallowed best-effort (the resume-only exception), not
+            # delivered, and not reported complete to the adapter.
+            assert h.sink.swallowed == []
+            assert h.sink.updates == []
+            assert h.sink.completions == []
+            stored = await h.kernel._markers.read_completion(ev.event_id)
+            assert stored is not None and stored.done_flag
+            assert stored.record.answer is not None
+            assert stored.record.answer.text == "done"
+            assert stored.record.answer_best_effort is False
+            assert any(
+                "delivery failed for ev-normal-1" in r.getMessage()
+                and "outbox record stands" in r.getMessage()
+                for r in caplog.records
+            )
+
+            # A sweep while the endpoint is still dead keeps it owed.
+            await h.kernel.sweep_pending_completions()
+            assert await h.kernel._markers.read_completion(ev.event_id) is not None
+            assert h.sink.completions == []
+
+            # The endpoint returns: the stored answer is replayed, then the
+            # completion, and the model is never run again.
+            h.sink.dead_endpoints.clear()
+            await h.kernel.sweep_pending_completions()
+            assert [text for _, _, text in h.sink.updates] == ["done"]
+            assert [c.event_id for c in h.sink.completions] == [ev.event_id]
+            assert await h.kernel._markers.read_completion(ev.event_id) is None
+            assert h.runner.opened == ["hello"]
 
     asyncio.run(go())
 

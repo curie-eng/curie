@@ -92,6 +92,13 @@ valid; assigning two distinct grantable tools to one route is rejected as
 single-valued rather than letting a model-selected request decide which tool receives the
 one-shot allowance.
 
+A grantable route whose tool is on a hosted connector behind the caller proxy is the
+exception. The proxy forwards a gated call only with a grant bound to its exact arguments,
+and a policy approval carries none, so the approved call could never run. The runner
+refuses that `request_approval` in-turn, before any card, and tells the model to call the
+tool directly. The permission gate then holds the call with its arguments on the card, and
+the resume grant is bound to them. It is still one approval.
+
 View what a bundle declares, offline and with no credential:
 
 ```bash

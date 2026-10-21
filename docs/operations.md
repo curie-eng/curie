@@ -2355,9 +2355,10 @@ workspace with no Slack access. Full flag reference is in
 
 ### What a reply says the agent changed
 
-A turn that ran a tool outside the read-only allowlist ends its reply with a
-`_What I changed:_` receipt, one line per action, each saying whether the
-platform recorded what a restore would need or why the action cannot be undone
+A turn with receipts enabled that ran a tool outside the read-only allowlist
+ends its reply with a `_What I changed:_` receipt, one line per action. Each
+line says whether the platform recorded what a restore would need or why the
+action cannot be undone
 ([ADR-0117](adr/0117-a-tool-that-changes-the-world-reports-what-it-changed.md)).
 No restore runs from the receipt yet; it says "restore information recorded",
 not "can be undone".
@@ -2367,9 +2368,9 @@ How much of it the people using the install see is the chart value
 
 | Value | The reply ends with |
 |---|---|
-| `all` (default) | every action, each saying whether restore information was recorded |
+| `all` | every action, each saying whether restore information was recorded |
 | `failures` | only the actions that reported failure, which a person should check before asking again; nothing when none failed |
-| `off` | no receipt, even when an action failed |
+| `off` (default) | no receipt, even when an action failed |
 
 The value changes only the reply. Every action is still recorded and readable
 through the API's `GET /actions`, and a turn that touched anything is still
@@ -2750,7 +2751,9 @@ supplies no trusted positive aligned authentication verdict that Curie can
 verify, guarantees neither header provenance nor stripping, and permits DMARC
 failure under `p=none`. Every message is refused with
 `authentication_unverifiable`; allowlisted senders, labels, missing rejection
-labels and provider supplied headers cannot bypass the gate. Any
+labels and provider supplied headers cannot bypass the gate. The gate opens only
+for a mail provider that verifies senders (ADR 0228, `CURIE_MAIL_PROVIDER`); the
+chart currently selects only the built-in AgentMail provider. Any
 `mailAdapter.allowedSenders` list containing `*` also fails boot unless
 `mailAdapter.allowAllSenders=true` is explicitly set, and that opt in never
 bypasses authentication. Provider evidence, parameter names, the full config
@@ -3107,6 +3110,47 @@ path. It is off by default. `actionExecutor.enabled: true` (compose:
 worker; with the connector reconciler also on, the worker Role gains a
 single-object `get` on Deployments, and nothing else. Restores run on the
 cluster tier only.
+
+**Running the executor with the connector reconciler off.** The executor reads
+two things about the connector it acts through: that connector's Deployment, by
+name, and the digest the agent's in-force version renders it at (from the API).
+By default it reads them only beside the connector reconciler, so with
+`worker.connectorReconciler.enabled: false` every forward execution and restore
+is refused before dispatch. An installation that keeps the reconciler off on
+purpose, for example because its hosted connectors are pinned and managed
+outside Curie, can set:
+
+```yaml
+actionExecutor:
+  enabled: true
+  connectorReadsWithoutReconciler: true
+worker:
+  connectorReconciler:
+    enabled: false
+```
+
+The worker Role then gains one rule, `get` on `apps/deployments` in the release
+namespace, and none of the reconciler's `create`, `list`, `patch` or `delete`
+rules; the worker receives `CURIE_ACTION_EXECUTOR_CONNECTOR_READS=true` and
+`CURIE_CONNECTOR_APP_NAME`, and logs `connector reconcile loop off` when the
+executor starts. The reconcile loop is not started. With
+`worker.serviceAccount.create: false`, grant the same `get` to your own service
+account. The render fails with the executor off or the reconciler on, and the
+worker refuses to boot on the same combinations.
+
+The executor still acts only at the pinned digest. Your connector Deployment
+must carry the name and the pod template the API renders for the in-force
+version (`<release>-<agent>-mcp-<connector>`, the `server` image pinned by
+`@sha256:` and the caller proxy's gated set), and show a completed rollout. An
+execution is refused `connector_digest_unavailable`, with no sandbox claimed,
+when that Deployment cannot be read (a missing grant answers 403), is absent,
+is mid-rollout, or serves a different digest. A forward tool the caller proxy
+does not gate is refused `tool_not_grant_bound`.
+
+One thing stays tied to the reconciler: restore capability probes are requested
+from a reconcile pass, so in this mode none runs and no new restore capability
+is recorded: an action on a digest with no recorded capability is not undoable. Forward executions and the digest an
+action records do not depend on probes.
 
 **A connector tool named `restore` is unchanged unless the connector also
 serves `observe_version`.** A lone `restore` stays an ordinary tool: in the

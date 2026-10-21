@@ -1285,6 +1285,61 @@ def test_a_remote_connector_never_receives_the_grant_header(tmp_path: Path) -> N
     assert servers["grafana"]["headers"][_GRANT_HEADER] == _GRANT_PLACEHOLDER
 
 
+def test_only_a_hosted_entry_with_a_caller_token_is_proxied(tmp_path: Path) -> None:
+    from curie_runner.connectors import proxied_connector_servers
+
+    root = _bundle(tmp_path, HOSTED + REMOTE.replace("connectors:\n", ""))
+    with_token = derive_mcp_servers(root, **SCOPE, caller_header=True, env={})
+    without_token = derive_mcp_servers(root, **SCOPE, caller_header=False, env={})
+    assert proxied_connector_servers(with_token) == frozenset({"grafana"})
+    assert proxied_connector_servers(without_token) == frozenset()
+
+
+@pytest.mark.parametrize(("caller_token", "expected"), [("cct.a.b", {"grafana"}), (None, set())])
+def test_the_boot_tells_the_gate_which_connectors_are_proxied(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caller_token: str | None,
+    expected: set[str],
+) -> None:
+    # Wiring pin: a grantable policy route to a proxied connector tool is
+    # refused in-turn only if build_runner hands the gate the proxied set.
+    monkeypatch.delenv("CURIE_STATE_URL", raising=False)
+    root = _bundle(tmp_path, HOSTED)
+    (root / ".claude-plugin" / "plugin.json").write_text(
+        json.dumps(
+            {
+                "name": "b",
+                "version": "0.1.0",
+                "description": "t",
+                "approvalPolicy": {
+                    "gates": [
+                        {
+                            "gate": "mcp__grafana__update_dashboard",
+                            "route": "ops",
+                            "grantableViaPolicy": True,
+                        }
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = _config_for(
+        root, release="curie", agent="acme-dev", namespace="curie", caller_token=caller_token
+    )
+
+    async def probe(*_args: Any, **_kwargs: Any) -> McpToolCapabilityProbe:
+        return McpToolCapabilityProbe(complete=True, has_potential_write_tool=True, tool_count=1)
+
+    monkeypatch.setattr(boot, "probe_mcp_tool_capability", probe)
+    monkeypatch.setattr(boot, "ClaudeAgentSession", _CapturedSession)
+    runner = build_runner(config, fake_model=False)
+    gate = runner._approval_gate
+    assert gate is not None
+    assert gate.proxied_connector_servers == frozenset(expected)
+
+
 def test_a_fallback_url_never_receives_the_caller_token(tmp_path: Path) -> None:
     servers = derive_mcp_servers(
         _bundle(tmp_path, HOSTED_WITH_FALLBACK),

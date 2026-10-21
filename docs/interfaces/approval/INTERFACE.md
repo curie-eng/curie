@@ -247,7 +247,14 @@ in code now:
   `grantableViaPolicy` grant carries no arguments, because it authorizes a business decision
   rather than one call, so its granted tool may be invoked on the resume turn with any
   arguments. An approval recorded before arguments were carried also stays name-only.
-  Permission-gate grants are argument-bound (#3174), as above. Among gates
+  Permission-gate grants are argument-bound (#3174), as above. A name-only grant cannot reach
+  a hosted connector behind the caller proxy, which forwards a gated call only with a grant
+  bound to its exact arguments (see [mcp-service-auth](../mcp-service-auth/INTERFACE.md)).
+  So `process_approval_request` (`runner/src/curie_runner/approval.py::process_approval_request`)
+  refuses a `request_approval` whose route grants a tool on a proxied connector, in-turn and
+  before any card. The refusal tells the model to call the tool directly, and the permission
+  gate then holds that call with its arguments shown. Grantable routes to every other tool are
+  unchanged. Among gates
   that set `grantableViaPolicy`, deploy validation also requires a route be claimed by only one
   distinct tool: two grantable gates on the same route naming the same tool are a duplicate and
   validate fine, but naming different tools is rejected as `approval_policy.grant_route_ambiguous`,

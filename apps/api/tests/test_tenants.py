@@ -17,6 +17,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
+from _migration_support import IsolatedMigrationDb
 from curie_api.config import get_settings
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -86,8 +87,11 @@ def _select_tenants() -> list[dict[str, Any]]:
 
 
 def test_migration_auto_provisions_exactly_one_default_tenant(
-    migrated: None,
+    isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
+    # Count only what the migration chain provisions, regardless of tenants
+    # committed by earlier integration tests in the session database.
+    isolated_migration_db.at("head")
     rows = _select_tenants()
 
     assert len(rows) == 1

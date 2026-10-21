@@ -247,9 +247,10 @@ end-to-end (no `target_url`) that boots via the substrate and releases in a fina
 
 The kernel closes the loop: it consumes `QueuedTurn` entries the dispatcher
 puts on the `curie:runs` Valkey stream, routes each to a runner turn in a
-claimed sandbox, streams the NDJSON (newline-delimited JSON) reply back into
-the Slack thread by editing the placeholder in place, and gets every failure
-mode right.
+claimed sandbox, consumes its NDJSON events, and delivers the terminal answer
+back into the Slack thread. Provisional assistant text and tool notes remain
+internal diagnostics. The ordinary completion outbox stores the terminal
+answer before delivery, so a delivery retry does not rerun the model.
 
 ```
 XREADGROUP curie:runs        Consumer (consumer group; a pending entry is
@@ -260,12 +261,15 @@ XREADGROUP curie:runs        Consumer (consumer group; a pending entry is
         -> SlackSink     chat.update placeholder to booting text (best effort)
         -> substrate.lookup/claim/resume   (sandbox substrate)
         -> RunnerClient  POST /v1/event | /v1/steer | /v1/interrupt   (runner)
-        -> SlackSink     chat.update the placeholder as frames stream
+        -> completion outbox   persist terminal answer under the lease fence
+        -> SlackSink     update/post the answer and sequential continuations
    -> XACK
 ```
 
-A targeted cron turn posts one message containing the final reply and does not
-show the booting caption or stream partial edits.
+A targeted cron turn delivers the final answer without a booting caption or
+partial edits. Oversized Slack answers use sequential continuation messages
+in the same thread rather than discarding text. Action receipts are off by
+default; an operator can explicitly select `all` or `failures`.
 
 Rules (detailed-architecture 2b), each with an integration test that provokes it
 (`tests/kernel/`):

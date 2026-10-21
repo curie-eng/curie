@@ -38,6 +38,8 @@ from plugin_format import (
     validate_bundle,
 )
 
+from .final_answer import FinalAnswerPolicy, strict_json_object
+
 # The SDK's skill-name check is private, and the SDK is pinned only ``>=``, so a
 # later release may move or rename it. When it is gone, use the local copy below.
 _sdk_validate_skill_name: Callable[[str], None] | None
@@ -104,44 +106,45 @@ class PluginBundleError(RuntimeError):
     """Raised when the mounted plugin bundle fails validation."""
 
 
-def load_bundle_web_search_enabled(plugin_dir: str | None) -> bool:
-    """Return the bundle's provider-side web-search choice (ADR-0138).
-
-    ``curie.bundle.json`` is a Curie-owned sidecar beside, not inside, the
-    frozen Claude plugin-format contract. An absent sidecar defaults on. A
-    present document is strict because a misspelled opt-out would otherwise
-    widen the model's capability while appearing to disable it.
-    """
-
+def _load_bundle_config(plugin_dir: str | None) -> dict[str, Any]:
+    """Strict Curie sidecar, separate from the frozen plugin manifest."""
     if not plugin_dir:
-        return True
+        return {}
     config_path = Path(plugin_dir) / BUNDLE_CONFIG_NAME
     try:
         raw = config_path.read_text(encoding="utf-8")
     except FileNotFoundError:
-        return True
-    except OSError as exc:
-        raise PluginBundleError(f"cannot read {config_path}: {exc}") from exc
-
+        return {}
+    except (OSError, UnicodeError) as exc:
+        raise PluginBundleError(f"cannot read {config_path}") from exc
     try:
-        loaded = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise PluginBundleError(
-            f"invalid {config_path}: expected JSON object ({exc.msg})"
-        ) from exc
+        loaded = json.loads(raw, object_pairs_hook=strict_json_object)
+    except ValueError as exc:
+        raise PluginBundleError(f"invalid {config_path}: expected JSON object") from exc
     if not isinstance(loaded, dict):
         raise PluginBundleError(f"invalid {config_path}: root must be a JSON object")
-    unknown = sorted(set(loaded) - {"webSearch"})
+    unknown = sorted(set(loaded) - {"webSearch", "finalAnswer"})
     if unknown:
-        raise PluginBundleError(
-            f"invalid {config_path}: unknown key(s): {', '.join(unknown)}"
-        )
-    enabled = loaded.get("webSearch", True)
-    if not isinstance(enabled, bool):
-        raise PluginBundleError(
-            f"invalid {config_path}: webSearch must be a JSON boolean"
-        )
-    return enabled
+        raise PluginBundleError(f"invalid {config_path}: unknown key(s): {', '.join(unknown)}")
+    if not isinstance(loaded.get("webSearch", True), bool):
+        raise PluginBundleError(f"invalid {config_path}: webSearch must be a JSON boolean")
+    if "finalAnswer" in loaded:
+        try:
+            FinalAnswerPolicy.parse(loaded["finalAnswer"])
+        except ValueError as exc:
+            raise PluginBundleError(f"invalid {config_path}: {exc}") from exc
+    return loaded
+
+
+def load_bundle_web_search_enabled(plugin_dir: str | None) -> bool:
+    """Return provider web-search policy, default on (ADR 0138)."""
+    return bool(_load_bundle_config(plugin_dir).get("webSearch", True))
+
+
+def load_bundle_final_answer(plugin_dir: str | None) -> FinalAnswerPolicy | None:
+    """Absent policy preserves unconstrained publication (ADR 0227)."""
+    config = _load_bundle_config(plugin_dir)
+    return FinalAnswerPolicy.parse(config["finalAnswer"]) if "finalAnswer" in config else None
 
 
 def load_bundle_platform_slack_grants(plugin_dir: str | None) -> frozenset[str]:

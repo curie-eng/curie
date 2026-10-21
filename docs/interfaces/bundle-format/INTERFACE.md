@@ -97,7 +97,22 @@ files**, each absent from a bundle that needs none, all three invisible to Claud
   the secret name shape and reserved fence (`connectors.config_name_invalid`,
   `connectors.config_name_reserved`), may not repeat (`connectors.duplicate_config`), may not also
   appear in `secrets`, `secret_files` or `sealed_secrets` (`connectors.config_is_secret`), and a
-  `url` connector cannot declare `config` (`connectors.remote_has_config`). Intake refuses any `sealed_secrets` declaration with
+  `url` connector cannot declare `config` (`connectors.remote_has_config`). A hosted connector may
+  declare `readiness_path`, an HTTP path the server answers when it can serve. Set, the server
+  container's readiness probe is exactly `httpGet` on that path and the `http` port
+  (`initialDelaySeconds: 2`, `periodSeconds: 10`, `timeoutSeconds: 5`, `failureThreshold: 3`) and
+  carries no `tcpSocket`; unset, it keeps the `tcpSocket` probe on the `http` port. The path starts
+  with `/` and is printable ASCII with no whitespace, `?` or `#` (`connectors.bad_readiness_path`),
+  and a `url` connector cannot declare it (`connectors.remote_has_readiness_path`). A hosted
+  connector may also declare `resources`, with optional `requests` and `limits`, each with optional
+  `cpu` and `memory` strings. Each value is merged per key over the server container's defaults
+  (`requests: {cpu: 10m, memory: 64Mi}`, `limits: {cpu: 500m, memory: 256Mi}`), so declaring only
+  `limits.memory` keeps the other three. Each value must be a positive Kubernetes quantity, and
+  after the merge each request must not exceed its limit (`connectors.bad_resources`); a `url`
+  connector cannot declare it (`connectors.remote_has_resources`). Neither field touches the caller
+  proxy container's probe or resources, and with both omitted the rendered Deployment is unchanged.
+  A consumer built before these fields refuses a bundle that sets either one as an unknown key.
+  Intake refuses any `sealed_secrets` declaration with
   `connectors.sealed_secrets_unsupported` until a decrypt path exists (see
   [sealed-credential](../sealed-credential/INTERFACE.md)). For a hosted (`image`/`build`) connector
   with `secrets:` declared, the rendered `.mcp.json` entry derives

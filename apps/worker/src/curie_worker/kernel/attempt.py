@@ -50,6 +50,7 @@ from ..reply_sink import (
     TargetRoute,
 )
 from ..runner_client import (
+    FinalAnswerProtocolError,
     RunnerError,
     RunnerSnapshotReadError,
     RunnerStreamTimeout,
@@ -549,6 +550,13 @@ async def _attempt_turn(
             classification=constants.CHANNEL_READ_UNENFORCED_CLASSIFICATION,
             error_message=exc.public_detail,
         )
+    except FinalAnswerProtocolError as exc:
+        release_order()
+        return failures.TurnOutcome(
+            terminal_ok=False,
+            classification="final-answer-validation",
+            error_message=str(exc),
+        )
     except MissingAgentPoolError as exc:
         # Before the SandboxError clause below, which would retry it. The
         # pool appears only after an operator changes the release values,
@@ -873,10 +881,12 @@ async def _consume(
     acc = delivery._StreamAccumulator(
         workspace_inferred_repo=workspace_inferred_repo,
         receipt_mode=self._config.turn_receipt,
+        verbatim_answer=getattr(turn, "verbatim_answer", False) is True,
     )
     silent_requesting_chat = self._is_factory_work_item_turn(qevent.event_id)
     reply = delivery._ThrottledReply(
         self._sink,
+        delivery_id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"curie-answer:{qevent.event_id}")),
         target=(
             None
             if routing._is_targetless(qevent) or silent_requesting_chat
@@ -1047,7 +1057,8 @@ async def _apply_frame(
 ) -> None:
     if isinstance(frame, TextDelta):
         acc.text_parts.append(frame.text)
-        await reply.stream(acc.rendered())
+        # Provisional assistant text can precede tool calls. Keep it for
+        # diagnostics, but only the terminal Final is an end-user answer.
     elif isinstance(frame, ToolNote):
         # Tool notes remain available on the ACI stream for internal
         # consumers, but they are not part of the user-facing reply. The
@@ -1080,6 +1091,14 @@ async def _apply_frame(
         acc.approval_granted_tool = frame.approval_granted_tool
         acc.approval_granted_arguments = frame.approval_granted_arguments
         acc.approval_display = frame.approval_display
+        acc.final_text_mode = frame.text_mode
+        if frame.text_mode is not None and not acc.verbatim_answer:
+            # A literal-delivery mark without negotiated exact output cannot
+            # be honored or safely decorated. Fail closed (ADR 0227).
+            acc.status = SessionStatus.CLASSIFIED_FAILURE
+            acc.classification = "final-answer-validation"
+            acc.final_text = "run failed: final answer validation required"
+            acc.final_text_mode = None
 
 
 async def _mark_side_effect_with_retry(
@@ -1164,9 +1183,15 @@ async def _finish(
 ) -> failures.TurnOutcome:
     if acc.status in (SessionStatus.DONE, SessionStatus.IDLE_AWAITING_INPUT):
         text = acc.rendered_with_receipt()
-        await reply.finalize(text)
+        verbatim = acc.delivers_verbatim
+        durable_answer = self._markers.supports_answer_outbox
+        if not durable_answer:
+            # The protected lane has a witnessed settlement contract. Preserve
+            # its existing send/ref adoption before witnessing completion.
+            await reply.finalize(text, verbatim=verbatim)
         return failures.TurnOutcome(
             terminal_ok=True,
+            answer=reply.prepare_final(text, verbatim=verbatim) if durable_answer else None,
             saw_side_effect=acc.saw_side_effect,
             text=text,
             status=acc.status,

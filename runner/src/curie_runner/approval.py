@@ -429,8 +429,39 @@ def process_approval_request(gate: ApprovalGate | None, args: dict[str, Any]) ->
         assert error is not None
         return _approval_error(error)
     if route is not None and gate is not None:
+        granted = gate.grantable_tool_for_route(route)
+        if granted is not None and _proxied_connector_tool(gate, granted):
+            # A policy approval carries no arguments, so the worker cannot mint
+            # the argument-bound grant the caller proxy requires and the
+            # approved call would be refused after a human said yes. The
+            # permission gate holds the call itself with its arguments shown,
+            # one approval, and the resume grant is bound to them. The route
+            # is not named: it selects the approver audience.
+            gate.policy_rejected = True
+            return _approval_error(_proxied_policy_refusal(granted))
         gate.policy_route = route
     return _APPROVAL_OK
+
+
+def _proxied_connector_tool(gate: ApprovalGate, tool: str) -> bool:
+    """Whether ``tool`` is ``mcp__<connector>__<tool>`` on a proxied connector.
+
+    The same live-name parse the worker uses before it mints a connector grant
+    (``apps/worker/src/curie_worker/kernel/claim.py::_connector_tool_grant``).
+    """
+
+    if not tool.startswith("mcp__") or tool.startswith("mcp__plugin_"):
+        return False
+    server, separator, upstream = tool.removeprefix("mcp__").partition("__")
+    return bool(separator and upstream) and server in gate.proxied_connector_servers
+
+
+def _proxied_policy_refusal(tool: str) -> str:
+    return (
+        f"Rejected: an approval request cannot carry {tool} through. Call {tool} "
+        "directly with the exact details you intend; it will be held for approval "
+        "with those details shown, and runs once after it is approved."
+    )
 
 
 # --- The permission gate (#245): canUseTool over approval-required tools --------
@@ -601,6 +632,13 @@ class ApprovalGate:
     bundle_name: str | None = None
     mcp_servers: set[str] | None = None
     connector_servers: set[str] | None = None
+    # Hosted connectors this session reaches through the caller proxy: the
+    # derived entries carrying the caller header. The proxy forwards a gated
+    # call only with a worker-minted grant bound to its exact arguments
+    # (#3552), which a policy approval cannot supply. ``__main__`` sets it once
+    # the connector entries are derived; empty means none, the safe default
+    # for every other tool.
+    proxied_connector_servers: frozenset[str] = frozenset()
     # Whether THIS session actually mounted the ``curie-state`` MCP server
     # (#2286 adversarial round). The runner mounts it only when
     # ``resolve_state_client`` returns a client, so the platform's own

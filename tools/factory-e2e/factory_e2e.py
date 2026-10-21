@@ -126,16 +126,18 @@ sandbox claim carried CURIE_REPO_CA_BUNDLE, the publication Job mounted
 and exactly one pull request, the stub saw no unsupported request, and no
 log shows a TLS verification failure.
 
-`repo-runner` (repo_runner.py) installs the operator's repository bindings in
-its own k8 namespace under release `factory-tools`. It uses a local scripted
-Messages endpoint that requests the actual image tool manifest, then drives X
-and Y on the same thread and both refusal faults on fresh threads. Set
-CURIE_FACTORY_REPO_RUNNER_PLAN to the JSON plan documented in that module and
-CURIE_LOCAL_STUB_HOST to an IPv4 reachable from k8. The scenario uses the
-ordinary GitHub fixture/App settings and refuses model credentials or an
-external model URL. Live acceptance is deferred to the w1 runtime wave: the
-current sticky repository selection produces workspace.selection_conflict,
-which fails the scenario. Synthetic observation samples are only judge tests.
+`repo-runner` (repo_runner.py) installs the operator's three repository
+bindings, two with runners and one without, in its own namespace under release
+`factory-tools` on the cluster named by an explicit --context (for example
+k8-scratch). A local scripted Messages endpoint requests the image tool
+manifest on each of seven turns: X and Y on their runners, the unconfigured
+repository on the agent image, Y refused with workspace.selection_conflict on
+X's thread, X after a runner change on that thread, and both refusal faults on
+fresh threads. Set CURIE_FACTORY_REPO_RUNNER_PLAN to the JSON plan documented
+in that module and CURIE_LOCAL_STUB_HOST to an IPv4 reachable from the
+cluster. The scenario uses the ordinary GitHub fixture/App settings and
+refuses model credentials or an external model URL. Synthetic observation
+samples are only judge tests.
 `curie dev factory-e2e judge-repo-runner --observation <file>` runs the offline
 judge with no credentials or cluster contact.
 
@@ -6401,10 +6403,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parents=[common],
         help="preflight, then one scenario driver",
         description=(
-            "repo-runner: k8 only, release factory-tools, local scripted model. "
-            "Set CURIE_FACTORY_REPO_RUNNER_PLAN (full chart bindings and four turns) "
-            "and CURIE_LOCAL_STUB_HOST. Requires the later w1 runner routing, manifest "
-            "and same-thread repository-switching runtime; current behavior fails closed."
+            "repo-runner: needs an explicit --context (a throwaway cluster such as "
+            "k8-scratch), release factory-tools, local scripted model. Set "
+            "CURIE_FACTORY_REPO_RUNNER_PLAN (three chart bindings and seven turns) and "
+            "CURIE_LOCAL_STUB_HOST."
         ),
     )
     scenario.add_argument("--scenario", required=True, choices=tuple(SCENARIOS))

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import uuid
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 
@@ -24,9 +23,15 @@ from ..behaviorpacks import (
 )
 from ..delivery_lease import DeliveryLease
 from ..hook_runs import HookRunOutcome, HookRunReason
-from ..markers import CompletionRecord, DoneMarkerValue, MalformedCompletionError
+from ..markers import (
+    CompletionRecord,
+    DoneMarkerValue,
+    MalformedCompletionError,
+    completion_generation,
+)
 from ..reply_sink import (
     DeletedReplyTargetError,
+    ObservedReplySink,
     ProviderEgressRefusedError,
     TargetRoute,
 )
@@ -272,6 +277,12 @@ async def _complete(
             outcome=cast("Any", outcome),
         ),
         route=route,
+        answer=turn.answer if turn is not None and outcome == "delivered" else None,
+        answer_best_effort=(
+            turn is not None
+            and turn.answer is not None
+            and self._is_approval_resume(qevent.event_id)
+        ),
         created_at=clock.time.time(),
         done=False,
     )
@@ -328,7 +339,7 @@ async def _complete(
             # redelivery escalates on its side-effect marker while the
             # successor drops at the terminal-row preamble.
             await self._markers.publish_successor(self._config.stream, successor.model_dump_json())
-        await self._markers.mark_done(event_id, marker_value=marker_value)
+        await self._markers.mark_done(event_id, marker_value=marker_value, generation=generation)
     constants._LIFECYCLE_OUTCOME.set(telemetry_outcome)
     if notice is not None:
         # Claimed before the post, so a cancellation during or after it can
@@ -374,7 +385,7 @@ async def _settle_and_publish(
     exists and this slice is settled. Otherwise the error stands and the carry
     keeps the run open, because the successor may still exist.
     """
-    record_generation = uuid.uuid4().hex
+    record_generation = completion_generation(record)
     hook_carry = constants._HOOK_RUN_CARRY.get()
     if hook_carry is not None:
         hook_carry.successor_maybe_published = True
@@ -496,7 +507,19 @@ async def _deliver_completion(self: Kernel, record: CompletionRecord, *, generat
     event id.
     """
     try:
-        await self._sink.emit(record.event, route=record.route)
+        completed = record.event
+        if record.answer is not None:
+            self._terminal_reply_attempted.add(record.event_id)
+            ack = await ObservedReplySink(self._sink).emit(
+                record.answer,
+                route=record.route,
+                best_effort_unreachable=record.answer_best_effort,
+            )
+            if ack.ref and completed.target.reply_ref is None:
+                completed = completed.model_copy(
+                    update={"target": completed.target.model_copy(update={"reply_ref": ack.ref})}
+                )
+        await self._sink.emit(completed, route=record.route)
     except DeletedReplyTargetError as exc:
         if await self._markers.dead_letter_completion(
             record, generation=generation, reason=exc.reason
@@ -548,7 +571,7 @@ async def _reemit_pending_completion(self: Kernel, event_id: str) -> None:
     except MalformedCompletionError as exc:
         await self._quarantine_completion(event_id, exc)
         return
-    if stored is None:
+    if stored is None or not stored.done_flag:
         return
     await self._deliver_completion(stored.record, generation=stored.generation)
 
@@ -573,7 +596,7 @@ async def _quarantine_completion(
         event_id,
         exc,
     )
-    await self._markers.drop_pending_member(event_id)
+    await self._markers.drop_pending_member(event_id, answer_namespace=exc.answer_namespace)
 
 
 async def sweep_pending_completions(self: Kernel) -> None:
@@ -617,14 +640,15 @@ async def sweep_pending_completions(self: Kernel) -> None:
     sent = 0
     now = clock.time.time()
     deadline = now + self._config.completion_sweep_budget_s
-    batch = await self._markers.pending_completions(self._config.completion_sweep_batch)
+    batch = await self._markers.pending_completion_entries(self._config.completion_sweep_batch)
     # ONE pipeline for the whole batch's records: the reads are independent
     # of each other and of every delivery decision below, so paying a round
     # trip per member (up to completion_sweep_batch of them, on the same
     # Valkey the kernel's locks live on) bought nothing. The wall-time budget
     # still bounds the part that is actually slow -- the delivery attempts.
-    stored_batch = await self._markers.read_completions(sorted(batch))
-    for seen, (event_id, stored) in enumerate(stored_batch.items()):
+    stored_batch = await self._markers.read_completion_entries(sorted(batch))
+    for seen, (entry, stored) in enumerate(stored_batch.items()):
+        event_id = entry.event_id
         if clock.time.time() >= deadline:
             logger.info(
                 "completion sweep budget (%.0fs) reached after %d record(s); "
@@ -643,7 +667,9 @@ async def sweep_pending_completions(self: Kernel) -> None:
             # record to guide it, and no route to reconstruct one from.
             # Only the stale index entry goes: deleting the KEY here would
             # destroy a record a concurrent retry may have just written.
-            await self._markers.drop_pending_member(event_id)
+            await self._markers.drop_pending_member(
+                event_id, answer_namespace=entry.answer_namespace
+            )
             continue
         record = stored.record
         age = now - record.created_at

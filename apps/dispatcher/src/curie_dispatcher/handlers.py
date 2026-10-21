@@ -93,7 +93,12 @@ from .approval_actions import (
 )
 from .config import DispatcherConfig, release_identity
 from .identities import delivery_key, minted_adapter
-from .identity import IdentityResolver, build_identity_client, principal_observer_middleware
+from .identity import (
+    IdentityResolver,
+    build_identity_client,
+    principal_observer_middleware,
+    slack_evidence,
+)
 from .inbound_attachments import derive_attachments
 from .inbound_text import derive_text
 from .marked_actions import MARK, REFUSAL, declared_driver, reserve_turn
@@ -105,6 +110,9 @@ if TYPE_CHECKING:
     from redis import Redis
 
 Clock = Callable[[], str]
+
+
+CONNECT_ACCOUNT_ACTION_ID = "curie_connect_account"
 
 
 def _utc_now_iso() -> str:
@@ -244,20 +252,59 @@ def _refused_caller(
     slack_identity: str,
     callers: list[str],
     lane: str,
+    body: dict[str, Any],
+    web_client: WebClient,
 ) -> bool:
     """Ask the platform whether this caller may start a turn; drop them if not.
 
     The one admission call site for every turn-starting lane, so the three
     lanes cannot drift apart on what they ask or how a refusal is recorded. It
     runs after the lane's own filters and BEFORE ``claim_event``: a refused
-    caller claims nothing, gets no placeholder and no reply (decision 3), and a
+    caller claims nothing and gets no public reply. Only a fresh API connect
+    URL can produce a private account-connect prompt (ADR 0220), and a
     later delivery of the same event after the list changes is judged afresh.
 
     Returns:
         True when the caller was refused and the delivery dropped.
     """
+    evidence = slack_evidence(body)
+
+    def offer_connect(url: str) -> None:
+        user = evidence.get("user_id") if evidence is not None else None
+        if not isinstance(user, str) or not user:
+            return
+        try:
+            web_client.chat_postEphemeral(
+                channel=channel,
+                user=user,
+                text="Connect your account, then ask again.",
+                blocks=[
+                    {
+                        "type": "section",
+                        "text": {"type": "mrkdwn", "text": "Connect your account, then ask again."},
+                    },
+                    {
+                        "type": "actions",
+                        "elements": [
+                            {
+                                "type": "button",
+                                "action_id": CONNECT_ACCOUNT_ACTION_ID,
+                                "text": {"type": "plain_text", "text": "Connect account"},
+                                "url": url,
+                            }
+                        ],
+                    },
+                ],
+            )
+        except Exception as error:  # noqa: BLE001 - a failed private prompt still refuses the turn
+            log.warning("private connect prompt failed error=%s", type(error).__name__)
+
     reason = admission.refusal(
-        address=channel, adapter=minted_adapter(slack_identity), callers=callers
+        address=channel,
+        adapter=minted_adapter(slack_identity),
+        callers=callers,
+        slack=evidence,
+        on_connect=offer_connect,
     )
     if reason is None:
         return False
@@ -504,6 +551,8 @@ def process_event(
                 )
             ),
             lane=lane,
+            body=body,
+            web_client=web_client,
         ):
             return None
         if not claim_event(redis_client, config, delivery_id):
@@ -652,7 +701,9 @@ def process_action(
     # Approval-card buttons (#246) resolve through the API, never become a
     # turn. Bolt runs every matching listener, so this catch-all sees the
     # click too and must yield to the dedicated approval listener.
-    if is_approval_action(str(actions[0].get("action_id", ""))):
+    action_id = str(actions[0].get("action_id", ""))
+    if is_approval_action(action_id) or action_id == CONNECT_ACCOUNT_ACTION_ID:
+        # URL buttons open a browser; confirming one must not replay a turn.
         return None
     command = action_command(actions[0])
     if not command:
@@ -705,6 +756,8 @@ def process_action(
             slack_identity=slack_identity,
             callers=[str(user)] if user else [],
             lane="action",
+            body=body,
+            web_client=web_client,
         ):
             return None
         if not claim_event(redis_client, config, slack_event_id):
@@ -874,6 +927,7 @@ def register_handlers(
                 address=channel,
                 adapter=minted_adapter(slack_identity),
                 callers=list(dict.fromkeys([driver.bot_user_id, driver.bot_id])),
+                slack=slack_evidence(body),
             )
             if refusal is not None:
                 drop(log, refusal, event_id=delivery_id, lane="mention")

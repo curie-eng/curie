@@ -441,6 +441,46 @@ class OutboundRedactor:
                     break
         return end
 
+    def _final_from_stream(self, text: str) -> str | None:
+        """Keep redaction context when a final selects only a stream suffix.
+
+        Translation deliberately drops pre-tool narration from its fallback
+        candidate. Secret spans crossing that boundary must still be redacted,
+        without restoring the dropped narration. A connector notice can precede
+        the suffix, so align the shared tail rather than requiring full equality.
+        """
+        shared = 0
+        for left, right in zip(reversed(text), reversed(self._streamed), strict=False):
+            if left != right:
+                break
+            shared += 1
+        if not shared:
+            return None
+        start = len(self._streamed) - shared
+        lead = len(text) - shared
+        breaks = [lead + at - start for at in self._streamed_breaks if at > start]
+        held = self._literal_intervals(self._streamed)
+        spans = sorted(held + [
+            match.span()
+            for rule in REDACTION_RULES
+            for match in rule.pattern.finditer(self._streamed)
+        ])
+        end = start
+        for first, last in spans:
+            if first < end and last > end:
+                end = last
+        if end > start:
+            # Extend across overlapping spans before masking. Redact the whole
+            # reconstructed final again below, including any notice prefix.
+            placeholder = (
+                _HELD_PLACEHOLDER if any(a < start < b for a, b in held) else "[REDACTED]"
+            )
+            cut = lead + end - start
+            text = text[:lead] + placeholder + text[cut:]
+            shift = len(placeholder) - (end - start)
+            breaks = [at + shift for at in breaks if at > cut]
+        return self._scrub_with_breaks(text, breaks, "")
+
     def push(self, line: str) -> tuple[str, ...]:
         record = cast("dict[str, object]", json.loads(line))
         if record.get("type") == "text_delta" and isinstance(record.get("text"), str):
@@ -470,15 +510,8 @@ class OutboundRedactor:
             # pause), perhaps behind the connector notice, gets the stream's
             # block breaks. It is scrubbed whole, never as its streamed chunks.
             final_text = record.get("text")
-            if (
-                self._streamed
-                and isinstance(final_text, str)
-                and final_text.endswith(self._streamed)
-            ):
-                lead = len(final_text) - len(self._streamed)
-                streamed_final = self._scrub_with_breaks(
-                    final_text, [lead + at for at in self._streamed_breaks], ""
-                )
+            if self._streamed and isinstance(final_text, str):
+                streamed_final = self._final_from_stream(final_text)
         for name in _CONTENT_FIELDS & record.keys():
             scrubbed: object
             if (

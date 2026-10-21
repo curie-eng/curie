@@ -51,6 +51,7 @@ from pydantic import ValidationError
 
 from .executor import EXECUTOR_MODE, ExecuteRefusal, Executor
 from .executor import RUNNER_MODE_ENV as RUNNER_MODE_ENV
+from .final_answer import FINAL_ANSWER_HEADER
 from .session import SessionRunner
 from .turn_progress import ProgressCapability
 from .workspace_snapshot import WorkspaceSnapshot, WorkspaceSnapshotError
@@ -377,6 +378,11 @@ def _frame_error(exc: Exception) -> str:
 
 async def _event(request: web.Request) -> web.StreamResponse:
     runner: SessionRunner = request.app[RUNNER]
+    support = request.headers.getall(FINAL_ANSWER_HEADER, [])
+    if (support and support != ["1"]) or (runner.final_answer_required and support != ["1"]):
+        return web.json_response(
+            {"error": "final answer publication support version 1 required"}, status=400
+        )
     admission_header = request.headers.get(_CAPACITY_ADMISSION_HEADER)
     if admission_header not in (None, "wait"):
         return web.json_response({"error": "invalid capacity admission mode"}, status=400)
@@ -397,6 +403,8 @@ async def _event(request: web.Request) -> web.StreamResponse:
         status=200,
         headers={"Content-Type": _NDJSON, _TURN_EPOCH_HEADER: turn_epoch},
     )
+    if runner.final_answer_required:
+        response.headers[FINAL_ANSWER_HEADER] = "1"
     await response.prepare(request)
     # aclosing guarantees the generator is finalized on THIS driving task. On a
     # client disconnect, response.write() raises from this frame; without

@@ -2168,6 +2168,9 @@ sys.exit(result.returncode)
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
                 Err(error) => return Err(error.into()),
             };
+            // macOS inherits the listener's nonblocking mode on accept. The
+            // event protocol waits for one bounded line after connecting.
+            stream.set_nonblocking(false)?;
             stream.set_read_timeout(Some(Duration::from_secs(2)))?;
             let mut event = String::new();
             BufReader::new(&stream).read_line(&mut event)?;
@@ -2202,6 +2205,25 @@ sys.exit(result.returncode)
                 thread::sleep(Duration::from_millis(5));
             }
         }
+    }
+
+    #[test]
+    fn barrier_reads_an_event_sent_after_the_connection_is_accepted() -> Result<()> {
+        let mut barrier = Barrier::new()?;
+        let address = barrier.listener.local_addr()?;
+        let (connected, ready) = std::sync::mpsc::channel();
+        let sender = thread::spawn(move || -> std::io::Result<()> {
+            let mut stream = TcpStream::connect(address)?;
+            connected.send(()).unwrap();
+            thread::sleep(Duration::from_millis(100));
+            stream.write_all(b"status:before:9.0\n")
+        });
+        ready.recv_timeout(Duration::from_secs(2))?;
+        let event = barrier.event();
+        sender.join().unwrap()?;
+        let (event, _) = event?.context("connected peer was not accepted")?;
+        assert_eq!(event, "status:before:9.0");
+        Ok(())
     }
 
     fn healthy(observation: &Observation) {
@@ -2340,13 +2362,17 @@ sys.exit(result.returncode)
         if std::env::var(CHILD).as_deref() == Ok(name) {
             return child_scenario();
         }
+        let _pacing = CLUSTER_PACING
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Other CLI tests temporarily replace PATH with fixture executables.
+        // Pin the real tool inventory and child environment while those
+        // mutations are excluded, just like every other process-env consumer.
+        let _environment = crate::PROCESS_ENV_LOCK.blocking_lock();
         if executable("docker").is_err() && std::env::var_os("CI_REQUIRE_DOCKER_TESTS").is_none() {
             eprintln!("skipping {name}: docker executable is unavailable");
             return Ok(());
         }
-        let _pacing = CLUSTER_PACING
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut fixture = Fixture::new()?;
         let outcome = fixture.start().and_then(|()| scenario(&mut fixture));
         let cleanup = fixture.cleanup();
