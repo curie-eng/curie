@@ -32,7 +32,7 @@ from .test_commissioning_records import permit_value
 
 pworker_service = wb.pworker_service
 
-ROLES = ("provisioner", "issuer", "control", "candidate_enqueue", "candidate_worker")
+ROLES = ("provisioner", "issuer", "control", "observer", "candidate_enqueue", "candidate_worker")
 CANDIDATES = ("candidate_enqueue", "candidate_worker")
 
 
@@ -121,7 +121,7 @@ def test_candidate_roles_require_the_campaign_permit(role: str, value: Any) -> N
         module().commissioning_acl_rules(role, permit=value)
 
 
-@pytest.mark.parametrize("role", ["provisioner", "issuer", "control"])
+@pytest.mark.parametrize("role", ["provisioner", "issuer", "control", "observer"])
 def test_installation_roles_take_no_campaign_permit(role: str) -> None:
     with pytest.raises(ValueError):
         module().commissioning_acl_rules(role, permit=permit())
@@ -220,6 +220,8 @@ EXPECTED: dict[str, dict[str, set[str]]] = {
         "get": CONTROL | {"permit", "journal", "floor"},
         "xadd": {"lane_stream"},
     },
+    # Design decision 7: reads ACL users only, never a key.
+    "observer": {"get": set()},
     "candidate_worker": {
         "get": CONTROL | {"permit", "journal", "floor", "admission"} | LANE,
         "set": LANE,
@@ -454,7 +456,6 @@ ADMIN = (
     # The provisioner disables principals and kills their sessions; it never
     # deletes a user, reads stored rules or password hashes, or lists clients.
     ("ACL", "DELUSER", "probe-user"),
-    ("ACL", "GETUSER", "probe-user"),
     ("ACL", "USERS"),
     ("CLIENT", "LIST"),
     ("CLIENT", "PAUSE", "1"),
@@ -472,8 +473,12 @@ def test_administrative_commands_stay_closed(pworker_service, principals, role) 
         assert not dryrun(pworker_service, username, call), (role, call[0])
     for call in PROVISIONER_ONLY:
         assert dryrun(pworker_service, username, call) == (role == "provisioner"), (role, call)
-    for call in (("ACL", "WHOAMI"), ("TIME",), ("INFO", "server"), ("PING",)):
-        assert dryrun(pworker_service, username, call), (role, call)
+    assert dryrun(pworker_service, username, ("ACL", "GETUSER", "probe-user")) == (
+        role == "observer"
+    )
+    assert dryrun(pworker_service, username, ("PING",))
+    for call in (("ACL", "WHOAMI"), ("TIME",), ("INFO", "server")):
+        assert dryrun(pworker_service, username, call) == (role != "observer"), (role, call)
     assert dryrun(pworker_service, username, ("SCAN", "0")) == (role == "candidate_worker")
 
 
@@ -498,9 +503,56 @@ def test_provisioner_reads_no_user_or_client_inventory(pworker_service, principa
         client.close()
 
 
+def test_observer_reads_principal_state_and_nothing_else(pworker_service, principals) -> None:
+    """Design decision 7: password hashes and enabled state through ACL GETUSER only."""
+    pworker_service.command("FLUSHDB")
+    target = principals["candidate_worker"]
+    key = "protected:commissioning:permit:example"
+    pworker_service.command("SET", key, "seed")
+    client = principals["observer"].raw(protocol=3)
+
+    def state() -> tuple[set[str], bool]:
+        reply = client.execute_command("ACL", "GETUSER", target.username)
+        reply = {(k.decode() if isinstance(k, bytes) else k): v for k, v in dict(reply).items()}
+        flags = {f.decode() if isinstance(f, bytes) else f for f in reply["flags"]}
+        hashes = {h.decode() if isinstance(h, bytes) else h for h in reply["passwords"]}
+        return hashes, "on" in flags
+
+    try:
+        hashes, enabled = state()
+        assert hashes == {hashlib.sha256(target.password.encode()).hexdigest()} and enabled
+        pworker_service.command("ACL", "SETUSER", target.username, "off", ">changed")
+        changed, enabled = state()
+        assert not enabled and changed > hashes
+        for call in (
+            ("ACL", "SETUSER", target.username, "on"),
+            ("ACL", "SETUSER", principals["observer"].username, "+@all", "~*"),
+            ("ACL", "DELUSER", target.username),
+            ("ACL", "USERS"),
+            ("ACL", "LIST"),
+            ("ACL", "LOG"),
+            ("ACL", "WHOAMI"),
+            ("CLIENT", "KILL", "USER", target.username),
+            ("CLIENT", "LIST"),
+            ("GET", key),
+            ("TYPE", key),
+            ("EXISTS", key),
+            ("SCAN", "0"),
+            ("EVAL", UNDECLARED_READ, 0, key),
+            ("PUBLISH", "probe", "1"),
+            ("SUBSCRIBE", "probe"),
+            ("TIME",),
+            ("INFO", "server"),
+        ):
+            assert not real(client, call), call
+        assert state()[1] is False
+    finally:
+        client.close()
+
+
 def test_identities_authenticate_as_themselves(pworker_service, principals) -> None:
     """Spec refusal step 3 needs ACL WHOAMI on each commissioning identity."""
-    for role in ROLES:
+    for role in (role for role in ROLES if role != "observer"):
         client = principals[role].raw(protocol=3)
         try:
             name = client.execute_command("ACL", "WHOAMI")

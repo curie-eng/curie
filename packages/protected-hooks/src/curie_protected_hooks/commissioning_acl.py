@@ -11,7 +11,10 @@ command the script issues is checked again, so declaring a key grants nothing.
 
 The provisioner disables principals and kills their sessions: ``ACL SETUSER``
 and ``CLIENT KILL`` only. The pinned Valkey cannot scope ``ACL SETUSER`` to named
-users, so that right is transitive; this is an open review point.
+users, so that right is transitive. Misuse is detected, not prevented: the ACL
+observer, which holds only ``ACL GETUSER`` and no key or channel, reads each
+principal's password hashes and enabled state for the reobservation check
+(the specification's design decision 7). This module does not run that check.
 """
 
 from __future__ import annotations
@@ -70,6 +73,8 @@ _CONTROL = (
     "(+setnx %W~" + ADMISSION + "*)",
     "(+eval %RW~" + PERMIT + "* %RW~" + ADMISSION + "* " + _CONTROL_KEYS.replace("~", "%RW~") + ")",
 )
+# Design decision 7: the checked provisioner never reads its own evidence.
+_OBSERVER = (*_RESET, *_HANDSHAKE, "+acl|getuser")
 _CANDIDATE_READS = "+get +type " + _CONTROL_READ + " %R~" + PERMIT + "* %R~" + JOURNAL + "*"
 
 
@@ -101,7 +106,12 @@ def commissioning_acl_rules(
     principals are confined to the lane the permit derives.
     """
     if type(role) is str:
-        installation = {"provisioner": _PROVISIONER, "issuer": _ISSUER, "control": _CONTROL}
+        installation = {
+            "provisioner": _PROVISIONER,
+            "issuer": _ISSUER,
+            "control": _CONTROL,
+            "observer": _OBSERVER,
+        }
         if role in installation:
             if permit is not None:
                 raise ValueError("installation principals take no campaign permit")
