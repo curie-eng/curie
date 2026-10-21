@@ -788,15 +788,17 @@ class SandboxSubstrate:
                     raise NoRouteError(thread_key)
                 # A suspended route keeps its claim but not its daemon (ADR 0217);
                 # resume provisions a fresh one with the replacement claim.
-                retire_by = time.monotonic() + _CONTROL_REQUEST_TIMEOUT_S
+                # The retirement budget starts once the patch returns or raises.
                 try:
                     self._k8s.set_sandbox_mode(record.handle.sandbox_name, "Suspended")
                     self._affinity.mark_suspended(
                         thread_key, history_ref, self._config.suspended_route_ttl_seconds
                     )
                 except Exception:
+                    retire_by = time.monotonic() + _CONTROL_REQUEST_TIMEOUT_S
                     self._retire_daemon_quietly(record.handle.claim_name, record.handle, retire_by)
                     raise
+                retire_by = time.monotonic() + _CONTROL_REQUEST_TIMEOUT_S
                 self._retire_daemon(record.handle.claim_name, record.handle, retire_by)
             except Exception as exc:  # noqa: BLE001 - existing broad catch retained
                 error = exc
@@ -1718,6 +1720,12 @@ class SandboxSubstrate:
             return False
         if files is None:
             return False
+        deadline = time.monotonic() + daemon.ping_timeout_seconds
+        # Service, policy and ping all share one pingTimeoutSeconds budget.
+        if not tool_daemon.endpoint_present(
+            self._k8s, daemon, handle.claim_name, deadline=deadline
+        ):
+            return False
         host = tool_daemon.service_host(handle.claim_name, daemon.namespace)
         return tool_daemon.ping(
             self._k8s,
@@ -1726,7 +1734,7 @@ class SandboxSubstrate:
             daemon.port,
             host,
             files,
-            daemon.ping_timeout_seconds,
+            deadline - time.monotonic(),
         )
 
     def _claim_fresh(

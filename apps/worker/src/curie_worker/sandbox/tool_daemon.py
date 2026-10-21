@@ -584,6 +584,31 @@ def request(
                     return answer
 
 
+def endpoint_present(
+    client: SandboxClient, config: ToolDaemonConfig, claim: str, *, deadline: float
+) -> bool:
+    """Whether ``claim``'s Service and ingress NetworkPolicy both exist. Fails closed.
+
+    The ping reaches the Pod through the API, so it cannot see a deleted Service
+    (the runner's DOCKER_HOST) or policy (the runner's only path to the daemon).
+    """
+
+    selector = _selector(config, claim)
+    try:
+        return all(
+            client.list_daemon_objects(
+                config.namespace,
+                kind,
+                label_selector=selector,
+                request_timeout_seconds=_bound(deadline),
+            )
+            for kind in ("Service", "NetworkPolicy")
+        )
+    except Exception as exc:  # noqa: BLE001 - unknown is not present
+        logger.warning("tool daemon endpoint of %s unreadable (%s)", claim, type(exc).__name__)
+        return False
+
+
 def ping(
     client: SandboxClient,
     namespace: str,
