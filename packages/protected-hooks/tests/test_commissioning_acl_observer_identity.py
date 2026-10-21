@@ -51,6 +51,10 @@ class BrokerReader:
         return False
 
 
+# The fixture manifest's qualification_id; the publisher's recipe is confined to it.
+QUALIFICATION_ID = "44444444-4444-4444-8444-444444444444"
+
+
 def _rules(name: str) -> tuple[str, ...]:
     if name in ("enqueue", "verifier"):
         return admission_acl_rules(name)
@@ -58,12 +62,14 @@ def _rules(name: str) -> tuple[str, ...]:
         return worker_acl_rules("worker")
     if name.startswith("candidate_"):
         return commissioning_acl_rules(name, permit=permit())
+    if name == "qualification_publisher":
+        return commissioning_acl_rules(name, qualification_id=QUALIFICATION_ID)
     return commissioning_acl_rules(name)
 
 
 @pytest.fixture
 def installed(pworker_service):
-    """The seven checked principals, the provisioner, the observer and an admin user."""
+    """The checked principals, the provisioner, the observer and an admin user."""
     users = {}
     try:
         for name in (*ACL_PRINCIPALS, "provisioner", "observer"):
@@ -89,6 +95,7 @@ def _producer(service, users, reader_role):
     value["control_identity"]["id"] = users["control"].username
     value["candidate_credentials"]["enqueue"]["id"] = users["candidate_enqueue"].username
     value["candidate_credentials"]["worker"]["id"] = users["candidate_worker"].username
+    value["qualification_publisher_identity"]["id"] = users["qualification_publisher"].username
     bootstrap = parse_commissioning_bootstrap(encoded(value))
     # The administrator-run installation step records the baseline.
     states = {

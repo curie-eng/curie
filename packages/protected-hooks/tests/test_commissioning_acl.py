@@ -33,8 +33,27 @@ from .test_commissioning_records import permit_value
 
 pworker_service = wb.pworker_service
 
-ROLES = ("provisioner", "issuer", "control", "observer", "candidate_enqueue", "candidate_worker")
+ROLES = (
+    "provisioner",
+    "issuer",
+    "control",
+    "observer",
+    "candidate_enqueue",
+    "candidate_worker",
+    "qualification_publisher",
+)
 CANDIDATES = ("candidate_enqueue", "candidate_worker")
+# The fixture manifest's qualification_id; the publisher is confined to it.
+QUALIFICATION_ID = "44444444-4444-4444-8444-444444444444"
+FOREIGN_QUALIFICATION_ID = "88888888-8888-4888-8888-888888888888"
+
+
+def options(role: str) -> dict[str, Any]:
+    if role in CANDIDATES:
+        return {"permit": permit()}
+    if role == "qualification_publisher":
+        return {"qualification_id": QUALIFICATION_ID}
+    return {}
 
 
 def module() -> Any:
@@ -122,18 +141,43 @@ def test_candidate_roles_require_the_campaign_permit(role: str, value: Any) -> N
         module().commissioning_acl_rules(role, permit=value)
 
 
-@pytest.mark.parametrize("role", ["provisioner", "issuer", "control", "observer"])
+@pytest.mark.parametrize(
+    "role", ["provisioner", "issuer", "control", "observer", "qualification_publisher"]
+)
 def test_installation_roles_take_no_campaign_permit(role: str) -> None:
     with pytest.raises(ValueError):
-        module().commissioning_acl_rules(role, permit=permit())
+        module().commissioning_acl_rules(role, permit=permit(), **options(role))
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        "",
+        "not-a-uuid",
+        "ABCDEFAB-ABCD-4BCD-8BCD-ABCDEFABCDEF",
+        1,
+        "*",
+        QUALIFICATION_ID + ":*",
+    ],
+)
+def test_qualification_publisher_requires_one_qualification_id(value: Any) -> None:
+    """Design decision 8: the publisher's keys come from one closed UUID, never a pattern."""
+    with pytest.raises(ValueError):
+        module().commissioning_acl_rules("qualification_publisher", qualification_id=value)
+
+
+@pytest.mark.parametrize("role", [r for r in ROLES if r != "qualification_publisher"])
+def test_only_the_publisher_takes_a_qualification_id(role: str) -> None:
+    with pytest.raises(ValueError):
+        module().commissioning_acl_rules(
+            role, qualification_id=QUALIFICATION_ID, permit=options(role).get("permit")
+        )
 
 
 def test_recipes_are_closed_distinct_and_start_from_reset() -> None:
     api = module()
-    recipes = {
-        role: api.commissioning_acl_rules(role, permit=permit() if role in CANDIDATES else None)
-        for role in ROLES
-    }
+    recipes = {role: api.commissioning_acl_rules(role, **options(role)) for role in ROLES}
     assert len(set(recipes.values())) == len(ROLES)
     for rules in recipes.values():
         assert type(rules) is tuple
@@ -172,6 +216,14 @@ def families() -> dict[str, tuple[str, str]]:
         "selection": ("protected:control:selection:example", "string"),
         "manifest": ("protected:control:manifest:example", "string"),
         "qualification": ("protected:control:qualification:example", "string"),
+        "own_qualification": (
+            "protected:control:qualification:" + QUALIFICATION_ID + ":1",
+            "string",
+        ),
+        "foreign_qualification": (
+            "protected:control:qualification:" + FOREIGN_QUALIFICATION_ID + ":1",
+            "string",
+        ),
         "readiness": ("protected:control:readiness:example", "string"),
         "source": ("protected:source:example", "string"),
         "production_admission": ("protected:admission:intent:example", "string"),
@@ -195,7 +247,14 @@ COMMISSIONING = {
     "foreign_lane_stream",
     "foreign_lane_key",
 }
-CONTROL = {"selection", "manifest", "qualification", "readiness"}
+CONTROL = {
+    "selection",
+    "manifest",
+    "qualification",
+    "own_qualification",
+    "foreign_qualification",
+    "readiness",
+}
 LANE = {"lane_stream", "lane_key", "lane_dead"}
 
 # The specification's principals table, as direct authority per command family.
@@ -223,6 +282,12 @@ EXPECTED: dict[str, dict[str, set[str]]] = {
     },
     # Design decision 7: reads ACL users only, never a key.
     "observer": {"get": set()},
+    # Design decision 8: one manifest's Qualification keys, written once, nothing else.
+    "qualification_publisher": {
+        "get": {"own_qualification"},
+        "setnx": {"own_qualification"},
+        "type": set(),
+    },
     "candidate_worker": {
         "get": CONTROL | {"permit", "journal", "floor", "admission"} | LANE,
         "set": LANE,
@@ -314,9 +379,7 @@ def principals(pworker_service):
     installed = {}
     try:
         for role in ROLES:
-            rules = module().commissioning_acl_rules(
-                role, permit=permit() if role in CANDIDATES else None
-            )
+            rules = module().commissioning_acl_rules(role, **options(role))
             installed[role] = wb.WorkerPrincipal(pworker_service, role=role, rules=rules)
             installed[role].install()
         manifest = pworker_service.manifest()
@@ -420,7 +483,7 @@ def test_type_and_exists_follow_the_read_authority(pworker_service, principals) 
     keys = families()
     for role in ROLES:
         rights = EXPECTED[role]
-        typed = rights["get"] | rights.get("xadd", set())
+        typed = rights.get("type", rights["get"] | rights.get("xadd", set()))
         for family, (key, kind) in keys.items():
             seed(pworker_service, key, kind)
             username = principals[role].username
@@ -478,8 +541,11 @@ def test_administrative_commands_stay_closed(pworker_service, principals, role) 
         role == "observer"
     )
     assert dryrun(pworker_service, username, ("PING",))
-    for call in (("ACL", "WHOAMI"), ("TIME",), ("INFO", "server")):
-        assert dryrun(pworker_service, username, call) == (role != "observer"), (role, call)
+    for call in (("ACL", "WHOAMI"), ("TIME",)):
+        assert dryrun(pworker_service, username, call) == (
+            role not in ("observer", "qualification_publisher")
+        ), (role, call)
+    assert dryrun(pworker_service, username, ("INFO", "server")) == (role != "observer")
     assert dryrun(pworker_service, username, ("SCAN", "0")) == (role == "candidate_worker")
 
 
@@ -556,7 +622,7 @@ def test_observer_reads_principal_state_and_nothing_else(pworker_service, princi
 
 def test_identities_authenticate_as_themselves(pworker_service, principals) -> None:
     """Spec refusal step 3 needs ACL WHOAMI on each commissioning identity."""
-    for role in (role for role in ROLES if role != "observer"):
+    for role in (role for role in ROLES if role not in ("observer", "qualification_publisher")):
         client = principals[role].raw(protocol=3)
         try:
             name = client.execute_command("ACL", "WHOAMI")
@@ -580,6 +646,35 @@ def test_issuer_writes_each_record_once(pworker_service, principals) -> None:
                 with pytest.raises(NoPermissionError):
                     client.execute_command(*call)
             assert pworker_service.command("GET", key) in (b"first", "first")
+    finally:
+        client.close()
+
+
+def test_publisher_writes_its_qualification_once(pworker_service, principals) -> None:
+    """Design decision 8: SETNX on its own Qualification key; never SET, DEL or a script."""
+    pworker_service.command("FLUSHDB")
+    client = principals["qualification_publisher"].raw(protocol=3)
+    own = "protected:control:qualification:" + QUALIFICATION_ID + ":1"
+    try:
+        # HELLO AUTH named the principal: the session exists only as that user.
+        assert client.execute_command("SETNX", own, "first") == 1
+        assert client.execute_command("SETNX", own, "second") == 0
+        assert client.execute_command("GET", own) in (b"first", "first")
+        for call in (
+            ("SET", own, "second"),
+            ("SET", own, "second", "NX"),
+            ("DEL", own),
+            ("PEXPIRE", own, "1000"),
+            ("EVAL", WRITE_SCRIPT, 1, own, "x"),
+            ("SETNX", "protected:control:qualification:" + FOREIGN_QUALIFICATION_ID + ":1", "x"),
+            ("SETNX", "protected:control:readiness:example", "x"),
+            ("GET", "protected:control:manifest:example"),
+            ("ACL", "WHOAMI"),
+            ("ACL", "GETUSER", "default"),
+            ("PUBLISH", "probe", "1"),
+        ):
+            assert not real(client, call), call
+        assert pworker_service.command("GET", own) in (b"first", "first")
     finally:
         client.close()
 
