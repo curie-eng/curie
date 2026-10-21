@@ -43,6 +43,7 @@ __all__ = [
 OWNER_LABEL = "commissioning.curietech.ai/owner"
 _KUBECONFIG = "kubeconfig"
 _LOG = "commands.log"
+_REGISTRY_PORT = 80
 _DOCKER_CONFIG = "docker"
 # Pinned profile shape: one node, the Docker driver and a fixed control plane.
 KUBERNETES_VERSION = "v1.35.1"
@@ -431,9 +432,15 @@ class LocalCluster:
         from .commissioning_local_broker import _start_forward, _stop
 
         argv = self.commands.kubectl_argv(
-            "port-forward", "service/registry", ":80", "--namespace", "kube-system"
+            "port-forward",
+            "service/registry",
+            f":{_REGISTRY_PORT}",
+            "--namespace",
+            "kube-system",
         )
-        process, port = _start_forward(argv, self.commands.environment(os.environ))
+        process, port = _start_forward(
+            argv, self.commands.environment(os.environ), target_port=_REGISTRY_PORT
+        )
         try:
             path = repository.split("/", 1)[1]
             request = urllib.request.Request(  # noqa: S310  loopback forward to the owned registry.

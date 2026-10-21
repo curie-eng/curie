@@ -739,3 +739,20 @@ def test_the_provisioner_kubeconfig_never_lands_beside_the_admin_one(tmp_path: P
     open_dir.chmod(0o755)
     with pytest.raises(InstallationRefused):
         LocalCluster(ledger, kubeconfig=open_dir / "kubeconfig")
+
+
+def test_a_forward_to_another_port_is_refused() -> None:
+    """The ready line must name the expected target port, the broker's by default."""
+    import sys
+
+    api = module()
+    script = (
+        "import time; print('Forwarding from 127.0.0.1:41234 -> 8000', flush=True); time.sleep(60)"
+    )
+    with pytest.raises(api.BrokerRefused):
+        api._start_forward([sys.executable, "-c", script], dict(os.environ))
+    process, port = api._start_forward(
+        [sys.executable, "-c", script], dict(os.environ), target_port=8000
+    )
+    api._stop(process)
+    assert port == 41234

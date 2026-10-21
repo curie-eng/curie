@@ -552,16 +552,14 @@ def test_kubectl_port_forward_stays_on_loopback(tmp_path: Path) -> None:
             commands.kubectl_argv(*args, *address)
 
 
-def test_minikube_enables_addons_and_lists_images_only_on_its_profile(tmp_path: Path) -> None:
+def test_minikube_enables_addons_only_on_its_profile(tmp_path: Path) -> None:
     api = module()
     commands = api.ClusterCommands(OWNER, kubeconfig=tmp_path / "kubeconfig")
     assert commands.minikube_argv("addons", "enable", "registry")[:3] == ["minikube", "-p", OWNER]
-    assert commands.minikube_argv("image", "ls", "--format", "json")[3:] == [
-        "image",
-        "ls",
-        "--format",
-        "json",
-    ]
-    for args in (("addons", "enable", "registry", "-p", "other"), ("addons", "--all")):
+    for args in (
+        ("addons", "enable", "registry", "-p", "other"),
+        ("addons", "--all"),
+        ("image", "ls", "--format", "json"),
+    ):
         with pytest.raises(api.OwnershipRefused):
             commands.minikube_argv(*args)

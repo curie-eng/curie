@@ -136,7 +136,6 @@ _MINIKUBE_FLAGS = frozenset(
         "--nodes",
         "-o",
         "--output",
-        "--format",
     }
 )
 _DOCKER_COMMANDS = frozenset(

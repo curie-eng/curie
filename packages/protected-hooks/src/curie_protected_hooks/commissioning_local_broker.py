@@ -102,7 +102,7 @@ _SECRET = BROKER_TLS_SECRET
 _APP_LABEL = "app.kubernetes.io/name"
 _VALKEY_UID = 999
 _CERT_DAYS = 30
-_FORWARD = re.compile(rb"Forwarding from 127\.0\.0\.1:([0-9]{1,5}) -> [0-9]{1,5}")
+_FORWARD = rb"Forwarding from 127\.0\.0\.1:([0-9]{1,5}) -> %d"
 
 
 class BrokerRefused(RuntimeError):
@@ -532,11 +532,11 @@ def _drain(stream: Any) -> None:
 
 
 def _start_forward(
-    argv: list[str], environment: Mapping[str, str]
+    argv: list[str], environment: Mapping[str, str], *, target_port: int = BROKER_PORT
 ) -> tuple[subprocess.Popen[bytes], int]:
     """Start a port-forward and return it with its loopback port.
 
-    The first line must announce the forward. Every later line is drained on
+    The first line must announce the forward to ``target_port``. Every later line is drained on
     a daemon thread for the life of the process, so the pipe never fills and
     stalls the forward. Any failure stops the process. @spec PROTECTED-COMMISSIONING-1.
     """
@@ -547,7 +547,7 @@ def _start_forward(
         assert process.stdout is not None
         ready, _, _ = select.select([process.stdout], [], [], 30)
         line = process.stdout.readline() if ready else b""
-        match = _FORWARD.match(line)
+        match = re.fullmatch(_FORWARD % target_port + rb"\r?\n?", line)
         _require(match is not None)
         assert match is not None
         threading.Thread(target=_drain, args=(process.stdout,), daemon=True).start()

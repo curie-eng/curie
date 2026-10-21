@@ -206,7 +206,7 @@ def test_production_refuses_before_the_campaign(installed: Installed) -> None:
     argv = commands.kubectl_argv(
         "port-forward", "service/" + API_NAME, ":8000", "--namespace", installed.namespace
     )
-    process, port = _start_forward(argv, commands.environment(os.environ))
+    process, port = _start_forward(argv, commands.environment(os.environ), target_port=8000)
     m = installed.manifest.as_dict()
     hook = "alerts"
     try:

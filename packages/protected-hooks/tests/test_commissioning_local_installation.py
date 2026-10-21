@@ -42,7 +42,7 @@ class FakeRunner:
         self.cluster_uid: str | None = "cluster-uid"
         self.uid = 0
         self.tags: dict[str, str] = {}
-        self.digest = "@sha256:" + "c" * 64
+        self.digest = "@sha256:" + "c" * 64  # what the registry answers for a pushed tag
 
     def _seen(self) -> list[tuple[str, str, str]]:
         return [(e.kind, e.key, e.state) for e in self.ledger.entries()]
@@ -69,13 +69,6 @@ class FakeRunner:
             if argv[1:3] == ["image", "rm"]:
                 del self.tags[argv[-1]]
                 return b""
-        if argv[0] == "minikube" and argv[3:5] == ["image", "ls"]:
-            return json.dumps(
-                [
-                    {"repoTags": [tag], "repoDigests": [tag.rsplit(":", 1)[0] + self.digest]}
-                    for tag in self.tags
-                ]
-            ).encode()
         if argv[0] == "minikube":
             return b""
         verb = argv[5]

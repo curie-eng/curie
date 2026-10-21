@@ -344,8 +344,9 @@ Before the campaign the provisioner installs, and the campaign measures:
   entry points.
 
 With no Qualification or Readiness record present, the production worker's
-`open_runtime` refuses before consuming and the support probe answers
-`qualification_unavailable`. Those refusals are the ADR 0224 observation that
+`open_runtime` refuses before consuming, a protected source policy cannot be
+published (its publication evaluation answers `qualification_unavailable`) and
+the support probe answers `source_closed` for that unpublished source. Those refusals are the ADR 0224 observation that
 production credentials are assigned and isolated while production dispatch
 authority is unavailable.
 
@@ -604,8 +605,9 @@ changes. The only measured value that changes is the selection's
 `admission_open`, the predeclared authorization switch; its other members stay
 equal under compare and set. The verifier re-reads B, G, M and the execution
 digest after the last write and records that they equal the premeasured values. Before
-activation the production worker refuses in `open_runtime` and the support
-probe answers `qualification_unavailable`; after it, the same unchanged readers
+activation the production worker refuses in `open_runtime`, a protected source
+policy's publication refuses with `qualification_unavailable` and the support
+probe answers `source_closed`; after it, the same unchanged readers
 accept because the records they already require now exist.
 
 ### 5. Evidence bar
