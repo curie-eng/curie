@@ -448,10 +448,14 @@ def _summary(rows: Sequence[Mapping[str, Any]], thresholds: Mapping[str, Any]) -
         "status": "PASS" if falsewrite_pass else "FAIL",
         "value": falsewrite_rate,
     }
-    gates["correction_duplicates"] = {
-        "status": "PASS" if duplicates <= thresholds["correction_duplicates"] else "FAIL",
-        "value": duplicates,
-    }
+    # A correction row is an evaluated F8 decision; with none the gate has no evidence.
+    if not any(str(row["fixture_id"]).startswith("F8-") for row in eligible):
+        gates["correction_duplicates"] = {"status": "NOT_AVAILABLE", "value": None}
+    else:
+        gates["correction_duplicates"] = {
+            "status": "PASS" if duplicates <= thresholds["correction_duplicates"] else "FAIL",
+            "value": duplicates,
+        }
     off_target: dict[str, dict[str, int]] = {}
     for row in excluded:
         for mutation in row["mutations"]:
@@ -1503,7 +1507,14 @@ def _check_cleanup_live(report: _Report) -> None:
         kind: {str(e["name" if kind == "volumes" else "id"]) for e in manifest[kind]}
         for kind in ("containers", "runners", "resolver_containers", "volumes", "networks")
     }
-    owned["images"] = {str(item) for item in _lst(manifest.get("images", []), "images")}
+    for raw in _lst(manifest.get("images", []), "images"):
+        entry = _obj(raw, "images entry")
+        _text(entry.get("id"), "image identity")
+        _require(
+            str(entry.get("owner")) == project or str(entry.get("owner")).startswith(f"{project}-"),
+            "images entry lacks ownership evidence",
+        )
+    owned["images"] = {str(e["id"]) for e in manifest.get("images", [])}
     for raw in _lst(manifest.get("removals"), "removals"):
         removal = _obj(raw, "removal")
         _require(set(removal) == {"kind", "id"}, "removal fields")
@@ -1526,6 +1537,9 @@ def _check_cleanup_live(report: _Report) -> None:
         key = "name" if kind == "volumes" else "id"
         for entry in manifest[kind]:
             _require(entry[key] not in inventory, f"owned {kind} {entry[key]} still exists")
+    images = set(_docker_lines("image", "ls", "--format", "{{.Repository}}:{{.Tag}}"))
+    for image in owned["images"]:
+        _require(image not in images, f"owned image {image} still exists")
     for raw in processes:
         process = _obj(raw, "process")
         stat = Path(f"/proc/{_int(process.get('pid'), 'pid', 1)}/stat")
@@ -2148,6 +2162,9 @@ def _new_stack(
     )
 
 
+PLATFORM_IMAGE_PREFIX = "ghcr.io/curie-eng/curie-"
+
+
 @dataclass
 class _Ownership:
     project_prefix: str
@@ -2157,7 +2174,9 @@ class _Ownership:
     resolvers: dict[str, str] = field(default_factory=dict)
     volumes: dict[str, str] = field(default_factory=dict)
     networks: dict[str, str] = field(default_factory=dict)
-    images: set[str] = field(default_factory=set)
+    images: dict[str, str] = field(default_factory=dict)
+    projects: set[str] = field(default_factory=set)
+    tags: set[str] = field(default_factory=set)
     unrelated: dict[str, list[str]] = field(default_factory=dict)
     removals: list[dict[str, str]] = field(default_factory=list)
 
@@ -2191,15 +2210,22 @@ class _Ownership:
             "network", "ls", "--no-trunc", "--filter", label, "--format", "{{.ID}}"
         ):
             self.networks[item] = stack.project
-        for item in _docker_lines(
-            "image",
-            "ls",
-            "--filter",
-            f"reference=*/*/*:{stack.tag}",
-            "--format",
-            "{{.Repository}}:{{.Tag}}",
-        ):
-            self.images.add(item)
+        self.projects.add(stack.project)
+        self.tags.add(stack.tag)
+        self.observe_images()
+
+    def observe_images(self) -> None:
+        """Record every image a harness stack built: compose names images for
+        services with a build section and no image as `<project>-<service>`, and
+        `local up --build` tags the platform images with the stack's private tag."""
+
+        for item in _docker_lines("image", "ls", "--format", "{{.Repository}}:{{.Tag}}"):
+            repository, _, tag = item.rpartition(":")
+            owner = next((p for p in self.projects if repository.startswith(f"{p}-")), None)
+            if owner is None and repository.startswith(PLATFORM_IMAGE_PREFIX) and tag in self.tags:
+                owner = self.project_prefix
+            if owner is not None:
+                self.images[item] = owner
 
     def remove_leftovers(self, *, images: bool = True) -> list[str]:
         problems: list[str] = []
@@ -2223,11 +2249,17 @@ class _Ownership:
             if identity in networks:
                 with contextlib.suppress(_Invalid):
                     self.remove("networks", identity, "network", "rm")
-        for image in sorted(self.images) if images else []:
-            try:
-                self.remove("images", image, "image", "rm")
-            except _Invalid:
-                problems.append("a private image tag could not be removed")
+        if images:
+            with contextlib.suppress(_Invalid):
+                self.observe_images()
+            present = set(_docker_lines("image", "ls", "--format", "{{.Repository}}:{{.Tag}}"))
+            for image in sorted(self.images):
+                if image not in present:
+                    continue
+                try:
+                    self.remove("images", image, "image", "rm")
+                except _Invalid:
+                    problems.append(f"owned image {image} could not be removed")
         return problems
 
     def manifest(self) -> dict[str, Any]:
@@ -2243,7 +2275,7 @@ class _Ownership:
             "volumes": rows(self.volumes, "name"),
             "networks": rows(self.networks),
             "processes": [],
-            "images": sorted(self.images),
+            "images": rows(self.images),
             "removals": list(self.removals),
         }
 
