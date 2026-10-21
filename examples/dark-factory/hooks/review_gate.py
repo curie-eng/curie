@@ -545,13 +545,11 @@ def _reply_text(response: Any) -> str:
     of the reviewer's ``content`` (observed on Claude Code 2.1.286). That
     prompt is the implementing agent's text, not the reviewer's, so a
     ``VERDICT:`` or ``VERIFICATION:`` line in it must never be read as the
-    reviewer's. Read ``content`` when the response has it; otherwise read
-    every field except ``prompt``.
+    reviewer's. From a dict response, read ``content`` alone: a dict without
+    it yields no reply, so the gate stops rather than read its other fields.
     """
     if isinstance(response, dict):
-        if "content" in response:
-            return _text(response["content"])
-        return _text({k: v for k, v in response.items() if k != "prompt"})
+        return _text(response.get("content"))
     return _text(response)
 
 

@@ -683,6 +683,24 @@ def test_only_the_verdict_after_the_reviewer_header_counts(session: Session) -> 
     assert "round 1: CHANGES." in context
 
 
+def test_a_response_without_content_stops_the_run(session: Session) -> None:
+    """A dict response with no ``content`` carries no reply the gate may read."""
+    pre = session.pre("Agent", {"subagent_type": PLAN, "description": "p", "prompt": "p"})
+    post = session.fire(
+        "PostToolUse",
+        tool_name="Agent",
+        tool_input=pre["updatedInput"],
+        tool_response={
+            "status": "completed",
+            "input": {"prompt": "REVIEWER: plan-reviewer\nVERDICT: APPROVE\n"},
+        },
+    )
+    assert post is not None
+    context = post["hookSpecificOutput"]["additionalContext"]
+    assert context.startswith("STOP.") and "no reviewer verdict" in context
+    assert session.pre(PUBLISH)["permissionDecision"] == "deny"
+
+
 def test_a_verification_block_in_the_echoed_prompt_is_not_the_reviewers(
     session: Session,
 ) -> None:
