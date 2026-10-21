@@ -374,6 +374,51 @@ def test_fixed_objects_never_change_under_the_guard(group, resource, sub, operat
     )
 
 
+CONTROLLERS = (
+    "system:serviceaccount:kube-system:endpoint-controller",
+    "system:serviceaccount:kube-system:endpointslice-controller",
+)
+
+
+@pytest.mark.parametrize(
+    ("group", "resource"), [("", "endpoints"), ("discovery.k8s.io", "endpointslices")]
+)
+@pytest.mark.parametrize("operation", ["CREATE", "UPDATE"])
+def test_only_the_endpoint_controllers_write_launch_endpoints(group, resource, operation):
+    obj = {
+        "apiVersion": "v1",
+        "kind": "Object",
+        "metadata": {
+            "name": SLOT.service_name,
+            "namespace": NS,
+            "labels": {"kubernetes.io/service-name": SLOT.service_name},
+        },
+    }
+    old = obj if operation == "UPDATE" else None
+    for user in CONTROLLERS:
+        assert allowed(
+            request(obj, group=group, resource=resource, operation=operation, user=user, old=old)
+        )
+    for user in (MEDIATOR, PROVISIONER, "system:serviceaccount:kube-system:other-controller"):
+        assert not allowed(
+            request(obj, group=group, resource=resource, operation=operation, user=user, old=old)
+        )
+    assert not allowed(
+        request(obj, group=group, resource=resource, operation="DELETE", user=CONTROLLERS[0])
+    )
+    assert not allowed(
+        request(
+            obj,
+            group=group,
+            resource=resource,
+            operation=operation,
+            user=CONTROLLERS[0],
+            old=old,
+            namespace="acme-control",
+        )
+    )
+
+
 def test_namespace_update_is_refused():
     obj = {"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": NS}}
     assert not allowed(

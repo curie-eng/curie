@@ -12,7 +12,9 @@ webhook configuration, this module answers allow only for:
 - a Pod UPDATE by the mediator or the provisioner that removes the launch
   finalizer and changes nothing else but managed field bookkeeping;
 - a Secret or Service CREATE by the mediator whose object has the launch
-  mechanics' fixed shape under a slot name.
+  mechanics' fixed shape under a slot name;
+- an Endpoints or EndpointSlice CREATE or UPDATE by one of the profile's
+  endpoint controllers, since those decide where the mediator dials.
 
 Everything else the webhook routes here refuses: ephemeral container, resize,
 exec, attach and port-forward requests; any update of a Secret, Service or
@@ -340,6 +342,14 @@ def _decide(review: Any, policy: GuardPolicy) -> None:
         _secret_create(q, policy, user)
     elif (group, resource, sub, operation) == ("", "services", "", "CREATE"):
         _service_create(q, policy, user)
+    elif (group, resource, sub) in (
+        ("", "endpoints", ""),
+        ("discovery.k8s.io", "endpointslices", ""),
+    ):
+        # Whoever writes a launch Service's endpoints decides where the mediator
+        # dials; only the endpoint controllers named in the profile may.
+        _require(operation in ("CREATE", "UPDATE"))
+        _require(user in v["principals"]["endpoint_controllers"])
     else:
         _invalid()
 
