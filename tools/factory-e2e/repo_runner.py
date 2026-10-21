@@ -118,11 +118,16 @@ SELECTION_CONFLICT_REPLY = "This thread is already bound to a different reposito
 _POOL_REFUSAL_REPLY = re.compile(
     r"This agent cannot start: repository (?P<repository>\S+) (?:"
     r"is bound to runner pool (?P<pool>\S+), but SandboxWarmPool (?P=pool) was not rendered "
-    r"\((?P<missing>missing_pool)\); redeploy its runner"
+    r"\((?P<missing>missing_pool)\); redeploy its runner "
+    r"with `curie cluster factory --repo (?P=repository)`"
     r"|runner image was built on platform runner \S+, not this installation's "
-    r"(?:sha256:[0-9a-f]{64}|unpinned runner image) \((?P<stale>stale_base)\); rebuild it"
-    r") with `curie cluster factory --repo (?P=repository)`\. "
-    r"An operator has to make that change\."
+    r"(?:sha256:[0-9a-f]{64}|unpinned runner image) \((?P<stale>stale_base)\); "
+    r"(?:pin agentSandbox\.runner\.digest in this installation's release values first, "
+    r"then rebuild and rebind it|rebuild and rebind it on the installed pinned platform runner) "
+    r"with `curie cluster factory --repo-runner (?P=repository)=<spec> --registry <registry> "
+    r"--namespace <namespace> --release <release> --context <context>`; use a repository "
+    r"runner spec containing its retained tools, probes and Dockerfile declaration"
+    r")\. An operator has to make that change\."
 )
 SCRIPTED_KEY = "scripted-no-upstream"
 # The chart's default agentSandbox.runner.image.

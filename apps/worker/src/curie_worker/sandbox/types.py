@@ -595,10 +595,21 @@ class RepoRunnerPoolRefused(MissingAgentPoolError):
                 f"{pool} was not rendered (missing_pool); redeploy its runner with {fix}"
             )
         else:
+            rebuild = (
+                f"`curie cluster factory --repo-runner {repo}=<spec> --registry <registry> "
+                "--namespace <namespace> --release <release> --context <context>`"
+            )
+            remedy = (
+                "pin agentSandbox.runner.digest in this installation's release values first, "
+                f"then rebuild and rebind it with {rebuild}"
+                if platform_digest is None
+                else f"rebuild and rebind it on the installed pinned platform runner with {rebuild}"
+            )
             message = (
                 f"repository {repo} runner image was built on platform runner {base}, "
                 f"not this installation's {platform_digest or 'unpinned runner image'} "
-                f"(stale_base); rebuild it with {fix}"
+                f"(stale_base); {remedy}; use a repository runner spec containing its retained "
+                "tools, probes and Dockerfile declaration"
             )
         SandboxError.__init__(self, message)
 

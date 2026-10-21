@@ -540,6 +540,30 @@ flag, or `CURIE_NAMESPACE` for namespace, still overrides the saved field.
 | `curie cluster reset-thread <agent> --thread-key <key> --yes` | Force a stuck thread's sandbox to be released via the platform API (`POST /agents/{id}/threads/{thread_key}/reset`, #737).<br>• The worker's next maintenance tick releases the thread's claim and route, so its next message cold-creates a fresh sandbox; conversation history is not deleted.<br>• Waits for the worker to drain the request. When the key matched no route (a named bot's key carries its identity as its own segment, `kind:identity:channel:conversation`), nothing was released: the command says so and exits 2 instead of reporting `released`; `--json` adds `route_existed` when the API reported the outcome.<br>• Interrupts a live turn on the thread first, so it refuses without `--yes`. |
 | `curie cluster delete <agent> --yes` | End every active deployment, then delete the agent through the platform API. Destructive and irreversible: refuses without `--yes`.<br>• If the final agent deletion fails, the agent remains present but any deployments already ended stay ended. |
 
+`curie cluster upgrade` rebuilds catalog-only repository runners whose recorded
+base differs from the effective pinned target platform runner. It builds and
+probes both platforms, reads back every receipt, then validates all updated
+receipts in a final Helm render before the single Helm upgrade. A build,
+readback or final-render failure runs no Helm upgrade and leaves installed
+values unchanged. Same-base receipts are preserved without rebuilding.
+
+The target combines chart defaults with retained and operator values. Repository
+runners require a valid literal `agentSandbox.runner.digest`; an unknown,
+malformed or tag-only target is refused during Validate, including dry runs.
+If the installed values retain an old explicit digest, supply the new platform
+digest through `--values-file <values-file>` when upgrading. Keeping the old
+pin keeps that platform runner as the effective target even when chart defaults
+change.
+
+Custom Dockerfile receipts remain unchanged. After upgrading, rebuild and rebind
+them with `curie cluster --context <context> factory --repo-runner
+acme-corp/acme-bot=runner.yaml --registry registry.example.com/acme --namespace
+<namespace> --release <release>`, using a spec containing the retained tools,
+probes and Dockerfile declaration from its own directory. The upgrade plan
+provides the repository and release scope. Until rebuilt on the installed
+pinned platform runner, a mismatched receipt is refused by the worker as
+`stale_base`. An unpinned installation must pin its platform runner first.
+
 ##### Console login
 
 Administrators can mint a Console login code without selecting an agent:
@@ -1140,8 +1164,10 @@ existing credential, provider, namespace, controller, gVisor, configuration and
 schema admission checks validate the final effective overlay. On upgrade, any
 derived stock runner layer rebind or stale binding removal becomes part of that
 final snapshot before schema compatibility and timeout metadata are rendered.
-All preflight renders and the actual Helm application use that same overlay and
-the same existing generated/inferred overrides. A file may not bypass a guard.
+All preflight renders use that overlay and the same existing generated/inferred
+overrides. During Apply, rebuilt repository receipts enter a cloned overlay;
+a final Helm render admits that complete candidate and supplies its timeout
+before the same candidate is applied. A file may not bypass a guard.
 
 `CLUSTER-VALUES-FILES c4`: file credentials use the existing private values-file
 lifecycle and stay out of previews, JSON plans, diagnostic contents and argument
