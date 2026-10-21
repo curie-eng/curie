@@ -137,6 +137,7 @@ def _usernames(bootstrap: CommissioningBootstrap) -> dict[str, str]:
         "candidate_worker": b["candidate_credentials"]["worker"],
         "qualification_publisher": b["qualification_publisher_identity"],
         "control_reader": b["control_reader_identity"],
+        "source_writer": b["source_writer_identity"],
     }
     return {name: refs[name]["id"] for name in ACL_PRINCIPALS}
 

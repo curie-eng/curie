@@ -63,12 +63,13 @@ to match.
 | Candidate worker | Commissioning worker | Reads permit, journal and committed admissions; consumes the campaign lane. | Writes control, permit, journal, admission or production lane keys. |
 | Production enqueue, worker, verifier | Production entry points | Unchanged LANE-3 roles from the manifest's `credential_refs`. | Reads or writes any `protected:commissioning:*` key. |
 | Production control reader | Production API ingress | The unchanged LANE-3 `control_reader` metadata role that the runtime directory's `bootstrap.json` names, under [design decision 10](#10-g-covers-every-broker-user-the-installation-creates). | Reads or writes any `protected:commissioning:*` key, or writes any key outside its unchanged role. |
+| Production source writer | Production API ingress, source administration | The unchanged LANE-3 `source_writer` metadata role that the runtime directory's `source_writer.json` names, under [design decision 10](#10-g-covers-every-broker-user-the-installation-creates). | Reads or writes any `protected:commissioning:*` key, or writes any key outside its unchanged role. |
 | Qualification publisher | Verifier, after acceptance | Writes the Qualification record of the manifest's `qualification_id` once with `SET NX`, and reads back only that key, under [design decision 8](#8-a-dedicated-principal-publishes-qualification). | Reads or writes any other key, or holds any scripting, ACL or channel right. |
 | ACL observer | Verifier and guard reobservation | Reads broker ACL users with `ACL GETUSER` only, for the check of [design decision 7](#7-acl-principal-state-is-observed-not-hashed). | Writes any ACL user, or reads or writes any key or channel. |
 | Ordinary worker, source, runner | None | No broker authentication. | Everything above. |
 
 All seven broker identities, the Qualification publisher, the production
-control reader and the ACL observer are distinct ACL users with distinct credential issuances. No principal holds a wildcard write grant that covers another row's
+control reader and source writer and the ACL observer are distinct ACL users with distinct credential issuances. No principal holds a wildcard write grant that covers another row's
 keys. The realizing ACL inventory is measured against the pinned Valkey
 version, including Lua key selectors, as LANE-3 requires. If the pinned version
 cannot separate these rights, the campaign refuses; it does not weaken a role.
@@ -155,6 +156,7 @@ those keep their grammars. It uses the same encoding rules as the permit.
 | `issuer_identity`, `control_identity` | `CredentialReference` values. |
 | `qualification_publisher_identity` | `CredentialReference` of the Qualification publisher of [design decision 8](#8-a-dedicated-principal-publishes-qualification). |
 | `control_reader_identity` | `CredentialReference` of the production control reader of [design decision 10](#10-g-covers-every-broker-user-the-installation-creates). |
+| `source_writer_identity` | `CredentialReference` of the production source writer of [design decision 10](#10-g-covers-every-broker-user-the-installation-creates). |
 | `mediator_identity`, `gateway_identity` | `CredentialReference` values for the launch mediator and provider gateway. |
 | `source_scope` | Sorted array of 1 to 64 source objects, as in the permit. |
 | `target_scope` | Sorted array of 1 to 64 `opaque_ref` values. |
@@ -163,6 +165,7 @@ those keep their grammars. It uses the same encoding rules as the permit.
 Every credential ID in B is pairwise distinct across `production_credentials`,
 `candidate_credentials`, `issuer_identity`, `control_identity`,
 `qualification_publisher_identity`, `control_reader_identity`,
+`source_writer_identity`,
 `mediator_identity` and `gateway_identity`.
 
 Hash order breaks the cycle between the records:
@@ -742,7 +745,8 @@ template and so no G.
 Decided by the maintainer on 2026-10-21.
 
 G covers every broker user the installation creates, including production
-metadata principals such as the control reader. Each such user's rules are
+metadata principals such as the control reader and the source writer. Each
+such user's rules are
 hashed into G, and the ACL principal state check of design decision 7 observes
 its password hash set and enabled state. No broker user exists outside that
 set.
@@ -752,13 +756,21 @@ directory of SOURCE-9 and [#4076](https://github.com/curie-eng/curie/issues/4076
 whose `bootstrap.json` names a LANE-3 `control_reader` principal distinct
 from the enqueue principal. That principal is not one of the manifest's
 `credential_refs`, so B names it separately as `control_reader_identity`, like
-the Qualification publisher of design decision 8. Its credential is issued by
-the administrator-run installation bootstrap. Its rules are the unchanged
-production `control_reader` recipe; no production recipe changes.
+the Qualification publisher of design decision 8.
 
-A production metadata principal that the installation does not create, such as
-a source writer that no installed component uses, is not added. Adding one
-later is a change to B and G, made before the campaign that measures them.
+Source administration (the protected source policy routes) writes source
+records through the runtime directory's `source_writer.json`, which names a
+LANE-3 `source_writer` principal. The campaign's permit sources need a
+protected source policy, so the installation creates this principal too, and
+B names it as `source_writer_identity`.
+
+Each credential is issued by the administrator-run installation bootstrap.
+Their rules are the unchanged production `control_reader` and `source_writer`
+recipes; no production recipe changes.
+
+A production metadata principal that the installation does not create is not
+added. Adding one later is a change to B and G, made before the campaign that
+measures them.
 
 Reasoning. Clause 6 requires every measured value to be in place before the
 campaign, and design decision 7 detects misuse of the provisioner's `ACL

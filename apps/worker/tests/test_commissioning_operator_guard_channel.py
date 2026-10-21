@@ -43,6 +43,7 @@ def bootstrap():
                 "control",
                 "qualification_publisher",
                 "control_reader",
+                "source_writer",
                 "mediator",
                 "gateway",
             )

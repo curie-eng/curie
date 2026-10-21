@@ -231,7 +231,7 @@ def commissioning_acl_rules(
 class GuardRecipes:
     """The merged recipes G hashes, one per guard principal, @spec PROTECTED-COMMISSIONING-2.
 
-    Production principals, the design decision 10 control reader included,
+    Production principals, the design decision 10 metadata principals included,
     take their unchanged LANE-3 recipes, the candidates
     their design decision 9 templates, and the Qualification publisher the
     recipe confined to the manifest's ``qualification_id``.
@@ -251,6 +251,7 @@ class GuardRecipes:
                 "qualification_publisher", qualification_id=qualification_id
             ),
             "control_reader": metadata_acl_rules("control_reader"),
+            "source_writer": metadata_acl_rules("source_writer"),
             "observer": commissioning_acl_rules("observer"),
         }
 

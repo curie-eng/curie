@@ -45,6 +45,7 @@ def bootstrap_value() -> dict[str, Any]:
             "generation": "1",
         },
         "control_reader_identity": {"id": "credential/example-control-reader", "generation": "1"},
+        "source_writer_identity": {"id": "credential/example-source-writer", "generation": "1"},
         "mediator_identity": {"id": "commissioning/example-mediator", "generation": "1"},
         "gateway_identity": {"id": "commissioning/example-gateway", "generation": "1"},
         "source_scope": [
@@ -180,6 +181,12 @@ def test_every_nested_bootstrap_object_is_closed(path: tuple[Any, ...]) -> None:
             id=v["candidate_credentials"]["enqueue"]["id"]
         ),
         lambda v: v["control_reader_identity"].update(id=v["gateway_identity"]["id"]),
+        lambda v: v["source_writer_identity"].update(id=v["control_reader_identity"]["id"]),
+        lambda v: v["source_writer_identity"].update(
+            id=v["production_credentials"]["worker"]["id"]
+        ),
+        lambda v: v["source_writer_identity"].update(id=v["control_identity"]["id"]),
+        lambda v: v["source_writer_identity"].update(id=v["mediator_identity"]["id"]),
         # Every credential ID in B is pairwise distinct, launch identities included.
         lambda v: v["mediator_identity"].update(id=v["gateway_identity"]["id"]),
         lambda v: v["mediator_identity"].update(id=v["issuer_identity"]["id"]),

@@ -65,8 +65,8 @@ def _rules(name: str) -> tuple[str, ...]:
         return commissioning_acl_rules(name, permit=permit())
     if name == "qualification_publisher":
         return commissioning_acl_rules(name, qualification_id=QUALIFICATION_ID)
-    if name == "control_reader":
-        return metadata_acl_rules("control_reader")
+    if name in ("control_reader", "source_writer"):
+        return metadata_acl_rules(name)
     return commissioning_acl_rules(name)
 
 
@@ -100,6 +100,7 @@ def _producer(service, users, reader_role):
     value["candidate_credentials"]["worker"]["id"] = users["candidate_worker"].username
     value["qualification_publisher_identity"]["id"] = users["qualification_publisher"].username
     value["control_reader_identity"]["id"] = users["control_reader"].username
+    value["source_writer_identity"]["id"] = users["source_writer"].username
     bootstrap = parse_commissioning_bootstrap(encoded(value))
     # The administrator-run installation step records the baseline.
     states = {

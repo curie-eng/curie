@@ -242,6 +242,7 @@ class QualificationPublisher:
                     "issuer_identity",
                     "control_identity",
                     "control_reader_identity",
+                    "source_writer_identity",
                     "mediator_identity",
                     "gateway_identity",
                 )
