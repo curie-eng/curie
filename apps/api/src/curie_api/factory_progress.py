@@ -721,7 +721,8 @@ def phase_view(
         elif approved:
             noun = "round" if loop_round == 1 else "rounds"
             separator = " · " if staged else ", "
-            labels[review] = f"approved{separator}{loop_round} {noun}"
+            completion_label = "approved" if review == WAIT_CI_PHASE else "completed"
+            labels[review] = f"{completion_label}{separator}{loop_round} {noun}"
         if active and current == start and kickbacks >= 1:
             redo.add(review)
         loops.append(
