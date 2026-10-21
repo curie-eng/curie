@@ -514,6 +514,44 @@ def _extra_decision(
     _bind_judge(report, row, rubric)
 
 
+def _fact_correction_snapshots(scope: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    fact_id = f"fact-correction-{scope['case_id']}"
+    obsolete = _fact_row(fact_id, "cabinet-0a0a0a is violet-111111")
+    corrected = {**obsolete, "statement": "cabinet-0a0a0a is violet-222222"}
+    return (
+        {"skills": [], "facts": [obsolete], "schedules": []},
+        {"skills": [], "facts": [corrected], "schedules": []},
+    )
+
+
+def _fact_correction_predicates(scope: dict[str, Any]) -> list[dict[str, Any]]:
+    target = f"fact-correction-{scope['case_id']}"
+    return [
+        {"name": "active_count", "class": "memory-fact", "target": target, "value": 1},
+        {
+            "name": "statement_equals",
+            "class": "memory-fact",
+            "target": target,
+            "value": "cabinet-0a0a0a is violet-222222",
+        },
+        {"name": "scope_equals", "class": "memory-fact", "target": target, "value": "agent"},
+    ]
+
+
+def _control_check_for(control_id: str, scope: dict[str, Any]) -> dict[str, Any]:
+    """Synthetic test data: one check that recomputes to PASS for the control."""
+    if control_id == "fact-correction":
+        # Shape chosen by the tests: fixture predicates replayed on before/after snapshots.
+        before, after = _fact_correction_snapshots(scope)
+        return {
+            "kind": "predicates",
+            "predicates": _fact_correction_predicates(scope),
+            "before": before,
+            "after": after,
+        }
+    return {"kind": "contains", "reply": "violet-a1b2c1", "expected": "violet"}
+
+
 def _add_controls(report: dict[str, Any], repetition: int) -> None:
     for phrase in range(1, 4):
         case_id = f"F1-P{phrase}-R{repetition}"
@@ -1002,9 +1040,7 @@ def frozen_report(tmp_path: Path) -> dict[str, Any]:
                             "control_id": control_id,
                             "status": "PASS",
                             # Synthetic test data: one check that recomputes to PASS.
-                            "checks": [
-                                {"kind": "contains", "reply": "violet-a1b2c1", "expected": "violet"}
-                            ],
+                            "checks": [_control_check_for(control_id, scope)],
                         },
                     ),
                 }
@@ -2568,3 +2604,46 @@ def test_control_claiming_pass_without_bound_evidence_fails(
     else:
         control["evidence_ref"] = "control-observation-missing"
     _check(tmp_path, report, passed=False)
+
+
+@pytest.mark.parametrize("damage", ["obsolete-and-corrected", "channel-scope-row"])
+def test_fact_correction_control_replays_fixture_predicates_and_rejects_a_bad_after_state(
+    tmp_path: Path, frozen_report: dict[str, Any], damage: str
+) -> None:
+    _check(tmp_path, frozen_report, passed=True)
+    report = copy.deepcopy(frozen_report)
+    control = next(row for row in report["controls"] if row["control_id"] == "fact-correction")
+    observation = _value(report, control["evidence_ref"])
+    check = observation["checks"][0]
+    assert check["kind"] == "predicates"
+    row = check["after"]["facts"][0]
+    if damage == "obsolete-and-corrected":
+        row["statement"] = "cabinet-0a0a0a is violet-222222, was violet-111111"
+    else:
+        check["after"]["facts"].append(
+            {**row, "id": "fact-channel", "scope": "channel", "channel": "C0EXAMPLE1"}
+        )
+    assert control["status"] == "PASS"
+    _rehash(report)
+    _check(tmp_path, report, passed=False)
+
+
+@pytest.mark.parametrize("validator", [verify_calibration, verify_report])
+@pytest.mark.parametrize("refs", ["empty", "unknown-key"])
+def test_calibration_pass_needs_nonempty_refs_naming_keys_in_its_evidence(
+    tmp_path: Path,
+    frozen_report: dict[str, Any],
+    validator: Callable[[Path], ScoreResult],
+    refs: str,
+) -> None:
+    _check(tmp_path, frozen_report, validator, passed=True)
+    report = copy.deepcopy(frozen_report)
+    row = next(item for item in report["calibration"]["rows"] if item["verdict"] == "PASS")
+    completion = json.loads(row["completion"])
+    completion["evidence_refs"] = [] if refs == "empty" else ["state:not-in-this-example"]
+    row["completion"] = json.dumps(completion)
+    row["completion_sha256"] = _sha(row["completion"].encode())
+    for generation in report["generations"]:
+        if generation["id"] == row["generation_id"]:
+            generation["completion_sha256"] = row["completion_sha256"]
+    _check(tmp_path, report, validator, passed=False)
