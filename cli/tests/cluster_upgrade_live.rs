@@ -7752,7 +7752,6 @@ fn repository_runner_upgrade_invalid_build_inputs_refuse_before_apply() {
         ("tool", "unknown tool"),
         ("probe", "empty command"),
         ("docker", "Docker is not"),
-        ("image", "must be under"),
     ] {
         let mut values = repository_runner_upgrade_values();
         let runner = &mut values["factory"]["bindings"][0]["repos"][0]["runner"];
@@ -7760,12 +7759,6 @@ fn repository_runner_upgrade_invalid_build_inputs_refuse_before_apply() {
             "tool" => runner["tools"] = serde_json::json!(["acme-unsupported-tool"]),
             "probe" => {
                 runner["probes"] = serde_json::json!([{"name": "acme-probe", "command": []}])
-            }
-            "image" => {
-                runner["image"] = Value::from(format!(
-                    "registry.example.com/acme/other-runner@{}",
-                    repository_runner_digest('a')
-                ))
             }
             "docker" => {}
             _ => unreachable!(),

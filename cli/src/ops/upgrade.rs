@@ -820,8 +820,10 @@ fn repository_runner_dockerfile(runner: &serde_json::Value) -> Option<&str> {
 }
 
 /// Recover the recorded registry without confusing its port with an image
-/// tag. Automatic catalog rebuilds only replace the builder's own image name.
-fn repository_runner_registry(image: &str, catalog: bool) -> Result<String> {
+/// tag. The registry is everything before the image's last path segment, for
+/// catalog and custom receipts alike; a catalog rebuild pushes to
+/// `<registry>/curie-repo-runner` whatever name the recorded receipt used.
+fn repository_runner_registry(image: &str) -> Result<String> {
     crate::repo_runner::bare_digest(image)?;
     let syntax = regex::Regex::new(
         r"^([A-Za-z0-9][A-Za-z0-9._/:-]*)/([A-Za-z0-9][A-Za-z0-9._-]*)(?::[A-Za-z0-9_][A-Za-z0-9_.-]*)?@sha256:[0-9a-f]{64}$",
@@ -830,12 +832,6 @@ fn repository_runner_registry(image: &str, catalog: bool) -> Result<String> {
     let captures = syntax
         .captures(image)
         .context("repository runner image must name a digest-pinned registry repository")?;
-    if catalog && &captures[2] != crate::repo_runner::IMAGE_NAME {
-        bail!(
-            "catalog repository runner image {image} must be under <registry>/{}",
-            crate::repo_runner::IMAGE_NAME
-        );
-    }
     Ok(captures[1].to_string())
 }
 
@@ -3230,7 +3226,7 @@ impl LiveHost {
                 .and_then(serde_json::Value::as_str)
                 .with_context(|| format!("repository {path} runner has no image"))?;
             if let Some(dockerfile) = repository_runner_dockerfile(runner) {
-                let registry = repository_runner_registry(image, false)
+                let registry = repository_runner_registry(image)
                     .with_context(|| format!("repository {path} manual rebuild registry"))?;
                 let command = self.custom_repository_rebuild_command(path, &registry)?;
                 self.repository_runner_plan.push(format!(
@@ -3253,7 +3249,7 @@ impl LiveHost {
                 .iter()
                 .map(|entry| entry.name.clone())
                 .collect();
-            let registry = repository_runner_registry(image, true)
+            let registry = repository_runner_registry(image)
                 .with_context(|| format!("repository {path} catalog rebuild registry"))?;
             if pending {
                 self.repository_runner_plan.push(format!(
@@ -4050,11 +4046,31 @@ impl LiveHost {
         // Convergence is not re-observed: the Converge phase has already
         // failed the run unless it was exact.
         let version_ok = self.inspect_version().as_deref() == Some(self.opts.to.as_str());
-        let overlay = self
+        let mut overlay = self
             .overlay
             .as_deref()
             .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
             .unwrap_or(serde_json::Value::Null);
+        // When Apply ran in this invocation, the overlay is the admitted
+        // candidate Helm applied. When it was skipped (a resume after a
+        // durable Apply, or a known-good rerun), the overlay merges the
+        // operator's values file over the installed values, so a file still
+        // carrying an old receipt would replace the one Helm serves. Check
+        // the receipts Helm applied instead, and fail closed if unreadable.
+        if self.apply_is_skipped() && !repository_runner_entries(&overlay).is_empty() {
+            match self.served_user_values() {
+                Ok(served) => overlay = served,
+                Err(error) => {
+                    return Ok(CanaryVerdict {
+                        canary: Canary { passed: false },
+                        issues: vec![format!(
+                            "could not read the serving release's applied repository \
+                             receipts: {error:#}"
+                        )],
+                    });
+                }
+            }
+        }
         let repository_runners = repository_runner_entries(&overlay);
         let has_catalog_runners = repository_runners
             .iter()
@@ -4098,6 +4114,30 @@ impl LiveHost {
         })
     }
 
+    /// The serving revision's user-supplied values (`helm get values`, not
+    /// `--all`): exactly the document Helm applied, without chart defaults.
+    fn served_user_values(&self) -> Result<serde_json::Value> {
+        let history = self
+            .release_history()?
+            .context("the release has no serving revision")?;
+        let revision =
+            crate::cluster_secrets::serving_revision(&history, &self.opts.common.release)
+                .map_err(anyhow::Error::msg)?;
+        let cmd =
+            crate::cluster_secrets::helm_get_json(&self.opts.common, "values", false, revision);
+        let (ok, out, err) = self.run(&cmd)?;
+        if !ok {
+            bail!(
+                "could not read installed values: {}",
+                crate::schema_window::redact_probe_text(err.trim())
+            );
+        }
+        if out.trim().is_empty() {
+            return Ok(serde_json::Value::Null);
+        }
+        serde_norway::from_str::<serde_json::Value>(&out).context("installed values are malformed")
+    }
+
     /// The release's `curie.fullname` under the retained overlay Apply hands
     /// Helm (#4321). No overlay, or one that does not parse, renders with the
     /// chart defaults, as Helm would.
@@ -4118,7 +4158,8 @@ impl LiveHost {
     ) -> Result<(String, Vec<String>)> {
         // A completed Apply or known-good rerun must not resolve a target
         // chart or runner. Installed computed values supply only the chart's
-        // naming defaults; receipts still come from the retained overlay.
+        // naming defaults; receipts come from `overlay`, which is the applied
+        // candidate or, when Apply was skipped, the serving user values.
         let defaults = match &self.chart_defaults {
             Some(defaults) => defaults.clone(),
             None => {
