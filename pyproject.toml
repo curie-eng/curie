@@ -94,6 +94,7 @@ root_packages = [
     "curie_worker",
     "curie_connector_proxy",
     "curie_commissioning_ingress",
+    "curie_commissioning_worker",
     "curie_dispatcher",
     "curie_discord_adapter",
     "curie_mail_adapter",
@@ -140,6 +141,7 @@ source_modules = [
     "curie_connector_proxy",
     "curie_e2e_connector",
     "curie_commissioning_ingress",
+    "curie_commissioning_worker",
     "curie_protected_hooks.runtime_directory",
 ]
 forbidden_modules = ["curie_protected_hooks.runtime_directory_writer"]
@@ -168,16 +170,19 @@ forbidden_modules = [
     "curie_protected_hooks.commissioning_records",
     "curie_protected_hooks.commissioning_reservations",
     "curie_protected_hooks.commissioning_scripts",
+    "curie_protected_hooks.commissioning_worker",
     "curie_protected_hooks.qualification_publication",
 ]
 
-# @spec PROTECTED-COMMISSIONING-2/4: the commissioning ingress is a separate
-# standalone process composition, a top-level package beside `curie_api` rather
-# than a module of it, so the contract above holds for the whole API with no
-# exception. No ordinary composition imports or mounts it; it may import the API's
-# shared signing and file-reading helpers, never the reverse.
+# @spec PROTECTED-COMMISSIONING-2/4: the commissioning ingress and worker are
+# separate standalone process compositions, top-level packages beside
+# `curie_api` and `curie_worker` rather than modules of them, so the contract
+# above holds for the whole API and worker with no exception. No ordinary
+# composition imports either. The ingress may import the API's shared signing
+# and file-reading helpers and the worker the worker's stream transport, never
+# the reverse.
 [[tool.importlinter.contracts]]
-name = "Ordinary compositions never import the commissioning ingress"
+name = "Ordinary compositions never import the commissioning compositions"
 type = "forbidden"
 source_modules = [
     "curie_api",
@@ -188,7 +193,14 @@ source_modules = [
     "curie_protected_hooks",
     "curie_connector_proxy",
 ]
-forbidden_modules = ["curie_commissioning_ingress"]
+forbidden_modules = ["curie_commissioning_ingress", "curie_commissioning_worker"]
+
+# The commissioning worker has no path into the API: no worker to API import.
+[[tool.importlinter.contracts]]
+name = "The commissioning worker imports nothing of the API"
+type = "forbidden"
+source_modules = ["curie_commissioning_worker"]
+forbidden_modules = ["curie_api", "curie_commissioning_ingress"]
 
 [[tool.importlinter.contracts]]
 # Telemetry attribute names are shared schema, not an application or harness
