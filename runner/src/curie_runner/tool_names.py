@@ -11,6 +11,10 @@ STATE_TOOL_SHORT_NAMES: Final = ("get", "set", "append", "list", "delete")
 STATE_TOOL_NAMES: Final[frozenset[str]] = frozenset(
     f"mcp__{STATE_SERVER_NAME}__{name}" for name in STATE_TOOL_SHORT_NAMES
 )
+# Get and list only read the store; set, append and delete change it.
+STATE_READ_TOOL_NAMES: Final[frozenset[str]] = frozenset(
+    f"mcp__{STATE_SERVER_NAME}__{name}" for name in ("get", "list")
+)
 PROGRESS_TOOL: Final = "report_progress"
 TURN_PROGRESS_TOOL: Final = "progress"
 # The platform channel read tools (ADR 0100, #2877), mounted on the reserved

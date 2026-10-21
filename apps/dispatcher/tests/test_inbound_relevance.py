@@ -37,6 +37,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 from unittest.mock import MagicMock
+from urllib.error import URLError
 
 import pytest
 import redis
@@ -1147,20 +1148,51 @@ def test_a_non_empty_top_level_text_is_derived_before_nexts_self_mention_policy(
 
 
 # ---------------------------------------------------------------------------
-# The claim-release regression (EB-20 / EB-21 / EB-22)
+# A failed placeholder never loses the request
 # ---------------------------------------------------------------------------
 #
-# HONEST CAVEAT, recorded so nobody reads more into these three tests than they
-# prove. In Socket Mode, Bolt acks the envelope BEFORE running the listener body
-# (slack_bolt/listener/thread_runner.py, ThreadListenerRunner.run: `ack()` is
-# called for auto-acknowledged Events API listeners, then the body is submitted
-# to the executor). Slack has therefore already been told "received", so a Slack
-# redelivery of the failed event is RARE -- it is not the normal consequence of
-# the listener raising. Releasing the claim restores idempotency *correctness*:
-# the adapter no longer holds a dedupe claim for work it never did, so any later
-# delivery of that event id -- a Slack retry, a replay, an operator-driven
-# re-send -- can still be processed. It is not a guarantee that every failed
-# placeholder is recovered.
+# The placeholder ("On it") is a courtesy; the request is the person's. In
+# Socket Mode Bolt acks the envelope BEFORE running the listener body
+# (slack_bolt/listener/thread_runner.py), so Slack has already been told
+# "received" and will not normally redeliver. A placeholder failure that stops
+# the turn is therefore a request lost for good, with no reply and no error the
+# person can see -- a burst test lost 7 of 100 mentions exactly this way when
+# Slack refused connections.
+#
+# So EVERY placeholder failure enqueues the turn with no placeholder
+# (``reply_handle.placeholder`` is None), and the worker posts the answer or its
+# failure notice as a fresh reply in the thread. The dedupe claim is KEPT in
+# every case, because the turn is now queued: a redelivery of the same event id
+# must be refused as a duplicate rather than queue the request twice.
+#
+# The failure shapes below are the ones that matter, not an exhaustive list:
+#
+#   * ``ratelimited`` -- Slack answered and refused; nothing was posted.
+#   * a refused connection -- nothing reached Slack; nothing was posted.
+#   * ``SlackRequestError`` -- the connection died mid-request; the post may or
+#     may not have landed.
+#   * ``fatal_error`` -- Slack documents it on chat.postMessage as "some aspect
+#     of the operation succeeded before the error was raised".
+#
+# In the last two a placeholder may already be in the thread. The answer then
+# arrives as a separate reply below it. A stale "On it" above an answer is the
+# accepted cost: the alternative is a request that silently disappears.
+
+_PLACEHOLDER_FAILURES = [
+    pytest.param(
+        SlackApiError("ratelimited", {"ok": False, "error": "ratelimited"}), id="ratelimited"
+    ),
+    # The burst test's shape: slack_sdk lets urllib's URLError escape for a
+    # refused connection once its own connection-error retry is spent.
+    pytest.param(
+        URLError(ConnectionRefusedError(111, "Connection refused")), id="connection-refused"
+    ),
+    pytest.param(SlackRequestError("the connection died mid-request"), id="mid-request"),
+    pytest.param(
+        SlackApiError("fatal_error", {"ok": False, "error": "fatal_error"}), id="fatal-error"
+    ),
+    pytest.param(ConnectionRefusedError(111, "Connection refused"), id="raw-oserror"),
+]
 
 
 def _raising_post_message(exc: BaseException) -> Any:
@@ -1170,12 +1202,25 @@ def _raising_post_message(exc: BaseException) -> Any:
     return _raise
 
 
-def test_a_failed_placeholder_releases_the_claim_on_the_event_lane(
-    redis_client: redis.Redis, config: DispatcherConfig
+def _placeholder_failures_logged(records: list[logging.LogRecord]) -> list[str]:
+    return [
+        r.getMessage()
+        for r in records
+        if "placeholder" in r.getMessage() and r.levelno >= logging.WARNING
+    ]
+
+
+def _expected_outcome(boom: BaseException) -> str:
+    """The log must say whether a placeholder may already be in the thread."""
+    if isinstance(boom, SlackApiError) and boom.response["error"] != "fatal_error":
+        return "Slack refused it"
+    return "may already be in the thread"
+
+
+@pytest.mark.parametrize("boom", _PLACEHOLDER_FAILURES)
+def test_a_failed_placeholder_still_enqueues_the_turn_on_the_event_lane(
+    redis_client: redis.Redis, config: DispatcherConfig, boom: BaseException
 ) -> None:
-    """`claim_event` runs before `chat_postMessage`; if the post raises, the key
-    must not stay claimed, or the event is terminally lost -- #2006's own class."""
-    boom = SlackApiError("ratelimited", {"ok": False, "error": "ratelimited"})
     failing = _build_harness(config, redis_client, chat_post_message=_raising_post_message(boom))
 
     failing.handler.handle(
@@ -1183,19 +1228,24 @@ def test_a_failed_placeholder_releases_the_claim_on_the_event_lane(
     )
     _drain(failing.app)
 
-    # Bolt acked first and then swallowed the exception into its error handler:
-    # without this collector the failure is invisible from the outside.
     assert failing.sock.acked_envelope_ids == ["env-boom"]
-    assert len(failing.errors) == 1, failing.errors
-    assert _stream_entries(redis_client, config) == []
-
-    # (a) The claim was released.
-    assert redis_client.exists(config.dedupe_key("Ev-boom")) == 0, (
-        "the dedupe claim survived a failed placeholder, so any later delivery of "
-        "Ev-boom is refused as a duplicate and the message is lost for good"
+    assert failing.errors == [], "a placeholder failure must not abort the listener"
+    entries = _stream_entries(redis_client, config)
+    assert len(entries) == 1, "the request was dropped because its placeholder failed"
+    queued = from_stream_fields(entries[0][1])
+    assert queued.text == "please answer"
+    assert queued.reply_handle is not None
+    assert queued.reply_handle.placeholder is None, (
+        "no placeholder was confirmed, so the worker must post a fresh reply, not edit one"
+    )
+    logged = _placeholder_failures_logged(failing.records)
+    assert len(logged) == 1, "the failed placeholder went unlogged"
+    assert _expected_outcome(boom) in logged[0]
+    assert redis_client.exists(config.dedupe_key("Ev-boom")) == 1, (
+        "the turn is queued, so the claim must be held against a redelivery"
     )
 
-    # (b) A redelivery of the SAME event id now succeeds.
+    # A redelivery of the same event id is a duplicate, not a second request.
     retry = _build_harness(config, redis_client)
     retry.handler.handle(
         retry.sock, _events_api_request("env-boom-2", "Ev-boom", _mention(text="please answer"))
@@ -1203,18 +1253,17 @@ def test_a_failed_placeholder_releases_the_claim_on_the_event_lane(
     _drain(retry.app)
 
     assert retry.errors == []
-    entries = _stream_entries(redis_client, config)
-    assert len(entries) == 1
-    assert from_stream_fields(entries[0][1]).text == "please answer"
+    assert len(_stream_entries(redis_client, config)) == 1
+    assert _drop_reasons_logged(retry.records) == [DropReason.DUPLICATE_DELIVERY]
 
 
-def test_a_failed_placeholder_releases_the_claim_on_the_action_lane(
-    redis_client: redis.Redis, config: DispatcherConfig
+@pytest.mark.parametrize("boom", _PLACEHOLDER_FAILURES)
+def test_a_failed_placeholder_still_enqueues_the_turn_on_the_action_lane(
+    redis_client: redis.Redis, config: DispatcherConfig, boom: BaseException
 ) -> None:
-    """The identical defect on the sibling mint site. `process_action` claims and
-    posts in the same order, so fixing one lane and not its twin would leave
-    button clicks silently lost -- this repo's dominant drift shape."""
-    boom = SlackApiError("ratelimited", {"ok": False, "error": "ratelimited"})
+    """The same rule on the sibling mint site: `process_action` shares
+    `_mint_turn`, and a lane-specific divergence is this repo's dominant drift
+    shape."""
     failing = _build_harness(config, redis_client, chat_post_message=_raising_post_message(boom))
 
     click = _block_action_body(
@@ -1224,20 +1273,47 @@ def test_a_failed_placeholder_releases_the_claim_on_the_action_lane(
     failing.handler.handle(failing.sock, _interactive_request("env-click-boom", click))
     _drain(failing.app)
 
-    assert len(failing.errors) == 1, failing.errors
-    assert _stream_entries(redis_client, config) == []
-    assert redis_client.exists(config.dedupe_key("action-trig-boom")) == 0, (
-        "the dedupe claim survived a failed placeholder on the action lane"
-    )
+    assert failing.errors == []
+    entries = _stream_entries(redis_client, config)
+    assert len(entries) == 1
+    queued = from_stream_fields(entries[0][1])
+    assert queued.text == "reports"
+    assert queued.reply_handle is not None
+    assert queued.reply_handle.placeholder is None
+    logged = _placeholder_failures_logged(failing.records)
+    assert len(logged) == 1, "the failed placeholder went unlogged"
+    assert _expected_outcome(boom) in logged[0]
+    assert redis_client.exists(config.dedupe_key("action-trig-boom")) == 1
 
     retry = _build_harness(config, redis_client)
     retry.handler.handle(retry.sock, _interactive_request("env-click-retry", click))
     _drain(retry.app)
 
     assert retry.errors == []
+    assert len(_stream_entries(redis_client, config)) == 1
+    assert _drop_reasons_logged(retry.records) == [DropReason.DUPLICATE_DELIVERY]
+
+
+def test_a_placeholder_response_without_a_ts_still_enqueues_the_turn(
+    redis_client: redis.Redis, config: DispatcherConfig
+) -> None:
+    """A post that answers without a ts left nothing to edit. Reading the ts
+    used to raise after the claim and lose the request; now the reply is
+    posted fresh."""
+    harness = _build_harness(config, redis_client, chat_post_message=MagicMock(return_value={}))
+
+    harness.handler.handle(
+        harness.sock, _events_api_request("env-nots", "Ev-nots", _mention(text="please answer"))
+    )
+    _drain(harness.app)
+
+    assert harness.errors == []
     entries = _stream_entries(redis_client, config)
     assert len(entries) == 1
-    assert from_stream_fields(entries[0][1]).text == "reports"
+    queued = from_stream_fields(entries[0][1])
+    assert queued.reply_handle is not None
+    assert queued.reply_handle.placeholder is None
+    assert redis_client.exists(config.dedupe_key("Ev-nots")) == 1
 
 
 def test_a_failed_enqueue_after_a_successful_placeholder_keeps_the_claim(
@@ -1272,147 +1348,6 @@ def test_a_failed_enqueue_after_a_successful_placeholder_keeps_the_claim(
     assert redis_client.exists(config.dedupe_key("Ev-xadd")) == 1, (
         "the claim must be HELD after a successful placeholder: releasing it would "
         "let Slack's redelivery post a second placeholder in the same thread"
-    )
-
-
-# ---------------------------------------------------------------------------
-# The other half of the release rule: ONLY an unambiguous refusal releases
-# ---------------------------------------------------------------------------
-#
-# The three tests above all fail the placeholder with a `SlackApiError` carrying
-# a real Slack error code, which is the one case where the claim is released.
-# That is a narrow evidence claim, not "the call raised": Slack answered, named
-# its refusal, and delivered nothing, so a later retry is clean.
-#
-# Everything else is ambiguous and KEEPS the claim. Two shapes are pinned below.
-#
-#   * A transport failure (`SlackRequestError`, a timeout, a dropped connection)
-#     carries no answer from Slack at all -- the request may well have been
-#     accepted before the connection died.
-#   * `fatal_error` wears an error code but is not a refusal. Slack documents it
-#     on chat.postMessage as "The server could not complete your operation(s)
-#     without encountering a catastrophic error. It's possible some aspect of
-#     the operation succeeded before the error was raised."
-#     (Slack: docs.slack.dev/reference/methods/chat.postMessage, errors table.)
-#
-# In both cases a placeholder may already be sitting in the thread, so releasing
-# would let a replay post a SECOND one -- exactly the duplicate the
-# claim-before-placeholder ordering exists to prevent. Keeping the claim is the
-# quieter of two imperfect outcomes, and it is a deliberate choice rather than
-# the #2006 bug reappearing, which is why it is pinned here.
-
-
-def test_an_ambiguous_transport_failure_keeps_the_claim_on_the_event_lane(
-    redis_client: redis.Redis, config: DispatcherConfig
-) -> None:
-    """A failure with no answer from Slack must NOT release: the post may have
-    landed, and a released claim would let a replay post a second placeholder."""
-    boom = SlackRequestError("the connection died mid-request")
-    failing = _build_harness(config, redis_client, chat_post_message=_raising_post_message(boom))
-
-    failing.handler.handle(
-        failing.sock,
-        _events_api_request("env-transport", "Ev-transport", _mention(text="please answer")),
-    )
-    _drain(failing.app)
-
-    assert failing.sock.acked_envelope_ids == ["env-transport"]
-    assert len(failing.errors) == 1, failing.errors
-    assert _stream_entries(redis_client, config) == []
-    assert redis_client.exists(config.dedupe_key("Ev-transport")) == 1, (
-        "a transport failure released the dedupe claim: Slack never answered, so the "
-        "placeholder may already be in the thread and a replay would post a second one"
-    )
-
-    # The user-visible consequence of holding the claim, asserted rather than
-    # inferred from the key: a redelivery of the same event id is refused with an
-    # enumerated reason instead of posting into the thread a second time.
-    retry = _build_harness(config, redis_client)
-    retry.handler.handle(
-        retry.sock,
-        _events_api_request("env-transport-2", "Ev-transport", _mention(text="please answer")),
-    )
-    _drain(retry.app)
-
-    assert retry.errors == []
-    assert _stream_entries(redis_client, config) == []
-    assert _drop_reasons_logged(retry.records) == [DropReason.DUPLICATE_DELIVERY]
-
-
-def test_a_fatal_error_response_keeps_the_claim_on_the_event_lane(
-    redis_client: redis.Redis, config: DispatcherConfig
-) -> None:
-    """`fatal_error` is an error code, but Slack's own chat.postMessage docs say
-    "some aspect of the operation succeeded before the error was raised" -- so it
-    is an ambiguous outcome, and treating it as a refusal would release a claim
-    whose placeholder may already be visible."""
-    boom = SlackApiError("fatal_error", {"ok": False, "error": "fatal_error"})
-    failing = _build_harness(config, redis_client, chat_post_message=_raising_post_message(boom))
-
-    failing.handler.handle(
-        failing.sock,
-        _events_api_request("env-fatal", "Ev-fatal", _mention(text="please answer")),
-    )
-    _drain(failing.app)
-
-    assert len(failing.errors) == 1, failing.errors
-    assert _stream_entries(redis_client, config) == []
-    assert redis_client.exists(config.dedupe_key("Ev-fatal")) == 1, (
-        "`fatal_error` released the dedupe claim, but Slack documents it as possibly "
-        "having succeeded in part -- a replay could post a second placeholder"
-    )
-
-
-def test_an_ambiguous_transport_failure_keeps_the_claim_on_the_action_lane(
-    redis_client: redis.Redis, config: DispatcherConfig
-) -> None:
-    """The identical rule on the sibling mint site: `process_action` shares
-    `_post_placeholder`, and a lane-specific divergence here is this repo's
-    dominant drift shape."""
-    boom = SlackRequestError("the connection died mid-request")
-    failing = _build_harness(config, redis_client, chat_post_message=_raising_post_message(boom))
-
-    click = _block_action_body(
-        actions=[{"type": "button", "action_id": "reports", "action_ts": "1.5"}],
-        trigger_id="trig-transport",
-    )
-    failing.handler.handle(failing.sock, _interactive_request("env-click-transport", click))
-    _drain(failing.app)
-
-    assert len(failing.errors) == 1, failing.errors
-    assert _stream_entries(redis_client, config) == []
-    assert redis_client.exists(config.dedupe_key("action-trig-transport")) == 1, (
-        "a transport failure released the dedupe claim on the action lane"
-    )
-
-    retry = _build_harness(config, redis_client)
-    retry.handler.handle(retry.sock, _interactive_request("env-click-transport-2", click))
-    _drain(retry.app)
-
-    assert retry.errors == []
-    assert _stream_entries(redis_client, config) == []
-    assert _drop_reasons_logged(retry.records) == [DropReason.DUPLICATE_DELIVERY]
-
-
-def test_a_fatal_error_response_keeps_the_claim_on_the_action_lane(
-    redis_client: redis.Redis, config: DispatcherConfig
-) -> None:
-    """`fatal_error`'s ambiguity is a property of Slack's Web API, not of a lane,
-    so the action lane must hold its claim for exactly the same reason."""
-    boom = SlackApiError("fatal_error", {"ok": False, "error": "fatal_error"})
-    failing = _build_harness(config, redis_client, chat_post_message=_raising_post_message(boom))
-
-    click = _block_action_body(
-        actions=[{"type": "button", "action_id": "reports", "action_ts": "1.5"}],
-        trigger_id="trig-fatal",
-    )
-    failing.handler.handle(failing.sock, _interactive_request("env-click-fatal", click))
-    _drain(failing.app)
-
-    assert len(failing.errors) == 1, failing.errors
-    assert _stream_entries(redis_client, config) == []
-    assert redis_client.exists(config.dedupe_key("action-trig-fatal")) == 1, (
-        "`fatal_error` released the dedupe claim on the action lane"
     )
 
 
