@@ -2620,9 +2620,9 @@ def test_fact_correction_control_replays_fixture_predicates_and_rejects_a_bad_af
     if damage == "obsolete-and-corrected":
         row["statement"] = "cabinet-0a0a0a is violet-222222, was violet-111111"
     else:
-        check["after"]["facts"].append(
-            {**row, "id": "fact-channel", "scope": "channel", "channel": "C0EXAMPLE1"}
-        )
+        # The predicates target the fact by id, so the corrected row itself moves to
+        # channel scope; scope_equals agent must reject it.
+        row.update(scope="channel", channel={"kind": "slack", "address": "C0EXAMPLE1"})
     assert control["status"] == "PASS"
     _rehash(report)
     _check(tmp_path, report, passed=False)
