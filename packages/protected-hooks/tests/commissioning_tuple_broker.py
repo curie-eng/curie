@@ -149,7 +149,9 @@ class CommissioningTuple:
             "max_permit_ms": 86400000,
         }
         self.references = {role: credentials[role] for role in ROLES}
-        self.passwords: dict[str, str] = {}
+        # Every role's secret exists up front, so a tuple that is never installed
+        # still renders its directory files.
+        self.passwords = {role: secrets.token_hex(24) for role in ROLES}
         # Each scoped source signs with its own secret; the permit admits the first only.
         self.sources = [
             {
@@ -180,7 +182,7 @@ class CommissioningTuple:
 
         for role in ROLES:
             permit = self.permit if role.startswith("candidate") else None
-            password = self.passwords.setdefault(role, secrets.token_hex(24))
+            password = self.passwords[role]
             self.broker.command(
                 "ACL",
                 "SETUSER",
