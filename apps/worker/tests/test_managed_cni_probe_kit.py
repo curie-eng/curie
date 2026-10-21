@@ -19,13 +19,19 @@ from curie_worker.managed_cni_probe_kit import (
     EgressEvidence,
     ObservationEntry,
     ProbeKitRefused,
+    RetainedEvidence,
+    SpoofEvidence,
     accepts,
     channel_digest,
     judge_denial,
     judge_egress,
     judge_guard_dry_run,
+    judge_node_origin,
     judge_policy_sets,
+    judge_retained,
     judge_reviews,
+    judge_running_nodes,
+    judge_spoof,
     producer_constants_digest,
     served_families,
 )
@@ -311,3 +317,121 @@ def test_served_families_is_the_union_of_the_three_sources() -> None:
         served_families(["not-an-address"], [], [])
     with pytest.raises(ProbeKitRefused):
         served_families([], ["IPv5"], [])
+
+
+# --- Cases 3, 4, 5 and 7 verdict rules (this slice) ---
+
+
+def clean_spoof(**changes: object) -> SpoofEvidence:
+    base = SpoofEvidence(
+        sender_ready=True,
+        listener_ready=True,
+        on_requested_node=True,
+        forged_family_address=True,
+        listener_deliveries=0,
+        sockets_sampled=True,
+        window_covered=True,
+        overflow_moved=False,
+        control_succeeded=True,
+        address_reassigned=False,
+    )
+    return dataclasses.replace(base, **changes)  # type: ignore[arg-type]
+
+
+def test_spoof_passes_only_when_nothing_reached_the_twin() -> None:
+    assert judge_spoof(clean_spoof()) == ("pass", "denied")
+    assert judge_spoof(clean_spoof(listener_deliveries=1)) == ("fail", "delivered")
+    # A delivery outranks every unavailable reason, so a leak is never hidden.
+    assert judge_spoof(clean_spoof(listener_deliveries=1, control_succeeded=False)) == (
+        "fail",
+        "delivered",
+    )
+
+
+def test_spoof_terminated_reused_address_is_unavailable_not_pass() -> None:
+    assert judge_spoof(clean_spoof(address_reassigned=True)) == (
+        "unavailable",
+        "address_reassigned",
+    )
+
+
+@pytest.mark.parametrize(
+    "changes,reason",
+    [
+        ({"forged_family_address": False}, "no_family_address"),
+        ({"sender_ready": False}, "phase_timeout"),
+        ({"listener_ready": False}, "phase_timeout"),
+        ({"on_requested_node": False}, "wrong_node"),
+        ({"sockets_sampled": False}, "listener_incomplete"),
+        ({"window_covered": False}, "listener_incomplete"),
+        ({"overflow_moved": True}, "listener_overflow"),
+        ({"control_succeeded": False}, "control_failed"),
+    ],
+)
+def test_spoof_unavailable_reasons(changes: dict[str, object], reason: str) -> None:
+    assert judge_spoof(clean_spoof(**changes)) == ("unavailable", reason)
+
+
+def clean_retained(**changes: object) -> RetainedEvidence:
+    base = RetainedEvidence(
+        established=True,
+        listener_ready=True,
+        on_requested_node=True,
+        family_address=True,
+        post_trigger_deliveries=0,
+        sockets_sampled=True,
+        window_covered=True,
+        overflow_moved=False,
+        trigger_confirmed=True,
+        control_succeeded=True,
+        reuse_provoked=True,
+    )
+    return dataclasses.replace(base, **changes)  # type: ignore[arg-type]
+
+
+def test_retained_fails_when_the_flow_keeps_passing_data() -> None:
+    assert judge_retained(clean_retained()) == ("pass", "denied")
+    assert judge_retained(clean_retained(post_trigger_deliveries=1)) == ("fail", "retained_flow")
+    # A retained flow outranks an unprovoked reuse: a leak is a leak.
+    assert judge_retained(clean_retained(post_trigger_deliveries=2, reuse_provoked=False)) == (
+        "fail",
+        "retained_flow",
+    )
+
+
+def test_retained_unprovoked_reuse_is_unavailable_not_pass() -> None:
+    assert judge_retained(clean_retained(reuse_provoked=False)) == (
+        "unavailable",
+        "reuse_not_provoked",
+    )
+
+
+@pytest.mark.parametrize(
+    "changes,reason",
+    [
+        ({"family_address": False}, "no_family_address"),
+        ({"established": False}, "phase_timeout"),
+        ({"on_requested_node": False}, "wrong_node"),
+        ({"window_covered": False}, "listener_incomplete"),
+        ({"overflow_moved": True}, "listener_overflow"),
+        ({"trigger_confirmed": False}, "trigger_unconfirmed"),
+        ({"control_succeeded": False}, "control_failed"),
+    ],
+)
+def test_retained_unavailable_reasons(changes: dict[str, object], reason: str) -> None:
+    assert judge_retained(clean_retained(**changes)) == ("unavailable", reason)
+
+
+def test_node_origin_records_a_fact_not_a_denial() -> None:
+    assert judge_node_origin(observed=True, reached=True) == ("pass", "reaches")
+    assert judge_node_origin(observed=True, reached=False) == ("pass", "blocked")
+    assert judge_node_origin(observed=False, reached=False) == (
+        "unavailable",
+        "node_probe_unavailable",
+    )
+
+
+def test_running_node_capability() -> None:
+    assert judge_running_nodes(0) == ("pass", "reviews_denied")
+    assert judge_running_nodes(2) == ("fail", "node_capable_pod")
+    assert judge_running_nodes(None) == ("unavailable", "review_unavailable")
