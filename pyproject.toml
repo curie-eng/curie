@@ -127,6 +127,7 @@ name = "Production composition never imports commissioning records"
 type = "forbidden"
 source_modules = ["curie_api", "curie_worker"]
 forbidden_modules = [
+    "curie_protected_hooks.commissioning_acl",
     "curie_protected_hooks.commissioning_bootstrap",
     "curie_protected_hooks.commissioning_encoding",
     "curie_protected_hooks.commissioning_records",
