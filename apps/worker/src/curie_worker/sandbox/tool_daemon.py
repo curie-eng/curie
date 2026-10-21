@@ -599,14 +599,18 @@ def endpoint_present(
         pod = client.get_daemon_pod(
             config.namespace, claim, request_timeout_seconds=_bound(deadline)
         )
-        return pod is not None and pod.ready and all(
-            client.list_daemon_objects(
-                config.namespace,
-                kind,
-                label_selector=selector,
-                request_timeout_seconds=_bound(deadline),
+        return (
+            pod is not None
+            and pod.ready
+            and all(
+                client.list_daemon_objects(
+                    config.namespace,
+                    kind,
+                    label_selector=selector,
+                    request_timeout_seconds=_bound(deadline),
+                )
+                for kind in ("Service", "NetworkPolicy")
             )
-            for kind in ("Service", "NetworkPolicy")
         )
     except Exception as exc:  # noqa: BLE001 - unknown is not present
         logger.warning("tool daemon endpoint of %s unreadable (%s)", claim, type(exc).__name__)
@@ -637,10 +641,11 @@ def ping(
 def await_ready(
     client: SandboxClient, provisioned: Provisioned, deadline: float, sleeps: Iterator[float]
 ) -> None:
-    """Wait, within the claim's own ``deadline``, for an authenticated ping.
+    """Wait, within the claim's own ``deadline``, for a Ready Pod and an authenticated ping.
 
     A Pod that is gone or has finished fails at once; a transient read is no
-    observation.
+    observation. An unready or terminating Pod can answer a port-forwarded ping
+    while the Service has no endpoint for it, so it never counts.
     """
 
     config = provisioned.config
@@ -663,6 +668,7 @@ def await_ready(
             remaining = deadline - time.monotonic()
             if (
                 pod.phase == "Running"
+                and pod.ready
                 and remaining > 0
                 and ping(
                     client,
