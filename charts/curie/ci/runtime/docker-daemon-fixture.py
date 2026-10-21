@@ -661,11 +661,10 @@ class Fixture:
         base = f"http://127.0.0.1:{self.port}/v2/" + repository.split("/", 1)[1]
         blob_dir = self.work / (name + "-blobs")
         blob_dir.mkdir()
-        blobs: dict[str, Path] = {}
 
         def fetch(expected: str) -> Json:
             require(re.fullmatch(SHA256, expected), "invalid_blob_digest")
-            path = blobs.setdefault(expected, blob_dir / expected.split(":")[1])
+            path = blob_dir / expected.split(":")[1]
             if not path.exists():
                 request = urllib.request.Request(
                     base + "/manifests/" + expected,
