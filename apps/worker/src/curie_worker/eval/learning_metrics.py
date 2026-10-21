@@ -455,7 +455,7 @@ def _predicate(raw: object) -> _Predicate:
             learning_class is LearningClass.SKILL
             and isinstance(value, list)
             and bool(value)
-            and all(_is_normalized_text(step) for step in value)
+            and all(isinstance(step, str) and _required_tokens(step) for step in value)
         )
     elif name == "schedule_matches":
         valid = (
@@ -532,17 +532,74 @@ def _norm(text: str) -> str:
         text = trimmed
 
 
+_TOKEN_SPLIT = re.compile(r"[^a-z0-9-]+")
+_NONCE = re.compile(r"^[a-z]+-[0-9a-f]{6}$")
+_STOPWORDS = frozenset(
+    "a an the and or of to in on for by as is it its this that then with from each their"
+    " those these be".split()
+)
+
+
+def _tokens(text: str) -> list[str]:
+    stripped = (token.strip("-") for token in _TOKEN_SPLIT.split(_norm(text)))
+    return [token for token in stripped if token]
+
+
+def _required_tokens(step: str) -> list[str]:
+    return [token for token in _tokens(step) if token not in _STOPWORDS]
+
+
 def _contains_in_order(body: object, steps: Sequence[object]) -> bool:
+    """Token anchors (decision after live run 7).
+
+    Every non-stopword token of every step must be a word of the body, nonce
+    tokens must first occur in the body in the same relative order as in the steps,
+    and each step's unique-token anchor must appear in step order.
+    """
     if not isinstance(body, str):
         raise EvidenceError("stored skill body must be text")
-    haystack, position = _norm(body), 0
-    for step in steps:
-        needle = _norm(str(step))
-        found = haystack.find(needle, position)
-        if found < 0:
+    words = _tokens(body)
+    first: dict[str, int] = {}
+    for index, word in enumerate(words):
+        first.setdefault(word, index)
+    required = [_required_tokens(str(step)) for step in steps]
+    nonces: list[str] = []
+    for tokens in required:
+        for token in tokens:
+            if token not in first:
+                return False
+            if _NONCE.match(token) and token not in nonces:
+                nonces.append(token)
+    positions = [first[token] for token in nonces]
+    if positions != sorted(positions):
+        return False
+    # Section A2: each step's anchor is its first token found in no other step; anchors
+    # must occur in step order under a greedy forward cursor.
+    cursor = 0
+    for index, tokens in enumerate(required):
+        others = {token for other, rest in enumerate(required) if other != index for token in rest}
+        anchor = next((token for token in tokens if token not in others), None)
+        if anchor is None:
+            continue
+        found = next((at for at in range(cursor, len(words)) if words[at] == anchor), None)
+        if found is None:
             return False
-        position = found + len(needle)
+        cursor = found
     return True
+
+
+def _statement_agrees(statement: object, expected: str) -> bool:
+    """Word-bounded normalized containment with no competing value of the nonce shape."""
+    if not isinstance(statement, str):
+        return False
+    needle, haystack = _norm(expected), _norm(statement)
+    bounded = rf"(?<![a-z0-9-]){re.escape(needle)}(?![a-z0-9-])"
+    if not needle or re.search(bounded, haystack) is None:
+        return False
+    allowed = {token for token in _tokens(expected) if _NONCE.match(token)}
+    if not allowed:
+        return True
+    return all(token in allowed for token in _tokens(statement) if _NONCE.match(token))
 
 
 def _schedule_agrees(observed: Mapping[str, object], expected: Mapping[str, object]) -> bool:
@@ -598,7 +655,7 @@ def _evaluate(check: _Predicate, before: StateSnapshot, after: StateSnapshot) ->
     observed = [_field(row, _FIELD_PREDICATES[check.name]) for row in active]
     if check.name == "statement_equals":
         return bool(observed) and all(
-            isinstance(value, str) and _norm(value) == _norm(str(check.value)) for value in observed
+            _statement_agrees(value, str(check.value)) for value in observed
         )
     return bool(observed) and all(value == check.value for value in observed)
 
@@ -738,10 +795,15 @@ def _metrics(rows: Sequence[DecisionResult], thresholds: Thresholds) -> dict[str
         else {"status": "PASS" if rate <= thresholds.falsewrite else "FAIL", "value": rate}
     )
     duplicates = sum(row.correction_duplicates for row in eligible)
-    gates["correction_duplicates"] = {
-        "status": "PASS" if duplicates <= thresholds.correction_duplicates else "FAIL",
-        "value": duplicates,
-    }
+    corrections = [row for row in eligible if row.case_id.startswith(_CORRECTION_FAMILY)]
+    gates["correction_duplicates"] = (
+        {"status": CaseStatus.NOT_AVAILABLE.value, "value": None}
+        if not corrections
+        else {
+            "status": "PASS" if duplicates <= thresholds.correction_duplicates else "FAIL",
+            "value": duplicates,
+        }
+    )
     return {
         "per_class": per_class,
         "gates": gates,
@@ -762,6 +824,8 @@ def _metrics(rows: Sequence[DecisionResult], thresholds: Thresholds) -> dict[str
 
 
 _DEFAULT_THRESHOLDS = Thresholds()
+# F8 is the correction-of-an-existing-skill family; its rows are the correction decisions.
+_CORRECTION_FAMILY = "F8-"
 _SEVERITY = {"PASS": 0, "NOT_AVAILABLE": 1, "FAIL": 2}
 
 
