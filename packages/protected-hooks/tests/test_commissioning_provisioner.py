@@ -403,6 +403,10 @@ def test_guard_hashes_candidate_templates_not_a_campaigns_lane() -> None:
             api.construct(profile(), acl=Recipes(instantiated))
         with pytest.raises(api.ProvisionerRefused):
             api.construct(profile(), acl=Recipes(minimal_rules(**{name: ("-@all",)})))
+        # A template that also pins one fixed campaign lane is not a template.
+        mixed = ("-@all", "~{lane}:*", "~protected:commissioning:lane:" + "a" * 64 + ":*")
+        with pytest.raises(api.ProvisionerRefused):
+            api.construct(profile(), acl=Recipes(minimal_rules(**{name: mixed})))
     with pytest.raises(api.ProvisionerRefused):
         api.construct(profile(), acl=Recipes(minimal_rules(issuer=("-@all", "~{lane}:*"))))
 
