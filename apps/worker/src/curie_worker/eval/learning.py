@@ -95,7 +95,10 @@ ACCOUNTING_BASES = frozenset(
     {"conservative-shared-key-upper-bound", "attributable-generation-cost"}
 )
 OWNER_LABEL = "curie.learning-eval.owner"
+# Fixture placeholder channel IDs. Each scenario agent gets its own synthetic
+# pair at render time, because a Slack channel route belongs to one agent.
 CHANNELS = ("C0EXAMPLE1", "C0EXAMPLE2")
+SYNTHETIC_CHANNEL = "C0SYNTHETIC"
 EVAL_ISOLATE_PREFIX = "eval:"
 THREAD_RE = re.compile(r"[0-9]+\.[0-9]{6}")
 INSTANCE_RE = re.compile(r"(F[1-8]-P[1-3])-R([1-9][0-9]*)")
@@ -2054,16 +2057,30 @@ _NEEDED_FIELD = {
 }
 
 
-def _substitute(value: Any, values: Mapping[str, str]) -> Any:
+def _substitute(
+    value: Any, values: Mapping[str, str], literals: Mapping[str, str] | None = None
+) -> Any:
     if isinstance(value, str):
         for key, replacement in values.items():
             value = value.replace("{" + key + "}", replacement)
+        for literal, replacement in (literals or {}).items():
+            value = value.replace(literal, replacement)
         return value
     if isinstance(value, list):
-        return [_substitute(item, values) for item in value]
+        return [_substitute(item, values, literals) for item in value]
     if isinstance(value, dict):
-        return {key: _substitute(item, values) for key, item in value.items()}
+        return {key: _substitute(item, values, literals) for key, item in value.items()}
     return value
+
+
+def _scenario_channels(run_id: str, repetition: int, fixture_id: str) -> tuple[str, str]:
+    """Two obviously synthetic Slack channel IDs unique per run, repetition and scenario."""
+
+    def one(index: int) -> str:
+        digest = hashlib.sha256(f"{run_id}:{repetition}:{fixture_id}:{index}".encode())
+        return "C0" + digest.hexdigest()[:9].upper()
+
+    return one(1), one(2)
 
 
 def _scenario_values(due: datetime) -> dict[str, str]:
@@ -2131,6 +2148,7 @@ class _Campaign:
         self.threads: set[str] = set()
         self.bind_errors = 0
         self.live_children = 0
+        self.channels: tuple[str, str] = CHANNELS
         self.platform_keys: list[str] = []
         self.windows: list[dict[str, Any]] = []
         self.f4_base: datetime | None = None
@@ -2247,7 +2265,10 @@ class _Campaign:
     def must(self, args: Sequence[str], scope: Mapping[str, Any], **kw: Any) -> Any:
         code, parsed, _, _, stderr = self.cli(args, scope, **kw)
         if code != 0:
-            raise _Stop(f"`{' '.join(args[:3])}` failed: {stderr}")
+            detail = stderr.strip()
+            if isinstance(parsed, dict) and parsed.get("error") is not None:
+                detail = f"{detail} {self.scrub(json.dumps(parsed['error']))}".strip()
+            raise _Stop(f"`{' '.join(args[:3])}` failed: {detail or 'no error output'}")
         return parsed
 
     def api(self, method: str, path: str, body: object | None = None) -> tuple[int, Any]:
@@ -2656,14 +2677,14 @@ class _Campaign:
                 "--plugin-dir",
                 str(FIXTURES / "learning-bundle"),
                 "--slack-channel",
-                CHANNELS[0],
+                self.channels[0],
             ],
             bare,
             timeout=600,
         )
         agent_id = _text(_obj(_obj(deployed, "deploy").get("agent"), "agent").get("id"), "id")
         status, _ = self.api(
-            "POST", f"/agents/{agent_id}/channels", {"kind": "slack", "address": CHANNELS[1]}
+            "POST", f"/agents/{agent_id}/channels", {"kind": "slack", "address": self.channels[1]}
         )
         if status not in (200, 201):
             raise _Stop(f"binding the second channel answered {status}")
@@ -2699,7 +2720,7 @@ class _Campaign:
         )
         memory = _obj(self.must(["local", "memory", name], bare), "memory")
         facts = {str(f["id"]): f for f in _lst(memory.get("facts"), "facts")}
-        for channel in CHANNELS:
+        for channel in self.channels:
             scoped = _obj(
                 self.must(["local", "memory", name, "--channel", f"slack={channel}"], bare),
                 "memory",
@@ -2800,43 +2821,32 @@ class _Campaign:
     def transcript(
         self, scope: Mapping[str, Any], agent_id: str, channel: str, thread: str
     ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-        base = f"/agents/{agent_id}/state/bindings/slack/{urllib.parse.quote(channel, safe='')}"
+        # The worker stores transcripts agent-wide under the conversation id
+        # (binding.py history_ref); a local message turn's id is slack:<channel>:<thread>.
+        thread_key = f"slack:{channel}:{thread}"
+        path = f"/agents/{agent_id}/state/transcript/{urllib.parse.quote(thread_key, safe='')}"
         deadline = time.monotonic() + 30
         while True:
-            status, listing = self.api("GET", f"{base}/transcript")
-            keys = [
-                str(_obj(e, "entry").get("key"))
-                for e in listing or []
-                if isinstance(e, dict) and thread in str(e.get("key"))
-            ]
-            if status == 200 and len(keys) == 1:
+            status, entry = self.api("GET", path)
+            if status == 200:
                 break
-            if time.monotonic() > deadline:
+            if status != 404 or time.monotonic() > deadline:
                 raise _Stop(f"no transcript for thread {thread} (status {status})")
             time.sleep(3)
-        status, entry = self.api("GET", f"{base}/transcript/{urllib.parse.quote(keys[0], safe='')}")
-        if status != 200:
-            raise _Stop(f"transcript read answered {status}")
-        value = _obj(entry, "transcript entry").get("value")
-        messages: list[Any]
-        if isinstance(value, dict) and isinstance(value.get("messages"), list):
-            messages = value["messages"]
-        elif isinstance(value, dict) and isinstance(value.get("turns"), list):
-            messages = [
-                m
-                for turn in value["turns"]
-                if isinstance(turn, dict)
-                for m in turn.get("messages", [])
-            ]
-        elif isinstance(value, list):
-            messages = value
-        else:
-            raise _Stop("the transcript value has no structured messages")
+        record = _obj(entry, "transcript entry")
+        if record.get("key") != thread_key:
+            raise _Stop("the transcript entry is bound to another thread")
+        value = record.get("value")
+        if not isinstance(value, list):
+            raise _Stop("the transcript value is not the runner's JSON array")
+        # history.py TurnRecord.to_dict: {"type": "turn", ..., "messages": [...]}
+        turns = [item for item in value if isinstance(item, dict) and item.get("type") == "turn"]
+        messages: list[Any] = [m for turn in turns for m in _lst(turn.get("messages", []), "msgs")]
         key = (agent_id, channel, thread)
         start = self.transcript_counts.get(key, 0)
         self.transcript_counts[key] = len(messages)
         turn = [m for m in messages[start:] if isinstance(m, dict)]
-        return {"binding_key": keys[0], "state_caller": "platform", "messages": turn}, turn
+        return {"binding_key": thread_key, "state_caller": "platform", "messages": turn}, turn
 
     # Scoring --------------------------------------------------------------------
 
@@ -3038,10 +3048,10 @@ class _Campaign:
         index: int,
     ) -> tuple[dict[str, Any], tuple[dict[str, Any], Any]]:
         before = self.snapshot(scope)
-        sent = self.message(scope, str(fixture["messages"][index]), CHANNELS[0], thread)
+        sent = self.message(scope, str(fixture["messages"][index]), self.channels[0], thread)
         after = self.snapshot(scope)
         try:
-            transcript, turn = self.transcript(scope, agent_id, CHANNELS[0], thread)
+            transcript, turn = self.transcript(scope, agent_id, self.channels[0], thread)
         except _Stop as exc:
             transcript, turn = {"error": str(exc)}, []
             self.failures.append(f"{scope['case_id']} transcript: {exc}")
@@ -3074,7 +3084,9 @@ class _Campaign:
         else:
             due = datetime.now(UTC) + timedelta(minutes=SCHEDULE_LEAD_MINUTES)
         values = _scenario_values(due)
-        fixture = _substitute(copy.deepcopy(dict(raw)), values)
+        self.channels = _scenario_channels(self.run_id, repetition, str(raw["id"]))
+        literals = dict(zip(CHANNELS, self.channels, strict=True))
+        fixture = _substitute(copy.deepcopy(dict(raw)), values, literals)
         case_id = f"{fixture['id']}-R{repetition}"
         name = f"le-{self.run_id}-r{repetition}-{fixture['id'].lower()}"
         scope: dict[str, Any] = {"repetition": repetition, "case_id": case_id, "agent_id": name}
@@ -3179,7 +3191,7 @@ class _Campaign:
                     return
             probe = probes[str(probe_id)]
             before_state = self.snapshot(scope)[0]
-            sent = self.message(scope, str(probe["input"]), CHANNELS[0], self.new_thread())
+            sent = self.message(scope, str(probe["input"]), self.channels[0], self.new_thread())
             after_state = self.snapshot(scope)[0]
             success = str(probe["expected"]) in sent["reply"]
             ref = self.add(
@@ -3223,13 +3235,13 @@ class _Campaign:
     ) -> str:
         bare = {k: scope[k] for k in ("repetition", "case_id", "agent_id")}
         _, _, _, before_ref, _ = self.cli(["local", "memory", str(scope["agent_id"])], bare)
-        sent = self.message(scope, text, CHANNELS[1], self.new_thread())
+        sent = self.message(scope, text, self.channels[1], self.new_thread())
         _, parsed, _, after_ref, _ = self.cli(["local", "memory", str(scope["agent_id"])], bare)
         facts = _lst(_obj(parsed, "memory").get("facts"), "facts")
         present = any(_obj(f, "fact").get("id") == fact_id for f in facts)
         try:
             transcript: dict[str, Any] = self.transcript(
-                scope, agent_id, CHANNELS[1], sent["thread"]
+                scope, agent_id, self.channels[1], sent["thread"]
             )[0]
         except _Stop as exc:
             transcript = {"error": str(exc)}
@@ -3244,8 +3256,8 @@ class _Campaign:
                 "input": text,
                 "output": output,
                 "thread": sent["thread"],
-                "channel": CHANNELS[1],
-                "teaching_channel": CHANNELS[0],
+                "channel": self.channels[1],
+                "teaching_channel": self.channels[0],
                 "before_snapshot_ref": before_ref,
                 "snapshot_ref": after_ref,
                 "invocation_id": sent["invocation_id"],
@@ -3278,7 +3290,7 @@ class _Campaign:
         bare = {k: scope[k] for k in ("repetition", "case_id", "agent_id")}
         subject = str(fixture["subject"])
         recall = fixture["probes"][0]
-        sent = self.message(scope, str(recall["input"]), CHANNELS[1], self.new_thread())
+        sent = self.message(scope, str(recall["input"]), self.channels[1], self.new_thread())
         ok = str(recall["required_value"]) in sent["reply"]
         self.record_control(
             scope,
@@ -3287,7 +3299,7 @@ class _Campaign:
             "fresh thread on the second channel",
         )
         correction = next(c for c in fixture["controls"] if c.get("id") == "fact-correction")
-        self.message(scope, str(correction["messages"][0]), CHANNELS[0], thread)
+        self.message(scope, str(correction["messages"][0]), self.channels[0], thread)
         state = self.snapshot(scope)[0]
         live = [
             f
@@ -3352,9 +3364,9 @@ class _Campaign:
         token = values["schedule_token"]
         due = self.find(after[0], "schedules", "prompt", token)
         cancel = next(c for c in fixture["controls"] if c.get("id") == "cancelled-one-shot")
-        self.message(scope, str(cancel["messages"][0]), CHANNELS[0], thread)
+        self.message(scope, str(cancel["messages"][0]), self.channels[0], thread)
         made = self.find(self.snapshot(scope)[0], "schedules", "prompt", values["cancel_token"])
-        self.message(scope, str(cancel["messages"][1]), CHANNELS[0], thread)
+        self.message(scope, str(cancel["messages"][1]), self.channels[0], thread)
         if len(due) != 1 or len(made) != 1:
             self.record_control(
                 scope,
@@ -3370,6 +3382,7 @@ class _Campaign:
                     "schedule_id": str(row["id"]),
                     "token": token_value,
                     "created": created,
+                    "channel": self.channels[0],
                 }
             )
 
@@ -3389,7 +3402,7 @@ class _Campaign:
             return
         control = next(c for c in fixture["controls"] if c.get("id") == "revise-and-cancel")
         original = self.find(after[0], "schedules", "prompt", values["schedule_token"])
-        self.message(scope, str(control["messages"][0]), CHANNELS[0], thread)
+        self.message(scope, str(control["messages"][0]), self.channels[0], thread)
         revised_state = self.snapshot(scope)[0]
         revised = [
             r
@@ -3402,7 +3415,7 @@ class _Campaign:
             and revised[0]["id"] == original[0]["id"]
             and revised[0].get("cron") == control["revised_cron"]
         )
-        self.message(scope, str(control["messages"][1]), CHANNELS[0], thread)
+        self.message(scope, str(control["messages"][1]), self.channels[0], thread)
         final = self.find(self.snapshot(scope)[0], "schedules", "prompt", values["revised_token"])
         cancelled = bool(final) and all(r.get("state") == "cancelled" for r in final)
         self.record_control(
@@ -3426,7 +3439,7 @@ class _Campaign:
             return
         probes = {str(p["id"]): p for p in fixture["probes"]}
         corrected = probes["corrected-procedure"]
-        sent = self.message(scope, str(corrected["input"]), CHANNELS[0], self.new_thread())
+        sent = self.message(scope, str(corrected["input"]), self.channels[0], self.new_thread())
         ok = str(corrected["expected"]) in sent["reply"]
         self.record_control(
             scope,
@@ -3436,7 +3449,7 @@ class _Campaign:
         )
         heads = self.find(after[0], "skills", "slug", str(fixture["subject"]))
         revert = next(c for c in fixture["controls"] if c.get("id") == "revert")
-        self.message(scope, str(revert["messages"][0]), CHANNELS[0], thread)
+        self.message(scope, str(revert["messages"][0]), self.channels[0], thread)
         restored = self.find(self.snapshot(scope)[0], "skills", "slug", str(fixture["subject"]))
         same = (
             len(heads) == 1
@@ -3448,7 +3461,7 @@ class _Campaign:
             scope, "revert", "PASS" if same else "FAIL", "same immutable skill with a new revision"
         )
         probe = probes["restored-procedure"]
-        sent = self.message(scope, str(probe["input"]), CHANNELS[0], self.new_thread())
+        sent = self.message(scope, str(probe["input"]), self.channels[0], self.new_thread())
         ok = str(probe["expected"]) in sent["reply"]
         self.record_control(
             scope, "restored-procedure", "PASS" if ok else "FAIL", "fresh-thread probe after revert"
@@ -3532,7 +3545,9 @@ class _Campaign:
             mine = [
                 dict(r)
                 for r in receipts
-                if not r["synthetic"] and r["channel"] == CHANNELS[0] and item["token"] in r["text"]
+                if not r["synthetic"]
+                and r["channel"] == item["channel"]
+                and item["token"] in r["text"]
             ]
             evidence = self.add(
                 "schedule-observation",
@@ -3540,7 +3555,7 @@ class _Campaign:
                     **scope,
                     "schedule_id": item["schedule_id"],
                     "task_token": item["token"],
-                    "channel": CHANNELS[0],
+                    "channel": item["channel"],
                     "zone": row.get("timezone"),
                     "kind": "one-shot" if one_shot else "recurring",
                     "due_at": f"{due_at:%Y-%m-%dT%H:%M:%S}Z",
@@ -3551,7 +3566,7 @@ class _Campaign:
                     "observation_end": _now(),
                     "tolerance_seconds": DELIVERY_TOLERANCE_SECONDS,
                     "delivery_route": {
-                        "channel": CHANNELS[0],
+                        "channel": item["channel"],
                         "worker_slack_api_port": self.stub_port,
                     },
                     "collector_receipts": mine,
@@ -3703,7 +3718,9 @@ class _Campaign:
         assert self.collector is not None
         request = urllib.request.Request(
             f"http://127.0.0.1:{self.collector.port}/api/chat.postMessage",
-            data=json.dumps({"channel": CHANNELS[0], "text": "synthetic transport check"}).encode(),
+            data=json.dumps(
+                {"channel": SYNTHETIC_CHANNEL, "text": "synthetic transport check"}
+            ).encode(),
             headers={"Content-Type": "application/json", "X-Learning-Synthetic": "1"},
             method="POST",
         )
