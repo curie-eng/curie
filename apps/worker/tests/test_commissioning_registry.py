@@ -266,6 +266,23 @@ def test_a_witness_needs_the_recorded_create_operation_and_guard(root: Path) -> 
         assert row.objects.secret_uid == SECRET_UID and row.state == "retiring"
 
 
+def test_only_a_pod_witness_clears_uncertain(root: Path) -> None:
+    """Workload binding W is the Pod; a Service or Secret witness leaves it uncertain."""
+    with open_registry(root) as registry:
+        row = create(registry)
+        row = registry.mark_uncertain(OWNER, LAUNCH, row.revision)
+        row = registry.record_witnessed_uid(
+            OWNER, LAUNCH, row.revision, witness("secret", SECRET_UID), "7"
+        )
+        assert row.state == "uncertain" and row.objects.secret_uid == SECRET_UID
+        row = registry.record_witnessed_uid(
+            OWNER, LAUNCH, row.revision, witness("service", SERVICE_UID), "7"
+        )
+        assert row.state == "uncertain" and row.objects.service_uid == SERVICE_UID
+        row = registry.record_witnessed_uid(OWNER, LAUNCH, row.revision, witness(), "7")
+        assert row.state == "retiring" and row.objects.pod_uid == POD_UID
+
+
 def test_uncertain_follows_the_campaign_ownership_state_machine(root: Path) -> None:
     errors = production()
     with open_registry(root) as registry:

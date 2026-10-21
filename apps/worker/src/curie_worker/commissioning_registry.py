@@ -606,8 +606,9 @@ class CommissioningLaunchRegistry:
         """Resolve one ambiguous create from the guard's witness of its exact operation.
 
         Only while ``retiring`` or ``uncertain``, only for an unknown UID, and
-        only for the recorded create operation ID and guard identity; an
-        ``uncertain`` launch becomes ``retiring``. The caller must also observe
+        only for the recorded create operation ID and guard identity. Only a
+        Pod witness moves an ``uncertain`` launch to ``retiring``; a Service or
+        Secret witness is recorded without changing the state. The caller must also observe
         the object at the exact recorded name with the witnessed UID. This
         storage API authenticates neither. @spec PROTECTED-COMMISSIONING-7/8.
         """
@@ -627,7 +628,9 @@ class CommissioningLaunchRegistry:
             ):
                 raise RegistryConflict()
             self._set_uid(db, launch_id, witness.kind, witness.uid, resource_version)
-            db.execute("UPDATE launches SET state='retiring' WHERE launch_id=?", (launch_id,))
+            if witness.kind == "pod":
+                # Workload binding W is the Pod: only its witness clears uncertainty.
+                db.execute("UPDATE launches SET state='retiring' WHERE launch_id=?", (launch_id,))
             return self._bump(db, worker_principal_id, launch_id)
 
     @_safe
