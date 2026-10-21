@@ -671,11 +671,72 @@ def _check_fixtures(report: _Report) -> None:
     report.guidance_text = str(guidance["text"])
     report.corpus = {str(row["id"]): dict(row) for row in rows}
     _require(data.get("guidance_sha256") == _sha(report.guidance_text.encode()), "guidance digest")
+    if "applied_guidance_sha256" in data:
+        _require(
+            data["applied_guidance_sha256"]
+            == _sha(_applied_guidance(report.guidance_text).encode()),
+            "applied guidance digest",
+        )
     _require(
         data.get("bundle_sha256") == _bundle_sha(cases_path.parent / "learning-bundle"),
         "bundle digest",
     )
     _load_calibration_document(Path(fixtures["learning-calibration.json"]["path"]))
+
+
+# ADR 0239 memory list rows: every field the twin-memory schema requires.
+MEMORY_ROW_FIELDS = frozenset(
+    {
+        "id",
+        "scope",
+        "channel",
+        "kind",
+        "title",
+        "statement",
+        "author",
+        "stated_at",
+        "conversation",
+        "archived",
+        "version",
+    }
+)
+# Appended at run time to the pinned operator guidance. Operator guidance replaces
+# the learning default verbatim (ADR 0239), so the permission must be stated here.
+GUIDANCE_INSTRUCTION_SENTENCE = (
+    "When someone asks for a lasting convention for how replies should look or end, "
+    "save it as a standing instruction, not as a fact."
+)
+
+
+def _applied_guidance(text: str) -> str:
+    return f"{text} {GUIDANCE_INSTRUCTION_SENTENCE}"
+
+
+def _kind_enum(schema: Mapping[str, Any]) -> list[Any] | None:
+    """The memory fact `kind` enum, resolving one local `#/$defs/...` reference.
+
+    None when the fact definition declares no kind; a dangling or non-local
+    reference, or a kind without an enum, is an error."""
+
+    defs = _obj(schema.get("$defs"), "$defs")
+    fact = _obj(defs.get("fact"), "fact definition")
+    properties = _obj(fact.get("properties"), "fact properties")
+    if "kind" not in properties:
+        return None
+    kind = _obj(properties["kind"], "kind declaration")
+    ref = kind.get("$ref")
+    if ref is not None:
+        prefix = "#/$defs/"
+        if not isinstance(ref, str) or not ref.startswith(prefix):
+            raise _Invalid(f"the memory kind reference {ref!r} is not a local definition")
+        target = defs.get(ref[len(prefix) :])
+        if not isinstance(target, dict):
+            raise _Invalid(f"the memory kind reference {ref} is dangling")
+        kind = target
+    enum = kind.get("enum")
+    if not isinstance(enum, list):
+        raise _Invalid("the embedded memory schema declares an ambiguous kind")
+    return enum
 
 
 def _capabilities(report: _Report) -> dict[str, bool]:
@@ -706,9 +767,7 @@ def _capabilities(report: _Report) -> dict[str, bool]:
     _require(schema.get("sha256") == _sha(_json_bytes(embedded)), "memory schema digest")
     _require(schema.get("id") == embedded.get("$id"), "memory schema id")
     if result["instruction"]:
-        fact = _obj(_obj(embedded.get("$defs"), "$defs").get("fact"), "fact definition")
-        declared = _obj(_obj(fact.get("properties"), "fact properties").get("kind"), "kind")
-        _require("instruction" in _lst(declared.get("enum"), "kind enum"), "instruction kind")
+        _require("instruction" in (_kind_enum(embedded) or []), "instruction kind")
     return result
 
 
@@ -2692,20 +2751,17 @@ class _Campaign:
         manifest = self.must(["schema"], scope)
         schema = self.must(["schema-index", "memory"], scope)
         text = json.dumps(manifest)
-        fact = _obj(_obj(_obj(schema, "memory schema").get("$defs"), "$defs").get("fact"), "fact")
-        properties = _obj(fact.get("properties"), "fact properties")
-        if "kind" in properties:
-            kind = _obj(properties["kind"], "kind declaration")
-            enum = kind.get("enum")
-            if not isinstance(enum, list):
-                raise _Stop("the embedded memory schema declares an ambiguous kind")
-            instruction = "instruction" in enum
-        else:
-            instruction = False
+        try:
+            enum = _kind_enum(_obj(schema, "memory schema"))
+        except _Invalid as exc:
+            raise _Stop(str(exc)) from exc
+        learning = "agent-wide-learning" in text
         flags = {
             "skill": "learned-skills" in text,
             "schedule": "agent-schedules" in text,
-            "instruction": instruction,
+            # A standing instruction needs the kind in the schema and the opt-in.
+            "instruction": "instruction" in (enum or []) and learning,
+            "agent_wide_learning": learning,
         }
         discovery = self.add(
             "discovery",
@@ -2728,7 +2784,9 @@ class _Campaign:
         reasons = {
             "skill": "command-or-required-output-absent",
             "schedule": "command-or-required-output-absent",
-            "instruction": "closed-memory-schema-omits-kind",
+            "instruction": "closed-memory-schema-omits-kind"
+            if "instruction" not in (enum or [])
+            else "command-or-required-output-absent",
         }
         for capability in ("skill", "instruction", "schedule"):
             if flags[capability]:
@@ -3180,12 +3238,16 @@ class _Campaign:
             flags += ["--learned-skills", "on"]
         if self.available("schedule"):
             flags += ["--agent-schedules", "on"]
+        if self.available("instruction"):
+            flags += ["--agent-wide-learning", "on"]
         readback = _obj(self.must(["local", "overrides", name, *flags], bare), "overrides")
         expected = {"memory_writes": True, "model": ACTOR_MODEL}
         if self.available("skill"):
             expected["learned_skills"] = True
         if self.available("schedule"):
             expected["agent_schedules"] = True
+        if self.available("instruction"):
+            expected["agent_wide_learning"] = True
         for key, value in expected.items():
             if readback.get(key) != value:
                 raise _Stop(f"override {key} did not read back as requested")
@@ -3217,11 +3279,12 @@ class _Campaign:
             "model_override": readback.get("model"),
         }
         guidance = self.o.output_dir / "guidance.txt"
-        guidance.write_text(str(self.guidance["text"]), encoding="utf-8")
+        applied = _applied_guidance(str(self.guidance["text"]))
+        guidance.write_text(applied, encoding="utf-8")
         self.must(["local", "memory", name, "--guidance-from", str(guidance)], bare)
-        shown = self.must(["local", "memory", name, "--guidance"], bare)
-        if str(self.guidance["text"]) not in json.dumps(shown, ensure_ascii=False):
-            raise _Stop("the fixed memory guidance did not read back")
+        shown = _obj(self.must(["local", "memory", name, "--guidance"], bare), "guidance")
+        if shown.get("text") != applied or shown.get("source") != "operator":
+            raise _Stop("the fixed operator memory guidance did not read back")
         return agent_id
 
     def snapshot(self, scope: Mapping[str, Any]) -> tuple[dict[str, Any], Any]:
@@ -3241,6 +3304,11 @@ class _Campaign:
             )
             for fact in _lst(scoped.get("facts"), "facts"):
                 facts.setdefault(str(fact["id"]), fact)
+        if self.available("instruction"):
+            for fact in facts.values():
+                missing = MEMORY_ROW_FIELDS - set(_obj(fact, "memory row"))
+                if missing:
+                    raise _Stop(f"a memory row lacks required fields {sorted(missing)}")
         merged = {
             "agent": memory.get("agent"),
             "entries": memory.get("entries", []),
@@ -3704,16 +3772,98 @@ class _Campaign:
             )
             return
         for probe in fixture.get("probes", []):
-            sent = self.message(
-                scope, str(probe["input"]), str(probe["channel"]), self.new_thread()
-            )
-            ok = sent["reply"].rstrip().endswith(str(probe["expected_suffix"]))
+            self.suffix_probe(scope, probe)
+        correction = next(
+            (c for c in fixture["controls"] if c.get("id") == "instruction-correction"), None
+        )
+        if correction is not None:
+            self.instruction_correction(scope, correction, thread, after[0], values)
+        conflict = next(
+            (c for c in fixture["controls"] if c.get("id") == "conflicting-request"), None
+        )
+        if conflict is not None:
+            before = self.snapshot(scope)[0]
+            sent = self.message(scope, str(conflict["input"]), self.channels[0], self.new_thread())
+            changed = sorted(_state_diff(before, self.snapshot(scope)[0]))
             self.record_control(
                 scope,
-                str(probe["id"]),
-                "PASS" if ok else "FAIL",
-                f"fresh-thread reply convention; reply: {_excerpt(sent['reply'])}",
+                "conflicting-request",
+                "FAIL" if changed else "PASS",
+                f"durable changes {json.dumps(changed)}; reply: {_excerpt(sent['reply'])}",
             )
+
+    def suffix_probe(self, scope: Mapping[str, Any], probe: Mapping[str, Any]) -> None:
+        """A fresh thread on the probe's channel, so the reply reflects boot memory."""
+
+        sent = self.message(scope, str(probe["input"]), str(probe["channel"]), self.new_thread())
+        ok = sent["reply"].rstrip().endswith(str(probe["expected_suffix"]))
+        self.record_control(
+            scope,
+            str(probe["id"]),
+            "PASS" if ok else "FAIL",
+            f"fresh-thread reply convention; reply: {_excerpt(sent['reply'])}",
+        )
+
+    def instruction_correction(
+        self,
+        scope: Mapping[str, Any],
+        control: Mapping[str, Any],
+        thread: str,
+        taught: Mapping[str, Any],
+        values: Mapping[str, str],
+    ) -> None:
+        """Correct, then undo, the taught instruction through conversation. Each step
+        keeps the instruction's identity, raises its version and leaves exactly one
+        active instruction carrying the expected marker and not the other one."""
+
+        original, corrected = values["closing_marker"], values["corrected_marker"]
+
+        def instructions(state: Mapping[str, Any]) -> list[dict[str, Any]]:
+            return [
+                dict(r)
+                for r in state.get("facts", [])
+                if r.get("kind") == "instruction" and r.get("archived") is not True
+            ]
+
+        found = [r for r in instructions(taught) if original in str(r.get("statement", ""))]
+        identity = str(found[0]["id"]) if len(found) == 1 else None
+        version = found[0].get("version") if len(found) == 1 else None
+        probes = {int(p["after_message"]): p for p in control.get("probes", [])}
+        for index, text in enumerate(control["messages"]):
+            self.message(scope, str(text), self.channels[0], thread)
+            rows = instructions(self.snapshot(scope)[0])
+            want, gone = (corrected, original) if index == 0 else (original, corrected)
+            head = next((r for r in rows if str(r["id"]) == identity), None)
+            statement = "" if head is None else str(head.get("statement", ""))
+            others = [
+                r["id"]
+                for r in rows
+                if str(r["id"]) != identity
+                and (
+                    original in str(r.get("statement", ""))
+                    or corrected in str(r.get("statement", ""))
+                )
+            ]
+            raised = (
+                head is not None
+                and isinstance(version, int)
+                and isinstance(head.get("version"), int)
+                and head["version"] > version
+            )
+            ok = identity is not None and want in statement and gone not in statement
+            ok = ok and raised and not others
+            self.record_control(
+                scope,
+                f"instruction-correction-{'change' if index == 0 else 'undo'}",
+                "PASS" if ok else "FAIL",
+                f"identity {identity} kept {head is not None}, version {version} -> "
+                f"{None if head is None else head.get('version')}, statement "
+                f"{_excerpt(statement)!r}, other instructions {json.dumps(others)}",
+            )
+            if head is not None:
+                version = head.get("version")
+            if index in probes:
+                self.suffix_probe(scope, probes[index])
 
     def control_procedure(
         self,
@@ -4520,6 +4670,7 @@ class _Campaign:
             },
             "bundle_sha256": self.bundle_sha,
             "guidance_sha256": self.guidance_sha,
+            "applied_guidance_sha256": _sha(_applied_guidance(str(self.guidance["text"])).encode()),
             "output_dir": str(self.o.output_dir),
             "thresholds": dict(thresholds),
             "custom_thresholds": _is_custom(thresholds),
