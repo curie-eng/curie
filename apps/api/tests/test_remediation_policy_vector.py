@@ -102,3 +102,28 @@ def test_a_number_a_json_value_can_change_is_refused_at_its_path(case: dict[str,
     with pytest.raises(module.PolicyRefused) as refused:
         module.validate_document(json.loads(case["text"]))
     assert (refused.value.code, refused.value.path) == (case["code"], case["path"])
+
+
+@pytest.mark.parametrize("index", [0, 1], ids=["first_action", "second_action"])
+def test_a_verifier_on_the_acting_connector_is_refused_at_its_connector(index: int) -> None:
+    """@spec AUTOMATED-REMEDIATION-17: a verifier that reads through the connector
+    that performed the action cannot certify that action's recovery, so the
+    document alone refuses it ``verifier_not_independent`` at the verifier's
+    ``connector`` (#4232). The same document with an independent verifier passes.
+    """
+
+    module = _validator()
+    base = next(case for case in _VECTOR["valid"] if case["name"] == "two_actions")["document"]
+    document = copy.deepcopy(base)
+    assert module.validate_document(copy.deepcopy(document)) == document
+    action = document["actions"][index]
+    action["verifier"]["connector"] = action["connector"]
+
+    with pytest.raises(module.PolicyRefused) as refused:
+        module.validate_document(document)
+
+    assert (refused.value.code, refused.value.path) == (
+        "verifier_not_independent",
+        f"/actions/{index}/verifier/connector",
+    )
+    assert refused.value.status_code == 422

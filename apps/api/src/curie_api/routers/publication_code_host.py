@@ -266,9 +266,15 @@ def _no_other_publication(
         )
         if found.verdict in REFUSING:
             links = ", ".join(p.url for p in found.publications)
+            what = (
+                "an open pull request from a factory publication branch whose author "
+                "cannot be verified"
+                if found.verdict == "unconfirmed"
+                else "an open factory pull request"
+            )
             raise PullRequestRefused(
                 "publication_exists",
-                f"the issue already has an open factory pull request ({found.verdict}): {links}",
+                f"the issue already has {what} ({found.verdict}): {links}",
             )
 
     return check

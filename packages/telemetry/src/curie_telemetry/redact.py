@@ -20,6 +20,21 @@ def _placeholder(name: str) -> str:
 
 REDACTION_RULES: tuple[RedactionRule, ...] = (
     RedactionRule(
+        "oidc_callback_query",
+        re.compile(r"(/console/oidc/callback)\?(?!\[REDACTED:)[^\s\"\']+"),
+        r"\1?[REDACTED:oidc_callback_query]",
+    ),
+    RedactionRule(
+        "directory_credential",
+        re.compile(r"\bdir\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"),
+        _placeholder("directory_credential"),
+    ),
+    RedactionRule(
+        "identity_connect_token",
+        re.compile(r"(/identity/connect/)(?!\[REDACTED:)[^/\s?\"\'#]+"),
+        r"\1[REDACTED:identity_connect_token]",
+    ),
+    RedactionRule(
         "pem_private_key",
         re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"),
         _placeholder("pem_private_key"),

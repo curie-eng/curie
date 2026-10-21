@@ -53,11 +53,17 @@ from ..approval_auth import (
     platform_key_or_adapter,
     require_adapter_principal,
 )
-from ..approvers import card_on_requesting_surface
+from ..approval_teams import (
+    approval_team_decision,
+    authenticated_actor_evidence,
+    team_restriction,
+)
+from ..approvers import IdpTeamApprovers, card_on_requesting_surface
 from ..auth import require_api_key, require_platform_key
 from ..authorizer import AuthzDecision, authorize_approval
 from ..config import get_settings
 from ..deps import ApproverSetSelectorDep, ResumeQueueDep, SessionDep, get_store
+from ..identity_fence import lock_identity_reader
 from ..models import Approval, ApprovalStatus
 from ..remediation_approvals import (
     REMEDIATION_PURPOSE,
@@ -526,6 +532,13 @@ async def resolve_approval(
     if principal.kind == "adapter" and card_on_requesting_surface(approval, binding):
         await _admit_adapter_answer(session, approval, principal.subject)
     approver_set = approver_sets(approval, binding)
+    team_decision = await approval_team_decision(session, approval, principal)
+    if team_decision.restricted:
+        approver_set = IdpTeamApprovers(
+            allowed=team_decision.allowed,
+            reason=team_decision.reason,
+            restriction=approver_set if team_restriction(approval, binding) else None,
+        )
     # Release the pooled DB connection before the membership lookup. A
     # group-bound set performs a Slack HTTP call (up to the client timeout), and
     # holding the read transaction's connection across it lets a Slack outage
@@ -542,7 +555,7 @@ async def resolve_approval(
         principal_kind=principal.kind,
     )
 
-    if principal.kind == "test_driver":
+    if principal.kind == "test_driver" and not team_decision.restricted:
         settings = get_settings()
         declared = any(
             driver.bot_user_id == principal.subject and driver.channel_id == principal.actor_channel
@@ -582,9 +595,33 @@ async def resolve_approval(
             authorizer=authorizer_name,
             authorized=authorized,
             reason=reason,
-            evidence=decision.evidence,
+            evidence=(
+                {**(decision.evidence or {}),
+                 "authenticated_actor": authenticated_actor_evidence(principal)}
+                if action == "resolved" and authorized else decision.evidence
+            ),
+            team_id=team_decision.team_id if team_decision.restricted else None,
+            team_epoch=team_decision.epoch if team_decision.restricted else None,
+            team_digest=team_decision.digest if team_decision.restricted else None,
         )
 
+    async def _refresh_authority() -> None:
+        nonlocal team_decision, decision
+        # A committing read helper releases transaction advisory locks. Every
+        # refresh re-acquires the fence and reads the current actor and policy.
+        was_restricted = team_decision.restricted
+        await lock_identity_reader(session)
+        team_decision = await approval_team_decision(session, approval, principal)
+        current_binding = await crud_approvals.get_approval_route_binding(session, approval)
+        if (was_restricted != team_decision.restricted
+                or team_decision.restricted and (
+                    not team_decision.allowed or current_binding != binding
+                )):
+            decision = AuthzDecision(False, "approver team membership or policy changed",
+                                     evidence={"kind": "idp_team", "reason": team_decision.reason})
+
+    if decision.allowed:
+        await _refresh_authority()
     if not decision.allowed:
         await _audit("denied", authorized=False, reason=decision.reason)
         raise HTTPException(status.HTTP_403_FORBIDDEN, decision.reason)
@@ -701,6 +738,12 @@ async def resolve_approval(
         if refused is not None:
             await _audit("remediation_refused", authorized=True, reason=refused.code)
             raise _remediation_refused(refused)
+        # resolution_refusal commits its read transaction. Do not let that
+        # release create an authorization gap before the resolution claim.
+        await _refresh_authority()
+        if not decision.allowed:
+            await _audit("denied", authorized=False, reason=decision.reason)
+            raise HTTPException(status.HTTP_403_FORBIDDEN, decision.reason)
 
     with operation_span(
         "curie.approval.resolve",

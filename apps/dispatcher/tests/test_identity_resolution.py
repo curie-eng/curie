@@ -778,7 +778,10 @@ def test_an_approval_click_is_acked_and_resolved_before_the_lookup_returns(
         app = _app(config, redis_client, lookup, resolver=resolver)
         sock = FakeSocketClient()
 
-        SocketModeHandler(app, app_token="xapp-test").handle(sock, _approval_click("env-a"))
+        interaction = _approval_click("env-a")
+        # The sender's team is authoritative even on another team's envelope.
+        interaction.payload["team"] = {"id": "T0EXAMPLE9"}
+        SocketModeHandler(app, app_token="xapp-test").handle(sock, interaction)
 
         assert sock.acked_envelope_ids == ["env-a"]
         assert lookup.entered.wait(5), "the lookup was never submitted"
@@ -787,6 +790,10 @@ def test_an_approval_click_is_acked_and_resolved_before_the_lookup_returns(
         assert not lookup.returned.is_set()
         ((name, evidence),) = lookup.calls
         assert name == "default"
+        forwarded = _norm(resolver.calls[0]["slack"])
+        assert forwarded == _norm(evidence)
+        assert forwarded["user_id"] == USER
+        assert forwarded["interaction_user_team_id"] == TEAM
         assert _norm(evidence)["delivery"] == "block_actions"
         assert _norm(evidence)["interaction_user_team_id"] == TEAM
     finally:
@@ -805,7 +812,10 @@ def test_a_note_submission_is_acked_and_resolved_before_the_lookup_returns(
         app = _app(config, redis_client, lookup, resolver=resolver)
         sock = FakeSocketClient()
 
-        SocketModeHandler(app, app_token="xapp-test").handle(sock, _note_submit("env-v"))
+        interaction = _note_submit("env-v")
+        # The sender's team is authoritative even on another team's envelope.
+        interaction.payload["team"] = {"id": "T0EXAMPLE9"}
+        SocketModeHandler(app, app_token="xapp-test").handle(sock, interaction)
 
         assert sock.acked_envelope_ids == ["env-v"]
         assert lookup.entered.wait(5), "the lookup was never submitted"
@@ -814,6 +824,10 @@ def test_a_note_submission_is_acked_and_resolved_before_the_lookup_returns(
         assert not lookup.returned.is_set()
         ((name, evidence),) = lookup.calls
         assert name == "default"
+        forwarded = _norm(resolver.calls[0]["slack"])
+        assert forwarded == _norm(evidence)
+        assert forwarded["user_id"] == USER
+        assert forwarded["interaction_user_team_id"] == TEAM
         assert _norm(evidence)["delivery"] == "view_submission"
     finally:
         lookup.gate.set()

@@ -97,7 +97,7 @@ async def authorize_approval(
     *,
     approver_set: ApproverSet,
     principal_kind: PrincipalKind,
-) -> tuple[str, AuthzDecision]:
+) -> tuple[str | None, AuthzDecision]:
     """Decide whether ``actor`` may resolve ``approval``, and name what decided
     (for the audit row).
 

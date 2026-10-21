@@ -434,6 +434,11 @@ def ci_view(detail: CiDetail, pull: dict[str, Any] | None = None) -> CiView:
         base_failing=base.failing_keys if base is not None else frozenset(),
         conflicted=conflicted(pull) if pull is not None else None,
         merged=pull.get("merged") is True if pull is not None else None,
+        closed_unmerged=(
+            pull.get("state") == "closed" and pull.get("merged") is not True
+            if pull is not None
+            else None
+        ),
     )
 
 

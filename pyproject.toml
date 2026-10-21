@@ -93,6 +93,7 @@ root_packages = [
     "curie_internal",
     "curie_worker",
     "curie_connector_proxy",
+    "curie_commissioning_ingress",
     "curie_dispatcher",
     "curie_discord_adapter",
     "curie_mail_adapter",
@@ -117,6 +118,77 @@ name = "Protected hook primitives stay independent of applications and harnesses
 type = "forbidden"
 source_modules = ["curie_protected_hooks"]
 forbidden_modules = ["curie_api", "curie_worker", "curie_runner", "claude_agent_sdk"]
+
+# @spec PROTECTED-HOOK-SOURCE-11: only provisioner composition imports the
+# runtime directory writer. The HTTP application and every package that
+# composes a process holding the ordinary platform key or ordinary application
+# credentials cannot reach it, and the shared grammar the API reads never
+# imports it. A provisioner entry inside a listed package needs a reviewed
+# ignore_imports exception naming that one module.
+[[tool.importlinter.contracts]]
+name = "The runtime directory writer stays out of ordinary compositions"
+type = "forbidden"
+source_modules = [
+    "curie_api",
+    "curie_worker",
+    "curie_dispatcher",
+    "curie_runner",
+    "curie_internal",
+    "curie_upgrade_pause",
+    "curie_discord_adapter",
+    "curie_mail_adapter",
+    "curie_connector_proxy",
+    "curie_e2e_connector",
+    "curie_commissioning_ingress",
+    "curie_protected_hooks.runtime_directory",
+]
+forbidden_modules = ["curie_protected_hooks.runtime_directory_writer"]
+
+# @spec PROTECTED-COMMISSIONING-1/2: production composition reads no commissioning
+# record. The whole API and worker are sources, so a new production module is
+# covered by default; a later commissioning entry needs a reviewed exception.
+# Later commissioning slices add their record modules to the forbidden list.
+[[tool.importlinter.contracts]]
+name = "Production composition never imports commissioning records"
+type = "forbidden"
+source_modules = ["curie_api", "curie_worker"]
+forbidden_modules = [
+    "curie_protected_hooks.commissioning_acceptance_writer",
+    "curie_protected_hooks.commissioning_acl",
+    "curie_protected_hooks.commissioning_admissions",
+    "curie_protected_hooks.commissioning_bootstrap",
+    "curie_protected_hooks.commissioning_campaign_records",
+    "curie_protected_hooks.commissioning_encoding",
+    "curie_protected_hooks.commissioning_journal",
+    "curie_protected_hooks.commissioning_local_ownership",
+    "curie_protected_hooks.commissioning_operator_guard",
+    "curie_protected_hooks.commissioning_operator_protocol",
+    "curie_protected_hooks.commissioning_producers",
+    "curie_protected_hooks.commissioning_provisioner",
+    "curie_protected_hooks.commissioning_records",
+    "curie_protected_hooks.commissioning_reservations",
+    "curie_protected_hooks.commissioning_scripts",
+    "curie_protected_hooks.qualification_publication",
+]
+
+# @spec PROTECTED-COMMISSIONING-2/4: the commissioning ingress is a separate
+# standalone process composition, a top-level package beside `curie_api` rather
+# than a module of it, so the contract above holds for the whole API with no
+# exception. No ordinary composition imports or mounts it; it may import the API's
+# shared signing and file-reading helpers, never the reverse.
+[[tool.importlinter.contracts]]
+name = "Ordinary compositions never import the commissioning ingress"
+type = "forbidden"
+source_modules = [
+    "curie_api",
+    "curie_worker",
+    "curie_dispatcher",
+    "curie_runner",
+    "curie_internal",
+    "curie_protected_hooks",
+    "curie_connector_proxy",
+]
+forbidden_modules = ["curie_commissioning_ingress"]
 
 [[tool.importlinter.contracts]]
 # Telemetry attribute names are shared schema, not an application or harness

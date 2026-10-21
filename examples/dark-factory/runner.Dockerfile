@@ -23,4 +23,15 @@ ENV UV_CACHE_DIR=${HOME}/.cache/uv
 ENV PNPM_HOME=${HOME}/.local/share/pnpm
 ENV PATH="/usr/local/cargo/bin:${PATH}"
 RUN rustup component add rustfmt clippy
+RUN set -eu; \
+    version=0.9.146; \
+    case "$(dpkg --print-architecture)" in \
+        amd64) target=x86_64-unknown-linux-gnu; sha256=682c21b777c333e96fd532e114d3a5a894e0729ab88d94c0a9f20f8419695428 ;; \
+        arm64) target=aarch64-unknown-linux-gnu; sha256=b2e33d7c72de7ade0ff7b3a948ac37516b24f8a836b7a8870c1f634a94be9de9 ;; \
+        *) echo "unsupported cargo-nextest architecture" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${version}/cargo-nextest-${version}-${target}.tar.gz" -o /tmp/cargo-nextest.tar.gz; \
+    echo "${sha256}  /tmp/cargo-nextest.tar.gz" | sha256sum -c -; \
+    tar -xzf /tmp/cargo-nextest.tar.gz -C /usr/local/cargo/bin cargo-nextest; \
+    rm /tmp/cargo-nextest.tar.gz
 USER 1000:1000

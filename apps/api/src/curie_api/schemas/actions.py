@@ -156,7 +156,10 @@ class ActionAuditOut(BaseModel):
     action: str
     actor: str
     actor_channel: str | None
-    authorizer: str
+    authorizer: str | None
+    team_id: uuid.UUID | None = None
+    team_epoch: int | None = None
+    team_digest: str | None = None
     authorized: bool
     reason: str | None
     evidence: dict[str, Any] | None

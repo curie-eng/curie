@@ -519,6 +519,57 @@ def test_a_dirty_pull_without_checks_fails_promptly_without_a_ci_fix(admitted: A
     assert sink.reruns == []
 
 
+def test_a_pull_request_closed_unmerged_during_the_ci_wait_fails_as_pr_closed(
+    admitted: Any,
+) -> None:
+    """#4754: green checks on a pull request a person closed never complete the run."""
+
+    client, github, sink = admitted
+    number = 9765
+    sink.ci_script = [ci_green()]
+    # GitHub reports a closed, unmerged pull request as state closed with
+    # merged false: https://docs.github.com/en/rest/pulls/pulls#get-a-pull-request
+    sink.pull_script = [
+        {"state": "closed", "merged": False, "mergeable": True, "mergeable_state": "clean"}
+    ]
+    published = _published(client, github, sink, number)
+    sink.issue_labels.setdefault(number, set()).add("curie-factory:pr-open")
+
+    _reconcile()
+
+    assert _terminal(number) == ("failed", "pr_closed")
+    body = _body(sink, published["id"])
+    assert body.startswith("Could not complete: a person closed the pull request without merging")
+    assert "a person closed the pull request without merging it during the CI wait." in body
+    assert "Cause: pr_closed" in body
+    assert "Reason: pr_closed" in body
+    assert published["pr_url"] in body
+    assert "SUCCEEDED" not in body
+    assert "Completed" not in body
+    assert "curie-factory:needs-human" in sink.issue_labels[number]
+    assert "curie-factory:pr-open" not in sink.issue_labels[number]
+    assert _ci_turns(published["id"]) == []
+    assert sink.reruns == []
+
+
+def test_a_pull_request_merged_during_the_ci_wait_still_completes(admitted: Any) -> None:
+    client, github, sink = admitted
+    number = 9766
+    sink.ci_script = [ci_green()]
+    sink.pull_script = [
+        {"state": "closed", "merged": True, "mergeable": None, "mergeable_state": "unknown"}
+    ]
+    published = _published(client, github, sink, number)
+
+    _reconcile()
+
+    assert _terminal(number) == ("completed", "completed")
+    body = _body(sink, published["id"])
+    assert body.startswith(f"Completed: {published['pr_url']}")
+    assert "pr_closed" not in body
+    assert "curie-factory:needs-human" not in sink.issue_labels.get(number, set())
+
+
 def test_null_pull_mergeability_waits_for_the_third_clean_observation(admitted: Any) -> None:
     client, github, sink = admitted
     number = 9762

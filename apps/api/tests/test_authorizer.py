@@ -54,7 +54,7 @@ def _authorize(
     binding: Any = None,
     group_client: GroupMembershipSource | None = None,
     principal_kind: str = "chat",
-) -> tuple[str, AuthzDecision]:
+) -> tuple[str | None, AuthzDecision]:
     """The resolve endpoint's exact shape: select a set from the binding, then
     authorize on it. Selection is real, so these stay end-to-end tests of the
     binding-to-decision path rather than of the authorizer in isolation."""

@@ -79,8 +79,15 @@
             "type": "boolean"
           },
           "authorizer": {
-            "title": "Authorizer",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Authorizer"
           },
           "created_at": {
             "format": "date-time",
@@ -114,6 +121,40 @@
               }
             ],
             "title": "Reason"
+          },
+          "team_digest": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Team Digest"
+          },
+          "team_epoch": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Team Epoch"
+          },
+          "team_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Team Id"
           }
         },
         "required": [
@@ -888,6 +929,16 @@
           "kind": {
             "title": "Kind",
             "type": "string"
+          },
+          "slack": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SlackEvidence"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
@@ -904,6 +955,17 @@
             "title": "Allowed",
             "type": "boolean"
           },
+          "connect_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Connect Url"
+          },
           "install_restricted": {
             "title": "Install Restricted",
             "type": "boolean"
@@ -919,6 +981,113 @@
           "install_restricted"
         ],
         "title": "AdmissionOut",
+        "type": "object"
+      },
+      "AgentAccessPolicyOut": {
+        "description": "An agent's policy; version 0 and no ``updated_at`` mean none was set.",
+        "properties": {
+          "agent_id": {
+            "format": "uuid",
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "approver_team_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Approver Team Id"
+          },
+          "invocation_team_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Invocation Team Id"
+          },
+          "tenant_id": {
+            "format": "uuid",
+            "title": "Tenant Id",
+            "type": "string"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          },
+          "version": {
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "agent_id",
+          "tenant_id",
+          "invocation_team_id",
+          "approver_team_id",
+          "version",
+          "updated_at"
+        ],
+        "title": "AgentAccessPolicyOut",
+        "type": "object"
+      },
+      "AgentAccessPolicyWrite": {
+        "additionalProperties": false,
+        "description": "Replace an agent's policy.\n\nBoth team keys are required so a write states the whole policy; ``null``\nclears that role back to today's behavior. ``expected_version`` is the\nversion the writer last read: 0 when the agent has no policy yet.",
+        "properties": {
+          "approver_team_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Approver Team Id"
+          },
+          "expected_version": {
+            "minimum": 0.0,
+            "title": "Expected Version",
+            "type": "integer"
+          },
+          "invocation_team_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Invocation Team Id"
+          }
+        },
+        "required": [
+          "invocation_team_id",
+          "approver_team_id",
+          "expected_version"
+        ],
+        "title": "AgentAccessPolicyWrite",
         "type": "object"
       },
       "AgentCreate": {
@@ -1739,8 +1908,15 @@
             "type": "boolean"
           },
           "authorizer": {
-            "title": "Authorizer",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Authorizer"
           },
           "created_at": {
             "format": "date-time",
@@ -1808,6 +1984,40 @@
               }
             ],
             "title": "Reason"
+          },
+          "team_digest": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Team Digest"
+          },
+          "team_epoch": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Team Epoch"
+          },
+          "team_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Team Id"
           }
         },
         "required": [
@@ -3042,6 +3252,21 @@
           }
         },
         "title": "BehaviorPacksConfig",
+        "type": "object"
+      },
+      "Body_confirm_connection_identity_connect__token__confirm_post": {
+        "properties": {
+          "csrf": {
+            "maxLength": 43,
+            "minLength": 43,
+            "title": "Csrf",
+            "type": "string"
+          }
+        },
+        "required": [
+          "csrf"
+        ],
+        "title": "Body_confirm_connection_identity_connect__token__confirm_post",
         "type": "object"
       },
       "Body_upload_bundle_agents__agent_id__versions__version_id__bundle_put": {
@@ -4772,6 +4997,709 @@
           "deployed_at"
         ],
         "title": "DeploymentOut",
+        "type": "object"
+      },
+      "DirectoryAccountIn": {
+        "additionalProperties": false,
+        "properties": {
+          "identity_namespace_id": {
+            "format": "uuid",
+            "title": "Identity Namespace Id",
+            "type": "string"
+          },
+          "provider_native_id": {
+            "maxLength": 320,
+            "minLength": 1,
+            "title": "Provider Native Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "identity_namespace_id",
+          "provider_native_id"
+        ],
+        "title": "DirectoryAccountIn",
+        "type": "object"
+      },
+      "DirectoryAttemptIn": {
+        "additionalProperties": false,
+        "properties": {
+          "error": {
+            "enum": [
+              "provider_unavailable",
+              "provider_rejected",
+              "invalid_snapshot"
+            ],
+            "title": "Error",
+            "type": "string"
+          },
+          "expected_epoch": {
+            "minimum": 0.0,
+            "title": "Expected Epoch",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "expected_epoch",
+          "error"
+        ],
+        "title": "DirectoryAttemptIn",
+        "type": "object"
+      },
+      "DirectoryBindingOut": {
+        "additionalProperties": false,
+        "properties": {
+          "config_version": {
+            "title": "Config Version",
+            "type": "integer"
+          },
+          "expires_at": {
+            "format": "date-time",
+            "title": "Expires At",
+            "type": "string"
+          },
+          "identity_epoch": {
+            "title": "Identity Epoch",
+            "type": "integer"
+          },
+          "issuer": {
+            "title": "Issuer",
+            "type": "string"
+          },
+          "managed_by": {
+            "title": "Managed By",
+            "type": "string"
+          },
+          "namespace_ids": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "title": "Namespace Ids",
+            "type": "array"
+          },
+          "team_ids": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "title": "Team Ids",
+            "type": "array"
+          },
+          "tenant_id": {
+            "format": "uuid",
+            "title": "Tenant Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenant_id",
+          "issuer",
+          "managed_by",
+          "team_ids",
+          "namespace_ids",
+          "config_version",
+          "identity_epoch",
+          "expires_at"
+        ],
+        "title": "DirectoryBindingOut",
+        "type": "object"
+      },
+      "DirectoryConfigIn": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_version": {
+            "minimum": 0.0,
+            "title": "Expected Version",
+            "type": "integer"
+          },
+          "governed_domains": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 100,
+            "title": "Governed Domains",
+            "type": "array"
+          },
+          "issuer": {
+            "maxLength": 2048,
+            "title": "Issuer",
+            "type": "string"
+          },
+          "managed_by": {
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+            "title": "Managed By",
+            "type": "string"
+          }
+        },
+        "required": [
+          "issuer",
+          "governed_domains",
+          "managed_by",
+          "expected_version"
+        ],
+        "title": "DirectoryConfigIn",
+        "type": "object"
+      },
+      "DirectoryConfigOut": {
+        "additionalProperties": false,
+        "properties": {
+          "governed_domains": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Governed Domains",
+            "type": "array"
+          },
+          "issuer": {
+            "title": "Issuer",
+            "type": "string"
+          },
+          "managed_by": {
+            "title": "Managed By",
+            "type": "string"
+          },
+          "tenant_id": {
+            "format": "uuid",
+            "title": "Tenant Id",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "tenant_id",
+          "issuer",
+          "governed_domains",
+          "managed_by",
+          "version"
+        ],
+        "title": "DirectoryConfigOut",
+        "type": "object"
+      },
+      "DirectoryCredentialIn": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_config_version": {
+            "minimum": 1.0,
+            "title": "Expected Config Version",
+            "type": "integer"
+          },
+          "expires_in_seconds": {
+            "default": 3600,
+            "maximum": 86400.0,
+            "minimum": 60.0,
+            "title": "Expires In Seconds",
+            "type": "integer"
+          },
+          "namespace_ids": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "maxItems": 1000,
+            "title": "Namespace Ids",
+            "type": "array"
+          },
+          "team_ids": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "maxItems": 1000,
+            "minItems": 1,
+            "title": "Team Ids",
+            "type": "array"
+          },
+          "tenant_id": {
+            "format": "uuid",
+            "title": "Tenant Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenant_id",
+          "expected_config_version",
+          "team_ids",
+          "namespace_ids"
+        ],
+        "title": "DirectoryCredentialIn",
+        "type": "object"
+      },
+      "DirectoryCredentialOut": {
+        "additionalProperties": false,
+        "properties": {
+          "credential": {
+            "title": "Credential",
+            "type": "string"
+          },
+          "expires_at": {
+            "format": "date-time",
+            "title": "Expires At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "credential",
+          "expires_at"
+        ],
+        "title": "DirectoryCredentialOut",
+        "type": "object"
+      },
+      "DirectoryNamespaceIn": {
+        "additionalProperties": false,
+        "properties": {
+          "authority": {
+            "default": "",
+            "maxLength": 256,
+            "title": "Authority",
+            "type": "string"
+          },
+          "key": {
+            "maxLength": 253,
+            "minLength": 1,
+            "title": "Key",
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "slack_workspace",
+              "email_domain"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "provider": {
+            "enum": [
+              "slack",
+              "email"
+            ],
+            "title": "Provider",
+            "type": "string"
+          },
+          "tenant_id": {
+            "format": "uuid",
+            "title": "Tenant Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenant_id",
+          "provider",
+          "kind",
+          "key"
+        ],
+        "title": "DirectoryNamespaceIn",
+        "type": "object"
+      },
+      "DirectoryNamespaceOut": {
+        "additionalProperties": false,
+        "properties": {
+          "authority": {
+            "title": "Authority",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "key": {
+            "title": "Key",
+            "type": "string"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "provider": {
+            "title": "Provider",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "tenant_id": {
+            "format": "uuid",
+            "title": "Tenant Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "tenant_id",
+          "provider",
+          "authority",
+          "kind",
+          "key",
+          "status"
+        ],
+        "title": "DirectoryNamespaceOut",
+        "type": "object"
+      },
+      "DirectoryPeopleOut": {
+        "additionalProperties": false,
+        "properties": {
+          "next_after_subject": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next After Subject"
+          },
+          "people": {
+            "items": {
+              "$ref": "#/components/schemas/DirectoryPersonOut"
+            },
+            "title": "People",
+            "type": "array"
+          }
+        },
+        "required": [
+          "people",
+          "next_after_subject"
+        ],
+        "title": "DirectoryPeopleOut",
+        "type": "object"
+      },
+      "DirectoryPersonIn": {
+        "additionalProperties": false,
+        "properties": {
+          "accounts": {
+            "items": {
+              "$ref": "#/components/schemas/DirectoryAccountIn"
+            },
+            "maxItems": 1000,
+            "title": "Accounts",
+            "type": "array"
+          },
+          "display_name": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Display Name"
+          },
+          "email": {
+            "anyOf": [
+              {
+                "maxLength": 320,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Email"
+          },
+          "status": {
+            "default": "active",
+            "enum": [
+              "active",
+              "disabled",
+              "revoked"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "subject": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Subject",
+            "type": "string"
+          }
+        },
+        "required": [
+          "subject"
+        ],
+        "title": "DirectoryPersonIn",
+        "type": "object"
+      },
+      "DirectoryPersonOut": {
+        "additionalProperties": false,
+        "properties": {
+          "authorization_version": {
+            "title": "Authorization Version",
+            "type": "integer"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "subject": {
+            "title": "Subject",
+            "type": "string"
+          }
+        },
+        "required": [
+          "subject",
+          "status",
+          "authorization_version"
+        ],
+        "title": "DirectoryPersonOut",
+        "type": "object"
+      },
+      "DirectorySnapshotIn": {
+        "additionalProperties": false,
+        "properties": {
+          "complete": {
+            "title": "Complete",
+            "type": "boolean"
+          },
+          "expected_epoch": {
+            "minimum": 0.0,
+            "title": "Expected Epoch",
+            "type": "integer"
+          },
+          "expected_identity_epoch": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Required for credentials with namespaces. Read identity_epoch from GET /directory/binding before observing provider data. After a conflict, read a fresh binding and refetch provider data; never relabel a stale payload.",
+            "title": "Expected Identity Epoch"
+          },
+          "people": {
+            "items": {
+              "$ref": "#/components/schemas/DirectoryPersonIn"
+            },
+            "maxItems": 10000,
+            "title": "People",
+            "type": "array"
+          }
+        },
+        "required": [
+          "expected_epoch",
+          "complete",
+          "people"
+        ],
+        "title": "DirectorySnapshotIn",
+        "type": "object"
+      },
+      "DirectorySnapshotOut": {
+        "additionalProperties": false,
+        "properties": {
+          "digest": {
+            "title": "Digest",
+            "type": "string"
+          },
+          "epoch": {
+            "title": "Epoch",
+            "type": "integer"
+          },
+          "member_count": {
+            "title": "Member Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "epoch",
+          "member_count",
+          "digest"
+        ],
+        "title": "DirectorySnapshotOut",
+        "type": "object"
+      },
+      "DirectoryStatusIn": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_version": {
+            "minimum": 1.0,
+            "title": "Expected Version",
+            "type": "integer"
+          },
+          "status": {
+            "enum": [
+              "active",
+              "disabled",
+              "revoked"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "subject": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Subject",
+            "type": "string"
+          }
+        },
+        "required": [
+          "subject",
+          "expected_version",
+          "status"
+        ],
+        "title": "DirectoryStatusIn",
+        "type": "object"
+      },
+      "DirectoryStatusOut": {
+        "additionalProperties": false,
+        "properties": {
+          "authorization_version": {
+            "title": "Authorization Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "authorization_version"
+        ],
+        "title": "DirectoryStatusOut",
+        "type": "object"
+      },
+      "DirectoryTeamIn": {
+        "additionalProperties": false,
+        "properties": {
+          "external_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "External Id",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "tenant_id": {
+            "format": "uuid",
+            "title": "Tenant Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenant_id",
+          "external_id",
+          "name"
+        ],
+        "title": "DirectoryTeamIn",
+        "type": "object"
+      },
+      "DirectoryTeamOut": {
+        "additionalProperties": false,
+        "properties": {
+          "digest": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Digest"
+          },
+          "epoch": {
+            "title": "Epoch",
+            "type": "integer"
+          },
+          "external_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "External Id"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "last_attempt_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Attempt At"
+          },
+          "last_error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Error"
+          },
+          "last_synced_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Synced At"
+          },
+          "managed_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Managed By"
+          },
+          "member_count": {
+            "title": "Member Count",
+            "type": "integer"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "tenant_id": {
+            "format": "uuid",
+            "title": "Tenant Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "tenant_id",
+          "external_id",
+          "name",
+          "managed_by",
+          "epoch",
+          "member_count",
+          "digest",
+          "last_synced_at",
+          "last_attempt_at",
+          "last_error"
+        ],
+        "title": "DirectoryTeamOut",
         "type": "object"
       },
       "Environment": {
@@ -11295,6 +12223,141 @@
         "title": "StateNamespaceOut",
         "type": "object"
       },
+      "TeamSyncOut": {
+        "properties": {
+          "digest": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Digest"
+          },
+          "epoch": {
+            "title": "Epoch",
+            "type": "integer"
+          },
+          "external_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "External Id"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "last_attempt_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Attempt At"
+          },
+          "last_error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Error"
+          },
+          "last_synced_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Synced At"
+          },
+          "managed_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Managed By"
+          },
+          "member_count": {
+            "title": "Member Count",
+            "type": "integer"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "source": {
+            "enum": [
+              "idp_group",
+              "curie_managed"
+            ],
+            "title": "Source",
+            "type": "string"
+          },
+          "sync_age_seconds": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sync Age Seconds"
+          },
+          "synced": {
+            "title": "Synced",
+            "type": "boolean"
+          },
+          "tenant_id": {
+            "format": "uuid",
+            "title": "Tenant Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "tenant_id",
+          "source",
+          "external_id",
+          "name",
+          "managed_by",
+          "epoch",
+          "member_count",
+          "digest",
+          "last_synced_at",
+          "last_attempt_at",
+          "last_error",
+          "synced",
+          "sync_age_seconds"
+        ],
+        "title": "TeamSyncOut",
+        "type": "object"
+      },
       "TerminationBody": {
         "properties": {
           "observation": {
@@ -14468,6 +15531,132 @@
           }
         },
         "summary": "Update Agent",
+        "tags": [
+          "agents"
+        ]
+      }
+    },
+    "/agents/{agent_id}/access-policy": {
+      "get": {
+        "operationId": "get_agent_access_policy_agents__agent_id__access_policy_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentAccessPolicyOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Agent Access Policy",
+        "tags": [
+          "agents"
+        ]
+      },
+      "put": {
+        "operationId": "put_agent_access_policy_agents__agent_id__access_policy_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AgentAccessPolicyWrite"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentAccessPolicyOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Put Agent Access Policy",
         "tags": [
           "agents"
         ]
@@ -21823,6 +23012,765 @@
         ]
       }
     },
+    "/directory/binding": {
+      "get": {
+        "operationId": "read_directory_binding_directory_binding_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Directory-Credential",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Directory-Credential"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DirectoryBindingOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Read Directory Binding",
+        "tags": [
+          "directory"
+        ]
+      }
+    },
+    "/directory/config/{tenant_id}": {
+      "get": {
+        "operationId": "get_directory_config_directory_config__tenant_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Tenant Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DirectoryConfigOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Directory Config",
+        "tags": [
+          "directory"
+        ]
+      },
+      "put": {
+        "operationId": "put_directory_config_directory_config__tenant_id__put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Tenant Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DirectoryConfigIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DirectoryConfigOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Put Directory Config",
+        "tags": [
+          "directory"
+        ]
+      }
+    },
+    "/directory/credentials": {
+      "post": {
+        "operationId": "issue_directory_credential_directory_credentials_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DirectoryCredentialIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DirectoryCredentialOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Issue Directory Credential",
+        "tags": [
+          "directory"
+        ]
+      }
+    },
+    "/directory/namespaces": {
+      "post": {
+        "operationId": "provision_directory_namespace_directory_namespaces_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DirectoryNamespaceIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DirectoryNamespaceOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Provision Directory Namespace",
+        "tags": [
+          "directory"
+        ]
+      }
+    },
+    "/directory/people": {
+      "get": {
+        "operationId": "list_directory_people_directory_people_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "after_subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 512,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After Subject"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Directory-Credential",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Directory-Credential"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DirectoryPeopleOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Directory People",
+        "tags": [
+          "directory"
+        ]
+      }
+    },
+    "/directory/people/status": {
+      "post": {
+        "operationId": "change_directory_account_status_directory_people_status_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Directory-Credential",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Directory-Credential"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DirectoryStatusIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DirectoryStatusOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Change Directory Account Status",
+        "tags": [
+          "directory"
+        ]
+      }
+    },
+    "/directory/teams": {
+      "post": {
+        "operationId": "provision_directory_team_directory_teams_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DirectoryTeamIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DirectoryTeamOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Provision Directory Team",
+        "tags": [
+          "directory"
+        ]
+      }
+    },
+    "/directory/teams/{team_id}": {
+      "get": {
+        "operationId": "read_directory_team_directory_teams__team_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "team_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Team Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Directory-Credential",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Directory-Credential"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DirectoryTeamOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Read Directory Team",
+        "tags": [
+          "directory"
+        ]
+      }
+    },
+    "/directory/teams/{team_id}/attempt": {
+      "post": {
+        "operationId": "record_directory_attempt_directory_teams__team_id__attempt_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "team_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Team Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Directory-Credential",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Directory-Credential"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DirectoryAttemptIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Record Directory Attempt",
+        "tags": [
+          "directory"
+        ]
+      }
+    },
+    "/directory/teams/{team_id}/snapshot": {
+      "put": {
+        "operationId": "apply_directory_snapshot_directory_teams__team_id__snapshot_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "team_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Team Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Directory-Credential",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Directory-Credential"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DirectorySnapshotIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DirectorySnapshotOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Apply Directory Snapshot",
+        "tags": [
+          "directory"
+        ]
+      }
+    },
     "/evals/matrix": {
       "get": {
         "operationId": "eval_matrix_evals_matrix_get",
@@ -22558,6 +24506,204 @@
         "summary": "Probe Hook Support",
         "tags": [
           "hooks"
+        ]
+      }
+    },
+    "/identity/admin/{tenant_id}/{resource}": {
+      "get": {
+        "operationId": "identity_view_identity_admin__tenant_id___resource__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Tenant Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "resource",
+            "required": true,
+            "schema": {
+              "enum": [
+                "people",
+                "links",
+                "namespaces"
+              ],
+              "title": "Resource",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Identity View Identity Admin  Tenant Id   Resource  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Identity View",
+        "tags": [
+          "identity-admin"
+        ]
+      }
+    },
+    "/identity/connect/{token}": {
+      "get": {
+        "operationId": "identity_connect_page_identity_connect__token__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "token",
+            "required": true,
+            "schema": {
+              "title": "Token",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Identity Connect Page",
+        "tags": [
+          "identity-connect"
+        ]
+      }
+    },
+    "/identity/connect/{token}/confirm": {
+      "post": {
+        "operationId": "confirm_connection_identity_connect__token__confirm_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "token",
+            "required": true,
+            "schema": {
+              "title": "Token",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_confirm_connection_identity_connect__token__confirm_post"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Confirm Connection",
+        "tags": [
+          "identity-connect"
         ]
       }
     },
@@ -24207,6 +26353,136 @@
         "summary": "Resume Schedule",
         "tags": [
           "schedules"
+        ]
+      }
+    },
+    "/teams": {
+      "get": {
+        "operationId": "list_team_sync_status_teams_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "tenant_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Tenant Id"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/TeamSyncOut"
+                  },
+                  "title": "Response List Team Sync Status Teams Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Team Sync Status",
+        "tags": [
+          "teams"
+        ]
+      }
+    },
+    "/teams/metrics": {
+      "get": {
+        "description": "Export current age and durable failure counts; never expire membership.",
+        "operationId": "directory_metrics_teams_metrics_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "tenant_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Tenant Id"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Directory Metrics",
+        "tags": [
+          "teams"
         ]
       }
     },

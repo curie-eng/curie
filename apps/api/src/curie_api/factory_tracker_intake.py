@@ -97,6 +97,13 @@ _HOLD_BODY = (
     "Curie could not start this issue yet: a tracker or code host it needs did not "
     "answer. Curie retries on its next poll; nothing is needed unless this persists."
 )
+# A hold for a rejected or unreadable credential instead names the operator's
+# action (#4755): fixed text, never the token or the exception's words.
+_CREDENTIAL_HOLD_BODY = (
+    "Curie could not start this issue yet: a tracker or code host credential it "
+    "needs was rejected or could not be read. The operator must replace that "
+    "credential. Curie retries on its next poll."
+)
 
 
 @dataclass(frozen=True)
@@ -339,12 +346,23 @@ def _deferred(scope: _Scope, label: str, what: str, exc: Exception) -> None:
 async def _hold(
     scope: _Scope, tracker: Tracker, label: str, issue: TrackerIssueRef, exc: Exception
 ) -> None:
-    """Log one issue's deferral and say so on the issue once (upserted)."""
+    """Log one issue's deferral and say so on the issue once (upserted).
+
+    The body follows the cause (#4755): a rejected or unreadable credential
+    names the operator's action, anything else says the host did not answer.
+    The credential classes are matched before any generic fallback, since
+    ``CredentialUnreadable`` is an ``Unavailable``.
+    """
 
     _deferred(scope, label, "notice", exc)
+    body = (
+        _CREDENTIAL_HOLD_BODY
+        if isinstance(exc, (CredentialUnreadable, Unauthorized))
+        else _HOLD_BODY
+    )
     try:
         await tracker.marked_comments.upsert_marked(
-            ReplyTarget.on_issue(issue), HOLD_MARKER, _HOLD_BODY
+            ReplyTarget.on_issue(issue), HOLD_MARKER, body
         )
     except ForgeError as failed:
         # The retained cursor is the retry authority; the hold is a courtesy.
@@ -491,7 +509,6 @@ async def _apply(
             else:
                 await _cancel(session, scope, label, notice)
         except NotFound:
-            # The issue or a repository it names is gone: nothing to retry.
             await session.rollback()
             logger.info(
                 "tracker intake for binding %s skipped a notice on a missing issue",
@@ -570,7 +587,27 @@ async def _admit(
     if isinstance(chosen, Refusal):
         await _comment(tracker, issue, REPO_REFUSAL_MARKER, refusal_body(chosen))
         return
-    connection, code_host, repository = await _chosen_repository(scope, chosen)
+    try:
+        connection, code_host, repository = await _chosen_repository(scope, chosen)
+    except NotFound:
+        await tracker.ticket_labels(issue)
+        logger.warning(
+            "tracker intake for binding %s refused repository alias %s path %s: "
+            "not found or inaccessible",
+            binding.name,
+            chosen.alias,
+            chosen.path,
+        )
+        await _comment(
+            tracker,
+            issue,
+            REPO_REFUSAL_MARKER,
+            f"Curie did not start this issue: repository `{chosen.alias}` was not found or "
+            "could not be accessed. Check this binding's repository path and code host "
+            "permissions, then re-add the factory label."
+            f"\n\n{REPO_REFUSAL_MARKER}\n",
+        )
+        return
     if existing is None and await _rediscovered(scope, tracker, notice, repository):
         return
     admission = await _admission(
@@ -619,7 +656,8 @@ async def _rediscovered(
     """True when the code host already has this issue's factory publication,
     so an admission with no local WorkItem is refused (#4629).
 
-    An open or ambiguous one is named on the issue; a completed one
+    An open, ambiguous or unconfirmed (Bitbucket Cloud, #4747) one is named
+    on the issue; a completed one
     whose trigger this notice replays is only logged. Evidence that cannot be
     read completely defers (one of ``_DEFERRED``), so the cursor stays. A
     `NotFound` from the listing defers too: the repository was just resolved, so

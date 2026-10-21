@@ -23,6 +23,7 @@ import uuid
 import xml.etree.ElementTree as ET
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
+from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -32,9 +33,17 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from curie_api import factory_notices
 from curie_api.config import get_settings
 from curie_api.factory_comment_text import marker_for
 from curie_api.factory_notices import FINAL_MARKER, result_section, sync_status_comments
+from curie_api.forges.types import (
+    MarkedComment,
+    PullRequest,
+    PullRequestRef,
+    PullRequestState,
+    UpsertResult,
+)
 from curie_api.github_app import GitHubAppError
 from curie_api.workitem_dispatch import DispatchConflict, acquire, defer
 from forge_fakes import factory_wake
@@ -56,6 +65,8 @@ from forge_fakes.github_comments import (  # noqa: F401  (fixtures)
     ci_entry,
     comments,
 )
+from forge_fakes.jira import JiraFake, jira_tracker
+from forge_fakes.jira import fake_client as jira_client
 from sqlalchemy import make_url, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from test_factory_progress import ACTIVITY, DECLARATION, STAGED_DECLARATION, progress_token, report
@@ -1036,7 +1047,8 @@ def test_diff_review_failure_keeps_completed_phases_after_renewed_plan_review(
     body = comment["body"]
     for label in ("Plan", "Plan review", "Failing test", "Implement"):
         assert f"[x] {label}" in body
-    assert "[ ] **Review diff** (in progress)" in body
+    assert "[ ] **Review diff** (stopped here)" in body
+    assert "in progress" not in body
     assert "[ ] Publish PR" in body
     assert "Status: NEEDS HUMAN" in body
     assert "Status: FAILED" not in body
@@ -1161,6 +1173,147 @@ def test_a_pending_publication_shows_publishing_and_stays_live(admitted: Any) ->
     assert FINAL_MARKER not in comment["body"]
     assert "Status: PUBLISHING" in comment["body"]
     assert _notices(request_id)[0]["finalized_at"] is None
+
+
+# --- the ticket links the pull request once, from the request that opened it (#4744) ---------
+
+
+class _JiraLinkPorts:
+    """The tracker and code host one port pass sees: comments are accepted,
+    the pull request is read back from its number, and the link is the real
+    Jira tracker writing to the Jira fake, recorded per linking request."""
+
+    def __init__(self, tracker: Any, request_id: uuid.UUID, linked: list[uuid.UUID]) -> None:
+        self.jira, self.request_id, self.linked = tracker, request_id, linked
+        self.marked_comments = self
+
+    @property
+    def capabilities(self) -> Any:
+        return self.jira.capabilities
+
+    async def upsert_marked(self, target: Any, marker: str, body: str) -> UpsertResult:
+        return UpsertResult(MarkedComment("1", target, body), written=True)
+
+    async def read_pull_request(self, ref: PullRequestRef) -> PullRequest:
+        return PullRequest(
+            ref=ref,
+            head_sha=HEAD_A,
+            head_ref="curie/publication",
+            base_ref="main",
+            state=PullRequestState.OPEN,
+            url=f"https://github.com/{REPO}/pull/{ref.number}",
+        )
+
+    async def link_pull_request(self, issue: Any, pull: PullRequest) -> None:
+        self.linked.append(self.request_id)
+        await self.jira.link_pull_request(issue, pull)
+
+
+def _link_through_jira(
+    monkeypatch: pytest.MonkeyPatch, jira: JiraFake
+) -> tuple[list[uuid.UUID], Any]:
+    """Route every status pass through the port comment sync against a Jira
+    ticket; returns the requests that wrote a remote link, in order, and the
+    ticket."""
+
+    issue = jira.seed_issue("Ticket")
+    linked: list[uuid.UUID] = []
+
+    async def sync_one(client: Any, settings: Any, claim: Any) -> int:
+        if claim.row.finalized_at is not None:
+            return 0
+        async with jira_client(jira) as http:
+            ports = _JiraLinkPorts(
+                jira_tracker(jira, client=http), claim.row.execution_request_id, linked
+            )
+            return await factory_notices._sync_port_comment(
+                ports,  # type: ignore[arg-type]
+                ports,  # type: ignore[arg-type]
+                replace(claim, tracker_issue=jira.ref(issue)),
+            )
+
+    monkeypatch.setattr(factory_notices, "_sync_one", sync_one)
+    return linked, issue
+
+
+def _bind_lineage_pr(work_item_id: uuid.UUID, pr: int) -> None:
+    _execute(
+        "UPDATE curie.thread_publication_lineages SET pr_number = :pr, pr_url = :url, "
+        "head_sha = :head WHERE id = (SELECT publication_lineage_id FROM curie.work_items "
+        "WHERE id = :id)",
+        {
+            "pr": pr,
+            "url": f"https://github.com/{REPO}/pull/{pr}",
+            "head": HEAD_A,
+            "id": work_item_id,
+        },
+    )
+
+
+def _second_request(client: Any, work_item_id: uuid.UUID, number: int, objective: str) -> uuid.UUID:
+    request_id = _insert_revision(work_item_id, number, objective, ISSUE_REPLY)
+    _start_running(request_id)
+    assert report(client, request_id, "implement", round=1).status_code == 201
+    return request_id
+
+
+def test_failed_first_publication_then_second_opens_pr_links_once(
+    admitted: Any,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, github, sink = admitted
+    jira = JiraFake()
+    linked, ticket = _link_through_jira(monkeypatch, jira)
+    number = 9931
+    first = _admit(client, github, sink, number)
+    _start_running(first)
+    work_item_id = _request(number)["work_item_id"]
+    # The first publication fails before any push: its lineage has no pull request.
+    _attach_publication(work_item_id, status="failed", pr=None)
+    _reconcile()
+    assert (_request(number)["status"], _request(number)["terminal_cause"]) == (
+        "failed",
+        "publication_failed",
+    )
+    assert linked == []
+
+    second = _second_request(client, work_item_id, number, "Fix the parser")
+    _bind_lineage_pr(work_item_id, 81)
+    _attach_revision_publication(work_item_id, second, head_sha=HEAD_A)
+    _reconcile()
+    _reconcile()
+
+    assert linked == [second]
+    (link,) = jira.issue(ticket.id).remote_links
+    assert link["globalId"] == f"https://github.com/{REPO}/pull/81"
+    assert len(jira.requests_of("remote_link_create")) == 1
+
+
+def test_revision_request_does_not_link_again(
+    admitted: Any,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, github, sink = admitted
+    jira = JiraFake()
+    linked, ticket = _link_through_jira(monkeypatch, jira)
+    number = 9932
+    first = _admit(client, github, sink, number)
+    _start_running(first)
+    work_item_id = _request(number)["work_item_id"]
+    _attach_publication(work_item_id, status="succeeded", pr=82)
+    _reconcile()
+    assert linked == [first]
+
+    revision = _second_request(
+        client, work_item_id, number, _revision_objective(82, "issuecomment-1")
+    )
+    _attach_revision_publication(work_item_id, revision)
+    _reconcile()
+    _reconcile()
+
+    assert linked == [first]
+    assert len(jira.requests_of("remote_link_create")) == 1
+    assert len(jira.issue(ticket.id).remote_links) == 1
 
 
 # --- 4 and 5: failure and cancel -----------------------------------------------------------

@@ -394,6 +394,24 @@ export interface paths {
         patch: operations["update_agent_agents__agent_id__patch"];
         trace?: never;
     };
+    "/agents/{agent_id}/access-policy": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Agent Access Policy */
+        get: operations["get_agent_access_policy_agents__agent_id__access_policy_get"];
+        /** Put Agent Access Policy */
+        put: operations["put_agent_access_policy_agents__agent_id__access_policy_put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/agents/{agent_id}/behavior-packs": {
         parameters: {
             query?: never;
@@ -2049,6 +2067,177 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/directory/binding": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read Directory Binding */
+        get: operations["read_directory_binding_directory_binding_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/directory/config/{tenant_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Directory Config */
+        get: operations["get_directory_config_directory_config__tenant_id__get"];
+        /** Put Directory Config */
+        put: operations["put_directory_config_directory_config__tenant_id__put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/directory/credentials": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Issue Directory Credential */
+        post: operations["issue_directory_credential_directory_credentials_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/directory/namespaces": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Provision Directory Namespace */
+        post: operations["provision_directory_namespace_directory_namespaces_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/directory/people": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Directory People */
+        get: operations["list_directory_people_directory_people_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/directory/people/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Change Directory Account Status */
+        post: operations["change_directory_account_status_directory_people_status_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/directory/teams": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Provision Directory Team */
+        post: operations["provision_directory_team_directory_teams_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/directory/teams/{team_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read Directory Team */
+        get: operations["read_directory_team_directory_teams__team_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/directory/teams/{team_id}/attempt": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Record Directory Attempt */
+        post: operations["record_directory_attempt_directory_teams__team_id__attempt_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/directory/teams/{team_id}/snapshot": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Apply Directory Snapshot */
+        put: operations["apply_directory_snapshot_directory_teams__team_id__snapshot_put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/evals/matrix": {
         parameters: {
             query?: never;
@@ -2260,6 +2449,57 @@ export interface paths {
          *     The delivery id is signed context only and reserves nothing.
          */
         post: operations["probe_hook_support_hooks__agent_id___hook__support_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/identity/admin/{tenant_id}/{resource}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Identity View */
+        get: operations["identity_view_identity_admin__tenant_id___resource__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/identity/connect/{token}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Identity Connect Page */
+        get: operations["identity_connect_page_identity_connect__token__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/identity/connect/{token}/confirm": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Confirm Connection */
+        post: operations["confirm_connection_identity_connect__token__confirm_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2626,6 +2866,43 @@ export interface paths {
          * @description Resume a named cron hook with one bounded catch up opportunity.
          */
         post: operations["resume_schedule_schedules__agent___name__resume_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/teams": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Team Sync Status */
+        get: operations["list_team_sync_status_teams_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/teams/metrics": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Directory Metrics
+         * @description Export current age and durable failure counts; never expire membership.
+         */
+        get: operations["directory_metrics_teams_metrics_get"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -3506,7 +3783,7 @@ export interface components {
             /** Authorized */
             authorized: boolean;
             /** Authorizer */
-            authorizer: string;
+            authorizer: string | null;
             /**
              * Created At
              * Format: date-time
@@ -3523,6 +3800,12 @@ export interface components {
             id: string;
             /** Reason */
             reason: string | null;
+            /** Team Digest */
+            team_digest?: string | null;
+            /** Team Epoch */
+            team_epoch?: number | null;
+            /** Team Id */
+            team_id?: string | null;
         };
         /**
          * ActionComplete
@@ -3805,6 +4088,7 @@ export interface components {
             callers?: string[];
             /** Kind */
             kind: string;
+            slack?: components["schemas"]["SlackEvidence"] | null;
         };
         /**
          * AdmissionOut
@@ -3817,10 +4101,52 @@ export interface components {
         AdmissionOut: {
             /** Allowed */
             allowed: boolean;
+            /** Connect Url */
+            connect_url?: string | null;
             /** Install Restricted */
             install_restricted: boolean;
             /** Restricted */
             restricted: boolean;
+        };
+        /**
+         * AgentAccessPolicyOut
+         * @description An agent's policy; version 0 and no ``updated_at`` mean none was set.
+         */
+        AgentAccessPolicyOut: {
+            /**
+             * Agent Id
+             * Format: uuid
+             */
+            agent_id: string;
+            /** Approver Team Id */
+            approver_team_id: string | null;
+            /** Invocation Team Id */
+            invocation_team_id: string | null;
+            /**
+             * Tenant Id
+             * Format: uuid
+             */
+            tenant_id: string;
+            /** Updated At */
+            updated_at: string | null;
+            /** Version */
+            version: number;
+        };
+        /**
+         * AgentAccessPolicyWrite
+         * @description Replace an agent's policy.
+         *
+         *     Both team keys are required so a write states the whole policy; ``null``
+         *     clears that role back to today's behavior. ``expected_version`` is the
+         *     version the writer last read: 0 when the agent has no policy yet.
+         */
+        AgentAccessPolicyWrite: {
+            /** Approver Team Id */
+            approver_team_id: string | null;
+            /** Expected Version */
+            expected_version: number;
+            /** Invocation Team Id */
+            invocation_team_id: string | null;
         };
         /** AgentCreate */
         AgentCreate: {
@@ -4097,7 +4423,7 @@ export interface components {
             /** Authorized */
             authorized: boolean;
             /** Authorizer */
-            authorizer: string;
+            authorizer: string | null;
             /**
              * Created At
              * Format: date-time
@@ -4120,6 +4446,12 @@ export interface components {
             principal_subject: string | null;
             /** Reason */
             reason: string | null;
+            /** Team Digest */
+            team_digest?: string | null;
+            /** Team Epoch */
+            team_epoch?: number | null;
+            /** Team Id */
+            team_id?: string | null;
         };
         /**
          * ApprovalCreateOut
@@ -4660,6 +4992,11 @@ export interface components {
              *     }
              */
             tips?: components["schemas"]["TipsPackConfig"];
+        };
+        /** Body_confirm_connection_identity_connect__token__confirm_post */
+        Body_confirm_connection_identity_connect__token__confirm_post: {
+            /** Csrf */
+            csrf: string;
         };
         /** Body_upload_bundle_agents__agent_id__versions__version_id__bundle_put */
         Body_upload_bundle_agents__agent_id__versions__version_id__bundle_put: {
@@ -5370,6 +5707,271 @@ export interface components {
             version_id: string;
             /** Workspace Enabled */
             workspace_enabled: boolean;
+        };
+        /** DirectoryAccountIn */
+        DirectoryAccountIn: {
+            /**
+             * Identity Namespace Id
+             * Format: uuid
+             */
+            identity_namespace_id: string;
+            /** Provider Native Id */
+            provider_native_id: string;
+        };
+        /** DirectoryAttemptIn */
+        DirectoryAttemptIn: {
+            /**
+             * Error
+             * @enum {string}
+             */
+            error: "provider_unavailable" | "provider_rejected" | "invalid_snapshot";
+            /** Expected Epoch */
+            expected_epoch: number;
+        };
+        /** DirectoryBindingOut */
+        DirectoryBindingOut: {
+            /** Config Version */
+            config_version: number;
+            /**
+             * Expires At
+             * Format: date-time
+             */
+            expires_at: string;
+            /** Identity Epoch */
+            identity_epoch: number;
+            /** Issuer */
+            issuer: string;
+            /** Managed By */
+            managed_by: string;
+            /** Namespace Ids */
+            namespace_ids: string[];
+            /** Team Ids */
+            team_ids: string[];
+            /**
+             * Tenant Id
+             * Format: uuid
+             */
+            tenant_id: string;
+        };
+        /** DirectoryConfigIn */
+        DirectoryConfigIn: {
+            /** Expected Version */
+            expected_version: number;
+            /** Governed Domains */
+            governed_domains: string[];
+            /** Issuer */
+            issuer: string;
+            /** Managed By */
+            managed_by: string;
+        };
+        /** DirectoryConfigOut */
+        DirectoryConfigOut: {
+            /** Governed Domains */
+            governed_domains: string[];
+            /** Issuer */
+            issuer: string;
+            /** Managed By */
+            managed_by: string;
+            /**
+             * Tenant Id
+             * Format: uuid
+             */
+            tenant_id: string;
+            /** Version */
+            version: number;
+        };
+        /** DirectoryCredentialIn */
+        DirectoryCredentialIn: {
+            /** Expected Config Version */
+            expected_config_version: number;
+            /**
+             * Expires In Seconds
+             * @default 3600
+             */
+            expires_in_seconds?: number;
+            /** Namespace Ids */
+            namespace_ids: string[];
+            /** Team Ids */
+            team_ids: string[];
+            /**
+             * Tenant Id
+             * Format: uuid
+             */
+            tenant_id: string;
+        };
+        /** DirectoryCredentialOut */
+        DirectoryCredentialOut: {
+            /** Credential */
+            credential: string;
+            /**
+             * Expires At
+             * Format: date-time
+             */
+            expires_at: string;
+        };
+        /** DirectoryNamespaceIn */
+        DirectoryNamespaceIn: {
+            /**
+             * Authority
+             * @default
+             */
+            authority?: string;
+            /** Key */
+            key: string;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "slack_workspace" | "email_domain";
+            /**
+             * Provider
+             * @enum {string}
+             */
+            provider: "slack" | "email";
+            /**
+             * Tenant Id
+             * Format: uuid
+             */
+            tenant_id: string;
+        };
+        /** DirectoryNamespaceOut */
+        DirectoryNamespaceOut: {
+            /** Authority */
+            authority: string;
+            /**
+             * Id
+             * Format: uuid
+             */
+            id: string;
+            /** Key */
+            key: string;
+            /** Kind */
+            kind: string;
+            /** Provider */
+            provider: string;
+            /** Status */
+            status: string;
+            /**
+             * Tenant Id
+             * Format: uuid
+             */
+            tenant_id: string;
+        };
+        /** DirectoryPeopleOut */
+        DirectoryPeopleOut: {
+            /** Next After Subject */
+            next_after_subject: string | null;
+            /** People */
+            people: components["schemas"]["DirectoryPersonOut"][];
+        };
+        /** DirectoryPersonIn */
+        DirectoryPersonIn: {
+            /** Accounts */
+            accounts?: components["schemas"]["DirectoryAccountIn"][];
+            /** Display Name */
+            display_name?: string | null;
+            /** Email */
+            email?: string | null;
+            /**
+             * Status
+             * @default active
+             * @enum {string}
+             */
+            status?: "active" | "disabled" | "revoked";
+            /** Subject */
+            subject: string;
+        };
+        /** DirectoryPersonOut */
+        DirectoryPersonOut: {
+            /** Authorization Version */
+            authorization_version: number;
+            /** Status */
+            status: string;
+            /** Subject */
+            subject: string;
+        };
+        /** DirectorySnapshotIn */
+        DirectorySnapshotIn: {
+            /** Complete */
+            complete: boolean;
+            /** Expected Epoch */
+            expected_epoch: number;
+            /**
+             * Expected Identity Epoch
+             * @description Required for credentials with namespaces. Read identity_epoch from GET /directory/binding before observing provider data. After a conflict, read a fresh binding and refetch provider data; never relabel a stale payload.
+             */
+            expected_identity_epoch?: number | null;
+            /** People */
+            people: components["schemas"]["DirectoryPersonIn"][];
+        };
+        /** DirectorySnapshotOut */
+        DirectorySnapshotOut: {
+            /** Digest */
+            digest: string;
+            /** Epoch */
+            epoch: number;
+            /** Member Count */
+            member_count: number;
+        };
+        /** DirectoryStatusIn */
+        DirectoryStatusIn: {
+            /** Expected Version */
+            expected_version: number;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "active" | "disabled" | "revoked";
+            /** Subject */
+            subject: string;
+        };
+        /** DirectoryStatusOut */
+        DirectoryStatusOut: {
+            /** Authorization Version */
+            authorization_version: number;
+        };
+        /** DirectoryTeamIn */
+        DirectoryTeamIn: {
+            /** External Id */
+            external_id: string;
+            /** Name */
+            name: string;
+            /**
+             * Tenant Id
+             * Format: uuid
+             */
+            tenant_id: string;
+        };
+        /** DirectoryTeamOut */
+        DirectoryTeamOut: {
+            /** Digest */
+            digest: string | null;
+            /** Epoch */
+            epoch: number;
+            /** External Id */
+            external_id: string | null;
+            /**
+             * Id
+             * Format: uuid
+             */
+            id: string;
+            /** Last Attempt At */
+            last_attempt_at: string | null;
+            /** Last Error */
+            last_error: string | null;
+            /** Last Synced At */
+            last_synced_at: string | null;
+            /** Managed By */
+            managed_by: string | null;
+            /** Member Count */
+            member_count: number;
+            /** Name */
+            name: string;
+            /**
+             * Tenant Id
+             * Format: uuid
+             */
+            tenant_id: string;
         };
         /**
          * Environment
@@ -8372,6 +8974,46 @@ export interface components {
             /** Namespace */
             namespace: string;
         };
+        /** TeamSyncOut */
+        TeamSyncOut: {
+            /** Digest */
+            digest: string | null;
+            /** Epoch */
+            epoch: number;
+            /** External Id */
+            external_id: string | null;
+            /**
+             * Id
+             * Format: uuid
+             */
+            id: string;
+            /** Last Attempt At */
+            last_attempt_at: string | null;
+            /** Last Error */
+            last_error: string | null;
+            /** Last Synced At */
+            last_synced_at: string | null;
+            /** Managed By */
+            managed_by: string | null;
+            /** Member Count */
+            member_count: number;
+            /** Name */
+            name: string;
+            /**
+             * Source
+             * @enum {string}
+             */
+            source: "idp_group" | "curie_managed";
+            /** Sync Age Seconds */
+            sync_age_seconds: number | null;
+            /** Synced */
+            synced: boolean;
+            /**
+             * Tenant Id
+             * Format: uuid
+             */
+            tenant_id: string;
+        };
         /** TerminationBody */
         TerminationBody: {
             /** Observation */
@@ -9757,6 +10399,76 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["AgentOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_agent_access_policy_agents__agent_id__access_policy_get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentAccessPolicyOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    put_agent_access_policy_agents__agent_id__access_policy_put: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AgentAccessPolicyWrite"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentAccessPolicyOut"];
                 };
             };
             /** @description Validation Error */
@@ -13528,6 +14240,391 @@ export interface operations {
             };
         };
     };
+    read_directory_binding_directory_binding_get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Directory-Credential"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DirectoryBindingOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_directory_config_directory_config__tenant_id__get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                tenant_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DirectoryConfigOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    put_directory_config_directory_config__tenant_id__put: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                tenant_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DirectoryConfigIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DirectoryConfigOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    issue_directory_credential_directory_credentials_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DirectoryCredentialIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DirectoryCredentialOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    provision_directory_namespace_directory_namespaces_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DirectoryNamespaceIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DirectoryNamespaceOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_directory_people_directory_people_get: {
+        parameters: {
+            query?: {
+                after_subject?: string | null;
+                limit?: number;
+            };
+            header?: {
+                "X-Curie-Directory-Credential"?: string | null;
+                "x-api-key"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DirectoryPeopleOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    change_directory_account_status_directory_people_status_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Directory-Credential"?: string | null;
+                "x-api-key"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DirectoryStatusIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DirectoryStatusOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    provision_directory_team_directory_teams_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DirectoryTeamIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DirectoryTeamOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    read_directory_team_directory_teams__team_id__get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Directory-Credential"?: string | null;
+                "x-api-key"?: string | null;
+            };
+            path: {
+                team_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DirectoryTeamOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    record_directory_attempt_directory_teams__team_id__attempt_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Directory-Credential"?: string | null;
+                "x-api-key"?: string | null;
+            };
+            path: {
+                team_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DirectoryAttemptIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    apply_directory_snapshot_directory_teams__team_id__snapshot_put: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Directory-Credential"?: string | null;
+                "x-api-key"?: string | null;
+            };
+            path: {
+                team_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DirectorySnapshotIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DirectorySnapshotOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     eval_matrix_evals_matrix_get: {
         parameters: {
             query: {
@@ -13844,6 +14941,111 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HookSupportOut"];
+                };
+            };
+        };
+    };
+    identity_view_identity_admin__tenant_id___resource__get: {
+        parameters: {
+            query?: {
+                limit?: number;
+                after?: string | null;
+            };
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                tenant_id: string;
+                resource: "people" | "links" | "namespaces";
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    identity_connect_page_identity_connect__token__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                token: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/html": string;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    confirm_connection_identity_connect__token__confirm_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                token: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/x-www-form-urlencoded": components["schemas"]["Body_confirm_connection_identity_connect__token__confirm_post"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/html": string;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };
@@ -14629,6 +15831,70 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["ScheduleControlOut"];
                 };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_team_sync_status_teams_get: {
+        parameters: {
+            query?: {
+                tenant_id?: string | null;
+            };
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TeamSyncOut"][];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    directory_metrics_teams_metrics_get: {
+        parameters: {
+            query?: {
+                tenant_id?: string | null;
+            };
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Validation Error */
             422: {

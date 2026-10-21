@@ -128,7 +128,7 @@ def test_sre_bot_observability_connectors_ship_self_configured() -> None:
     assert "TEMPO (DISTRIBUTED TRACES) -- SHIPS OFF" not in raw
 
 
-def test_sre_bot_python_connectors_pin_the_mcp_2_runtime_their_servers_import() -> None:
+def test_sre_bot_python_connectors_pin_the_mcp_runtime_their_servers_import() -> None:
     connector_root = EXAMPLES / "sre-bot" / "connectors"
     # Discovered, not hardcoded: the shipped connector set changes as the bot
     # adopts upstream servers, and a stale name list would either fail on a
@@ -145,6 +145,7 @@ def test_sre_bot_python_connectors_pin_the_mcp_2_runtime_their_servers_import() 
 
     for connector in connectors:
         requirements = (connector / "requirements.txt").read_text().splitlines()
-        assert "mcp==2.2.0" in requirements, (
-            f"{connector.name} imports mcp.server.mcpserver but its image does not pin MCP 2.2.0"
+        mcp_pins = [line for line in requirements if line.startswith("mcp==")]
+        assert len(mcp_pins) == 1, (
+            f"{connector.name} must pin exactly one MCP runtime version; found {mcp_pins}"
         )

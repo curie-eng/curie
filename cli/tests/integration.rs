@@ -4,6 +4,7 @@
 
 mod support;
 
+mod access_policy_verb;
 mod actions_cli;
 mod agent_update_body;
 mod api_deploy;
@@ -68,6 +69,7 @@ mod connector_lock;
 mod connector_mount_visibility;
 mod connector_rollout;
 mod connector_rollout_live;
+mod connector_secret_digest;
 mod connector_selection;
 mod connector_start_wait;
 mod connector_startup_events;

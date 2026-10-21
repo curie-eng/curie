@@ -137,10 +137,23 @@ does not apply to this intake, and nothing here should be read as if it did.
 - The pinned Kubernetes connector this example uses is an upstream server and is
   not a reversible connector in the sense of
   [Writing a connector the platform can undo](../../../docs/writing-a-reversible-connector.md):
-  the bundle carries no `observe_version` or `restore` for it. A policy written
-  for this bundle could therefore declare only `idempotent` actions, each needing
-  its own qualification drills, and would still need a different connector to
-  verify them.
+  the bundle carries no `observe_version` or `restore` for it, and its replies
+  carry no sealed prior state or version. No action through it can be qualified,
+  idempotent or reversible, because a qualification compares the versions the
+  ledger recorded. The opt-in
+  [remediation scaler connector](../README.md#remediation-scaler-connector-opt-in)
+  is an acting connector that can be qualified, for setting an allowlisted
+  Deployment's replica count; an action through it still needs its own
+  qualification drills and a different connector to verify it.
+
+The Alertmanager source has an opt-in protected mode that realizes
+`HOOK-SOURCE-POLICY-6` of ADR 0190: it requests and signs `read-only` under the
+hook's scoped source key, checks the support probe before each delivery and
+verifies the effective policy in every receipt
+([protected source mode](../README.md#protected-source-mode-opt-in)). This
+email intake has no such mode. It signs the ordinary `email-alert` hook with
+the shared agent secret, posts its Slack placeholder before delivery, and does
+not verify an effective policy, so it cannot feed a protected hook as shipped.
 
 Moving this intake onto a protected hook is a separate decision for the
 installation. Do it, qualify each action

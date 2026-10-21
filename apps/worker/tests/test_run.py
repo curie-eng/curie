@@ -1183,6 +1183,7 @@ def test_run_supervises_the_cron_loop_until_shutdown(
 
 def test_sigterm_stops_the_deploy_notice_consumer(
     monkeypatch: pytest.MonkeyPatch,
+    worker_db: Any,
 ) -> None:
     events: list[str] = []
     runtime = _FakeRuntime(_FakeCardStore(events), events)
@@ -1216,7 +1217,9 @@ def test_sigterm_stops_the_deploy_notice_consumer(
             "add_signal_handler",
             lambda sig, handler: handlers.__setitem__(sig, handler),
         )
-        await asyncio.wait_for(run._run(WorkerConfig(), {}), timeout=1)
+        await asyncio.wait_for(
+            run._run(WorkerConfig(database_url=worker_db[2]), {}), timeout=1
+        )
 
     def fake_build(config: WorkerConfig, env: Any, *, resources: Any) -> _FakeRuntime:
         _register_legacy_fake_transports(runtime, resources)
