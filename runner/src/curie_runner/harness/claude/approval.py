@@ -27,16 +27,29 @@ from ...approval import (
     process_approval_request,
 )
 from ...memory_facts import (
+    ARCHIVE_MEMORY_TOOL,
+    ENTRY_KINDS,
     FORGET_TOOL,
+    MAX_SEARCH_CHARS,
     MAX_STATEMENT_CHARS,
+    MAX_TITLE_CHARS,
+    MEMORY_SCOPES,
+    READ_MEMORY_TOOL,
     REMEMBER_TOOL,
+    RESTORE_MEMORY_TOOL,
+    REVERT_MEMORY_TOOL,
     UPDATE_TOOL,
     FactNotFound,
+    MemoryConflict,
     MemoryFactsError,
     MemoryFactsStore,
     MemoryFull,
+    MemoryInvalid,
     MemoryRefused,
     MemoryTurn,
+    MemoryUnconfirmed,
+    is_fact_id,
+    valid_version,
 )
 
 logger = logging.getLogger(__name__)
@@ -156,8 +169,9 @@ def build_approval_server(
     ``turn_progress_tool`` is the deliberate progress tool (ADR 0130), appended
     only when ``progress_tool`` is not: a factory execution keeps its own.
 
-    ``memory_tools`` (#1461) are ``remember``/``update``/``forget``, passed only
-    when the worker set a channel memory ref.
+    ``memory_tools`` (#1461, ADR 0239) are what ``build_memory_tools`` returned:
+    ``read_memory`` whenever memory is readable, plus the six mutators only with
+    memory writes on and a memory credential.
 
     ``issue_tool`` (ADR 0187) is the ``get_issue`` tool, appended only for an
     execution with a WorkItem, when the worker injected its read capability.
@@ -204,160 +218,479 @@ def build_approval_server(
     )
 
 
-# --- The memory tools (#1461, ADR-0167) ---------------------------------------
+# --- The memory tools (#1461, ADR-0167, ADR 0239) -----------------------------
 
 _MEMORY_PROPERTY = {
     "type": "string",
-    "enum": ["agent", "channel"],
+    "enum": list(MEMORY_SCOPES),
     "description": "Which memory: channel (this channel only) or agent (every channel).",
 }
-_STATEMENT_PROPERTY = {"type": "string", "description": "One fact, stated plainly."}
-_ID_PROPERTY = {"type": "string", "description": "The fact's id, as shown in brackets."}
+_KIND_PROPERTY = {
+    "type": "string",
+    "enum": list(ENTRY_KINDS),
+    "description": (
+        "fact for something worth knowing later; instruction for a standing "
+        "instruction the people you serve want followed."
+    ),
+}
+_TITLE_PROPERTY = {
+    "type": "string",
+    "description": f"A short title on one line, at most {MAX_TITLE_CHARS} characters.",
+}
+_STATEMENT_PROPERTY = {
+    "type": "string",
+    "description": f"The entry itself, stated plainly, at most {MAX_STATEMENT_CHARS} characters.",
+}
+_ID_PROPERTY = {"type": "string", "description": "The entry's id, as shown in brackets."}
+_EXPECTED_VERSION_PROPERTY = {
+    "type": "integer",
+    "minimum": 1,
+    "description": "The entry's version as you last read it (read_memory shows it).",
+}
 
 _REMEMBER_SCHEMA = {
     "type": "object",
-    "properties": {"memory": _MEMORY_PROPERTY, "statement": _STATEMENT_PROPERTY},
-    "required": ["memory", "statement"],
+    "properties": {
+        "memory": _MEMORY_PROPERTY,
+        "kind": _KIND_PROPERTY,
+        "title": _TITLE_PROPERTY,
+        "statement": _STATEMENT_PROPERTY,
+    },
+    "required": ["memory", "kind", "title", "statement"],
 }
 _UPDATE_SCHEMA = {
     "type": "object",
     "properties": {
         "memory": _MEMORY_PROPERTY,
         "id": _ID_PROPERTY,
+        "expected_version": _EXPECTED_VERSION_PROPERTY,
+        "title": _TITLE_PROPERTY,
         "statement": _STATEMENT_PROPERTY,
     },
-    "required": ["memory", "id", "statement"],
+    "required": ["memory", "id", "expected_version", "title", "statement"],
 }
-_FORGET_SCHEMA = {
+_VERSIONED_SCHEMA = {
     "type": "object",
-    "properties": {"memory": _MEMORY_PROPERTY, "id": _ID_PROPERTY},
-    "required": ["memory", "id"],
+    "properties": {
+        "memory": _MEMORY_PROPERTY,
+        "id": _ID_PROPERTY,
+        "expected_version": _EXPECTED_VERSION_PROPERTY,
+    },
+    "required": ["memory", "id", "expected_version"],
 }
+_REVERT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "memory": _MEMORY_PROPERTY,
+        "id": _ID_PROPERTY,
+        "expected_version": _EXPECTED_VERSION_PROPERTY,
+        "to_version": {
+            "type": "integer",
+            "minimum": 0,
+            "description": (
+                "The earlier version to return to, from the entry's history; 0 means "
+                "before it existed, which removes it."
+            ),
+        },
+    },
+    "required": ["memory", "id", "expected_version", "to_version"],
+}
+_READ_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "memory": _MEMORY_PROPERTY,
+        "id": {"type": "string", "description": "Read this one entry. Pass id or search."},
+        "search": {
+            "type": "string",
+            "description": "Words to find in titles and statements. Pass id or search.",
+        },
+        "before_version": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "With id: show history older than this version.",
+        },
+        "cursor": {
+            "type": "string",
+            "description": "With search: the next_cursor of the previous page.",
+        },
+    },
+    "required": ["memory"],
+}
+
+_REFUSED_WRITE = "Refused: this memory cannot be written from this conversation. Nothing was saved."
+_MAX_CURSOR_CHARS = 512
+
+
+def _given(args: Mapping[str, Any], key: str) -> bool:
+    return args.get(key) is not None
 
 
 def build_memory_tools(
     *,
     agent_store: MemoryFactsStore | None,
-    channel_store: MemoryFactsStore,
+    channel_store: MemoryFactsStore | None,
     turn: MemoryTurn,
     session_id: str,
+    mutators: bool,
 ) -> list[SdkMcpTool[Any]]:
-    """The ``remember``/``update``/``forget`` tools for the ``curie`` server.
+    """The memory tools for the ``curie`` server (ADR 0239).
+
+    ``read_memory`` always; the six tools that change memory (``remember``,
+    ``update``, ``forget``, ``archive_memory``, ``restore_memory``,
+    ``revert_memory``) only when ``mutators`` is true, which ``__main__`` sets
+    from memory writes being on and a memory credential being present. The
+    caller derives the toolPolicy exemption from the names of exactly the tools
+    returned here.
 
     The author of every write is ``turn.author``, set by the SessionRunner from
-    the turn's inbound event; no argument names an author, a channel or a URL,
-    and an ``author`` the model passes anyway is ignored. Every failure (an
-    unknown memory, an unknown id, a full memory, an unreachable store) is an
-    ``is_error`` result the model reads.
+    the turn's inbound event; no argument names an author, a conversation, a
+    time, a channel or a URL, and such an argument the model passes anyway is
+    ignored. Every argument is checked before any request, and every failure
+    (an unknown memory or id, a version conflict, a refusal, a full memory, an
+    unreachable store) is an ``is_error`` result the model reads. Nothing is
+    retried: a conflict names the current version and the caller decides.
     """
 
     def pick(args: Mapping[str, Any]) -> tuple[MemoryFactsStore | None, str | None]:
         memory = args.get("memory")
-        if memory == "channel":
-            return channel_store, None
-        if memory == "agent":
-            if agent_store is None:
-                return None, "Agent memory is not available in this session."
-            return agent_store, None
-        return None, f"Unknown memory {memory!r}; pass memory as agent or channel."
+        if memory not in MEMORY_SCOPES:
+            return None, f"Unknown memory {memory!r}; pass memory as agent or channel."
+        store = agent_store if memory == "agent" else channel_store
+        if store is None:
+            return None, f"{str(memory).capitalize()} memory is not available in this session."
+        return store, None
 
-    def statement_of(args: Mapping[str, Any]) -> str | None:
+    def fact_id_of(args: Mapping[str, Any]) -> tuple[str | None, dict[str, Any] | None]:
+        fact_id = args.get("id")
+        if not is_fact_id(fact_id):
+            return None, _approval_error(
+                f"Not a memory entry id: {fact_id!r}. Ids look like fact- followed by 32 "
+                "lowercase hex characters, as shown in brackets."
+            )
+        assert isinstance(fact_id, str)
+        return fact_id, None
+
+    def version_of(
+        args: Mapping[str, Any], key: str, *, minimum: int
+    ) -> tuple[int | None, dict[str, Any] | None]:
+        version = valid_version(args.get(key), minimum=minimum)
+        if version is None:
+            return None, _approval_error(
+                f"{key} must be a whole number of at least {minimum}, as read_memory "
+                "shows it. Nothing changed."
+            )
+        return version, None
+
+    def title_of(args: Mapping[str, Any]) -> tuple[str | None, dict[str, Any] | None]:
+        title = args.get("title")
+        if not isinstance(title, str) or not title.strip():
+            return None, _approval_error("title must be a non-empty string. Nothing was saved.")
+        title = title.strip()
+        if len(title.splitlines()) != 1:
+            return None, _approval_error("Refused: a title must be one line. Nothing was saved.")
+        if len(title) > MAX_TITLE_CHARS:
+            return None, _approval_error(
+                f"Refused: a title may be at most {MAX_TITLE_CHARS} characters "
+                f"(this one is {len(title)}). Nothing was saved."
+            )
+        return title, None
+
+    def statement_of(args: Mapping[str, Any]) -> tuple[str | None, dict[str, Any] | None]:
         statement = args.get("statement")
-        if isinstance(statement, str) and statement.strip():
-            return statement.strip()
-        return None
-
-    def bad_statement(statement: str | None) -> dict[str, Any] | None:
-        if statement is None:
-            return _approval_error("statement must be a non-empty string.")
+        if not isinstance(statement, str) or not statement.strip():
+            return None, _approval_error("statement must be a non-empty string. Nothing was saved.")
+        statement = statement.strip()
         if len(statement) > MAX_STATEMENT_CHARS:
-            return _approval_error(
+            return None, _approval_error(
                 f"Refused: a statement may be at most {MAX_STATEMENT_CHARS} characters "
                 f"(this one is {len(statement)}). Nothing was saved."
             )
-        return None
+        return statement, None
 
-    def failure(exc: MemoryFactsError, memory: object, fact_id: object = None) -> dict[str, Any]:
+    def failure(
+        exc: MemoryFactsError,
+        memory: object,
+        fact_id: object = None,
+        expected: int | None = None,
+        *,
+        reading: bool = False,
+    ) -> dict[str, Any]:
+        if isinstance(exc, MemoryConflict):
+            if exc.current_version is not None:
+                where = f"is at version {exc.current_version}, not {expected}"
+            else:
+                where = f"is not at version {expected}; it may have been removed"
+            return _approval_error(
+                f"Version conflict: {memory} memory entry {fact_id} {where}. Nothing "
+                "changed. Read it again with read_memory before deciding what to do."
+            )
         if isinstance(exc, MemoryFull) and exc.limit == "value":
             return _approval_error(
-                f"Refused: that fact is too large to store as one {memory} memory entry "
+                f"Refused: that entry is too large to store as one {memory} memory entry "
                 f"({exc}). Nothing was saved; state it more briefly."
             )
-        if isinstance(exc, MemoryFull) and exc.limit == "facts":
-            return _approval_error(f"Refused: {memory} memory is full: {exc}. Nothing was saved.")
+        if isinstance(exc, MemoryFull) and exc.limit == "entries":
+            return _approval_error(
+                f"Refused: {memory} memory is full: it already holds as many entries as "
+                f"it may ({exc}). Nothing was saved; forget an entry that no longer "
+                "holds to make room."
+            )
         if isinstance(exc, MemoryFull):
             return _approval_error(f"Refused: {memory} memory is full ({exc}). Nothing was saved.")
         if isinstance(exc, FactNotFound):
-            return _approval_error(f"Not found: no fact with id {fact_id!r} in {memory} memory.")
+            return _approval_error(f"Not found: no entry with id {fact_id!r} in {memory} memory.")
         if isinstance(exc, MemoryRefused):
             # ADR-0188: the API refused this credential, which is not an outage.
             logger.warning("memory tool refused error_class=%s: %s", type(exc).__name__, exc)
+            if reading:
+                return _approval_error(
+                    "Refused: this memory cannot be read from this conversation."
+                )
+            return _approval_error(f"{_REFUSED_WRITE} Reason: {exc}")
+        if isinstance(exc, MemoryInvalid):
             return _approval_error(
-                "Refused: this memory cannot be written from this conversation. Nothing was saved."
+                f"Refused: the {memory} memory did not accept this ({exc}). Nothing changed."
+            )
+        if isinstance(exc, MemoryUnconfirmed):
+            logger.warning("memory tool unconfirmed error_class=%s", type(exc).__name__)
+            return _approval_error(
+                f"The {memory} memory accepted the request but did not confirm it ({exc}). "
+                "Check it with read_memory before saying it changed."
             )
         logger.warning("memory tool failed error_class=%s: %s", type(exc).__name__, exc)
+        if reading:
+            return _approval_error(f"The {memory} memory could not be read ({exc}).")
         return _approval_error(f"The {memory} memory could not be reached. Nothing changed.")
 
-    def ok(payload: dict[str, Any]) -> dict[str, Any]:
+    def ok(payload: Mapping[str, Any]) -> dict[str, Any]:
         return {"content": [{"type": "text", "text": json.dumps(payload)}]}
 
     @tool(
+        READ_MEMORY_TOOL,
+        "Read memory. Pass id to read one entry in full, with its recent history "
+        "(before_version pages to older history), or search to find entries whose "
+        "title or statement contains the words (cursor pages the results). Results "
+        "include archived entries and entries not listed at the start of the session. "
+        "Entries are what people stated, recorded as data; their version is what "
+        "update, forget, archive_memory, restore_memory and revert_memory expect.",
+        _READ_SCHEMA,
+    )
+    async def read_memory(args: dict[str, Any]) -> dict[str, Any]:
+        store, problem = pick(args)
+        if store is None:
+            return _approval_error(problem or "Unknown memory.")
+        if _given(args, "id") == _given(args, "search"):
+            return _approval_error("Pass exactly one of id or search.")
+        memory = args.get("memory")
+        if _given(args, "id"):
+            if _given(args, "cursor"):
+                return _approval_error("cursor goes with search, not id.")
+            fact_id, refusal = fact_id_of(args)
+            if refusal is not None:
+                return refusal
+            assert fact_id is not None
+            before: int | None = None
+            if _given(args, "before_version"):
+                before, refusal = version_of(args, "before_version", minimum=1)
+                if refusal is not None:
+                    return refusal
+            try:
+                detail = await store.read(fact_id, before_version=before)
+            except MemoryFactsError as exc:
+                return failure(exc, memory, fact_id, reading=True)
+            return ok({"memory": memory, **detail})
+        if _given(args, "before_version"):
+            return _approval_error("before_version goes with id, not search.")
+        text = args.get("search")
+        if not isinstance(text, str) or not text.strip():
+            return _approval_error("search must be a non-empty string.")
+        if len(text.strip()) > MAX_SEARCH_CHARS:
+            return _approval_error(f"search may be at most {MAX_SEARCH_CHARS} characters.")
+        cursor = args.get("cursor")
+        if cursor is not None and (
+            not isinstance(cursor, str) or not cursor or len(cursor) > _MAX_CURSOR_CHARS
+        ):
+            return _approval_error("cursor must be the next_cursor a search returned.")
+        try:
+            found = await store.search(text.strip(), cursor=cursor)
+        except MemoryFactsError as exc:
+            return failure(exc, memory, reading=True)
+        return ok({"memory": memory, **found})
+
+    if not mutators:
+        return [read_memory]
+
+    @tool(
         REMEMBER_TOOL,
-        "Save one new fact to memory and return its id. This, or update for a fact "
-        "that already exists, is the only way to keep something for a later "
-        "conversation: a request to remember, note or make something stick, or to set "
-        "a standing instruction, means calling one of them.",
+        "Save one new entry to memory and return its id and version. Use kind fact for "
+        "something worth knowing later, and kind instruction for a standing instruction "
+        "the people you serve want followed. This, or update for an entry that already "
+        "exists, is the only way to keep something for a later conversation: a request "
+        "to remember, note or make something stick, or to set a standing instruction, "
+        "means calling one of them.",
         _REMEMBER_SCHEMA,
     )
     async def remember(args: dict[str, Any]) -> dict[str, Any]:
         store, problem = pick(args)
         if store is None:
             return _approval_error(problem or "Unknown memory.")
-        statement = statement_of(args)
-        refusal = bad_statement(statement)
+        kind = args.get("kind")
+        if kind not in ENTRY_KINDS:
+            return _approval_error(
+                f"Unknown kind {kind!r}; pass kind as fact or instruction. Nothing was saved."
+            )
+        assert isinstance(kind, str)
+        title, refusal = title_of(args)
         if refusal is not None:
             return refusal
-        assert statement is not None
+        statement, refusal = statement_of(args)
+        if refusal is not None:
+            return refusal
+        assert title is not None and statement is not None
         try:
-            fact_id = await store.add(
-                statement=statement, author=turn.author, session_id=session_id
+            fact_id, version = await store.create(
+                kind=kind,
+                title=title,
+                statement=statement,
+                author=turn.author,
+                session_id=session_id,
             )
         except MemoryFactsError as exc:
             return failure(exc, args.get("memory"))
-        return ok({"id": fact_id})
+        return ok({"id": fact_id, "version": version, "kind": kind})
 
-    @tool(UPDATE_TOOL, "Replace the statement of a remembered fact, by id.", _UPDATE_SCHEMA)
+    @tool(
+        UPDATE_TOOL,
+        "Replace the title and statement of a remembered entry, by id, at the "
+        "expected_version you last read. Its kind never changes. A version conflict "
+        "means it changed since you read it.",
+        _UPDATE_SCHEMA,
+    )
     async def update(args: dict[str, Any]) -> dict[str, Any]:
         store, problem = pick(args)
         if store is None:
             return _approval_error(problem or "Unknown memory.")
-        statement = statement_of(args)
-        refusal = bad_statement(statement)
+        fact_id, refusal = fact_id_of(args)
         if refusal is not None:
             return refusal
-        assert statement is not None
-        fact_id = args.get("id")
+        expected, refusal = version_of(args, "expected_version", minimum=1)
+        if refusal is not None:
+            return refusal
+        title, refusal = title_of(args)
+        if refusal is not None:
+            return refusal
+        statement, refusal = statement_of(args)
+        if refusal is not None:
+            return refusal
+        assert fact_id is not None and expected is not None
+        assert title is not None and statement is not None
         try:
-            await store.update(
-                str(fact_id), statement=statement, author=turn.author, session_id=session_id
+            version = await store.update(
+                fact_id,
+                expected_version=expected,
+                title=title,
+                statement=statement,
+                author=turn.author,
+                session_id=session_id,
             )
         except MemoryFactsError as exc:
-            return failure(exc, args.get("memory"), fact_id)
-        return ok({"id": fact_id, "updated": True})
+            return failure(exc, args.get("memory"), fact_id, expected)
+        return ok({"id": fact_id, "version": version, "updated": True})
 
-    @tool(FORGET_TOOL, "Remove a remembered fact, by id.", _FORGET_SCHEMA)
+    @tool(
+        FORGET_TOOL,
+        "Remove a remembered entry, by id, at the expected_version you last read. "
+        "Its history is kept, and revert_memory can bring it back.",
+        _VERSIONED_SCHEMA,
+    )
     async def forget(args: dict[str, Any]) -> dict[str, Any]:
         store, problem = pick(args)
         if store is None:
             return _approval_error(problem or "Unknown memory.")
-        fact_id = args.get("id")
+        fact_id, refusal = fact_id_of(args)
+        if refusal is not None:
+            return refusal
+        expected, refusal = version_of(args, "expected_version", minimum=1)
+        if refusal is not None:
+            return refusal
+        assert fact_id is not None and expected is not None
         try:
-            await store.forget(str(fact_id))
+            await store.forget(fact_id, expected_version=expected)
         except MemoryFactsError as exc:
-            return failure(exc, args.get("memory"), fact_id)
+            return failure(exc, args.get("memory"), fact_id, expected)
         return ok({"id": fact_id, "forgotten": True})
 
-    return [remember, update, forget]
+    def lifecycle(operation: str, description: str, schema: dict[str, Any], name: str) -> Any:
+        @tool(name, description, schema)
+        async def change(args: dict[str, Any]) -> dict[str, Any]:
+            store, problem = pick(args)
+            if store is None:
+                return _approval_error(problem or "Unknown memory.")
+            fact_id, refusal = fact_id_of(args)
+            if refusal is not None:
+                return refusal
+            expected, refusal = version_of(args, "expected_version", minimum=1)
+            if refusal is not None:
+                return refusal
+            assert fact_id is not None and expected is not None
+            to_version: int | None = None
+            if operation == "revert":
+                to_version, refusal = version_of(args, "to_version", minimum=0)
+                if refusal is not None:
+                    return refusal
+                assert to_version is not None
+                if to_version >= expected:
+                    return _approval_error(
+                        "to_version must be an earlier version than expected_version. "
+                        "Nothing changed."
+                    )
+            try:
+                result = await store.change(
+                    operation, fact_id, expected_version=expected, to_version=to_version
+                )
+            except MemoryFactsError as exc:
+                return failure(exc, args.get("memory"), fact_id, expected)
+            return ok({"memory": args.get("memory"), **result})
+
+        return change
+
+    archive_memory = lifecycle(
+        "archive",
+        "Archive a remembered entry, by id, at the expected_version you last read: it "
+        "stays readable with read_memory but is left out of the start of later sessions.",
+        _VERSIONED_SCHEMA,
+        ARCHIVE_MEMORY_TOOL,
+    )
+    restore_memory = lifecycle(
+        "restore",
+        "Restore an archived entry, by id, at the expected_version you last read, so "
+        "later sessions can show it again.",
+        _VERSIONED_SCHEMA,
+        RESTORE_MEMORY_TOOL,
+    )
+    revert_memory = lifecycle(
+        "revert",
+        "Return an entry, by id, to an earlier version from its history (read_memory "
+        "shows it), at the expected_version you last read. to_version 0 removes it. "
+        "The revert is a new version; the history is kept.",
+        _REVERT_SCHEMA,
+        REVERT_MEMORY_TOOL,
+    )
+    return [
+        read_memory,
+        remember,
+        update,
+        forget,
+        archive_memory,
+        restore_memory,
+        revert_memory,
+    ]
+
+
+def memory_tool_live_names(tools: Sequence[SdkMcpTool[Any]]) -> frozenset[str]:
+    """The live SDK names of ``tools`` on the ``curie`` server: the exact exemption set."""
+
+    return frozenset(f"mcp__{APPROVAL_SERVER_NAME}__{t.name}" for t in tools)
 
 
 def build_can_use_tool(gate: ApprovalGate) -> CanUseTool:

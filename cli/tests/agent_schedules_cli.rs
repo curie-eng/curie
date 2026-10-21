@@ -456,7 +456,7 @@ fn overrides_agent_schedules_rejects_other_values() {
 fn overrides_agent_schedules_patches_the_agent_over_http() {
     for (flag, expected) in [("on", true), ("off", false)] {
         let agent = format!(
-            r##"{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"model":null,"thinking":null,"execution_deadline_seconds":null,"created_at":"2026-07-05T00:00:00Z","memory":false,"memory_writes":true,"agent_schedules":{expected}}}"##
+            r##"{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"model":null,"thinking":null,"execution_deadline_seconds":null,"created_at":"2026-07-05T00:00:00Z","memory":false,"memory_writes":true,"agent_wide_learning":false,"agent_schedules":{expected}}}"##
         );
         let list = format!("[{agent}]");
         let server = serve(move |req| match (req.method.as_str(), req.path.as_str()) {
@@ -492,7 +492,7 @@ fn overrides_agent_schedules_patches_the_agent_over_http() {
 /// ADR 0238 switch and policy settings.
 fn agent_row(agent_schedules: bool, max_active: u32) -> String {
     format!(
-        r##"{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"model":null,"thinking":null,"execution_deadline_seconds":null,"created_at":"2026-07-05T00:00:00Z","memory":false,"memory_writes":true,"agent_schedules":{agent_schedules},"schedule_timezone":"UTC","schedule_max_active":{max_active},"schedule_min_interval_minutes":15}}"##
+        r##"{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"model":null,"thinking":null,"execution_deadline_seconds":null,"created_at":"2026-07-05T00:00:00Z","memory":false,"memory_writes":true,"agent_wide_learning":false,"agent_schedules":{agent_schedules},"schedule_timezone":"UTC","schedule_max_active":{max_active},"schedule_min_interval_minutes":15}}"##
     )
 }
 

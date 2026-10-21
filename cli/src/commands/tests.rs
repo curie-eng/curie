@@ -1794,6 +1794,7 @@ fn precheck_agent(routes: &[&str]) -> crate::api::Agent {
         "channels": [{"kind": "slack", "address": "C0EXAMPLE0"}],
         "approval_routes": routes,
         "memory": false,
+        "agent_wide_learning": false,
     }))
     .expect("the fixture is a valid AgentOut")
 }

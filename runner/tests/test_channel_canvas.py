@@ -48,6 +48,7 @@ from plugin_format import CHANNEL_READ_SERVER_NAME, PLATFORM_SLACK_GRANT_FIELDS
 
 from .test_channel_read import (
     _TOKEN,
+    MEMORY_LIVE_NAMES,
     NO_CAP,
     SENTINEL,
     _assert_refused,
@@ -406,7 +407,7 @@ def test_canvas_tools_are_never_platform_exempt() -> None:
     for name in CANVAS_NAMES:
         assert not is_platform_owned_tool(name, state_server_mounted=True)
         assert not is_platform_owned_tool(
-            name, state_server_mounted=True, memory_tools_mounted=True
+            name, state_server_mounted=True, memory_tool_names=MEMORY_LIVE_NAMES
         )
 
 

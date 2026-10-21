@@ -670,7 +670,15 @@ def test_off_mode_never_renders_a_receipt() -> None:
 
 # --- #1461: memory saves are recorded, not announced --------------------------
 
-_MEMORY_TOOLS = ("mcp__curie__remember", "mcp__curie__update", "mcp__curie__forget")
+_MEMORY_TOOLS = (
+    "mcp__curie__read_memory",
+    "mcp__curie__remember",
+    "mcp__curie__update",
+    "mcp__curie__forget",
+    "mcp__curie__archive_memory",
+    "mcp__curie__restore_memory",
+    "mcp__curie__revert_memory",
+)
 
 
 def test_memory_tool_actions_are_left_out_of_the_receipt() -> None:
@@ -714,7 +722,9 @@ def test_the_receipt_filter_names_match_the_runner_published_memory_tools() -> N
     from curie_worker import receipt
 
     published = {f"mcp__{APPROVAL_SERVER_NAME}__{name}" for name in MEMORY_TOOL_NAMES}
-    assert published <= platform_tool_names(state_server_mounted=False, memory_tools_mounted=True)
+    assert published <= platform_tool_names(
+        state_server_mounted=False, memory_tool_names=frozenset(published)
+    )
     assert set(receipt._UNANNOUNCED_TOOLS) == published
     assert set(_MEMORY_TOOLS) == published
 

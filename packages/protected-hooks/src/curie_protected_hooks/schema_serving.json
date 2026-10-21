@@ -321,6 +321,9 @@
       "0107",
       "0106"
     ],
+    "selfimp_memory_0001": [
+      "selfimp_sched_0001"
+    ],
     "selfimp_safety_0001": [
       "0108"
     ],
@@ -331,6 +334,6 @@
       "selfimp_safety_0001"
     ]
   },
-  "schema_head": "selfimp_sched_0001",
-  "schema_min": "selfimp_sched_0001"
+  "schema_head": "selfimp_memory_0001",
+  "schema_min": "selfimp_memory_0001"
 }

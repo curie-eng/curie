@@ -279,6 +279,11 @@ def _sandbox(api_url: str, *, memory_writes: bool) -> Sandbox:
         {"kind": "slack", "address": channel_b},
     )
     assert second.status == 201, second
+    # The API refuses a sandbox write unless the agent's stored memory_writes
+    # is on (ADR 0239), so mirror the worker-side switch on the API agent.
+    if memory_writes:
+        writes = _http(f"{api_url}/agents/{agent_id}", "PATCH", {"memory_writes": True})
+        assert writes.status == 200, writes
 
     config = WorkerConfig(api_key=API_KEY, api_base_url=api_url, runner_api_base_url=api_url)
     resolver = BindingResolver.__new__(BindingResolver)
@@ -307,12 +312,18 @@ def _other_channel(sandbox: Sandbox) -> str:
     return ref.replace(own, other)
 
 
-def _fact(statement: str, author: str) -> dict[str, str]:
+def _fact(statement: str, author: str) -> dict[str, object]:
+    # The typed canonical shape (ADR 0239); the API stamps author, stated_at
+    # and conversation for a sandbox writer.
     return {
+        "kind": "fact",
+        "title": "Probe fact",
         "statement": statement,
         "author": author,
         "stated_at": "2026-10-01T00:00:00+00:00",
         "session_id": "sess-probe",
+        "conversation": None,
+        "archived": False,
     }
 
 
@@ -470,7 +481,7 @@ def test_turn_token_is_refused_after_its_turn_is_closed(api_url: str) -> None:
     after = _http(f"{ref}/{OTHER_FACT}", "PUT", {"value": _fact("after", ALICE)}, key=turn_token)
     assert after.status == 403, after
     assert "turn has ended" in json.dumps(after.body), after
-    assert _http(f"{ref}/{FACT}", "DELETE", key=turn_token).status == 403
+    assert _http(f"{ref}/{FACT}?expected_version=1", "DELETE", key=turn_token).status == 403
     assert _http(f"{ref}/{OTHER_FACT}").status == 404
     # Reads with it still work, and the next turn's credential still writes.
     read = _http(f"{ref}/{FACT}", key=turn_token)
@@ -494,8 +505,8 @@ def test_boot_env_token_is_refused_after_its_claim_is_released(api_url: str) -> 
     and a released claim refuses it immediately while it is still unexpired.
     """
 
+    from curie_internal.sandbox_token import mint
     from curie_worker.binding import BOOT_TOKEN_GRACE_SECONDS, boot_token_facts
-    from curie_worker.sandbox_token import mint
 
     sandbox = _sandbox(api_url, memory_writes=False)
     before = int(time.time())

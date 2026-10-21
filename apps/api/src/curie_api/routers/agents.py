@@ -400,6 +400,11 @@ async def update_agent(
     if data.memory_writes is not None:
         # Same plain-None rule as `memory`: omitted (or null) is unchanged.
         agent = await crud_agents.update_agent_memory_writes(session, agent, data.memory_writes)
+    if data.agent_wide_learning is not None:
+        # Same plain-None rule: omitted (or null) is unchanged (ADR 0239).
+        agent = await crud_agents.update_agent_wide_learning(
+            session, agent, data.agent_wide_learning
+        )
     schedule_settings = (
         data.agent_schedules,
         data.schedule_timezone,

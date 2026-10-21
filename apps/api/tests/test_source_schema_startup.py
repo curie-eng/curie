@@ -51,7 +51,7 @@ def invoke() -> None:
     asyncio.run(asyncio.wait_for(assert_servable(), 35))
 
 
-@pytest.mark.parametrize("revision", ["selfimp_sched_0001", "future-expand"])
+@pytest.mark.parametrize("revision", ["selfimp_memory_0001", "future-expand"])
 def test_actual_api_admits_known_or_future_with_readable_source_structure(
     startup_db: str, revision: str
 ) -> None:
@@ -89,7 +89,38 @@ def test_schema_built_at_0100_is_refused_without_migrating(
     assert sql_dicts("SELECT version_num FROM curie.alembic_version") == [{"version_num": "0100"}]
 
 
-@pytest.mark.parametrize("revision", ["selfimp_sched_0001", "future-expand"])
+def test_schema_built_at_agent_schedules_is_refused_without_migrating(
+    isolated_migration_db: IsolatedMigrationDb,
+) -> None:
+    """Twin memory: the Agent ORM reads ``agents.agent_wide_learning``.
+
+    A real schema built at selfimp_sched_0001, the revision right below the
+    twin memory expansion, has no such column, so the API must refuse it
+    rather than serve and fail on the first agent read.
+    """
+    isolated_migration_db.at("selfimp_sched_0001")
+    with pytest.raises(RuntimeError, match="below application min"):
+        invoke()
+    assert sql_dicts("SELECT version_num FROM curie.alembic_version") == [
+        {"version_num": "selfimp_sched_0001"}
+    ]
+    assert sql_dicts("SELECT to_regclass('curie.memory_revisions')::text AS revisions") == [
+        {"revisions": None}
+    ]
+
+
+def test_schema_built_at_twin_memory_is_served(
+    isolated_migration_db: IsolatedMigrationDb,
+) -> None:
+    """The liveness twin of the refusal above: a real selfimp_memory_0001 schema serves."""
+    isolated_migration_db.at("selfimp_memory_0001")
+    invoke()
+    assert sql_dicts("SELECT version_num FROM curie.alembic_version") == [
+        {"version_num": "selfimp_memory_0001"}
+    ]
+
+
+@pytest.mark.parametrize("revision", ["selfimp_memory_0001", "future-expand"])
 def test_compatible_stamp_without_actual_ledger_refuses(
     startup_db: str, revision: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -129,7 +160,7 @@ def test_required_projection_column_missing_refuses(
     with pytest.raises(RuntimeError, match="schema_structure_unavailable"):
         invoke()
     assert sql_dicts("SELECT version_num FROM curie.alembic_version") == [
-        {"version_num": "selfimp_sched_0001"}
+        {"version_num": "selfimp_memory_0001"}
     ]
 
 
@@ -149,7 +180,7 @@ def test_incompatible_actual_column_type_refuses(
     with pytest.raises(RuntimeError, match="schema_structure_unavailable"):
         invoke()
     assert sql_dicts("SELECT version_num FROM curie.alembic_version") == [
-        {"version_num": "selfimp_sched_0001"}
+        {"version_num": "selfimp_memory_0001"}
     ]
 
 
@@ -200,7 +231,7 @@ def test_configured_metadata_schema_is_distinct_from_actual_curie_source_schema(
     schema = "metadata_" + uuid.uuid4().hex
     sql_dicts(f"CREATE SCHEMA {schema}")
     sql_dicts(f"CREATE TABLE {schema}.alembic_version(version_num varchar(32) PRIMARY KEY)")
-    sql_dicts(f"INSERT INTO {schema}.alembic_version VALUES ('selfimp_sched_0001')")
+    sql_dicts(f"INSERT INTO {schema}.alembic_version VALUES ('selfimp_memory_0001')")
     url = get_settings().database_url
     assert subprocess_probe(url=url, schema=schema) == {"ok": True}
     sql_dicts("DROP TABLE curie.hook_source_operations")

@@ -224,6 +224,19 @@ async def update_agent_memory_writes(
     return agent
 
 
+async def update_agent_wide_learning(
+    session: AsyncSession, agent: Agent, agent_wide_learning: bool
+) -> Agent:
+    """Set whether the agent is opted in to agent-wide learning (ADR 0239).
+    Takes effect at the next sandbox boot for guidance and instructions, and at
+    once for sandbox instruction writes; memory writes are untouched."""
+
+    agent.agent_wide_learning = agent_wide_learning
+    await session.commit()
+    await session.refresh(agent)
+    return agent
+
+
 async def update_agent_schedule_settings(
     session: AsyncSession,
     agent: Agent,

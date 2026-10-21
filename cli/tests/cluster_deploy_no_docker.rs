@@ -45,7 +45,8 @@ fn agent_json() -> Value {
         "name": "acme-bot",
         "channels": [{"kind": "slack", "address": "C0EXAMPLE1"}],
         "created_at": "2026-09-29T00:00:00Z",
-        "memory": false
+        "memory": false,
+        "agent_wide_learning": false
     })
 }
 
@@ -403,6 +404,7 @@ fn cron_agent(channels: Value) -> Value {
         "source_bindings": null,
         "secrets": null,
         "memory": false,
+        "agent_wide_learning": false,
         "created_at": "2026-09-29T00:00:00Z"
     })
 }

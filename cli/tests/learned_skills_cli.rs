@@ -32,7 +32,7 @@ fn skills_path() -> String {
 
 fn agent_json(learned: bool) -> String {
     format!(
-        r##"{{"id":"{AGENT_ID}","name":"{AGENT_NAME}","channels":[{{"kind":"slack","address":"#x"}}],"created_at":"2026-07-05T00:00:00Z","memory":false,"learned_skills":{learned}}}"##
+        r##"{{"id":"{AGENT_ID}","name":"{AGENT_NAME}","channels":[{{"kind":"slack","address":"#x"}}],"created_at":"2026-07-05T00:00:00Z","memory":false,"agent_wide_learning":false,"learned_skills":{learned}}}"##
     )
 }
 

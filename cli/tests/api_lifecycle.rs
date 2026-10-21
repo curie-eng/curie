@@ -18,7 +18,7 @@ fn agent_list() -> Response {
     Response::json(
         200,
         &format!(
-            r##"[{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"created_at":"2026-07-05T00:00:00Z","memory":false}}]"##
+            r##"[{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"created_at":"2026-07-05T00:00:00Z","memory":false,"agent_wide_learning":false}}]"##
         ),
     )
 }
@@ -957,7 +957,7 @@ fn agent_list_with_overrides() -> Response {
     Response::json(
         200,
         &format!(
-            r##"[{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"model":"kimi-k2","thinking":"adaptive","created_at":"2026-07-05T00:00:00Z","memory":false,"memory_writes":true}}]"##
+            r##"[{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"model":"kimi-k2","thinking":"adaptive","created_at":"2026-07-05T00:00:00Z","memory":false,"agent_wide_learning":false,"memory_writes":true}}]"##
         ),
     )
 }
@@ -989,10 +989,12 @@ async fn overrides_inspect_reads_both_fields_and_writes_nothing() {
             execution_deadline_seconds: _,
             runner_resources: _,
             memory_writes,
+            agent_wide_learning,
             learned_skills: _,
             changed,
         } => {
             assert_eq!(agent, "deal-desk");
+            assert!(!agent_wide_learning, "the learning opt-in defaults off");
             assert_eq!(model.as_deref(), Some("kimi-k2"));
             assert_eq!(thinking.as_deref(), Some("adaptive"));
             // #1461: the inspect reports the memory-writes switch as stored.
@@ -1018,7 +1020,7 @@ async fn overrides_set_patches_only_the_field_named() {
         ("PATCH", p) if *p == format!("/agents/{AGENT_ID}") => Response::json(
             200,
             &format!(
-                r##"{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"model":null,"thinking":"enabled:2000","memory":false}}"##
+                r##"{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"model":null,"thinking":"enabled:2000","memory":false,"agent_wide_learning":false}}"##
             ),
         ),
         other => panic!("unexpected request: {other:?}"),
@@ -1069,7 +1071,7 @@ async fn overrides_clear_sends_explicit_null_not_an_empty_string() {
         ("PATCH", p) if *p == format!("/agents/{AGENT_ID}") => Response::json(
             200,
             &format!(
-                r##"{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"model":null,"thinking":null,"memory":false}}"##
+                r##"{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"model":null,"thinking":null,"memory":false,"agent_wide_learning":false}}"##
             ),
         ),
         other => panic!("unexpected request: {other:?}"),
@@ -1159,7 +1161,7 @@ async fn overrides_set_execution_deadline_patches_only_that_field() {
         ("PATCH", p) if *p == format!("/agents/{AGENT_ID}") => Response::json(
             200,
             &format!(
-                r##"{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"model":null,"thinking":null,"execution_deadline_seconds":120,"memory":false}}"##
+                r##"{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"model":null,"thinking":null,"execution_deadline_seconds":120,"memory":false,"agent_wide_learning":false}}"##
             ),
         ),
         other => panic!("unexpected request: {other:?}"),
@@ -1201,7 +1203,7 @@ async fn overrides_clear_execution_deadline_sends_explicit_null_not_an_empty_str
         ("PATCH", p) if *p == format!("/agents/{AGENT_ID}") => Response::json(
             200,
             &format!(
-                r##"{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"model":"kimi-k2","thinking":"adaptive","execution_deadline_seconds":null,"memory":false}}"##
+                r##"{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"model":"kimi-k2","thinking":"adaptive","execution_deadline_seconds":null,"memory":false,"agent_wide_learning":false}}"##
             ),
         ),
         other => panic!("unexpected request: {other:?}"),
@@ -1263,7 +1265,7 @@ async fn overrides_set_runner_resources_patches_only_that_field() {
         ("PATCH", p) if *p == format!("/agents/{AGENT_ID}") => Response::json(
             200,
             &format!(
-                r##"{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"model":null,"thinking":null,"execution_deadline_seconds":null,"runner_resources":{RUNNER_RESOURCES_JSON},"memory":false}}"##
+                r##"{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"model":null,"thinking":null,"execution_deadline_seconds":null,"runner_resources":{RUNNER_RESOURCES_JSON},"memory":false,"agent_wide_learning":false}}"##
             ),
         ),
         other => panic!("unexpected request: {other:?}"),
@@ -1310,7 +1312,7 @@ async fn overrides_clear_runner_resources_sends_explicit_null_not_an_empty_strin
         ("PATCH", p) if *p == format!("/agents/{AGENT_ID}") => Response::json(
             200,
             &format!(
-                r##"{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"model":"kimi-k2","thinking":"adaptive","execution_deadline_seconds":null,"runner_resources":null,"memory":false}}"##
+                r##"{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"model":"kimi-k2","thinking":"adaptive","execution_deadline_seconds":null,"runner_resources":null,"memory":false,"agent_wide_learning":false}}"##
             ),
         ),
         other => panic!("unexpected request: {other:?}"),
@@ -1362,7 +1364,7 @@ async fn overrides_inspect_reports_null_runner_resources_as_platform_default() {
         ("GET", "/agents") => Response::json(
             200,
             &format!(
-                r##"[{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"model":"kimi-k2","thinking":"adaptive","execution_deadline_seconds":null,"runner_resources":null,"created_at":"2026-07-05T00:00:00Z","memory":false,"memory_writes":false}}]"##
+                r##"[{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"model":"kimi-k2","thinking":"adaptive","execution_deadline_seconds":null,"runner_resources":null,"created_at":"2026-07-05T00:00:00Z","memory":false,"agent_wide_learning":false,"memory_writes":false}}]"##
             ),
         ),
         other => panic!("unexpected request: {other:?}"),
@@ -1387,6 +1389,7 @@ async fn overrides_inspect_reports_null_runner_resources_as_platform_default() {
         execution_deadline_seconds,
         runner_resources,
         memory_writes,
+        agent_wide_learning,
         learned_skills,
         changed,
     } = &out
@@ -1436,12 +1439,18 @@ async fn overrides_inspect_reports_null_runner_resources_as_platform_default() {
         execution_deadline_seconds,
         runner_resources,
         *memory_writes,
+        *agent_wide_learning,
         *learned_skills,
         *changed,
     );
     assert_eq!(
+        json.get("agent_wide_learning"),
+        Some(&serde_json::Value::Bool(false)),
+        "inspect JSON must include agent_wide_learning false: {json}"
+    );
+    assert_eq!(
         line,
-        "overrides for deal-desk: model kimi-k2, reviewer model credential default, thinking adaptive, execution deadline platform default, runner resources platform default, memory writes off, learned skills off"
+        "overrides for deal-desk: model kimi-k2, reviewer model credential default, thinking adaptive, execution deadline platform default, runner resources platform default, memory writes off, agent-wide learning off, learned skills off"
     );
 
     let rec = server.recorded();
@@ -1455,7 +1464,7 @@ async fn overrides_error_includes_the_api_quota_refusal_detail() {
         ("GET", "/agents") => Response::json(
             200,
             &format!(
-                r##"[{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"created_at":"2026-07-05T00:00:00Z","memory":false,"runner_resources":null}}]"##
+                r##"[{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"created_at":"2026-07-05T00:00:00Z","memory":false,"agent_wide_learning":false,"runner_resources":null}}]"##
             ),
         ),
         ("PATCH", p) if *p == format!("/agents/{AGENT_ID}") => {
@@ -1592,7 +1601,7 @@ fn curie_against(base_url: &str, rest: &[&str]) -> std::process::Output {
 
 fn agent_json_with_memory_writes(memory_writes: bool) -> String {
     format!(
-        r##"{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"model":null,"thinking":null,"execution_deadline_seconds":null,"created_at":"2026-07-05T00:00:00Z","memory":false,"memory_writes":{memory_writes}}}"##
+        r##"{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"model":null,"thinking":null,"execution_deadline_seconds":null,"created_at":"2026-07-05T00:00:00Z","memory":false,"agent_wide_learning":false,"memory_writes":{memory_writes}}}"##
     )
 }
 
@@ -1662,6 +1671,140 @@ fn overrides_memory_writes_off_patches_a_json_false() {
     let patch = rec.iter().find(|r| r.method == "PATCH").expect("a PATCH");
     let body: serde_json::Value = serde_json::from_slice(&patch.body).expect("JSON body");
     assert_eq!(body, serde_json::json!({"memory_writes": false}));
+}
+
+// --- `<tier> overrides`: a missing agent_wide_learning is not "off" (CR3-1) ----
+//
+// The API always sends the field. When a response omits it, defaulting to false
+// would report a value the API never stored, so the command must refuse and name
+// the field instead.
+
+fn agent_json_agent_wide_learning(field: Option<bool>) -> String {
+    let learning = match field {
+        Some(v) => format!(r#","agent_wide_learning":{v}"#),
+        None => String::new(),
+    };
+    format!(
+        r##"{{"id":"{AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"model":null,"thinking":null,"execution_deadline_seconds":null,"created_at":"2026-07-05T00:00:00Z","memory":false{learning},"memory_writes":true}}"##
+    )
+}
+
+fn assert_refused_naming_agent_wide_learning(output: &std::process::Output) {
+    assert!(
+        !output.status.success(),
+        "must fail; stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        text.contains("agent_wide_learning"),
+        "the error must name agent_wide_learning: {text}"
+    );
+}
+
+#[test]
+fn overrides_inspect_refuses_when_agent_lacks_agent_wide_learning() {
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => {
+            Response::json(200, &format!("[{}]", agent_json_agent_wide_learning(None)))
+        }
+        _ => not_found(),
+    });
+
+    let output = curie_against(&server.base_url, &["local", "overrides", "deal-desk"]);
+    assert_refused_naming_agent_wide_learning(&output);
+    assert!(
+        server.recorded().iter().all(|r| r.method == "GET"),
+        "inspect must not write: {:?}",
+        server.recorded()
+    );
+}
+
+#[test]
+fn overrides_set_refuses_before_patching_when_get_lacks_agent_wide_learning() {
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => {
+            Response::json(200, &format!("[{}]", agent_json_agent_wide_learning(None)))
+        }
+        ("PATCH", p) if *p == format!("/agents/{AGENT_ID}") => {
+            Response::json(200, &agent_json_agent_wide_learning(Some(true)))
+        }
+        _ => not_found(),
+    });
+
+    let output = curie_against(
+        &server.base_url,
+        &[
+            "local",
+            "overrides",
+            "deal-desk",
+            "--agent-wide-learning",
+            "on",
+        ],
+    );
+    assert_refused_naming_agent_wide_learning(&output);
+    assert!(
+        server.recorded().iter().all(|r| r.method != "PATCH"),
+        "no PATCH may be sent: {:?}",
+        server.recorded()
+    );
+}
+
+#[test]
+fn overrides_set_refuses_when_patch_response_lacks_agent_wide_learning() {
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => Response::json(
+            200,
+            &format!("[{}]", agent_json_agent_wide_learning(Some(false))),
+        ),
+        ("PATCH", p) if *p == format!("/agents/{AGENT_ID}") => {
+            Response::json(200, &agent_json_agent_wide_learning(None))
+        }
+        _ => not_found(),
+    });
+
+    let output = curie_against(
+        &server.base_url,
+        &[
+            "local",
+            "overrides",
+            "deal-desk",
+            "--agent-wide-learning",
+            "on",
+        ],
+    );
+    assert_refused_naming_agent_wide_learning(&output);
+}
+
+#[test]
+fn overrides_inspect_reports_present_agent_wide_learning_true_and_false() {
+    for stored in [true, false] {
+        let server = serve(move |req| match (req.method.as_str(), req.path.as_str()) {
+            ("GET", "/agents") => Response::json(
+                200,
+                &format!("[{}]", agent_json_agent_wide_learning(Some(stored))),
+            ),
+            _ => not_found(),
+        });
+
+        let output = curie_against(&server.base_url, &["local", "overrides", "deal-desk"]);
+        assert!(
+            output.status.success(),
+            "stored {stored}; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("inspect emits JSON");
+        assert_eq!(
+            json.get("agent_wide_learning"),
+            Some(&serde_json::json!(stored)),
+            "inspect JSON must report the stored value: {json}"
+        );
+    }
 }
 
 #[test]

@@ -323,6 +323,11 @@ class Agent(Base):
     # agent (#1461, ADR-0167). Operator-owned; off by default. When on, the
     # worker hands the runner the binding-scoped channel memory URL.
     memory_writes: Mapped[bool] = mapped_column(default=False, server_default="false")
+    # Whether this agent is opted in to agent-wide learning (ADR 0239). Operator
+    # owned and off by default, independent of ``memory_writes``: it authorizes
+    # standing instructions (kind ``instruction``) and selects the learning
+    # default guidance. It never turns memory writes on.
+    agent_wide_learning: Mapped[bool] = mapped_column(default=False, server_default="false")
     # Whether the agent may create and change its own schedules (ADR 0238), and
     # the limits it is held to. Operator-owned; off by default.
     agent_schedules: Mapped[bool] = mapped_column(default=False, server_default="false")
@@ -2304,6 +2309,42 @@ class WorkflowStateEntry(Base):
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
 
+
+class MemoryRevision(Base):
+    """One immutable revision of a canonical memory entry (ADR 0239).
+
+    Every successful create, update, delete, archive, restore and revert of a
+    ``memory`` / ``fact-<hex>`` head appends exactly one row here in the same
+    transaction as the head mutation; the migration seeds one ``baseline`` row
+    per valid pre-existing fact. ``snapshot`` is the resulting canonical value,
+    null for a deletion. ``scope`` is the head's ``binding_scope`` with the
+    agent-wide scope stored as ``memory_records.AGENT_SCOPE`` (never null), so
+    the unique key below holds for agent-wide rows too. Rows are never updated;
+    deleting the agent removes them.
+    """
+
+    __tablename__ = "memory_revisions"
+    __table_args__ = (
+        UniqueConstraint(
+            "agent_id", "scope", "fact_id", "version", name="uq_memory_revisions_version"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE")
+    )
+    scope: Mapped[str] = mapped_column(Text)
+    fact_id: Mapped[str] = mapped_column(Text)
+    version: Mapped[int]
+    operation: Mapped[str] = mapped_column(Text)
+    # none_as_null: a deletion tombstone is SQL NULL, not the JSON null literal.
+    snapshot: Mapped[Any | None] = mapped_column(JSONB(none_as_null=True), default=None)
+    actor: Mapped[str] = mapped_column(Text)
+    source: Mapped[str] = mapped_column(Text)
+    conversation: Mapped[str | None] = mapped_column(Text, default=None)
+    reverted_to_version: Mapped[int | None] = mapped_column(default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class ThreadTranscript(Base):

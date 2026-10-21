@@ -54,7 +54,7 @@ fn agent_json(channels: &[&str]) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        r#"{{"id":"{AGENT_ID}","name":"{AGENT_NAME}","channels":[{bindings}],"created_at":"2026-07-05T00:00:00Z","memory":false}}"#
+        r#"{{"id":"{AGENT_ID}","name":"{AGENT_NAME}","channels":[{bindings}],"created_at":"2026-07-05T00:00:00Z","memory":false,"agent_wide_learning":false}}"#
     )
 }
 
@@ -85,7 +85,7 @@ fn api(write: impl Fn(&str, &str) -> Option<Response> + Send + Sync + 'static) -
 /// (ADR-0168 decision 3).
 fn agent_json_with_identity(channel: &str, adapter: &str) -> String {
     format!(
-        r#"{{"id":"{AGENT_ID}","name":"{AGENT_NAME}","channels":[{{"kind":"slack","address":"{channel}","adapter":"{adapter}"}}],"created_at":"2026-07-05T00:00:00Z","memory":false}}"#
+        r#"{{"id":"{AGENT_ID}","name":"{AGENT_NAME}","channels":[{{"kind":"slack","address":"{channel}","adapter":"{adapter}"}}],"created_at":"2026-07-05T00:00:00Z","memory":false,"agent_wide_learning":false}}"#
     )
 }
 

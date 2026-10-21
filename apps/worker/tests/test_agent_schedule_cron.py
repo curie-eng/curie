@@ -48,7 +48,7 @@ SENDER = "U0EXAMPLE1"
 @pytest.fixture
 def campaign(worker_db: Any) -> Iterator[Any]:
     support, clone, url = worker_db
-    clone.at("selfimp_sched_0001")
+    clone.at("selfimp_memory_0001")
     actual = Campaign(support, url)
     # No bundle triggers: only agent schedules can fire in these tests.
     empty = actual.bundle([])

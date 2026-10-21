@@ -22,19 +22,29 @@ import re
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from typing import Annotated, Any, Literal, NoReturn
 from urllib.parse import unquote
 
 import redis.asyncio as redis
 from curie_internal import sandbox_token
 from curie_telemetry import record_metric
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response, status
+from fastapi import Path as FastAPIPath
 from sqlalchemy import Text, cast, delete, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from curie_api.crud import agents as crud_agents
 from curie_api.crud import channels as crud_channels
+from curie_api.schemas.memory_records import (
+    FACT_ID_PATTERN,
+    MemoryContextOut,
+    MemoryDetailOut,
+    MemoryLifecycleIn,
+    MemoryRecordOut,
+    MemoryRevertIn,
+    MemoryScope,
+    MemorySearchOut,
+)
 from curie_api.schemas.state import (
     MemoryTurnClosedIn,
     SandboxCredentialReleasedIn,
@@ -44,11 +54,11 @@ from curie_api.schemas.state import (
     StateNamespaceOut,
 )
 
-from .. import state_mutation, threadkeys, transcripts
+from .. import memory_records, state_mutation, threadkeys, transcripts
 from ..auth import require_internal_worker_token, verify_platform_key
 from ..config import get_settings
 from ..deps import SessionDep
-from ..models import ThreadTranscript, WorkflowStateEntry
+from ..models import Agent, ThreadTranscript, WorkflowStateEntry
 from ..transcripts import TRANSCRIPT_NAMESPACE
 from ..transcripts import json_size as _json_size
 
@@ -89,6 +99,10 @@ LEARNED_SKILLS_NAMESPACE = "learned_skills"
 RESERVED_NAMESPACES = frozenset(
     {MEMORY_NAMESPACE, TRANSCRIPT_NAMESPACE, AGENT_SCHEDULES_NAMESPACE, LEARNED_SKILLS_NAMESPACE}
 )
+# The path segment of the typed memory routes (ADR 0239). Those routes are
+# registered before the generic ``{namespace}/{key}`` ones, and the generic
+# routes refuse it as a namespace, so it can never also be a state namespace.
+TYPED_MEMORY_SEGMENT = "_memory"
 
 # The only memory keys a sandbox credential may write (ADR-0188): the fact ids
 # the runner's memory tools mint. Mirrors ``memory_facts._FACT_ID`` in the
@@ -132,7 +146,8 @@ class StatePrincipal:
     ``schedules``, ``conversation`` and ``scheduled`` are the per-turn agent
     schedule claims (ADR 0238); ``scheduled`` is None unless the claim is an
     exact JSON boolean. ``skills`` and ``conversation`` are the per-turn
-    learned-skill claims (ADR 0237). A STATE token with no ``memory`` claim was
+    learned-skill claims (ADR 0237), and ``conversation`` is also stamped as a
+    memory write's source conversation (ADR 0239). A STATE token with no ``memory`` claim was
     minted by a pre-ADR-0188 worker: ``legacy``, which fails closed on memory
     (read-only, agent memory only)."""
 
@@ -480,31 +495,27 @@ async def require_turn_open(
         _refuse(principal, agent_id, path, TURN_ENDED)
 
 
-def _stamp_author(
-    principal: StatePrincipal,
-    agent_id: uuid.UUID,
-    namespace: str,
-    data: StateEntryPut,
-    path: str,
-) -> StateEntryPut:
-    """ADR-0188: a sandbox fact's author is the per-turn credential's ``sender``
-    claim, whatever the body says, and its ``stated_at`` is the server's clock,
-    so a sandbox write cannot backdate a fact. ``session_id`` is kept as sent.
-    The platform key keeps the body as given."""
+def _memory_actor(
+    principal: StatePrincipal, agent_id: uuid.UUID, path: str
+) -> memory_records.Actor:
+    """Who a canonical memory mutation is attributed to (ADR-0188, ADR 0239).
 
-    if principal.caller is not StateCaller.STATE or namespace != MEMORY_NAMESPACE:
-        return data
+    A sandbox write's author is the per-turn credential's signed ``sender`` and
+    its source conversation the signed ``conversation`` claim, whatever the body
+    says; a credential missing either cannot be attributed, so it cannot write.
+    The platform key is the operator."""
+
+    if principal.caller is StateCaller.PLATFORM:
+        return memory_records.Actor.operator()
+    if principal.caller is not StateCaller.STATE or principal.memory != "write":
+        _refuse(principal, agent_id, path, "memory credential is read-only")
     if principal.sender is None:
         _refuse(principal, agent_id, path, "memory write credential names no sender")
-    if not isinstance(data.value, dict):
-        raise HTTPException(
-            422,
-            "a memory fact written with a sandbox credential must be a JSON object",
-        )
-    # The runner's ``memory_facts._now`` format: RFC3339 UTC with a ``Z``.
-    stated_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
-    stamped = {**data.value, "author": principal.sender, "stated_at": stated_at}
-    return data.model_copy(update={"value": stamped})
+    if principal.conversation is None:
+        _refuse(principal, agent_id, path, "memory write credential names no conversation")
+    return memory_records.Actor(
+        source="sandbox", name=principal.sender, conversation=principal.conversation
+    )
 
 
 async def _binding_scope(
@@ -555,6 +566,11 @@ async def forbid_reserved_namespace(
     refusal by composing ``CURIE_STATE_URL`` directly with the token it holds;
     here the token it holds is simply refused. The broad token's narrower reach
     on ``memory`` (ADR-0188) is ``_check_memory_reach``."""
+    if namespace == TYPED_MEMORY_SEGMENT:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            f"{TYPED_MEMORY_SEGMENT!r} is not a state namespace; it is the typed memory routes",
+        )
     if principal.caller is not StateCaller.PLATFORM and namespace == AGENT_SCHEDULES_NAMESPACE:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
@@ -577,6 +593,255 @@ async def forbid_reserved_namespace(
 
 
 router = APIRouter(prefix="/agents", tags=["state"], dependencies=[Depends(require_state_access)])
+
+
+# --- Typed memory routes (ADR 0239) --------------------------------------------
+#
+# Registered here, BEFORE every generic ``/{agent_id}/state/{namespace}/...``
+# route, so ``_memory/context`` is never parsed as namespace ``_memory`` and key
+# ``context`` (``forbid_reserved_namespace`` also refuses ``_memory`` as a
+# generic namespace). Same ``require_state_access`` dependency as the rest of
+# the router. A sandbox credential's channel is the binding its claims name,
+# never one it passes; the platform key names a channel explicitly.
+
+
+async def _typed_agent(session: AsyncSession, agent_id: uuid.UUID) -> Agent:
+    agent = await crud_agents.get_agent(session, agent_id)
+    if agent is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
+    return agent
+
+
+def _typed_path(name: str) -> str:
+    return f"state/{TYPED_MEMORY_SEGMENT}/{name}"
+
+
+async def _typed_scope(
+    principal: StatePrincipal,
+    agent_id: uuid.UUID,
+    session: AsyncSession,
+    scope: MemoryScope,
+    channel_kind: str | None,
+    channel_address: str | None,
+    path: str,
+) -> str | None:
+    """The ``binding_scope`` a typed memory request addresses.
+
+    A sandbox credential may not name a channel; ``channel`` is its own signed
+    binding, and a credential with none (legacy or unbound) reaches agent memory
+    only. Runs before any database lookup for a sandbox caller, so a refusal
+    cannot probe which bindings exist. The platform key must name the binding
+    for ``channel``, which must belong to the agent."""
+
+    if principal.caller is StateCaller.APP:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, "memory is reserved by the platform; use the memory tools"
+        )
+    if principal.caller is StateCaller.STATE:
+        if channel_kind is not None or channel_address is not None:
+            _refuse(
+                principal,
+                agent_id,
+                path,
+                "a sandbox credential may not name a channel; channel memory is its own binding",
+            )
+        if scope == "agent":
+            return None
+        if principal.legacy or principal.binding is None:
+            _refuse(principal, agent_id, path, "credential is scoped to another channel")
+        return principal.binding
+    if scope == "agent":
+        if channel_kind is not None or channel_address is not None:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_CONTENT,
+                "scope 'agent' takes no channel_kind or channel_address",
+            )
+        return None
+    if channel_kind is None or channel_address is None:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "scope 'channel' needs channel_kind and channel_address with the platform key",
+        )
+    return await _binding_scope(session, agent_id, channel_kind, channel_address)
+
+
+async def _typed_writer(
+    principal: StatePrincipal, agent_id: uuid.UUID, request: Request, path: str
+) -> memory_records.Actor:
+    """The write conditions of a typed mutation: a sandbox caller needs the
+    per-turn write credential of a turn still open, with signed sender and
+    conversation claims. The agent's current ``memory_writes`` (and, for an
+    instruction, ``agent_wide_learning``) are checked inside the transaction."""
+
+    if principal.caller is StateCaller.STATE:
+        if principal.memory != "write":
+            _refuse(principal, agent_id, path, "memory credential is read-only")
+        await _check_turn_open(principal, agent_id, MEMORY_NAMESPACE, request, path)
+    return _memory_actor(principal, agent_id, path)
+
+
+@router.get("/{agent_id}/state/_memory/context", response_model=MemoryContextOut)
+async def memory_context(
+    agent_id: uuid.UUID,
+    session: SessionDep,
+    principal: Annotated[StatePrincipal, Depends(require_state_access)],
+    channel_kind: str | None = None,
+    channel_address: str | None = None,
+) -> MemoryContextOut:
+    """The bounded boot memory (ADR 0239): the learning toggle, the effective
+    guidance, at most 20 active standing instructions and the titles of at most
+    50 active facts from agent memory plus the caller's own channel, with
+    totals and omitted counts. No fact statement is ever in it.
+
+    A sandbox credential sees its own binding (none when it names none). The
+    platform key sees agent memory, plus one binding when it names both
+    ``channel_kind`` and ``channel_address``."""
+
+    path = _typed_path("context")
+    named = channel_kind is not None or channel_address is not None
+    channel: str | None = None
+    if principal.caller is StateCaller.STATE and not named:
+        if not principal.legacy:
+            channel = principal.binding
+    elif named or principal.caller is not StateCaller.PLATFORM:
+        channel = await _typed_scope(
+            principal, agent_id, session, "channel", channel_kind, channel_address, path
+        )
+    agent = await _typed_agent(session, agent_id)
+    return await memory_records.context(session, agent, channel)
+
+
+@router.get("/{agent_id}/state/_memory/entries/{fact_id}", response_model=MemoryDetailOut)
+async def memory_entry(
+    agent_id: uuid.UUID,
+    fact_id: Annotated[str, FastAPIPath(pattern=FACT_ID_PATTERN)],
+    scope: MemoryScope,
+    session: SessionDep,
+    principal: Annotated[StatePrincipal, Depends(require_state_access)],
+    before_version: Annotated[int | None, Query(ge=1)] = None,
+    channel_kind: str | None = None,
+    channel_address: str | None = None,
+) -> MemoryDetailOut:
+    """One entry, live or deleted, with its newest 10 revisions older than
+    ``before_version`` (each with its snapshot). A deleted head answers with
+    ``deleted`` true and the deletion's version, so it can be reverted; an
+    identity never created is 404."""
+
+    path = _typed_path(f"entries/{fact_id}")
+    binding_scope = await _typed_scope(
+        principal, agent_id, session, scope, channel_kind, channel_address, path
+    )
+    await _typed_agent(session, agent_id)
+    return await memory_records.detail(session, agent_id, binding_scope, fact_id, before_version)
+
+
+@router.get("/{agent_id}/state/_memory/search", response_model=MemorySearchOut)
+async def memory_search(
+    agent_id: uuid.UUID,
+    scope: MemoryScope,
+    q: Annotated[str, Query(min_length=1, max_length=500)],
+    session: SessionDep,
+    principal: Annotated[StatePrincipal, Depends(require_state_access)],
+    cursor: str | None = None,
+    limit: Annotated[
+        int, Query(ge=1, le=memory_records.SEARCH_MAX_LIMIT)
+    ] = memory_records.SEARCH_DEFAULT_LIMIT,
+    channel_kind: str | None = None,
+    channel_address: str | None = None,
+) -> MemorySearchOut:
+    """Literal, case-insensitive search of one scope's titles and statements,
+    active and archived entries alike, with full records. A miss is an empty
+    page; ``next_cursor`` continues a longer result."""
+
+    path = _typed_path("search")
+    binding_scope = await _typed_scope(
+        principal, agent_id, session, scope, channel_kind, channel_address, path
+    )
+    await _typed_agent(session, agent_id)
+    return await memory_records.search(session, agent_id, binding_scope, q, cursor, limit)
+
+
+async def _set_archived(
+    agent_id: uuid.UUID,
+    data: MemoryLifecycleIn,
+    archived: bool,
+    session: AsyncSession,
+    request: Request,
+    principal: StatePrincipal,
+) -> MemoryRecordOut | Response:
+    path = _typed_path("archive" if archived else "restore")
+    binding_scope = await _typed_scope(
+        principal, agent_id, session, data.scope, data.channel_kind, data.channel_address, path
+    )
+    actor = await _typed_writer(principal, agent_id, request, path)
+    agent = await _typed_agent(session, agent_id)
+    try:
+        return await memory_records.set_archived(
+            session, agent, binding_scope, data.id, data.expected_version, archived, actor
+        )
+    except memory_records.VersionConflict as conflict:
+        return conflict.response()
+
+
+@router.post("/{agent_id}/state/_memory/archive", response_model=MemoryRecordOut)
+async def archive_memory(
+    agent_id: uuid.UUID,
+    data: MemoryLifecycleIn,
+    session: SessionDep,
+    request: Request,
+    principal: Annotated[StatePrincipal, Depends(require_state_access)],
+) -> MemoryRecordOut | Response:
+    """Archive one entry under compare-and-set: it leaves the boot context but
+    stays readable, searchable and counted. Already archived at the current
+    version: unchanged, with no new revision."""
+
+    return await _set_archived(agent_id, data, True, session, request, principal)
+
+
+@router.post("/{agent_id}/state/_memory/restore", response_model=MemoryRecordOut)
+async def restore_memory(
+    agent_id: uuid.UUID,
+    data: MemoryLifecycleIn,
+    session: SessionDep,
+    request: Request,
+    principal: Annotated[StatePrincipal, Depends(require_state_access)],
+) -> MemoryRecordOut | Response:
+    """Restore an archived entry under compare-and-set."""
+
+    return await _set_archived(agent_id, data, False, session, request, principal)
+
+
+@router.post("/{agent_id}/state/_memory/revert", response_model=MemoryDetailOut)
+async def revert_memory(
+    agent_id: uuid.UUID,
+    data: MemoryRevertIn,
+    session: SessionDep,
+    request: Request,
+    principal: Annotated[StatePrincipal, Depends(require_state_access)],
+) -> MemoryDetailOut | Response:
+    """Revert one entry to an earlier version as a new version (``to_version``
+    0 removes the head). Works on a deleted entry, which it restores under the
+    same id. A stale ``expected_version`` is 409 and changes nothing."""
+
+    path = _typed_path("revert")
+    binding_scope = await _typed_scope(
+        principal, agent_id, session, data.scope, data.channel_kind, data.channel_address, path
+    )
+    actor = await _typed_writer(principal, agent_id, request, path)
+    agent = await _typed_agent(session, agent_id)
+    try:
+        await memory_records.revert(
+            session,
+            agent,
+            binding_scope,
+            data.id,
+            data.expected_version,
+            data.to_version,
+            actor,
+        )
+    except memory_records.VersionConflict as conflict:
+        return conflict.response()
+    return await memory_records.detail(session, agent_id, binding_scope, data.id)
 
 
 # Advisory-lock class for the per-agent namespace-count cap (#933). The
@@ -848,11 +1113,28 @@ async def _put_state(
     key: str,
     data: StateEntryPut,
     session: AsyncSession,
-) -> StateEntryOut:
+    actor: memory_records.Actor | None = None,
+) -> StateEntryOut | Response:
     # Unknown agent is a 404 (the FK would also reject, but this is the clear
     # signal). expected_version opts into compare-and-set.
-    if await crud_agents.get_agent(session, agent_id) is None:
+    agent = await crud_agents.get_agent(session, agent_id)
+    if agent is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
+    if memory_records.is_canonical_key(namespace, key):
+        # ADR 0239: a canonical memory entry is typed, versioned, counted and
+        # audited, all in the one memory transaction.
+        assert actor is not None, "canonical memory writes are attributed by the route"
+        try:
+            head = await memory_records.put_canonical(
+                session, agent, scope, key, data.value, data.expected_version, actor
+            )
+        except memory_records.VersionConflict as conflict:
+            return conflict.response()
+        return StateEntryOut.model_validate(head)
+    if namespace == MEMORY_NAMESPACE:
+        # The log and guidance share the namespace byte budget with the
+        # canonical entries, so they serialize on the same scope lock.
+        await memory_records.lock_scope(session, agent_id, scope)
     if namespace == TRANSCRIPT_NAMESPACE:
         row = await transcripts.put(
             session, agent_id, scope, key, data.value, data.expected_version
@@ -897,7 +1179,7 @@ async def put_state(
     session: SessionDep,
     request: Request,
     principal: Annotated[StatePrincipal, Depends(require_state_access)],
-) -> StateEntryOut:
+) -> StateEntryOut | Response:
     path = _state_path(namespace, key)
     _check_memory_reach(
         principal, agent_id, namespace, requested_binding=None, key=key, write=True, path=path
@@ -911,8 +1193,12 @@ async def put_state(
         path=path,
     )
     await _check_turn_open(principal, agent_id, namespace, request, path)
-    data = _stamp_author(principal, agent_id, namespace, data, path)
-    return await _put_state(agent_id, None, namespace, key, data, session)
+    actor = (
+        _memory_actor(principal, agent_id, path)
+        if memory_records.is_canonical_key(namespace, key)
+        else None
+    )
+    return await _put_state(agent_id, None, namespace, key, data, session, actor)
 
 
 @router.put(
@@ -930,7 +1216,7 @@ async def put_state_for_binding(
     session: SessionDep,
     request: Request,
     principal: Annotated[StatePrincipal, Depends(require_state_access)],
-) -> StateEntryOut:
+) -> StateEntryOut | Response:
     path = _state_path(namespace, key, kind, address)
     _check_memory_reach(
         principal,
@@ -950,9 +1236,25 @@ async def put_state_for_binding(
         path=path,
     )
     await _check_turn_open(principal, agent_id, namespace, request, path)
-    data = _stamp_author(principal, agent_id, namespace, data, path)
+    actor = (
+        _memory_actor(principal, agent_id, path)
+        if memory_records.is_canonical_key(namespace, key)
+        else None
+    )
     scope = await _binding_scope(session, agent_id, kind, address)
-    return await _put_state(agent_id, scope, namespace, key, data, session)
+    return await _put_state(agent_id, scope, namespace, key, data, session, actor)
+
+
+def _refuse_canonical_append(namespace: str, key: str) -> None:
+    """A canonical memory entry is never appended to, by any principal (ADR
+    0239): it is one typed object written by PUT, versioned and audited. The
+    refusal depends only on the path, so it precedes the reach checks."""
+
+    if memory_records.is_canonical_key(namespace, key):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "a memory entry is written with PUT; append is not allowed on it",
+        )
 
 
 async def _append_state(
@@ -971,6 +1273,10 @@ async def _append_state(
     """
     if await crud_agents.get_agent(session, agent_id) is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
+    if namespace == MEMORY_NAMESPACE:
+        # The legacy log shares the namespace byte budget with the canonical
+        # entries (ADR 0239): the same scope lock, before the row lock.
+        await memory_records.lock_scope(session, agent_id, scope)
     if namespace == TRANSCRIPT_NAMESPACE:
         row = await transcripts.append(session, agent_id, scope, key, data.item, data.reserve_bytes)
         return _transcript_out(row)
@@ -1014,6 +1320,7 @@ async def append_state(
     session: SessionDep,
     principal: Annotated[StatePrincipal, Depends(require_state_access)],
 ) -> StateEntryOut:
+    _refuse_canonical_append(namespace, key)
     _check_memory_reach(
         principal,
         agent_id,
@@ -1050,6 +1357,7 @@ async def append_state_for_binding(
     session: SessionDep,
     principal: Annotated[StatePrincipal, Depends(require_state_access)],
 ) -> StateEntryOut:
+    _refuse_canonical_append(namespace, key)
     _check_memory_reach(
         principal,
         agent_id,
@@ -1355,6 +1663,7 @@ async def _delete_state(
     expected_version: int | None,
     session: AsyncSession,
     caller: StateCaller,
+    actor: memory_records.Actor | None = None,
 ) -> Response:
     # expected_version opts into compare-and-delete (#2820), so an operator
     # that exported a transcript never deletes turns appended after the export.
@@ -1377,6 +1686,22 @@ async def _delete_state(
 
     if namespace == TRANSCRIPT_NAMESPACE:
         return recorded(await transcripts.remove(session, agent_id, scope, key, expected_version))
+    if memory_records.is_canonical_key(namespace, key):
+        # ADR 0239: compare-and-delete is required, and the deletion is a
+        # revision written in the same transaction as the head's removal.
+        assert actor is not None, "canonical memory deletes are attributed by the route"
+        agent = await crud_agents.get_agent(session, agent_id)
+        if agent is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
+        try:
+            await memory_records.delete_canonical(
+                session, agent, scope, key, expected_version, actor
+            )
+        except memory_records.VersionConflict as conflict:
+            return conflict.response()
+        return recorded(True)
+    if namespace == MEMORY_NAMESPACE:
+        await memory_records.lock_scope(session, agent_id, scope)
     entry = await _get_entry(session, agent_id, scope, namespace, key)
     if expected_version is None:
         if entry is not None:
@@ -1443,8 +1768,13 @@ async def delete_state(
         path=_state_path(namespace, key),
     )
     await _check_turn_open(principal, agent_id, namespace, request, path)
+    actor = (
+        _memory_actor(principal, agent_id, path)
+        if memory_records.is_canonical_key(namespace, key)
+        else None
+    )
     return await _delete_state(
-        agent_id, None, namespace, key, expected_version, session, principal.caller
+        agent_id, None, namespace, key, expected_version, session, principal.caller, actor
     )
 
 
@@ -1483,9 +1813,14 @@ async def delete_state_for_binding(
         path=_state_path(namespace, key, kind, address),
     )
     await _check_turn_open(principal, agent_id, namespace, request, path)
+    actor = (
+        _memory_actor(principal, agent_id, path)
+        if memory_records.is_canonical_key(namespace, key)
+        else None
+    )
     scope = await _binding_scope(session, agent_id, kind, address)
     return await _delete_state(
-        agent_id, scope, namespace, key, expected_version, session, principal.caller
+        agent_id, scope, namespace, key, expected_version, session, principal.caller, actor
     )
 
 

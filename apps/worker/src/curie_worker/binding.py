@@ -1597,13 +1597,13 @@ class BindingResolver:
         conversation, schedules, scheduled, skills}``. ``memory`` is ``"write"``
         only with memory writes on (else ``"read"``, so the API refuses fact
         writes); the API writes only fact keys with it, only on the channel
-        ``binding`` names, and stamps ``sender`` as the fact's author.
-        ``schedules`` is ``"write"`` only with agent schedules on;
-        ``conversation`` is the thread key, and ``scheduled`` marks a
-        scheduled run or its approval continuation, which may not create or
-        change schedules. ``skills`` is ``"write"`` only with learned skills
-        on, and the API stamps ``sender`` and ``conversation`` on each skill
-        change.
+        ``binding`` names, and stamps ``sender`` as the fact's author and
+        ``conversation`` (this turn's ``thread_key``) as its source
+        conversation (ADR 0239). ``schedules`` is ``"write"`` only with agent
+        schedules on, and ``scheduled`` marks a scheduled run or its approval
+        continuation, which may not create or change schedules (ADR 0238).
+        ``skills`` is ``"write"`` only with learned skills on, and the API
+        stamps ``sender`` and ``conversation`` on each skill change (ADR 0237).
 
         None unless there is a key to sign with, the agent has memory writes,
         agent schedules or learned skills on, the turn names a binding, and the

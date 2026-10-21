@@ -76,6 +76,7 @@ fn agent_json(name: &str, routes: Option<&[&str]>) -> Value {
         "approval_required_tools": null,
         "approval_routes": routes,
         "memory": false,
+        "agent_wide_learning": false,
     })
 }
 
