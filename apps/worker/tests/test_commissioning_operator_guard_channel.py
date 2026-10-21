@@ -67,12 +67,26 @@ class Fact:
         return self.facts[self.fact] if self.value is None else self.value(self.calls)
 
 
+OBSERVER = "example/acl-observer"
+
+
 class Reader:
     def __init__(self):
         self.reply = {"flags": ["on"], "passwords": ["a" * 64]}
+        self.own = {
+            "flags": ["on"],
+            "passwords": ["b" * 64],
+            "commands": "-@all +auth +hello +ping +client|setname +client|setinfo +acl|getuser",
+            "keys": "",
+            "channels": "",
+            "selectors": [],
+        }
 
     async def getuser(self, username):
-        return self.reply
+        return self.own if username == OBSERVER else self.reply
+
+    async def key_read_denied(self, key):
+        return True
 
 
 def compose(store, *, provisioner=None, timeout_s=2.0):
@@ -95,7 +109,7 @@ def compose(store, *, provisioner=None, timeout_s=2.0):
         acl=producers.AclPrincipalStateProducer(
             reader=Reader(),
             baseline=baseline,
-            observer_username="example/acl-observer",
+            observer_username=OBSERVER,
             provisioner_username="example/provisioner",
         ),
         phase=lambda: producers.PhaseExpectation("campaign", {}),

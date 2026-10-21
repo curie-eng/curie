@@ -71,6 +71,18 @@ class Fact:
         return DIGESTS[self.fact] if value is None else value  # type: ignore[return-value]
 
 
+# What the broker reports for the observer recipe (measured on the pinned Valkey
+# by test_commissioning_acl_observer_identity.py).
+OBSERVER_REPLY = {
+    "flags": ["on"],
+    "passwords": ["d" * 64],
+    "commands": "-@all +auth +hello +ping +client|setname +client|setinfo +acl|getuser",
+    "keys": "",
+    "channels": "",
+    "selectors": [],
+}
+
+
 class Reader:
     """Fake read-only ACL observer: ACL GETUSER replies keyed by username."""
 
@@ -83,7 +95,16 @@ class Reader:
             }
             for name in ACL_PRINCIPALS
         }
+        self.replies[OBSERVER] = dict(OBSERVER_REPLY)
+        self.denied: object = True
+        self.probed: list[str] = []
         self.calls = 0
+
+    async def key_read_denied(self, key: str) -> bool:
+        self.probed.append(key)
+        if isinstance(self.denied, BaseException):
+            raise self.denied
+        return self.denied  # type: ignore[return-value]
 
     async def getuser(self, username: str) -> object:
         self.calls += 1
@@ -136,7 +157,7 @@ def test_each_call_reobserves_every_producer_acl_and_channel_without_caching():
 
     asyncio.run(body())
     assert all(p.calls == 3 for p in producers.values())
-    assert reader.calls == 3 * len(ACL_PRINCIPALS)
+    assert reader.calls == 3 * (len(ACL_PRINCIPALS) + 1) and len(reader.probed) == 3
     assert transport.sent == [DIGESTS] * 3
     assert guard.calls == 3 and len(guard.latencies_ms) == 3
     assert all(type(ms) is int and ms >= 0 for ms in guard.latencies_ms)
@@ -406,3 +427,98 @@ def test_resp3_flags_as_a_set_parse_like_a_list():
         assert parse_getuser_reply({"flags": flags, "passwords": ["a" * 64]}) == expected
     with pytest.raises(ProducerRefused):
         parse_getuser_reply({"flags": ["on"], "passwords": {"a" * 64}})
+
+
+class NoPermission(Exception):
+    """What a reader authenticated as anyone but the observer meets on ACL GETUSER."""
+
+
+def test_a_reader_authenticated_as_the_provisioner_fails_the_check():
+    # Only the observer recipe holds acl|getuser (the #4841 matrix): any other
+    # principal, the provisioner included, is refused GETUSER on every user.
+    reader = Reader()
+    reader.replies = {user: NoPermission("NOPERM") for user in reader.replies}
+    guard, _, _, transport = build(reader=reader)
+    with pytest.raises(OperatorGuardRefused):
+        asyncio.run(guard.require_current())
+    assert transport.sent == []
+
+
+@pytest.mark.parametrize("denied", [False, None, 1, "denied", RuntimeError("connection reset")])
+def test_a_reader_that_can_read_keys_or_cannot_probe_fails_the_check(denied):
+    # A default or administrative user also holds GETUSER; it can read a key.
+    reader = Reader()
+    reader.denied = denied
+    guard, _, _, transport = build(reader=reader)
+    with pytest.raises(OperatorGuardRefused):
+        asyncio.run(guard.require_current())
+    assert transport.sent == []
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"commands": "+@all"},
+        {"commands": OBSERVER_REPLY["commands"] + " +acl|setuser"},
+        {"commands": OBSERVER_REPLY["commands"].replace(" +ping", "")},
+        {"commands": OBSERVER_REPLY["commands"] + " +acl|getuser"},
+        {"keys": "~*"},
+        {"keys": "%R~protected:*"},
+        {"channels": "&*"},
+        {"selectors": [["commands", "+get", "keys", "~*", "channels", ""]]},
+        {"flags": ["off"]},
+        {"flags": ["on", "nopass"]},
+        {"flags": ["on", "allkeys"]},
+        {"flags": ["on", "sanitize-payload"]},
+        "missing-commands",
+        "missing-selectors",
+    ],
+    ids=[
+        "all-commands",
+        "extra-command",
+        "missing-command",
+        "duplicate-command",
+        "all-keys",
+        "read-keys",
+        "channels",
+        "selector",
+        "disabled",
+        "nopass",
+        "allkeys-flag",
+        "unmeasured-flag",
+        "missing-commands",
+        "missing-selectors",
+    ],
+)
+def test_a_reader_whose_own_rules_differ_from_the_observer_recipe_fails(change):
+    reader = Reader()
+    reply = dict(OBSERVER_REPLY)
+    if change == "missing-commands":
+        reply.pop("commands")
+    elif change == "missing-selectors":
+        reply.pop("selectors")
+    else:
+        reply.update(change)  # type: ignore[arg-type]
+    reader.replies[OBSERVER] = reply
+    guard, _, _, transport = build(reader=reader)
+    with pytest.raises(OperatorGuardRefused):
+        asyncio.run(guard.require_current())
+    assert transport.sent == []
+
+
+def test_the_observer_rules_check_accepts_resp2_and_byte_strings():
+    reader = Reader()
+    flat: list[object] = []
+    for key, value in OBSERVER_REPLY.items():
+        flat.append(key.encode())
+        flat.append(
+            value.encode()
+            if isinstance(value, str)
+            else [v.encode() for v in value]
+            if key != "selectors"
+            else value
+        )
+    reader.replies[OBSERVER] = flat
+    guard, _, _, transport = build(reader=reader)
+    asyncio.run(guard.require_current())
+    assert len(transport.sent) == 1

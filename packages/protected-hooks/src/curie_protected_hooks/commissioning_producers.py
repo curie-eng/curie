@@ -29,6 +29,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import NoReturn, Protocol
 
+from .commissioning_acl import commissioning_acl_rules
 from .commissioning_bootstrap import CommissioningBootstrap
 from .commissioning_provisioner import BROKER_PRINCIPALS
 
@@ -183,9 +184,58 @@ class PhaseExpectation:
 
 
 class AclUserReader(Protocol):
-    """The read-only ACL observer principal: ``ACL GETUSER`` and nothing else."""
+    """A broker session that claims to be the read-only ACL observer principal."""
 
-    async def getuser(self, username: str) -> object: ...
+    async def getuser(self, username: str) -> object:
+        """The raw ``ACL GETUSER`` reply; raises on any refusal or error."""
+        ...
+
+    async def key_read_denied(self, key: str) -> bool:
+        """``True`` only when the broker answers a ``GET`` of ``key`` with ``NOPERM``.
+
+        ``False`` when the read succeeds; raises on anything else.
+        """
+        ...
+
+
+# Any key: the observer recipe grants none, so its read must be refused.
+OBSERVER_PROBE_KEY = "protected:control:manifest:acl-observer-probe"
+# Recipe actions the broker applies but never reports back as rules.
+_ACTIONS = frozenset({"resetkeys", "resetchannels", "clearselectors"})
+_OBSERVER_COMMANDS = frozenset(
+    token for token in commissioning_acl_rules("observer") if token not in _ACTIONS
+)
+# The pinned Valkey reports exactly ``on`` for the installed observer recipe;
+# any other flag (``nopass``, ``allkeys``, ``allchannels``, ``off``) refuses.
+_OBSERVER_FLAGS = frozenset({"on"})
+
+
+def _fields(reply: object) -> dict[str, object]:
+    if type(reply) is list:
+        _require(len(reply) % 2 == 0)
+        pairs = [(_text(reply[i]), reply[i + 1]) for i in range(0, len(reply), 2)]
+    else:
+        _require(type(reply) is dict)
+        assert isinstance(reply, dict)
+        pairs = [(_text(key), value) for key, value in reply.items()]
+    fields = dict(pairs)
+    _require(len(fields) == len(pairs))
+    return fields
+
+
+def _require_observer_rules(reply: object) -> None:
+    """The session's own user reports exactly the observer recipe and nothing more."""
+    fields = _fields(reply)
+    _require({"flags", "commands", "keys", "channels", "selectors"} <= fields.keys())
+    flags = fields["flags"]
+    _require(type(flags) in (list, set, frozenset))
+    assert isinstance(flags, (list, set, frozenset))
+    names = {_text(flag) for flag in flags}
+    _require(names == _OBSERVER_FLAGS)
+    commands = _text(fields["commands"]).split(" ")
+    _require(len(set(commands)) == len(commands) and set(commands) == _OBSERVER_COMMANDS)
+    _require(_text(fields["keys"]) == "" and _text(fields["channels"]) == "")
+    _require(type(fields["selectors"]) is list and fields["selectors"] == [])
 
 
 def _text(value: object) -> str:
@@ -198,15 +248,8 @@ def _text(value: object) -> str:
 def parse_getuser_reply(reply: object) -> AclPrincipalState:
     """Closed reading of a RESP2 (flat pairs) or RESP3 (map) ``ACL GETUSER`` reply."""
     try:
-        if type(reply) is list:
-            _require(len(reply) % 2 == 0)
-            pairs = [(_text(reply[i]), reply[i + 1]) for i in range(0, len(reply), 2)]
-        else:
-            _require(type(reply) is dict)
-            assert isinstance(reply, dict)
-            pairs = [(_text(key), value) for key, value in reply.items()]
-        fields = dict(pairs)
-        _require(len(fields) == len(pairs) and {"flags", "passwords"} <= fields.keys())
+        fields = _fields(reply)
+        _require({"flags", "passwords"} <= fields.keys())
         flags, passwords = fields["flags"], fields["passwords"]
         # RESP3 sends ``flags`` as a set and ``passwords`` as an array.
         _require(type(flags) in (list, set, frozenset) and type(passwords) is list)
@@ -251,6 +294,7 @@ class AclPrincipalStateProducer:
         """Observe every principal now; equal hash sets and phase-expected enabled state."""
         try:
             _require(type(phase) is PhaseExpectation)
+            await self._require_observer()
             rows = self._baseline.principals
             replies = await asyncio.gather(
                 *(self._reader.getuser(rows[name][0]) for name in ACL_PRINCIPALS)
@@ -264,6 +308,20 @@ class AclPrincipalStateProducer:
             raise
         except Exception:  # noqa: BLE001 -- an unavailable observation is a refusal.
             _refuse()
+
+    async def _require_observer(self) -> None:
+        """The session reading the evidence is the observer, without ``ACL WHOAMI``.
+
+        Design decision 7 grants the observer ``ACL GETUSER`` only, so identity
+        is established from what that session can and cannot do. Under the
+        merged recipes only the observer holds ``acl|getuser``: every other
+        principal, the provisioner included, is refused ``GETUSER``, so a
+        successful read already excludes them. A default or administrative user
+        also holds it, but can read keys: the probe read must be refused. Last,
+        the bound observer user must report exactly the observer recipe.
+        """
+        _require_observer_rules(await self._reader.getuser(self.observer_username))
+        _require((await self._reader.key_read_denied(OBSERVER_PROBE_KEY)) is True)
 
 
 PhaseSource = Callable[[], PhaseExpectation]
