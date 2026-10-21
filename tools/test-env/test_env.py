@@ -72,7 +72,18 @@ def run_process(
     process: subprocess.Popen[str] | None = None
     try:
         # Defer parent interrupts across Popen so the child always has an owner.
-        with signal_handlers(lambda number, _frame: pending.append(number)):
+        # A signal the caller ignores, as cleanup does, stays ignored.
+        ignored = {
+            number
+            for number in (signal.SIGINT, signal.SIGTERM)
+            if signal.getsignal(number) is signal.SIG_IGN
+        }
+
+        def defer(number: int, _frame: Any) -> None:
+            if number not in ignored:
+                pending.append(number)
+
+        with signal_handlers(defer):
             process = subprocess.Popen(
                 command,
                 cwd=root,
