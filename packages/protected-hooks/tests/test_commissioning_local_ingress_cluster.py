@@ -25,6 +25,7 @@ from curie_protected_hooks.commissioning_local_bootstrap import (
     INSTALLER_SECRET,
     AdministratorBootstrap,
     ProvisionerGrant,
+    worker_namespace,
 )
 from curie_protected_hooks.commissioning_local_broker import (
     BrokerUser,
@@ -32,8 +33,9 @@ from curie_protected_hooks.commissioning_local_broker import (
     broker_principals,
     check_guard_binding,
 )
-from curie_protected_hooks.commissioning_local_installation import LocalCluster
+from curie_protected_hooks.commissioning_local_installation import OWNER_LABEL, LocalCluster
 from curie_protected_hooks.commissioning_local_ownership import OwnershipLedger, fresh_owner
+from curie_protected_hooks.commissioning_local_worker import WORKER_NAME, LocalWorker
 from curie_protected_hooks.commissioning_local_workloads import API_NAME, LocalIngress
 from curie_protected_hooks.commissioning_provisioner import construct
 from curie_protected_hooks.runtime_directory import (
@@ -42,6 +44,7 @@ from curie_protected_hooks.runtime_directory import (
     parse_source_writer,
 )
 
+from .commissioning_worker_vectors import worker_profile
 from .test_commissioning_local_broker import IMAGE
 from .test_commissioning_provisioner import profile, profile_fields
 
@@ -63,6 +66,9 @@ class Installed:
     namespace: str
     api_image: str
     ingress: LocalIngress
+    provisioner: LocalCluster
+    worker_image: str
+    worker_files: dict[str, bytes]
 
 
 @pytest.fixture(scope="module")
@@ -84,6 +90,9 @@ def installed(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Installed]:
         api_image = cluster.publish_image(
             "api", dockerfile=ROOT / "apps" / "api" / "Dockerfile", context=ROOT
         )
+        worker_image = cluster.publish_image(
+            "worker", dockerfile=ROOT / "apps" / "worker" / "Dockerfile", context=ROOT
+        )
         recipes = GuardRecipes(profile_fields()["qualification_id"])
         principals = broker_principals(
             recipes, profile(), provisioner_id="commissioning/example-provisioner"
@@ -103,9 +112,9 @@ def installed(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Installed]:
         broker.install(image=IMAGE, installer_secret=INSTALLER_SECRET)
         admin.enroll(broker)
         users = dict(admin.credentials())
-        del admin
         identity = broker.observe(grant.provisioner)
-        result = construct(profile(broker_identity=identity), acl=recipes)
+        chosen = worker_profile(broker_identity=identity)
+        result = construct(chosen, acl=recipes)
         check_guard_binding(grant.principals, result.guard_config)
         broker.install_control_records(
             grant.provisioner, result.manifest, qualification_generation="1"
@@ -114,8 +123,31 @@ def installed(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Installed]:
         ingress.install(
             api_image=api_image, manifest=result.manifest, ca_pem=broker.ca_pem, grant=grant
         )
+        worker_files, template = LocalWorker(provisioner, namespace=namespace).install(
+            worker_image=worker_image,
+            manifest=result.manifest,
+            execution_config=chosen.execution_config,
+            projection=chosen.projection,
+            measurement_file=result.measurement_file,
+            ca_pem=broker.ca_pem,
+            grant=grant,
+            secrets=ingress.secrets,
+        )
+        # Protected workloads are installation: the administrator creates the worker.
+        admin.install_worker(template)
+        del admin
         yield Installed(
-            cluster, broker, grant, users, result.manifest, namespace, api_image, ingress
+            cluster,
+            broker,
+            grant,
+            users,
+            result.manifest,
+            namespace,
+            api_image,
+            ingress,
+            provisioner,
+            worker_image,
+            worker_files,
         )
     finally:
         if broker is not None:
@@ -264,3 +296,277 @@ def test_production_refuses_before_the_campaign(installed: Installed) -> None:
         )
     finally:
         _stop(process)
+
+
+def worker_get(installed: Installed, resource: str) -> dict[str, Any]:
+    raw = installed.cluster.kubectl(
+        "get", resource, "--namespace", worker_namespace(installed.namespace), "--output", "json"
+    )
+    value: dict[str, Any] = json.loads(raw)
+    return value
+
+
+def _worker_logs(installed: Installed) -> bytes:
+    """Every log the provisioner can read for the worker Pod, until the refusal shows.
+
+    The current container may be waiting in back-off and the previous one's
+    log may not be retrievable at every instant, so each read is tolerated and
+    the whole read is retried.
+    """
+    import time
+
+    from curie_protected_hooks.commissioning_local_installation import InstallationRefused
+
+    namespace = worker_namespace(installed.namespace)
+    deadline = time.monotonic() + 120
+    while True:
+        name = _worker_pod(installed)["metadata"]["name"]
+        texts = []
+        for container, extra in (("stage", ()), ("worker", ()), ("worker", ("--previous",))):
+            try:
+                texts.append(
+                    installed.provisioner.kubectl(
+                        "logs",
+                        "pod/" + name,
+                        "--namespace",
+                        namespace,
+                        "--container",
+                        container,
+                        *extra,
+                    )  # fmt: skip
+                )
+            except InstallationRefused:
+                continue
+        logs = b"\n".join(texts)
+        if b"protected worker stopped without confirmed completion" in logs:
+            return logs
+        assert time.monotonic() < deadline, "no worker refusal in its logs"
+        time.sleep(5)
+
+
+def _worker_pod(installed: Installed) -> dict[str, Any]:
+    pods = worker_get(installed, "pods")["items"]
+    (pod,) = [p for p in pods if p["metadata"]["name"].startswith(WORKER_NAME + "-")]
+    return pod
+
+
+def test_the_worker_runs_its_final_template_and_refuses_before_the_campaign(
+    installed: Installed,
+) -> None:
+    """Clause 6: with no Readiness or Qualification the production worker refuses
+    on every start, at its final template, image and mounts."""
+    import time
+
+    deadline = time.monotonic() + 300
+    while True:
+        pod = _worker_pod(installed)
+        statuses = pod["status"].get("containerStatuses") or []
+        terminated = [
+            s.get("lastState", {}).get("terminated") or s.get("state", {}).get("terminated")
+            for s in statuses
+        ]
+        if any(t and t.get("exitCode") == 1 for t in terminated):
+            break
+        assert time.monotonic() < deadline, "the worker never exited"
+        time.sleep(5)
+    (init,) = pod["status"]["initContainerStatuses"]
+    assert init["state"]["terminated"]["exitCode"] == 0
+    (status,) = pod["status"]["containerStatuses"]
+    assert status["imageID"].endswith(installed.worker_image.split("@", 1)[1])
+    assert status["ready"] is False
+    # The provisioner reads the worker's status and logs, nothing more.
+    logs = _worker_logs(installed)
+    assert b"protected worker stopped without confirmed completion" in logs
+
+
+def test_the_worker_files_parse_and_readiness_is_absent_on_the_broker(
+    installed: Installed,
+) -> None:
+    """The refusal is the missing Readiness, not a broken file: a probe with the
+    worker's image and volumes runs its loaders and reaches the broker as the
+    production worker."""
+    import copy
+
+    deployment = worker_get(installed, "deployment/" + WORKER_NAME)
+    spec = copy.deepcopy(deployment["spec"]["template"]["spec"])
+    (worker,) = spec["containers"]
+    worker["command"] = ["python", "-c", _PROBE, "/run/curie/protected-worker"]
+    spec["restartPolicy"] = "Never"
+    name = "curie-worker-probe"
+    namespace = worker_namespace(installed.namespace)
+    probe = {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": name,
+            "namespace": namespace,
+            "labels": {OWNER_LABEL: installed.cluster.owner},
+        },
+        "spec": spec,
+    }
+    # The administrator runs the probe: the provisioner cannot create Pods here.
+    installed.cluster.create(probe)
+    installed.cluster.kubectl(
+        "wait", "--for=jsonpath={.status.phase}=Succeeded", "pod/" + name,
+        "--namespace", namespace, "--timeout", "240s", timeout=270,
+    )  # fmt: skip
+    logs = installed.provisioner.kubectl("logs", "pod/" + name, "--namespace", namespace).decode()
+    assert logs.strip().splitlines()[-1] == (
+        "bootstrap=ok process=ok launch=ok broker=ok readiness=absent qualification=absent"
+    )
+
+
+_PROBE = """
+import asyncio, ssl, sys
+from curie_worker.protected_entry import load_process_settings, _open_root, _read
+from curie_worker.protected_worker_bootstrap import load_worker_bootstrap
+from curie_protected_hooks.worker_transport import AuthenticatedWorkerClient
+
+async def main(directory):
+    bootstrap = load_worker_bootstrap(directory)
+    tls = load_process_settings(directory).launch_tls
+    # The mounted client key matches its certificate and the pinned CA loads.
+    context = ssl.create_default_context(cafile=tls.ca_file)
+    context.load_cert_chain(tls.client_certificate, tls.client_key)
+    root = _open_root(directory)
+    ca = _read(root, "ca.pem").decode("ascii")
+    broker = await AuthenticatedWorkerClient.connect(bootstrap.manifest, bootstrap.credential, ca)
+    try:
+        m = bootstrap.manifest.as_dict()
+        readiness = await broker.read_control(
+            "protected:control:readiness:" + m["runtime_id"] + ":" + m["runtime_generation"]
+        )
+        qualification = await broker.read_control(
+            "protected:control:qualification:" + m["qualification_id"] + ":1"
+        )
+    finally:
+        await broker.close()
+    print(
+        "bootstrap=ok process=ok launch=ok broker=ok readiness="
+        + ("absent" if readiness is None else "present")
+        + " qualification="
+        + ("absent" if qualification is None else "present")
+    )
+
+asyncio.run(main(sys.argv[1]))
+"""
+
+
+def test_the_worker_secret_holds_only_its_own_credentials(installed: Installed) -> None:
+    decoded = b"".join(installed.worker_files.values()).decode("ascii", "replace")
+    assert installed.users["worker"].password in decoded
+    for name in ("observer", "qualification_publisher", "provisioner", "issuer", "control"):
+        assert installed.users[name].password not in decoded, name
+    # The provisioner rendered no private key: the worker's client key is the
+    # administrator's Secret, mounted beside the worker; the mediator's waits in
+    # the credentials namespace.
+    assert "PRIVATE KEY" not in decoded
+
+
+def test_the_provisioner_identity_is_refused_both_launch_secrets(installed: Installed) -> None:
+    from curie_protected_hooks.commissioning_local_bootstrap import (
+        MEDIATOR_SECRET,
+        WORKER_CLIENT_SECRET,
+        credentials_namespace,
+    )
+
+    commands, runner = installed.provisioner.commands, installed.provisioner.runner
+    for name, namespace in (
+        (WORKER_CLIENT_SECRET, worker_namespace(installed.namespace)),
+        (MEDIATOR_SECRET, credentials_namespace(installed.namespace)),
+    ):
+        argv = commands.kubectl_argv(
+            "get", "secret/" + name, "--namespace", namespace, "--output", "json"
+        )
+        assert runner.probe(argv, timeout=60) != 0, name
+
+
+def test_the_provisioner_cannot_create_a_pod_or_deployment_beside_the_worker_key(
+    installed: Installed,
+) -> None:
+    """The worker namespace holds the worker's client key; the provisioner may write only
+    its runtime Secret there and read status, so no Pod of its making can mount the key."""
+    from curie_protected_hooks.commissioning_local_bootstrap import WORKER_CLIENT_SECRET
+    from curie_protected_hooks.commissioning_local_installation import InstallationRefused
+
+    namespace = worker_namespace(installed.namespace)
+    reader = {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": "read-worker-key",
+            "namespace": namespace,
+            "labels": {OWNER_LABEL: installed.cluster.owner},
+        },
+        "spec": {
+            "restartPolicy": "Never",
+            "automountServiceAccountToken": False,
+            "securityContext": {
+                "runAsNonRoot": True,
+                "runAsUser": 1000,
+                "seccompProfile": {"type": "RuntimeDefault"},
+            },
+            "containers": [
+                {
+                    "name": "read",
+                    "image": installed.worker_image,
+                    "command": ["cat", "/key/launch-client.key"],
+                    "securityContext": {
+                        "allowPrivilegeEscalation": False,
+                        "readOnlyRootFilesystem": True,
+                        "capabilities": {"drop": ["ALL"]},
+                    },
+                    "volumeMounts": [{"name": "key", "mountPath": "/key"}],
+                }
+            ],
+            "volumes": [{"name": "key", "secret": {"secretName": WORKER_CLIENT_SECRET}}],
+        },
+    }
+    with pytest.raises(InstallationRefused):
+        installed.provisioner.create(reader)
+    copied = worker_get(installed, "deployment/" + WORKER_NAME)
+    template = {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {
+            "name": "other-worker",
+            "namespace": namespace,
+            "labels": {OWNER_LABEL: installed.cluster.owner},
+        },
+        "spec": copied["spec"],
+    }
+    with pytest.raises(InstallationRefused):
+        installed.provisioner.create(template)
+    for verb in (("get", "secrets"), ("get", "secret/" + WORKER_CLIENT_SECRET)):
+        argv = installed.provisioner.commands.kubectl_argv(
+            *verb, "--namespace", namespace, "--output", "json"
+        )
+        assert installed.provisioner.runner.probe(argv, timeout=60) != 0
+    # Status reads stay allowed.
+    argv = installed.provisioner.commands.kubectl_argv(
+        "get", "deployment/" + WORKER_NAME, "--namespace", namespace, "--output", "json"
+    )
+    assert installed.provisioner.runner.probe(argv, timeout=60) == 0
+
+
+def test_the_worker_logs_carry_no_secret(installed: Installed) -> None:
+    """The provisioner may read the worker's logs, so they must hold no credential or key."""
+    from curie_protected_hooks.commissioning_local_bootstrap import WORKER_CLIENT_SECRET
+
+    namespace = worker_namespace(installed.namespace)
+    logs = _worker_logs(installed)
+    assert b"protected worker stopped without confirmed completion" in logs
+    client = json.loads(
+        installed.cluster.kubectl(
+            "get", "secret/" + WORKER_CLIENT_SECRET, "--namespace", namespace, "--output", "json"
+        )
+    )["data"]
+    secrets = [
+        installed.users["worker"].password.encode(),
+        base64.b64decode(client["launch-client.key"]),
+        installed.ingress.secrets.internal_worker_token.encode(),
+        installed.ingress.secrets.postgres_password.encode(),
+        b"PRIVATE KEY",
+    ]
+    for secret in secrets:
+        assert secret not in logs

@@ -563,3 +563,10 @@ def test_minikube_enables_addons_only_on_its_profile(tmp_path: Path) -> None:
     ):
         with pytest.raises(api.OwnershipRefused):
             commands.minikube_argv(*args)
+
+
+def test_kubectl_reads_one_containers_logs_including_the_previous_start(tmp_path: Path) -> None:
+    api = module()
+    commands = api.ClusterCommands(OWNER, kubeconfig=tmp_path / "kubeconfig")
+    args = ("logs", "pod/w", "--namespace", "owned", "--container", "worker", "--previous")
+    assert commands.kubectl_argv(*args)[5:] == list(args)
