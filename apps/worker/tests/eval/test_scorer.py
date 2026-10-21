@@ -74,13 +74,10 @@ def test_recall_penalizes_missing_calls() -> None:
     assert match_trajectory(spec, ["a", "b"]).passed is True
     # Missing one expected tool -> recall 0.5 -> fail at 1.0, pass at 0.5.
     assert match_trajectory(spec, ["a"]).passed is False
-    assert (
-        match_trajectory(
-            TrajectorySpec(expected=("a", "b"), mode=TrajectoryMode.RECALL, threshold=0.5),
-            ["a"],
-        ).passed
-        is True
-    )
+    assert match_trajectory(
+        TrajectorySpec(expected=("a", "b"), mode=TrajectoryMode.RECALL, threshold=0.5),
+        ["a"],
+    ).passed is True
 
 
 def test_failed_match_carries_a_debuggable_detail() -> None:

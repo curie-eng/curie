@@ -31,7 +31,9 @@ from curie_worker.runner_client import RunnerClient
 
 # The committed cross-language eval-case fixture, shared by the model and stream
 # tests. conftest.py -> parents[2] is apps/worker.
-EVAL_CASES_EXAMPLE_PATH = Path(__file__).resolve().parents[2] / "schema" / "eval-cases.example.json"
+EVAL_CASES_EXAMPLE_PATH = (
+    Path(__file__).resolve().parents[2] / "schema" / "eval-cases.example.json"
+)
 
 
 @pytest.fixture
@@ -206,9 +208,9 @@ async def _eval_harness() -> AsyncIterator[tuple[str, FakeEvalRunner, RunnerClie
 def make_eval_harness() -> Callable[
     [], contextlib.AbstractAsyncContextManager[tuple[str, FakeEvalRunner, RunnerClient]]
 ]:
-    def factory() -> contextlib.AbstractAsyncContextManager[
-        tuple[str, FakeEvalRunner, RunnerClient]
-    ]:
+    def factory() -> (
+        contextlib.AbstractAsyncContextManager[tuple[str, FakeEvalRunner, RunnerClient]]
+    ):
         return _eval_harness()
 
     return factory

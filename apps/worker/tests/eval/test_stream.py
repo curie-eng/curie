@@ -447,7 +447,9 @@ class _FakeK8s:
         del keep, created_before
         return []
 
-    def get_sandbox(self, name: str, *, request_timeout_seconds: float) -> SandboxView | None:
+    def get_sandbox(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> SandboxView | None:
         assert request_timeout_seconds > 0
         if not any(c.sandbox_name == name for c in self.claims.values()):
             return None

@@ -32,9 +32,10 @@ def _result(
 
 
 def _samples(passes: int, fails: int) -> list[EvalCaseResult]:
-    return [_result(EvalOutcome.PASS, output="ok") for _ in range(passes)] + [
-        _result(EvalOutcome.FAIL, output="no") for _ in range(fails)
-    ]
+    return (
+        [_result(EvalOutcome.PASS, output="ok") for _ in range(passes)]
+        + [_result(EvalOutcome.FAIL, output="no") for _ in range(fails)]
+    )
 
 
 def test_single_sample_is_returned_unchanged() -> None:
@@ -68,12 +69,16 @@ def test_majority_tie_fails_deny_by_default() -> None:
 
 
 def test_pass_at_k_one_of_three_is_green() -> None:
-    agg = aggregate("c", _samples(1, 2), SampleConfig(n=3, policy=AggregationPolicy.PASS_AT_K, k=1))
+    agg = aggregate(
+        "c", _samples(1, 2), SampleConfig(n=3, policy=AggregationPolicy.PASS_AT_K, k=1)
+    )
     assert agg.passed is True
 
 
 def test_pass_at_k_threshold_not_met_is_red() -> None:
-    agg = aggregate("c", _samples(1, 2), SampleConfig(n=3, policy=AggregationPolicy.PASS_AT_K, k=2))
+    agg = aggregate(
+        "c", _samples(1, 2), SampleConfig(n=3, policy=AggregationPolicy.PASS_AT_K, k=2)
+    )
     assert agg.passed is False
     assert agg.error is None
     assert agg.variance is not None and "pass@2" in agg.variance
@@ -162,7 +167,8 @@ def test_all_incomplete_samples_keep_error() -> None:
     """When no sample completed, `error` stays set so ADR-0068 can still
     distinguish never-answered from a 0% graded fail."""
     samples = [
-        _result(EvalOutcome.FAIL, error="runner reported a classified failure") for _ in range(3)
+        _result(EvalOutcome.FAIL, error="runner reported a classified failure")
+        for _ in range(3)
     ]
     agg = aggregate("c", samples, SampleConfig(n=3))
     assert agg.passed is False

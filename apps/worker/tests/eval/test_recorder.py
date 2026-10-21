@@ -194,7 +194,9 @@ def test_model_none_records_no_model_tag() -> None:
             )
             await recorder.record(run)
 
-        trace = next(e for e in captured[0]["batch"] if e["type"] == "trace-create")["body"]
+        trace = next(
+            e for e in captured[0]["batch"] if e["type"] == "trace-create"
+        )["body"]
         assert not any(t.startswith("model:") for t in trace["tags"])
         assert trace["metadata"]["model"] is None
 
@@ -295,14 +297,20 @@ def test_a_graded_run_scores_every_case_and_is_not_tagged_plumbing() -> None:
             suite="s",
             model="claude-opus-4-8",
             results=[
-                EvalCaseResult(case_id="c1", outcome=EvalOutcome.PASS, output="ok", latency_ms=1.0),
-                EvalCaseResult(case_id="c2", outcome=EvalOutcome.FAIL, output="no", latency_ms=1.0),
+                EvalCaseResult(
+                    case_id="c1", outcome=EvalOutcome.PASS, output="ok", latency_ms=1.0
+                ),
+                EvalCaseResult(
+                    case_id="c2", outcome=EvalOutcome.FAIL, output="no", latency_ms=1.0
+                ),
             ],
         )
         batch = await _capture_batch(run)
 
         scores = {
-            e["body"]["traceId"]: e["body"]["value"] for e in batch if e["type"] == "score-create"
+            e["body"]["traceId"]: e["body"]["value"]
+            for e in batch
+            if e["type"] == "score-create"
         }
         assert scores[_trace_by_case(batch, "c1")["id"]] == 1.0
         assert scores[_trace_by_case(batch, "c2")["id"]] == 0.0

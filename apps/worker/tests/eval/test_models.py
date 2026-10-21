@@ -162,7 +162,9 @@ def test_committed_fixture_parses_and_grades(eval_cases_example_path: Path) -> N
     scaffold output is platform-loadable (the latent bug in issue #8). Its smoke
     grader now asserts the agent named itself (#527), so it is falsifiable: an
     empty/off-topic turn fails, an introduction naming the agent passes."""
-    suite = EvalSuite.model_validate_json(eval_cases_example_path.read_text(encoding="utf-8"))
+    suite = EvalSuite.model_validate_json(
+        eval_cases_example_path.read_text(encoding="utf-8")
+    )
     assert len(suite.cases) == 1
     grader = suite.cases[0].grader
     assert grader.kind == GraderKind.CONTAINS
