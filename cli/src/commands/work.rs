@@ -1,6 +1,9 @@
 //! Hook fires, schedules, and work items for a deployed agent.
 
 use super::*;
+use crate::api_requests::{
+    AgentScheduleCancel, AgentScheduleRevert, AgentScheduleUpdate, AgentUpdate,
+};
 
 /// The prompt of one cron hook declared in `.claude-plugin/plugin.json`.
 pub fn hook_prompt(plugin_dir: &Path, name: &str) -> Result<String> {
@@ -168,11 +171,223 @@ pub struct SchedulesOpts {
     pub dry_run: bool,
 }
 
+/// Inputs for an agent-schedule verb of `<tier> schedules --agent X` (ADR 0238).
+pub struct AgentScheduleOpts {
+    pub api_url: String,
+    pub api_key: String,
+    pub agent: Option<String>,
+    pub verb: AgentScheduleVerb,
+    pub dry_run: bool,
+}
+
+/// Output of an agent-schedule verb: the API body as sent (one schedule, or
+/// `{"revisions": [..]}`), or `{"agent", "policy"}` for a policy setter.
+pub struct AgentScheduleOutput {
+    pub body: serde_json::Value,
+}
+
+impl crate::ui::CliOutput for AgentScheduleOutput {
+    fn to_json(&self) -> serde_json::Value {
+        self.body.clone()
+    }
+
+    fn render(&self, ui: &crate::ui::Ui) {
+        if let Some(items) = self
+            .body
+            .get("revisions")
+            .and_then(serde_json::Value::as_array)
+        {
+            for item in items {
+                ui.payload(&format!(
+                    "{} {}",
+                    item.get("revision")
+                        .map_or_else(|| "-".to_string(), ToString::to_string),
+                    agent_schedule_line(item)
+                ));
+            }
+        } else if let Some(policy) = self.body.get("policy") {
+            ui.payload(&format!(
+                "{} schedule policy: {policy}",
+                self.body["agent"].as_str().unwrap_or("-")
+            ));
+        } else {
+            ui.payload(&agent_schedule_line(&self.body));
+        }
+    }
+}
+
+/// One agent-schedule verb of `<tier> schedules --agent X` (ADR 0238). The
+/// schedule verbs hit `/agents/{id}/schedules/..`; the `Set*` verbs patch the
+/// agent's schedule policy columns.
+#[derive(Debug, Clone)]
+pub enum AgentScheduleVerb {
+    Show(String),
+    Cancel(String),
+    History(String),
+    Update {
+        id: String,
+        prompt: Option<String>,
+        cron: Option<String>,
+        run_at: Option<String>,
+        timezone: Option<String>,
+        expected_revision: u32,
+    },
+    Revert {
+        id: String,
+        to_revision: Option<u32>,
+        expected_revision: u32,
+    },
+    SetTimezone(String),
+    SetMaxActive(u32),
+    SetMinIntervalMinutes(u32),
+}
+
+/// What a verb sends, with its typed body.
+enum AgentScheduleRequest {
+    Show(String),
+    History(String),
+    Cancel(String, AgentScheduleCancel),
+    Update(String, AgentScheduleUpdate),
+    Revert(String, AgentScheduleRevert),
+    Policy(Box<AgentUpdate>),
+}
+
+impl AgentScheduleRequest {
+    /// Method, path after the agent id, and JSON body of the planned request.
+    fn plan(&self) -> Result<(&'static str, Vec<String>, Option<serde_json::Value>)> {
+        let route = |id: &String, more: Option<&str>| {
+            let mut tail = vec!["schedules".to_string(), id.clone()];
+            tail.extend(more.map(str::to_string));
+            tail
+        };
+        Ok(match self {
+            AgentScheduleRequest::Show(id) => ("GET", route(id, None), None),
+            AgentScheduleRequest::History(id) => ("GET", route(id, Some("revisions")), None),
+            AgentScheduleRequest::Cancel(id, body) => (
+                "POST",
+                route(id, Some("cancel")),
+                Some(serde_json::to_value(body)?),
+            ),
+            AgentScheduleRequest::Update(id, body) => {
+                ("PATCH", route(id, None), Some(serde_json::to_value(body)?))
+            }
+            AgentScheduleRequest::Revert(id, body) => (
+                "POST",
+                route(id, Some("revert")),
+                Some(serde_json::to_value(body)?),
+            ),
+            AgentScheduleRequest::Policy(body) => {
+                ("PATCH", Vec::new(), Some(serde_json::to_value(body)?))
+            }
+        })
+    }
+}
+
+/// A schedule id is a UUID; refused locally before it can shape a URL path.
+fn schedule_id(id: &str) -> Result<String> {
+    match uuid::Uuid::parse_str(id) {
+        Ok(_) => Ok(id.to_string()),
+        Err(_) => Err(crate::exit::usage(format!(
+            "schedule ID must be a UUID, got {id:?}"
+        ))),
+    }
+}
+
+impl AgentScheduleVerb {
+    fn request(&self) -> Result<AgentScheduleRequest> {
+        let policy = |update: AgentUpdate| AgentScheduleRequest::Policy(Box::new(update));
+        Ok(match self {
+            AgentScheduleVerb::Show(id) => AgentScheduleRequest::Show(schedule_id(id)?),
+            AgentScheduleVerb::History(id) => AgentScheduleRequest::History(schedule_id(id)?),
+            AgentScheduleVerb::Cancel(id) => AgentScheduleRequest::Cancel(
+                schedule_id(id)?,
+                AgentScheduleCancel {
+                    expected_revision: None,
+                },
+            ),
+            AgentScheduleVerb::Update {
+                id,
+                prompt,
+                cron,
+                run_at,
+                timezone,
+                expected_revision,
+            } => {
+                if prompt.is_none() && cron.is_none() && run_at.is_none() && timezone.is_none() {
+                    return Err(crate::exit::usage(
+                        "--update needs at least one of --prompt, --cron, --run-at, --timezone",
+                    ));
+                }
+                AgentScheduleRequest::Update(
+                    schedule_id(id)?,
+                    AgentScheduleUpdate {
+                        expected_revision: *expected_revision,
+                        prompt: prompt.clone(),
+                        cron: cron.clone(),
+                        run_at: run_at.clone(),
+                        timezone: timezone.clone(),
+                    },
+                )
+            }
+            AgentScheduleVerb::Revert {
+                id,
+                to_revision,
+                expected_revision,
+            } => AgentScheduleRequest::Revert(
+                schedule_id(id)?,
+                AgentScheduleRevert {
+                    expected_revision: *expected_revision,
+                    to_revision: *to_revision,
+                },
+            ),
+            AgentScheduleVerb::SetTimezone(zone) => policy(AgentUpdate {
+                schedule_timezone: Some(zone.clone()),
+                ..Default::default()
+            }),
+            AgentScheduleVerb::SetMaxActive(max) => policy(AgentUpdate {
+                schedule_max_active: Some(*max),
+                ..Default::default()
+            }),
+            AgentScheduleVerb::SetMinIntervalMinutes(minutes) => policy(AgentUpdate {
+                schedule_min_interval_minutes: Some(*minutes),
+                ..Default::default()
+            }),
+        })
+    }
+}
+
 /// Output of `<tier> schedules`. `List` is the API body, not a reshaped copy.
 pub enum SchedulesOutput {
     DryRun(crate::ui::DryRunPlan),
     List(crate::api::ScheduleList),
     Control(crate::api::ScheduleControl),
+}
+
+/// One text line for an agent schedule JSON object.
+fn agent_schedule_line(item: &serde_json::Value) -> String {
+    let text = |key: &str| {
+        item.get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-")
+            .to_string()
+    };
+    let when = match item.get("cron").and_then(serde_json::Value::as_str) {
+        Some(cron) => cron.to_string(),
+        None => text("run_at"),
+    };
+    let next = item
+        .get("next_run_local")
+        .and_then(serde_json::Value::as_str)
+        .map_or_else(|| text("next_run_at"), str::to_string);
+    format!(
+        "{} {} {} {} {} {}",
+        text("id"),
+        text("state"),
+        when,
+        text("timezone"),
+        next,
+        text("created_by")
+    )
 }
 
 impl crate::ui::CliOutput for SchedulesOutput {
@@ -194,7 +409,7 @@ impl crate::ui::CliOutput for SchedulesOutput {
                 if control.paused { "paused" } else { "resumed" }
             )),
             SchedulesOutput::List(list) => {
-                if list.schedules.is_empty() {
+                if list.schedules.is_empty() && list.agent_schedules.is_empty() {
                     ui.payload("no schedules");
                     return;
                 }
@@ -238,6 +453,9 @@ impl crate::ui::CliOutput for SchedulesOutput {
                             ));
                         }
                     }
+                }
+                for item in &list.agent_schedules {
+                    ui.payload(&agent_schedule_line(item));
                 }
             }
         }
@@ -290,6 +508,59 @@ pub async fn schedules(opts: SchedulesOpts) -> Result<SchedulesOutput> {
     Ok(SchedulesOutput::List(
         client.list_schedules(opts.agent.as_deref()).await?,
     ))
+}
+
+/// Run (or plan) one agent-schedule verb. The real run resolves `--agent` to
+/// the agent id first; the dry run shows the agent as given.
+pub async fn agent_schedule(opts: AgentScheduleOpts) -> Result<Box<dyn crate::ui::CliOutput>> {
+    let verb = &opts.verb;
+    let agent = opts
+        .agent
+        .as_deref()
+        .ok_or_else(|| crate::exit::usage("agent schedule verbs require --agent"))?;
+    let request = verb.request()?;
+    let base = opts.api_url.trim_end_matches('/');
+    if opts.dry_run {
+        let (method, tail, body) = request.plan()?;
+        let tail: Vec<&str> = tail.iter().map(String::as_str).collect();
+        let mut line = format!(
+            "{method} {base}{}",
+            crate::api::agent_schedule_path(agent, &tail)
+        );
+        if let Some(body) = body {
+            line.push(' ');
+            line.push_str(&body.to_string());
+        }
+        return Ok(Box::new(SchedulesOutput::DryRun(crate::ui::DryRunPlan {
+            lines: vec![line],
+        })));
+    }
+    let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
+    let found = client.find_agent(agent).await?;
+    let body = match request {
+        AgentScheduleRequest::Show(id) => client.get_agent_schedule(&found.id, &id).await?,
+        AgentScheduleRequest::History(id) => {
+            serde_json::to_value(client.get_agent_schedule_revisions(&found.id, &id).await?)?
+        }
+        AgentScheduleRequest::Cancel(id, body) => {
+            client.cancel_agent_schedule(&found.id, &id, &body).await?
+        }
+        AgentScheduleRequest::Update(id, body) => {
+            client.update_agent_schedule(&found.id, &id, &body).await?
+        }
+        AgentScheduleRequest::Revert(id, body) => {
+            client.revert_agent_schedule(&found.id, &id, &body).await?
+        }
+        AgentScheduleRequest::Policy(update) => {
+            // The stored settings from the PATCH response, not the request.
+            let saved = client.update_agent(&found.id, &update).await?;
+            serde_json::json!({
+                "agent": saved.name,
+                "policy": saved.schedule_policy(),
+            })
+        }
+    };
+    Ok(Box::new(AgentScheduleOutput { body }))
 }
 
 /// A work item ID must be a UUID. Refused locally as a usage error (exit 2)

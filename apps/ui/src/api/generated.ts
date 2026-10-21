@@ -1114,6 +1114,112 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/agents/{agent_id}/schedules": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Agent Schedules
+         * @description The agent's schedule switch, limits and schedules (active and paused;
+         *     ``all`` adds cancelled and done). A sandbox credential sees none while
+         *     the toggle is off.
+         */
+        get: operations["list_agent_schedules_agents__agent_id__schedules_get"];
+        put?: never;
+        /** Create Agent Schedule */
+        post: operations["create_agent_schedule_agents__agent_id__schedules_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/{agent_id}/schedules/{schedule_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Agent Schedule */
+        get: operations["get_agent_schedule_agents__agent_id__schedules__schedule_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /** Update Agent Schedule */
+        patch: operations["update_agent_schedule_agents__agent_id__schedules__schedule_id__patch"];
+        trace?: never;
+    };
+    "/agents/{agent_id}/schedules/{schedule_id}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Cancel Agent Schedule
+         * @description Tombstone the schedule and settle its deferred runs. A scheduled run
+         *     may cancel. An active, paused or done schedule cancels the same way;
+         *     cancelling a done one-shot revokes its run's pending approval
+         *     continuation, which the worker resumes for a done schedule but never for
+         *     a cancelled one. Cancelling a cancelled schedule is a no-op.
+         */
+        post: operations["cancel_agent_schedule_agents__agent_id__schedules__schedule_id__cancel_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/{agent_id}/schedules/{schedule_id}/revert": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Revert Agent Schedule
+         * @description Restore an earlier revision's configuration as a new revision. The
+         *     operator, or a person through the agent; never a scheduled run.
+         */
+        post: operations["revert_agent_schedule_agents__agent_id__schedules__schedule_id__revert_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/{agent_id}/schedules/{schedule_id}/revisions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Agent Schedule Revisions
+         * @description The schedule's change log, oldest first. Platform key only.
+         */
+        get: operations["list_agent_schedule_revisions_agents__agent_id__schedules__schedule_id__revisions_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/agents/{agent_id}/state": {
         parameters: {
             query?: never;
@@ -3978,6 +4084,11 @@ export interface components {
         };
         /** AgentOut */
         AgentOut: {
+            /**
+             * Agent Schedules
+             * @default false
+             */
+            agent_schedules?: boolean;
             /** Approval Required Tools */
             approval_required_tools: string[] | null;
             /** Approval Routes */
@@ -4050,6 +4161,21 @@ export interface components {
             runner_resources?: {
                 [key: string]: unknown;
             } | null;
+            /**
+             * Schedule Max Active
+             * @default 20
+             */
+            schedule_max_active?: number;
+            /**
+             * Schedule Min Interval Minutes
+             * @default 15
+             */
+            schedule_min_interval_minutes?: number;
+            /**
+             * Schedule Timezone
+             * @default UTC
+             */
+            schedule_timezone?: string;
             /** Secrets */
             secrets: string[] | null;
             /** Source Bindings */
@@ -4058,6 +4184,221 @@ export interface components {
             } | null;
             /** Thinking */
             thinking: string | null;
+        };
+        /** AgentScheduleCancel */
+        AgentScheduleCancel: {
+            /** Expected Revision */
+            expected_revision?: number | null;
+        };
+        /**
+         * AgentScheduleCreate
+         * @description Exactly one of ``cron`` and ``run_at``. ``run_at`` with an offset is that
+         *     instant; without one it is wall time in ``timezone`` (the agent's zone when
+         *     omitted). ``destination`` and ``idempotency_key`` are for the operator: a
+         *     sandbox schedule replies on its turn's binding and is keyed by its turn.
+         */
+        AgentScheduleCreate: {
+            /** Cron */
+            cron?: string | null;
+            destination?: components["schemas"]["AgentScheduleDestination"] | null;
+            /** Idempotency Key */
+            idempotency_key?: string | null;
+            /** Prompt */
+            prompt: string;
+            /** Run At */
+            run_at?: string | null;
+            /** Timezone */
+            timezone?: string | null;
+        };
+        /**
+         * AgentScheduleDestination
+         * @description The binding an operator-created schedule replies on. ``adapter`` omitted
+         *     resolves like a turn's binding: the one row, or the default Slack identity.
+         */
+        AgentScheduleDestination: {
+            /** Adapter */
+            adapter?: string | null;
+            /** Address */
+            address: string;
+            /** Kind */
+            kind: string;
+        };
+        /**
+         * AgentScheduleDestinationOut
+         * @description The binding an agent schedule replies on, stored at create.
+         */
+        AgentScheduleDestinationOut: {
+            /** Adapter */
+            adapter: string | null;
+            /** Address */
+            address: string;
+            /** Kind */
+            kind: string;
+        };
+        /**
+         * AgentScheduleList
+         * @description The agent's schedule switch and limits, and its schedules.
+         */
+        AgentScheduleList: {
+            /** Enabled */
+            enabled: boolean;
+            /** Max Active */
+            max_active: number;
+            /** Min Interval Minutes */
+            min_interval_minutes: number;
+            /** Schedules */
+            schedules: components["schemas"]["AgentScheduleOut"][];
+            /** Timezone */
+            timezone: string;
+        };
+        /**
+         * AgentScheduleOut
+         * @description One agent-created schedule (ADR 0238). ``conversation`` and ``turn`` are
+         *     shown to the platform caller only; a sandbox response leaves them unset.
+         */
+        AgentScheduleOut: {
+            /** Agent */
+            agent: string;
+            /**
+             * Agent Id
+             * Format: uuid
+             */
+            agent_id: string;
+            /** Consecutive Failures */
+            consecutive_failures: number;
+            /** Conversation */
+            conversation?: string | null;
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /** Created By */
+            created_by: string;
+            /**
+             * Created Source
+             * @enum {string}
+             */
+            created_source: "agent" | "operator";
+            /** Cron */
+            cron: string | null;
+            destination: components["schemas"]["AgentScheduleDestinationOut"];
+            /**
+             * Id
+             * Format: uuid
+             */
+            id: string;
+            /** Last Fire At */
+            last_fire_at: string | null;
+            /** Last Outcome */
+            last_outcome: ("ran" | "deferred" | "skipped" | "blocked" | "reclaimed" | "failed") | null;
+            /** Last Reason */
+            last_reason: ("turn_error" | "target_unbound" | "approval_gate_targetless" | "agent_killed" | "budget_exhausted" | "run_in_flight" | "catch_up_expired" | "deferred_expired" | "reply_undeliverable" | "prior_side_effect" | "deployment_missing" | "hook_paused" | "live_session" | "enqueue_failed" | "claim_expired" | "daily_budget" | "schedule_changed") | null;
+            /** Next Run At */
+            next_run_at: string | null;
+            /** Next Run Local */
+            next_run_local: string | null;
+            /** Paused */
+            paused: boolean;
+            /** Prompt */
+            prompt: string;
+            /** Revision */
+            revision: number;
+            /** Run At */
+            run_at: string | null;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "active" | "paused" | "cancelled" | "done";
+            /** Timezone */
+            timezone: string;
+            /** Turn */
+            turn?: string | null;
+            /**
+             * Updated At
+             * Format: date-time
+             */
+            updated_at: string;
+            /** Updated By */
+            updated_by: string | null;
+        };
+        /**
+         * AgentScheduleRevert
+         * @description Restore revision ``to_revision``'s configuration as a new revision;
+         *     omitted is the revision before the current one.
+         */
+        AgentScheduleRevert: {
+            /** Expected Revision */
+            expected_revision: number;
+            /** To Revision */
+            to_revision?: number | null;
+        };
+        /** AgentScheduleRevisionOut */
+        AgentScheduleRevisionOut: {
+            /**
+             * Action
+             * @enum {string}
+             */
+            action: "create" | "update" | "pause" | "resume" | "cancel" | "revert" | "complete";
+            /** Author */
+            author: string;
+            /** Conversation */
+            conversation: string | null;
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /** Cron */
+            cron: string | null;
+            /** Prompt */
+            prompt: string;
+            /** Revision */
+            revision: number;
+            /** Run At */
+            run_at: string | null;
+            /** Seq */
+            seq: number;
+            /**
+             * Source
+             * @enum {string}
+             */
+            source: "agent" | "operator" | "scheduler";
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "active" | "paused" | "cancelled" | "done";
+            /** Timezone */
+            timezone: string;
+            /** Turn */
+            turn: string | null;
+        };
+        /** AgentScheduleRevisions */
+        AgentScheduleRevisions: {
+            /** Revisions */
+            revisions: components["schemas"]["AgentScheduleRevisionOut"][];
+        };
+        /**
+         * AgentScheduleUpdate
+         * @description A compare-and-set change. A prompt, cron, run_at or timezone change moves
+         *     the revision; ``paused`` is logged without moving it. ``cron`` and
+         *     ``run_at`` are exclusive: giving one replaces the other.
+         */
+        AgentScheduleUpdate: {
+            /** Cron */
+            cron?: string | null;
+            /** Expected Revision */
+            expected_revision: number;
+            /** Paused */
+            paused?: boolean | null;
+            /** Prompt */
+            prompt?: string | null;
+            /** Run At */
+            run_at?: string | null;
+            /** Timezone */
+            timezone?: string | null;
         };
         /**
          * AgentSchedulesOut
@@ -4091,6 +4432,8 @@ export interface components {
          *     many agents now, so binding is a routing fact, not a name.
          */
         AgentUpdate: {
+            /** Agent Schedules */
+            agent_schedules?: boolean | null;
             /** Approval Required Tools */
             approval_required_tools?: string[] | null;
             /** Approval Routes */
@@ -4127,6 +4470,12 @@ export interface components {
             runner_resources?: {
                 [key: string]: unknown;
             } | null;
+            /** Schedule Max Active */
+            schedule_max_active?: number | null;
+            /** Schedule Min Interval Minutes */
+            schedule_min_interval_minutes?: number | null;
+            /** Schedule Timezone */
+            schedule_timezone?: string | null;
             /** Secrets */
             secrets?: {
                 [key: string]: string;
@@ -6197,7 +6546,7 @@ export interface components {
             /** Outcome */
             outcome: ("ran" | "deferred" | "skipped" | "blocked" | "reclaimed" | "failed") | null;
             /** Reason */
-            reason?: ("turn_error" | "target_unbound" | "approval_gate_targetless" | "agent_killed" | "budget_exhausted" | "run_in_flight" | "catch_up_expired" | "deferred_expired" | "reply_undeliverable" | "prior_side_effect" | "deployment_missing" | "hook_paused" | "live_session" | "enqueue_failed" | "claim_expired" | "daily_budget") | null;
+            reason?: ("turn_error" | "target_unbound" | "approval_gate_targetless" | "agent_killed" | "budget_exhausted" | "run_in_flight" | "catch_up_expired" | "deferred_expired" | "reply_undeliverable" | "prior_side_effect" | "deployment_missing" | "hook_paused" | "live_session" | "enqueue_failed" | "claim_expired" | "daily_budget" | "schedule_changed") | null;
             /**
              * Slot Utc
              * Format: date-time
@@ -8334,11 +8683,11 @@ export interface components {
             /** Last Manual Outcome */
             last_manual_outcome: ("ran" | "deferred" | "skipped" | "blocked" | "reclaimed" | "failed") | null;
             /** Last Manual Reason */
-            last_manual_reason: ("turn_error" | "target_unbound" | "approval_gate_targetless" | "agent_killed" | "budget_exhausted" | "run_in_flight" | "catch_up_expired" | "deferred_expired" | "reply_undeliverable" | "prior_side_effect" | "deployment_missing" | "hook_paused" | "live_session" | "enqueue_failed" | "claim_expired" | "daily_budget") | null;
+            last_manual_reason: ("turn_error" | "target_unbound" | "approval_gate_targetless" | "agent_killed" | "budget_exhausted" | "run_in_flight" | "catch_up_expired" | "deferred_expired" | "reply_undeliverable" | "prior_side_effect" | "deployment_missing" | "hook_paused" | "live_session" | "enqueue_failed" | "claim_expired" | "daily_budget" | "schedule_changed") | null;
             /** Last Outcome */
             last_outcome: ("ran" | "deferred" | "skipped" | "blocked" | "reclaimed" | "failed") | null;
             /** Last Reason */
-            last_reason?: ("turn_error" | "target_unbound" | "approval_gate_targetless" | "agent_killed" | "budget_exhausted" | "run_in_flight" | "catch_up_expired" | "deferred_expired" | "reply_undeliverable" | "prior_side_effect" | "deployment_missing" | "hook_paused" | "live_session" | "enqueue_failed" | "claim_expired" | "daily_budget") | null;
+            last_reason?: ("turn_error" | "target_unbound" | "approval_gate_targetless" | "agent_killed" | "budget_exhausted" | "run_in_flight" | "catch_up_expired" | "deferred_expired" | "reply_undeliverable" | "prior_side_effect" | "deployment_missing" | "hook_paused" | "live_session" | "enqueue_failed" | "claim_expired" | "daily_budget" | "schedule_changed") | null;
             /** Name */
             name: string;
             /** Paused */
@@ -8352,9 +8701,12 @@ export interface components {
         };
         /**
          * ScheduleListOut
-         * @description Every in-force cron hook the platform can see.
+         * @description Every in-force cron hook the platform can see, and every active agent
+         *     schedule (ADR 0238).
          */
         ScheduleListOut: {
+            /** Agent Schedules */
+            agent_schedules: components["schemas"]["AgentScheduleOut"][];
             /** Schedules */
             schedules: components["schemas"]["AgentSchedulesOut"][];
         };
@@ -11911,6 +12263,269 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["KillState"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_agent_schedules_agents__agent_id__schedules_get: {
+        parameters: {
+            query?: {
+                all?: boolean;
+            };
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentScheduleList"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    create_agent_schedule_agents__agent_id__schedules_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AgentScheduleCreate"];
+            };
+        };
+        responses: {
+            /** @description Idempotent replay */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentScheduleOut"];
+                };
+            };
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentScheduleOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_agent_schedule_agents__agent_id__schedules__schedule_id__get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+                schedule_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentScheduleOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    update_agent_schedule_agents__agent_id__schedules__schedule_id__patch: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+                schedule_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AgentScheduleUpdate"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentScheduleOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    cancel_agent_schedule_agents__agent_id__schedules__schedule_id__cancel_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+                schedule_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AgentScheduleCancel"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentScheduleOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    revert_agent_schedule_agents__agent_id__schedules__schedule_id__revert_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+                schedule_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AgentScheduleRevert"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentScheduleOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_agent_schedule_revisions_agents__agent_id__schedules__schedule_id__revisions_get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+                schedule_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentScheduleRevisions"];
                 };
             };
             /** @description Validation Error */

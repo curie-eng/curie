@@ -25,7 +25,11 @@ HookRunReason = Literal[
     "enqueue_failed",
     "claim_expired",
     "daily_budget",
+    "schedule_changed",
 ]
+# What an agent schedule reads back as (ADR 0238): stored active, cancelled or
+# done, with paused derived from ``schedule_controls`` while active.
+AgentScheduleState = Literal["active", "paused", "cancelled", "done"]
 
 
 class ScheduleHookOut(BaseModel):
@@ -61,10 +65,50 @@ class AgentSchedulesOut(BaseModel):
     hooks: list[ScheduleHookOut]
 
 
+class AgentScheduleDestinationOut(BaseModel):
+    """The binding an agent schedule replies on, stored at create."""
+
+    kind: str
+    address: str
+    adapter: str | None
+
+
+class AgentScheduleOut(BaseModel):
+    """One agent-created schedule (ADR 0238). ``conversation`` and ``turn`` are
+    shown to the platform caller only; a sandbox response leaves them unset."""
+
+    id: uuid.UUID
+    agent: str
+    agent_id: uuid.UUID
+    revision: int
+    state: AgentScheduleState
+    cron: str | None
+    run_at: datetime | None
+    timezone: str
+    prompt: str
+    created_by: str
+    created_source: Literal["agent", "operator"]
+    destination: AgentScheduleDestinationOut
+    next_run_at: datetime | None
+    next_run_local: str | None
+    paused: bool
+    consecutive_failures: int
+    last_fire_at: datetime | None
+    last_outcome: ScheduleOutcome | None
+    last_reason: HookRunReason | None
+    created_at: datetime
+    updated_at: datetime
+    updated_by: str | None
+    conversation: str | None = None
+    turn: str | None = None
+
+
 class ScheduleListOut(BaseModel):
-    """Every in-force cron hook the platform can see."""
+    """Every in-force cron hook the platform can see, and every active agent
+    schedule (ADR 0238)."""
 
     schedules: list[AgentSchedulesOut]
+    agent_schedules: list[AgentScheduleOut]
 
 
 class HookFireOut(BaseModel):

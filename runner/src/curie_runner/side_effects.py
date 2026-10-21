@@ -29,6 +29,7 @@ reads as an escape hatch that silently does nothing (#488).
 from collections.abc import Iterable
 
 from .tool_names import (
+    AGENT_SCHEDULE_READ_ONLY_TOOL_NAMES,
     CANVAS_READ_ONLY_TOOL_NAMES,
     CHANNEL_READ_TOOL_NAMES,
     LEARNED_SKILL_READ_ONLY_TOOL_NAMES,
@@ -62,6 +63,7 @@ PLATFORM_IDEMPOTENT_TOOLS: frozenset[str] = (
         }
     )
     | CHANNEL_READ_TOOL_NAMES
+    | AGENT_SCHEDULE_READ_ONLY_TOOL_NAMES
     | CANVAS_READ_ONLY_TOOL_NAMES
     | LEARNED_SKILL_READ_ONLY_TOOL_NAMES
 )

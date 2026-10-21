@@ -1133,6 +1133,38 @@ def test_a_scheduled_run_reads_but_cannot_change_skills(
     assert _create(client, _writer(aid, channel), aid, "app-made").status_code == 201
 
 
+def _continuation(aid: str, channel: str, *, scheduled: bool) -> dict[str, str]:
+    """An approval continuation's credential: the approver is the sender, and
+    ``scheduled`` (ADR 0238) says whether its chain started at a cron event."""
+    claims = {
+        "binding": f"slack:{channel}",
+        "memory": "read",
+        "sender": SENDER,
+        "turn": _turn(),
+        "conversation": CONVERSATION,
+        "skills": "write",
+        "scheduled": scheduled,
+    }
+    token = mint(get_settings().api_key, agent=aid, scope="state", exp=_FAR_FUTURE, claims=claims)
+    return {"X-API-Key": token}
+
+
+def test_a_scheduled_continuation_reads_but_cannot_change_skills(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    aid, channel = _agent(client, auth_headers)
+    skill = _created(client, auth_headers, aid)
+    job = _continuation(aid, channel, scheduled=True)
+    assert [s["slug"] for s in _list(client, job, aid)["skills"]] == ["cut-release"]
+    for resp in _every_route(client, job, aid, skill["id"])[3:]:
+        assert resp.status_code == 403, (resp.request.method, resp.request.url, resp.text)
+        assert SCHEDULED in _detail(resp)
+    assert _ok(_show(client, auth_headers, aid, skill["id"]))["revision"] == 1
+    # Liveness: the same person's continuation of their own turn writes.
+    person = _continuation(aid, channel, scheduled=False)
+    assert _create(client, person, aid, "app-made").status_code == 201
+
+
 @pytest.mark.parametrize(
     "claims",
     [

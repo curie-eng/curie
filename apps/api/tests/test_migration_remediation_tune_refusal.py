@@ -30,8 +30,8 @@ from sqlalchemy.exc import IntegrityError
 
 BELOW = "0095"
 REVISION = "0096"
-# The learned skills expand (selfimp_skills_0001) is the single head.
-HEAD = "selfimp_skills_0001"
+# The agent schedules expand (selfimp_sched_0001) is the single head.
+HEAD = "selfimp_sched_0001"
 TUNE_REFUSAL = "tune_execution_not_automated"
 REFUSAL_CHECK = "remediation_nominations_refusal_ck"
 

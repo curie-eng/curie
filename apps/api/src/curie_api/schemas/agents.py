@@ -11,6 +11,7 @@ from plugin_format.connector_render import agent_forges_join
 from plugin_format.connectors import ADMITS_SELF
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator, model_validator
 
+from ..agent_schedule_time import valid_zone
 from ..config import get_settings
 from ..forges import types as forge_types
 from ..forges.paths import valid_repository_path
@@ -467,6 +468,14 @@ def _validate_publication_policy_value(value: str | None) -> str | None:
     return value
 
 
+def _validate_schedule_timezone(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if not valid_zone(value):
+        raise ValueError("schedule_timezone must be an IANA zone such as America/New_York")
+    return value
+
+
 def _validate_publication_branch_prefix(value: str | None) -> str | None:
     if value is None:
         return None
@@ -612,6 +621,13 @@ class AgentUpdate(BaseModel):
     # it unchanged; the column is NOT NULL, so like `memory` there is no
     # default for a null to clear back to.
     memory_writes: bool | None = None
+    # Agent-created schedules (ADR 0238): the switch, the default zone and the
+    # limits. Same plain-None rule as `memory_writes`; the switch is strict,
+    # so "yes" is not a boolean.
+    agent_schedules: StrictBool | None = None
+    schedule_timezone: str | None = None
+    schedule_max_active: Annotated[int, Field(ge=1, le=100)] | None = None
+    schedule_min_interval_minutes: Annotated[int, Field(ge=1, le=1440)] | None = None
     # Whether the agent loads and edits learned skills (ADR 0237). Same
     # plain-None rule as `memory_writes`, but strict: "yes" is not a boolean.
     learned_skills: StrictBool | None = None
@@ -632,6 +648,7 @@ class AgentUpdate(BaseModel):
     _check_secrets = field_validator("secrets")(_validate_secret_map)
     _check_hook_partitions = field_validator("hook_partitions")(_validate_hook_partitions)
     _check_source_bindings = field_validator("source_bindings")(_validate_source_bindings)
+    _check_schedule_timezone = field_validator("schedule_timezone")(_validate_schedule_timezone)
     _check_publication_policy = field_validator("publication_policy")(
         _validate_publication_policy_value
     )
@@ -682,6 +699,11 @@ class AgentOut(BaseModel):
     memory: bool
     # Whether the runner mounts its remember/update/forget tools (#1461).
     memory_writes: bool = False
+    # Agent-created schedules (ADR 0238): the switch, default zone and limits.
+    agent_schedules: bool = False
+    schedule_timezone: str = "UTC"
+    schedule_max_active: int = 20
+    schedule_min_interval_minutes: int = 15
     # Whether the agent loads and edits learned skills (ADR 0237).
     learned_skills: bool = False
     publication_policy: Literal["approve", "auto"] = "approve"

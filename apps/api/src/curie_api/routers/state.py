@@ -80,11 +80,15 @@ STATE_APP_SCOPE = "state.app"
 # (``runner/src/curie_runner/state.py``) and ``memory.MEMORY_NAMESPACE`` /
 # the history transcript key -- a bundle wanting durable memory uses the remember
 # tool, not raw state. A future fixed namespace must be added here too.
-# ``learned_skills`` is never stored in raw state at all (ADR 0237): its own
-# router is the only door, so every sandbox credential is refused on it.
+# ``agent_schedules`` (ADR 0238) and ``learned_skills`` (ADR 0237) are never
+# stored in raw state at all: each has its own router as the only door, so every
+# sandbox credential is refused on them.
 MEMORY_NAMESPACE = "memory"
+AGENT_SCHEDULES_NAMESPACE = "agent_schedules"
 LEARNED_SKILLS_NAMESPACE = "learned_skills"
-RESERVED_NAMESPACES = frozenset({MEMORY_NAMESPACE, TRANSCRIPT_NAMESPACE, LEARNED_SKILLS_NAMESPACE})
+RESERVED_NAMESPACES = frozenset(
+    {MEMORY_NAMESPACE, TRANSCRIPT_NAMESPACE, AGENT_SCHEDULES_NAMESPACE, LEARNED_SKILLS_NAMESPACE}
+)
 
 # The only memory keys a sandbox credential may write (ADR-0188): the fact ids
 # the runner's memory tools mint. Mirrors ``memory_facts._FACT_ID`` in the
@@ -124,18 +128,23 @@ class StatePrincipal:
     """Who a state-router request is, as far as the router needs to know.
 
     ``binding``, ``memory``, ``sender`` and ``turn`` are the ADR-0188 claims of a
-    STATE token (all None for the platform key and the app token); ``skills``
-    and ``conversation`` are the per-turn learned-skill claims (ADR 0237). A STATE token
-    with no ``memory`` claim was minted by a pre-ADR-0188 worker: ``legacy``,
-    which fails closed on memory (read-only, agent memory only)."""
+    STATE token (all None for the platform key and the app token);
+    ``schedules``, ``conversation`` and ``scheduled`` are the per-turn agent
+    schedule claims (ADR 0238); ``scheduled`` is None unless the claim is an
+    exact JSON boolean. ``skills`` and ``conversation`` are the per-turn
+    learned-skill claims (ADR 0237). A STATE token with no ``memory`` claim was
+    minted by a pre-ADR-0188 worker: ``legacy``, which fails closed on memory
+    (read-only, agent memory only)."""
 
     caller: StateCaller
     binding: str | None = None
     memory: Literal["read", "write"] | None = None
     sender: str | None = None
     turn: str | None = None
+    schedules: Literal["write"] | None = None
     skills: Literal["write"] | None = None
     conversation: str | None = None
+    scheduled: bool | None = None
 
     @property
     def legacy(self) -> bool:
@@ -145,6 +154,11 @@ class StatePrincipal:
 def _str_claim(payload: dict[str, Any], name: str) -> str | None:
     value = payload.get(name)
     return value if isinstance(value, str) else None
+
+
+def _bool_claim(payload: dict[str, Any], name: str) -> bool | None:
+    value = payload.get(name)
+    return value if isinstance(value, bool) else None
 
 
 def _state_principal(payload: dict[str, Any]) -> StatePrincipal:
@@ -158,9 +172,13 @@ def _state_principal(payload: dict[str, Any]) -> StatePrincipal:
         memory=memory,
         sender=_str_claim(payload, "sender"),
         turn=_str_claim(payload, "turn"),
-        # Only an exact "write" grants learned-skill writes: fail closed.
+        # Only an exact "write" grants schedule or learned-skill writes: fail
+        # closed. Only an exact boolean is a scheduled claim; anything else is
+        # None, which configures nothing.
+        schedules="write" if payload.get("schedules") == "write" else None,
         skills="write" if payload.get("skills") == "write" else None,
         conversation=_str_claim(payload, "conversation"),
+        scheduled=_bool_claim(payload, "scheduled"),
     )
 
 
@@ -443,7 +461,8 @@ async def require_turn_open(
     principal: StatePrincipal, agent_id: uuid.UUID, request: Request, path: str
 ) -> None:
     """Refuse a STATE credential whose ``turn`` the worker has reported ended
-    (#3776), for memory facts and learned skills (ADR 0237) alike. The caller
+    (#3776), for memory facts, agent schedules (ADR 0238) and learned skills
+    (ADR 0237) alike. The caller
     decides which writes are turn-bound. A Valkey failure is a 503, never a
     silently accepted write. A credential with no turn claim is not turn-bound."""
 
@@ -536,6 +555,12 @@ async def forbid_reserved_namespace(
     refusal by composing ``CURIE_STATE_URL`` directly with the token it holds;
     here the token it holds is simply refused. The broad token's narrower reach
     on ``memory`` (ADR-0188) is ``_check_memory_reach``."""
+    if principal.caller is not StateCaller.PLATFORM and namespace == AGENT_SCHEDULES_NAMESPACE:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            f"namespace {namespace!r} is reserved by the platform; "
+            "use the agent schedule tools instead",
+        )
     if principal.caller is not StateCaller.PLATFORM and namespace == LEARNED_SKILLS_NAMESPACE:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,

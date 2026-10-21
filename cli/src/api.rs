@@ -9,9 +9,10 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::api_requests::{
-    ActionUndo, AgentCreate, AgentUpdate, ApprovalPrincipalMint, ApprovalRecover, ApprovalResolve,
-    ChannelBindingWrite, ChannelCallersWrite, ChannelTokenRequest, ConsoleLoginCodeMint,
-    DeploymentCreate, EvalTriggerRequest, LearnedSkillRevert, MemoryEntryCreate, MemoryGuidanceIn,
+    ActionUndo, AgentCreate, AgentScheduleCancel, AgentScheduleRevert, AgentScheduleUpdate,
+    AgentUpdate, ApprovalPrincipalMint, ApprovalRecover, ApprovalResolve, ChannelBindingWrite,
+    ChannelCallersWrite, ChannelTokenRequest, ConsoleLoginCodeMint, DeploymentCreate,
+    EvalTriggerRequest, LearnedSkillRevert, MemoryEntryCreate, MemoryGuidanceIn,
     RemediationBreakerClose, RemediationPolicyMutation, RemediationPolicyWrite,
     RemediationQualificationWrite, RemediationVerifierRunStart, ResolveTargetRequest,
     RoutingCheckRequest, VersionCreate,
@@ -348,6 +349,19 @@ pub struct Agent {
     /// as off, which is what it does.
     #[serde(default)]
     pub memory_writes: bool,
+    /// Whether the agent may create and change its own schedules (ADR 0238).
+    /// Defaulted to off, the `AgentOut` default.
+    #[serde(default)]
+    pub agent_schedules: bool,
+    /// The zone a schedule without its own timezone runs in (ADR 0238).
+    #[serde(default = "default_schedule_timezone")]
+    pub schedule_timezone: String,
+    /// How many active schedules the agent may hold (ADR 0238).
+    #[serde(default = "default_schedule_max_active")]
+    pub schedule_max_active: u32,
+    /// The shortest cron interval the agent may schedule, in minutes (ADR 0238).
+    #[serde(default = "default_schedule_min_interval_minutes")]
+    pub schedule_min_interval_minutes: u32,
     /// Whether the runner loads and may edit this agent's learned skills
     /// (ADR 0237). Defaulted so an older platform reads as off.
     #[serde(default)]
@@ -420,6 +434,41 @@ fn default_publication_policy() -> String {
 
 fn default_publication_policy_version() -> i64 {
     1
+}
+
+// The `AgentOut` defaults for the ADR 0238 schedule settings.
+fn default_schedule_timezone() -> String {
+    "UTC".to_string()
+}
+
+fn default_schedule_max_active() -> u32 {
+    20
+}
+
+fn default_schedule_min_interval_minutes() -> u32 {
+    15
+}
+
+/// An agent's stored ADR 0238 schedule settings, as `<tier> overrides` and the
+/// `<tier> schedules` policy setters print them.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AgentSchedulePolicy {
+    pub agent_schedules: bool,
+    pub schedule_timezone: String,
+    pub schedule_max_active: u32,
+    pub schedule_min_interval_minutes: u32,
+}
+
+impl Agent {
+    /// The schedule settings this agent row carries.
+    pub fn schedule_policy(&self) -> AgentSchedulePolicy {
+        AgentSchedulePolicy {
+            agent_schedules: self.agent_schedules,
+            schedule_timezone: self.schedule_timezone.clone(),
+            schedule_max_active: self.schedule_max_active,
+            schedule_min_interval_minutes: self.schedule_min_interval_minutes,
+        }
+    }
 }
 
 /// One route's display-only binding, mirroring `ApprovalRouteBindingOut`.
@@ -791,6 +840,17 @@ pub struct ForgeCredentialHealthReport {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ScheduleList {
     pub schedules: Vec<AgentSchedules>,
+    /// Agent-created and operator-created schedules (ADR 0238), kept as the
+    /// API sent them. Required: a list without it is refused, not read as none.
+    pub agent_schedules: Vec<serde_json::Value>,
+}
+
+/// `GET /agents/{id}/schedules/{id}/revisions` (`AgentScheduleRevisions`,
+/// ADR 0238). Only the object form is accepted; each revision is kept as the
+/// API sent it.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AgentScheduleRevisions {
+    pub revisions: Vec<serde_json::Value>,
 }
 
 /// One durable hook run record (`HookFireOut`, #2932).
@@ -2242,6 +2302,22 @@ pub(crate) fn hook_fire_path(agent: &str, name: &str) -> String {
 /// `/agents/{agent}/hooks/{name}/runs/{run_id}`.
 pub(crate) fn hook_run_path(agent: &str, name: &str, run_id: &str) -> String {
     hook_agent_path(agent, name, &["runs", run_id])
+}
+
+/// The percent-encoded path `/agents/{agent}/{tail..}` for the agent-schedule
+/// routes, pushed segment by segment like [`hook_fire_path`].
+pub(crate) fn agent_schedule_path(agent: &str, tail: &[&str]) -> String {
+    let mut url = reqwest::Url::parse("http://schedule.invalid").expect("static URL base parses");
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .expect("static URL base accepts path segments");
+        segments.push("agents").push(agent);
+        for segment in tail {
+            segments.push(segment);
+        }
+    }
+    url.path().to_string()
 }
 
 /// Percent-encode an agent hook path by pushing each segment through a
@@ -3717,6 +3793,132 @@ impl ApiClient {
             .json()
             .await
             .context("decoding schedule list")
+    }
+
+    /// `GET /agents/{agent_id}/schedules/{schedule_id}` (ADR 0238), as sent.
+    pub async fn get_agent_schedule(
+        &self,
+        agent_id: &str,
+        schedule_id: &str,
+    ) -> Result<serde_json::Value> {
+        let resp = self
+            .send_request(
+                self.http
+                    .get(format!(
+                        "{}/agents/{agent_id}/schedules/{schedule_id}",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key),
+                "GET /agents/{id}/schedules/{id}",
+            )
+            .await?;
+        Self::expect_ok(resp, "reading the agent schedule")
+            .await?
+            .json()
+            .await
+            .context("decoding agent schedule")
+    }
+
+    /// `GET /agents/{agent_id}/schedules/{schedule_id}/revisions`, as sent.
+    pub async fn get_agent_schedule_revisions(
+        &self,
+        agent_id: &str,
+        schedule_id: &str,
+    ) -> Result<AgentScheduleRevisions> {
+        let resp = self
+            .send_request(
+                self.http
+                    .get(format!(
+                        "{}/agents/{agent_id}/schedules/{schedule_id}/revisions",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key),
+                "GET /agents/{id}/schedules/{id}/revisions",
+            )
+            .await?;
+        Self::expect_ok(resp, "reading agent schedule revisions")
+            .await?
+            .json()
+            .await
+            .context("decoding agent schedule revisions")
+    }
+
+    /// `PATCH /agents/{agent_id}/schedules/{schedule_id}`.
+    pub async fn update_agent_schedule(
+        &self,
+        agent_id: &str,
+        schedule_id: &str,
+        body: &AgentScheduleUpdate,
+    ) -> Result<serde_json::Value> {
+        let resp = self
+            .send_request(
+                self.http
+                    .patch(format!(
+                        "{}/agents/{agent_id}/schedules/{schedule_id}",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key)
+                    .json::<AgentScheduleUpdate>(body),
+                "PATCH /agents/{id}/schedules/{id}",
+            )
+            .await?;
+        Self::expect_ok(resp, "updating the agent schedule")
+            .await?
+            .json()
+            .await
+            .context("decoding agent schedule")
+    }
+
+    /// `POST /agents/{agent_id}/schedules/{schedule_id}/cancel`.
+    pub async fn cancel_agent_schedule(
+        &self,
+        agent_id: &str,
+        schedule_id: &str,
+        body: &AgentScheduleCancel,
+    ) -> Result<serde_json::Value> {
+        let resp = self
+            .send_request(
+                self.http
+                    .post(format!(
+                        "{}/agents/{agent_id}/schedules/{schedule_id}/cancel",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key)
+                    .json::<AgentScheduleCancel>(body),
+                "POST /agents/{id}/schedules/{id}/cancel",
+            )
+            .await?;
+        Self::expect_ok(resp, "cancelling the agent schedule")
+            .await?
+            .json()
+            .await
+            .context("decoding agent schedule")
+    }
+
+    /// `POST /agents/{agent_id}/schedules/{schedule_id}/revert`.
+    pub async fn revert_agent_schedule(
+        &self,
+        agent_id: &str,
+        schedule_id: &str,
+        body: &AgentScheduleRevert,
+    ) -> Result<serde_json::Value> {
+        let resp = self
+            .send_request(
+                self.http
+                    .post(format!(
+                        "{}/agents/{agent_id}/schedules/{schedule_id}/revert",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key)
+                    .json::<AgentScheduleRevert>(body),
+                "POST /agents/{id}/schedules/{id}/revert",
+            )
+            .await?;
+        Self::expect_ok(resp, "reverting the agent schedule")
+            .await?
+            .json()
+            .await
+            .context("decoding agent schedule")
     }
 
     pub async fn control_schedule(

@@ -1,7 +1,7 @@
 ---
 seam: CLI output (agent-facing `--json`)
 kind: CLEAN
-impls: 77 outputs behind one trait
+impls: 79 outputs behind one trait
 grade: not separately graded
 epics:
   - "#456"
@@ -13,7 +13,7 @@ order: 18
 > Part of the Curie swappable-seam catalog — see the [seam index](../../interfaces.md).
 
 <!-- BEGIN GENERATED: header (curie dev docs-lint) -->
-> **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** 77 outputs behind one trait &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
+> **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** 79 outputs behind one trait &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
 <!-- END GENERATED: header -->
 
 **Kind legend:** CLEAN = a real `Protocol`/typed port class · SOFT = swap via env/URL/prefix/wire, no code interface · NONE = not built yet.
@@ -66,7 +66,7 @@ This is the catalog's first **Rust** seam. It is listed here because the agent-f
 
 ## Implementations today
 
-77 `CliOutput` implementations, all in the CLI crate, grouped by owning module:
+79 `CliOutput` implementations, all in the CLI crate, grouped by owning module:
 
 - **`DryRunPlan`** (`cli/src/ui.rs`) — the generic `--dry-run` plan; JSON is
   `{"dry_run":true,"plan":[lines]}` and the human render is the same lines verbatim,
@@ -81,8 +81,8 @@ This is the catalog's first **Rust** seam. It is listed here because the agent-f
   `EvalOutput`, `DeployOutput`, `AllTargetsDeployOutput`, `KillOutput`, `ResumeOutput`,
   `BudgetOutput`, `ResetThreadOutput`,
   `DeleteOutput`, `VersionsOutput`, `MemoryOutput`, `MemoryGuidanceOutput`, `HookOutput`, `ApprovalsOutput`,
-  `SkillApprovalsOutput`, `OverridesOutput`, `PublicationPolicyOutput`, `WorkItemsOutput`,
-  `SchedulesOutput`, `HookFireOutput`, `ChannelsOutput`, `CallersOutput`,
+  `SkillApprovalsOutput`, `OverridesOutput`, `AgentOverridesOutput` (the `local`/`cluster overrides` verbs: `OverridesOutput` plus the stored agent-schedule settings), `PublicationPolicyOutput`, `WorkItemsOutput`,
+  `SchedulesOutput`, `AgentScheduleOutput`, `HookFireOutput`, `ChannelsOutput`, `CallersOutput`,
   `ActionsOutput` (the `local`/`cluster actions` verbs and the action executor receipt),
   `RemediationPolicyOutput` (the `local`/`cluster remediation-policy` verbs: one policy generation, the breaker `close-breaker` closed, or a hook's `breakers`),
   `RemediationOutput` (the `local`/`cluster remediation` receipt verbs: a nomination list or one nomination's receipt),

@@ -3,6 +3,8 @@
 The ranking matches the worker cron loop: prod outranks dev, then the newest
 active deployment. Declarations are read from that version's bundle. ``hook_runs``
 supplies the newest slot of each source for a name the bundle still declares.
+Agent-created schedules (ADR 0238) are listed beside them, and pause and resume
+accept their ``agent-schedule:<id>`` names.
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
+from curie_api.crud import agent_schedules as agent_store
 from curie_api.crud import agents as crud_agents
 from curie_api.schemas.schedules import (
     AgentSchedulesOut,
@@ -235,6 +238,13 @@ async def list_schedules(
     """Cron hooks on each in-force deployment, with separate latest run histories."""
 
     selected = None if agent is None else await resolve_agent(session, agent)
+    created = await agent_store.views(
+        session,
+        await agent_store.listed(
+            session, None if selected is None else selected.id, include_all=False
+        ),
+        platform=True,
+    )
     rows = await _in_force(session, None if selected is None else selected.id)
     if selected is not None and not rows:
         return ScheduleListOut(
@@ -245,7 +255,8 @@ async def list_schedules(
                     bundle_error=None,
                     hooks=[],
                 )
-            ]
+            ],
+            agent_schedules=created,
         )
     listed: list[AgentSchedulesOut] = []
     for row in rows:
@@ -259,11 +270,20 @@ async def list_schedules(
             )
         )
     listed.sort(key=lambda item: item.agent)
-    return ScheduleListOut(schedules=listed)
+    return ScheduleListOut(schedules=listed, agent_schedules=created)
 
 
 async def _named_hook(session: AsyncSession, store: ObjectStore, raw_agent: str, name: str) -> Any:
     agent = await resolve_agent(session, raw_agent)
+    if name.startswith(agent_store.NAME_PREFIX):
+        # An agent schedule is named by its id, not declared in the bundle.
+        schedule_id = agent_store.parse_name(name)
+        schedule = (
+            None if schedule_id is None else await agent_store.get(session, agent.id, schedule_id)
+        )
+        if schedule is None or schedule.state == agent_store.CANCELLED:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "schedule not found")
+        return agent
     rows = await _in_force(session, agent.id)
     if not rows or rows[0]["bundle_ref"] is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "schedule not found")
@@ -277,12 +297,13 @@ async def _named_hook(session: AsyncSession, store: ObjectStore, raw_agent: str,
     return agent
 
 
-async def _change_pause(
-    session: AsyncSession, store: ObjectStore, raw_agent: str, name: str, *, pause: bool
-) -> ScheduleControlOut:
-    agent = await _named_hook(session, store, raw_agent, name)
-    params = {"agent_id": agent.id, "name": name}
-    await session.execute(text(_LOCK_SQL), {"agent_id": str(agent.id), "name": name})
+async def apply_control(
+    session: AsyncSession, agent_id: uuid.UUID, name: str, *, pause: bool
+) -> None:
+    """Pause or resume ``name`` in the caller's transaction, which already holds
+    the admission lock. A resume also clears the failure streak."""
+
+    params = {"agent_id": agent_id, "name": name}
     statement = _PAUSE_SQL if pause else _RESUME_SQL
     await session.execute(text(statement.format(schema=SCHEMA)), params)
     if not pause:
@@ -294,6 +315,31 @@ async def _change_pause(
             ),
             params,
         )
+
+
+async def _change_pause(
+    session: AsyncSession, store: ObjectStore, raw_agent: str, name: str, *, pause: bool
+) -> ScheduleControlOut:
+    agent = await _named_hook(session, store, raw_agent, name)
+    await session.execute(text(_LOCK_SQL), {"agent_id": str(agent.id), "name": name})
+    schedule_id = agent_store.parse_name(name)
+    if schedule_id is not None:
+        # Same lock order as every agent schedule change: admission lock, then
+        # the row; pause and resume are logged without moving the revision.
+        schedule = await agent_store.get(session, agent.id, schedule_id, for_update=True)
+        if schedule is None or schedule.state == agent_store.CANCELLED:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "schedule not found")
+        if await agent_store.is_paused(session, schedule) != pause:
+            await apply_control(session, agent.id, name, pause=pause)
+            await agent_store.log(
+                session,
+                schedule,
+                action="pause" if pause else "resume",
+                state=agent_store.read_state(schedule, pause),
+                stamp=agent_store.OPERATOR,
+            )
+    else:
+        await apply_control(session, agent.id, name, pause=pause)
     await session.commit()
     return ScheduleControlOut(agent=agent.name, name=name, paused=pause)
 

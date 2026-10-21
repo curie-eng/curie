@@ -297,6 +297,7 @@ fn work_item_list() -> curie::api::WorkItemList {
 /// Locked `GET /schedules` body, including `last_outcome` `failed`.
 fn locked_schedule_list() -> serde_json::Value {
     serde_json::json!({
+        "agent_schedules": [],
         "schedules": [
             {
                 "agent": "acme-bot",

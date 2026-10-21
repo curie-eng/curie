@@ -73,7 +73,7 @@ from ..workspace import (
 if TYPE_CHECKING:
     from .core import Kernel
 
-from . import clock, constants, failures, memory, routing, workspace
+from . import clock, constants, failures, hooks, memory, routing, workspace
 from .log import logger
 
 
@@ -856,9 +856,31 @@ async def _route_and_start(
             thread_key=thread_key,
             remaining_s=remaining_s,
         )
-        steered = await self._runner.steer(
-            handle.base_url, steer_event, token=handle.token or None, remaining_s=remaining_s
-        )
+        schedule_resume = hooks._schedule_resume()
+        if schedule_resume is not None:
+            # ADR 0238: an approval continuation of an agent schedule firing
+            # steers only while the schedule still allows it, under the
+            # schedule's lock held across the steer, as a start would.
+            recorder = self._hook_runs
+            if recorder is None:
+                raise hooks.ScheduleResumeRefused(
+                    "no hook run recorder to check the agent schedule"
+                )
+            async with recorder.resume_guard(*schedule_resume) as allowed:
+                if not allowed:
+                    raise hooks.ScheduleResumeRefused(
+                        "agent schedule changed before the resume steered"
+                    )
+                steered = await self._runner.steer(
+                    handle.base_url,
+                    steer_event,
+                    token=handle.token or None,
+                    remaining_s=remaining_s,
+                )
+        else:
+            steered = await self._runner.steer(
+                handle.base_url, steer_event, token=handle.token or None, remaining_s=remaining_s
+            )
         if steered:
             memory_turns = constants._MEMORY_TURNS.get()
             if memory_turns is not None:

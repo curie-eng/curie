@@ -16,6 +16,7 @@
     "live_session",
     "enqueue_failed",
     "claim_expired",
-    "daily_budget"
+    "daily_budget",
+    "schedule_changed"
   ]
 }

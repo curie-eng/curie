@@ -521,7 +521,7 @@ fn schedules_history_split_is_v3_and_hook_source_is_v1_2() {
     .expect("schedules schema is JSON");
     assert_eq!(
         schedules["$id"],
-        "https://schemas.curietech.ai/cli/schedules/v3.json"
+        "https://schemas.curietech.ai/cli/schedules/v3.1.json"
     );
     let hook = &schedules["$defs"]["hook"];
     let required = hook["required"].as_array().expect("hook required fields");
@@ -559,7 +559,7 @@ fn schedules_history_split_is_v3_and_hook_source_is_v1_2() {
         .as_array()
         .expect("schema result inventory");
     for (schema, version) in [
-        ("schedules.schema.json", "3.0"),
+        ("schedules.schema.json", "3.1"),
         ("hook-fire.schema.json", "1.2"),
     ] {
         let entry = results

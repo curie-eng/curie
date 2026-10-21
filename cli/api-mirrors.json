@@ -14,6 +14,11 @@
       "omissions": []
     },
     {
+      "struct": "AgentScheduleRevisions",
+      "schema": "AgentScheduleRevisions",
+      "omissions": []
+    },
+    {
       "struct": "ForgeCredentialHealthReport",
       "schema": "ForgeCredentialHealthReport",
       "omissions": []
@@ -557,6 +562,26 @@
   "_requests_comment": "Typed request bodies (#3834). Every platform JSON send in cli/src/api.rs is a .json::<T>(..) call on self.http.<method>(format!(\"{}<path>\", self.base_url, ..)). request_mirrors maps each body struct (cli/src/api_requests.rs, or a shared Serialize DTO in cli/src/api.rs) to its OpenAPI request schema, with justified omissions just like mirrors. requests binds each sending fn to the struct, method and OpenAPI path it sends; the gate checks the method and path against the source and the operation's requestBody schema against the mirror. Check with: curie dev field-parity",
   "request_mirrors": [
     {
+      "struct": "AgentScheduleUpdate",
+      "schema": "AgentScheduleUpdate",
+      "omissions": [
+        {
+          "field": "paused",
+          "why": "Pausing goes through `schedules --pause/--resume` on the existing schedule control route, so the update verb never sends it."
+        }
+      ]
+    },
+    {
+      "struct": "AgentScheduleCancel",
+      "schema": "AgentScheduleCancel",
+      "omissions": []
+    },
+    {
+      "struct": "AgentScheduleRevert",
+      "schema": "AgentScheduleRevert",
+      "omissions": []
+    },
+    {
       "struct": "AgentCreate",
       "schema": "AgentCreate",
       "omissions": [
@@ -769,6 +794,24 @@
   ],
   "requests": [
     {
+      "function": "update_agent_schedule",
+      "struct": "AgentScheduleUpdate",
+      "method": "patch",
+      "path": "/agents/{agent_id}/schedules/{schedule_id}"
+    },
+    {
+      "function": "cancel_agent_schedule",
+      "struct": "AgentScheduleCancel",
+      "method": "post",
+      "path": "/agents/{agent_id}/schedules/{schedule_id}/cancel"
+    },
+    {
+      "function": "revert_agent_schedule",
+      "struct": "AgentScheduleRevert",
+      "method": "post",
+      "path": "/agents/{agent_id}/schedules/{schedule_id}/revert"
+    },
+    {
       "function": "create_agent",
       "struct": "AgentCreate",
       "method": "post",
@@ -976,7 +1019,11 @@
         {"field": "publication_policy", "why": "Publication policy has its own operator command."},
         {"field": "publication_policy_version", "why": "Publication policy has its own operator command."},
         {"field": "publication_draft", "why": "Publication policy has its own operator command."},
-        {"field": "publication_branch_prefix", "why": "Publication policy has its own operator command."}
+        {"field": "publication_branch_prefix", "why": "Publication policy has its own operator command."},
+        {"field": "agent_schedules", "why": "Agent schedule settings belong to the overrides command."},
+        {"field": "schedule_timezone", "why": "Agent schedule settings belong to the overrides command."},
+        {"field": "schedule_max_active", "why": "Agent schedule settings belong to the overrides command."},
+        {"field": "schedule_min_interval_minutes", "why": "Agent schedule settings belong to the overrides command."}
       ]
     },
     {
@@ -1080,6 +1127,22 @@
         {
           "field": "source_bindings",
           "why": "Hook configuration has its own operator command. The overrides command changes model behavior only."
+        },
+        {
+          "field": "agent_schedules",
+          "why": "AgentOverridesOutput wraps this result and emits the stored agent schedule settings."
+        },
+        {
+          "field": "schedule_timezone",
+          "why": "AgentOverridesOutput wraps this result and emits the stored agent schedule settings."
+        },
+        {
+          "field": "schedule_max_active",
+          "why": "AgentOverridesOutput wraps this result and emits the stored agent schedule settings."
+        },
+        {
+          "field": "schedule_min_interval_minutes",
+          "why": "AgentOverridesOutput wraps this result and emits the stored agent schedule settings."
         }
       ]
     },

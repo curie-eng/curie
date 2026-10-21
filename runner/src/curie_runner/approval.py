@@ -74,6 +74,7 @@ from .caller_feedback import action_label
 from .memory_facts import MEMORY_TOOL_NAMES
 from .publication_precheck import PublicationPrecheck
 from .tool_names import (
+    AGENT_SCHEDULE_TOOL_NAMES,
     LEARNED_SKILL_TOOL_NAMES,
     PROGRESS_TOOL,
     STATE_TOOL_NAMES,
@@ -660,6 +661,9 @@ class ApprovalGate:
     # (#1461). Same fact-not-default reasoning as ``state_server_mounted``:
     # ``__main__`` sets it from the expression that decides the mount.
     memory_tools_mounted: bool = False
+    # Whether THIS session mounted the ``agent_schedules`` server (ADR 0238), on
+    # the same reasoning.
+    agent_schedules_mounted: bool = False
     # Whether THIS session mounted the ``learned_skills`` server (ADR 0237), on
     # the same reasoning.
     learned_skills_mounted: bool = False
@@ -935,6 +939,7 @@ def platform_tool_names(
     *,
     state_server_mounted: bool,
     memory_tools_mounted: bool = False,
+    agent_schedules_mounted: bool = False,
     learned_skills_mounted: bool = False,
 ) -> frozenset[str]:
     """The live tool names Curie's own in-process servers mounted THIS session.
@@ -952,8 +957,8 @@ def platform_tool_names(
     tool cannot be published without being exempted (#2286).
 
     The three memory tools (#1461) join the set only when the runner mounted
-    them, on the same reasoning as the state tools, and so do the six
-    learned-skills tools (ADR 0237).
+    them, on the same reasoning as the state tools, and so do the five
+    agent-schedule tools (ADR 0238) and the six learned-skills tools (ADR 0237).
     """
 
     names = _APPROVAL_SERVER_TOOL_NAMES
@@ -961,6 +966,8 @@ def platform_tool_names(
         names = names | STATE_TOOL_NAMES
     if memory_tools_mounted:
         names = names | MEMORY_TOOL_LIVE_NAMES
+    if agent_schedules_mounted:
+        names = names | AGENT_SCHEDULE_TOOL_NAMES
     if learned_skills_mounted:
         names = names | LEARNED_SKILL_TOOL_NAMES
     return names
@@ -971,6 +978,7 @@ def is_platform_owned_tool(
     *,
     state_server_mounted: bool,
     memory_tools_mounted: bool = False,
+    agent_schedules_mounted: bool = False,
     learned_skills_mounted: bool = False,
 ) -> bool:
     """Whether a live SDK name is one Curie's own servers published (#2286).
@@ -1006,6 +1014,7 @@ def is_platform_owned_tool(
     return live_tool_name in platform_tool_names(
         state_server_mounted=state_server_mounted,
         memory_tools_mounted=memory_tools_mounted,
+        agent_schedules_mounted=agent_schedules_mounted,
         learned_skills_mounted=learned_skills_mounted,
     )
 
@@ -1039,6 +1048,7 @@ def _tool_policy_outcome(gate: ApprovalGate, tool_name: str) -> ToolPolicyDecisi
         tool_name,
         state_server_mounted=gate.state_server_mounted,
         memory_tools_mounted=gate.memory_tools_mounted,
+        agent_schedules_mounted=gate.agent_schedules_mounted,
         learned_skills_mounted=gate.learned_skills_mounted,
     ):
         return None
