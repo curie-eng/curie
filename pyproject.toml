@@ -170,6 +170,7 @@ forbidden_modules = [
     "curie_protected_hooks.commissioning_records",
     "curie_protected_hooks.commissioning_reservations",
     "curie_protected_hooks.commissioning_scripts",
+    "curie_protected_hooks.commissioning_verifier",
     "curie_protected_hooks.commissioning_worker",
     "curie_protected_hooks.qualification_publication",
 ]

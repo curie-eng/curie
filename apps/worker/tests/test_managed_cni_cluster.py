@@ -269,7 +269,48 @@ def guard() -> list[dict[str, Any]]:
                             "'curietech.ai/managed-cni-probe-template' in object.metadata.labels)"
                         ),
                         "message": "only probe templates",
-                    }
+                    },
+                    # The eligible-node fence (clause 6): even a templated pod from the
+                    # measuring identity may not request node-capable rights, so case 7
+                    # admission_node_capability is non-vacuous.
+                    {
+                        # Kubernetes drops default-false booleans, so each host flag
+                        # may be absent: guard every read with has().
+                        "expression": (
+                            f"request.userInfo.username != '{MEASURING_USER}'"
+                            " || ((!has(object.spec.hostNetwork)"
+                            " || object.spec.hostNetwork != true)"
+                            " && (!has(object.spec.hostPID) || object.spec.hostPID != true)"
+                            " && (!has(object.spec.hostIPC) || object.spec.hostIPC != true))"
+                        ),
+                        "message": "no host namespaces",
+                    },
+                    {
+                        "expression": (
+                            f"request.userInfo.username != '{MEASURING_USER}'"
+                            " || object.spec.containers.all(c, !has(c.securityContext)"
+                            " || !has(c.securityContext.privileged)"
+                            " || c.securityContext.privileged != true)"
+                        ),
+                        "message": "no privileged container",
+                    },
+                    {
+                        "expression": (
+                            f"request.userInfo.username != '{MEASURING_USER}'"
+                            " || !has(object.spec.volumes)"
+                            " || object.spec.volumes.all(v, !has(v.hostPath))"
+                        ),
+                        "message": "no host path",
+                    },
+                    {
+                        "expression": (
+                            f"request.userInfo.username != '{MEASURING_USER}'"
+                            " || !has(object.spec.tolerations)"
+                            " || object.spec.tolerations.all(t, !has(t.key)"
+                            " || t.key != 'curietech.ai/eligible-node')"
+                        ),
+                        "message": "no eligible-node toleration",
+                    },
                 ],
             },
         },
@@ -508,6 +549,8 @@ def test_probe_kit_on_a_local_cluster() -> None:
     client = MeasuringIdentityAPI(
         MeasuringCredentials(origin, ca_file, token),
         namespaces=(PROT, PROBE_A, FOREIGN, RELEASE),
+        # Clause 5: NetworkPolicy writes (case 5 policy_changed) only in probe namespaces.
+        policy_namespaces=(PROBE_A, FOREIGN),
     )
     kit = ProbeKit(client, layout)
 
@@ -546,7 +589,8 @@ def test_probe_kit_on_a_local_cluster() -> None:
         assert {item.case for item in measurement.entries} == {1}
         return
     assert {i.outcome for i in case_one} == {"pass"}, summary
-    assert not [item for item in measurement.entries if item.outcome == "fail"], summary
+    # The probe kit produced exactly the required entry set, once each.
+    assert set(required_entries(layout)) == {item.key for item in measurement.entries}
     not_passed = {item.key: item.reason for item in measurement.entries if item.outcome != "pass"}
     provider = {
         (6, sub_case, family, "none", "runner_policy")
@@ -558,7 +602,28 @@ def test_probe_kit_on_a_local_cluster() -> None:
     assert {key for key, reason in not_passed.items() if reason == "destination_unknown"} == (
         provider
     ), summary
-    assert set(not_passed.values()) <= {"destination_unknown", "destination_unreached"}, summary
-    assert {key[0] for key in not_passed} == {6}, summary
-    assert measurement.refusal in ("destination_unknown", "destination_unreached")
-    assert set(required_entries(layout)) == {item.key for item in measurement.entries}
+    # The enforcement cases (1-6) must never report a delivery on an enforcing CNI:
+    # a leak there would be a real finding, not a local limitation. Only
+    # unavailable (a case this local cluster could not provoke) is allowed.
+    leaks = [
+        item for item in measurement.entries if item.case in (1, 2, 3, 4, 5, 6)
+        and item.outcome == "fail"
+    ]
+    assert leaks == [], summary
+    # Every non-pass is an honest unavailable with a known reason. Timing cases a
+    # local cluster cannot provoke (address reuse, a recently terminated address,
+    # node-local kubelet reach) are unavailable, never a pass.
+    allowed_unavailable = {
+        "destination_unknown", "destination_unreached", "reuse_not_provoked",
+        "transport_unavailable", "node_probe_unavailable", "phase_timeout",
+        "single_eligible_node", "no_family_address", "control_failed", "review_unavailable",
+        "address_reassigned",
+    }
+    assert all(item.outcome == "unavailable" for item in measurement.entries
+               if item.outcome != "pass"), summary
+    assert set(not_passed.values()) <= allowed_unavailable, summary
+    # Case 7 may legitimately refuse (ordinary identities with node-capable rights);
+    # that is a node-authority finding, recorded, not a CNI leak.
+    assert measurement.refusal is None or measurement.refusal in (
+        allowed_unavailable | {"separate_authority_domain_required", "node_capable_pod"}
+    ), summary

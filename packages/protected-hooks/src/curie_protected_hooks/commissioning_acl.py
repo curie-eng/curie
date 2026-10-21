@@ -25,12 +25,14 @@ holds no script, ACL subcommand or channel and needs no ``ACL WHOAMI``: the
 from __future__ import annotations
 
 import hashlib
+import re
 
+from .admission_acl import admission_acl_rules
 from .admission_records import _encode
 from .authority_records import AuthorityRecordInvalid, _scalar
 from .commissioning_records import CommissioningPermit
 from .execution_namespace import LaneNamespace
-from .worker_acl import _COMMANDS, _HANDSHAKE, _RESET
+from .worker_acl import _COMMANDS, _HANDSHAKE, _RESET, worker_acl_rules
 
 # @spec PROTECTED-COMMISSIONING-1: key families of the principals table.
 PREFIX = "protected:commissioning:"
@@ -82,6 +84,10 @@ _CONTROL = (
 # Design decision 7: the checked provisioner never reads its own evidence.
 _OBSERVER = (*_RESET, *_HANDSHAKE, "+acl|getuser")
 QUALIFICATION = "protected:control:qualification:"
+# Design decision 9: the one placeholder a candidate template carries.
+LANE_PLACEHOLDER = "{lane}"
+_LANE_PREFIX = re.compile(r"protected:commissioning:lane:[0-9a-f]{64}")
+CANDIDATE_ROLES = ("candidate_enqueue", "candidate_worker")
 _CANDIDATE_READS = "+get +type " + _CONTROL_READ + " %R~" + PERMIT + "* %R~" + JOURNAL + "*"
 
 
@@ -120,6 +126,70 @@ def _publisher(qualification_id: str | None) -> tuple[str, ...]:
     )
 
 
+def _candidate(role: str, prefix: str) -> tuple[str, ...]:
+    """One candidate recipe for a lane prefix; the stream is ``<prefix>:runs``."""
+    if role == "candidate_enqueue":
+        return (
+            *_RESET,
+            *_HANDSHAKE,
+            *_IDENTITY,
+            "(" + _CANDIDATE_READS + ")",
+            "(+xadd +type ~" + prefix + ":runs)",
+        )
+    # The unchanged kernel's measured inventory, confined to this lane only.
+    # The empty pattern matches the delivery lease's empty second key only.
+    commands = " ".join("+" + command for command in _COMMANDS.split())
+    return (
+        *_RESET,
+        *_HANDSHAKE,
+        *_IDENTITY,
+        "(" + _CANDIDATE_READS + " %R~" + ADMISSION + "*)",
+        "(" + commands + " ~" + prefix + ":* ~)",
+    )
+
+
+def commissioning_acl_template(role: str) -> tuple[str, ...]:
+    """A candidate recipe with the campaign lane prefix as ``{lane}``.
+
+    Design decision 9: G is built before any permit, so G hashes this
+    template; it is the same for every campaign of the installation.
+    @spec PROTECTED-COMMISSIONING-1 PROTECTED-COMMISSIONING-2.
+    """
+    if type(role) is str and role in CANDIDATE_ROLES:
+        return _candidate(role, LANE_PLACEHOLDER)
+    raise ValueError("unknown candidate role")
+
+
+def instantiate_candidate_rules(role: str, lane: LaneNamespace) -> tuple[str, ...]:
+    """The template with ``{lane}`` replaced by one commissioning lane's prefix.
+
+    @spec PROTECTED-COMMISSIONING-1.
+    """
+    template = commissioning_acl_template(role)
+    if (
+        type(lane) is not LaneNamespace
+        or type(lane.prefix) is not str
+        or _LANE_PREFIX.fullmatch(lane.prefix) is None
+        or lane.stream != lane.prefix + ":runs"
+    ):
+        raise ValueError("commissioning lane required")
+    return tuple(rule.replace(LANE_PLACEHOLDER, lane.prefix) for rule in template)
+
+
+def check_candidate_rules(role: str, rules: object, *, permit: CommissioningPermit) -> None:
+    """Refuse unless ``rules`` are exactly the template for the permit's lane.
+
+    Design decision 9: another campaign's lane, a missing, extra or reordered
+    rule, or any rule outside the template refuses. Returns ``None`` and
+    authorizes nothing. @spec PROTECTED-COMMISSIONING-1.
+    """
+    if type(permit) is not CommissioningPermit:
+        raise ValueError("commissioning permit required")
+    expected = instantiate_candidate_rules(role, derive_commissioning_lane(permit))
+    if type(rules) is not tuple or rules != expected:
+        raise ValueError("candidate rules differ from the campaign's template")
+
+
 def commissioning_acl_rules(
     role: str,
     *,
@@ -150,27 +220,43 @@ def commissioning_acl_rules(
             if permit is not None:
                 raise ValueError("installation principals take no campaign permit")
             return installation[role]
-        if role in ("candidate_enqueue", "candidate_worker"):
+        if role in CANDIDATE_ROLES:
             if type(permit) is not CommissioningPermit:
                 raise ValueError("commissioning permit required")
-            lane = derive_commissioning_lane(permit)
-        if role == "candidate_enqueue":
-            return (
-                *_RESET,
-                *_HANDSHAKE,
-                *_IDENTITY,
-                "(" + _CANDIDATE_READS + ")",
-                "(+xadd +type ~" + lane.stream + ")",
-            )
-        if role == "candidate_worker":
-            # The unchanged kernel's measured inventory, confined to this lane only.
-            # The empty pattern matches the delivery lease's empty second key only.
-            commands = " ".join("+" + command for command in _COMMANDS.split())
-            return (
-                *_RESET,
-                *_HANDSHAKE,
-                *_IDENTITY,
-                "(" + _CANDIDATE_READS + " %R~" + ADMISSION + "*)",
-                "(" + commands + " ~" + lane.prefix + ":* ~)",
-            )
+            return instantiate_candidate_rules(role, derive_commissioning_lane(permit))
     raise ValueError("unknown commissioning role")
+
+
+class GuardRecipes:
+    """The merged recipes G hashes, one per guard principal, @spec PROTECTED-COMMISSIONING-2.
+
+    Production principals take their unchanged LANE-3 recipes, the candidates
+    their design decision 9 templates, and the Qualification publisher the
+    recipe confined to the manifest's ``qualification_id``.
+    """
+
+    def __init__(self, qualification_id: str) -> None:
+        """@spec PROTECTED-COMMISSIONING-2."""
+        self._recipes = {
+            "enqueue": admission_acl_rules("enqueue"),
+            "worker": worker_acl_rules("worker"),
+            "verifier": admission_acl_rules("verifier"),
+            "issuer": commissioning_acl_rules("issuer"),
+            "control": commissioning_acl_rules("control"),
+            "candidate_enqueue": commissioning_acl_template("candidate_enqueue"),
+            "candidate_worker": commissioning_acl_template("candidate_worker"),
+            "qualification_publisher": commissioning_acl_rules(
+                "qualification_publisher", qualification_id=qualification_id
+            ),
+            "observer": commissioning_acl_rules("observer"),
+        }
+
+    def __repr__(self) -> str:
+        """@spec PROTECTED-COMMISSIONING-2."""
+        return "GuardRecipes()"
+
+    def rules(self, principal: str) -> tuple[str, ...]:
+        """@spec PROTECTED-COMMISSIONING-2."""
+        if type(principal) is not str or principal not in self._recipes:
+            raise ValueError("unknown guard principal")
+        return self._recipes[principal]

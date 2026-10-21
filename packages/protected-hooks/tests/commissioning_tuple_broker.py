@@ -79,8 +79,8 @@ class CommissioningTuple:
         from curie_protected_hooks.authority_records import parse_manifest
         from curie_protected_hooks.commissioning_bootstrap import parse_commissioning_bootstrap
         from curie_protected_hooks.commissioning_provisioner import (
-            BROKER_PRINCIPALS,
             COMMISSIONING_ENTRY_POINT,
+            GUARD_PRINCIPALS,
             PRODUCTION_ENTRY_POINT,
         )
         from curie_protected_hooks.commissioning_records import parse_commissioning_permit
@@ -105,6 +105,7 @@ class CommissioningTuple:
             "candidate_enqueue": b["candidate_credentials"]["enqueue"],
             "candidate_worker": b["candidate_credentials"]["worker"],
             "qualification_publisher": b["qualification_publisher_identity"],
+            "observer": {"id": "commissioning/example-observer", "generation": "1"},
         }
         g = {
             "schema_version": 1,
@@ -115,7 +116,7 @@ class CommissioningTuple:
             "network_policy_sha256": "c" * 64,
             "broker_acl": {
                 name: {"credential": credentials[name], "rules_sha256": "d" * 64}
-                for name in BROKER_PRINCIPALS
+                for name in GUARD_PRINCIPALS
             },
         }
         g.update(guard or {})
