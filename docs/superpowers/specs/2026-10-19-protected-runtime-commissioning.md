@@ -62,11 +62,12 @@ to match.
 | Candidate enqueue | Commissioning ingress | Reads permit and journal; submits bounded intents to the campaign lane. | Writes committed admissions, permit, journal, or any production key. |
 | Candidate worker | Commissioning worker | Reads permit, journal and committed admissions; consumes the campaign lane. | Writes control, permit, journal, admission or production lane keys. |
 | Production enqueue, worker, verifier | Production entry points | Unchanged LANE-3 roles from the manifest's `credential_refs`. | Reads or writes any `protected:commissioning:*` key. |
+| Qualification publisher | Verifier, after acceptance | Writes the Qualification record of the manifest's `qualification_id` once with `SET NX`, and reads back only that key, under [design decision 8](#8-a-dedicated-principal-publishes-qualification). | Reads or writes any other key, or holds any scripting, ACL or channel right. |
 | ACL observer | Verifier and guard reobservation | Reads broker ACL users with `ACL GETUSER` only, for the check of [design decision 7](#7-acl-principal-state-is-observed-not-hashed). | Writes any ACL user, or reads or writes any key or channel. |
 | Ordinary worker, source, runner | None | No broker authentication. | Everything above. |
 
-All seven broker identities and the ACL observer are distinct ACL users with
-distinct credential issuances. No principal holds a wildcard write grant that covers another row's
+All seven broker identities, the Qualification publisher and the ACL observer
+are distinct ACL users with distinct credential issuances. No principal holds a wildcard write grant that covers another row's
 keys. The realizing ACL inventory is measured against the pinned Valkey
 version, including Lua key selectors, as LANE-3 requires. If the pinned version
 cannot separate these rights, the campaign refuses; it does not weaken a role.
@@ -151,6 +152,7 @@ those keep their grammars. It uses the same encoding rules as the permit.
 | `production_credentials` | Object with exactly `enqueue`, `worker` and `verifier`; must equal the manifest's `credential_refs`. |
 | `candidate_credentials` | Object with exactly `enqueue` and `worker`. |
 | `issuer_identity`, `control_identity` | `CredentialReference` values. |
+| `qualification_publisher_identity` | `CredentialReference` of the Qualification publisher of [design decision 8](#8-a-dedicated-principal-publishes-qualification). |
 | `mediator_identity`, `gateway_identity` | `CredentialReference` values for the launch mediator and provider gateway. |
 | `source_scope` | Sorted array of 1 to 64 source objects, as in the permit. |
 | `target_scope` | Sorted array of 1 to 64 `opaque_ref` values. |
@@ -207,6 +209,13 @@ Reaching any limit moves the journal to `closing`, records the exhausted
 counter, and blocks every positive operation, including dispatch of an already
 charged reservation. Changing scope or limits requires a new campaign. Retries,
 parked deliveries, a new control process or a restored broker cannot renew one.
+
+Clarification (2026-10-20): a limit of N permits exactly N charged operations.
+The reservation whose charge reaches a limit was charged within it, so it alone
+stays dispatchable, and a launch it reserved may record its ownership, while
+the journal is `closing` for that exhaustion. Every later reservation, and the
+dispatch of every other already charged reservation, refuses. A `closed` or
+`failed` journal dispatches nothing.
 
 At `expires_at_ms`, at limit exhaustion, on a broker `run_id` change or on
 revocation, the campaign refuses new positive work and the supervisor terminates
@@ -340,12 +349,14 @@ principal:
    Their rules stay as G measured them.
 3. The issuer writes the closed `commissioning_acceptance` record (clause 7)
    after the ADR 0236 verifier accepts.
-4. The existing Qualification and Readiness publishers that ADR 0236 lets the
-   verifier construct only after acceptance, holding the manifest's verifier
-   credential, write Qualification at
-   `protected:control:qualification:{qualification_id}:{qualification_generation}`
-   and Readiness at `protected:control:readiness:{runtime_id}:{runtime_generation}`,
-   both in their unchanged v1 grammars and bound to M.
+4. The Qualification and Readiness publishers that ADR 0236 lets the verifier
+   construct only after acceptance write both records in their unchanged v1
+   grammars, bound to M. The Qualification publisher of
+   [design decision 8](#8-a-dedicated-principal-publishes-qualification) writes
+   Qualification at
+   `protected:control:qualification:{qualification_id}:{qualification_generation}`.
+   The Readiness publisher, holding the manifest's verifier credential, writes
+   Readiness at `protected:control:readiness:{runtime_id}:{runtime_generation}`.
 5. The provisioner compares and sets the selection from `admission_open: false`
    to `true`, with every other member unchanged.
 
@@ -572,7 +583,8 @@ cannot hold, this specification returns to ADR review rather than redefining
 | Commissioning journal | Yes | `closing` to `closed` | Commissioning control |
 | Candidate ACL users' enabled state and live sessions | Rules only | Disabled, sessions killed | Provisioner |
 | `commissioning_acceptance` | No | Created | Commissioning issuer |
-| Qualification and Readiness | Absent | Created | Verifier's publishers |
+| Qualification | Absent | Created | Qualification publisher |
+| Readiness | Absent | Created | Verifier credential's Readiness publisher |
 
 Every changed row is broker state written by a principal whose identity and
 rules G already measured, and, as clause 6 requires, none is an input to
@@ -651,3 +663,35 @@ principal's.
 Residual risk: a change made between two observations is detected at the next
 observation, not prevented. A guard call or Readiness issuance after the change
 refuses.
+
+### 8. A dedicated principal publishes Qualification
+
+Decided by the maintainer on 2026-10-21.
+
+Clause 6 step 4 needs a writer for the Qualification record, and no existing
+principal may hold it. The provisioner never writes Qualification, so that the
+party being verified never publishes its own qualification. The production
+verifier's unchanged LANE-3 rules grant `SET` on Readiness only, and widening
+them would change a production recipe that every installation measures.
+
+A commissioned installation therefore has one more broker identity, the
+Qualification publisher. Its rules grant `SET NX` and `GET` on the Qualification
+keys of the manifest's `qualification_id` only, plus the session handshake and
+`INFO server` for the epoch pin. They grant no other key, no scripting, no ACL
+subcommand and no channel. The verifier constructs it only after acceptance, as
+ADR 0236 requires. Identical bytes already stored are a replay; different bytes
+refuse, so Qualification stays immutable.
+
+Like every other broker identity, its credential reference is predeclared in
+bootstrap B as `qualification_publisher_identity`. That ID differs from every
+other credential ID in B. Its credential is issued by the administrator-run
+installation bootstrap. G hashes its rules, and the ACL principal state check
+of design decision 7 covers its password hash set and enabled state.
+
+This reconciles with the
+[admission](2026-10-03-protected-hook-admission.md) key table, which names the
+provisioner as Qualification owner. That table still holds for an installation
+that is not commissioned. A commissioned installation moves the write to this
+publisher. Only the writer changes: the Qualification grammar, its key and the
+production readers stay as they are. The readers check the record's content and
+binding to M, not which principal wrote it.
