@@ -37,7 +37,7 @@ fn agent_json(callers: Option<&[&str]>) -> String {
         Some(ids) => serde_json::to_string(ids).expect("ids serialize"),
     };
     format!(
-        r#"{{"id":"{AGENT_ID}","name":"{AGENT_NAME}","channels":[{{"kind":"slack","address":"{CHANNEL}","adapter":"default","allowed_callers":{list}}}],"created_at":"2026-09-25T00:00:00Z","memory":false}}"#
+        r#"{{"id":"{AGENT_ID}","name":"{AGENT_NAME}","channels":[{{"kind":"slack","address":"{CHANNEL}","adapter":"default","allowed_callers":{list}}}],"created_at":"2026-09-25T00:00:00Z","memory":false,"agent_wide_learning":false}}"#
     )
 }
 

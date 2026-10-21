@@ -5,7 +5,9 @@ Two credentials, both ``scope="state"`` so an old API still accepts them:
 * the long-lived boot-env token (``CURIE_MEMORY_TOKEN`` / ``CURIE_HISTORY_TOKEN``)
   carries ``{binding, memory: "read"}``;
 * the per-turn token from ``BindingResolver.turn_memory_token`` carries
-  ``{binding, memory, sender, turn, conversation, skills}`` and a short expiry.
+  ``{binding, memory, sender, turn, conversation, skills}`` and a short expiry;
+  ``conversation`` is the turn's thread key (ADR 0239), the signed source
+  conversation the API stamps on a memory write and on a learned-skill change.
   It is only minted when the agent has memory writes or learned skills on
   (ADR 0237), the turn names a binding, and the thread is not eval-isolated.
   ``memory`` is ``"write"`` only with memory writes on; ``skills`` is
@@ -234,6 +236,26 @@ def test_eval_isolated_turn_gets_no_turn_token() -> None:
     assert _turn_token(thread_key="eval:case-1") is None
     # A thread that merely starts with "eval-" is a normal turn.
     assert _turn_token(thread_key="eval-case-1") is not None
+
+
+def test_turn_token_signs_the_thread_key_as_conversation() -> None:
+    # ADR 0239: the API stamps a memory write's source conversation from this
+    # signed claim, never from the request body, so the worker must sign the
+    # exact thread key the turn runs in. Two threads on one binding get two
+    # different conversations.
+    first = _turn_token(thread_key="slack:C0123:1700000000.000001")
+    second = _turn_token(thread_key="slack:C0123:1700000000.000002")
+    assert first is not None and second is not None
+    assert _claims(first)["conversation"] == "slack:C0123:1700000000.000001"
+    assert _claims(second)["conversation"] == "slack:C0123:1700000000.000002"
+    # The boot-env read credential names no conversation: it is not a write.
+    env = _resolver().boot_env(
+        _resolved(memory_writes=True),
+        "slack:C0123:1700000000.000001",
+        kind="slack",
+        address="C0123",
+    )
+    assert "conversation" not in _claims(env["CURIE_MEMORY_TOKEN"])
 
 
 # --- learned skills (ADR 0237) -------------------------------------------------------

@@ -499,7 +499,7 @@ fn metrics_preserve_complete_summary_and_series_dtos_and_filters() {
     let summary_body = serde_json::to_string(&summary).unwrap();
     let series_body = serde_json::to_string(&series).unwrap();
     let agents = serde_json::to_string(&json!([
-        {"id": AGENT_ID, "name": "acme-bot", "channels": [{"kind": "slack", "address": "C0EXAMPLE1"}], "memory": false}
+        {"id": AGENT_ID, "name": "acme-bot", "channels": [{"kind": "slack", "address": "C0EXAMPLE1"}], "memory": false, "agent_wide_learning": false}
     ]))
     .unwrap();
     let server = serve(move |request| {
@@ -974,8 +974,8 @@ fn metrics_agent_name_resolves_to_the_documented_trace_filter_token() {
     // the CLI actually sends decides the result: on pre-fix code this test
     // reads the zero payloads and fails.
     let agents = serde_json::to_string(&json!([
-        {"id": AGENT_ID, "name": "acme-bot", "channels": [{"kind": "slack", "address": "C0EXAMPLE1"}], "memory": false},
-        {"id": "22222222-2222-2222-2222-222222222222", "name": "other-agent", "channels": [{"kind": "slack", "address": "C0EXAMPLE2"}], "memory": false}
+        {"id": AGENT_ID, "name": "acme-bot", "channels": [{"kind": "slack", "address": "C0EXAMPLE1"}], "memory": false, "agent_wide_learning": false},
+        {"id": "22222222-2222-2222-2222-222222222222", "name": "other-agent", "channels": [{"kind": "slack", "address": "C0EXAMPLE2"}], "memory": false, "agent_wide_learning": false}
     ]))
     .unwrap();
     let token = format!("agent-{AGENT_ID}");
@@ -1104,7 +1104,7 @@ fn metrics_refuse_an_unknown_agent_and_an_empty_agent_value() {
     // and a present-but-empty value is refused without a lookup, mirroring the
     // runs --agent-id refusal so both flags answer the same falsey class.
     let agents = serde_json::to_string(&json!([
-        {"id": "22222222-2222-2222-2222-222222222222", "name": "other-agent", "channels": [{"kind": "slack", "address": "C0EXAMPLE2"}], "memory": false}
+        {"id": "22222222-2222-2222-2222-222222222222", "name": "other-agent", "channels": [{"kind": "slack", "address": "C0EXAMPLE2"}], "memory": false, "agent_wide_learning": false}
     ]))
     .unwrap();
     let server = serve(move |request| {

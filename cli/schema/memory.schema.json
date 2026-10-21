@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/memory/v2.2.json",
+  "$id": "https://schemas.curietech.ai/cli/memory/v3.json",
   "title": "curie <tier> memory --json",
-  "description": "The payload of `curie <tier> memory <agent>` and its channel, delete, add, and guidance flags: a dry run plan, the retained memory log and attributed individual facts, a confirmed deletion, an operator seeded add result, or the effective memory guidance. Lists always emit facts, including an empty array; facts is optional in the schema to retain validity of prior list payloads.",
+  "description": "The payload of `curie <tier> memory <agent>` and its channel, delete, add, guidance, and lifecycle flags: a dry run plan, the retained memory log and attributed individual facts, a confirmed deletion, an operator seeded add result, the effective memory guidance, an archived or restored entry (`--archive`, `--restore`, shaped as the API's MemoryRecordOut), or an entry with its newest revisions (`--history`, `--revert`, shaped as the API's MemoryDetailOut). Each listed fact carries its author and stated_at (null when the stored fact never recorded them), its kind (fact or instruction), title, conversation (null when unknown), archived flag, and head version (ADR 0239). Lists always emit facts, including an empty array; facts is optional in the schema to retain validity of prior list payloads.",
   "$defs": {
     "dryRun": {
       "type": "object",
@@ -42,6 +42,12 @@
         "address"
       ]
     },
+    "kind": {
+      "enum": [
+        "fact",
+        "instruction"
+      ]
+    },
     "fact": {
       "type": "object",
       "additionalProperties": false,
@@ -58,23 +64,227 @@
         "channel": {
           "$ref": "#/$defs/channel"
         },
+        "kind": {
+          "$ref": "#/$defs/kind"
+        },
+        "title": {
+          "type": "string"
+        },
         "statement": {
           "type": "string"
         },
         "author": {
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "stated_at": {
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "conversation": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "archived": {
+          "type": "boolean"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 0
         }
       },
       "required": [
         "id",
         "scope",
         "channel",
+        "kind",
+        "title",
         "statement",
         "author",
-        "stated_at"
+        "stated_at",
+        "conversation",
+        "archived",
+        "version"
+      ]
+    },
+    "record": {
+      "description": "One canonical memory head (MemoryRecordOut).",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "scope": {
+          "enum": [
+            "agent",
+            "channel"
+          ]
+        },
+        "kind": {
+          "$ref": "#/$defs/kind"
+        },
+        "title": {
+          "type": "string"
+        },
+        "statement": {
+          "type": "string"
+        },
+        "author": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "stated_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "conversation": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "archived": {
+          "type": "boolean"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "updated_at": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "scope",
+        "kind",
+        "title",
+        "statement",
+        "author",
+        "stated_at",
+        "conversation",
+        "archived",
+        "version",
+        "updated_at"
+      ]
+    },
+    "revision": {
+      "description": "One immutable revision (MemoryRevisionOut). snapshot is the resulting canonical value, null for a deletion.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "version": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "operation": {
+          "enum": [
+            "baseline",
+            "create",
+            "update",
+            "delete",
+            "archive",
+            "restore",
+            "revert"
+          ]
+        },
+        "actor": {
+          "type": "string"
+        },
+        "source": {
+          "enum": [
+            "sandbox",
+            "operator",
+            "migration"
+          ]
+        },
+        "conversation": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "created_at": {
+          "type": "string"
+        },
+        "reverted_to_version": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "snapshot": {
+          "type": [
+            "object",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "version",
+        "operation",
+        "actor",
+        "source",
+        "conversation",
+        "created_at",
+        "reverted_to_version",
+        "snapshot"
+      ]
+    },
+    "detail": {
+      "description": "A canonical memory entry with its newest revisions (MemoryDetailOut). entry is null and deleted is true when the head was forgotten or reverted to absence; version is then the latest revision's version.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "entry": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/record"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "deleted": {
+          "type": "boolean"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "history": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/revision"
+          }
+        },
+        "history_before": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        }
+      },
+      "required": [
+        "entry",
+        "deleted",
+        "version",
+        "history",
+        "history_before"
       ]
     }
   },
@@ -165,6 +375,7 @@
         "source": {
           "enum": [
             "default",
+            "learning_default",
             "operator"
           ]
         },
@@ -209,6 +420,12 @@
         "channel",
         "deleted"
       ]
+    },
+    {
+      "$ref": "#/$defs/record"
+    },
+    {
+      "$ref": "#/$defs/detail"
     }
   ]
 }

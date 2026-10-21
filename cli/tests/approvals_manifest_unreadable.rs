@@ -24,7 +24,7 @@ fn agents_response() -> Response {
     Response::json(
         200,
         &format!(
-            r##"[{{"id":"{AGENT_ID}","name":"weather","channels":[{{"kind":"slack","address":"#weather"}}],"approval_required_tools":[],"memory":false}}]"##
+            r##"[{{"id":"{AGENT_ID}","name":"weather","channels":[{{"kind":"slack","address":"#weather"}}],"approval_required_tools":[],"memory":false,"agent_wide_learning":false}}]"##
         ),
     )
 }

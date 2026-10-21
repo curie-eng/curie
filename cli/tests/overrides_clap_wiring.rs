@@ -732,7 +732,7 @@ const MW_AGENT_ID: &str = "22222222-2222-2222-2222-222222222222";
 
 fn mw_agent_json(memory_writes: bool) -> String {
     format!(
-        r##"{{"id":"{MW_AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"model":"kimi-k2","thinking":"adaptive","execution_deadline_seconds":null,"runner_resources":null,"created_at":"2026-07-05T00:00:00Z","memory":false,"memory_writes":{memory_writes}}}"##
+        r##"{{"id":"{MW_AGENT_ID}","name":"deal-desk","channels":[{{"kind":"slack","address":"#x"}}],"model":"kimi-k2","thinking":"adaptive","execution_deadline_seconds":null,"runner_resources":null,"created_at":"2026-07-05T00:00:00Z","memory":false,"memory_writes":{memory_writes},"agent_wide_learning":false}}"##
     )
 }
 
@@ -842,4 +842,200 @@ fn overrides_write_of_another_field_still_reports_memory_writes() {
         Some(&serde_json::Value::Bool(true)),
         "{json}"
     );
+}
+
+// --- `--agent-wide-learning on|off` (ADR 0239) ------------------------------
+//
+// A non-null boolean independent of `memory_writes`: the PATCH carries a JSON
+// boolean under `agent_wide_learning` only when the flag is given, and every
+// inspect and write result reports the stored value at both tiers.
+
+fn tier_connection(tier: &'static str) -> Vec<&'static str> {
+    let mut argv = vec![tier, "overrides", "deal-desk"];
+    if tier == "cluster" {
+        argv.extend([
+            "--api-url",
+            "http://127.0.0.1:9",
+            "--api-key",
+            "curie-test-key",
+        ]);
+    }
+    argv
+}
+
+#[test]
+fn agent_wide_learning_on_and_off_send_json_booleans_at_both_tiers() {
+    for tier in ["local", "cluster"] {
+        for (value, expected) in [("on", true), ("off", false)] {
+            let mut argv = tier_connection(tier);
+            argv.extend(["--agent-wide-learning", value, "--dry-run", "--json"]);
+            let plan = dry_run_plan_line(&argv);
+            assert_eq!(
+                patch_body(&plan),
+                serde_json::json!({"agent_wide_learning": expected}),
+                "{tier}: --agent-wide-learning {value} must send only a JSON boolean: {plan}"
+            );
+        }
+    }
+}
+
+#[test]
+fn agent_wide_learning_is_independent_of_memory_writes_and_omitted_when_absent() {
+    for tier in ["local", "cluster"] {
+        for (flags, expected) in [
+            (
+                vec!["--memory-writes", "on", "--agent-wide-learning", "off"],
+                serde_json::json!({"memory_writes": true, "agent_wide_learning": false}),
+            ),
+            (
+                vec!["--memory-writes", "off", "--agent-wide-learning", "on"],
+                serde_json::json!({"memory_writes": false, "agent_wide_learning": true}),
+            ),
+            (
+                vec!["--memory-writes", "on"],
+                serde_json::json!({"memory_writes": true}),
+            ),
+            (
+                vec!["--model", MODEL_SENTINEL],
+                serde_json::json!({"model": MODEL_SENTINEL}),
+            ),
+        ] {
+            let mut argv = tier_connection(tier);
+            argv.extend(flags.iter().copied());
+            argv.extend(["--dry-run", "--json"]);
+            let plan = dry_run_plan_line(&argv);
+            assert_eq!(patch_body(&plan), expected, "{tier} {flags:?}: {plan}");
+        }
+    }
+}
+
+#[test]
+fn agent_wide_learning_rejects_a_value_other_than_on_or_off_at_both_tiers() {
+    for tier in ["local", "cluster"] {
+        let mut anchor = tier_connection(tier);
+        anchor.extend(["--agent-wide-learning", "on", "--dry-run", "--json"]);
+        dry_run_plan_line(&anchor);
+        for value in ["yes", "true", "1", ""] {
+            let mut argv = tier_connection(tier);
+            argv.extend(["--agent-wide-learning", value, "--dry-run", "--json"]);
+            usage_refused(&argv);
+        }
+        let mut bare = tier_connection(tier);
+        bare.extend(["--agent-wide-learning", "--dry-run", "--json"]);
+        usage_refused(&bare);
+    }
+}
+
+#[test]
+fn agent_wide_learning_inspect_and_write_report_the_stored_value_at_both_tiers() {
+    for tier in ["local", "cluster"] {
+        let mut initial: serde_json::Value = serde_json::from_str(&mw_agent_json(false)).unwrap();
+        initial["agent_wide_learning"] = serde_json::json!(false);
+        let stored = std::sync::Arc::new(std::sync::Mutex::new(initial));
+        let state = std::sync::Arc::clone(&stored);
+        let server = serve(move |req| {
+            let mut state = state.lock().unwrap();
+            match (req.method.as_str(), req.path.as_str()) {
+                ("GET", "/agents") => {
+                    Response::json(200, &serde_json::json!([state.clone()]).to_string())
+                }
+                ("PATCH", p) if *p == format!("/agents/{MW_AGENT_ID}") => {
+                    let patch: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+                    state
+                        .as_object_mut()
+                        .unwrap()
+                        .extend(patch.as_object().unwrap().clone());
+                    Response::json(200, &state.to_string())
+                }
+                _ => Response::json(404, r#"{"detail":"not found"}"#),
+            }
+        });
+        let run = |flags: &[&str]| {
+            let output = Command::new(bin())
+                .args([tier, "overrides", "deal-desk"])
+                .args(flags)
+                .args(["--api-url", &server.base_url, "--api-key", "k", "--json"])
+                .env_remove("CURIE_API_URL")
+                .env_remove("CURIE_API_KEY")
+                .env("NO_PROXY", "127.0.0.1,localhost")
+                .env("no_proxy", "127.0.0.1,localhost")
+                .output()
+                .expect("run agent-wide learning override");
+            assert!(
+                output.status.success(),
+                "{tier}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            json_of(&String::from_utf8_lossy(&output.stdout))
+        };
+        let patches = || -> Vec<serde_json::Value> {
+            server
+                .recorded()
+                .into_iter()
+                .filter(|r| r.method == "PATCH")
+                .map(|r| serde_json::from_slice(&r.body).unwrap())
+                .collect()
+        };
+
+        let inspected = run(&[]);
+        assert_eq!(
+            inspected.get("agent_wide_learning"),
+            Some(&serde_json::Value::Bool(false)),
+            "{tier}: inspect reports the stored default-off value: {inspected}"
+        );
+        assert_eq!(inspected["changed"], false, "{inspected}");
+        assert!(patches().is_empty(), "inspection must not write");
+
+        let enabled = run(&["--agent-wide-learning", "on"]);
+        assert_eq!(enabled["agent_wide_learning"], true, "{enabled}");
+        assert_eq!(
+            enabled["memory_writes"], false,
+            "writes stay off: {enabled}"
+        );
+        assert_eq!(enabled["changed"], true, "{enabled}");
+        assert_eq!(
+            patches(),
+            vec![serde_json::json!({"agent_wide_learning": true})]
+        );
+        assert_eq!(run(&[])["agent_wide_learning"], true);
+
+        let sibling = run(&["--memory-writes", "on"]);
+        assert_eq!(sibling["agent_wide_learning"], true, "{sibling}");
+        assert_eq!(sibling["memory_writes"], true, "{sibling}");
+
+        let disabled = run(&["--agent-wide-learning", "off"]);
+        assert_eq!(disabled["agent_wide_learning"], false, "{disabled}");
+        assert_eq!(disabled["memory_writes"], true, "{disabled}");
+        assert_eq!(
+            patches(),
+            vec![
+                serde_json::json!({"agent_wide_learning": true}),
+                serde_json::json!({"memory_writes": true}),
+                serde_json::json!({"agent_wide_learning": false}),
+            ]
+        );
+        let schema_path = format!(
+            "{}/schema/overrides.schema.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let schema: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(schema_path).unwrap()).unwrap();
+        let validator = jsonschema::validator_for(&schema).expect("overrides schema compiles");
+        for output in [&inspected, &enabled, &disabled] {
+            assert!(
+                validator.is_valid(output),
+                "{tier}: overrides output must validate: {output}"
+            );
+        }
+        let mut missing = inspected.clone();
+        missing
+            .as_object_mut()
+            .unwrap()
+            .remove("agent_wide_learning");
+        assert!(
+            !validator.is_valid(&missing),
+            "agent_wide_learning must be a required overrides field"
+        );
+    }
 }

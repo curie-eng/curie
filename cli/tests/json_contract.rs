@@ -1055,7 +1055,9 @@ fn eval_schema_gate_has_teeth() {
 // (cli/tests/schema_inventory.rs) proves the set below is exhaustive.
 // ─────────────────────────────────────────────────────────────────────────────
 
-use curie::api::{ApprovalRecord, MemoryEntry, Version};
+use curie::api::{
+    ApprovalRecord, MemoryDetail, MemoryEntry, MemoryRecord, MemoryRevision, Version,
+};
 use curie::commands::{
     ApprovalsOutput, BudgetOutput, BumpVersionOutput, ChartCheckOutcome, ChartCheckOutput,
     CheckMatch, CheckReport, ConnectorBuildOutput, ConnectorBuildRecord, DeclaredServer,
@@ -2430,9 +2432,14 @@ fn memory_output_validates_all_variants() {
                 id: "fact-0123456789abcdef0123456789abcdef".to_string(),
                 scope: "agent".to_string(),
                 channel: None,
+                kind: "fact".to_string(),
+                title: "Reply length".to_string(),
                 statement: "prefer terse".to_string(),
-                author: "operator@example.com".to_string(),
-                stated_at: "2026-10-01T03:04:05.123456+00:00".to_string(),
+                author: Some("operator@example.com".to_string()),
+                stated_at: Some("2026-10-01T03:04:05.123456+00:00".to_string()),
+                conversation: None,
+                archived: false,
+                version: 1,
             },
             MemoryFact {
                 id: "fact-11111111111111111111111111111111".to_string(),
@@ -2441,9 +2448,14 @@ fn memory_output_validates_all_variants() {
                     kind: "slack".to_string(),
                     address: "C0EXAMPLE1".to_string(),
                 }),
+                kind: "instruction".to_string(),
+                title: "Morning updates".to_string(),
                 statement: "prefer morning updates".to_string(),
-                author: "U0EXAMPLE1".to_string(),
-                stated_at: "2026-10-02T03:04:05Z".to_string(),
+                author: Some("U0EXAMPLE1".to_string()),
+                stated_at: Some("2026-10-02T03:04:05Z".to_string()),
+                conversation: Some("slack:C0EXAMPLE1:1700000000.000100".to_string()),
+                archived: true,
+                version: 4,
             },
         ],
     };
@@ -2473,11 +2485,14 @@ fn memory_output_validates_all_variants() {
         assert_valid("memory.schema.json", &deleted.to_json());
     }
     let schema = load_schema("memory.schema.json");
-    assert_eq!(
-        schema["$id"],
-        "https://schemas.curietech.ai/cli/memory/v2.2.json"
+    // ADR 0239 adds required typed fact fields and lifecycle results to a
+    // closed schema, which ADR 0101 makes a major bump.
+    let id = schema["$id"].as_str().expect("memory schema $id");
+    assert!(
+        id.starts_with("https://schemas.curietech.ai/cli/memory/v3"),
+        "the typed memory payload needs memory schema v3: {id}"
     );
-    // The minor schema extension also accepts a previously emitted list.
+    // The schema also accepts a list without facts.
     assert_valid(
         "memory.schema.json",
         &serde_json::json!({"agent": "d", "entries": []}),
@@ -2511,6 +2526,74 @@ fn memory_output_validates_all_variants() {
         message_verb: "local".to_string(),
     };
     assert_valid("memory.schema.json", &added.to_json());
+
+    // ADR 0239 lifecycle results: an archived or restored entry, and an entry
+    // with its revisions (live and deleted).
+    let record = memory_record_sample();
+    assert_valid(
+        "memory.schema.json",
+        &MemoryOutput::Record(record.clone()).to_json(),
+    );
+    for (entry, deleted) in [(Some(record), false), (None, true)] {
+        let detail = MemoryOutput::Detail(MemoryDetail {
+            entry,
+            deleted,
+            version: 3,
+            history: memory_history_sample(),
+            history_before: None,
+        });
+        assert_valid("memory.schema.json", &detail.to_json());
+    }
+}
+
+fn memory_record_sample() -> MemoryRecord {
+    MemoryRecord {
+        id: "fact-0123456789abcdef0123456789abcdef".to_string(),
+        scope: "agent".to_string(),
+        kind: "fact".to_string(),
+        title: "Reply length".to_string(),
+        statement: "prefer terse".to_string(),
+        author: Some("U0EXAMPLE1".to_string()),
+        stated_at: Some("2026-10-01T03:04:05Z".to_string()),
+        conversation: Some("slack:C0EXAMPLE1:1700000000.000100".to_string()),
+        archived: true,
+        version: 3,
+        updated_at: "2026-10-03T03:04:05Z".to_string(),
+    }
+}
+
+fn memory_history_sample() -> Vec<MemoryRevision> {
+    vec![
+        MemoryRevision {
+            version: 3,
+            operation: "revert".to_string(),
+            actor: "operator".to_string(),
+            source: "operator".to_string(),
+            conversation: None,
+            created_at: "2026-10-03T03:04:05Z".to_string(),
+            reverted_to_version: Some(0),
+            snapshot: None,
+        },
+        MemoryRevision {
+            version: 1,
+            operation: "create".to_string(),
+            actor: "U0EXAMPLE1".to_string(),
+            source: "sandbox".to_string(),
+            conversation: Some("slack:C0EXAMPLE1:1700000000.000100".to_string()),
+            created_at: "2026-10-01T03:04:05Z".to_string(),
+            reverted_to_version: None,
+            snapshot: Some(serde_json::json!({
+                "kind": "fact",
+                "title": "Reply length",
+                "statement": "prefer terse",
+                "author": "U0EXAMPLE1",
+                "stated_at": "2026-10-01T03:04:05Z",
+                "session_id": "session-example-1",
+                "conversation": "slack:C0EXAMPLE1:1700000000.000100",
+                "archived": false,
+            })),
+        },
+    ]
 }
 
 fn approval_record() -> ApprovalRecord {

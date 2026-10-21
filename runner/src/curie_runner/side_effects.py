@@ -51,6 +51,9 @@ from .tool_names import (
 # through the platform, so a retry after one repeats no real-world action. The
 # canvas list and read tools (ADR 0200) only read too; ``edit_canvas_cell``
 # writes to the provider and is deliberately absent, so it stays a side effect.
+# ``read_memory`` (ADR 0239) only reads the agent's own memory records. The six
+# memory mutators (remember, update, forget, archive_memory, restore_memory,
+# revert_memory) write durable state and stay side effects.
 # The learned-skills list and read tools (ADR 0237) only read the agent's own
 # skills; the four tools that change them stay side effects.
 PLATFORM_IDEMPOTENT_TOOLS: frozenset[str] = (
@@ -60,6 +63,7 @@ PLATFORM_IDEMPOTENT_TOOLS: frozenset[str] = (
             "mcp__curie__report_progress",
             "mcp__curie__progress",
             "mcp__curie__get_issue",
+            "mcp__curie__read_memory",
         }
     )
     | CHANNEL_READ_TOOL_NAMES

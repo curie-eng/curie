@@ -101,7 +101,7 @@ fn stub_path(tools: &Path) -> OsString {
 }
 
 fn bound_agents_json() -> String {
-    r#"[{"id":"11111111-1111-1111-1111-111111111111","name":"acme-bot","channels":[{"kind":"slack","address":"C0EXAMPLE1"}],"memory":false,"repo_full_name":"acme-corp/acme-bot"}]"#.to_string()
+    r#"[{"id":"11111111-1111-1111-1111-111111111111","name":"acme-bot","channels":[{"kind":"slack","address":"C0EXAMPLE1"}],"memory":false,"agent_wide_learning":false,"repo_full_name":"acme-corp/acme-bot"}]"#.to_string()
 }
 
 fn serve_agents() -> MockServer {

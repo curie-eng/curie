@@ -12,8 +12,8 @@ use crate::api_requests::{
     ActionUndo, AgentCreate, AgentScheduleCancel, AgentScheduleRevert, AgentScheduleUpdate,
     AgentUpdate, ApprovalPrincipalMint, ApprovalRecover, ApprovalResolve, ChannelBindingWrite,
     ChannelCallersWrite, ChannelTokenRequest, ConsoleLoginCodeMint, DeploymentCreate,
-    EvalTriggerRequest, LearnedSkillRevert, MemoryEntryCreate, MemoryGuidanceIn,
-    RemediationBreakerClose, RemediationPolicyMutation, RemediationPolicyWrite,
+    EvalTriggerRequest, LearnedSkillRevert, MemoryEntryCreate, MemoryGuidanceIn, MemoryLifecycleIn,
+    MemoryRevertIn, RemediationBreakerClose, RemediationPolicyMutation, RemediationPolicyWrite,
     RemediationQualificationWrite, RemediationVerifierRunStart, ResolveTargetRequest,
     RoutingCheckRequest, VersionCreate,
 };
@@ -349,6 +349,12 @@ pub struct Agent {
     /// as off, which is what it does.
     #[serde(default)]
     pub memory_writes: bool,
+    /// Whether this agent opted in to agent-wide learning (ADR 0239): the
+    /// learning default guidance and standing instructions. Independent of
+    /// `memory_writes`. Absent deserializes as `None`: the platform did not
+    /// report it, and consumers refuse rather than assume it is off.
+    #[serde(default)]
+    pub agent_wide_learning: Option<bool>,
     /// Whether the agent may create and change its own schedules (ADR 0238).
     /// Defaulted to off, the `AgentOut` default.
     #[serde(default)]
@@ -954,9 +960,90 @@ pub struct StateEntry {
     pub updated_at: String,
 }
 
+/// One canonical memory head as the typed memory routes return it
+/// (`MemoryRecordOut`, ADR 0239). Serialized back verbatim as the archive and
+/// restore result, so the CLI cannot drop a field by hand-picking one.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MemoryRecord {
+    pub id: String,
+    pub scope: String,
+    pub kind: String,
+    pub title: String,
+    pub statement: String,
+    /// Null only for an entry with no stored attribution (a historical head
+    /// the migration could not attribute).
+    pub author: Option<String>,
+    pub stated_at: Option<String>,
+    pub conversation: Option<String>,
+    pub archived: bool,
+    pub version: u64,
+    pub updated_at: String,
+}
+
+/// One immutable revision of a canonical memory entry (`MemoryRevisionOut`).
+/// `snapshot` is the resulting canonical value, null for a deletion.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MemoryRevision {
+    pub version: u64,
+    pub operation: String,
+    pub actor: String,
+    pub source: String,
+    pub conversation: Option<String>,
+    pub created_at: String,
+    pub reverted_to_version: Option<u64>,
+    pub snapshot: Option<serde_json::Value>,
+}
+
+/// A canonical memory entry with its newest revisions (`MemoryDetailOut`).
+/// `entry` is null and `deleted` true when the head was forgotten or reverted
+/// to absence; `version` is then the latest revision's version.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MemoryDetail {
+    pub entry: Option<MemoryRecord>,
+    pub deleted: bool,
+    pub version: u64,
+    pub history: Vec<MemoryRevision>,
+    pub history_before: Option<u64>,
+}
+
+/// The scope a typed memory route acts on: agent-wide memory, or one exact
+/// bound channel pair.
+#[derive(Debug, Clone, Copy)]
+pub enum MemoryScope<'a> {
+    Agent,
+    Channel { kind: &'a str, address: &'a str },
+}
+
+impl<'a> MemoryScope<'a> {
+    /// The scope for an optional selected channel pair.
+    pub fn of(channel: Option<(&'a str, &'a str)>) -> Self {
+        match channel {
+            Some((kind, address)) => MemoryScope::Channel { kind, address },
+            None => MemoryScope::Agent,
+        }
+    }
+
+    /// The `scope` value the typed routes take.
+    pub fn name(&self) -> &'static str {
+        match self {
+            MemoryScope::Agent => "agent",
+            MemoryScope::Channel { .. } => "channel",
+        }
+    }
+
+    /// The `channel_kind` and `channel_address` pair, for channel scope only.
+    pub fn channel(&self) -> Option<(&'a str, &'a str)> {
+        match *self {
+            MemoryScope::Agent => None,
+            MemoryScope::Channel { kind, address } => Some((kind, address)),
+        }
+    }
+}
+
 /// An agent's effective memory guidance (`MemoryGuidanceOut`, #1461): the
 /// text the runner shows beside its memory tools, and whether it is the
-/// platform `default` or `operator`-set.
+/// platform `default`, the `learning_default` for an agent that opted in to
+/// agent-wide learning (ADR 0239), or `operator`-set.
 #[derive(Debug, Clone, Deserialize)]
 pub struct MemoryGuidance {
     pub text: String,
@@ -2359,6 +2446,41 @@ pub(crate) fn memory_state_url(
         path.push("memory");
         if let Some(key) = key {
             path.push(key);
+        }
+    }
+    Ok(url)
+}
+
+/// Build the typed memory detail route (ADR 0239):
+/// `/agents/{id}/state/_memory/entries/{fact_id}?scope=agent|channel` plus the
+/// exact `channel_kind` and `channel_address` for channel scope. Identities
+/// travel as path segments and query values, never interpolated.
+pub(crate) fn memory_entry_url(
+    base_url: &str,
+    agent_id: &str,
+    scope: MemoryScope<'_>,
+    fact_id: &str,
+) -> Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse(base_url)?;
+    {
+        let mut path = url
+            .path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("api URL cannot hold path segments"))?;
+        path.pop_if_empty()
+            .push("agents")
+            .push(agent_id)
+            .push("state")
+            .push("_memory")
+            .push("entries")
+            .push(fact_id);
+    }
+    {
+        let mut query = url.query_pairs_mut();
+        query.append_pair("scope", scope.name());
+        if let Some((kind, address)) = scope.channel() {
+            query
+                .append_pair("channel_kind", kind)
+                .append_pair("channel_address", address);
         }
     }
     Ok(url)
@@ -4049,6 +4171,124 @@ impl ApiClient {
             .await?;
         Self::expect_ok(response, "deleting memory fact").await?;
         Ok(())
+    }
+
+    /// A typed memory route's refusal (ADR 0239). A 409 means the head moved
+    /// after the CLI read it: that is reported as a stale version and never
+    /// retried, because a retry would overwrite a change nobody reviewed.
+    async fn expect_memory_ok(resp: reqwest::Response, what: &str) -> Result<reqwest::Response> {
+        if resp.status() != reqwest::StatusCode::CONFLICT {
+            return Self::expect_ok(resp, what).await;
+        }
+        let body = resp.text().await.unwrap_or_default();
+        let reason = api_detail_reason(&body).unwrap_or_else(|| "version conflict".to_string());
+        Err(crate::exit::CliError::failure(format!(
+            "{what} refused with 409: stale version, the entry changed after it was read ({reason})"
+        ))
+        .with_fix(
+            "read the current entry with --history, then run the command again if it still applies",
+        )
+        .into())
+    }
+
+    /// Read one canonical memory entry with its newest revisions:
+    /// `GET /agents/{id}/state/_memory/entries/{fact_id}`.
+    pub async fn get_memory_entry(
+        &self,
+        agent_id: &str,
+        scope: MemoryScope<'_>,
+        fact_id: &str,
+    ) -> Result<MemoryDetail> {
+        let url = memory_entry_url(&self.base_url, agent_id, scope, fact_id)?;
+        let response = self
+            .send_request(
+                self.http.get(url).header("X-API-Key", &self.api_key),
+                "GET memory entry",
+            )
+            .await?;
+        Self::expect_ok(response, "reading memory entry")
+            .await?
+            .json()
+            .await
+            .context("decoding memory entry detail")
+    }
+
+    /// Archive one canonical entry at its read version:
+    /// `POST /agents/{id}/state/_memory/archive`.
+    pub async fn archive_memory_entry(
+        &self,
+        agent_id: &str,
+        body: &MemoryLifecycleIn,
+    ) -> Result<MemoryRecord> {
+        let resp = self
+            .send_request(
+                self.http
+                    .post(format!(
+                        "{}/agents/{agent_id}/state/_memory/archive",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key)
+                    .json::<MemoryLifecycleIn>(body),
+                "POST /agents/{id}/state/_memory/archive",
+            )
+            .await?;
+        Self::expect_memory_ok(resp, "archiving memory entry")
+            .await?
+            .json()
+            .await
+            .context("decoding archived memory entry")
+    }
+
+    /// Restore one archived canonical entry at its read version:
+    /// `POST /agents/{id}/state/_memory/restore`.
+    pub async fn restore_memory_entry(
+        &self,
+        agent_id: &str,
+        body: &MemoryLifecycleIn,
+    ) -> Result<MemoryRecord> {
+        let resp = self
+            .send_request(
+                self.http
+                    .post(format!(
+                        "{}/agents/{agent_id}/state/_memory/restore",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key)
+                    .json::<MemoryLifecycleIn>(body),
+                "POST /agents/{id}/state/_memory/restore",
+            )
+            .await?;
+        Self::expect_memory_ok(resp, "restoring memory entry")
+            .await?
+            .json()
+            .await
+            .context("decoding restored memory entry")
+    }
+
+    /// Revert one canonical entry to an earlier revision, or to absence with
+    /// revision 0: `POST /agents/{id}/state/_memory/revert`.
+    pub async fn revert_memory_entry(
+        &self,
+        agent_id: &str,
+        body: &MemoryRevertIn,
+    ) -> Result<MemoryDetail> {
+        let resp = self
+            .send_request(
+                self.http
+                    .post(format!(
+                        "{}/agents/{agent_id}/state/_memory/revert",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key)
+                    .json::<MemoryRevertIn>(body),
+                "POST /agents/{id}/state/_memory/revert",
+            )
+            .await?;
+        Self::expect_memory_ok(resp, "reverting memory entry")
+            .await?
+            .json()
+            .await
+            .context("decoding reverted memory entry")
     }
 
     /// An agent's active learned skills: `GET /agents/{id}/learned-skills`.

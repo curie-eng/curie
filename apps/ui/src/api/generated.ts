@@ -951,7 +951,7 @@ export interface paths {
         };
         /**
          * Get Memory Guidance
-         * @description The agent's effective memory guidance and its source (#1461).
+         * @description The agent's effective memory guidance and its source (#1461, ADR 0239).
          */
         get: operations["get_memory_guidance_agents__agent_id__memory_guidance_get"];
         /**
@@ -1229,6 +1229,142 @@ export interface paths {
         };
         /** List Namespaces */
         get: operations["list_namespaces_agents__agent_id__state_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/{agent_id}/state/_memory/archive": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Archive Memory
+         * @description Archive one entry under compare-and-set: it leaves the boot context but
+         *     stays readable, searchable and counted. Already archived at the current
+         *     version: unchanged, with no new revision.
+         */
+        post: operations["archive_memory_agents__agent_id__state__memory_archive_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/{agent_id}/state/_memory/context": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Memory Context
+         * @description The bounded boot memory (ADR 0239): the learning toggle, the effective
+         *     guidance, at most 20 active standing instructions and the titles of at most
+         *     50 active facts from agent memory plus the caller's own channel, with
+         *     totals and omitted counts. No fact statement is ever in it.
+         *
+         *     A sandbox credential sees its own binding (none when it names none). The
+         *     platform key sees agent memory, plus one binding when it names both
+         *     ``channel_kind`` and ``channel_address``.
+         */
+        get: operations["memory_context_agents__agent_id__state__memory_context_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/{agent_id}/state/_memory/entries/{fact_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Memory Entry
+         * @description One entry, live or deleted, with its newest 10 revisions older than
+         *     ``before_version`` (each with its snapshot). A deleted head answers with
+         *     ``deleted`` true and the deletion's version, so it can be reverted; an
+         *     identity never created is 404.
+         */
+        get: operations["memory_entry_agents__agent_id__state__memory_entries__fact_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/{agent_id}/state/_memory/restore": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Restore Memory
+         * @description Restore an archived entry under compare-and-set.
+         */
+        post: operations["restore_memory_agents__agent_id__state__memory_restore_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/{agent_id}/state/_memory/revert": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Revert Memory
+         * @description Revert one entry to an earlier version as a new version (``to_version``
+         *     0 removes the head). Works on a deleted entry, which it restores under the
+         *     same id. A stale ``expected_version`` is 409 and changes nothing.
+         */
+        post: operations["revert_memory_agents__agent_id__state__memory_revert_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/{agent_id}/state/_memory/search": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Memory Search
+         * @description Literal, case-insensitive search of one scope's titles and statements,
+         *     active and archived entries alike, with full records. A miss is an empty
+         *     page; ``next_cursor`` continues a longer result.
+         */
+        get: operations["memory_search_agents__agent_id__state__memory_search_get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -4089,6 +4225,11 @@ export interface components {
              * @default false
              */
             agent_schedules?: boolean;
+            /**
+             * Agent Wide Learning
+             * @default false
+             */
+            agent_wide_learning?: boolean;
             /** Approval Required Tools */
             approval_required_tools: string[] | null;
             /** Approval Routes */
@@ -4434,6 +4575,8 @@ export interface components {
         AgentUpdate: {
             /** Agent Schedules */
             agent_schedules?: boolean | null;
+            /** Agent Wide Learning */
+            agent_wide_learning?: boolean | null;
             /** Approval Required Tools */
             approval_required_tools?: string[] | null;
             /** Approval Routes */
@@ -6940,6 +7083,51 @@ export interface components {
             start: string;
         };
         /**
+         * MemoryContextOut
+         * @description The bounded boot context (``GET .../_memory/context``).
+         *
+         *     At most 20 active instructions (full records, empty unless agent-wide
+         *     learning is on) and at most 50 active fact titles, newest updated first,
+         *     from agent memory plus the caller's own channel. No fact statement appears
+         *     anywhere in it.
+         */
+        MemoryContextOut: {
+            /** Agent Wide Learning */
+            agent_wide_learning: boolean;
+            guidance: components["schemas"]["MemoryGuidanceOut"];
+            /** Index */
+            index: components["schemas"]["MemoryIndexItemOut"][];
+            /** Instructions */
+            instructions: components["schemas"]["MemoryRecordOut"][];
+            /** Memory Writes */
+            memory_writes: boolean;
+            omitted: components["schemas"]["MemoryOmittedOut"];
+            totals: components["schemas"]["MemoryTotalsOut"];
+        };
+        /**
+         * MemoryDetailOut
+         * @description An entry with a page of its history (``GET .../_memory/entries/{id}``,
+         *     ``POST .../_memory/revert``).
+         *
+         *     ``entry`` is null and ``deleted`` true when the head was forgotten or
+         *     reverted to absence; ``version`` is then the deletion's version, the one a
+         *     revert must name as ``expected_version``. ``history`` is at most the 10
+         *     newest revisions older than the requested ``before_version``;
+         *     ``history_before`` is the value to pass back for the next older page, null
+         *     when there is none.
+         */
+        MemoryDetailOut: {
+            /** Deleted */
+            deleted: boolean;
+            entry: components["schemas"]["MemoryRecordOut"] | null;
+            /** History */
+            history: components["schemas"]["MemoryRevisionOut"][];
+            /** History Before */
+            history_before: number | null;
+            /** Version */
+            version: number;
+        };
+        /**
          * MemoryEntryCreate
          * @description Append one operator-authored memory record (#1904).
          *
@@ -6995,17 +7183,69 @@ export interface components {
          * MemoryGuidanceOut
          * @description The agent's effective memory guidance and where it comes from (#1461).
          *
-         *     ``source`` is ``operator`` when guidance is stored for the agent, else
-         *     ``default`` and ``text`` is the platform default.
+         *     ``source`` is ``operator`` when guidance is stored for the agent; else
+         *     ``learning_default`` when the agent is opted in to agent-wide learning and
+         *     ``text`` is the learning default (ADR 0239); else ``default`` and ``text``
+         *     is the platform default.
          */
         MemoryGuidanceOut: {
             /**
              * Source
              * @enum {string}
              */
-            source: "default" | "operator";
+            source: "default" | "operator" | "learning_default";
             /** Text */
             text: string;
+        };
+        /**
+         * MemoryIndexItemOut
+         * @description One active fact in the boot index: its title, never its statement.
+         */
+        MemoryIndexItemOut: {
+            /** Id */
+            id: string;
+            /**
+             * Scope
+             * @enum {string}
+             */
+            scope: "agent" | "channel";
+            /** Title */
+            title: string;
+            /** Version */
+            version: number;
+        };
+        /**
+         * MemoryLifecycleIn
+         * @description Archive or restore one entry under compare-and-set.
+         *
+         *     ``channel_kind``/``channel_address`` name the binding for a platform-key
+         *     caller with ``scope="channel"``. A sandbox caller's channel is the binding
+         *     its credential is signed for, and naming one is refused.
+         */
+        MemoryLifecycleIn: {
+            /** Channel Address */
+            channel_address?: string | null;
+            /** Channel Kind */
+            channel_kind?: string | null;
+            /** Expected Version */
+            expected_version: number;
+            /** Id */
+            id: string;
+            /**
+             * Scope
+             * @enum {string}
+             */
+            scope: "agent" | "channel";
+        };
+        /**
+         * MemoryOmittedOut
+         * @description Active entries the bounded context left out.
+         */
+        MemoryOmittedOut: {
+            /** Facts */
+            facts: number;
+            /** Instructions */
+            instructions: number;
         };
         /**
          * MemoryProvenanceOut
@@ -7027,6 +7267,121 @@ export interface components {
             source?: string | null;
             /** Source Trace Ids */
             source_trace_ids?: string[];
+        };
+        /**
+         * MemoryRecordOut
+         * @description One canonical memory entry (a fact or a standing instruction).
+         *
+         *     ``author`` and ``stated_at`` are null only for an entry stored before ADR
+         *     0239 that never named them; the migration does not invent provenance.
+         *     ``conversation`` is the signed source conversation of the last sandbox
+         *     write, null for operator writes and migrated entries.
+         */
+        MemoryRecordOut: {
+            /** Archived */
+            archived: boolean;
+            /** Author */
+            author: string | null;
+            /** Conversation */
+            conversation: string | null;
+            /** Id */
+            id: string;
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "fact" | "instruction";
+            /**
+             * Scope
+             * @enum {string}
+             */
+            scope: "agent" | "channel";
+            /** Stated At */
+            stated_at: string | null;
+            /** Statement */
+            statement: string;
+            /** Title */
+            title: string;
+            /**
+             * Updated At
+             * Format: date-time
+             */
+            updated_at: string;
+            /** Version */
+            version: number;
+        };
+        /**
+         * MemoryRevertIn
+         * @description Revert one entry to an earlier version; ``to_version`` 0 is absence.
+         */
+        MemoryRevertIn: {
+            /** Channel Address */
+            channel_address?: string | null;
+            /** Channel Kind */
+            channel_kind?: string | null;
+            /** Expected Version */
+            expected_version: number;
+            /** Id */
+            id: string;
+            /**
+             * Scope
+             * @enum {string}
+             */
+            scope: "agent" | "channel";
+            /** To Version */
+            to_version: number;
+        };
+        /**
+         * MemoryRevisionOut
+         * @description One immutable revision. ``snapshot`` is the resulting canonical value,
+         *     null for a deletion (a forget, or a revert to absence).
+         */
+        MemoryRevisionOut: {
+            /** Actor */
+            actor: string;
+            /** Conversation */
+            conversation: string | null;
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /**
+             * Operation
+             * @enum {string}
+             */
+            operation: "baseline" | "create" | "update" | "delete" | "archive" | "restore" | "revert";
+            /** Reverted To Version */
+            reverted_to_version: number | null;
+            /** Snapshot */
+            snapshot: unknown | null;
+            /** Source */
+            source: string;
+            /** Version */
+            version: number;
+        };
+        /**
+         * MemorySearchOut
+         * @description A page of literal search results over active and archived entries.
+         */
+        MemorySearchOut: {
+            /** Entries */
+            entries: components["schemas"]["MemoryRecordOut"][];
+            /** Next Cursor */
+            next_cursor: string | null;
+        };
+        /**
+         * MemoryTotalsOut
+         * @description Counts over both visible scopes: active instructions, active facts, and
+         *     archived entries of either kind.
+         */
+        MemoryTotalsOut: {
+            /** Archived */
+            archived: number;
+            /** Facts */
+            facts: number;
+            /** Instructions */
+            instructions: number;
         };
         /**
          * MemoryTraceBackOut
@@ -8922,6 +9277,10 @@ export interface components {
          *     compare-and-set: the write is rejected with 409 unless it matches the stored
          *     version (omit it for a blind upsert). ``value`` is any JSON value (object,
          *     array, or scalar); an array value is what ``append`` grows.
+         *
+         *     On a canonical memory key (``memory`` / ``fact-<32 hex>``, ADR 0239) the
+         *     value must be the typed entry shape, a create sends no ``expected_version``
+         *     (or 0), and an update must send the head's version (428 when omitted).
          */
         StateEntryPut: {
             /** Expected Version */
@@ -12559,6 +12918,232 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["StateNamespaceOut"][];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    archive_memory_agents__agent_id__state__memory_archive_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MemoryLifecycleIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRecordOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    memory_context_agents__agent_id__state__memory_context_get: {
+        parameters: {
+            query?: {
+                channel_kind?: string | null;
+                channel_address?: string | null;
+            };
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryContextOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    memory_entry_agents__agent_id__state__memory_entries__fact_id__get: {
+        parameters: {
+            query: {
+                scope: "agent" | "channel";
+                before_version?: number | null;
+                channel_kind?: string | null;
+                channel_address?: string | null;
+            };
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+                fact_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryDetailOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    restore_memory_agents__agent_id__state__memory_restore_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MemoryLifecycleIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryRecordOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    revert_memory_agents__agent_id__state__memory_revert_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MemoryRevertIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryDetailOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    memory_search_agents__agent_id__state__memory_search_get: {
+        parameters: {
+            query: {
+                scope: "agent" | "channel";
+                q: string;
+                cursor?: string | null;
+                limit?: number;
+                channel_kind?: string | null;
+                channel_address?: string | null;
+            };
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemorySearchOut"];
                 };
             };
             /** @description Validation Error */

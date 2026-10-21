@@ -140,6 +140,21 @@ banned in this contract, so all three tiers are written out in full:
 - local tier: `curie local status --json` then `curie local eval --json`
 - cluster tier: `curie cluster status --json` then `curie cluster eval --json`
 
+**After changing an agent's memory (ADR 0239).** `curie local overrides
+acme-bot --agent-wide-learning on --json` exits 0 only when
+`agent_wide_learning` is `true` in the payload, and `memory_writes` still holds
+its earlier value: the two switches are independent. `curie local memory
+acme-bot --json` lists each entry with its `kind`, `archived` flag and
+`version`. After `curie local memory acme-bot --archive
+fact-0123456789abcdef0123456789abcdef --json`, `archived` is `true` and
+`version` is one higher than the listing showed; `curie local memory acme-bot
+--history fact-0123456789abcdef0123456789abcdef --json` then shows `archive` as
+the newest revision's `operation`. A nonzero exit that says the version is
+stale changed nothing; read `--history` again before retrying. The cluster tier
+takes the same flags on `curie cluster memory`. A memory change reaches the
+model only in a new thread, so prove it with a `local message` that omits
+`--continue`, never from the warm thread that made the change.
+
 **After `curie cluster upgrade --to 0.9.0 --json`:** `status` is `"succeeded"`
 only when `convergence.exact` is true and `canary.passed` is true. A failed
 attempt reports `previous_serving` or one `fail_forward.command`. The

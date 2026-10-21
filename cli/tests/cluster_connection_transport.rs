@@ -564,7 +564,7 @@ fn versions_api(request: &Request) -> Response {
     if request.path.ends_with("/agents") {
         Response::json(
             200,
-            r#"[{"id":"agent-1","name":"acme-bot","channels":[{"kind":"slack","address":"C0EXAMPLE1"}],"memory":false}]"#,
+            r#"[{"id":"agent-1","name":"acme-bot","channels":[{"kind":"slack","address":"C0EXAMPLE1"}],"memory":false,"agent_wide_learning":false}]"#,
         )
     } else if request.path.ends_with("/agents/agent-1/versions") {
         Response::json(200, "[]")

@@ -58,9 +58,10 @@ CONTRACT = "0041"
 # WorkItems are keyed by their tracker issue (0103 contract, #3831), and
 # channel and WorkItem reads carry the trigger label of 0105 (#4361).
 # The 0108 join requires both stable reply selectors (0106) and identity links (0107).
-# The Agent ORM reads the agent schedule columns (selfimp_sched_0001, ADR 0238),
-# so that revision is the floor.
-APP_SCHEMA_MIN = "selfimp_sched_0001"
+# The Agent ORM reads agents.learned_skills (selfimp_skills_0001, ADR 0237), the
+# agent schedule columns (selfimp_sched_0001, ADR 0238) and the twin memory toggle
+# of selfimp_memory_0001 (ADR 0239), so twin memory is the floor.
+APP_SCHEMA_MIN = "selfimp_memory_0001"
 REVIEW_SCHEMA_MIN = "0063"
 PREV = "0040"
 
@@ -150,6 +151,7 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "selfimp_safety_0001",
             "selfimp_skills_0001",
             "selfimp_sched_0001",
+            "selfimp_memory_0001",
         } <= pending
         assert not pending & {"0091", "0092", "0093"}
     else:
@@ -169,8 +171,9 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "selfimp_safety_0001",
             "selfimp_skills_0001",
             "selfimp_sched_0001",
+            "selfimp_memory_0001",
         }
-    assert current_revision() == "selfimp_sched_0001"
+    assert current_revision() == "selfimp_memory_0001"
     assert sql_rows("SELECT name FROM curie.agents WHERE id=:id", {"id": agent_id}) == [
         ("merge-example",)
     ]

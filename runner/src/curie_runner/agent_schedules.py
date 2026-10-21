@@ -20,8 +20,8 @@ from urllib.parse import quote
 
 import aiohttp
 
+from .learned_skills import _detail
 from .memory import MEMORY_TOKEN_ENV
-from .memory_facts import _detail
 from .state import STATE_TOKEN_ENV, STATE_URL_ENV
 from .tool_names import AGENT_SCHEDULES_SERVER_NAME as AGENT_SCHEDULES_SERVER_NAME
 
