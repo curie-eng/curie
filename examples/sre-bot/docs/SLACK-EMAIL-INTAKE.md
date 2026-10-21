@@ -142,6 +142,15 @@ does not apply to this intake, and nothing here should be read as if it did.
   its own qualification drills, and would still need a different connector to
   verify them.
 
+The Alertmanager source has an opt-in protected mode that realizes
+`HOOK-SOURCE-POLICY-6` of ADR 0190: it requests and signs `read-only` under the
+hook's scoped source key, checks the support probe before each delivery and
+verifies the effective policy in every receipt
+([protected source mode](../README.md#protected-source-mode-opt-in)). This
+email intake has no such mode. It signs the ordinary `email-alert` hook with
+the shared agent secret, posts its Slack placeholder before delivery, and does
+not verify an effective policy, so it cannot feed a protected hook as shipped.
+
 Moving this intake onto a protected hook is a separate decision for the
 installation. Do it, qualify each action
 ([drill order](../../../docs/operations.md#qualifying-an-action-the-drill-order)),
