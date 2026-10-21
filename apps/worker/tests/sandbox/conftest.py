@@ -615,6 +615,8 @@ class FakeSandboxClient:
     daemon_failures: dict[tuple[str, str], BaseException] = field(default_factory=dict)
     # status.phase every newly created daemon Pod reports.
     daemon_phase: str = "Running"
+    # The Ready condition new daemon Pods report (a terminating Pod reads as not ready).
+    daemon_ready: bool = True
     # How many next streams are refused as dockerd still starting up would be.
     daemon_unready_streams: int = 0
     # Pods whose dockerd answers every request with 503.
@@ -697,6 +699,7 @@ class FakeSandboxClient:
                 manifest=manifest,
                 created_at=None if ageless else (created_at or datetime.now(UTC)),
                 phase=self.daemon_phase if kind == "Pod" else None,
+                ready=self.daemon_ready,
             )
         return seeded
 
@@ -745,6 +748,7 @@ class FakeSandboxClient:
             manifest=copy.deepcopy(dict(manifest)),
             created_at=datetime.now(UTC),
             phase=self.daemon_phase if kind == "Pod" else None,
+            ready=self.daemon_ready,
         )
         # A successful create's op carries the uid the API server returned.
         self.ops[index] = self.ops[index]._replace(detail=uid)

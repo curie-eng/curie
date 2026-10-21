@@ -729,6 +729,25 @@ def test_a_daemon_that_never_answers_fails_the_claim_within_one_budget(
     assert docker_substrate.lookup("T-never") is None
 
 
+def test_a_daemon_that_answers_but_is_never_ready_fails_the_claim_and_rolls_back(
+    fake_k8s: FakeSandboxClient,
+    docker_substrate: SandboxSubstrate,
+    redis_client: redis.Redis,
+    key_prefix: str,
+) -> None:
+    """An unready or terminating Pod is out of the Service's endpoints even when
+    its port-forwarded ping answers, so it never satisfies initial readiness."""
+
+    fake_k8s.daemon_ready = False
+    with pytest.raises(ClaimTimeoutError):
+        docker_substrate.claim("T-unready", workspace_repo=REPO)
+    (claim_op,) = [op for op in fake_k8s.ops if op.verb == "create_claim"]
+    assert claim_op.target not in fake_k8s.claims
+    assert fake_k8s.daemon_objects == {}
+    assert redis_client.get(_marker_key(key_prefix, claim_op.target)) is None
+    assert docker_substrate.lookup("T-unready") is None
+
+
 def test_a_daemon_that_answers_late_still_serves_the_claim(
     fake_k8s: FakeSandboxClient,
     docker_substrate: SandboxSubstrate,
