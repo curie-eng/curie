@@ -312,6 +312,7 @@ testpaths = [
     # fixture the e2e ladder builds into a bundle; its tests ship beside it.
     "cli/scripts/fixtures/reversible-reference",
     "tools/preflight/tests",
+    "tools/test-env",
     "tools/doclint/tests",
     # @spec PROTECTED-HOOK-LANE-2
     "packages/protected-hooks/tests",
