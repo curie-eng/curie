@@ -26,7 +26,7 @@ The port is the `TranscriptStore` `Protocol` in
 ```python
 class TranscriptStore(Protocol):
     async def load(self) -> list[HistoryRecord]: ...
-    async def append(self, record: HistoryRecord) -> None: ...
+    async def append(self, record: HistoryRecord) -> bool: ...
 ```
 
 A `TurnRecord` preserves ordered `user`/`assistant` messages and JSON content
@@ -46,86 +46,89 @@ conversation, reconstructed through the selected harness adapter.
 
 ## Current contract
 
-- **Resolution.** `resolve_history(history_ref, env)`: an absent ref →
-  `NullTranscriptStore`; an `http(s)://` ref → `StateApiTranscriptStore`; any
-  other scheme (an old SDK-resume id, `s3://` …) is reserved for a future loader
-  and rejected loudly.
-- **Load side.** `load()` returns prior turns/summaries oldest-first (empty when
-  none). The state API advertises its configured transcript value cap on both
-  a successful GET and a missing transcript response. The runner requires that
-  cap and uses it for every history bound; it does not assume a local default.
-  The API default is 16 MiB (chart value `api.transcriptMaxThreadBytes`,
-  env `TRANSCRIPT_MAX_THREAD_BYTES`), sized for a whole factory turn. At boot `build_conversation_replay`
-  reconstructs the ordered portable prefix. The Claude adapter prefers an
-  optional native checkpoint so its exact
-  cache-breakpoint shape survives; without one it materializes deterministic
-  provider-local entries from role/content. It restores a checkpoint only when
-  every system prompt the checkpoint recorded is the one this boot composed:
-  the Claude CLI resends a recorded prompt on resume instead of the one it is
-  given, so a checkpoint from an earlier prompt would hide this turn's
-  attachments, new memory, or a redeployed bundle prompt. A checkpoint recorded
-  under another prompt is set aside and the portable prefix is materialized. The fake consumes the same portable prefix, and a
-  harness declaring no structured-replay capability fails rather than receiving
-  rendered system text. A configured load failure blocks boot because continuing
-  without approval/tool context could duplicate an operation.
-- **A turn's own message.** The user message a turn records is the prompt the
-  runner sent for it, and the current message's attachments ride on the first
-  prompt that runner sends: the person's text, then a notice naming each file
-  by its absolute path. Later prompts to the same runner carry no notice, because
-  `attachments-init` only runs when a sandbox boots and the worker boots one for
-  every turn that carries a file. The portable prefix and a native checkpoint
-  therefore both show which message carried which files, so a file re-attached
-  under an unchanged name is announced even when this boot's system prompt is
-  the one the checkpoint recorded. The legacy `user` projection stays the
-  person's text. A boot also materializes the files earlier messages in the
-  thread carried, read from the thread's attachment ledger
-  ([ADR 0205](../../adr/0205-an-attachment-belongs-to-its-thread.md)), at the
-  paths their own notices gave. The notice names only the current message's
-  files, and the system prompt preamble lists the earlier ones, so a text-only
-  turn whose runner boots fresh never names them as its own.
-- **Append side.** `append(record)` durably writes one turn. A serving runner
-  holds a persistable `DONE` or `AWAITING_APPROVAL` final until append finishes
-  within its 15 second budget. A dangling denied tool call gets an explicit
-  nonexecuted result so the next provider request is structurally valid.
-  Classified failures, budget/auth halts, idle outcomes, and synthetic
-  incomplete fallback finals are not recorded. Best effort applies only to
-  ordinary persistence failures: they retain the candidate final while marking
-  history durability lost. Every runner append sends `reserve_bytes` (8192), so
-  the state API refuses with 413 any append that would leave less than that free
-  under the value cap. The reserve keeps room for the worker's publication
-  outcome append, which sends no reserve. A 413 on a turn append is not a
-  failure yet: the store reads the key and its version, rewrites it with a
-  compare-and-set `PUT` to the compacted value (see Capacity recovery), and
-  retries a version conflict with a fresh read, three attempts in all. A 413
-  that survives compaction is the narrow exception. It becomes
-  `HistoryCapacityError`, discards the candidate record and approval state,
-  emits `history-persistence-error`, and ends with one `CLASSIFIED_FAILURE`
-  final. The worker does not retry that classified failure.
-- **Compaction and cache.** Crossing the turn/byte bound appends one deterministic
-  `SummaryRecord`; ordinary appends retain the exact prefix until the next
-  boundary. Compaction deliberately drops the old native checkpoint; the first
-  turn over the new portable summary writes a fresh one, while later turns append
-  only deltas. Within one active turn, older completed tool exchanges can be
-  replaced with a deterministic marker when the turn exceeds the bound. The
-  first user message, final answer, recent tool call and result pairs, and any
-  pending approval remain intact. A 413 while boot appends its summary makes
-  boot rewrite the value it loaded with a
-  compare-and-set `PUT` to the compacted value, then reload and rebuild the
-  replay from what is stored. A write after that load returns 409 and boot
-  reloads instead of writing a stale view, for at most three passes. Only when
-  the compacted value still cannot fit, or the passes never settle, does boot
-  refuse: the runner serves, and every turn ends with the append path's
-  `history-persistence-error` and one `CLASSIFIED_FAILURE` final before any
-  model or tool starts, so the worker does not retry it. Any other boot
-  compaction failure is still fatal. The first
-  resumed terminal result records
-  `curie.history.resume.cache_read` with the provider's observed cache-read token
-  count and a bounded `cache_hit` attribute.
-- **Timeouts.** A worker retries a stream timeout only when the runner confirms
-  that timeout ownership was accepted. A conflict or unconfirmed result is the
-  terminal worker outcome `runner-timeout-unconfirmed`; it is not retryable.
-  It is a worker display value, not a runner `ErrorEvent` classification, so raw
-  ingress of that token remains `unclassified`.
+1. **Resolution.** `resolve_history(history_ref, env)`: an absent ref →
+   `NullTranscriptStore`; an `http(s)://` ref → `StateApiTranscriptStore`; any
+   other scheme (an old SDK-resume id, `s3://` …) is reserved for a future loader
+   and rejected loudly.
+2. **Load side.** `load()` returns prior turns/summaries oldest-first (empty when
+   none). The state API advertises its configured transcript value cap on both
+   a successful GET and a missing transcript response. The runner requires that
+   cap and uses it for every history bound; it does not assume a local default.
+   The API default is 16 MiB (chart value `api.transcriptMaxThreadBytes`,
+   env `TRANSCRIPT_MAX_THREAD_BYTES`), sized for a whole factory turn. At boot `build_conversation_replay`
+   reconstructs the ordered portable prefix. The Claude adapter prefers an
+   optional native checkpoint so its exact
+   cache-breakpoint shape survives; without one it materializes deterministic
+   provider-local entries from role/content. It restores a checkpoint only when
+   every system prompt the checkpoint recorded is the one this boot composed:
+   the Claude CLI resends a recorded prompt on resume instead of the one it is
+   given, so a checkpoint from an earlier prompt would hide this turn's
+   attachments, new memory, or a redeployed bundle prompt. A checkpoint recorded
+   under another prompt is set aside and the portable prefix is materialized. The fake consumes the same portable prefix, and a
+   harness declaring no structured-replay capability fails rather than receiving
+   rendered system text. A configured load failure blocks boot because continuing
+   without approval/tool context could duplicate an operation.
+3. **A turn's own message.** The user message a turn records is the prompt the
+   runner sent for it, and the current message's attachments ride on the first
+   prompt that runner sends: the person's text, then a notice naming each file
+   by its absolute path. Later prompts to the same runner carry no notice, because
+   `attachments-init` only runs when a sandbox boots and the worker boots one for
+   every turn that carries a file. The portable prefix and a native checkpoint
+   therefore both show which message carried which files, so a file re-attached
+   under an unchanged name is announced even when this boot's system prompt is
+   the one the checkpoint recorded. The legacy `user` projection stays the
+   person's text. A boot also materializes the files earlier messages in the
+   thread carried, read from the thread's attachment ledger
+   ([ADR 0205](../../adr/0205-an-attachment-belongs-to-its-thread.md)), at the
+   paths their own notices gave. The notice names only the current message's
+   files, and the system prompt preamble lists the earlier ones, so a text-only
+   turn whose runner boots fresh never names them as its own.
+4. **Append side.** `append(record)` durably writes one turn and returns whether
+   native replay was retained. A normal append returns true only for a turn
+   retaining `harness_replay`; capacity compaction drops it and returns false.
+   `NullTranscriptStore.append` also returns false. A serving runner
+   holds a persistable `DONE` or `AWAITING_APPROVAL` final until append finishes
+   within its 15 second budget. A dangling denied tool call gets an explicit
+   nonexecuted result so the next provider request is structurally valid.
+   Classified failures, budget/auth halts, idle outcomes, and synthetic
+   incomplete fallback finals are not recorded. Best effort applies only to
+   ordinary persistence failures: they retain the candidate final while marking
+   history durability lost. Every runner append sends `reserve_bytes` (8192), so
+   the state API refuses with 413 any append that would leave less than that free
+   under the value cap. The reserve keeps room for the worker's publication
+   outcome append, which sends no reserve. A 413 on a turn append is not a
+   failure yet: the store reads the key and its version, rewrites it with a
+   compare-and-set `PUT` to the compacted value (see Capacity recovery), and
+   retries a version conflict with a fresh read, three attempts in all. A 413
+   that survives compaction is the narrow exception. It becomes
+   `HistoryCapacityError`, discards the candidate record and approval state,
+   emits `history-persistence-error`, and ends with one `CLASSIFIED_FAILURE`
+   final. The worker does not retry that classified failure.
+5. **Compaction and cache.** Crossing the turn/byte bound appends one deterministic
+   `SummaryRecord`; ordinary appends retain the exact prefix until the next
+   boundary. Compaction deliberately drops the old native checkpoint; the first
+   turn over the new portable summary writes a fresh one, while later turns append
+   only deltas. Within one active turn, older completed tool exchanges can be
+   replaced with a deterministic marker when the turn exceeds the bound. The
+   first user message, final answer, recent tool call and result pairs, and any
+   pending approval remain intact. A 413 while boot appends its summary makes
+   boot rewrite the value it loaded with a
+   compare-and-set `PUT` to the compacted value, then reload and rebuild the
+   replay from what is stored. A write after that load returns 409 and boot
+   reloads instead of writing a stale view, for at most three passes. Only when
+   the compacted value still cannot fit, or the passes never settle, does boot
+   refuse: the runner serves, and every turn ends with the append path's
+   `history-persistence-error` and one `CLASSIFIED_FAILURE` final before any
+   model or tool starts, so the worker does not retry it. Any other boot
+   compaction failure is still fatal. The first
+   resumed terminal result records
+   `curie.history.resume.cache_read` with the provider's observed cache-read token
+   count and a bounded `cache_hit` attribute.
+6. **Timeouts.** A worker retries a stream timeout only when the runner confirms
+   that timeout ownership was accepted. A conflict or unconfirmed result is the
+   terminal worker outcome `runner-timeout-unconfirmed`; it is not retryable.
+   It is a worker display value, not a runner `ErrorEvent` classification, so raw
+   ingress of that token remains `unclassified`.
 
 ## Implementations today
 
@@ -161,9 +164,23 @@ failure.
 delivers the ref as `http(s)://api/agents/<id>/state/transcript/<thread_key>`
 (URL-encoded thread key) and forwards a scoped, agent-bound `state` token
 (ADR-0033, #410) as the history token rather than the raw platform key. The ref
-is **deterministic per (agent, thread)**, so a fresh, a restarted, and a resumed
-sandbox all boot with the same ref and rehydrate identically — the
-unplanned-restart case needs no special worker/kernel branch.
+is deterministic per ordinary agent and thread, so fresh, restarted and resumed
+sandboxes use the same ref. Protected deliveries use a separate derivation:
+`apps/worker/src/curie_worker/protected_history.py::protected_history_key` derives
+the key from the verified runtime id and generation, actual reply kind, channel
+and route identity, and execution session key. The protected address is
+deterministic for those delivery coordinates, rather than only the ordinary
+agent/thread pair. The execution profile's `bindings`, validated by
+`apps/worker/src/curie_worker/protected_configuration.py`, supply
+`history_signing_credential_ref` and `runner_facing_api_base_url`.
+Production composition in `apps/worker/src/curie_worker/protected_run.py` uses
+`ProtectedMediatedBindingResolver` from
+`apps/worker/src/curie_worker/protected_binding.py`; its `boot_env` validates the
+delivery and returns `{}`. The issuer in
+`apps/worker/src/curie_worker/protected_launch_server.py` mints the binding-scoped
+history token using the execution profile's signing credential reference.
+`apps/worker/src/curie_worker/protected_kubernetes_projection.py::render_delivery_environment`
+renders the transcript URL from that profile's API base and the derived key.
 
 ## Known leakage
 

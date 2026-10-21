@@ -692,6 +692,12 @@ class _GateConfig:
         self.db_schema = "curie"
         self.internal_worker_token = "wt"
 
+    @property
+    def executor_reads_connectors(self) -> bool:
+        # Mirrors ``WorkerConfig.executor_reads_connectors`` with the
+        # executor's own connector reads (#4800) off.
+        return self.action_executor_enabled and self.connector_reconcile_enabled
+
 
 @pytest.mark.parametrize(
     ("reconcile", "executor"),

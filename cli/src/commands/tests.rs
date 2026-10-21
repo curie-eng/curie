@@ -371,7 +371,7 @@ fn recorded_query<'a>(
 }
 
 #[test]
-fn remote_skill_refuses_hosted_connector_secret_files_as_a_usage_error() {
+fn hosted_connector_secret_files_use_daemon_volumes() {
     for source in [
         "image: ghcr.io/example/acme-connector:1",
         "build:\n      context: connectors/acme\n      platforms: [linux/amd64]",
@@ -380,33 +380,37 @@ fn remote_skill_refuses_hosted_connector_secret_files_as_a_usage_error() {
             "connectors:\n  acme-connector:\n    {source}\n    secret_files:\n      ACME_API_TOKEN: /run/secrets/acme-token\n"
         ))
         .expect("a hosted connector with secret files is a valid declaration");
-        let err =
-            super::skill::refuse_remote_connector_secret_files(&decl, Some("docker.example.com"))
-                .expect_err("remote skill startup must refuse client-side secret file binds");
-        assert_eq!(crate::exit::classify(&err).0, crate::exit::ExitClass::Usage);
-        let message = err.to_string();
-        for expected in ["acme-connector", "secret_files", "DOCKER_PUBLISHED_HOST"] {
-            assert!(message.contains(expected), "{message}");
-        }
-        assert!(
-            super::skill::refuse_remote_connector_secret_files(&decl, None).is_ok(),
-            "the same declaration must remain usable with local Docker"
-        );
+        let volumes = crate::connector_build::ConnectorSecretVolumes::new(&decl);
+        let mounts = volumes
+            .mounts("acme-connector", &decl.connectors["acme-connector"])
+            .expect("hosted secret files have a daemon volume");
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].target, "/run/secrets/acme-token");
+        assert_eq!(mounts[0].volume, volumes.volumes["acme-connector"]);
+        assert!(mounts[0].docker_mount().starts_with("type=volume,"));
     }
 }
 
 #[test]
-fn remote_skill_accepts_hosted_connector_environment_secrets() {
+fn hosted_connector_environment_secrets_require_no_file_volume() {
     let decl = crate::connector_build::parse_connectors(
         "connectors:\n  acme-connector:\n    image: ghcr.io/example/acme-connector:1\n    env:\n      API_URL: https://api.example.com\n    secrets:\n      - ACME_API_TOKEN\n",
     )
     .expect("an env-only hosted connector is a valid declaration");
-    super::skill::refuse_remote_connector_secret_files(&decl, Some("docker.example.com"))
-        .expect("remote Docker must continue to support connector environment secrets");
+    let volumes = crate::connector_build::ConnectorSecretVolumes::new(&decl);
+    assert!(volumes.volumes.is_empty());
+    assert!(volumes
+        .mounts("acme-connector", &decl.connectors["acme-connector"])
+        .expect("environment secrets require no file mounts")
+        .is_empty());
+    assert_eq!(
+        crate::connector_build::declared_secret_names(&decl.connectors["acme-connector"]),
+        vec!["ACME_API_TOKEN".to_string()]
+    );
 }
 
 #[test]
-fn remote_skill_accepts_secret_files_for_connectors_it_does_not_host() {
+fn unhosted_connector_secret_files_allocate_no_daemon_volumes() {
     for source in [
         "url: https://mcp.example.com/sse",
         "image: ghcr.io/example/acme-connector:1\n    unhosted_url: https://mcp.example.com/sse",
@@ -415,8 +419,8 @@ fn remote_skill_accepts_secret_files_for_connectors_it_does_not_host() {
             "connectors:\n  acme-connector:\n    {source}\n    secret_files:\n      ACME_API_TOKEN: /run/secrets/acme-token\n"
         ))
         .expect("an existing connector endpoint is a valid declaration");
-        super::skill::refuse_remote_connector_secret_files(&decl, Some("docker.example.com"))
-            .expect("a connector at an existing URL does not require a secret file mount");
+        let volumes = crate::connector_build::ConnectorSecretVolumes::new(&decl);
+        assert!(volumes.volumes.is_empty());
     }
 }
 
@@ -2779,9 +2783,7 @@ fn recorded_runner(digest: Option<&str>, snapshot_dir: Option<&str>) -> RunnerSt
     }
 }
 
-/// The eval sweep's runner spec, mounting `dir`. Mirrors what
-/// `boot_eval_runner` builds, so these tests end where the user's Docker
-/// daemon does: in `run_args()`.
+/// The eval sweep's client snapshot is transferred into its Docker volume.
 fn sweep_spec(dir: &Path) -> StartSpec {
     StartSpec {
         image: "curie-runner".into(),
@@ -2802,7 +2804,7 @@ fn sweep_spec(dir: &Path) -> StartSpec {
 }
 
 fn mounts(spec: &StartSpec) -> Vec<String> {
-    spec.run_args()
+    spec.run_args("curie-snapshot-acme-eval")
         .windows(2)
         .filter(|pair| pair[0] == "-v")
         .map(|pair| pair[1].clone())
@@ -2866,7 +2868,7 @@ fn sweep_snapshot_reuses_the_recorded_runners_snapshot() {
     );
     assert_eq!(
         mounts(&sweep_spec(&dir)),
-        vec![format!("{RECORDED_SNAPSHOT}:/plugin:ro")],
+        vec!["curie-snapshot-acme-eval:/plugin:ro".to_string()],
         "the sweep's runner must boot on the recorded snapshot"
     );
 }
@@ -2920,7 +2922,7 @@ fn resolve_sweep_mount_returns_the_recorded_snapshot_when_one_exists() {
             assert_eq!(digest, RECORDED_DIGEST);
             assert_eq!(
                 mounts(&sweep_spec(&dir)),
-                vec![format!("{RECORDED_SNAPSHOT}:/plugin:ro")],
+                vec!["curie-snapshot-acme-eval:/plugin:ro".to_string()],
                 "the resolved mount is what the sweep's docker run receives"
             );
         }
@@ -2974,7 +2976,7 @@ fn bundle_source() -> (tempfile::TempDir, PathBuf) {
 /// The argv-terminating helper for the two `EvalBundle` tests: what
 /// `boot_eval_runner` would hand the Docker daemon for this bundle.
 fn eval_mounts(bundle: &EvalBundle) -> Vec<String> {
-    mounts(&eval_runner_spec(
+    let spec = eval_runner_spec(
         bundle,
         "curie-runner",
         7345,
@@ -2982,7 +2984,9 @@ fn eval_mounts(bundle: &EvalBundle) -> Vec<String> {
         "opus",
         vec![],
         vec![],
-    ))
+    );
+    assert_eq!(spec.plugin_dir, bundle.dir());
+    mounts(&spec)
 }
 
 /// #1087 AC2's wiring guard. The pure-resolver tests above prove
@@ -3027,7 +3031,7 @@ fn the_eval_bundle_packs_a_snapshot_and_never_mounts_the_mutable_source() {
     let mounts = eval_mounts(&bundle);
     assert_eq!(
         mounts,
-        vec![format!("{}:/plugin:ro", bundle.dir().display())],
+        vec!["curie-snapshot-acme-eval:/plugin:ro".to_string()],
         "the snapshot is what reaches the Docker daemon"
     );
     assert!(
@@ -3065,42 +3069,7 @@ fn the_eval_bundle_reuses_the_recorded_snapshot_and_its_digest() {
     );
     assert_eq!(
         eval_mounts(&bundle),
-        vec![format!("{}:/plugin:ro", bundle.dir().display())]
-    );
-}
-
-/// An aborted boot releases the credentials it staged, not just the
-/// containers. Deleting the wipe from `release_boot_scaffolding` fails here.
-///
-/// Nothing else will ever collect them: no state was recorded, so no `skill
-/// down` can find the bundle (#1087). Driven with no sidecar, no connector
-/// and no network so it reaches no Docker daemon -- what is under test is
-/// the release list, not the removals.
-#[tokio::test]
-async fn an_aborted_boot_releases_the_staged_credentials() {
-    let dir = tempfile::tempdir().unwrap();
-    crate::connector_build::stage_secret_file(
-        dir.path(),
-        "kubernetes",
-        "/secrets/kubeconfig",
-        "creds",
-    )
-    .unwrap();
-    let root = crate::connector_build::connector_secrets_root(dir.path());
-    assert!(root.exists());
-
-    super::release_boot_scaffolding(
-        None,
-        &[],
-        None,
-        &dir.path().join(".curie/snapshots/never-packed"),
-        dir.path(),
-    )
-    .await;
-
-    assert!(
-        !root.exists(),
-        "a resolved credential must not outlive the boot that staged it"
+        vec!["curie-snapshot-acme-eval:/plugin:ro".to_string()]
     );
 }
 
@@ -3194,4 +3163,177 @@ async fn prepare_deploy_refuses_a_plain_sealing_key_on_both_tiers() {
             "{tier:?}: the refusal must not echo the key's value: {rendered}"
         );
     }
+}
+
+// --- Docker subpath minimums at the real bring-up entry points (4671) ---
+
+struct SubpathEnvRestore {
+    path: Option<std::ffi::OsString>,
+    token: Option<std::ffi::OsString>,
+}
+
+impl Drop for SubpathEnvRestore {
+    fn drop(&mut self) {
+        match self.path.take() {
+            Some(value) => std::env::set_var("PATH", value),
+            None => std::env::remove_var("PATH"),
+        }
+        match self.token.take() {
+            Some(value) => std::env::set_var("ACME_API_TOKEN", value),
+            None => std::env::remove_var("ACME_API_TOKEN"),
+        }
+    }
+}
+
+fn install_subpath_docker_stub(
+    bin: &Path,
+    log: &Path,
+    engine_api: &str,
+    compose_version: &str,
+) -> SubpathEnvRestore {
+    use std::os::unix::fs::PermissionsExt;
+    let script = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\ncase \"$*\" in\n  \"version --format {{{{.Server.APIVersion}}}}\") printf '%s\\n' '{engine_api}' ;;\n  \"compose version --short\") printf '%s\\n' '{compose_version}' ;;\n  *) printf 'unexpected docker invocation: %s\\n' \"$*\" >&2; exit 64 ;;\nesac\n",
+        log = log.display()
+    );
+    let docker_path = bin.join("docker");
+    std::fs::write(&docker_path, script).expect("write docker stub");
+    std::fs::set_permissions(&docker_path, std::fs::Permissions::from_mode(0o755))
+        .expect("make docker stub executable");
+    let restore = SubpathEnvRestore {
+        path: std::env::var_os("PATH"),
+        token: std::env::var_os("ACME_API_TOKEN"),
+    };
+    let mut paths = vec![bin.to_path_buf()];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    std::env::set_var("PATH", std::env::join_paths(paths).expect("join test PATH"));
+    std::env::set_var("ACME_API_TOKEN", "test-token-value");
+    restore
+}
+
+fn subpath_scope() -> crate::connector_build::ConnectorScope {
+    crate::connector_build::ConnectorScope {
+        release: "curie".to_string(),
+        agent: "acme-bot".to_string(),
+        namespace: "default".to_string(),
+    }
+}
+
+fn subpath_decl(secret_files: bool) -> crate::connector_build::ConnectorsFileDecl {
+    let secret_block = if secret_files {
+        "    secret_files:\n      ACME_API_TOKEN: /run/secrets/acme-token\n"
+    } else {
+        ""
+    };
+    crate::connector_build::parse_connectors(&format!(
+        "connectors:\n  acme-connector:\n    image: ghcr.io/example/acme-connector:1\n{secret_block}"
+    ))
+    .expect("a hosted connector declaration")
+}
+
+#[tokio::test]
+async fn docker_subpath_preflight_skill_bring_up_refuses_old_engine_before_any_volume() {
+    let _lock = crate::PROCESS_ENV_LOCK.lock().await;
+    let bin = tempfile::tempdir().expect("bin dir");
+    let plugin = tempfile::tempdir().expect("plugin dir");
+    let log = bin.path().join("docker.log");
+    let _restore = install_subpath_docker_stub(bin.path(), &log, "1.44", "v2.26.0");
+    let decl = subpath_decl(true);
+    let result = super::start_skill_connectors(
+        plugin.path(),
+        &decl,
+        &subpath_scope(),
+        "test-net",
+        "test-project",
+    )
+    .await;
+    let err = result.expect_err("Engine API 1.44 must refuse the skill bring-up");
+    let text = format!("{err:#}");
+    for needle in ["Docker Engine 26.0", "1.45", "1.44", "acme-connector"] {
+        assert!(
+            text.contains(needle),
+            "{needle} missing from refusal: {text}"
+        );
+    }
+    let log_text = std::fs::read_to_string(&log).unwrap_or_default();
+    assert_eq!(
+        log_text.trim(),
+        "version --format {{.Server.APIVersion}}",
+        "the version check is the only docker call before the refusal: {log_text}"
+    );
+}
+
+#[tokio::test]
+async fn docker_subpath_preflight_local_bring_up_refuses_old_compose_before_any_volume() {
+    let _lock = crate::PROCESS_ENV_LOCK.lock().await;
+    let bin = tempfile::tempdir().expect("bin dir");
+    let plugin = tempfile::tempdir().expect("plugin dir");
+    let log = bin.path().join("docker.log");
+    let _restore = install_subpath_docker_stub(bin.path(), &log, "1.56", "v2.25.0");
+    let decl = subpath_decl(true);
+    let lock = crate::connector_build::ConnectorLockFileDecl {
+        version: crate::connector_build::LOCK_VERSION,
+        connectors: std::collections::BTreeMap::new(),
+        runner: None,
+    };
+    let result = super::bring_up_local(
+        plugin.path(),
+        &decl,
+        &lock,
+        &subpath_scope(),
+        "test-project",
+    )
+    .await;
+    let err = result.expect_err("Compose v2.25.0 must refuse the local bring-up");
+    let text = format!("{err:#}");
+    for needle in ["Docker Compose 2.26.0", "2.25.0", "acme-connector"] {
+        assert!(
+            text.contains(needle),
+            "{needle} missing from refusal: {text}"
+        );
+    }
+    let log_text = std::fs::read_to_string(&log).unwrap_or_default();
+    assert_eq!(
+        log_text.trim(),
+        "version --format {{.Server.APIVersion}}\ncompose version --short",
+        "only the two version checks run before the refusal: {log_text}"
+    );
+}
+
+#[tokio::test]
+async fn docker_subpath_preflight_bring_ups_skip_version_checks_without_secret_files() {
+    let _lock = crate::PROCESS_ENV_LOCK.lock().await;
+    let bin = tempfile::tempdir().expect("bin dir");
+    let plugin = tempfile::tempdir().expect("plugin dir");
+    let log = bin.path().join("docker.log");
+    let _restore = install_subpath_docker_stub(bin.path(), &log, "1.44", "v2.25.0");
+    let decl = subpath_decl(false);
+    let lock = crate::connector_build::ConnectorLockFileDecl {
+        version: crate::connector_build::LOCK_VERSION,
+        connectors: std::collections::BTreeMap::new(),
+        runner: None,
+    };
+    let _ = super::start_skill_connectors(
+        plugin.path(),
+        &decl,
+        &subpath_scope(),
+        "test-net",
+        "test-project",
+    )
+    .await;
+    let _ = super::bring_up_local(
+        plugin.path(),
+        &decl,
+        &lock,
+        &subpath_scope(),
+        "test-project",
+    )
+    .await;
+    let log_text = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !log_text.contains("version --format") && !log_text.contains("compose version"),
+        "no version check may run without secret_files: {log_text}"
+    );
 }

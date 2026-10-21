@@ -27,8 +27,10 @@ in the container env.
 
 > Handoff: `CURIE_BUNDLE_REF` is a RustFS object key; the runner reads
 > `CURIE_PLUGIN_DIR` as a local mounted path and does not fetch. Fetching the
-> bundle key into the plugin dir is sandbox provisioning (an init container in the
-> sandbox substrate's SandboxTemplate / the chart), owned there, not by the worker.
+> bundle key into the plugin dir belongs to sandbox provisioning. Kubernetes
+> uses the SandboxTemplate's init containers; the Docker substrate fetches and
+> validates the bundle, then copies it through the Docker API into a read-only
+> named volume.
 
 **Kill switch** (`killswitch.py`): subscribes to the kill-switch Valkey channel
 `curie:kill-events`; on `kill` for an agent it interrupts that agent's live
@@ -607,6 +609,15 @@ worker claims runner containers on the same Docker daemon exactly as the
 compose-managed one would. For an offline round-trip, add `CURIE_FAKE_MODEL=1`
 to the env above and drop the credential.
 
+The Docker substrate fetches and validates the bundle, workspace, and attachment
+inputs before copying them through the Docker API into named volumes. Each
+volume and transfer helper carries claim and creation-attempt ownership labels.
+The runner mounts the bundle and attachments read only and the workspace read
+write with ownership set to UID/GID `1000:1000`. Temporary extraction directories
+belong to the worker process and need no matching path on the daemon host.
+Failed creation, claim deletion, and orphan cleanup remove only the owned
+resources. Kubernetes keeps its existing init-container provisioning path.
+
 ## Delivery ownership: one deadline, one fenced owner (ADR-0131)
 
 Owning a PEL row is necessary but not sufficient to execute or settle a
@@ -1080,7 +1091,12 @@ only when the remaining delivery budget is at least 70 seconds plus
 turn waits durably for capacity under its original event identity, with a
 fixed deadline set by `CURIE_CAPACITY_WAIT_BUDGET_S` (24 hours by default).
 The worker acknowledges a parked stream delivery, then wakes the turn through
-the same stream when its retry is due. Waiting does not use a runner attempt or
+the same stream when its retry is due. Each refused retry is due 5000 ms after
+that park, or at the original deadline when less time remains. The delay does
+not grow with earlier refusals. A queued notice that was already delivered is
+not sent again on those retries when no sandbox grant was confirmed and the
+grant outcome is not unknown. A failed notice stays queued for another try.
+A confirmed or unknown grant keeps the existing notice retry. Waiting does not use a runner attempt or
 hold a conversation lock. Its placeholder says queued while waiting and
 receives an expiry message if the deadline passes. An approval resume does not
 wait. It runs the same reclamation pass after its own quota refusal, and when

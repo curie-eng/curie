@@ -1,7 +1,7 @@
 //! The CLI mirror of the API's remediation policy document validator.
 //!
 //! @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-3 @spec AUTOMATED-REMEDIATION-10
-//! @spec AUTOMATED-REMEDIATION-24 @spec AUTOMATED-REMEDIATION-25
+//! @spec AUTOMATED-REMEDIATION-17 @spec AUTOMATED-REMEDIATION-24 @spec AUTOMATED-REMEDIATION-25
 //!
 //! `apps/api/src/curie_api/remediation_policy_document.py` validates a policy
 //! document; `curie <tier> remediation-policy apply` runs this mirror first so
@@ -717,7 +717,8 @@ fn validate_qualification(action: &Map<String, Value>, path: &str) -> Checked<()
     }
 }
 
-// @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-24 @spec AUTOMATED-REMEDIATION-25
+// @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-17 @spec AUTOMATED-REMEDIATION-24
+// @spec AUTOMATED-REMEDIATION-25
 /// One action; returns its name. The closed key set is the action kind's:
 /// `tune` has its own, and any other or unknown kind the `remediate`/`prevent`
 /// set.
@@ -803,6 +804,15 @@ fn validate_action<'a>(action: &'a Value, path: &str) -> Checked<&'a str> {
             path,
             format!("a {kind} action declares both a precondition and a verifier"),
         ));
+    }
+    if let Some(verifier) = action.get("verifier").filter(|value| !value.is_null()) {
+        if verifier["connector"] == action["connector"] {
+            return Err(refuse(
+                "verifier_not_independent",
+                format!("{path}/verifier/connector"),
+                "the verifier must read through its own connector, not the acting connector",
+            ));
+        }
     }
     if automatic && NEVER_AUTOMATIC_KINDS.contains(&kind) {
         return Err(refuse(

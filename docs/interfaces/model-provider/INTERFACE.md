@@ -106,6 +106,16 @@ gateway. A minimal config: `CURIE_MODEL_BASE_URL=https://api.deepseek.com/anthro
 
 ## Known leakage
 
+The CLI's OpenRouter credit check sends the model credential as bearer auth to
+OpenRouter's hardcoded default URLs `https://openrouter.ai/api/v1/key` and
+`https://openrouter.ai/api/v1/credits`
+(`cli/src/openrouter_credit.rs`). This provider-specific account query sits
+outside runner wire selection. Separately,
+`Settings.factory_price_source_url` (`apps/api/src/curie_api/config.py::Settings`)
+defaults to the OpenRouter model catalog for factory cost estimates. Its
+OpenRouter-shaped reader is the [model-pricing](../model-pricing/INTERFACE.md)
+seam; model endpoint selection does not select or replace that catalog.
+
 The gotcha the seam encodes rather than a bleed-through: base URL override mode must
 carry a **non-empty** placeholder key, `NO_OP_API_KEY = "not-needed"`
 (`runner/src/curie_runner/sdk_auth.py::NO_OP_API_KEY`). The bundled Claude CLI treats an empty `ANTHROPIC_API_KEY` as

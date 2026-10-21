@@ -14,15 +14,18 @@ No response ever carries a provider payload or a credential.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Awaitable, Callable
 from typing import NoReturn
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from sqlalchemy import select
 
 from curie_api.crud import publication_queries as crud_publication_queries
+from curie_api.factory_rediscovery import REFUSING, publishing_code_host, rediscover
 from curie_api.forges.errors import ForgeError, NotFound, Unauthorized, Unavailable
-from curie_api.forges.hosts import code_host_for, forge_code_host, resolve_stored
+from curie_api.forges.hosts import resolve_stored
 from curie_api.forges.ports import CodeHost
+from curie_api.forges.trackers import tracker_for_work_item
 from curie_api.forges.types import GITHUB, PullRequest, PullRequestRef, RepositoryRef
 from curie_api.publication_pulls import (
     PullRequestContract,
@@ -104,9 +107,7 @@ async def _code_host(
     settings = get_settings()
     client = request.app.state.http_client
     repository = await lineage_repository(session, settings, lineage)
-    if repository.kind == GITHUB:
-        return code_host_for(settings, client), repository
-    return forge_code_host(settings, client, repository), repository
+    return publishing_code_host(settings, client, repository), repository
 
 
 def _out(pull: PullRequest) -> PublicationPullRequestOut:
@@ -212,6 +213,73 @@ async def _base_ref(
     return default_branch
 
 
+def _no_other_publication(
+    request: Request,
+    session: SessionDep,
+    publication: Publication,
+    lineage: ThreadPublicationLineage,
+    code_host: CodeHost,
+) -> Callable[[], Awaitable[None]]:
+    """The check `adopt_or_open` runs right before it opens a new pull request.
+
+    For a publication of a tracker-admitted WorkItem, it refuses
+    ``publication_exists`` when the code host already lists another open
+    factory publication for the issue (or more than one), so a publication
+    that appeared between
+    admission and now is never doubled (#4629). A completed one does not
+    block: only an open publication is a duplicate.
+    """
+
+    async def check() -> None:
+        if publication.execution_request_id is None:
+            return
+        item = await session.scalar(
+            select(WorkItem)
+            .join(ExecutionRequest, ExecutionRequest.work_item_id == WorkItem.id)
+            .where(ExecutionRequest.id == publication.execution_request_id)
+        )
+        if item is None:
+            return
+        try:
+            tracker = tracker_for_work_item(
+                request.app.state.forges,
+                request.app.state.http_client,
+                item.tracker_issue,
+                item.repository,
+                item.code_host_installation_id,
+            )
+        except NotFound:
+            if item.tracker_issue.kind == GITHUB:
+                # A GitHub WorkItem on an install with no GitHub tracker has no
+                # factory intake and no tracker to name its issue.
+                return
+            raise
+        # The WorkItem's recorded repository, with its immutable id, is the one
+        # its issue's references are judged against.
+        found = await rediscover(
+            tracker,
+            code_host,
+            item.tracker_issue,
+            item.repository,
+            event_at=None,
+            exclude_branch=lineage.branch,
+        )
+        if found.verdict in REFUSING:
+            links = ", ".join(p.url for p in found.publications)
+            what = (
+                "an open pull request from a factory publication branch whose author "
+                "cannot be verified"
+                if found.verdict == "unconfirmed"
+                else "an open factory pull request"
+            )
+            raise PullRequestRefused(
+                "publication_exists",
+                f"the issue already has {what} ({found.verdict}): {links}",
+            )
+
+    return check
+
+
 @router.post(
     "/{publication_id}/pull-request",
     response_model=PublicationPullRequestOut,
@@ -247,7 +315,11 @@ async def recover_publication_pull_request(
             draft=publication.open_as_draft,
         )
         pull = await adopt_or_open(
-            code_host, repository, contract, expected_head_sha=data.expected_head_sha
+            code_host,
+            repository,
+            contract,
+            expected_head_sha=data.expected_head_sha,
+            before_open=_no_other_publication(request, session, publication, lineage, code_host),
         )
     except PullRequestRefused as refused:
         _refuse(refused.code, refused.message)

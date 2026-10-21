@@ -25,9 +25,9 @@ approved publication. It does not write the published lineage head directly.
 `PublicationLineageAuthority`
 (`apps/worker/src/curie_worker/publication_loop.py::PublicationLineageAuthority`)
 draws that typed boundary. The current implementation sends the outcome to the
-API, which verifies current GitHub identity and atomically advances the lineage
-with the publication outcome. GitHub mutations remain the reconciler's separate
-responsibility.
+API, which verifies current code-host identity and atomically advances the
+lineage with the publication outcome. Code-host writes use separate internal
+API endpoints and are outside this authority operation.
 
 This is a built internal authority boundary. One implementation ships; the
 port does not establish a supported third party publication service.
@@ -64,9 +64,14 @@ of the platform API key.
 
 The API route
 (`apps/api/src/curie_api/routers/publications.py::advance_publication_lineage`)
-checks the publication outcome before contacting GitHub, then calls
-`verify_publication_identity`
-(`apps/api/src/curie_api/publication_authority.py::verify_publication_identity`).
+uses two identity branches. For GitHub it checks the publication outcome before
+contacting the host, then calls `verify_publication_identity`
+(`apps/api/src/curie_api/publication_authority.py::verify_publication_identity`)
+for installation, repository and pull request node identity and base checks.
+For other hosts it first calls `verify_code_host_identity`
+(`apps/api/src/curie_api/publication_authority.py::verify_code_host_identity`)
+through the forge `CodeHost`, then checks the outcome against that read's URL
+(`apps/api/src/curie_api/routers/publications.py::_verified_identity`).
 The stored writer repeats the outcome checks under row locks
 (`apps/api/src/curie_api/crud/lineages.py::publication_lineage_outcome_conflict`,
 `apps/api/src/curie_api/crud/lineages.py::advance_publication_lineage`). The
@@ -99,8 +104,8 @@ One production client, `PublicationLineageClient`, implements the worker port.
 `_build_publication_loop`
 (`apps/worker/src/curie_worker/run.py::_build_publication_loop`)
 supplies it to `PublicationReconciler` with the API URL, internal worker token,
-and shared HTTP client. The API authority uses GitHub identity reads and
-Postgres persistence. Worker doubles in
+and shared HTTP client. The API authority uses GitHub App identity reads or
+forge `CodeHost` identity reads, plus Postgres persistence. Worker doubles in
 `apps/worker/tests/test_publication_loop.py` exercise the port without adding a
 second production authority. Client wire and error behavior are covered in
 `apps/worker/tests/test_publication_clients.py`; API identity checks are covered
@@ -108,14 +113,15 @@ in `apps/api/tests/test_publication_lineage_identity.py`.
 
 ## Known leakage
 
-The operation deliberately carries GitHub pull request identity, a commit SHA,
-and GitHub metadata time. It is not a provider neutral publication abstraction.
-The API owns the current repository, installation, pull request node, and base
-ref verification, so changing that provider requires more than replacing the
-worker client.
+The wire still carries a numeric `pr_number`, commit SHA and metadata-update
+time. Those shapes constrain another provider even though the API supports
+code hosts beyond GitHub. Installation and node checks belong to its GitHub
+branch; the forge branch resolves the stored repository and reads the pull
+request through `CodeHost`, checking branch, head, state, URL and base ref.
+Replacing the worker client alone does not replace either authority branch.
 
 The port covers published outcome advancement. Publication leasing, approval,
-credential redemption, GitHub writes, and terminal lineage marking have their
+credential redemption, code-host writes, and terminal lineage marking have their
 own paths. `PostgresPublicationStore` does not write a published head
 (`apps/worker/src/curie_worker/publication_store.py::PostgresPublicationStore`),
 but the reconciler still uses its store to mark a lineage terminal. Replacing

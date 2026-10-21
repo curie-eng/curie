@@ -3,10 +3,10 @@
 A run is orphaned when its runtime owner is provably gone. A row carrying this
 process's own name is orphaned when the kernel does not hold it: a restarted
 container reuses its name, so the previous incarnation's runs look like ours.
-A peer row is orphaned only after two absent liveness observations at least
-absence_proof_s apart, so one missed heartbeat never kills a live run. The
-sweeper asks the API to declare the owner lost; the existing terminate chain
-then tears down the sandbox and fails the run.
+A peer row is orphaned only after two absent liveness observations with known
+capability at least absence_proof_s apart, so one missed heartbeat never kills
+a live run. The sweeper asks the API to declare the owner lost; the existing
+terminate chain then tears down the sandbox and fails the run.
 """
 
 from __future__ import annotations
@@ -15,9 +15,10 @@ import asyncio
 import logging
 import time
 import uuid
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Callable, Sequence
 from typing import Protocol
 
+from .threadlock import OwnerLiveness
 from .workitem_dispatch import WorkItemConflict, WorkItemTransportError
 
 logger = logging.getLogger(__name__)
@@ -46,7 +47,7 @@ class WorkItemOrphanSweeper:
     def __init__(
         self,
         client: OrphanClient,
-        liveness: Callable[[str], Awaitable[bool]],
+        liveness: OwnerLiveness,
         *,
         self_name: str,
         locally_owned: Callable[[uuid.UUID], bool],
@@ -67,13 +68,33 @@ class WorkItemOrphanSweeper:
     async def _peer_gone(self, owner: str, observed: dict[str, bool]) -> bool:
         # One liveness observation per owner per sweep.
         if owner not in observed:
-            if await self._liveness(owner):
+            try:
+                capable = await self._liveness.is_capable(owner)
+                alive = await self._liveness.is_alive(owner)
+            except asyncio.CancelledError:
+                self._first_absent.pop(owner, None)
+                raise
+            except Exception:
+                self._first_absent.pop(owner, None)
+                observed[owner] = False
+                logger.warning(
+                    "work-item owner liveness observation failed for %s; "
+                    "orphan declaration skipped",
+                    owner,
+                    exc_info=True,
+                )
+                return False
+            if not capable or alive:
                 self._first_absent.pop(owner, None)
                 observed[owner] = False
             else:
                 now = self._clock()
-                first = self._first_absent.setdefault(owner, now)
-                observed[owner] = now - first >= self._absence_proof_s
+                first = self._first_absent.get(owner)
+                if first is None:
+                    self._first_absent[owner] = now
+                    observed[owner] = False
+                else:
+                    observed[owner] = now - first >= self._absence_proof_s
         return observed[owner]
 
     async def _orphaned(self, row: _RuntimeOwner, observed: dict[str, bool]) -> bool:

@@ -589,9 +589,9 @@ valkey:
 # onward need the 25.12 line (Langfuse v3.225.7 compose pins
 # clickhouse-server:25.12), pinned here to the 25.12.11.4 patch build so the
 # alias cannot move under the chart version (#2319). AVX is a chart-default
-# requirement because 25.12 is not SSE4.2-safe. Do not move this pin
+# requirement on x86 because 25.12 is not SSE4.2-safe. Do not move this pin
 # independently of the Langfuse pin (#2210). The AVX preflight
-# still allows an explicit sse42SafeTags override on AVX-less nodes; that
+# still allows an explicit sse42SafeTags override on AVX-less x86 nodes; that
 # override cannot apply the current Langfuse migration set.
 # BYO: deploy=false + host/httpPort/nativePort (existingSecret key clickhousePassword).
 # ---------------------------------------------------------------------------
@@ -610,7 +610,7 @@ clickhouse:
     # by digest, or the preflight judges the wrong build.
     digest: ""
   # Tags whose upstream binaries still ship an SSE4.2 build (no AVX required).
-  # The AVX preflight passes an AVX-less node only if the configured tag begins
+  # The AVX preflight passes an AVX-less x86 node only if the configured tag begins
   # with one of these. Not a supported default: the 25.12 line is required by the
   # Langfuse pin and is deliberately absent from this list. 24.8/24.3 are LTS
   # lines; 23.8 is the prior LTS.
@@ -792,6 +792,17 @@ connectorCaller:
 # (ACTION-EXECUTOR-12, -14); with the executor off that grant is absent and
 # actions record no digest, so they are not undoable.
 #
+# connectorReadsWithoutReconciler (#4800, default false) is for an installation
+# that keeps worker.connectorReconciler off, for example because its hosted
+# connectors are pinned and managed outside Curie. On, the worker Role gains
+# only that single-object `get` on Deployments, none of the reconciler's rules,
+# and the worker reads the acting connector's Deployment and the in-force digest
+# itself; the reconcile loop stays off. An execution whose Deployment cannot be
+# read, or does not serve the in-force digest, is refused
+# `connector_digest_unavailable` before dispatch. Capability probes are still
+# requested only by a reconcile pass, so restores need a recorded capability.
+# Requires enabled: true; a render with the reconciler on fails.
+#
 # maxConcurrentSandboxes (AUTOMATED-REMEDIATION-12, executor amendment E9) is the
 # most executions live (claimed or dispatched) across the installation at once,
 # rendered as CURIE_ACTION_EXECUTOR_MAX_CONCURRENT_SANDBOXES into both the API,
@@ -801,6 +812,7 @@ connectorCaller:
 # write. It leaves sandbox quota to ordinary turns; an integer of at least 1.
 actionExecutor:
   enabled: false
+  connectorReadsWithoutReconciler: false
   maxConcurrentSandboxes: 2
 
 # Automated remediation (AUTOMATED-REMEDIATION-1). One switch, rendered as
@@ -1419,6 +1431,14 @@ api:
   # approval evidence. A sealed install generates and persists this value
   # independently; values-dev.yaml keeps the published deterministic default.
   approvalChatAttesterSecret: curie-dev-approval-chat-attester
+  # Remediation authority key (ADR 0231). Binding (PUT) and arming a remediation
+  # policy need it in X-Curie-Remediation-Authority; the platform key plus an
+  # operator principal is not enough, because every worker holds the platform
+  # key. It MUST differ from apiKey (the render refuses equality) and is mounted
+  # into the API Deployment only. A sealed install generates and persists it;
+  # values-dev.yaml keeps the published deterministic default. Read it back with
+  # kubectl get secret <release>-secrets -o jsonpath='{.data.remediationAuthorityKey}'.
+  remediationAuthorityKey: curie-dev-remediation-authority
   # Probe cadences. Database aware /ready keeps the API out of the Service until
   # Postgres responds, while process local /health keeps the process alive.
   # Liveness must outlast readiness. Cutoffs: readiness 120s, liveness 195s.
@@ -2522,15 +2542,16 @@ ui:
 # ---------------------------------------------------------------------------
 preflights:
   # (a) CPU-AVX / ClickHouse-pin check. Runs as a pre-install/pre-upgrade hook
-  # Job on the cluster. Chart defaults require AVX: clickhouse.image.tag 25.12
+  # Job on the cluster. Chart defaults require AVX on x86: clickhouse.image.tag 25.12
   # is required by langfuse.image.tag 3.225.5 and is not SSE4.2-safe. If the
-  # node lacks AVX the Job FAILS unless the operator pins a tag in
+  # x86 node lacks AVX the Job FAILS unless the operator pins a tag in
   # clickhouse.sse42SafeTags -- catching the exit-132 SIGILL before pods
-  # crash-loop. Skipped when clickhouse.deploy is false (BYO ClickHouse).
+  # crash-loop. Native ARM64 passes without x86 AVX; unsupported architectures
+  # fail. Skipped when clickhouse.deploy is false (BYO ClickHouse).
   avxCheck:
     enabled: true
     image: busybox:1.36.1
-    # Test knob: pretend the node has no AVX. With the default 25.12 tag this
+    # Test knob: simulate an x86 node without AVX, including on ARM64. With the default 25.12 tag this
     # exercises the AVX-required failure branch; pin an sse42SafeTags tag to
     # exercise the older-tag override. Never set true in a real install.
     forceNoAvx: false
@@ -3143,13 +3164,13 @@ security:
   # chart credentials once its design pass lands.)
   checkDefaultCredentials: false
   # Auto-generate per-release chart credentials (issue #195). Default false: a
-  # no-override `helm install` generates strong random values for the thirteen
+  # no-override `helm install` generates strong random values for the fourteen
   # chart owned credentials: the backing store passwords, Langfuse
   # salt/encryptionKey/nextauthSecret, the two init credentials, the
-  # api/webhook keys, worker.internalWorkerToken, and
-  # api.approvalChatAttesterSecret. Set true (values-dev.yaml does) for a
-  # deterministic dev/CI render that keeps the published defaults
-  # byte-for-byte. The eleven non init credentials persist via `lookup`, so
+  # api/webhook keys, worker.internalWorkerToken,
+  # api.approvalChatAttesterSecret, and api.remediationAuthorityKey. Set true
+  # (values-dev.yaml does) for a deterministic dev/CI render that keeps the published defaults
+  # byte-for-byte. The twelve non init credentials persist via `lookup`, so
   # `helm upgrade` re-uses them. Their explicit `--set` overrides and per
   # store `existingSecret` values support
   # rotation and recovery. The two Langfuse init credentials are first boot

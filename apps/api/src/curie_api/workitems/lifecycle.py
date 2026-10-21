@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from curie_telemetry.redact import redact_text
-from sqlalchemy import and_, exists, func, or_, select, update
+from sqlalchemy import and_, case, exists, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -74,9 +74,9 @@ _ACTIVE_STATUSES = ("waiting", "running", "cancellation_requested")
 IN_FLIGHT_PUBLICATION = ("pending", "approved", "launching", "running")
 AWAITING_PUBLICATION = (*IN_FLIGHT_PUBLICATION, "succeeded")
 # A failed finish that never published defers to an in-flight publication (#2577, #3128).
-_UNPUBLISHED_CAUSES = frozenset({"no_pull_request", "early_stop"})
+_UNPUBLISHED_CAUSES = frozenset({"no_pull_request", "early_stop", "revision_unchanged"})
 # Longest provider message a factory notice keeps (#3073).
-_NOTICE_DETAIL_MAX = 1200
+_NOTICE_DETAIL_MAX = 4000
 # Consecutive owner_lost requests a WorkItem runs before a person is needed (ADR 0206).
 OWNER_LOST_RETRY_LIMIT = 3
 
@@ -1403,7 +1403,13 @@ async def terminalize_execution(
     # The CI gate's causes (#3097) end a request whose pull request already
     # opened, so they share the opened-PR deadline exception. Keep this literal
     # equal to ``factory_ci.CI_CAUSES`` (importing it here would be circular).
-    ci_cause = cause.strip() in {"ci_failed", "ci_timeout", "ci_unverified", "merge_conflict"}
+    ci_cause = cause.strip() in {
+        "ci_failed",
+        "ci_timeout",
+        "ci_unverified",
+        "merge_conflict",
+        "pr_closed",
+    }
     opened = (status == "completed" or ci_cause) and await _opened_pull_request(
         session, work_item, request
     )
@@ -1692,6 +1698,21 @@ async def hold_for_ci_fix(
     return changed_id is not None
 
 
+def _release_parked_hold() -> ColumnElement[datetime]:
+    # hold_for_approval / hold_for_ci_fix park the lease at the execution
+    # deadline so owner loss cannot reclaim waiting work. An explicit stop must
+    # let any worker claim termination (#4627), so expire a parked hold now. An
+    # ordinary short live lease is kept so claim_termination still fences a
+    # live owner.
+    return case(
+        (
+            ExecutionRequest.runtime_heartbeat_expires_at == ExecutionRequest.execution_deadline,
+            func.clock_timestamp(),
+        ),
+        else_=ExecutionRequest.runtime_heartbeat_expires_at,
+    )
+
+
 async def request_cancellation(
     session: AsyncSession,
     *,
@@ -1776,6 +1797,7 @@ async def request_cancellation(
                 status="cancellation_requested",
                 terminal_cause="issue_cancelled",
                 cancellation_requested_at=now,
+                runtime_heartbeat_expires_at=_release_parked_hold(),
                 version=ExecutionRequest.version + 1,
                 updated_at=func.clock_timestamp(),
             )
@@ -1855,6 +1877,7 @@ async def readmit(
                     status="cancellation_requested",
                     terminal_cause="issue_cancelled",
                     cancellation_requested_at=now,
+                    runtime_heartbeat_expires_at=_release_parked_hold(),
                     version=ExecutionRequest.version + 1,
                     updated_at=func.clock_timestamp(),
                 )

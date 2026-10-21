@@ -59,6 +59,7 @@ from starlette.requests import Request
 from starlette.responses import Response
 from starlette.routing import Route
 
+from forge_fakes import factory_wake
 from forge_fakes import gitlab as gitlab_fake
 from forge_fakes.github import forges_env_json
 from forge_fakes.github_comments import _clear_ci_keys, _rows
@@ -599,7 +600,9 @@ def start_request(request_id: uuid.UUID) -> int:
         try:
             async with AsyncSession(engine) as session:
                 acquired = await acquire(
-                    session, request_id, owner="gitlab-owner", generation=generation
+                    session, request_id, owner="gitlab-owner", generation=generation,
+                    wake=await factory_wake(session, request_id),
+                    context=None,
                 )
                 assert not isinstance(acquired, DispatchConflict), acquired
                 started = await start(
@@ -609,6 +612,7 @@ def start_request(request_id: uuid.UUID) -> int:
                     generation=generation,
                     claim_name="claim-gitlab",
                     sandbox_name="sbx-gitlab",
+                    context=acquired.context,
                 )
                 assert not isinstance(started, DispatchConflict), started
                 return int(started.runtime_epoch)

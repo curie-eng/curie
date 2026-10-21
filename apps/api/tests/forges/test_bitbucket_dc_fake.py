@@ -117,6 +117,7 @@ def _port_calls(
             pull, title="t", body=None
         ),
         Operation.READ_PULL_REQUEST: lambda: adapter.read_pull_request(pull),
+        Operation.LIST_FACTORY_PUBLICATIONS: lambda: adapter.list_factory_publications(repo),
         Operation.OBSERVE_CI: lambda: adapter.observe_ci(repo, sha),
         Operation.LIST_REVIEW_FEEDBACK: lambda: adapter.list_review_feedback(pull, None),
         Operation.VERIFY_FEEDBACK: lambda: adapter.verify_feedback(feedback),
@@ -379,13 +380,16 @@ async def test_bitbucket_dc_resolve_by_numeric_id_pages_the_repos(
 
 
 @pytest.mark.anyio
-async def test_bitbucket_dc_credential_is_bearer_on_the_base_url(
+async def test_bitbucket_dc_credential_is_bearer_on_the_scm_origin(
     fake: BitbucketDcFake, adapter: Any
 ) -> None:
-    credential = await adapter.credential(fake.repository(), CredentialScope.PUSH)
+    repository = fake.repository()
+    credential = await adapter.credential(repository, CredentialScope.PUSH)
 
     assert credential.header is CredentialHeader.AUTHORIZATION_BEARER
-    assert credential.origin == API_URL
+    assert credential.origin == f"{API_URL}/scm"
+    # Every consumer derives the clone URL as <origin>/<path>.git.
+    assert f"{credential.origin}/{repository.path}.git" == f"{API_URL}/scm/FAC/demo.git"
     assert credential.scope is CredentialScope.PUSH
     assert credential.git_header() == f"Authorization: Bearer {FACTORY_TOKEN}"
     assert FACTORY_TOKEN not in repr(credential)
@@ -402,7 +406,7 @@ async def test_bitbucket_dc_renamed_repository_is_refused_for_a_credential(
     with pytest.raises(NotFound):
         await adapter.credential(stored, CredentialScope.CLONE)
     current = RepositoryRef(types.BITBUCKET_DC, HOST, "1", "FAC/demo-renamed")
-    assert (await adapter.credential(current, CredentialScope.CLONE)).origin == API_URL
+    assert (await adapter.credential(current, CredentialScope.CLONE)).origin == f"{API_URL}/scm"
 
 
 @pytest.mark.anyio

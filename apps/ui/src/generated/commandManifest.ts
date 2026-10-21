@@ -2216,7 +2216,7 @@ export const commandManifest = {
           ]
         },
         {
-          "about": "A protected hook's remediation policy: show it, apply a document, arm, disarm or remove it, or close an open circuit breaker. Writes run as the operator principal in CURIE_APPROVAL_PRINCIPAL_TOKEN",
+          "about": "A protected hook's remediation policy: show it, apply a document, arm, disarm or remove it, or close an open circuit breaker. Writes run as the operator principal in CURIE_APPROVAL_PRINCIPAL_TOKEN; apply and arm also need the remediation authority in CURIE_REMEDIATION_AUTHORITY_KEY",
           "hidden": false,
           "name": "remediation-policy",
           "subcommands": [
@@ -2263,7 +2263,7 @@ export const commandManifest = {
               "name": "show"
             },
             {
-              "about": "Bind or replace a hook's policy from a JSON document (`PUT`). The document is validated with the platform's rules before any request",
+              "about": "Bind or replace a hook's policy from a JSON document (`PUT`). The document is validated with the platform's rules before any request. Needs the remediation authority in CURIE_REMEDIATION_AUTHORITY_KEY",
               "args": [
                 {
                   "global": false,
@@ -2329,7 +2329,7 @@ export const commandManifest = {
               "name": "apply"
             },
             {
-              "about": "Arm the current policy so its automatic actions may run (`POST .../arm`)",
+              "about": "Arm the current policy so its automatic actions may run (`POST .../arm`). Needs the remediation authority in CURIE_REMEDIATION_AUTHORITY_KEY",
               "args": [
                 {
                   "global": false,
@@ -3013,6 +3013,14 @@ export const commandManifest = {
               "help": "Administratively mint a reusable, subject-bound operator principal. The token is delivered once; export it as CURIE_APPROVAL_PRINCIPAL_TOKEN before resolving",
               "id": "mint_operator_principal",
               "long": "mint-operator-principal",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Administratively mint a reusable, subject-bound remediation operator principal (scope remediation.administer) for remediation policy, breaker, and qualification writes. The token is delivered once; export it as CURIE_APPROVAL_PRINCIPAL_TOKEN for those writes. It cannot resolve approvals",
+              "id": "mint_remediation_principal",
+              "long": "mint-remediation-principal",
               "positional": false,
               "required": false
             },
@@ -6816,6 +6824,210 @@ export const commandManifest = {
           "name": "callers"
         },
         {
+          "about": "Show or change which IdP teams may invoke the agent and approve for it (`GET`/`PUT /agents/{id}/access-policy`, ADR 0220)",
+          "args": [
+            {
+              "global": false,
+              "help": "Agent name or id",
+              "id": "agent",
+              "positional": true,
+              "required": true
+            },
+            {
+              "global": false,
+              "help": "The team whose members may start a turn with the agent",
+              "id": "invocation_team",
+              "long": "invocation-team",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "The team whose members may resolve the agent's approvals",
+              "id": "approver_team",
+              "long": "approver-team",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Remove the invocation team, so today's caller rules apply",
+              "id": "clear_invocation_team",
+              "long": "clear-invocation-team",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Remove the approver team, so each route's approvers apply",
+              "id": "clear_approver_team",
+              "long": "clear-approver-team",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "env": "CURIE_API_URL",
+              "global": false,
+              "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
+              "id": "api_url",
+              "long": "api-url",
+              "positional": false,
+              "required": false
+            },
+            {
+              "env": "CURIE_API_KEY",
+              "global": false,
+              "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+              "id": "api_key",
+              "long": "api-key",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "env": "CURIE_NAMESPACE",
+              "global": false,
+              "help": "Kubernetes namespace of the release. Default: curie",
+              "id": "namespace",
+              "long": "namespace",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "global": false,
+              "help": "Helm release name. Default: curie",
+              "id": "release",
+              "long": "release",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Print what would be done and exit without making a request",
+              "id": "dry_run",
+              "long": "dry-run",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "long_about": "Show or change which IdP teams may invoke the agent and approve for it (`GET`/`PUT /agents/{id}/access-policy`, ADR 0220).\n\nWith no team flag this shows the policy. A team is named by its id, as `GET /teams` lists it, and must be an IdP group team of the agent's tenant. A role left unmentioned keeps its team. The write sends back the version it read, so a concurrent change is refused rather than overwritten. Each configured role is enforced on every channel.",
+          "name": "access-policy"
+        },
+        {
+          "about": "Inspect tenant identities or apply IdP configuration, namespace or team JSON. Writes use the API's expected-version contract; links and people are read-only",
+          "args": [
+            {
+              "global": false,
+              "id": "tenant",
+              "long": "tenant",
+              "positional": false,
+              "required": true
+            },
+            {
+              "global": false,
+              "id": "resource",
+              "long": "resource",
+              "positional": false,
+              "possible_values": [
+                "config",
+                "people",
+                "links",
+                "namespaces",
+                "teams"
+              ],
+              "required": true
+            },
+            {
+              "global": false,
+              "help": "JSON request file. Config uses PUT; namespaces and teams use POST",
+              "id": "apply",
+              "long": "apply",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Continue a bounded people, links or namespaces page",
+              "id": "after",
+              "long": "after",
+              "positional": false,
+              "required": false
+            },
+            {
+              "env": "CURIE_API_URL",
+              "global": false,
+              "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
+              "id": "api_url",
+              "long": "api-url",
+              "positional": false,
+              "required": false
+            },
+            {
+              "env": "CURIE_API_KEY",
+              "global": false,
+              "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+              "id": "api_key",
+              "long": "api-key",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "env": "CURIE_NAMESPACE",
+              "global": false,
+              "help": "Kubernetes namespace of the release. Default: curie",
+              "id": "namespace",
+              "long": "namespace",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "global": false,
+              "help": "Helm release name. Default: curie",
+              "id": "release",
+              "long": "release",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "id": "dry_run",
+              "long": "dry-run",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "directory"
+        },
+        {
           "about": "Mint or inspect the mail adapter's channel token (`POST /channels/token`)",
           "args": [
             {
@@ -8101,7 +8313,7 @@ export const commandManifest = {
           ]
         },
         {
-          "about": "A protected hook's remediation policy: show it, apply a document, arm, disarm or remove it, or close an open circuit breaker. Writes run as the operator principal in CURIE_APPROVAL_PRINCIPAL_TOKEN",
+          "about": "A protected hook's remediation policy: show it, apply a document, arm, disarm or remove it, or close an open circuit breaker. Writes run as the operator principal in CURIE_APPROVAL_PRINCIPAL_TOKEN; apply and arm also need the remediation authority in CURIE_REMEDIATION_AUTHORITY_KEY",
           "hidden": false,
           "name": "remediation-policy",
           "subcommands": [
@@ -8168,7 +8380,7 @@ export const commandManifest = {
               "name": "show"
             },
             {
-              "about": "Bind or replace a hook's policy from a JSON document (`PUT`). The document is validated with the platform's rules before any request",
+              "about": "Bind or replace a hook's policy from a JSON document (`PUT`). The document is validated with the platform's rules before any request. Needs the remediation authority in CURIE_REMEDIATION_AUTHORITY_KEY",
               "args": [
                 {
                   "global": false,
@@ -8254,7 +8466,7 @@ export const commandManifest = {
               "name": "apply"
             },
             {
-              "about": "Arm the current policy so its automatic actions may run (`POST .../arm`)",
+              "about": "Arm the current policy so its automatic actions may run (`POST .../arm`). Needs the remediation authority in CURIE_REMEDIATION_AUTHORITY_KEY",
               "args": [
                 {
                   "global": false,
@@ -9165,6 +9377,14 @@ export const commandManifest = {
             },
             {
               "global": false,
+              "help": "Administratively mint a reusable, subject-bound remediation operator principal (scope remediation.administer) for remediation policy, breaker, and qualification writes. The token is delivered once; export it as CURIE_APPROVAL_PRINCIPAL_TOKEN for those writes. It cannot resolve approvals",
+              "id": "mint_remediation_principal",
+              "long": "mint-remediation-principal",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
               "help": "Administratively mint a single-use, subject-bound Console login code",
               "id": "mint_console_login_code",
               "long": "mint-console-login-code",
@@ -9433,7 +9653,7 @@ export const commandManifest = {
                 "github"
               ],
               "global": false,
-              "help": "Code host the factory publishes to. Only github is installed in this build",
+              "help": "Code host the factory publishes to: github, gitlab with --tracker gitlab, or bitbucket-cloud or bitbucket-dc with --tracker jira-cloud",
               "id": "code_host",
               "long": "code-host",
               "positional": false,
@@ -9450,7 +9670,7 @@ export const commandManifest = {
                 "github"
               ],
               "global": false,
-              "help": "Tracker the factory takes issues from: github, or jira-cloud with --code-host github",
+              "help": "Tracker the factory takes issues from: github, gitlab, or jira-cloud with --code-host github, bitbucket-cloud or bitbucket-dc",
               "id": "tracker",
               "long": "tracker",
               "positional": false,
@@ -9514,6 +9734,22 @@ export const commandManifest = {
               "help": "Jira groupId whose members may start work. Refused for github",
               "id": "start_group",
               "long": "start-group",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Jira Cloud site or API gateway URL beside a Bitbucket code host, whose own URL is --forge-url. Refused for any other pairing",
+              "id": "tracker_url",
+              "long": "tracker-url",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "File holding the Jira API token beside a Bitbucket code host, whose own token is --token-file. Refused for any other pairing",
+              "id": "tracker_token_file",
+              "long": "tracker-token-file",
               "positional": false,
               "required": false
             }

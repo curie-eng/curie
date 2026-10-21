@@ -1014,7 +1014,7 @@ impl crate::ui::CliOutput for ClusterStatusOutput {
                     url.render(ui);
                 }
                 for line in &s.credentials {
-                    ui.payload(&line.summary());
+                    ui.payload(&line.status_line());
                 }
                 ui.payload(&format!(
                     "upgrade {} · phase {} · known-good {}",
@@ -1096,6 +1096,113 @@ fn unresolved_context_error(
             "rerun with an explicit context: `curie cluster --context <name> status`; available contexts: {names}"
         )),
     )
+}
+
+/// Port-forward readiness budget for the credential health read; matches
+/// `message::start_port_forward`'s own readiness deadline.
+const HEALTH_PORT_FORWARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// Request budget for `GET /forges/credentials/health`.
+const HEALTH_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Overall budget for the whole credential health read: key discovery
+/// (kubectl and helm), the port-forward and the request.
+const HEALTH_READ_OVERALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// The overall budget. Debug builds only: `CURIE_TEST_HEALTH_READ_DEADLINE_MS`
+/// shortens it (never lengthens it) so a test can prove a hung discovery.
+fn health_read_overall_timeout() -> std::time::Duration {
+    #[cfg(debug_assertions)]
+    if let Ok(raw) = std::env::var("CURIE_TEST_HEALTH_READ_DEADLINE_MS") {
+        if let Ok(milliseconds) = raw.parse::<u64>() {
+            if (1..=HEALTH_READ_OVERALL_TIMEOUT.as_millis() as u64).contains(&milliseconds) {
+                return std::time::Duration::from_millis(milliseconds);
+            }
+        }
+    }
+    HEALTH_READ_OVERALL_TIMEOUT
+}
+
+/// Why the credential health report could not be read. Only the class is ever
+/// shown: no error text, URL with a key, or response body reaches output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HealthReadFailure {
+    ApiKey,
+    PortForward,
+    Timeout,
+    Request,
+}
+
+impl HealthReadFailure {
+    pub(crate) fn describe(self) -> &'static str {
+        match self {
+            HealthReadFailure::ApiKey => "the release API key could not be discovered",
+            HealthReadFailure::PortForward => "the API port-forward did not open",
+            HealthReadFailure::Timeout => {
+                "the API did not answer GET /forges/credentials/health in time"
+            }
+            HealthReadFailure::Request => "GET /forges/credentials/health failed",
+        }
+    }
+}
+
+/// Read the API's forge credential health report over a short-lived
+/// port-forward (#4630). The discovered key goes only into the `X-API-Key`
+/// header; a failure is reported by class alone.
+async fn read_forge_credential_health(
+    opts: &CommonOpts,
+    fullname: &ReleaseFullname,
+) -> std::result::Result<crate::api::ForgeCredentialHealthReport, HealthReadFailure> {
+    // One deadline over every step. Dropping the future on timeout kills the
+    // kubectl/helm children (`kill_on_drop` in run_capture and the port-forward).
+    tokio::time::timeout(
+        health_read_overall_timeout(),
+        read_forge_credential_health_steps(opts, fullname),
+    )
+    .await
+    .map_err(|_| HealthReadFailure::Timeout)?
+}
+
+async fn read_forge_credential_health_steps(
+    opts: &CommonOpts,
+    fullname: &ReleaseFullname,
+) -> std::result::Result<crate::api::ForgeCredentialHealthReport, HealthReadFailure> {
+    let api_key = discover_api_key(&opts.namespace, &opts.release)
+        .await
+        .map_err(|_| HealthReadFailure::ApiKey)?;
+    let forward = crate::message::port_forward_command(
+        &opts.namespace,
+        fullname,
+        "api",
+        0,
+        crate::message::API_REMOTE_PORT,
+    );
+    let (_child, port) = tokio::time::timeout(
+        HEALTH_PORT_FORWARD_TIMEOUT + std::time::Duration::from_secs(1),
+        crate::message::start_port_forward(&forward, 0, "credential health api"),
+    )
+    .await
+    .map_err(|_| HealthReadFailure::PortForward)?
+    .map_err(|_| HealthReadFailure::PortForward)?;
+    let client =
+        crate::api::ApiClient::with_resolved_key(&format!("http://127.0.0.1:{port}"), &api_key)
+            .map_err(|_| HealthReadFailure::Request)?;
+    tokio::time::timeout(
+        HEALTH_REQUEST_TIMEOUT,
+        client.forge_credential_health(HEALTH_REQUEST_TIMEOUT),
+    )
+    .await
+    .map_err(|_| HealthReadFailure::Timeout)?
+    .map_err(|error| {
+        if error
+            .chain()
+            .filter_map(|cause| cause.downcast_ref::<reqwest::Error>())
+            .any(reqwest::Error::is_timeout)
+        {
+            HealthReadFailure::Timeout
+        } else {
+            HealthReadFailure::Request
+        }
+    })
 }
 
 pub async fn status(opts: CommonOpts, context_resolved: bool) -> Result<ClusterStatusOutput> {
@@ -1202,7 +1309,13 @@ pub async fn status(opts: CommonOpts, context_resolved: bool) -> Result<ClusterS
         unhealthy.push("could not list release pods".to_string());
     }
 
-    let (ui_url, langfuse_url, worker_claims, delivery) = tokio::join!(
+    let mut credentials = match &computed {
+        Ok(Some(values)) => crate::forge_expiry::report(values, time::OffsetDateTime::now_utc()),
+        _ => Vec::new(),
+    };
+    let read_health = !credentials.is_empty() && helm_ok;
+
+    let (ui_url, langfuse_url, worker_claims, delivery, health) = tokio::join!(
         resolve_service_url(&opts, &fullname, "ui", "UI", &host, true),
         resolve_service_url(&opts, &fullname, "langfuse-web", "Langfuse", &host, false),
         worker_claim_probe.observe(),
@@ -1218,6 +1331,13 @@ pub async fn status(opts: CommonOpts, context_resolved: bool) -> Result<ClusterS
                         .await
                 }
                 Err(_) => None,
+            }
+        },
+        async {
+            if read_health {
+                Some(read_forge_credential_health(&opts, &fullname).await)
+            } else {
+                None
             }
         },
     );
@@ -1254,14 +1374,21 @@ pub async fn status(opts: CommonOpts, context_resolved: bool) -> Result<ClusterS
         None => crate::completion_outbox::Report::unknown(),
     };
 
-    let credentials = match &computed {
-        Ok(Some(values)) => crate::forge_expiry::report(values, time::OffsetDateTime::now_utc()),
-        _ => Vec::new(),
-    };
     for line in &credentials {
         if let Some(warning) = &line.warning {
             warnings.push(format!("{}: {warning}", line.summary()));
         }
+    }
+    if let Some(health) = health {
+        let (entries, read_failure) = match &health {
+            Ok(report) => (Some(report.entries.as_slice()), None),
+            Err(failure) => (None, Some(failure.describe())),
+        };
+        crate::forge_expiry::merge_authentication(&mut credentials, entries);
+        let (rejected, unknown) =
+            crate::forge_expiry::authentication_diagnoses(&credentials, read_failure);
+        unhealthy.extend(rejected);
+        warnings.extend(unknown);
     }
 
     if upgrade.known_good_version.is_none() && helm_ok {
@@ -2831,6 +2958,31 @@ fn deployed_release_namespace(
     Ok(None)
 }
 
+fn deployed_curie_releases_in_namespace(output: &str, namespace: &str) -> Result<Vec<String>> {
+    let mut names = Vec::new();
+    for entry in helm_release_entries(output)? {
+        if entry.get("namespace").and_then(|value| value.as_str()) != Some(namespace)
+            || entry.get("status").and_then(|value| value.as_str()) != Some("deployed")
+            || !entry
+                .get("chart")
+                .and_then(|value| value.as_str())
+                .and_then(|chart| chart.strip_prefix("curie-"))
+                .and_then(|version| version.as_bytes().first())
+                .is_some_and(|digit| digit.is_ascii_digit())
+        {
+            continue;
+        }
+        let name = entry
+            .get("name")
+            .and_then(|value| value.as_str())
+            .filter(|name| !name.is_empty())
+            .context("malformed Helm release list JSON: deployed Curie release has no name")?;
+        names.push(name.to_string());
+    }
+    names.sort();
+    Ok(names)
+}
+
 /// Discover a Helm release's platform API key by reading it out of the chart
 /// Secret (data key `apiKey`), whose name is discovered by label selector
 /// rather than computed -- see [`release_secret_name`] -- decoded server-side
@@ -2903,12 +3055,13 @@ pub async fn discover_api_key(namespace: &str, release: &str) -> Result<String> 
             plain("json"),
         ],
     );
-    let deployed_alternate = match run_capture(&all_cmd).await {
-        Ok((true, all_output, _)) => {
-            deployed_release_namespace(&all_output, release, namespace).unwrap_or(None)
-        }
+    let all_output = match run_capture(&all_cmd).await {
+        Ok((true, output, _)) => Some(output),
         _ => None,
     };
+    let deployed_alternate = all_output
+        .as_deref()
+        .and_then(|output| deployed_release_namespace(output, release, namespace).unwrap_or(None));
 
     let status_command =
         format!("`curie cluster status --namespace {namespace} --release {release}`");
@@ -2931,12 +3084,38 @@ pub async fn discover_api_key(namespace: &str, release: &str) -> Result<String> 
             ),
             format!("retry this command with `--namespace {alternate_namespace}`"),
         ),
-        (None, None) => (
-            format!(
-                "no deployed release named {release} was found in namespace {namespace}; inspect the target with {status_command}"
-            ),
-            format!("run {status_command} and deploy the release before retrying"),
-        ),
+        (None, None) => {
+            let candidates = all_output
+                .as_deref()
+                .and_then(|output| deployed_curie_releases_in_namespace(output, namespace).ok())
+                .unwrap_or_default();
+            match candidates.as_slice() {
+                [] => {
+                    let list_command = format!("`helm list -n {namespace}`");
+                    (
+                        format!(
+                            "no deployed release named {release} was found in namespace {namespace}; inspect the target with {list_command}"
+                        ),
+                        format!("run {list_command} and deploy the release before retrying"),
+                    )
+                }
+                [candidate] => (
+                    format!(
+                        "no deployed release named {release} was found in namespace {namespace}; the Curie release in that namespace is {candidate}. Retry this command with `--release {candidate}`"
+                    ),
+                    format!("retry this command with `--release {candidate}`"),
+                ),
+                _ => {
+                    let names = candidates.join(", ");
+                    (
+                        format!(
+                            "no deployed release named {release} was found in namespace {namespace}; the Curie releases in that namespace are {names}. Retry this command with `--release <one of: {names}>`"
+                        ),
+                        format!("retry this command with `--release <one of: {names}>`"),
+                    )
+                }
+            }
+        }
     };
     Err(crate::exit::CliError::usage(message).with_fix(fix).into())
 }
@@ -3053,7 +3232,7 @@ esac
             r#"#!/bin/sh
 printf '%s\n' "$*" >> "$CURIE_TEST_HELM_LOG"
 case "$*" in
-  *"-n curie"*)
+  *"list -n "*)
     case "$*" in
       *"--all"*) printf '%s\n' "$CURIE_TEST_HELM_REQUESTED" ;;
       *) printf '%s\n' "${CURIE_TEST_HELM_REQUESTED_DEFAULT:-$CURIE_TEST_HELM_REQUESTED}" ;;
@@ -3104,6 +3283,239 @@ esac
                 .any(|line| line == "list -A --all -o json"),
             "the all namespace release state was not read: {invocations}"
         );
+    }
+
+    async fn discover_release_in_namespace_error(
+        requested: &str,
+        all: &str,
+        all_forbidden: bool,
+    ) -> anyhow::Error {
+        let _lock = crate::PROCESS_ENV_LOCK.lock().await;
+        let tools = tempfile::tempdir().expect("create fake cluster tools");
+        let _restore = install_cluster_diagnosis_tools(tools.path());
+        let log = tools.path().join("helm.log");
+        std::env::set_var("CURIE_TEST_HELM_LOG", &log);
+        std::env::set_var("CURIE_TEST_HELM_REQUESTED", requested);
+        std::env::set_var("CURIE_TEST_HELM_REQUESTED_DEFAULT", "[]");
+        std::env::set_var("CURIE_TEST_HELM_ALL", all);
+        std::env::set_var("CURIE_TEST_HELM_ALL_DEFAULT", "[]");
+        std::env::set_var(
+            "CURIE_TEST_HELM_ALL_FORBIDDEN",
+            if all_forbidden { "1" } else { "0" },
+        );
+
+        let error = discover_api_key("demo", "curie")
+            .await
+            .expect_err("release advice must not adopt a different release or yield an API key");
+        let invocations = std::fs::read_to_string(log).expect("read Helm invocation log");
+        assert_eq!(
+            invocations.lines().collect::<Vec<_>>(),
+            ["list -n demo --all -o json", "list -A --all -o json"],
+            "release diagnosis must read pending states and reuse the all-namespace listing"
+        );
+        error
+    }
+
+    fn assert_release_in_namespace_guidance(
+        error: &anyhow::Error,
+        expected_message: &str,
+        expected_fix: &str,
+    ) {
+        assert_eq!(error.to_string(), expected_message);
+        let (class, fix) = crate::exit::classify(error);
+        assert_eq!(class, crate::exit::ExitClass::Usage);
+        assert_eq!(fix.as_deref(), Some(expected_fix));
+        assert_eq!(
+            crate::exit::error_json(error),
+            serde_json::json!({"error": expected_message, "fix": expected_fix})
+        );
+    }
+
+    fn assert_release_in_namespace_listing_fallback(error: &anyhow::Error) {
+        let message = error.to_string();
+        let (class, fix) = crate::exit::classify(error);
+        assert_eq!(class, crate::exit::ExitClass::Usage);
+        assert!(
+            message.starts_with("no deployed release named curie was found in namespace demo;"),
+            "missing release diagnosis was lost: {message}"
+        );
+        assert!(
+            message.contains("`helm list -n demo`"),
+            "missing namespace listing advice: {message}"
+        );
+        let fix = fix.expect("missing structured namespace listing fix");
+        assert!(
+            fix.contains("`helm list -n demo`"),
+            "the structured fix must inspect the namespace: {fix}"
+        );
+        for advice in [&message, &fix] {
+            assert!(
+                !advice.contains("curie cluster status")
+                    && !advice.contains("--release")
+                    && !advice.contains("--api-key")
+                    && !advice.contains("CURIE_API_KEY"),
+                "missing release advice guessed a target or offered a key remedy: {advice}"
+            );
+        }
+        assert_eq!(
+            crate::exit::error_json(error),
+            serde_json::json!({"error": message, "fix": fix})
+        );
+    }
+
+    // Observed with Helm v3.16.4: `helm list -n demo --all -o json` returned an array
+    // with name="demo", namespace="demo", chart="curie-0.13.0", and status="deployed";
+    // status was also observed as "pending-upgrade" during upgrade.
+    #[tokio::test]
+    async fn release_in_namespace_names_the_only_deployed_curie_release() {
+        let listing =
+            r#"[{"name":"demo","namespace":"demo","status":"deployed","chart":"curie-0.13.0"}]"#;
+        let error = discover_release_in_namespace_error(listing, listing, false).await;
+
+        assert_release_in_namespace_guidance(
+            &error,
+            "no deployed release named curie was found in namespace demo; the Curie release in that namespace is demo. Retry this command with `--release demo`",
+            "retry this command with `--release demo`",
+        );
+    }
+
+    #[tokio::test]
+    async fn release_in_namespace_sorts_multiple_candidates_and_ignores_other_charts() {
+        let listing = r#"[
+            {"name":"zeta","namespace":"demo","status":"deployed","chart":"curie-0.13.0"},
+            {"name":"cache","namespace":"demo","status":"deployed","chart":"valkey-1.0.0"},
+            {"name":"alpha","namespace":"demo","status":"deployed","chart":"curie-1.2.3"}
+        ]"#;
+        let error = discover_release_in_namespace_error(listing, listing, false).await;
+        let message = error.to_string();
+
+        assert!(
+            message.starts_with("no deployed release named curie was found in namespace demo;"),
+            "missing release diagnosis was lost: {message}"
+        );
+        assert!(
+            message.contains("alpha, zeta"),
+            "candidate names must be sorted and comma-separated: {message}"
+        );
+        assert!(
+            message.contains("`--release <one of: alpha, zeta>`"),
+            "multiple candidates need an explicit choice: {message}"
+        );
+        assert!(
+            !message.contains("cache"),
+            "an unrelated chart was offered as a Curie release: {message}"
+        );
+        assert_release_in_namespace_guidance(
+            &error,
+            &message,
+            "retry this command with `--release <one of: alpha, zeta>`",
+        );
+    }
+
+    #[tokio::test]
+    async fn release_in_namespace_rejects_non_candidates() {
+        for (name, namespace, chart, status) in [
+            ("unrelated", "demo", "valkey-1.0.0", "deployed"),
+            ("addon", "demo", "curie-addon-0.13.0", "deployed"),
+            ("prefixed-version", "demo", "curie-v0.13.0", "deployed"),
+            ("empty-suffix", "demo", "curie-", "deployed"),
+            ("bare-chart", "demo", "curie", "deployed"),
+            ("other-namespace", "other", "curie-0.13.0", "deployed"),
+            ("failed-release", "demo", "curie-0.13.0", "failed"),
+            ("pending-release", "demo", "curie-0.13.0", "pending-upgrade"),
+        ] {
+            let listing = serde_json::json!([{
+                "name": name,
+                "namespace": namespace,
+                "chart": chart,
+                "status": status,
+            }])
+            .to_string();
+            let requested = if namespace == "demo" { &listing } else { "[]" };
+            let error = discover_release_in_namespace_error(requested, &listing, false).await;
+
+            assert_release_in_namespace_listing_fallback(&error);
+        }
+    }
+
+    #[tokio::test]
+    async fn release_in_namespace_falls_back_when_listing_is_empty_malformed_or_failed() {
+        for (listing, all_forbidden) in [
+            ("[]", false),
+            ("", false),
+            ("not-json", false),
+            ("{}", false),
+            (
+                r#"[{"name":"demo","namespace":"demo","status":"deployed","chart":"curie-0.13.0"}]"#,
+                true,
+            ),
+        ] {
+            let error = discover_release_in_namespace_error("[]", listing, all_forbidden).await;
+
+            assert_release_in_namespace_listing_fallback(&error);
+        }
+    }
+
+    #[tokio::test]
+    async fn release_in_namespace_preserves_alternate_namespace_precedence() {
+        let requested =
+            r#"[{"name":"demo","namespace":"demo","status":"deployed","chart":"curie-0.13.0"}]"#;
+        let all = r#"[
+            {"name":"demo","namespace":"demo","status":"deployed","chart":"curie-0.13.0"},
+            {"name":"curie","namespace":"healthy","status":"deployed","chart":"curie-0.13.0"}
+        ]"#;
+        let error = discover_release_in_namespace_error(requested, all, false).await;
+
+        assert_release_in_namespace_guidance(
+            &error,
+            "no release named curie was found in namespace demo; a deployed release with that name is available in namespace healthy. Retry this command with `--namespace healthy`",
+            "retry this command with `--namespace healthy`",
+        );
+    }
+
+    #[tokio::test]
+    async fn release_in_namespace_preserves_failed_release_alternate_namespace_precedence() {
+        let requested = r#"[
+            {"name":"curie","namespace":"demo","status":"failed","chart":"curie-0.13.0"},
+            {"name":"demo","namespace":"demo","status":"deployed","chart":"curie-0.13.0"}
+        ]"#;
+        let all = r#"[
+            {"name":"curie","namespace":"demo","status":"failed","chart":"curie-0.13.0"},
+            {"name":"demo","namespace":"demo","status":"deployed","chart":"curie-0.13.0"},
+            {"name":"curie","namespace":"healthy","status":"deployed","chart":"curie-0.13.0"}
+        ]"#;
+        let error = discover_release_in_namespace_error(requested, all, false).await;
+
+        assert_release_in_namespace_guidance(
+            &error,
+            "release curie in namespace demo is failed, not deployed; a deployed release named curie is available in namespace healthy. Inspect the failed release with `curie cluster status --namespace demo --release curie` or retry this command with `--namespace healthy`",
+            "retry this command with `--namespace healthy`",
+        );
+    }
+
+    #[tokio::test]
+    async fn release_in_namespace_preserves_requested_failed_and_pending_states() {
+        for status in [
+            "failed",
+            "pending-install",
+            "pending-upgrade",
+            "pending-rollback",
+        ] {
+            let listing = serde_json::json!([
+                {"name":"curie","namespace":"demo","status":status,"chart":"curie-0.13.0"},
+                {"name":"demo","namespace":"demo","status":"deployed","chart":"curie-0.13.0"},
+            ])
+            .to_string();
+            let error = discover_release_in_namespace_error(&listing, &listing, false).await;
+
+            assert_release_in_namespace_guidance(
+                &error,
+                &format!(
+                    "release curie in namespace demo is {status}, not deployed; inspect its state with `curie cluster status --namespace demo --release curie`"
+                ),
+                "run `curie cluster status --namespace demo --release curie` and repair or redeploy the release",
+            );
+        }
     }
 
     #[tokio::test]

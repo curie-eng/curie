@@ -785,7 +785,7 @@ def build(
                     ConsumerLivenessStore(async_redis),
                     stream=config.stream,
                     group=config.consumer_group,
-                ).is_alive,
+                ),
                 self_name=config.consumer_name,
                 locally_owned=kernel.owns_work_item,
                 absence_proof_s=config.consumer_heartbeat_ttl_ms / 1000,
@@ -1038,15 +1038,16 @@ def _build_action_recorder(
 ) -> ActionRecorder:
     """The ledger client, wrapped to attribute connector digests where it can.
 
-    @spec ACTION-EXECUTOR-12: only on the cluster tier with the connector
-    reconciler (which owns the Deployments read) and the executor (whose chart
-    gate is what grants the worker ``get`` on Deployments) both enabled, and an
-    internal worker token to send attribution under. With either flag off the
+    @spec ACTION-EXECUTOR-12: only on the cluster tier with the executor
+    enabled and its connector reads on (``WorkerConfig.executor_reads_connectors``:
+    the connector reconciler, or the executor's own reads without it, #4800),
+    which is exactly when the chart grants the worker ``get`` on Deployments,
+    and an internal worker token to send attribution under. Otherwise the
     worker Role has no such ``get``, so the wrapper is not composed and every
     action records a null digest, as on the local tier.
     """
 
-    if not (config.connector_reconcile_enabled and config.action_executor_enabled):
+    if not config.executor_reads_connectors:
         return client
     if not config.internal_worker_token:
         # The API takes attribution only under the worker token; without one
@@ -1094,10 +1095,14 @@ def _build_action_executor(
     nothing. The executor routes take only the internal worker token, so a
     worker without one cannot run it.
 
-    Tiers. With the connector reconciler on (the cluster tier) the loop reads
-    the connector Deployment, which the chart lets the worker ``get`` only with
-    the executor enabled, and the in-force digest from the same API render the
-    reconciler applies. Without it (the local tier) there is no Deployment and
+    Tiers. With the executor's connector reads on (the cluster tier, with the
+    connector reconciler or, #4800, the executor's own reads while the
+    reconcile loop stays off) the loop reads the connector Deployment, which
+    the chart lets the worker ``get`` only with the executor enabled, and the
+    in-force digest from the same API render the reconciler applies. An
+    unreadable Deployment or a digest that does not match refuses
+    ``connector_digest_unavailable`` before any sandbox claim. Without either
+    (the local tier) there is no Deployment and
     no caller proxy: every restore refuses ``tool_not_grant_bound`` and every
     probe ``connector_digest_unavailable``, which is what the local tier proves
     (ACTION-EXECUTOR-7). No consumer, stream, thread lock or marker is touched.
@@ -1114,9 +1119,14 @@ def _build_action_executor(
 
     deployments = None
     manifests = None
-    if config.connector_reconcile_enabled:
+    if config.executor_reads_connectors:
         from .connector_k8s import connector_deployments_api
 
+        if not config.connector_reconcile_enabled:
+            logger.info(
+                "action executor reads connector Deployments by name; "
+                "connector reconcile loop off"
+            )
         deployments = connector_deployments_api()
         manifests = HttpManifestSource(
             api_base_url=config.api_base_url,

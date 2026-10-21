@@ -47,6 +47,7 @@ from curie_runner.history import (
 )
 from curie_runner.session import SessionRunner
 from plugin_format import PLATFORM_PUBLISH_TOOL_NAME, TOOL_POLICY_ENFORCEMENT, ToolPolicy
+from runner_boot_session import initialized_session_sync
 
 _HAS_CRED = bool(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") or os.environ.get("ANTHROPIC_API_KEY"))
 _OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "")
@@ -862,7 +863,7 @@ def test_live_provider_web_search_default_and_bundle_opt_out(tmp_path: Path) -> 
                 ),
             }
         )
-        return build_runner(config)._factory()._options
+        return initialized_session_sync(build_runner(config))._options
 
     async def observe(options: ClaudeAgentOptions, prompt: str) -> dict[str, Any]:
         observed: dict[str, Any] = {

@@ -6,13 +6,16 @@ import hashlib
 import importlib
 import importlib.util
 import inspect
+import io
 import ipaddress
 import json
 import os
+import re
 import secrets
 import shutil
 import socket
 import subprocess
+import tarfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
@@ -116,26 +119,66 @@ class TLSBroker:
         """@spec PROTECTED-HOOK-LANE-3."""
         return "<owned-tls-broker>"
 
-    def docker(self, *args, allow_port_collision=False):
+    def docker(self, *args, allow_port_collision=False, input_data=None):
         """Anonymous owned daemon operations, @spec PROTECTED-HOOK-LANE-3."""
         try:
             result = subprocess.run(
-                ["docker", *args], env=self.env, capture_output=True, text=True, timeout=60
+                ["docker", *args], env=self.env, capture_output=True, input=input_data, timeout=60
             )
         except (OSError, subprocess.TimeoutExpired):
             fail_safely("owned TLS Docker operation failed")
+        stderr = result.stderr.decode(errors="replace")
         if result.returncode:
             if (
                 allow_port_collision
                 and args[0] == "run"
                 and any(
-                    marker in result.stderr.lower()
+                    marker in stderr.lower()
                     for marker in ("address already in use", "port is already allocated")
                 )
             ):
                 return None
-            fail_safely("owned TLS Docker operation refused")
-        return result.stdout
+            for secret in self.docker_redactions:
+                stderr = stderr.replace(secret, "<fixture-secret>")
+            stderr = re.sub(r"\b[a-z][a-z0-9+.-]*://\S+", "<endpoint>", stderr)
+            if "PRIVATE KEY" in stderr:
+                stderr = "<private-key-output>"
+            fail_safely("owned TLS Docker operation refused: " + stderr.strip())
+        return result.stdout.decode(errors="replace")
+
+    def copy_tls(self, *names):
+        """Copy only named credentials with their private modes and ownership."""
+        try:
+            with io.BytesIO() as payload:
+                with tarfile.open(fileobj=payload, mode="w") as archive:
+                    archive.addfile(archive.gettarinfo(str(self.private), arcname="tls"))
+                    for name in names:
+                        archive.add(self.private / name, arcname="tls/" + name, recursive=False)
+                self.docker("cp", "-a", "-", self.seed_cid + ":/", input_data=payload.getvalue())
+        except (OSError, tarfile.TarError):
+            fail_safely("owned TLS credential copy failed")
+
+    def remove_tls_owned(self, owner):
+        """Remove only this fixture's credential helper and volume after failures too."""
+        if self.tls_volume is None:
+            return
+        for owned in self.docker(
+            "ps", "-aq", "--no-trunc", "--filter", "label=curie.test.owner=" + owner
+        ).splitlines():
+            identity = json.loads(self.docker("inspect", owned))[0]
+            assert identity["Config"]["Labels"]["curie.test.owner"] == owner
+            self.docker("rm", "-f", owned)
+        volumes = self.docker(
+            "volume", "ls", "-q", "--filter", "label=curie.test.owner=" + owner
+        ).splitlines()
+        for volume in volumes:
+            assert volume == self.tls_volume
+            self.docker("volume", "rm", volume)
+        assert not self.docker("ps", "-aq", "--filter", "label=curie.test.owner=" + owner).strip()
+        assert not self.docker(
+            "volume", "ls", "-q", "--filter", "label=curie.test.owner=" + owner
+        ).strip()
+        self.tls_volume = None
 
     def remove_owned(self, owner, cidfile):
         """Validate each failed or finished resource, @spec PROTECTED-HOOK-LANE-3."""
@@ -180,6 +223,7 @@ class TLSBroker:
         """Actual live TLS context replacement, @spec PROTECTED-HOOK-LANE-2/3."""
         old_run_id = self.command("INFO", "server")["run_id"]
         self.pin = certificate(self.private, self.ca_key, self.ca_cert, basename="rotated")
+        self.copy_tls("rotated.crt", "rotated.key")
         self.command(
             "CONFIG", "SET", "tls-cert-file", "/tls/rotated.crt", "tls-key-file", "/tls/rotated.key"
         )
@@ -252,6 +296,8 @@ def tls_broker(tmp_path_factory):
     fixture.private.chmod(0o700)
     fixture.cid = None
     fixture.admin = None
+    fixture.tls_volume = None
+    fixture.docker_redactions = []
     cidfile = fixture.private / "container.cid"
     owner = "curie-tls-test-" + uuid4().hex
     try:
@@ -264,6 +310,7 @@ def tls_broker(tmp_path_factory):
         fixture.docker("ps", "--format", "{{.ID}}")
         fixture.reader_password = FixtureSecret(secrets.token_hex(24))
         provisioner_password = FixtureSecret(secrets.token_hex(24))
+        fixture.docker_redactions = [fixture.reader_password, provisioner_password]
         fixture.ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         now = datetime.now(UTC)
         subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "fixture-ca")])
@@ -306,6 +353,24 @@ def tls_broker(tmp_path_factory):
             + " ".join(metadata_acl_rules("control_reader"))
             + "\n",
         )
+        fixture.tls_volume = owner + "-tls"
+        fixture.docker(
+            "volume", "create", "--label", "curie.test.owner=" + owner, fixture.tls_volume
+        )
+        fixture.seed_cid = fixture.docker(
+            "create",
+            "--name",
+            owner + "-seed",
+            "--label",
+            "curie.test.owner=" + owner,
+            "--user",
+            f"{os.getuid()}:{os.getgid()}",
+            "--mount",
+            "type=volume,src=" + fixture.tls_volume + ",dst=/tls",
+            "valkey/valkey:8.1.10-alpine",
+            "true",
+        ).strip()
+        fixture.copy_tls("ca.crt", "server.crt", "server.key", "users.acl")
         for _attempt in range(5):
             with socket.socket() as probe:
                 probe.bind(("127.0.0.1", 0))
@@ -323,8 +388,8 @@ def tls_broker(tmp_path_factory):
                 f"{os.getuid()}:{os.getgid()}",
                 "-p",
                 f"127.0.0.1:{fixture.port}:6379",
-                "-v",
-                str(fixture.private) + ":/tls:ro",
+                "--mount",
+                "type=volume,src=" + fixture.tls_volume + ",dst=/tls,readonly",
                 "valkey/valkey:8.1.10-alpine",
                 "valkey-server",
                 "--port",
@@ -380,9 +445,12 @@ def tls_broker(tmp_path_factory):
             try:
                 fixture.remove_owned(owner, cidfile)
             finally:
-                for path in fixture.private.iterdir():
-                    if path.is_file():
-                        path.unlink()
+                try:
+                    fixture.remove_tls_owned(owner)
+                finally:
+                    for path in fixture.private.iterdir():
+                        if path.is_file():
+                            path.unlink()
 
 
 @pytest.fixture

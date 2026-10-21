@@ -479,7 +479,9 @@ impl From<RemediationPolicyWriteArgs> for commands::PolicyWriteArgs {
 /// The `remediation-policy` verbs, shared by `local` and `cluster` so the two
 /// tiers cannot drift. `C` is the tier's connection flags, carried on each
 /// leaf so they parse after the verb's own arguments. Writes authenticate
-/// their operator with CURIE_APPROVAL_PRINCIPAL_TOKEN.
+/// their operator with CURIE_APPROVAL_PRINCIPAL_TOKEN; `apply` and `arm` also
+/// present the remediation authority from CURIE_REMEDIATION_AUTHORITY_KEY
+/// (ADR 0231).
 #[derive(Subcommand, Debug, Clone)]
 pub(crate) enum RemediationPolicyCommand<C: clap::Args> {
     /// Read a hook's current remediation policy generation
@@ -494,6 +496,7 @@ pub(crate) enum RemediationPolicyCommand<C: clap::Args> {
     },
     /// Bind or replace a hook's policy from a JSON document (`PUT`). The
     /// document is validated with the platform's rules before any request.
+    /// Needs the remediation authority in CURIE_REMEDIATION_AUTHORITY_KEY.
     Apply {
         /// Agent name or id.
         agent: String,
@@ -508,6 +511,7 @@ pub(crate) enum RemediationPolicyCommand<C: clap::Args> {
         conn: C,
     },
     /// Arm the current policy so its automatic actions may run (`POST .../arm`).
+    /// Needs the remediation authority in CURIE_REMEDIATION_AUTHORITY_KEY.
     Arm {
         /// Agent name or id.
         agent: String,
@@ -1465,12 +1469,13 @@ pub(crate) enum FactoryAction {
         /// Print the steps and exit without creating a cluster or applying anything.
         #[arg(long)]
         dry_run: bool,
-        /// Code host the factory publishes to. Only github is installed in
-        /// this build.
+        /// Code host the factory publishes to: github, gitlab with --tracker
+        /// gitlab, or bitbucket-cloud or bitbucket-dc with --tracker
+        /// jira-cloud.
         #[arg(long, value_enum, value_name = "KIND", default_value = "github")]
         code_host: curie::factory_quickstart::CodeHostKind,
-        /// Tracker the factory takes issues from: github, or jira-cloud with
-        /// --code-host github.
+        /// Tracker the factory takes issues from: github, gitlab, or
+        /// jira-cloud with --code-host github, bitbucket-cloud or bitbucket-dc.
         #[arg(long, value_enum, value_name = "KIND", default_value = "github")]
         tracker: curie::factory_quickstart::TrackerKind,
         /// Base URL of a non-GitHub forge. Refused for github.
@@ -1499,6 +1504,14 @@ pub(crate) enum FactoryAction {
         /// Jira groupId whose members may start work. Refused for github.
         #[arg(long, value_name = "GROUP")]
         start_group: Option<String>,
+        /// Jira Cloud site or API gateway URL beside a Bitbucket code host,
+        /// whose own URL is --forge-url. Refused for any other pairing.
+        #[arg(long, value_name = "URL")]
+        tracker_url: Option<String>,
+        /// File holding the Jira API token beside a Bitbucket code host,
+        /// whose own token is --token-file. Refused for any other pairing.
+        #[arg(long, value_name = "PATH")]
+        tracker_token_file: Option<PathBuf>,
     },
 }
 

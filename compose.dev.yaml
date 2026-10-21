@@ -309,7 +309,11 @@ services:
     restart: "no"
 
   otel-collector:
-    image: otel/opentelemetry-collector-contrib:0.119.0
+    build:
+      context: otel
+      dockerfile_inline: |
+        FROM otel/opentelemetry-collector-contrib:0.119.0
+        COPY collector-config.yaml /etc/otel/collector-config.yaml
     profiles: *full_profiles
     user: "10001:10001"
     # Multi-homed onto curie_runner (#631): a hardened runner exports OTLP to
@@ -326,7 +330,6 @@ services:
       # base64("pk-lf-curie-dev:sk-lf-curie-dev"); matches the LANGFUSE_INIT keys above.
       LANGFUSE_OTLP_AUTH_HEADER: ${LANGFUSE_OTLP_AUTH_HEADER:-Basic cGstbGYtY3VyaWUtZGV2OnNrLWxmLWN1cmllLWRldg==}
     volumes:
-      - ./otel/collector-config.yaml:/etc/otel/collector-config.yaml:ro
       - otel_collector_storage:/var/lib/otelcol/storage
     ports:
       - "127.0.0.1:24317:4317"
@@ -420,6 +423,10 @@ services:
       # the authenticated Slack identity/channel evidence accepted by the API.
       # Only the API verifier and dispatcher producer receive it.
       CURIE_APPROVAL_CHAT_ATTESTER_SECRET: ${CURIE_APPROVAL_CHAT_ATTESTER_SECRET:-curie-dev-approval-chat-attester}
+      # Remediation authority (ADR 0231): binding and arming a remediation
+      # policy need it in X-Curie-Remediation-Authority. It is independent from
+      # API_KEY, which every worker holds, so only the API receives it.
+      CURIE_REMEDIATION_AUTHORITY_KEY: ${CURIE_REMEDIATION_AUTHORITY_KEY:-curie-dev-remediation-authority}
       CURIE_INTERNAL_WORKER_TOKEN: curie-dev-worker-token
       # The action executor switch (ACTION-EXECUTOR-1). curie-worker reads the
       # same interpolation, so one CURIE_ACTION_EXECUTOR_ENABLED in the
@@ -576,12 +583,6 @@ services:
     user: "0"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      # Shared bundle staging dir. The worker fetches each plugin bundle from
-      # RustFS and bind-mounts it into the runner container it spawns; because the
-      # runner runs on the HOST daemon, that bind source must resolve on the host
-      # at the SAME absolute path the worker used. An identical host:container
-      # path plus TMPDIR pointed here makes the worker's tempdir host-resolvable.
-      - /tmp/curie-bundles:/tmp/curie-bundles
     environment:
       - CURIE_SANDBOX_SUBSTRATE=docker
       # The image the worker spawns per turn -- the one that decides whether the
@@ -594,7 +595,6 @@ services:
       # platform and builds its runner as a plain `curie-runner` -- so the worker
       # went looking for a `curie-runner:ci-local` nothing had built.
       - CURIE_RUNNER_IMAGE=${CURIE_RUNNER_IMAGE:-ghcr.io/curie-eng/curie-runner:latest}
-      - TMPDIR=/tmp/curie-bundles
       - VALKEY_HOST=localhost
       - VALKEY_PORT=26379
       - VALKEY_PASSWORD=${VALKEY_PASSWORD:-valkeypass}

@@ -135,6 +135,7 @@ impl Fixture {
         for relative in [
             "tools/test-env/test_env.py",
             "tools/e2e-ci-selection/select_tiers.py",
+            "tools/e2e-ci-selection/cli_pytest_files.txt",
             ".github/e2e-selection.yaml",
             "release/atlas.py",
             "cli/Cargo.toml",

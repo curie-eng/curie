@@ -37,7 +37,7 @@ import pytest
 import redis
 from aci_protocol import STREAM_PAYLOAD_FIELD
 from channel_protocol.work_item_events import execute_event_id
-from curie_api import factory_base, factory_notices, workitem_dispatch
+from curie_api import factory_base, factory_notices, factory_tracker_intake, workitem_dispatch
 from curie_api.config import get_settings
 from curie_api.factory_comment_text import marker_for
 from curie_api.factory_notices import FINAL_MARKER
@@ -81,8 +81,9 @@ from curie_api.workitems.lifecycle import WorkItemOutcome
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
 from fastapi.testclient import TestClient
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from forge_fakes import factory_wake
 from forge_fakes.github import REPO, forges_document, forges_env_json
 from forge_fakes.github_comments import _clear_ci_keys, _rows
 
@@ -198,7 +199,11 @@ def jira_tracker_entry() -> dict[str, Any]:
         "kind": "jira_cloud",
         "host": JIRA_HOST,
         "api_url": f"https://{JIRA_HOST}",
-        "credential": {"type": "static_token", "token": "fixture-jira-token"},
+        "credential": {
+            "type": "static_token",
+            "username": "acme-bot@example.com",
+            "token": "fixture-jira-token",
+        },
         "label": LABEL,
         "mention": MENTION,
     }
@@ -340,20 +345,26 @@ def _ci_turns(request_id: uuid.UUID) -> list[dict[str, Any]]:
     return [t for t in _turns() if t["event_id"].startswith(prefix)]
 
 
-def _start(request_id: uuid.UUID) -> None:
-    """A worker acquires the published generation and starts the runtime."""
+def _start(request_id: uuid.UUID) -> int:
+    """A worker acquires the published generation and starts the runtime;
+    returns the runtime epoch."""
 
     generation = _rows(
         "SELECT dispatch_generation FROM curie.execution_requests WHERE id = :id",
         {"id": request_id},
     )[0]["dispatch_generation"]
 
-    async def go() -> None:
+    async def go() -> int:
         engine = create_async_engine(get_settings().database_url)
         try:
             async with AsyncSession(engine) as session:
                 acquired = await acquire(
-                    session, request_id, owner="factory-owner", generation=generation
+                    session,
+                    request_id,
+                    owner="factory-owner",
+                    generation=generation,
+                    wake=await factory_wake(session, request_id),
+                    context=None,
                 )
                 assert not isinstance(acquired, DispatchConflict), acquired
                 started = await start(
@@ -363,12 +374,14 @@ def _start(request_id: uuid.UUID) -> None:
                     generation=generation,
                     claim_name="claim-factory",
                     sandbox_name="sbx-factory",
+                    context=acquired.context,
                 )
                 assert not isinstance(started, DispatchConflict), started
+                return int(started.runtime_epoch)
         finally:
             await engine.dispose()
 
-    asyncio.run(go())
+    return asyncio.run(go())
 
 
 def _agent_id() -> uuid.UUID:
@@ -378,20 +391,34 @@ def _agent_id() -> uuid.UUID:
     return agent_id
 
 
-def _create_agent(client: TestClient) -> None:
+def _create_agent(client: TestClient, *, binding_name: str) -> None:
     created = client.post(
         "/agents",
         headers={"X-API-Key": get_settings().api_key},
         json={
             "name": f"acme-factory-{uuid.uuid4().hex[:8]}",
             "repo_full_name": REPO,
-            "channel": {"kind": "github", "address": REPO},
+            "channel": {"kind": "jira", "address": binding_name},
         },
     )
     assert created.status_code == 201, created.text
 
 
 # --- the pair ----------------------------------------------------------------------
+
+WORKER = {"X-Curie-Worker-Token": "factory-terminus-worker"}
+# A one-line README patch; the publication route never applies it.
+PATCH_B64 = "ZGlmZiAtLWdpdCBhL1JFQURNRS5tZCBiL1JFQURNRS5tZAo="
+
+
+@dataclass(frozen=True)
+class Publication:
+    """A running request's approved publication, its branch pushed."""
+
+    id: str
+    branch: str
+    body: str
+    head_sha: str
 
 
 @dataclass(frozen=True)
@@ -417,6 +444,8 @@ class BitbucketPair:
     issue: TrackerIssueRef
     # The one Jira account the binding's start allowlist names.
     starter: Actor
+    # The booted install's API, for the worker's internal routes.
+    client: TestClient
     replies: list[Reply] = field(default_factory=list)
     cursor: str | None = None
     feedback_cursor: str | None = None
@@ -435,7 +464,8 @@ class BitbucketPair:
             ("curie_api.repository_access", ("code_host_for",)),
             ("curie_api.github_factory", ("factory_code_host",)),
             ("curie_api.routers.publications", ("code_host_for",)),
-            ("curie_api.routers.publication_code_host", ("code_host_for",)),
+            ("curie_api.routers.publication_code_host", ("publishing_code_host",)),
+            ("curie_api.factory_rediscovery", ("publishing_code_host",)),
         ):
             for seam in seams:
                 monkeypatch.setattr(f"{module}.{seam}", host)
@@ -544,9 +574,9 @@ class BitbucketPair:
             return await self._dispatch(
                 Admission(
                     agent_id=agent_id,
-                    kind="github",
-                    address=REPO,
-                    reply_conversation_id=f"{types.JIRA_CLOUD}-issue-{self.issue.issue_id}",
+                    kind="jira",
+                    address=self.binding.name,
+                    reply_conversation_id=f"issue-{self.issue.issue_id}",
                     issue=self.issue,
                     repository=self.repository,
                     code_host_installation_id=None,
@@ -640,9 +670,9 @@ class BitbucketPair:
             return await self._dispatch(
                 Admission(
                     agent_id=agent_id,
-                    kind="github",
-                    address=REPO,
-                    reply_conversation_id=f"{types.JIRA_CLOUD}-issue-{self.issue.issue_id}",
+                    kind="jira",
+                    address=self.binding.name,
+                    reply_conversation_id=f"issue-{self.issue.issue_id}",
                     issue=self.issue,
                     repository=self.repository,
                     code_host_installation_id=None,
@@ -678,6 +708,122 @@ class BitbucketPair:
             assert isinstance(result, WorkItemOutcome), result
 
         asyncio.run(go())
+
+    def intake(self) -> None:
+        """One real tracker intake pass (`factory_tracker_intake.poll_trackers`):
+        each label's poll from its stored cursor, then the sweep that judges
+        every labelled issue's latest label add again."""
+
+        async def go() -> None:
+            engine = create_async_engine(get_settings().database_url)
+            try:
+                async with self.backend.adapter_client() as http:
+                    await factory_tracker_intake.poll_trackers(
+                        async_sessionmaker(engine, expire_on_commit=False),
+                        get_settings(),
+                        http,
+                        due={},
+                        clock=0.0,
+                    )
+            finally:
+                await engine.dispose()
+
+        asyncio.run(go())
+
+    def publish(self, issue: TrackerIssueRef) -> Publication:
+        """The worker's publication for ``issue``'s waiting request: the run
+        starts, the publication is created through ``POST
+        /v1/internal/publications`` as the bundle sends it, and its branch is
+        pushed. The approval is recorded by SQL (the approval Job path is not
+        offline), as in ``tests/forges/test_jira_github_lifecycle.py``."""
+
+        from test_factory_ci_wait import _execute
+        from test_factory_terminus import _reconcile
+
+        (item,) = _rows(
+            "SELECT id, agent_id, conversation_id, repository_path, tracker_issue_id "
+            "FROM curie.work_items WHERE tracker_kind = :kind AND tracker_issue_id = :issue",
+            {"kind": issue.kind, "issue": issue.issue_id},
+        )
+        (request,) = _rows(
+            "SELECT id, requester, reply_kind, reply_address, reply_conversation_id "
+            "FROM curie.execution_requests WHERE work_item_id = :id AND status = 'waiting'",
+            {"id": item["id"]},
+        )
+        _reconcile()
+        epoch = _start(request["id"])
+        headers = {"X-API-Key": get_settings().api_key}
+        version = self.client.post(
+            f"/agents/{item['agent_id']}/versions",
+            json={"version_label": "v1", "created_by": "operator"},
+            headers=headers,
+        )
+        assert version.status_code == 201, version.text
+        deployment = self.client.post(
+            "/deployments",
+            json={
+                "agent_id": str(item["agent_id"]),
+                "version_id": version.json()["id"],
+                "environment": "dev",
+                "workspace_enabled": True,
+            },
+            headers=headers,
+        )
+        assert deployment.status_code == 201, deployment.text
+        deployment_id = deployment.json()["id"]
+        base = asyncio.run(self.code_host.branch_head(self.repository, "main"))
+        selected = self.client.post(
+            f"/v1/internal/workspaces/{deployment_id}/selection",
+            json={
+                "conversation_id": item["conversation_id"],
+                "author": request["requester"],
+                "repo_full_name": item["repository_path"],
+            },
+            headers=WORKER,
+        )
+        assert selected.status_code == 200, selected.text
+        created = self.client.post(
+            "/v1/internal/publications",
+            json={
+                "deployment_id": deployment_id,
+                "conversation_id": item["conversation_id"],
+                "reply_conversation_id": request["reply_conversation_id"],
+                "repo_full_name": item["repository_path"],
+                "author": request["requester"],
+                "summary": "Publish the widget parser fix",
+                "reply_kind": request["reply_kind"],
+                "reply_channel": request["reply_address"],
+                "reply_placeholder": f"jira-{item['tracker_issue_id']}",
+                "dedupe_key": f"bitbucket-publication-{uuid.uuid4().hex}",
+                "base_sha": base,
+                "work_item_request_id": str(request["id"]),
+                "work_item_runtime_epoch": epoch,
+                "patch_b64": PATCH_B64,
+                "changed_paths": ["README.md"],
+                "expires_in_seconds": 600,
+                "title": "Keep the last field of a line",
+                "body": "Parsing a three-field line now yields three fields.",
+            },
+            headers=WORKER,
+        )
+        assert created.status_code == 201, created.text
+        publication = created.json()
+        _execute(
+            "UPDATE curie.publications SET status = 'approved' WHERE id = :id",
+            {"id": uuid.UUID(publication["id"])},
+        )
+        head = self.backend.push(publication["branch"], "Keep the last field of a line")
+        return Publication(publication["id"], publication["branch"], publication["body"], head)
+
+    def open_publication(self, publication: Publication) -> httpx.Response:
+        """The worker's ``POST /v1/internal/publications/{id}/pull-request``:
+        the route adopts the branch's pull request or opens one."""
+
+        return self.client.post(
+            f"/v1/internal/publications/{publication.id}/pull-request",
+            json={"expected_head_sha": publication.head_sha},
+            headers=WORKER,
+        )
 
 
 def _document(half: dict[str, Any]) -> dict[str, Any]:
@@ -727,7 +873,7 @@ def bitbucket_pair(
     get_settings.cache_clear()
     try:
         with TestClient(create_app()) as client:
-            _create_agent(client)
+            _create_agent(client, binding_name=binding_entry["name"])
             http = backend.adapter_client()
             try:
                 registry = forges_registry(get_settings())
@@ -759,6 +905,7 @@ def bitbucket_pair(
                     resolved,
                     issue,
                     starter=Actor(starter_id, "jira-starter"),
+                    client=client,
                 )
                 pair._patch(monkeypatch)
                 yield pair

@@ -95,7 +95,7 @@ CI_CLAIM_SECONDS = 60
 # they may land after the execution deadline. ``ci_fix_unpublished`` is written
 # by the worker and stays bounded by the deadline. ``workitems`` keeps an equal
 # literal set (importing this one there would be circular).
-CI_CAUSES = frozenset({"ci_failed", "ci_timeout", "ci_unverified", "merge_conflict"})
+CI_CAUSES = frozenset({"ci_failed", "ci_timeout", "ci_unverified", "merge_conflict", "pr_closed"})
 
 # Reason codes that can never become readable by waiting.
 PERMANENT_UNREADABLE = frozenset(
@@ -154,8 +154,9 @@ class CiView:
     what the failing ones said, when the code host offers that.
     ``base_failing`` holds the keys of checks failing on the base branch head
     (#4105); it is empty when the base was not read, so every failure counts
-    as caused by the change. ``conflicted`` and ``merged`` come from the
-    pull request read; both stay None when it was not read. ``reason`` is
+    as caused by the change. ``conflicted``, ``merged`` and ``closed_unmerged``
+    come from the pull request read; all stay None when it was not read, and
+    ``conflicted`` also when the pull request's head is not ``head_sha``. ``reason`` is
     set, with nothing observed, when the code host could not answer; it is a
     fixed reason code and never carries a response body, header, URL or token.
     """
@@ -167,6 +168,7 @@ class CiView:
     base_failing: frozenset[str] = frozenset()
     conflicted: bool | None = None
     merged: bool | None = None
+    closed_unmerged: bool | None = None
 
     @property
     def runs(self) -> list[NormalizedCheck]:
@@ -209,6 +211,9 @@ async def observe(
     current head read, so a failure the change did not cause is known (#4105).
     With ``pull_request``, that pull request is also read for whether it
     conflicts with its base (#4263); a failed read leaves that unknown.
+    Mergeability is kept only when the pull request's current head is
+    ``head_sha`` (#4624), since a proof for a moved head says nothing about
+    this one.
     """
 
     if not isinstance(head_sha, str) or not _SHA.fullmatch(head_sha):
@@ -234,7 +239,12 @@ async def observe(
     except ForgeError:
         # Mergeability stays unknown; the checks above still stand.
         return view
-    return replace(view, conflicted=pull.conflicted, merged=pull.state is PullRequestState.MERGED)
+    return replace(
+        view,
+        conflicted=pull.conflicted if pull.head_sha == head_sha else None,
+        merged=pull.state is PullRequestState.MERGED,
+        closed_unmerged=pull.state is PullRequestState.CLOSED,
+    )
 
 
 def _stamp(moment: datetime | None) -> str | None:
@@ -442,7 +452,7 @@ def _recorded_metadata_ci_policy(raw: str | bytes | None) -> MetadataCiPolicy | 
 
 
 VerdictKind = Literal[
-    "green", "no_ci", "failing", "pending", "timed_out", "unverified", "merge_conflict"
+    "green", "no_ci", "failing", "pending", "timed_out", "unverified", "merge_conflict", "pr_closed"
 ]
 GateResult = Literal["settled", "waiting", "fixing", "continued"]
 
@@ -568,7 +578,14 @@ def decide(
 
     A failure whose check key also fails on the base branch head
     (``view.base_failing``, #4105) is pre-existing and judged as not failing.
+
+    A pull request a person closed without merging is ``pr_closed`` before any
+    check is judged and without a grace period (#4754): green checks on a
+    closed pull request never complete the request.
     """
+
+    if view.closed_unmerged is True and view.merged is not True:
+        return Verdict(kind="pr_closed", reason="pr_closed")
 
     unselected_path = unselected_python_path(changed_paths, python_ci)
     if unselected_path is not None:
@@ -1290,6 +1307,7 @@ async def gate(
             "timed_out": "ci_timeout",
             "unverified": "ci_unverified",
             "merge_conflict": "merge_conflict",
+            "pr_closed": "pr_closed",
         }[verdict.kind]
         text = tried_summary(facts.publications, verdict, pr_url)
     async with sessionmaker() as session:

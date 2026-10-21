@@ -33,7 +33,7 @@ from curie_api.forges.bitbucket_dc.comments import BitbucketDcMarkedComments
 from curie_api.forges.bitbucket_dc.transport import BUILD_STATUS_API, DcTransport, object_of
 from curie_api.forges.bitbucket_dc.version import MINIMUM, ServerTooOld, parse_version
 from curie_api.forges.capabilities import CODE_HOST_OPERATIONS, Operation, Support
-from curie_api.forges.credential_providers import StaticTokenProvider
+from curie_api.forges.credential_providers import StaticTokenProvider, TokenSnapshot
 from curie_api.forges.errors import Ambiguous, NotFound, Unavailable, Unsupported
 from curie_api.forges.paths import valid_repository_path
 from curie_api.forges.types import (
@@ -45,6 +45,7 @@ from curie_api.forges.types import (
     Commit,
     Credential,
     CredentialScope,
+    FactoryPublication,
     FeedbackKind,
     FeedbackPage,
     NormalizedCheck,
@@ -56,8 +57,11 @@ from curie_api.forges.types import (
     RerunObserver,
     RerunRecord,
     ReviewFeedback,
+    publication_body,
+    publication_url,
     status_key,
 )
+from curie_api.publication_policy import is_publication_branch
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +108,10 @@ def _text(value: Any) -> str:
 
 def _int(value: Any) -> int:
     return value if type(value) is int else 0
+
+
+def _dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
 
 
 def _user_id(user: Any) -> str | None:
@@ -214,18 +222,22 @@ class BitbucketDcCodeHost:
         self,
         client: httpx.AsyncClient,
         *,
+        entry: str,
         api_url: str,
         host: str,
-        token: str,
+        token: TokenSnapshot,
         credentials: StaticTokenProvider,
         page_size: int = 100,
     ) -> None:
         self.host = host
-        self._http = DcTransport(client, api_url=api_url, token=token)
+        self._http = DcTransport(client, entry=entry, api_url=api_url, token=token)
+        self._token = token
         self._credentials = credentials
         self._page_size = page_size
         # The server's version as it reported it, and parsed.
         self._version: tuple[str, tuple[int, int, int]] | None = None
+        # The numeric user id the access token acts as, once read.
+        self._own_id: int | None = None
         self._comments = BitbucketDcMarkedComments(self)
 
     def __repr__(self) -> str:
@@ -316,7 +328,8 @@ class BitbucketDcCodeHost:
         self.repo_path(repository)
         if await self._path_of(repository.project_id) != repository.path:
             raise NotFound("repository_renamed")
-        return await self._credentials.get(scope)
+        # The token this adapter's requests sent, not a fresh read (#4630).
+        return self._credentials.credential(self._token, scope)
 
     async def branch_head(self, repository: RepositoryRef, branch: str) -> str | None:
         await self.ensure_version(Operation.BRANCH_HEAD)
@@ -416,6 +429,116 @@ class BitbucketDcCodeHost:
         if len(matches) > 1:
             raise Ambiguous("pull_request")
         return await self._pull(repository, matches[0])
+
+    async def own_user_id(self) -> int | None:
+        """The numeric id of the user the access token acts as (its bot user),
+        or None when the server does not say.
+
+        The REST API (rest/api/latest) has no current-user resource. Bitbucket
+        Server and Data Center name the authenticated user of an authenticated
+        answer in the ``X-AUSERID`` response header (and ``X-AUSERNAME``), as
+        Atlassian's server products do; it is not a documented REST contract,
+        and a proxy may strip it. Read from ``GET /application-properties``;
+        a numeric id is cached. An absent header is None, so ownership degrades
+        to unverified, which rediscovery ignores (`list_factory_publications`). A
+        present header that is not a numeric id is `Unavailable` and is not cached, so the listing
+        fails closed rather than guessing ownership.
+        """
+
+        if self._own_id is None:
+            response = await self._http.request(
+                "GET", "/application-properties", what="own_identity"
+            )
+            raw = response.headers.get("x-auserid")
+            if raw is None:
+                return None
+            raw = raw.strip()
+            if not raw.isascii() or not raw.isdigit():
+                raise Unavailable("own_identity")
+            self._own_id = int(raw)
+        return self._own_id
+
+    async def list_factory_publications(
+        self, repository: RepositoryRef
+    ) -> tuple[FactoryPublication, ...]:
+        """Every pull request from a publication branch of ``repository``
+        itself, in any state, opened by the token's own user when the server
+        names it (#4629).
+
+        ``GET /projects/{KEY}/repos/{slug}/pull-requests?state=ALL``
+        (https://developer.atlassian.com/server/bitbucket/rest/v904/api-group-pull-requests/#api-api-latest-projects-projectkey-repos-repositoryslug-pull-requests-get)
+        read to its last page: the pull requests whose target is this
+        repository. One counts when both ``fromRef`` and ``toRef`` name this
+        repository's id and, when `own_user_id` is known, ``author.user.id`` is
+        it (``owner_verified=True``). Without the ``X-AUSERID`` header every
+        such pull request is listed with ``owner_verified=False``, and
+        rediscovery ignores unverified publications on Data Center, so nothing
+        is suppressed there and a reinstall can still open one duplicate pull
+        request. An item, author, branch, state, description or URL
+        that cannot be read fails the listing; a null or absent description
+        is an empty body, and the ``links.self`` URL must be on the configured server
+        (`types.publication_url`). ``closed_at`` is ``closedDate``, else
+        ``updatedDate``: never earlier than the real close, so a doubt keeps
+        an old trigger suppressed.
+        """
+
+        await self.ensure_version(Operation.LIST_FACTORY_PUBLICATIONS)
+        repo = self.repo_path(repository)
+        own = await self.own_user_id()
+        listed = await self._http.pages(
+            f"{repo}/pull-requests",
+            what="pull_request",
+            limit=self._page_size,
+            params={"state": "ALL"},
+            strict=True,
+        )
+        found: list[FactoryPublication] = []
+        for item in listed:
+            number, state = item.get("id"), item.get("state")
+            author = _dict(item.get("author"))
+            source, target = item.get("fromRef"), item.get("toRef")
+            user_id = _user_id(author.get("user"))
+            if (
+                type(number) is not int
+                or not isinstance(state, str)
+                or state not in _PULL_STATES
+                or (own is not None and user_id is None)
+                or not isinstance(source, dict)
+                or not isinstance(target, dict)
+            ):
+                raise Unavailable("pull_request")
+            branch = source.get("displayId")
+            if not isinstance(branch, str) or not branch:
+                raise Unavailable("pull_request")
+            if (own is not None and user_id != str(own)) or not is_publication_branch(branch):
+                continue
+            if not all(
+                str(_dict(ref.get("repository")).get("id")) == repository.project_id
+                for ref in (source, target)
+            ):
+                # A fork's branch is never ours.
+                continue
+            links = _dict(item.get("links")).get("self")
+            first = links[0] if isinstance(links, list) and links else None
+            url = first.get("href") if isinstance(first, dict) else None
+            pull_state = _PULL_STATES[state]
+            closed_at = None
+            if pull_state is not PullRequestState.OPEN:
+                closed_at = _ms_time(item.get("closedDate")) or _ms_time(item.get("updatedDate"))
+            # Data Center omits an empty ``description`` from the JSON entirely.
+            body = publication_body(item, "description") if "description" in item else ""
+            found.append(
+                FactoryPublication(
+                    ref=PullRequestRef(repository, str(number)),
+                    url=publication_url(url, self._http.root),
+                    head_ref=branch,
+                    state=pull_state,
+                    body=body,
+                    closed_at=closed_at,
+                    owner_verified=own is not None,
+                )
+            )
+        return tuple(found)
 
     async def open_pull_request(
         self,

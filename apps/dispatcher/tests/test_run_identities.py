@@ -87,19 +87,39 @@ def _run_connection_and_capture(
     logger_name: str,
     caplog: pytest.LogCaptureFixture,
 ) -> list[str]:
-    """Drive the extra-clients warning and the connected line, without blocking.
-
-    The recorded ``SocketModeHandler.connect``/``close`` are no-ops, so ``run``
-    reaches its log line and then would block on ``self._closed.wait()``
-    forever; a handler whose own connect never blocks is exactly what a real
-    Socket Mode connection is not, so the wait is the one piece worth faking.
-    """
+    """Capture identity logs, then close the running connection within 2 s."""
     sm_connection = connection.connect()
     listener = sm_connection._handler.client.message_listeners[-1]
+    connected = threading.Event()
+    errors: list[BaseException] = []
+
+    class ConnectedLog(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            if record.getMessage().startswith("socket mode connected identity="):
+                connected.set()
+
+    def run() -> None:
+        try:
+            sm_connection.run()
+        except BaseException as exc:  # noqa: BLE001 - report thread failures to the test
+            errors.append(exc)
+
+    logger = logging.getLogger(logger_name)
+    connected_log = ConnectedLog()
+    thread = threading.Thread(target=run, name="test-identity-socket-run", daemon=True)
     with caplog.at_level(logging.INFO, logger=logger_name):
-        listener(sm_connection._handler.client, {"type": "hello", "num_connections": 2}, "")
-        sm_connection._closed.wait = lambda *_a, **_k: True  # type: ignore[method-assign]
-        sm_connection.run()
+        logger.addHandler(connected_log)
+        try:
+            listener(sm_connection._handler.client, {"type": "hello", "num_connections": 2}, "")
+            thread.start()
+            assert connected.wait(2), "Socket Mode connection did not log its identity"
+        finally:
+            sm_connection.close()
+            if thread.ident is not None:
+                thread.join(timeout=2.0)
+            logger.removeHandler(connected_log)
+            assert not thread.is_alive(), "Socket Mode run thread survived cleanup"
+    assert errors == []
     return [record.getMessage() for record in caplog.records]
 
 

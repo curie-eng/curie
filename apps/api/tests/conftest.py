@@ -14,14 +14,22 @@ import secrets
 import sys
 import uuid
 from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import asyncpg
 import pytest
 import redis
 from alembic import command
+from botocore.exceptions import (
+    ConnectionClosedError,
+    ConnectTimeoutError,
+    EndpointConnectionError,
+    ReadTimeoutError,
+)
 from curie_api.config import get_settings
 from curie_api.main import create_app
 from curie_test_support.valkey import connect_or_skip
@@ -70,6 +78,13 @@ get_settings.cache_clear()
 os.environ.setdefault(
     "CURIE_APPROVAL_CHAT_ATTESTER_SECRET", "approval-chat-attester-test-secret"
 )
+# A dedicated placeholder remediation authority key (ADR 0231) for the policy
+# bind and arm routes. It is intentionally distinct from the platform key: the
+# point of the key is that a holder of the platform key (every worker) cannot
+# satisfy it, so a test suite where the two match would prove nothing.
+os.environ.setdefault(
+    "CURIE_REMEDIATION_AUTHORITY_KEY", "remediation-authority-test-secret"
+)
 
 DB_PREFIX = "curie_test_"
 TS_FORMAT = "%Y%m%d%H%M%S"
@@ -78,13 +93,19 @@ TS_FORMAT = "%Y%m%d%H%M%S"
 async def _admin_connect(base: URL) -> asyncpg.Connection:
     """Connect to the `postgres` maintenance DB to run CREATE/DROP DATABASE."""
 
-    return await asyncpg.connect(
-        user=base.username,
-        password=base.password,
-        host=base.host,
-        port=base.port,
-        database="postgres",
-    )
+    try:
+        return await asyncpg.connect(
+            user=base.username,
+            password=base.password,
+            host=base.host,
+            port=base.port,
+            database="postgres",
+        )
+    except OSError as exc:
+        exc.add_note(
+            f"could not connect to Postgres at {base.host}:{base.port}: start the compose stack"
+        )
+        raise
 
 
 def _stale(datname: str, cutoff: datetime) -> bool:
@@ -198,8 +219,27 @@ def client(_disposable_db: Any) -> Any:
     address = "2001:db8::" + ":".join(
         suffix[index : index + 4] for index in range(0, 16, 4)
     )
-    with TestClient(create_app(), client=(address, 5000)) as test_client:
+    with _test_client(TestClient(create_app(), client=(address, 5000))) as test_client:
         yield test_client
+
+
+@contextmanager
+def _test_client(client: TestClient) -> Iterator[TestClient]:
+    try:
+        with client:
+            yield client
+    except (
+        EndpointConnectionError,
+        ConnectionClosedError,
+        ConnectTimeoutError,
+        ReadTimeoutError,
+    ) as exc:
+        endpoint = urlsplit(get_settings().s3_endpoint_url)
+        port = endpoint.port or (443 if endpoint.scheme == "https" else 80)
+        exc.add_note(
+            f"could not connect to RustFS at {endpoint.hostname}:{port}: start the compose stack"
+        )
+        raise
 
 
 # --- hook ingress fixtures (test_hooks.py, test_hook_partition.py) -------------
@@ -233,7 +273,7 @@ def valkey(runs_stream: str) -> Iterator[redis.Redis]:
 @pytest.fixture
 def hooks_client(_disposable_db: Any, runs_stream: str) -> Iterator[TestClient]:
     # Built AFTER runs_stream so the app reads the per-test stream name.
-    with TestClient(create_app()) as test_client:
+    with _test_client(TestClient(create_app())) as test_client:
         yield test_client
 
 

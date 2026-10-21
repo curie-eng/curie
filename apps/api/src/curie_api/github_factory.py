@@ -26,7 +26,7 @@ from curie_api.workitems.lifecycle import (
     same_repository,
 )
 
-from . import factory_base, workitem_dispatch
+from . import factory_base, factory_rediscovery, workitem_dispatch
 from .config import Settings
 from .factory_admission import (
     LABEL_REFUSAL_MARKER,
@@ -42,6 +42,7 @@ from .forges.github.binding import GITHUB_CHANNEL_KIND, resolve_binding
 from .forges.github.comments import static_token
 from .forges.github.identity import delivery_uuid
 from .forges.github.tracker import GitHubTracker, IssueFacts, last_label_event
+from .forges.github.transport import parse_time
 from .forges.hosts import (
     factory_code_host,
     factory_code_host_entry,
@@ -105,6 +106,7 @@ IGNORED = {
     "label_not_admitting",
     "work_item_other_agent",
     "label_conflict",
+    "publication_exists",
 }
 
 
@@ -430,11 +432,49 @@ async def _settle_label_refusal(
         logger.info("factory label refusal on issue %d left unedited", number)
 
 
+async def _refuse_rediscovered(
+    notice: FactoryNotice,
+    settings: Settings,
+    client: httpx.AsyncClient,
+    verified: VerifiedIssue,
+) -> None:
+    """Refuse a label admission with no local WorkItem when the code host
+    already has this issue's factory publication (#4629).
+
+    Raises `FactoryRefused` ``publication_exists`` (an open, ambiguous or
+    unconfirmed one is named on the issue; a completed one whose trigger this
+    replays is logged), or `FeedbackUnavailable` when the evidence cannot be
+    read completely, so the caller defers instead of admitting.
+    """
+
+    issue = notice_issue(notice, forges_registry(settings))
+    code_host = factory_rediscovery.publishing_code_host(settings, client, verified.repository)
+    try:
+        found = await factory_rediscovery.rediscover(
+            verified.tracker,
+            code_host,
+            issue,
+            verified.repository,
+            event_at=notice.label_event_at,
+        )
+    except ForgeError:
+        raise FeedbackUnavailable("publication_listing_unavailable") from None
+    if found.verdict == "clear":
+        return
+    try:
+        await factory_rediscovery.report(verified.tracker, issue, found)
+    except ForgeError:
+        raise FeedbackUnavailable("publication_report_unavailable") from None
+    raise FactoryRefused("publication_exists")
+
+
 async def admit_notice(
     session: AsyncSession,
     notice: FactoryNotice,
     settings: Settings,
     verified: VerifiedIssue,
+    *,
+    client: httpx.AsyncClient,
 ) -> WebhookResult:
     registry = forges_registry(settings)
     # Under the issue lock: the WorkItem decides whether the base is resolved
@@ -456,6 +496,9 @@ async def admit_notice(
         served = await _refuse_label_admission(
             session, registry, notice, verified, existing, binding
         )
+    if existing is None and notice.disposition == "admit":
+        # No local history: the code host's own publications decide (#4629).
+        await _refuse_rediscovered(notice, settings, client, verified)
     facts = _facts(notice, binding, registry)
     if existing is not None and (
         notice.disposition == "mention" or await _has_open_pr(session, existing)
@@ -557,7 +600,11 @@ async def _with_label_event(
     actor = event.get("actor")
     if not isinstance(actor, dict) or actor.get("type") == "Bot":
         raise FactoryRefused("app_authored")
-    return replace(notice, label_event_id=event["id"])
+    return replace(
+        notice,
+        label_event_id=event["id"],
+        label_event_at=parse_time(event.get("created_at")),
+    )
 
 
 async def handle_factory_delivery(
@@ -622,7 +669,7 @@ async def handle_factory_delivery(
         elif notice.disposition == "base_label":
             outcome = await record_base_label_notice(session, notice, verified, settings)
         else:
-            outcome = await admit_notice(session, notice, settings, verified)
+            outcome = await admit_notice(session, notice, settings, verified, client=client)
     except FeedbackUnavailable as exc:
         settle_review_delivery(audit, "retryable", exc.code)
         await session.commit()

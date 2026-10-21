@@ -616,6 +616,28 @@ for an executor that is not running. The gate narrows the single-object read
 path rather than creating a read capability: the reconciler's existing `list`
 grant already returns the same Deployment objects (measurement M5).
 
+Amendment of 2026-10-19 ([#4800](https://github.com/curie-eng/curie/issues/4800)):
+an installation that keeps the connector reconciler off, for example because
+its hosted connectors are pinned and managed outside Curie, may opt in to the
+executor's own connector reads with `actionExecutor.connectorReadsWithoutReconciler`
+(default off; rendered as `CURIE_ACTION_EXECUTOR_CONNECTOR_READS`). It requires
+the executor and is refused at render and at worker boot with the reconciler
+on. The worker Role then gains only this single-object `get` on Deployments, in
+its own rule, and none of the reconciler's rules; the worker composes this
+recorder and builds the ACTION-EXECUTOR-14 serving check exactly as it does
+beside the reconciler, while the reconcile loop stays off. Here the `get` is a
+read capability the Role did not otherwise hold, which the operator opts into
+in place of the reconciler's `create`, `list`, `patch` and `delete` over four
+kinds, so the grant is strictly smaller than the path it replaces. It reads the
+Deployment object through the Kubernetes API and never reaches the tenant
+connector, and every refusal above is unchanged: an unreadable Deployment or a
+digest that is not the in-force one refuses `connector_digest_unavailable`.
+Capability probes (ACTION-EXECUTOR-13) are still requested only from a
+reconcile pass, so in this mode no probe runs and restores need a capability
+row recorded otherwise. ADR 0121, ADR 0124 and ADR 0203 decide what the executor
+runs and that it runs only at the pinned digest; none decides which worker loop
+supplies the Deployment read, so this is a realization choice inside them.
+
 <!-- @spec ACTION-EXECUTOR-13 -->
 **ACTION-EXECUTOR-13. Restore capability from the advertised list.** When the
 connector reconcile observes a hosted connector rolled out at a digest with no

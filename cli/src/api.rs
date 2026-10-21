@@ -9,9 +9,10 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::api_requests::{
-    ActionUndo, AgentCreate, AgentUpdate, ApprovalPrincipalMint, ApprovalRecover, ApprovalResolve,
-    ChannelBindingWrite, ChannelCallersWrite, ChannelTokenRequest, ConsoleLoginCodeMint,
-    DeploymentCreate, EvalTriggerRequest, MemoryEntryCreate, MemoryGuidanceIn,
+    ActionUndo, AgentAccessPolicyWrite, AgentCreate, AgentUpdate, ApprovalPrincipalMint,
+    ApprovalRecover, ApprovalResolve, ChannelBindingWrite, ChannelCallersWrite,
+    ChannelTokenRequest, ConsoleLoginCodeMint, DeploymentCreate, DirectoryConfigIn,
+    DirectoryNamespaceIn, DirectoryTeamIn, EvalTriggerRequest, MemoryEntryCreate, MemoryGuidanceIn,
     RemediationBreakerClose, RemediationPolicyMutation, RemediationPolicyWrite,
     RemediationQualificationWrite, RemediationVerifierRunStart, ResolveTargetRequest,
     RoutingCheckRequest, VersionCreate,
@@ -277,6 +278,18 @@ impl ChannelBinding {
             .as_deref()
             .filter(|adapter| !(self.kind == "slack" && *adapter == DEFAULT_SLACK_IDENTITY))
     }
+}
+
+/// An agent's invocation and approver teams (`AgentAccessPolicyOut`, ADR 0220).
+/// Version 0 with no `updated_at` means no policy was ever set.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AgentAccessPolicy {
+    pub agent_id: String,
+    pub tenant_id: String,
+    pub invocation_team_id: Option<String>,
+    pub approver_team_id: Option<String>,
+    pub version: u64,
+    pub updated_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -761,6 +774,28 @@ pub struct AgentSchedules {
     pub hooks: Vec<ScheduleHook>,
 }
 
+/// One forge credential's authentication probe (`ForgeCredentialHealth`, #4630).
+/// No field carries credential bytes.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ForgeCredentialHealth {
+    /// `code_host` or `tracker`.
+    pub section: String,
+    pub name: String,
+    pub kind: String,
+    pub credential_type: String,
+    /// `accepted`, `rejected` or `unknown`.
+    pub authentication: String,
+    pub reason: Option<String>,
+    pub observed_at: String,
+}
+
+/// `GET /forges/credentials/health` (`ForgeCredentialHealthReport`, #4630).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ForgeCredentialHealthReport {
+    pub observed_at: String,
+    pub entries: Vec<ForgeCredentialHealth>,
+}
+
 /// `GET /schedules` (`ScheduleListOut`).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ScheduleList {
@@ -1231,6 +1266,21 @@ pub struct RemediationBreaker {
     pub closed_by: Option<String>,
     pub close_reason: Option<String>,
 }
+
+// @spec AUTOMATED-REMEDIATION-3
+/// The header binding (`PUT`) and arming a remediation policy carry the
+/// remediation authority in (ADR 0231). Disarm, delete and breaker close never
+/// send it.
+pub const REMEDIATION_AUTHORITY_HEADER: &str = "X-Curie-Remediation-Authority";
+
+// @spec AUTOMATED-REMEDIATION-3
+/// Where the operator finds the remediation authority (ADR 0231): the value the
+/// API holds as `CURIE_REMEDIATION_AUTHORITY_KEY`.
+pub const REMEDIATION_AUTHORITY_FIX: &str =
+    "export the API's remediation authority as CURIE_REMEDIATION_AUTHORITY_KEY: in a cluster \
+     it is the remediationAuthorityKey entry of the release's <release>-secrets Secret \
+     (chart value api.remediationAuthorityKey); for the local stack it is \
+     CURIE_REMEDIATION_AUTHORITY_KEY in its .env (default curie-dev-remediation-authority)";
 
 // @spec AUTOMATED-REMEDIATION-3 @spec AUTOMATED-REMEDIATION-20 @spec AUTOMATED-REMEDIATION-22
 /// What a `404` from a remediation route tells the operator to check.
@@ -1993,20 +2043,11 @@ pub(crate) fn validate_allowlist_entry(entry: &str) -> Result<()> {
 /// the new agent to that repository rather than 409, which is worse.
 fn agent_create_body(
     name: &str,
-    slack_channel: &str,
+    channel: ChannelBindingWrite,
     repo_full_name: Option<&str>,
-    identity: Option<&str>,
 ) -> AgentCreate {
     AgentCreate {
-        channel: ChannelBindingWrite {
-            // @spec ADR-0168 d8: only a named identity travels; the default is
-            // omitted, exactly as every create sent it before the identity existed.
-            adapter: named_identity("slack", identity).map(str::to_string),
-            address: slack_channel.to_string(),
-            endpoint: None,
-            kind: "slack".to_string(),
-            trigger_label: None,
-        },
+        channel,
         name: name.to_string(),
         repo_full_name: repo_full_name.map(str::to_string),
     }
@@ -2088,7 +2129,7 @@ fn agent_update_body(repo_full_name: Option<&str>) -> AgentUpdate {
 ///
 /// `trigger_label` travels only when named (#4361); `ChannelChange::resolve`
 /// has already refused it on any kind but a tracker surface.
-fn add_channel_body(
+pub(crate) fn add_channel_body(
     kind: &str,
     address: &str,
     endpoint: Option<&str>,
@@ -2222,6 +2263,77 @@ pub(crate) fn memory_state_url(
 }
 
 impl ApiClient {
+    /// Read a route selected by the directory verb's bounded resource inventory.
+    pub async fn directory_admin_read(&self, path: &str) -> Result<serde_json::Value> {
+        let response = self
+            .http
+            .get(format!("{}{path}", self.base_url))
+            .header("X-API-Key", &self.api_key)
+            .send()
+            .await
+            .context("directory administration request")?;
+        Self::expect_ok(response, "directory administration")
+            .await?
+            .json()
+            .await
+            .context("decoding directory administration response")
+    }
+
+    pub async fn put_directory_config(
+        &self,
+        tenant_id: &str,
+        body: &DirectoryConfigIn,
+    ) -> Result<serde_json::Value> {
+        let response = self
+            .http
+            .put(format!("{}/directory/config/{tenant_id}", self.base_url))
+            .header("X-API-Key", &self.api_key)
+            .json::<DirectoryConfigIn>(body)
+            .send()
+            .await
+            .context("directory configuration request")?;
+        Self::expect_ok(response, "directory configuration")
+            .await?
+            .json()
+            .await
+            .context("decoding directory configuration response")
+    }
+
+    pub async fn create_directory_namespace(
+        &self,
+        body: &DirectoryNamespaceIn,
+    ) -> Result<serde_json::Value> {
+        let response = self
+            .http
+            .post(format!("{}/directory/namespaces", self.base_url))
+            .header("X-API-Key", &self.api_key)
+            .json::<DirectoryNamespaceIn>(body)
+            .send()
+            .await
+            .context("directory namespace request")?;
+        Self::expect_ok(response, "directory namespace")
+            .await?
+            .json()
+            .await
+            .context("decoding directory namespace response")
+    }
+
+    pub async fn create_directory_team(&self, body: &DirectoryTeamIn) -> Result<serde_json::Value> {
+        let response = self
+            .http
+            .post(format!("{}/directory/teams", self.base_url))
+            .header("X-API-Key", &self.api_key)
+            .json::<DirectoryTeamIn>(body)
+            .send()
+            .await
+            .context("directory team request")?;
+        Self::expect_ok(response, "directory team")
+            .await?
+            .json()
+            .await
+            .context("decoding directory team response")
+    }
+
     /// The server caps `/approvals` results at this many rows
     /// (`apps/api/.../routers/approvals.py`: `min(max(limit, 1), 200)`); the CLI
     /// requests exactly the cap so hitting it is how the caller detects possible
@@ -2592,11 +2704,10 @@ impl ApiClient {
     pub async fn create_agent(
         &self,
         name: &str,
-        slack_channel: &str,
+        channel: ChannelBindingWrite,
         repo_full_name: Option<&str>,
-        identity: Option<&str>,
     ) -> Result<Agent> {
-        let body = agent_create_body(name, slack_channel, repo_full_name, identity);
+        let body = agent_create_body(name, channel, repo_full_name);
         let resp = self
             .send_request(
                 self.http
@@ -2606,10 +2717,17 @@ impl ApiClient {
                 "POST /agents",
             )
             .await?;
-        if resp.status() == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
-            if let Some(identity) = named_identity("slack", identity) {
-                let body = resp.text().await.unwrap_or_default();
-                return Err(identity_refusal("slack", slack_channel, identity, &body));
+        if resp.status() == reqwest::StatusCode::UNPROCESSABLE_ENTITY
+            && body.channel.kind == "slack"
+        {
+            if let Some(identity) = named_identity("slack", body.channel.adapter.as_deref()) {
+                let response = resp.text().await.unwrap_or_default();
+                return Err(identity_refusal(
+                    "slack",
+                    &body.channel.address,
+                    identity,
+                    &response,
+                ));
             }
         }
         Self::expect_ok(resp, "creating the agent")
@@ -2619,7 +2737,12 @@ impl ApiClient {
             .context("decoding created agent")
     }
 
-    pub async fn find_or_create_agent(&self, name: &str, slack_channel: &str) -> Result<Agent> {
+    pub async fn find_or_create_agent(
+        &self,
+        name: &str,
+        channel: ChannelBindingWrite,
+        repo_full_name: Option<&str>,
+    ) -> Result<Agent> {
         if let Some(existing) = self
             .list_agents()
             .await?
@@ -2628,7 +2751,7 @@ impl ApiClient {
         {
             return Ok(existing);
         }
-        self.create_agent(name, slack_channel, None, None).await
+        self.create_agent(name, channel, repo_full_name).await
     }
 
     /// `PATCH /agents/{id}` with a typed body the caller already built (see
@@ -2804,6 +2927,47 @@ impl ApiClient {
             .json()
             .await
             .context("decoding the agent after the caller list write")
+    }
+
+    /// Read an agent's access policy: `GET /agents/{id}/access-policy`
+    /// (ADR 0220). An agent with no policy answers version 0.
+    pub async fn get_agent_access_policy(&self, agent_id: &str) -> Result<AgentAccessPolicy> {
+        let resp = self
+            .http
+            .get(format!("{}/agents/{agent_id}/access-policy", self.base_url))
+            .header("X-API-Key", &self.api_key)
+            .send()
+            .await
+            .context("GET /agents/{id}/access-policy")?;
+        Self::expect_ok(resp, "reading the agent's access policy")
+            .await?
+            .json()
+            .await
+            .context("decoding the agent's access policy")
+    }
+
+    /// Replace an agent's access policy: `PUT /agents/{id}/access-policy`
+    /// (ADR 0220). The API refuses with 409 when `expected_version` is not the
+    /// stored version, and with 422 when a team is not an IdP group team of
+    /// the agent's tenant; it answers the policy as stored.
+    pub async fn put_agent_access_policy(
+        &self,
+        agent_id: &str,
+        body: &AgentAccessPolicyWrite,
+    ) -> Result<AgentAccessPolicy> {
+        let resp = self
+            .http
+            .put(format!("{}/agents/{agent_id}/access-policy", self.base_url))
+            .header("X-API-Key", &self.api_key)
+            .json::<AgentAccessPolicyWrite>(body)
+            .send()
+            .await
+            .context("PUT /agents/{id}/access-policy")?;
+        Self::expect_ok(resp, "setting the agent's access policy")
+            .await?
+            .json()
+            .await
+            .context("decoding the agent's access policy")
     }
 
     /// Mint a scoped `chn` token for one binding (`POST /channels/token`).
@@ -2995,9 +3159,8 @@ impl ApiClient {
             }
             None => {
                 let channel = slack_channel.unwrap_or(DEFAULT_SLACK_CHANNEL);
-                let agent = self
-                    .create_agent(name, channel, repo_full_name, identity)
-                    .await?;
+                let binding = add_channel_body("slack", channel, None, identity, None);
+                let agent = self.create_agent(name, binding, repo_full_name).await?;
                 // `AgentCreate` still carries the singular channel, so a created
                 // agent holds exactly the one binding it was created with.
                 let outcome = ChannelOutcome::Created(
@@ -3586,6 +3749,29 @@ impl ApiClient {
             .context("decoding connector manifests")
     }
 
+    /// Read-only authentication probe of every recorded forge credential
+    /// (`GET /forges/credentials/health`, #4630). The request is bounded by
+    /// `timeout`; the response carries no credential bytes.
+    pub async fn forge_credential_health(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<ForgeCredentialHealthReport> {
+        let resp = self
+            .send_request(
+                self.http
+                    .get(format!("{}/forges/credentials/health", self.base_url))
+                    .header("X-API-Key", &self.api_key)
+                    .timeout(timeout),
+                "GET /forges/credentials/health",
+            )
+            .await?;
+        Self::expect_ok(resp, "reading forge credential health")
+            .await?
+            .json()
+            .await
+            .context("decoding forge credential health")
+    }
+
     pub async fn list_versions(&self, agent_id: &str) -> Result<Vec<Version>> {
         let resp = self
             .send_request(
@@ -4124,14 +4310,15 @@ impl ApiClient {
 
     // @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-3
     /// Bind or replace a hook's policy: `PUT .../remediation-policy` with the
-    /// CAS pair and the document, on the platform key and the operator
-    /// principal.
+    /// CAS pair and the document, on the platform key, the operator principal
+    /// and the ADR 0231 remediation authority.
     pub async fn put_remediation_policy(
         &self,
         agent_id: &str,
         hook: &str,
         body: &RemediationPolicyWrite,
         principal_token: &str,
+        authority: &str,
     ) -> Result<RemediationPolicyGeneration> {
         let resp = self
             .send_request(
@@ -4142,6 +4329,7 @@ impl ApiClient {
                     ))
                     .header("X-API-Key", &self.api_key)
                     .header("X-Curie-Approval-Principal", principal_token)
+                    .header(REMEDIATION_AUTHORITY_HEADER, authority)
                     .json::<RemediationPolicyWrite>(body),
                 "PUT /agents/{id}/hooks/{hook}/remediation-policy",
             )
@@ -4154,13 +4342,15 @@ impl ApiClient {
     }
 
     // @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-3
-    /// Arm the current policy: `POST .../remediation-policy/arm`.
+    /// Arm the current policy: `POST .../remediation-policy/arm`, which also
+    /// needs the ADR 0231 remediation authority.
     pub async fn arm_remediation_policy(
         &self,
         agent_id: &str,
         hook: &str,
         body: &RemediationPolicyMutation,
         principal_token: &str,
+        authority: &str,
     ) -> Result<RemediationPolicyGeneration> {
         let resp = self
             .send_request(
@@ -4171,6 +4361,7 @@ impl ApiClient {
                     ))
                     .header("X-API-Key", &self.api_key)
                     .header("X-Curie-Approval-Principal", principal_token)
+                    .header(REMEDIATION_AUTHORITY_HEADER, authority)
                     .json::<RemediationPolicyMutation>(body),
                 "POST /agents/{id}/hooks/{hook}/remediation-policy/arm",
             )
@@ -4516,6 +4707,9 @@ impl ApiClient {
                 )
             }
             (StatusCode::NOT_FOUND, _) => CliError::failure(message).with_fix(not_found_fix),
+            (StatusCode::FORBIDDEN, Some("remediation_authority_required")) => {
+                CliError::failure(message).with_fix(REMEDIATION_AUTHORITY_FIX)
+            }
             (StatusCode::FORBIDDEN, _) => CliError::failure(message).with_fix(
                 "export an operator principal as CURIE_APPROVAL_PRINCIPAL_TOKEN (mint one with \
                  `curie <local|cluster> approvals <AGENT> --mint-operator-principal <SUBJECT>`)",
@@ -4717,6 +4911,43 @@ impl ApiClient {
                 &body,
                 "expires_at",
                 "operator principal delivery",
+            )?,
+        })
+    }
+
+    /// Mint a reusable remediation-operator principal (scope
+    /// `remediation.administer`) under the platform key. One-time delivery,
+    /// never cached by the CLI.
+    pub async fn mint_remediation_principal(
+        &self,
+        subject: &str,
+    ) -> Result<OperatorPrincipalDelivery> {
+        let resp = self
+            .send_request(
+                self.http
+                    .post(format!(
+                        "{}/approvals/principals/remediation-operator",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key)
+                    .json::<ApprovalPrincipalMint>(&ApprovalPrincipalMint {
+                        subject: subject.to_string(),
+                    }),
+                "POST /approvals/principals/remediation-operator",
+            )
+            .await?;
+        let body: serde_json::Value = Self::expect_ok(resp, "minting remediation principal")
+            .await?
+            .json()
+            .await
+            .context("decoding remediation principal delivery")?;
+        Ok(OperatorPrincipalDelivery {
+            token: required_response_string(&body, "token", "remediation principal delivery")?,
+            subject: required_response_string(&body, "subject", "remediation principal delivery")?,
+            expires_at: required_response_string(
+                &body,
+                "expires_at",
+                "remediation principal delivery",
             )?,
         })
     }
@@ -4950,8 +5181,8 @@ mod tests {
     use super::{
         add_channel_body, agent_create_body, agent_update_body, api_key_for_destination,
         is_insecure_endpoint, mint_channel_token_body, prevalidate_series_span,
-        validate_allowlist_entry, ChannelBinding, ListedTargets, ResolvedTarget,
-        DEFAULT_SLACK_IDENTITY,
+        validate_allowlist_entry, ChannelBinding, ChannelBindingWrite, ListedTargets,
+        ResolvedTarget, DEFAULT_SLACK_IDENTITY,
     };
 
     /// A typed request body as it goes on the wire.
@@ -5112,10 +5343,20 @@ mod tests {
         // A value the caller did not pass is not a binding the caller intended.
         // The column is no longer unique (ADR-0091, migration 0018), so an
         // unsolicited value would silently bind rather than 409.
-        let body = wire(&agent_create_body("bot", "C123", None, None));
+        let body = wire(&agent_create_body(
+            "bot",
+            ChannelBindingWrite {
+                kind: "slack".into(),
+                address: "C0EXAMPLE1".into(),
+                adapter: None,
+                endpoint: None,
+                trigger_label: None,
+            },
+            None,
+        ));
         assert_eq!(body["name"], "bot");
         assert_eq!(body["channel"]["kind"], "slack");
-        assert_eq!(body["channel"]["address"], "C123");
+        assert_eq!(body["channel"]["address"], "C0EXAMPLE1");
         assert!(body.get("repo_full_name").is_none());
     }
 
@@ -5123,7 +5364,17 @@ mod tests {
     fn create_agent_body_binds_the_repo_when_asked() {
         // Creation is the first chance to bind, and the only one that needs no
         // second request: AgentUpdate carries repo_full_name too (#1194).
-        let body = wire(&agent_create_body("bot", "C123", Some("acme/bundle"), None));
+        let body = wire(&agent_create_body(
+            "bot",
+            ChannelBindingWrite {
+                kind: "slack".into(),
+                address: "C0EXAMPLE1".into(),
+                adapter: None,
+                endpoint: None,
+                trigger_label: None,
+            },
+            Some("acme/bundle"),
+        ));
         assert_eq!(body["repo_full_name"], "acme/bundle");
     }
 

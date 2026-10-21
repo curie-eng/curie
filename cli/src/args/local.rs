@@ -507,7 +507,8 @@ pub(crate) enum LocalAction {
     },
     /// A protected hook's remediation policy: show it, apply a document, arm,
     /// disarm or remove it, or close an open circuit breaker. Writes run as the
-    /// operator principal in CURIE_APPROVAL_PRINCIPAL_TOKEN.
+    /// operator principal in CURIE_APPROVAL_PRINCIPAL_TOKEN; apply and arm also
+    /// need the remediation authority in CURIE_REMEDIATION_AUTHORITY_KEY.
     RemediationPolicy {
         #[command(subcommand)]
         verb: RemediationPolicyCommand<LocalObservabilityConn>,
@@ -556,6 +557,13 @@ pub(crate) enum LocalAction {
         /// CURIE_APPROVAL_PRINCIPAL_TOKEN before resolving.
         #[arg(long, value_name = "SUBJECT")]
         mint_operator_principal: Option<String>,
+        /// Administratively mint a reusable, subject-bound remediation operator
+        /// principal (scope remediation.administer) for remediation policy,
+        /// breaker, and qualification writes. The token is delivered once;
+        /// export it as CURIE_APPROVAL_PRINCIPAL_TOKEN for those writes. It
+        /// cannot resolve approvals.
+        #[arg(long, value_name = "SUBJECT")]
+        mint_remediation_principal: Option<String>,
         /// Administratively mint a single-use, subject-bound Console login code.
         #[arg(long, value_name = "SUBJECT")]
         mint_console_login_code: Option<String>,

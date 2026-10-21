@@ -12,15 +12,28 @@ follow progress, approve restricted actions, and inspect the result. The platfor
 is Apache-2.0 and runs in your infrastructure, with shared memory facilities,
 model configuration, and cost visibility.
 
-Start with a **Software Factory co-worker** that turns assigned GitHub issues into reviewed
-pull requests, or an **SRE co-worker** that investigates Kubernetes workloads from
-Slack. Then convert your existing agents into a co-worker with supported skills and tools onto the same platform.
+Start with a **Software Factory co-worker**. Use Codex, Claude Code, or another
+coding agent to help investigate and specify a bounded GitHub, GitLab, or Jira
+Cloud issue. Delegate the issue to Curie for implementation and review; it
+returns a pull request or merge request for your team to accept. You can also
+deploy an **SRE co-worker** for Kubernetes investigations, or adapt an existing
+agent's instructions and tools to the same platform.
 
 | Start here | First outcome |
 | --- | --- |
-| [Software Factory](#software-factory-on-your-laptop) | Label an issue and get a reviewed PR or a clear failure reason. |
+| [Software Factory](#software-factory-on-your-laptop) | Label an issue and get a reviewed PR or merge request, or a clear failure reason. |
 | [SRE co-worker](#sre-co-worker-on-your-laptop) | Ask about your local cluster in Slack; approve configured mutations. |
 | [Bring your existing agent](#make-your-existing-agent-a-co-worker) | Reuse its instructions and tools, then connect it to a workspace. |
+
+### See the Software Factory
+
+<a href="https://vimeo.com/1231115133/eadc6eb936">
+  <img src="https://i.vimeocdn.com/video/2206199274-0dcf4f345f0dfb2733cf53dfbdb85b3441e3f593dcd23cfdce0c45bb50d46146-d?f=webp&amp;region=us" width="720" alt="Watch the Curie Software Factory demo: GitHub issues to reviewed pull requests.">
+</a>
+
+[Watch the Software Factory demo](https://vimeo.com/1231115133/eadc6eb936), then
+follow the local quickstart below. The video features GitHub; the quickstarts
+also cover supported GitLab and Jira Cloud paths.
 
 ## Quickstart
 
@@ -59,6 +72,17 @@ export CURIE_MODEL
 
 ### Software Factory on your laptop
 
+Choose where your issues and code live:
+
+| Issues | Code and result | Start here |
+| --- | --- | --- |
+| GitHub | GitHub pull request | Follow the GitHub steps below |
+| GitLab | GitLab merge request | [GitLab quickstart](docs/guides/factory-gitlab-quickstart.md), for gitlab.com or self-managed GitLab |
+| Jira Cloud | GitHub pull request | [Jira Cloud with GitHub quickstart](docs/guides/factory-jira-github-quickstart.md) |
+| Jira Cloud | Bitbucket Cloud or Data Center pull request | [Jira Cloud with Bitbucket quickstart](docs/guides/dark-factory-quickstart.md#run-quickstart-for-bitbucket), for Bitbucket Cloud or Data Center 9.4.0 or later |
+
+#### GitHub
+
 Create a GitHub repository with an initial commit, or use a small existing
 repository. Write a bounded issue with clear acceptance criteria.
 
@@ -78,6 +102,24 @@ The command creates a local kind cluster, installs Curie, and prints a GitHub
 App registration link. Open that link, create the App, generate its private key,
 and install it on the selected repository. Note the App ID and the absolute
 path of the downloaded key file.
+
+On Apple Silicon, an older released chart can stop here with an AVX preflight
+error. ARM64 does not use x86 AVX. Recover only that architecture-specific
+failure in this trial cluster, then rerun the quickstart command using the
+same variables. Do not repeat the cluster-name or kubeconfig initialization:
+
+```bash
+KUBECONFIG="$CURIE_FACTORY_KUBECONFIG" curie cluster up \
+  --context "kind-$CURIE_FACTORY_CLUSTER" --model "$CURIE_MODEL" \
+  --set preflights.avxCheck.enabled=false
+KUBECONFIG="$CURIE_FACTORY_KUBECONFIG" curie factory quickstart \
+  --repo "$CURIE_FACTORY_REPO" --kind-name "$CURIE_FACTORY_CLUSTER" \
+  --model "$CURIE_MODEL"
+```
+
+The current source chart detects native ARM64 with the preflight enabled.
+Keep the check enabled on x86. See the
+[ARM recovery details](docs/guides/dark-factory-quickstart.md#apple-silicon-recovery-for-older-charts).
 
 **2. Complete the setup with your App.**
 
@@ -183,6 +225,9 @@ kind delete cluster --name "$CURIE_SRE_CLUSTER"
 Keep your agent's useful instructions and tools. Curie provides workspace
 interaction, deployment, supervision, and operational controls around a
 supported bundle.
+
+[Watch how Curie turns an existing agent into a co-worker](https://vimeo.com/1230537103/2d607d04a5),
+then follow the steps below to adapt your own agent.
 
 1. **Adapt the package.** Put instructions into skills and declare tools through
    MCP. Existing deterministic code can remain behind a tool wrapper.

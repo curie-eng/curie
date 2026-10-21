@@ -1304,9 +1304,9 @@ def test_ingress_policy_selects_the_connector_not_the_sandbox() -> None:
         "release-r", "app-name", "agent-a"
     )
     dep = next(o for o in objs if o["kind"] == "Deployment")
-    assert ing["spec"]["podSelector"]["matchLabels"] == dep["spec"]["template"]["metadata"][
-        "labels"
-    ]
+    assert (
+        ing["spec"]["podSelector"]["matchLabels"] == dep["spec"]["template"]["metadata"]["labels"]
+    )
 
 
 def test_ingress_is_port_scoped_to_the_connector_port() -> None:
@@ -1629,9 +1629,7 @@ def test_service_dns_vectors(vector: dict) -> None:
         == vector["object_name"]
     )
     assert (
-        r.service_dns(
-            vector["release"], vector["agent"], vector["connector"], vector["namespace"]
-        )
+        r.service_dns(vector["release"], vector["agent"], vector["connector"], vector["namespace"])
         == vector["service_dns"]
     )
 
@@ -1640,9 +1638,7 @@ def test_the_dns_corpus_covers_the_truncation_branch() -> None:
     # Without an over-long name in the corpus the vectors freeze only the
     # concatenation, and the truncation-with-digest branch -- the half a hand
     # port gets wrong -- stays unpinned in both languages.
-    bases = [
-        f"{v['release']}-{v['agent']}-mcp-{v['connector']}" for v in _DNS_VECTORS["vectors"]
-    ]
+    bases = [f"{v['release']}-{v['agent']}-mcp-{v['connector']}" for v in _DNS_VECTORS["vectors"]]
     assert any(len(base) > 63 for base in bases)
     truncated = [
         v
@@ -1965,9 +1961,7 @@ def test_a_server_on_the_proxy_port_moves_the_proxy_not_the_server() -> None:
     spec = HOSTED.model_copy(update={"port": r.CALLER_PROXY_PORT})
     objs = _proxied(spec)
     containers = _containers(objs)
-    assert containers["server"]["ports"] == [
-        {"name": "http", "containerPort": r.CALLER_PROXY_PORT}
-    ]
+    assert containers["server"]["ports"] == [{"name": "http", "containerPort": r.CALLER_PROXY_PORT}]
     assert containers[r.CALLER_PROXY_CONTAINER]["ports"] == [
         {"name": "caller", "containerPort": r.CALLER_PROXY_ALTERNATE_PORT}
     ]
@@ -2346,3 +2340,62 @@ def test_the_new_fields_set_to_their_defaults_render_the_same_bytes() -> None:
             {**case["spec"], "readiness_path": None, "resources": None}
         )
         assert _baseline_render_digest(explicit, case["connector"]) == case["sha256"], case["name"]
+# `no_client_auth`: no Authorization header is derived, and the rendered
+# objects do not change (#4669).
+# --------------------------------------------------------------------------- #
+def _no_client_auth_spec(**overrides: object) -> ConnectorSpec:
+    fields: dict = {
+        "image": "ghcr.io/example/docs-mcp:1",
+        "port": 8000,
+        "secrets": ["UPSTREAM_CLIENT_ID", "UPSTREAM_CLIENT_SECRET"],
+        "no_client_auth": (
+            "In-cluster MCP server reached over the pod network; it authenticates no "
+            "client and the boundary is its ingress NetworkPolicy."
+        ),
+    }
+    fields.update(overrides)
+    return ConnectorSpec(**fields)
+
+
+def test_no_client_auth_hosted_entry_has_no_authorization_header() -> None:
+    assert "headers" not in _github_entry(_no_client_auth_spec())
+
+
+def test_no_client_auth_single_plain_secret_derives_no_header() -> None:
+    assert "headers" not in _github_entry(_no_client_auth_spec(secrets=["UPSTREAM_TOKEN"]))
+
+
+def test_no_client_auth_unhosted_entry_has_no_authorization_header() -> None:
+    spec = _no_client_auth_spec(
+        secrets=["UPSTREAM_TOKEN"], unhosted_url="http://127.0.0.1:9000/mcp"
+    )
+    entry = r.unhosted_mcp_entry(spec)
+    assert entry is not None
+    assert "headers" not in entry
+
+
+def test_no_client_auth_rendered_objects_equal_the_same_declaration_without_it() -> None:
+    with_key = _objs(spec=_no_client_auth_spec())
+    without_key = _objs(
+        spec=ConnectorSpec(
+            image="ghcr.io/example/docs-mcp:1",
+            port=8000,
+            secrets=["UPSTREAM_CLIENT_ID", "UPSTREAM_CLIENT_SECRET"],
+        )
+    )
+    assert with_key == without_key
+    kinds = {obj["kind"] for obj in with_key}
+    assert {"Deployment", "Service", "NetworkPolicy"} <= kinds
+
+
+def test_no_client_auth_secrets_keep_pod_side_delivery() -> None:
+    deployment = next(
+        obj for obj in _objs(spec=_no_client_auth_spec()) if obj["kind"] == "Deployment"
+    )
+    env = deployment["spec"]["template"]["spec"]["containers"][0]["env"]
+    by_name = {item["name"]: item for item in env}
+    for name in ("UPSTREAM_CLIENT_ID", "UPSTREAM_CLIENT_SECRET"):
+        assert by_name[name] == {
+            "name": name,
+            "valueFrom": {"secretKeyRef": {"name": "conn-secrets", "key": name, "optional": False}},
+        }

@@ -104,7 +104,7 @@
                 },
                 {
                   "type": "text",
-                  "text": " (in progress, round 2)"
+                  "text": " (stopped here)"
                 }
               ]
             }
@@ -148,7 +148,7 @@
       "content": [
         {
           "type": "text",
-          "text": "Status: WORKING"
+          "text": "Status: FAILED"
         }
       ]
     },
@@ -156,14 +156,97 @@
       "type": "rule"
     },
     {
-      "type": "codeBlock",
-      "attrs": {
-        "language": "text"
-      },
+      "type": "paragraph",
       "content": [
         {
           "type": "text",
-          "text": "tests failed: 2"
+          "text": "Agent's last message:"
+        }
+      ]
+    },
+    {
+      "type": "blockquote",
+      "content": [
+        {
+          "type": "paragraph",
+          "content": [
+            {
+              "type": "text",
+              "text": "Maintainer decision required",
+              "marks": [
+                {
+                  "type": "strong"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "paragraph",
+          "content": [
+            {
+              "type": "text",
+              "text": "Choose "
+            },
+            {
+              "type": "text",
+              "text": "parser.py",
+              "marks": [
+                {
+                  "type": "code"
+                }
+              ]
+            },
+            {
+              "type": "text",
+              "text": " before retrying."
+            }
+          ]
+        },
+        {
+          "type": "orderedList",
+          "content": [
+            {
+              "type": "listItem",
+              "content": [
+                {
+                  "type": "paragraph",
+                  "content": [
+                    {
+                      "type": "text",
+                      "text": "Confirm the input format."
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "listItem",
+              "content": [
+                {
+                  "type": "paragraph",
+                  "content": [
+                    {
+                      "type": "text",
+                      "text": "Pick the parser."
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "attrs": {
+            "order": 1
+          }
+        }
+      ]
+    },
+    {
+      "type": "paragraph",
+      "content": [
+        {
+          "type": "text",
+          "text": "Cause: no_pull_request"
         }
       ]
     },

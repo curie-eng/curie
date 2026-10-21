@@ -22,7 +22,7 @@ data:
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "curie.fullname" . }}-clickhouse
+  name: {{ include "curie.checkedObjectName" (dict "kind" "Service" "name" (printf "%s-clickhouse" (include "curie.fullname" .))) }}
   labels:
     {{- include "curie.labels" . | nindent 4 }}
 spec:
@@ -40,7 +40,7 @@ spec:
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: {{ include "curie.fullname" . }}-clickhouse
+  name: {{ include "curie.checkedObjectName" (dict "kind" "StatefulSet" "name" (printf "%s-clickhouse" (include "curie.fullname" .))) }}
   labels:
     {{- include "curie.labels" . | nindent 4 }}
 spec:

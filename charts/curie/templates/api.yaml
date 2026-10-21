@@ -36,7 +36,7 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "curie.fullname" . }}-api
+  name: {{ include "curie.checkedObjectName" (dict "kind" "Service" "name" (printf "%s-api" (include "curie.fullname" .))) }}
   labels:
     {{- include "curie.labels" . | nindent 4 }}
     app.kubernetes.io/component: api
@@ -81,7 +81,7 @@ spec:
       annotations:
         {{- with (include "curie.secretChecksum" (dict
         "root" $
-        "keys" (list "apiKey" "approvalChatAttesterSecret" "internalWorkerToken" "installationId" "githubWebhookSecret")
+        "keys" (list "apiKey" "approvalChatAttesterSecret" "remediationAuthorityKey" "internalWorkerToken" "installationId" "githubWebhookSecret")
         "refs" $checksumRefs
         "env" (printf "%s\n%s\n%s\n%s\n%s" (include "curie.env.postgres" $) (include "curie.env.valkey" $) (include "curie.env.slack" (dict "root" $ "workload" "api")) (include "curie.env.otel" (dict "root" $ "extraEnv" $.Values.api.extraEnv)) $checksumExtraEnv))) }}
         checksum/secret: {{ . }}
@@ -217,6 +217,13 @@ spec:
                 secretKeyRef:
                   name: {{ include "curie.secretName" . }}
                   key: approvalChatAttesterSecret
+            # ADR 0231: the remediation policy bind and arm authority. Only the
+            # API receives it; no worker, dispatcher or runner may hold it.
+            - name: CURIE_REMEDIATION_AUTHORITY_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "curie.secretName" . }}
+                  key: remediationAuthorityKey
             - name: CURIE_INTERNAL_WORKER_TOKEN
               valueFrom:
                 secretKeyRef:

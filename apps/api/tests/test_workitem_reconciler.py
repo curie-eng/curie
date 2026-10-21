@@ -32,6 +32,7 @@ from curie_telemetry import build_resource, configure_meter_provider
 from curie_telemetry import metrics as telemetry_metrics
 from curie_telemetry import tracing as telemetry_tracing
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
+from forge_fakes import factory_wake
 from forge_fakes.github_comments import ci_pending
 from opentelemetry import trace
 from opentelemetry.sdk.metrics import MeterProvider
@@ -1457,7 +1458,14 @@ def test_start_failed_request_gets_no_execute_wake_while_a_waiting_sibling_does(
             text("SELECT dispatch_generation FROM curie.execution_requests WHERE id = :id"),
             {"id": request_id},
         )
-        granted = await acquire(session, request_id, owner="worker-a", generation=generation)
+        granted = await acquire(
+            session,
+            request_id,
+            owner="worker-a",
+            generation=generation,
+            wake=await factory_wake(session, request_id),
+            context=None,
+        )
         assert getattr(granted, "code", None) is None, granted
         deferred = await defer(
             session,

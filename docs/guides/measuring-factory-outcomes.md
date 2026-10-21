@@ -1,7 +1,7 @@
 # Measuring Software Factory outcomes
 
 Evaluate the factory by accepted work and human effort, alongside model usage.
-A pull request being opened is an output; it is not automatically a completed
+A pull request or merge request being opened is an output; it is not automatically a completed
 engineering task or saved developer time. Start with a bounded trial and record
 both successes and failures. See the [factory overview](../software-factory.md)
 and [administrator guide](../administering-co-workers.md).
@@ -16,11 +16,11 @@ installed release before choosing a measurement method.
 | Evidence | Supported surface | What you must still measure |
 |---|---|---|
 | Issue, PR, execution requests, state, and cause | Issue status comment; `curie cluster work-items [ID]`; operator API `GET /work-items` and `GET /work-items/{id}` | Your cohort, completion definition, observation cutoff, and exclusions |
-| CI at the PR head | GitHub checks; `ci` on the work item detail API | Historic CI snapshots if you need a time series; list API has `ci: null` |
+| CI at the PR or merge-request head | The selected code host's CI status; `ci` on the work item detail API | Historic CI snapshots if you need a time series; list API has `ci: null` |
 | Tokens and estimated cost over requests | Operator API `GET /work-items/{id}/usage`; terminal issue usage summary when recorded | Provider-billed cost reconciliation and costs outside reported model usage |
 | Implementer/reviewer split | Usage API `roles` and `models` | Whether a model choice improves acceptance or reduces review effort |
-| Merged PR | GitHub PR merge state and timestamp | Whether it meets the agreed task definition and remains accepted |
-| Accepted PR | Human decision recorded in GitHub or your trial ledger | Acceptance rubric; this is not a platform-derived business KPI |
+| Merged change | The code host's PR or merge-request state and timestamp | Whether it meets the agreed task definition and remains accepted |
+| Accepted change | Human decision recorded in the code host or your trial ledger | Acceptance rubric; this is not a platform-derived business KPI |
 | Human effort | Manual time log | Issue preparation, supervision, review, rework, and operational effort |
 
 These APIs require an operator platform API key; follow
@@ -31,7 +31,7 @@ analytics API. A truncated list cannot establish a full cohort; keep a manual
 issue ledger for the trial and fetch each known item's detail and usage.
 
 The usage shape is defined in
-[`schemas.py`](../../apps/api/src/curie_api/schemas.py), the routes in
+[work item schemas](../../apps/api/src/curie_api/schemas/workitems.py), the routes in
 [`work_item_outcomes.py`](../../apps/api/src/curie_api/routers/work_item_outcomes.py),
 and aggregation/pricing in
 [`factory_usage.py`](../../apps/api/src/curie_api/factory_usage.py).

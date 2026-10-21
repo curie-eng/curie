@@ -35,12 +35,15 @@ from aci_protocol import (
     ToolNote,
     TurnSource,
 )
-from curie_worker.approvals import ApprovalRequest, CreatedApproval
+from curie_worker.approvals import ApprovalRequest, CreatedApproval, PublicationLineage
 from curie_worker.behaviorpacks import BehaviorPacks
+from curie_worker.binding import FactoryContext, FactoryWake
+from curie_worker.sandbox import SuspendedThreadError
 from curie_worker.workitem_dispatch import (
     WorkItemAcquireGrant,
     WorkItemConflict,
     WorkItemRequestView,
+    WorkItemRunning,
     WorkItemStartGrant,
     WorkItemTransportError,
 )
@@ -49,6 +52,7 @@ from apps.worker.tests.kernel.test_work_item_workspace import (
     _PR_NOT_ADOPTED_RESPONSE,
     _HttpPrecheckApi,
 )
+from apps.worker.tests.queue_fixtures import factory_context, factory_conversation
 
 AGENT_ID = uuid.UUID("11111111-1111-4111-8111-111111111111")
 DEPLOYMENT_ID = uuid.UUID("22222222-2222-4222-8222-222222222222")
@@ -56,6 +60,7 @@ CHANNEL = "C0EXAMPLE1"
 WORK_ITEM_REPO = "acme-corp/widgets"
 ISSUE_URL = f"https://github.com/{WORK_ITEM_REPO}/issues/123"
 ISSUE_PROMPT = f"Resolve {ISSUE_URL}"
+PR_URL = f"https://github.com/{WORK_ITEM_REPO}/pull/77"
 PUBLISH_TOOL = "mcp__curie__publish_changes"
 PROGRESS_TOOL = "mcp__curie__report_progress"
 # A credential shape the shared redaction policy (curie_telemetry.redact
@@ -64,7 +69,7 @@ GITHUB_TOKEN = "gh" + "p_" + "A1b2C3d4" * 5
 
 
 class _Binding:
-    async def resolve(self, kind: str, adapter: str | None, channel: str) -> object:
+    def _deployment(self) -> object:
         return SimpleNamespace(
             agent_id=AGENT_ID,
             agent_name="acme-bot",
@@ -73,6 +78,13 @@ class _Binding:
             adapter=None,
             approval_routes=None,
         )
+
+    async def resolve(self, kind: str, adapter: str | None, channel: str) -> object:
+        return self._deployment()
+
+    async def resolve_factory(self, context: FactoryContext) -> object:
+        assert context.agent_id == AGENT_ID
+        return self._deployment()
 
     def boot_env(self, _resolved: object, thread_key: str, **_: object) -> dict[str, str]:
         return {
@@ -102,13 +114,22 @@ class _Workspace:
                 caller_run=kwargs.get("caller_run"),
             )
             return SimpleNamespace(handle=handoff, prepared=None)
-        handle = self.substrate.claim(  # type: ignore[attr-defined]
-            str(kwargs["thread_key"]),
-            env=kwargs.get("env"),
-            agent_name=kwargs.get("agent_name"),
-            workspace_repo=kwargs.get("repo_full_name"),
-            caller_run=kwargs.get("caller_run"),
-        )
+        try:
+            handle = self.substrate.claim(  # type: ignore[attr-defined]
+                str(kwargs["thread_key"]),
+                env=kwargs.get("env"),
+                agent_name=kwargs.get("agent_name"),
+                workspace_repo=kwargs.get("repo_full_name"),
+                caller_run=kwargs.get("caller_run"),
+            )
+        except SuspendedThreadError:
+            handle = self.substrate.resume(  # type: ignore[attr-defined]
+                str(kwargs["thread_key"]),
+                env=kwargs.get("env"),
+                agent_name=kwargs.get("agent_name"),
+                workspace_repo=kwargs.get("repo_full_name"),
+                caller_run=kwargs.get("caller_run"),
+            )
         return SimpleNamespace(handle=handle, prepared=None)
 
     def touch(self, _thread_key: str, *, ttl_seconds: int) -> bool:
@@ -130,35 +151,118 @@ class _WorkItems:
         self.deadline_s = deadline_s
         self.calls: list[str] = []
         self.finishes: list[dict[str, object]] = []
+        self.acquisitions: dict[uuid.UUID, WorkItemAcquireGrant] = {}
+        self.starts: dict[uuid.UUID, WorkItemStartGrant] = {}
+        self.terminal_outcomes: dict[uuid.UUID, str] = {}
+        self.deadline_holds: set[uuid.UUID] = set()
         self.after_finish: Callable[[], Awaitable[None]] | None = None
         # What each ``get_request`` answers, in order: a status, or an error to
         # raise, or a number of seconds to hang before reading as ``running``.
-        # Once exhausted, the request reads as ``running``.
+        # Once exhausted, reads return the recorded request state.
         self.request_reads = list(request_reads or [])
 
     async def acquire(
-        self, request_id: uuid.UUID, *, owner: str, generation: int
+        self,
+        request_id: uuid.UUID,
+        *,
+        owner: str,
+        generation: int,
+        wake: FactoryWake,
+        context: FactoryContext | None,
     ) -> WorkItemAcquireGrant:
         self.calls.append("acquire")
-        return WorkItemAcquireGrant(
+        if request_id in self.starts or request_id in self.terminal_outcomes:
+            raise WorkItemConflict("not_dispatchable")
+        existing = self.acquisitions.get(request_id)
+        if existing is not None:
+            assert existing.generation == generation
+            assert context is None or context == existing.context
+            return existing
+        grant = WorkItemAcquireGrant(
             generation=generation,
             work_item_id=request_id,
-            conversation_id=f"work-item-{request_id}",
-            wait_deadline=(datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+            conversation_id=factory_conversation(wake),
+            wait_deadline=datetime.now(UTC) + timedelta(hours=1),
             repository_path=WORK_ITEM_REPO,
+            context=factory_context(AGENT_ID, wake),
+        )
+        self.acquisitions[request_id] = grant
+        return grant
+
+    async def running_for_conversation(
+        self, conversation_id: str, *, wake: FactoryWake
+    ) -> WorkItemRunning | None:
+        self.calls.append("running_for_conversation")
+        matches = [
+            (request_id, grant)
+            for request_id, grant in self.acquisitions.items()
+            if grant.conversation_id == conversation_id
+        ]
+        if not matches:
+            return None
+        running = [
+            (request_id, grant, self.starts[request_id])
+            for request_id, grant in matches
+            if request_id in self.starts
+            and request_id not in self.terminal_outcomes
+            and self.starts[request_id].execution_deadline > datetime.now(UTC)
+        ]
+        if not running:
+            raise WorkItemConflict("execution_ended")
+        assert len(running) == 1
+        request_id, grant, started = running[0]
+        if factory_conversation(wake) != grant.conversation_id:
+            raise WorkItemConflict("factory_wake_mismatch")
+        return WorkItemRunning(
+            request_id=request_id,
+            work_item_id=grant.work_item_id,
+            agent_id=grant.agent_id,
+            generation=grant.generation,
+            conversation_id=grant.conversation_id,
+            wait_deadline=grant.wait_deadline,
+            repository_path=grant.repository_path,
+            runtime_epoch=started.runtime_epoch,
+            execution_deadline=started.execution_deadline,
+            lease_held_to_deadline=request_id in self.deadline_holds,
+            context=grant.context,
+            refusal=None,
         )
 
-    async def start(self, request_id: uuid.UUID, **_: object) -> WorkItemStartGrant:
+    async def start(
+        self, request_id: uuid.UUID, *, context: FactoryContext, **_: object
+    ) -> WorkItemStartGrant:
         self.calls.append("start")
-        return WorkItemStartGrant(
+        acquired = self.acquisitions[request_id]
+        assert context == acquired.context
+        assert request_id not in self.starts
+        assert request_id not in self.terminal_outcomes
+        started = WorkItemStartGrant(
             runtime_epoch=1,
             execution_deadline=datetime.now(UTC) + timedelta(seconds=self.deadline_s),
             remaining_s=self.deadline_s,
             heartbeat_interval_s=60.0,
         )
+        self.starts[request_id] = started
+        return started
 
-    async def finish(self, _request_id: uuid.UUID, **kwargs: object) -> None:
+    async def hold_for_approval(
+        self, request_id: uuid.UUID, *, runtime_epoch: int, **_: object,
+    ) -> None:
+        self.calls.append("hold_for_approval")
+        assert runtime_epoch == self.starts[request_id].runtime_epoch
+        assert request_id not in self.terminal_outcomes
+        self.deadline_holds.add(request_id)
+
+    async def finish(self, request_id: uuid.UUID, **kwargs: object) -> None:
         self.calls.append("finish")
+        started = self.starts[request_id]
+        assert kwargs["runtime_epoch"] == started.runtime_epoch
+        assert request_id not in self.terminal_outcomes
+        outcome = kwargs["outcome"]
+        assert outcome in {"completed", "failed"}
+        assert isinstance(outcome, str)
+        self.terminal_outcomes[request_id] = outcome
+        self.deadline_holds.discard(request_id)
         self.finishes.append(kwargs)
         if self.after_finish is not None:
             await self.after_finish()
@@ -166,9 +270,15 @@ class _WorkItems:
     async def issue_read_context(self, request_id: uuid.UUID) -> tuple[str, str]:
         return "acme widgets issue 7", f"wir.capability-for-{request_id}"
 
-    async def get_request(self, _request_id: uuid.UUID) -> WorkItemRequestView:
+    async def get_request(self, request_id: uuid.UUID) -> WorkItemRequestView:
         self.calls.append("get_request")
-        read = self.request_reads.pop(0) if self.request_reads else "running"
+        if request_id not in self.acquisitions:
+            raise WorkItemConflict("not_found")
+        started = self.starts.get(request_id)
+        status = self.terminal_outcomes.get(
+            request_id, "running" if started is not None else "waiting"
+        )
+        read = self.request_reads.pop(0) if self.request_reads else status
         if isinstance(read, BaseException):
             raise read
         if isinstance(read, float):
@@ -176,7 +286,7 @@ class _WorkItems:
             read = "running"
         return WorkItemRequestView(
             status=read,
-            runtime_epoch=1,
+            runtime_epoch=started.runtime_epoch if started is not None else 0,
             runtime_claim_name=None,
             runtime_sandbox_name=None,
         )
@@ -416,11 +526,12 @@ def test_the_unpublished_cause_follows_the_work_evidence(tools: frozenset[str], 
 
 
 class _PublicationApi:
-    def __init__(self) -> None:
+    def __init__(self, lineage: PublicationLineage | None = None) -> None:
         self.creates: list[object] = []
+        self.lineage = lineage
 
-    async def get_publication_lineage(self, *_args: object) -> None:
-        return None
+    async def get_publication_lineage(self, *_args: object) -> PublicationLineage | None:
+        return self.lineage
 
     async def get_publication_precheck_context(self, **_kwargs: object) -> None:
         return None
@@ -430,6 +541,59 @@ class _PublicationApi:
 
         self.creates.append(request)
         return CreatedPublication(id="publication-1", approval_id="approval-1", status="pending")
+
+
+def _revision_lineage(pr_url: str | None, conversation_id: str) -> PublicationLineage:
+    return PublicationLineage(
+        id=uuid.uuid4(),
+        deployment_id=DEPLOYMENT_ID,
+        conversation_id=conversation_id,
+        repo_full_name=WORK_ITEM_REPO,
+        base_sha="b" * 40,
+        branch="curie/thread-example",
+        pr_number=77,
+        pr_url=pr_url,
+        head_sha="a" * 40,
+        state="open",
+        version=2,
+        latest_revision=1,
+        has_pending_revision=False,
+        has_pending_outcome=False,
+        visible_outcome_revision=1,
+    )
+
+
+@pytest.mark.parametrize(
+    ("pr_url", "worked_cause"),
+    [
+        (PR_URL, "revision_unchanged"),
+        (None, "no_pull_request"),
+        ("", "no_pull_request"),
+        (" \t ", "no_pull_request"),
+    ],
+)
+@pytest.mark.parametrize("context_only", [False, True])
+def test_issue_4752_unpublished_revision_uses_the_recorded_pull_request(
+    make_harness, pr_url: str | None, worked_cause: str, context_only: bool
+) -> None:
+    async def exercise() -> None:
+        publications = _PublicationApi(_revision_lineage(pr_url, "1700000000.000001"))
+        detail = "checkout_changed_before_plan_approval"
+        opened, items, terminal = await _run_execute(
+            make_harness,
+            [[_tool("Read" if context_only else "Bash"), _done("Checking.")], [_done(detail)]],
+            publication_creator=publications,
+        )
+
+        assert len(opened) == 2
+        assert terminal
+        assert len(items.finishes) == 1
+        assert items.finishes[0]["outcome"] == "failed"
+        assert items.finishes[0]["cause"] == ("early_stop" if context_only else worked_cause)
+        assert items.finishes[0]["detail"] == detail
+        assert publications.creates == []
+
+    asyncio.run(exercise())
 
 
 def _patch_snapshot(h: object, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1434,13 +1598,21 @@ def test_publication_pending_on_an_early_stop_finish_settles_the_event(
 # --- W12: an approval-resume turn is never continued ---------------------------------
 
 
-def test_an_approval_resume_turn_is_not_continued(make_harness) -> None:
+@pytest.mark.parametrize(
+    ("pr_url", "cause"),
+    [(PR_URL, "revision_unchanged"), (None, "no_pull_request"), (" \t ", "no_pull_request")],
+)
+def test_an_approval_resume_turn_is_not_continued(
+    make_harness, pr_url: str | None, cause: str
+) -> None:
+    """#4752: approval resume keeps lineage and never opens an unpublished continuation."""
+
     async def exercise() -> None:
         async with make_harness(
             binding=_Binding(),
             workspace_factory=_Workspace,
             approvals=_Approvals(),
-            publication_creator=_PublicationApi(),
+            publication_creator=_PublicationApi(_revision_lineage(pr_url, "1700000000.000001")),
         ) as h:
             items = _WorkItems()
             h.kernel._work_items = items
@@ -1470,7 +1642,7 @@ def test_an_approval_resume_turn_is_not_continued(make_harness) -> None:
 
             assert len(h.runner.opened) == 2
             assert len(items.finishes) == 1
-            assert items.finishes[0]["cause"] == "no_pull_request"
+            assert items.finishes[0]["cause"] == cause
             assert items.finishes[0]["detail"] == "Resumed. Nothing to publish."
 
     asyncio.run(exercise())

@@ -17,6 +17,7 @@ from curie_runner.__main__ import build_runner
 from curie_runner.adapter import build_options
 from curie_runner.config import RunnerConfig
 from curie_runner.fake import FakeModelSession
+from runner_boot_session import initialized_session_sync
 
 _BUDGET = '{"max_output_tokens_per_run": 10000, "max_usd_per_day": 1.0}'
 _BASE = {
@@ -155,6 +156,6 @@ def test_build_runner_wires_disallowed_tools_onto_the_fake_session(
         }
     )
     runner = build_runner(config, fake_model=True)
-    session = runner._factory()
+    session = initialized_session_sync(runner)
     assert isinstance(session, FakeModelSession)
     assert session._disallowed_tools == ("mcp__curie-state__append", "Write")

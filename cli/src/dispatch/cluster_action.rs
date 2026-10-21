@@ -1236,6 +1236,73 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                 .await?,
             )
         }
+        ClusterAction::Directory {
+            tenant,
+            resource,
+            apply,
+            after,
+            conn,
+            dry_run,
+        } => {
+            let (api_url, api_key, _port_forward) = commands::resolve_cluster_conn(
+                conn.api_url,
+                conn.api_key,
+                &conn.namespace,
+                &conn.release,
+                dry_run,
+            )
+            .await?;
+            emit(
+                commands::directory_admin(
+                    api_url,
+                    api_key,
+                    tenant.to_string(),
+                    resource,
+                    apply,
+                    after,
+                    dry_run,
+                )
+                .await?,
+            )
+        }
+        ClusterAction::AccessPolicy {
+            agent,
+            invocation_team,
+            approver_team,
+            clear_invocation_team,
+            clear_approver_team,
+            conn,
+            dry_run,
+        } => {
+            // Resolved before the connection, like `Callers`: a malformed team
+            // id is a usage error, not a cluster lookup that fails elsewhere.
+            let change = commands::AccessPolicyChange::resolve(
+                invocation_team,
+                approver_team,
+                clear_invocation_team,
+                clear_approver_team,
+            )?;
+            let (api_url, api_key, _port_forward) = commands::resolve_cluster_conn(
+                conn.api_url,
+                conn.api_key,
+                &conn.namespace,
+                &conn.release,
+                dry_run,
+            )
+            .await?;
+            emit(
+                commands::agent_access_policy(
+                    AgentActionOpts {
+                        api_url,
+                        api_key,
+                        agent,
+                        dry_run,
+                    },
+                    change,
+                )
+                .await?,
+            )
+        }
         ClusterAction::Callers {
             agent,
             surface,
@@ -1710,6 +1777,7 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
             reject,
             note,
             mint_operator_principal,
+            mint_remediation_principal,
             mint_console_login_code,
             route_resolution,
             route_approvers,
@@ -1753,6 +1821,7 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                         reject,
                         note,
                         mint_operator_principal,
+                        mint_remediation_principal,
                         mint_console_login_code,
                         route_resolution,
                         route_approvers,

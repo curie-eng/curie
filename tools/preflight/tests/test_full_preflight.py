@@ -85,6 +85,7 @@ def repository(tmp_path: Path) -> Path:
         "scripts/check-commit-messages.sh",
         "tools/fix-pin-ci/check.py",
         "tools/e2e-ci-selection/select_tiers.py",
+        "tools/e2e-ci-selection/cli_pytest_files.txt",
         "release/atlas.py",
         "cli/Cargo.toml",
         "pyproject.toml",
@@ -713,17 +714,56 @@ def test_ci_only_selector_reports_tiers_and_kind_jobs(repository: Path) -> None:
     assert "approval" in text
 
 
+@pytest.mark.parametrize("base", ("main", "next"))
+@pytest.mark.parametrize(
+    "path",
+    (
+        "charts/curie/templates/api.yaml",
+        "cli/src/config_migrate.rs",
+        ".github/workflows/ci.yaml",
+    ),
+    ids=("chart", "factory", "upgrade-workflow"),
+)
+def test_ci_only_pr_upgrade_smoke_reports_negative_without_positive(
+    repository: Path, base: str, path: str
+) -> None:
+    if base == "next":
+        git(repository, "update-ref", "refs/remotes/origin/next", "origin/main")
+    if path == ".github/workflows/ci.yaml":
+        workflow = repository / path
+        text = workflow.read_text()
+        name = "    name: E2E released chart upgrade (released install to candidate)\n"
+        assert text.count(name) == 1
+        workflow.write_text(text.replace(name, "    name: Example released chart upgrade\n", 1))
+    head = commit_paths(repository, [path])
+
+    selected = load_tool().select_ci_only(repository, [path], base, head)
+
+    upgrade_selected = base == "main" or path == ".github/workflows/ci.yaml"
+    for entry in (
+        "released-upgrade", "e2e-cluster-upgrade-matrix", "e2e-released-upgrade-negative",
+    ):
+        assert (entry in selected) is upgrade_selected, selected
+    assert "e2e-released-upgrade" not in selected
+    if base == "next":
+        assert "cluster" not in selected
+
+
 def test_ci_only_cli_text_and_json_agree(repository: Path, recorded_gh: Path) -> None:
     commit_paths(repository, ["charts/curie/templates/api.yaml"])
     result = full_preflight(repository, "--dry-run", "--json")
     assert result.returncode == 0, result.stdout + result.stderr
     report = json.loads(result.stdout)
     assert any("cluster" in entry for entry in report["ci_only"])
+    assert "e2e-cluster-upgrade-matrix" in report["ci_only"]
+    assert "e2e-released-upgrade-negative" in report["ci_only"]
+    assert "e2e-released-upgrade" not in report["ci_only"]
     readable = full_preflight(repository, "--dry-run")
     assert readable.returncode == 0, readable.stdout + readable.stderr
     text = readable.stdout + readable.stderr
     assert "runs in CI only" in text
     assert all(entry in text for entry in report["ci_only"])
+    assert "e2e-released-upgrade: runs in CI only" not in text
 
 
 def test_ci_only_docs_change_has_no_tiers(repository: Path) -> None:

@@ -3,6 +3,7 @@
 # suppress the chart entry. The shared validator still refuses repeated extraEnv names.
 worker:
   BUNDLE_BUCKET: agentSandbox.runner.bundleFetch.bucket
+  CURIE_ACTION_EXECUTOR_CONNECTOR_READS: actionExecutor.connectorReadsWithoutReconciler
   CURIE_ACTION_EXECUTOR_ENABLED: actionExecutor.enabled
   CURIE_ACTION_EXECUTOR_MAX_CONCURRENT_SANDBOXES: actionExecutor.maxConcurrentSandboxes
   CURIE_ADAPTER_CREDENTIALS: worker.adapterCredentialsExistingSecret
@@ -151,6 +152,7 @@ api:
   CURIE_INTERNAL_WORKER_TOKEN: worker.internalWorkerToken
   CURIE_PUBLICATION_PATCH_MAX_BYTES: worker.publication.patchMaxBytes
   CURIE_PUBLICATION_RETENTION_SECONDS: worker.publication.retentionSeconds
+  CURIE_REMEDIATION_AUTHORITY_KEY: api.remediationAuthorityKey
   CURIE_REMEDIATION_ENABLED: remediation.enabled
   CURIE_SANDBOX_QUOTA_LIMITS_CPU: resourceQuota.hard.limitsCpu
   CURIE_SANDBOX_QUOTA_LIMITS_MEMORY: resourceQuota.hard.limitsMemory

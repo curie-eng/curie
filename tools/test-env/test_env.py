@@ -260,7 +260,9 @@ def private_network_subnets(project: str, occupied: Sequence[str]) -> tuple[str,
     seed = int(hashlib.sha256(project.encode()).hexdigest(), 16)
     selected: list[str] = []
     for pool_index, pool in enumerate(pools):
-        candidates = list(pool.subnets(new_prefix=24))
+        candidates: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = list(
+            pool.subnets(new_prefix=24)
+        )
         start = (seed + pool_index) % len(candidates)
         for offset in range(len(candidates)):
             candidate = candidates[(start + offset) % len(candidates)]

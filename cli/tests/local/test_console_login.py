@@ -174,12 +174,10 @@ def stack(request: pytest.FixtureRequest, tmp_path: pathlib.Path, source_artifac
       S3_ENDPOINT_URL: "${{S3_ENDPOINT_URL}}"
       CURIE_API_URL: "${{CURIE_API_URL}}"
       CURIE_DOCKER_NETWORK: "${{CURIE_DOCKER_NETWORK}}"
-      TMPDIR: "${{CURIE_LOCAL_STAGING_DIR}}"
       SLACK_API_BASE_URL: "http://127.0.0.1:${{CURIE_LOCAL_STUB_PORT}}/api/"
       OTEL_EXPORTER_OTLP_ENDPOINT: ""
     volumes: !override
       - /var/run/docker.sock:/var/run/docker.sock
-      - "${{CURIE_LOCAL_STAGING_DIR}}:${{CURIE_LOCAL_STAGING_DIR}}"
 networks:
   curie_runner:
     name: "{project}_runner"
@@ -214,7 +212,6 @@ networks:
             "CURIE_LOCAL_POSTGRES_HOST": "127.0.0.1",
             "CURIE_LOCAL_POSTGRES_PORT": "1",
             "CURIE_LOCAL_STUB_PORT": "1",
-            "CURIE_LOCAL_STAGING_DIR": str(tmp_path / "staging"),
             "CURIE_API_KEY": POISONED_KEY,
             "CURIE_TEST_DISCOVERED_KEY": api_key,
             "CURIE_TEST_KUBECTL_LOG": str(kubectl_log),

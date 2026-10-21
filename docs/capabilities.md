@@ -1,19 +1,12 @@
 # Curie capabilities and release status
 
-Use this reference to compare existing capabilities and upcoming v0.13.0
-contents. Curie is an open-source
-platform for turning supported agents into co-workers, with Software Factory as
+Use this reference to compare supported capabilities and their limits. Curie
+is an open-source platform for turning supported agents into co-workers, with Software Factory as
 the first adoption path. The [factory overview](software-factory.md),
 [existing-agent guide](bring-your-agent.md), and
 [administrator guide](administering-co-workers.md) explain how to use it.
 
 ## Reading the status
-
-**Included in v0.13.0** identifies upcoming release contents with the limits
-stated in each row. The GitLab and Jira Cloud factory integrations and Bitbucket
-adapters listed below are absent from stable v0.12.5. Check
-[release notes](https://github.com/curie-eng/curie/releases) to confirm publication
-before installing v0.13.0.
 
 Use this reference alongside the documentation for your installed release.
 Source references explain the implementation; they do not establish that a
@@ -22,11 +15,9 @@ feature described on a development branch is available in a released build.
 1. **Released:** the implementation is available in the supported workflow. This is not a claim
    that every provider, environment, or workflow received a fresh live test.
 2. **Released with limits:** the implementation ships, with the stated constraint.
-3. **Included in v0.13.0:** the implementation is present on `next` for the upcoming
-   release, with the scope and limits stated in each row.
-4. **Unavailable:** a complete supported adoption path is absent or currently
+3. **Unavailable:** a complete supported adoption path is absent or currently
    refused. A design, interface, or partial adapter does not establish support.
-5. **Unreleased:** a feature is not part of the documented stable workflow.
+4. **Unreleased:** a feature is not part of the documented stable workflow.
    Check [release notes](https://github.com/curie-eng/curie/releases) before
    depending on it.
 
@@ -47,9 +38,9 @@ one does not imply support for the other.
 | Discord | Released with limits | A separate adapter supports mentions, public threads, and text replies. It has no chart or Compose deployment recipe and no interactive approval buttons, direct messages, or attachments. See [Discord adapter](../adapters/discord/README.md). |
 | Email through AgentMail | Unavailable for inbound work | The adapter ships, but every inbound message and approval answer is refused with `authentication_unverifiable`. A trusted sender-authentication source is required before this becomes an adoption path. Outbound reply handling does not make inbound conversations usable. See [canonical inbound security](../apps/mail-adapter/README.md#inbound-security). |
 | Teams | Unavailable | No supported first-party Teams channel is supplied. |
-| GitLab Software Factory | Included in v0.13.0 | GitLab is both tracker and code host on gitlab.com and self-managed servers. Requires GitLab 17.0 or later; only 19.4.1 has been tested. Factory acceptance passed with a real model on the GitLab fixture. See [GitLab quickstart](guides/dark-factory-quickstart.md#gitlab) and [acceptance pairings](../tools/factory-e2e/acceptance.py). |
-| Jira Cloud Software Factory with GitHub | Included in v0.13.0 | Jira Cloud supplies issues and status comments while GitHub handles pull requests, CI, and review. A GitHub App remains required. Jira Cloud with GitLab has no installed acceptance path. See [Jira Cloud quickstart](guides/dark-factory-quickstart.md#jira-cloud) and [acceptance pairings](../tools/factory-e2e/acceptance.py). |
-| Bitbucket Cloud and Data Center adapters | Included in v0.13.0, adapters and drivers only | Code-host adapters and factory-loop drivers ship for Bitbucket Cloud and Data Center 9.4.0 or later. The combined Jira Cloud and Bitbucket quickstart and acceptance pairings remain refused and are deferred to v0.13.1. The guide documents hand-written chart values; these do not establish a supported or live-proved installation path. See [Bitbucket configuration](guides/dark-factory-quickstart.md#bitbucket-cloud-and-data-center) and [refused acceptance pairings](../tools/factory-e2e/acceptance.py). |
+| GitLab Software Factory | Released with limits | GitLab is both tracker and code host on gitlab.com and self-managed servers. Requires GitLab 17.0 or later; only 19.4.1 has been tested. Factory acceptance passed with a real model on the GitLab fixture. See [GitLab quickstart](guides/factory-gitlab-quickstart.md) and [acceptance pairings](../tools/factory-e2e/acceptance.py). |
+| Jira Cloud Software Factory with GitHub | Released with limits | Jira Cloud supplies issues and status comments while GitHub handles pull requests, CI, and review. A GitHub App remains required. Jira Cloud with GitLab has no installed acceptance path. See [Jira Cloud quickstart](guides/factory-jira-github-quickstart.md) and [acceptance pairings](../tools/factory-e2e/acceptance.py). |
+| Jira Cloud Software Factory with Bitbucket | Released with limits | Jira Cloud supplies issues while Bitbucket Cloud or Data Center 9.4.0 or later handles pull requests, build statuses, and review. Factory acceptance passed with a real model on both hosts. Bitbucket has no CI diagnostics, and on Bitbucket Cloud a pull request with no CI completes after the 120-second grace only when Cloud's mergeability checks report the Git check passed clean, conflicts fail as `merge_conflict`, and an unknown answer ends `ci_unverified`. That behavior is covered by documented-shape fixtures; live proof with repository, project and workspace access tokens is not yet recorded. After a reinstall or loss of factory storage, Bitbucket Cloud refuses admission of an issue that has an open factory pull request with an operator confirmation comment instead of publishing a duplicate, because it cannot verify who opened that pull request; closing or confirming the existing pull request clears the block, where confirming means removing the trigger label from the issue and reviewing the pull request as usual, and closing it lets the still-labelled issue be admitted on a later intake pass. See [Bitbucket quickstart](guides/dark-factory-quickstart.md#run-quickstart-for-bitbucket) and [acceptance pairings](../tools/factory-e2e/acceptance.py). |
 
 ## Existing agents and models
 
@@ -71,9 +62,19 @@ one does not imply support for the other.
 | Human approvals | Released with limits | A configured route identifies who may resolve a request. Approval does not widen a tool's underlying system permissions or establish cross-channel identity. See [approvals](approvals.md) and [SRE authority](../examples/sre-bot/README.md#kubernetes-authority). |
 | Runner budget controls | Released with limits | Output tokens are checked at SDK message boundaries. The field called `max_usd_per_day` is passed to the SDK as a per-session USD ceiling; it is not a shared daily ledger across runs. Estimates can overshoot at call boundaries and are not a provider billing guarantee. See [runner accounting](../runner/src/curie_runner/budget.py) and [factory operations](operations.md#the-default-factory-agent). |
 | Usage and estimated factory cost | Released with limits | Per-model usage and price-derived estimates are recorded for work items. Unknown usage/pricing is distinct from a free run. See [usage implementation](../apps/api/src/curie_api/factory_usage.py) and [outcome measurement](guides/measuring-factory-outcomes.md). |
-| Factory console enhancements | Included in v0.13.0 | The Factory view on `next` shows Queued, Running, Needs you, and Shipped lanes, with stage progress and actionable causes. Its read-only detail panel displays stages, PR and CI outcomes, estimated total and per-model costs, and request status. Shipped means a PR was published; correctness remains owned by the bundle. These enhancements are absent from stable v0.12.5. See [Factory view](../apps/ui/src/views/wired/WiredFactory.tsx) and [detail panel](../apps/ui/src/views/wired/FactoryDetail.tsx). |
+| Factory console enhancements | Released with limits | The Factory view shows Queued, Running, Needs you, and Shipped lanes, with stage progress and actionable causes. Its read-only detail panel displays stages, PR and CI outcomes, estimated total and per-model costs, and request status. Shipped means a PR was published; correctness remains owned by the bundle. See [Factory view](../apps/ui/src/views/wired/WiredFactory.tsx) and [detail panel](../apps/ui/src/views/wired/FactoryDetail.tsx). |
 | Measured ROI | Unavailable as an automatic promise | Usage and estimates help evaluate economics. Savings require a baseline, accepted outcomes, and measured human review effort. Follow the outcome measurement guide. |
 | Traces, versions, and operator control | Released with limits | The console and API expose runs, costs, versions, approvals, and memory. Retained telemetry depends on the configured stores and exporters. Trace visibility is not a blanket tamper-proof audit guarantee. See [observability](../ARCHITECTURE.md#the-observability-pipeline) and [operations](operations.md). |
+
+## Hooks, undo, and automated remediation
+
+| Capability | Status | What to expect and where to check |
+| --- | --- | --- |
+| Automated hook turns | Released with limits | An alert or event delivered through a hook starts a turn whose tool access cannot be widened by the source, and which stays `read-only`. See [read-only adoption](superpowers/specs/2026-09-30-hook-read-only-adoption.md) and [ADR 0190](adr/0190-automated-hook-sources-cannot-widen-their-tool-access.md). |
+| Protected hook lane | Unavailable | The protected worker, broker admission and source-policy routes ship, but no supported installation path exists yet: the chart and Compose render no protected broker, worker or runtime directory, and first-install commissioning, which issues the Qualification and Readiness records the lane requires, is not defined ([#4557](https://github.com/curie-eng/curie/issues/4557), [ADR 0224](adr/0224-protected-runtime-commissioning-precedes-installation-acceptance.md)). Until then a source-policy activation answers `runtime_unavailable`. See [protected hook lane](superpowers/specs/2026-10-02-protected-hook-lane.md) and [source policy](superpowers/specs/2026-10-02-protected-hook-source-policy.md). |
+| Undo of a recorded action | Released with limits | The platform restores a recorded action through the connector's own `restore` verb, with no model in the path. It needs a hosted connector at a pinned digest that serves `observe_version` and `restore` and replies to writes with a sealed snapshot. Actions recorded before 0.13.0 and cleartext replies are not undoable, and undo runs on the cluster tier only. See [writing a reversible connector](writing-a-reversible-connector.md) and the [action ledger](../ARCHITECTURE.md#the-action-ledger-and-the-connector-action-executor). |
+| Automated remediation | Unavailable | The policy, admission, executor, verifier and receipt implementation ships, but it acts only on nominations from protected hooks, which have no supported installation path yet (see the row above). When that exists: Off by default, cluster tier only, protected hooks only. A turn nominates a bounded action the administrator's policy already declares; the platform admits, executes and verifies it without a model, or asks an approver. Nothing runs unattended until the installation has recorded drills for that action, and an `idempotent` action also needs a connector whose write replies are sealed. Automated alert turns do not change alert rules. See [operations](operations.md#automated-remediation), [writing nominations](writing-remediation-nominations.md) and [ARCHITECTURE](../ARCHITECTURE.md#automated-remediation). |
+| Autonomous incident resolution | Unavailable | Remediation is bounded and opt-in per action; it is not a promise that an incident is diagnosed, fixed or kept stable without a person. Which paths are verified is your installation's recorded evidence, not a platform guarantee. |
 
 ## Deployment ownership
 

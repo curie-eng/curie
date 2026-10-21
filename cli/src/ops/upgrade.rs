@@ -1541,6 +1541,9 @@ trait UpgradeDriver {
     fn runner_layer_plan(&self) -> RunnerLayerPlan {
         RunnerLayerPlan::default()
     }
+    fn runner_layer_pending(&self) -> Option<String> {
+        None
+    }
     /// Retire the SandboxClaims of every agent [`Self::runner_layer_plan`]
     /// rebinds or clears after Apply (#3422, #4321), so a live thread's next
     /// turn cold-starts on its new runner instead of keeping the old layer.
@@ -1622,6 +1625,7 @@ async fn run_lifecycle_inner<H: UpgradeDriver>(
         &host.runner_layer_plan(),
         host.helm_timeout_seconds(),
     );
+    plan.extend(host.runner_layer_pending());
     if same_version {
         // #2861: the rerun runs no Helm upgrade, so the plan must not show one.
         plan.retain(|line| {
@@ -2095,6 +2099,7 @@ struct LiveHost {
     schema_refusal: Option<String>,
     /// What the upgrade does to each layered agent (#3218, #4321).
     runner_layers: RunnerLayerPlan,
+    runner_layer_pending: Option<String>,
     /// The target chart's own `fullnameOverride` and `nameOverride` defaults,
     /// read once with the runner defaults; the canary names templates from
     /// them under the retained overlay (#4321).
@@ -2243,6 +2248,17 @@ fn helm_values_document(values: &serde_json::Value) -> Result<String> {
     serde_json::to_string_pretty(values).context("could not serialize the migrated overlay")
 }
 
+/// The Validate refusal for an overlay whose factory trackers and bindings
+/// the API would reject (#4622): a dangling tracker reference or two bindings
+/// on one tracker scope. `None` when the overlay passes.
+fn factory_refusal(overlay: &str) -> Option<String> {
+    let values: serde_json::Value = match serde_json::from_str(overlay) {
+        Ok(values) => values,
+        Err(error) => return Some(format!("retained values overlay is malformed: {error}")),
+    };
+    crate::factory_intake::check_factory_document(&values).err()
+}
+
 fn merge_forward_only(overlay: Option<&str>) -> Result<String> {
     let mut doc: serde_json::Value = match overlay {
         Some(text) if !text.trim().is_empty() => {
@@ -2300,6 +2316,7 @@ impl LiveHost {
             schema_decision: None,
             schema_refusal: None,
             runner_layers: RunnerLayerPlan::default(),
+            runner_layer_pending: None,
             chart_name_defaults: None,
             helm_timeout_seconds: HELM_TIMEOUT_DEFAULT_SECS,
             timeout_refusal: None,
@@ -2791,6 +2808,12 @@ impl LiveHost {
             Ok(None) => {}
             Err(error) => self.config_refusal = Some(format!("{error:#}")),
         }
+        // #4622, ADR 0197: the retained values merged with every
+        // --values-file are the document Apply hands Helm, so its forge
+        // references are checked here, before any mutation.
+        if self.config_refusal.is_none() {
+            self.config_refusal = self.overlay.as_deref().and_then(factory_refusal);
+        }
         if self.current.is_some() && self.config_refusal.is_none() {
             let caller_configured = self
                 .overlay
@@ -2873,12 +2896,14 @@ impl LiveHost {
     /// The deploy guard guarantees every bound layer was built on the current
     /// installation's runner, so they all stop matching exactly when the
     /// target runner's digest differs from the current one. A release with no
-    /// layered agent costs no extra read. Either runner being unknown counts
+    /// layered agent costs no extra read. Either observed runner being unknown counts
     /// as a change: keeping an old layer under a new worker is the failure this
     /// exists to prevent, and running the platform runner is always servable.
     /// A stock dark factory binding asks the registry for the layer published
     /// for `--to` and is rebound to it when its base is the target runner.
-    /// Otherwise Validate refuses unless the operator consents to clearing it.
+    /// An unobserved target runner in a cold release defers stock rebinding
+    /// until chart download and verification by the live run. Otherwise
+    /// Validate refuses unless the operator consents to clearing it.
     fn compute_runner_layers(&mut self) {
         let Some(overlay) = self
             .overlay
@@ -2887,7 +2912,7 @@ impl LiveHost {
         else {
             return;
         };
-        let bindings = crate::cluster_secrets::layered_bindings(&overlay);
+        let mut bindings = crate::cluster_secrets::layered_bindings(&overlay);
         if bindings.is_empty() {
             return;
         }
@@ -2909,21 +2934,42 @@ impl LiveHost {
             };
             return;
         }
+        let target_reference = target_runner_ref(chart_default.as_ref(), &overlay, &self.opts.to);
+        if self.opts.chart.pending_release().is_some() && target_reference.is_none() {
+            let stock_agents: Vec<_> = bindings
+                .iter()
+                .filter(|(_, binding)| is_stock_layer(binding))
+                .map(|(agent, _)| agent.as_str())
+                .collect();
+            if !stock_agents.is_empty() {
+                self.runner_layer_pending = Some(format!(
+                    "runner layers conditional rebind: {} to the dark factory runner layer \
+                     published for {} if the platform runner changes and the published layer \
+                     matches the target runner base; the target runner is unobserved until \
+                     release chart download, so runner and published-layer compatibility \
+                     checks are pending",
+                    stock_agents.join(", "),
+                    self.opts.to
+                ));
+            }
+            bindings.retain(|_, binding| !is_stock_layer(binding));
+            if bindings.is_empty() {
+                return;
+            }
+        }
         let current = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
                 .block_on(crate::cluster_secrets::installed_runner(&self.opts.common))
         })
         .ok()
         .map(|(_, pinned)| pinned);
-        let target = target_runner_ref(chart_default.as_ref(), &overlay, &self.opts.to).and_then(
-            |reference| {
-                tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current()
-                        .block_on(crate::cluster_secrets::pin_runner_reference(&reference))
-                })
-                .ok()
-            },
-        );
+        let target = target_reference.and_then(|reference| {
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(crate::cluster_secrets::pin_runner_reference(&reference))
+            })
+            .ok()
+        });
         let stock = if needs_stock_lookup(&bindings, current.as_deref(), target.as_deref()) {
             let published = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current()
@@ -3208,6 +3254,19 @@ impl LiveHost {
         let revision =
             crate::cluster_secrets::serving_revision(&history, &self.opts.common.release)
                 .map_err(anyhow::Error::msg)?;
+        let chart = history
+            .as_array()
+            .and_then(|rows| {
+                rows.iter().find(|row| {
+                    row["revision"]
+                        .as_u64()
+                        .or_else(|| row["revision"].as_str()?.parse().ok())
+                        == Some(u64::from(revision))
+                })
+            })
+            .and_then(|row| row["chart"].as_str())
+            .unwrap_or_default()
+            .to_string();
         let values_cmd =
             crate::cluster_secrets::helm_get_json(&self.opts.common, "values", false, revision);
         let (ok, out, err) = self.run(&values_cmd)?;
@@ -3222,28 +3281,30 @@ impl LiveHost {
                 bail!("could not read retained helm values: {}", err.trim());
             }
             return if self.opts.file_values.is_some() {
-                self.migrate_effective_overlay(serde_json::json!({}))
+                self.migrate_effective_overlay(serde_json::json!({}), None)
             } else {
                 Ok(None)
             };
         }
         if out.trim().is_empty() {
             return if self.opts.file_values.is_some() {
-                self.migrate_effective_overlay(serde_json::json!({}))
+                self.migrate_effective_overlay(serde_json::json!({}), Some((revision, chart)))
             } else {
                 Ok(None)
             };
         }
-        let values: serde_json::Value =
-            serde_norway::from_str(&out).context("retained helm values are malformed")?;
-        self.migrate_effective_overlay(values)
+        let values: serde_json::Value = serde_norway::from_str(&out)
+            .map_err(|_| anyhow::anyhow!("retained helm values are malformed"))?;
+        self.migrate_effective_overlay(values, Some((revision, chart)))
     }
 
     /// @spec CLUSTER-VALUES-FILES c3: admit the final merged input once.
     fn migrate_effective_overlay(
         &self,
         mut values: serde_json::Value,
+        installed: Option<(u32, String)>,
     ) -> Result<Option<(String, Vec<String>)>> {
+        let user_values = values.clone();
         if let Some(files) = &self.opts.file_values {
             crate::config_migrate::clear_replaced_secret_refs(&mut values, &files.0);
             super::lint_values::merge_values(&mut values, files.0.clone());
@@ -3251,8 +3312,49 @@ impl LiveHost {
         // Unlike `up.rs`, the installed chart version is known here, so
         // `infer_schema_version` is not guessing when the overlay predates
         // `config.schemaVersion`.
-        let outcome =
-            crate::config_migrate::migrate_installed_config(values, self.current.as_deref())?;
+        let factory = if crate::config_migrate::has_legacy_factory_input(&values) {
+            let source = if let Some((revision, installed_chart)) = installed {
+                let command = crate::cluster_secrets::helm_get_json(
+                    &self.opts.common,
+                    "values",
+                    true,
+                    revision,
+                );
+                let (ok, out, _) = self.run(&command).map_err(|_| {
+                    anyhow::anyhow!("installed factory computed values could not be read")
+                })?;
+                if !ok {
+                    bail!("installed factory computed values could not be read");
+                }
+                let computed_values = serde_json::from_str(&out).map_err(|_| {
+                    anyhow::anyhow!("installed factory computed values are malformed")
+                })?;
+                Some(crate::factory_config_migrate::InstalledFactorySource {
+                    revision,
+                    installed_chart,
+                    user_values,
+                    computed_values,
+                })
+            } else {
+                None
+            };
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(
+                    crate::factory_config_migrate::resolve_factory_migration_context(
+                        &self.opts.common,
+                        source.as_ref(),
+                        &values,
+                    ),
+                )
+            })?
+        } else {
+            crate::config_migrate::FactoryMigrationContext::NotRequired
+        };
+        let outcome = crate::config_migrate::migrate_installed_config(
+            values,
+            self.current.as_deref(),
+            &factory,
+        )?;
         // Every line, not just the schema line: the change lines carry names
         // only, and redaction is `redacted_upgrade_plan`'s contract (#4322).
         let schema_plan = crate::config_migrate::redacted_upgrade_plan(&outcome);
@@ -3787,6 +3889,10 @@ impl UpgradeDriver for LiveHost {
     }
     fn runner_layer_plan(&self) -> RunnerLayerPlan {
         self.runner_layers.clone()
+    }
+
+    fn runner_layer_pending(&self) -> Option<String> {
+        self.runner_layer_pending.clone()
     }
 
     fn helm_timeout_seconds(&self) -> u64 {
@@ -5451,5 +5557,52 @@ mod runner_layer_guard_tests {
         let defaults = serde_json::json!({"nameOverride": "acme"});
         let overlay = serde_json::json!({});
         assert_eq!(effective_fullname(defaults, overlay), "rel-acme");
+    }
+}
+
+#[cfg(test)]
+mod factory_refusal_tests {
+    use super::factory_refusal;
+
+    fn overlay(bindings: serde_json::Value) -> String {
+        serde_json::to_string_pretty(&serde_json::json!({
+            "config": {"schemaVersion": "0.9.0"},
+            "factory": {
+                "trackers": [
+                    {"name": "jira", "kind": "jira_cloud", "host": "example.atlassian.net"},
+                    {"name": "jira-site", "kind": "jira_cloud", "host": " Example.Atlassian.NET "},
+                ],
+                "bindings": bindings,
+            }
+        }))
+        .expect("overlay serializes")
+    }
+
+    #[test]
+    fn a_merged_overlay_with_two_bindings_on_one_scope_refuses_at_validate() {
+        let refusal = factory_refusal(&overlay(serde_json::json!([
+            {"name": "jira", "tracker": "jira", "trackerScopeId": "s"},
+            {"name": "example", "tracker": "jira-site", "trackerScopeId": "s"},
+        ])))
+        .expect("refused");
+        for needle in [
+            "jira and example",
+            "jira_cloud on example.atlassian.net",
+            "trackerScopeId s",
+        ] {
+            assert!(refusal.contains(needle), "{needle}: {refusal}");
+        }
+    }
+
+    #[test]
+    fn a_merged_overlay_with_one_binding_per_scope_passes() {
+        assert_eq!(
+            factory_refusal(&overlay(serde_json::json!([
+                {"name": "jira", "tracker": "jira", "trackerScopeId": "s"},
+                {"name": "example", "tracker": "jira-site", "trackerScopeId": "t"},
+            ]))),
+            None
+        );
+        assert_eq!(factory_refusal("{}"), None);
     }
 }

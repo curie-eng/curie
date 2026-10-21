@@ -24,6 +24,7 @@ from . import adapter_principal, approval_principal
 from .auth import CONSOLE_SESSION_COOKIE, require_api_key
 from .config import get_settings
 from .deps import SessionDep
+from .identity.slack import SlackEvidence
 
 APPROVAL_PRINCIPAL_HEADER = "X-Curie-Approval-Principal"
 ADAPTER_PRINCIPAL_HEADER = "X-Curie-Adapter-Principal"
@@ -64,6 +65,8 @@ class AuthenticatedApprovalPrincipal:
     # serves, which scope the approvals it may resolve.
     adapter: str | None = None
     adapter_bindings: frozenset[uuid.UUID] = frozenset()
+    principal_id: uuid.UUID | None = None
+    slack: SlackEvidence | None = None
 
 
 def _unauthorized(detail: str = "missing or invalid approval principal") -> HTTPException:
@@ -77,16 +80,26 @@ def _unauthorized(detail: str = "missing or invalid approval principal") -> HTTP
 async def authenticate_console_session(
     session: SessionDep, token: str | None
 ) -> AuthenticatedApprovalPrincipal | None:
-    """Return the live, subject-bound console principal for ``token``.
+    """Return the live console resolver identity for ``token``.
 
-    Legacy sessions with no subject remain valid for unrelated future console
-    uses but can never become an approval resolver.
+    OIDC sessions name the active IdP principal; legacy login-code sessions
+    retain their immutable subject and cannot satisfy an IdP approver team.
     """
 
     if not token:
         return None
     row = await crud_console.live_console_session(session, token)
-    if row is None or row.subject is None or not row.subject.strip():
+    if row is None:
+        return None
+    if row.principal_id is not None:
+        principal = await crud_console.live_principal_session(session, token)
+        if principal is None:
+            return None
+        return AuthenticatedApprovalPrincipal(
+            subject=str(principal.id), kind="console", actor_channel=None,
+            principal_id=principal.id,
+        )
+    if row.subject is None or not row.subject.strip():
         return None
     return AuthenticatedApprovalPrincipal(
         subject=row.subject,
@@ -282,6 +295,7 @@ async def authenticate_principal(
         subject=claims.subject,
         kind=claims.kind,
         actor_channel=claims.actor_channel,
+        slack=claims.slack,
     )
 
 

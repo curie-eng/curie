@@ -5,9 +5,11 @@ reference").
 `POST /v1/internal/publications` for a WorkItem request asks the WorkItem's
 tracker for `closing_reference(issue, repository)` and appends it when the body
 lacks it, beside the verification statements. A GitHub body the bundle already
-wrote with `Closes #<n>` is stored byte for byte; one that omitted it gains it
-(the named delta). A Jira WorkItem's body gains `Jira: <KEY> <url>`, the key
-read from the Jira fake by issue id. A tracker that cannot answer refuses the
+wrote with `Closes #<n>` keeps its text; one that omitted it gains it (the named
+delta). Every such body then ends with the canonical marker line naming the
+issue by its immutable identity (`factory_rediscovery.issue_marker`, #4629).
+A Jira WorkItem's body gains `Jira: <KEY> <url>`, the key read from the Jira
+fake by issue id. A tracker that cannot answer refuses the
 publication 503 retryable, never storing a body without the reference.
 
 The factory request is admitted through the real GitHub label webhook (the
@@ -30,7 +32,9 @@ from typing import Any
 import httpx
 import pytest
 from curie_api.config import get_settings
+from curie_api.factory_rediscovery import issue_marker
 from curie_api.forges.registry import forges_registry
+from curie_api.forges.types import TrackerIssueRef
 from fastapi.testclient import TestClient
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -76,6 +80,25 @@ def _issue_number(payload: dict[str, Any]) -> int:
     return int(payload["reply_conversation_id"].removeprefix("issue-"))
 
 
+def _marker(request_id: uuid.UUID) -> str:
+    """The canonical marker line of the request's WorkItem issue."""
+
+    (row,) = _rows(
+        "SELECT w.tracker_kind, w.tracker_host, w.tracker_scope_id, w.tracker_issue_id "
+        "FROM curie.work_items w JOIN curie.execution_requests r ON r.work_item_id = w.id "
+        "WHERE r.id = :request",
+        {"request": request_id},
+    )
+    return issue_marker(
+        TrackerIssueRef(
+            row["tracker_kind"],
+            row["tracker_host"],
+            row["tracker_scope_id"],
+            row["tracker_issue_id"],
+        )
+    )
+
+
 def _passed(client: TestClient, request_id: uuid.UUID) -> None:
     # A passed in-sandbox check: no verification statement is appended, so the
     # closing reference is the only possible change to the body.
@@ -86,7 +109,7 @@ def _passed(client: TestClient, request_id: uuid.UUID) -> None:
 # --- GitHub -----------------------------------------------------------------------
 
 
-def test_a_github_body_that_already_closes_the_issue_is_stored_byte_for_byte(
+def test_a_github_body_that_already_closes_the_issue_keeps_its_text(
     _factory_publication_case: Case,
 ) -> None:
     client, request_id, payload = _factory_publication_case
@@ -97,8 +120,9 @@ def test_a_github_body_that_already_closes_the_issue_is_stored_byte_for_byte(
     created = _post_factory_publication(client, payload)
 
     assert created.status_code == 201, created.text
-    assert created.json()["body"] == body
-    assert _factory_publication_body(created.json()["id"]) == body
+    marked = f"{body.rstrip()}\n\n{_marker(request_id)}"
+    assert created.json()["body"] == marked
+    assert _factory_publication_body(created.json()["id"]) == marked
 
 
 def test_a_github_body_without_the_closing_reference_gains_it_once(
@@ -113,7 +137,7 @@ def test_a_github_body_without_the_closing_reference_gains_it_once(
 
     assert created.status_code == 201, created.text
     stored = _factory_publication_body(created.json()["id"])
-    assert stored == f"{payload['body']}\n\n{reference}"
+    assert stored == f"{payload['body']}\n\n{reference}\n\n{_marker(request_id)}"
     assert stored.count(reference) == 1
 
 
@@ -188,7 +212,7 @@ def test_a_jira_body_gains_the_issue_key_and_url(
     assert created.status_code == 201, created.text
     reference = f"Jira: {key} {jira_fake.SITE}/browse/{key}"
     stored = _factory_publication_body(created.json()["id"])
-    assert stored == f"{payload['body']}\n\n{reference}"
+    assert stored == f"{payload['body']}\n\n{reference}\n\n{_marker(request_id)}"
     # The key is read by issue id, with the bot's credential; nothing is written.
     reads = fake.requests_of("issue")
     assert reads and all(r.method == "GET" for r in reads)
@@ -209,7 +233,9 @@ def test_a_moved_jira_issue_is_referenced_by_its_current_key(
 
     assert created.status_code == 201, created.text
     stored = _factory_publication_body(created.json()["id"])
-    assert stored.endswith(f"\n\nJira: WEB-41 {jira_fake.SITE}/browse/WEB-41")
+    assert stored.endswith(
+        f"\n\nJira: WEB-41 {jira_fake.SITE}/browse/WEB-41\n\n{_marker(request_id)}"
+    )
     assert key not in stored
 
 
@@ -237,7 +263,7 @@ def test_a_tracker_that_cannot_answer_refuses_the_publication_retryably(
     retried = _post_factory_publication(client, payload)
     assert retried.status_code == 201, retried.text
     assert _factory_publication_body(retried.json()["id"]).endswith(
-        f"\n\nJira: {key} {jira_fake.SITE}/browse/{key}"
+        f"\n\nJira: {key} {jira_fake.SITE}/browse/{key}\n\n{_marker(request_id)}"
     )
 
 
@@ -314,5 +340,5 @@ def test_the_python_ci_policy_is_the_jira_binding_s_not_another_binding_s(
         # Liveness: the GitHub binding's policy does not reach the Jira WorkItem.
         assert answered.status_code == 201, answered.text
         assert _factory_publication_body(answered.json()["id"]).endswith(
-            f"Jira: {key} {jira_fake.SITE}/browse/{key}"
+            f"Jira: {key} {jira_fake.SITE}/browse/{key}\n\n{_marker(request_id)}"
         )

@@ -162,9 +162,24 @@ def render(f: FixtureAPI, images: Json) -> tuple[list[Json], Json]:
         "factory": {
             "sandboxEgress": {"factory": True},
             "docker": docker,
+            "trackers": [
+                {
+                    "name": "github",
+                    "kind": "github",
+                    "host": "github.com",
+                    "apiUrl": "https://api.github.com",
+                    "credential": {
+                        "type": "github_app",
+                        "existingSecret": "acme-github-app",
+                        "existingSecretKey": "private-key",
+                    },
+                }
+            ],
             "bindings": [
                 {
                     "name": "acme",
+                    "tracker": "github",
+                    "trackerScopeId": "123456",
                     "repos": [
                         {
                             "path": "acme-corp/api",

@@ -29,6 +29,7 @@ PYTHON = {
         "Lockfile is up to date",
         "Alembic revision gate",
         "Schema window gate",
+        "Contract migration timing gate",
         "Ruff",
         "Mypy",
         "Import boundaries (harness SDK containment)",
@@ -177,6 +178,65 @@ def load_helper() -> ModuleType:
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.mark.parametrize(
+    ("body", "needs_stack"),
+    [
+        (
+            "Fix pin: tools/factory-e2e/tests/test_c4_initial_binding.py::"
+            "test_second_factory_agent_uses_initial_tracker_binding",
+            False,
+        ),
+        (
+            "Fix pin: tools/factory-e2e/tests/test_c4_upgrade_migration.py::"
+            "test_v0125_factory_upgrade_uses_supported_flow",
+            False,
+        ),
+        (
+            "Fix pin: tools/factory-e2e/tests/test_c4_upgrade_migration.py::"
+            "test_v0125_factory_upgrade_uses_supported_flow[secondary]",
+            False,
+        ),
+        (
+            "Fix pin: tools/factory-e2e/tests/test_c4_forge_instances.py::"
+            "test_forge_instances_survive_upgrade",
+            False,
+        ),
+        ("Fix pin: tools/factory-e2e/tests/test_c4_forge_instances_extra.py::test_example", True),
+        ("Fix pin: apps/api/tests/test_agents.py::test_create_agent", True),
+        ("Fix pin: cli/tests/verify_fix_pin.rs::ci_gate_pins", True),
+        ("Fix pin: tools/factory-e2e/tests/test_scripted_driver.py::test_example", True),
+        ("Fix pin: tools/factory-e2e/tests/test_c4_initial_binding_extra.py::test_example", True),
+        (
+            "Fix pin: tools/factory-e2e/tests/test_c4_upgrade_migration_extra.py::"
+            "test_v0125_factory_upgrade_uses_supported_flow",
+            True,
+        ),
+        (
+            "<!-- Fix pin: tools/factory-e2e/tests/test_c4_upgrade_migration.py::"
+            "test_v0125_factory_upgrade_uses_supported_flow -->",
+            False,
+        ),
+        ("Fix pin: n/a - documentation only", False),
+        ("Fix pin: --help", False),
+        ("<!-- Fix pin: apps/api/tests/test_agents.py::test_create_agent -->", False),
+        ("", False),
+    ],
+)
+def test_body_service_selection_uses_the_parsed_stack_requirement(
+    tmp_path: Path,
+    body: str,
+    needs_stack: bool,
+) -> None:
+    root = tmp_path / "checkout"
+    checker = root / "tools/fix-pin-ci/check.py"
+    checker.parent.mkdir(parents=True)
+    shutil.copy2(ROOT / "tools/fix-pin-ci/check.py", checker)
+    body_file = tmp_path / "body.md"
+    body_file.write_text(body)
+
+    assert load_tool().body_needs_services(root, body_file) is needs_stack
 
 
 def test_private_services_handoff_protected_source_resources() -> None:

@@ -190,4 +190,28 @@ def test_a_jira_static_token_entry_loads_its_token_from_the_file(tmp_path: Path)
     (loaded,) = config.trackers
     assert loaded.kind == "jira_cloud"
     assert loaded.credential.username == "factory-bot@example.com"
-    assert loaded.credential.token.get_secret_value().strip() == "jira-token-from-file"
+    assert loaded.credential.current_token() == "jira-token-from-file"
+
+
+def test_a_key_file_and_a_client_secret_file_load_byte_for_byte(tmp_path: Path) -> None:
+    """#4623: only a static token is normalized; a PEM key keeps its trailing
+    newline and a client secret keeps its surrounding whitespace."""
+
+    pem = KEY + "\n"
+    config = load_forges_json(json.dumps(_github_document(_key_file(tmp_path, pem))))
+    assert config.code_hosts[0].credential.private_key.get_secret_value() == pem
+
+    secret = " client-secret-fixture\n"
+    jira = samples.jira_tracker("corp-jira")
+    jira["credential"].pop("client_secret")
+    jira["credential"]["client_secret_file"] = str(_key_file(tmp_path, secret, "client_secret"))
+    (tracker,) = load_forges_json(json.dumps({"trackers": [jira]})).trackers
+    assert tracker.credential.client_secret.get_secret_value() == secret
+
+
+def test_a_token_file_newline_is_not_part_of_the_token(tmp_path: Path) -> None:
+    entry = samples.gitlab_code_host("corp-gitlab")
+    entry["credential"].pop("token")
+    entry["credential"]["token_file"] = str(_key_file(tmp_path, "glpat-fixture\r\n", "token"))
+    (code_host,) = load_forges_json(json.dumps({"code_hosts": [entry]})).code_hosts
+    assert code_host.credential.current_token() == "glpat-fixture"

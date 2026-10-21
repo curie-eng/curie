@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal, cast
 
+from aci_protocol.turn import route_identity
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy import and_, exists, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
@@ -35,6 +37,10 @@ from curie_api.workitems.lifecycle import (
 from .config import Settings, get_settings
 from .factory_notices import start_failed_sentence
 from .factory_reply_target import reply_columns
+from .forges import surfaces, types
+from .forges.errors import NotFound
+from .forges.registry import forges_registry
+from .forges.trackers import binding_for_scope, reply_route
 from .forges.types import ReplyTarget, RepositoryRef, TrackerIssueRef
 from .models import Agent, AgentChannel, ExecutionRequest, Publication, WorkItem
 from .threadkeys import (
@@ -71,6 +77,15 @@ RefusalCode = Literal[
     "binding_missing",
     "repository_not_allowed",
     "publication_pending",
+    "factory_wake_mismatch",
+    "factory_agent_missing",
+    "factory_agent_mismatch",
+    "factory_tenant_mismatch",
+    "factory_binding_missing",
+    "factory_binding_ambiguous",
+    "factory_binding_changed",
+    "factory_surface_mismatch",
+    "factory_start_failed",
 ]
 
 DispatchResult = WorkItemOutcome | WorkItemConflict
@@ -126,6 +141,43 @@ class AcquireGrant:
     conversation_id: str
     wait_deadline: datetime
     repository_path: str
+    context: FactoryContext
+
+
+class FactoryWake(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    kind: str
+    address: str
+    adapter: str | None
+    conversation_id: str
+
+
+class FactoryContext(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    agent_id: uuid.UUID
+    tenant_id: uuid.UUID
+    binding_id: uuid.UUID
+    kind: str
+    address: str
+    adapter: str | None
+
+
+@dataclass(frozen=True)
+class RunningResult:
+    lease_held_to_deadline: bool
+    request_id: uuid.UUID
+    work_item_id: uuid.UUID
+    agent_id: uuid.UUID
+    generation: int
+    conversation_id: str
+    wait_deadline: datetime
+    repository_path: str
+    runtime_epoch: int
+    execution_deadline: datetime
+    context: FactoryContext | None
+    refusal: RefusalCode | None
 
 
 @dataclass(frozen=True)
@@ -576,12 +628,157 @@ async def _lock_pair(
     return work_item, request
 
 
+async def _factory_wake_matches(
+    session: AsyncSession, work_item: WorkItem, request: ExecutionRequest, wake: FactoryWake
+) -> bool:
+    adapter = await legacy_route_adapter_of(session, work_item.agent_id, work_item.conversation_id)
+    return (
+        wake.kind == request.reply_kind
+        and wake.address == request.reply_address
+        and wake.conversation_id == request.reply_conversation_id
+        and route_identity(wake.kind, wake.adapter) == route_identity(wake.kind, adapter)
+    )
+
+
+def _factory_surface_matches(
+    work_item: WorkItem, request: ExecutionRequest, binding: AgentChannel
+) -> bool:
+    if binding.kind not in surfaces.TRACKER_SURFACE_KINDS:
+        return True
+    registry = forges_registry(get_settings())
+    issue, repository = work_item.tracker_issue, work_item.repository
+    try:
+        target = surfaces.resolve_surface(registry, binding.kind, binding.address)
+        route = reply_route(registry, issue, repository.path)
+    except (surfaces.SurfaceUnconfigured, NotFound):
+        return False
+    tracker = target.tracker
+    if (
+        tracker is None
+        or tracker.kind != issue.kind
+        or tracker.host != issue.host
+        or not any(
+            host.kind == repository.kind and host.host == repository.host
+            for host in registry.config.code_hosts
+        )
+        or route != (request.reply_kind, request.reply_address, request.reply_conversation_id)
+    ):
+        return False
+    if issue.kind in {types.GITHUB, types.GITLAB} and (
+        repository.kind != issue.kind
+        or repository.host != issue.host
+        or repository.project_id != issue.scope_id
+    ):
+        return False
+    if issue.kind != types.GITHUB:
+        configured = binding_for_scope(registry, issue)
+        if configured is None or configured.name != target.binding_name:
+            return False
+        policy = registry.binding_repository_policy(configured, repository)
+        if policy is None or policy.project_id != repository.project_id:
+            return False
+    return True
+
+
+async def _factory_context(
+    session: AsyncSession, work_item: WorkItem, request: ExecutionRequest
+) -> FactoryContext | RefusalCode:
+    agent = await session.get(Agent, work_item.agent_id, populate_existing=True)
+    if agent is None:
+        return "factory_agent_missing"
+    if (
+        request.work_item_id != work_item.id
+        or not request.reply_kind
+        or not request.reply_address
+        or not request.reply_conversation_id
+    ):
+        return "factory_surface_mismatch"
+    adapter = await legacy_route_adapter_of(session, work_item.agent_id, work_item.conversation_id)
+    if not route_thread_key_matches(
+        request.reply_kind,
+        adapter,
+        request.reply_address,
+        request.reply_conversation_id,
+        work_item.conversation_id,
+    ):
+        return "factory_surface_mismatch"
+    try:
+        binding = await crud_channels.binding_for_route(
+            session,
+            request.reply_kind,
+            adapter,
+            request.reply_address,
+            agent_id=work_item.agent_id,
+        )
+    except crud_channels.AmbiguousRoute:
+        return "factory_binding_ambiguous"
+    if binding is None:
+        return "factory_binding_missing"
+    if binding.agent_id != work_item.agent_id:
+        return "factory_agent_mismatch"
+    if binding.tenant_id != agent.tenant_id:
+        return "factory_tenant_mismatch"
+    if not _factory_surface_matches(work_item, request, binding):
+        return "factory_surface_mismatch"
+    return FactoryContext(
+        agent_id=agent.id,
+        tenant_id=agent.tenant_id,
+        binding_id=binding.id,
+        kind=binding.kind,
+        address=binding.address,
+        adapter=route_identity(binding.kind, binding.adapter),
+    )
+
+
+def _factory_context_change(
+    current: FactoryContext, expected: FactoryContext
+) -> RefusalCode | None:
+    if current.agent_id != expected.agent_id:
+        return "factory_agent_mismatch"
+    if current.tenant_id != expected.tenant_id:
+        return "factory_tenant_mismatch"
+    if current != expected:
+        return "factory_binding_changed"
+    return None
+
+
+async def _defer_factory_refusal(
+    session: AsyncSession,
+    work_item: WorkItem,
+    request: ExecutionRequest,
+    *,
+    owner: str,
+    generation: int,
+    refusal: RefusalCode,
+) -> DispatchConflict:
+    work_item_id, request_id = work_item.id, request.id
+    result = await _apply_deferral(
+        session,
+        work_item,
+        request,
+        owner=owner,
+        generation=generation,
+        reason=f"not_started:{refusal}",
+        capacity=False,
+        now=await database_now(session),
+    )
+    if isinstance(result, DispatchConflict):
+        return result
+    return DispatchConflict(
+        code="factory_start_failed" if result.terminal_cause is not None else refusal,
+        work_item_id=work_item_id,
+        request_id=request_id,
+    )
+
+
 async def acquire(
     session: AsyncSession,
     request_id: uuid.UUID,
     *,
     owner: str,
     generation: int,
+    wake: FactoryWake,
+    context: FactoryContext | None,
 ) -> AcquireGrant | DispatchConflict:
     locked = await _lock_pair(session, request_id)
     if isinstance(locked, DispatchConflict):
@@ -640,28 +837,13 @@ async def acquire(
             work_item_id=work_item.id,
             request_id=request.id,
         )
-    if held and request.acquire_owner == owner:
-        grant = AcquireGrant(
-            generation=generation,
+    if not await _factory_wake_matches(session, work_item, request, wake):
+        return await _refuse(
+            session,
+            "factory_wake_mismatch",
             work_item_id=work_item.id,
-            conversation_id=work_item.conversation_id,
-            wait_deadline=deadline,
-            repository_path=work_item.repository_path,
+            request_id=request.id,
         )
-        await session.execute(
-            update(ExecutionRequest)
-            .where(
-                ExecutionRequest.id == request.id,
-                ExecutionRequest.acquire_owner == owner,
-                ExecutionRequest.acquired_generation == generation,
-            )
-            .values(
-                acquire_expires_at=now + lease,
-                updated_at=func.clock_timestamp(),
-            )
-        )
-        await session.commit()
-        return grant
     changed_id = await session.scalar(
         update(ExecutionRequest)
         .where(
@@ -684,12 +866,24 @@ async def acquire(
             work_item_id=work_item.id,
             request_id=request.id,
         )
+    current = await _factory_context(session, work_item, request)
+    refusal = (
+        current
+        if isinstance(current, str)
+        else _factory_context_change(current, context) if context is not None else None
+    )
+    if refusal is not None:
+        return await _defer_factory_refusal(
+            session, work_item, request, owner=owner, generation=generation, refusal=refusal
+        )
+    assert isinstance(current, FactoryContext)
     grant = AcquireGrant(
         generation=generation,
         work_item_id=work_item.id,
         conversation_id=work_item.conversation_id,
         wait_deadline=deadline,
         repository_path=work_item.repository_path,
+        context=current,
     )
     await session.commit()
     return grant
@@ -747,6 +941,30 @@ async def defer(
         or request.acquire_expires_at <= now
     ):
         return await _refuse(session, "not_dispatchable", request_id=request.id)
+    return await _apply_deferral(
+        session,
+        work_item,
+        request,
+        owner=owner,
+        generation=generation,
+        reason=reason,
+        capacity=capacity,
+        now=now,
+    )
+
+
+async def _apply_deferral(
+    session: AsyncSession,
+    work_item: WorkItem | None,
+    request: ExecutionRequest,
+    *,
+    owner: str,
+    generation: int,
+    reason: str,
+    capacity: bool,
+    now: datetime,
+) -> DeferResult | DispatchConflict:
+    counts_as_start = not capacity and reason.startswith(START_DEFERRAL_REASON_PREFIX)
     settings = get_settings()
     values: dict[str, Any] = {}
     if capacity:
@@ -831,6 +1049,7 @@ async def start(
     generation: int,
     claim_name: str,
     sandbox_name: str,
+    context: FactoryContext,
 ) -> StartResult | DispatchConflict:
     locked = await _lock_pair(session, request_id)
     if isinstance(locked, DispatchConflict):
@@ -848,6 +1067,24 @@ async def start(
             "not_dispatchable",
             work_item_id=work_item.id,
             request_id=request.id,
+        )
+    if work_item.cancelled_at is not None:
+        return await _refuse(
+            session, "work_item_cancelled", work_item_id=work_item.id, request_id=request.id
+        )
+    if request.status != "waiting" or request.wait_deadline is None:
+        return await _refuse(
+            session, "not_dispatchable", work_item_id=work_item.id, request_id=request.id
+        )
+    if now >= request.wait_deadline:
+        return await _refuse(
+            session, "waiting_deadline_elapsed", work_item_id=work_item.id, request_id=request.id
+        )
+    current = await _factory_context(session, work_item, request)
+    refusal = current if isinstance(current, str) else _factory_context_change(current, context)
+    if refusal is not None:
+        return await _defer_factory_refusal(
+            session, work_item, request, owner=owner, generation=generation, refusal=refusal
         )
     settings = get_settings()
     ttl = timedelta(seconds=settings.work_item_runtime_ttl_seconds)
@@ -1379,8 +1616,8 @@ async def cancel(
 
 
 async def running_for_conversation(
-    session: AsyncSession, conversation_id: str
-) -> tuple[Literal["absent", "ended", "running"], ExecutionRequest | None]:
+    session: AsyncSession, conversation_id: str, *, wake: FactoryWake
+) -> tuple[Literal["absent", "ended", "running"], RunningResult | DispatchConflict | None]:
     """The execution whose work item uses this scoped conversation.
 
     ``absent`` is an ordinary approval with no factory run. ``ended`` means
@@ -1415,7 +1652,42 @@ async def running_for_conversation(
     )
     if running is None:
         return "ended", None
-    return "running", running
+    locked = await _lock_pair(session, running.id)
+    if isinstance(locked, DispatchConflict):
+        return "ended", None
+    work_item, running = locked
+    now = await database_now(session)
+    if (
+        running.status != "running"
+        or work_item.cancelled_at is not None
+        or running.execution_deadline is None
+        or running.wait_deadline is None
+        or now >= running.execution_deadline
+    ):
+        return "ended", None
+    if not await _factory_wake_matches(session, work_item, running, wake):
+        return "running", DispatchConflict(code="factory_wake_mismatch", request_id=running.id)
+    current = await _factory_context(session, work_item, running)
+    result = RunningResult(
+        lease_held_to_deadline=(
+            running.runtime_heartbeat_expires_at is not None
+            and running.runtime_heartbeat_expires_at == running.execution_deadline
+            and now < running.execution_deadline
+        ),
+        request_id=running.id,
+        work_item_id=work_item.id,
+        agent_id=work_item.agent_id,
+        generation=running.dispatch_generation,
+        conversation_id=work_item.conversation_id,
+        wait_deadline=running.wait_deadline,
+        repository_path=work_item.repository_path,
+        runtime_epoch=running.runtime_epoch,
+        execution_deadline=running.execution_deadline,
+        context=current if isinstance(current, FactoryContext) else None,
+        refusal=current if isinstance(current, str) else None,
+    )
+    await session.commit()
+    return "running", result
 
 
 async def get_request(session: AsyncSession, request_id: uuid.UUID) -> ExecutionRequest | None:

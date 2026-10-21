@@ -16,7 +16,8 @@ from __future__ import annotations
 
 import re
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from pathlib import Path
 from typing import Annotated, Literal, Self
 from urllib.parse import urlsplit
 
@@ -25,15 +26,20 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    ModelWrapValidatorHandler,
     SecretStr,
+    ValidationError,
+    ValidationInfo,
+    ValidatorFunctionWrapHandler,
     field_validator,
     model_validator,
 )
+from pydantic_core import InitErrorDetails, PydanticCustomError
 
 from curie_api.branches import valid_base_branch
 from curie_api.forges import types
 from curie_api.forges.capabilities import NATIVE_FORGES, mandatory_capabilities
-from curie_api.forges.errors import InvalidPairing
+from curie_api.forges.errors import CredentialUnreadable, InvalidPairing
 from curie_api.forges.paths import valid_repository_path
 from curie_api.forges.runner_config import DockerConfig, RunnerConfig
 from curie_api.github_review_events import valid_github_login
@@ -52,7 +58,9 @@ MAX_LABEL_LENGTH = 50
 
 
 class _Model(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    # Only the outermost model's setting counts, and a refusal would otherwise
+    # echo the raw input, secrets included, as ``input_value``.
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
 
 def valid_config_name(value: str) -> bool:
@@ -103,6 +111,119 @@ def _duplicates(values: Iterable[str]) -> list[str]:
 
 # Credentials -----------------------------------------------------------------
 
+# What surrounds a static token in a file or a pasted value: ASCII whitespace
+# only, so a token is never altered by Unicode rules (#4623).
+_ASCII_WHITESPACE = " \t\n\r\x0b\x0c"
+_UNSAFE_IN_HEADER = re.compile(r"[\x00-\x1f\x7f]")
+# The input a rebuilt credential refusal carries in place of the value.
+_MASK = SecretStr("**********")
+
+
+class StaticTokenRefused(ValueError):
+    """A static token that cannot be sent. ``problem`` never names the value."""
+
+    def __init__(self, problem: str) -> None:
+        self.problem = problem
+        super().__init__(f"a static token {problem}")
+
+
+def header_safe(value: str) -> bool:
+    """Whether ``value`` carries no line break, other ASCII control character or
+    DEL, so it can go in an HTTP header or git credential as it is."""
+
+    return _UNSAFE_IN_HEADER.search(value) is None
+
+
+def normalize_static_token(value: str) -> str:
+    """``value`` without its surrounding ASCII whitespace.
+
+    Refuses an empty result and one that still carries a line break, another
+    ASCII control character or DEL, which no HTTP header or git credential may.
+    """
+
+    token = value.strip(_ASCII_WHITESPACE)
+    if not token:
+        raise StaticTokenRefused("must be non-empty")
+    if not header_safe(token):
+        raise StaticTokenRefused("contains a line break or control character")
+    return token
+
+
+def read_static_token(path: str) -> str:
+    """The static token in the file at ``path`` now, normalized.
+
+    Read on every call, so a replaced file (a Kubernetes Secret volume's
+    ``..data`` swap included) is what the next caller gets; nothing is cached.
+    `CredentialUnreadable` when the file is missing, unreadable, empty or
+    malformed; its text is fixed and never carries the content (#4630).
+    """
+
+    problem: str | None = None
+    content = ""
+    try:
+        content = Path(path).read_text()
+    except (OSError, UnicodeDecodeError):
+        # Decided outside the handler: a decode error holds the file's bytes.
+        problem = "cannot be read"
+    if problem is None and not content.strip():
+        problem = "is empty"
+    if problem is None:
+        try:
+            return normalize_static_token(content)
+        except StaticTokenRefused as refused:
+            problem = refused.problem
+    raise CredentialUnreadable(problem)
+
+
+def _masked(refused: ValidationError, *, entry: str | None) -> ValidationError:
+    """``refused`` rebuilt with every error's input masked.
+
+    pydantic's ``errors()`` and ``json()`` carry the raw input whatever
+    ``hide_input_in_errors`` says, and a model holding a secret has it in that
+    input. Each error keeps its location, type and message. A static-token
+    refusal is typed ``static_token``; given ``entry``, its message names it.
+    Raise the result outside the ``except`` block, so no context keeps the
+    original.
+    """
+
+    line_errors: list[InitErrorDetails] = []
+    for error in refused.errors(include_url=False, include_input=False):
+        context = error.get("ctx") or {}
+        cause = context.get("error")
+        if isinstance(cause, StaticTokenRefused):
+            problem: str | None = cause.problem
+            message = f"a static token {cause.problem}"
+        elif error["type"] == "static_token":
+            problem, message = context["problem"], error["msg"]
+        else:
+            problem, message = None, error["msg"]
+        if problem is None:
+            kind = PydanticCustomError(error["type"], "{message}", {"message": message})
+        else:
+            if entry is not None:
+                message = f"{entry} static token {problem}"
+            kind = PydanticCustomError(
+                "static_token", "{message}", {"message": message, "problem": problem}
+            )
+        line_errors.append({"type": kind, "loc": error["loc"], "input": _MASK})
+    return ValidationError.from_exception_data(refused.title, line_errors)
+
+
+def _masking[M](value: object, handler: Callable[[object], M]) -> M:
+    """``handler(value)``, any refusal re-raised with its input masked.
+
+    A model holding a secret, or holding one that does, validates through this
+    from a ``mode="wrap"`` model validator declared after its other validators,
+    so it wraps all of them, also when the model is built on its own.
+    """
+
+    try:
+        return handler(value)
+    except ValidationError as refused:
+        masked = _masked(refused, entry=None)
+    # Raised outside the handler so no context keeps the original error.
+    raise masked
+
 
 class GitHubAppCredentialConfig(_Model):
     """A GitHub App: the platform re-mints one-hour installation tokens."""
@@ -118,6 +239,12 @@ class GitHubAppCredentialConfig(_Model):
         if not value.get_secret_value().strip():
             raise ValueError("a GitHub App private key must be non-empty")
         return value
+
+    # Declared last, so it wraps every check above (see `_masking`).
+    @model_validator(mode="wrap")
+    @classmethod
+    def mask_refusal(cls, value: object, handler: ModelWrapValidatorHandler[Self]) -> Self:
+        return _masking(value, handler)
 
 
 class OAuthClientCredentialConfig(_Model):
@@ -136,9 +263,20 @@ class OAuthClientCredentialConfig(_Model):
             raise ValueError("an OAuth client secret must be non-empty")
         return value
 
+    # Declared last, so it wraps every check above (see `_masking`).
+    @model_validator(mode="wrap")
+    @classmethod
+    def mask_refusal(cls, value: object, handler: ModelWrapValidatorHandler[Self]) -> Self:
+        return _masking(value, handler)
+
 
 class StaticTokenCredentialConfig(_Model):
     """A long-lived token an operator rotates.
+
+    Exactly one source: ``token_file``, the file the chart mounts from a Secret
+    and the only source ``CURIE_FORGES`` accepts, or ``token``, an inline value
+    for programmatic use. The file is read again by every `current_token` call,
+    so a rotated Secret is used at the next operation with no restart (#4630).
 
     ``expires_at`` set: a known expiry. ``never_expires``: the token was issued
     without one. Neither: the forge does not report it, so the expiry is unknown.
@@ -146,18 +284,47 @@ class StaticTokenCredentialConfig(_Model):
     """
 
     type: Literal["static_token"] = "static_token"
-    token: SecretStr
+    token: SecretStr | None = None
+    token_file: str | None = Field(default=None, min_length=1)
     username: str | None = Field(default=None, min_length=1)
     expires_at: AwareDatetime | None = None
     never_expires: bool = False
 
+    @field_validator("token")
+    @classmethod
+    def check_token(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is None:
+            return None
+        return SecretStr(normalize_static_token(value.get_secret_value()))
+
+    @model_validator(mode="after")
+    def check_source(self) -> Self:
+        if (self.token is None) == (self.token_file is None):
+            raise StaticTokenRefused("names exactly one of token or token_file")
+        return self
+
     @model_validator(mode="after")
     def check_expiry(self) -> Self:
-        if not self.token.get_secret_value().strip():
-            raise ValueError("a static token must be non-empty")
         if self.expires_at is not None and self.never_expires:
-            raise ValueError("a static token has an expires_at or never_expires, not both")
+            raise StaticTokenRefused("has an expires_at or never_expires, not both")
         return self
+
+    def current_token(self) -> str:
+        """The token to send now: the inline value, or the file read again now.
+
+        `CredentialUnreadable` when the file cannot be sent; never an earlier value.
+        """
+
+        if self.token is not None:
+            return self.token.get_secret_value()
+        assert self.token_file is not None
+        return read_static_token(self.token_file)
+
+    # Declared last, so it wraps every check above (see `_masking`).
+    @model_validator(mode="wrap")
+    @classmethod
+    def mask_refusal(cls, value: object, handler: ModelWrapValidatorHandler[Self]) -> Self:
+        return _masking(value, handler)
 
 
 CredentialConfig = Annotated[
@@ -171,6 +338,24 @@ _CREDENTIAL_KINDS: dict[str, frozenset[str]] = {
     "github_app": frozenset({types.GITHUB}),
     "oauth_client_credentials": frozenset({types.JIRA_CLOUD}),
 }
+
+
+def _named_credential(
+    what: str, value: object, handler: ValidatorFunctionWrapHandler, info: ValidationInfo
+) -> CredentialConfig:
+    """Validate a credential. Every refusal comes out with its input masked,
+    and a static-token refusal names the entry."""
+
+    try:
+        credential: CredentialConfig = handler(value)
+        return credential
+    except ValidationError as refused:
+        name = info.data.get("name")
+        masked = _masked(
+            refused, entry=f"{what} {name!r}" if isinstance(name, str) else f"{what} unnamed"
+        )
+    # Raised outside the handler so the refusal keeps no inner error as context.
+    raise masked
 
 
 def _check_credential(kind: str, credential: CredentialConfig) -> None:
@@ -207,10 +392,23 @@ class CodeHostConfig(_Model):
     def check_api_url(cls, value: str) -> str:
         return _api_url(value)
 
+    @field_validator("credential", mode="wrap")
+    @classmethod
+    def name_credential(
+        cls, value: object, handler: ValidatorFunctionWrapHandler, info: ValidationInfo
+    ) -> CredentialConfig:
+        return _named_credential("code host", value, handler, info)
+
     @model_validator(mode="after")
     def check_credential(self) -> Self:
         _check_credential(self.kind, self.credential)
         return self
+
+    # Declared last, so it wraps every check above (see `_masking`).
+    @model_validator(mode="wrap")
+    @classmethod
+    def mask_refusal(cls, value: object, handler: ModelWrapValidatorHandler[Self]) -> Self:
+        return _masking(value, handler)
 
 
 class TrackerConfig(_Model):
@@ -241,6 +439,13 @@ class TrackerConfig(_Model):
     def check_api_url(cls, value: str) -> str:
         return _api_url(value)
 
+    @field_validator("credential", mode="wrap")
+    @classmethod
+    def name_credential(
+        cls, value: object, handler: ValidatorFunctionWrapHandler, info: ValidationInfo
+    ) -> CredentialConfig:
+        return _named_credential("tracker", value, handler, info)
+
     @field_validator("label")
     @classmethod
     def check_label(cls, value: str) -> str:
@@ -264,6 +469,12 @@ class TrackerConfig(_Model):
         if not valid_mention:
             raise ValueError(f"mention {self.mention!r} is not a {self.kind} account")
         return self
+
+    # Declared last, so it wraps every check above (see `_masking`).
+    @model_validator(mode="wrap")
+    @classmethod
+    def mask_refusal(cls, value: object, handler: ModelWrapValidatorHandler[Self]) -> Self:
+        return _masking(value, handler)
 
     @property
     def native(self) -> bool:
@@ -506,6 +717,12 @@ class ForgesConfig(_Model):
         _check_repository_runner_configs(self.bindings, code_hosts)
         return self
 
+    # Declared last, so it wraps every check above (see `_masking`).
+    @model_validator(mode="wrap")
+    @classmethod
+    def mask_refusal(cls, value: object, handler: ModelWrapValidatorHandler[Self]) -> Self:
+        return _masking(value, handler)
+
     def tracker(self, name: str) -> TrackerConfig:
         return next(tracker for tracker in self.trackers if tracker.name == name)
 
@@ -541,9 +758,7 @@ def _check_repository_runner_configs(
     their existing cross-host path behavior.
     """
 
-    declarations: dict[
-        tuple[str, str, str], tuple[str, RunnerConfig | None, DockerConfig]
-    ] = {}
+    declarations: dict[tuple[str, str, str], tuple[str, RunnerConfig | None, DockerConfig]] = {}
     paths: dict[str, tuple[set[tuple[str, str, str]], bool, str]] = {}
     for binding in bindings:
         for repo in binding.repos:

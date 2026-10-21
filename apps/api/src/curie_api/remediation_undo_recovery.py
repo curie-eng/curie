@@ -28,6 +28,7 @@ from typing import cast
 
 import httpx
 from fastapi import HTTPException
+from pydantic import ValidationError
 from sqlalchemy import String, and_, select
 from sqlalchemy import cast as sql_cast
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -35,6 +36,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .approval_auth import AuthenticatedApprovalPrincipal, AuthenticatedPrincipalKind
 from .approvers import ApproverSetSelector
 from .config import get_settings
+from .identity.slack import SlackEvidence
 from .models import (
     ActionAuditEntry,
     Approval,
@@ -72,7 +74,34 @@ async def _approving_principal(
     )
     if entry is None or entry.principal_kind not in _PRINCIPAL_KINDS:
         return None
+    proof = (
+        entry.evidence.get("authenticated_actor") if isinstance(entry.evidence, dict) else None
+    )
+    principal_id = None
+    slack = None
+    bindings: frozenset[uuid.UUID] = frozenset()
+    if isinstance(proof, dict) and proof.get("kind") == entry.principal_kind:
+        try:
+            if entry.principal_kind == "console" and proof.get("principal_id") == entry.actor:
+                principal_id = uuid.UUID(entry.actor)
+            if entry.principal_kind == "chat" and isinstance(proof.get("slack"), dict):
+                candidate = SlackEvidence.model_validate(proof["slack"])
+                if candidate.user_id == entry.actor:
+                    slack = candidate
+            values = proof.get("adapter_bindings")
+            if (
+                entry.principal_kind == "adapter"
+                and isinstance(values, list)
+                and len(values) <= 1000
+                and all(isinstance(value, str) for value in values)
+            ):
+                bindings = frozenset(uuid.UUID(value) for value in values)
+        except (ValueError, ValidationError):
+            return None
     return AuthenticatedApprovalPrincipal(
+        principal_id=principal_id,
+        slack=slack,
+        adapter_bindings=bindings,
         subject=entry.actor,
         kind=cast(AuthenticatedPrincipalKind, entry.principal_kind),
         actor_channel=entry.actor_channel,

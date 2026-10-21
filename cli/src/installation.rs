@@ -1421,6 +1421,10 @@ async fn complete_installation_plan(
     } else {
         None
     };
+    let prepared =
+        crate::ops::prepare_factory_migration(up, live, complete_live_state, false).await?;
+    let up = prepared.opts;
+    let live = prepared.existing;
     let preserves_undeclared_github_token = cfg.credentials.github_token.is_none()
         && !cfg.set.contains_key(crate::ops::GITHUB_TOKEN_KEY)
         && live
@@ -1431,10 +1435,11 @@ async fn complete_installation_plan(
             .is_some_and(|token| !token.is_empty());
     let up = crate::ops::complete_up_opts(
         up,
-        live.as_ref(),
+        prepared.effective.as_ref().or(live.as_ref()),
         github_token.as_deref(),
         false,
         complete_live_state,
+        &prepared.context,
     )?;
     let up_values = crate::ops::up_value_plan(&up);
     // Deliberately NOT gated on `complete_live_state`. `apply --dry-run` sets
@@ -2902,9 +2907,15 @@ mod diff_tests {
             up,
             github_token,
         } = local;
-        let up =
-            crate::ops::complete_up_opts(up, Some(live), github_token.as_deref(), false, false)
-                .expect("complete desired values");
+        let up = crate::ops::complete_up_opts(
+            up,
+            Some(live),
+            github_token.as_deref(),
+            false,
+            false,
+            &crate::config_migrate::FactoryMigrationContext::NotRequired,
+        )
+        .expect("complete desired values");
         let mut desired = crate::ops::up_value_plan(&up).effective_values();
         if cfg.credentials.model.is_some() {
             desired

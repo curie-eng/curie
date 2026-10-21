@@ -43,18 +43,21 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
     # Feature migrations append after the published v0.12.2 head; published
     # application windows remain fixed while the candidate advances. The
     # minimum is the join containing both the stable reply selector columns
-    # and the feature train schema.
-    candidate = {"schema_min": "0108", "schema_head": "0108"}
+    # and the feature train schema. The released v0.13.0 window stays at that
+    # join while the candidate advances to team sync state (0120) and agent access
+    # policies (0121).
+    released_0130 = {"schema_min": "0108", "schema_head": "0108"}
+    candidate = {"schema_min": "0122", "schema_head": "0122"}
     assert catalog["windows"]["0.12.0"] == released
     assert catalog["windows"]["0.12.0-rc.1"] == released
     assert catalog["windows"]["0.12.1"] == stable
     assert catalog["windows"]["0.12.2"] == {"schema_min": "0076", "schema_head": "0081"}
     assert catalog["windows"]["0.12.3"] == {"schema_min": "0076", "schema_head": "0093"}
     assert catalog["candidate"] == candidate
-    assert catalog["windows"]["0.13.0"] == candidate
-    assert catalog["revisions"][-12:] == [
+    assert catalog["windows"]["0.13.0"] == released_0130
+    assert catalog["revisions"][-15:] == [
         "0095", "0096", "0097", "0098", "0099", "0100", "0101", "0102", "0103",
-        "0105", "0107", "0108",
+        "0105", "0107", "0108", "0120", "0121", "0122",
     ]
     assert "0074" not in catalog["revisions"]
     prior_windows = json.loads(

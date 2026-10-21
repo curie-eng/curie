@@ -716,13 +716,16 @@ async def append_approval_audit(
     actor: str,
     actor_channel: str | None,
     decision: str,
-    authorizer: str,
+    authorizer: str | None,
     authorized: bool,
     reason: str | None,
     evidence: dict[str, Any] | None = None,
     principal_kind: str | None = None,
     authenticated: bool = False,
     principal_subject: str | None = None,
+    team_id: uuid.UUID | None = None,
+    team_epoch: int | None = None,
+    team_digest: str | None = None,
 ) -> ApprovalAuditEntry:
     """Append one audit row (#247). Append-only by design; never updated.
 
@@ -745,6 +748,9 @@ async def append_approval_audit(
         authorized=authorized,
         reason=reason,
         evidence=evidence,
+        team_id=team_id,
+        team_epoch=team_epoch,
+        team_digest=team_digest,
     )
     session.add(entry)
     await session.commit()

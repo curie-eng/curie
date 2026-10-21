@@ -351,6 +351,7 @@ _HTTP_OPERATIONS = [
     "/approvals/principals/adapter",
     "/approvals/principals/adapter/rotate",
     "/approvals/principals/operator",
+    "/approvals/principals/remediation-operator",
     "/approvals/{approval_id}",
     "/approvals/{approval_id}/audit",
     "/approvals/{approval_id}/resolve",
@@ -404,6 +405,24 @@ _HTTP_OPERATIONS = [
     # Principal resolution and Slack identity reports (#2910, #3039, ADR 0198).
     "/identity/resolve",
     "/identity/slack-reports",
+    "/identity/admin/{tenant_id}/{resource}",
+    "/directory/binding",
+    "/directory/config/{tenant_id}",
+    "/directory/credentials",
+    "/directory/teams",
+    "/directory/teams/{team_id}",
+    "/directory/teams/{team_id}/snapshot",
+    "/directory/teams/{team_id}/attempt",
+    "/directory/people",
+    "/directory/people/status",
+    "/directory/namespaces",
+    "/identity/connect/{token}",
+    "/identity/connect/{token}/confirm",
+    # Team directory sync status (#4584, ADR 0220).
+    "/teams",
+    "/teams/metrics",
+    # An agent's invocation and approver teams (#4585, ADR 0220).
+    "/agents/{agent_id}/access-policy",
     "/publications",
     "/publications/precheck",
     "/publications/{publication_id}",
@@ -452,6 +471,8 @@ _HTTP_OPERATIONS = [
     # Deliberate progress from a running turn (ADR 0130).
     "/v1/turn-progress/{progress_id}",
     "/v1/factory/cards/{token}.svg",
+    # Forge credential health (#4630).
+    "/forges/credentials/health",
     "/remediation-nominations",
     "/remediation-nominations/{nomination_id}",
     "/schedules",

@@ -9,6 +9,12 @@
 //! Namespace labels follow the Namespace metadata object, including the
 //! `kubernetes.io/metadata.name` label Kubernetes writes on every namespace:
 //! https://kubernetes.io/docs/reference/labels-annotations-taints/#kubernetesiometadataname
+//! Secret data and resource versions follow the Kubernetes API:
+//! https://kubernetes.io/docs/reference/kubernetes-api/config-and-storage-resources/secret-v1/
+//! PVC and StatefulSet inventories and Secret timestamps follow the Kubernetes API:
+//! https://kubernetes.io/docs/reference/kubernetes-api/config-and-storage-resources/persistent-volume-claim-v1/
+//! https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/stateful-set-v1/
+//! https://kubernetes.io/docs/reference/kubernetes-api/common-definitions/object-meta/
 
 #![cfg(unix)]
 
@@ -89,7 +95,7 @@ fn candidate_runner_registry() -> OciRegistryStub {
 // The driver answers explicit external commands and rejects unknown ones.
 // State lives inside the owned temporary fixture, never in a real cluster.
 const TOOL_DRIVER: &str = r#"#!/usr/bin/python3
-import json, os, sys, time
+import base64, json, os, re, sys, time
 from pathlib import Path
 root = Path(os.environ['QUICKSTART_FIXTURE'])
 tool = Path(sys.argv[0]).name
@@ -99,6 +105,7 @@ with (root / 'calls').open('a') as log:
 ns = os.environ.get('QUICKSTART_NAMESPACE', 'curie')
 release = os.environ.get('QUICKSTART_RELEASE', 'curie')
 values_file = root / ('values' if release == 'curie' else 'values-' + release)
+history_file = root / 'helm-history'
 def emit(value):
     print(json.dumps(value)); sys.exit(0)
 def deep_merge(dst, src):
@@ -145,6 +152,14 @@ def record_upgrade(args):
             continue
         index += 1
     values_file.write_text(json.dumps(doc))
+    if history_file.exists():
+        history = json.loads(history_file.read_text())
+        revision = max(row['revision'] for row in history) + 1
+        for row in history:
+            if row['status'] == 'deployed': row['status'] = 'superseded'
+        description = args[args.index('--description')+1] if '--description' in args else 'Upgrade complete'
+        history.append({'revision':revision,'status':'deployed','description':description})
+        history_file.write_text(json.dumps(history))
 def absent(kind, name):
     print('Error from server (NotFound): ' + kind + ' "' + name + '" not found', file=sys.stderr)
     sys.exit(1)
@@ -173,7 +188,9 @@ if tool == 'helm':
     if args[:2] == ['get','hooks']: sys.exit(0)
     if args[:2] == ['get','metadata']: emit({'appVersion':os.environ['QUICKSTART_VERSION'],'version':os.environ['QUICKSTART_VERSION'],'chart':'curie-'+os.environ['QUICKSTART_VERSION']})
     if args[:2] == ['get','manifest']: emit(deployment)
-    if args[0] == 'history': emit([{'revision':1,'status':os.environ.get('QUICKSTART_REVISION_STATUS','deployed')}])
+    if args[0] == 'history':
+        if history_file.exists(): emit(json.loads(history_file.read_text()))
+        emit([{'revision':1,'status':os.environ.get('QUICKSTART_REVISION_STATUS','deployed')}])
     if args[0] == 'status': emit({'version':1,'info':{'status':'deployed'},'hooks':[]})
     if args[:2] == ['show','chart']: print('name: curie\nversion: '+os.environ['QUICKSTART_VERSION']+'\nappVersion: '+os.environ['QUICKSTART_VERSION']); sys.exit(0)
     if args[0] == 'template':
@@ -186,6 +203,7 @@ if tool == 'helm':
         print('Error: could not find template '+template+' in chart', file=sys.stderr); sys.exit(1)
     if args[0] == 'upgrade':
         intake_upgrade = False
+        jira_upgrade = False
         runner_env_upgrade = any('agentSandbox.runnerEnv.' in arg for arg in args)
         for index, argument in enumerate(args[:-1]):
             if argument in ['-f','--values']:
@@ -195,6 +213,7 @@ if tool == 'helm':
                 try:
                     document = json.loads(overlay)
                     intake_upgrade |= document.get('factory', {}).get('intake') == 'poll'
+                    jira_upgrade |= any(entry.get('kind') == 'jira_cloud' for entry in document.get('factory', {}).get('trackers', []))
                     runner_env_upgrade |= bool(document.get('agentSandbox', {}).get('runnerEnv'))
                 except Exception:
                     pass
@@ -205,6 +224,8 @@ if tool == 'helm':
             print('Error: fixture merged upgrade refused', file=sys.stderr); sys.exit(1)
         if os.environ.get('QUICKSTART_FAIL') == 'runner-env' and runner_env_upgrade:
             print('Error: fixture runner env upgrade refused', file=sys.stderr); sys.exit(1)
+        if os.environ.get('QUICKSTART_FAIL') == 'jira' and jira_upgrade:
+            print('Error: fixture Jira tracker upgrade refused', file=sys.stderr); sys.exit(1)
         if os.environ.get('QUICKSTART_GVISOR_RETRY') == '1' and not (root / 'retried').exists():
             (root / 'retried').touch()
             time.sleep(10)
@@ -216,12 +237,35 @@ if tool == 'kubectl':
     if args[:2] == ['config','view']:
         emit({'clusters':[{'cluster':{'server':'https://127.0.0.1:9'}}],'users':[{'user':{'token':'fixture'}}]})
     if 'scale' in args: print('deployment.apps/coredns scaled'); sys.exit(0)
-    if 'apply' in args: sys.stdin.read(); print('secret configured'); sys.exit(0)
+    if 'apply' in args:
+        body = sys.stdin.read()
+        if history_file.exists():
+            document = json.loads(body)
+            document['metadata']['resourceVersion'] = '1'
+            (root / ('object-' + document['metadata']['name'])).write_text(json.dumps(document))
+        print('secret configured'); sys.exit(0)
+    if any(verb in args for verb in ['create','replace']) and args[-2:] == ['-f','-']:
+        document = json.load(sys.stdin)
+        path = root / ('object-' + document['metadata']['name'])
+        if 'create' in args and path.exists():
+            print('Error from server (AlreadyExists): object already exists', file=sys.stderr); sys.exit(1)
+        document['metadata']['resourceVersion'] = '1'
+        path.write_text(json.dumps(document))
+        print('object saved'); sys.exit(0)
     if 'delete' in args and 'sandboxclaim' in args: print('No resources found'); sys.exit(0)
     if args and args[0] == 'api-resources': print('configmaps\nserviceaccounts'); sys.exit(0)
     if 'rollout' in args or 'label' in args or 'patch' in args: print('fixture command completed'); sys.exit(0)
     if 'get' in args:
         ix = args.index('get'); kind = args[ix+1]; name = args[ix+2] if len(args) > ix+2 else ''
+        if kind == 'pvc' and args[ix:] == ['get','pvc','-n',ns,'-o','json','-l','app.kubernetes.io/instance='+release+',app.kubernetes.io/component in (postgres,clickhouse,rustfs,valkey)']:
+            emit({'apiVersion':'v1','kind':'PersistentVolumeClaimList','items':[]})
+        if kind == 'statefulset' and args[ix:] == ['get','statefulset','-n',ns,'-o','json']:
+            emit({'apiVersion':'apps/v1','kind':'StatefulSetList','items':[]})
+        if kind == 'secret' and name == 'sh.helm.release.v1.'+release+'.v1':
+            if args[ix:] != ['get','secret',name,'-n',ns,'-o','json']:
+                print('unexpected fixture command: '+tool+' '+str(args), file=sys.stderr)
+                sys.exit(64)
+            emit({'apiVersion':'v1','kind':'Secret','type':'helm.sh/release.v1','metadata':{'name':name,'namespace':ns,'creationTimestamp':'2026-10-17T10:00:00Z','labels':{'owner':'helm','name':release,'version':'1','status':'failed'}}})
         if kind == 'runtimeclass': print('Error from server (Forbidden): runtimeclasses.node.k8s.io "'+name+'" is forbidden: User "fixture" cannot get resource "runtimeclasses" in API group "node.k8s.io" at the cluster scope', file=sys.stderr); sys.exit(1)
         if kind == 'apiservices.apiregistration.k8s.io': emit({'apiVersion':'v1','kind':'List','items':[]})
         if kind == 'events' and '--watch' in args:
@@ -244,7 +288,32 @@ if tool == 'kubectl':
             emit({'apiVersion':'v1','kind':'List','items':items})
         if kind == 'serviceaccounts': emit({'apiVersion':'v1','kind':'List','items':[]})
         if kind in ['secret','secrets'] and name and name == os.environ.get('QUICKSTART_APP_SECRET'): print((root / 'app.pem').read_text()); sys.exit(0)
-        if kind in ['secret','secrets']: absent(kind, name)
+        if kind in ['secret','secrets']:
+            path = root / ('object-' + name)
+            if path.exists():
+                document = json.loads(path.read_text())
+                if name == os.environ.get('QUICKSTART_STALE_SECRET'):
+                    reads = root / 'stale-secret-reads'
+                    count = int(reads.read_text()) + 1 if reads.exists() else 1
+                    reads.write_text(str(count))
+                    if count == 2:
+                        if os.environ.get('QUICKSTART_STALE_KIND') == 'revision':
+                            history = json.loads(history_file.read_text())
+                            revision = max(row['revision'] for row in history) + 1
+                            for row in history:
+                                if row['status'] == 'deployed': row['status'] = 'superseded'
+                            history.append({'revision':revision,'status':'deployed','description':'Operator upgrade'})
+                            history_file.write_text(json.dumps(history))
+                        else:
+                            document['metadata']['resourceVersion'] = '2'
+                            path.write_text(json.dumps(document))
+                for argument in args:
+                    if argument.startswith('go-template='):
+                        key = re.search(r'index \.data "([^"]+)"', argument).group(1)
+                        print(base64.b64decode(document['data'][key]).decode()); sys.exit(0)
+                emit(document)
+            if '--ignore-not-found' in args: sys.exit(0)
+            absent(kind, name)
         if kind in ['priorityclass','priorityclasses'] and name not in ['-o','--output']: emit(owned('PriorityClass',name))
         if kind in ['deployment','deployments'] and name == 'agent-sandbox-controller': emit(owned('Deployment',name))
         if kind == 'deployments,statefulsets,daemonsets,pods,jobs': emit({'items':[live,pod]})
@@ -257,19 +326,32 @@ sys.exit(64)
 "#;
 
 fn agent() -> Value {
-    json!({"id":"agent-fixture","name":"dark-factory","channels":[{"kind":"slack","address":"C0EXAMPLE1"}],"created_at":"2026-10-04T00:00:00Z","memory":false,"memory_writes":true,"publication_policy":"auto","execution_deadline_seconds":3600})
+    json!({"id":"agent-fixture","name":"dark-factory","channels":[],"created_at":"2026-10-04T00:00:00Z","memory":false,"memory_writes":true,"publication_policy":"auto","execution_deadline_seconds":3600})
 }
 
 fn platform(req: &Request, state: &std::sync::Mutex<Value>) -> Response {
     let path = req.path.split('?').next().unwrap();
     let mut saved = state.lock().unwrap();
     let result = match (req.method.as_str(), path) {
+        ("GET", "/agents") if saved.is_null() => json!([]),
         ("GET", "/agents") => json!([saved.clone()]),
         ("POST", "/agents") => {
             let created: Value = serde_json::from_slice(&req.body).unwrap();
+            assert!(
+                saved.is_null(),
+                "the fixture agent must be created only once"
+            );
+            assert!(
+                created["channel"].is_object(),
+                "AgentCreate needs an initial binding"
+            );
+            *saved = agent();
             saved["name"] = created["name"].clone();
-            saved["channels"] = json!([]);
-            saved.clone()
+            saved["channels"] = json!([created["channel"].clone()]);
+            if let Some(repo) = created.get("repo_full_name") {
+                saved["repo_full_name"] = repo.clone();
+            }
+            return Response::json(201, &saved.to_string());
         }
         ("GET", "/agents/agent-fixture") => saved.clone(),
         ("PATCH", "/agents/agent-fixture") => {
@@ -282,7 +364,19 @@ fn platform(req: &Request, state: &std::sync::Mutex<Value>) -> Response {
         }
         ("POST", "/agents/agent-fixture/channels") => {
             let binding: Value = serde_json::from_slice(&req.body).unwrap();
-            saved["channels"].as_array_mut().unwrap().push(binding);
+            let channels = saved["channels"].as_array_mut().unwrap();
+            if let Some(held) = channels.iter().find(|held| {
+                held["kind"] == binding["kind"] && held["address"] == binding["address"]
+            }) {
+                if held["trigger_label"] != binding["trigger_label"] {
+                    return Response::json(
+                        409,
+                        r#"{"detail":"surface already has another label"}"#,
+                    );
+                }
+            } else {
+                channels.push(binding);
+            }
             saved.clone()
         }
         ("POST", "/agents/agent-fixture/versions") => {
@@ -420,9 +514,11 @@ impl Fixture {
                     200,
                     r#"{"total_count":1,"repositories":[{"full_name":"acme/widgets"}]}"#,
                 ),
-                ("GET", "/repos/acme/widgets") => {
-                    Response::json(200, r#"{"default_branch":"main"}"#)
-                }
+                // https://docs.github.com/en/rest/repos/repos#get-a-repository
+                ("GET", "/repos/acme/widgets") => Response::json(
+                    200,
+                    r#"{"id":987654,"full_name":"acme/widgets","private":true,"default_branch":"main"}"#,
+                ),
                 ("GET", "/repos/acme/widgets/commits/main") => {
                     Response::json(200, r#"{"sha":"1111111111111111111111111111111111111111"}"#)
                 }
@@ -450,7 +546,7 @@ impl Fixture {
             }
             Response::json(404, "{}")
         });
-        let agent_state = std::sync::Mutex::new(agent());
+        let agent_state = std::sync::Mutex::new(Value::Null);
         Self {
             dir,
             github,
@@ -1203,12 +1299,12 @@ fn namespace_mutations(fixture: &Fixture) -> Vec<Vec<String>> {
         .filter_map(|line| {
             let call: Vec<String> = serde_json::from_str(line).ok()?;
             (call.first().map(String::as_str) == Some("kubectl")
-                && matches!(
-                    call.get(1).map(String::as_str),
-                    Some(
+                && call.iter().skip(1).any(|argument| {
+                    matches!(
+                        argument.as_str(),
                         "patch" | "label" | "annotate" | "create" | "delete" | "apply" | "replace"
                     )
-                ))
+                }))
             .then_some(call)
         })
         .collect()
@@ -1462,9 +1558,9 @@ fn both_default_passes_stay_within_the_line_budget_against_a_fake_cluster() {
     for (method, path, field, value) in [
         (
             "POST",
-            "/agents/agent-fixture/channels",
-            "address",
-            json!("acme/widgets"),
+            "/agents",
+            "channel",
+            json!({"kind":"github","address":"acme/widgets"}),
         ),
         (
             "PATCH",
@@ -1494,6 +1590,20 @@ fn both_default_passes_stay_within_the_line_budget_against_a_fake_cluster() {
             "the ready path did not apply {field}"
         );
     }
+    let creations: Vec<_> = requests
+        .iter()
+        .filter(|request| request.method == "POST" && request.path == "/agents")
+        .collect();
+    assert_eq!(creations.len(), 1);
+    let create_index = requests
+        .iter()
+        .position(|request| request.method == "POST" && request.path == "/agents")
+        .unwrap();
+    let deployment_index = requests
+        .iter()
+        .position(|request| request.method == "POST" && request.path == "/deployments")
+        .unwrap();
+    assert!(create_index < deployment_index);
     let upgrades = helm_upgrade_calls(&fixture);
     assert_eq!(
         upgrades.len(),
@@ -1685,6 +1795,349 @@ fn a_runner_env_upgrade_failure_stops_before_deploy() {
             .all(|request| request.method == "GET"),
         "the runner env failure must prevent agent and deployment mutations: {shown}"
     );
+}
+
+const JIRA_TOKEN: &str = "jira-fixture-token-4736";
+const JIRA_AGENT: &str = "acme-jira";
+
+struct JiraFixture {
+    cli: Fixture,
+    jira: MockServer,
+}
+
+impl JiraFixture {
+    fn new() -> Self {
+        let cli = Fixture::new();
+        let mut values: Value =
+            serde_json::from_slice(&fs::read(cli.dir.path().join("values")).unwrap()).unwrap();
+        values["security"]["gvisor"]["mode"] = json!("off");
+        values["agentSandbox"]["runner"]["model"] = json!(curie::factory_quickstart::DEFAULT_MODEL);
+        values["agentSandbox"]["runnerEnv"] = json!({
+            JIRA_AGENT: {"CLAUDE_CODE_MAX_OUTPUT_TOKENS":"2048","ACME_MODE":"selected"},
+            "acme-other": {"CLAUDE_CODE_MAX_OUTPUT_TOKENS":"4096","ACME_MODE":"sibling"}
+        });
+        cli.record_values(values);
+        // Helm history's revision, status and description are external wire fields:
+        // https://helm.sh/docs/helm/helm_history/
+        fs::write(
+            cli.dir.path().join("helm-history"),
+            json!([{"revision":1,"status":"deployed","description":"Install complete"}])
+                .to_string(),
+        )
+        .unwrap();
+        fs::write(cli.dir.path().join("jira-token"), JIRA_TOKEN).unwrap();
+        let bundle = cli.dir.path().join("jira-bundle");
+        fs::create_dir_all(bundle.join(".claude-plugin")).unwrap();
+        fs::write(
+            bundle.join(".claude-plugin/plugin.json"),
+            json!({"name":"acme-registration","version":"1.0.0"}).to_string(),
+        )
+        .unwrap();
+        // Jira REST v3 responses and Basic authentication:
+        // https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-server-info/#api-rest-api-3-serverinfo-get
+        // https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-myself/#api-rest-api-3-myself-get
+        // https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-users/#api-rest-api-3-user-get
+        // https://developer.atlassian.com/cloud/jira/platform/basic-auth-for-rest-apis/
+        // Public /_edge/tenant_info follows factory_quickstart_jira.rs's fixture.
+        let jira = serve(|request| {
+            let path = request.path.split('?').next().unwrap();
+            if request.method == "GET" && path == "/_edge/tenant_info" {
+                return Response::json(
+                    200,
+                    r#"{"cloudId":"0f1e2d3c-4b5a-4978-8796-a5b4c3d2e1f0"}"#,
+                );
+            }
+            let auth = base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                format!("acme-bot@example.com:{JIRA_TOKEN}"),
+            );
+            if request.header("authorization") != Some(format!("Basic {auth}").as_str()) {
+                return Response::json(401, r#"{"errorMessages":["Unauthorized"],"errors":{}}"#);
+            }
+            match (request.method.as_str(), path) {
+                ("GET", "/rest/api/3/serverInfo") => Response::json(
+                    200,
+                    &json!({"baseUrl":format!("http://{}", request.header("host").unwrap()),"deploymentType":"Cloud"}).to_string(),
+                ),
+                ("GET", "/rest/api/3/myself") => Response::json(
+                    200,
+                    r#"{"accountId":"acme-bot","accountType":"atlassian","active":true}"#,
+                ),
+                ("GET", "/rest/api/3/user") => Response::json(
+                    200,
+                    r#"{"accountId":"acme-starter","accountType":"atlassian","active":true}"#,
+                ),
+                _ => Response::json(404, r#"{"errorMessages":["Not found"],"errors":{}}"#),
+            }
+        });
+        Self { cli, jira }
+    }
+
+    fn values(&self) -> Value {
+        serde_json::from_slice(&fs::read(self.cli.dir.path().join("values")).unwrap()).unwrap()
+    }
+
+    fn command(&self, app_flags: bool) -> Command {
+        let mut command = self.cli.command(
+            app_flags,
+            &[
+                "--color",
+                "never",
+                "--context",
+                "kind-curie-factory",
+                "--agent",
+                JIRA_AGENT,
+                "--code-host",
+                "github",
+                "--tracker",
+                "jira-cloud",
+                "--forge-url",
+                &self.jira.base_url,
+                "--forge-username",
+                "acme-bot@example.com",
+                "--start-account",
+                "acme-starter",
+            ],
+        );
+        command
+            .arg("--token-file")
+            .arg(self.cli.dir.path().join("jira-token"))
+            .arg("--plugin-dir")
+            .arg(self.cli.dir.path().join("jira-bundle"))
+            .env_remove("QUICKSTART_APP_SECRET")
+            .stdin(Stdio::null());
+        command
+    }
+}
+
+fn capture_quickstart(mut command: Command) -> (i32, String) {
+    let output = command.output().unwrap();
+    (
+        output.status.code().unwrap_or(1),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    )
+}
+
+fn jira_upgrade_documents(fixture: &Fixture) -> Vec<Value> {
+    fs::read_to_string(fixture.dir.path().join("helm-values"))
+        .unwrap_or_default()
+        .lines()
+        .map(|line| {
+            let document: String = serde_json::from_str(line).unwrap();
+            serde_json::from_str::<Value>(&document).unwrap()
+        })
+        .filter(|values| {
+            values
+                .pointer("/factory/trackers")
+                .and_then(Value::as_array)
+                .is_some_and(|trackers| trackers.iter().any(|t| t["kind"] == "jira_cloud"))
+        })
+        .collect()
+}
+
+fn jira_write_counts(fixture: &Fixture) -> (usize, usize, usize, usize) {
+    let (helm, kubernetes, _, platform) = add_agent_writes(fixture);
+    let github = fixture
+        .github
+        .recorded()
+        .iter()
+        .filter(|request| {
+            request.method != "GET" && request.path != "/app/installations/42/access_tokens"
+        })
+        .count();
+    (helm, kubernetes, github, platform)
+}
+
+#[test]
+fn jira_registration_binds_runner_env_in_the_tracker_upgrade() {
+    for app_flags in [true, false] {
+        let fixture = JiraFixture::new();
+        if !app_flags {
+            let (code, shown) = capture_quickstart(fixture.command(true));
+            assert_eq!(code, 0, "{shown}");
+            let mut values = fixture.values();
+            values["factory"]["bindings"] = json!([]);
+            values["agentSandbox"]["runnerEnv"][JIRA_AGENT]["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] =
+                json!("2048");
+            fixture.cli.record_values(values);
+        }
+        let before = helm_upgrade_calls(&fixture.cli).len();
+        let before_documents = jira_upgrade_documents(&fixture.cli).len();
+        let (code, shown) = capture_quickstart(fixture.command(app_flags));
+        assert_eq!(code, 0, "app_flags={app_flags}: {shown}");
+        let documents = jira_upgrade_documents(&fixture.cli);
+        assert_eq!(documents.len(), before_documents + 1, "{documents:?}");
+        let overlay = documents.last().unwrap();
+        assert_eq!(
+            overlay.pointer("/agentSandbox/runnerEnv"),
+            Some(&json!({JIRA_AGENT:{"CLAUDE_CODE_MAX_OUTPUT_TOKENS":"16000"}})),
+            "the Jira tracker upgrade must contain only the selected agent's ceiling: {overlay}"
+        );
+        let upgrades = helm_upgrade_calls(&fixture.cli);
+        assert_eq!(
+            upgrades.len() - before,
+            if app_flags { 2 } else { 1 },
+            "GitHub intake and Jira registration need no standalone env upgrade: {upgrades:?}"
+        );
+        for upgrade in &upgrades[before..] {
+            assert!(
+                upgrade.iter().any(|arg| arg == "--reuse-values"),
+                "{upgrade:?}"
+            );
+            assert!(!upgrade.iter().any(|arg| arg == "--install"), "{upgrade:?}");
+        }
+        let values = fixture.values();
+        assert_eq!(
+            values.pointer("/agentSandbox/runnerEnv"),
+            Some(&json!({
+                JIRA_AGENT:{"CLAUDE_CODE_MAX_OUTPUT_TOKENS":"16000","ACME_MODE":"selected"},
+                "acme-other":{"CLAUDE_CODE_MAX_OUTPUT_TOKENS":"4096","ACME_MODE":"sibling"}
+            }))
+        );
+        assert!(
+            fixture
+                .cli
+                .platform
+                .recorded()
+                .iter()
+                .any(|request| { request.method == "POST" && request.path == "/deployments" }),
+            "the successful registration must reach deployment: {shown}"
+        );
+    }
+}
+
+#[test]
+fn jira_existing_site_without_a_tracker_write_still_binds_runner_env() {
+    let fixture = JiraFixture::new();
+    let (code, shown) = capture_quickstart(fixture.command(true));
+    assert_eq!(code, 0, "{shown}");
+    let mut values = fixture.values();
+    values["agentSandbox"]["runnerEnv"][JIRA_AGENT]["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] =
+        json!("2048");
+    fixture.cli.record_values(values.clone());
+    let before = helm_upgrade_calls(&fixture.cli).len();
+    let before_documents = jira_upgrade_documents(&fixture.cli).len();
+    let before_deploys = fixture.cli.platform.recorded().len();
+    let (code, shown) = capture_quickstart(fixture.command(false));
+    assert_eq!(code, 0, "{shown}");
+    assert_eq!(jira_upgrade_documents(&fixture.cli).len(), before_documents);
+    assert_eq!(
+        helm_upgrade_calls(&fixture.cli).len(),
+        before + 1,
+        "{shown}"
+    );
+    values["agentSandbox"]["runnerEnv"][JIRA_AGENT]["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] =
+        json!("16000");
+    assert_eq!(
+        fixture.values(),
+        values,
+        "only the runner setting should change"
+    );
+    assert!(
+        fixture.cli.platform.recorded()[before_deploys..]
+            .iter()
+            .any(|request| request.method == "POST" && request.path == "/deployments"),
+        "the no-tracker-write path must reach deployment: {shown}"
+    );
+    let before = helm_upgrade_calls(&fixture.cli).len();
+    let (code, shown) = capture_quickstart(fixture.command(false));
+    assert_eq!(code, 0, "{shown}");
+    assert_eq!(helm_upgrade_calls(&fixture.cli).len(), before, "{shown}");
+}
+
+#[test]
+fn jira_tracker_upgrade_failure_stops_before_runner_env_and_deploy() {
+    let fixture = JiraFixture::new();
+    let mut command = fixture.command(true);
+    command.env("QUICKSTART_FAIL", "jira");
+    let (code, shown) = capture_quickstart(command);
+    assert_eq!(code, 1, "{shown}");
+    assert!(shown.contains("Jira tracker upgrade refused"), "{shown}");
+    assert_eq!(helm_upgrade_calls(&fixture.cli).len(), 2, "{shown}");
+    assert_eq!(
+        fixture.values().pointer("/agentSandbox/runnerEnv"),
+        Some(&json!({
+            JIRA_AGENT:{"CLAUDE_CODE_MAX_OUTPUT_TOKENS":"2048","ACME_MODE":"selected"},
+            "acme-other":{"CLAUDE_CODE_MAX_OUTPUT_TOKENS":"4096","ACME_MODE":"sibling"}
+        }))
+    );
+    assert!(fixture
+        .cli
+        .platform
+        .recorded()
+        .iter()
+        .all(|request| request.method == "GET"));
+    assert!(!shown.contains(JIRA_TOKEN), "{shown}");
+}
+
+#[test]
+fn jira_conflicting_binding_refuses_before_any_write_on_both_app_paths() {
+    for app_flags in [true, false] {
+        let fixture = JiraFixture::new();
+        let (code, shown) = capture_quickstart(fixture.command(true));
+        assert_eq!(code, 0, "{shown}");
+        let mut values = fixture.values();
+        let binding = values["factory"]["bindings"]
+            .as_array_mut()
+            .unwrap()
+            .first_mut()
+            .unwrap();
+        binding["startAuthority"]["accounts"] = json!(["acme-other-starter"]);
+        values["agentSandbox"]["runnerEnv"][JIRA_AGENT]["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] =
+            json!("2048");
+        fixture.cli.record_values(values.clone());
+        let before = jira_write_counts(&fixture.cli);
+        let (code, shown) = capture_quickstart(fixture.command(app_flags));
+        assert_eq!(code, 2, "app_flags={app_flags}: {shown}");
+        assert!(
+            shown.contains("startAuthority") && shown.contains("refused"),
+            "{shown}"
+        );
+        assert_eq!(jira_write_counts(&fixture.cli), before, "{shown}");
+        assert_eq!(fixture.values(), values);
+        assert!(!shown.contains(JIRA_TOKEN), "{shown}");
+    }
+}
+
+#[test]
+fn jira_stale_observation_refuses_before_tracker_env_and_deploy() {
+    for (kind, cause) in [("secret", "resourceVersion"), ("revision", "revision")] {
+        let fixture = JiraFixture::new();
+        let (code, shown) = capture_quickstart(fixture.command(true));
+        assert_eq!(code, 0, "{shown}");
+        let mut values = fixture.values();
+        let secret = values["factory"]["trackers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tracker| tracker["kind"] == "jira_cloud")
+            .unwrap()["credential"]["existingSecret"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        values["factory"]["bindings"] = json!([]);
+        values["agentSandbox"]["runnerEnv"][JIRA_AGENT]["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] =
+            json!("2048");
+        fixture.cli.record_values(values.clone());
+        let before = jira_write_counts(&fixture.cli);
+        let mut command = fixture.command(false);
+        command
+            .env("QUICKSTART_STALE_SECRET", secret)
+            .env("QUICKSTART_STALE_KIND", kind);
+        let (code, shown) = capture_quickstart(command);
+        assert_eq!(code, 2, "{kind}: {shown}");
+        assert!(
+            shown.contains(cause) && shown.contains("stale"),
+            "{kind}: {shown}"
+        );
+        assert_eq!(jira_write_counts(&fixture.cli), before, "{kind}: {shown}");
+        assert_eq!(fixture.values(), values);
+        assert!(!shown.contains(JIRA_TOKEN), "{shown}");
+    }
 }
 
 #[test]

@@ -153,6 +153,7 @@ Set `base=next` when your worktree targets `next`.
     echo "cross-train lineage skipped: base $base is not a train branch"
   fi
   uv run python scripts/check-schema-window.py
+  uv run python scripts/check-contract-migration-timing.py
   uv run ruff check .
   uv run mypy
   uv run lint-imports
@@ -236,8 +237,10 @@ is an exception to the CLI entry point guidance in `CLAUDE.md`.
    worker needs explicit override entries for its database, Valkey, S3, API
    and worker OTel endpoints, plus `CURIE_DOCKER_NETWORK` matching the private
    runner network. Shell exports do not replace literal Compose environment
-   entries. Use private image tags and staging paths when building or running
-   workers; preserve the worker's identical host/container staging mount path.
+   entries. Use private image tags when building or running workers. The Docker
+   substrate copies validated bundle, workspace, and attachment inputs through
+   the Docker API into claim-owned named volumes. Workspaces and temporary
+   directories need no shared filesystem or matching daemon-host paths.
 4. Export the full isolated contract before the baseline. The baseline consumes
    `COMPOSE_PROJECT_NAME` and `COMPOSE_FILE`, keeps the default shared lock only
    when it selected the default project itself, and uses a project scoped lock
@@ -284,7 +287,6 @@ is an exception to the CLI entry point guidance in `CLAUDE.md`.
    export CURIE_DOCKER_NETWORK=curie-check-2780-a_runner
    export CURIE_LOCAL_STUB_PORT=18155
    export CURIE_LOCAL_POSTGRES_HOST=127.0.0.1 CURIE_LOCAL_POSTGRES_PORT=35432
-   export CURIE_LOCAL_STAGING_DIR=/tmp/curie-bundles-2780-a
    export CURIE_LOCAL_IMAGE_TAG=dev-2780-a
    export CURIE_WORKER_OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:34318
    export CURIE_LOCAL_OTEL_METRICS_URL=http://127.0.0.1:38888/metrics
@@ -949,7 +951,7 @@ required and proved, not carried on the original classification.
 | cluster | chart templates, RBAC, securityContext, NetworkPolicy, sandbox claims, init containers | `CURIE_E2E_TIERS=cluster curie dev e2e-ladder`, or `curie dev chart-runtime-e2e` for a chart, sandbox, or bundle slice |
 | live provider | model routing, credential resolution, provider auth, token or cost accounting, meaning the product's own model and integration credentials, never the agent tooling that runs this workflow; also the MCP/workspace/coding-tool path set below | the required rungs with `CURIE_E2E_LIVE=1`, since a fake-tier pass proves wiring and nothing about a real model |
 | external integration | Slack, git push webhooks, connector OAuth, or any third-party API shape; Slack is required on the MCP/workspace/coding-tool path set below | drive the real integration; a replayed fixture or a fake does not close this tier |
-| factory | API factory runtime, CI, progress, or publication behavior; runner verification preflight or factory progress; the dark factory example; worker work item execution | `curie dev factory-e2e scripted` from a source checkout (add `--build-images` when the four local images are not built), or the `E2E scripted factory scenario (kind, scripted model)` PR CI job, which runs it whenever a factory path changes |
+| factory | API factory runtime, CI, progress, or publication behavior; runner verification preflight or factory progress; the dark factory example; worker work item execution | `curie dev factory-e2e scripted` from a source checkout (add `--build-images` when the four local images are not built), or the `scenario` leg of the `E2E scripted factory (kind, scripted model, <leg>)` PR CI job, which runs it whenever a factory path changes |
 
 The factory path set includes `apps/api/src/curie_api/factory_runtime*`,
 `factory_ci*`, `factory_progress*`, and `routers/publications*`;

@@ -10,6 +10,7 @@
       "env",
       "headers",
       "image",
+      "no_client_auth",
       "port",
       "proxy_upstream_host",
       "readiness_path",

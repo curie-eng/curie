@@ -7,8 +7,9 @@ real routes and real Postgres:
 * ``/agents/{agent_id}/hooks/{hook}/remediation-policy`` ``GET``, ``PUT`` and
   ``DELETE``, and ``POST .../arm`` and ``POST .../disarm``, under
   ``require_api_key`` (AUTOMATED-REMEDIATION-3);
-* every write also needs an ADR 0106 operator principal, recorded as
-  ``bound_by`` on the generation; without one it is refused
+* every write also needs an ADR 0106 operator principal carrying the
+  ``remediation.administer`` scope, recorded as ``bound_by`` on the generation;
+  without one, or with an ``approval.resolve`` operator token, it is refused
   ``operator_principal_required``; a hook-key-signed request is ``401``;
 * generations follow the source policy rule: compare and swap on
   ``expected_generation`` (``stale_policy_generation``), idempotent on
@@ -41,6 +42,7 @@ import threading
 import time
 import uuid
 from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
 import asyncpg
@@ -61,6 +63,8 @@ OPERATOR = "U0EXAMPLE1"
 OTHER_OPERATOR = "U0EXAMPLE2"
 CHANNEL = "C0EXAMPLE1"
 PRINCIPAL_HEADER = "X-Curie-Approval-Principal"
+AUTHORITY_HEADER = "X-Curie-Remediation-Authority"
+AUTHORITY_SETTING = "CURIE_REMEDIATION_AUTHORITY_KEY"
 
 # Approval routes on the agent: an explicit user list, a user group, and a route
 # with no approvers block (the channel-members fallback, ADR 0123).
@@ -182,6 +186,7 @@ def _tune_action(**overrides: Any) -> dict[str, Any]:
     action.update(overrides)
     return action
 
+
 # ---------------------------------------------------------------------------
 # Fixtures and helpers
 # ---------------------------------------------------------------------------
@@ -254,7 +259,22 @@ def remediation_off() -> Iterator[None]:
 
 
 def _operator(subject: str = OPERATOR) -> dict[str, str]:
-    """An ADR 0106 operator principal, minted as ``POST /approvals/principals/operator`` does."""
+    """A remediation operator principal, minted as
+    ``POST /approvals/principals/remediation-operator`` does.
+    """
+
+    token = approval_principal.mint(
+        get_settings().api_key,
+        subject=subject,
+        kind="operator",
+        scope=approval_principal.REMEDIATION_ADMIN_SCOPE,
+        exp=int(time.time()) + 300,
+    )
+    return {PRINCIPAL_HEADER: token}
+
+
+def _approval_operator(subject: str = OPERATOR) -> dict[str, str]:
+    """A valid ADR 0106 approval resolution operator principal (``approval.resolve``)."""
 
     token = approval_principal.mint(
         get_settings().api_key,
@@ -266,8 +286,25 @@ def _operator(subject: str = OPERATOR) -> dict[str, str]:
     return {PRINCIPAL_HEADER: token}
 
 
+def _authority() -> dict[str, str]:
+    """The ADR 0231 remediation authority header, carrying the API's configured key."""
+
+    return {AUTHORITY_HEADER: get_settings().remediation_authority_key}
+
+
 def _admin(auth_headers: dict[str, str], subject: str = OPERATOR) -> dict[str, str]:
-    """The administrative credential plus an operator principal: a valid writer."""
+    """The administrative credential, an operator principal and the remediation
+    authority: a valid writer for every verb, bind and arm included (ADR 0231).
+    """
+
+    return {**auth_headers, **_operator(subject), **_authority()}
+
+
+def _reducer(auth_headers: dict[str, str], subject: str = OPERATOR) -> dict[str, str]:
+    """The administrative credential plus an operator principal, with no remediation
+    authority: enough for ``DELETE``, disarm and breaker close, which only reduce
+    what runs automatically (ADR 0231).
+    """
 
     return {**auth_headers, **_operator(subject)}
 
@@ -438,17 +475,22 @@ def test_a_write_without_an_operator_principal_is_refused_and_creates_nothing(
 
     The administrative credential alone is not enough for any write: ``PUT``,
     ``DELETE``, arm and disarm are each refused ``operator_principal_required``
-    and leave the policy and its generations as they were.
+    and leave the policy and its generations as they were. ``PUT`` and arm carry
+    the correct ADR 0231 remediation authority, so the refusal is the missing
+    principal's: the authority never stands in for attribution.
     """
 
+    authorized = {**auth_headers, **_authority()}
     if verb == "put":
         before_rows: list[dict[str, Any]] = []
-        response = _put(client, agent_id, auth_headers)
+        response = _put(client, agent_id, authorized)
     else:
         generation = _bind(client, agent_id, auth_headers)
         before_rows = _generation_rows(agent_id)
         if verb == "delete":
             response = _delete(client, agent_id, auth_headers, expected=str(generation))
+        elif verb == "arm":
+            response = _post(client, agent_id, verb, authorized, expected=str(generation))
         else:
             response = _post(client, agent_id, verb, auth_headers, expected=str(generation))
 
@@ -460,18 +502,470 @@ def test_a_write_without_an_operator_principal_is_refused_and_creates_nothing(
         assert _policy_row(agent_id) is None
 
 
+def _write(
+    client: TestClient, agent: str, verb: str, headers: dict[str, str], generation: int
+) -> Any:
+    """One policy write; ``generation`` is the current one (``0`` when unbound)."""
+
+    if verb == "put":
+        return _put(client, agent, headers, expected=str(generation))
+    if verb == "delete":
+        return _delete(client, agent, headers, expected=str(generation))
+    return _post(client, agent, verb, headers, expected=str(generation))
+
+
+@pytest.mark.usefixtures("remediation_off")
+@pytest.mark.parametrize("verb", ["put", "delete", "arm", "disarm"])
+def test_an_approval_resolve_operator_token_cannot_write_remediation_policy(
+    client: TestClient, auth_headers: dict[str, str], agent_id: str, verb: str
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-3
+
+    A valid, unexpired operator principal minted with the approval resolution
+    scope carries no authority over remediation policy: with the platform key,
+    a correct ``expected_generation`` and remediation off, ``PUT``, ``DELETE``,
+    arm and disarm are each refused ``operator_principal_required`` and create
+    no generation.
+    """
+
+    assert get_settings().remediation_enabled is False
+    generation = 0 if verb == "put" else _bind(client, agent_id, auth_headers)
+    before_rows = _generation_rows(agent_id)
+    before_policy = _policy_row(agent_id)
+
+    headers = {**auth_headers, **_approval_operator()}
+    if verb in ("put", "arm"):
+        headers.update(_authority())
+    response = _write(client, agent_id, verb, headers, generation)
+
+    assert response.status_code == 403, response.text
+    assert _code(response) == "operator_principal_required"
+    assert response.headers.get("cache-control") == "no-store"
+    assert _generation_rows(agent_id) == before_rows
+    assert _policy_row(agent_id) == before_policy
+
+
+@pytest.mark.usefixtures("remediation_off")
+@pytest.mark.parametrize("verb", ["put", "delete", "arm", "disarm"])
+def test_a_remediation_operator_token_writes_remediation_policy_bound_by_it(
+    client: TestClient, auth_headers: dict[str, str], agent_id: str, verb: str
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-3
+
+    The liveness side of the scope refusal: the same four writes, under the
+    same preconditions, with a ``remediation.administer`` operator principal,
+    each create a generation recorded with that principal's subject.
+    """
+
+    generation = 0 if verb == "put" else _bind(client, agent_id, auth_headers)
+
+    writer = _admin if verb in ("put", "arm") else _reducer
+    response = _write(client, agent_id, verb, writer(auth_headers, OTHER_OPERATOR), generation)
+
+    assert response.status_code == 200, response.text
+    assert _generation(response) > generation
+    assert response.json()["bound_by"] == OTHER_OPERATOR
+    assert _generation_rows(agent_id)[-1]["bound_by"] == OTHER_OPERATOR
+
+
 def test_a_principal_without_the_administrative_credential_is_401(
     client: TestClient, agent_id: str
 ) -> None:
     """@spec AUTOMATED-REMEDIATION-3: the routes sit under ``require_api_key``;
-    an operator principal is in addition to it, never instead of it.
+    an operator principal (and the ADR 0231 remediation authority) is in
+    addition to it, never instead of it.
     """
 
-    response = _put(client, agent_id, _operator())
+    response = _put(client, agent_id, {**_operator(), **_authority()})
 
     assert response.status_code == 401, response.text
     assert _policy_row(agent_id) is None
     assert _generation_rows(agent_id) == []
+
+
+# ---------------------------------------------------------------------------
+# ADR 0231: bind and arm need the independent remediation authority
+# ---------------------------------------------------------------------------
+
+
+@contextmanager
+def _authority_unset() -> Iterator[None]:
+    """The API with ``CURIE_REMEDIATION_AUTHORITY_KEY`` unset (its default)."""
+
+    before = os.environ.pop(AUTHORITY_SETTING, None)
+    get_settings.cache_clear()
+    try:
+        assert get_settings().remediation_authority_key == ""
+        yield
+    finally:
+        if before is not None:
+            os.environ[AUTHORITY_SETTING] = before
+        get_settings.cache_clear()
+
+
+def _assert_authority_refused(response: Any) -> None:
+    assert response.status_code == 403, response.text
+    assert _code(response) == "remediation_authority_required"
+    assert response.headers.get("cache-control") == "no-store"
+
+
+def _bind_or_arm(
+    client: TestClient, agent: str, verb: str, headers: dict[str, str], generation: int
+) -> Any:
+    if verb == "put":
+        return _put(client, agent, headers, expected=str(generation))
+    return _post(client, agent, "arm", headers, expected=str(generation))
+
+
+def _wrong_authorities() -> list[str]:
+    """Values a platform-key holder can produce, none of which is the authority."""
+
+    settings = get_settings()
+    return [
+        "not-the-remediation-authority",
+        settings.api_key,
+        settings.remediation_authority_key + "x",
+        settings.remediation_authority_key[:-1],
+        _operator()[PRINCIPAL_HEADER],
+        "",
+    ]
+
+
+def test_the_suite_authority_is_configured_and_distinct_from_the_platform_key() -> None:
+    """ADR 0231: the fixture this file relies on. The suite's authority is set
+    and differs from the platform key, or every refusal below would be vacuous.
+    """
+
+    settings = get_settings()
+    assert settings.remediation_authority_key.strip()
+    assert settings.remediation_authority_key != settings.api_key
+
+
+@pytest.mark.parametrize("verb", ["put", "arm"])
+def test_a_bind_or_arm_without_the_remediation_authority_is_refused_and_creates_nothing(
+    client: TestClient, auth_headers: dict[str, str], agent_id: str, verb: str
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-3 (ADR 0231)
+
+    The platform key and a ``remediation.administer`` operator principal are
+    both derivable from the platform key every worker holds, so with no
+    ``X-Curie-Remediation-Authority`` header ``PUT`` and arm are refused
+    ``remediation_authority_required`` and write no generation.
+    """
+
+    generation = 0 if verb == "put" else _bind(client, agent_id, auth_headers)
+    before_rows = _generation_rows(agent_id)
+    before_policy = _policy_row(agent_id)
+
+    response = _bind_or_arm(client, agent_id, verb, _reducer(auth_headers), generation)
+
+    _assert_authority_refused(response)
+    assert _generation_rows(agent_id) == before_rows
+    assert _policy_row(agent_id) == before_policy
+    read = client.get(_url(agent_id), headers=auth_headers)
+    if verb == "put":
+        assert read.status_code == 404, read.text
+    else:
+        assert _generation(read) == generation
+        assert read.json()["armed"] is False
+
+
+@pytest.mark.parametrize("verb", ["put", "arm"])
+def test_a_bind_or_arm_with_a_wrong_remediation_authority_is_refused_and_creates_nothing(
+    client: TestClient, auth_headers: dict[str, str], agent_id: str, verb: str
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-3 (ADR 0231)
+
+    A wrong authority is refused like a missing one, including the platform
+    key itself, a near miss on either side, an operator principal token and an
+    empty value: nothing a platform-key holder can derive satisfies it.
+    """
+
+    generation = 0 if verb == "put" else _bind(client, agent_id, auth_headers)
+    before_rows = _generation_rows(agent_id)
+    before_policy = _policy_row(agent_id)
+
+    for wrong in _wrong_authorities():
+        headers = {**_reducer(auth_headers), AUTHORITY_HEADER: wrong}
+        response = _bind_or_arm(client, agent_id, verb, headers, generation)
+        _assert_authority_refused(response)
+        assert wrong not in json.dumps(response.json()) or wrong == ""
+
+    assert _generation_rows(agent_id) == before_rows
+    assert _policy_row(agent_id) == before_policy
+
+
+@pytest.mark.parametrize("verb", ["put", "arm"])
+def test_a_bind_or_arm_is_refused_when_the_api_has_no_remediation_authority(
+    client: TestClient, auth_headers: dict[str, str], agent_id: str, verb: str
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-3 (ADR 0231): fail closed.
+
+    With ``CURIE_REMEDIATION_AUTHORITY_KEY`` unset in the API, no header value
+    matches, not the empty string, not the value the key used to have, and not
+    the platform key: ``PUT`` and arm are ``remediation_authority_required`` and
+    write no generation.
+    """
+
+    configured = get_settings().remediation_authority_key
+    generation = 0 if verb == "put" else _bind(client, agent_id, auth_headers)
+    before_rows = _generation_rows(agent_id)
+    before_policy = _policy_row(agent_id)
+
+    with _authority_unset():
+        for sent in (None, "", configured, get_settings().api_key):
+            headers = _reducer(auth_headers)
+            if sent is not None:
+                headers[AUTHORITY_HEADER] = sent
+            response = _bind_or_arm(client, agent_id, verb, headers, generation)
+            _assert_authority_refused(response)
+
+    assert _generation_rows(agent_id) == before_rows
+    assert _policy_row(agent_id) == before_policy
+
+
+@pytest.mark.parametrize("verb", ["put", "arm"])
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"not json",
+        b"{}",
+        b'{"expected_generation": 7, "operation_id": "nope", "policy": []}',
+    ],
+)
+def test_the_remediation_authority_is_checked_before_the_body_is_validated(
+    client: TestClient, auth_headers: dict[str, str], agent_id: str, verb: str, body: bytes
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-3 (ADR 0231)
+
+    An unauthorized caller learns nothing about the body schema: with no
+    authority, a malformed or ill-typed body is ``403``
+    ``remediation_authority_required``, never ``422``.
+    """
+
+    generation = 0 if verb == "put" else _bind(client, agent_id, auth_headers)
+    before_rows = _generation_rows(agent_id)
+    url = _url(agent_id) if verb == "put" else _url(agent_id, suffix="/arm")
+    method = "PUT" if verb == "put" else "POST"
+
+    response = client.request(
+        method,
+        url,
+        content=body,
+        headers={**_reducer(auth_headers), "Content-Type": "application/json"},
+    )
+
+    _assert_authority_refused(response)
+    assert _generation_rows(agent_id) == before_rows
+    if verb == "put":
+        assert generation == 0
+        assert _policy_row(agent_id) is None
+
+
+def _raw_request(
+    client: TestClient, agent: str, verb: str, headers: dict[str, str], body: bytes
+) -> Any:
+    return client.request(
+        "PUT" if verb == "put" else "POST",
+        _url(agent) if verb == "put" else _url(agent, suffix="/arm"),
+        content=body,
+        headers={**headers, "Content-Type": "application/json"},
+    )
+
+
+@pytest.mark.parametrize("verb", ["put", "arm"])
+def test_an_undecodable_body_without_the_remediation_authority_is_403_not_a_body_error(
+    client: TestClient, auth_headers: dict[str, str], agent_id: str, verb: str
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-3 (ADR 0231): the authority is checked before
+    the body is decoded, so bytes that are not UTF-8 leak no body error.
+    """
+
+    if verb == "arm":
+        _bind(client, agent_id, auth_headers)
+    before_rows = _generation_rows(agent_id)
+
+    response = _raw_request(client, agent_id, verb, _reducer(auth_headers), b"\xff")
+
+    _assert_authority_refused(response)
+    assert _generation_rows(agent_id) == before_rows
+
+
+@pytest.mark.parametrize("verb", ["put", "arm"])
+@pytest.mark.parametrize("body", [b"\xff", b"not json", b"{}"])
+@pytest.mark.parametrize("with_principal", [False, True])
+def test_an_unauthenticated_caller_is_401_before_any_authority_or_body_error(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    agent_id: str,
+    verb: str,
+    body: bytes,
+    with_principal: bool,
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-3 (ADR 0231): precedence is 401 (no platform
+    key, no console session), then 403 ``remediation_authority_required``, then
+    body errors. An unauthenticated caller never sees the 403 or a body error.
+    """
+
+    if verb == "arm":
+        _bind(client, agent_id, auth_headers)
+    before_rows = _generation_rows(agent_id)
+
+    headers = _operator() if with_principal else {}
+    response = _raw_request(client, agent_id, verb, headers, body)
+
+    assert response.status_code == 401, response.text
+    assert "remediation_authority_required" not in response.text
+    assert _generation_rows(agent_id) == before_rows
+
+
+@pytest.mark.parametrize("verb", ["put", "arm"])
+@pytest.mark.parametrize(
+    "body, status",
+    [(b"not json", 422), (b"\xff", 400)],
+)
+def test_an_authorized_undecodable_or_non_json_body_is_a_body_error_not_an_authority_refusal(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    agent_id: str,
+    verb: str,
+    body: bytes,
+    status: int,
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-3 (ADR 0231): the liveness side. With the
+    platform key, a principal and the correct authority the authority gate
+    passes, so the body is what is refused, and nothing is written.
+    """
+
+    if verb == "arm":
+        _bind(client, agent_id, auth_headers)
+    before_rows = _generation_rows(agent_id)
+
+    response = _raw_request(client, agent_id, verb, _admin(auth_headers), body)
+
+    assert response.status_code == status, response.text
+    assert "remediation_authority_required" not in response.text
+    assert _generation_rows(agent_id) == before_rows
+
+
+@pytest.mark.parametrize("verb", ["put", "arm"])
+def test_a_malformed_body_with_the_remediation_authority_is_still_a_validation_error(
+    client: TestClient, auth_headers: dict[str, str], agent_id: str, verb: str
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-3 (ADR 0231): the authority check does not
+    swallow validation; an authorized malformed body is still ``422``.
+    """
+
+    if verb == "arm":
+        _bind(client, agent_id, auth_headers)
+    before_rows = _generation_rows(agent_id)
+    url = _url(agent_id) if verb == "put" else _url(agent_id, suffix="/arm")
+
+    response = client.request(
+        "PUT" if verb == "put" else "POST",
+        url,
+        content=b"{}",
+        headers={**_admin(auth_headers), "Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 422, response.text
+    assert _generation_rows(agent_id) == before_rows
+
+
+@pytest.mark.parametrize("verb", ["put", "arm"])
+def test_a_bind_or_arm_with_the_remediation_authority_creates_a_generation(
+    client: TestClient, auth_headers: dict[str, str], agent_id: str, verb: str
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-3 (ADR 0231): the liveness side.
+
+    A well-formed ``PUT`` or arm with the platform key, a remediation operator
+    principal and the correct authority is not refused: it writes the next
+    generation, recorded with the principal's subject as ``bound_by``.
+    """
+
+    generation = 0 if verb == "put" else _bind(client, agent_id, auth_headers)
+
+    response = _bind_or_arm(
+        client, agent_id, verb, _admin(auth_headers, OTHER_OPERATOR), generation
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.headers.get("cache-control") == "no-store"
+    assert _generation(response) > generation
+    assert response.json()["bound_by"] == OTHER_OPERATOR
+    assert response.json()["armed"] is (verb == "arm")
+    rows = _generation_rows(agent_id)
+    assert rows[-1]["generation"] == _generation(response)
+    assert rows[-1]["bound_by"] == OTHER_OPERATOR
+
+
+@pytest.mark.parametrize("verb", ["put", "arm"])
+def test_the_remediation_authority_without_the_platform_key_is_401(
+    client: TestClient, auth_headers: dict[str, str], agent_id: str, verb: str
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-3 (ADR 0231): the authority is in addition to
+    the administrative credential, never instead of it.
+    """
+
+    generation = 0 if verb == "put" else _bind(client, agent_id, auth_headers)
+    before_rows = _generation_rows(agent_id)
+
+    response = _bind_or_arm(client, agent_id, verb, {**_operator(), **_authority()}, generation)
+
+    assert response.status_code == 401, response.text
+    assert _generation_rows(agent_id) == before_rows
+
+
+@pytest.mark.parametrize("verb", ["put", "arm"])
+def test_the_remediation_authority_without_an_operator_principal_is_refused(
+    client: TestClient, auth_headers: dict[str, str], agent_id: str, verb: str
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-3 (ADR 0231): the principal stays required
+    for ``bound_by`` attribution; the platform key and the authority alone are
+    ``operator_principal_required`` and write nothing.
+    """
+
+    generation = 0 if verb == "put" else _bind(client, agent_id, auth_headers)
+    before_rows = _generation_rows(agent_id)
+
+    response = _bind_or_arm(client, agent_id, verb, {**auth_headers, **_authority()}, generation)
+
+    assert response.status_code == 403, response.text
+    assert _code(response) == "operator_principal_required"
+    assert response.headers.get("cache-control") == "no-store"
+    assert _generation_rows(agent_id) == before_rows
+
+
+@pytest.mark.parametrize("verb", ["delete", "disarm"])
+def test_remove_and_disarm_need_no_remediation_authority(
+    client: TestClient, auth_headers: dict[str, str], agent_id: str, verb: str
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-3 (ADR 0231)
+
+    ``DELETE`` and disarm only reduce what runs automatically, so they keep the
+    platform key plus operator principal: with no authority header, and even
+    with the API's key unset, each writes its generation.
+    """
+
+    g1 = _bind(client, agent_id, auth_headers)
+    armed = _post(client, agent_id, "arm", _admin(auth_headers), expected=str(g1))
+    assert armed.status_code == 200, armed.text
+    g2 = _generation(armed)
+    headers = _reducer(auth_headers, OTHER_OPERATOR)
+    assert AUTHORITY_HEADER not in headers
+
+    with _authority_unset():
+        if verb == "delete":
+            response = _delete(client, agent_id, headers, expected=str(g2))
+        else:
+            response = _post(client, agent_id, "disarm", headers, expected=str(g2))
+
+    assert response.status_code == 200, response.text
+    assert _generation(response) > g2
+    assert response.json()["armed"] is False
+    assert response.json()["active"] is (verb == "disarm")
+    assert response.json()["bound_by"] == OTHER_OPERATOR
+    assert _generation_rows(agent_id)[-1]["bound_by"] == OTHER_OPERATOR
 
 
 def _hook_signed_headers(agent: str, body: bytes) -> dict[str, str]:
@@ -565,7 +1059,7 @@ def test_a_stale_expected_generation_is_refused_and_changes_nothing(
         assert response.status_code == 409, response.text
         assert _code(response) == "stale_policy_generation"
 
-    response = _delete(client, agent_id, _admin(auth_headers), expected="0")
+    response = _delete(client, agent_id, _reducer(auth_headers), expected="0")
     assert response.status_code == 409, response.text
     assert _code(response) == "stale_policy_generation"
 
@@ -651,7 +1145,7 @@ def test_arm_disarm_and_tightening_each_create_a_generation_and_rows_are_kept(
     assert tightened.status_code == 200, tightened.text
     g3 = _generation(tightened)
 
-    disarmed = _post(client, agent_id, "disarm", _admin(auth_headers), expected=str(g3))
+    disarmed = _post(client, agent_id, "disarm", _reducer(auth_headers), expected=str(g3))
     assert disarmed.status_code == 200, disarmed.text
     g4 = _generation(disarmed)
     assert disarmed.json()["armed"] is False
@@ -682,7 +1176,7 @@ def test_removal_keeps_a_positive_generation_with_active_false(
     armed = _post(client, agent_id, "arm", _admin(auth_headers), expected=str(g1))
     g2 = _generation(armed)
 
-    removed = _delete(client, agent_id, _admin(auth_headers), expected=str(g2))
+    removed = _delete(client, agent_id, _reducer(auth_headers), expected=str(g2))
 
     assert removed.status_code == 200, removed.text
     assert removed.headers.get("cache-control") == "no-store"
@@ -948,9 +1442,7 @@ VALID: list[Any] = [
         id="tightened-limits",
     ),
     pytest.param(_policy(actions=[_action(kind="prevent")]), id="prevent-not-automatic"),
-    pytest.param(
-        _policy(actions=[_action(reversibility="idempotent")]), id="idempotent-action"
-    ),
+    pytest.param(_policy(actions=[_action(reversibility="idempotent")]), id="idempotent-action"),
 ]
 
 
@@ -1054,9 +1546,7 @@ NON_FINITE: list[Any] = [
     pytest.param(
         _policy(
             actions=[
-                _action(
-                    verifier={**VERIFIER, "arguments": {"query": "up", "step": float("inf")}}
-                )
+                _action(verifier={**VERIFIER, "arguments": {"query": "up", "step": float("inf")}})
             ]
         ),
         id="read-arguments-infinity",

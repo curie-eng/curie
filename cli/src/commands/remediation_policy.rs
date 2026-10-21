@@ -7,13 +7,17 @@
 //! `apply` runs the mirrored document validator
 //! ([`crate::remediation_policy`]) first, so a document the API would refuse
 //! is refused here with the API's code and path before any request.
+//! `apply` and `arm` also present the ADR 0231 remediation authority from
+//! CURIE_REMEDIATION_AUTHORITY_KEY in `X-Curie-Remediation-Authority`;
+//! `disarm` and `remove` only reduce what runs automatically, so they never
+//! send it.
 //! `close-breaker` closes one open circuit breaker with the operator's reason
 //! (AUTOMATED-REMEDIATION-11), under the same principal.
 //!
 //! Every input check runs in [`RemediationPolicyVerb::validate`], before the
 //! dispatcher resolves the connection: at the cluster tier that resolution
-//! reads Helm state and opens a port-forward, none of which a bad document or
-//! a missing principal should trigger.
+//! reads Helm state and opens a port-forward, none of which a bad document, a
+//! missing principal or a missing authority should trigger.
 
 use std::path::PathBuf;
 
@@ -346,12 +350,32 @@ fn write_principal_token() -> Result<String> {
                  nobody)",
             )
             .with_fix(
-                "mint a reusable operator credential with `curie <local|cluster> approvals \
-                 <AGENT> --mint-operator-principal <SUBJECT>`, export the one-time result as \
+                "mint a reusable remediation operator credential with `curie <local|cluster> approvals \
+                 <AGENT> --mint-remediation-principal <SUBJECT>`, export the one-time result as \
                  CURIE_APPROVAL_PRINCIPAL_TOKEN, and retry",
             ),
         )
     })
+}
+
+// @spec AUTOMATED-REMEDIATION-3
+/// The ADR 0231 remediation authority binding and arming present. It is read
+/// from the environment only, never a flag, so it stays out of process
+/// arguments and shell history, and it is never echoed.
+fn remediation_authority() -> Result<String> {
+    std::env::var("CURIE_REMEDIATION_AUTHORITY_KEY")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow::Error::from(
+                CliError::usage(
+                    "binding (apply) and arming a remediation policy require \
+                     CURIE_REMEDIATION_AUTHORITY_KEY, the API's remediation authority (ADR \
+                     0231); the platform key and the operator principal are not enough",
+                )
+                .with_fix(crate::api::REMEDIATION_AUTHORITY_FIX),
+            )
+        })
 }
 
 enum Validated {
@@ -378,14 +402,17 @@ pub struct ValidatedRemediationPolicy {
     hook: String,
     verb: Validated,
     principal: Option<String>,
+    /// The remediation authority, for `apply` and `arm` only.
+    authority: Option<String>,
 }
 
 impl RemediationPolicyVerb {
     // @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-3 @spec AUTOMATED-REMEDIATION-11
     /// Check the invocation's own inputs: the hook name, the CAS pair, the
-    /// policy document, a breaker id and close reason and, for a write, the
-    /// principal. Pure apart from
-    /// reading the policy file: no network, no cluster, no key discovery.
+    /// policy document, a breaker id and close reason, for a write the
+    /// principal and, for `apply` and `arm`, the remediation authority. Pure
+    /// apart from reading the policy file and the environment: no network, no
+    /// cluster, no key discovery.
     pub fn validate(self) -> Result<ValidatedRemediationPolicy> {
         let (agent, hook, verb) = match self {
             RemediationPolicyVerb::Show { agent, hook } => (agent, hook, Validated::Show),
@@ -442,11 +469,16 @@ impl RemediationPolicyVerb {
             Validated::Show | Validated::Breakers(_) => None,
             _ => Some(write_principal_token()?),
         };
+        let authority = match verb {
+            Validated::Apply { .. } | Validated::Arm(_) => Some(remediation_authority()?),
+            _ => None,
+        };
         Ok(ValidatedRemediationPolicy {
             agent,
             hook,
             verb,
             principal,
+            authority,
         })
     }
 }
@@ -463,6 +495,7 @@ pub async fn remediation_policy(
         hook,
         verb,
         principal,
+        authority,
     } = validated;
     let operation_id = match &verb {
         Validated::Show | Validated::Breakers(_) => None,
@@ -472,7 +505,7 @@ pub async fn remediation_policy(
         }
         Validated::CloseBreaker { .. } => None,
     };
-    match send(opts, agent, hook, verb, principal).await {
+    match send(opts, agent, hook, verb, principal, authority).await {
         Ok((verb, answer)) => Ok(RemediationPolicyOutput {
             verb,
             answer,
@@ -524,10 +557,12 @@ async fn send(
     hook: String,
     verb: Validated,
     principal: Option<String>,
+    authority: Option<String>,
 ) -> Result<(&'static str, RemediationPolicyAnswer)> {
     let client = api_client(&opts)?;
     let agent_id = client.find_agent(&agent).await?.id;
     let principal = principal.unwrap_or_default();
+    let authority = authority.unwrap_or_default();
     use RemediationPolicyAnswer::{Breaker, Breakers, Policy};
     Ok(match verb {
         // @spec AUTOMATED-REMEDIATION-11
@@ -547,7 +582,7 @@ async fn send(
             "apply",
             Policy(
                 client
-                    .put_remediation_policy(&agent_id, &hook, &body, &principal)
+                    .put_remediation_policy(&agent_id, &hook, &body, &principal, &authority)
                     .await?,
             ),
         ),
@@ -555,7 +590,7 @@ async fn send(
             "arm",
             Policy(
                 client
-                    .arm_remediation_policy(&agent_id, &hook, &cas, &principal)
+                    .arm_remediation_policy(&agent_id, &hook, &cas, &principal, &authority)
                     .await?,
             ),
         ),

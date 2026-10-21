@@ -180,6 +180,13 @@ CHECKS = (
         ".",
         "python",
     ),
+    exact(
+        "python-static",
+        "Contract migration timing gate",
+        "uv run python scripts/check-contract-migration-timing.py",
+        ".",
+        "python",
+    ),
     exact("python-static", "Ruff", "uv run ruff check .", ".", "python"),
     exact("python-static", "Mypy", "uv run mypy", ".", "python"),
     exact(
@@ -549,9 +556,9 @@ def select_ci_only(root: Path, paths: list[str], base: str, head: str) -> list[s
     if flags.get("factory") == "true":
         selected.append("factory scenario on e2e-ladder-cluster")
     if flags.get("released_upgrade") == "true":
-        selected.append("e2e-cluster-upgrade-matrix")
+        selected.extend(("e2e-cluster-upgrade-matrix", "e2e-released-upgrade-negative"))
     if flags.get("released_upgrade_full") == "true":
-        selected.extend(("e2e-released-upgrade", "e2e-released-upgrade-negative"))
+        selected.append("e2e-released-upgrade")
     return selected
 
 
@@ -638,7 +645,7 @@ def open_waiver_issues(root: Path, repository: str, body: str) -> list[int]:
     return opened
 
 
-def fix_pin_needs_curie(root: Path, event: Path, directory: Path) -> bool:
+def fix_pin_requirements(root: Path, event: Path, directory: Path) -> dict[str, bool]:
     output = directory / "fix-pin-output"
     check = run_check(
         root,
@@ -648,7 +655,16 @@ def fix_pin_needs_curie(root: Path, event: Path, directory: Path) -> bool:
     )
     if check["status"] == "failed":
         raise ValueError(check["detail"])
-    return "needed=true" in output.read_text().splitlines()
+    values = dict(line.split("=", 1) for line in output.read_text().splitlines())
+    if set(values) != {"needed", "needs_stack", "needs_kind", "needs_factory_upgrade"} or any(
+        value not in {"true", "false"} for value in values.values()
+    ):
+        raise ValueError("Fix pin build selection returned invalid infrastructure requirements")
+    return {key: value == "true" for key, value in values.items()}
+
+
+def fix_pin_needs_curie(root: Path, event: Path, directory: Path) -> bool:
+    return fix_pin_requirements(root, event, directory)["needed"]
 
 
 def check_pr_body(
@@ -889,7 +905,7 @@ def body_needs_services(root: Path, body_file: Path) -> bool:
         event = Path(directory) / "event.json"
         event.write_text(json.dumps({"pull_request": {"body": body_file.read_text()}}))
         event.chmod(0o600)
-        return fix_pin_needs_curie(root, event, Path(directory))
+        return fix_pin_requirements(root, event, Path(directory))["needs_stack"]
 
 
 def execute_full(

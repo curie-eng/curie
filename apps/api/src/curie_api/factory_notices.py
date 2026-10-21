@@ -24,6 +24,7 @@ State labels move through the tracker port's ``set_state_label``.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import math
@@ -32,6 +33,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from decimal import Decimal
 from typing import Any
 
 import httpx
@@ -43,9 +45,9 @@ from starlette.concurrency import run_in_threadpool
 from .code_host_trust import code_host_verify
 from .config import Settings
 from .factory_comment_text import marker_for, redact_factory_comment, status_marker
-from .factory_progress import PhaseView, phase_view, pill_for
+from .factory_progress import VERIFICATION_PREFLIGHT_PHASE, PhaseView, phase_view, pill_for
 from .factory_reply_target import stored_reply_target
-from .factory_usage import usage_line, work_item_usage
+from .factory_usage import format_usd, usage_line, work_item_usage
 from .forges.capabilities import Operation, Support
 from .forges.errors import ForgeError, Unauthorized
 from .forges.github.comments import static_token
@@ -138,6 +140,9 @@ _CAUSE_TEXT = {
     ),
     "early_stop": "the agent stopped before doing any work on the issue.",
     "no_pull_request": "the run ended without publishing a pull request.",
+    "revision_unchanged": (
+        "the existing pull request is unchanged because this revision published nothing."
+    ),
     "execution_deadline": "the run did not finish before its deadline.",
     "capacity_wait_expired": "no runner capacity came free before the wait expired.",
     "start_failed": "the sandbox did not start.",
@@ -170,6 +175,7 @@ _CAUSE_TEXT = {
         "no pull request checks. The pull request stays open; resolve the conflicts "
         "to continue."
     ),
+    "pr_closed": "a person closed the pull request without merging it during the CI wait.",
     "ci_fix_unpublished": (
         "a CI fix round ended without pushing a fix. The pull request stays open."
     ),
@@ -183,13 +189,14 @@ _DETAIL_CAUSES = frozenset(
         "ci_timeout",
         "ci_unverified",
         "merge_conflict",
+        "pr_closed",
         "approval_create_failed",
         "publication_unrecorded",
     }
 )
 # A run that ended without publishing carries the agent's own last message
-# (#3128). That text is model-authored, so it renders inert inside a code fence.
-_AGENT_MESSAGE_CAUSES = frozenset({"early_stop", "no_pull_request"})
+# (#3128). Quote each line and neutralize HTML, image syntax and mentions.
+_AGENT_MESSAGE_CAUSES = frozenset({"early_stop", "no_pull_request", "revision_unchanged"})
 # Wire classification a text-only consumer reads off the status comment (#3401).
 # Same tokens as the channel reply's ``curie-turn-failure:`` line. Causes with
 # no entry stay unlabeled rather than inventing a class.
@@ -359,12 +366,14 @@ def result_section(
     superseded: bool = False,
     lost_streak: int = 0,
     lost_retried: bool = False,
+    run_cost_usd: Decimal | None = None,
 ) -> str:
     """The terminal result lines of a status comment, without any marker.
 
     For ``owner_lost``, ``lost_streak`` is the consecutive losses through
     this request and ``lost_retried`` whether its settlement admitted a
     successor (ADR 0206); together they choose the retry or exhausted sentence.
+    ``run_cost_usd`` is this request's recorded estimate, not the WorkItem total.
     """
 
     if cause == "completed":
@@ -451,12 +460,22 @@ def result_section(
                 and math.isfinite(usd := float(usd_budget[1]))
                 and usd > 0
             ):
-                sentence = (
-                    "the run reached its USD cap "
-                    f"(max_usd_per_day={usd_budget[1]}) before it finished. "
-                    "To raise the USD cap, run "
-                    "`curie cluster budget <agent> --limit <usd>`, then retry."
-                )
+                if run_cost_usd is not None and run_cost_usd < Decimal(usd_budget[1]):
+                    sentence = (
+                        "the run stopped on the agent SDK's own USD estimate, which reached "
+                        f"the cap (max_usd_per_day={usd_budget[1]}), while Curie's recorded "
+                        f"estimate for this run is {format_usd(run_cost_usd)}. "
+                        "The SDK prices this model above its provider price, so raising the "
+                        "cap only delays the stop. To raise it anyway, run "
+                        "`curie cluster budget <agent> --limit <usd>`, then retry."
+                    )
+                else:
+                    sentence = (
+                        "the run reached its USD cap "
+                        f"(max_usd_per_day={usd_budget[1]}) before it finished. "
+                        "To raise the USD cap, run "
+                        "`curie cluster budget <agent> --limit <usd>`, then retry."
+                    )
             else:
                 sentence = (
                     "the run reached a budget limit before it finished, but Curie "
@@ -501,31 +520,38 @@ def _inert_line(text: str) -> str:
 
 
 def _agent_message_block(message: str) -> str:
-    """The agent's last message, fenced so GitHub renders none of it.
+    """The agent's last message as a neutralized Markdown blockquote.
 
-    The fence is longer than any backtick run in the message, so the message
-    cannot close it and spoof the ``Cause:`` line. HTML comment openers are
-    broken because the marker scan reads the raw body.
+    Normalize CRLF and lone CR to LF before quoting every line, so the message
+    cannot spoof a top-level ``Cause:`` line. Escape ``&`` before breaking HTML
+    comment openers for the raw marker scan, escaping ``<`` and ``![``, and
+    inserting U+200B after every ``@``. This neutralizes HTML, images and
+    literal or entity-encoded mentions. A blank line separates the quote from
+    Curie's following lines.
     """
 
+    message = message.replace("\r\n", "\n").replace("\r", "\n")
+    message = redact_factory_comment(message)
+    message = message.replace("&", "&amp;")
     message = _break_html_comments(message)
-    fence = _fence_for(message, minimum=3)
-    return f"Agent's last message:\n{fence}text\n{message}\n{fence}\n"
+    message = message.replace("<", "&lt;").replace("![", "!\\[").replace("@", "@\u200b")
+    quoted = "\n".join(f"> {line}" if line else ">" for line in message.split("\n"))
+    return f"Agent's last message:\n{quoted}\n\n"
 
 
 def _escape_markdown(value: str) -> str:
     return "".join(f"\\{char}" if char in _MARKDOWN_SPECIAL else char for char in value)
 
 
-def _checklist(view: PhaseView) -> list[str]:
+def _checklist(view: PhaseView, *, final: bool) -> list[str]:
     lines: list[str] = []
     for slot in view.phases:
         label = _escape_markdown(slot.label)
         if slot.state == "done":
             lines.append(f"- [x] {label}")
         elif slot.state == "current":
-            detail = "in progress"
-            if slot.round_label is not None and slot.round_label.startswith("round "):
+            detail = "stopped here" if final else "in progress"
+            if not final and slot.round_label is not None and slot.round_label.startswith("round "):
                 detail += f", {slot.round_label}"
             lines.append(f"- [ ] **{label}** ({detail})")
         elif slot.state == "redo":
@@ -548,10 +574,11 @@ def status_body(
 ) -> str:
     """The whole status comment. A ``result`` makes it the final body.
 
-    Model-written notes are never rendered here, only on the card, so model
-    text cannot become a Markdown link or a mention on GitHub. The card already
-    draws the phases, so with a card the checklist and the waiting placeholder
-    are left out; without one the checklist is the fallback (#3125).
+    Live progress notes stay on the card; a final budget result includes its
+    last nonempty note as one inert line. A final result can also include the
+    agent's last message as a neutralized Markdown quote. With a card, the checklist
+    and waiting placeholder are left out; without one the checklist is the
+    fallback (#3125).
     """
 
     parts: list[str] = []
@@ -560,7 +587,7 @@ def status_body(
     if card_url:
         parts.append(f"![Curie status]({card_url})")
     elif phase_view is not None and phase_view.phases:
-        parts.append("\n".join(_checklist(phase_view)))
+        parts.append("\n".join(_checklist(phase_view, final=result is not None)))
     elif result is None:
         parts.append(_WAITING_FOR_PROGRESS)
     parts.append(f"Status: {pill_label}")
@@ -610,36 +637,55 @@ async def sync_status_comments(
         timeout=settings.github_app_timeout_seconds, verify=code_host_verify(settings)
     ) as client:
         for _ in range(limit):
-            async with sessionmaker() as session:
-                claim = await _claim_next(
-                    session,
-                    settings,
-                    owner=owner,
-                    attempted_ids=attempted_ids,
-                    paused_for_upgrade=paused_for_upgrade,
-                )
-                await session.commit()
-            if claim is None:
-                break
-            attempted_ids.add(claim.row.execution_request_id)
-            calls = GitHubCalls()
-            token = github_calls.set(calls)
-            started = time.monotonic()
+            claim = None
             try:
-                writes += await _sync_one(client, settings, claim)
-                claim.row.attempts += 1
                 async with sessionmaker() as session:
-                    await _write_back(session, claim, owner=owner)
+                    claim = await _claim_next(
+                        session,
+                        settings,
+                        owner=owner,
+                        attempted_ids=attempted_ids,
+                        paused_for_upgrade=paused_for_upgrade,
+                    )
                     await session.commit()
-            finally:
-                github_calls.reset(token)
-                elapsed_ms = (time.monotonic() - started) * 1000
-                logger.info(
-                    "factory status sync calls=%d elapsed_ms=%.1f",
-                    calls.count,
-                    elapsed_ms,
-                    extra={"call_count": calls.count, "elapsed_ms": elapsed_ms},
-                )
+                if claim is None:
+                    break
+                attempted_ids.add(claim.row.execution_request_id)
+                calls = GitHubCalls()
+                token = github_calls.set(calls)
+                started = time.monotonic()
+                try:
+                    writes += await _sync_one(client, settings, claim)
+                    claim.row.attempts += 1
+                    async with sessionmaker() as session:
+                        await _write_back(session, claim, owner=owner)
+                        await session.commit()
+                finally:
+                    github_calls.reset(token)
+                    elapsed_ms = (time.monotonic() - started) * 1000
+                    logger.info(
+                        "factory status sync calls=%d elapsed_ms=%.1f",
+                        calls.count,
+                        elapsed_ms,
+                        extra={"call_count": calls.count, "elapsed_ms": elapsed_ms},
+                    )
+            except asyncio.CancelledError:
+                if claim is not None:
+                    cleanup = asyncio.create_task(
+                        _release_sync_claim(
+                            sessionmaker, claim.row.execution_request_id, owner=owner
+                        )
+                    )
+                    try:
+                        while not cleanup.done():
+                            try:
+                                await asyncio.shield(cleanup)
+                            except asyncio.CancelledError:
+                                continue
+                        cleanup.result()
+                    except BaseException:
+                        logger.exception("factory status sync claim release failed")
+                raise
     return writes
 
 
@@ -740,13 +786,18 @@ async def _claim_next(
         .execution_options(synchronize_session=False)
     )
     target = stored_reply_target(request, work_item)
+    # The pull request belongs to the lineage's first succeeded publication: a
+    # failed attempt never pushed, so it cannot have opened it (#4744).
     opened_pr = (
         pr_number
         if pr_number is not None
         and work_item.publication_lineage_id is not None
         and await session.scalar(
             select(Publication.execution_request_id)
-            .where(Publication.lineage_id == work_item.publication_lineage_id)
+            .where(
+                Publication.lineage_id == work_item.publication_lineage_id,
+                Publication.status == "succeeded",
+            )
             .order_by(Publication.created_at, Publication.id)
             .limit(1)
         )
@@ -815,6 +866,21 @@ async def _write_back(session: AsyncSession, claim: _StatusClaim, *, owner: str)
         logger.info("factory status sync dropped stale owner writeback")
         return False
     return True
+
+
+async def _release_sync_claim(
+    sessionmaker: async_sessionmaker[AsyncSession], request_id: uuid.UUID, *, owner: str
+) -> None:
+    async with sessionmaker() as session:
+        await session.execute(
+            update(FactoryStatusComment)
+            .where(
+                FactoryStatusComment.execution_request_id == request_id,
+                FactoryStatusComment.sync_owner == owner,
+            )
+            .values(sync_owner=None, sync_lease_expires_at=None)
+        )
+        await session.commit()
 
 
 async def _sync_one(
@@ -1087,6 +1153,15 @@ async def _render(
                 )
                 is None
             )
+            usage = await work_item_usage(session, work_item.id)
+            run_cost_usd = next(
+                (
+                    entry.estimated_cost_usd
+                    for entry in usage.requests
+                    if entry.request_id == request.id
+                ),
+                None,
+            )
             result = result_section(
                 cause,
                 pr_url=pr_url,
@@ -1097,12 +1172,14 @@ async def _render(
                 and await _superseded(session, work_item, request),
                 lost_streak=streak,
                 lost_retried=retrying,
+                run_cost_usd=run_cost_usd,
             )
             # Tokens and estimated cost over every round of the work item
             # (#3223), after the Cause line so its parse is unchanged.
-            usage = usage_line(await work_item_usage(session, work_item.id))
-            if usage is not None:
-                result = result.rstrip("\n") + "\n" + usage + "\n"
+            line = usage_line(usage)
+            if line is not None:
+                separator = "\n\n" if result.endswith("\n\n") else "\n"
+                result = result.rstrip("\n") + separator + line + "\n"
     publishing = (
         await session.scalar(
             select(Publication.id)
@@ -1114,7 +1191,7 @@ async def _render(
         )
     ) is not None
     view: PhaseView | None = None
-    if row.declaration is not None:
+    if row.declaration is not None or (result is not None and cause == "budget_exceeded"):
         reports = list(
             await session.scalars(
                 select(ExecutionRequestPhaseReport)
@@ -1122,7 +1199,26 @@ async def _render(
                 .order_by(ExecutionRequestPhaseReport.id)
             )
         )
-        view = phase_view(row.declaration, reports, request.status, cause)
+        if row.declaration is not None:
+            view = phase_view(row.declaration, reports, request.status, cause)
+        if result is not None and cause == "budget_exceeded":
+            latest_note = next(
+                (
+                    report
+                    for report in reversed(reports)
+                    if report.phase != VERIFICATION_PREFLIGHT_PHASE
+                    and report.note
+                    and report.note.strip()
+                ),
+                None,
+            )
+            if latest_note is not None:
+                labels = (
+                    {phase.id: phase.label for phase in view.phases} if view is not None else {}
+                )
+                label = labels.get(latest_note.phase, latest_note.phase)
+                progress = _inert_line(f"Last progress note: {label}: {latest_note.note}")[:300]
+                result += progress + "\n"
     pill_label, _color, _live = pill_for(request.status, publishing, retrying=retrying)
     pending_count = await session.scalar(
         select(func.count(ExecutionRequest.id)).where(

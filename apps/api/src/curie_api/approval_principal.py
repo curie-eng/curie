@@ -1,7 +1,9 @@
 """Authenticated principals for approval resolution (ADR-0106, #1531).
 
-An approval principal is a short-lived HMAC credential accepted only by the
-approval resolver.  Its subject and proof kind are claims in the credential,
+An approval principal is a short-lived HMAC credential accepted by the
+approval resolver; an ``operator`` principal minted with the
+``remediation.administer`` scope is accepted instead by the remediation policy
+writes (#4228).  Its subject and proof kind are claims in the credential,
 never values supplied in a resolution body.  ``chat`` principals are signed by
 the dispatcher's dedicated attester secret and bind the channel Slack delivered
 to one approval.  ``operator`` principals are signed by the platform key and
@@ -21,9 +23,15 @@ from dataclasses import dataclass
 from typing import Literal
 
 from curie_internal.sandbox_token import b64url, b64url_decode, signature
+from pydantic import ValidationError
+
+from .identity.slack import SlackEvidence
 
 _PREFIX = "apr"
 APPROVE_SCOPE = "approval.resolve"
+# A distinct scope for remediation policy administration (#4228): same token
+# format and platform key as APPROVE_SCOPE, but neither scope verifies the other.
+REMEDIATION_ADMIN_SCOPE = "remediation.administer"
 OPERATOR_TOKEN_TTL_SECONDS = 12 * 60 * 60
 PrincipalKind = Literal["chat", "operator", "test_driver"]
 
@@ -36,6 +44,7 @@ class ApprovalPrincipalClaims:
     kind: PrincipalKind
     actor_channel: str | None
     approval_id: str | None
+    slack: SlackEvidence | None = None
 
 
 def mint(
@@ -47,6 +56,7 @@ def mint(
     exp: int,
     actor_channel: str | None = None,
     approval_id: str | None = None,
+    slack: SlackEvidence | None = None,
 ) -> str:
     """Mint a strict approval-principal credential.
 
@@ -72,6 +82,9 @@ def mint(
         if approval_id is not None:
             raise ValueError("operator approval principals cannot bind an approval")
 
+    if slack is not None and (kind != "chat" or slack.user_id != subject):
+        raise ValueError("Slack evidence must name the chat principal")
+    extra = {"slack": slack.model_dump(mode="json")} if slack is not None else {}
     payload = json.dumps(
         {
             "sub": subject,
@@ -80,6 +93,7 @@ def mint(
             "approval_id": approval_id,
             "scope": scope,
             "exp": exp,
+            **extra,
         },
         separators=(",", ":"),
         sort_keys=True,
@@ -141,7 +155,7 @@ def verify_claims(
         payload = json.loads(b64url_decode(payload_seg))
     except (ValueError, json.JSONDecodeError):
         return None
-    if not isinstance(payload, dict) or set(payload) != {
+    if not isinstance(payload, dict) or set(payload) - {"slack"} != {
         "sub",
         "kind",
         "actor_channel",
@@ -178,9 +192,18 @@ def verify_claims(
             return None
         if approval_id is not None:
             return None
+    slack = None
+    if "slack" in payload:
+        try:
+            slack = SlackEvidence.model_validate(payload["slack"])
+        except ValidationError:
+            return None
+        if kind != "chat" or slack.user_id != subject:
+            return None
     return ApprovalPrincipalClaims(
         subject=subject,
         kind=kind,
         actor_channel=actor_channel,
         approval_id=claimed_approval_id,
+        slack=slack,
     )

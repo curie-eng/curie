@@ -93,8 +93,13 @@ def _registered_chart_step(
     for scenario_id, entry in registry.get("scenarios", {}).items():
         if not isinstance(scenario_id, str) or not isinstance(entry, dict):
             continue
+        leg = entry.get("leg")
+        if not isinstance(leg, str):
+            continue
         condition = (
-            "${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), '"
+            "${{ matrix.leg == '"
+            + leg
+            + "' && contains(fromJSON(needs.changes.outputs.chart_scenarios), '"
             + scenario_id
             + "') }}"
         )

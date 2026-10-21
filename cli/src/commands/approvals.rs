@@ -13,6 +13,8 @@ pub struct ApprovalCmd {
     pub note: Option<String>,
     /// Administrative subject for a reusable operator-principal mint.
     pub mint_operator_principal: Option<String>,
+    /// Administrative subject for a reusable remediation-operator principal mint.
+    pub mint_remediation_principal: Option<String>,
     /// Administrative subject for a single-use console login-code mint.
     pub mint_console_login_code: Option<String>,
     /// `--route-resolution NAME=CHANNEL`, repeatable.
@@ -563,6 +565,12 @@ pub enum ApprovalsOutput {
     OperatorPrincipal {
         delivery: crate::api::OperatorPrincipalDelivery,
     },
+    /// One-time delivery of a reusable remediation-operator credential
+    /// (scope `remediation.administer`). Same delivery rules as the operator
+    /// principal; it cannot resolve approvals.
+    RemediationPrincipal {
+        delivery: crate::api::OperatorPrincipalDelivery,
+    },
     /// One-time delivery of a subject-bound console login code.
     ConsoleLoginCode {
         delivery: crate::api::ConsoleLoginCodeDelivery,
@@ -652,6 +660,13 @@ impl crate::ui::CliOutput for ApprovalsOutput {
             }),
             ApprovalsOutput::OperatorPrincipal { delivery } => serde_json::json!({
                 "operator_principal": {
+                    "token": delivery.token,
+                    "subject": delivery.subject,
+                    "expires_at": delivery.expires_at,
+                },
+            }),
+            ApprovalsOutput::RemediationPrincipal { delivery } => serde_json::json!({
+                "remediation_principal": {
                     "token": delivery.token,
                     "subject": delivery.subject,
                     "expires_at": delivery.expires_at,
@@ -815,6 +830,15 @@ impl crate::ui::CliOutput for ApprovalsOutput {
                 ));
                 // This explicit mint result is the token's one delivery. Keep
                 // it off progress/error output and do not cache it.
+                ui.payload_plain(&delivery.token);
+            }
+            ApprovalsOutput::RemediationPrincipal { delivery } => {
+                ui.note(&format!(
+                    "minted a remediation operator principal for {} (expires {}); assign the \
+                     token to CURIE_APPROVAL_PRINCIPAL_TOKEN without pasting it into shell history",
+                    delivery.subject, delivery.expires_at
+                ));
+                // One-time delivery, same rules as the operator principal.
                 ui.payload_plain(&delivery.token);
             }
             ApprovalsOutput::ConsoleLoginCode { delivery } => {
@@ -1050,6 +1074,9 @@ pub async fn approvals(
             cmd.mint_operator_principal
                 .as_ref()
                 .map(|_| "--mint-operator-principal"),
+            cmd.mint_remediation_principal
+                .as_ref()
+                .map(|_| "--mint-remediation-principal"),
             cmd.mint_console_login_code
                 .as_ref()
                 .map(|_| "--mint-console-login-code"),
@@ -1146,21 +1173,28 @@ pub async fn approvals(
         });
     }
 
-    let mint_subject = match (
-        cmd.mint_operator_principal.as_deref(),
-        cmd.mint_console_login_code.as_deref(),
-    ) {
-        (Some(_), Some(_)) => {
-            return Err(crate::exit::usage(
-                "--mint-operator-principal and --mint-console-login-code are separate \
-                 administrative actions; run one per invocation",
-            ));
-        }
-        (Some(subject), None) => Some(("operator", subject)),
-        (None, Some(subject)) => Some(("console", subject)),
-        (None, None) => None,
-    };
-    if let Some((kind, subject)) = mint_subject {
+    let mint_requests: Vec<(MintKind, &str)> = [
+        cmd.mint_operator_principal
+            .as_deref()
+            .map(|subject| (MintKind::Operator, subject)),
+        cmd.mint_remediation_principal
+            .as_deref()
+            .map(|subject| (MintKind::Remediation, subject)),
+        cmd.mint_console_login_code
+            .as_deref()
+            .map(|subject| (MintKind::ConsoleLoginCode, subject)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if mint_requests.len() > 1 {
+        return Err(crate::exit::usage(
+            "--mint-operator-principal, --mint-remediation-principal and \
+             --mint-console-login-code are separate administrative actions; run one per \
+             invocation",
+        ));
+    }
+    if let Some(&(kind, subject)) = mint_requests.first() {
         if subject.trim().is_empty() {
             return Err(crate::exit::usage(
                 "the principal subject must not be blank",
@@ -1180,10 +1214,10 @@ pub async fn approvals(
             ));
         }
         if opts.dry_run {
-            let endpoint = if kind == "operator" {
-                "approvals/principals/operator"
-            } else {
-                "console/login-codes"
+            let endpoint = match kind {
+                MintKind::Operator => "approvals/principals/operator",
+                MintKind::Remediation => "approvals/principals/remediation-operator",
+                MintKind::ConsoleLoginCode => "console/login-codes",
             };
             return Ok(ApprovalsOutput::DryRun(crate::ui::DryRunPlan {
                 lines: vec![format!(
@@ -1193,15 +1227,17 @@ pub async fn approvals(
             }));
         }
         let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
-        return if kind == "operator" {
-            Ok(ApprovalsOutput::OperatorPrincipal {
+        return Ok(match kind {
+            MintKind::Operator => ApprovalsOutput::OperatorPrincipal {
                 delivery: client.mint_operator_principal(subject).await?,
-            })
-        } else {
-            Ok(ApprovalsOutput::ConsoleLoginCode {
+            },
+            MintKind::Remediation => ApprovalsOutput::RemediationPrincipal {
+                delivery: client.mint_remediation_principal(subject).await?,
+            },
+            MintKind::ConsoleLoginCode => ApprovalsOutput::ConsoleLoginCode {
                 delivery: client.mint_console_login_code(subject).await?,
-            })
-        };
+            },
+        });
     }
 
     if route_write || cmd.list_routes {
@@ -1438,4 +1474,12 @@ pub async fn approvals(
         gated_tools: gates,
         manifest_unreadable: unreadable,
     })
+}
+
+/// The one-time credential a `--mint-*` flag asks the API to issue.
+#[derive(Clone, Copy)]
+enum MintKind {
+    Operator,
+    Remediation,
+    ConsoleLoginCode,
 }
