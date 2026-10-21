@@ -49,8 +49,17 @@ from .protected_launch_registry import (
 EPOCH_HEADER = "X-Curie-Turn-Epoch"
 CONTROL_DEADLINE = web.RequestKey("protected_launch_control_deadline", asyncio.Timeout)
 
-# The closed authorizer set. A new authorizer is a reviewed change to this set.
+# The closed authorizer set. A new authorizer is a reviewed change to this set
+# and to ``_authorizer_classes``. Names only filter class definitions; the
+# mechanics admit an authorizer by its exact class object.
 _AUTHORIZERS = frozenset({"curie_worker.protected_launch_server.ProductionLaunchAuthorizer"})
+
+
+def _authorizer_classes() -> tuple[type[LaunchAuthorizer], ...]:
+    # Imported here because the authorizer modules import these mechanics.
+    from .protected_launch_server import ProductionLaunchAuthorizer
+
+    return (ProductionLaunchAuthorizer,)
 
 
 class LaunchRefusal(Exception):
@@ -84,7 +93,10 @@ class LaunchAuthorizer:
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
-        if cls.__module__ + "." + cls.__qualname__ not in _AUTHORIZERS:
+        # An authorizer is never subclassed: @final is static only.
+        if cls.__bases__ != (LaunchAuthorizer,) or (
+            cls.__module__ + "." + cls.__qualname__ not in _AUTHORIZERS
+        ):
             raise TypeError("Protected launch authorizers are closed")
 
     async def reverify(self, live: LiveLaunch) -> tuple[Any, Projection, dict[str, Any]]:
@@ -118,9 +130,7 @@ class ProtectedLaunchMechanics:
         runner_ca_file: str | None,
     ) -> None:
         require(
-            isinstance(authorizer, LaunchAuthorizer)
-            and type(authorizer).__module__ + "." + type(authorizer).__qualname__ in _AUTHORIZERS
-            and type(kubernetes) is KubernetesLaunchAPI
+            type(authorizer) in _authorizer_classes() and type(kubernetes) is KubernetesLaunchAPI
         )
         self._authorizer, self._kube = authorizer, kubernetes
         self._runner_scheme, self._runner_dns_suffix = runner_scheme, runner_dns_suffix
