@@ -803,6 +803,40 @@ async def case_six(run: _Run) -> list[ObservationEntry]:
     return entries
 
 
+async def _egress_baseline(
+    run: _Run, family: str, node: str, table: Mapping[str, Sequence[tuple[str, int, str]]]
+) -> set[tuple[str, int, str]]:
+    """Destinations that answer an unrestricted pod in the probe namespace, same node.
+
+    It runs after the runner-policy probe, so the denied direction is asserted
+    first. Any handshake, reply or reset counts as reached.
+    """
+    destinations = sorted({item for items in table.values() for item in items})
+    if not destinations:
+        return set()
+    attempts, _nonces = _attempts(destinations)
+    try:
+        pod = await _start(
+            run,
+            template="probe_sender",
+            namespace=run.layout.probe_namespace,
+            node=node,
+            labels={},
+            argument=_sender_argument(attempts),
+            finished=True,
+        )
+        record = await _sender_record(run, pod)
+    except ProbeKitRefused:
+        return set()
+    if record is None or pod is None or pod.node != node or pod.address(family) is None:
+        return set()
+    return {
+        (address, port, protocol)
+        for address, port, protocol, _nonce, result in record.attempts
+        if result in ("connected", "reply", "refused")
+    }
+
+
 async def _egress_family(
     run: _Run, family: str, addresses: Mapping[str, tuple[str, ...]] | None
 ) -> list[ObservationEntry]:
@@ -834,6 +868,7 @@ async def _egress_family(
         record = await _sender_record(run, pod)
     except ProbeKitRefused:
         pod, record = None, None
+    reached = await _egress_baseline(run, family, home, table)
     observed = [] if record is None else list(record.attempts)
     control_ok = bool(peers) and all(
         any(
@@ -851,6 +886,7 @@ async def _egress_family(
             "nonces": sorted(control_nonces),
             "client": [list(i) for i in observed if i[3] in control_nonces],
         },
+        "baseline_reached": sorted(list(item) for item in reached),
     }
 
     def verdict_for(keys: Sequence[str]) -> tuple[Verdict, list[list[Any]]]:
@@ -867,6 +903,11 @@ async def _egress_family(
             replies=replies,
             unattributed=unattributed,
             control_succeeded=control_ok,
+            destinations_reached=all(
+                (str(ipaddress.ip_address(address)), port, protocol) in reached
+                for key in keys
+                for address, port, protocol in table[key]
+            ),
         )
         return judge_egress(evidence), [list(item) for item in mine]
 

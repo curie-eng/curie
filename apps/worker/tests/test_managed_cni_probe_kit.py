@@ -210,8 +210,18 @@ def test_egress_is_judged_at_the_client() -> None:
         replies=0,
         unattributed=0,
         control_succeeded=True,
+        destinations_reached=True,
     )
     assert judge_egress(clean) == ("pass", "denied")
+    # A destination an unrestricted pod cannot reach either proves no denial.
+    assert judge_egress(dataclasses.replace(clean, destinations_reached=False)) == (
+        "unavailable",
+        "destination_unreached",
+    )
+    assert judge_egress(dataclasses.replace(clean, destinations_reached=False, handshakes=1)) == (
+        "fail",
+        "reply_received",
+    )
     assert judge_egress(dataclasses.replace(clean, replies=1)) == ("fail", "reply_received")
     assert judge_egress(dataclasses.replace(clean, handshakes=1, control_succeeded=False)) == (
         "fail",

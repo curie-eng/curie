@@ -544,11 +544,18 @@ def test_probe_kit_on_a_local_cluster() -> None:
         return
     assert {i.outcome for i in case_one} == {"pass"}, summary
     assert not [item for item in measurement.entries if item.outcome == "fail"], summary
-    unavailable = {item.key for item in measurement.entries if item.outcome != "pass"}
-    assert unavailable == {
+    not_passed = {item.key: item.reason for item in measurement.entries if item.outcome != "pass"}
+    provider = {
         (6, sub_case, family, "none", "runner_policy")
         for sub_case in ("instance_metadata", "cloud_network")
         for family in families
-    }, summary
-    assert measurement.refusal == "destination_unknown"
+    }
+    # A local cluster has no provider destinations. A destination this host's
+    # network drops for every pod proves no denial, so it is unavailable.
+    assert {key for key, reason in not_passed.items() if reason == "destination_unknown"} == (
+        provider
+    ), summary
+    assert set(not_passed.values()) <= {"destination_unknown", "destination_unreached"}, summary
+    assert {key[0] for key in not_passed} == {6}, summary
+    assert measurement.refusal in ("destination_unknown", "destination_unreached")
     assert set(required_entries(layout)) == {item.key for item in measurement.entries}

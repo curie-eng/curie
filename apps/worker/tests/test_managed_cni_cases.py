@@ -91,6 +91,7 @@ class ModelCluster:
         self.bump_policy_after_reads: int | None = None
         self.policy_reads = 0
         self.created = 0
+        self.dropped: set[str] = set()  # addresses the environment drops for every pod
 
     def clock(self) -> float:
         return self.now
@@ -168,7 +169,9 @@ class ModelCluster:
                 elif address == PEER.address:
                     delivered = sender["metadata"]["labels"].get(ROLE) == "runner"
                 else:
-                    delivered = not self.enforcing
+                    # The probe namespace carries no egress policy.
+                    unrestricted = sender["metadata"]["namespace"] == "probe-a"
+                    delivered = (unrestricted or not self.enforcing) and address not in self.dropped
                 result = (
                     ("connected" if item["proto"] in ("tcp", "dns_tcp") else "reply")
                     if (delivered)
@@ -369,3 +372,14 @@ def test_wildcard_subjects_refuse() -> None:
 
     with pytest.raises(ProbeKitRefused):
         Subject("Group", "*")
+
+
+def test_a_destination_nobody_can_reach_is_unavailable_not_pass() -> None:
+    cluster = ModelCluster()
+    cluster.dropped = {"8.8.8.8"}
+    result = outcomes(measure(cluster))
+    assert result[(6, "external_dns", "ipv4", "none", "runner_policy")] == (
+        "unavailable",
+        "destination_unreached",
+    )
+    assert result[(6, "internet", "ipv4", "none", "runner_policy")] == ("pass", "denied")

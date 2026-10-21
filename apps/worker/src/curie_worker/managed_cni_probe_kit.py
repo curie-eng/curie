@@ -106,6 +106,7 @@ REASONS = frozenset(
         "wrong_node",
         "single_eligible_node",
         "destination_unknown",
+        "destination_unreached",
         "transport_unavailable",
         "guard_refused",
         "guard_admitted",
@@ -298,6 +299,9 @@ class EgressEvidence:
     # report: the probe cannot attribute them to the policy engine.
     unattributed: int
     control_succeeded: bool
+    # Every destination answered an unrestricted probe pod on the same node. A
+    # destination that answers nobody would read as denied without any policy.
+    destinations_reached: bool
 
 
 def judge_egress(evidence: EgressEvidence) -> Verdict:
@@ -313,6 +317,8 @@ def judge_egress(evidence: EgressEvidence) -> Verdict:
         return ("unavailable", "unreachable_unattributed")
     if not evidence.control_succeeded:
         return ("unavailable", "control_failed")
+    if not evidence.destinations_reached:
+        return ("unavailable", "destination_unreached")
     return ("pass", "denied")
 
 
