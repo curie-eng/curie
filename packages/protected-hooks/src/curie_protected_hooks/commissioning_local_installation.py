@@ -44,6 +44,8 @@ OWNER_LABEL = "commissioning.curietech.ai/owner"
 _KUBECONFIG = "kubeconfig"
 _LOG = "commands.log"
 _REGISTRY_PORT = 80
+# kubectl announces the Pod's port, where the registry addon's container listens.
+_REGISTRY_TARGET_PORT = 5000
 _DOCKER_CONFIG = "docker"
 # Pinned profile shape: one node, the Docker driver and a fixed control plane.
 KUBERNETES_VERSION = "v1.35.1"
@@ -439,7 +441,7 @@ class LocalCluster:
             "kube-system",
         )
         process, port = _start_forward(
-            argv, self.commands.environment(os.environ), target_port=_REGISTRY_PORT
+            argv, self.commands.environment(os.environ), target_port=_REGISTRY_TARGET_PORT
         )
         try:
             path = repository.split("/", 1)[1]
