@@ -119,7 +119,7 @@ _KUBECTL_FLAGS = frozenset(
         "--duration",
     }
 )
-_MINIKUBE_COMMANDS = frozenset({"start", "status", "stop", "delete", "ip", "image"})
+_MINIKUBE_COMMANDS = frozenset({"start", "status", "stop", "delete", "ip", "image", "addons"})
 _MINIKUBE_FLAGS = frozenset(
     {
         "--driver",
@@ -136,6 +136,7 @@ _MINIKUBE_FLAGS = frozenset(
         "--nodes",
         "-o",
         "--output",
+        "--format",
     }
 )
 _DOCKER_COMMANDS = frozenset(

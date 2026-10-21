@@ -545,6 +545,42 @@ def test_port_forward_without_a_ready_line_refuses_and_is_stopped() -> None:
         api._start_forward([sys.executable, "-c", script], dict(os.environ))
 
 
+def test_provisioner_installs_m_and_a_closed_selection_once(valkey: Valkey) -> None:
+    """Clause 6, before the campaign: M and the selection with ``admission_open: false``."""
+    from curie_protected_hooks.admission_records import parse_selection
+
+    api = module()
+    result, _ = provisioned()
+    manifest = result.manifest
+    m = manifest.as_dict()
+    provisioner = session(valkey, "provisioner")
+    worker = session(valkey, "worker")
+    try:
+        api.install_control_records(provisioner, manifest, qualification_generation="1")
+        stored = worker.get("protected:control:manifest:" + manifest.digest)
+        assert stored == manifest.canonical_bytes
+        selection = parse_selection(worker.get("protected:control:selection:" + m["runtime_id"]))
+        assert selection == {
+            "schema_version": 1,
+            "runtime_id": m["runtime_id"],
+            "runtime_generation": m["runtime_generation"],
+            "manifest_digest": manifest.digest,
+            "qualification_id": m["qualification_id"],
+            "qualification_generation": "1",
+            "broker_run_id": m["broker_identity"]["run_id"],
+            "admission_open": False,
+        }
+        # Identical bytes are a replay; any other selection for the runtime refuses.
+        api.install_control_records(provisioner, manifest, qualification_generation="1")
+        with pytest.raises(api.BrokerRefused):
+            api.install_control_records(provisioner, manifest, qualification_generation="2")
+        with pytest.raises(NoPermissionError):
+            worker.set("protected:control:selection:" + m["runtime_id"], b"x")
+    finally:
+        for client in (provisioner, worker):
+            client.close()
+
+
 def admin_cluster(tmp_path: Path) -> tuple[Any, Any, Any]:
     """The administrator's cluster view, its admin kubeconfig in its own directory."""
     from curie_protected_hooks.commissioning_local_installation import LocalCluster

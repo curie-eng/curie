@@ -18,8 +18,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import secrets
 import stat
 import subprocess
+import urllib.request
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -363,9 +366,103 @@ class LocalCluster:
                 self._remove_object(entry.key, entry.state, entry.identity)
             elif entry.kind == "minikube-profile":
                 self._remove_profile(entry.state, entry.identity)
+            elif entry.kind == "image-tag":
+                self._remove_image(entry.key, entry.state, entry.identity)
             else:
                 _refuse()
         _require(self.ledger.all_removed())
+
+    def enable_registry(self) -> None:
+        """The profile's own image registry, for images pinned by digest.
+
+        @spec PROTECTED-COMMISSIONING-5.
+        """
+        self.runner.run(self.commands.minikube_argv("addons", "enable", "registry"), timeout=300)
+        for workload in ("deployment/registry", "daemonset/registry-proxy"):
+            self.kubectl(
+                "rollout", "status", workload, "--namespace", "kube-system", "--timeout", "300s",
+                timeout=330,
+            )  # fmt: skip
+
+    def publish_image(self, name: str, *, dockerfile: Path, context: Path) -> str:
+        """Build an image from this checkout and return its registry-pinned reference.
+
+        The host tag is registered before the build and removed with the
+        installation. The image is pushed to the profile's registry, so the
+        returned ``repository@sha256:...`` is a manifest digest the node pulls.
+        @spec PROTECTED-COMMISSIONING-5.
+        """
+        _require(re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", name) is not None)
+        repository = f"localhost:5000/{self.owner}/{name}"
+        tag = repository + ":" + secrets.token_hex(8)
+        ticket = self.ledger.intend("image-tag", tag)
+        try:
+            self.runner.run(
+                self.commands.docker_argv("build", "-t", tag, "-f", str(dockerfile), str(context)),
+                timeout=1800,
+            )
+            image_id = (
+                self.runner.run(
+                    self.commands.docker_argv("image", "inspect", "--format", "{{.Id}}", tag),
+                    timeout=60,
+                )
+                .decode()
+                .strip()
+            )
+            _require(re.fullmatch(r"sha256:[0-9a-f]{64}", image_id) is not None)
+        except Exception:  # noqa: BLE001  An interrupted build may have tagged the image.
+            self.ledger.uncertain("image-tag", tag)
+            _refuse()
+        self.ledger.bind(ticket, owner=self.owner, id=image_id)
+        self.runner.run(self.commands.minikube_argv("image", "load", tag), timeout=900)
+        self.runner.run(self.commands.minikube_argv("image", "push", tag), timeout=900)
+        reference = repository + "@" + self._registry_digest(repository, tag.rsplit(":", 1)[1])
+        _require(
+            re.fullmatch(re.escape(repository) + r"@sha256:[0-9a-f]{64}", reference) is not None
+        )
+        return reference
+
+    def _registry_digest(self, repository: str, tag: str) -> str:
+        """The manifest digest the profile's registry serves for a pushed tag.
+
+        Read over this installation's own port-forward to the registry Service;
+        it is the digest the node pulls. @spec PROTECTED-COMMISSIONING-5.
+        """
+        from .commissioning_local_broker import _start_forward, _stop
+
+        argv = self.commands.kubectl_argv(
+            "port-forward", "service/registry", ":80", "--namespace", "kube-system"
+        )
+        process, port = _start_forward(argv, self.commands.environment(os.environ))
+        try:
+            path = repository.split("/", 1)[1]
+            request = urllib.request.Request(  # noqa: S310  loopback forward to the owned registry.
+                f"http://127.0.0.1:{port}/v2/{path}/manifests/{tag}",
+                method="HEAD",
+                headers={
+                    "Accept": "application/vnd.docker.distribution.manifest.v2+json, "
+                    "application/vnd.oci.image.manifest.v1+json"
+                },
+            )
+            with urllib.request.urlopen(request, timeout=30) as response:  # noqa: S310
+                digest = response.headers.get("Docker-Content-Digest", "")
+        except Exception:  # noqa: BLE001  One redacted refusal.
+            _refuse()
+        finally:
+            _stop(process)
+        _require(re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is not None)
+        return str(digest)
+
+    def _remove_image(self, key: str, state: str, identity: Mapping[str, str]) -> None:
+        # Only the exact recorded tag is untagged; the image layers stay shared.
+        argv = self.commands.docker_argv("image", "inspect", "--format", "{{.Id}}", key)
+        if self.runner.probe(argv, timeout=60) == 0:
+            if state == "created":
+                observed = self.runner.run(argv, timeout=60).decode().strip()
+                _require(observed == identity.get("id"))
+            self.runner.run(self.commands.docker_argv("image", "rm", key), timeout=120)
+        _require(self.runner.probe(argv, timeout=60) != 0)
+        self.ledger.removed("image-tag", key)
 
     def objects(self) -> Iterator[str]:
         """Ledger keys of created Kubernetes objects, @spec PROTECTED-COMMISSIONING-5."""

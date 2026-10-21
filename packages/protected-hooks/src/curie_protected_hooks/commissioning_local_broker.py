@@ -45,7 +45,8 @@ from redis.backoff import NoBackoff
 from redis.connection import SSLConnection
 from redis.retry import Retry
 
-from .authority_records import _BROKER, _object
+from .admission_records import _encode, parse_selection
+from .authority_records import _BROKER, Manifest, _object
 from .commissioning_acl import (
     CANDIDATE_ROLES,
     commissioning_acl_rules,
@@ -78,6 +79,7 @@ __all__ = [
     "check_guard_binding",
     "namespace_object",
     "enable_candidates",
+    "install_control_records",
     "pinned_session",
     "broker_principals",
     "CANDIDATE_IDLE",
@@ -100,7 +102,7 @@ _SECRET = BROKER_TLS_SECRET
 _APP_LABEL = "app.kubernetes.io/name"
 _VALKEY_UID = 999
 _CERT_DAYS = 30
-_FORWARD = re.compile(rb"Forwarding from 127\.0\.0\.1:([0-9]{1,5}) -> 6379")
+_FORWARD = re.compile(rb"Forwarding from 127\.0\.0\.1:([0-9]{1,5}) -> [0-9]{1,5}")
 
 
 class BrokerRefused(RuntimeError):
@@ -564,6 +566,45 @@ def _stop(process: subprocess.Popen[bytes]) -> None:
         process.wait(timeout=10)
 
 
+def install_control_records(
+    session: Redis, manifest: Manifest, *, qualification_generation: str
+) -> None:
+    """Write M and its selection with ``admission_open: false``, once.
+
+    Clause 6, before the campaign: the selection names M's digest, its
+    ``qualification_id``, the predeclared ``qualification_generation`` and the
+    live ``broker_run_id`` M pins. Identical stored bytes are a replay; any
+    other value refuses. Runs on a provisioner session, which holds ``SET`` on
+    both families. @spec PROTECTED-COMMISSIONING-6.
+    """
+    try:
+        _require(type(manifest) is Manifest)
+        m = manifest.as_dict()
+        selection = {
+            "schema_version": 1,
+            "runtime_id": m["runtime_id"],
+            "runtime_generation": m["runtime_generation"],
+            "manifest_digest": manifest.digest,
+            "qualification_id": m["qualification_id"],
+            "qualification_generation": qualification_generation,
+            "broker_run_id": m["broker_identity"]["run_id"],
+            "admission_open": False,
+        }
+        raw = _encode(selection)
+        _require(parse_selection(raw) == selection)
+        records = (
+            ("protected:control:manifest:" + manifest.digest, manifest.canonical_bytes),
+            ("protected:control:selection:" + m["runtime_id"], raw),
+        )
+        for key, value in records:
+            if not session.set(key, value, nx=True):
+                _require(session.get(key) == value)
+    except BrokerRefused:
+        raise
+    except Exception:  # noqa: BLE001  One redacted refusal.
+        _refuse()
+
+
 class LocalBroker:
     """Install the broker and open pinned provisioner-side sessions.
 
@@ -683,6 +724,25 @@ class LocalBroker:
         _require(self._material is not None and self._port is not None)
         assert self._material is not None and self._port is not None
         return pinned_session(self._material, ("127.0.0.1", self._port), user, run_id=run_id)
+
+    def install_control_records(
+        self, provisioner: BrokerUser, manifest: Manifest, *, qualification_generation: str
+    ) -> None:
+        """The module function on a provisioner session pinned to M's live epoch.
+
+        @spec PROTECTED-COMMISSIONING-6.
+        """
+        identity = self.identity
+        if type(manifest) is not Manifest or identity is None:
+            _refuse()
+        _require(manifest.as_dict()["broker_identity"] == identity)
+        session = self.session(provisioner, run_id=identity["run_id"])
+        try:
+            install_control_records(
+                session, manifest, qualification_generation=qualification_generation
+            )
+        finally:
+            session.close()
 
     def start_campaign(
         self, provisioner: BrokerUser, principals: Mapping[str, Principal], permit: Any
