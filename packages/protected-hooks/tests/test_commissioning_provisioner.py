@@ -27,7 +27,20 @@ PRINCIPALS = (
     "candidate_enqueue",
     "candidate_worker",
     "qualification_publisher",
+    "observer",
 )
+CANDIDATES = ("candidate_enqueue", "candidate_worker")
+OBSERVER = {"id": "commissioning/example-observer", "generation": "1"}
+
+
+def minimal_rules(**changes: tuple[Any, ...]) -> dict[str, tuple[Any, ...]]:
+    """Valid stand-in rules; candidates carry the design decision 9 placeholder."""
+    rules: dict[str, tuple[Any, ...]] = {
+        name: ("-@all", "+acl|whoami") + (("~{lane}:*",) if name in CANDIDATES else ())
+        for name in PRINCIPALS
+    }
+    rules.update(changes)
+    return rules
 
 
 Mutation = Callable[[dict[str, Any]], None]
@@ -141,6 +154,7 @@ def profile_fields(**changes: Any) -> dict[str, Any]:
         "issuer_identity": copy.deepcopy(b["issuer_identity"]),
         "control_identity": copy.deepcopy(b["control_identity"]),
         "qualification_publisher_identity": copy.deepcopy(b["qualification_publisher_identity"]),
+        "observer_identity": copy.deepcopy(OBSERVER),
         "mediator_identity": copy.deepcopy(b["mediator_identity"]),
         "gateway_identity": copy.deepcopy(b["gateway_identity"]),
         "source_scope": copy.deepcopy(b["source_scope"]),
@@ -164,7 +178,12 @@ class Recipes:
     def __init__(self, rules: dict[str, tuple[str, ...]] | None = None) -> None:
         self.calls: list[str] = []
         self._rules = rules or {
-            name: ("-@all", "resetkeys", "+acl|whoami", "%R~protected:example:" + name + ":*")
+            name: (
+                "-@all",
+                "resetkeys",
+                "+acl|whoami",
+                "%R~protected:example:" + name + (":{lane}" if name in CANDIDATES else "") + ":*",
+            )
             for name in PRINCIPALS
         }
 
@@ -279,6 +298,7 @@ def test_guard_hashes_each_principals_rules_bound_to_its_credential() -> None:
         "qualification_publisher": fields["qualification_publisher_identity"],
         "candidate_enqueue": fields["candidate_credentials"]["enqueue"],
         "candidate_worker": fields["candidate_credentials"]["worker"],
+        "observer": OBSERVER,
     }
     assert set(guard["broker_acl"]) == set(PRINCIPALS)
     for name in PRINCIPALS:
@@ -325,8 +345,7 @@ def test_guard_config_is_canonical_and_round_trips() -> None:
 )
 def test_guard_refuses_rules_carrying_enabled_state_or_passwords(rule: str) -> None:
     api = module()
-    rules = {name: ("-@all", "+acl|whoami") for name in PRINCIPALS}
-    rules["candidate_worker"] = ("-@all", rule)
+    rules = minimal_rules(issuer=("-@all", rule))
     with pytest.raises(api.ProvisionerRefused) as raised:
         api.construct(profile(), acl=Recipes(rules))
     assert "secret" not in str(raised.value)
@@ -335,45 +354,23 @@ def test_guard_refuses_rules_carrying_enabled_state_or_passwords(rule: str) -> N
 @pytest.mark.parametrize("value", [(), ["-@all"], ("-@all", 7), None])
 def test_guard_refuses_malformed_rule_recipes(value: Any) -> None:
     api = module()
-    rules: dict[str, Any] = {name: ("-@all",) for name in PRINCIPALS}
+    rules: dict[str, Any] = minimal_rules()
     rules["issuer"] = value
     with pytest.raises(api.ProvisionerRefused):
         api.construct(profile(), acl=Recipes(rules))
 
 
-class MergedRecipes:
-    """The merged production and commissioning recipes, one per principal in G."""
+def MergedRecipes(qualification_id: str) -> Any:
+    """The merged recipes G hashes; candidates as design decision 9 templates."""
+    from curie_protected_hooks.commissioning_acl import GuardRecipes
 
-    def __init__(self, qualification_id: str) -> None:
-        from curie_protected_hooks.admission_acl import admission_acl_rules
-        from curie_protected_hooks.commissioning_acl import commissioning_acl_rules
-        from curie_protected_hooks.commissioning_records import parse_commissioning_permit
-        from curie_protected_hooks.worker_acl import worker_acl_rules
-
-        from .test_commissioning_records import permit_value
-
-        permit = parse_commissioning_permit(json.dumps(permit_value()).encode())
-        self.recipes = {
-            "enqueue": admission_acl_rules("enqueue"),
-            "worker": worker_acl_rules("worker"),
-            "verifier": admission_acl_rules("verifier"),
-            "issuer": commissioning_acl_rules("issuer"),
-            "control": commissioning_acl_rules("control"),
-            "candidate_enqueue": commissioning_acl_rules("candidate_enqueue", permit=permit),
-            "candidate_worker": commissioning_acl_rules("candidate_worker", permit=permit),
-            "qualification_publisher": commissioning_acl_rules(
-                "qualification_publisher", qualification_id=qualification_id
-            ),
-        }
-
-    def rules(self, principal: str) -> tuple[str, ...]:
-        return self.recipes[principal]
+    return GuardRecipes(qualification_id)
 
 
 def test_guard_accepts_the_merged_recipes() -> None:
     recipes = MergedRecipes(profile_fields()["qualification_id"])
     # The production worker and candidate worker carry the long measured command selector.
-    assert max(len(rule) for rules in recipes.recipes.values() for rule in rules) > 512
+    assert max(len(rule) for name in PRINCIPALS for rule in recipes.rules(name)) > 512
     guard = json.loads(module().construct(profile(), acl=recipes).guard_config)
     for name in PRINCIPALS:
         assert guard["broker_acl"][name]["rules_sha256"] == sha(
@@ -381,9 +378,87 @@ def test_guard_accepts_the_merged_recipes() -> None:
         )
 
 
+def test_guard_hashes_candidate_templates_not_a_campaigns_lane() -> None:
+    """Design decision 9: G is built before any permit."""
+    from curie_protected_hooks.commissioning_acl import (
+        commissioning_acl_rules,
+        commissioning_acl_template,
+    )
+
+    from .test_commissioning_records import permit_value
+
+    api = module()
+    recipes = MergedRecipes(profile_fields()["qualification_id"])
+    guard = json.loads(api.construct(profile(), acl=recipes).guard_config)
+    for name in CANDIDATES:
+        template = list(commissioning_acl_template(name))
+        assert guard["broker_acl"][name]["rules_sha256"] == sha(canonical(template))
+    permit = permit_value()
+    from curie_protected_hooks.commissioning_records import parse_commissioning_permit
+
+    record = parse_commissioning_permit(json.dumps(permit).encode())
+    for name in CANDIDATES:
+        instantiated = minimal_rules(**{name: commissioning_acl_rules(name, permit=record)})
+        with pytest.raises(api.ProvisionerRefused):
+            api.construct(profile(), acl=Recipes(instantiated))
+        with pytest.raises(api.ProvisionerRefused):
+            api.construct(profile(), acl=Recipes(minimal_rules(**{name: ("-@all",)})))
+    with pytest.raises(api.ProvisionerRefused):
+        api.construct(profile(), acl=Recipes(minimal_rules(issuer=("-@all", "~{lane}:*"))))
+
+
+def test_guard_binds_the_acl_observer_outside_b() -> None:
+    """Design decision 7: G hashes the observer's rules; B names no observer."""
+    from curie_protected_hooks.commissioning_acl import commissioning_acl_rules
+
+    api = module()
+    assert api.GUARD_PRINCIPALS == (*api.BROKER_PRINCIPALS, "observer")
+    assert "observer" not in api.BROKER_PRINCIPALS
+    result = api.construct(profile(), acl=MergedRecipes(profile_fields()["qualification_id"]))
+    entry = json.loads(result.guard_config)["broker_acl"]["observer"]
+    assert entry == {
+        "credential": OBSERVER,
+        "rules_sha256": sha(canonical(list(commissioning_acl_rules("observer")))),
+    }
+    assert "observer" not in json.dumps(result.bootstrap.as_dict())
+    fields = profile_fields()
+    for taken in (
+        fields["issuer_identity"],
+        fields["production_credentials"]["verifier"],
+        fields["candidate_credentials"]["worker"],
+        fields["qualification_publisher_identity"],
+        fields["mediator_identity"],
+        fields["gateway_identity"],
+    ):
+        with pytest.raises(api.ProvisionerRefused):
+            api.construct(profile(observer_identity=dict(taken)), acl=Recipes())
+    for bad in ({"id": "x"}, {"id": "commissioning/o", "generation": 1}, None):
+        with pytest.raises(api.ProvisionerRefused):
+            api.construct(profile(observer_identity=bad), acl=Recipes())
+
+
+def test_verify_tuple_refuses_an_observer_that_b_names() -> None:
+    api = module()
+    result = built()
+    value = json.loads(result.guard_config)
+    value["broker_acl"]["observer"]["credential"] = profile_fields()["issuer_identity"]
+    guard = canonical(value)
+    m = result.manifest.as_dict()
+    m["guard_identity"]["config_sha256"] = sha(guard)
+    from curie_protected_hooks.authority_records import parse_manifest
+
+    manifest = parse_manifest(canonical(m))
+    with pytest.raises(api.ProvisionerRefused):
+        api.verify_tuple(result.bootstrap, guard, manifest)
+    value["broker_acl"]["observer"]["credential"] = OBSERVER
+    guard = canonical(value)
+    m["guard_identity"]["config_sha256"] = sha(guard)
+    api.verify_tuple(result.bootstrap, guard, parse_manifest(canonical(m)))
+
+
 def test_guard_bounds_each_rule_and_each_principals_rule_set() -> None:
     api = module()
-    rules = {name: ("-@all", "+acl|whoami") for name in PRINCIPALS}
+    rules = minimal_rules()
     longest = "(+get ~" + "k" * 4088 + ")"
     assert len(longest) == 4096
     rules["worker"] = ("-@all", longest)
