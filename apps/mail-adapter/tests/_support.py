@@ -181,6 +181,12 @@ class MailState:
         # message_id -> how many times its body has been fetched. The retry
         # budget is only observable as a count that stops growing.
         self.body_calls: dict[str, int] = {}
+        # The receiving mail system's own authentication result per message id,
+        # served beside the body as `receiving_verdict`. Only a test sets it,
+        # never `add_inbound`'s sender-shaped arguments, because it stands for
+        # evidence the sender cannot write (ADR 0228 decision 3). Only the
+        # verifying test provider reads it; AgentMail's provider ignores it.
+        self.verdicts: dict[str, dict[str, str]] = {}
         self.reply_gate = threading.Event()
         self.reply_gate.set()
         self.reply_entered = threading.Event()
@@ -431,7 +437,10 @@ class MailHandler(_JsonHandler):
             body = state.bodies.get(parts[4])
             if body is None:
                 return self._send(404, {"detail": "no such message"})
-            return self._send(200, body)
+            served = dict(body)
+            if parts[4] in state.verdicts:
+                served["receiving_verdict"] = dict(state.verdicts[parts[4]])
+            return self._send(200, served)
         # /v0/inboxes/{inbox}/threads/{thread_id}
         if len(parts) == 5 and parts[3] == "threads":
             state.thread_calls += 1

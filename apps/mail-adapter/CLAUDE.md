@@ -85,11 +85,19 @@ the enforceable-rule summary.
 
 ## Inbound gate
 
-**Every current email approval answer is refused by the same authentication
-gate as a turn**, before body fetch or approval resolution. The existing
-reference parser and resolution transport have no current inbound caller.
-They cannot authenticate a sender and must never be exposed to unauthenticated
-intake.
+**The adapter is neutral; the mail service is a provider (ADR 0228).** The
+adapter calls only the `MailProvider` protocol in `provider.py`; AgentMail is
+`agentmail.AgentMailProvider`. Never read a provider's raw shape (labels,
+`extracted_text`, header maps, HTTP statuses) outside its provider module, and
+never let a provider own approval logic.
+
+**An email approval answer passes the same gate as a turn**, before approval
+resolution: `_listing_rejection` before any fetch, `_message_rejection` after
+it. The reference parser and the resolution transport are reached only from
+the intake path, after a `verified` verdict whose domain equals the one From
+mailbox's domain. They cannot authenticate a sender themselves and must never
+be exposed to unauthenticated intake. A provider that declares
+`verifies_senders` false (AgentMail) refuses every message from the listing.
 
 The parser's ADR-0177 rules remain: an answer is never a turn, its reference
 must be live and issued in this thread, it must not be sent automatically
@@ -104,14 +112,17 @@ platform checks the binding's `allowed_callers` and the route's approver
 message. A settled card spends its reference.
 
 **Inbound mail fails closed before a turn or approval can be admitted.** A
-sender must match the allowlist and have a positive authentication verdict that
-Curie itself verifies. A provider label, absence of a rejection label, or
-provider supplied header never counts as that verdict. AgentMail supplies no
+sender must match the allowlist and carry a `verified` sender verdict from a
+provider that verifies senders. A provider may build `verified` only from
+results the receiving mail system attaches and the service guarantees a sender
+cannot supply. A provider label, absence of a rejection label, or any header a
+sender could have written never counts as that verdict. AgentMail supplies no
 trusted positive aligned verdict, guarantees neither header provenance nor
-stripping, and permits DMARC failure under `p=none`; every message is therefore
-refused with `authentication_unverifiable`. Never describe the allowlist or
-provider filtering as authenticating a sender. See the provider evidence in the
-README before proposing a new authentication source.
+stripping, and permits DMARC failure under `p=none`; its provider therefore
+declares `verifies_senders` false and every AgentMail message is refused with
+`authentication_unverifiable`. Never describe the allowlist or provider
+filtering as authenticating a sender. See the provider evidence in the README
+before proposing a new authentication source.
 
 **`conversations` is written only after sender authentication and allowlist
 checks pass.** Never seed it from a poll listing. Every current AgentMail
@@ -131,13 +142,20 @@ authentication. Every current AgentMail message is still refused.
 `CURIE_CHANNEL_TOKEN`, `CURIE_EGRESS_SECRET`, `ADAPTER_INGRESS_ENABLED` and the
 `CURIE_MAIL_*` knobs. Full table in `apps/mail-adapter/README.md`, and
 `tests/test_config.py` fails if the table and the code drift apart. A new field
-means a new README row.
+means a new README row. `CURIE_MAIL_PROVIDER` picks the provider; a provider
+reads its own settings, and only the built-in reads `AGENTMAIL_*`.
 
 ## Verify (AgentMail-free)
 
 ```bash
 uv run pytest apps/mail-adapter/tests -q
 ```
+
+The intake path and approvals by email are driven end to end through
+`tests/_verifying_provider.py`, a provider that speaks AgentMail's wire to the
+fake server and takes its verdict from a field only the fake receiving system
+sets. `tests/test_provider_conformance.py` runs the conformance kit against
+both providers.
 
 Only the two external dependencies are faked, both as real local
 `ThreadingHTTPServer` instances: AgentMail's API and the platform's channel

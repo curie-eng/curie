@@ -2751,7 +2751,9 @@ supplies no trusted positive aligned authentication verdict that Curie can
 verify, guarantees neither header provenance nor stripping, and permits DMARC
 failure under `p=none`. Every message is refused with
 `authentication_unverifiable`; allowlisted senders, labels, missing rejection
-labels and provider supplied headers cannot bypass the gate. Any
+labels and provider supplied headers cannot bypass the gate. The gate opens only
+for a mail provider that verifies senders (ADR 0228, `CURIE_MAIL_PROVIDER`); the
+chart currently selects only the built-in AgentMail provider. Any
 `mailAdapter.allowedSenders` list containing `*` also fails boot unless
 `mailAdapter.allowAllSenders=true` is explicitly set, and that opt in never
 bypasses authentication. Provider evidence, parameter names, the full config

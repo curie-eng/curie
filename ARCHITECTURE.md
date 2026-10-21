@@ -263,6 +263,11 @@ provenance and stripping. The mail adapter therefore refuses every current
 AgentMail inbound message with `authentication_unverifiable` before starting a
 turn or resolving an approval. Replies for historical accepted deliveries remain
 deliverable. See [inbound security](apps/mail-adapter/README.md#inbound-security).
+Since ADR 0228 the mail service is a provider behind one interface
+([mail provider seam](docs/interfaces/mail-provider/INTERFACE.md)): the intake
+path and approvals by email live once in the neutral adapter and open only for a
+provider that verifies senders, which AgentMail cannot. Other mail services plug
+in out of tree.
 
 ADR-0007's Decision names **six** things Curie builds around that spine: the
 web UI, the API server, the Slack dispatcher, the worker+runner glue, the CLI,
@@ -1371,9 +1376,11 @@ The following are built and verified:
 
 - **running** the sandbox-substrate resilience E2E at N1 scale (the scenario is real Python, env-gated on `CURIE_SANDBOX_E2E` — what is deferred is the run, not the code)
 - usable **email ingress**: the adapter ships with tests and opt-in chart wiring,
-  but its authentication gate refuses every inbound AgentMail message. A trusted
-  authentication source and a live send/reply rehearsal are still needed; see
-  [`apps/mail-adapter/README.md`](apps/mail-adapter/README.md#inbound-security).
+  but its authentication gate refuses every inbound AgentMail message. The intake
+  path now opens for a mail provider that verifies senders (ADR 0228), none of
+  which ships in this repository, and the chart can select only AgentMail. A
+  trusted authentication source and a live send/reply rehearsal are still needed;
+  see [`apps/mail-adapter/README.md`](apps/mail-adapter/README.md#inbound-security).
 - the Interview-Me onboarding compiler
 - automatic memory generation
 - the **native OpenAI wire format**
