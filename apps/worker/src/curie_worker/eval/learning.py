@@ -242,6 +242,13 @@ def _now() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
+def _tail(text: str, lines: int = 40, limit: int = 6000) -> str:
+    """The last lines of a child's output: a failure's cause is at the end."""
+
+    kept = "\n".join(text.rstrip().splitlines()[-lines:])
+    return kept if len(kept) <= limit else "..." + kept[-limit:]
+
+
 def _bounded(text: str) -> str:
     return text if len(text) <= MAX_STDERR else text[:MAX_STDERR] + "..."
 
@@ -1382,7 +1389,22 @@ def _check_cleanup_live(report: _Report) -> None:
     processes = _lst(manifest.get("processes"), "processes")
     observed = _docker_lines("info", "--format", "{{.ID}}")
     _require(observed == [daemon], "the configured Docker daemon is not the recorded one")
-    unrelated = _obj(cleanup.get("unrelated_before"), "unrelated inventory")
+    # Other sessions create and remove their own resources on a shared engine, so
+    # unrelated inventory is recorded but never judged. Preservation is proven by
+    # every harness removal targeting only an identity in the ownership manifest.
+    owned: dict[str, set[str]] = {
+        kind: {str(e["name" if kind == "volumes" else "id"]) for e in manifest[kind]}
+        for kind in ("containers", "runners", "resolver_containers", "volumes", "networks")
+    }
+    owned["images"] = {str(item) for item in _lst(manifest.get("images", []), "images")}
+    for raw in _lst(manifest.get("removals"), "removals"):
+        removal = _obj(raw, "removal")
+        _require(set(removal) == {"kind", "id"}, "removal fields")
+        _require(removal["kind"] in owned, "unknown removal kind")
+        _require(
+            removal["id"] in owned[str(removal["kind"])],
+            "a removal targeted an identity outside the ownership manifest",
+        )
     inventories = {
         "containers": set(
             _docker_lines("container", "ls", "--all", "--no-trunc", "--format", "{{.ID}}")
@@ -1397,9 +1419,6 @@ def _check_cleanup_live(report: _Report) -> None:
         key = "name" if kind == "volumes" else "id"
         for entry in manifest[kind]:
             _require(entry[key] not in inventory, f"owned {kind} {entry[key]} still exists")
-    for kind, before in unrelated.items():
-        _require(kind in inventories, "unknown unrelated inventory")
-        _require(set(_lst(before, kind)) <= inventories[kind], f"unrelated {kind} vanished")
     for raw in processes:
         process = _obj(raw, "process")
         stat = Path(f"/proc/{_int(process.get('pid'), 'pid', 1)}/stat")
@@ -1858,6 +1877,7 @@ class _Stack:
     ports: dict[str, dict[int, int]]
     stub_port: int
     stub_host: str
+    repetition: int = 0
     # The stack's platform API key: generated per stack, held in memory only,
     # handed to `local up` and every inner CLI child as CURIE_API_KEY (which
     # `local up` adopts instead of generating its own), never in argv or reports.
@@ -1924,7 +1944,9 @@ def _stub_bind_host() -> str:
     return "127.0.0.1"
 
 
-def _new_stack(output: Path, run_id: str, repetition: int, stub_port: int) -> _Stack:
+def _new_stack(
+    output: Path, run_id: str, repetition: int, stub_port: int, attempt: int = 1
+) -> _Stack:
     used = {stub_port}
     ports: dict[str, dict[int, int]] = {}
     for service, inner in _PUBLISHED.items():
@@ -1935,14 +1957,15 @@ def _new_stack(output: Path, run_id: str, repetition: int, stub_port: int) -> _S
                 host = _free_port()
             used.add(host)
             ports[service][port] = host
-    project = f"curie-learning-{run_id}-r{repetition}"
+    project = f"curie-learning-{run_id}-r{repetition}a{attempt}"
     return _Stack(
         project,
         f"learning-{run_id}",
-        output / f"compose-override-r{repetition}.yaml",
+        output / f"compose-override-r{repetition}a{attempt}.yaml",
         ports,
         stub_port,
         _stub_advertise_host(),
+        repetition,
     )
 
 
@@ -1957,6 +1980,13 @@ class _Ownership:
     networks: dict[str, str] = field(default_factory=dict)
     images: set[str] = field(default_factory=set)
     unrelated: dict[str, list[str]] = field(default_factory=dict)
+    removals: list[dict[str, str]] = field(default_factory=list)
+
+    def remove(self, kind: str, identity: str, *args: str) -> None:
+        """Every removal the harness issues targets one recorded owned identity."""
+
+        self.removals.append({"kind": kind, "id": identity})
+        _docker_lines(*args, identity)
 
     def observe(self, stack: _Stack) -> None:
         label = f"label=com.docker.compose.project={stack.project}"
@@ -1992,26 +2022,31 @@ class _Ownership:
         ):
             self.images.add(item)
 
-    def remove_leftovers(self) -> list[str]:
+    def remove_leftovers(self, *, images: bool = True) -> list[str]:
         problems: list[str] = []
         live = set(_docker_lines("container", "ls", "--all", "--no-trunc", "--format", "{{.ID}}"))
-        for identity in [*self.containers, *self.runners, *self.resolvers]:
-            if identity in live:
-                with contextlib.suppress(_Invalid):
-                    _docker_lines("container", "rm", "--force", "--volumes", identity)
+        for kind, owned in (
+            ("containers", self.containers),
+            ("runners", self.runners),
+            ("resolver_containers", self.resolvers),
+        ):
+            for identity in owned:
+                if identity in live:
+                    with contextlib.suppress(_Invalid):
+                        self.remove(kind, identity, "container", "rm", "--force", "--volumes")
         volumes = set(_docker_lines("volume", "ls", "--format", "{{.Name}}"))
         for name in self.volumes:
             if name in volumes:
                 with contextlib.suppress(_Invalid):
-                    _docker_lines("volume", "rm", "--force", name)
+                    self.remove("volumes", name, "volume", "rm", "--force")
         networks = set(_docker_lines("network", "ls", "--no-trunc", "--format", "{{.ID}}"))
         for identity in self.networks:
             if identity in networks:
                 with contextlib.suppress(_Invalid):
-                    _docker_lines("network", "rm", identity)
-        for image in sorted(self.images):
+                    self.remove("networks", identity, "network", "rm")
+        for image in sorted(self.images) if images else []:
             try:
-                _docker_lines("image", "rm", image)
+                self.remove("images", image, "image", "rm")
             except _Invalid:
                 problems.append("a private image tag could not be removed")
         return problems
@@ -2030,6 +2065,7 @@ class _Ownership:
             "networks": rows(self.networks),
             "processes": [],
             "images": sorted(self.images),
+            "removals": list(self.removals),
         }
 
 
@@ -2148,6 +2184,8 @@ class _Campaign:
         self.threads: set[str] = set()
         self.bind_errors = 0
         self.live_children = 0
+        self.paid_started = False
+        self.setup_retries: list[dict[str, Any]] = []
         self.channels: tuple[str, str] = CHANNELS
         self.platform_keys: list[str] = []
         self.windows: list[dict[str, Any]] = []
@@ -2206,7 +2244,7 @@ class _Campaign:
         for secret in [self.key, *self.platform_keys]:
             if secret:
                 text = text.replace(secret, "[redacted]")
-        return _bounded(text)
+        return _tail(text)
 
     def cli(
         self,
@@ -2259,7 +2297,10 @@ class _Campaign:
             parsed,
             invocation_id,
             result_ref,
-            self.scrub(stderr.decode("utf-8", errors="replace")),
+            self.scrub(
+                stderr.decode("utf-8", errors="replace")
+                + ("" if parsed is not None else "\n" + stdout.decode("utf-8", errors="replace"))
+            ),
         )
 
     def must(self, args: Sequence[str], scope: Mapping[str, Any], **kw: Any) -> Any:
@@ -2370,6 +2411,7 @@ class _Campaign:
         sequence = self.call_sequence
         try:
             operation = self.ledger.admit(purpose, JUDGE_RESERVE, scope)
+            self.paid_started = True
         except _Stop as exc:
             self.stopped = str(exc)
             raise
@@ -2511,8 +2553,10 @@ class _Campaign:
         }
 
     def up(self, repetition: int) -> None:
-        for attempt in range(2):
-            self.stack = _new_stack(self.o.output_dir, self.run_id, repetition, self.stub_port)
+        for attempt in (1, 2):
+            self.stack = _new_stack(
+                self.o.output_dir, self.run_id, repetition, self.stub_port, attempt
+            )
             self.platform_keys.append(self.stack.api_key)
             self.stack.write_override()
             assert self.stack is not None
@@ -2539,9 +2583,15 @@ class _Campaign:
             if code == 0:
                 self.verify_started()
                 return
+            # Resource setup failed: tear down this partial owned stack by its
+            # recorded identity. Retry once with a fresh project and fresh
+            # ports, but never once any paid call has started.
             self.down(repetition)
-            if attempt == 1 or "port" not in stderr.lower():
-                raise _Stop(f"local up failed: {stderr}")
+            with contextlib.suppress(_Invalid):
+                self.ownership.remove_leftovers(images=False)
+            if attempt == 2 or self.paid_started:
+                raise _Stop(f"local up failed:\n{stderr}")
+            self.setup_retries.append({"repetition": repetition, "reason": stderr[-2000:]})
 
     def verify_started(self) -> None:
         assert self.stack is not None
@@ -2638,6 +2688,7 @@ class _Campaign:
                 stdin=subprocess.DEVNULL,
             )
         finally:
+            self.ownership.removals.append({"kind": "resolver_containers", "id": identity})
             subprocess.run(
                 [docker, "rm", "--force", identity],
                 env=_docker_env(),
@@ -2766,6 +2817,7 @@ class _Campaign:
         if thread.startswith(EVAL_ISOLATE_PREFIX):
             raise _Stop("an ordinary thread must not use the eval isolation prefix")
         operation = self.ledger.admit("actor", ACTOR_RESERVE, bare)
+        self.paid_started = True
         before = self.ledger.last_usage
         self.live_children += 1
         try:
@@ -2806,7 +2858,7 @@ class _Campaign:
         )
         result = parsed if isinstance(parsed, dict) else {}
         if code != 0 or result.get("finalized") is not True:
-            self.failures.append(f"{scope['case_id']} turn did not finalize: {stderr[:160]}")
+            self.failures.append(f"{scope['case_id']} turn did not finalize: {stderr[-300:]}")
         return {
             "invocation_id": invocation,
             "result_ref": result_ref,
@@ -3738,7 +3790,7 @@ class _Campaign:
         if self.stack is not None:
             # `local down --wipe` runs for the same project, compose files and
             # platform key that `local up` used for this stack.
-            repetition = int(self.stack.project.rsplit("-r", 1)[-1])
+            repetition = self.stack.repetition
             try:
                 self.down(repetition)
             except (_Stop, _Invalid, OSError, subprocess.SubprocessError) as exc:
@@ -3852,6 +3904,7 @@ class _Campaign:
                 "synthetic_transport_receipt": self.synthetic,
             },
             "runner_turn_bound": "native runner default, not overridden by this harness",
+            "setup_retries": self.setup_retries,
         }
         path = self.o.output_dir / "report.json"
         path.write_bytes(_json_bytes(report))
