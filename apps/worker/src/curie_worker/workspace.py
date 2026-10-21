@@ -729,8 +729,12 @@ def scrubbed_git_environment(
 
 _GIT_DIAGNOSTIC_LINE = re.compile(r"^(?:fatal|error|remote):")
 _GIT_DIAGNOSTIC_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
-_GIT_URL_USERINFO = re.compile(r"(https?://)[^\s/@]+@")
-_GIT_AUTHORIZATION_VALUE = re.compile(r"(?i)(authorization:\s*)\S+")
+_GIT_URL_USERINFO = re.compile(r"(?i)(https?://)[^\s/@]+@")
+# The value runs to the next URL or the end of the line, so a scheme other
+# than Basic or Bearer cannot leave a second secret word behind.
+_GIT_AUTHORIZATION_VALUE = re.compile(
+    r"(?i)(authorization:\s*)(?:(?!https?://)(?!;)(?!(?:fatal|error|remote):)\S+\s*)+"
+)
 _GIT_BASIC_OR_BEARER = re.compile(r"(?i)\b(?:Basic|Bearer)\s+\S+")
 _GIT_HUB_TOKEN = re.compile(r"\b(?:ghs_|ghp_|gho_|ghu_|ghr_|github_pat_)[A-Za-z0-9_]+")
 _GIT_DIAGNOSTIC_LIMIT = 240

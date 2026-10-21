@@ -2535,6 +2535,23 @@ def test_redact_git_diagnostic_strips_header_schemes_without_a_redeemed_credenti
     assert diagnostic.count("<redacted>") >= 2
 
 
+def test_redact_git_diagnostic_covers_spaced_header_values_and_mixed_case_urls(
+    workspace: Any,
+) -> None:
+    password = "opaque-password"
+    secret = "opaque-secret"
+    stderr = (
+        f"remote: Authorization: token {secret}\n"
+        f"fatal: HTTPS://alice:{password}@example.com/repo.git denied\n"
+    )
+    diagnostic = workspace.redact_git_diagnostic(stderr)
+    assert secret not in diagnostic
+    assert password not in diagnostic
+    assert "alice" not in diagnostic
+    assert "Authorization: <redacted>" in diagnostic
+    assert "https://example.com/repo.git" in diagnostic.lower()
+
+
 def test_diagnostic_cap_drops_a_token_cut_at_the_boundary(workspace: Any, tmp_path: Path) -> None:
     secret = "redeemed-credential-value"
     padding = "fatal: " + ("y" * 220) + " "
