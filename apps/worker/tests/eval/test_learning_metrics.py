@@ -1259,3 +1259,74 @@ def test_summary_keeps_numeric_correction_duplicates_with_one_evaluated_correcti
     gate = _summary(rows)["gates"]["correction_duplicates"]
     assert gate["status"] == "PASS"
     assert gate["value"] == 0
+
+
+# The rows below were recorded from a live learning-eval run (run 7) and anonymized. They
+# preserve the fixture meaning while rewording it, so verbatim containment cannot grade them.
+F1_P2_LINES = [
+    "1. Read the unit tag and integer quantity from the input.",
+    "2. Choose the route by unit tag: for kg choose route-1ecd41; for cm choose route-d0d301. "
+    "Leave the quantity unchanged.",
+    "3. Return the selected route, a slash, the quantity, a slash, and rt-c5cab1 "
+    "(format: <route>/<quantity>/rt-c5cab1).",
+]
+F1_P2_STEPS = [
+    "Read the unit tag and integer quantity.",
+    "For kg choose route-1ecd41; for cm choose route-d0d301; leave the quantity unchanged.",
+    "Return the selected route, a slash, the quantity, a slash, and rt-c5cab1.",
+]
+F8_P2_STEPS = ["second word", "third word", "first word"]
+F8_P2_BODY = "Place the second word before the third, then the first word last."
+F3_P3_STATEMENT = "The reference value for cabinet-573d74 is violet-743263."
+
+
+def _f3_score(statement):
+    check = _predicate(
+        "statement_equals",
+        LearningClass.MEMORY_FACT,
+        "fact-example",
+        value="cabinet-573d74 is violet-743263",
+    )
+    after = _parse(facts=[_fact(statement=statement)])
+    return _score(_snapshot(), after, check).passed
+
+
+def test_real_f1_p2_reworded_body_passes_token_anchored_steps():
+    assert _body_score("\n".join(F1_P2_LINES), F1_P2_STEPS) is True
+
+
+def test_real_f8_p2_reworded_correction_body_passes_token_anchored_steps():
+    assert _body_score(F8_P2_BODY, F8_P2_STEPS) is True
+
+
+def test_real_f3_p3_reworded_statement_passes_statement_equals():
+    assert _f3_score(F3_P3_STATEMENT) is True
+
+
+def test_f1_p2_body_with_a_wrong_route_marker_fails():
+    body = "\n".join(F1_P2_LINES).replace("route-1ecd41", "route-999999")
+    assert _body_score(body, F1_P2_STEPS) is False
+
+
+def test_f1_p2_body_missing_the_leave_quantity_unchanged_content_fails():
+    body = "\n".join(F1_P2_LINES).replace(" Leave the quantity unchanged.", "")
+    assert _body_score(body, F1_P2_STEPS) is False
+
+
+def test_f1_p2_body_with_nonce_bearing_steps_reversed_fails():
+    first, second, third = F1_P2_LINES
+    assert _body_score("\n".join([first, third, second]), F1_P2_STEPS) is False
+
+
+def test_f8_p2_body_omitting_the_third_word_fails():
+    body = "Place the second word before the first word last."
+    assert _body_score(body, F8_P2_STEPS) is False
+
+
+def test_f3_p3_statement_with_a_different_value_fails():
+    assert _f3_score("The reference value for cabinet-573d74 is violet-000000.") is False
+
+
+def test_f3_p3_statement_holding_both_obsolete_and_new_values_fails():
+    statement = "The reference value for cabinet-573d74 is violet-743263, not violet-111111."
+    assert _f3_score(statement) is False
