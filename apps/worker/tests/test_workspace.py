@@ -2563,6 +2563,8 @@ def test_diagnostic_cap_drops_a_token_cut_at_the_boundary(workspace: Any, tmp_pa
         else:
             os.environ["PATH"] = saved
     assert secret not in caught.value.diagnostic
+    assert "redeemed" not in caught.value.diagnostic
+    assert caught.value.diagnostic.endswith("y")
     assert "TAIL" not in caught.value.diagnostic
     assert len(caught.value.diagnostic) <= 240
 
