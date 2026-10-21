@@ -46,8 +46,10 @@ creates and verify that the same confirmed identity is reused.
 For verification-feasibility cases, materialize the sandbox configuration, workflow
 and tests as raw files. Let the agent inspect them and run permitted baseline probes.
 Check the actual per-criterion classification, evidence and full draft for preserved
-intent. Inspect tracker logs to prove unsupported or unknown criteria receive no
-intake label, including after explicit start consent. A supported sandbox route
+intent. Check that missing coverage becomes explicit tests to add and that approved
+external qualification remains visible without blocking selection. Inspect tracker
+logs to prove unresolved gaps preventing verification of the agreed implementation
+receive no intake label, including after explicit start consent. A supported sandbox route
 and a supported observable CI route are positive controls. Host-only success,
 secret-dependent CI with no factory observation path, a new test that fails only
 for the missing feature, and changed environment evidence exercise the boundaries.
@@ -96,7 +98,7 @@ one update and one label addition with readbacks, the complete reviewed body was
 preserved, and unknown human time remained unknown in the local pilot record.
 No managed version command or real external operation ran in that replay.
 
-The verification-feasibility revision was exercised in fresh contexts using raw
+The earlier verification-feasibility revision was exercised in fresh contexts using raw
 synthetic repository files, trusted sandbox configuration and local fake tracker
 state. A Python standard-library task retained proposed tests as sandbox-verifiable
 and completed approved publication and selection. A live-cloud requirement with
@@ -107,3 +109,17 @@ live tests skipped; the agents did not treat those skips as integration evidence
 The coordinator checked exact published bodies, final labels and tracker operation
 logs. These are observations of preparation decisions and local fake effects,
 not proof of a real factory environment, deployed enforcement or improved outcomes.
+
+The later testable-scope revision supersedes the blanket external-route gate. Its
+cases distinguish approved deferred qualification from a live check retained as
+mandatory acceptance and from a missing runner needed to test the implementation.
+Fresh host contexts exercised all three boundaries using raw repository files
+and local fake tracker tools. With explicit scope approval, a storage-adapter
+issue required new automated tests, kept live delivery as visible deferred
+qualification, and completed publication plus one observed intake label addition.
+When the developer retained live delivery as mandatory acceptance, publication
+completed but selection was withheld. An unavailable proprietary runner needed to
+verify core semantics likewise prevented selection while approved publication
+completed. Exact final bodies, open state, readbacks, one update per issue and
+label operations were checked. No product implementation, real external service,
+deployed factory execution or outcome improvement was demonstrated.

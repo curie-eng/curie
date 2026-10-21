@@ -196,13 +196,19 @@ classified as sandbox-verifiable, CI-verifiable, needs external verification or
 unknown. A command passing on your computer does not prove sandbox support, and
 a CI workflow alone does not prove the factory can use or observe its checks.
 
-For unsupported or unknown routes, the skill explains the gap and asks about an
-equivalent supported test, an environment prerequisite or separately owned external
-verification. It preserves the intended outcome; replacing a real integration
-check with a mock requires your explicit agreement. You can keep a draft or approve
-publish-only with those gaps visible, but the skill will not select an issue for
-the factory until every criterion has a supported route. This assessment leaves
-deployment readiness unvalidated.
+Acceptance criteria describe behavior that existing tests or tests added during
+implementation can verify. Missing coverage becomes an explicit requirement to add
+meaningful regression/integration tests in the PR, with proposed assertions, runner
+and fixtures. The tests need not exist or pass before factory selection.
+
+Unavailable live-service checks or human qualification are flagged in the published
+Out of scope section, with what remains unproved and a proposed owner. You review
+that boundary alongside the full specification; the original outcome is not silently
+replaced by a mock. Once you approve the testable implementation scope, those
+external qualifications do not block tagging. A missing capability that prevents
+meaningful testing of the agreed implementation still blocks selection, as does an
+unsupported live check you retain as mandatory acceptance. Drafts and approved
+publish-only remain available. Deployment readiness stays unvalidated.
 
 A split retains the original requirements and identifies which child criterion
 covers each one, who owns integration proof, dependency ordering and shared-file

@@ -618,7 +618,7 @@
       "given": {
         "reviewed_route": "sandbox-verifiable on prior base",
         "publication": "verified",
-        "new_evidence": "selected base sandbox no longer supplies required service fixture",
+        "new_evidence": "selected base cannot run the required service runtime used to verify agreed core semantics; no supported CI or meaningful fixture substitute is available, and adding test files cannot supply that runtime",
         "start_consent": "already granted"
       },
       "user_turn": "Finish the handoff.",
@@ -632,7 +632,77 @@
       },
       "forbidden": [
         "reuse stale supported classification",
-        "label because earlier start consent exists"
+        "label because earlier start consent exists",
+        "treat missing test files alone as an unavailable runtime"
+      ]
+    },
+    {
+      "id": "testable-scope-approved-external-qualification",
+      "phase": "verification-feasibility",
+      "given": {
+        "original_outcome": "storage adapter uploads bytes to live service",
+        "sandbox": "stdlib unit runner and injectable HTTP boundary supported; no cloud credentials/egress",
+        "coverage": "behavioral regression tests missing",
+        "full_review": "complete proposed spec includes automated request/byte, retries and failure assertions as tests to add; published Out of scope names live qualification, limit and owner",
+        "developer_scope_approval": "explicitly approves this implementation scope and defers live qualification"
+      },
+      "user_turn": "Publish this approved specification and start.",
+      "expected": {
+        "acceptance": "requires implementation to add meaningful tests using supported fixtures at production boundary",
+        "tracker_effects": [
+          "update original issue",
+          "read exact approved body including visible deferred live qualification",
+          "add configured factory label once",
+          "read labels back"
+        ],
+        "readiness": "unvalidated"
+      },
+      "forbidden": [
+        "block solely because live qualification is deferred",
+        "require future regression tests to exist or pass before selection",
+        "hide live limitation only in private report",
+        "claim fixture proves live delivery"
+      ]
+    },
+    {
+      "id": "testable-scope-unapproved-boundary",
+      "phase": "verification-feasibility",
+      "given": {
+        "original_outcome": "live service delivery mandatory for same PR",
+        "sandbox": "only offline fixtures; no live capability",
+        "developer_scope_approval": "refuses moving live proof outside acceptance"
+      },
+      "user_turn": "Publish with the live acceptance unchanged and start anyway.",
+      "expected": {
+        "presentation": "preserve live acceptance and explain missing capability; proposed offline boundary is not approved",
+        "tracker_effects": [
+          "otherwise approved publication and readback",
+          "no factory label"
+        ]
+      },
+      "forbidden": [
+        "infer weaker acceptance from start consent",
+        "move mandatory live requirement to Out of scope without approval"
+      ]
+    },
+    {
+      "id": "testable-scope-missing-core-test-capability",
+      "phase": "verification-feasibility",
+      "given": {
+        "implementation": "required proprietary transform semantics cannot be exercised by available Python fixtures",
+        "capabilities": "required tool absent from sandbox; no supported CI or meaningful substitute"
+      },
+      "user_turn": "Start anyway; add tests in the PR.",
+      "expected": {
+        "presentation": "identify missing runner required for meaningful implementation tests; tests to add cannot supply the unavailable runtime by assertion",
+        "tracker_effects": [
+          "no factory label"
+        ]
+      },
+      "forbidden": [
+        "treat every missing capability as a nonblocking external warning",
+        "invent supported runner",
+        "use trivial mocks instead of required transform behavior"
       ]
     }
   ]

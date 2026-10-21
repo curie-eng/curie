@@ -93,20 +93,25 @@ Inspect the repository's actual sandbox image/setup, test instructions and CI
 configuration, plus trusted factory configuration when available. A command
 working on the developer's computer does not establish sandbox support.
 
-Record the observable pass/fail result, concrete verification command or proposed
-test, execution environment, required capabilities and evidence for each criterion.
-Classify its route as **sandbox-verifiable**, **CI-verifiable**, **needs external
-verification** or **unknown**. CI counts only when evidence shows the factory can
-use that check and observe its result. Keep route feasibility separate from
-whether the future implementation passes and from deployment readiness.
+Draft acceptance criteria around behavior that existing tests or tests added during
+implementation can verify. For missing coverage, specify the regression/integration
+test to add, meaningful pass/fail assertions, runner and supported fixtures. Tests
+need not exist or pass at preparation time. Do not require deployment introspection
+when repository setup and documented factory tooling establish a feasible route.
 
-For an external or unknown route, explain the specific missing capability and ask
-about an equivalent supported test, a prerequisite environment change, or a
-separately owned external verification step. Never silently drop an outcome or
-replace a real integration requirement with a mock. Any weaker requirement needs
-explicit developer review. Show these gaps in the complete specification review.
-Drafting and approved publish-only remain available, but do not offer or perform
-factory selection for an issue while any criterion lacks a supported route.
+Separate unavailable live-service checks, credentials, hardware or human judgment
+from the proposed implementation acceptance. Flag these external qualification
+steps visibly in the issue's Out of scope section, with their impact, proposed
+owner and what remains unproved. Preserve the original request in a coverage map
+and explicitly present this boundary for developer approval in the full-spec
+review; approval can cover the whole boundary without another question round.
+Never silently replace a required live outcome with a mocked assertion.
+
+A developer-approved external qualification step does not block factory selection
+when the agreed implementation has meaningful automated verification. Block only
+when an unresolved decision or missing capability prevents testing the agreed
+implementation itself, or the developer retains an unsupported check as mandatory
+acceptance. Assigning an owner or moving text cannot resolve such a core gap.
 
 ## Choose the deliverable
 
@@ -146,8 +151,10 @@ unanswered behavioral choice stays unresolved; do not offer to publish it as fin
 After intent approval, ask whether to **publish only**, **publish and start the
 factory**, or **keep local drafts**. Name the repository, create/update actions
 and exact issues to select, and explain that adding the configured factory label
-can start implementation. Offer publish-and-start only for issues that pass the
-verification feasibility check; otherwise explain the blocking criteria and offer
+can start implementation. Offer publish-and-start when the agreed implementation
+has feasible automated tests, including tests to add;
+flagged and approved external qualification does not block it. For core verification
+gaps, explain the blocking criteria and offer
 publish-only or local drafts. Review approval alone is not permission to publish or
 select. An explicit choice covering publication and selection authorizes both;
 do not ask again between those steps unless content, destination, selected issues

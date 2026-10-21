@@ -39,11 +39,17 @@ CI verification requires evidence that the factory can use the named check and
 observe its result. Proposed tests are allowed when their runner and prerequisites
 are supported; they need not pass before the feature is implemented.
 
+Missing coverage becomes explicit acceptance requiring tests to be added in the
+implementation PR, with meaningful assertions, runner and supported fixtures.
+Preparation does not require the future regression test to exist or pass already.
+Flag unavailable external qualification in the published Out of scope section,
+preserving the original outcome, what tests cannot prove, missing capability and
+proposed owner. Present that boundary for approval with the full specification.
+Approved external qualification outside the agreed implementation acceptance does
+not block factory tagging. Missing capabilities required to test that implementation
+still do; naming a human owner or silently weakening the tests does not resolve them.
 Drafts and publish-only issues may retain `Runs in: external:<owner/environment>`
-or `Runs in: unknown` with the missing capabilities explicit in Preconditions.
-They cannot be selected for the factory until all criteria have supported sandbox
-or CI routes. Moving an outcome or weakening a live test to a mock requires explicit
-developer review. Naming a human owner does not resolve the original issue's gap.
+or `Runs in: unknown` when the developer keeps unsupported checks in acceptance.
 
 The packaged skill [reference](../../examples/dark-factory/preparation/skills/prepare-factory-ticket/references/specification.md)
 contains the full authoring and publication workflow. Verification commands in a

@@ -18,8 +18,10 @@ publication with factory selection, or keeping local drafts. Approved publicatio
 uses the host agent's existing authenticated tracker tools; the skill verifies
 published content before applying the confirmed factory label to eligible issues.
 Before review it assesses every criterion's verification route against repository
-sandbox and factory evidence. Unsupported or unknown routes remain visible and
-block selection, while approved publish-only remains available. Host-only test
+sandbox and factory evidence. Missing coverage becomes tests to add in the PR.
+External qualification is flagged in the published issue and does not block selection
+after approval of the testable implementation scope. Only gaps preventing meaningful
+verification of that scope remain blockers; publish-only stays available. Host-only test
 success and the existence of a CI workflow do not establish factory support.
 No tracker connection is needed for drafting or installation. Readiness remains
 unvalidated. Connected validation and validated handoff remain #4488 and #4490.
