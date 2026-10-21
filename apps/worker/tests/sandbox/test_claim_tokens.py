@@ -15,6 +15,7 @@ tests green while it lands on the claim in plain text.
 from __future__ import annotations
 
 import copy
+import json
 from typing import Any
 
 import pytest
@@ -22,12 +23,13 @@ from aci_protocol import BootEnv
 from curie_worker.sandbox.claim_tokens import (
     CLAIM_LABEL,
     CLAIM_TOKEN_ENVS,
+    DOCKER_CERT_DIR,
     claim_object_names,
     claim_template_spec,
     split_claim_tokens,
 )
 from curie_worker.sandbox.resources import resources_object_name
-from curie_worker.sandbox.types import SubstrateConfig
+from curie_worker.sandbox.types import SubstrateConfig, ToolDaemonMount
 
 _OVERRIDE: dict[str, Any] = {
     "requests": {"cpu": "500m", "memory": "1Gi", "ephemeral-storage": "1Gi"},
@@ -424,3 +426,136 @@ def test_claim_object_names_accept_the_longest_claim_that_fits() -> None:
 def test_claim_object_names_refuse_an_over_long_claim() -> None:
     with pytest.raises(ValueError):
         claim_object_names("c" * 49)
+
+
+# -- 7. the Docker daemon client mount (ADR 0217) -------------------------------
+
+_DOCKER_CLAIM = "curie-thread-0123456789-abc123"
+_DOCKER_FILES = ("ca.pem", "cert.pem", "key.pem")
+
+
+def _mount(lifetime: int = 86400) -> ToolDaemonMount:
+    host = f"{_DOCKER_CLAIM}.acme-docker.svc"
+    return ToolDaemonMount(
+        # Placeholders: the template must never carry file content at all.
+        files={name: f"placeholder-{name}" for name in _DOCKER_FILES},
+        env={
+            "DOCKER_HOST": f"tcp://{host}:2376",
+            "DOCKER_PUBLISHED_HOST": host,
+            "DOCKER_TLS_VERIFY": "1",
+            "DOCKER_CERT_PATH": DOCKER_CERT_DIR,
+        },
+        active_deadline_seconds=lifetime,
+    )
+
+
+def _docker_spec(source: dict[str, Any], mount: ToolDaemonMount | None) -> dict[str, Any]:
+    return claim_template_spec(
+        source,
+        secret_name=f"{_DOCKER_CLAIM}-tokens",
+        token_names=[BootEnv.env_key("runner_token")],
+        runner_resources=None,
+        claim=_DOCKER_CLAIM,
+        tool_daemon=mount,
+    )
+
+
+def _source_with_sidecar() -> dict[str, Any]:
+    """The chart spec plus an existing pod volume and a second main container."""
+
+    source = _chart_spec()
+    pod = source["podTemplate"]["spec"]
+    pod["volumes"] = [{"name": "bundles", "emptyDir": {"sizeLimit": "2Gi"}}]
+    _runner(source)["volumeMounts"] = [{"name": "bundles", "mountPath": "/bundles"}]
+    # A warm-pod placeholder of a Docker key is replaced, never duplicated.
+    _runner(source)["env"].append({"name": "DOCKER_HOST", "value": "unix:///nowhere"})
+    pod["containers"].append({"name": "log-shipper", "image": "example.com/shipper:dev"})
+    return source
+
+
+def test_docker_cert_dir_is_the_runner_cert_path() -> None:
+    assert DOCKER_CERT_DIR == "/var/run/curie/docker"
+
+
+def test_tool_daemon_mounts_the_client_files_read_only_on_the_runner_only() -> None:
+    source = _source_with_sidecar()
+    pristine = copy.deepcopy(source)
+    mount = _mount()
+
+    spec = _docker_spec(source, mount)
+
+    assert source == pristine, "the source template spec must not be mutated"
+    pod = spec["podTemplate"]["spec"]
+    runner = _runner(spec)
+    (cert_mount,) = [m for m in runner["volumeMounts"] if m["mountPath"] == DOCKER_CERT_DIR]
+    assert cert_mount["readOnly"] is True
+    # The runner's existing mounts and the pod's existing volumes are kept.
+    assert {"name": "bundles", "mountPath": "/bundles"} in runner["volumeMounts"]
+    assert {"name": "bundles", "emptyDir": {"sizeLimit": "2Gi"}} in pod["volumes"]
+
+    (volume,) = [v for v in pod["volumes"] if v["name"] == cert_mount["name"]]
+    assert set(volume) == {"name", "secret"}
+    secret = volume["secret"]
+    # The per-claim token Secret, and only the three client files from it.
+    assert secret["secretName"] == f"{_DOCKER_CLAIM}-tokens"
+    assert [(item["key"], item["path"]) for item in secret["items"]] == [
+        (name, name) for name in _DOCKER_FILES
+    ]
+    assert not secret.get("optional")
+
+    env = runner["env"]
+    for name, value in mount.env.items():
+        assert [entry for entry in env if entry["name"] == name] == [
+            {"name": name, "value": value}
+        ], name
+    assert _runner(spec)["env"].count({"name": "DOCKER_HOST", "value": "unix:///nowhere"}) == 0
+
+    # Nothing else in the pod sees the files or the Docker env.
+    sidecar = next(c for c in pod["containers"] if c["name"] == "log-shipper")
+    assert sidecar == next(
+        c for c in pristine["podTemplate"]["spec"]["containers"] if c["name"] == "log-shipper"
+    )
+    assert pod["initContainers"] == pristine["podTemplate"]["spec"]["initContainers"]
+    # Placeholder file content never lands in the template: the Secret holds it.
+    rendered = json.dumps(spec)
+    for name in _DOCKER_FILES:
+        assert f"placeholder-{name}" not in rendered
+    assert "-----BEGIN" not in rendered
+
+
+def test_tool_daemon_bounds_the_pod_by_the_absolute_claim_lifetime() -> None:
+    spec = _docker_spec(_chart_spec(), _mount(lifetime=4321))
+    assert spec["podTemplate"]["spec"]["activeDeadlineSeconds"] == 4321
+
+
+def test_without_a_tool_daemon_the_spec_is_unchanged() -> None:
+    source = _source_with_sidecar()
+    plain = claim_template_spec(
+        copy.deepcopy(source),
+        secret_name=f"{_DOCKER_CLAIM}-tokens",
+        token_names=[BootEnv.env_key("runner_token")],
+        runner_resources=None,
+        claim=_DOCKER_CLAIM,
+    )
+
+    assert _docker_spec(copy.deepcopy(source), None) == plain
+    pod = plain["podTemplate"]["spec"]
+    assert "activeDeadlineSeconds" not in pod
+    assert [v["name"] for v in pod["volumes"]] == ["bundles"]
+    assert all(m["mountPath"] != DOCKER_CERT_DIR for m in _runner(plain)["volumeMounts"])
+    # The source's own placeholder is left exactly as the chart rendered it.
+    assert {"name": "DOCKER_HOST", "value": "unix:///nowhere"} in _runner(plain)["env"]
+    assert not any(
+        entry["name"] in {"DOCKER_PUBLISHED_HOST", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH"}
+        for entry in _runner(plain)["env"]
+    )
+
+
+def test_tool_daemon_mount_on_a_runner_with_no_mounts_or_volumes() -> None:
+    source = _chart_spec()
+    spec = _docker_spec(source, _mount())
+    runner = _runner(spec)
+    (cert_mount,) = runner["volumeMounts"]
+    assert cert_mount["mountPath"] == DOCKER_CERT_DIR and cert_mount["readOnly"] is True
+    (volume,) = spec["podTemplate"]["spec"]["volumes"]
+    assert volume["name"] == cert_mount["name"]

@@ -21,6 +21,7 @@ must NOT appear unnamed, for two separate reasons:
 from __future__ import annotations
 
 import importlib
+import time
 from typing import Any
 
 import pytest
@@ -73,6 +74,7 @@ def test_the_attachment_reference_targets_only_the_attachment_init_container() -
             "CURIE_BUDGET": "{}",
             attachments_ref_env: ATTACHMENT_REF_VALUE,
         },
+        deadline=time.monotonic() + 300,
     )
     entries = api.created[0]["spec"]["env"]
 
@@ -111,7 +113,10 @@ def test_a_claim_with_no_attachments_emits_no_named_attachment_env() -> None:
 
     api = _FakeApi()
     _client(api).create_claim(
-        "claim-plain", pool="pool", env={"CURIE_BUDGET": "{}", "CURIE_SESSION_ID": "s"}
+        "claim-plain",
+        pool="pool",
+        env={"CURIE_BUDGET": "{}", "CURIE_SESSION_ID": "s"},
+        deadline=time.monotonic() + 300,
     )
     entries = api.created[0]["spec"]["env"]
 

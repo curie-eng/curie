@@ -10,13 +10,22 @@ client is exercised by the env-gated k8scratch e2e in ``test_e2e_k8scratch.py``.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import copy
 import json
 import os
+import socket
+import ssl
+import tempfile
+import threading
+import time
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 import pytest
 import redis
@@ -27,18 +36,43 @@ from curie_test_support.valkey import (
     connect_or_skip,
 )
 from curie_worker.sandbox import (
+    MANAGED_BY_LABEL,
+    MANAGED_BY_VALUE,
     AffinityStore,
     ClaimView,
     QuotaRejection,
     SandboxView,
     SubstrateConfig,
 )
+from curie_worker.sandbox.claim_tokens import CLAIM_LABEL
 from curie_worker.sandbox.docker import DockerError, DockerSandboxClient
-from curie_worker.sandbox.types import SandboxTermination
+from curie_worker.sandbox.types import ClaimTimeoutError, SandboxError, SandboxTermination
 from redis.asyncio import Redis as AsyncRedis
 from redis.asyncio.retry import Retry as AsyncRetry
 from redis.backoff import NoBackoff
 from redis.maint_notifications import MaintNotificationsConfig
+
+if TYPE_CHECKING:
+    from curie_worker.sandbox.types import (
+        DaemonObjectKind,
+        DaemonObjectView,
+        ListableDaemonKind,
+        ToolDaemonMount,
+    )
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    """The live tool-daemon e2e's target (test_e2e_tool_daemon.py, ADR 0217).
+
+    Read only when ``CURIE_SANDBOX_E2E=1``; every value comes from the caller.
+    """
+
+    group = parser.getgroup("curie-sandbox-e2e")
+    for name in ("--context", "--namespace", "--daemon-namespace", "--release"):
+        group.addoption(name, default=None)
+    group.addoption("--candidate", default=None)
+    group.addoption("--work-dir", default=None)
+    group.addoption("--check-failure-cleanup", action="store_true", default=False)
 
 
 def pytest_ignore_collect(collection_path: Path, config: pytest.Config) -> bool:
@@ -401,6 +435,125 @@ class FakeClaim:
     ready_message: str | None = None
     # The executor claim's header set (ACTION-EXECUTOR-5); None is an ordinary claim.
     executor_secret_names: frozenset[str] | None = None
+    # What a Docker-enabled claim's runner was handed (ADR 0217), else None.
+    tool_daemon: ToolDaemonMount | None = None
+    # The absolute time.monotonic() deadline create_claim was bounded by.
+    deadline: float | None = None
+
+
+class Op(NamedTuple):
+    """One recorded client call, in order (``FakeSandboxClient.ops``).
+
+    ``verb`` is ``create_claim`` / ``delete_claim`` for claims, and ``create``,
+    ``list``, ``delete``, ``get`` or ``stream`` for the daemon seam. ``target``
+    is the object name, or the label selector for ``list``. ``detail`` is the
+    uid a ``delete`` was fenced by, or the timeout a ``stream`` was bounded by.
+    """
+
+    verb: str
+    namespace: str
+    kind: str
+    target: str
+    detail: object = None
+
+
+DAEMON_VERBS = frozenset({"create", "list", "delete", "get", "stream"})
+
+
+@dataclass
+class FakeDaemonObject:
+    """One object the fake daemon namespace stores, as the API server would."""
+
+    namespace: str
+    kind: str
+    name: str
+    uid: str
+    manifest: dict[str, Any]
+    created_at: datetime | None
+    # Pod only: ``status.phase``.
+    phase: str | None = None
+
+    @property
+    def labels(self) -> dict[str, str]:
+        return dict((self.manifest.get("metadata") or {}).get("labels") or {})
+
+
+def label_selector_matches(labels: Mapping[str, str], selector: str) -> bool:
+    """Equality (``k=v``) and existence (``k``) terms, comma-joined, as kube does."""
+
+    for term in filter(None, selector.split(",")):
+        key, sep, value = term.partition("=")
+        if sep:
+            if labels.get(key) != value:
+                return False
+        elif key not in labels:
+            return False
+    return True
+
+
+def _http_response(status: int, body: bytes, *, chunked: bool = False) -> bytes:
+    reason = {200: "OK", 404: "Not Found", 503: "Service Unavailable"}[status]
+    if not chunked:
+        head = f"HTTP/1.1 {status} {reason}\r\nContent-Length: {len(body)}\r\n"
+        return (head + "Content-Type: text/plain\r\nConnection: close\r\n\r\n").encode() + body
+    middle = len(body) // 2
+    chunks = b"".join(
+        f"{len(part):x}\r\n".encode() + part + b"\r\n" for part in (body[:middle], body[middle:])
+    )
+    head = f"HTTP/1.1 {status} {reason}\r\nTransfer-Encoding: chunked\r\n"
+    return (head + "Content-Type: application/json\r\nConnection: close\r\n\r\n").encode() + (
+        chunks + b"0\r\n\r\n"
+    )
+
+
+def _serve_daemon_tls(
+    raw: socket.socket, files: Mapping[str, str], *, daemon_id: str, name: str, refused: bool
+) -> None:
+    """Serve one connection the way dockerd ``--tlsverify`` does.
+
+    Real TLS with the server files of the daemon's Secret, and the client must
+    present a certificate chaining to that Secret's ``ca.pem`` (CERT_REQUIRED),
+    so a claim's own credential is accepted and any other claim's is refused.
+    """
+
+    try:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        with tempfile.TemporaryDirectory() as tmp:
+            cert = Path(tmp, "server-cert.pem")
+            key = Path(tmp, "server-key.pem")
+            cert.write_text(files["server-cert.pem"])
+            key.write_text(files["server-key.pem"])
+            context.load_cert_chain(cert, key)
+        context.verify_mode = ssl.CERT_REQUIRED
+        context.verify_flags |= ssl.VERIFY_X509_STRICT
+        context.load_verify_locations(cadata=files["ca.pem"])
+        raw.settimeout(10.0)
+        with context.wrap_socket(raw, server_side=True) as tls:
+            request = b""
+            while b"\r\n\r\n" not in request:
+                chunk = tls.recv(4096)
+                if not chunk:
+                    return
+                request += chunk
+            path = request.split(b" ", 2)[1].decode()
+            if refused:
+                tls.sendall(_http_response(503, b"daemon is not serving"))
+            elif path == "/_ping":
+                tls.sendall(_http_response(200, b"OK"))
+            elif path == "/info":
+                info = json.dumps({"ID": daemon_id, "Name": name}).encode()
+                tls.sendall(_http_response(200, info, chunked=True))
+            else:
+                tls.sendall(_http_response(404, b"page not found"))
+            # Connection: close, as dockerd ends it: close_notify, then EOF.
+            with contextlib.suppress(OSError, ValueError):
+                tls.unwrap().close()
+    except (OSError, ValueError, KeyError):
+        # ssl.SSLError is an OSError: a refused client certificate ends here.
+        pass
+    finally:
+        raw.close()
 
 
 @dataclass
@@ -443,17 +596,302 @@ class FakeSandboxClient:
     template_reaps: list[tuple[set[str], datetime]] = field(default_factory=list)
     template_reap_error: BaseException | None = None
 
+    # -- claim creation shape (ADR 0217 lifecycle tests) -----------------------
+    # Every claim and daemon call, in order; ``daemon_calls`` is the daemon part.
+    ops: list[Op] = field(default_factory=list)
+    # How long a successful create_claim takes, so a test can spend the budget.
+    claim_create_delay_seconds: float = 0.0
+    # create_claim raises this before persisting anything.
+    create_claim_error: BaseException | None = None
+    # create_claim persists the claim, then raises this (an ambiguous create:
+    # the API server stored it but the response was lost to a timeout).
+    create_claim_persist_error: BaseException | None = None
+
+    # -- tool daemon model (ADR 0217) ------------------------------------------
+    # The daemon namespace's objects, keyed (namespace, kind, name).
+    daemon_objects: dict[tuple[str, str, str], FakeDaemonObject] = field(default_factory=dict)
+    # (verb, kind) -> raised by that daemon call, after it is recorded.
+    daemon_failures: dict[tuple[str, str], BaseException] = field(default_factory=dict)
+    # status.phase every newly created daemon Pod reports.
+    daemon_phase: str = "Running"
+    # How many next streams are refused as dockerd still starting up would be.
+    daemon_unready_streams: int = 0
+    # Pods whose dockerd answers every request with 503.
+    refused_pods: set[str] = field(default_factory=set)
+    # Pod name -> raised by a port-forward stream to it.
+    stream_failures: dict[str, BaseException] = field(default_factory=dict)
+    # (kind, name) replaced by another actor right after every list sees it:
+    # the stored object gets a new uid, so a uid-fenced delete must miss it.
+    replace_after_list: set[tuple[str, str]] = field(default_factory=set)
+    # How long each successful daemon create takes.
+    daemon_op_delay_seconds: float = 0.0
+    daemon_request_timeouts: list[float] = field(default_factory=list)
+
+    @property
+    def daemon_calls(self) -> list[Op]:
+        return [op for op in self.ops if op.verb in DAEMON_VERBS]
+
+    def daemon_objects_of(self, claim: str) -> dict[str, FakeDaemonObject]:
+        """The stored daemon objects named for ``claim``, by kind."""
+
+        return {obj.kind: obj for obj in self.daemon_objects.values() if obj.name == claim}
+
+    def seed_daemon(
+        self,
+        namespace: str,
+        claim: str,
+        *,
+        port: int,
+        server_files: Mapping[str, str] | None = None,
+        created_at: datetime | None = None,
+        ageless: bool = False,
+        labels: Mapping[str, str] | None = None,
+        kinds: tuple[str, ...] = ("NetworkPolicy", "Service", "Pod", "Secret"),
+    ) -> dict[str, FakeDaemonObject]:
+        """Store a daemon object set as a worker that crashed (or another one) left it.
+
+        ``created_at`` defaults to now; ``ageless`` stores objects whose age the
+        API cannot report. ``labels`` replaces the default claim, managed-by and
+        chart selector labels (instance ``t``). The Secret is owned by the Pod's uid.
+        """
+
+        object_labels = (
+            dict(labels)
+            if labels is not None
+            else {
+                CLAIM_LABEL: claim,
+                MANAGED_BY_LABEL: MANAGED_BY_VALUE,
+                "app.kubernetes.io/name": "curie",
+                "app.kubernetes.io/instance": "t",
+                "app.kubernetes.io/component": "docker-daemon",
+            }
+        )
+        seeded: dict[str, FakeDaemonObject] = {}
+        for kind in kinds:
+            manifest: dict[str, Any] = {
+                "apiVersion": "networking.k8s.io/v1" if kind == "NetworkPolicy" else "v1",
+                "kind": kind,
+                "metadata": {"name": claim, "namespace": namespace, "labels": dict(object_labels)},
+            }
+            if kind == "Pod":
+                manifest["spec"] = {
+                    "containers": [
+                        {"name": "dockerd", "ports": [{"containerPort": port, "protocol": "TCP"}]}
+                    ],
+                    "volumes": [{"name": "certs", "secret": {"secretName": claim}}],
+                }
+            if kind == "Secret":
+                manifest["type"] = "Opaque"
+                manifest["stringData"] = dict(server_files or {})
+                pod = seeded.get("Pod")
+                if pod is not None:
+                    manifest["metadata"]["ownerReferences"] = [
+                        {"apiVersion": "v1", "kind": "Pod", "name": claim, "uid": pod.uid}
+                    ]
+            seeded[kind] = self.daemon_objects[(namespace, kind, claim)] = FakeDaemonObject(
+                namespace=namespace,
+                kind=kind,
+                name=claim,
+                uid=str(uuid.uuid4()),
+                manifest=manifest,
+                created_at=None if ageless else (created_at or datetime.now(UTC)),
+                phase=self.daemon_phase if kind == "Pod" else None,
+            )
+        return seeded
+
+    def _daemon_call(
+        self,
+        verb: str,
+        namespace: str,
+        kind: str,
+        target: str,
+        timeout: float,
+        detail: object = None,
+    ) -> None:
+        assert timeout > 0, f"{verb} {kind} {target} was not bounded"
+        self.daemon_request_timeouts.append(timeout)
+        self.ops.append(Op(verb, namespace, kind, target, detail))
+        error = self.daemon_failures.get((verb, kind))
+        if error is not None:
+            raise error
+
+    def create_daemon_object(
+        self,
+        namespace: str,
+        manifest: Mapping[str, Any],
+        *,
+        request_timeout_seconds: float,
+    ) -> str:
+        from curie_worker.sandbox.types import ClaimNameConflict
+
+        kind = str(manifest["kind"])
+        name = str(manifest["metadata"]["name"])
+        assert kind in {"Pod", "Service", "NetworkPolicy", "Secret"}, kind
+        assert manifest["metadata"].get("namespace") in (None, namespace)
+        index = len(self.ops)
+        self._daemon_call("create", namespace, kind, name, request_timeout_seconds)
+        if self.daemon_op_delay_seconds:
+            time.sleep(self.daemon_op_delay_seconds)
+        if (namespace, kind, name) in self.daemon_objects:
+            # The API server's 409 AlreadyExists.
+            raise ClaimNameConflict(f"{kind} {name} already exists in {namespace}")
+        uid = str(uuid.uuid4())
+        self.daemon_objects[(namespace, kind, name)] = FakeDaemonObject(
+            namespace=namespace,
+            kind=kind,
+            name=name,
+            uid=uid,
+            manifest=copy.deepcopy(dict(manifest)),
+            created_at=datetime.now(UTC),
+            phase=self.daemon_phase if kind == "Pod" else None,
+        )
+        # A successful create's op carries the uid the API server returned.
+        self.ops[index] = self.ops[index]._replace(detail=uid)
+        return uid
+
+    def _daemon_view(self, obj: FakeDaemonObject) -> DaemonObjectView:
+        from curie_worker.sandbox.types import DaemonObjectView
+
+        return DaemonObjectView(
+            kind=cast("DaemonObjectKind", obj.kind),
+            name=obj.name,
+            uid=obj.uid,
+            claim=obj.labels.get(CLAIM_LABEL),
+            created_at=obj.created_at,
+            phase=obj.phase,
+        )
+
+    def list_daemon_objects(
+        self,
+        namespace: str,
+        kind: ListableDaemonKind,
+        *,
+        label_selector: str,
+        request_timeout_seconds: float,
+    ) -> list[DaemonObjectView]:
+        # The worker Role may create and delete daemon Secrets, never list them.
+        assert kind in {"Pod", "Service", "NetworkPolicy"}, kind
+        self._daemon_call("list", namespace, kind, label_selector, request_timeout_seconds)
+        found = [
+            obj
+            for (ns, stored_kind, _name), obj in self.daemon_objects.items()
+            if ns == namespace
+            and stored_kind == kind
+            and label_selector_matches(obj.labels, label_selector)
+        ]
+        views = [self._daemon_view(obj) for obj in found]
+        for obj in found:
+            if (kind, obj.name) in self.replace_after_list:
+                obj.uid = str(uuid.uuid4())
+        return views
+
+    def delete_daemon_object(
+        self,
+        namespace: str,
+        kind: DaemonObjectKind,
+        name: str,
+        *,
+        uid: str,
+        request_timeout_seconds: float,
+    ) -> None:
+        assert uid, "every daemon delete is fenced by the uid it means"
+        self._daemon_call("delete", namespace, kind, name, request_timeout_seconds, uid)
+        stored = self.daemon_objects.get((namespace, kind, name))
+        if stored is None or stored.uid != uid:
+            # Absent, or replaced since it was observed: not ours, nothing to do.
+            return
+        del self.daemon_objects[(namespace, kind, name)]
+        if kind == "Pod":
+            # Garbage collection: Secrets owned by this Pod's uid go with it.
+            for key, obj in list(self.daemon_objects.items()):
+                refs = (obj.manifest.get("metadata") or {}).get("ownerReferences") or []
+                if obj.namespace == namespace and any(ref.get("uid") == uid for ref in refs):
+                    del self.daemon_objects[key]
+
+    def get_daemon_pod(
+        self, namespace: str, name: str, *, request_timeout_seconds: float
+    ) -> DaemonObjectView | None:
+        self._daemon_call("get", namespace, "Pod", name, request_timeout_seconds)
+        stored = self.daemon_objects.get((namespace, "Pod", name))
+        return None if stored is None else self._daemon_view(stored)
+
+    def open_daemon_stream(
+        self, namespace: str, pod: str, port: int, *, timeout_seconds: float
+    ) -> AbstractContextManager[socket.socket]:
+        self._daemon_call("stream", namespace, "Pod", pod, timeout_seconds, timeout_seconds)
+        failure = self.stream_failures.get(pod)
+        if failure is not None:
+            raise failure
+        if self.daemon_unready_streams > 0:
+            self.daemon_unready_streams -= 1
+            raise SandboxError("port-forward: connection refused (dockerd starting)")
+        stored = self.daemon_objects.get((namespace, "Pod", pod))
+        if stored is None:
+            raise SandboxError(f"port-forward: pod {pod} not found")
+        if stored.phase != "Running":
+            raise SandboxError(f"port-forward: pod {pod} is {stored.phase}")
+        spec = stored.manifest.get("spec") or {}
+        ports = {
+            entry.get("containerPort")
+            for container in spec.get("containers") or []
+            for entry in container.get("ports") or []
+        }
+        if port not in ports:
+            raise SandboxError(f"port-forward: nothing listens on {pod}:{port}")
+        secret_names = [
+            str(volume["secret"]["secretName"])
+            for volume in spec.get("volumes") or []
+            if (volume.get("secret") or {}).get("secretName")
+        ]
+        secret = next(
+            (
+                self.daemon_objects[(namespace, "Secret", secret_name)]
+                for secret_name in secret_names
+                if (namespace, "Secret", secret_name) in self.daemon_objects
+            ),
+            None,
+        )
+        if secret is None:
+            # The kubelet never starts a container whose Secret volume is missing.
+            raise SandboxError(f"port-forward: pod {pod} has no certificate Secret mounted")
+        client_end, server_end = socket.socketpair()
+        threading.Thread(
+            target=_serve_daemon_tls,
+            args=(server_end, dict(secret.manifest.get("stringData") or {})),
+            kwargs={
+                "daemon_id": f"FAKE:{stored.uid}",
+                "name": pod,
+                "refused": pod in self.refused_pods,
+            },
+            daemon=True,
+        ).start()
+        return contextlib.closing(client_end)
+
     def create_claim(
         self,
         name: str,
         *,
         pool: str,
+        deadline: float,
         env: dict[str, str] | None = None,
         labels: dict[str, str] | None = None,
         runner_resources: dict[str, object] | None = None,
         agent_name: str | None = None,
         executor_secret_names: frozenset[str] | None = None,
+        tool_daemon: ToolDaemonMount | None = None,
     ) -> None:
+        from curie_worker.sandbox.types import ClaimNameConflict
+
+        self.ops.append(Op("create_claim", self.namespace, "SandboxClaim", name, deadline))
+        if time.monotonic() >= deadline:
+            raise ClaimTimeoutError(f"claim {name}: the shared claim deadline already passed")
+        if self.claim_create_delay_seconds:
+            time.sleep(self.claim_create_delay_seconds)
+        if self.create_claim_error is not None:
+            raise self.create_claim_error
+        if name in self.claims:
+            # The API server's 409 AlreadyExists: the name belongs to another claim.
+            raise ClaimNameConflict(f"claim {name} already exists")
         sandbox_name = f"sbx-{name}"
         self.claims[name] = FakeClaim(
             name=name,
@@ -467,12 +905,16 @@ class FakeSandboxClient:
             ready_reason=self.ready_reason,
             ready_message=self.ready_message,
             executor_secret_names=executor_secret_names,
+            tool_daemon=tool_daemon,
+            deadline=deadline,
         )
         self.sandboxes[sandbox_name] = FakeSandbox(
             name=sandbox_name,
             service_fqdn=f"{sandbox_name}.{self.namespace}.svc.cluster.local",
         )
         self.created.append(name)
+        if self.create_claim_persist_error is not None:
+            raise self.create_claim_persist_error
 
     def get_claim(self, name: str, *, request_timeout_seconds: float) -> ClaimView | None:
         assert request_timeout_seconds > 0
@@ -493,6 +935,7 @@ class FakeSandboxClient:
 
     def delete_claim(self, name: str, *, request_timeout_seconds: float) -> None:
         assert request_timeout_seconds > 0
+        self.ops.append(Op("delete_claim", self.namespace, "SandboxClaim", name))
         claim = self.claims.pop(name, None)
         if claim is not None:
             self.sandboxes.pop(claim.sandbox_name, None)
