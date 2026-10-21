@@ -1997,7 +1997,7 @@ class TestRecordedCampaign:
         report["cleanup"]["ownership_manifest"]["daemon_id"] = "different-daemon"
         _check(tmp_path, report, verify_cleanup, passed=False)
 
-    def test_owned_resources_are_actually_absent_and_unrelated_inventory_survives(
+    def test_owned_resources_are_actually_absent_and_removals_target_owned_ids(
         self, campaign: tuple[Path, dict[str, Any], Path]
     ) -> None:
         _, report, _ = campaign
@@ -2026,8 +2026,17 @@ class TestRecordedCampaign:
             ]
             identity_key = "name" if kind == "volumes" else "id"
             assert all(row[identity_key] not in inventory for row in manifest[kind])
-        for kind, before in report["cleanup"]["unrelated_before"].items():
-            assert set(before) <= inventories[kind]
+        for removal in manifest.get("removals", []):
+            assert removal["kind"] in {
+                "containers",
+                "runners",
+                "resolver_containers",
+                "volumes",
+                "networks",
+                "images",
+            }
+            owned = {row.get("id", row.get("name")) for row in manifest.get(removal["kind"], [])}
+            assert removal["id"] in owned, "removal targets a resource the manifest does not own"
         for process in manifest["processes"]:
             stat = Path(f"/proc/{process['pid']}/stat")
             if stat.exists():

@@ -1127,3 +1127,112 @@ def test_append_log_entries_cannot_substitute_for_canonical_facts():
     assert snapshot.facts == ()
     assert diff_state(_snapshot(), snapshot) == ()
     assert snapshot.available == DURABLE
+
+
+# The three row shapes below were recorded from a live learning-eval run against the pinned CLI
+# and anonymized. They differ from the fixture text only in Markdown marks, a trailing period,
+# and extra prompt wording around the token.
+REAL_SKILL_BODY = (
+    "1. Read the three input words in their given order.\n"
+    "2. Place the third word first, the first word second, and the second word last.\n"
+    "3. Return `rm-db6ac1` followed by those three words, separated by colons."
+)
+REAL_STEPS = [
+    "Read the three input words in their given order.",
+    "Place the third word first, the first word second, and the second word last.",
+    "Return rm-db6ac1 followed by those three words, separated by colons.",
+]
+REAL_FACT = "cabinet-7bb2f8 is violet-153e9e."
+REAL_PROMPT = (
+    'Post the exact text "tok-7be4bc" as a message in the Slack channel where this '
+    "schedule was created. Post only that text, with no additional commentary."
+)
+
+
+def _real_schedule(**changes):
+    row = {
+        "prompt": REAL_PROMPT,
+        "cron": "40 9 * * 1-5",
+        "run_at": None,
+        "created_by": "U-curie-message",
+        "destination": {"kind": "slack", "address": "C0EXAMPLE1", "adapter": "default"},
+    }
+    return _schedule(**{**row, **changes})
+
+
+def _real_schedule_check(**changes):
+    value = {
+        "state": "active",
+        "cron": "40 9 * * 1-5",
+        "run_at": None,
+        "timezone": "Etc/UTC",
+        "prompt": "tok-7be4bc",
+        "created_by": "U-curie-message",
+        **changes,
+    }
+    return _predicate("schedule_matches", LearningClass.SCHEDULE, "schedule-example", value=value)
+
+
+def _steps_check(steps=REAL_STEPS):
+    return _predicate("body_contains_steps", LearningClass.SKILL, "sample-ordering", steps=steps)
+
+
+def _body_score(body, steps=REAL_STEPS):
+    after = _parse(skills=[_skill(body=body)])
+    return _score(_snapshot(), after, _steps_check(steps)).passed
+
+
+def test_real_skill_body_with_markdown_marks_and_list_markers_passes_steps():
+    assert _body_score(REAL_SKILL_BODY) is True
+
+
+def test_real_fact_statement_with_trailing_period_passes_statement_equals():
+    check = _predicate(
+        "statement_equals",
+        LearningClass.MEMORY_FACT,
+        "fact-example",
+        value="cabinet-7bb2f8 is violet-153e9e",
+    )
+    after = _parse(facts=[_fact(statement=REAL_FACT)])
+    assert _score(_snapshot(), after, check).passed is True
+
+
+def test_real_schedule_row_passes_when_prompt_contains_the_token():
+    after = _parse(schedules=[_real_schedule()])
+    assert _score(_snapshot(), after, _real_schedule_check()).passed is True
+
+
+def test_skill_body_missing_a_step_fails():
+    body = "\n".join(REAL_SKILL_BODY.splitlines()[:2])
+    assert _body_score(body) is False
+
+
+def test_skill_body_with_steps_out_of_order_fails():
+    first, second, third = REAL_SKILL_BODY.splitlines()
+    assert _body_score("\n".join([second, first, third])) is False
+
+
+def test_skill_body_with_wrong_marker_fails():
+    assert _body_score(REAL_SKILL_BODY.replace("rm-db6ac1", "rm-000000")) is False
+
+
+def test_fact_statement_with_wrong_value_fails():
+    check = _predicate(
+        "statement_equals",
+        LearningClass.MEMORY_FACT,
+        "fact-example",
+        value="cabinet-7bb2f8 is violet-153e9e",
+    )
+    after = _parse(facts=[_fact(statement="cabinet-7bb2f8 is violet-000000.")])
+    assert _score(_snapshot(), after, check).passed is False
+
+
+def test_schedule_prompt_lacking_the_token_fails():
+    prompt = "Post the exact text as a message in the Slack channel where this was created."
+    after = _parse(schedules=[_real_schedule(prompt=prompt)])
+    assert _score(_snapshot(), after, _real_schedule_check()).passed is False
+
+
+def test_schedule_with_wrong_cron_fails():
+    after = _parse(schedules=[_real_schedule(cron="0 9 * * 1-5")])
+    assert _score(_snapshot(), after, _real_schedule_check()).passed is False
