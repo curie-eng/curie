@@ -917,7 +917,17 @@ class Installation:
         return values
 
     def releases(self) -> list[dict[str, Any]]:
-        listed = json.loads(self.helm("list", "--all", "-o", "json").stdout or "[]")
+        version = self.helm("version", "--template", "{{.Version}}").stdout.strip()
+        major = re.match(r"v([34])\.", version)
+        if major is None:
+            raise InfrastructureError("unsupported Helm release inventory version")
+        # Preserve every status, including pending and retained uninstalled records.
+        # Helm 3 requires --all; Helm 4 includes all statuses by default and
+        # removes that flag. See both authoritative command contracts:
+        # https://helm.sh/docs/v3/helm/helm_list/
+        # https://helm.sh/docs/helm/helm_list/
+        all_statuses = ("--all",) if major[1] == "3" else ()
+        listed = json.loads(self.helm("list", *all_statuses, "-o", "json").stdout or "[]")
         if not isinstance(listed, list):
             raise InfrastructureError("Helm did not return a release list")
         return [entry for entry in listed if isinstance(entry, dict)]
