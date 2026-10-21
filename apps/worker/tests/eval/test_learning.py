@@ -976,10 +976,14 @@ def _summary(rows: list[dict[str, Any]], thresholds: dict[str, Any]) -> dict[str
         else "FAIL",
         "value": falsewrite_rate,
     }
-    gates["correction_duplicates"] = {
-        "status": "PASS" if duplicates <= thresholds["correction_duplicates"] else "FAIL",
-        "value": duplicates,
-    }
+    corrections = [row for row in eligible if row["fixture_id"].startswith("F8-")]
+    if not corrections:
+        gates["correction_duplicates"] = {"status": "NOT_AVAILABLE", "value": None}
+    else:
+        gates["correction_duplicates"] = {
+            "status": "PASS" if duplicates <= thresholds["correction_duplicates"] else "FAIL",
+            "value": duplicates,
+        }
     off_target: dict[str, dict[str, int]] = {}
     for row in excluded:
         for mutation in row["mutations"]:
@@ -1303,9 +1307,28 @@ def test_current_base_keeps_all_24_executions_and_null_global_gates(
     assert len(report["cases"]) == 24
     assert report["metrics"]["gates"]["precision"] == {"status": "NOT_AVAILABLE", "value": None}
     assert report["metrics"]["gates"]["recall"] == {"status": "NOT_AVAILABLE", "value": None}
+    assert report["metrics"]["gates"]["correction_duplicates"] == {
+        "status": "NOT_AVAILABLE",
+        "value": None,
+    }
     assert report["delivery_metrics"]["delivery_rate"] is None
     assert report["metrics"]["distractor"]["evaluated"] == 3
     report["acceptance"] = "PASS"
+    _check(tmp_path, report, passed=False)
+
+
+def test_correction_duplicates_pass_is_rejected_when_no_correction_row_was_evaluated(
+    tmp_path: Path, frozen_report: dict[str, Any]
+) -> None:
+    report = copy.deepcopy(frozen_report)
+    _current_base(report)
+    _check(tmp_path, report, passed=True)
+    assert not any(
+        row["fixture_id"].startswith("F8-") and row["status"] != "NOT_AVAILABLE"
+        for row in report["decisions"]
+    )
+    report["metrics"]["gates"]["correction_duplicates"] = {"status": "PASS", "value": 0}
+    _rehash(report)
     _check(tmp_path, report, passed=False)
 
 
@@ -1942,7 +1965,13 @@ class TestRecordedCampaign:
                 assert invocation["argv"][0] == report["binary"]["path"]
                 thread = invocation["argv"][invocation["argv"].index("--thread") + 1]
                 assert re.fullmatch(r"[0-9]+\.[0-9]{6}", thread)
-                assert row["actor_generation_id"]
+                assert isinstance(row["actor_record_id"], str) and row["actor_record_id"]
+                generation = next(
+                    item for item in report["generations"] if item["id"] == row["actor_record_id"]
+                )
+                assert generation["generation_id"] is None
+                assert generation["identity_basis"] == "configured-route"
+                assert generation["usage"]["source"] == "shared-key-delta"
                 assert row["stub_port"] == report["collector"]["port_b"]
                 assert row["stub_bind_succeeded"] is True
 
