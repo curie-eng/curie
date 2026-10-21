@@ -92,12 +92,20 @@ def termination() -> Any:
     return production().TerminationObservation(POD_UID, CONTAINER, "9", 0, "2026-10-21T00:00:00Z")
 
 
-def test_names_are_deterministic_and_distinct_from_production() -> None:
+def test_names_are_deterministic_and_the_guard_admitted_derivation() -> None:
+    """The measured guard admits only the production mediator's launch names."""
     names = api().object_names(LAUNCH)
     hexid = LAUNCH.replace("-", "")
-    assert names == ("pc-p-" + hexid, "pc-s-" + hexid, "pc-c-" + hexid)
-    assert all(not name.startswith("pl-") for name in names)
+    assert names == ("pl-p-" + hexid, "pl-s-" + hexid, "pl-c-" + hexid)
     assert api().object_names(OTHER_LAUNCH) != names
+    server = Path(importlib.import_module("curie_worker.protected_launch_server").__file__)
+    source = server.read_text(encoding="utf-8")
+    for line in (
+        'pod_name="pl-p-" + suffix',
+        'service_name="pl-s-" + suffix',
+        'secret_name="pl-c-" + suffix',
+    ):
+        assert line in source
 
 
 def test_create_plans_the_deterministic_names_before_any_effect(root: Path) -> None:

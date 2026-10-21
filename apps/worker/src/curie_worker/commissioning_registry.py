@@ -57,12 +57,15 @@ _FILE = "commissioning.sqlite"
 def object_names(launch_id: str) -> tuple[str, str, str]:
     """Deterministic owned Pod, Service and Secret names of one campaign launch.
 
-    The ``pc-`` prefix never collides with the production mediator's ``pl-``
-    names. @spec PROTECTED-COMMISSIONING-8.
+    The derivation is the production mediator's (``pl-p-``, ``pl-s-``,
+    ``pl-c-`` plus the launch UUID hex), because the measured guard admits only
+    those names; the guard is not revised for commissioning. The two never
+    overlap in time: a production launch needs a Qualification, which exists
+    only after the campaign closes. @spec PROTECTED-COMMISSIONING-8.
     """
     _scalar(launch_id, "uuid")
     suffix = UUID(launch_id).hex
-    return "pc-p-" + suffix, "pc-s-" + suffix, "pc-c-" + suffix
+    return "pl-p-" + suffix, "pl-s-" + suffix, "pl-c-" + suffix
 
 
 @_closed_record
