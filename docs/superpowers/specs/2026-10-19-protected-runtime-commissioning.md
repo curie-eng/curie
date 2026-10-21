@@ -62,10 +62,11 @@ to match.
 | Candidate enqueue | Commissioning ingress | Reads permit and journal; submits bounded intents to the campaign lane. | Writes committed admissions, permit, journal, or any production key. |
 | Candidate worker | Commissioning worker | Reads permit, journal and committed admissions; consumes the campaign lane. | Writes control, permit, journal, admission or production lane keys. |
 | Production enqueue, worker, verifier | Production entry points | Unchanged LANE-3 roles from the manifest's `credential_refs`. | Reads or writes any `protected:commissioning:*` key. |
+| ACL observer | Verifier and guard reobservation | Reads broker ACL users with `ACL GETUSER` only, for the check of [design decision 7](#7-acl-principal-state-is-observed-not-hashed). | Writes any ACL user, or reads or writes any key or channel. |
 | Ordinary worker, source, runner | None | No broker authentication. | Everything above. |
 
-All seven broker identities are distinct ACL users with distinct credential
-issuances. No principal holds a wildcard write grant that covers another row's
+All seven broker identities and the ACL observer are distinct ACL users with
+distinct credential issuances. No principal holds a wildcard write grant that covers another row's
 keys. The realizing ACL inventory is measured against the pinned Valkey
 version, including Lua key selectors, as LANE-3 requires. If the pinned version
 cannot separate these rights, the campaign refuses; it does not weaken a role.
@@ -161,7 +162,8 @@ Hash order breaks the cycle between the records:
    bytes or reference to a file whose hash includes B.
 2. Construct guard configuration G containing `sha256(B)`, the admission
    policy, RBAC, network policy and broker ACL rule recipes. G hashes each
-   principal's rules, not its enabled state or password.
+   principal's rules, not its enabled state or password. The ACL principal
+   state check of design decision 7 covers what G excludes.
 3. Construct the final v1 manifest M with
    `guard_identity.config_sha256 = sha256(G)`.
 4. Issue each permit bound to `sha256(B)` and `sha256(M)`. M and permits are
@@ -255,7 +257,8 @@ nothing after it runs.
    references (`ACL WHOAMI`), not by possessing a reference.
 4. The permit parses and `validate_commissioning_binding` accepts it.
 5. The guard revision and primitive measurements re-observed through the ADR
-   0236 channel match the premeasured tuple.
+   0236 channel match the premeasured tuple, and the ACL principal state check
+   of design decision 7 passes.
 6. The journal is `running` and broker `TIME` is below `expires_at_ms`.
 7. The source, generation, policy fingerprint and target are inside the
    permit's scope.
@@ -606,3 +609,45 @@ ADR 0224's "Proposed decision" heading), its `Status:` line decides its
 authority. ADR 0045 makes the status line the mutable part of an immutable ADR,
 and ADR 0085 makes the Accepted status the authority for implementation. This
 specification edits no ADR file and cites each ADR at its current status.
+
+### 7. ACL principal state is observed, not hashed
+
+Decided by the maintainer on 2026-10-20.
+
+The pinned Valkey cannot scope `ACL SETUSER` to named users or to disabling. The
+provisioner keeps `ACL SETUSER` and `CLIENT KILL`, which clause 6 step 2 needs,
+so it could also change a principal's password or re-enable a disabled user.
+G does not hash enabled state or passwords: G is fixed at installation and
+bound into M, while enabled state must change at activation (clause 6 step 2)
+and a credential rotation must not change M. Misuse of this right is therefore
+detected, not prevented.
+
+The administrator-run installation bootstrap, before any campaign, records the
+baseline: for every broker identity in the principals table, the set of
+password hashes and the enabled state. The provisioner never writes this
+reference. Every
+reobservation, meaning each guard call (refusal order step 5) and each
+Readiness issuance, then compares, for each commissioning and production
+principal:
+
+* the password hash set with the value recorded at installation; and
+* the enabled state with the value recorded at installation and with the state
+  expected for the current campaign phase (for example, candidate principals
+  disabled after activation step 2).
+
+Any difference, or an unavailable observation, refuses.
+
+A legitimate credential rotation changes a password hash set. Only the
+administrator-run installation step that recorded the baseline updates it,
+never the provisioner at campaign time. Until the record is updated, every
+guard call and Readiness issuance refuses.
+
+A dedicated ACL observer principal reads this state. Its rules grant only
+`ACL GETUSER`: no `ACL SETUSER`, no other ACL subcommand, no key and no
+channel. It is distinct from the provisioner, so the party being checked never
+reads or reports its own evidence. Its rules are part of G like every other
+principal's.
+
+Residual risk: a change made between two observations is detected at the next
+observation, not prevented. A guard call or Readiness issuance after the change
+refuses.
