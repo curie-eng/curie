@@ -2193,6 +2193,10 @@ struct LiveHost {
     checkpoint_data_present: bool,
     checkpoint_record: Option<serde_json::Value>,
     recovery_plan: Vec<String>,
+    /// Whether Apply was already complete or unnecessary before this
+    /// invocation ran any phase. Set once in `compute_pre_mutation`; unlike
+    /// `apply_is_skipped()`, it does not change when this run completes Apply.
+    apply_skipped_at_start: bool,
 }
 
 /// Ruling 2: Helm SILENTLY IGNORES `--version` for a local directory or
@@ -2409,6 +2413,7 @@ impl LiveHost {
             checkpoint_data_present: false,
             checkpoint_record: None,
             recovery_plan: Vec::new(),
+            apply_skipped_at_start: false,
         })
     }
 
@@ -2885,6 +2890,9 @@ impl LiveHost {
     /// A cold release dry-run keeps only target-dependent checks pending;
     /// retained configuration checks still run.
     fn compute_pre_mutation(&mut self) {
+        // Record, current and known_good are loaded by now and no phase has
+        // run, so this is the state the invocation started from.
+        self.apply_skipped_at_start = self.apply_is_skipped();
         match self.retained_overlay() {
             Ok(Some((overlay, schema_plan))) => {
                 self.overlay = Some(overlay);
@@ -4052,12 +4060,14 @@ impl LiveHost {
             .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
             .unwrap_or(serde_json::Value::Null);
         // When Apply ran in this invocation, the overlay is the admitted
-        // candidate Helm applied. When it was skipped (a resume after a
-        // durable Apply, or a known-good rerun), the overlay merges the
+        // candidate Helm applied. When it was already skipped at the start
+        // of this invocation (a resume after a durable Apply, or a
+        // known-good rerun; judged before any phase so completing Apply
+        // here does not flip it), the overlay merges the
         // operator's values file over the installed values, so a file still
         // carrying an old receipt would replace the one Helm serves. Check
         // the receipts Helm applied instead, and fail closed if unreadable.
-        if self.apply_is_skipped() && !repository_runner_entries(&overlay).is_empty() {
+        if self.apply_skipped_at_start && !repository_runner_entries(&overlay).is_empty() {
             match self.served_user_values() {
                 Ok(served) => overlay = served,
                 Err(error) => {
