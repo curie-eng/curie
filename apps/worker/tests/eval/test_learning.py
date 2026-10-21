@@ -674,8 +674,8 @@ def frozen_report(tmp_path: Path) -> dict[str, Any]:
         "accounting": {
             "budget_usd": "5.00",
             "baseline_usage_usd": "10.00",
-            "end_usage_usd": "10.34",
-            "charged_usd": "0.34",
+            "end_usage_usd": "10.58",
+            "charged_usd": "0.58",
             "unresolved_reservations_usd": "0.00",
             "shutdown_and_inflight_reserve_usd": "0.01",
             "operations": [],
@@ -862,6 +862,43 @@ def frozen_report(tmp_path: Path) -> dict[str, Any]:
                 "status": "settled",
             }
         )
+        # Synthetic test data: one judge generation bound to each recorded semantic PASS.
+        judge_prompt = f"synthetic judge prompt {index}"
+        judge_completion = json.dumps(
+            {"verdict": "PASS", "action": kind, "reason": "Supported.", "evidence_refs": []}
+        )
+        judge_generation_id = f"gen-placeholder-judge-decision-{index}"
+        judge_operation_id = f"judge-operation-{index}"
+        report["generations"].append(
+            {
+                "id": judge_generation_id,
+                "model": JUDGE,
+                "usage": {"prompt_tokens": 10, "completion_tokens": 10},
+                "cost_usd": "0.01",
+                "purpose": "judge",
+                "prompt_sha256": _sha(judge_prompt.encode()),
+                "call_sequence": 100 + index,
+                "completion_sha256": _sha(judge_completion.encode()),
+                "ledger_operation_id": judge_operation_id,
+                **scope,
+            }
+        )
+        report["accounting"]["operations"].append(
+            {
+                "id": judge_operation_id,
+                "generation_id": judge_generation_id,
+                "reserve_usd": "0.02",
+                "settled_usd": "0.01",
+                "status": "settled",
+            }
+        )
+        report["decisions"][-1]["judge_ref"] = {
+            "generation_id": judge_generation_id,
+            "call_sequence": 100 + index,
+            "prompt_sha256": _sha(judge_prompt.encode()),
+            "completion_sha256": _sha(judge_completion.encode()),
+            "completion": judge_completion,
+        }
     _add_controls(report, 1)
     # Wire shapes: https://openrouter.ai/docs/api/reference/overview and
     # https://openrouter.ai/docs/api/api-reference/generations/get-generation
@@ -1068,13 +1105,13 @@ def _duplicate_repetition(report: dict[str, Any], repetition: int = 2) -> None:
         {
             row["id"]: f"r{repetition}-{row['id']}"
             for row in original["generations"]
-            if row["purpose"] == "actor" and row["repetition"] == 1
+            if row["purpose"] in ("actor", "judge") and row["repetition"] == 1
         }
     )
     actor_operations = {
         row["ledger_operation_id"]
         for row in original["generations"]
-        if row["purpose"] == "actor" and row["repetition"] == 1
+        if row["purpose"] in ("actor", "judge") and row["repetition"] == 1
     }
     replacements.update({key: f"r{repetition}-{key}" for key in actor_operations})
 
@@ -1107,7 +1144,7 @@ def _duplicate_repetition(report: dict[str, Any], repetition: int = 2) -> None:
             [
                 row
                 for row in original["generations"]
-                if row["purpose"] == "actor" and row["repetition"] == 1
+                if row["purpose"] in ("actor", "judge") and row["repetition"] == 1
             ]
         )
     )
@@ -1124,7 +1161,7 @@ def _duplicate_repetition(report: dict[str, Any], repetition: int = 2) -> None:
     report["collector"]["delivery_windows"].append(
         {**report["collector"]["delivery_windows"][0], "repetition": repetition}
     )
-    charge = Decimal("0.10") + Decimal("0.24") * repetition
+    charge = Decimal("0.10") + Decimal("0.48") * repetition
     report["accounting"]["end_usage_usd"] = str(Decimal("10.00") + charge)
     report["accounting"]["charged_usd"] = str(charge)
     _derive(report)
@@ -2073,3 +2110,85 @@ class TestRecordedCampaign:
                 assert fields[19] != str(process["start_time_ticks"]), (
                     "owned process is still running"
                 )
+
+
+def test_final_charge_below_the_recorded_campaign_usage_delta_fails(
+    tmp_path: Path, frozen_report: dict[str, Any]
+) -> None:
+    _check(tmp_path, frozen_report, passed=True)
+    report = copy.deepcopy(frozen_report)
+    accounting = report["accounting"]
+    delta = Decimal(accounting["end_usage_usd"]) - Decimal(accounting["baseline_usage_usd"])
+    accounting["charged_usd"] = str(delta - Decimal("0.01"))
+    _rehash(report)
+    _check(tmp_path, report, passed=False)
+
+
+@pytest.mark.parametrize("charge", ["0.00", "0.01", None])
+def test_unresolved_operation_must_stay_charged_at_its_full_reservation(
+    tmp_path: Path, frozen_report: dict[str, Any], charge: str | None
+) -> None:
+    _check(tmp_path, frozen_report, passed=True)
+    report = copy.deepcopy(frozen_report)
+    operation = report["accounting"]["operations"][0]
+    operation.pop("settled_usd", None)
+    operation.update(status="unresolved", reserve_usd="0.05", charged_usd=charge)
+    _rehash(report)
+    _check(tmp_path, report, passed=False)
+
+
+def test_judged_semantic_pass_without_a_matching_judge_generation_binding_fails(
+    tmp_path: Path, frozen_report: dict[str, Any]
+) -> None:
+    _check(tmp_path, frozen_report, passed=True)
+    missing = copy.deepcopy(frozen_report)
+    del missing["decisions"][0]["judge_ref"]
+    _rehash(missing)
+    _check(tmp_path, missing, passed=False)
+    mismatched = copy.deepcopy(frozen_report)
+    mismatched["decisions"][0]["judge_ref"]["completion_sha256"] = _sha(b"another completion")
+    _rehash(mismatched)
+    _check(tmp_path, mismatched, passed=False)
+    wrong_verdict = copy.deepcopy(frozen_report)
+    ref = wrong_verdict["decisions"][0]["judge_ref"]
+    ref["completion"] = json.dumps({"verdict": "FAIL", "action": "skill", "reason": "x"})
+    ref["completion_sha256"] = _sha(ref["completion"].encode())
+    for generation in wrong_verdict["generations"]:
+        if generation["id"] == ref["generation_id"]:
+            generation["completion_sha256"] = ref["completion_sha256"]
+    _rehash(wrong_verdict)
+    _check(tmp_path, wrong_verdict, passed=False)
+
+
+def test_live_campaign_decision_with_predicates_unlike_the_fixture_derived_ones_fails(
+    tmp_path: Path, frozen_report: dict[str, Any]
+) -> None:
+    report = copy.deepcopy(frozen_report)
+    report["data_origin"] = "live-campaign"
+    report["decisions"][0]["admitted_predicates"] = [
+        {"name": "statement_equals", "class": "memory-fact", "target": "invented", "value": "x"}
+    ]
+    _rehash(report)
+    _check(tmp_path, report, passed=False)
+
+
+def test_cli_verify_report_rejects_a_report_whose_data_origin_is_not_live_campaign(
+    tmp_path: Path, frozen_report: dict[str, Any]
+) -> None:
+    assert frozen_report["data_origin"] != "live-campaign"
+    path = _write(tmp_path / "report.json", frozen_report)
+    assert _module_exit(["verify-report", str(path)]) != 0
+
+
+@pytest.mark.parametrize("attempt", ["success", "error", "unmatched"])
+def test_forbidden_persistence_attempt_cannot_be_recorded_as_a_passing_decision(
+    tmp_path: Path, frozen_report: dict[str, Any], attempt: str
+) -> None:
+    _check(tmp_path, frozen_report, passed=True)
+    report = copy.deepcopy(frozen_report)
+    # The F7 distractor fixture forbids persistence attempts.
+    row = next(item for item in report["decisions"] if item["fixture_id"].startswith("F7-"))
+    assert row["status"] == "PASS"
+    row["attempts"] = [{"kind": "memory-fact", "operation": "create", "outcome": attempt}]
+    _rehash(report)
+    _check(tmp_path, report, passed=False)

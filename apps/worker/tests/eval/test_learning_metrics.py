@@ -1236,3 +1236,26 @@ def test_schedule_prompt_lacking_the_token_fails():
 def test_schedule_with_wrong_cron_fails():
     after = _parse(schedules=[_real_schedule(cron="0 9 * * 1-5")])
     assert _score(_snapshot(), after, _real_schedule_check()).passed is False
+
+
+def test_summary_marks_correction_duplicates_not_available_without_an_evaluated_correction():
+    rows = [
+        _result(base, status=CaseStatus.NOT_AVAILABLE, predicted=())
+        if base[1] == "8"
+        else _result(base)
+        for base in CASE_IDS
+    ]
+    gate = _summary(rows)["gates"]["correction_duplicates"]
+    assert gate == {"status": "NOT_AVAILABLE", "value": None}
+
+
+def test_summary_keeps_numeric_correction_duplicates_with_one_evaluated_correction():
+    rows = [
+        _result(base, status=CaseStatus.NOT_AVAILABLE, predicted=())
+        if base[1] == "8" and base != "F8-P1"
+        else _result(base)
+        for base in CASE_IDS
+    ]
+    gate = _summary(rows)["gates"]["correction_duplicates"]
+    assert gate["status"] == "PASS"
+    assert gate["value"] == 0
