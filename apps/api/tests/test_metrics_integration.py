@@ -45,14 +45,19 @@ def _lf_metric(query: dict[str, Any]) -> list[dict[str, Any]]:
     return data
 
 
-# The summary counts agent runs only (traces whose name contains `curie-run:`)
-# and excludes eval traces (#547), so every reference aggregate below applies
-# the same two name filters or the counts diverge on a Langfuse that also holds
-# platform or eval traces.
+# The summary excludes eval traces (#547) from every metric, and counts runs,
+# latency and error rate over agent runs only (traces whose name contains
+# `curie-run:`). Tokens and cost keep the eval exclusion alone. Each reference
+# aggregate below applies the same name filters as the metric it checks, or the
+# numbers diverge on a Langfuse that also holds platform or eval traces.
+def _eval_exclusion(name_col: str) -> dict[str, Any]:
+    return {"column": name_col, "operator": "does not contain", "value": "eval:", "type": "string"}
+
+
 def _run_scope(name_col: str) -> list[dict[str, Any]]:
     return [
         {"column": name_col, "operator": "contains", "value": "curie-run:", "type": "string"},
-        {"column": name_col, "operator": "does not contain", "value": "eval:", "type": "string"},
+        _eval_exclusion(name_col),
     ]
 
 
@@ -175,8 +180,9 @@ def test_summary_matches_langfuse_aggregates(
         {
             "view": "observations",
             "metrics": [{"measure": "totalCost", "aggregation": "sum"}],
-            # Observations key the trace name on traceName.
-            "filters": _run_scope("traceName"),
+            # Cost is not narrowed to run traces, so only the eval exclusion
+            # applies. Observations key the trace name on traceName.
+            "filters": [_eval_exclusion("traceName")],
             "fromTimestamp": start,
             "toTimestamp": end,
         }

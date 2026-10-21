@@ -82,9 +82,9 @@ _EVAL_TRACE_PREFIX = "eval:"
 # The runner names every agent run's trace `curie-run:<session_id>`
 # (runner/src/curie_runner/__main__.py). Langfuse also receives platform traces
 # that are not agent runs (`http.server.request`, `curie.turn.ingress`,
-# `curie.background.*`, `curie.sandbox.cleanup`). Every metric is scoped to the
-# run traces so runs, latency, tokens, cost and error rate all describe the same
-# set of runs, with or without an agent filter.
+# `curie.background.*`, `curie.sandbox.cleanup`). Runs, latency and error rate
+# are scoped to the run traces, with or without an agent filter; tokens and cost
+# are not (see _RUN_SCOPED).
 _AGENT_RUN_TRACE_PREFIX = "curie-run:"
 
 # Which scalar metrics are narrowed to agent-run traces. Runs and latency are
@@ -132,9 +132,9 @@ def _filters(
             {"column": name_col, "operator": "contains", "value": agent, "type": "string"}
         )
     # Drop eval traces from the aggregate (#547). Eval traces are named
-    # `eval:<suite>:<case_id>`, so the run scope above already leaves them out;
-    # the explicit exclusion stays so an eval trace can never be counted even if
-    # an eval name ever carried the run prefix.
+    # `eval:<suite>:<case_id>`. Tokens and cost skip the run scope above, so with
+    # no agent filter this is their only name filter; on the run-scoped queries
+    # it keeps an eval trace out even if an eval name ever carried the run prefix.
     filters.append(
         {
             "column": name_col,
