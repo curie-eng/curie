@@ -17,6 +17,10 @@ The skill presents complete drafts for review, then offers publication only,
 publication with factory selection, or keeping local drafts. Approved publication
 uses the host agent's existing authenticated tracker tools; the skill verifies
 published content before applying the confirmed factory label to eligible issues.
+Before review it assesses every criterion's verification route against repository
+sandbox and factory evidence. Unsupported or unknown routes remain visible and
+block selection, while approved publish-only remains available. Host-only test
+success and the existence of a CI workflow do not establish factory support.
 No tracker connection is needed for drafting or installation. Readiness remains
 unvalidated. Connected validation and validated handoff remain #4488 and #4490.
 See the factory bundle README for rendering and provider-specific installation.

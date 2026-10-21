@@ -27,10 +27,23 @@ Use these seven headings once each, as Markdown h2 or h3:
 
 Keep required sections substantive and outside code examples or comments.
 Number acceptance criteria consecutively from 1. Each criterion includes a
-`Verified by:` field naming an actual command or test and a `Runs in:` field
-naming `sandbox` or `ci:<actual required check name>`. Replace placeholders with
+`Verified by:` field naming an actual command or test. For factory-selectable
+issues, its `Runs in:` field names `sandbox` or `ci:<actual required check name>`. Replace placeholders with
 real checks identified through inspection. Record why a CI check covers the
 criterion; local review cannot certify deployment configuration.
+
+Each criterion also receives a local feasibility assessment: sandbox-verifiable,
+CI-verifiable, needs external verification or unknown. The report records the
+evidence for environment support, not just a command that worked on the host.
+CI verification requires evidence that the factory can use the named check and
+observe its result. Proposed tests are allowed when their runner and prerequisites
+are supported; they need not pass before the feature is implemented.
+
+Drafts and publish-only issues may retain `Runs in: external:<owner/environment>`
+or `Runs in: unknown` with the missing capabilities explicit in Preconditions.
+They cannot be selected for the factory until all criteria have supported sandbox
+or CI routes. Moving an outcome or weakening a live test to a mock requires explicit
+developer review. Naming a human owner does not resolve the original issue's gap.
 
 The packaged skill [reference](../../examples/dark-factory/preparation/skills/prepare-factory-ticket/references/specification.md)
 contains the full authoring and publication workflow. Verification commands in a

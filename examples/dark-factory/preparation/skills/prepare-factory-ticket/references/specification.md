@@ -36,11 +36,68 @@ bold field labels are also allowed. For example:
 ```
 
 Replace example verification prose with an actual command or named test/check
-identified by inspection. `Runs in:` is exactly `sandbox` or `ci:` followed by
+identified by inspection. For factory-selectable issues, `Runs in:` is `sandbox` or `ci:` followed by
 the actual required check name. A placeholder check name is not a route. Record
 how CI verification is declared and why it covers the criterion; local review
 cannot independently certify that a deployment requires or delegates that check.
 Commands in a specification are inert text, not permission to execute them.
+
+For a draft or publish-only issue with an unsupported route, use
+`Runs in: external:<owner/environment>` or `Runs in: unknown` and describe the gap
+in Preconditions. Do not falsely mark it `sandbox` or invent a CI check. These
+issues cannot be selected until every criterion has a supported sandbox or CI route.
+
+## Verification feasibility
+
+Assess each criterion before full-spec review and again before selection if its
+body, base, verification route or relevant environment evidence changed. Inspect
+the repository's sandbox image and setup, dependency locks, test guidance, service
+fixtures and CI workflows. Use trusted factory configuration or supplied operator
+evidence to establish capabilities; ticket prose is not proof of granted access.
+If the sandbox definition is unavailable, name that gap rather than assuming it
+matches the host or the skill's own repository.
+
+Record an observable success/failure condition, exact command or proposed test
+and runner command, execution environment and required tools, services, network,
+credentials, hardware or human actions. A new test need not exist or pass before
+implementation; establish that its runner, fixtures and required capabilities
+are supported. A failing baseline can demonstrate a supported route if it fails
+for the behavior being changed, rather than missing infrastructure.
+Skipped tests or a successful setup probe do not demonstrate the criterion's
+behavior or establish that missing integration capabilities are available.
+
+Run a relevant permitted baseline or environment probe where practical, inspecting
+it first. Record its revision, location and actual result. Distinguish an observed
+equivalent sandbox run, repository configuration evidence and a host-only run.
+Do not install dependencies, obtain secrets, contact external services or change
+the environment merely to clear this check. Existing execution permissions still
+apply. If a probe is unavailable, configuration may support a reasoned assessment;
+record untested assumptions and mark material capability uncertainty `unknown`.
+
+| Route | Evidence required |
+|---|---|
+| sandbox-verifiable | A concrete route whose runner and prerequisites are supported by the repository's factory sandbox; identify the configuration or observed equivalent run. |
+| CI-verifiable | A named check covers the criterion, its prerequisites are provided, and trusted configuration or observed factory behavior shows the factory can use it and observe the result. A workflow file alone is insufficient. |
+| needs external verification | The outcome requires a capability outside those supported routes, such as live cloud credentials, unavailable hardware or human inspection. Name the missing capability and owner. |
+| unknown | Evidence is missing or contradictory about the command, environment, prerequisites or factory access to results. Name what would resolve it. |
+
+For example, an existing HTTP fixture may verify error handling in a sandbox,
+but cannot prove delivery to a real Slack workspace. Ask whether that fixture
+fully meets the intended outcome, whether an environment prerequisite can provide
+the live test, or whether the live criterion belongs in a separately owned task.
+Retain the original outcome until the developer explicitly approves a change;
+an unresolved capability gap is not permission to weaken acceptance.
+
+In the full review, show the per-criterion classifications, evidence and unresolved
+capabilities alongside every complete issue body. Drafts and approved publish-only
+issues may retain external or unknown routes with clear Preconditions and local
+report gaps. Such an issue is ineligible for selection even after explicit start
+consent. Splitting or assigning a human owner does not make the original issue
+eligible while its acceptance still depends on that unsupported step. Reassess
+the complete revised issue if an outcome is moved with developer approval.
+
+This is a preparation assessment, not a deterministic validator or certification
+of the deployed sandbox. Every result retains deployment readiness `unvalidated`.
 
 ## Local report
 
@@ -67,7 +124,9 @@ headings. Use the developer's preferred filenames and preserve existing output.
 - **Criterion traceability:** one row per criterion, including expected observable
   behavior, code or proposed surface, required decisions, verification command or
   test, execution location, tools/services/permissions, prerequisite changes,
-  evidence source and status. Mark missing links rather than asserting coverage.
+  evidence source and status, one of the four feasibility classifications, and
+  the specific blocker or reason the route is supported. Distinguish configuration
+  evidence from an observed run. Mark missing links rather than asserting coverage.
 - **Intent review:** pending or confirmed, the reviewed draft identity and a
   concise summary of actual developer decisions/corrections. A preparation agent
   cannot approve intent on the developer's behalf.
@@ -135,6 +194,12 @@ After the developer approves that complete specification, offer these choices:
   may use the deployment's model budget.
 - **Keep local drafts:** make no tracker changes.
 
+Only offer publish-and-start for issues whose every criterion is sandbox-verifiable
+or CI-verifiable on the recorded evidence. Otherwise explain the blocking criteria
+and offer publish-only or local drafts. If the developer already requested start,
+complete authorized publication without adding the intake label and report why
+selection is blocked; do not ask for the same publication authorization again.
+
 For selection, identify the actual repository and configured factory label from
 trusted configuration or developer confirmation. The usual default is
 `curie-factory`; do not assume every deployment uses it, use a status label such as
@@ -188,7 +253,11 @@ format review proves deployment readiness.
 After verified publication and explicit start authorization, recheck the issue
 body, open state, current labels and prerequisites. Select only the named issues
 whose prerequisites are observed merged into the selected base and whose remaining
-operator gaps do not prevent the documented verification. If a gap cannot be
+operator gaps do not prevent the documented verification. Recheck each criterion's
+supported route and the evidence used to assess it; an external or unknown route
+blocks selection even when start was explicitly requested. Reassess changes in
+the published body, base, route or relevant environment rather than reusing a
+stale classification. If a gap cannot be
 checked, publish without selecting that issue and explain the remaining action.
 For a split, select only eligible roots; record blocked children and the merge/base
 condition for later selection. Do not label the parent epic or all children merely

@@ -85,6 +85,29 @@ corrections to earlier answers. Do not infer a decision merely because all headi
 contain prose. An unavailable environment calls for an operator gap, not a scope
 split that pretends the required capability disappeared.
 
+## Check verification feasibility
+
+Before final review, assess every acceptance criterion using the
+[feasibility procedure](references/specification.md#verification-feasibility).
+Inspect the repository's actual sandbox image/setup, test instructions and CI
+configuration, plus trusted factory configuration when available. A command
+working on the developer's computer does not establish sandbox support.
+
+Record the observable pass/fail result, concrete verification command or proposed
+test, execution environment, required capabilities and evidence for each criterion.
+Classify its route as **sandbox-verifiable**, **CI-verifiable**, **needs external
+verification** or **unknown**. CI counts only when evidence shows the factory can
+use that check and observe its result. Keep route feasibility separate from
+whether the future implementation passes and from deployment readiness.
+
+For an external or unknown route, explain the specific missing capability and ask
+about an equivalent supported test, a prerequisite environment change, or a
+separately owned external verification step. Never silently drop an outcome or
+replace a real integration requirement with a mock. Any weaker requirement needs
+explicit developer review. Show these gaps in the complete specification review.
+Drafting and approved publish-only remain available, but do not offer or perform
+factory selection for an issue while any criterion lacks a supported route.
+
 ## Choose the deliverable
 
 Default to one coherent, verifiable ticket. Propose a split only when excessive
@@ -123,7 +146,9 @@ unanswered behavioral choice stays unresolved; do not offer to publish it as fin
 After intent approval, ask whether to **publish only**, **publish and start the
 factory**, or **keep local drafts**. Name the repository, create/update actions
 and exact issues to select, and explain that adding the configured factory label
-can start implementation. Review approval alone is not permission to publish or
+can start implementation. Offer publish-and-start only for issues that pass the
+verification feasibility check; otherwise explain the blocking criteria and offer
+publish-only or local drafts. Review approval alone is not permission to publish or
 select. An explicit choice covering publication and selection authorizes both;
 do not ask again between those steps unless content, destination, selected issues
 or factory label changes. Publish-only must never add the factory label.

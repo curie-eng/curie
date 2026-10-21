@@ -188,6 +188,22 @@ report records original identity, inspected/base revisions, unresolved questions
 criterion traceability, observed evidence and developer review status. Raw
 conversations and credentials do not belong in the report.
 
+Before final review, the skill checks whether each acceptance criterion has a
+verification route the repository's factory environment supports. It inspects
+sandbox setup, test tooling and CI configuration, recording the observable result,
+command or proposed test, required capabilities and evidence. Each route is
+classified as sandbox-verifiable, CI-verifiable, needs external verification or
+unknown. A command passing on your computer does not prove sandbox support, and
+a CI workflow alone does not prove the factory can use or observe its checks.
+
+For unsupported or unknown routes, the skill explains the gap and asks about an
+equivalent supported test, an environment prerequisite or separately owned external
+verification. It preserves the intended outcome; replacing a real integration
+check with a mock requires your explicit agreement. You can keep a draft or approve
+publish-only with those gaps visible, but the skill will not select an issue for
+the factory until every criterion has a supported route. This assessment leaves
+deployment readiness unvalidated.
+
 A split retains the original requirements and identifies which child criterion
 covers each one, who owns integration proof, dependency ordering and shared-file
 constraints. A dependent child can be complete while still blocked. Save a

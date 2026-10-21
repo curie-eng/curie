@@ -43,6 +43,17 @@ back before the intake label was added, then labels were read back. For refusal
 cases, assert the absence of the prohibited writes. For recovery, count actual
 creates and verify that the same confirmed identity is reused.
 
+For verification-feasibility cases, materialize the sandbox configuration, workflow
+and tests as raw files. Let the agent inspect them and run permitted baseline probes.
+Check the actual per-criterion classification, evidence and full draft for preserved
+intent. Inspect tracker logs to prove unsupported or unknown criteria receive no
+intake label, including after explicit start consent. A supported sandbox route
+and a supported observable CI route are positive controls. Host-only success,
+secret-dependent CI with no factory observation path, a new test that fails only
+for the missing feature, and changed environment evidence exercise the boundaries.
+Publish-only must remain available without pretending gaps are resolved. Do not
+count these fixtures as observed runs; record fresh host results separately.
+
 ## Observed evaluation boundary
 
 The previous preparation-only workflow was replayed with a fresh model context.
@@ -84,3 +95,15 @@ managed update and repository resolution instructions. The fake tracker received
 one update and one label addition with readbacks, the complete reviewed body was
 preserved, and unknown human time remained unknown in the local pilot record.
 No managed version command or real external operation ran in that replay.
+
+The verification-feasibility revision was exercised in fresh contexts using raw
+synthetic repository files, trusted sandbox configuration and local fake tracker
+state. A Python standard-library task retained proposed tests as sandbox-verifiable
+and completed approved publication and selection. A live-cloud requirement with
+missing credentials/network and a staging CI requirement with no factory result
+observation path both retained their original outcomes, completed approved
+publication and received no intake label. Their baseline runners exited zero with
+live tests skipped; the agents did not treat those skips as integration evidence.
+The coordinator checked exact published bodies, final labels and tracker operation
+logs. These are observations of preparation decisions and local fake effects,
+not proof of a real factory environment, deployed enforcement or improved outcomes.
