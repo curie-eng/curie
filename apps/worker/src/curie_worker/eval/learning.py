@@ -1228,9 +1228,15 @@ def _control_check(check: Mapping[str, Any]) -> bool:
             and restored[0]["id"] == heads[0]["id"]
             and int(restored[0].get("revision", 0)) > int(heads[0].get("revision", 0))
         )
-    if kind == "single-value":
-        rows = _lst(check["rows"], "fact rows")
-        return len(rows) == 1 and _text(check["value"], "value") in str(rows[0]["statement"])
+    if kind == "predicates":
+        return _recompute_deterministic(
+            {
+                "admitted_predicates": _lst(check["predicates"], "control predicates"),
+                "available": check.get("available", list(DURABLE)),
+                "before": check["before"],
+                "after": check["after"],
+            }
+        )
     if kind == "aux":
         return check.get("section") in ("procedure_probes", "memory_negative", "deliveries")
     # An "observed" check records a failure the harness saw (for example a failed
@@ -1886,6 +1892,11 @@ def _check_calibration(report: _Report) -> None:
             raise _Invalid("calibration completion is malformed") from exc
         refs = set(example["evidence"]["refs"])
         _require(set(verdict.evidence_refs) <= refs, "completion cites unknown evidence")
+        if verdict.verdict == "PASS":
+            _require(
+                bool(verdict.evidence_refs),
+                f"calibration {row['id']} PASS cites none of its evidence",
+            )
         _require(verdict.verdict == row.get("verdict"), "verdict disagrees with the completion")
         _require(row["verdict"] == example["expected"], f"calibration {row['id']} misjudged")
         matches = [g for g in generations if g.get("id") == row.get("generation_id")]
@@ -1922,18 +1933,35 @@ def _check_calibration(report: _Report) -> None:
     )
 
 
+DOCKER_READ_TIMEOUT_SECONDS = 240
+
+
 def _docker_lines(*args: str) -> list[str]:
     docker = shutil.which("docker")
     if docker is None:
         raise _Invalid("the caller's Docker client is unavailable")
-    completed = subprocess.run(
-        [docker, *args],
-        capture_output=True,
-        timeout=60,
-        check=False,
-        stdin=subprocess.DEVNULL,
-        env=_observer_env(),
+    # A shared engine can be slow to answer reads; a read gets a longer timeout
+    # and one retry. Mutations keep a single 60 s attempt.
+    read_only = args[:1] in (("ps",), ("info",), ("inspect",)) or (
+        len(args) > 1
+        and args[0] in ("image", "container", "volume", "network")
+        and args[1] in ("ls", "inspect")
     )
+    attempts = 2 if read_only else 1
+    for attempt in range(1, attempts + 1):
+        try:
+            completed = subprocess.run(
+                [docker, *args],
+                capture_output=True,
+                timeout=DOCKER_READ_TIMEOUT_SECONDS if read_only else 60,
+                check=False,
+                stdin=subprocess.DEVNULL,
+                env=_observer_env(),
+            )
+            break
+        except subprocess.TimeoutExpired:
+            if attempt == attempts:
+                raise
     if completed.returncode != 0:
         raise _Invalid("the caller's Docker daemon could not be observed")
     return completed.stdout.decode("utf-8", errors="replace").splitlines()
@@ -3478,7 +3506,7 @@ class _Campaign:
                 grader=Grader(kind=GraderKind.CONTAINS, expected="unused"),
             )
             evidence = example["evidence"]
-            scorer.score(case, str(evidence["output"]), list(evidence["trajectory"]))
+            scored = scorer.score(case, str(evidence["output"]), list(evidence["trajectory"]))
             if self.stopped:
                 raise _Stop(self.stopped)
             if self.last_verdict is None:
@@ -3509,6 +3537,9 @@ class _Campaign:
                     "source": "provider",
                 }
             )
+            if verdict == "PASS" and not scored.passed:
+                # The scorer refuses a PASS without nonempty supported evidence refs.
+                self.failures.append(f"calibration {example['id']}: {scored.detail}")
             if verdict != example["expected"]:
                 self.failures.append(f"calibration {example['id']} judged {verdict}")
         by_group = {str(e["group"]): e for e in examples}
@@ -4747,6 +4778,7 @@ class _Campaign:
             ],
         )
         correction = next(c for c in fixture["controls"] if c.get("id") == "fact-correction")
+        prior = self.snapshot(scope)[0]
         self.message(scope, str(correction["messages"][0]), self.channels[0], thread)
         state = self.snapshot(scope)[0]
         live = [
@@ -4760,7 +4792,18 @@ class _Campaign:
             None,
             f"{len(live)} active facts for the subject after correction: "
             f"{json.dumps([(f.get('id'), f.get('scope'), f.get('statement')) for f in live])}",
-            [{"kind": "single-value", "rows": live, "value": values["corrected_value"]}],
+            [
+                {
+                    # The correction's rendered fixture predicates, replayed with
+                    # score_state; statement_equals rejects an obsolete value kept
+                    # alongside the corrected one.
+                    "kind": "predicates",
+                    "predicates": copy.deepcopy(correction["predicates"]),
+                    "available": sorted(c for c in DURABLE if self.available(c)),
+                    "before": prior,
+                    "after": state,
+                }
+            ],
         )
         if not live:
             return
