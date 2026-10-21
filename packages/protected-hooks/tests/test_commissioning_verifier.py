@@ -853,15 +853,20 @@ def test_a_candidate_rule_change_before_publication_constructs_nothing(monkeypat
 def test_a_guard_that_hashes_instantiated_rules_instead_of_the_template_refuses(
     role: str,
 ) -> None:
+    """Design decision 9: such a G cannot be built, so it never reaches the verifier.
+
+    The provisioner core refuses a candidate entry that holds an instantiated lane
+    prefix. A G that carries other non-template candidate rules is refused by the
+    verifier itself (the stand-in recipes test below).
+    """
     from curie_protected_hooks.commissioning_acl import commissioning_acl_rules
+    from curie_protected_hooks.commissioning_provisioner import ProvisionerRefused
 
     sample = permit_value_for_templates()
     candidates = {r: template(r, sample) for r in ("candidate_enqueue", "candidate_worker")}
     candidates[role] = tuple(commissioning_acl_rules(role, permit=sample))
-    h = Harness()
-    h.records = records(recipes=Recipes(candidates))
-    with pytest.raises(module().VerifierRefused):
-        h.verifier()
+    with pytest.raises(ProvisionerRefused):
+        records(recipes=Recipes(candidates))
 
 
 def test_a_guard_whose_candidate_rules_are_not_the_recipe_template_refuses() -> None:
