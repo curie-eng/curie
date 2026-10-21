@@ -2632,6 +2632,220 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/shared-connectors/applications": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Register Shared Application
+         * @description 201 for a new application; 200 with the same record for an identical replay.
+         */
+        post: operations["register_shared_application_shared_connectors_applications_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/shared-connectors/applications/{application_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Shared Application */
+        get: operations["get_shared_application_shared_connectors_applications__application_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/shared-connectors/applications/{application_id}/bindings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Import Shared Binding */
+        post: operations["import_shared_binding_shared_connectors_applications__application_id__bindings_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/shared-connectors/applications/{application_id}/database": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Provision Shared Database */
+        post: operations["provision_shared_database_shared_connectors_applications__application_id__database_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/shared-connectors/applications/{application_id}/database/rotate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Rotate Shared Database */
+        post: operations["rotate_shared_database_shared_connectors_applications__application_id__database_rotate_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/shared-connectors/applications/{application_id}/disable": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Disable Shared Application
+         * @description Answers only after the disable commits; later resolves refuse.
+         */
+        post: operations["disable_shared_application_shared_connectors_applications__application_id__disable_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/shared-connectors/applications/{application_id}/members/{agent_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Replace Shared Members */
+        put: operations["replace_shared_members_shared_connectors_applications__application_id__members__agent_id__put"];
+        post?: never;
+        /** Remove Shared Member */
+        delete: operations["remove_shared_member_shared_connectors_applications__application_id__members__agent_id__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/shared-connectors/applications/{application_id}/recipients/{recipient_id}/retire": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Retire Shared Recipient */
+        post: operations["retire_shared_recipient_shared_connectors_applications__application_id__recipients__recipient_id__retire_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/shared-connectors/bindings/{binding_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Shared Binding */
+        get: operations["get_shared_binding_shared_connectors_bindings__binding_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/shared-connectors/bindings/{binding_id}/check": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Check Shared Binding */
+        post: operations["check_shared_binding_shared_connectors_bindings__binding_id__check_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/shared-connectors/bindings/{binding_id}/disable": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Disable Shared Binding
+         * @description Answers only after the disable commits; later resolves refuse.
+         */
+        post: operations["disable_shared_binding_shared_connectors_bindings__binding_id__disable_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/shared-connectors/bindings/{binding_id}/reimport": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Reimport Shared Binding */
+        post: operations["reimport_shared_binding_shared_connectors_bindings__binding_id__reimport_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/factory/cards/{token}.svg": {
         parameters: {
             query?: never;
@@ -2965,6 +3179,43 @@ export interface paths {
          * @description Record one protected turn's nomination block.
          */
         post: operations["submit_remediation_nominations_v1_internal_remediation_nominations_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/shared-connectors/applications/{application_id}/database/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Report Shared Database Status */
+        put: operations["report_shared_database_status_v1_internal_shared_connectors_applications__application_id__database_status_put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/shared-connectors/applications/{application_id}/recipients": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Register Shared Recipient
+         * @description 201 for a new key; 200 for a replay of a live one, current or not.
+         */
+        post: operations["register_shared_recipient_v1_internal_shared_connectors_applications__application_id__recipients_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -8190,6 +8441,476 @@ export interface components {
              * @default []
              */
             settings?: components["schemas"]["SettingConfig"][];
+        };
+        /** SharedAliasIn */
+        SharedAliasIn: {
+            /** Alias */
+            alias: string;
+            /** Tools */
+            tools: string[] | null;
+        };
+        /** SharedAliasOut */
+        SharedAliasOut: {
+            /** Alias */
+            alias: string;
+            /** Tools */
+            tools: string[] | null;
+        };
+        /** SharedApplicationDisabled */
+        SharedApplicationDisabled: {
+            /** Acknowledged */
+            acknowledged: boolean;
+            /**
+             * Application Id
+             * Format: uuid
+             */
+            application_id: string;
+            /** Enabled */
+            enabled: boolean;
+        };
+        /** SharedApplicationOut */
+        SharedApplicationOut: {
+            /**
+             * Application Id
+             * Format: uuid
+             */
+            application_id: string;
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /** Credential Slots */
+            credential_slots: string[];
+            /**
+             * Custody
+             * @enum {string}
+             */
+            custody: "platform" | "connector";
+            database: components["schemas"]["SharedDatabaseOut"] | null;
+            /** Enabled */
+            enabled: boolean;
+            /** Installation Id */
+            installation_id: string;
+            policy: components["schemas"]["SharedPolicyOut"];
+            /** Policy Generation */
+            policy_generation: number;
+            /** Provider Origins */
+            provider_origins: string[];
+            /** Recipients */
+            recipients: components["schemas"]["SharedRecipientOut"][];
+            /** Server Image */
+            server_image: string;
+            snapshot_seal: components["schemas"]["SharedSecretRefOut"] | null;
+        };
+        /** SharedApplicationRegistration */
+        SharedApplicationRegistration: {
+            /** Application */
+            application: {
+                [key: string]: unknown;
+            };
+            policy: components["schemas"]["SharedPolicy"];
+        };
+        /** SharedBindingCheck */
+        SharedBindingCheck: {
+            source: components["schemas"]["SharedSourceVersion"];
+        };
+        /** SharedBindingCheckOut */
+        SharedBindingCheckOut: {
+            /**
+             * Binding Id
+             * Format: uuid
+             */
+            binding_id: string;
+            /** Credential Revision */
+            credential_revision: number;
+            recorded_source: components["schemas"]["SharedSourceVersion"];
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "current" | "source_stale";
+        };
+        /** SharedBindingDisabled */
+        SharedBindingDisabled: {
+            /** Acknowledged */
+            acknowledged: boolean;
+            /**
+             * Binding Id
+             * Format: uuid
+             */
+            binding_id: string;
+            /** Enabled */
+            enabled: boolean;
+        };
+        /** SharedBindingImport */
+        SharedBindingImport: {
+            /**
+             * Agent Id
+             * Format: uuid
+             */
+            agent_id: string;
+            credential?: components["schemas"]["SharedCredentialEnvelope"] | null;
+            /** Provider Account */
+            provider_account: string;
+            refresh_grant?: components["schemas"]["SharedRefreshGrantIn"] | null;
+            source?: components["schemas"]["SharedSourceMetadata"] | null;
+        };
+        /** SharedBindingOut */
+        SharedBindingOut: {
+            /**
+             * Agent Id
+             * Format: uuid
+             */
+            agent_id: string;
+            /**
+             * Application Id
+             * Format: uuid
+             */
+            application_id: string;
+            /**
+             * Binding Id
+             * Format: uuid
+             */
+            binding_id: string;
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /** Credential Revision */
+            credential_revision: number;
+            /**
+             * Custody
+             * @enum {string}
+             */
+            custody: "platform" | "connector";
+            /** Enabled */
+            enabled: boolean;
+            /** Provider Account */
+            provider_account: string;
+            /** Recipient Id */
+            recipient_id: string | null;
+            refresh: components["schemas"]["SharedRefreshOut"] | null;
+            source: components["schemas"]["SharedSourceMetadata"] | null;
+            /**
+             * Updated At
+             * Format: date-time
+             */
+            updated_at: string;
+        };
+        /** SharedBindingReimport */
+        SharedBindingReimport: {
+            credential: components["schemas"]["SharedCredentialEnvelope"];
+            /** Expected Revision */
+            expected_revision: number;
+            source: components["schemas"]["SharedSourceMetadata"];
+        };
+        /** SharedBundledDatabaseOut */
+        SharedBundledDatabaseOut: {
+            /**
+             * Application Id
+             * Format: uuid
+             */
+            application_id: string;
+            /** Dsn Revision */
+            dsn_revision: number;
+            /**
+             * Mode
+             * @constant
+             */
+            mode: "bundled";
+            /** Recipient Id */
+            recipient_id: string;
+            /** Role Name */
+            role_name: string;
+            /** Sealed Dsn */
+            sealed_dsn: string;
+            /**
+             * Status
+             * @constant
+             */
+            status: "provisioned";
+        };
+        /**
+         * SharedCredentialEnvelope
+         * @description A credential the CLI sealed to one of the application's recipients.
+         */
+        SharedCredentialEnvelope: {
+            /** Ciphertext */
+            ciphertext: string;
+            /** Recipient Id */
+            recipient_id: string;
+        };
+        /** SharedDatabaseOut */
+        SharedDatabaseOut: {
+            /** Dsn Recipient Id */
+            dsn_recipient_id: string | null;
+            /** Dsn Revision */
+            dsn_revision: number;
+            dsn_secret: components["schemas"]["SharedSecretRefOut"] | null;
+            /**
+             * Mode
+             * @enum {string}
+             */
+            mode: "bundled" | "managed";
+            /** Role Name */
+            role_name: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "provisioned" | "pending" | "ready" | "failed";
+            /** Status Reason */
+            status_reason: string | null;
+        };
+        /**
+         * SharedDatabaseProvision
+         * @description ``bundled``: the API creates the role. ``managed``: an operator's role.
+         */
+        SharedDatabaseProvision: {
+            /**
+             * Mode
+             * @enum {string}
+             */
+            mode: "bundled" | "managed";
+            /** Role Name */
+            role_name?: string | null;
+        };
+        /** SharedDatabaseRotate */
+        SharedDatabaseRotate: {
+            /** Expected Dsn Revision */
+            expected_dsn_revision: number;
+        };
+        /** SharedDatabaseStatusOut */
+        SharedDatabaseStatusOut: {
+            /**
+             * Application Id
+             * Format: uuid
+             */
+            application_id: string;
+            /** Dsn Revision */
+            dsn_revision: number;
+            /**
+             * Mode
+             * @enum {string}
+             */
+            mode: "bundled" | "managed";
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "provisioned" | "pending" | "ready" | "failed";
+            /** Status Reason */
+            status_reason: string | null;
+        };
+        /** SharedDatabaseStatusReport */
+        SharedDatabaseStatusReport: {
+            /** Dsn Revision */
+            dsn_revision: number;
+            /** Reason */
+            reason?: string | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "ready" | "failed";
+        };
+        /** SharedManagedDatabaseOut */
+        SharedManagedDatabaseOut: {
+            /**
+             * Application Id
+             * Format: uuid
+             */
+            application_id: string;
+            dsn_secret: components["schemas"]["SharedSecretRefOut"];
+            /**
+             * Mode
+             * @constant
+             */
+            mode: "managed";
+            /** Role Name */
+            role_name: string;
+            /**
+             * Status
+             * @constant
+             */
+            status: "pending";
+        };
+        /** SharedMembershipOut */
+        SharedMembershipOut: {
+            /**
+             * Agent Id
+             * Format: uuid
+             */
+            agent_id: string;
+            /** Aliases */
+            aliases: components["schemas"]["SharedAliasOut"][];
+            /**
+             * Application Id
+             * Format: uuid
+             */
+            application_id: string;
+            /** Policy Generation */
+            policy_generation: number;
+        };
+        /** SharedMembershipReplace */
+        SharedMembershipReplace: {
+            /** Aliases */
+            aliases: components["schemas"]["SharedAliasIn"][];
+        };
+        /**
+         * SharedPolicy
+         * @description The operator-approved tool set and who holds the credential.
+         */
+        SharedPolicy: {
+            /**
+             * Custody
+             * @default platform
+             * @enum {string}
+             */
+            custody?: "platform" | "connector";
+            /** Tools */
+            tools: string[];
+        };
+        /** SharedPolicyOut */
+        SharedPolicyOut: {
+            /**
+             * Custody
+             * @enum {string}
+             */
+            custody: "platform" | "connector";
+            /** Tools */
+            tools: string[];
+        };
+        /** SharedRecipientOut */
+        SharedRecipientOut: {
+            /** Algorithm */
+            algorithm: string;
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /** Current */
+            current: boolean;
+            /** Recipient Id */
+            recipient_id: string;
+            /** Retired At */
+            retired_at: string | null;
+        };
+        /** SharedRecipientPublicKey */
+        SharedRecipientPublicKey: {
+            /**
+             * Algorithm
+             * @constant
+             */
+            algorithm: "x25519-sealed-box";
+            /** Key */
+            key: string;
+        };
+        /** SharedRecipientReadback */
+        SharedRecipientReadback: {
+            /** Public Key Sha256 */
+            public_key_sha256: string;
+        };
+        /** SharedRecipientRegistered */
+        SharedRecipientRegistered: {
+            /**
+             * Application Id
+             * Format: uuid
+             */
+            application_id: string;
+            /** Current */
+            current: boolean;
+            /** Recipient Id */
+            recipient_id: string;
+        };
+        /**
+         * SharedRecipientRegistration
+         * @description Public key material only; any other field (a private key) is refused.
+         */
+        SharedRecipientRegistration: {
+            /**
+             * Application Id
+             * Format: uuid
+             */
+            application_id: string;
+            public_key: components["schemas"]["SharedRecipientPublicKey"];
+            readback: components["schemas"]["SharedRecipientReadback"];
+            /** Recipient Id */
+            recipient_id: string;
+        };
+        /** SharedRecipientRetired */
+        SharedRecipientRetired: {
+            /**
+             * Application Id
+             * Format: uuid
+             */
+            application_id: string;
+            /** Recipient Id */
+            recipient_id: string;
+            /**
+             * Retired At
+             * Format: date-time
+             */
+            retired_at: string;
+        };
+        /** SharedRefreshGrantIn */
+        SharedRefreshGrantIn: {
+            /** Client Config Fingerprint */
+            client_config_fingerprint: string;
+            /** Grant Id */
+            grant_id: string;
+        };
+        /** SharedRefreshOut */
+        SharedRefreshOut: {
+            /** Client Config Fingerprint */
+            client_config_fingerprint: string;
+            /** Epoch */
+            epoch: number;
+            /** Grant Id */
+            grant_id: string;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "ready" | "refreshing" | "recovery_required";
+        };
+        /** SharedSecretRefOut */
+        SharedSecretRefOut: {
+            /** Key */
+            key: string;
+            /** Name */
+            name: string;
+        };
+        /**
+         * SharedSourceMetadata
+         * @description Where an imported credential came from; never its material.
+         */
+        SharedSourceMetadata: {
+            /** Fingerprint */
+            fingerprint: string;
+            /**
+             * Kind
+             * @constant
+             */
+            kind: "kubernetes-secret";
+            /** Name */
+            name: string;
+            /** Namespace */
+            namespace: string;
+            /** Resource Version */
+            resource_version: string;
+            /** Uid */
+            uid: string;
+        };
+        /** SharedSourceVersion */
+        SharedSourceVersion: {
+            /** Resource Version */
+            resource_version: string;
+            /** Uid */
+            uid: string;
         };
         /**
          * SlackEvidence
@@ -14641,6 +15362,464 @@ export interface operations {
             };
         };
     };
+    register_shared_application_shared_connectors_applications_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SharedApplicationRegistration"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SharedApplicationOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_shared_application_shared_connectors_applications__application_id__get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                application_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SharedApplicationOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    import_shared_binding_shared_connectors_applications__application_id__bindings_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                application_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SharedBindingImport"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SharedBindingOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    provision_shared_database_shared_connectors_applications__application_id__database_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                application_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SharedDatabaseProvision"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SharedBundledDatabaseOut"] | components["schemas"]["SharedManagedDatabaseOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    rotate_shared_database_shared_connectors_applications__application_id__database_rotate_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                application_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SharedDatabaseRotate"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SharedBundledDatabaseOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    disable_shared_application_shared_connectors_applications__application_id__disable_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                application_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SharedApplicationDisabled"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    replace_shared_members_shared_connectors_applications__application_id__members__agent_id__put: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                application_id: string;
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SharedMembershipReplace"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SharedMembershipOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    remove_shared_member_shared_connectors_applications__application_id__members__agent_id__delete: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                application_id: string;
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SharedMembershipOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    retire_shared_recipient_shared_connectors_applications__application_id__recipients__recipient_id__retire_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                application_id: string;
+                recipient_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SharedRecipientRetired"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_shared_binding_shared_connectors_bindings__binding_id__get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                binding_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SharedBindingOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    check_shared_binding_shared_connectors_bindings__binding_id__check_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                binding_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SharedBindingCheck"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SharedBindingCheckOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    disable_shared_binding_shared_connectors_bindings__binding_id__disable_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                binding_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SharedBindingDisabled"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    reimport_shared_binding_shared_connectors_bindings__binding_id__reimport_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                binding_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SharedBindingReimport"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SharedBindingOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     factory_status_card_v1_factory_cards__token__svg_get: {
         parameters: {
             query?: never;
@@ -15360,6 +16539,80 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+        };
+    };
+    report_shared_database_status_v1_internal_shared_connectors_applications__application_id__database_status_put: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path: {
+                application_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SharedDatabaseStatusReport"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SharedDatabaseStatusOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    register_shared_recipient_v1_internal_shared_connectors_applications__application_id__recipients_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path: {
+                application_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SharedRecipientRegistration"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SharedRecipientRegistered"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
             };
         };
     };

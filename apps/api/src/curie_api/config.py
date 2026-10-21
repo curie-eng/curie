@@ -432,6 +432,12 @@ class Settings(BaseSettings):
     # (#2374, mirrored from WorkerConfig.installation_id). Blank is standalone
     # or Compose, which use the legacy release-wide key.
     installation_id: str = Field(default="", validation_alias="CURIE_INSTALLATION_ID")
+    # True only when the chart observed the installation ID it persisted rather
+    # than rendering a placeholder (ADR 0239). Shared connector registration
+    # refuses while it is false, so it fails closed; chart wiring comes later.
+    installation_id_observed: bool = Field(
+        default=False, validation_alias="CURIE_INSTALLATION_ID_OBSERVED"
+    )
 
     # The runs stream approval resolutions enqueue resume turns onto (#244).
     # Must match the worker's CURIE_STREAM (its consumer side) -- which is why

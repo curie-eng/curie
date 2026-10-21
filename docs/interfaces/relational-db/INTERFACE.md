@@ -64,9 +64,11 @@ column names are a second, ORM-independent coupling a conforming DB must honor.
 - **Migrations**: the target DB must apply the **whole Alembic chain in `apps/api/alembic/versions/`**, in revision order, ending at `alembic heads`. The chain grows with the product, so it is deliberately not enumerated here: `ls apps/api/alembic/versions/` is the list, and `alembic heads` is the tip a conforming DB must reach. A single head is the invariant — a fork means two branches each added a migration (rebase and merge the heads before swapping anything). Two recent expand revisions make authenticated review feedback part of this schema contract: `0042_review_lineage_authority.py` adds immutable App-observed authority to publication lineages and the `publication_review_reservations` concurrency table; `0043_github_review_feedback.py` adds the `github_review_deliveries` audit table and the `github_review_feedback` durable feedback/outbox table. The latter stores normalized feedback and a credential-free queued turn, never a raw webhook body or GitHub credential.
 
 The current application schema window is `schema_min: "0108"` and
-`schema_head: "0108"`, as recorded in
+`schema_head: "0109"`, as recorded in
 `apps/api/src/curie_api/schema_compat.json`. Revision `0108` merges the `0107`
-and `0106` histories (`apps/api/alembic/versions/0108_merge_stable_reply_identity.py`).
+and `0106` histories (`apps/api/alembic/versions/0108_merge_stable_reply_identity.py`);
+revision `0109` adds the shared connector store
+(`apps/api/alembic/versions/0109_shared_connector_store.py`).
 These values describe this candidate, not a historical release window.
 
 The `channel_canvas_edits` table (`apps/api/src/curie_api/models.py::ChannelCanvasEdit`,
@@ -251,6 +253,25 @@ Migration `0107_identity_links.py` (identity namespaces and links, #2910,
 ADR-0198 decision 5) is additive: two new tables, whose active-link uniqueness
 is a partial unique index (`identity_links_active_native_key`,
 `WHERE revoked_at IS NULL`).
+
+Migration `0109_shared_connector_store.py` (shared connector applications,
+ADR 0239) is additive: six tables (`shared_connector_applications`,
+`shared_connector_recipients`, `shared_connector_database_roles`,
+`shared_connector_memberships`, `shared_connector_bindings` and
+`shared_connector_refresh_intents`) holding immutable application pins, the
+recipients credentials are sealed to, sealed credential ciphertext (never
+plaintext) and durable refresh state. Each shared application reads them
+through its own non-superuser login role, which the API creates on demand with
+SELECT on the six tables, UPDATE on only the `lock_guard` column of application
+and binding rows, and EXECUTE on four SECURITY DEFINER refresh and reseal
+functions; that role holds no other privilege. Row level security is enabled
+but not forced, so the owning API role is unaffected, and every policy derives
+the caller's application from the authenticated role (`current_user` matched
+against `shared_connector_database_roles.role_name`), never from a client-set
+setting. Triggers refuse changes to pinned columns, serialize recipient
+retirement against writers, and raise an application's `policy_generation`
+whenever its membership rows change. The downgrade drops the store and the
+bundled roles the API created; operator-managed role names survive.
 
 The candidate application serving window and ordered revision ancestry live in
 `packages/protected-hooks/src/curie_protected_hooks/schema_serving.json`,
