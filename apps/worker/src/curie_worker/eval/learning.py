@@ -2160,8 +2160,9 @@ SHUTDOWN_RESERVE = Decimal("0.10")
 # scheduled fire reserves the full cap plus one priced final-generation overshoot.
 AGENT_DAILY_USD = Decimal("0.75")
 # Lowered before a scenario's schedules can fire; it bounds each fire's session.
-FIRE_DAILY_USD = Decimal("0.15")
-FIRE_OUTPUT_TOKENS = 2000
+# 0.15 left too little room: a one-line reminder fire hit budget-exceeded live.
+FIRE_DAILY_USD = Decimal("0.40")
+FIRE_OUTPUT_TOKENS = 6000
 FIRE_CAP_MARGIN_SECONDS = 120
 AGENT_OUTPUT_TOKENS = 8000
 ACTOR_PROMPT_TOKENS_BOUND = 60000
