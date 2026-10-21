@@ -70,14 +70,20 @@ _TOP = {
     "slot_policy",
 }
 _GUARD = {"name", "service_name", "image", "server_ca_sha256", "timeout_seconds"}
-_PRINCIPALS = {"mediator", "provisioner", "endpoint_controllers"}
+_PRINCIPALS = {
+    "mediator",
+    "provisioner",
+    "endpoint_controllers",
+    "pod_binders",
+    "pod_status_controllers",
+}
 # The controllers that write a launch Service's Endpoints and EndpointSlices:
 # per-controller service accounts, or the controller manager's own identity
 # when it runs without service account credentials.
-_CONTROLLER = (
-    r"system:serviceaccount:kube-system:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
-    r"|system:kube-controller-manager"
-)
+_KUBE_SYSTEM_SA = r"system:serviceaccount:kube-system:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+_CONTROLLER = _KUBE_SYSTEM_SA + r"|system:kube-controller-manager"
+# The scheduler binds launch Pods to nodes and records scheduling conditions.
+_BINDER = _KUBE_SYSTEM_SA + r"|system:kube-scheduler"
 _LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
 # A webhook name is a fully qualified DNS subdomain with at least three labels.
 _WEBHOOK = r"(?=.{1,253}$)" + _LABEL + r"(?:\." + _LABEL + r"){2,}"
@@ -120,16 +126,23 @@ def _validate(value: Any) -> None:
     _scalar(guard["server_ca_sha256"], "sha256")
     _require(type(guard["timeout_seconds"]) is int and 1 <= guard["timeout_seconds"] <= 10)
     principals = _closed(v["principals"], _PRINCIPALS)
-    controllers = principals["endpoint_controllers"]
-    _require(type(controllers) is list and 1 <= len(controllers) <= 4)
-    for user in controllers:
-        _pattern(user, _CONTROLLER)
-    _require(controllers == sorted(set(controllers)))
+    system: set[str] = set()
+    for name, pattern, low in (
+        ("endpoint_controllers", _CONTROLLER, 1),
+        ("pod_binders", _BINDER, 1),
+        ("pod_status_controllers", _CONTROLLER, 0),
+    ):
+        users = principals[name]
+        _require(type(users) is list and low <= len(users) <= 4)
+        for user in users:
+            _pattern(user, pattern)
+        _require(users == sorted(set(users)))
+        system.update(users)
     for name in ("mediator", "provisioner"):
         user = principals[name]
         _pattern(user, _USERNAME)
         _require(user not in _RESERVED_USERS and not user.startswith("system:node:"))
-        _require(user not in controllers)
+        _require(user not in system)
     _require(principals["mediator"] != principals["provisioner"])
 
 
@@ -239,17 +252,22 @@ def server_ca_digest(pem: bytes) -> str:
 
 
 def _rule(
-    group: str, resources: list[str], operations: list[str], scope: str = "Namespaced"
+    group: str,
+    resources: list[str],
+    operations: list[str],
+    scope: str = "Namespaced",
+    versions: str = "v1",
 ) -> dict[str, Any]:
     return {
         "apiGroups": [group],
-        "apiVersions": ["v1"],
+        "apiVersions": [versions],
         "operations": operations,
         "resources": resources,
         "scope": scope,
     }
 
 
+_CHANGE = ["CREATE", "UPDATE", "DELETE"]
 # Every request that can place or change a workload, its credentials, its
 # identity or its network in the workload namespace. The guard decides each;
 # anything it does not recognize refuses.
@@ -268,6 +286,18 @@ _RULES = (
     # named in the profile may.
     _rule("", ["endpoints"], ["CREATE", "UPDATE"]),
     _rule("discovery.k8s.io", ["endpointslices"], ["CREATE", "UPDATE"]),
+    # Pod status carries the Pod IPs and readiness that steer the launch
+    # Service, and a binding chooses the node: only the Pod's own node, the
+    # named binders and the named status controllers may write them.
+    _rule("", ["pods/status"], ["UPDATE"]),
+    _rule("", ["pods/binding", "bindings"], ["CREATE"]),
+    # Namespaced policy kinds of common CNIs change workload networking as
+    # NetworkPolicy does; every write refuses. A CNI kind not listed here is
+    # covered only by the network fact's reobservation of the policy set.
+    _rule("cilium.io", ["ciliumnetworkpolicies"], _CHANGE, versions="*"),
+    _rule("crd.projectcalico.org", ["networkpolicies"], _CHANGE, versions="*"),
+    _rule("projectcalico.org", ["networkpolicies"], _CHANGE, versions="*"),
+    _rule("vpcresources.k8s.aws", ["securitygrouppolicies"], _CHANGE, versions="*"),
 )
 
 

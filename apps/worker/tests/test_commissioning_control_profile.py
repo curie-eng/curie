@@ -70,6 +70,11 @@ def profile_value():
                 "system:serviceaccount:kube-system:endpoint-controller",
                 "system:serviceaccount:kube-system:endpointslice-controller",
             ],
+            "pod_binders": ["system:kube-scheduler"],
+            "pod_status_controllers": [
+                "system:serviceaccount:kube-system:node-controller",
+                "system:serviceaccount:kube-system:pod-garbage-collector",
+            ],
         },
         "slot_policy": "launch-id-names-v1",
     }
@@ -77,6 +82,23 @@ def profile_value():
 
 def profile(value=None):
     return cp.parse_control_profile(canonical(profile_value() if value is None else value))
+
+
+def test_pod_status_controllers_may_be_empty():
+    value = profile_value()
+    value["principals"]["pod_status_controllers"] = []
+    assert profile(value).as_dict()["principals"]["pod_status_controllers"] == []
+
+
+def test_cni_policy_kinds_are_routed_at_every_version():
+    hook = cp.render_control_objects(profile(), projection=projection(), server_ca_pem=CA)[3][
+        "webhooks"
+    ][0]
+    groups = {"cilium.io", "crd.projectcalico.org", "projectcalico.org", "vpcresources.k8s.aws"}
+    for rule in hook["rules"]:
+        if rule["apiGroups"][0] in groups:
+            assert rule["apiVersions"] == ["*"]
+            assert rule["operations"] == ["CREATE", "UPDATE", "DELETE"]
 
 
 def test_controller_manager_without_service_account_credentials_is_accepted():
@@ -177,6 +199,26 @@ def _drop(path):
             ("principals", "endpoint_controllers"),
             [f"system:serviceaccount:kube-system:c{i}" for i in range(5)],
         ),
+        _drop(("principals", "pod_binders")),
+        _set(("principals", "pod_binders"), []),
+        _set(("principals", "pod_binders"), ["system:kube-controller-manager"]),
+        _set(("principals", "pod_binders"), ["acme-mediator"]),
+        _set(
+            ("principals", "pod_binders"),
+            [
+                "system:kube-scheduler",
+                "system:serviceaccount:kube-system:a",
+                "system:kube-scheduler",
+            ],
+        ),
+        _drop(("principals", "pod_status_controllers")),
+        _set(("principals", "pod_status_controllers"), ["system:node:worker-1"]),
+        _set(("principals", "pod_status_controllers"), ["system:kube-scheduler"]),
+        _set(
+            ("principals", "pod_status_controllers"),
+            [f"system:serviceaccount:kube-system:c{i}" for i in range(5)],
+        ),
+        _set(("principals", "mediator"), "system:kube-scheduler"),
     ],
 )
 def test_profile_refuses_every_closed_member_change(mutate):
@@ -320,6 +362,15 @@ def test_rendered_rules_cover_every_container_list_and_fixed_object():
         ("", "endpoints", "UPDATE"),
         ("discovery.k8s.io", "endpointslices", "CREATE"),
         ("discovery.k8s.io", "endpointslices", "UPDATE"),
+        ("", "pods/status", "UPDATE"),
+        ("", "pods/binding", "CREATE"),
+        ("", "bindings", "CREATE"),
+        ("cilium.io", "ciliumnetworkpolicies", "CREATE"),
+        ("cilium.io", "ciliumnetworkpolicies", "UPDATE"),
+        ("cilium.io", "ciliumnetworkpolicies", "DELETE"),
+        ("crd.projectcalico.org", "networkpolicies", "CREATE"),
+        ("projectcalico.org", "networkpolicies", "UPDATE"),
+        ("vpcresources.k8s.aws", "securitygrouppolicies", "CREATE"),
     ]:
         assert expected in covered
     # The rendering is a copy: changing it cannot widen the next rendering.
