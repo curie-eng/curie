@@ -1,4 +1,4 @@
-"""The local Cilium network producer on a disposable multi-node minikube profile, ADR 0236.
+"""The local Cilium network and peer facts on a disposable multi-node minikube profile, ADR 0236.
 
 @spec PROTECTED-COMMISSIONING-5. Opt-in: it runs only with an explicit
 kubeconfig file, context and minikube profile of a disposable local cluster
@@ -10,9 +10,10 @@ installation bootstrap: namespaces, role-label NetworkPolicies, stand-in broker
 and mediator, a declared egress peer, the stand-in guard and the measuring
 ServiceAccount. This test adds the Cilium reads to the measuring identity and
 an owned off-cluster fixture container on the node network as the local
-``cloud_network`` destination. It then runs the producer, calls the network
-fact, and shows that a policy or engine configuration change refuses the next
-call and that a non-enforcing configuration refuses before any probe pod.
+``cloud_network`` destination. It then runs the producer and calls the
+network, hostile-peer and retained-peer facts. It shows that a policy or
+engine configuration change refuses the next network call and that a
+non-enforcing configuration refuses before any probe pod.
 Local results qualify no other installation and no managed CNI.
 """
 
@@ -351,6 +352,8 @@ def test_local_cilium_network_producer_on_a_local_cluster() -> None:
     client = LocalCiliumAPI(
         MeasuringCredentials(origin, ca_file, token),
         namespaces=(PROT, PROBE_A, FOREIGN, RELEASE),
+        # Clause 5: NetworkPolicy writes (case 5 policy_changed) only in probe namespaces.
+        policy_namespaces=(PROBE_A, FOREIGN),
     )
     probe_layout = layout(nodes, extra["system_set"], Destination(address, FIXTURE_PORT, "tcp"))
     producer = LocalCiliumNetworkProducer(client, probe_layout, profile=PROFILE)
@@ -371,6 +374,12 @@ def test_local_cilium_network_producer_on_a_local_cluster() -> None:
     async def run() -> dict[str, Any]:
         try:
             measurement = await producer.measure()
+            peers = {}
+            for name in ("hostile_peer", "retained_peer"):
+                try:
+                    peers[name] = await producer.fact(name).observe()
+                except ProbeKitRefused:
+                    peers[name] = None
             first = await call("first")
             second = await call("second")
             kubectl(
@@ -405,6 +414,7 @@ def test_local_cilium_network_producer_on_a_local_cluster() -> None:
                 remove_config_key("policy-audit-mode")
             return {
                 "measurement": measurement,
+                "peers": peers,
                 "digests": (first, second, added, restored, changed, back, audit_call),
                 "proxy": (proxy_changed, proxy_back),
                 "audit": audit,
@@ -431,6 +441,7 @@ def test_local_cilium_network_producer_on_a_local_cluster() -> None:
                     "refusal": measurement.refusal,
                     "entries": summary,
                     "fact_calls": calls,
+                    "peer_facts": outcome["peers"],
                     "audit_mode_refusal": outcome["audit"].refusal,
                     "kube_proxy_mode": kube_proxy_mode(result.identity),
                     "kit_evidence": list(result.kit.evidence),
@@ -441,9 +452,29 @@ def test_local_cilium_network_producer_on_a_local_cluster() -> None:
                 sort_keys=True,
             )
     assert result.kit.leftovers == ()
-    assert measurement.refusal is None, summary
+    assert result.bracket is None, summary
     assert {item.key for item in measurement.entries} == local_required_entries(probe_layout)
-    assert {item.outcome for item in measurement.entries} == {"pass"}, summary
+    # No delivery on an enforcing local Cilium: a fail would be a real finding.
+    assert not [item for item in measurement.entries if item.outcome == "fail"], summary
+    # Every local entry outside cases 3, 4 and 5 passes. A timing case this local
+    # cluster cannot provoke is an honest unavailable, never a pass.
+    assert all(item.outcome == "pass" for item in measurement.entries if item.case in (1, 2, 6, 8))
+    not_passed = {item.reason for item in measurement.entries if item.outcome != "pass"}
+    assert not_passed <= {
+        "reuse_not_provoked",
+        "transport_unavailable",
+        "sequence_state_unavailable",
+        "address_reassigned",
+        "phase_timeout",
+        "control_failed",
+    }, summary
+    # Case 5 workload_replaced cannot pass from user space, so the producer refuses.
+    assert measurement.refusal is not None
+    # Each peer fact is a digest exactly when every entry of its own channel passed.
+    for name, cases in (("hostile_peer", (2, 3, 4)), ("retained_peer", (5,))):
+        clean = all(item.outcome == "pass" for item in measurement.entries if item.case in cases)
+        assert (outcome["peers"][name] is not None) == clean, (name, summary)
+    assert outcome["peers"]["retained_peer"] is None
     first, second, added, restored, changed, back, audit_call = outcome["digests"]
     assert first is not None and first == second == restored == back
     assert added is None and changed is None and audit_call is None

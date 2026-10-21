@@ -1,4 +1,4 @@
-"""The local Cilium network producer and its per-call network fact, ADR 0236.
+"""The local Cilium network producer and its three per-call peer facts, ADR 0236.
 
 @spec PROTECTED-COMMISSIONING-5. The local Cilium producer measures preventive
 network enforcement of a disposable local installation. It reuses the managed
@@ -12,19 +12,24 @@ encoding unchanged, and adds what is local to Cilium:
   measured against an owned fixture on the node network, supplied as the
   ``cloud_network`` destination.
 
-ADR 0236 binds the network fact into every signed guard reply. Re-running the
-behavioral cases takes minutes, so each fact call reobserves what binds the
-measurement instead: the engine identity and the policy set. Any difference,
-or a measurement that did not pass every local entry, refuses. This module
-implements the commissioning ``FactProducer`` protocol structurally;
-production composition never imports it.
+ADR 0236 binds the network, hostile-peer and retained-peer facts into every
+signed guard reply. Re-running the behavioral cases takes minutes, so each fact
+call reobserves what binds the measurement instead: the engine identity and the
+policy set. Any difference refuses every fact. Each fact then judges only its
+own channel's entries, so evidence shows which fact refused: an unavailable
+spoof or address-reuse entry refuses the hostile-peer fact, and case 5
+``workload_replaced``, which cannot pass from user space, refuses the
+retained-peer fact. The producer's own verdict still refuses while any local
+entry is not ``pass``. This module implements the commissioning
+``FactProducer`` protocol structurally; production composition never imports
+it.
 """
 
 from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -62,23 +67,24 @@ LOCAL_PRODUCER_KIND = "local-cilium-v1"
 # Sub-cases this producer does not measure even within its own cases: a local
 # Docker-driver install has no instance metadata service.
 NOT_APPLICABLE_SUB_CASES = frozenset({"instance_metadata"})
-# The local Cilium network fact measures cases 1, 6 and 8 only. Case 2 belongs to
-# the hostile fact and case 7 joins when local case 7 is wired; both arrive with
-# the peer slice.
-LOCAL_NETWORK_CASES = (1, 6, 8)
-# Allowlist, not a denylist: exactly the sub-cases of those cases the fact
-# measures today. Everything else the shared kit returns -- cases 2, 3, 4, 5, 7
-# and any future kit case -- is dropped before the digest and before the verdict,
-# so a later kit case cannot leak into the local fact or its refusal.
+# ADR 0236 fact -> probe kit channel and the cases this producer measures for it.
+# Case 7 (node-local traffic) is not wired locally yet.
+FACTS = {
+    "network": ("network", (1, 6, 8)),
+    "hostile_peer": ("hostile", (2, 3, 4)),
+    "retained_peer": ("retained_peer", (5,)),
+}
+LOCAL_CASES = tuple(sorted({case for _channel, cases in FACTS.values() for case in cases}))
+# Allowlist, not a denylist: exactly the sub-cases of those cases. Everything else
+# the shared kit returns -- case 7 and any future kit case -- is dropped before the
+# digests and before the verdict, so a later kit case cannot leak into a local fact
+# or its refusal.
 _LOCAL_SUB_CASES = frozenset(
     (case, sub_case)
-    for case in LOCAL_NETWORK_CASES
+    for case in LOCAL_CASES
     for sub_case in SUB_CASES[case]
     if sub_case not in NOT_APPLICABLE_SUB_CASES
 )
-# ADR 0236 fact name -> probe kit channel and the cases this producer measures
-# for it. The hostile and retained-peer facts follow with the peer slice.
-FACTS = {"network": ("network", (1, 6, 8))}
 
 
 def _in_local_scope(case: int, sub_case: str) -> bool:
@@ -86,8 +92,8 @@ def _in_local_scope(case: int, sub_case: str) -> bool:
 
 
 def _keep_entry(item: ObservationEntry) -> bool:
-    """Keep only this producer's cases. Cases 2, 3, 4, 5, 7 and any future kit case
-    are dropped unconditionally. Instance metadata is not measured on a local
+    """Keep only this producer's cases. Case 7 and any future kit case are dropped
+    unconditionally. Instance metadata is not measured on a local
     install, so an ``unavailable``/``destination_unknown`` entry is dropped, but a
     real observation is kept so a metadata leak still fails the measurement."""
     if _in_local_scope(item.case, item.sub_case):
@@ -95,6 +101,8 @@ def _keep_entry(item: ObservationEntry) -> bool:
     if item.case == 6 and item.sub_case == "instance_metadata":
         return (item.outcome, item.reason) != ("unavailable", "destination_unknown")
     return False
+
+
 # Kit refusals that stop before the remaining cases; the local filter keeps them.
 _EARLY = ("enforcement_absent", "non_vacuity_unavailable")
 
@@ -111,9 +119,7 @@ class _Kit(Protocol):
 
 
 def local_required_entries(layout: ProbeLayout) -> frozenset[EntryKey]:
-    return frozenset(
-        key for key in required_entries(layout) if _in_local_scope(key[0], key[1])
-    )
+    return frozenset(key for key in required_entries(layout) if _in_local_scope(key[0], key[1]))
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,6 +128,9 @@ class LocalResult:
     identity: CiliumIdentity | None
     policies: PolicySet | None
     kit: KitResult | None
+    # A refusal of the measurement as a whole (engine, policies, cleanup or an
+    # early kit stop); it refuses every fact, unlike a refused entry.
+    bracket: str | None = None
 
 
 class LocalCiliumNetworkProducer:
@@ -172,12 +181,13 @@ class LocalCiliumNetworkProducer:
         try:
             before = await self._identity()
         except ProbeKitRefused:
-            return LocalResult(Measurement((), "cni_unavailable"), None, None, None)
+            return LocalResult(Measurement((), "cni_unavailable"), None, None, None, "cni")
         if set(before.families) != set(self._layout.families):
-            return LocalResult(Measurement((), "families_unserved"), before, None, None)
+            return LocalResult(Measurement((), "families_unserved"), before, None, None, "cni")
         policies = await self._policies()
         if policies is None:
-            return LocalResult(Measurement((), "policy_set_unavailable"), before, None, None)
+            refused = Measurement((), "policy_set_unavailable")
+            return LocalResult(refused, before, policies, None, "policies")
         kit = await self._kit.measure()
         report = self._kit.last
         # Keep only this producer's own cases; drop every other kit case (including
@@ -187,16 +197,14 @@ class LocalCiliumNetworkProducer:
             after: CiliumIdentity | None = await self._identity()
         except ProbeKitRefused:
             after = None
-        refusal = self._refusal(
-            kit, report, entries, before, after, await self._policies() == policies
-        )
-        return LocalResult(Measurement(entries, refusal), before, policies, report)
+        bracket = self._bracket(kit, report, before, after, await self._policies() == policies)
+        refusal = bracket or self._entry_refusal(entries, local_required_entries(self._layout))
+        return LocalResult(Measurement(entries, refusal), before, policies, report, bracket)
 
-    def _refusal(
-        self,
+    @staticmethod
+    def _bracket(
         kit: Measurement,
         report: KitResult | None,
-        entries: tuple[ObservationEntry, ...],
         before: CiliumIdentity,
         after: CiliumIdentity | None,
         policies_unchanged: bool,
@@ -211,11 +219,16 @@ class LocalCiliumNetworkProducer:
             return "policy_set_changed"
         if kit.refusal in _EARLY:
             return kit.refusal
+        return None
+
+    @staticmethod
+    def _entry_refusal(
+        entries: Sequence[ObservationEntry], required: frozenset[EntryKey] | set[EntryKey]
+    ) -> str | None:
         failed = next((item for item in entries if item.outcome != "pass"), None)
         if failed is not None:
             return failed.reason
-        required = local_required_entries(self._layout)
-        # Exactly the local entries: none missing, none repeated, none extra.
+        # Exactly the required entries: none missing, none repeated, none extra.
         if not accepts(entries, required) or len(entries) != len(required):
             return "incomplete"
         return None
@@ -229,11 +242,11 @@ class LocalCiliumNetworkProducer:
         result = self.last
         require(result is not None)
         assert result is not None
-        require(result.measurement.refusal is None and result.identity is not None)
+        require(result.bracket is None and result.identity is not None)
         assert result.identity is not None
         entries = [item for item in result.measurement.entries if item.case in cases]
         required = {key for key in local_required_entries(self._layout) if key[0] in cases}
-        require(accepts(entries, required))
+        require(self._entry_refusal(entries, required) is None)
         current = await self._identity()
         require(current.digest == result.identity.digest)
         require(await self._policies() == result.policies)
