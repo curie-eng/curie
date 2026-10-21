@@ -426,6 +426,11 @@ class _Predicate:
     value: object
 
 
+def _is_normalized_text(value: object) -> bool:
+    """Containment needles must survive normalization, or they would match anything."""
+    return isinstance(value, str) and bool(_norm(value))
+
+
 def _predicate(raw: object) -> _Predicate:
     if not isinstance(raw, Mapping):
         raise EvidenceError("predicate must be an object")
@@ -450,7 +455,7 @@ def _predicate(raw: object) -> _Predicate:
             learning_class is LearningClass.SKILL
             and isinstance(value, list)
             and bool(value)
-            and all(_is_nonempty_str(step) for step in value)
+            and all(_is_normalized_text(step) for step in value)
         )
     elif name == "schedule_matches":
         valid = (
@@ -458,6 +463,7 @@ def _predicate(raw: object) -> _Predicate:
             and isinstance(value, Mapping)
             and bool(value)
             and set(value) <= _SCHEDULE_MATCH_FIELDS
+            and ("prompt" not in value or _is_normalized_text(value["prompt"]))
         )
     elif name == "scope_equals":
         valid = value in ("agent", "channel") and _is_str(value)
@@ -503,6 +509,53 @@ def _field(row: JsonObject, name: str) -> object:
     return row[name]
 
 
+_LIST_MARKER = re.compile(r"^[ \t]*(?:[0-9]+[.)]|[-*+\u2022])[ \t]+", re.MULTILINE)
+_EMPHASIS_UNDERSCORE = re.compile(r"(?<![0-9A-Za-z])_+|_+(?![0-9A-Za-z])")
+_QUOTES = "\"'\u201c\u201d\u2018\u2019"
+
+
+def _norm(text: str) -> str:
+    """Normalize stored prose for the three content oracles (decision after live run 4).
+
+    Drops a leading list marker per line, inline Markdown marks (backticks,
+    asterisks, emphasis underscores but not underscores inside identifiers),
+    collapses whitespace, casefolds, and strips trailing ``.;:`` and
+    surrounding quotes.
+    """
+    text = _LIST_MARKER.sub("", text)
+    text = _EMPHASIS_UNDERSCORE.sub("", text.replace("`", "").replace("*", ""))
+    text = " ".join(text.split()).casefold()
+    while True:
+        trimmed = text.strip().rstrip(".;:").strip().strip(_QUOTES)
+        if trimmed == text:
+            return text
+        text = trimmed
+
+
+def _contains_in_order(body: object, steps: Sequence[object]) -> bool:
+    if not isinstance(body, str):
+        raise EvidenceError("stored skill body must be text")
+    haystack, position = _norm(body), 0
+    for step in steps:
+        needle = _norm(str(step))
+        found = haystack.find(needle, position)
+        if found < 0:
+            return False
+        position = found + len(needle)
+    return True
+
+
+def _schedule_agrees(observed: Mapping[str, object], expected: Mapping[str, object]) -> bool:
+    for key, value in expected.items():
+        stored = observed[key]
+        if key == "prompt":
+            if not isinstance(stored, str) or _norm(str(value)) not in _norm(stored):
+                return False
+        elif stored != value:
+            return False
+    return True
+
+
 def _evaluate(check: _Predicate, before: StateSnapshot, after: StateSnapshot) -> bool:
     if check.name == "unchanged_other_stores":
         return not any(item.kind is check.kind for item in diff_state(before, after))
@@ -537,14 +590,16 @@ def _evaluate(check: _Predicate, before: StateSnapshot, after: StateSnapshot) ->
         expected = check.value
         assert isinstance(expected, Mapping)
         values = [{key: _field(row, key) for key in expected} for row in current]
-        return bool(values) and all(value == dict(expected) for value in values)
+        return bool(values) and all(_schedule_agrees(value, expected) for value in values)
     if check.name == "body_contains_steps":
         bodies = [_field(row, "body") for row in active]
         assert isinstance(check.value, list)
-        return bool(bodies) and all(
-            isinstance(body, str) and all(step in body for step in check.value) for body in bodies
-        )
+        return bool(bodies) and all(_contains_in_order(body, check.value) for body in bodies)
     observed = [_field(row, _FIELD_PREDICATES[check.name]) for row in active]
+    if check.name == "statement_equals":
+        return bool(observed) and all(
+            isinstance(value, str) and _norm(value) == _norm(str(check.value)) for value in observed
+        )
     return bool(observed) and all(value == check.value for value in observed)
 
 
