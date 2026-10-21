@@ -164,6 +164,8 @@ def broker_principals(
                 "issuer_identity": profile.issuer_identity,
                 "control_identity": profile.control_identity,
                 "qualification_publisher_identity": profile.qualification_publisher_identity,
+                "control_reader_identity": profile.control_reader_identity,
+                "source_writer_identity": profile.source_writer_identity,
                 "candidate_credentials": profile.candidate_credentials,
             }
         )
@@ -684,12 +686,19 @@ class LocalBroker:
     def start_campaign(
         self, provisioner: BrokerUser, principals: Mapping[str, Principal], permit: Any
     ) -> None:
-        """``enable_candidates`` on a provisioner session, @spec PROTECTED-COMMISSIONING-1."""
-        session = self.session(provisioner)
+        """``enable_candidates`` on a provisioner session; a failure closes the forward.
+
+        @spec PROTECTED-COMMISSIONING-1.
+        """
         try:
-            enable_candidates(session, principals, permit)
-        finally:
-            session.close()
+            session = self.session(provisioner)
+            try:
+                enable_candidates(session, principals, permit)
+            finally:
+                session.close()
+        except BaseException:
+            self.close()
+            raise
 
     def close(self) -> None:
         """Stop the port-forward; the objects are the cluster ledger's to remove.

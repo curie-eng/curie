@@ -85,6 +85,9 @@ def test_principals_take_the_profiles_ids_and_the_rules_g_hashed() -> None:
 
     assert made["observer"].rules == commissioning_acl_rules("observer")
     assert made["observer"].username == profile_fields()["observer_identity"]["id"]
+    # Design decision 10: the production metadata principals take B's identities.
+    for name in ("control_reader", "source_writer"):
+        assert made[name].username == profile_fields()[name + "_identity"]["id"]
     for name in CANDIDATES:
         assert made[name].rules == commissioning_acl_template(name)
     assert made["provisioner"].rules == commissioning_acl_rules("provisioner")
@@ -343,6 +346,13 @@ def session(valkey: Valkey, name: str, **kwargs: Any) -> Any:
     )
 
 
+def test_the_baseline_covers_every_identity_the_installation_creates(valkey: Valkey) -> None:
+    """Design decision 7 covers the provisioner and the observer too."""
+    assert set(valkey.baseline) == set(valkey.users)
+    assert {"provisioner", "observer"} <= set(valkey.baseline)
+    assert all(len(state.password_hashes) == 1 for state in valkey.baseline.values())
+
+
 def test_the_installer_is_closed_after_enrollment(valkey: Valkey) -> None:
     api = module()
     with pytest.raises((AuthenticationError, ResponseError)):
@@ -378,6 +388,8 @@ def test_every_user_authenticates_as_its_own_identity(valkey: Valkey) -> None:
         "worker",
         "verifier",
         "qualification_publisher",
+        "control_reader",
+        "source_writer",
         "observer",
     }
 
@@ -534,3 +546,54 @@ def test_port_forward_without_a_ready_line_refuses_and_is_stopped() -> None:
     script = "import time; print('error: unable to forward', flush=True); time.sleep(60)"
     with pytest.raises(api.BrokerRefused):
         api._start_forward([sys.executable, "-c", script], dict(os.environ))
+
+
+def _broker_with_a_live_forward(tmp_path: Path) -> tuple[Any, Any, Any]:
+    """A broker whose forward is a real process with nothing behind its port."""
+    import socket
+    import sys
+
+    from curie_protected_hooks.commissioning_local_installation import LocalCluster
+    from curie_protected_hooks.commissioning_local_ownership import OwnershipLedger
+
+    from .test_commissioning_local_installation import FakeRunner
+
+    api = module()
+    ledger = OwnershipLedger.create(tmp_path / "run", owner=OWNER)
+    cluster = LocalCluster(ledger, runner=FakeRunner(ledger))
+    broker = api.LocalBroker(cluster, namespace=NAMESPACE)
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    script = (
+        f"import time; print('Forwarding from 127.0.0.1:{port} -> 6379', flush=True); "
+        "time.sleep(60)"
+    )
+    broker._forward, broker._port = api._start_forward(
+        [sys.executable, "-c", script], dict(os.environ)
+    )
+    broker._material = api.BrokerMaterial.generate(api.server_name(NAMESPACE))
+    return api, cluster, broker
+
+
+def test_a_failed_campaign_start_closes_the_forward(tmp_path: Path) -> None:
+    from .test_commissioning_acl import permit
+
+    api, _, broker = _broker_with_a_live_forward(tmp_path)
+    process = broker._forward
+    provisioner = api.BrokerUser("commissioning/example-provisioner", (), "x")
+    with pytest.raises(Exception):  # noqa: B017, PT011  Nothing answers behind the forward.
+        broker.start_campaign(provisioner, principals(), permit())
+    assert broker._forward is None and process.poll() is not None
+
+
+def test_a_failed_enrollment_closes_the_forward(tmp_path: Path) -> None:
+    api, cluster, broker = _broker_with_a_live_forward(tmp_path)
+    process = broker._forward
+    admin = bootstrap().AdministratorBootstrap(
+        cluster, namespace=NAMESPACE, principals=principals(), baseline_dir=tmp_path / "admin"
+    )
+    admin.issue()
+    with pytest.raises(bootstrap().BootstrapRefused):
+        admin.enroll(broker)
+    assert broker._forward is None and process.poll() is not None

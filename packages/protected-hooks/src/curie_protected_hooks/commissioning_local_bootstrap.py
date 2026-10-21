@@ -42,7 +42,7 @@ from .commissioning_local_broker import (
 )
 from .commissioning_local_installation import OWNER_LABEL, LocalCluster
 from .commissioning_producers import AclPrincipalState, parse_getuser_reply
-from .commissioning_provisioner import BROKER_PRINCIPALS, GUARD_PRINCIPALS
+from .commissioning_provisioner import GUARD_PRINCIPALS
 
 __all__ = [
     "INSTALLER_SECRET",
@@ -124,7 +124,9 @@ def enroll_users(
 
     The broker derives each password hash from ``>password``. Candidates are
     created off with no right; design decision 9 enables them per campaign.
-    Returns each checked principal's ``ACL GETUSER`` state.
+    Returns every created user's ``ACL GETUSER`` state: design decision 7
+    covers every identity in the principals table, the provisioner and the
+    observer included.
     @spec PROTECTED-COMMISSIONING-1.
     """
     try:
@@ -141,7 +143,7 @@ def enroll_users(
             name: parse_getuser_reply(
                 session.execute_command("ACL", "GETUSER", credentials[name].username)
             )
-            for name in BROKER_PRINCIPALS
+            for name in credentials
         }
     except BootstrapRefused:
         raise
@@ -259,19 +261,29 @@ class AdministratorBootstrap:
         """
         _require(bool(self.__credentials) and self.__installer is not None)
         assert self.__installer is not None
-        installer = BrokerUser("default", (), self.__installer)
-        session = pinned_session(broker.material, broker.dial, installer)
         try:
-            baseline = enroll_users(session, self.__credentials)
-            close_installer(session)
-        finally:
-            session.close()
-        try:
-            pinned_session(broker.material, broker.dial, installer).ping()
-        except (AuthenticationError, ResponseError):
-            pass
-        else:
+            installer = BrokerUser("default", (), self.__installer)
+            session = pinned_session(broker.material, broker.dial, installer)
+            try:
+                baseline = enroll_users(session, self.__credentials)
+                close_installer(session)
+            finally:
+                session.close()
+            try:
+                pinned_session(broker.material, broker.dial, installer).ping()
+            except (AuthenticationError, ResponseError):
+                pass
+            else:
+                _refuse()
+        except BootstrapRefused:
+            broker.close()
+            raise
+        except Exception:  # noqa: BLE001  One redacted refusal; the forward never outlives it.
+            broker.close()
             _refuse()
+        except BaseException:
+            broker.close()
+            raise
         self.__installer = None
         self._write_baseline(baseline)
         return baseline
