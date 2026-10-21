@@ -158,6 +158,10 @@ those keep their grammars. It uses the same encoding rules as the permit.
 | `target_scope` | Sorted array of 1 to 64 `opaque_ref` values. |
 | `max_permit_ms` | generation. |
 
+Every credential ID in B is pairwise distinct across `production_credentials`,
+`candidate_credentials`, `issuer_identity`, `control_identity`,
+`qualification_publisher_identity`, `mediator_identity` and `gateway_identity`.
+
 Hash order breaks the cycle between the records:
 
 1. Construct bootstrap B. It contains no manifest digest, guard digest, permit
@@ -683,8 +687,9 @@ ADR 0236 requires. Identical bytes already stored are a replay; different bytes
 refuse, so Qualification stays immutable.
 
 Like every other broker identity, its credential reference is predeclared in
-bootstrap B as `qualification_publisher_identity`. That ID differs from every
-other credential ID in B. Its credential is issued by the administrator-run
+bootstrap B as `qualification_publisher_identity`. Every credential ID in B,
+the mediator's and gateway's included, is pairwise distinct, so the publisher
+is never the verifier or any other principal B names. Its credential is issued by the administrator-run
 installation bootstrap. G hashes its rules, and the ACL principal state check
 of design decision 7 covers its password hash set and enabled state.
 
