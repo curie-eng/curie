@@ -1330,3 +1330,42 @@ def test_f3_p3_statement_with_a_different_value_fails():
 def test_f3_p3_statement_holding_both_obsolete_and_new_values_fails():
     statement = "The reference value for cabinet-573d74 is violet-743263, not violet-111111."
     assert _f3_score(statement) is False
+
+
+def _f8_rows(*decisions):
+    rows = []
+    for base in CASE_IDS:
+        if base[1] != "8":
+            rows.append(_result(base))
+            continue
+        decision_id, duplicates, status = decisions[int(base[-1]) - 1]
+        rows.append(
+            _result(
+                base,
+                decision_id=decision_id,
+                correction_duplicates=duplicates,
+                status=status,
+                predicted=() if status is CaseStatus.NOT_AVAILABLE else None,
+            )
+        )
+    return rows
+
+
+def test_correction_gate_counts_only_f8_correct_decisions_not_seed_rows():
+    rows = _f8_rows(
+        ("seed", 5, CaseStatus.PASS),
+        ("correct", 1, CaseStatus.PASS),
+        ("correct", 0, CaseStatus.PASS),
+    )
+    gate = _summary(rows)["gates"]["correction_duplicates"]
+    assert gate == {"status": "FAIL", "value": 1}
+
+
+def test_correction_gate_is_not_available_when_only_seed_rows_were_evaluated():
+    rows = _f8_rows(
+        ("seed", 2, CaseStatus.PASS),
+        ("correct", 0, CaseStatus.NOT_AVAILABLE),
+        ("correct", 0, CaseStatus.NOT_AVAILABLE),
+    )
+    gate = _summary(rows)["gates"]["correction_duplicates"]
+    assert gate == {"status": "NOT_AVAILABLE", "value": None}

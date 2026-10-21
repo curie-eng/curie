@@ -150,9 +150,9 @@ def test_empty_expected_sequence_is_valid_for_ratio_edges() -> None:
 
 
 def test_committed_trajectory_schema_is_current() -> None:
-    assert render_trajectory_schema() == trajectory_schema_path().read_text(
-        encoding="utf-8"
-    ), "trajectory schema is stale; regenerate and commit it"
+    assert render_trajectory_schema() == trajectory_schema_path().read_text(encoding="utf-8"), (
+        "trajectory schema is stale; regenerate and commit it"
+    )
 
 
 def test_python_matcher_owns_the_shared_cross_language_vectors() -> None:

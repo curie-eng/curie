@@ -389,3 +389,20 @@ def test_escaped_duplicate_json_key_is_still_a_duplicate():
     )
     with pytest.raises(ValueError):
         parse_judge_verdict(raw)
+
+
+def test_judge_prompt_carries_the_teaching_request_and_expected_meaning():
+    prompts = []
+
+    def complete(prompt):
+        prompts.append(prompt)
+        return _verdict(refs=("request:teaching", "expected:meaning"))
+
+    evidence = _evidence()
+    evidence["refs"]["request:teaching"] = "Please remember that the sample reference is violet-73."
+    evidence["refs"]["expected:meaning"] = "One current reference violet-73 is retained."
+    scorer = LearningJudgeScorer({_case().id: _spec(evidence=evidence)}, complete=complete)
+    result = scorer.score(_case(), evidence["output"], evidence["trajectory"])
+    assert result.passed is True
+    assert "Please remember that the sample reference is violet-73." in prompts[0]
+    assert "One current reference violet-73 is retained." in prompts[0]

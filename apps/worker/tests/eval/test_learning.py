@@ -29,6 +29,8 @@ from curie_worker.eval.learning import (
     verify_negative,
     verify_report,
 )
+from curie_worker.eval.learning_judge import JudgeSpec, LearningJudgeScorer
+from curie_worker.eval.models import EvalCase, Grader, GraderKind
 from curie_worker.eval.scorer import ScoreResult
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -378,7 +380,7 @@ def _observation(
             },
             "retention": "PASS" if present and value in output else "FAIL",
             "no_recall": value not in output,
-            "no_fabrication": value not in output,
+            "no_fabrication": not re.search(r"[a-z]+-[0-9a-f]{6}", output),
             "guidance_sha256": report["guidance_sha256"],
             "bundle_sha256": report["bundle_sha256"],
         },
@@ -418,6 +420,98 @@ def _schedule_row(item_id: str, *, state: str = "terminal") -> dict[str, Any]:
         "prompt": f"Post token-{item_id}",
         "created_by": "U0EXAMPLE1",
     }
+
+
+def _bind_judge(report: dict[str, Any], row: dict[str, Any], rubric: str) -> None:
+    """Synthetic test data: bind one judge generation to a recorded decision.
+
+    The prompt is the real one built by LearningJudgeScorer for the recorded evidence.
+    """
+    sequence = 101 + sum(item["purpose"] == "judge" for item in report["generations"])
+    request = f"synthetic teaching request for {row['case_id']} {row['decision_id']}"
+    meaning = f"synthetic expected meaning for {row['case_id']} {row['decision_id']}"
+    evidence = {
+        "output": "completed",
+        "trajectory": [],
+        "refs": {"request:teaching": request, "expected:meaning": meaning},
+    }
+    completion = json.dumps(
+        {
+            "verdict": "PASS",
+            "action": row["expected"],
+            "reason": "Supported.",
+            "evidence_refs": ["request:teaching", "expected:meaning"],
+        }
+    )
+    prompts: list[str] = []
+
+    def complete(prompt: str) -> str:
+        prompts.append(prompt)
+        return completion
+
+    spec = JudgeSpec(rubric=rubric, evidence=evidence, deterministic=ScoreResult(passed=True))
+    case = EvalCase(
+        id=row["case_id"], input=request, grader=Grader(kind=GraderKind.EXACT, expected="x")
+    )
+    LearningJudgeScorer({case.id: spec}, complete=complete).score(case, "completed", [])
+    generation_id = f"gen-judge-{row['case_id']}-{row['decision_id']}"
+    operation_id = f"judge-operation-{row['case_id']}-{row['decision_id']}"
+    scope = {key: row[key] for key in ("repetition", "case_id", "agent_id")}
+    report["generations"].append(
+        {
+            "id": generation_id,
+            "model": JUDGE,
+            "usage": {"prompt_tokens": 10, "completion_tokens": 10},
+            "cost_usd": "0.01",
+            "purpose": "judge",
+            "prompt_sha256": _sha(prompts[0].encode()),
+            "call_sequence": sequence,
+            "completion_sha256": _sha(completion.encode()),
+            "ledger_operation_id": operation_id,
+            **scope,
+        }
+    )
+    report["accounting"]["operations"].append(
+        {
+            "id": operation_id,
+            "generation_id": generation_id,
+            "reserve_usd": "0.02",
+            "settled_usd": "0.01",
+            "status": "settled",
+        }
+    )
+    row["judge_ref"] = {
+        "generation_id": generation_id,
+        "case_id": row["case_id"],
+        "decision_id": row["decision_id"],
+        "call_sequence": sequence,
+        "prompt_sha256": _sha(prompts[0].encode()),
+        "completion_sha256": _sha(completion.encode()),
+        "completion": completion,
+        "evidence": evidence,
+    }
+
+
+def _extra_decision(
+    report: dict[str, Any], base: dict[str, Any], decision_id: str, kind: str, rubric: str
+) -> None:
+    """Synthetic test data: a further labeled decision of the same case (consent, correct)."""
+    row = {
+        **copy.deepcopy(base),
+        "decision_id": decision_id,
+        "expected": kind,
+        "predicted": [kind],
+        "distractor": False,
+        "attempts": [],
+    }
+    row.pop("judge_ref", None)
+    if kind == "nothing":
+        row["mutations"] = []
+        observation = copy.deepcopy(_value(report, base["evidence_ref"]))
+        observation.update(after=copy.deepcopy(observation["before"]), semantic_action="nothing")
+        row["evidence_ref"] = _evidence(report, "teaching-observation", observation)
+    report["decisions"].append(row)
+    _bind_judge(report, row, rubric)
 
 
 def _add_controls(report: dict[str, Any], repetition: int) -> None:
@@ -473,7 +567,7 @@ def _add_controls(report: dict[str, Any], repetition: int) -> None:
         case_id = f"F3-P{phrase}-R{repetition}"
         scope = {"repetition": repetition, "case_id": case_id, "agent_id": f"agent-{case_id}"}
         fact_id = f"fact-{case_id}"
-        value = f"synthetic-value-{phrase}-{repetition}"
+        value = f"violet-a1b2c{phrase}"
         before = _observation(report, scope, value=value, present=True, output=value)
         deletion_id, deletion_result = _invocation(
             report,
@@ -670,12 +764,15 @@ def frozen_report(tmp_path: Path) -> dict[str, Any]:
         "memory_negative": {"version": 1, "rows": []},
         "deliveries": {"version": 1, "rows": []},
         "generations": [],
+        # Synthetic test data: recorded private worker attempt cap and schedule reservations.
+        "worker": {"max_attempts": 1},
+        "schedule_reservations": [],
         "calibration": {"version": 1, "rows": [], "deterministic_controls": []},
         "accounting": {
             "budget_usd": "5.00",
             "baseline_usage_usd": "10.00",
-            "end_usage_usd": "10.58",
-            "charged_usd": "0.58",
+            "end_usage_usd": "10.70",
+            "charged_usd": "0.70",
             "unresolved_reservations_usd": "0.00",
             "shutdown_and_inflight_reserve_usd": "0.01",
             "operations": [],
@@ -860,45 +957,35 @@ def frozen_report(tmp_path: Path) -> dict[str, Any]:
                 "reserve_usd": "0.02",
                 "settled_usd": "0.01",
                 "status": "settled",
+                # Synthetic test data: two equal usage readings at least 10 s apart.
+                "usage_polls": [
+                    {"polled_at": "2026-01-01T11:57:00Z", "usage_usd": "10.01"},
+                    {"polled_at": "2026-01-01T11:57:12Z", "usage_usd": "10.01"},
+                ],
             }
         )
         # Synthetic test data: one judge generation bound to each recorded semantic PASS.
-        judge_prompt = f"synthetic judge prompt {index}"
-        judge_completion = json.dumps(
-            {"verdict": "PASS", "action": kind, "reason": "Supported.", "evidence_refs": []}
-        )
-        judge_generation_id = f"gen-placeholder-judge-decision-{index}"
-        judge_operation_id = f"judge-operation-{index}"
-        report["generations"].append(
-            {
-                "id": judge_generation_id,
-                "model": JUDGE,
-                "usage": {"prompt_tokens": 10, "completion_tokens": 10},
-                "cost_usd": "0.01",
-                "purpose": "judge",
-                "prompt_sha256": _sha(judge_prompt.encode()),
-                "call_sequence": 100 + index,
-                "completion_sha256": _sha(judge_completion.encode()),
-                "ledger_operation_id": judge_operation_id,
-                **scope,
-            }
-        )
-        report["accounting"]["operations"].append(
-            {
-                "id": judge_operation_id,
-                "generation_id": judge_generation_id,
-                "reserve_usd": "0.02",
-                "settled_usd": "0.01",
-                "status": "settled",
-            }
-        )
-        report["decisions"][-1]["judge_ref"] = {
-            "generation_id": judge_generation_id,
-            "call_sequence": 100 + index,
-            "prompt_sha256": _sha(judge_prompt.encode()),
-            "completion_sha256": _sha(judge_completion.encode()),
-            "completion": judge_completion,
-        }
+        decision_cases = fixture_cases[case_id]["decisions"]
+        base = report["decisions"][-1]
+        _bind_judge(report, base, decision_cases[0]["rubric"])
+        if family == 1:
+            for decision_id, extra_kind in (
+                ("consent-offer", "nothing"),
+                ("consent-refusal", "nothing"),
+                ("consent-approval", "skill"),
+            ):
+                _extra_decision(report, base, decision_id, extra_kind, decision_cases[0]["rubric"])
+        if family == 8:
+            _extra_decision(report, base, "correct", "skill", decision_cases[1]["rubric"])
+        if kind == "schedule":
+            report["schedule_reservations"].append(
+                {
+                    "repetition": 1,
+                    "case_id": scope["case_id"],
+                    "schedule_id": item["id"],
+                    "disposition": "reserved",
+                }
+            )
     _add_controls(report, 1)
     # Wire shapes: https://openrouter.ai/docs/api/reference/overview and
     # https://openrouter.ai/docs/api/api-reference/generations/get-generation
@@ -990,7 +1077,9 @@ def _summary(rows: list[dict[str, Any]], thresholds: dict[str, Any]) -> dict[str
     distractors = [row for row in eligible if row["distractor"]]
     falsewrites = sum(bool(row["mutations"]) for row in distractors)
     falsewrite_rate = falsewrites / len(distractors) if distractors else None
-    duplicates = sum(row["correction_duplicates"] for row in eligible)
+    duplicates = sum(
+        row["correction_duplicates"] for row in eligible if row["decision_id"] == "correct"
+    )
     gates = {}
     for name in ("precision", "recall"):
         values = [row[name] for row in metrics.values()]
@@ -1013,7 +1102,11 @@ def _summary(rows: list[dict[str, Any]], thresholds: dict[str, Any]) -> dict[str
         else "FAIL",
         "value": falsewrite_rate,
     }
-    corrections = [row for row in eligible if row["fixture_id"].startswith("F8-")]
+    corrections = [
+        row
+        for row in eligible
+        if row["fixture_id"].startswith("F8-") and row["decision_id"] == "correct"
+    ]
     if not corrections:
         gates["correction_duplicates"] = {"status": "NOT_AVAILABLE", "value": None}
     else:
@@ -1153,6 +1246,9 @@ def _duplicate_repetition(report: dict[str, Any], repetition: int = 2) -> None:
             [row for row in original["accounting"]["operations"] if row["id"] in actor_operations]
         )
     )
+    report["schedule_reservations"].extend(
+        remap([row for row in original["schedule_reservations"] if row["repetition"] == 1])
+    )
     for key in ("procedure_probes", "memory_negative", "deliveries"):
         report[key]["rows"].extend(
             remap([row for row in original[key]["rows"] if row["repetition"] == 1])
@@ -1161,7 +1257,7 @@ def _duplicate_repetition(report: dict[str, Any], repetition: int = 2) -> None:
     report["collector"]["delivery_windows"].append(
         {**report["collector"]["delivery_windows"][0], "repetition": repetition}
     )
-    charge = Decimal("0.10") + Decimal("0.48") * repetition
+    charge = Decimal("0.10") + Decimal("0.60") * repetition
     report["accounting"]["end_usage_usd"] = str(Decimal("10.00") + charge)
     report["accounting"]["charged_usd"] = str(charge)
     _derive(report)
@@ -1329,6 +1425,12 @@ def _current_base(report: dict[str, Any]) -> None:
                 "facts": [],
                 "schedules": [],
             }
+    report["decisions"] = [
+        row
+        for row in report["decisions"]
+        if not (row["decision_id"].startswith("consent-") and row["expected"] == "nothing")
+    ]
+    report["schedule_reservations"] = []
     for section in ("procedure_probes", "deliveries"):
         report[section]["rows"] = []
     report["acceptance"] = "NOT_AVAILABLE"
@@ -2191,4 +2293,143 @@ def test_forbidden_persistence_attempt_cannot_be_recorded_as_a_passing_decision(
     assert row["status"] == "PASS"
     row["attempts"] = [{"kind": "memory-fact", "operation": "create", "outcome": attempt}]
     _rehash(report)
+    _check(tmp_path, report, passed=False)
+
+
+@pytest.mark.parametrize("attempts", [0, 2, 3, True, "1", None, "missing"])
+def test_report_must_record_one_attempt_for_the_private_worker(
+    tmp_path: Path, frozen_report: dict[str, Any], attempts: object
+) -> None:
+    _check(tmp_path, frozen_report, passed=True)
+    report = copy.deepcopy(frozen_report)
+    if attempts == "missing":
+        del report["worker"]
+    else:
+        report["worker"]["max_attempts"] = attempts
+    _check(tmp_path, report, passed=False)
+
+
+@pytest.mark.parametrize("damage", ["no-polls", "one-poll", "too-close", "unequal", "zero-usage"])
+def test_actor_settlement_needs_a_stable_second_usage_poll(
+    tmp_path: Path, frozen_report: dict[str, Any], damage: str
+) -> None:
+    _check(tmp_path, frozen_report, passed=True)
+    report = copy.deepcopy(frozen_report)
+    operation = next(
+        row for row in report["accounting"]["operations"] if row["id"].startswith("actor-operation")
+    )
+    polls = operation["usage_polls"]
+    if damage == "no-polls":
+        del operation["usage_polls"]
+    elif damage == "one-poll":
+        del polls[1]
+    elif damage == "too-close":
+        polls[1]["polled_at"] = "2026-01-01T11:57:03Z"
+    elif damage == "unequal":
+        polls[1]["usage_usd"] = "10.02"
+    else:
+        polls[0]["usage_usd"] = polls[1]["usage_usd"] = "10.00"
+    _check(tmp_path, report, passed=False)
+
+
+@pytest.mark.parametrize("damage", ["unreserved", "missing-row"])
+def test_active_schedule_must_be_reserved_or_cancelled(
+    tmp_path: Path, frozen_report: dict[str, Any], damage: str
+) -> None:
+    _check(tmp_path, frozen_report, passed=True)
+    report = copy.deepcopy(frozen_report)
+    assert report["schedule_reservations"]
+    if damage == "unreserved":
+        report["schedule_reservations"][0]["disposition"] = "unreserved"
+    else:
+        report["schedule_reservations"].pop(0)
+    _check(tmp_path, report, passed=False)
+
+
+@pytest.mark.parametrize("ref", ["request:teaching", "expected:meaning"])
+def test_judge_evidence_without_the_request_or_expected_meaning_fails(
+    tmp_path: Path, frozen_report: dict[str, Any], ref: str
+) -> None:
+    _check(tmp_path, frozen_report, passed=True)
+    report = copy.deepcopy(frozen_report)
+    del report["decisions"][0]["judge_ref"]["evidence"]["refs"][ref]
+    _check(tmp_path, report, passed=False)
+
+
+@pytest.mark.parametrize("damage", ["other-case", "other-decision", "shared-generation"])
+def test_judge_reference_must_bind_to_its_own_decision(
+    tmp_path: Path, frozen_report: dict[str, Any], damage: str
+) -> None:
+    _check(tmp_path, frozen_report, passed=True)
+    report = copy.deepcopy(frozen_report)
+    first, second = report["decisions"][0], report["decisions"][-1]
+    assert (first["case_id"], first["decision_id"]) != (second["case_id"], second["decision_id"])
+    if damage == "other-case":
+        first["judge_ref"]["case_id"] = second["case_id"]
+    elif damage == "other-decision":
+        first["judge_ref"]["decision_id"] = second["decision_id"]
+    else:
+        second["judge_ref"] = {
+            **copy.deepcopy(first["judge_ref"]),
+            "case_id": second["case_id"],
+            "decision_id": second["decision_id"],
+        }
+    _check(tmp_path, report, passed=False)
+
+
+def test_report_without_any_f8_correct_decision_fails_even_with_seed_rows(
+    tmp_path: Path, frozen_report: dict[str, Any]
+) -> None:
+    _check(tmp_path, frozen_report, passed=True)
+    report = copy.deepcopy(frozen_report)
+    kept = [row for row in report["decisions"] if row["decision_id"] != "correct"]
+    assert any(row["decision_id"] == "seed" for row in kept)
+    assert len(kept) < len(report["decisions"])
+    report["decisions"] = kept
+    _derive(report)
+    _check(tmp_path, report, passed=False)
+
+
+@pytest.mark.parametrize("section", ["procedure_probes", "memory_negative", "deliveries"])
+def test_report_missing_a_fixture_derived_control_fails(
+    tmp_path: Path, frozen_report: dict[str, Any], section: str
+) -> None:
+    _check(tmp_path, frozen_report, passed=True)
+    report = copy.deepcopy(frozen_report)
+    report[section]["rows"].pop(0)
+    _derive(report)
+    _check(tmp_path, report, passed=False)
+
+
+@pytest.mark.parametrize("validator", [verify_negative, verify_report])
+def test_memory_negative_reply_with_another_nonce_shaped_value_is_a_fabrication(
+    tmp_path: Path, frozen_report: dict[str, Any], validator: Callable[[Path], ScoreResult]
+) -> None:
+    _check(tmp_path, frozen_report, validator, passed=True)
+    report = copy.deepcopy(frozen_report)
+    row = report["memory_negative"]["rows"][0]
+    after = _value(report, row["after_evidence"])
+    required = _value(report, row["before_evidence"])["required_value"]
+    assert re.fullmatch(r"violet-[0-9a-f]{6}", required)
+    after["output"] = "I think it is violet-0f0f0f."
+    after["no_recall"] = True
+    after["no_fabrication"] = True
+    _rehash(report)
+    _check(tmp_path, report, validator, passed=False)
+
+
+@pytest.mark.parametrize("decision_id", ["consent-offer", "consent-refusal", "consent-approval"])
+def test_report_missing_an_f1_consent_decision_fails(
+    tmp_path: Path, frozen_report: dict[str, Any], decision_id: str
+) -> None:
+    _check(tmp_path, frozen_report, passed=True)
+    report = copy.deepcopy(frozen_report)
+    before = len(report["decisions"])
+    report["decisions"] = [
+        row
+        for row in report["decisions"]
+        if not (row["decision_id"] == decision_id and row["fixture_id"] == "F1-P1")
+    ]
+    assert len(report["decisions"]) == before - 1
+    _derive(report)
     _check(tmp_path, report, passed=False)

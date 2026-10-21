@@ -111,9 +111,7 @@ def test_a_case_that_errors_is_failed_not_fatal(make_eval_harness) -> None:
             suite = EvalSuite(
                 name="s",
                 cases=[
-                    EvalCase(
-                        id="bad", input="explode", grader=Grader(kind=CONTAINS, expected="x")
-                    ),
+                    EvalCase(id="bad", input="explode", grader=Grader(kind=CONTAINS, expected="x")),
                     EvalCase(id="good", input="fine", grader=Grader(kind=CONTAINS, expected="yes")),
                 ],
             )
@@ -357,9 +355,7 @@ def test_gate_blocked_turn_is_green_and_narrate_only_is_red(make_eval_harness) -
 
             # Inverse guard: a default (done) case never passes on an
             # awaiting-approval final, so the default gate did not loosen.
-            default_case = EvalCase(
-                id="d", input="q", grader=Grader(kind=CONTAINS, expected="")
-            )
+            default_case = EvalCase(id="d", input="q", grader=Grader(kind=CONTAINS, expected=""))
             fake.awaiting_approval_inputs = {"q"}
             fake.responses = {"q": "blocked the close"}
             default_result = await EvalRunner(client).run(
@@ -416,23 +412,17 @@ def test_tool_called_grader_greens_on_the_tool_note_and_reds_without_it(
                     EvalCase(
                         id="called",
                         input="run it",
-                        grader=Grader(
-                            kind=GraderKind.TOOL_CALLED, expected="DeterministicEngine"
-                        ),
+                        grader=Grader(kind=GraderKind.TOOL_CALLED, expected="DeterministicEngine"),
                     ),
                     EvalCase(
                         id="only-narrated",
                         input="narrate",
-                        grader=Grader(
-                            kind=GraderKind.TOOL_CALLED, expected="DeterministicEngine"
-                        ),
+                        grader=Grader(kind=GraderKind.TOOL_CALLED, expected="DeterministicEngine"),
                     ),
                     EvalCase(
                         id="did-nothing",
                         input="idle",
-                        grader=Grader(
-                            kind=GraderKind.TOOL_CALLED, expected="DeterministicEngine"
-                        ),
+                        grader=Grader(kind=GraderKind.TOOL_CALLED, expected="DeterministicEngine"),
                     ),
                 ],
             )
@@ -536,9 +526,7 @@ def test_a_real_turn_is_still_graded_when_the_run_is_not_fake(make_eval_harness)
     asyncio.run(go())
 
 
-@pytest.mark.parametrize(
-    "breakage", ["classified_failure_inputs", "idle_inputs", "fail_inputs"]
-)
+@pytest.mark.parametrize("breakage", ["classified_failure_inputs", "idle_inputs", "fail_inputs"])
 def test_a_fake_turn_that_does_not_complete_is_a_failure_not_plumbing_ok(
     make_eval_harness, breakage: str
 ) -> None:
@@ -712,8 +700,11 @@ def test_fake_model_run_leaves_cost_none_even_with_usage(make_eval_harness) -> N
             fake.responses = {"q": "all done"}
             fake.usage = {"q": (1_000_000, 200_000)}
             result = await EvalRunner(client).run(
-                _one_case_suite(), base_url=base_url, version="v1",
-                model="claude-opus-4-8", fake=True,
+                _one_case_suite(),
+                base_url=base_url,
+                version="v1",
+                model="claude-opus-4-8",
+                fake=True,
             )
 
             case = result.results[0]
@@ -753,6 +744,7 @@ def test_a_bare_timeout_error_records_a_nonempty_error(make_eval_harness) -> Non
 
     async def go() -> None:
         async with make_eval_harness() as (base_url, fake, client):
+
             async def _timeout(*args, **kwargs):
                 # aiohttp raises a bare asyncio.TimeoutError (== builtin TimeoutError
                 # since 3.11) on timeout; its str() is empty, which is the whole bug.
