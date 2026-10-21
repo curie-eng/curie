@@ -11,11 +11,13 @@ prune operations. Nothing here runs a command or calls a cluster.
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
 import secrets
-from collections.abc import Iterator, Sequence
+import stat
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NoReturn, Self
@@ -47,9 +49,133 @@ _STATES = frozenset({"intended", "created", "uncertain", "removed"})
 _OWNER = re.compile(r"curie-commission-[0-9a-f]{12}")
 _LEDGER = "ownership.json"
 _MAX_KEY = 512
-# Flags that would point a command at another cluster, user or profile.
-_KUBECTL_SELECTION = frozenset({"--context", "--kubeconfig", "--cluster", "--user"})
-_PROFILE_SELECTION = frozenset({"-p", "--profile"})
+# Operator arguments: every spelling that selects another cluster, credential,
+# profile or Docker daemon. The argv builders below use allowlists instead.
+_SELECTION = frozenset(
+    {
+        "--context",
+        "--kubeconfig",
+        "--cluster",
+        "--user",
+        "--server",
+        "-s",
+        "--token",
+        "--as",
+        "--as-group",
+        "--as-uid",
+        "--username",
+        "--password",
+        "--certificate-authority",
+        "--client-certificate",
+        "--client-key",
+        "--tls-server-name",
+        "--insecure-skip-tls-verify",
+        "-p",
+        "--profile",
+        "-H",
+        "--host",
+    }
+)
+# Subcommands and flags each tool may receive; anything else refuses. The first
+# argument must be the subcommand, so no global flag precedes it.
+_KUBECTL_COMMANDS = frozenset(
+    {"get", "apply", "create", "delete", "patch", "wait", "rollout", "describe", "logs", "label"}
+)
+_KUBECTL_FLAGS = frozenset(
+    {
+        "-n",
+        "--namespace",
+        "-o",
+        "--output",
+        "-f",
+        "--filename",
+        "-l",
+        "--selector",
+        "--field-selector",
+        "--timeout",
+        "--for",
+        "--ignore-not-found",
+        "--grace-period",
+        "--server-side",
+        "--field-manager",
+        "--force-conflicts",
+        "--type",
+        "-p",
+        "--patch",
+        "--subresource",
+        "--overwrite",
+    }
+)
+_MINIKUBE_COMMANDS = frozenset({"start", "status", "stop", "delete", "ip", "image"})
+_MINIKUBE_FLAGS = frozenset(
+    {
+        "--driver",
+        "--container-runtime",
+        "--kubernetes-version",
+        "--cni",
+        "--network",
+        "--keep-context",
+        "--memory",
+        "--cpus",
+        "--interactive",
+        "--wait",
+        "--wait-timeout",
+        "--nodes",
+        "-o",
+        "--output",
+    }
+)
+_DOCKER_COMMANDS = frozenset(
+    {
+        "network",
+        "container",
+        "volume",
+        "image",
+        "inspect",
+        "run",
+        "rm",
+        "ps",
+        "tag",
+        "push",
+        "pull",
+        "save",
+        "load",
+        "build",
+    }
+)
+_DOCKER_FLAGS = frozenset(
+    {
+        "--label",
+        "--filter",
+        "--format",
+        "-f",
+        "--force",
+        "--type",
+        "--name",
+        "--network",
+        "-d",
+        "--detach",
+        "--publish",
+        "--volume",
+        "-v",
+        "--rm",
+        "--restart",
+        "-t",
+        "--tag",
+        "--driver",
+        "-q",
+        "--quiet",
+        "-o",
+        "--output",
+        "-i",
+        "--input",
+        "--platform",
+        "--read-only",
+    }
+)
+_DOCKER_FORBIDDEN_WORDS = frozenset({"prune", "system", "context"})
+# Ambient variables that select a cluster, profile or daemon; cleared, then pinned.
+_AMBIENT_PREFIXES = ("DOCKER_", "MINIKUBE_", "KUBECTL_", "KUBE")
 
 
 class OwnershipRefused(RuntimeError):
@@ -127,6 +253,30 @@ def _entry(value: Any) -> dict[str, Any]:
     return entry
 
 
+def _find(entries: list[dict[str, Any]], kind: str, key: str) -> dict[str, Any]:
+    entry = next((e for e in entries if e["kind"] == kind and e["key"] == key), None)
+    _require(entry is not None)
+    assert entry is not None
+    return entry
+
+
+def _private_directory(root: Path) -> None:
+    """A real directory, not a symlink, owned by this user with mode 0700."""
+    info = os.lstat(root)
+    _require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid())
+    _require(stat.S_IMODE(info.st_mode) == 0o700)
+
+
+def _read_private(path: Path) -> str:
+    """Read a regular 0600 file owned by this user without following a symlink."""
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    with os.fdopen(descriptor, "r", encoding="utf-8") as stream:
+        info = os.fstat(stream.fileno())
+        _require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid())
+        _require(stat.S_IMODE(info.st_mode) == 0o600)
+        return stream.read()
+
+
 class OwnershipLedger:
     """Register-before-create ledger of one installation, @spec PROTECTED-COMMISSIONING-5."""
 
@@ -152,42 +302,63 @@ class OwnershipLedger:
         except FileExistsError:
             _refuse()
         root.chmod(0o700)
+        _private_directory(root)
         ledger = cls(root, owner, [])
-        ledger._save()
+        ledger._save(ledger._entries)
         return ledger
 
     @classmethod
-    def open(cls, root: Path) -> Self:
-        """Reopen after a restart; tickets do not survive it, @spec PROTECTED-COMMISSIONING-5."""
+    def open(cls, root: Path, *, owner: str) -> Self:
+        """Reopen this installation's ledger after a restart.
+
+        Tickets do not survive it. @spec PROTECTED-COMMISSIONING-5.
+        """
         try:
-            value = json.loads((root / _LEDGER).read_text(encoding="utf-8"))
+            _require(valid_owner(owner))
+            _private_directory(root)
+            value = json.loads(_read_private(root / _LEDGER))
             _require(type(value) is dict and value.keys() == {"owner", "entries"})
-            _require(valid_owner(value["owner"]) and type(value["entries"]) is list)
+            _require(value["owner"] == owner and type(value["entries"]) is list)
             entries = [_entry(entry) for entry in value["entries"]]
             keys = {(entry["kind"], entry["key"]) for entry in entries}
             _require(len(keys) == len(entries))
-            return cls(root, value["owner"], entries)
+            return cls(root, owner, entries)
         except OwnershipRefused:
             raise
         except (OSError, ValueError, TypeError, KeyError, RecursionError):
             _refuse()
 
-    def _save(self) -> None:
+    def _save(self, entries: list[dict[str, Any]]) -> None:
+        """Durably replace the ledger file; the caller swaps memory only after."""
         path = self.root / _LEDGER
         temporary = self.root / (_LEDGER + ".tmp")
-        raw = json.dumps({"owner": self.owner, "entries": self._entries}, indent=2) + "\n"
-        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        raw = json.dumps({"owner": self.owner, "entries": entries}, indent=2) + "\n"
+        # A leftover or planted temporary is removed, never written through.
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+        descriptor = os.open(temporary, flags, 0o600)
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
             stream.write(raw)
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
+        directory = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
 
-    def _find(self, kind: str, key: str) -> dict[str, Any]:
-        entry = next((e for e in self._entries if e["kind"] == kind and e["key"] == key), None)
-        _require(entry is not None)
-        assert entry is not None
-        return entry
+    def _update(self, kind: str, key: str, states: tuple[str, ...], **changes: Any) -> None:
+        """Change one entry in a copy, save it, then swap memory."""
+        entries = copy.deepcopy(self._entries)
+        entry = _find(entries, kind, key)
+        _require(entry["state"] in states)
+        entry.update(changes)
+        self._save(entries)
+        self._entries = entries
 
     def intend(self, kind: str, key: str) -> CreateTicket:
         """Record ownership durably, then return the create ticket.
@@ -196,8 +367,12 @@ class OwnershipLedger:
         """
         _require(kind in KINDS and _text(key))
         _require(all(e["kind"] != kind or e["key"] != key for e in self._entries))
-        self._entries.append({"kind": kind, "key": key, "state": "intended", "identity": {}})
-        self._save()
+        entries = [
+            *copy.deepcopy(self._entries),
+            {"kind": kind, "key": key, "state": "intended", "identity": {}},
+        ]
+        self._save(entries)
+        self._entries = entries
         return CreateTicket(kind, key, self._token)
 
     def bind(self, ticket: CreateTicket, **identity: str) -> None:
@@ -206,40 +381,32 @@ class OwnershipLedger:
         @spec PROTECTED-COMMISSIONING-5.
         """
         _require(type(ticket) is CreateTicket and ticket._ledger == self._token)
-        entry = self._find(ticket.kind, ticket.key)
-        _require(entry["state"] == "intended")
-        entry["state"], entry["identity"] = "created", _identity(identity)
-        self._save()
+        self._update(
+            ticket.kind, ticket.key, ("intended",), state="created", identity=_identity(identity)
+        )
 
     def uncertain(self, kind: str, key: str) -> None:
         """An ambiguous or interrupted create, @spec PROTECTED-COMMISSIONING-5."""
-        entry = self._find(kind, key)
-        _require(entry["state"] == "intended")
-        entry["state"] = "uncertain"
-        self._save()
+        self._update(kind, key, ("intended",), state="uncertain")
 
     def resolve(self, kind: str, key: str, **identity: str) -> None:
         """Bind an uncertain create found by its exact recorded name and owner.
 
-        A created entry is never rebound, so a same-name object is never
-        adopted. @spec PROTECTED-COMMISSIONING-5.
+        The observed object must carry this installation's owner label. A
+        created entry is never rebound, so a same-name object is never adopted.
+        @spec PROTECTED-COMMISSIONING-5.
         """
-        entry = self._find(kind, key)
-        _require(entry["state"] == "uncertain")
-        entry["state"], entry["identity"] = "created", _identity(identity)
-        self._save()
+        _require(identity.get("owner") == self.owner)
+        self._update(kind, key, ("uncertain",), state="created", identity=_identity(identity))
 
     def removed(self, kind: str, key: str) -> None:
         """Record independently confirmed absence; terminal, @spec PROTECTED-COMMISSIONING-5."""
-        entry = self._find(kind, key)
         # An intended entry may have been created; it must first become uncertain.
-        _require(entry["state"] in ("created", "uncertain"))
-        entry["state"] = "removed"
-        self._save()
+        self._update(kind, key, ("created", "uncertain"), state="removed")
 
     def identity(self, kind: str, key: str) -> dict[str, str]:
         """@spec PROTECTED-COMMISSIONING-5."""
-        return dict(self._find(kind, key)["identity"])
+        return dict(_find(self._entries, kind, key)["identity"])
 
     def entries(self) -> tuple[Entry, ...]:
         """@spec PROTECTED-COMMISSIONING-5."""
@@ -258,25 +425,38 @@ class OwnershipLedger:
         return all(e["state"] == "removed" for e in self._entries)
 
 
-def _flag(argument: str) -> str:
-    return argument.split("=", 1)[0]
+def _flag(argument: str) -> str | None:
+    """The flag name an argument sets, including glued short forms, or None."""
+    if not argument.startswith("-") or argument == "-":
+        return None
+    if argument.startswith("--"):
+        return argument.split("=", 1)[0]
+    return argument[:2]
 
 
 def refuse_cluster_selection(argv: Sequence[str]) -> None:
-    """Refuse operator arguments that select a cluster, kubeconfig or profile.
+    """Refuse operator arguments that select a cluster, credential, profile or daemon.
 
     The operator command creates its own profile and private kubeconfig; it
     never acts on a caller's context. @spec PROTECTED-COMMISSIONING-5.
     """
     _require(all(type(argument) is str for argument in argv))
-    selection = _KUBECTL_SELECTION | _PROFILE_SELECTION
-    _require(not any(_flag(argument) in selection for argument in argv))
+    _require(not any(_flag(argument) in _SELECTION for argument in argv))
+
+
+def _allowed(args: tuple[str, ...], commands: frozenset[str], flags: frozenset[str]) -> None:
+    _require(all(type(a) is str for a in args))
+    _require(bool(args) and args[0] in commands)
+    for argument in args:
+        flag = _flag(argument)
+        _require(flag is None or flag in flags)
 
 
 class ClusterCommands:
     """Argv bound to this installation's profile and private kubeconfig.
 
-    Building argv runs nothing. @spec PROTECTED-COMMISSIONING-5.
+    Building argv runs nothing. Each tool takes only listed subcommands and
+    flags. @spec PROTECTED-COMMISSIONING-5.
     """
 
     def __init__(self, profile: str, *, kubeconfig: Path) -> None:
@@ -288,28 +468,28 @@ class ClusterCommands:
         """@spec PROTECTED-COMMISSIONING-5."""
         return "ClusterCommands()"
 
-    def environment_overrides(self) -> dict[str, str]:
-        """The operator's own kubeconfig is never read or changed.
+    def environment(self, ambient: Mapping[str, str]) -> dict[str, str]:
+        """A copy of ``ambient`` without cluster, profile or daemon selection.
 
-        @spec PROTECTED-COMMISSIONING-5.
+        The operator's own kubeconfig is never read or changed. @spec PROTECTED-COMMISSIONING-5.
         """
-        return {"KUBECONFIG": str(self.kubeconfig)}
+        result = {k: v for k, v in ambient.items() if not k.startswith(_AMBIENT_PREFIXES)}
+        result["KUBECONFIG"] = str(self.kubeconfig)
+        result["MINIKUBE_PROFILE"] = self.profile
+        return result
 
     def kubectl_argv(self, *args: str) -> list[str]:
         """@spec PROTECTED-COMMISSIONING-5."""
-        _require(all(type(a) is str for a in args))
-        _require(not any(_flag(a) in _KUBECTL_SELECTION for a in args))
-        _require(not (args and args[0] == "config"))
+        _allowed(args, _KUBECTL_COMMANDS, _KUBECTL_FLAGS)
         return ["kubectl", "--context", self.profile, "--kubeconfig", str(self.kubeconfig), *args]
 
     def minikube_argv(self, *args: str) -> list[str]:
         """@spec PROTECTED-COMMISSIONING-5."""
-        _require(all(type(a) is str for a in args))
-        _require(not any(_flag(a) in _PROFILE_SELECTION or a == "--all" for a in args))
+        _allowed(args, _MINIKUBE_COMMANDS, _MINIKUBE_FLAGS)
         return ["minikube", "-p", self.profile, *args]
 
     def docker_argv(self, *args: str) -> list[str]:
         """@spec PROTECTED-COMMISSIONING-5."""
-        _require(all(type(a) is str for a in args))
-        _require("prune" not in args and not (args and args[0] == "system"))
+        _allowed(args, _DOCKER_COMMANDS, _DOCKER_FLAGS)
+        _require(not _DOCKER_FORBIDDEN_WORDS.intersection(args))
         return ["docker", *args]

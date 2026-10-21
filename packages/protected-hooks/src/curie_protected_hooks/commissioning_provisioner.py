@@ -83,9 +83,9 @@ BROKER_PRINCIPALS = (
 _GUARD_KIND = "commissioning_guard_config"
 _GUARD_MAX_BYTES = 16384
 _PINNED_IMAGE = re.compile(r"([\x21-\x3f\x41-\x7e]{1,2000})@(sha256:[0-9a-f]{64})")
-_RULE = re.compile(r"[\x21-\x7e]{1,512}")
+_RULE = re.compile(r"[\x21-\x7e](?:[\x20-\x7e]{0,510}[\x21-\x7e])?")
 # ACL tokens that carry a user's enabled state or password. G hashes rules only.
-_STATE_TOKENS = frozenset({"on", "off", "nopass", "resetpass"})
+_STATE_TOKENS = frozenset({"on", "off", "nopass", "resetpass", "reset"})
 _PASSWORD_PREFIXES = (">", "<", "#", "!")
 _SHA256 = "sha256"
 
@@ -241,8 +241,9 @@ def _rules_digest(rules: Any) -> str:
     _require(type(rules) is tuple and bool(rules))
     for rule in rules:
         _require(type(rule) is str and _RULE.fullmatch(rule) is not None)
-        for token in rule.strip("()").split():
-            token = token.strip("()")
+        for token in rule.split():
+            # ACL keywords are case-insensitive; compare the folded spelling.
+            token = token.strip("()").lower()
             _require(token not in _STATE_TOKENS and not token.startswith(_PASSWORD_PREFIXES))
     return hashlib.sha256(_encode(list(rules))).hexdigest()
 
