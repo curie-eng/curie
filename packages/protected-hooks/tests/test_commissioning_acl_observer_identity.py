@@ -13,6 +13,7 @@ import copy
 
 import pytest
 from curie_protected_hooks.admission_acl import admission_acl_rules
+from curie_protected_hooks.broker_metadata import metadata_acl_rules
 from curie_protected_hooks.commissioning_acl import commissioning_acl_rules
 from curie_protected_hooks.commissioning_bootstrap import parse_commissioning_bootstrap
 from curie_protected_hooks.commissioning_producers import (
@@ -64,6 +65,8 @@ def _rules(name: str) -> tuple[str, ...]:
         return commissioning_acl_rules(name, permit=permit())
     if name == "qualification_publisher":
         return commissioning_acl_rules(name, qualification_id=QUALIFICATION_ID)
+    if name == "control_reader":
+        return metadata_acl_rules("control_reader")
     return commissioning_acl_rules(name)
 
 
@@ -96,6 +99,7 @@ def _producer(service, users, reader_role):
     value["candidate_credentials"]["enqueue"]["id"] = users["candidate_enqueue"].username
     value["candidate_credentials"]["worker"]["id"] = users["candidate_worker"].username
     value["qualification_publisher_identity"]["id"] = users["qualification_publisher"].username
+    value["control_reader_identity"]["id"] = users["control_reader"].username
     bootstrap = parse_commissioning_bootstrap(encoded(value))
     # The administrator-run installation step records the baseline.
     states = {

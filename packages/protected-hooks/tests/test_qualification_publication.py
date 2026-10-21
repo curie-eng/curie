@@ -472,7 +472,7 @@ def test_only_the_bootstrap_publisher_writes_qualification(
     others = [
         *(ref["id"] for ref in b["production_credentials"].values()),
         *(ref["id"] for ref in b["candidate_credentials"].values()),
-        *(b[m]["id"] for m in ("issuer_identity", "control_identity")),
+        *(b[m]["id"] for m in ("issuer_identity", "control_identity", "control_reader_identity")),
         *(b[m]["id"] for m in ("mediator_identity", "gateway_identity")),
     ]
     for username in others:

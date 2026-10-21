@@ -30,6 +30,7 @@ import re
 from .admission_acl import admission_acl_rules
 from .admission_records import _encode
 from .authority_records import AuthorityRecordInvalid, _scalar
+from .broker_metadata import metadata_acl_rules
 from .commissioning_records import CommissioningPermit
 from .execution_namespace import LaneNamespace
 from .worker_acl import _COMMANDS, _HANDSHAKE, _RESET, worker_acl_rules
@@ -230,7 +231,8 @@ def commissioning_acl_rules(
 class GuardRecipes:
     """The merged recipes G hashes, one per guard principal, @spec PROTECTED-COMMISSIONING-2.
 
-    Production principals take their unchanged LANE-3 recipes, the candidates
+    Production principals, the design decision 10 control reader included,
+    take their unchanged LANE-3 recipes, the candidates
     their design decision 9 templates, and the Qualification publisher the
     recipe confined to the manifest's ``qualification_id``.
     """
@@ -248,6 +250,7 @@ class GuardRecipes:
             "qualification_publisher": commissioning_acl_rules(
                 "qualification_publisher", qualification_id=qualification_id
             ),
+            "control_reader": metadata_acl_rules("control_reader"),
             "observer": commissioning_acl_rules("observer"),
         }
 

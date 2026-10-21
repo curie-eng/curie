@@ -38,7 +38,14 @@ def bootstrap():
         "candidate_credentials": {"enqueue": _ref("c-enqueue"), "worker": _ref("c-worker")},
         **{
             n + "_identity": _ref(n)
-            for n in ("issuer", "control", "qualification_publisher", "mediator", "gateway")
+            for n in (
+                "issuer",
+                "control",
+                "qualification_publisher",
+                "control_reader",
+                "mediator",
+                "gateway",
+            )
         },
         "source_scope": [
             {

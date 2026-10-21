@@ -81,6 +81,7 @@ BROKER_PRINCIPALS = (
     "candidate_enqueue",
     "candidate_worker",
     "qualification_publisher",
+    "control_reader",
 )
 # G's principals: every B credential above plus design decision 7's ACL
 # observer. G hashes the observer's rules and binds its credential, which B
@@ -174,6 +175,7 @@ class ProvisionerProfile:
     issuer_identity: dict[str, Any]
     control_identity: dict[str, Any]
     qualification_publisher_identity: dict[str, Any]
+    control_reader_identity: dict[str, Any]
     observer_identity: dict[str, Any]
     mediator_identity: dict[str, Any]
     gateway_identity: dict[str, Any]
@@ -332,6 +334,7 @@ def _bootstrap(profile: ProvisionerProfile, execution_digest: str) -> Commission
         "issuer_identity": profile.issuer_identity,
         "control_identity": profile.control_identity,
         "qualification_publisher_identity": profile.qualification_publisher_identity,
+        "control_reader_identity": profile.control_reader_identity,
         "mediator_identity": profile.mediator_identity,
         "gateway_identity": profile.gateway_identity,
         "source_scope": profile.source_scope,
@@ -347,6 +350,7 @@ def _principal_credentials(b: dict[str, Any]) -> dict[str, Any]:
         "issuer": b["issuer_identity"],
         "control": b["control_identity"],
         "qualification_publisher": b["qualification_publisher_identity"],
+        "control_reader": b["control_reader_identity"],
         "candidate_enqueue": b["candidate_credentials"]["enqueue"],
         "candidate_worker": b["candidate_credentials"]["worker"],
     }
