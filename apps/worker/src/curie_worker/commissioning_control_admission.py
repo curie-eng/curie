@@ -14,7 +14,11 @@ webhook configuration, this module answers allow only for:
 - a Secret or Service CREATE by the mediator whose object has the launch
   mechanics' fixed shape under a slot name;
 - an Endpoints or EndpointSlice CREATE or UPDATE by one of the profile's
-  endpoint controllers, since those decide where the mediator dials.
+  endpoint controllers, since those decide where the mediator dials;
+- a launch Pod status UPDATE by the node the Pod is bound to, or by one of the
+  profile's binders or status controllers, since status carries the IPs and
+  readiness that steer the launch Service;
+- a launch Pod binding by one of the profile's binders.
 
 Everything else the webhook routes here refuses: ephemeral container, resize,
 exec, attach and port-forward requests; any update of a Secret, Service or
@@ -101,6 +105,7 @@ _REQUEST = {
 # admission. Each is bounded here; none can stand in for a measured field.
 _CREATED = {"uid", "creationTimestamp", "managedFields", "generation", "resourceVersion"}
 _SECRET_KEYS = ("runner-token", "history-token", "model-credential")
+_NODE = r"(?=.{1,253}$)[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?"
 
 
 class ControlAdmissionInvalid(ValueError):
@@ -326,6 +331,40 @@ def _service_defaults(spec: dict[str, Any]) -> None:
         _require(families in (["IPv4"], ["IPv6"]))
 
 
+def _pod_status(q: dict[str, Any], policy: GuardPolicy, user: str) -> None:
+    """Pod status steers the launch Service: only the Pod's own node or named controllers."""
+    principals = policy.profile.as_dict()["principals"]
+    old = _dict(q.get("oldObject"))
+    slot_for_name(_dict(old.get("metadata")).get("name"), "pod")
+    node = _dict(old.get("spec")).get("nodeName")
+    groups = q["userInfo"].get("groups", [])
+    own_node = (
+        type(node) is str
+        and re.fullmatch(_NODE, node) is not None
+        and user == "system:node:" + node
+        and type(groups) is list
+        and "system:nodes" in groups
+    )
+    _require(
+        own_node
+        or user in principals["pod_binders"]
+        or user in principals["pod_status_controllers"]
+    )
+
+
+def _binding(q: dict[str, Any], policy: GuardPolicy, user: str) -> None:
+    """A binding chooses the node of a launch Pod: only the named binders."""
+    _require(user in policy.profile.as_dict()["principals"]["pod_binders"])
+    obj = _dict(q["object"])
+    _require(obj.get("apiVersion") == "v1" and obj.get("kind") == "Binding")
+    slot_for_name(_dict(obj.get("metadata")).get("name"), "pod")
+    target = _dict(obj.get("target"))
+    _require(target.keys() <= {"apiVersion", "kind", "name"} and target.get("kind") == "Node")
+    _require(target.get("apiVersion", "v1") == "v1")
+    name = target.get("name")
+    _require(type(name) is str and re.fullmatch(_NODE, name) is not None)
+
+
 def _decide(review: Any, policy: GuardPolicy) -> None:
     q = _request(review)
     group, resource, sub = _resource(q)
@@ -342,6 +381,13 @@ def _decide(review: Any, policy: GuardPolicy) -> None:
         _secret_create(q, policy, user)
     elif (group, resource, sub, operation) == ("", "services", "", "CREATE"):
         _service_create(q, policy, user)
+    elif (group, resource, sub, operation) == ("", "pods", "status", "UPDATE"):
+        _pod_status(q, policy, user)
+    elif (group, resource, sub, operation) in (
+        ("", "pods", "binding", "CREATE"),
+        ("", "bindings", "", "CREATE"),
+    ):
+        _binding(q, policy, user)
     elif (group, resource, sub) in (
         ("", "endpoints", ""),
         ("discovery.k8s.io", "endpointslices", ""),

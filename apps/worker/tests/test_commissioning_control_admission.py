@@ -326,6 +326,11 @@ def service():
     return value
 
 
+@pytest.mark.parametrize("user", [PROVISIONER, "kubernetes-admin"])
+def test_service_by_anyone_but_the_mediator_is_refused(user):
+    assert not allowed(request(service(), resource="services", user=user))
+
+
 def test_measured_service_create_by_the_mediator_is_allowed():
     assert allowed(request(service(), resource="services"))
     assert allowed(request(service_document(NS, SLOT.service_name, LAUNCH), resource="services"))
@@ -641,3 +646,126 @@ def test_server_answers_only_admission_posts_over_tls(tmp_path):
             await runner.cleanup()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda m: m.update(managedFields=[dict(m["managedFields"][0])] * 17),
+        lambda m: m["managedFields"][0].update(extra="x"),
+        lambda m: m["managedFields"][0].update(time="yesterday"),
+        lambda m: m["managedFields"][0].update(fieldsV1=[]),
+        lambda m: m["managedFields"][0].update(manager=""),
+        lambda m: m.update(managedFields={}),
+    ],
+)
+def test_managed_field_bookkeeping_is_bounded(mutate):
+    pod = admitted_pod()
+    mutate(pod["metadata"])
+    assert not allowed(request(pod))
+    pod = admitted_pod()
+    pod["metadata"]["managedFields"] = [dict(pod["metadata"]["managedFields"][0])] * 16
+    assert allowed(request(pod))
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda q: q["requestResource"].update(resource="deployments"),
+        lambda q: q["requestResource"].update(group="apps"),
+        lambda q: q["requestResource"].update(version="v2"),
+        lambda q: q.update(requestSubResource="status"),
+    ],
+)
+def test_request_resource_must_equal_the_resource(mutate):
+    review = request(admitted_pod())
+    mutate(review["request"])
+    assert not allowed(review)
+
+
+NODE = "worker-1"
+BINDER = "system:kube-scheduler"
+STATUS_CONTROLLER = "system:serviceaccount:kube-system:node-controller"
+
+
+def _status_request(user, *, groups=None, node=NODE):
+    old = _live(admitted_pod())
+    old["spec"]["nodeName"] = node
+    new = deepcopy(old)
+    new["status"] = {"phase": "Running", "podIP": "10.0.0.7", "podIPs": [{"ip": "10.0.0.7"}]}
+    review = request(new, sub="status", operation="UPDATE", user=user, old=old)
+    if groups is not None:
+        review["request"]["userInfo"]["groups"] = groups
+    return review
+
+
+def test_pod_status_from_its_own_node_binders_and_status_controllers_is_allowed():
+    assert allowed(
+        _status_request("system:node:" + NODE, groups=["system:nodes", "system:authenticated"])
+    )
+    assert allowed(_status_request(BINDER))
+    assert allowed(_status_request(STATUS_CONTROLLER))
+
+
+@pytest.mark.parametrize(
+    ("user", "groups"),
+    [
+        ("system:node:worker-2", ["system:nodes", "system:authenticated"]),
+        ("system:node:" + NODE, ["system:authenticated"]),
+        (MEDIATOR, None),
+        (PROVISIONER, None),
+        ("kubernetes-admin", ["system:masters", "system:authenticated"]),
+        ("system:serviceaccount:kube-system:other-controller", None),
+    ],
+)
+def test_pod_status_from_anyone_else_is_refused(user, groups):
+    assert not allowed(_status_request(user, groups=groups))
+
+
+def test_pod_status_of_an_unbound_or_foreign_pod_is_refused():
+    review = _status_request("system:node:", groups=["system:nodes"], node="")
+    assert not allowed(review)
+    review = _status_request(BINDER)
+    for pod in (review["request"]["object"], review["request"]["oldObject"]):
+        pod["metadata"]["name"] = "ordinary-pod"
+    assert not allowed(review)
+
+
+def _binding(**target):
+    return {
+        "apiVersion": "v1",
+        "kind": "Binding",
+        "metadata": {"name": SLOT.pod_name, "namespace": NS, "uid": POD_UID},
+        "target": {"apiVersion": "v1", "kind": "Node", "name": NODE, **target},
+    }
+
+
+@pytest.mark.parametrize(("resource", "sub"), [("pods", "binding"), ("bindings", "")])
+def test_only_binders_bind_launch_pods_to_a_node(resource, sub):
+    assert allowed(request(_binding(), resource=resource, sub=sub, user=BINDER))
+    for user in (MEDIATOR, PROVISIONER, STATUS_CONTROLLER, "kubernetes-admin"):
+        assert not allowed(request(_binding(), resource=resource, sub=sub, user=user))
+    for bad in (_binding(kind="Pod"), _binding(name="Bad_Node")):
+        assert not allowed(request(bad, resource=resource, sub=sub, user=BINDER))
+    foreign = _binding()
+    foreign["metadata"]["name"] = "ordinary-pod"
+    assert not allowed(request(foreign, resource=resource, sub=sub, user=BINDER))
+
+
+@pytest.mark.parametrize(
+    ("group", "resource"),
+    [
+        ("cilium.io", "ciliumnetworkpolicies"),
+        ("crd.projectcalico.org", "networkpolicies"),
+        ("projectcalico.org", "networkpolicies"),
+        ("vpcresources.k8s.aws", "securitygrouppolicies"),
+    ],
+)
+@pytest.mark.parametrize("operation", ["CREATE", "UPDATE", "DELETE"])
+def test_cni_policy_writes_always_refuse(group, resource, operation):
+    obj = {"apiVersion": "x/v1", "kind": "Policy", "metadata": {"name": "p", "namespace": NS}}
+    for user in (MEDIATOR, PROVISIONER, BINDER, "kubernetes-admin"):
+        review = request(obj, group=group, resource=resource, operation=operation, user=user)
+        review["request"]["resource"]["version"] = "v2"
+        review["request"]["requestResource"]["version"] = "v2"
+        assert not allowed(review)
