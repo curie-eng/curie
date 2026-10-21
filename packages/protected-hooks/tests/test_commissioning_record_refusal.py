@@ -57,7 +57,6 @@ def refuses_without_effect(broker, records, call) -> None:
     except records.AdmissionUnavailable as error:
         safe_error(error, broker)
     assert snapshot(broker) == before
-    assert not broker.command("EXISTS", "curie:runs")
 
 
 @pytest.mark.parametrize("kind", KINDS)
@@ -94,23 +93,61 @@ def test_atomic_admission_refuses_an_all_commissioning_control_set(admission_bro
         for kind in KINDS:
             b.command("SET", key, vectors[kind])
             refuses_without_effect(b, r, lambda: f.admit(request(r)))
+            assert not b.command("EXISTS", "curie:runs")
+
+
+def preparing(broker, records, f, req):
+    """Real partial admission: the enqueue recipe minus ``xadd`` keeps the script's
+    earlier writes, leaving a preparing intent with its state, recovery, binding,
+    event index and quota member. @spec PROTECTED-HOOK-ADMISSION-4/5."""
+    rules = admission_acl.admission_acl_rules("enqueue")
+    denied = tuple(
+        rule.replace(" +xadd", "") if "%RW~curie:runs)" in rule else rule for rule in rules
+    )
+    assert denied != rules
+    broker.command("ACL", "SETUSER", "enqueue", *denied)
+    try:
+        with pytest.raises(records.AdmissionUnavailable):
+            f.admit(req)
+    finally:
+        broker.command("ACL", "SETUSER", "enqueue", *rules)
+    assert not broker.command("EXISTS", "curie:runs")
+
+
+FAMILIES = ("intent", "state", "commit", "recovery", "binding", "event")
 
 
 @pytest.mark.parametrize("kind", KINDS)
-@pytest.mark.parametrize("family", ["intent", "state", "commit", "recovery", "binding", "event"])
+@pytest.mark.parametrize(
+    "phase,family",
+    [("preparing", family) for family in FAMILIES]
+    # A committed delivery has no recovery record and never reads one.
+    + [("committed", family) for family in FAMILIES if family != "recovery"],
+)
 def test_atomic_admission_never_adopts_a_commissioning_admission_record(
-    admission_broker, family, kind
+    admission_broker, phase, family, kind
 ):
-    """A commissioning record under an admission key is neither adopted nor replaced.
+    """A commissioning record in place of one stored admission record is never adopted.
 
-    Admission and recovery of the same delivery refuse or are unavailable and
-    the commissioning bytes stay as they were. @spec PROTECTED-COMMISSIONING-4.
+    Over a genuine preparing or committed delivery, the substituted key holds
+    that delivery's genuine record, except a preparing delivery's commit record
+    and event index, which the substitution forges. Admission and recovery then refuse or are
+    unavailable: nothing commits, no stream entry or receipt appears, and the
+    commissioning bytes stay as they were. @spec PROTECTED-COMMISSIONING-4.
     """
     b = admission_broker
     r, f, _ = setup_product(b)
     req = request(r)
+    if phase == "preparing":
+        preparing(b, r, f, req)
+    else:
+        assert f.admit(req).as_dict()["status"] == "accepted"
     suffix = "event/example" if family in {"binding", "event"} else r.delivery_digest(req.identity)
     key = "protected:admission:" + family + ":" + suffix
+    # A preparing delivery has no commit record or event index: there the
+    # substitution forges one.
+    genuine = phase == "committed" or family not in {"commit", "event"}
+    assert b.command("EXISTS", key) == genuine, (phase, family)
     raw = records_for(b)[kind]
     b.command("SET", key, raw)
     refuses_without_effect(b, r, lambda: f.admit(req))

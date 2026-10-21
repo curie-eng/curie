@@ -22,12 +22,15 @@ from typing import Any
 
 import pytest
 from _protected_ingress_harness import (
+    QUOTA,
     _broker,
     admission_key,
     assert_detail,
     broker_snapshot,
     control_key,
     deliver,
+    digest,
+    event_id,
     ingress_app,
     ingress_broker_fixture,  # noqa: F401  (fixture)
     install,
@@ -168,6 +171,20 @@ def test_signed_ingress_refuses_every_commissioning_control_record(
 # -- admission reconciliation ------------------------------------------------------------
 
 
+def delivery_state(broker: Any, agent: str, delivery: str) -> dict[str, Any]:
+    """One delivery's broker records and quota member, @spec PROTECTED-HOOK-ADMISSION-5."""
+    keys = [
+        admission_key(kind, agent, delivery) for kind in ("intent", "state", "commit", "recovery")
+    ]
+    keys += [
+        "protected:admission:" + kind + ":" + event_id(agent, delivery)
+        for kind in ("binding", "event")
+    ]
+    value: dict[str, Any] = {key: broker.command("DUMP", key) for key in keys}
+    value[QUOTA] = broker.command("ZSCORE", QUOTA, digest(agent, delivery))
+    return value
+
+
 def test_reconciler_never_commits_a_commissioning_intent(
     ingress_broker: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -190,12 +207,14 @@ def test_reconciler_never_commits_a_commissioning_intent(
             interrupt(broker, rt, agent, "sound")
             for kind in KINDS:
                 broker.command("SET", admission_key("intent", agent, kind), records[kind])
+            before = {kind: delivery_state(broker, agent, kind) for kind in KINDS}
             await until(
                 lambda: committed(broker, agent, "sound"),
                 3 * TICK,
                 "commissioning intents stopped the tick",
             )
             for kind in KINDS:
+                assert delivery_state(broker, agent, kind) == before[kind], kind
                 assert not committed(broker, agent, kind), kind
                 assert broker.command("GET", admission_key("intent", agent, kind)) == records[kind]
             assert len(private_entries(broker)) == 1
