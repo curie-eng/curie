@@ -2304,48 +2304,101 @@ fn retained_manifest_fix(common: &CommonOpts, revision: u32, published_head: &st
 
 /// After the catalog window refuses an unambiguous target, admit it only when
 /// its retained manifest carries the build's own ADR 0142 schema-compat
-/// metadata, that declared head is strictly later than the catalog head and no
-/// later than the next catalogued release's head, and the declared window
-/// contains the live revision. Requiring a later head keeps every published
-/// release judged by its catalog window. The upper bound admits only a build
-/// cut between its release and the next one, so a chart packaged from a newer
-/// tree under an older version keeps the catalog refusal. Any failure keeps
-/// the original refusal.
+/// metadata, that declared window passes
+/// [`crate::schema_window::declared_window_within_release`], and it contains
+/// the live revision. Any failure keeps the original refusal.
 async fn declared_window_admits_rollback(
     common: &CommonOpts,
     ui: &crate::ui::Ui,
     revision: u32,
     target_app: &str,
-    catalog_head: &str,
     live: &str,
-    history_apps: &[String],
 ) -> bool {
+    retained_declared_window(common, ui, revision, target_app)
+        .await
+        .is_some_and(|declared| {
+            crate::schema_window::declared_window_within_release(target_app, &declared)
+                && crate::schema_window::live_in_window(live, &declared)
+        })
+}
+
+/// The window a revision's retained manifest declares through the build's own
+/// ADR 0142 schema-compat metadata, or `None` on any read, identity or window
+/// failure, including a published artifact with no such metadata.
+async fn retained_declared_window(
+    common: &CommonOpts,
+    ui: &crate::ui::Ui,
+    revision: u32,
+    app_version: &str,
+) -> Option<crate::schema_window::Window> {
     let manifest_cmd = helm_retained_manifest_cmd(common, revision);
     ui.plumbing(&format!("+ {}", manifest_cmd.display()));
     let Ok((true, manifest_out, _)) = run_capture(&manifest_cmd).await else {
-        return false;
+        return None;
     };
     let Ok(crate::schema_compat::RetainedManifestIdentity::Candidate(metadata)) =
-        crate::schema_compat::classify_retained_manifest(&manifest_out, target_app)
+        crate::schema_compat::classify_retained_manifest(&manifest_out, app_version)
     else {
-        return false;
+        return None;
     };
-    let Ok(declared) =
-        crate::schema_window::candidate_window(&metadata.schema_min, &metadata.schema_head)
-    else {
-        return false;
-    };
-    // candidate_window refuses a min after its head, so this orders the heads.
-    let later_head = declared.schema_head != catalog_head
-        && crate::schema_window::candidate_window(catalog_head, &declared.schema_head).is_ok();
-    let before_next_release =
-        crate::schema_window::next_release_head(target_app).is_none_or(|next_head| {
-            crate::schema_window::candidate_window(&declared.schema_head, &next_head).is_ok()
+    crate::schema_window::candidate_window(&metadata.schema_min, &metadata.schema_head).ok()
+}
+
+/// History builds a refused rollback may name as its fail-forward target
+/// because their retained manifests declare a window that passes
+/// [`crate::schema_window::declared_window_within_release`] and contains
+/// `live`. Only rows that could change the answer are read: a deployed or
+/// superseded revision (one Helm never finished applying is no evidence its
+/// build ran), whose version is catalogued unambiguously, whose catalog window
+/// does not already contain `live`, and which outranks the best target found so
+/// far. Newest revisions are read first, so one build per version is kept, from
+/// its highest revision. Any failure skips the row: the hint falls back to the
+/// catalog text and never errors.
+async fn declared_fail_forward_builds(
+    common: &CommonOpts,
+    ui: &crate::ui::Ui,
+    history: &[HelmRevision],
+    live: &str,
+) -> Vec<crate::schema_window::DeclaredBuild> {
+    let history_apps = history_application_versions(history);
+    let mut best =
+        crate::schema_window::newest_fail_forward(history_apps.iter().map(String::as_str), live);
+    let mut rows: Vec<&HelmRevision> = history
+        .iter()
+        .filter(|row| is_eligible_rollback_status(&row.status))
+        .collect();
+    rows.sort_by_key(|row| std::cmp::Reverse(row.revision));
+    let mut builds = Vec::new();
+    for row in rows {
+        let Some(app_version) = row.application_version() else {
+            continue;
+        };
+        let Some(catalog) = crate::schema_window::window_for(&app_version) else {
+            continue;
+        };
+        if catalog.artifact_identity_ambiguous
+            || crate::schema_window::live_in_window(live, &catalog)
+            || !crate::schema_window::version_outranks(&app_version, best.as_deref())
+        {
+            continue;
+        }
+        let Some(window) = retained_declared_window(common, ui, row.revision, &app_version).await
+        else {
+            continue;
+        };
+        if !crate::schema_window::declared_window_within_release(&app_version, &window)
+            || !crate::schema_window::live_in_window(live, &window)
+        {
+            continue;
+        }
+        best = Some(app_version.clone());
+        builds.push(crate::schema_window::DeclaredBuild {
+            app_version,
+            helm_revision: row.revision,
+            window,
         });
-    later_head
-        && before_next_release
-        && crate::schema_window::check_target_schema(target_app, &declared, live, history_apps)
-            .is_ok()
+    }
+    builds
 }
 
 async fn probe_live_schema_revision(common: &CommonOpts, ui: &crate::ui::Ui) -> Result<String> {
@@ -2423,7 +2476,8 @@ fn require_target_application_version(
 /// The offline half of the rollback schema gate, run by a dry run: the target
 /// has an application version and the embedded catalog declares its range. The
 /// live window stays real-run only, so a live revision here only names the
-/// fail-forward version in the refusal.
+/// fail-forward version in the refusal. The dry run names only catalogued
+/// versions because it reads no retained manifests.
 fn dry_run_schema_catalog_check(
     history: &[HelmRevision],
     to_revision: u32,
@@ -2441,6 +2495,7 @@ fn dry_run_schema_catalog_check(
             &target_app,
             &live,
             &history_application_versions(history),
+            &[],
         ),
         None => crate::schema_window::SchemaRefusal {
             message: crate::schema_window::missing_target_window_message(&target_app),
@@ -2538,15 +2593,16 @@ pub async fn rollback(opts: RollbackOpts) -> Result<ClusterRollbackOutput> {
         };
         let target_app = require_target_application_version(&history, choice.to_revision)?;
         let Some(catalog_window) = crate::schema_window::window_for(&target_app) else {
+            let declared = declared_fail_forward_builds(&opts.common, ui, &history, &live).await;
             let refusal = crate::schema_window::missing_target_window_refusal(
                 &target_app,
                 &live,
                 &history_apps,
+                &declared,
             );
             return Err(schema_gate_refusal(&refusal.message, &refusal.fix));
         };
         let catalog_ambiguous = catalog_window.artifact_identity_ambiguous;
-        let catalog_head = catalog_window.schema_head.clone();
         let (resolved_window, published_identity_fix) = if catalog_ambiguous {
             let manifest_cmd = helm_retained_manifest_cmd(&opts.common, choice.to_revision);
             ui.plumbing(&format!("+ {}", manifest_cmd.display()));
@@ -2606,24 +2662,27 @@ pub async fn rollback(opts: RollbackOpts) -> Result<ClusterRollbackOutput> {
         } else {
             (catalog_window, None)
         };
-        if let Err(refusal) = crate::schema_window::check_target_schema(
-            &target_app,
-            &resolved_window,
-            &live,
-            &history_apps,
-        ) {
-            let admitted = !catalog_ambiguous
+        let admitted = crate::schema_window::live_in_window(&live, &resolved_window)
+            || (!catalog_ambiguous
                 && declared_window_admits_rollback(
                     &opts.common,
                     ui,
                     choice.to_revision,
                     &target_app,
-                    &catalog_head,
                     &live,
-                    &history_apps,
                 )
-                .await;
-            if !admitted {
+                .await);
+        if !admitted {
+            // Only a refusal reads history manifests for the fail-forward hint,
+            // so an admitted rollback adds no Helm calls.
+            let declared = declared_fail_forward_builds(&opts.common, ui, &history, &live).await;
+            if let Err(refusal) = crate::schema_window::check_target_schema(
+                &target_app,
+                &resolved_window,
+                &live,
+                &history_apps,
+                &declared,
+            ) {
                 let fix = published_identity_fix
                     .map(|identity| format!("{}. {identity}", refusal.fix))
                     .unwrap_or(refusal.fix);
