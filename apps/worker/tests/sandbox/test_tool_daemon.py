@@ -1839,6 +1839,11 @@ FAULTS: dict[str, Callable[[FakeSandboxClient, redis.Redis, str, str], object]] 
         k8s.daemon_objects[(DAEMON_NS, "Pod", claim)], "phase", "Failed"
     ),
     "ping-refused": lambda k8s, r, p, claim: k8s.refused_pods.add(claim),
+    # Unready or terminating, the Pod still answers a port-forwarded ping but is
+    # out of the Service's endpoints, so the runner's DOCKER_HOST cannot reach it.
+    "pod-unready": lambda k8s, r, p, claim: setattr(
+        k8s.daemon_objects[(DAEMON_NS, "Pod", claim)], "ready", False
+    ),
     "stream-raises": lambda k8s, r, p, claim: k8s.stream_failures.__setitem__(
         claim, KubeTransientError("port-forward failed")
     ),

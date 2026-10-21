@@ -3170,6 +3170,37 @@ def test_list_daemon_objects_filters_by_selector_and_reports_age_and_phase() -> 
     assert _finite_positive(kwargs["_request_timeout"])
 
 
+@pytest.mark.parametrize(
+    ("ready", "deleting", "expected"),
+    [("True", False, True), ("False", False, False), ("True", True, False), (None, False, False)],
+    ids=["ready", "not-ready", "terminating", "no-condition"],
+)
+def test_get_daemon_pod_reports_ready_only_for_a_ready_live_pod(
+    ready: str | None, deleting: bool, expected: bool
+) -> None:
+    """Ready is the Pod's Ready condition (what the headless Service's endpoints
+    follow) and never true once deletionTimestamp is set (a terminating Pod
+    leaves the endpoints). Shapes per the core/v1 Pod API."""
+
+    api = _DaemonApi()
+    client = _daemon_client(api)
+    client.create_daemon_object(_DAEMON_NS, _manifest("Pod"), request_timeout_seconds=1.0)
+    wire = api.daemon[("pods", _DAEMON_NS, "claim-d")]
+    wire["status"] = {"phase": "Running"}
+    if ready is not None:
+        wire["status"]["conditions"] = [
+            {"type": "PodScheduled", "status": "True"},
+            {"type": "Ready", "status": ready},
+        ]
+    if deleting:
+        wire["metadata"]["deletionTimestamp"] = "2026-10-03T12:05:00Z"
+
+    view = client.get_daemon_pod(_DAEMON_NS, "claim-d", request_timeout_seconds=1.0)
+
+    assert view is not None and view.phase == "Running"
+    assert view.ready is expected
+
+
 def test_delete_daemon_object_is_fenced_by_uid_and_idempotent() -> None:
     api = _DaemonApi()
     client = _daemon_client(api)

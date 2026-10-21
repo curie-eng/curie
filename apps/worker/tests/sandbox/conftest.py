@@ -470,8 +470,9 @@ class FakeDaemonObject:
     uid: str
     manifest: dict[str, Any]
     created_at: datetime | None
-    # Pod only: ``status.phase``.
+    # Pod only: ``status.phase``, and the Ready condition with no deletionTimestamp.
     phase: str | None = None
+    ready: bool = True
 
     @property
     def labels(self) -> dict[str, str]:
