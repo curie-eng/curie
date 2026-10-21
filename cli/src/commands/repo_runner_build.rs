@@ -38,58 +38,92 @@ impl crate::ui::CliOutput for rr::RepoRunnerBuildOutput {
 /// platforms in one `docker buildx bake`, probe every tool inside it, push it,
 /// and report its digests.
 pub async fn build_repo_runner(opts: RepoRunnerBuildOpts) -> Result<rr::RepoRunnerBuildOutput> {
-    use crate::connector_build as cb;
-
     let loaded = rr::load_spec(&opts.spec)?;
-    if !crate::ops::on_path("docker") {
-        bail!(
-            "Docker is not installed or not on PATH. Install Docker \
-             (https://docs.docker.com/get-docker/) and retry."
-        );
-    }
+    require_repo_runner_docker()?;
     let image = crate::artifacts::resolve_image(
         opts.runner_image.as_deref(),
         crate::artifacts::Channel::current(),
         crate::artifacts::version(),
     );
     let (base_ref, _) = resolve_runner_base(&image, true).await?;
-    let base_digest = rr::bare_digest(&base_ref)?;
-    let dockerfile_digest = match &loaded.spec.dockerfile {
-        Some(dockerfile) => Some(cb::source_digest_of(
-            &loaded.dir,
+    let dockerfile = loaded
+        .spec
+        .dockerfile
+        .as_ref()
+        .map(|rel| (loaded.dir.clone(), rel.clone()));
+    build_repo_runner_spec(&loaded.spec, dockerfile, &opts.registry, &base_ref).await
+}
+
+/// Rebuild a retained catalog declaration on the upgrade's explicit target.
+/// There is no input file or Dockerfile context to reconstruct here.
+pub(crate) async fn build_catalog_repo_runner(
+    spec: &rr::RepoRunnerSpec,
+    registry: &str,
+    base_ref: &str,
+) -> Result<rr::RepoRunnerBuildOutput> {
+    rr::validate_spec(spec)?;
+    if spec.dockerfile.is_some() {
+        bail!("automatic repository runner rebuilds require a catalog-only declaration");
+    }
+    require_repo_runner_docker()?;
+    build_repo_runner_spec(spec, None, registry, base_ref).await
+}
+
+fn require_repo_runner_docker() -> Result<()> {
+    if !crate::ops::on_path("docker") {
+        bail!(
+            "Docker is not installed or not on PATH. Install Docker \
+             (https://docs.docker.com/get-docker/) and retry."
+        );
+    }
+    Ok(())
+}
+
+async fn build_repo_runner_spec(
+    spec: &rr::RepoRunnerSpec,
+    dockerfile: Option<(PathBuf, String)>,
+    registry: &str,
+    base_ref: &str,
+) -> Result<rr::RepoRunnerBuildOutput> {
+    use crate::connector_build as cb;
+
+    let base_digest = rr::bare_digest(base_ref)?;
+    let dockerfile_digest = match &dockerfile {
+        Some((dir, rel)) => Some(cb::source_digest_of(
+            dir,
             &cb::ConnectorBuildDecl {
                 context: ".".to_string(),
-                dockerfile: dockerfile.clone(),
+                dockerfile: rel.clone(),
                 platforms: rr::PLATFORMS.iter().map(|p| p.to_string()).collect(),
             },
         )?),
         None => None,
     };
-    let tag = rr::input_tag(&loaded.spec, dockerfile_digest.as_deref(), &base_digest);
-    let registry = opts.registry.trim().trim_end_matches('/');
+    let tag = rr::input_tag(spec, dockerfile_digest.as_deref(), &base_digest);
+    let registry = registry.trim().trim_end_matches('/');
     let image_ref = format!("{registry}/{}:{tag}", rr::IMAGE_NAME);
 
     // The bake file, the metadata buildx writes and the generated targets'
     // empty context, in a directory only the owner can enter.
     let work = std::env::temp_dir().join(format!("curie-repo-runner-{}", uuid::Uuid::new_v4()));
     create_private_dir(&work).with_context(|| format!("create {}", work.display()))?;
-    let result = bake_and_inspect(&work, &loaded, &image_ref, &base_ref).await;
+    let result = bake_and_inspect(&work, spec, dockerfile, &image_ref, base_ref).await;
     let _ = std::fs::remove_dir_all(&work);
     let (index_digest, platform_digests) = result?;
 
     Ok(rr::RepoRunnerBuildOutput {
         runner: rr::RunnerRecord {
-            tools: rr::selected_entries(&loaded.spec)
+            tools: rr::selected_entries(spec)
                 .iter()
                 .map(|e| e.name.clone())
                 .collect(),
             image: format!("{image_ref}@{index_digest}"),
             base: base_digest,
             platform_digests,
-            dockerfile: loaded.spec.dockerfile.clone(),
-            probes: loaded.spec.probes.clone(),
+            dockerfile: spec.dockerfile.clone(),
+            probes: spec.probes.clone(),
         },
-        platform_runner: base_ref,
+        platform_runner: base_ref.to_string(),
         catalog_version: rr::CATALOG_VERSION,
         manifest_path: rr::MANIFEST_PATH.to_string(),
     })
@@ -97,7 +131,8 @@ pub async fn build_repo_runner(opts: RepoRunnerBuildOpts) -> Result<rr::RepoRunn
 
 async fn bake_and_inspect(
     work: &Path,
-    loaded: &rr::LoadedSpec,
+    spec: &rr::RepoRunnerSpec,
+    dockerfile: Option<(PathBuf, String)>,
     image_ref: &str,
     base_ref: &str,
 ) -> Result<(String, BTreeMap<String, String>)> {
@@ -109,12 +144,8 @@ async fn bake_and_inspect(
     let plan = rr::BakePlan {
         image_ref: image_ref.to_string(),
         base_ref: base_ref.to_string(),
-        spec: loaded.spec.clone(),
-        dockerfile: loaded
-            .spec
-            .dockerfile
-            .as_ref()
-            .map(|rel| (loaded.dir.clone(), rel.clone())),
+        spec: spec.clone(),
+        dockerfile,
         empty_context,
     };
     let bake_file = work.join("bake.json");

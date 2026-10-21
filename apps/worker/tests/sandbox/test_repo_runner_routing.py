@@ -212,7 +212,19 @@ def test_stale_base_is_refused_before_any_kubernetes_write(
     message = str(refusal)
     assert REPO in message
     assert "stale_base" in message
-    assert f"curie cluster factory --repo {REPO}" in message
+    command = f"curie cluster factory --repo-runner {REPO}="
+    assert command in message
+    spec = message.split(command, 1)[1].split()[0].rstrip("`.;")
+    assert spec and not spec.startswith("-")
+    assert "--registry " in message
+    registry = message.split("--registry ", 1)[1].split()[0].rstrip("`.;")
+    assert registry and not registry.startswith("-")
+    assert "rebuild" in message.lower()
+    if platform is None:
+        assert "pin " in message.lower()
+        assert message.lower().index("pin ") < message.lower().index("rebuild")
+    else:
+        assert platform in message
     _assert_nothing_written(probing_k8s, affinity, "T-stale")
 
 
