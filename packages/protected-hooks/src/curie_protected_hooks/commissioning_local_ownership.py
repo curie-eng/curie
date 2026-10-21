@@ -79,7 +79,19 @@ _SELECTION = frozenset(
 # Subcommands and flags each tool may receive; anything else refuses. The first
 # argument must be the subcommand, so no global flag precedes it.
 _KUBECTL_COMMANDS = frozenset(
-    {"get", "apply", "create", "delete", "patch", "wait", "rollout", "describe", "logs", "label"}
+    {
+        "get",
+        "apply",
+        "create",
+        "delete",
+        "patch",
+        "wait",
+        "rollout",
+        "describe",
+        "logs",
+        "label",
+        "port-forward",
+    }
 )
 _KUBECTL_FLAGS = frozenset(
     {
@@ -104,6 +116,7 @@ _KUBECTL_FLAGS = frozenset(
         "--patch",
         "--subresource",
         "--overwrite",
+        "--duration",
     }
 )
 _MINIKUBE_COMMANDS = frozenset({"start", "status", "stop", "delete", "ip", "image"})
