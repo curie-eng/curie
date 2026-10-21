@@ -159,6 +159,7 @@ forbidden_modules = [
     "curie_protected_hooks.commissioning_local_ownership",
     "curie_protected_hooks.commissioning_provisioner",
     "curie_protected_hooks.commissioning_records",
+    "curie_protected_hooks.commissioning_reservations",
     "curie_protected_hooks.commissioning_scripts",
 ]
 

@@ -183,3 +183,189 @@ return advance(j, target)
 """
 
 JOURNAL_SCRIPT = PRELUDE + _JOURNAL_BODY
+
+# Reservations and launch ownership read the journal through the same prelude.
+_RECORDS = r"""
+local KINDS = {delivery=1, launch=2, model_call=3}
+local RESERVATION = {record_type=true, permit_digest=true, operation_id=true, kind=true,
+                     request_digest=true, charge=true, status=true, claim=true}
+local function uuid(s)
+  return type(s) == 'string' and #s == 36 and
+    string.match(s, '^%x%x%x%x%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%x%x%x%x%x%x%x%x$') ~= nil and
+    string.lower(s) == s
+end
+local function sha256(s)
+  return type(s) == 'string' and #s == 64 and string.match(s, '^[0-9a-f]+$') ~= nil
+end
+local function reservation_key(operation_id)
+  return 'protected:commissioning:reservation:' .. suffix .. ':' .. operation_id
+end
+local function load_reservation(key)
+  local raw = redis.call('GET', key)
+  if not raw then return nil, 'absent' end
+  local decoded, r = pcall(cjson.decode, raw)
+  if not decoded or not closed(r, RESERVATION) or not closed(r.charge, COUNTER_SET) then return nil, 'corrupt' end
+  if r.record_type ~= 'commissioning_reservation' or r.permit_digest ~= permit_digest or
+     not uuid(r.operation_id) or key ~= reservation_key(r.operation_id) or not KINDS[r.kind] or
+     not sha256(r.request_digest) or (r.status ~= 'reserved' and r.status ~= 'dispatched') or
+     type(r.claim) ~= 'string' or (r.claim ~= '' and not uuid(r.claim)) then return nil, 'corrupt' end
+  for _, name in ipairs(COUNTERS) do
+    if not decimal(r.charge[name], true) then return nil, 'corrupt' end
+  end
+  return r, nil
+end
+local function reservation_reply(r, j, fresh)
+  local reply = {'reservation', r.status, r.kind, r.request_digest}
+  for _, name in ipairs(COUNTERS) do table.insert(reply, r.charge[name]) end
+  for _, value in ipairs({r.claim, fresh and '1' or '0', j.state, j.generation, j.exhausted,
+                          string.format('%.0f', now)}) do
+    table.insert(reply, value)
+  end
+  return reply
+end
+"""
+
+_RESERVATION_BODY = r"""
+local reservation_key_name = KEYS[4]
+local operation_id, kind, request_digest = ARGV[4], ARGV[5], ARGV[6]
+if not uuid(operation_id) or reservation_key_name ~= reservation_key(operation_id) then return refuse('binding') end
+local j, problem = load_journal()
+if not j then return refuse(problem) end
+local r
+r, problem = load_reservation(reservation_key_name)
+if problem == 'corrupt' then return refuse(problem) end
+if verb == 'reserve' then
+  if not KINDS[kind] or not sha256(request_digest) then return refuse('charge') end
+  local charge, positive = {}, false
+  for i, name in ipairs(COUNTERS) do
+    if not decimal(ARGV[6 + i], true) then return refuse('charge') end
+    charge[name] = ARGV[6 + i]
+  end
+  if charge[COUNTERS[KINDS[kind]]] == '0' then return refuse('charge') end
+  if r then
+    -- A replay returns the recorded status and never charges or authorizes again.
+    if r.kind ~= kind or r.request_digest ~= request_digest then return refuse('mismatch') end
+    for _, name in ipairs(COUNTERS) do
+      if r.charge[name] ~= charge[name] then return refuse('mismatch') end
+    end
+    return reservation_reply(r, j, false)
+  end
+  if j.state ~= 'running' then return refuse('state') end
+  local denied = authority()
+  if denied then return refuse(denied) end
+  local totals, exhausted = {}, nil
+  for i, name in ipairs(COUNTERS) do
+    local total = add(j.counters[name], charge[name])
+    if not decimal(total, true) or cmp(total, limits[i]) > 0 then return refuse('limit') end
+    totals[name] = total
+    if total == limits[i] and not exhausted then exhausted = name end
+  end
+  j.counters = totals
+  r = {record_type='commissioning_reservation', permit_digest=permit_digest,
+       operation_id=operation_id, kind=kind, request_digest=request_digest,
+       charge=charge, status='reserved', claim=''}
+  redis.call('SET', reservation_key_name, cjson.encode(r))
+  if exhausted then
+    -- Reaching a limit closes the campaign in the same step; nothing dispatches after it.
+    j.exhausted = exhausted
+    local reply = advance(j, 'closing')
+    if reply[1] ~= 'journal' then return reply end
+  else
+    save_journal(j)
+  end
+  return reservation_reply(r, j, true)
+end
+if not r then return refuse('absent') end
+if verb == 'read' then return reservation_reply(r, j, false) end
+if verb ~= 'dispatch' then return refuse('verb') end
+-- Consumed before forwarding: a second dispatch of one ID is never authority.
+if r.status == 'dispatched' then return reservation_reply(r, j, false) end
+if j.state ~= 'running' then return refuse('state') end
+local denied = authority()
+if denied then return refuse(denied) end
+r.status = 'dispatched'
+redis.call('SET', reservation_key_name, cjson.encode(r))
+return reservation_reply(r, j, true)
+"""
+
+RESERVATION_SCRIPT = PRELUDE + _RECORDS + _RESERVATION_BODY
+
+_OWNERSHIP_BODY = r"""
+local ownership_key, index_key = KEYS[4], KEYS[5]
+local launch_id, expected, proposed_bytes = ARGV[4], ARGV[5], ARGV[6]
+if not uuid(launch_id) or
+   ownership_key ~= 'protected:commissioning:ownership:' .. suffix .. ':' .. launch_id or
+   index_key ~= 'protected:commissioning:ownership:' .. suffix then return refuse('binding') end
+local j, problem = load_journal()
+if not j then return refuse(problem) end
+local function decode_ownership(raw)
+  local decoded, o = pcall(cjson.decode, raw)
+  if not decoded or type(o) ~= 'table' or type(o.campaign) ~= 'table' or
+     o.record_type ~= 'commissioning_launch_ownership' or o.launch_id ~= launch_id or
+     not decimal(o.revision, false) then return nil end
+  local c = o.campaign
+  if c.campaign_id ~= permit.campaign_id or c.campaign_generation ~= permit.campaign_generation or
+     c.permit_digest ~= permit_digest or c.bootstrap_digest ~= permit.bootstrap_digest or
+     c.manifest_digest ~= permit.manifest_digest or c.runtime_id ~= permit.runtime_id or
+     c.runtime_generation ~= permit.runtime_generation or
+     c.broker_run_id ~= permit.broker_identity.run_id then return nil end
+  return o
+end
+local function load_index()
+  local raw = redis.call('GET', index_key)
+  if not raw then return {} end
+  local decoded, list = pcall(cjson.decode, raw)
+  if not decoded or type(list) ~= 'table' then return nil end
+  for _, id in pairs(list) do if not uuid(id) then return nil end end
+  return list
+end
+local index = load_index()
+if not index then return refuse('corrupt') end
+if verb == 'list' then
+  local reply = {'ownership_index'}
+  for _, id in ipairs(index) do table.insert(reply, id) end
+  return reply
+end
+local current = redis.call('GET', ownership_key)
+if verb == 'read' then
+  if not current then return {'ownership_absent'} end
+  return {'ownership', current}
+end
+local proposed = decode_ownership(proposed_bytes)
+if not proposed then return refuse('binding') end
+if verb == 'create' then
+  -- Ownership is recorded before any create, only under live authority and only
+  -- for a launch reservation already consumed for dispatch and not yet claimed.
+  if current then return refuse('exists') end
+  if proposed.state ~= 'creating' or proposed.revision ~= '1' then return refuse('ownership') end
+  if j.state ~= 'running' then return refuse('state') end
+  local denied = authority()
+  if denied then return refuse(denied) end
+  local reservation_key_name = KEYS[6]
+  local reservation_id = ARGV[7]
+  if not uuid(reservation_id) or reservation_key_name ~= reservation_key(reservation_id) then return refuse('binding') end
+  local r
+  r, problem = load_reservation(reservation_key_name)
+  if not r then return refuse(problem) end
+  if r.kind ~= 'launch' or r.status ~= 'dispatched' or
+     r.request_digest ~= proposed.launch_request_digest then return refuse('ownership') end
+  if r.claim ~= '' then return refuse('claimed') end
+  r.claim = launch_id
+  redis.call('SET', reservation_key_name, cjson.encode(r))
+  table.insert(index, launch_id)
+  redis.call('SET', index_key, cjson.encode(index))
+  redis.call('SET', ownership_key, proposed_bytes)
+  return {'ownership', proposed_bytes}
+end
+if verb ~= 'advance' then return refuse('verb') end
+-- Retirement and observation stay available after expiry, closing or a run_id change.
+if not current then return refuse('absent') end
+if current ~= expected then return refuse('generation') end
+local before = decode_ownership(current)
+if not before then return refuse('corrupt') end
+if proposed.revision ~= add(before.revision, '1') then return refuse('generation') end
+redis.call('SET', ownership_key, proposed_bytes)
+return {'ownership', proposed_bytes}
+"""
+
+OWNERSHIP_SCRIPT = PRELUDE + _RECORDS + _OWNERSHIP_BODY

@@ -64,10 +64,15 @@ _STATES = ("prepared", "running", "closing", "closed", "failed")
 _REASONS = (
     "absent",
     "binding",
+    "charge",
+    "claimed",
     "corrupt",
     "exists",
     "floor",
     "generation",
+    "limit",
+    "mismatch",
+    "ownership",
     "principal",
     "run_id",
     "state",
@@ -470,19 +475,42 @@ class CommissioningJournal:
             raise CommissioningJournalRefused("generation")
         if self.__session.terminal and verb in ("prepare", "start", "require_running"):
             raise CommissioningJournalRefused("terminal")
-        reply = await self.__session.execute(
+        return _reply(await self._eval(JOURNAL_SCRIPT, (), verb, str(expected)))
+
+    @property
+    def keys(self) -> CampaignKeys:
+        """The permit, journal and floor keys of this campaign."""
+        return self.__keys
+
+    @property
+    def permit(self) -> CommissioningPermit:
+        """The immutable permit this journal is bound to."""
+        return self.__permit
+
+    @property
+    def terminal(self) -> bool:
+        """Whether the bound session may only read, close or fail."""
+        return self.__session.terminal
+
+    async def _eval(self, script: str, keys: tuple[str, ...], verb: str, *args: str) -> Any:
+        """Run one commissioning script over this campaign's prelude keys and permit.
+
+        For the reservation and ownership scripts of the same campaign; the
+        script, not the caller, checks every key it is given.
+        """
+        return await self.__session.execute(
             "EVAL",
-            JOURNAL_SCRIPT,
-            3,
+            script,
+            3 + len(keys),
             self.__keys.permit,
             self.__keys.journal,
             self.__keys.floor,
+            *keys,
             verb,
             self.__permit.canonical_bytes.decode("ascii"),
             self.__permit.digest,
-            str(expected),
+            *args,
         )
-        return _reply(reply)
 
     async def prepare(self) -> JournalState:
         """Advance the runtime floor and create the ``prepared`` journal."""
