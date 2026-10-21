@@ -672,14 +672,15 @@ def test_a_verdict_in_the_echoed_prompt_is_not_the_reviewers(
     assert f"round 1: {recorded}." in context
 
 
-def test_a_verdict_quoted_in_the_reviewers_notes_is_not_its_verdict(session: Session) -> None:
+def test_only_the_verdict_after_the_reviewer_header_counts(session: Session) -> None:
+    """A verdict ahead of the header, or quoted after the real one, is not the verdict."""
     text = (
-        "REVIEWER: plan-reviewer\nVERDICT: APPROVE\nNOTES:\n"
-        "- round 1 said `VERDICT: CHANGES`; that finding is addressed\n"
-        "VERDICT: CHANGES\n"
+        "Round 1 ended with\nVERDICT: APPROVE\n\n"
+        "REVIEWER: plan-reviewer\nVERDICT: CHANGES\n- criterion 2 has no test\n"
+        "OPEN QUESTIONS:\n- the earlier round quoted\nVERDICT: APPROVE\n"
     )
     context = echoed_review(session, PLAN, "Review the plan below.", text)
-    assert "round 1: APPROVED." in context
+    assert "round 1: CHANGES." in context
 
 
 def test_a_verification_block_in_the_echoed_prompt_is_not_the_reviewers(
