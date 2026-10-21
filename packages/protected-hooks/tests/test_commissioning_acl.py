@@ -18,6 +18,7 @@ import hashlib
 import importlib
 import importlib.util
 import json
+import secrets
 from typing import Any
 
 import pytest
@@ -519,11 +520,14 @@ def test_observer_reads_principal_state_and_nothing_else(pworker_service, princi
         return hashes, "on" in flags
 
     try:
+        # Stored hashes are set directly; no password value is hashed here.
+        first, second = secrets.token_hex(32), secrets.token_hex(32)
+        pworker_service.command("ACL", "SETUSER", target.username, "resetpass", "#" + first)
         hashes, enabled = state()
-        assert hashes == {hashlib.sha256(target.password.encode()).hexdigest()} and enabled
-        pworker_service.command("ACL", "SETUSER", target.username, "off", ">changed")
+        assert hashes == {first} and enabled
+        pworker_service.command("ACL", "SETUSER", target.username, "off", "#" + second)
         changed, enabled = state()
-        assert not enabled and changed > hashes
+        assert not enabled and changed == {first, second}
         for call in (
             ("ACL", "SETUSER", target.username, "on"),
             ("ACL", "SETUSER", principals["observer"].username, "+@all", "~*"),
