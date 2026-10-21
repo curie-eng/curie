@@ -65,12 +65,17 @@ class FakeControl:
 
     permit_digest = PERMIT
     worker_principal_id = OWNER
+    worker_credential = {"id": OWNER, "generation": "1"}
+    entry_point = "commissioning-worker-v1"
     guard_identity = GUARD
 
     def __init__(self, events: list[Any], expires_at_ms: int) -> None:
         self.events, self.expires_at_ms = events, expires_at_ms
         self.ownership: dict[str, tuple[str, str | None]] = {}
         self.plans = 0
+        self.owned = asyncio.Event()
+        self.release = asyncio.Event()
+        self.release.set()
 
     async def plan(self, raw: bytes) -> Plan:
         self.plans += 1
@@ -86,6 +91,8 @@ class FakeControl:
         assert plan.launch_id not in self.ownership
         self.events.append(("OWN", namespace, pod_name))
         self.ownership[plan.launch_id] = ("creating", None)
+        self.owned.set()
+        await self.release.wait()
 
     async def advance(self, launch_id: str, state: str, pod_uid: str | None) -> None:
         current, uid = self.ownership[launch_id]
@@ -96,6 +103,17 @@ class FakeControl:
 
     async def unsettled(self) -> tuple[str, ...]:
         return tuple(k for k, (s, _) in self.ownership.items() if s != "retired")
+
+
+class Identity:
+    """Stand-in for the provisioner-owned binding of a client key to B's candidate."""
+
+    def __init__(self, root: Path, *, accept: bool = True) -> None:
+        self.pin, self.accept, self.calls = pin(root, "worker"), accept, []
+
+    def authenticates(self, certificate: bytes, *, credential: Any, entry_point: str) -> bool:
+        self.calls.append((credential, entry_point))
+        return self.accept and public_key_identity(certificate) == self.pin
 
 
 class Assignments:
@@ -179,6 +197,10 @@ async def mediator(tmp_path: Path, cluster: Cluster, **options: Any) -> Any:
     registry.mkdir(mode=0o700, exist_ok=True)
     expires = options.pop("expires_at_ms", int(time.time() * 1000) + 2 * 3600 * 1000)
     control = options.pop("control", None) or FakeControl(cluster.events, expires)
+    identity = options.pop("identity", "default")
+    if identity == "default":
+        identity = Identity(root)
+    assignments = options.pop("assignments", None) or Assignments()
     runner_app = web.Application()
     runner_app.router.add_route("*", "/{tail:.*}", cluster.runner)
     runner_owner = web.AppRunner(runner_app, access_log=None)
@@ -200,9 +222,9 @@ async def mediator(tmp_path: Path, cluster: Cluster, **options: Any) -> Any:
                     None,
                 ),
                 control=control,
-                worker=launch.CandidateWorker(OWNER, pin(root, "worker")),
+                identity=identity,
                 measured=measured(),
-                assignments=Assignments(),
+                assignments=assignments,
                 kubernetes=KubernetesLaunchAPI(
                     KubernetesTLS(
                         origin,
@@ -510,5 +532,137 @@ def test_restart_settles_durable_ownership_without_a_local_row(tmp_path):
                     break
                 await asyncio.sleep(0.05)
         assert control.ownership[orphan] == ("uncertain", None)
+
+    asyncio.run(scenario())
+
+
+def test_the_settle_pass_never_marks_a_launch_mid_create_uncertain(tmp_path):
+    """Ownership is recorded before the local row; settle must not judge that gap."""
+
+    async def scenario() -> None:
+        cluster = Cluster()
+        async with mediator(tmp_path, cluster) as (server, control, url, root):
+            control.release.clear()
+            raw = request_bytes()
+            launch_id = json.loads(raw)["launch_id"]
+            cluster.launch_id = launch_id
+            async with httpx.AsyncClient(verify=context(root), trust_env=False) as http:
+                creating = asyncio.create_task(http.post(url + ROUTE, content=raw))
+                await asyncio.wait_for(control.owned.wait(), 10)
+                assert server._registry.find(OWNER, launch_id) is None
+                settle = asyncio.create_task(server._settle_once())
+                await asyncio.sleep(0.2)
+                assert control.ownership[launch_id] == ("creating", None)
+                control.release.set()
+                assert (await creating).status_code == 202
+                await asyncio.wait_for(settle, 10)
+                await settled(server, launch_id)
+            assert control.ownership[launch_id][0] == "bound"
+
+    asyncio.run(scenario())
+
+
+def test_a_request_after_the_permit_expired_refuses(tmp_path):
+    async def scenario() -> None:
+        cluster = Cluster()
+        expired = int(time.time() * 1000) - 1
+        async with mediator(tmp_path, cluster, expires_at_ms=expired) as (_, control, url, root):
+            async with httpx.AsyncClient(verify=context(root), trust_env=False) as http:
+                response = await http.post(url + ROUTE, content=request_bytes())
+            assert response.status_code == 403 and control.plans == 0
+
+    asyncio.run(scenario())
+
+
+def test_the_permit_expiry_check_refuses_on_its_own(tmp_path):
+    """The mediator refuses once the permit expired, independent of the certificate rule.
+
+    TLS already refuses an expired certificate, so this drives the mediator's
+    own check directly with the candidate key in a certificate that ended
+    before the permit did: only the permit's expiry can refuse it.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.x509.oid import NameOID
+
+    async def scenario() -> None:
+        cluster = Cluster()
+        async with mediator(tmp_path, cluster) as (server, control, _, root):
+            key = serialization.load_pem_private_key((root / "worker.key").read_bytes(), None)
+            ended = datetime.now(UTC) - timedelta(minutes=5)
+            name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "worker")])
+            der = (
+                x509.CertificateBuilder()
+                .subject_name(name)
+                .issuer_name(name)
+                .public_key(key.public_key())
+                .serial_number(x509.random_serial_number())
+                .not_valid_before(ended - timedelta(hours=1))
+                .not_valid_after(ended)
+                .sign(key, hashes.SHA256())
+                .public_bytes(serialization.Encoding.DER)
+            )
+
+            class Transport:
+                def get_extra_info(self, name: str) -> Any:
+                    assert name == "ssl_object"
+                    return self
+
+                def getpeercert(self, binary_form: bool) -> bytes:
+                    return der
+
+            request = type("Request", (), {"transport": Transport()})()
+            control.expires_at_ms = int(time.time() * 1000) + 3600 * 1000
+            assert server._owner(request) == OWNER
+            # The certificate still ends before the permit; only the permit expired.
+            control.expires_at_ms = int(time.time() * 1000) - 1000
+            assert int(ended.timestamp() * 1000) <= control.expires_at_ms
+            with pytest.raises(launch._Refusal):
+                server._owner(request)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("identity", [None, "refusing"], ids=["absent", "refusing"])
+def test_the_candidate_identity_is_bound_by_the_provisioner_or_refuses(tmp_path, identity):
+    async def scenario() -> None:
+        cluster = Cluster()
+        root = certificates(tmp_path / "tls")
+        chosen = None if identity is None else Identity(root, accept=False)
+        async with mediator(tmp_path, cluster, identity=chosen) as (_, control, url, root):
+            async with httpx.AsyncClient(verify=context(root), trust_env=False) as http:
+                response = await http.post(url + ROUTE, content=request_bytes())
+            assert response.status_code == 403 and control.plans == 0
+            if chosen is not None:
+                # The records, never the caller, name the credential and entry point.
+                assert chosen.calls == [(control.worker_credential, control.entry_point)]
+
+    asyncio.run(scenario())
+
+
+def test_a_failed_assignment_retires_in_a_tracked_task(tmp_path):
+    class Failing:
+        async def assign(self, plan: Any, *, expires_at_ms: int) -> Any:
+            raise RuntimeError("assignment unavailable")
+
+    async def scenario() -> None:
+        cluster = Cluster()
+        async with mediator(tmp_path, cluster, assignments=Failing()) as (
+            server,
+            control,
+            url,
+            root,
+        ):
+            raw = request_bytes()
+            launch_id = json.loads(raw)["launch_id"]
+            async with httpx.AsyncClient(verify=context(root), trust_env=False) as http:
+                assert (await http.post(url + ROUTE, content=raw)).status_code == 503
+            tracked = set(server._background)
+            await asyncio.gather(*tracked, return_exceptions=True)
+            assert not server._background
+            # Nothing was created, so no UID is known and the create is uncertain.
+            assert server._registry.get(OWNER, launch_id).state == "uncertain"
+            assert control.ownership[launch_id] == ("uncertain", None)
 
     asyncio.run(scenario())

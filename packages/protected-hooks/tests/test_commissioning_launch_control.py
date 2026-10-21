@@ -67,7 +67,9 @@ class Admitted(Running):
         )
         self.reservations = reservations
         self.session = await self.principals.session("control")
-        return control_module().CampaignLaunchControl(reservations, self.session)
+        return control_module().CampaignLaunchControl(
+            reservations, self.session, bootstrap=self.campaign.trusted["bootstrap"]
+        )
 
     async def __aexit__(self, *args: Any) -> None:
         await self.session.close()
@@ -189,7 +191,11 @@ def test_only_a_live_control_session_binds_launch_control(pworker_service, princ
                 session = await principals.session(role, terminal=terminal)
                 try:
                     with refused():
-                        control_module().CampaignLaunchControl(context.reservations, session)
+                        control_module().CampaignLaunchControl(
+                            context.reservations,
+                            session,
+                            bootstrap=context.campaign.trusted["bootstrap"],
+                        )
                 finally:
                     await session.close()
 
@@ -205,5 +211,28 @@ def test_the_permit_supplies_expiry_and_the_candidate_worker(pworker_service, pr
             assert control.worker_principal_id == p["candidate_credentials"]["worker"]["id"]
             assert control.permit_digest == context.campaign.permit.digest
             assert control.guard_identity == p["guard_identity"]
+            assert control.worker_credential == p["candidate_credentials"]["worker"]
+            b = context.campaign.trusted["bootstrap"].as_dict()
+            assert control.entry_point == b["entry_points"]["commissioning"]
+            assert control.entry_point != b["entry_points"]["production"]
+
+    run(scenario())
+
+
+def test_launch_control_refuses_a_bootstrap_the_permit_does_not_name(
+    pworker_service, principals
+) -> None:
+    from curie_protected_hooks.commissioning_bootstrap import parse_commissioning_bootstrap
+
+    async def scenario() -> None:
+        context = Admitted(principals)
+        async with context:
+            value = context.campaign.trusted["bootstrap"].as_dict()
+            value["max_permit_ms"] = str(int(value["max_permit_ms"]) - 1)
+            other = parse_commissioning_bootstrap(encoded(value))
+            with refused("binding"):
+                control_module().CampaignLaunchControl(
+                    context.reservations, context.session, bootstrap=other
+                )
 
     run(scenario())

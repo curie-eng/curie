@@ -64,7 +64,7 @@ from .protected_launch_registry import (
     RegistryRetired,
     RegistryUnauthorized,
 )
-from .protected_launch_server import ServerConfig, public_key_identity
+from .protected_launch_server import ServerConfig
 
 CAPABILITY_HEADER = "X-Curie-Launch-Capability"
 OwnershipState = Literal["bound", "retiring", "retired", "uncertain"]
@@ -95,6 +95,16 @@ class LaunchControl(Protocol):
     @property
     def worker_principal_id(self) -> str: ...
     @property
+    def worker_credential(self) -> dict[str, str]:
+        """The permit's candidate worker credential reference."""
+        ...
+
+    @property
+    def entry_point(self) -> str:
+        """Bootstrap B's predeclared commissioning entry point."""
+        ...
+
+    @property
     def guard_identity(self) -> dict[str, str]:
         """The permit's guard identity: ``control_id``, ``revision`` and ``config_sha256``."""
         ...
@@ -114,6 +124,19 @@ class LaunchControl(Protocol):
     async def unsettled(self) -> tuple[str, ...]:
         """Launch IDs whose durable ownership is not ``retired``."""
         ...
+
+
+class CandidateIdentity(Protocol):
+    """The provisioner-owned binding of a client certificate to B's candidate worker.
+
+    The provisioner issues the candidate worker's client certificate for B's
+    commissioning entry point and the permit's candidate worker credential.
+    The mediator passes both from the records, never from its caller.
+    """
+
+    def authenticates(
+        self, certificate: bytes, *, credential: dict[str, str], entry_point: str
+    ) -> bool: ...
 
 
 class CreateWitness(Protocol):
@@ -138,18 +161,6 @@ class CampaignRunnerAssignment:
 
 class CampaignAssignments(Protocol):
     async def assign(self, plan: LaunchPlan, *, expires_at_ms: int) -> CampaignRunnerAssignment: ...
-
-
-@dataclass(frozen=True, slots=True, repr=False)
-class CandidateWorker:
-    principal_id: str
-    public_key_sha256: str
-
-    def __post_init__(self) -> None:
-        require(re.fullmatch(r"[0-9a-f]{64}", self.public_key_sha256) is not None)
-        require(
-            re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,255}", self.principal_id) is not None
-        )
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -239,17 +250,18 @@ class CommissioningLaunchServer:
         config: ServerConfig,
         *,
         control: LaunchControl,
-        worker: CandidateWorker,
+        identity: CandidateIdentity | None,
         measured: MeasuredLaunch,
         assignments: CampaignAssignments,
         kubernetes: KubernetesLaunchAPI,
         witness: CreateWitness | None = None,
     ) -> None:
         require(type(config) is ServerConfig and type(kubernetes) is KubernetesLaunchAPI)
-        require(type(worker) is CandidateWorker and type(measured) is MeasuredLaunch)
-        require(worker.principal_id == control.worker_principal_id)
+        require(type(measured) is MeasuredLaunch)
+        require(control.worker_principal_id == control.worker_credential["id"])
         self._tls = config.tls_context()
-        self._config, self._control, self._worker = config, control, worker
+        self._config, self._control, self._identity = config, control, identity
+        self._principal = control.worker_principal_id
         self._measured, self._assignments, self._witness = measured, assignments, witness
         self._kube = kubernetes
         self._mechanics = ProtectedLaunchMechanics(
@@ -263,6 +275,7 @@ class CommissioningLaunchServer:
         self._registry: CommissioningLaunchRegistry = self._mechanics.registry
         self._live = self._mechanics.live
         self._settle_task: asyncio.Task[None] | None = None
+        self._background: set[asyncio.Task[None]] = set()
         self._app = web.Application(client_max_size=65536, middlewares=[self._middleware])
         self._app.router.add_route("*", "/{tail:.*}", self._http)
         self._app.on_shutdown.append(self._shutdown)
@@ -273,11 +286,21 @@ class CommissioningLaunchServer:
         return self._app
 
     def _owner(self, request: web.Request) -> str:
-        """Pinned candidate key, a certificate expiring by the permit, and a live permit."""
+        """B's candidate worker, a certificate expiring by the permit, and a live permit.
+
+        Without the provisioner's candidate identity binding every request refuses.
+        """
         ssl_object = request.transport.get_extra_info("ssl_object") if request.transport else None
         peer = ssl_object.getpeercert(binary_form=True) if ssl_object else None
-        if not peer or not hmac.compare_digest(
-            public_key_identity(peer), self._worker.public_key_sha256
+        if (
+            not peer
+            or self._identity is None
+            or self._identity.authenticates(
+                peer,
+                credential=self._control.worker_credential,
+                entry_point=self._control.entry_point,
+            )
+            is not True
         ):
             raise _Refusal("unauthorized", 403)
         not_after = x509.load_der_x509_certificate(peer).not_valid_after_utc.timestamp()
@@ -285,7 +308,7 @@ class CommissioningLaunchServer:
             raise _Refusal("unauthorized", 403)
         if int(time.time() * 1000) >= self._control.expires_at_ms:
             raise _Refusal("unauthorized", 403)
-        return self._worker.principal_id
+        return self._principal
 
     @web.middleware
     async def _middleware(self, request: web.Request, handler: Any) -> web.StreamResponse:
@@ -441,7 +464,7 @@ class CommissioningLaunchServer:
             except BaseException:
                 current = self._registry.get(owner, launch_id)
                 self._registry.transition(owner, launch_id, current.revision, "retiring")
-                asyncio.create_task(self._retire(owner, launch_id))
+                self._track(self._retire(owner, launch_id))
                 raise
             live = LiveLaunch(
                 owner,
@@ -462,6 +485,11 @@ class CommissioningLaunchServer:
                 self._prepare(owner, launch_id), name="commissioning-launch-create"
             )
             return self._created(row, live, retry=False)
+
+    def _track(self, work: Any) -> None:
+        task: asyncio.Task[None] = asyncio.create_task(work, name="commissioning-launch-retire")
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
 
     def _created(
         self, row: CommissioningLaunchSnapshot, live: LiveLaunch, *, retry: bool
@@ -553,20 +581,33 @@ class CommissioningLaunchServer:
         if state in {"retired", "retiring", "uncertain"}:
             await self._control.advance(launch_id, state, row.objects.pod_uid)
 
+    async def _settle_once(self) -> None:
+        """One pass over durable ownership that is not ``retired``.
+
+        Each decision is taken under the create lock: a create records ownership
+        and then its local row inside that lock, so a launch mid-create is never
+        judged by its missing row. Retirement itself runs outside the lock.
+        """
+        due = []
+        for launch_id in await self._control.unsettled():
+            async with self._mechanics.create_lock:
+                row = self._registry.find(self._principal, launch_id)
+                if row is None:
+                    # Ownership without a local row: no create is attributable.
+                    await self._control.advance(launch_id, "uncertain", None)
+                elif launch_id not in self._live or row.state in {
+                    "retiring",
+                    "uncertain",
+                    "retired",
+                }:
+                    due.append(launch_id)
+        for launch_id in due:
+            await self._settle(self._principal, launch_id)
+
     async def _settle_loop(self) -> None:
         while not self._mechanics.closing:
             try:
-                for launch_id in await self._control.unsettled():
-                    row = self._registry.find(self._worker.principal_id, launch_id)
-                    if row is None:
-                        # Ownership without a local row: no create is attributable.
-                        await self._control.advance(launch_id, "uncertain", None)
-                    elif launch_id not in self._live or row.state in {
-                        "retiring",
-                        "uncertain",
-                        "retired",
-                    }:
-                        await self._settle(self._worker.principal_id, launch_id)
+                await self._settle_once()
             except Exception:  # noqa: BLE001 - durable ownership is retried, never assumed
                 pass
             await asyncio.sleep(1)
@@ -581,8 +622,9 @@ class CommissioningLaunchServer:
     async def _shutdown(self, app: web.Application) -> None:
         # The shared shutdown retires every live launch; uncertain ones wait for
         # the guard's witness instead, from durable ownership after restart.
+        await asyncio.gather(*tuple(self._background), return_exceptions=True)
         for launch_id in tuple(self._live):
-            if self._registry.get(self._worker.principal_id, launch_id).state == "uncertain":
+            if self._registry.get(self._principal, launch_id).state == "uncertain":
                 self._detach(launch_id)
                 self._live.pop(launch_id)
         await self._mechanics.shutdown(app)
@@ -591,6 +633,6 @@ class CommissioningLaunchServer:
             await asyncio.gather(self._settle_task, return_exceptions=True)
         for launch_id in tuple(self._live):
             try:
-                await self._settle(self._worker.principal_id, launch_id)
+                await self._settle(self._principal, launch_id)
             except Exception:  # noqa: BLE001 - the next control process resumes from ownership
                 pass

@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .commissioning_admissions import admission_key, campaign_binding
+from .commissioning_bootstrap import CommissioningBootstrap
 from .commissioning_campaign_records import (
     CampaignLaunchOwnership,
     CampaignRecordInvalid,
@@ -55,23 +56,35 @@ class CampaignLaunchControl:
     @spec PROTECTED-COMMISSIONING-8.
     """
 
-    __slots__ = ("__reservations", "__session")
+    __slots__ = ("__bootstrap", "__reservations", "__session")
+    __bootstrap: CommissioningBootstrap
     __reservations: CampaignReservations
     __session: CommissioningSession
 
-    def __init__(self, reservations: CampaignReservations, session: CommissioningSession) -> None:
-        """Bind the journal's reservations and an admission-reading control session.
+    def __init__(
+        self,
+        reservations: CampaignReservations,
+        session: CommissioningSession,
+        *,
+        bootstrap: CommissioningBootstrap,
+    ) -> None:
+        """Bind the journal's reservations, a control session and the permit's B.
 
         @spec PROTECTED-COMMISSIONING-8.
         """
-        if type(reservations) is not CampaignReservations or type(session) is not (
-            CommissioningSession
+        if (
+            type(reservations) is not CampaignReservations
+            or type(session) is not CommissioningSession
+            or type(bootstrap) is not CommissioningBootstrap
         ):
             raise CommissioningJournalRefused()
-        control = reservations.journal.permit.as_dict()["control_identity"]
-        if session.terminal or session.principal != control:
+        permit = reservations.journal.permit.as_dict()
+        if session.terminal or session.principal != permit["control_identity"]:
             raise CommissioningJournalRefused("principal")
+        if bootstrap.digest != permit["bootstrap_digest"]:
+            raise CommissioningJournalRefused("binding")
         self.__reservations, self.__session = reservations, session
+        self.__bootstrap = bootstrap
 
     def __repr__(self) -> str:
         """@spec PROTECTED-COMMISSIONING-8."""
@@ -94,6 +107,18 @@ class CampaignLaunchControl:
     def worker_principal_id(self) -> str:
         """The permit's candidate worker credential ID."""
         value: str = self.__permit()["candidate_credentials"]["worker"]["id"]
+        return value
+
+    @property
+    def worker_credential(self) -> dict[str, str]:
+        """The permit's candidate worker credential reference."""
+        value: dict[str, str] = self.__permit()["candidate_credentials"]["worker"]
+        return value
+
+    @property
+    def entry_point(self) -> str:
+        """B's predeclared commissioning entry point."""
+        value: str = self.__bootstrap.as_dict()["entry_points"]["commissioning"]
         return value
 
     @property
