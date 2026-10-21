@@ -877,8 +877,8 @@ carry writer credentials. One new API module owns loading the runtime files
 for administration and the probe alike. It imports no source service or probe
 module, which removes the import cycle; the probe module imports its loader
 from it unchanged in behavior, and
-[#4076](https://github.com/curie-eng/curie/issues/4076) later moves that
-grammar into the shared package. The probe, GET and secret route never open
+[#4076](https://github.com/curie-eng/curie/issues/4076) moves that grammar
+into the shared package under SOURCE-11. The probe, GET and secret route never open
 the writer file. No route, CLI verb, chart default, environment variable or
 platform key creates, returns or derives it, and it is never mounted into an
 ordinary worker or runner. Its absence leaves GET, secret and probe behavior
@@ -1354,6 +1354,95 @@ qualification. No protected turn reaches a worker, runner, model or reply,
 and read only enforcement is not observed on a runner. #3603 stays open and the installation gate stays
 closed.
 
+## Shared runtime directory grammar and provisioner writer
+
+<!-- @spec PROTECTED-HOOK-SOURCE-11 -->
+The grammar of the SOURCE-9 runtime directory lives in the internal protected
+hooks package, `curie_protected_hooks.runtime_directory`, as the one definition
+that the API reader, the provisioner writer and any later consumer validate
+against ([#4076](https://github.com/curie-eng/curie/issues/4076)). It owns the
+five file names, the 65536 byte bound on each file, the strict JSON rule
+(UTF-8; duplicate members at any depth, floats and the constants `NaN` and
+`Infinity` refused) and three parsers over file bytes: the bootstrap
+(`manifest.json`, `ca.pem` and `bootstrap.json` together), `source_writer.json`
+given the bootstrap control reader, and `enqueue.json` given the bootstrap. Each
+parser accepts exactly the shapes SOURCE-9 and SOURCE-6 define and raises one
+`RuntimeDirectoryInvalid` without detail for any defect, a file over the bound
+included. `apps/api/src/curie_api/protected_runtime_files.py` keeps its
+descriptor, regular file, nonblocking and bounded reads and its three loaders,
+and calls these parsers. The inputs it accepts and refuses do not change.
+
+The same module defines the canonical encoding a writer emits.
+`bootstrap.json`, `source_writer.json` and `enqueue.json` are JSON objects with
+sorted members, no insignificant whitespace and ASCII escapes.
+`max_readiness_ms` is written as the decimal string of an integer from 1
+through 9007199254740991. `manifest.json` is the manifest's canonical bytes.
+`ca.pem` is ASCII PEM text that the broker CA check accepts. The `enqueue.json`
+`credential_ref` is copied from the manifest's `credential_refs.enqueue` and is
+never a separate input, so a writer cannot produce the stale reference that
+SOURCE-6 refuses.
+
+The provisioner writer is `curie_protected_hooks.runtime_directory_writer`. It
+renders the file set from typed inputs: the manifest record, the CA PEM text,
+the readiness maximum, the control reader principal and, optionally, the
+source writer and enqueue principals. Before it returns or writes any byte it
+parses its own output with the shared parsers and refuses with the same single
+error, so every shape the reader refuses is refused by the writer first. A
+missing optional principal writes no file, and the matching API loader then
+refuses as SOURCE-6 specifies. The writer has two outputs: the mapping from file
+name to bytes, which a Kubernetes provisioner places in the data of a Secret it
+owns, and a host directory publication for a Docker substrate.
+
+A host directory publication takes a root directory owned by the provisioner,
+named by an absolute, normalized path. Every component of that path is opened
+without following symlinks. Each ancestor must be owned by the superuser or the
+writing user and must not be writable by group or others unless it carries the
+sticky bit. The root itself must be owned by the writing user and must not be
+writable by group or others. Otherwise the writer refuses before writing. One
+publication at a time holds an exclusive lock on the root. Each publication
+creates a new version directory inside the root with mode 0700, creates each
+file there with exclusive create, without following symlinks and with mode
+0400, flushes the files and the version directory to disk (with a full device
+flush where the host offers one), and then replaces the root's `current`
+symlink, whose target is the relative version name, by one atomic rename. A
+`current` that is not a symlink to a version name of this form is refused.
+`CURIE_PROTECTED_RUNTIME_DIR` names `<root>/current`. A reader opens the
+directory once and reads every file relative to that descriptor, so it
+observes either the whole previous file set or the whole new one, the layout a
+Kubernetes Secret volume presents through `..data`. The writer keeps the
+current version and the one before it. It removes an older entry only when it
+has the writer's version name and shape (a directory owned by the writing user
+with mode 0700 that holds only regular runtime files), and it removes leftover
+temporary links, so a reader that opened the previous version is not cut off.
+A publication that fails before the rename leaves `current` unchanged and
+removes its partial version. The rename is the publication: flushing the root
+and pruning after it are best effort and never report a failure for a set that
+readers already see. No output, error, exception context or representation of
+the writer contains a credential value.
+
+Only provisioner composition imports the writer. An import-linter contract
+forbids it, directly or transitively, to the HTTP application and every
+package that composes a process holding the ordinary platform API key or
+ordinary application credentials: all of `curie_api`, `curie_worker`,
+`curie_dispatcher`, `curie_runner`, `curie_internal`, `curie_upgrade_pause`,
+the Discord and mail adapters, the connector proxy and the e2e connector. A
+test runs the contract against a forbidden import from each listed package and
+observes it fail. The shared grammar module itself imports no writer. A
+provisioner process that writes this directory composes from its own entry
+point; placing one inside a listed package needs a reviewed exception naming
+that one module.
+
+Not realized here: LANE-8 still owns mounting the directory read only into the
+API alone, never into an ordinary worker, runner or route, on Docker and on
+Kubernetes; who may read the mount (the files are owner only, and read access
+for the API comes from that installation's mount and ownership); provisioning
+of the broker principals the files name; and qualification. The writer
+produces and validates bytes. It does not establish that application
+identities cannot change the mounted directory. The ancestor and ownership
+checks above run in the writer only: the API loader resolves
+`CURIE_PROTECTED_RUNTIME_DIR` afresh on every load without them, so the
+integrity of that path inside the API rests on the LANE-8 read only mount.
+
 ## Acceptance cases and commands
 
 Each test/implementation unit cites its corresponding ID above. Required cases:
@@ -1419,6 +1508,22 @@ Each test/implementation unit cites its corresponding ID above. Required cases:
   enqueued one 409; a reconciler recovery racing a signed retry of the same
   delivery leaves one entry and the original receipt; and no response, log or
   error contains a credential, payload or source key.
+* SOURCE-11: the writer's published directory is accepted by the unchanged API
+  loaders (`load_bootstrap`, `load_administration`, `load_ingress`) with equal
+  manifest bytes, CA, readiness maximum and principals, and its rendered
+  mapping equals the published files; for each invalid shape the reader
+  refuses (readiness maximum out of range or not an integer, a file over the
+  bound, CA text that is not PEM or not ASCII, a writer or enqueue username
+  equal to the control reader's, a `default` username), hand written bytes are
+  refused by the loader and the writer refuses the same input with nothing
+  published; a rotation is observed whole by a new read while a descriptor on
+  the previous version still reads it; overlapping publications leave a whole
+  `current`; a publication that fails while writing leaves `current` unchanged
+  with no partial version; an unsafe root (a symlink in any component, a
+  relative or unnormalized path, a writable ancestor or root, a foreign
+  `current`) is refused; pruning skips entries that are not the writer's
+  versions; a refusal carries no exception context; and the import contract
+  fails when any listed package imports the writer.
 
 Run `uv run pytest apps/api/tests/test_hook_tool_access.py
 apps/api/tests/test_hooks.py -q` plus the
