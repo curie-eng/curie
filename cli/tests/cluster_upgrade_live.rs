@@ -6954,6 +6954,23 @@ fn assert_repository_runner_build_failure(before: Value, fail_at: &str, expected
         installed["agentSandbox"], before["agentSandbox"],
         "{installed}"
     );
+    let body = json(&output);
+    let command = body["fail_forward"]["command"]
+        .as_str()
+        .unwrap_or_else(|| panic!("fail_forward.command must be a string: {body}"));
+    assert!(
+        command.contains("cluster upgrade --to"),
+        "{command} / {body}"
+    );
+    assert!(
+        !command.contains("rollback"),
+        "a build failure before Helm must not advise rollback: {command} / {body}"
+    );
+    let reason = body["fail_forward"]["reason"]
+        .as_str()
+        .unwrap_or_else(|| panic!("fail_forward.reason must be a string: {body}"));
+    assert!(reason.contains("before Helm"), "{reason} / {body}");
+    assert!(reason.contains("unchanged"), "{reason} / {body}");
 }
 
 #[test]
