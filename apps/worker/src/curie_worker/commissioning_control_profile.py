@@ -15,8 +15,9 @@ Rendering is source only. Whether the API server calls the guard, and whether
 the live objects still equal this rendering, is observed elsewhere: the
 webhook configuration cannot be guarded by any admission webhook, so its
 removal or change is detected by reobservation, not prevented. The pinned
-Kubernetes minors bound the cluster versions whose admitted Pod shape the guard
-was measured against; any other version refuses.
+Kubernetes minors bound the cluster versions whose admitted object shapes the
+guard is built for; any other version refuses. The measurement on each pinned
+minor is recorded with the admission server.
 """
 
 from __future__ import annotations
@@ -42,8 +43,9 @@ from .protected_launch_records import (
     safe_validation,
 )
 
-# The Kubernetes minors whose admitted object shapes the guard was measured
-# against. A minor joins only with that measurement, never by default.
+# The Kubernetes minors whose admitted object shapes the guard is built for. A
+# minor joins only together with a cluster measurement of the guard on it (the
+# admission server's evidence), never by default.
 SUPPORTED_KUBERNETES_MINORS = ("1.34", "1.35")
 SLOT_POLICY = "launch-id-names-v1"
 RECORD_TYPE = "commissioning_control_profile"
@@ -68,7 +70,14 @@ _TOP = {
     "slot_policy",
 }
 _GUARD = {"name", "service_name", "image", "server_ca_sha256", "timeout_seconds"}
-_PRINCIPALS = {"mediator", "provisioner"}
+_PRINCIPALS = {"mediator", "provisioner", "endpoint_controllers"}
+# The controllers that write a launch Service's Endpoints and EndpointSlices:
+# per-controller service accounts, or the controller manager's own identity
+# when it runs without service account credentials.
+_CONTROLLER = (
+    r"system:serviceaccount:kube-system:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+    r"|system:kube-controller-manager"
+)
 _LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
 # A webhook name is a fully qualified DNS subdomain with at least three labels.
 _WEBHOOK = r"(?=.{1,253}$)" + _LABEL + r"(?:\." + _LABEL + r"){2,}"
@@ -111,10 +120,16 @@ def _validate(value: Any) -> None:
     _scalar(guard["server_ca_sha256"], "sha256")
     _require(type(guard["timeout_seconds"]) is int and 1 <= guard["timeout_seconds"] <= 10)
     principals = _closed(v["principals"], _PRINCIPALS)
-    for name in _PRINCIPALS:
+    controllers = principals["endpoint_controllers"]
+    _require(type(controllers) is list and 1 <= len(controllers) <= 4)
+    for user in controllers:
+        _pattern(user, _CONTROLLER)
+    _require(controllers == sorted(set(controllers)))
+    for name in ("mediator", "provisioner"):
         user = principals[name]
         _pattern(user, _USERNAME)
         _require(user not in _RESERVED_USERS and not user.startswith("system:node:"))
+        _require(user not in controllers)
     _require(principals["mediator"] != principals["provisioner"])
 
 
@@ -178,7 +193,7 @@ def validate_control_profile_binding(
     _require(v["workload_namespace"] == p["namespace"])
     _require(v["authority_domain_id"] == p["authority_domain_id"])
     runner = f"system:serviceaccount:{p['namespace']}:{p['service_account']}"
-    _require(runner not in v["principals"].values())
+    _require(runner not in (v["principals"]["mediator"], v["principals"]["provisioner"]))
 
 
 @safe_validation(ControlProfileInvalid)
@@ -248,6 +263,11 @@ _RULES = (
     _rule("networking.k8s.io", ["networkpolicies"], ["CREATE", "UPDATE", "DELETE"]),
     _rule("rbac.authorization.k8s.io", ["roles", "rolebindings"], ["CREATE", "UPDATE", "DELETE"]),
     _rule("", ["namespaces"], ["UPDATE"], "Cluster"),
+    # A launch Service selects its runner by label, so whoever writes its
+    # endpoints decides where the mediator dials. Only the endpoint controllers
+    # named in the profile may.
+    _rule("", ["endpoints"], ["CREATE", "UPDATE"]),
+    _rule("discovery.k8s.io", ["endpointslices"], ["CREATE", "UPDATE"]),
 )
 
 

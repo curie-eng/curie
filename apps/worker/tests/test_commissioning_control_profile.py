@@ -63,13 +63,28 @@ def profile_value():
             "server_ca_sha256": cp.server_ca_digest(CA),
             "timeout_seconds": 5,
         },
-        "principals": {"mediator": "acme-mediator", "provisioner": "acme-provisioner"},
+        "principals": {
+            "mediator": "acme-mediator",
+            "provisioner": "acme-provisioner",
+            "endpoint_controllers": [
+                "system:serviceaccount:kube-system:endpoint-controller",
+                "system:serviceaccount:kube-system:endpointslice-controller",
+            ],
+        },
         "slot_policy": "launch-id-names-v1",
     }
 
 
 def profile(value=None):
     return cp.parse_control_profile(canonical(profile_value() if value is None else value))
+
+
+def test_controller_manager_without_service_account_credentials_is_accepted():
+    value = profile_value()
+    value["principals"]["endpoint_controllers"] = ["system:kube-controller-manager"]
+    assert profile(value).as_dict()["principals"]["endpoint_controllers"] == [
+        "system:kube-controller-manager"
+    ]
 
 
 def test_canonical_profile_digest_is_g_member_and_copies_are_fresh():
@@ -141,6 +156,27 @@ def _drop(path):
         _set(("principals", "mediator"), "system:kube-scheduler"),
         _set(("principals", "provisioner"), "system:node:worker-1"),
         _set(("principals", "provisioner"), ""),
+        _set(("principals", "mediator"), "system:serviceaccount:kube-system:endpoint-controller"),
+        _set(("principals", "endpoint_controllers"), []),
+        _set(("principals", "endpoint_controllers"), "system:kube-controller-manager"),
+        _set(("principals", "endpoint_controllers"), ["acme-mediator"]),
+        _set(("principals", "endpoint_controllers"), ["system:serviceaccount:acme-runtime:x"]),
+        _set(("principals", "endpoint_controllers"), ["system:serviceaccount:kube-system:Bad"]),
+        _set(
+            ("principals", "endpoint_controllers"),
+            [
+                "system:serviceaccount:kube-system:endpointslice-controller",
+                "system:serviceaccount:kube-system:endpoint-controller",
+            ],
+        ),
+        _set(
+            ("principals", "endpoint_controllers"),
+            ["system:kube-controller-manager", "system:kube-controller-manager"],
+        ),
+        _set(
+            ("principals", "endpoint_controllers"),
+            [f"system:serviceaccount:kube-system:c{i}" for i in range(5)],
+        ),
     ],
 )
 def test_profile_refuses_every_closed_member_change(mutate):
@@ -280,6 +316,10 @@ def test_rendered_rules_cover_every_container_list_and_fixed_object():
         ("networking.k8s.io", "networkpolicies", "DELETE"),
         ("rbac.authorization.k8s.io", "rolebindings", "CREATE"),
         ("", "namespaces", "UPDATE"),
+        ("", "endpoints", "CREATE"),
+        ("", "endpoints", "UPDATE"),
+        ("discovery.k8s.io", "endpointslices", "CREATE"),
+        ("discovery.k8s.io", "endpointslices", "UPDATE"),
     ]:
         assert expected in covered
     # The rendering is a copy: changing it cannot widen the next rendering.
