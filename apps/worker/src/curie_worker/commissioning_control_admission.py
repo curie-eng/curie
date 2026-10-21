@@ -239,8 +239,26 @@ def _pod_create(q: dict[str, Any], policy: GuardPolicy, user: str) -> None:
     spec = _dict(pod["spec"])
     _containers(spec, expected["spec"])
     _require("nodeName" not in spec)
+    _admission_defaults(spec)
     _defaults(spec)
     _exact(spec, expected["spec"])
+
+
+def _admission_defaults(spec: dict[str, Any]) -> None:
+    """Defaults the measured API servers add or omit beyond the projection's own.
+
+    Measured on Kubernetes 1.34 and 1.35: the Priority admission plugin sets the
+    default priority and preemption policy, and an empty ``args`` list is not
+    serialized. Each is accepted only at exactly that value.
+    """
+    for key, value in (("priority", 0), ("preemptionPolicy", "PreemptLowerPriority")):
+        if key in spec:
+            _require(type(spec[key]) is type(value) and spec.pop(key) == value)
+    containers = spec.get("containers")
+    if type(containers) is list:
+        for container in containers:
+            if type(container) is dict:
+                container.setdefault("args", [])
 
 
 def _pod_update(q: dict[str, Any], policy: GuardPolicy, user: str) -> None:

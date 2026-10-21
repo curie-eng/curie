@@ -64,6 +64,18 @@ def admitted_pod():
         ],
     )
     pod["status"] = {"phase": "Pending", "qosClass": "Guaranteed"}
+    # The serialization measured from real API servers (1.34 and 1.35): false and
+    # empty members are omitted, and admission adds the priority defaults.
+    spec, container = pod["spec"], pod["spec"]["containers"][0]
+    for key in ("args", "stdin", "stdinOnce", "tty"):
+        del container[key]
+    for mount in container["volumeMounts"]:
+        del mount["readOnly"]
+    for key in ("hostIPC", "hostNetwork", "hostPID"):
+        del spec[key]
+    for toleration in spec["tolerations"]:
+        del toleration["value"]
+    spec.update(preemptionPolicy="PreemptLowerPriority", priority=0, serviceAccount="acme-runner")
     return pod
 
 
@@ -156,6 +168,10 @@ def _container(pod):
         lambda p: p["metadata"].update(namespace="other"),
         lambda p: p.update(status={"phase": "Running"}),
         lambda p: p.update(kind="Binding"),
+        lambda p: p["spec"].update(priority=1000),
+        lambda p: p["spec"].update(priorityClassName="system-node-critical"),
+        lambda p: p["spec"].update(preemptionPolicy="Never"),
+        lambda p: _container(p).update(args=["--debug"]),
     ],
 )
 def test_pod_off_the_template_is_refused(mutate):
