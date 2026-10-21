@@ -23,6 +23,7 @@ import stat
 import subprocess
 import tarfile
 import threading
+import traceback
 import uuid
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
@@ -2667,6 +2668,9 @@ def test_clone_diagnostic_omits_credentials_from_the_exception_and_log(
     assert token not in message
     assert secret not in caplog.text
     assert token not in caplog.text
+    rendered = "".join(traceback.format_exception(caught.value))
+    assert secret not in rendered
+    assert token not in rendered
     diagnostic = message.split("exited 7: ", 1)[1].removesuffix(")")
     assert len(diagnostic) <= 240
     assert "https://example.test/acme" in message

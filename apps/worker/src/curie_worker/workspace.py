@@ -1366,6 +1366,14 @@ class WorkspacePreparer:
                     diagnostic = _redact_redeemed_credential(
                         getattr(exc, "diagnostic", ""), credential
                     )
+                    if isinstance(exc, GitCommandError):
+                        # The chained cause is logged with the outer error.
+                        # It must not keep a credential the outer text dropped.
+                        exc.diagnostic = diagnostic
+                        exc.args = (
+                            "workspace command failed: "
+                            f"git {exc.step} exited {exc.exit_status}: {diagnostic}",
+                        )
                     if step in {"clone", "fetch", "checkout"} and isinstance(status, int):
                         detail = (
                             "git refused the server-derived repository checkout "
