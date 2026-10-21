@@ -51,7 +51,10 @@ JUDGE_MODEL = "anthropic/claude-sonnet-5.5"
 PROVIDER_HOST = "openrouter.ai"
 OPENROUTER_API = "https://openrouter.ai/api/v1"
 MAX_BUDGET = Decimal("5.00")
-JUDGE_MAX_TOKENS = 512
+# The pinned judge endpoint refuses disabled reasoning, so reasoning gets its
+# own 512-token budget inside a 1536-token completion ceiling.
+JUDGE_MAX_TOKENS = 1536
+JUDGE_REASONING_TOKENS = 512
 CASE_IDS = tuple(f"F{family}-P{phrase}" for family in range(1, 9) for phrase in range(1, 4))
 CLASSES = ("skill", "memory-fact", "instruction", "schedule", "clarify", "nothing")
 DURABLE = CLASSES[:4]
@@ -736,7 +739,10 @@ def _check_cases(report: _Report) -> None:
         observation = report.value(case.get("transcript_ref"))
         _require("transcript" in observation, f"{case['case_id']} transcript is missing")
         _same_scope(observation, case, "transcript")
-        _text(case.get("actor_generation_id"), "actor generation")
+        if case.get("actor_generation_id") is None:
+            _text(case.get("actor_record_id"), "actor record")
+        else:
+            _text(case.get("actor_generation_id"), "actor generation")
         _require(case.get("stub_port") == collector.get("port_b"), "message stub port")
         _require(case.get("stub_bind_succeeded") is True, "message stub bind")
         case["_thread"] = thread
@@ -810,6 +816,11 @@ def _check_decisions(report: _Report, capabilities: Mapping[str, bool]) -> list[
             if soft:
                 _require(observation.get("semantic") == "PASS", f"{case_id} semantic support")
                 _require(soft == {observation.get("semantic_action")}, f"{case_id} semantics")
+        if report.data.get("data_origin") == "live-campaign" and status in ("PASS", "FAIL"):
+            _require(
+                _recompute_deterministic(observation) == observation.get("deterministic"),
+                f"{case_id} deterministic outcome is not recomputable from its snapshots",
+            )
         if status == "PASS":
             _require(expected in predicted, f"{case_id} passed without its class")
             _require(observation.get("deterministic") is True, f"{case_id} deterministic")
@@ -817,6 +828,56 @@ def _check_decisions(report: _Report, capabilities: Mapping[str, bool]) -> list[
         rows.append(row)
     _require(covered == set(report.cases), "every executed scenario needs a scored decision")
     return rows
+
+
+def _recompute_deterministic(observation: Mapping[str, Any]) -> bool:
+    """Rerun score_state on the recorded snapshots and admitted predicates."""
+
+    from .learning_metrics import EvidenceError, LearningClass, StateSnapshot, score_state
+
+    predicates = _lst(observation.get("admitted_predicates"), "admitted predicates")
+    available = frozenset(
+        LearningClass(str(k)) for k in _lst(observation.get("available"), "available classes")
+    )
+
+    def state(raw: object, label: str) -> StateSnapshot:
+        record = _obj(raw, label)
+        return StateSnapshot(
+            skills=tuple(_obj(r, "skill row") for r in _lst(record.get("skills"), "skills")),
+            facts=tuple(_obj(r, "fact row") for r in _lst(record.get("facts"), "facts")),
+            schedules=tuple(
+                _obj(r, "schedule row") for r in _lst(record.get("schedules"), "schedules")
+            ),
+            available=available,
+        )
+
+    try:
+        result = score_state(
+            state(observation.get("before"), "before"),
+            state(observation.get("after"), "after"),
+            {"predicates": predicates},
+        )
+    except EvidenceError:
+        return False
+    return result.passed
+
+
+def _verdict_failures(report: _Report, rows: list[dict[str, Any]]) -> list[str]:
+    """A report never passes while a runnable decision or control failed or errored."""
+
+    failures = [
+        f"decision {row['case_id']} {row['decision_id']} is {row['status']}"
+        for row in rows
+        if row["status"] in ("FAIL", "ERROR")
+    ]
+    for raw in _lst(report.data.get("controls", []), "controls"):
+        control = _obj(raw, "control")
+        if control.get("status") in ("FAIL", "ERROR"):
+            failures.append(
+                f"control {control.get('case_id')} {control.get('control')} is "
+                f"{control.get('status')}"
+            )
+    return failures
 
 
 def _check_metrics(report: _Report, rows: list[dict[str, Any]]) -> list[str]:
@@ -853,8 +914,21 @@ def _check_generations_and_accounting(report: _Report) -> None:
         identity = _text(operation.get("id"), "operation id")
         _require(identity not in operations, f"duplicate operation {identity}")
         _decimal(operation.get("reserve_usd"), "reserve")
-        settled += _decimal(operation.get("settled_usd"), "settled")
-        _require(operation.get("status") == "settled", f"operation {identity} is unsettled")
+        reserve = _decimal(operation.get("reserve_usd"), "reserve")
+        amount = _decimal(operation.get("settled_usd"), "settled")
+        status = operation.get("status")
+        _require(
+            status in ("settled", "unresolved", "released"), f"operation {identity} is unsettled"
+        )
+        if status == "unresolved":
+            _require(amount == reserve, f"unknown-cost {identity} must keep its full reservation")
+        if status == "released":
+            _require(amount == 0, f"released {identity} carries a charge")
+            _require(
+                not operation.get("generation_id") and not operation.get("record_id"),
+                f"released {identity} is bound to a generation",
+            )
+        settled += amount
         operations[identity] = operation
     seen: set[str] = set()
     for raw in _lst(data.get("generations"), "generations"):
@@ -864,20 +938,48 @@ def _check_generations_and_accounting(report: _Report) -> None:
         seen.add(identity)
         purpose = generation.get("purpose")
         _require(purpose in ("actor", "judge", "calibration", "auxiliary"), "purpose")
+        labeled = generation.get("identity_basis") == "configured-route"
         if purpose == "actor":
             _require(generation.get("model") == ACTOR_MODEL, f"{identity} actor model")
-        elif purpose in ("judge", "calibration"):
-            _require(generation.get("model") == JUDGE_MODEL, f"{identity} judge model")
+            if labeled:
+                _require(generation.get("generation_id") is None, f"{identity} invents an id")
+                route = _obj(generation.get("route"), f"{identity} route")
+                _require(route.get("resolved_host") == PROVIDER_HOST, f"{identity} route host")
+                _require(
+                    route.get("agent_model_override") == ACTOR_MODEL
+                    and route.get("worker_model") == ACTOR_MODEL,
+                    f"{identity} configured route model",
+                )
+                _require(
+                    _obj(generation.get("usage"), f"{identity} usage").get("source")
+                    == "shared-key-delta",
+                    f"{identity} usage source",
+                )
+            else:
+                _require(
+                    not identity.startswith("actor-"), f"{identity} looks like a fabricated id"
+                )
+        else:
+            _require(not labeled, f"{identity} judge rows keep provider ids")
+            if purpose in ("judge", "calibration"):
+                _require(generation.get("model") == JUDGE_MODEL, f"{identity} judge model")
         _obj(generation.get("usage"), f"{identity} usage")
         cost = _decimal(generation.get("cost_usd"), f"{identity} cost")
         bound = operations.get(str(generation.get("ledger_operation_id")))
         _require(bound is not None, f"{identity} has no ledger operation")
         assert bound is not None
         operation = bound
-        _require(operation["generation_id"] == identity, f"{identity} ledger binding")
+        if labeled:
+            _require(
+                operation.get("record_id") == identity and not operation.get("generation_id"),
+                f"{identity} ledger binding",
+            )
+        else:
+            _require(operation["generation_id"] == identity, f"{identity} ledger binding")
         _require(Decimal(operation["settled_usd"]) == cost, f"{identity} settled cost")
     for case in report.cases.values():
-        _require(case["actor_generation_id"] in seen, "actor generation is unrecorded")
+        actor = case.get("actor_generation_id") or case.get("actor_record_id")
+        _require(actor in seen, "actor generation is unrecorded")
     budget = _decimal(accounting.get("budget_usd"), "budget")
     _require(0 < budget <= MAX_BUDGET, "campaign budget must be within (0, 5.00]")
     baseline = _decimal(accounting.get("baseline_usage_usd"), "baseline usage")
@@ -1457,6 +1559,7 @@ def _report_checks(report: _Report) -> list[str]:
     _check_cases(report)
     rows = _check_decisions(report, capabilities)
     failures = _check_metrics(report, rows)
+    failures += _verdict_failures(report, rows)
     _check_generations_and_accounting(report)
     _check_collector_and_cleanup(report)
     failures += _check_procedures(report, capabilities["skill"])
@@ -1513,9 +1616,16 @@ def verify_cleanup(path: Path) -> ScoreResult:
 # Live campaign: provider accounting -----------------------------------------------
 
 SHUTDOWN_RESERVE = Decimal("0.10")
-ACTOR_RESERVE = Decimal("0.12")
-JUDGE_RESERVE = Decimal("0.03")
-SETTLE_SECONDS = 20
+# Native per-agent caps set through `local budget` right after deploy. The
+# daily USD cap bounds an agent's total spend, including scheduled fires; a
+# reservation adds a final-generation overshoot priced from the catalog.
+AGENT_DAILY_USD = Decimal("0.25")
+AGENT_OUTPUT_TOKENS = 8000
+ACTOR_PROMPT_TOKENS_BOUND = 60000
+JUDGE_PROMPT_CHARS_PER_TOKEN = 2
+RESERVE_MARGIN = Decimal("1.25")
+SCHEDULE_FIRES_RESERVED = 2
+SETTLE_SECONDS = 60
 NORMAL_POLL_SECONDS = 60
 DELIVERY_TOLERANCE_SECONDS = 240
 SCHEDULE_LEAD_MINUTES = 12
@@ -1605,8 +1715,7 @@ class _Provider:
                     "temperature": 0,
                     "messages": [{"role": "user", "content": prompt}],
                     "usage": {"include": True},
-                    # Keep the 512-token budget for the verdict, not hidden reasoning.
-                    "reasoning": {"enabled": False},
+                    "reasoning": {"max_tokens": JUDGE_REASONING_TOKENS},
                 },
             ),
             "completion",
@@ -1637,7 +1746,8 @@ class _Ledger:
         self._db = sqlite3.connect(path)
         self._db.execute(
             "CREATE TABLE IF NOT EXISTS operations (id TEXT PRIMARY KEY, purpose TEXT, "
-            "reserve TEXT, settled TEXT, status TEXT, generation_id TEXT, scope TEXT)"
+            "reserve TEXT, settled TEXT, status TEXT, generation_id TEXT, scope TEXT, "
+            "record_id TEXT)"
         )
         self._db.commit()
         self.budget = budget
@@ -1648,12 +1758,27 @@ class _Ledger:
         self.sequence = 0
         self.closed: str | None = None
 
-    def _sum(self, column: str, status: str) -> Decimal:
+    def _sum(self, column: str, *statuses: str, agent: str | None = None) -> Decimal:
         rows = self._db.execute(
-            f"SELECT {column} FROM operations WHERE status = ?",
-            (status,),  # noqa: S608
+            f"SELECT {column}, scope FROM operations WHERE status IN "  # noqa: S608
+            f"({', '.join('?' for _ in statuses)})",
+            statuses,
         ).fetchall()
-        return sum((Decimal(row[0]) for row in rows), Decimal(0))
+        return sum(
+            (
+                Decimal(row[0])
+                for row in rows
+                if agent is None or json.loads(row[1]).get("agent_id") == agent
+            ),
+            Decimal(0),
+        )
+
+    def agent_spent(self, agent: str) -> Decimal:
+        """Charged and still-reserved money attributed to one scenario agent."""
+
+        return self._sum("settled", "settled", "unresolved", agent=agent) + self._sum(
+            "reserve", "reserved", agent=agent
+        )
 
     def observe(self, usage: Decimal) -> None:
         """Keep a high-water mark of shared-key usage. The provider's counter is
@@ -1668,7 +1793,10 @@ class _Ledger:
         self.last_usage = usage
 
     def charged(self) -> Decimal:
-        return max(self.last_usage - self.baseline, self._sum("settled", "settled"))
+        """Observed shared-key delta or the sum of settled and unresolved charges,
+        whichever is larger. An unresolved charge keeps its full reservation."""
+
+        return max(self.last_usage - self.baseline, self._sum("settled", "settled", "unresolved"))
 
     def admit(self, purpose: str, reserve: Decimal, scope: Mapping[str, Any]) -> str:
         if self.closed is not None:
@@ -1681,28 +1809,59 @@ class _Ledger:
         self.sequence += 1
         identity = f"{purpose}-operation-{self.sequence}"
         self._db.execute(
-            "INSERT INTO operations VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (identity, purpose, str(reserve), "0", "reserved", "", json.dumps(dict(scope))),
+            "INSERT INTO operations VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (identity, purpose, str(reserve), "0", "reserved", "", json.dumps(dict(scope)), ""),
         )
         self._db.commit()
         return identity
 
-    def settle(self, identity: str, before: Decimal, cost: Decimal | None, generation: str) -> str:
+    def settle(
+        self,
+        identity: str,
+        before: Decimal,
+        cost: Decimal | None,
+        *,
+        generation: str | None = None,
+        record: str | None = None,
+    ) -> str:
+        """Settle one operation. Unknown cost never becomes zero: with no provider
+        cost and no observed usage movement the full reservation stays charged."""
+
         deadline = time.monotonic() + SETTLE_SECONDS
         usage = self.provider.usage()
         while cost is None and usage <= before and time.monotonic() < deadline:
-            time.sleep(2)
+            time.sleep(3)
             usage = self.provider.usage()
         self.observe(usage)
-        settled = max(
-            cost if cost is not None else Decimal(0), max(Decimal(0), self.last_usage - before)
-        )
+        delta = max(Decimal(0), self.last_usage - before)
+        status = "settled"
+        if cost is not None:
+            settled = max(cost, delta)
+        elif delta > 0:
+            settled = delta
+        else:
+            row = self._db.execute(
+                "SELECT reserve FROM operations WHERE id = ?", (identity,)
+            ).fetchone()
+            settled = Decimal(row[0])
+            status = "unresolved"
+            self.notes.append(f"{_now()} {identity} cost unknown; full reservation stays charged")
         self._db.execute(
-            "UPDATE operations SET settled = ?, status = 'settled', generation_id = ? WHERE id = ?",
-            (str(settled), generation, identity),
+            "UPDATE operations SET settled = ?, status = ?, generation_id = ?, record_id = ? "
+            "WHERE id = ?",
+            (str(settled), status, generation or "", record or "", identity),
         )
         self._db.commit()
         return str(settled)
+
+    def release(self, identity: str, reason: str) -> None:
+        """Release a reservation whose work provably did not run (a cancelled fire)."""
+
+        self._db.execute(
+            "UPDATE operations SET settled = '0', status = 'released' WHERE id = ?", (identity,)
+        )
+        self._db.commit()
+        self.notes.append(f"{_now()} {identity} released: {reason}")
 
     def fail(self, identity: str, reason: str) -> None:
         """An unresolved charge closes admission and keeps its reservation charged."""
@@ -1713,19 +1872,22 @@ class _Ledger:
         ).fetchone()
         if row is not None:
             self._db.execute(
-                "UPDATE operations SET settled = ?, status = 'settled' WHERE id = ?",
+                "UPDATE operations SET settled = ?, status = 'unresolved' WHERE id = ?",
                 (row[0], identity),
             )
             self._db.commit()
 
-    def operations(self) -> list[dict[str, str]]:
+    def operations(self) -> list[dict[str, str | None]]:
         rows = self._db.execute(
-            "SELECT id, generation_id, reserve, settled, status FROM operations ORDER BY rowid"
+            "SELECT id, generation_id, reserve, settled, status, record_id, purpose "
+            "FROM operations ORDER BY rowid"
         ).fetchall()
         return [
             {
                 "id": r[0],
-                "generation_id": r[1],
+                "generation_id": r[1] or None,
+                "record_id": r[5] or None,
+                "purpose": r[6],
                 "reserve_usd": r[2],
                 "settled_usd": r[3],
                 "status": r[4],
@@ -1749,6 +1911,7 @@ class _Ledger:
             "end_usage_usd": str(self.last_usage),
             "charged_usd": str(self.charged()),
             "unresolved_reservations_usd": str(self._sum("reserve", "reserved")),
+            "unknown_cost_charged_usd": str(self._sum("settled", "unresolved")),
             "shutdown_and_inflight_reserve_usd": str(SHUTDOWN_RESERVE),
             "operations": self.operations(),
             "basis": "conservative-shared-key-upper-bound",
@@ -2200,6 +2363,8 @@ class _Campaign:
         self.threads: set[str] = set()
         self.bind_errors = 0
         self.live_children = 0
+        self.prices: dict[str, dict[str, Decimal]] = {}
+        self.agent_caps: dict[str, dict[str, Any]] = {}
         self.paid_started = False
         self.setup_retries: list[dict[str, Any]] = []
         self.channels: tuple[str, str] = CHANNELS
@@ -2212,7 +2377,7 @@ class _Campaign:
         self.stopped: str | None = None
         self.resolved: dict[str, Any] = {}
         self.pending: list[dict[str, Any]] = []
-        self.transcript_counts: dict[tuple[str, str, str], int] = {}
+        self.window_usage = Decimal(0)
         corpus_path = FIXTURES / "learning-cases.json"
         self.guidance, self.corpus = _load_corpus(corpus_path)
         self.calibration_doc = _load_calibration_document(FIXTURES / "learning-calibration.json")
@@ -2414,19 +2579,44 @@ class _Campaign:
     def preflight_provider(self) -> None:
         if self.provider is None:
             raise _Stop("CURIE_CREDENTIALS is not set; no paid proof can run")
-        self.provider.catalog()
+        self.prices = {
+            model: {k: Decimal(str(v)) for k, v in pricing.items() if k in ("prompt", "completion")}
+            for model, pricing in self.provider.catalog().items()
+        }
         remaining = self.provider.remaining()
         budget = self.o.budget if remaining is None else min(self.o.budget, remaining)
         if budget <= SHUTDOWN_RESERVE:
             raise _Stop("known provider credit cannot cover the campaign reserve")
         self.ledger = _Ledger(self.o.output_dir / "ledger.sqlite", budget, self.provider)
 
+    def overshoot(self) -> Decimal:
+        """One final generation at the native output cap, priced from the catalog."""
+
+        price = self.prices[ACTOR_MODEL]
+        bound = (
+            price["prompt"] * ACTOR_PROMPT_TOKENS_BOUND + price["completion"] * AGENT_OUTPUT_TOKENS
+        )
+        return (bound * RESERVE_MARGIN).quantize(Decimal("0.000001"))
+
+    def actor_reserve(self, agent: str) -> Decimal:
+        """The agent's remaining native daily cap plus one final-generation overshoot."""
+
+        assert self.ledger is not None
+        remaining = max(Decimal(0), AGENT_DAILY_USD - self.ledger.agent_spent(agent))
+        return remaining + self.overshoot()
+
+    def judge_reserve(self, prompt: str) -> Decimal:
+        price = self.prices[JUDGE_MODEL]
+        tokens = len(prompt) // JUDGE_PROMPT_CHARS_PER_TOKEN + 1
+        bound = price["prompt"] * tokens + price["completion"] * JUDGE_MAX_TOKENS
+        return max(Decimal("0.001"), (bound * RESERVE_MARGIN).quantize(Decimal("0.000001")))
+
     def judge(self, prompt: str, purpose: str, scope: Mapping[str, Any]) -> str:
         assert self.ledger is not None and self.provider is not None
         self.call_sequence += 1
         sequence = self.call_sequence
         try:
-            operation = self.ledger.admit(purpose, JUDGE_RESERVE, scope)
+            operation = self.ledger.admit(purpose, self.judge_reserve(prompt), scope)
             self.paid_started = True
         except _Stop as exc:
             self.stopped = str(exc)
@@ -2438,7 +2628,7 @@ class _Campaign:
             self.ledger.fail(operation, "judge charge status is unknown")
             self.stopped = str(exc)
             raise
-        settled = self.ledger.settle(operation, before, response["cost"], response["id"])
+        settled = self.ledger.settle(operation, before, response["cost"], generation=response["id"])
         text = str(response["text"])
         self.generations.append(
             {
@@ -2769,6 +2959,33 @@ class _Campaign:
         for key, value in expected.items():
             if readback.get(key) != value:
                 raise _Stop(f"override {key} did not read back as requested")
+        caps = _obj(
+            self.must(
+                [
+                    "local",
+                    "budget",
+                    name,
+                    "--limit",
+                    str(AGENT_DAILY_USD),
+                    "--output-tokens",
+                    str(AGENT_OUTPUT_TOKENS),
+                ],
+                bare,
+            ),
+            "budget",
+        )
+        cap = caps.get("max_usd_per_day")
+        if (
+            not isinstance(cap, (int, float, str))
+            or Decimal(str(cap)) != AGENT_DAILY_USD
+            or caps.get("max_output_tokens_per_run") != AGENT_OUTPUT_TOKENS
+        ):
+            raise _Stop(f"native agent budget did not read back: {json.dumps(caps)}")
+        self.agent_caps[name] = {
+            "max_usd_per_day": str(cap),
+            "max_output_tokens_per_run": AGENT_OUTPUT_TOKENS,
+            "model_override": readback.get("model"),
+        }
         guidance = self.o.output_dir / "guidance.txt"
         guidance.write_text(str(self.guidance["text"]), encoding="utf-8")
         self.must(["local", "memory", name, "--guidance-from", str(guidance)], bare)
@@ -2832,7 +3049,7 @@ class _Campaign:
         bare = {k: scope[k] for k in ("repetition", "case_id", "agent_id")}
         if thread.startswith(EVAL_ISOLATE_PREFIX):
             raise _Stop("an ordinary thread must not use the eval isolation prefix")
-        operation = self.ledger.admit("actor", ACTOR_RESERVE, bare)
+        operation = self.ledger.admit("actor", self.actor_reserve(str(scope["agent_id"])), bare)
         self.paid_started = True
         before = self.ledger.last_usage
         self.live_children += 1
@@ -2859,11 +3076,23 @@ class _Campaign:
             self.live_children -= 1
         if code != 0 and ("address already in use" in stderr.lower() or " bind" in stderr):
             self.bind_errors += 1
-        generation = f"actor-{operation}"
-        settled = self.ledger.settle(operation, before, None, generation)
+        # The provider gives the harness no per-turn generation id for runner
+        # traffic, so the row is labeled by its configured route, not an invented id.
+        generation = operation
+        settled = self.ledger.settle(operation, before, None, record=operation)
         self.generations.append(
             {
-                "id": generation,
+                "id": operation,
+                "generation_id": None,
+                "identity_basis": "configured-route",
+                "route": {
+                    "resolved_host": self.resolved.get("host"),
+                    "resolved_model": self.resolved.get("model"),
+                    "agent_model_override": self.agent_caps.get(str(scope["agent_id"]), {}).get(
+                        "model_override"
+                    ),
+                    "worker_model": ACTOR_MODEL,
+                },
                 "model": ACTOR_MODEL,
                 "usage": {"source": "shared-key-delta"},
                 "cost_usd": settled,
@@ -2887,34 +3116,64 @@ class _Campaign:
         }
 
     def transcript(
-        self, scope: Mapping[str, Any], agent_id: str, channel: str, thread: str
+        self, scope: Mapping[str, Any], agent_id: str, channel: str, thread: str, text: str
     ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        """Return the exact runner turn item written for the message ``text``.
+
+        The evidence is the last turn item whose user message carries the sent
+        text, never a positional slice. Malformed items reject the transcript."""
+
         # The worker stores transcripts agent-wide under the conversation id
         # (binding.py history_ref); a local message turn's id is slack:<channel>:<thread>.
         thread_key = f"slack:{channel}:{thread}"
         path = f"/agents/{agent_id}/state/transcript/{urllib.parse.quote(thread_key, safe='')}"
+        sent = text.strip()
         deadline = time.monotonic() + 30
         while True:
             status, entry = self.api("GET", path)
-            if status == 200:
-                break
-            if status != 404 or time.monotonic() > deadline:
+            if status not in (200, 404) or (status == 404 and time.monotonic() > deadline):
                 raise _Stop(f"no transcript for thread {thread} (status {status})")
+            if status == 200:
+                record = _obj(entry, "transcript entry")
+                if record.get("key") != thread_key:
+                    raise _Stop("the transcript entry is bound to another thread")
+                value = record.get("value")
+                if not isinstance(value, list):
+                    raise _Stop("the transcript value is not the runner's JSON array")
+                # history.py TurnRecord.to_dict: {"type": "turn", "user", "ts", "messages"}
+                matches: list[tuple[int, dict[str, Any]]] = []
+                for index, item in enumerate(value):
+                    if not isinstance(item, dict) or not isinstance(item.get("type"), str):
+                        raise _Stop(f"transcript item {index} is malformed")
+                    if item["type"] != "turn":
+                        continue
+                    user, messages = item.get("user"), item.get("messages")
+                    if (
+                        not isinstance(user, str)
+                        or not isinstance(messages, list)
+                        or any(
+                            not isinstance(m, dict) or not isinstance(m.get("role"), str)
+                            for m in messages
+                        )
+                    ):
+                        raise _Stop(f"transcript turn item {index} is malformed")
+                    if sent and sent in user:
+                        matches.append((index, item))
+                if matches:
+                    break
+            if time.monotonic() > deadline:
+                raise _Stop(f"no transcript turn for the message sent on thread {thread}")
             time.sleep(3)
-        record = _obj(entry, "transcript entry")
-        if record.get("key") != thread_key:
-            raise _Stop("the transcript entry is bound to another thread")
-        value = record.get("value")
-        if not isinstance(value, list):
-            raise _Stop("the transcript value is not the runner's JSON array")
-        # history.py TurnRecord.to_dict: {"type": "turn", ..., "messages": [...]}
-        turns = [item for item in value if isinstance(item, dict) and item.get("type") == "turn"]
-        messages: list[Any] = [m for turn in turns for m in _lst(turn.get("messages", []), "msgs")]
-        key = (agent_id, channel, thread)
-        start = self.transcript_counts.get(key, 0)
-        self.transcript_counts[key] = len(messages)
-        turn = [m for m in messages[start:] if isinstance(m, dict)]
-        return {"binding_key": thread_key, "state_caller": "platform", "messages": turn}, turn
+        index, item = matches[-1]
+        turn: list[dict[str, Any]] = list(item["messages"])
+        return {
+            "binding_key": thread_key,
+            "state_caller": "platform",
+            "turn_index": index,
+            "turn_ts": item.get("ts"),
+            "turn_user": _bounded(str(item["user"])),
+            "messages": turn,
+        }, turn
 
     # Scoring --------------------------------------------------------------------
 
@@ -3000,6 +3259,8 @@ class _Campaign:
             status, detail = "NOT_AVAILABLE", "every predicate needs an absent field"
         elif transcript_error is not None:
             status, detail = "ERROR", f"transcript evidence: {transcript_error}"
+        elif durable and not any(a["matched"] and not a["is_error"] for a in attempts):
+            status, detail = "ERROR", "missing tool evidence"
         else:
             try:
                 result = score_state(before[1], after[1], {"predicates": kept})
@@ -3083,6 +3344,8 @@ class _Campaign:
                 "semantic": semantic,
                 "correction_duplicates": duplicates,
                 "unavailable_predicates": unavailable,
+                "admitted_predicates": kept,
+                "available": sorted(c for c in DURABLE if self.available(c)),
                 "invocation_id": sent["invocation_id"],
             },
         )
@@ -3116,10 +3379,11 @@ class _Campaign:
         index: int,
     ) -> tuple[dict[str, Any], tuple[dict[str, Any], Any]]:
         before = self.snapshot(scope)
-        sent = self.message(scope, str(fixture["messages"][index]), self.channels[0], thread)
+        text = str(fixture["messages"][index])
+        sent = self.message(scope, text, self.channels[0], thread)
         after = self.snapshot(scope)
         try:
-            transcript, turn = self.transcript(scope, agent_id, self.channels[0], thread)
+            transcript, turn = self.transcript(scope, agent_id, self.channels[0], thread, text)
         except _Stop as exc:
             transcript, turn = {"error": str(exc)}, []
             self.failures.append(f"{scope['case_id']} transcript: {exc}")
@@ -3135,7 +3399,8 @@ class _Campaign:
                     "invocation_id": sent["invocation_id"],
                     "reply_ref": sent["result_ref"],
                     "transcript_ref": self.decisions[-1]["evidence_ref"],
-                    "actor_generation_id": sent["generation"],
+                    "actor_generation_id": None,
+                    "actor_record_id": sent["generation"],
                     "stub_port": self.stub_port,
                     "stub_bind_succeeded": sent["exit_code"] == 0,
                 }
@@ -3318,7 +3583,7 @@ class _Campaign:
         present = any(_obj(f, "fact").get("id") == fact_id for f in facts)
         try:
             transcript: dict[str, Any] = self.transcript(
-                scope, agent_id, self.channels[1], sent["thread"]
+                scope, agent_id, self.channels[1], sent["thread"], text
             )[0]
         except _Stop as exc:
             transcript = {"error": str(exc)}
@@ -3455,10 +3720,19 @@ class _Campaign:
                 f"cancel-target {json.dumps([(r.get('id'), r.get('state')) for r in made])}",
             )
             return
+        assert self.ledger is not None
+        bare = {k: scope[k] for k in ("repetition", "case_id", "agent_id")}
         for row, token_value in ((due[0], token), (made[0], values["cancel_token"])):
+            # One actor-turn reservation for the expected fire and one for a retry,
+            # held until the fire settles or the schedule is cancelled.
+            reserve = self.actor_reserve(str(scope["agent_id"])) * SCHEDULE_FIRES_RESERVED
+            operation = self.ledger.admit(
+                "schedule", reserve, {**bare, "schedule_id": str(row["id"])}
+            )
             self.pending.append(
                 {
-                    "scope": {k: scope[k] for k in ("repetition", "case_id", "agent_id")},
+                    "scope": bare,
+                    "operation": operation,
                     "schedule_id": str(row["id"]),
                     "token": token_value,
                     "created": created,
@@ -3634,6 +3908,9 @@ class _Campaign:
 
     def observe_deliveries(self, repetition: int) -> None:
         pending = [p for p in self.pending if p["scope"]["repetition"] == repetition]
+        assert self.ledger is not None
+        self.ledger.observe(self.ledger.provider.usage())
+        self.window_usage = self.ledger.last_usage
         window_opened = self.open_window(repetition)
         try:
             self.collect(repetition, pending, window_opened)
@@ -3660,6 +3937,7 @@ class _Campaign:
             time.sleep(min(30.0, max(1.0, (wait_until - datetime.now(UTC)).total_seconds())))
         receipts = self.collector.receipts()
         self.close_window()
+        window_settled = False
         for item in pending:
             scope = item["scope"]
             found, source = self.schedule_row(scope, item["schedule_id"])
@@ -3718,6 +3996,7 @@ class _Campaign:
                     f"{scope['case_id']} {item['schedule_id']} fell due while a message child "
                     "still held port B"
                 )
+            cancelled = row.get("state") == "cancelled"
             if row.get("state") == "active":
                 with contextlib.suppress(_Stop):
                     self.must(
@@ -3731,6 +4010,38 @@ class _Campaign:
                         ],
                         scope,
                     )
+                    cancelled = True
+            self.settle_schedule(
+                item,
+                fired=bool(mine) or row.get("state") not in ("active", "cancelled"),
+                cancelled=cancelled,
+                first=not window_settled,
+            )
+            window_settled = (
+                window_settled or bool(mine) or row.get("state") not in ("active", "cancelled")
+            )
+
+    def settle_schedule(
+        self, item: Mapping[str, Any], *, fired: bool, cancelled: bool, first: bool
+    ) -> None:
+        """Release a fire reservation only once the fire provably cannot run; a fired
+        schedule is charged with the window's usage movement, and the first fired item
+        carries the whole window delta so later fires add nothing twice."""
+
+        assert self.ledger is not None
+        operation = str(item["operation"])
+        if not fired:
+            if cancelled:
+                self.ledger.release(operation, f"schedule {item['schedule_id']} cancelled unfired")
+            return
+        if first:
+            self.ledger.settle(operation, self.window_usage, None, record=operation)
+        else:
+            self.ledger.settle(operation, self.ledger.last_usage, Decimal(0), record=operation)
+            self.ledger.notes.append(
+                f"{_now()} {operation} fired in the same window; its cost is inside the "
+                "window delta already charged"
+            )
 
     # Whole lifecycle --------------------------------------------------------------
 
@@ -3787,8 +4098,11 @@ class _Campaign:
             ],
             "cost_policy": {
                 "campaign_budget_usd": str(self.o.budget),
-                "actor_reserve_usd": str(ACTOR_RESERVE),
-                "judge_reserve_usd": str(JUDGE_RESERVE),
+                "agent_daily_cap_usd": str(AGENT_DAILY_USD),
+                "agent_output_tokens_per_run": AGENT_OUTPUT_TOKENS,
+                "actor_reserve": "remaining native daily cap plus a priced final-generation "
+                "overshoot",
+                "judge_reserve": "priced from the prompt and the 1536-token ceiling",
                 "shutdown_reserve_usd": str(SHUTDOWN_RESERVE),
                 "judge_max_tokens": JUDGE_MAX_TOKENS,
             },
@@ -3982,6 +4296,7 @@ class _Campaign:
             },
             "runner_turn_bound": "native runner default, not overridden by this harness",
             "setup_retries": self.setup_retries,
+            "agent_caps": self.agent_caps,
         }
         path = self.o.output_dir / "report.json"
         path.write_bytes(_json_bytes(report))
