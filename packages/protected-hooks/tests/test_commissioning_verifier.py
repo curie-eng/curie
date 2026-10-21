@@ -858,10 +858,11 @@ def test_a_guard_that_hashes_instantiated_rules_instead_of_the_template_refuses(
     sample = permit_value_for_templates()
     candidates = {r: template(r, sample) for r in ("candidate_enqueue", "candidate_worker")}
     candidates[role] = tuple(commissioning_acl_rules(role, permit=sample))
-    h = Harness()
-    h.records = records(recipes=Recipes(candidates))
-    with pytest.raises(module().VerifierRefused):
-        h.verifier()
+    # Design decision 9: the provisioner already refuses to build such a G, so no
+    # verifier is ever handed one; the verifier's own template check is covered by
+    # test_a_guard_whose_candidate_rules_are_not_the_recipe_template_refuses.
+    with pytest.raises(provisioner().ProvisionerRefused):
+        records(recipes=Recipes(candidates))
 
 
 def test_a_guard_whose_candidate_rules_are_not_the_recipe_template_refuses() -> None:
