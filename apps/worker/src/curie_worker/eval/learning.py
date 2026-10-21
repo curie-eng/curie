@@ -820,11 +820,21 @@ def _check_decisions(report: _Report, capabilities: Mapping[str, bool]) -> list[
             if soft:
                 _require(observation.get("semantic") == "PASS", f"{case_id} semantic support")
                 _require(soft == {observation.get("semantic_action")}, f"{case_id} semantics")
-        if report.data.get("data_origin") == "live-campaign" and status in ("PASS", "FAIL"):
+        forbidden = _forbids_persistence(spec) and bool(row["attempts"])
+        if forbidden:
+            _require(status != "PASS", f"{case_id} passed despite a forbidden persistence attempt")
+        if report.data.get("data_origin") == "live-campaign":
             _require(
-                _recompute_deterministic(observation) == observation.get("deterministic"),
-                f"{case_id} deterministic outcome is not recomputable from its snapshots",
+                _rederived_predicates(report, spec, observation, capabilities)
+                == observation.get("admitted_predicates"),
+                f"{case_id} admitted predicates differ from the fixture-derived ones",
             )
+            if status in ("PASS", "FAIL"):
+                _require(
+                    (_recompute_deterministic(observation) and not forbidden)
+                    == observation.get("deterministic"),
+                    f"{case_id} deterministic outcome is not recomputable from its snapshots",
+                )
         if status == "PASS":
             _require(expected in predicted, f"{case_id} passed without its class")
             _require(observation.get("deterministic") is True, f"{case_id} deterministic")
@@ -832,6 +842,77 @@ def _check_decisions(report: _Report, capabilities: Mapping[str, bool]) -> list[
         rows.append(row)
     _require(covered == set(report.cases), "every executed scenario needs a scored decision")
     return rows
+
+
+def _rederived_predicates(
+    report: _Report,
+    spec: Mapping[str, Any],
+    observation: Mapping[str, Any],
+    capabilities: Mapping[str, bool],
+) -> list[dict[str, Any]]:
+    """Render the pinned fixture predicates with the recorded substitutions and
+    admit them against recorded capability evidence and the recorded snapshots."""
+
+    available = {str(k) for k in _lst(observation.get("available"), "available classes")}
+    _require(
+        available == {k for k in DURABLE if capabilities[k]},
+        "decision capability evidence disagrees with discovery",
+    )
+    substitutions = _obj(observation.get("substitutions"), "substitutions")
+    values = {
+        str(k): _text(v, "substitution")
+        for k, v in _obj(substitutions.get("values"), "values").items()
+    }
+    literals = {
+        str(k): _text(v, "literal")
+        for k, v in _obj(substitutions.get("literals"), "literals").items()
+    }
+    _require(set(literals) == set(CHANNELS), "substituted literals are the fixture channels")
+    rendered = _substitute(copy.deepcopy(spec["predicates"]), values, literals)
+    before = _obj(observation.get("before"), "before")
+    after = _obj(observation.get("after"), "after")
+    kept, _ = _admit_predicates(rendered, before, after, available)
+    return kept
+
+
+def _check_judge_bindings(report: _Report, rows: list[dict[str, Any]]) -> None:
+    """Every judged decision binds one recorded judge generation whose completion
+    parses to the recorded semantic verdict."""
+
+    from .learning_judge import parse_judge_verdict
+
+    generations = {
+        str(_obj(g, "generation").get("id")): _obj(g, "generation")
+        for g in _lst(report.data.get("generations"), "generations")
+    }
+    for row in rows:
+        observation = report.value(row.get("evidence_ref"))
+        semantic = observation.get("semantic", "NOT_RUN")
+        if row["status"] == "NOT_AVAILABLE" or (semantic == "NOT_RUN" and "judge_ref" not in row):
+            continue
+        label = f"{row['case_id']} {row['decision_id']}"
+        ref = _obj(row.get("judge_ref"), f"{label} judge reference")
+        generation = generations.get(_text(ref.get("generation_id"), f"{label} judge id"))
+        _require(generation is not None, f"{label} judge generation is unrecorded")
+        assert generation is not None
+        _require(generation.get("purpose") == "judge", f"{label} judge generation purpose")
+        for key in ("call_sequence", "prompt_sha256", "completion_sha256"):
+            _require(generation.get(key) == ref.get(key), f"{label} judge {key} binding")
+        completion = _text(ref.get("completion"), f"{label} judge completion")
+        _require(
+            _sha(completion.encode()) == ref.get("completion_sha256"),
+            f"{label} judge completion digest",
+        )
+        if semantic == "ERROR":
+            try:
+                parse_judge_verdict(completion)
+            except ValueError:
+                continue
+            raise _Invalid(f"{label} records a malformed verdict that parses")
+        verdict = parse_judge_verdict(completion)
+        _require(verdict.verdict == semantic, f"{label} judge verdict disagrees")
+        action = None if verdict.action is None else str(verdict.action)
+        _require(action == observation.get("semantic_action"), f"{label} judge action disagrees")
 
 
 def _recompute_deterministic(observation: Mapping[str, Any]) -> bool:
@@ -926,6 +1007,11 @@ def _check_generations_and_accounting(report: _Report) -> None:
         )
         if status == "unresolved":
             _require(amount == reserve, f"unknown-cost {identity} must keep its full reservation")
+            if "charged_usd" in operation:
+                _require(
+                    _decimal(operation.get("charged_usd"), "charged") == reserve,
+                    f"unknown-cost {identity} must stay charged at its full reservation",
+                )
         if status == "released":
             _require(amount == 0, f"released {identity} carries a charge")
             _require(
@@ -990,7 +1076,7 @@ def _check_generations_and_accounting(report: _Report) -> None:
     end = _decimal(accounting.get("end_usage_usd"), "end usage")
     _require(end >= baseline, "a shared-key usage decrease is never a refund")
     charged = _decimal(accounting.get("charged_usd"), "charged")
-    _require(charged >= end - baseline, "shared-key spend was subtracted")
+    _require(charged >= end - baseline, "final charge is below the campaign usage delta")
     _require(charged >= settled, "charged spend is below settled operations")
     unresolved = _decimal(accounting.get("unresolved_reservations_usd"), "unresolved")
     _require(unresolved == 0, "reservations remain unresolved")
@@ -1575,6 +1661,7 @@ def _report_checks(report: _Report) -> list[str]:
     failures = _check_metrics(report, rows)
     failures += _verdict_failures(report, rows)
     _check_generations_and_accounting(report)
+    _check_judge_bindings(report, rows)
     _check_collector_and_cleanup(report)
     failures += _check_procedures(report, capabilities["skill"])
     failures += _check_negative(report)
@@ -1630,15 +1717,16 @@ def verify_cleanup(path: Path) -> ScoreResult:
 # Live campaign: provider accounting -----------------------------------------------
 
 SHUTDOWN_RESERVE = Decimal("0.10")
-# Native per-agent caps set through `local budget` right after deploy. The
-# daily USD cap bounds an agent's total spend, including scheduled fires; a
-# reservation adds a final-generation overshoot priced from the catalog.
-AGENT_DAILY_USD = Decimal("0.25")
+# Native per-agent caps set through `local budget` right after deploy. The runner
+# applies the configured cap per session (SDK max_budget_usd, priced from the
+# SDK's own table, which prices the pinned actor above the billed rate), so a
+# fresh session can spend the whole cap: every actor turn and every expected
+# scheduled fire reserves the full cap plus one priced final-generation overshoot.
+AGENT_DAILY_USD = Decimal("0.75")
 AGENT_OUTPUT_TOKENS = 8000
 ACTOR_PROMPT_TOKENS_BOUND = 60000
 JUDGE_PROMPT_CHARS_PER_TOKEN = 2
 RESERVE_MARGIN = Decimal("1.25")
-SCHEDULE_FIRES_RESERVED = 2
 SETTLE_SECONDS = 60
 NORMAL_POLL_SECONDS = 60
 DELIVERY_TOLERANCE_SECONDS = 240
@@ -1772,27 +1860,25 @@ class _Ledger:
         self.sequence = 0
         self.closed: str | None = None
 
-    def _sum(self, column: str, *statuses: str, agent: str | None = None) -> Decimal:
+    def _sum(self, column: str, *statuses: str) -> Decimal:
         rows = self._db.execute(
-            f"SELECT {column}, scope FROM operations WHERE status IN "  # noqa: S608
+            f"SELECT {column} FROM operations WHERE status IN "  # noqa: S608
             f"({', '.join('?' for _ in statuses)})",
             statuses,
         ).fetchall()
-        return sum(
-            (
-                Decimal(row[0])
-                for row in rows
-                if agent is None or json.loads(row[1]).get("agent_id") == agent
-            ),
-            Decimal(0),
-        )
+        return sum((Decimal(row[0]) for row in rows), Decimal(0))
 
-    def agent_spent(self, agent: str) -> Decimal:
-        """Charged and still-reserved money attributed to one scenario agent."""
+    def hold_unresolved(self, identity: str, reason: str) -> None:
+        """Keep a reservation whose outcome can no longer be observed charged in
+        full: an upper bound that counts in charged spend, never a zero."""
 
-        return self._sum("settled", "settled", "unresolved", agent=agent) + self._sum(
-            "reserve", "reserved", agent=agent
+        self._db.execute(
+            "UPDATE operations SET settled = reserve, status = 'unresolved' "
+            "WHERE id = ? AND status = 'reserved'",
+            (identity,),
         )
+        self._db.commit()
+        self.notes.append(f"{_now()} {identity} unresolved at its full reservation: {reason}")
 
     def observe(self, usage: Decimal) -> None:
         """Keep a high-water mark of shared-key usage. The provider's counter is
@@ -1904,12 +1990,17 @@ class _Ledger:
                 "purpose": r[6],
                 "reserve_usd": r[2],
                 "settled_usd": r[3],
+                "charged_usd": r[3],
                 "status": r[4],
             }
             for r in rows
         ]
 
     def final(self) -> dict[str, Any]:
+        for (identity,) in self._db.execute(
+            "SELECT id FROM operations WHERE status = 'reserved'"
+        ).fetchall():
+            self.hold_unresolved(identity, "still reserved at campaign end")
         deadline = time.monotonic() + 60
         usage = self.provider.usage()
         while time.monotonic() < deadline:
@@ -2295,6 +2386,51 @@ class _Options:
 
 
 _PERSISTENCE_TOOLS = ("memory", "remember", "forget", "skill", "schedule")
+
+
+def _admit_predicates(
+    predicates: Sequence[Mapping[str, Any]],
+    before: Mapping[str, Any],
+    after: Mapping[str, Any],
+    available: set[str],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Admit a decision's rendered fixture predicates against the capability
+    evidence and the stored fields the before and after snapshots carry."""
+
+    kept: list[dict[str, Any]] = []
+    unavailable: list[dict[str, Any]] = []
+    for raw in predicates:
+        predicate = dict(raw)
+        kind = str(predicate["class"])
+        if kind not in available:
+            unavailable.append({**predicate, "reason": "capability absent"})
+            continue
+        store = {"skill": "skills", "schedule": "schedules"}.get(kind, "facts")
+        rows = [
+            r
+            for r in [*before[store], *after[store]]
+            if store != "facts" or (r.get("kind") == "instruction") == (kind == "instruction")
+        ]
+        name = str(predicate["name"])
+        needed: list[str] = []
+        if name in _NEEDED_FIELD:
+            needed = [_NEEDED_FIELD[name]]
+        elif name == "author_equals":
+            needed = ["created_by" if kind == "schedule" else "author"]
+        elif name == "schedule_matches":
+            needed = list(_obj(predicate["value"], "schedule match"))
+        missing = [f for f in needed if any(f not in row for row in rows)]
+        if missing:
+            unavailable.append({**predicate, "reason": f"absent stored field {missing[0]}"})
+        else:
+            kept.append(predicate)
+    return kept, unavailable
+
+
+def _forbids_persistence(spec: Mapping[str, Any]) -> bool:
+    return spec.get("forbid_persistence_attempts") is True
+
+
 _NEEDED_FIELD = {
     "statement_equals": "statement",
     "scope_equals": "scope",
@@ -2397,6 +2533,10 @@ class _Campaign:
         self.live_children = 0
         self.prices: dict[str, dict[str, Decimal]] = {}
         self.agent_caps: dict[str, dict[str, Any]] = {}
+        self.unbound_fires: dict[str, list[str]] = {}
+        self.bound_fires: dict[tuple[str, str], str] = {}
+        self.open_fires: set[str] = set()
+        self.substitutions: dict[str, Any] = {}
         self.paid_started = False
         self.setup_retries: list[dict[str, Any]] = []
         self.channels: tuple[str, str] = CHANNELS
@@ -2630,12 +2770,68 @@ class _Campaign:
         )
         return (bound * RESERVE_MARGIN).quantize(Decimal("0.000001"))
 
-    def actor_reserve(self, agent: str) -> Decimal:
-        """The agent's remaining native daily cap plus one final-generation overshoot."""
+    def actor_reserve(self) -> Decimal:
+        """The full native per-session cap plus one final-generation overshoot."""
+
+        return AGENT_DAILY_USD + self.overshoot()
+
+    # Scheduled-fire reservations ---------------------------------------------------
+    #
+    # The worker cron loop fires an agent one-shot at most once: a deferred slot is
+    # re-queued only before its turn ran, and a lapsed claim is recorded
+    # `reclaimed` and never republished (cron_loop.py). So one reservation per
+    # schedule a message can create, with no retry reservation.
+
+    def reserve_fire(self, scope: Mapping[str, Any], why: str) -> None:
+        assert self.ledger is not None
+        bare = {k: scope[k] for k in ("repetition", "case_id", "agent_id")}
+        operation = self.ledger.admit("schedule", self.actor_reserve(), {**bare, "why": why})
+        self.unbound_fires.setdefault(str(scope["agent_id"]), []).append(operation)
+        self.open_fires.add(operation)
+
+    def bind_fire(self, scope: Mapping[str, Any], schedule_id: str) -> str | None:
+        agent = str(scope["agent_id"])
+        if (agent, schedule_id) in self.bound_fires:
+            return self.bound_fires[(agent, schedule_id)]
+        unbound = self.unbound_fires.get(agent, [])
+        if not unbound:
+            return None
+        operation = unbound.pop(0)
+        self.bound_fires[(agent, schedule_id)] = operation
+        return operation
+
+    def release_fire(self, operation: str | None, reason: str) -> None:
+        assert self.ledger is not None
+        if operation is not None and operation in self.open_fires:
+            self.ledger.release(operation, reason)
+            self.open_fires.discard(operation)
+
+    def reconcile_fires(self, scope: Mapping[str, Any]) -> None:
+        """At scenario end, release reservations for schedules a message did not
+        create (the CLI shows no unbound active schedule) and bind the rest."""
+
+        agent = str(scope["agent_id"])
+        if not self.unbound_fires.get(agent):
+            return
+        bound = {sid for (owner, sid) in self.bound_fires if owner == agent}
+        active = [
+            str(r["id"])
+            for r in self.snapshot(scope)[0].get("schedules", [])
+            if r.get("state") == "active" and str(r["id"]) not in bound
+        ]
+        for schedule_id in active:
+            self.bind_fire(scope, schedule_id)
+        for operation in self.unbound_fires.pop(agent, []):
+            self.release_fire(operation, "the CLI shows no schedule created for it")
+
+    def close_fires(self, reason: str) -> None:
+        """A stack going down can no longer fire; an unobserved fire stays charged."""
 
         assert self.ledger is not None
-        remaining = max(Decimal(0), AGENT_DAILY_USD - self.ledger.agent_spent(agent))
-        return remaining + self.overshoot()
+        for operation in sorted(self.open_fires):
+            self.ledger.hold_unresolved(operation, reason)
+        self.open_fires.clear()
+        self.unbound_fires.clear()
 
     def judge_reserve(self, prompt: str) -> Decimal:
         price = self.prices[JUDGE_MODEL]
@@ -2868,6 +3064,8 @@ class _Campaign:
         )
         if code != 0:
             self.failures.append(f"local down failed: {stderr}")
+        if self.ledger is not None:
+            self.close_fires("stack torn down before the fire was observed")
         self.stack = None
 
     def resolver_preflight(self) -> None:
@@ -3081,7 +3279,7 @@ class _Campaign:
         bare = {k: scope[k] for k in ("repetition", "case_id", "agent_id")}
         if thread.startswith(EVAL_ISOLATE_PREFIX):
             raise _Stop("an ordinary thread must not use the eval isolation prefix")
-        operation = self.ledger.admit("actor", self.actor_reserve(str(scope["agent_id"])), bare)
+        operation = self.ledger.admit("actor", self.actor_reserve(), bare)
         self.paid_started = True
         before = self.ledger.last_usage
         self.live_children += 1
@@ -3215,34 +3413,8 @@ class _Campaign:
         before: Mapping[str, Any],
         after: Mapping[str, Any],
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        kept: list[dict[str, Any]] = []
-        unavailable: list[dict[str, Any]] = []
-        for raw in predicates:
-            predicate = dict(raw)
-            kind = str(predicate["class"])
-            if not self.available(kind):
-                unavailable.append({**predicate, "reason": "capability absent"})
-                continue
-            store = {"skill": "skills", "schedule": "schedules"}.get(kind, "facts")
-            rows = [
-                r
-                for r in [*before[store], *after[store]]
-                if store != "facts" or (r.get("kind") == "instruction") == (kind == "instruction")
-            ]
-            name = str(predicate["name"])
-            needed: list[str] = []
-            if name in _NEEDED_FIELD:
-                needed = [_NEEDED_FIELD[name]]
-            elif name == "author_equals":
-                needed = ["created_by" if kind == "schedule" else "author"]
-            elif name == "schedule_matches":
-                needed = list(_obj(predicate["value"], "schedule match"))
-            missing = [f for f in needed if any(f not in row for row in rows)]
-            if missing:
-                unavailable.append({**predicate, "reason": f"absent stored field {missing[0]}"})
-            else:
-                kept.append(predicate)
-        return kept, unavailable
+        available = {c for c in DURABLE if self.available(c)}
+        return _admit_predicates(predicates, before, after, available)
 
     def score_decision(
         self,
@@ -3285,12 +3457,17 @@ class _Campaign:
         semantic = "NOT_RUN"
         action: str | None = None
         predicted: list[str] = list(durable)
+        judge_ref: dict[str, Any] | None = None
         if expected in DURABLE and not self.available(expected):
             status, detail = "NOT_AVAILABLE", "expected capability is absent"
         elif not kept:
             status, detail = "NOT_AVAILABLE", "every predicate needs an absent field"
         elif transcript_error is not None:
             status, detail = "ERROR", f"transcript evidence: {transcript_error}"
+        elif _forbids_persistence(spec) and attempts:
+            # Any persistence attempt (success, error or unmatched) fails a
+            # forbidden decision deterministically, before any judging.
+            status, detail = "FAIL", "a persistence attempt was made where none is allowed"
         elif durable and not any(a["matched"] and not a["is_error"] for a in attempts):
             status, detail = "ERROR", "missing tool evidence"
         else:
@@ -3335,8 +3512,16 @@ class _Campaign:
             if self.stopped:
                 raise _Stop(self.stopped)
             if self.last_verdict is not None:
+                prompt_text, completion, generation_id, _, sequence = self.last_verdict
+                judge_ref = {
+                    "generation_id": generation_id,
+                    "call_sequence": sequence,
+                    "prompt_sha256": _sha(prompt_text.encode()),
+                    "completion_sha256": _sha(completion.encode()),
+                    "completion": completion,
+                }
                 try:
-                    verdict = parse_judge_verdict(self.last_verdict[1])
+                    verdict = parse_judge_verdict(completion)
                     semantic = verdict.verdict
                     action = None if verdict.action is None else str(verdict.action)
                 except ValueError:
@@ -3378,6 +3563,7 @@ class _Campaign:
                 "unavailable_predicates": unavailable,
                 "admitted_predicates": kept,
                 "available": sorted(c for c in DURABLE if self.available(c)),
+                "substitutions": copy.deepcopy(self.substitutions),
                 "invocation_id": sent["invocation_id"],
             },
         )
@@ -3397,6 +3583,8 @@ class _Campaign:
                 "detail": _bounded(detail),
             }
         )
+        if judge_ref is not None:
+            self.decisions[-1]["judge_ref"] = judge_ref
         if status in ("FAIL", "ERROR"):
             self.failures.append(f"{scope['case_id']} {spec['id']} {status}: {_bounded(detail)}")
 
@@ -3412,6 +3600,11 @@ class _Campaign:
     ) -> tuple[dict[str, Any], tuple[dict[str, Any], Any]]:
         before = self.snapshot(scope)
         text = str(fixture["messages"][index])
+        if self.available("schedule") and any(
+            int(spec["message"]) == index and spec["expected"] == "schedule"
+            for spec in fixture["decisions"]
+        ):
+            self.reserve_fire(scope, f"message {index} expects a schedule")
         sent = self.message(scope, text, self.channels[0], thread)
         after = self.snapshot(scope)
         try:
@@ -3452,6 +3645,7 @@ class _Campaign:
         self.channels = _scenario_channels(self.run_id, repetition, str(raw["id"]))
         literals = dict(zip(CHANNELS, self.channels, strict=True))
         fixture = _substitute(copy.deepcopy(dict(raw)), values, literals)
+        self.substitutions = {"values": dict(values), "literals": literals}
         case_id = f"{fixture['id']}-R{repetition}"
         name = f"le-{self.run_id}-r{repetition}-{fixture['id'].lower()}"
         scope: dict[str, Any] = {"repetition": repetition, "case_id": case_id, "agent_id": name}
@@ -3470,6 +3664,7 @@ class _Campaign:
         }.get(family)
         if control is not None:
             control(scope, fixture, agent_id, thread, after, values)
+        self.reconcile_fires(scope)
 
     def record_control(
         self, scope: Mapping[str, Any], control: str, status: str, detail: str
@@ -3482,7 +3677,7 @@ class _Campaign:
                 "detail": detail,
             }
         )
-        if status == "FAIL":
+        if status in ("FAIL", "ERROR"):
             self.failures.append(f"{scope['case_id']} control {control}: {detail}")
 
     def find(
@@ -3739,8 +3934,13 @@ class _Campaign:
         token = values["schedule_token"]
         due = self.find(after[0], "schedules", "prompt", token)
         cancel = next(c for c in fixture["controls"] if c.get("id") == "cancelled-one-shot")
+        if len(due) == 1:
+            self.bind_fire(scope, str(due[0]["id"]))
+        self.reserve_fire(scope, "cancel-target one-shot")
         self.message(scope, str(cancel["messages"][0]), self.channels[0], thread)
         made = self.find(self.snapshot(scope)[0], "schedules", "prompt", values["cancel_token"])
+        if len(made) == 1:
+            self.bind_fire(scope, str(made[0]["id"]))
         self.message(scope, str(cancel["messages"][1]), self.channels[0], thread)
         if len(due) != 1 or len(made) != 1:
             self.record_control(
@@ -3752,15 +3952,15 @@ class _Campaign:
                 f"cancel-target {json.dumps([(r.get('id'), r.get('state')) for r in made])}",
             )
             return
-        assert self.ledger is not None
         bare = {k: scope[k] for k in ("repetition", "case_id", "agent_id")}
-        for row, token_value in ((due[0], token), (made[0], values["cancel_token"])):
-            # One actor-turn reservation for the expected fire and one for a retry,
-            # held until the fire settles or the schedule is cancelled.
-            reserve = self.actor_reserve(str(scope["agent_id"])) * SCHEDULE_FIRES_RESERVED
-            operation = self.ledger.admit(
-                "schedule", reserve, {**bare, "schedule_id": str(row["id"])}
+        target, source = self.schedule_row(scope, str(made[0]["id"]))
+        if source == "absent" or (target is not None and target.get("state") == "cancelled"):
+            self.release_fire(
+                self.bound_fires.get((str(scope["agent_id"]), str(made[0]["id"]))),
+                f"schedule {made[0]['id']} observed cancelled before its slot",
             )
+        for row, token_value in ((due[0], token), (made[0], values["cancel_token"])):
+            operation = self.bound_fires.get((str(scope["agent_id"]), str(row["id"])))
             self.pending.append(
                 {
                     "scope": bare,
@@ -3789,6 +3989,8 @@ class _Campaign:
             return
         control = next(c for c in fixture["controls"] if c.get("id") == "revise-and-cancel")
         original = self.find(after[0], "schedules", "prompt", values["schedule_token"])
+        if len(original) == 1:
+            self.bind_fire(scope, str(original[0]["id"]))
         self.message(scope, str(control["messages"][0]), self.channels[0], thread)
         revised_state = self.snapshot(scope)[0]
         revised = [
@@ -3819,6 +4021,16 @@ class _Campaign:
             and not live
             and (state == "cancelled" or (final is None and source == "absent"))
         )
+        if source == "error":
+            self.record_control(
+                scope, "revise-and-cancel", "ERROR", "the schedule read after cancel failed"
+            )
+            return
+        if cancelled:
+            self.release_fire(
+                self.bound_fires.get((str(scope["agent_id"]), str(original[0]["id"]))),
+                f"schedule {original[0]['id']} observed cancelled",
+            )
         observed = {
             "original": [(r["id"], r.get("state"), r.get("cron")) for r in original],
             "revised": [(r["id"], r.get("state"), r.get("cron")) for r in revised],
@@ -3897,14 +4109,21 @@ class _Campaign:
         for raw in _lst(listed.get("agent_schedules"), "agent_schedules"):
             if str(_obj(raw, "schedule").get("id")) == schedule_id:
                 return dict(raw), "list"
-        code, parsed, _, _, _ = self.cli(
+        code, parsed, _, _, stderr = self.cli(
             ["local", "schedules", "--agent", name, "--show", schedule_id], bare
         )
         if code == 0 and isinstance(parsed, dict):
             row = parsed if "id" in parsed else parsed.get("schedule")
             if isinstance(row, dict) and str(row.get("id")) == schedule_id:
                 return dict(row), "show"
-        return None, "absent"
+            return None, "error"
+        # Only the API's documented answer for an unknown schedule counts as absent
+        # (agent_schedules router: 404 "schedule not found"); any other failure
+        # or malformed read is an error, never a cancellation.
+        said = f"{json.dumps(parsed) if parsed is not None else ''} {stderr}"
+        if code != 0 and "404" in said and "schedule not found" in said:
+            return None, "absent"
+        return None, "error"
 
     def open_window(self, repetition: int) -> datetime:
         """Bind the collector on port B once every message child of the repetition exited."""
@@ -3973,6 +4192,10 @@ class _Campaign:
         for item in pending:
             scope = item["scope"]
             found, source = self.schedule_row(scope, item["schedule_id"])
+            if source == "error":
+                self.failures.append(
+                    f"{scope['case_id']} {item['schedule_id']} ERROR: the schedule read failed"
+                )
             stored = [found] if found is not None else []
             row = found if found is not None else rows[item["schedule_id"]]
             run_at = str(row.get("run_at") or "")
@@ -4061,10 +4284,15 @@ class _Campaign:
         carries the whole window delta so later fires add nothing twice."""
 
         assert self.ledger is not None
+        if item.get("operation") is None or item["operation"] not in self.open_fires:
+            return
         operation = str(item["operation"])
+        self.open_fires.discard(operation)
         if not fired:
             if cancelled:
                 self.ledger.release(operation, f"schedule {item['schedule_id']} cancelled unfired")
+            else:
+                self.open_fires.add(operation)
             return
         if first:
             self.ledger.settle(operation, self.window_usage, None, record=operation)
@@ -4132,8 +4360,9 @@ class _Campaign:
                 "campaign_budget_usd": str(self.o.budget),
                 "agent_daily_cap_usd": str(AGENT_DAILY_USD),
                 "agent_output_tokens_per_run": AGENT_OUTPUT_TOKENS,
-                "actor_reserve": "remaining native daily cap plus a priced final-generation "
-                "overshoot",
+                "actor_reserve": "full native per-session cap plus a priced final-generation "
+                "overshoot, one turn in flight;"
+                " each expected scheduled fire reserves the same",
                 "judge_reserve": "priced from the prompt and the 1536-token ceiling",
                 "shutdown_reserve_usd": str(SHUTDOWN_RESERVE),
                 "judge_max_tokens": JUDGE_MAX_TOKENS,
@@ -4500,6 +4729,15 @@ def _validate_command(args: argparse.Namespace) -> int:
     curie_bin = _pinned_binary(args.curie_bin)
     path = Path(args.report)
     result = _VALIDATORS[args.command](path)
+    if result.passed and args.command == "verify-report":
+        # The public function accepts labeled synthetic vectors for unit tests;
+        # the operator validator only accepts a live campaign's report.
+        try:
+            origin = _obj(_read_json(path), "report").get("data_origin")
+        except (_Invalid, OSError, ValueError):
+            origin = None
+        if origin != "live-campaign":
+            result = ScoreResult(passed=False, detail="the report is not from a live campaign")
     if result.passed:
         try:
             recorded = _obj(_obj(_read_json(path), "report").get("binary"), "binary")
