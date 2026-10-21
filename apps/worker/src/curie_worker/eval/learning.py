@@ -1072,8 +1072,6 @@ def _check_judge_bindings(report: _Report, rows: list[dict[str, Any]]) -> None:
         _require(evidence.get("output") == observation.get("output"), f"{label} judge output")
         if live:
             # Rebuild the exact prompt from the recorded evidence and pinned rubric.
-            fixture = report.corpus[str(row["fixture_id"])]
-            spec = next(d for d in _fixture_decisions(fixture) if d["id"] == row["decision_id"])
             substitutions = _obj(observation.get("substitutions"), "substitutions")
             rubric = _substitute(
                 _decision_rubric(spec),
@@ -1936,6 +1934,18 @@ def _check_calibration(report: _Report) -> None:
 DOCKER_READ_TIMEOUT_SECONDS = 240
 
 
+def _docker_inventory() -> dict[str, list[str]]:
+    """The three inventories both the campaign and cleanup verification observe."""
+
+    return {
+        "containers": _docker_lines(
+            "container", "ls", "--all", "--no-trunc", "--format", "{{.ID}}"
+        ),
+        "volumes": _docker_lines("volume", "ls", "--format", "{{.Name}}"),
+        "networks": _docker_lines("network", "ls", "--no-trunc", "--format", "{{.ID}}"),
+    }
+
+
 def _docker_lines(*args: str) -> list[str]:
     docker = shutil.which("docker")
     if docker is None:
@@ -2039,13 +2049,7 @@ def _check_cleanup_live(report: _Report) -> None:
             removal["id"] in owned[str(removal["kind"])],
             "a removal targeted an identity outside the ownership manifest",
         )
-    inventories = {
-        "containers": set(
-            _docker_lines("container", "ls", "--all", "--no-trunc", "--format", "{{.ID}}")
-        ),
-        "volumes": set(_docker_lines("volume", "ls", "--format", "{{.Name}}")),
-        "networks": set(_docker_lines("network", "ls", "--no-trunc", "--format", "{{.ID}}")),
-    }
+    inventories = {kind: set(rows) for kind, rows in _docker_inventory().items()}
     for kind in ("containers", "runners", "resolver_containers", "volumes", "networks"):
         inventory = inventories[
             "containers" if kind in {"runners", "resolver_containers"} else kind
@@ -2218,8 +2222,11 @@ class _Provider:
             route = path.split("?")[0]
             raise _Stop(f"provider {route} unreachable: {type(exc).__name__}") from None
 
+    def _key_data(self) -> dict[str, Any]:
+        return _obj(_obj(self._request("GET", "/key"), "key").get("data"), "key data")
+
     def usage(self) -> Decimal:
-        data = _obj(_obj(self._request("GET", "/key"), "key").get("data"), "key data")
+        data = self._key_data()
         value = data.get("usage")
         if isinstance(value, bool) or not isinstance(value, int | float):
             raise _Stop("provider key usage is not numeric")
@@ -2229,7 +2236,7 @@ class _Provider:
         return amount
 
     def remaining(self) -> Decimal | None:
-        data = _obj(_obj(self._request("GET", "/key"), "key").get("data"), "key data")
+        data = self._key_data()
         value = data.get("limit_remaining")
         if value is None:
             return None
@@ -2304,6 +2311,16 @@ class _Ledger:
         self.sequence = 0
         self.closed: str | None = None
 
+    def _write(self, sql: str, params: tuple[object, ...]) -> None:
+        self._db.execute(sql, params)
+        self._db.commit()
+
+    def _reserved(self, identity: str) -> Decimal:
+        row = self._db.execute(
+            "SELECT reserve FROM operations WHERE id = ?", (identity,)
+        ).fetchone()
+        return Decimal(row[0])
+
     def _sum(self, column: str, *statuses: str) -> Decimal:
         rows = self._db.execute(
             f"SELECT {column} FROM operations WHERE status IN "  # noqa: S608
@@ -2313,8 +2330,7 @@ class _Ledger:
         return sum((Decimal(row[0]) for row in rows), Decimal(0))
 
     def bind_record(self, identity: str, record: str) -> None:
-        self._db.execute("UPDATE operations SET record_id = ? WHERE id = ?", (record, identity))
-        self._db.commit()
+        self._write("UPDATE operations SET record_id = ? WHERE id = ?", (record, identity))
 
     def charge_of(self, identity: str) -> str:
         row = self._db.execute(
@@ -2326,12 +2342,11 @@ class _Ledger:
         """Keep a reservation whose outcome can no longer be observed charged in
         full: an upper bound that counts in charged spend, never a zero."""
 
-        self._db.execute(
+        self._write(
             "UPDATE operations SET settled = reserve, status = 'unresolved' "
             "WHERE id = ? AND status = 'reserved'",
             (identity,),
         )
-        self._db.commit()
         self.notes.append(f"{_now()} {identity} unresolved at its full reservation: {reason}")
 
     def observe(self, usage: Decimal) -> None:
@@ -2362,7 +2377,7 @@ class _Ledger:
             raise _Stop(self.closed)
         self.sequence += 1
         identity = f"{purpose}-operation-{self.sequence}"
-        self._db.execute(
+        self._write(
             "INSERT INTO operations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 identity,
@@ -2377,7 +2392,6 @@ class _Ledger:
                 "{}",
             ),
         )
-        self._db.commit()
         return identity
 
     def settle(
@@ -2405,18 +2419,14 @@ class _Ledger:
         elif delta > 0:
             settled = delta
         else:
-            row = self._db.execute(
-                "SELECT reserve FROM operations WHERE id = ?", (identity,)
-            ).fetchone()
-            settled = Decimal(row[0])
+            settled = self._reserved(identity)
             status = "unresolved"
             self.notes.append(f"{_now()} {identity} cost unknown; full reservation stays charged")
-        self._db.execute(
+        self._write(
             "UPDATE operations SET settled = ?, status = ?, generation_id = ?, record_id = ? "
             "WHERE id = ?",
             (str(settled), status, generation or "", record or "", identity),
         )
-        self._db.commit()
         return str(settled)
 
     def annotate(self, identity: str, **fields: Any) -> None:
@@ -2424,20 +2434,16 @@ class _Ledger:
 
         row = self._db.execute("SELECT meta FROM operations WHERE id = ?", (identity,)).fetchone()
         meta = {**json.loads(row[0] or "{}"), **fields}
-        self._db.execute(
-            "UPDATE operations SET meta = ? WHERE id = ?", (json.dumps(meta), identity)
-        )
-        self._db.commit()
+        self._write("UPDATE operations SET meta = ? WHERE id = ?", (json.dumps(meta), identity))
 
     def resize(self, identity: str, reserve: Decimal, reason: str) -> None:
         """Lower a still-held reservation once a smaller native cap bounds its work."""
 
-        self._db.execute(
+        self._write(
             "UPDATE operations SET reserve = ? WHERE id = ? AND status = 'reserved' "
             "AND CAST(reserve AS REAL) > ?",
             (str(reserve), identity, float(reserve)),
         )
-        self._db.commit()
         self.notes.append(f"{_now()} {identity} reservation lowered to {reserve}: {reason}")
 
     def fits(self, reserve: Decimal) -> bool:
@@ -2472,29 +2478,24 @@ class _Ledger:
         if stable is not None:
             settled, status = stable - before, "settled"
         else:
-            row = self._db.execute(
-                "SELECT reserve FROM operations WHERE id = ?", (identity,)
-            ).fetchone()
-            settled, status = Decimal(row[0]), "unresolved"
+            settled, status = self._reserved(identity), "unresolved"
             self.notes.append(
                 f"{_now()} {identity} usage never stabilized; reservation stays charged"
             )
-        self._db.execute(
+        self._write(
             "UPDATE operations SET settled = ?, status = ?, record_id = ?, usage_polls = ? "
             "WHERE id = ?",
             (str(settled), status, record, json.dumps(polls), identity),
         )
-        self._db.commit()
         return str(settled)
 
     def release(self, identity: str, reason: str) -> None:
         """Release a reservation whose work provably did not run: a cancelled fire, or
         a message child that failed binding its stub before enqueueing anything."""
 
-        self._db.execute(
+        self._write(
             "UPDATE operations SET settled = '0', status = 'released' WHERE id = ?", (identity,)
         )
-        self._db.commit()
         self.notes.append(f"{_now()} {identity} released: {reason}")
 
     def fail(self, identity: str, reason: str) -> None:
@@ -2505,11 +2506,10 @@ class _Ledger:
             "SELECT reserve FROM operations WHERE id = ?", (identity,)
         ).fetchone()
         if row is not None:
-            self._db.execute(
+            self._write(
                 "UPDATE operations SET settled = ?, status = 'unresolved' WHERE id = ?",
                 (row[0], identity),
             )
-            self._db.commit()
 
     def operations(self) -> list[dict[str, Any]]:
         rows = self._db.execute(
@@ -2995,6 +2995,10 @@ def _substitute(
     return value
 
 
+def _scenario_scope(scope: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: scope[key] for key in ("repetition", "case_id", "agent_id")}
+
+
 def _scenario_channels(run_id: str, repetition: int, fixture_id: str) -> tuple[str, str]:
     """Two obviously synthetic Slack channel IDs unique per run, repetition and scenario."""
 
@@ -3328,7 +3332,7 @@ class _Campaign:
 
     def reserve_fire(self, scope: Mapping[str, Any], why: str) -> None:
         assert self.ledger is not None
-        bare = {k: scope[k] for k in ("repetition", "case_id", "agent_id")}
+        bare = _scenario_scope(scope)
         operation = self.ledger.admit("schedule", self.actor_reserve(), {**bare, "why": why})
         self.unbound_fires.setdefault(str(scope["agent_id"]), []).append(operation)
         self.open_fires.add(operation)
@@ -3369,6 +3373,40 @@ class _Campaign:
         for operation in self.unbound_fires.pop(agent, []):
             self.release_fire(operation, "the CLI shows no schedule created for it")
 
+    def set_budget(
+        self,
+        name: str,
+        bare: Mapping[str, Any],
+        limit: Decimal,
+        tokens: int,
+        failure: str,
+    ) -> object:
+        """Set one native budget and require the read-back to match it."""
+
+        caps = _obj(
+            self.must(
+                [
+                    "local",
+                    "budget",
+                    name,
+                    "--limit",
+                    str(limit),
+                    "--output-tokens",
+                    str(tokens),
+                ],
+                bare,
+            ),
+            "budget",
+        )
+        cap = caps.get("max_usd_per_day")
+        if (
+            not isinstance(cap, (int, float, str))
+            or Decimal(str(cap)) != limit
+            or caps.get("max_output_tokens_per_run") != tokens
+        ):
+            raise _Stop(f"{failure}: {json.dumps(caps)}")
+        return cap
+
     def lower_fire_cap(self, scope: Mapping[str, Any]) -> None:
         """After the scenario's last ordinary turn, lower the agent's native cap so it
         bounds every pending fire's session, read it back, then hold each fire due
@@ -3384,29 +3422,14 @@ class _Campaign:
         }
         if not held:
             return
-        bare = {k: scope[k] for k in ("repetition", "case_id", "agent_id")}
-        caps = _obj(
-            self.must(
-                [
-                    "local",
-                    "budget",
-                    agent,
-                    "--limit",
-                    str(FIRE_DAILY_USD),
-                    "--output-tokens",
-                    str(FIRE_OUTPUT_TOKENS),
-                ],
-                bare,
-            ),
-            "budget",
+        bare = _scenario_scope(scope)
+        cap = self.set_budget(
+            agent,
+            bare,
+            FIRE_DAILY_USD,
+            FIRE_OUTPUT_TOKENS,
+            "the lowered fire budget did not read back",
         )
-        cap = caps.get("max_usd_per_day")
-        if (
-            not isinstance(cap, (int, float, str))
-            or Decimal(str(cap)) != FIRE_DAILY_USD
-            or caps.get("max_output_tokens_per_run") != FIRE_OUTPUT_TOKENS
-        ):
-            raise _Stop(f"the lowered fire budget did not read back: {json.dumps(caps)}")
         lowered_at = datetime.now(UTC)
         self.agent_caps.setdefault(agent, {})["fire_cap"] = {
             "max_usd_per_day": str(cap),
@@ -3592,6 +3615,18 @@ class _Campaign:
             "compose_disable_env_file": True,
         }
 
+    def compose_argv(self, *head: str) -> list[str]:
+        assert self.stack is not None
+        return [
+            *head,
+            "--project",
+            self.stack.project,
+            "-f",
+            str(self.base_compose),
+            "-f",
+            str(self.stack.override),
+        ]
+
     def up(self, repetition: int) -> None:
         for attempt in (1, 2):
             self.stack = _new_stack(
@@ -3601,19 +3636,7 @@ class _Campaign:
             self.stack.write_override()
             assert self.stack is not None
             code, _, _, _, stderr = self.cli(
-                [
-                    "local",
-                    "up",
-                    "--build",
-                    "--model",
-                    ACTOR_MODEL,
-                    "--project",
-                    self.stack.project,
-                    "-f",
-                    str(self.base_compose),
-                    "-f",
-                    str(self.stack.override),
-                ],
+                self.compose_argv("local", "up", "--build", "--model", ACTOR_MODEL),
                 {"repetition": repetition},
                 credentials=True,
                 timeout=5400,
@@ -3680,18 +3703,7 @@ class _Campaign:
         with contextlib.suppress(_Invalid):
             self.ownership.observe(self.stack)
         code, _, _, _, stderr = self.cli(
-            [
-                "local",
-                "down",
-                "--wipe",
-                "--yes",
-                "--project",
-                self.stack.project,
-                "-f",
-                str(self.base_compose),
-                "-f",
-                str(self.stack.override),
-            ],
+            self.compose_argv("local", "down", "--wipe", "--yes"),
             {"repetition": repetition},
             timeout=900,
             extra=self.compose_extra(),
@@ -3788,7 +3800,7 @@ class _Campaign:
     def provision(self, scope: dict[str, Any]) -> str:
         assert self.stack is not None
         name = str(scope["agent_id"])
-        bare = {k: scope[k] for k in ("repetition", "case_id", "agent_id")}
+        bare = _scenario_scope(scope)
         deployed = self.must(
             [
                 "local",
@@ -3827,28 +3839,13 @@ class _Campaign:
         for key, value in expected.items():
             if readback.get(key) != value:
                 raise _Stop(f"override {key} did not read back as requested")
-        caps = _obj(
-            self.must(
-                [
-                    "local",
-                    "budget",
-                    name,
-                    "--limit",
-                    str(AGENT_DAILY_USD),
-                    "--output-tokens",
-                    str(AGENT_OUTPUT_TOKENS),
-                ],
-                bare,
-            ),
-            "budget",
+        cap = self.set_budget(
+            name,
+            bare,
+            AGENT_DAILY_USD,
+            AGENT_OUTPUT_TOKENS,
+            "native agent budget did not read back",
         )
-        cap = caps.get("max_usd_per_day")
-        if (
-            not isinstance(cap, (int, float, str))
-            or Decimal(str(cap)) != AGENT_DAILY_USD
-            or caps.get("max_output_tokens_per_run") != AGENT_OUTPUT_TOKENS
-        ):
-            raise _Stop(f"native agent budget did not read back: {json.dumps(caps)}")
         self.agent_caps[name] = {
             "max_usd_per_day": str(cap),
             "max_output_tokens_per_run": AGENT_OUTPUT_TOKENS,
@@ -3867,7 +3864,7 @@ class _Campaign:
         from .learning_metrics import EvidenceError, LearningClass, parse_cli_snapshot
 
         name = str(scope["agent_id"])
-        bare = {k: scope[k] for k in ("repetition", "case_id", "agent_id")}
+        bare = _scenario_scope(scope)
         skills = (
             self.must(["local", "skills", name, "list"], bare) if self.available("skill") else None
         )
@@ -3936,7 +3933,7 @@ class _Campaign:
         self, scope: Mapping[str, Any], text: str, channel: str, thread: str
     ) -> dict[str, Any]:
         assert self.ledger is not None
-        bare = {k: scope[k] for k in ("repetition", "case_id", "agent_id")}
+        bare = _scenario_scope(scope)
         if thread.startswith(EVAL_ISOLATE_PREFIX):
             raise _Stop("an ordinary thread must not use the eval isolation prefix")
         argv = [
@@ -4049,7 +4046,7 @@ class _Campaign:
         if not self.available("schedule"):
             return
         assert self.ledger is not None
-        bare = {k: scope[k] for k in ("repetition", "case_id", "agent_id")}
+        bare = _scenario_scope(scope)
         agent = str(scope["agent_id"])
         listed = _obj(self.must(["local", "schedules", "--agent", agent], bare), "schedules")
         for raw in _lst(listed.get("agent_schedules"), "agent_schedules"):
@@ -4174,7 +4171,7 @@ class _Campaign:
         from .learning_metrics import EvidenceError, match_tool_results, score_state
         from .models import EvalCase, Grader, GraderKind
 
-        bare = {k: scope[k] for k in ("repetition", "case_id", "agent_id")}
+        bare = _scenario_scope(scope)
         expected = str(spec["expected"])
         changed = sorted(_state_diff(before[0], after[0]))
         durable = sorted({kind for kind, _ in changed})
@@ -4369,7 +4366,7 @@ class _Campaign:
         if int(fixture.get("primary_message", 0)) == index:
             self.cases.append(
                 {
-                    **{k: scope[k] for k in ("repetition", "case_id", "agent_id")},
+                    **_scenario_scope(scope),
                     "fixture_id": fixture["id"],
                     "primary": True,
                     "invocation_id": sent["invocation_id"],
@@ -4453,7 +4450,7 @@ class _Campaign:
         checks recompute its status. ``status`` None derives PASS or FAIL from the
         checks; NOT_AVAILABLE and ERROR are recorded as given."""
 
-        bare = {k: scope[k] for k in ("repetition", "case_id", "agent_id")}
+        bare = _scenario_scope(scope)
         recorded = [dict(c) for c in checks]
         if status is None:
             passed = bool(recorded) and all(_control_check(c) for c in recorded)
@@ -4581,13 +4578,6 @@ class _Campaign:
                     or corrected in str(r.get("statement", ""))
                 )
             ]
-            raised = (
-                head is not None
-                and isinstance(version, int)
-                and isinstance(head.get("version"), int)
-                and head["version"] > version
-            )
-            del raised
             checks.append(
                 {
                     "kind": "instruction-step",
@@ -4626,7 +4616,7 @@ class _Campaign:
                 scope, "removed-skill", "NOT_AVAILABLE", "learned skills are absent"
             )
             return
-        bare = {k: scope[k] for k in ("repetition", "case_id", "agent_id")}
+        bare = _scenario_scope(scope)
         control = next(c for c in fixture["controls"] if c.get("id") == "removed-skill")
         heads = self.find(after[0], "skills", "slug", str(fixture["subject"]))
         if len(heads) != 1:
@@ -4706,7 +4696,7 @@ class _Campaign:
     def retention_probe(
         self, scope: Mapping[str, Any], fact_id: str, value: str, text: str, agent_id: str
     ) -> str:
-        bare = {k: scope[k] for k in ("repetition", "case_id", "agent_id")}
+        bare = _scenario_scope(scope)
         _, _, _, before_ref, _ = self.cli(["local", "memory", str(scope["agent_id"])], bare)
         sent = self.message(scope, text, self.channels[1], self.new_thread())
         _, parsed, _, after_ref, _ = self.cli(["local", "memory", str(scope["agent_id"])], bare)
@@ -4760,7 +4750,7 @@ class _Campaign:
         after: Any,
         values: Mapping[str, str],
     ) -> None:
-        bare = {k: scope[k] for k in ("repetition", "case_id", "agent_id")}
+        bare = _scenario_scope(scope)
         subject = str(fixture["subject"])
         recall = fixture["probes"][0]
         sent = self.message(scope, str(recall["input"]), self.channels[1], self.new_thread())
@@ -4877,7 +4867,7 @@ class _Campaign:
                 scope, "real-clock-delivery", "FAIL", detail, [self.observed(detail)]
             )
             return
-        bare = {k: scope[k] for k in ("repetition", "case_id", "agent_id")}
+        bare = _scenario_scope(scope)
         target, source = self.schedule_row(scope, str(made[0]["id"]))
         if source == "absent" or (target is not None and target.get("state") == "cancelled"):
             self.release_fire(
@@ -5049,7 +5039,7 @@ class _Campaign:
         list alone is not its state; `--show <id>` reads that one row.
         """
 
-        bare = {k: scope[k] for k in ("repetition", "case_id", "agent_id")}
+        bare = _scenario_scope(scope)
         name = str(scope["agent_id"])
         listed = _obj(self.must(["local", "schedules", "--agent", name], bare), "schedules")
         for raw in _lst(listed.get("agent_schedules"), "agent_schedules"):
@@ -5335,13 +5325,7 @@ class _Campaign:
                 self.discover()
                 self.preflight_provider()
                 self.ownership.daemon_id = "\n".join(_docker_lines("info", "--format", "{{.ID}}"))
-                self.ownership.unrelated = {
-                    "containers": _docker_lines(
-                        "container", "ls", "--all", "--no-trunc", "--format", "{{.ID}}"
-                    ),
-                    "volumes": _docker_lines("volume", "ls", "--format", "{{.Name}}"),
-                    "networks": _docker_lines("network", "ls", "--no-trunc", "--format", "{{.ID}}"),
-                }
+                self.ownership.unrelated = _docker_inventory()
                 self.stub_port = _free_port()
                 ordered = sorted(self.corpus, key=lambda row: str(row["id"])[:2] == "F4")
                 for repetition in range(1, self.o.repetitions + 1):
