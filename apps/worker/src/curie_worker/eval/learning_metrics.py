@@ -532,6 +532,8 @@ def _norm(text: str) -> str:
         text = trimmed
 
 
+# Section A3: share of a step's distinct non-nonce tokens the body must contain.
+_STEP_TOKEN_COVERAGE = 0.85
 _TOKEN_SPLIT = re.compile(r"[^a-z0-9-]+")
 _NONCE = re.compile(r"^[a-z]+-[0-9a-f]{6}$")
 _STOPWORDS = frozenset(
@@ -552,7 +554,8 @@ def _required_tokens(step: str) -> list[str]:
 def _contains_in_order(body: object, steps: Sequence[object]) -> bool:
     """Token anchors (decision after live run 7).
 
-    Every non-stopword token of every step must be a word of the body, nonce
+    Every nonce of every step and at least 85 percent of each step's other distinct
+    non-stopword tokens must be words of the body, nonce
     tokens must first occur in the body in the same relative order as in the steps,
     and each step's unique-token anchor must appear in step order.
     """
@@ -565,11 +568,15 @@ def _contains_in_order(body: object, steps: Sequence[object]) -> bool:
     required = [_required_tokens(str(step)) for step in steps]
     nonces: list[str] = []
     for tokens in required:
+        plain = {token for token in tokens if not _NONCE.match(token)}
+        if plain and len(plain & first.keys()) < _STEP_TOKEN_COVERAGE * len(plain):
+            return False
         for token in tokens:
-            if token not in first:
-                return False
-            if _NONCE.match(token) and token not in nonces:
-                nonces.append(token)
+            if _NONCE.match(token):
+                if token not in first:
+                    return False
+                if token not in nonces:
+                    nonces.append(token)
     positions = [first[token] for token in nonces]
     if positions != sorted(positions):
         return False
