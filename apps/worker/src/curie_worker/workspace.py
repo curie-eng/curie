@@ -745,10 +745,24 @@ def redact_git_diagnostic(stderr: str) -> str:
     text = "; ".join(matched[-2:])
     text = _GIT_DIAGNOSTIC_CONTROL.sub("", text)
     text = _GIT_URL_USERINFO.sub(r"\1", text)
-    text = _GIT_AUTHORIZATION_VALUE.sub(r"\1<redacted>", text)
+    # Scheme-plus-value first, so a later header pass cannot leave the value behind.
     text = _GIT_BASIC_OR_BEARER.sub("<redacted>", text)
+    text = _GIT_AUTHORIZATION_VALUE.sub(r"\1<redacted>", text)
     text = _GIT_HUB_TOKEN.sub("<redacted>", text)
-    return text[:_GIT_DIAGNOSTIC_LIMIT]
+    return _cap_git_diagnostic(text)
+
+
+def _cap_git_diagnostic(text: str) -> str:
+    """Cap at 240 characters without keeping a word sliced at the boundary."""
+
+    if len(text) <= _GIT_DIAGNOSTIC_LIMIT:
+        return text
+    clipped = text[:_GIT_DIAGNOSTIC_LIMIT]
+    if text[_GIT_DIAGNOSTIC_LIMIT].isspace() or clipped[-1].isspace():
+        return clipped.rstrip()
+    if not any(character.isspace() for character in clipped):
+        return ""
+    return clipped.rsplit(None, 1)[0]
 
 
 def _redact_redeemed_credential(diagnostic: str, credential: WorkspaceCredential) -> str:
@@ -757,7 +771,7 @@ def _redact_redeemed_credential(diagnostic: str, credential: WorkspaceCredential
     redacted = diagnostic.replace(header, "<redacted>")
     if token:
         redacted = redacted.replace(token, "<redacted>")
-    return redacted[:_GIT_DIAGNOSTIC_LIMIT]
+    return _cap_git_diagnostic(redacted)
 
 
 class SubprocessCommands:

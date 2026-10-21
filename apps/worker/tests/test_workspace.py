@@ -2517,6 +2517,56 @@ def test_prepare_batches_skip_worktree_for_many_escaping_links(
     assert len(_workspace_warnings(caplog)) == 1
 
 
+def test_redact_git_diagnostic_strips_header_schemes_without_a_redeemed_credential(
+    workspace: Any,
+) -> None:
+    basic_value = "dXNlcjpzM2NyZXQ="
+    bearer_value = "glpat-not-a-github-token"
+    raw_token = "redeemed-credential-value"
+    stderr = (
+        "hint: ignore\n"
+        f"fatal: Authorization: Basic {basic_value}\n"
+        f"remote: Authorization: Bearer {bearer_value} {raw_token}\n"
+    )
+    diagnostic = workspace.redact_git_diagnostic(stderr)
+    assert basic_value not in diagnostic
+    assert bearer_value not in diagnostic
+    assert "Authorization: <redacted>" in diagnostic
+    assert diagnostic.count("<redacted>") >= 2
+
+
+def test_diagnostic_cap_drops_a_token_cut_at_the_boundary(workspace: Any, tmp_path: Path) -> None:
+    secret = "redeemed-credential-value"
+    padding = "fatal: " + ("y" * 220) + " "
+    assert len(padding) < 240
+    stderr_line = padding + secret + "TAIL"
+    git_bin = tmp_path / "bin"
+    git_bin.mkdir()
+    git = git_bin / "git"
+    git.write_text(
+        "#!/bin/sh\n" f"echo '{stderr_line}' >&2\n" "exit 9\n",
+        encoding="utf-8",
+    )
+    git.chmod(0o755)
+    commands = workspace.SubprocessCommands()
+    saved = os.environ.get("PATH")
+    os.environ["PATH"] = f"{git_bin}{os.pathsep}{saved}"
+    try:
+        with pytest.raises(workspace.GitCommandError) as caught:
+            commands.run(
+                ["git", "clone", "https://example.test/acme.git", "dest"],
+                timeout_seconds=10,
+            )
+    finally:
+        if saved is None:
+            os.environ.pop("PATH", None)
+        else:
+            os.environ["PATH"] = saved
+    assert secret not in caught.value.diagnostic
+    assert "TAIL" not in caught.value.diagnostic
+    assert len(caught.value.diagnostic) <= 240
+
+
 def test_unreachable_clone_reports_git_step_status_and_fatal_line(
     workspace: Any, tmp_path: Path
 ) -> None:
