@@ -85,7 +85,7 @@ async def seed(s: AsyncSession):
         agent_id=agent.id,
         tenant_id=tenant.id,
         kind="slack",
-        address="C0EXAMPLE1",
+        address=f"C0EXAMPLE1{uuid.uuid4().hex.upper()}",
         adapter="default",
     )
     s.add_all(
