@@ -534,7 +534,29 @@ def test_a_missing_peer_entry_refuses_its_fact(missing: str) -> None:
 
 
 @pytest.mark.parametrize("name", ["network", "hostile_peer", "retained_peer"])
-def test_a_bracket_refusal_refuses_every_fact(name: str) -> None:
+@pytest.mark.parametrize(
+    "refusal,leftovers,expected",
+    [
+        # The engine identity is also rechecked per call; these two are not, so only
+        # the bracket guard can refuse a peer fact after them.
+        ("enforcement_absent", (), "enforcement_absent"),
+        (None, ("probe-a/cni-d8-1",), "cleanup_unconfirmed"),
+        ("non_vacuity_unavailable", (), "non_vacuity_unavailable"),
+    ],
+)
+def test_a_bracket_refusal_refuses_every_fact(
+    name: str, refusal: str | None, leftovers: tuple[str, ...], expected: str
+) -> None:
+    # Every entry passes, so no per-fact entry check could refuse on its own.
+    kit = FakeKit(kit_entries(layout()), refusal=refusal, leftovers=leftovers)
+    made, _, _ = producer(kit=kit)
+    assert asyncio.run(made.measure()).refusal == expected
+    with pytest.raises(ProbeKitRefused):
+        observe(made, name)
+
+
+@pytest.mark.parametrize("name", ["network", "hostile_peer", "retained_peer"])
+def test_an_engine_change_during_the_measurement_refuses_every_fact(name: str) -> None:
     cluster = FakeCluster(installation())
 
     def restart() -> None:
