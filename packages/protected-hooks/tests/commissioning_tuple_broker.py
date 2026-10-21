@@ -105,6 +105,8 @@ class CommissioningTuple:
             "candidate_enqueue": b["candidate_credentials"]["enqueue"],
             "candidate_worker": b["candidate_credentials"]["worker"],
             "qualification_publisher": b["qualification_publisher_identity"],
+            "control_reader": b["control_reader_identity"],
+            "source_writer": b["source_writer_identity"],
             "observer": {"id": "commissioning/example-observer", "generation": "1"},
         }
         g = {

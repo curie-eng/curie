@@ -80,7 +80,11 @@ platform mounts an in-process `curie-state` MCP server into every sandbox
 (`runner/src/curie_runner/state.py::build_state_server`), carrying get / set /
 append / list / delete tools over the per-key and per-namespace routes; the
 namespace listing is not exposed as a tool. `memory` and `transcript` are reserved
-so a skill cannot corrupt the memory or history namespaces. A bundle
+so a skill cannot corrupt the memory or history namespaces. `get` and `list` only
+read, so the runner's side-effect classifier treats them as idempotent under every
+harness (`runner/src/curie_runner/side_effects.py::PLATFORM_IDEMPOTENT_TOOLS`): a
+read does not raise `side_effect_flag`, block a retry, or appear on the turn's
+receipt. `set`, `append` and `delete` change the store and stay side-effecting. A bundle
 script that talks to the store directly reads the same URL and scoped token from
 `CURIE_STATE_URL` / `CURIE_STATE_TOKEN`.
 
