@@ -3724,7 +3724,10 @@ class TenantIdentityProvider(Base):
     """Versioned authority configuration, separate from its directory projection."""
 
     __tablename__ = "tenant_identity_providers"
-    __table_args__ = (CheckConstraint("version >= 1", name="tenant_identity_providers_version_ck"),)
+    __table_args__ = (
+        CheckConstraint("version >= 1", name="tenant_identity_providers_version_ck"),
+        CheckConstraint("identity_epoch >= 0", name="tenant_identity_providers_identity_epoch_ck"),
+    )
     tenant_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey(f"{SCHEMA}.tenants.id"), primary_key=True
     )
@@ -3732,6 +3735,9 @@ class TenantIdentityProvider(Base):
     governed_domains: Mapped[list[str]] = mapped_column(JSONB)
     managed_by: Mapped[str] = mapped_column(String)
     version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+
+    # Shared channel-account ownership spans teams, so team epochs cannot fence it.
+    identity_epoch: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0")
 
 
 class IdentityAuditEvent(Base):

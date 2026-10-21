@@ -2067,6 +2067,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/directory/binding": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read Directory Binding */
+        get: operations["read_directory_binding_directory_binding_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/directory/config/{tenant_id}": {
         parameters: {
             query?: never;
@@ -5711,6 +5728,31 @@ export interface components {
             /** Expected Epoch */
             expected_epoch: number;
         };
+        /** DirectoryBindingOut */
+        DirectoryBindingOut: {
+            /** Config Version */
+            config_version: number;
+            /**
+             * Expires At
+             * Format: date-time
+             */
+            expires_at: string;
+            /** Identity Epoch */
+            identity_epoch: number;
+            /** Issuer */
+            issuer: string;
+            /** Managed By */
+            managed_by: string;
+            /** Namespace Ids */
+            namespace_ids: string[];
+            /** Team Ids */
+            team_ids: string[];
+            /**
+             * Tenant Id
+             * Format: uuid
+             */
+            tenant_id: string;
+        };
         /** DirectoryConfigIn */
         DirectoryConfigIn: {
             /** Expected Version */
@@ -5854,6 +5896,11 @@ export interface components {
             complete: boolean;
             /** Expected Epoch */
             expected_epoch: number;
+            /**
+             * Expected Identity Epoch
+             * @description Required for credentials with namespaces. Read identity_epoch from GET /directory/binding before observing provider data. After a conflict, read a fresh binding and refetch provider data; never relabel a stale payload.
+             */
+            expected_identity_epoch?: number | null;
             /** People */
             people: components["schemas"]["DirectoryPersonIn"][];
         };
@@ -14181,6 +14228,37 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    read_directory_binding_directory_binding_get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Directory-Credential"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DirectoryBindingOut"];
+                };
             };
             /** @description Validation Error */
             422: {

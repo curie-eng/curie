@@ -5046,6 +5046,65 @@
         "title": "DirectoryAttemptIn",
         "type": "object"
       },
+      "DirectoryBindingOut": {
+        "additionalProperties": false,
+        "properties": {
+          "config_version": {
+            "title": "Config Version",
+            "type": "integer"
+          },
+          "expires_at": {
+            "format": "date-time",
+            "title": "Expires At",
+            "type": "string"
+          },
+          "identity_epoch": {
+            "title": "Identity Epoch",
+            "type": "integer"
+          },
+          "issuer": {
+            "title": "Issuer",
+            "type": "string"
+          },
+          "managed_by": {
+            "title": "Managed By",
+            "type": "string"
+          },
+          "namespace_ids": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "title": "Namespace Ids",
+            "type": "array"
+          },
+          "team_ids": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "title": "Team Ids",
+            "type": "array"
+          },
+          "tenant_id": {
+            "format": "uuid",
+            "title": "Tenant Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenant_id",
+          "issuer",
+          "managed_by",
+          "team_ids",
+          "namespace_ids",
+          "config_version",
+          "identity_epoch",
+          "expires_at"
+        ],
+        "title": "DirectoryBindingOut",
+        "type": "object"
+      },
       "DirectoryConfigIn": {
         "additionalProperties": false,
         "properties": {
@@ -5403,6 +5462,19 @@
             "minimum": 0.0,
             "title": "Expected Epoch",
             "type": "integer"
+          },
+          "expected_identity_epoch": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Required for credentials with namespaces. Read identity_epoch from GET /directory/binding before observing provider data. After a conflict, read a fresh binding and refetch provider data; never relabel a stale payload.",
+            "title": "Expected Identity Epoch"
           },
           "people": {
             "items": {
@@ -22937,6 +23009,55 @@
         "summary": "Get Deployment",
         "tags": [
           "deployments"
+        ]
+      }
+    },
+    "/directory/binding": {
+      "get": {
+        "operationId": "read_directory_binding_directory_binding_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Directory-Credential",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Directory-Credential"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DirectoryBindingOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Read Directory Binding",
+        "tags": [
+          "directory"
         ]
       }
     },

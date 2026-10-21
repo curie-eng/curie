@@ -10,6 +10,7 @@ import pytest
 from _migration_support import IsolatedMigrationDb
 from curie_api.config import get_settings
 from curie_api.schema_compat import assert_servable
+from curie_protected_hooks.schema_serving import load_window
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
@@ -88,7 +89,7 @@ def test_real_required_table_wait_obeys_deadline_or_cancellation_and_disposes_ba
                 async with observer.connect() as observed:
                     assert (
                         await observed.scalar(text("SELECT version_num FROM curie.alembic_version"))
-                        == "0121"
+                        == load_window().schema_head
                     )
                     assert (
                         await observed.scalar(

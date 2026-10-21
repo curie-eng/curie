@@ -87,8 +87,10 @@ async def update_configuration(
 async def authenticate(
     session: AsyncSession,
     claims: DirectoryClaims,
+    *,
+    write: bool = False,
 ) -> TenantIdentityProvider:
-    config = await configuration(session, claims.scope.tenant_id)
+    config = await configuration(session, claims.scope.tenant_id, write=write)
     if (
         config.version != claims.config_version
         or config.issuer != claims.scope.issuer
@@ -193,6 +195,11 @@ async def ingest_snapshot(
             raise directory_sync.DirectorySyncError("incomplete_snapshot")
         namespaces = await scoped_namespaces(session, claims, config)
         accounts = validated_accounts(body.people, namespaces, config)
+        if body.expected_identity_epoch is None:
+            if claims.namespace_ids:
+                raise directory_sync.DirectorySyncError("identity_epoch_required")
+        elif body.expected_identity_epoch != config.identity_epoch:
+            raise directory_sync.DirectoryConflict("stale_identity_epoch")
         principal_ids: list[uuid.UUID] = []
         now = datetime.now(UTC)
         for person in sorted(body.people, key=lambda person: person.subject):
@@ -294,7 +301,7 @@ async def ingest_snapshot(
                     principal_id=principal.id,
                     details={"link_id": str(link.id)},
                 )
-        return await directory_sync.apply_snapshot(
+        result = await directory_sync.apply_snapshot(
             session,
             scope=claims.scope,
             team_id=team_id,
@@ -302,3 +309,8 @@ async def ingest_snapshot(
             principal_ids=principal_ids,
             complete=True,
         )
+        if claims.namespace_ids:
+            # This must roll back together with links, membership and audits.
+            config.identity_epoch += 1
+            await session.flush()
+        return result

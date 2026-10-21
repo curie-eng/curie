@@ -23,6 +23,7 @@ import pytest
 from _migration_support import IsolatedMigrationDb, alembic_config, sql_dicts, sql_rows
 from alembic import command
 from alembic.script import ScriptDirectory
+from curie_protected_hooks.schema_serving import load_window
 from sqlalchemy.exc import DBAPIError
 
 BELOW = "0093a"
@@ -77,7 +78,7 @@ def test_one_hand_written_revision_on_the_assumed_parent() -> None:
 
     revision, down = _revision()
     assert (revision, down) == (HEAD, BELOW)
-    assert ScriptDirectory.from_config(alembic_config()).get_heads() == ["0121"]
+    assert ScriptDirectory.from_config(alembic_config()).get_heads() == [load_window().schema_head]
 
 
 def test_the_record_is_keyed_by_what_it_qualifies(

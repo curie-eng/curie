@@ -406,6 +406,7 @@ _HTTP_OPERATIONS = [
     "/identity/resolve",
     "/identity/slack-reports",
     "/identity/admin/{tenant_id}/{resource}",
+    "/directory/binding",
     "/directory/config/{tenant_id}",
     "/directory/credentials",
     "/directory/teams",

@@ -32,7 +32,11 @@ def upgrade() -> None:
         sa.Column("governed_domains", postgresql.JSONB(), nullable=False),
         sa.Column("managed_by", sa.String(), nullable=False),
         sa.Column("version", sa.Integer(), nullable=False, server_default="1"),
+        sa.Column("identity_epoch", sa.BigInteger(), nullable=False, server_default="0"),
         sa.CheckConstraint("version >= 1", name="tenant_identity_providers_version_ck"),
+        sa.CheckConstraint(
+            "identity_epoch >= 0", name="tenant_identity_providers_identity_epoch_ck"
+        ),
         schema=S,
     )
     op.create_table(

@@ -69,6 +69,17 @@ class DirectoryCredentialIn(DirectoryModel):
     expires_in_seconds: int = Field(default=3600, strict=True, ge=60, le=86400)
 
 
+class DirectoryBindingOut(DirectoryModel):
+    tenant_id: uuid.UUID
+    issuer: str
+    managed_by: str
+    team_ids: list[uuid.UUID]
+    namespace_ids: list[uuid.UUID]
+    config_version: int
+    identity_epoch: int
+    expires_at: datetime
+
+
 class DirectoryCredentialOut(DirectoryModel):
     credential: str
     expires_at: datetime
@@ -109,6 +120,16 @@ class DirectoryPersonIn(DirectoryModel):
 
 class DirectorySnapshotIn(DirectoryModel):
     expected_epoch: int = Field(strict=True, ge=0)
+    expected_identity_epoch: int | None = Field(
+        default=None,
+        strict=True,
+        ge=0,
+        description=(
+            "Required for credentials with namespaces. Read identity_epoch from "
+            "GET /directory/binding before observing provider data. After a conflict, "
+            "read a fresh binding and refetch provider data; never relabel a stale payload."
+        ),
+    )
     complete: bool = Field(strict=True)
     people: list[DirectoryPersonIn] = Field(max_length=10000)
 

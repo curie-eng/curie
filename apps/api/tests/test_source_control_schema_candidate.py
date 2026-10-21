@@ -14,6 +14,7 @@ from alembic import command
 from curie_api.config import get_settings
 from curie_api.main import create_app
 from curie_api.schema_compat import current_revision
+from curie_protected_hooks.schema_serving import load_window
 from fastapi.testclient import TestClient
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -132,8 +133,8 @@ def test_released_0076_startup_refuses_without_migrating_then_0101_starts(
             with TestClient(create_app()):
                 pass
         assert current_revision() == "0100"
-        command.upgrade(alembic_config(), "0108")
-        assert current_revision() == "0108"
+        command.upgrade(alembic_config(), load_window().schema_head)
+        assert current_revision() == load_window().schema_head
         with TestClient(create_app()) as client:
             response = client.get("/health")
             assert response.status_code == 200

@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from .test_team_authorization import seed
 
 
-def test_metrics_report_age_and_failure_count_without_changing_membership(migrated):
+def test_metrics_report_age_and_failure_count_without_changing_membership(clean_db):
     async def check():
         engine = create_async_engine(get_settings().database_url)
         try:

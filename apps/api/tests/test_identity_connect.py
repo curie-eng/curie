@@ -351,7 +351,7 @@ def connect_browser(migrated: None, request: pytest.FixtureRequest):
     from contextlib import asynccontextmanager
 
     from curie_api import oidc
-    from curie_api.routers import agent_access, console, identity_connect
+    from curie_api.routers import agent_access, channels, console, identity_connect
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
     from oidc_test_idp import AUDIENCE, CLIENT_SECRET, REDIRECT_URI, TestIdP, enabled_env, oidc_env
@@ -417,6 +417,7 @@ def connect_browser(migrated: None, request: pytest.FixtureRequest):
 
             app = FastAPI(lifespan=lifespan)
             app.include_router(agent_access.router)
+            app.include_router(channels.router)
             app.include_router(console.router)
             app.include_router(identity_connect.router)
 
@@ -792,3 +793,130 @@ def test_connect_browser_proof_is_private_scoped_and_rechecks_deactivation(conne
         path + "/confirm", data={"csrf": csrf}, headers={"Origin": "https://testserver"}
     )
     assert refused.status_code == 401 and browser_links(tenant_id) == []
+
+
+@pytest.mark.parametrize("connect_browser", ["/api"], indirect=True)
+def test_admission_wire_keeps_real_connect_url_and_private_confirmation(connect_browser):
+    """The optional capability is delivered, then omitted for a resolved refusal."""
+    import re
+    from urllib.parse import urlsplit
+
+    import httpx
+    from curie_api.models import Agent, AgentAccessPolicy, AgentChannel
+    from oidc_test_idp import enabled_env, oidc_env
+    from sqlalchemy import delete
+
+    client, _, tenant_id, principal_id, _, idp = connect_browser
+    address = "C0EXAMPLE" + uuid.uuid4().hex[:8].upper()
+    sender = "U0EXAMPLE2"
+
+    async def add_route():
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with AsyncSession(engine, expire_on_commit=False) as session:
+                team_id = await session.scalar(select(Team.id).where(Team.tenant_id == tenant_id))
+                assert team_id is not None
+                agent = Agent(tenant_id=tenant_id, name=f"acme-connect-wire-{uuid.uuid4().hex}")
+                session.add(agent)
+                await session.flush()
+                session.add_all(
+                    [
+                        AgentChannel(
+                            agent_id=agent.id,
+                            tenant_id=tenant_id,
+                            kind="slack",
+                            address=address,
+                            adapter="example-bot",
+                        ),
+                        AgentAccessPolicy(
+                            agent_id=agent.id,
+                            tenant_id=tenant_id,
+                            invocation_team_id=team_id,
+                        ),
+                    ]
+                )
+                await session.commit()
+                return agent.id
+        finally:
+            await engine.dispose()
+
+    agent_id = asyncio.run(add_route())
+    original_redirect = idp.redirect_uri
+    try:
+        # This external IdP fixture accepts exactly the registered public HTTPS callback.
+        # No IdP endpoint is replaced; authorize/token/JWKS run over its real loopback HTTP.
+        idp.redirect_uri = idp.redirect_uri.replace("http://testserver", "https://testserver", 1)
+        with oidc_env(enabled_env(idp)):
+            body = {
+                "kind": "slack",
+                "address": address,
+                "adapter": "example-bot",
+                "callers": [sender],
+                "slack": {
+                    "delivery": "app_mention",
+                    "user_id": sender,
+                    "event_user_team": "TEXAMPLE1",
+                },
+            }
+            headers = {"X-API-Key": get_settings().api_key}
+            response = client.post("/api/channels/admission", json=body, headers=headers)
+            assert response.status_code == 200, response.text
+            answer = response.json()
+            url = urlsplit(answer["connect_url"])
+            assert (url.scheme, url.netloc) == ("https", "testserver")
+            assert url.path.startswith("/api/identity/connect/")
+            assert not url.query and not url.fragment
+            assert answer == {
+                "allowed": False,
+                "restricted": True,
+                "install_restricted": True,
+                "connect_url": answer["connect_url"],
+            }
+            assert response.headers["cache-control"] == "private, no-store"
+            assert browser_links(tenant_id) == []
+
+            page = client.get(url.path)
+            assert page.status_code == 200, page.text
+            assert page.headers["cache-control"] == "private, no-store"
+            assert page.headers["referrer-policy"] == "no-referrer"
+            login = client.get("/api/console/oidc/login", follow_redirects=False)
+            assert login.status_code == 302, login.text
+            with httpx.Client(trust_env=False, follow_redirects=False, timeout=10) as browser:
+                authorized = browser.get(login.headers["location"])
+            back = urlsplit(authorized.headers["location"])
+            callback = client.get(f"{back.path}?{back.query}", follow_redirects=False)
+            assert callback.status_code == 303 and callback.headers["location"] == url.path
+            assert browser_links(tenant_id) == []
+            page = client.get(url.path)
+            csrf = re.search(r'name="csrf" value="([^"]+)"', page.text).group(1)
+            confirmed = client.post(
+                url.path + "/confirm",
+                data={"csrf": csrf},
+                headers={"Origin": "https://testserver"},
+            )
+            assert confirmed.status_code == 200, confirmed.text
+            assert (sender, principal_id) in browser_links(tenant_id)
+            assert client.get("/api/console/session").status_code == 401
+            # Connecting proves identity only. This person is outside the caller team.
+            resolved = client.post("/api/channels/admission", json=body, headers=headers)
+            assert resolved.status_code == 200, resolved.text
+            assert resolved.json() == {
+                "allowed": False,
+                "restricted": True,
+                "install_restricted": True,
+            }
+    finally:
+        idp.redirect_uri = original_redirect
+
+        async def remove_route():
+            engine = create_async_engine(get_settings().database_url)
+            try:
+                async with AsyncSession(engine) as session:
+                    for model in (AgentAccessPolicy, AgentChannel):
+                        await session.execute(delete(model).where(model.agent_id == agent_id))
+                    await session.execute(delete(Agent).where(Agent.id == agent_id))
+                    await session.commit()
+            finally:
+                await engine.dispose()
+
+        asyncio.run(remove_route())

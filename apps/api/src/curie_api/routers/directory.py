@@ -17,9 +17,11 @@ from ..auth import require_platform_key, verify_platform_key
 from ..config import get_settings
 from ..deps import SessionDep
 from ..directory_credential import DirectoryClaims
+from ..identity_fence import lock_identity_reader
 from ..models import IdentityNamespace, Principal, Team
 from ..schemas.directory import (
     DirectoryAttemptIn,
+    DirectoryBindingOut,
     DirectoryConfigIn,
     DirectoryConfigOut,
     DirectoryCredentialIn,
@@ -46,7 +48,7 @@ class DirectoryRoute(APIRoute):
         async def redacted(request: Request) -> Response:
             try:
                 response = await handler(request)
-                response.headers["Cache-Control"] = "no-store"
+                response.headers["Cache-Control"] = "private, no-store"
                 return response
             except RequestValidationError:
                 if request.method == "PUT" and request.url.path.endswith("/snapshot"):
@@ -94,15 +96,17 @@ def refusal(error: directory_sync.DirectorySyncError) -> HTTPException:
     return HTTPException(status_code=status, detail=code, headers={"Cache-Control": "no-store"})
 
 
-async def directory_access(
+async def authenticated_directory_claims(
     session: SessionDep,
-    credential: Annotated[str | None, Header(alias="X-Curie-Directory-Credential")] = None,
-    x_api_key: Annotated[str | None, Header()] = None,
+    credential: str | None,
+    x_api_key: str | None,
+    *,
+    write: bool = False,
 ) -> DirectoryClaims:
     claims = directory_credential.verify(credential or "", get_settings().api_key)
     if claims is not None and x_api_key is None:
         try:
-            await directory_service.authenticate(session, claims)
+            await directory_service.authenticate(session, claims, write=write)
             return claims
         except directory_sync.DirectorySyncError:
             pass
@@ -113,7 +117,94 @@ async def directory_access(
     )
 
 
+async def directory_access(
+    session: SessionDep,
+    credential: Annotated[str | None, Header(alias="X-Curie-Directory-Credential")] = None,
+    x_api_key: Annotated[str | None, Header()] = None,
+) -> DirectoryClaims:
+    return await authenticated_directory_claims(session, credential, x_api_key)
+
+
 DirectoryDep = Annotated[DirectoryClaims, Depends(directory_access)]
+
+
+async def snapshot_access(
+    body: DirectorySnapshotIn,
+    session: SessionDep,
+    credential: Annotated[str | None, Header(alias="X-Curie-Directory-Credential")] = None,
+    x_api_key: Annotated[str | None, Header()] = None,
+) -> tuple[DirectoryClaims, DirectorySnapshotIn]:
+    # Validate the body before taking the exclusive config lock. A malformed
+    # body's failure recorder uses another session while dependencies unwind.
+    # Never nest DirectoryDep here: its shared lock would require an upgrade.
+    claims = await authenticated_directory_claims(session, credential, x_api_key, write=True)
+    return claims, body
+
+
+SnapshotDep = Annotated[
+    tuple[DirectoryClaims, DirectorySnapshotIn], Depends(snapshot_access)
+]
+
+
+@router.get("/binding", response_model=DirectoryBindingOut)
+async def read_directory_binding(
+    request: Request,
+    session: SessionDep,
+    credential: Annotated[str | None, Header(alias="X-Curie-Directory-Credential")] = None,
+) -> DirectoryBindingOut:
+    # This is credential self-description, never an administrative lookup.
+    # Reject collisions instead of choosing between independently authenticated
+    # identities; ordinary HTTP metadata carries no authority here.
+    invalid = HTTPException(
+        status_code=401,
+        detail="invalid_directory_credential",
+        headers={"Cache-Control": "private, no-store"},
+    )
+    if (
+        len(request.headers.getlist("X-Curie-Directory-Credential")) != 1
+        or "authorization" in request.headers
+        or "cookie" in request.headers
+        or "x-api-key" in request.headers
+        or any(
+            key.startswith("x-curie-") and key != "x-curie-directory-credential"
+            for key in request.headers
+        )
+        or directory_credential.verify(credential or "", get_settings().api_key) is None
+    ):
+        raise invalid
+    # Before *any* tenant/config/team/namespace read, and held until session
+    # close: a committed reconfiguration cannot race an old binding answer.
+    await lock_identity_reader(session)
+    try:
+        # Repeat cryptographic/expiry checks after any wait for the fence.
+        claims = await directory_access(session, credential, None)
+        config = await directory_service.configuration(session, claims.scope.tenant_id)
+        team_ids = set(await session.scalars(
+            select(Team.id).where(
+                Team.id.in_(claims.scope.team_ids),
+                Team.tenant_id == claims.scope.tenant_id,
+                Team.source == "idp_group",
+                Team.managed_by == claims.scope.managed_by,
+            ).order_by(Team.id).with_for_update(read=True)
+        ))
+        if team_ids != claims.scope.team_ids:
+            raise invalid
+        # Reuse ingestion's active/tenant and governed-email/issuer checks.
+        # Its row locks are released on session close without any mutation.
+        await directory_service.scoped_namespaces(session, claims, config)
+        return DirectoryBindingOut(
+            tenant_id=claims.scope.tenant_id,
+            issuer=config.issuer,
+            managed_by=config.managed_by,
+            team_ids=sorted(team_ids, key=str),
+            namespace_ids=sorted(claims.namespace_ids, key=str),
+            config_version=config.version,
+            identity_epoch=config.identity_epoch,
+            expires_at=datetime.fromtimestamp(claims.exp, UTC),
+        )
+    except (directory_sync.DirectorySyncError, HTTPException):
+        # Do not reveal which foreign/reconfigured scope failed validation.
+        raise invalid from None
 
 
 @router.get(
@@ -284,10 +375,10 @@ async def read_directory_team(
 @router.put("/teams/{team_id}/snapshot", response_model=DirectorySnapshotOut)
 async def apply_directory_snapshot(
     team_id: uuid.UUID,
-    body: DirectorySnapshotIn,
     session: SessionDep,
-    claims: DirectoryDep,
+    access: SnapshotDep,
 ) -> DirectorySnapshotOut:
+    claims, body = access
     try:
         config = await directory_service.authenticate(session, claims)
         result = await directory_service.ingest_snapshot(session, claims, config, team_id, body)

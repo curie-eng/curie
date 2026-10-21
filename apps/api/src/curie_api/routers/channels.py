@@ -844,6 +844,7 @@ async def ingest_turn(
 @router.post(
     "/admission",
     response_model=AdmissionOut,
+    response_model_exclude_none=True,
     dependencies=[Depends(require_api_key)],
 )
 async def check_admission(

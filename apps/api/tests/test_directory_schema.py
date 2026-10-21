@@ -81,6 +81,35 @@ def test_0122_round_trip_and_tenant_provenance_constraints(isolated_migration_db
         {"id": old_link, "tenant": tenant, "namespace": namespace, "person": person},
     )
     command.upgrade(alembic_config(), "0122")
+    # Exercise the migration's server default, not an ORM Python default.
+    sql_dicts(
+        "INSERT INTO curie.tenant_identity_providers "
+        "(tenant_id,issuer,governed_domains,managed_by) VALUES "
+        "(:tenant,'https://idp.example.com','[]'::jsonb,'example-adapter')",
+        {"tenant": tenant},
+    )
+    assert sql_dicts(
+        "SELECT identity_epoch FROM curie.tenant_identity_providers WHERE tenant_id=:tenant",
+        {"tenant": tenant},
+    ) == [{"identity_epoch": 0}]
+    # More than signed32-bit verifies the actual database column is bigint.
+    assert sql_dicts(
+        "UPDATE curie.tenant_identity_providers SET identity_epoch=:epoch "
+        "WHERE tenant_id=:tenant RETURNING identity_epoch",
+        {"tenant": tenant, "epoch": 2**31},
+    ) == [{"identity_epoch": 2**31}]
+    with pytest.raises(IntegrityError) as negative:
+        sql_dicts(
+            "UPDATE curie.tenant_identity_providers SET identity_epoch=-1 WHERE tenant_id=:tenant",
+            {"tenant": tenant},
+        )
+    assert getattr(negative.value.orig.__cause__, "constraint_name", None) == (
+        "tenant_identity_providers_identity_epoch_ck"
+    )
+    assert sql_dicts(
+        "SELECT identity_epoch FROM curie.tenant_identity_providers WHERE tenant_id=:tenant",
+        {"tenant": tenant},
+    ) == [{"identity_epoch": 2**31}]
     assert "created_by_directory" in column_names("identity_links")
     assert {"verified_email", "verified_at", "verified_principal_id"} <= set(
         column_names("identity_connect_tokens")

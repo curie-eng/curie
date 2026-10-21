@@ -302,7 +302,7 @@ class ScriptedResolver:
 
     def __init__(self, outcome: ResolveOutcome) -> None:
         self.outcome = outcome
-        self.calls: list[dict[str, str]] = []
+        self.calls: list[dict[str, Any]] = []
 
     def resolve(
         self,
@@ -312,19 +312,24 @@ class ScriptedResolver:
         attested_user: str,
         attested_channel: str,
         note: str | None = None,
+        test_driver: bool = False,
+        slack: dict[str, Any] | None = None,
     ) -> ResolveOutcome:
         # `note` is recorded, not ignored: the dialog path's whole point is that
         # the approver's reason reaches the record, and a stand-in that dropped
         # it would let that regress silently (#1053).
-        self.calls.append(
-            {
-                "approval_id": approval_id,
-                "decision": decision,
-                "attested_user": attested_user,
-                "attested_channel": attested_channel,
-                "note": note,
-            }
-        )
+        call: dict[str, Any] = {
+            "approval_id": approval_id,
+            "decision": decision,
+            "attested_user": attested_user,
+            "attested_channel": attested_channel,
+            "note": note,
+        }
+        if test_driver:
+            call["test_driver"] = True
+        if slack is not None:
+            call["slack"] = dict(slack)
+        self.calls.append(call)
         return self.outcome
 
     def exists(self, approval_id: str) -> bool | None:

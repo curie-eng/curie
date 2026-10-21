@@ -26,12 +26,13 @@ import pytest
 from _migration_support import IsolatedMigrationDb, alembic_config, sql_dicts, sql_rows
 from alembic import command
 from alembic.script import ScriptDirectory
+from curie_protected_hooks.schema_serving import load_window
 from sqlalchemy.exc import IntegrityError
 
 BELOW = "0095"
 REVISION = "0096"
-# Agent access policies (0121), above the train merge, are the single head.
-HEAD = "0121"
+# The application contract names the single compatible candidate head.
+HEAD = load_window().schema_head
 TUNE_REFUSAL = "tune_execution_not_automated"
 REFUSAL_CHECK = "remediation_nominations_refusal_ck"
 
