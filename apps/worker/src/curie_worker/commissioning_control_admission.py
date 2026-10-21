@@ -73,7 +73,7 @@ from .protected_kubernetes_projection import (
     _exact,
     parse_projection,
 )
-from .protected_launch_kubernetes import FINALIZER, secret_document, service_document
+from .protected_launch_documents import FINALIZER, secret_document, service_document
 from .protected_launch_records import _decode, _text, _timestamp, canonical_json
 
 MESSAGE = "Protected control admission refused"

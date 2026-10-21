@@ -196,6 +196,7 @@ source_modules = [
     "curie_worker.protected_kubernetes_projection",
     "curie_worker.protected_lane",
     "curie_worker.protected_launch_client",
+    "curie_worker.protected_launch_documents",
     "curie_worker.protected_launch_kubernetes",
     "curie_worker.protected_launch_mechanics",
     "curie_worker.protected_launch_records",
@@ -233,13 +234,8 @@ forbidden_modules = [
     "curie_worker.protected_launch_mechanics",
     "curie_worker.protected_launch_server",
     "curie_worker.protected_launch_client",
+    "curie_worker.protected_launch_kubernetes",
     "curie_worker.protected_launch_registry",
-]
-# The guard builds the expected Secret and Service from the launch mechanics'
-# own shape functions. Their module names the registry's termination record type
-# and nothing else of it.
-ignore_imports = [
-    "curie_worker.protected_launch_kubernetes -> curie_worker.protected_launch_registry",
 ]
 
 # @spec PROTECTED-COMMISSIONING-2/4: the commissioning ingress and worker are
