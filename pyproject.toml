@@ -174,6 +174,66 @@ forbidden_modules = [
     "curie_protected_hooks.qualification_publication",
 ]
 
+# @spec PROTECTED-COMMISSIONING-8: the guard's control profile, slots and
+# admission policy are installation objects, read by the guard and the
+# commissioning compositions only. No production composition imports them, and
+# they reach no launch authority, so the guard can decide admission but can
+# never itself create, reserve or authorize a launch. The guard modules live in
+# `curie_worker`, so the first contract names every protected production module
+# explicitly: import-linter does not check a package against its own modules.
+[[tool.importlinter.contracts]]
+name = "Production composition never imports the commissioning guard"
+type = "forbidden"
+source_modules = [
+    "curie_api",
+    "curie_worker.protected_binding",
+    "curie_worker.protected_completion",
+    "curie_worker.protected_configuration",
+    "curie_worker.protected_dispatch",
+    "curie_worker.protected_entry",
+    "curie_worker.protected_execution",
+    "curie_worker.protected_history",
+    "curie_worker.protected_kubernetes_projection",
+    "curie_worker.protected_lane",
+    "curie_worker.protected_launch_client",
+    "curie_worker.protected_launch_kubernetes",
+    "curie_worker.protected_launch_mechanics",
+    "curie_worker.protected_launch_records",
+    "curie_worker.protected_launch_registry",
+    "curie_worker.protected_launch_server",
+    "curie_worker.protected_markers",
+    "curie_worker.protected_nomination",
+    "curie_worker.protected_nomination_filter",
+    "curie_worker.protected_recovery",
+    "curie_worker.protected_retirement",
+    "curie_worker.protected_run",
+    "curie_worker.protected_runner",
+    "curie_worker.protected_substrate",
+    "curie_worker.protected_substrate_facts",
+    "curie_worker.protected_substrate_readers",
+    "curie_worker.protected_worker_bootstrap",
+]
+forbidden_modules = [
+    "curie_worker.commissioning_control_profile",
+    "curie_worker.commissioning_control_slots",
+]
+
+[[tool.importlinter.contracts]]
+name = "The commissioning guard holds no launch authority"
+type = "forbidden"
+source_modules = [
+    "curie_worker.commissioning_control_profile",
+    "curie_worker.commissioning_control_slots",
+]
+forbidden_modules = [
+    "curie_api",
+    "curie_worker.protected_entry",
+    "curie_worker.protected_launch_mechanics",
+    "curie_worker.protected_launch_server",
+    "curie_worker.protected_launch_client",
+    "curie_worker.protected_launch_registry",
+]
+
 # @spec PROTECTED-COMMISSIONING-2/4: the commissioning ingress and worker are
 # separate standalone process compositions, top-level packages beside
 # `curie_api` and `curie_worker` rather than modules of them, so the contract
