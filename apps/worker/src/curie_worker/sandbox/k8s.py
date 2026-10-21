@@ -427,6 +427,15 @@ def _aware(moment: object) -> datetime | None:
     return moment.astimezone(UTC) if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
 
 
+def _pod_ready(obj: Any) -> bool:
+    """The Ready condition the Service endpoints follow; never for a terminating Pod."""
+
+    if obj.metadata.deletion_timestamp is not None:
+        return False
+    conditions = getattr(getattr(obj, "status", None), "conditions", None) or []
+    return any(c.type == "Ready" and c.status == "True" for c in conditions)
+
+
 def _daemon_view(kind: DaemonObjectKind, obj: Any) -> DaemonObjectView:
     metadata = obj.metadata
     return DaemonObjectView(
@@ -436,6 +445,7 @@ def _daemon_view(kind: DaemonObjectKind, obj: Any) -> DaemonObjectView:
         claim=(metadata.labels or {}).get(CLAIM_LABEL),
         created_at=_aware(metadata.creation_timestamp),
         phase=getattr(getattr(obj, "status", None), "phase", None) if kind == "Pod" else None,
+        ready=kind == "Pod" and _pod_ready(obj),
     )
 
 

@@ -587,15 +587,19 @@ def request(
 def endpoint_present(
     client: SandboxClient, config: ToolDaemonConfig, claim: str, *, deadline: float
 ) -> bool:
-    """Whether ``claim``'s Service and ingress NetworkPolicy both exist. Fails closed.
+    """Whether ``claim``'s Pod is ready and its Service and policy exist. Fails closed.
 
-    The ping reaches the Pod through the API, so it cannot see a deleted Service
-    (the runner's DOCKER_HOST) or policy (the runner's only path to the daemon).
+    The ping reaches the Pod through the API, so it cannot see an unready or
+    terminating Pod (out of the Service's endpoints), a deleted Service (the
+    runner's DOCKER_HOST) or policy (the runner's only path to the daemon).
     """
 
     selector = _selector(config, claim)
     try:
-        return all(
+        pod = client.get_daemon_pod(
+            config.namespace, claim, request_timeout_seconds=_bound(deadline)
+        )
+        return pod is not None and pod.ready and all(
             client.list_daemon_objects(
                 config.namespace,
                 kind,

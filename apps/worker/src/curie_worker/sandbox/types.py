@@ -463,7 +463,8 @@ class DaemonObjectView:
     """What the substrate reads back about one daemon object.
 
     ``claim`` is its ``curietech.ai/sandbox-claim`` label; ``created_at`` is
-    tz-aware, and None (unknown age) is never swept. ``phase`` is a Pod's.
+    tz-aware, and None (unknown age) is never swept. ``phase`` is a Pod's;
+    ``ready`` is a Pod's Ready condition, false once it is terminating.
     """
 
     kind: DaemonObjectKind
@@ -472,6 +473,7 @@ class DaemonObjectView:
     claim: str | None
     created_at: datetime | None
     phase: str | None = None
+    ready: bool = False
 
 
 @dataclass(frozen=True)

@@ -760,6 +760,7 @@ class FakeSandboxClient:
             claim=obj.labels.get(CLAIM_LABEL),
             created_at=obj.created_at,
             phase=obj.phase,
+            ready=obj.kind == "Pod" and obj.ready and obj.phase == "Running",
         )
 
     def list_daemon_objects(
