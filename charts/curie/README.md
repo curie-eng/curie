@@ -1416,7 +1416,7 @@ daemon lifecycle and certificate issuance are not implemented here.
    creates it with that label.
 2. A Role and RoleBinding there for the worker ServiceAccount: create, get,
    list and delete on pods, services and networkpolicies, get on pods/log,
-   create and delete on secrets.
+   create and get on pods/portforward, create and delete on secrets.
 3. A ResourceQuota from `factory.docker.quota.hard` and a Container LimitRange
    from `factory.docker.limitRange` (`max`, `min`, `default`,
    `defaultRequest`). All are required.
