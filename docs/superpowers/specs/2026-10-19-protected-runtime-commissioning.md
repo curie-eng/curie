@@ -700,3 +700,36 @@ that is not commissioned. A commissioned installation moves the write to this
 publisher. Only the writer changes: the Qualification grammar, its key and the
 production readers stay as they are. The readers check the record's content and
 binding to M, not which principal wrote it.
+
+### 9. G hashes candidate rule templates, instantiated per campaign
+
+Decided by the maintainer on 2026-10-21.
+
+Clause 2 fixes the hash order B, then G, then M, then permits. G hashes every
+principal's rules, but the candidate enqueue and candidate worker rules name the
+campaign lane, which clause 1 derives from the permit's runtime and campaign
+identity. No permit exists when G is built, so G cannot hash instantiated
+candidate rules.
+
+G therefore hashes each candidate principal's rule template. A template is the
+exact rule list with every occurrence of the campaign lane prefix
+`protected:commissioning:lane:<digest>` replaced by the single placeholder
+`{lane}`. It is the same template for every campaign of the installation, so G
+stays fixed at installation and needs no permit. No other part of a candidate
+rule varies, and no other principal's rules take a placeholder.
+
+When a campaign starts, the provisioner instantiates each template with the lane
+the permit derives and sets the candidate user's rules to exactly that list. The
+ACL principal state check of design decision 7 then also compares each
+candidate user's rules with the template instantiated for the lane of the
+current permit. A lane other than the current permit's, or any rule outside the
+instantiated template, refuses.
+
+Reasoning. The alternatives each lose a property the specification needs.
+Fixing the campaign identity before G would force a new installation for every
+campaign, including a retry after a failed one. A runtime-scoped lane with no
+campaign identity would drop the per-campaign isolation of clause 1. A template
+keeps both: lanes stay distinct per campaign, and G, M and every other measured
+value stay unchanged across campaigns. Activation step 2 disables the
+candidate users and leaves their instantiated rules in place; it changes no
+template and so no G.
