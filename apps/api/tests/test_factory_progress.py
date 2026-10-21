@@ -1365,7 +1365,56 @@ def test_linear_progress_ticks_every_earlier_phase_even_a_skipped_one() -> None:
     ] * 4
     plan = _loop(view, "plan")
     assert (plan.kickbacks, plan.approved, plan.active) == (0, True, False)
-    assert _labels(view)["plan_review"] == "approved, 1 round"
+    assert _labels(view)["plan_review"] == "completed, 1 round"
+
+
+@pytest.mark.parametrize(
+    ("declaration", "separator"),
+    [(DECLARATION, ", "), (STAGED_DECLARATION, " · ")],
+    ids=["unstaged", "staged"],
+)
+@pytest.mark.parametrize(
+    ("cap", "status"),
+    [(3, "running"), (1, "completed")],
+    ids=["later_phase", "completed_advisory_cap1"],
+)
+def test_completed_review_does_not_claim_a_verdict(
+    declaration: dict[str, Any], separator: str, cap: int, status: str
+) -> None:
+    declaration = {
+        **declaration,
+        "loops": [{**loop, "cap": cap} for loop in declaration["loops"]],
+    }
+    view = phase_view(
+        declaration,
+        _reports_of(("plan", 1), ("plan_review", 1), ("implement", 1)),
+        status,
+        "completed" if status == "completed" else None,
+    )
+
+    label = f"completed{separator}1 round"
+    assert _labels(view)["plan_review"] == label
+    assert {stage.id: stage.round_label for stage in view.stages}["plan_review"] == label
+    plan = _loop(view, "plan")
+    assert (plan.cap, plan.round, plan.kickbacks, plan.approved, plan.active) == (
+        cap,
+        1,
+        0,
+        True,
+        False,
+    )
+    assert _states(view)["plan_review"] == _stage_states(view)["plan_review"] == "done"
+    assert view.current == ("implement" if status == "running" else None)
+    assert (
+        _states(view)["implement"]
+        == _stage_states(view)["implement"]
+        == ("current" if status == "running" else "done")
+    )
+    assert (
+        _states(view)["wait_ci"]
+        == _stage_states(view)["wait_ci"]
+        == ("pending" if status == "running" else "done")
+    )
 
 
 def test_a_plan_kickback_marks_the_review_redo_and_labels_round_two() -> None:
@@ -1403,7 +1452,7 @@ def test_a_diff_review_approved_after_three_rounds_has_two_kickbacks() -> None:
     )
     loop = _loop(view, "implement")
     assert (loop.round, loop.kickbacks, loop.approved, loop.active) == (3, 2, True, False)
-    assert _labels(view)["review_diff"] == "approved, 3 rounds"
+    assert _labels(view)["review_diff"] == "completed, 3 rounds"
     assert _states(view)["review_diff"] == "done"
 
 
@@ -1417,7 +1466,7 @@ def test_a_review_approved_in_one_round_draws_no_arc() -> None:
     loop = _loop(view, "plan")
     assert loop.kickbacks == 0
     assert loop.approved is True
-    assert _labels(view)["plan_review"] == "approved, 1 round"
+    assert _labels(view)["plan_review"] == "completed, 1 round"
 
 
 def test_a_completed_request_is_all_done_with_no_current_marker() -> None:
@@ -1600,7 +1649,7 @@ def test_third_diff_round_keeps_plan_approved_and_badges_two_review_kickbacks() 
         2,
     )
     assert {stage.id: stage.round_label for stage in view.stages}["plan_review"] == (
-        "approved · 2 rounds"
+        "completed · 2 rounds"
     )
 
 
@@ -1670,7 +1719,7 @@ def test_a_ci_fix_keeps_diff_approved_while_ci_loop_is_live() -> None:
     assert view.current == "implement"
     assert (diff.approved, diff.active, diff.kickbacks) == (True, False, 1)
     assert _stage_states(view)["review_diff"] == "done"
-    assert labels["review_diff"] == "approved · 2 rounds"
+    assert labels["review_diff"] == "completed · 2 rounds"
     assert (ci.active, ci.kickbacks, ci.round) == (True, 1, 2)
     assert labels["wait_ci"] == "round 2 of 3"
 
@@ -1685,6 +1734,10 @@ def test_success_marks_every_declared_stage_done_and_approves_all_loops() -> Non
     assert view.current is None
     assert set(_stage_states(view).values()) == {"done"}
     assert all(loop.approved for loop in view.loops)
+    assert _labels(view)["wait_ci"] == "approved · 1 round"
+    assert {stage.id: stage.round_label for stage in view.stages}["wait_ci"] == (
+        "approved · 1 round"
+    )
 
 
 @pytest.mark.parametrize("status", ["failed", "expired"])
