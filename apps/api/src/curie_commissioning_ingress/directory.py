@@ -11,8 +11,12 @@ the runtime directory writer and adds three commissioning files:
   ``password``) and 1 to 64 synthetic signed ``sources``, each exactly
   ``source`` (as in the permit), ``hook``, ``secret`` and ``target_ref``.
 
-The production ``bootstrap.json``, ``enqueue.json`` and ``source_writer.json``
-are never opened. Possessing the directory authorizes nothing: the ingress
+The provisioner writes this directory directly; it is not a Secret volume, so
+the reader is strict: no path component may be a symlink, the directory and
+every file must be owned by the expected user and writable by neither group nor
+others, and each file must be a bounded regular file. The production
+``bootstrap.json``, ``enqueue.json`` and ``source_writer.json`` are never
+opened. Possessing the directory authorizes nothing: the ingress
 still needs the issuer-written permit, a running journal and the guard. Every
 defect is one ``CommissioningDirectoryInvalid`` without detail.
 """
@@ -22,10 +26,11 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 from dataclasses import dataclass, field
 from typing import Any
 
-from curie_api.protected_runtime_files import _DIRECTORY_FLAGS, _read_file
+from curie_protected_hooks.artifact_measurement import _open_root
 from curie_protected_hooks.authority_records import (
     _CREDENTIAL,
     Manifest,
@@ -51,6 +56,8 @@ _HOOK = re.compile(r"[A-Za-z0-9_-]{1,64}", re.ASCII)
 _SECRET_BYTES = (16, 8192)
 _MAX_SOURCES = 64
 _CAMPAIGN: dict[str, Any] = {"campaign_id": "uuid", "campaign_generation": "generation"}
+_FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+_SHARED_WRITE = stat.S_IWGRP | stat.S_IWOTH
 _SOURCE: dict[str, Any] = {
     "source_id": "uuid",
     "generation": "generation",
@@ -89,6 +96,42 @@ class CommissioningDirectory:
 def _require(condition: bool) -> None:
     if not condition:
         raise CommissioningDirectoryInvalid()
+
+
+def _owned(status: os.stat_result, owner: int) -> None:
+    """Owned by ``owner`` and writable by neither group nor others."""
+    _require(status.st_uid == owner and not status.st_mode & _SHARED_WRITE)
+
+
+def _open_directory(directory: str, owner: int) -> int:
+    """The directory, reached without following a symlink at any component."""
+    descriptor = _open_root(directory)
+    try:
+        status = os.fstat(descriptor)
+        _require(stat.S_ISDIR(status.st_mode))
+        _owned(status, owner)
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _read_file(directory_fd: int, name: str, owner: int) -> bytes:
+    """One bounded regular file, never through a symlink, owned and not shared-writable."""
+    descriptor = os.open(name, _FILE_FLAGS, dir_fd=directory_fd)
+    try:
+        status = os.fstat(descriptor)
+        _require(stat.S_ISREG(status.st_mode) and status.st_size <= MAX_FILE_BYTES)
+        _owned(status, owner)
+        chunks: list[bytes] = []
+        total = 0
+        while chunk := os.read(descriptor, MAX_FILE_BYTES + 1 - total):
+            chunks.append(chunk)
+            total += len(chunk)
+            _require(total <= MAX_FILE_BYTES)
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
 
 
 def _strict_json(raw: bytes) -> Any:
@@ -139,19 +182,20 @@ def _ingress(
     return value["campaign"], principal["credential_ref"], credential, by_id
 
 
-def load_commissioning_directory(directory: str) -> CommissioningDirectory:
+def load_commissioning_directory(directory: str, *, owner: int) -> CommissioningDirectory:
     """Every commissioning file under one opened directory, read afresh.
 
-    Blocking; the caller runs it off the event loop. @spec PROTECTED-COMMISSIONING-2.
+    ``owner`` is the user the provisioner writes as. Blocking; the caller runs
+    it off the event loop. @spec PROTECTED-COMMISSIONING-2.
     """
     try:
-        directory_fd = os.open(directory, _DIRECTORY_FLAGS)
+        directory_fd = _open_directory(directory, owner)
         try:
-            manifest_raw = _read_file(directory_fd, MANIFEST_FILE)
-            ca_raw = _read_file(directory_fd, CA_FILE)
-            bootstrap_raw = _read_file(directory_fd, BOOTSTRAP_FILE)
-            guard_raw = _read_file(directory_fd, GUARD_FILE)
-            ingress_raw = _read_file(directory_fd, INGRESS_FILE)
+            manifest_raw = _read_file(directory_fd, MANIFEST_FILE, owner)
+            ca_raw = _read_file(directory_fd, CA_FILE, owner)
+            bootstrap_raw = _read_file(directory_fd, BOOTSTRAP_FILE, owner)
+            guard_raw = _read_file(directory_fd, GUARD_FILE, owner)
+            ingress_raw = _read_file(directory_fd, INGRESS_FILE, owner)
         finally:
             os.close(directory_fd)
         campaign, reference, credential, sources = _ingress(ingress_raw)

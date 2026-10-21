@@ -91,6 +91,16 @@ class ChannelCampaignGuard:
         self._latencies: list[int] = []
 
     @property
+    def premeasured(self) -> dict[str, str]:
+        """A fresh copy of the premeasured digests this guard binds, keyed by fact.
+
+        A caller compares the bootstrap, manifest and permit digests with its own
+        before relying on the guard, so a guard measured for another installation
+        or campaign is never accepted. @spec PROTECTED-COMMISSIONING-4.
+        """
+        return dict(self._expected)
+
+    @property
     def calls(self) -> int:
         return len(self._latencies)
 

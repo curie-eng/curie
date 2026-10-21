@@ -7,12 +7,14 @@ failure decides the refusal with nothing after it running:
    digest matches G and M (the directory is read afresh per request);
 2. a broker session pinned to M's server identity authenticates as the
    candidate enqueue principal B names, and the live ``run_id`` equals M's;
-3. the control capability is a journal session that proved ``ACL WHOAMI`` as
-   B's control identity when it opened, not a reference to one;
+3. the commissioning issuer and control sessions, pinned to M, answer
+   ``ACL WHOAMI`` now as B's issuer and control identities, and the control
+   session is the one the campaign journal runs on;
 4. the issuer-written permit parses and ``validate_commissioning_binding``
    accepts it at live broker time; the permit is the control journal's;
-5. the campaign's ``ChannelCampaignGuard`` passes, called afresh for every
-   request (ADR 0236 rejects caching); with no guard the ingress refuses here;
+5. the campaign's ``ChannelCampaignGuard``, premeasured for this B, M and
+   permit, passes, called afresh for every request (ADR 0236 rejects caching);
+   with no guard, or one measured for another tuple, the ingress refuses here;
 6. the journal is ``running`` and broker ``TIME`` is below ``expires_at_ms``;
 7. the signed source, its generation, policy fingerprint and target are inside
    the permit's scope;
@@ -21,12 +23,11 @@ failure decides the refusal with nothing after it running:
    authority, the candidate enqueue adds one lane entry and the control
    commits its admission.
 
-The permit key accepts only the issuer's ``SETNX`` under the installed ACL, so
-a permit read there was written by the authenticated issuer. Step 2 pins the
+Step 2 pins the
 live ``run_id`` to M's; step 4 binds the permit's to M's. Reaching step 9
 charges the reservation even when the envelope then refuses: there are no
-refunds. The control capability is passed in process here; how the control
-process offers it across a process boundary belongs to the control process.
+refunds. The issuer and control sessions are passed in process here; how the
+operator offers them across a process boundary belongs to the control process.
 """
 
 from __future__ import annotations
@@ -34,21 +35,27 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Any, NoReturn, cast
+from typing import Any, NoReturn, Self, cast
 from uuid import UUID, uuid5
 
 from curie_api import hook_signing
-from curie_protected_hooks.authority_records import _pairs, _reject_number, _scalar
+from curie_protected_hooks.authority_records import Manifest, _pairs, _reject_number, _scalar
 from curie_protected_hooks.commissioning_acl import PERMIT, derive_commissioning_lane
 from curie_protected_hooks.commissioning_admissions import CampaignAdmissions, campaign_binding
+from curie_protected_hooks.commissioning_bootstrap import CommissioningBootstrap
 from curie_protected_hooks.commissioning_campaign_records import (
     CampaignAdmission,
     CampaignEnvelope,
     _encode,
 )
-from curie_protected_hooks.commissioning_journal import CommissioningSession, campaign_keys
+from curie_protected_hooks.commissioning_journal import (
+    CommissioningJournal,
+    CommissioningSession,
+    campaign_keys,
+)
 from curie_protected_hooks.commissioning_operator_guard import ChannelCampaignGuard
 from curie_protected_hooks.commissioning_provisioner import (
     COMMISSIONING_ENTRY_POINT,
@@ -57,6 +64,7 @@ from curie_protected_hooks.commissioning_provisioner import (
 )
 from curie_protected_hooks.commissioning_records import (
     BrokerObservation,
+    CommissioningPermit,
     parse_commissioning_permit,
     validate_commissioning_binding,
 )
@@ -89,23 +97,57 @@ class CommissioningIngressRefused(Exception):
 
 
 class CampaignControl:
-    """The control principal's reservations and admissions for one campaign.
+    """The control principal's session, reservations and admissions for one campaign.
 
-    Built only over a ``CampaignReservations`` whose journal session proved
-    ``ACL WHOAMI`` as the permit's control identity when it opened.
-    @spec PROTECTED-COMMISSIONING-3/4.
+    ``open`` binds the campaign journal to the given control session, so the
+    session the ingress authenticates at step 3 is the one every reservation,
+    dispatch and admission runs on. @spec PROTECTED-COMMISSIONING-3/4.
     """
 
-    __slots__ = ("__admissions", "__reservations")
+    __slots__ = ("__admissions", "__reservations", "__session")
     __admissions: CampaignAdmissions
     __reservations: CampaignReservations
+    __session: CommissioningSession
 
-    def __init__(self, reservations: CampaignReservations) -> None:
-        """@spec PROTECTED-COMMISSIONING-4."""
-        if type(reservations) is not CampaignReservations:
-            raise ValueError("commissioning control reservations required")
-        self.__reservations = reservations
-        self.__admissions = CampaignAdmissions(reservations)
+    def __new__(cls) -> Self:
+        """Only ``open`` builds a control capability, @spec PROTECTED-COMMISSIONING-4."""
+        raise ValueError("commissioning control is opened, not constructed")
+
+    @classmethod
+    async def open(
+        cls,
+        session: CommissioningSession,
+        permit: CommissioningPermit,
+        *,
+        manifest: Manifest,
+        bootstrap: CommissioningBootstrap,
+        trusted_issuer: dict[str, Any],
+        trusted_control: dict[str, Any],
+        max_permit_ms: int,
+    ) -> Self:
+        """Open the campaign journal on ``session``; it closes with the journal.
+
+        @spec PROTECTED-COMMISSIONING-3/4.
+        """
+        journal = await CommissioningJournal.open(
+            session,
+            permit,
+            manifest=manifest,
+            bootstrap=bootstrap,
+            trusted_issuer=trusted_issuer,
+            trusted_control=trusted_control,
+            max_permit_ms=max_permit_ms,
+        )
+        control = object.__new__(cls)
+        control.__session = session
+        control.__reservations = CampaignReservations(journal)
+        control.__admissions = CampaignAdmissions(control.__reservations)
+        return control
+
+    @property
+    def session(self) -> CommissioningSession:
+        """The authenticated control session the journal runs on."""
+        return self.__session
 
     def __repr__(self) -> str:
         """@spec PROTECTED-COMMISSIONING-4."""
@@ -163,13 +205,21 @@ class CommissioningIngress:
         self,
         directory: str,
         *,
+        issuer: CommissioningSession | None = None,
         control: CampaignControl | None = None,
         guard: ChannelCampaignGuard | None = None,
+        owner: int | None = None,
     ) -> None:
-        """Nothing is read or connected until a request; @spec PROTECTED-COMMISSIONING-4."""
+        """Nothing is read or connected until a request; @spec PROTECTED-COMMISSIONING-4.
+
+        ``owner`` is the user the provisioner writes the directory as; by
+        default this process's effective user.
+        """
         self._directory = directory
+        self._issuer = issuer
         self._control = control
         self._guard = guard
+        self._owner = os.geteuid() if owner is None else owner
 
     def __repr__(self) -> str:
         """@spec PROTECTED-COMMISSIONING-4."""
@@ -185,7 +235,9 @@ class CommissioningIngress:
         session: CommissioningSession | None = None
         try:
             with _step(1):
-                d = await asyncio.to_thread(load_commissioning_directory, self._directory)
+                d = await asyncio.to_thread(
+                    load_commissioning_directory, self._directory, owner=self._owner
+                )
                 b = d.bootstrap.as_dict()
                 _require(COMPOSITION in ENTRY_POINT_COMPOSITIONS[COMMISSIONING_ENTRY_POINT])
                 _require(b["entry_points"]["commissioning"] == COMMISSIONING_ENTRY_POINT)
@@ -202,6 +254,15 @@ class CommissioningIngress:
                 journal = control.reservations.journal
                 _require(not journal.terminal)
                 _require(journal.permit.as_dict()["control_identity"] == b["control_identity"])
+                _require(type(self._issuer) is CommissioningSession)
+                issuer = cast(CommissioningSession, self._issuer)
+                for acting, trusted in (
+                    (issuer, b["issuer_identity"]),
+                    (control.session, b["control_identity"]),
+                ):
+                    _require(not acting.terminal and acting.pinned_to(d.manifest))
+                    _require(acting.principal == trusted)
+                    _require(await acting.execute("ACL", "WHOAMI") == trusted["id"])
             with _step(4):
                 selected = d.campaign
                 raw = await session.execute(
@@ -227,7 +288,13 @@ class CommissioningIngress:
                 _require(journal.permit.digest == permit.digest)
             with _step(5):
                 _require(type(self._guard) is ChannelCampaignGuard)
-                await cast(ChannelCampaignGuard, self._guard).require_current()
+                guard = cast(ChannelCampaignGuard, self._guard)
+                # The guard must be measured for this installation and campaign.
+                measured = guard.premeasured
+                _require(measured["bootstrap"] == d.bootstrap.digest)
+                _require(measured["manifest"] == d.manifest.digest)
+                _require(measured["permit"] == permit.digest)
+                await guard.require_current()
             with _step(6):
                 _journal(await session.execute("GET", campaign_keys(permit).journal), permit.digest)
                 _require(await session.broker_time_ms() < int(p["expires_at_ms"]))

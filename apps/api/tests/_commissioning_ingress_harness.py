@@ -317,13 +317,50 @@ class CommissioningTuple:
 class GuardProbe:
     """A real ``ChannelCampaignGuard`` over fake producers and a fake signed channel.
 
-    Only fakes implement the ADR 0236 producers here, as in the guard's own
-    tests; this proves the ingress calls the guard, not that a campaign passed.
+    The premeasured bootstrap, manifest and permit digests and the ACL baseline
+    are this tuple's own; the other facts are fixed placeholders. Only fakes
+    implement the ADR 0236 producers here, as in the guard's own tests; this
+    proves the ingress binds and calls the guard, not that a campaign passed.
     """
 
-    def __init__(self, *, refuse: bool = False) -> None:
-        self.guard, self._producers, _, self.transport = _guard_vectors.build(
-            transport=_guard_vectors.Transport(refuse=refuse)
+    def __init__(self, campaign: CommissioningTuple, *, refuse: bool = False) -> None:
+        from curie_protected_hooks.commissioning_operator_guard import ChannelCampaignGuard
+        from curie_protected_hooks.commissioning_producers import (
+            ACL_PRINCIPALS,
+            OBSERVATION_FACTS,
+            AclBaseline,
+            ReobservationSet,
+        )
+
+        v = _guard_vectors
+        premeasured = {
+            name: hashlib.sha256(name.encode()).hexdigest() for name in OBSERVATION_FACTS
+        }
+        premeasured.update(
+            bootstrap=campaign.bootstrap.digest,
+            manifest=campaign.manifest.digest,
+            permit=campaign.permit.digest,
+        )
+        self._producers = {name: v.Fact(name, premeasured[name]) for name in OBSERVATION_FACTS}
+        baseline = AclBaseline(campaign.bootstrap, v.STATES)
+        reader = v.Reader()
+        reader.replies = {
+            username: {
+                "flags": ["on"],
+                "passwords": sorted(v.hashes(name)),
+                "commands": "-@all",
+            }
+            for name, (username, _) in baseline.principals.items()
+            if name in ACL_PRINCIPALS
+        }
+        reader.replies[v.OBSERVER] = dict(v.OBSERVER_REPLY)
+        self.transport = v.Transport(refuse=refuse)
+        self.guard = ChannelCampaignGuard(
+            premeasured=premeasured,
+            control=ReobservationSet(tuple(self._producers.values())),
+            acl=v.observer(reader, baseline=baseline),
+            phase=lambda: v.CAMPAIGN,
+            transport=self.transport,
         )
 
     @property

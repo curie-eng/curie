@@ -13,10 +13,12 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import os
 import subprocess
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -52,23 +54,39 @@ def campaign(pworker_service: Any) -> Any:
         pworker_service.command("FLUSHDB")
 
 
+@dataclass
+class Parties:
+    """The authenticated issuer session and control capability the ingress holds."""
+
+    issuer: Any
+    control: Any
+
+
 @asynccontextmanager
-async def running(campaign: Any, **journal: Any) -> AsyncIterator[Any]:
-    """An issued permit and its control journal, as the ingress's control capability."""
+async def running(campaign: Any, *, start: bool = True) -> AsyncIterator[Parties]:
+    """An issued permit, its journal (started unless ``start`` is false), issuer and control."""
     from curie_commissioning_ingress.ingress import CampaignControl
-    from curie_protected_hooks.commissioning_reservations import CampaignReservations
 
     await campaign.issue()
-    opened = await campaign.journal(**journal)
+    await (await campaign.journal(start=start)).close()
+    issuer = await campaign.session("issuer")
     try:
-        yield CampaignControl(CampaignReservations(opened))
+        control = await CampaignControl.open(
+            await campaign.session("control"), campaign.permit, **campaign.trusted
+        )
+        try:
+            yield Parties(issuer, control)
+        finally:
+            await control.reservations.journal.close()
     finally:
-        await opened.close()
+        await issuer.close()
 
 
-def ingress(directory: Path, **kwargs: Any) -> Any:
+def ingress(directory: Path, parties: Parties | None = None, **kwargs: Any) -> Any:
     from curie_commissioning_ingress.ingress import CommissioningIngress
 
+    if parties is not None:
+        kwargs = {"issuer": parties.issuer, "control": parties.control, **kwargs}
     return CommissioningIngress(str(directory), **kwargs)
 
 
@@ -95,12 +113,12 @@ def test_a_signed_delivery_enqueues_one_lane_entry_and_commits_its_admission(
     )
 
     directory = campaign.write_directory(tmp_path / "runtime")
-    guard = GuardProbe()
+    guard = GuardProbe(campaign)
     request = campaign.signed(BODY)
 
     async def scenario() -> Any:
-        async with running(campaign) as control:
-            return await ingress(directory, control=control, guard=guard.guard).admit(**request)
+        async with running(campaign) as parties:
+            return await ingress(directory, parties, guard=guard.guard).admit(**request)
 
     admission = run(scenario())
     assert guard.calls == 1
@@ -173,12 +191,55 @@ def test_step_1_refuses_before_any_broker_connection(
     pworker_service: Any, campaign: Any, tmp_path: Path, files: Any
 ) -> None:
     directory = campaign.write_directory(tmp_path / "runtime", **files(campaign))
-    guard = GuardProbe()
+    guard = GuardProbe(campaign)
 
     async def scenario() -> None:
-        async with running(campaign) as control:
+        async with running(campaign) as parties:
             before, opened = snapshot(pworker_service), connections(pworker_service)
-            target = ingress(directory, control=control, guard=guard.guard)
+            target = ingress(directory, parties, guard=guard.guard)
+            assert await refusal(target, campaign.signed(BODY)) == 1
+            assert connections(pworker_service) == opened
+            assert snapshot(pworker_service) == before
+
+    run(scenario())
+    assert guard.calls == 0
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "symlinked-file",
+        "symlinked-directory",
+        "group-writable-file",
+        "world-writable-directory",
+        "other-owner",
+    ],
+)
+def test_step_1_refuses_a_directory_not_strictly_owned_by_the_provisioner(
+    pworker_service: Any, campaign: Any, tmp_path: Path, fault: str
+) -> None:
+    directory = campaign.write_directory(tmp_path / "runtime")
+    owner = None
+    if fault == "symlinked-file":
+        real = tmp_path / "manifest.real"
+        (directory / "manifest.json").rename(real)
+        (directory / "manifest.json").symlink_to(real)
+    elif fault == "symlinked-directory":
+        link = tmp_path / "link"
+        link.symlink_to(directory)
+        directory = link
+    elif fault == "group-writable-file":
+        (directory / "commissioning_bootstrap.json").chmod(0o620)
+    elif fault == "world-writable-directory":
+        directory.chmod(0o702)
+    else:
+        owner = os.geteuid() + 1
+    guard = GuardProbe(campaign)
+
+    async def scenario() -> None:
+        async with running(campaign) as parties:
+            before, opened = snapshot(pworker_service), connections(pworker_service)
+            target = ingress(directory, parties, guard=guard.guard, owner=owner)
             assert await refusal(target, campaign.signed(BODY)) == 1
             assert connections(pworker_service) == opened
             assert snapshot(pworker_service) == before
@@ -189,7 +250,7 @@ def test_step_1_refuses_before_any_broker_connection(
 
 def test_step_1_refuses_a_missing_directory(campaign: Any, tmp_path: Path) -> None:
     async def scenario() -> None:
-        target = ingress(tmp_path / "absent", guard=GuardProbe().guard)
+        target = ingress(tmp_path / "absent", guard=GuardProbe(campaign).guard)
         assert await refusal(target, campaign.signed(BODY)) == 1
 
     run(scenario())
@@ -216,12 +277,12 @@ def test_step_2_refuses_an_unauthenticated_or_repinned_session(
         value["candidate_enqueue"]["credential_ref"]["generation"] = "9"
         overrides["commissioning_ingress.json"] = canonical(value)
     directory = campaign.write_directory(tmp_path / "runtime", **overrides)
-    guard = GuardProbe()
+    guard = GuardProbe(campaign)
 
     async def scenario() -> None:
-        async with running(campaign) as control:
+        async with running(campaign) as parties:
             before = snapshot(pworker_service)
-            target = ingress(directory, control=control, guard=guard.guard)
+            target = ingress(directory, parties, guard=guard.guard)
             assert await refusal(target, campaign.signed(BODY)) == 2
             assert snapshot(pworker_service) == before
 
@@ -232,31 +293,47 @@ def test_step_2_refuses_an_unauthenticated_or_repinned_session(
 # --- Step 3: the control identity authenticated, not merely referenced ----------------------
 
 
-@pytest.mark.parametrize("control", ["absent", "terminal"])
-def test_step_3_refuses_without_an_authenticated_control(
-    pworker_service: Any, campaign: Any, tmp_path: Path, control: str
+@pytest.mark.parametrize(
+    "fault", ["no-control", "terminal-control", "no-issuer", "issuer-is-control", "terminal-issuer"]
+)
+def test_step_3_refuses_unless_issuer_and_control_authenticate_now(
+    pworker_service: Any, campaign: Any, tmp_path: Path, fault: str
 ) -> None:
+    """Issuer and control must each be a live session answering ACL WHOAMI as B names."""
     from curie_commissioning_ingress.ingress import CampaignControl
-    from curie_protected_hooks.commissioning_reservations import CampaignReservations
 
     directory = campaign.write_directory(tmp_path / "runtime")
-    guard = GuardProbe()
+    guard = GuardProbe(campaign)
 
     async def scenario() -> None:
-        async with running(campaign):
-            capability = None
-            terminal = None
-            if control == "terminal":
-                terminal = await campaign.journal(terminal=True)
-                capability = CampaignControl(CampaignReservations(terminal))
+        async with running(campaign) as parties:
+            opened: list[Any] = []
             try:
+                if fault == "no-control":
+                    override: dict[str, Any] = {"control": None}
+                elif fault == "terminal-control":
+                    terminal = await CampaignControl.open(
+                        await campaign.session("control", terminal=True),
+                        campaign.permit,
+                        **campaign.trusted,
+                    )
+                    opened.append(terminal.reservations.journal)
+                    override = {"control": terminal}
+                elif fault == "no-issuer":
+                    override = {"issuer": None}
+                elif fault == "issuer-is-control":
+                    override = {"issuer": parties.control.session}
+                else:
+                    session = await campaign.session("issuer", terminal=True)
+                    opened.append(session)
+                    override = {"issuer": session}
                 before = snapshot(pworker_service)
-                target = ingress(directory, control=capability, guard=guard.guard)
+                target = ingress(directory, parties, guard=guard.guard, **override)
                 assert await refusal(target, campaign.signed(BODY)) == 3
                 assert snapshot(pworker_service) == before
             finally:
-                if terminal is not None:
-                    await terminal.close()
+                for item in opened:
+                    await item.close()
 
     run(scenario())
     assert guard.calls == 0
@@ -273,12 +350,12 @@ def test_step_3_refuses_a_control_whose_identity_is_not_the_bootstrap_one(
         tmp_path / "runtime",
         **{"commissioning_ingress.json": canonical(campaign.ingress_file())},
     )
-    guard = GuardProbe()
+    guard = GuardProbe(campaign)
 
     async def scenario() -> None:
-        async with running(campaign) as control:
+        async with running(campaign) as parties:
             before = snapshot(pworker_service)
-            target = ingress(directory, control=control, guard=guard.guard)
+            target = ingress(directory, parties, guard=guard.guard)
             assert await refusal(target, campaign.signed(BODY)) == 3
             assert snapshot(pworker_service) == before
 
@@ -299,22 +376,22 @@ def test_step_4_refuses_an_absent_or_foreign_permit(
     directory = campaign.write_directory(
         tmp_path / "runtime", **{"commissioning_ingress.json": canonical(value)}
     )
-    guard = GuardProbe()
+    guard = GuardProbe(campaign)
 
     async def scenario() -> None:
         if fault == "not-issued":
             # A control journal over a permit the issuer never wrote cannot exist,
             # so the capability is opened on the issued permit and then the key is lost.
-            async with running(campaign) as control:
+            async with running(campaign) as parties:
                 pworker_service.command("DEL", "protected:commissioning:permit:" + campaign.suffix)
                 before = snapshot(pworker_service)
-                target = ingress(directory, control=control, guard=guard.guard)
+                target = ingress(directory, parties, guard=guard.guard)
                 assert await refusal(target, campaign.signed(BODY)) == 4
                 assert snapshot(pworker_service) == before
             return
-        async with running(campaign) as control:
+        async with running(campaign) as parties:
             before = snapshot(pworker_service)
-            target = ingress(directory, control=control, guard=guard.guard)
+            target = ingress(directory, parties, guard=guard.guard)
             assert await refusal(target, campaign.signed(BODY)) == 4
             assert snapshot(pworker_service) == before
 
@@ -329,12 +406,12 @@ def test_step_4_refuses_a_permit_bound_to_another_manifest(
     m = campaign.manifest.as_dict()
     m["qualification_id"] = "45454545-4545-4545-8545-454545454545"
     directory = campaign.write_directory(tmp_path / "runtime", **{"manifest.json": canonical(m)})
-    guard = GuardProbe()
+    guard = GuardProbe(campaign)
 
     async def scenario() -> None:
-        async with running(campaign) as control:
+        async with running(campaign) as parties:
             before = snapshot(pworker_service)
-            target = ingress(directory, control=control, guard=guard.guard)
+            target = ingress(directory, parties, guard=guard.guard)
             assert await refusal(target, campaign.signed(BODY)) == 4
             assert snapshot(pworker_service) == before
 
@@ -350,7 +427,7 @@ def test_step_5_refuses_without_the_campaign_guard_and_when_it_refuses(
     pworker_service: Any, campaign: Any, tmp_path: Path, guard: str
 ) -> None:
     directory = campaign.write_directory(tmp_path / "runtime")
-    probe = GuardProbe(refuse=True)
+    probe = GuardProbe(campaign, refuse=True)
 
     class StandIn:
         """Satisfies the guard's method shape without being the guard."""
@@ -361,9 +438,9 @@ def test_step_5_refuses_without_the_campaign_guard_and_when_it_refuses(
     supplied = {"absent": None, "refuses": probe.guard, "stand-in": StandIn()}[guard]
 
     async def scenario() -> None:
-        async with running(campaign) as control:
+        async with running(campaign) as parties:
             before = snapshot(pworker_service)
-            target = ingress(directory, control=control, guard=supplied)
+            target = ingress(directory, parties, guard=supplied)
             assert await refusal(target, campaign.signed(BODY)) == 5
             assert snapshot(pworker_service) == before
 
@@ -371,15 +448,40 @@ def test_step_5_refuses_without_the_campaign_guard_and_when_it_refuses(
     assert probe.calls == (1 if guard == "refuses" else 0)
 
 
+@pytest.mark.parametrize("measured_for", ["another-installation", "another-campaign"])
+def test_step_5_refuses_a_guard_measured_for_another_tuple(
+    pworker_service: Any, campaign: Any, tmp_path: Path, measured_for: str
+) -> None:
+    directory = campaign.write_directory(tmp_path / "runtime")
+    if measured_for == "another-installation":
+        other = CommissioningTuple(pworker_service, bootstrap={"max_permit_ms": "86400001"})
+    else:
+        other = CommissioningTuple(pworker_service, campaign_generation="5")
+    assert (other.bootstrap.digest == campaign.bootstrap.digest) is (
+        measured_for == "another-campaign"
+    )
+    probe = GuardProbe(other)
+
+    async def scenario() -> None:
+        async with running(campaign) as parties:
+            before = snapshot(pworker_service)
+            target = ingress(directory, parties, guard=probe.guard)
+            assert await refusal(target, campaign.signed(BODY)) == 5
+            assert snapshot(pworker_service) == before
+
+    run(scenario())
+    assert probe.calls == 0
+
+
 def test_the_guard_is_called_once_per_request_and_never_cached(
     pworker_service: Any, campaign: Any, tmp_path: Path
 ) -> None:
     directory = campaign.write_directory(tmp_path / "runtime")
-    guard = GuardProbe()
+    guard = GuardProbe(campaign)
 
     async def scenario() -> None:
-        async with running(campaign) as control:
-            target = ingress(directory, control=control, guard=guard.guard)
+        async with running(campaign) as parties:
+            target = ingress(directory, parties, guard=guard.guard)
             await target.admit(**campaign.signed(BODY))
             await target.admit(**campaign.signed(BODY))
             guard.refuse()
@@ -399,16 +501,16 @@ def test_step_6_refuses_unless_the_journal_is_running(
     pworker_service: Any, campaign: Any, tmp_path: Path, state: str
 ) -> None:
     directory = campaign.write_directory(tmp_path / "runtime")
-    guard = GuardProbe()
+    guard = GuardProbe(campaign)
 
     async def scenario() -> None:
-        async with running(campaign, start=state != "prepared") as control:
+        async with running(campaign, start=state != "prepared") as parties:
             if state == "closing":
-                journal = control.reservations.journal
+                journal = parties.control.reservations.journal
                 current = await journal.status()
                 await journal.begin_close(current.generation)
             before = snapshot(pworker_service)
-            target = ingress(directory, control=control, guard=guard.guard)
+            target = ingress(directory, parties, guard=guard.guard)
             assert await refusal(target, campaign.signed(BODY)) == 6
             assert snapshot(pworker_service) == before
 
@@ -424,7 +526,7 @@ def test_step_7_refuses_an_unauthenticated_or_out_of_scope_source(
     pworker_service: Any, campaign: Any, tmp_path: Path, fault: str
 ) -> None:
     directory = campaign.write_directory(tmp_path / "runtime")
-    guard = GuardProbe()
+    guard = GuardProbe(campaign)
     if fault == "signature":
         request = campaign.signed(BODY, secret="0" * 48)
     elif fault == "unknown-source":
@@ -436,9 +538,9 @@ def test_step_7_refuses_an_unauthenticated_or_out_of_scope_source(
         request = campaign.signed(BODY, source=1)
 
     async def scenario() -> None:
-        async with running(campaign) as control:
+        async with running(campaign) as parties:
             before = snapshot(pworker_service)
-            target = ingress(directory, control=control, guard=guard.guard)
+            target = ingress(directory, parties, guard=guard.guard)
             assert await refusal(target, request) == 7
             assert snapshot(pworker_service) == before
 
@@ -456,9 +558,9 @@ def test_step_7_refuses_a_permitted_source_whose_target_the_permit_excludes(
     )
 
     async def scenario() -> None:
-        async with running(campaign) as control:
+        async with running(campaign) as parties:
             before = snapshot(pworker_service)
-            target = ingress(directory, control=control, guard=GuardProbe().guard)
+            target = ingress(directory, parties, guard=GuardProbe(campaign).guard)
             assert await refusal(target, campaign.signed(BODY)) == 7
             assert snapshot(pworker_service) == before
 
@@ -475,8 +577,8 @@ def test_step_8_refuses_a_replayed_delivery_without_a_second_entry(
     request = campaign.signed(BODY)
 
     async def scenario() -> None:
-        async with running(campaign) as control:
-            target = ingress(directory, control=control, guard=GuardProbe().guard)
+        async with running(campaign) as parties:
+            target = ingress(directory, parties, guard=GuardProbe(campaign).guard)
             await target.admit(**request)
             before = snapshot(pworker_service)
             assert await refusal(target, request) == 8
@@ -497,8 +599,8 @@ def test_an_exhausted_delivery_limit_stops_the_next_delivery_at_step_6(
         directory = limited.write_directory(tmp_path / "runtime")
 
         async def scenario() -> None:
-            async with running(limited) as control:
-                target = ingress(directory, control=control, guard=GuardProbe().guard)
+            async with running(limited) as parties:
+                target = ingress(directory, parties, guard=GuardProbe(limited).guard)
                 await target.admit(**limited.signed(BODY))
                 assert await refusal(target, limited.signed(BODY)) == 6
 
@@ -519,8 +621,8 @@ def test_step_9_refuses_an_oversized_payload_after_charging_without_dispatch(
     request = campaign.signed(b"x" * 32769)
 
     async def scenario() -> None:
-        async with running(campaign) as control:
-            target = ingress(directory, control=control, guard=GuardProbe().guard)
+        async with running(campaign) as parties:
+            target = ingress(directory, parties, guard=GuardProbe(campaign).guard)
             assert await refusal(target, request) == 9
 
     run(scenario())
@@ -555,9 +657,9 @@ def test_the_explicit_app_admits_signed_requests_and_refuses_with_one_fixed_answ
         }
 
     async def scenario() -> None:
-        async with running(campaign) as control:
+        async with running(campaign) as parties:
             app = create_commissioning_app(
-                ingress(directory, control=control, guard=GuardProbe().guard)
+                ingress(directory, parties, guard=GuardProbe(campaign).guard)
             )
             transport = httpx.ASGITransport(app=app)
             async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
