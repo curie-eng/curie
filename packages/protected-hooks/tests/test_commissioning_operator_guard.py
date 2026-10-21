@@ -42,6 +42,7 @@ USERS = {
     "control": _b["control_identity"]["id"],
     "candidate_enqueue": _b["candidate_credentials"]["enqueue"]["id"],
     "candidate_worker": _b["candidate_credentials"]["worker"]["id"],
+    "qualification_publisher": _b["qualification_publisher_identity"]["id"],
 }
 OBSERVER, PROVISIONER = "commissioning/example-acl-observer", "commissioning/example-provisioner"
 

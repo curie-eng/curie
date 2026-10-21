@@ -36,7 +36,10 @@ def bootstrap():
         "entry_points": {"production": "composition/p", "commissioning": "composition/c"},
         "production_credentials": {n: _ref(n) for n in ("enqueue", "worker", "verifier")},
         "candidate_credentials": {"enqueue": _ref("c-enqueue"), "worker": _ref("c-worker")},
-        **{n + "_identity": _ref(n) for n in ("issuer", "control", "mediator", "gateway")},
+        **{
+            n + "_identity": _ref(n)
+            for n in ("issuer", "control", "qualification_publisher", "mediator", "gateway")
+        },
         "source_scope": [
             {
                 "source_id": "77777777-7777-4777-8777-777777777777",
