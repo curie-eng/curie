@@ -56,9 +56,11 @@ from .managed_cni_probe_programs import (
 )
 
 # Case 6 fixed destinations, two per family (producer constants of this kind).
+# Internet addresses must answer on both 443 and 80, or the reachability
+# baseline would make the entry unavailable on every cluster.
 INTERNET = {
-    "ipv4": ("1.1.1.1", "8.8.4.4"),
-    "ipv6": ("2606:4700:4700::1111", "2001:4860:4860::8844"),
+    "ipv4": ("1.1.1.1", "1.0.0.1"),
+    "ipv6": ("2606:4700:4700::1111", "2606:4700:4700::1001"),
 }
 RESOLVERS = {
     "ipv4": ("8.8.8.8", "9.9.9.9"),
