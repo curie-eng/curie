@@ -2369,6 +2369,10 @@ sys.exit(result.returncode)
         // Pin the real tool inventory and child environment while those
         // mutations are excluded, just like every other process-env consumer.
         let _environment = crate::PROCESS_ENV_LOCK.blocking_lock();
+        if executable("docker").is_err() && std::env::var_os("CI_REQUIRE_DOCKER_TESTS").is_none() {
+            eprintln!("skipping {name}: docker executable is unavailable");
+            return Ok(());
+        }
         let mut fixture = Fixture::new()?;
         let outcome = fixture.start().and_then(|()| scenario(&mut fixture));
         let cleanup = fixture.cleanup();

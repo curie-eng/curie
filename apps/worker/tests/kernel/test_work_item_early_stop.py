@@ -35,7 +35,7 @@ from aci_protocol import (
     ToolNote,
     TurnSource,
 )
-from curie_worker.approvals import ApprovalRequest, CreatedApproval
+from curie_worker.approvals import ApprovalRequest, CreatedApproval, PublicationLineage
 from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.binding import FactoryContext, FactoryWake
 from curie_worker.sandbox import SuspendedThreadError
@@ -60,6 +60,7 @@ CHANNEL = "C0EXAMPLE1"
 WORK_ITEM_REPO = "acme-corp/widgets"
 ISSUE_URL = f"https://github.com/{WORK_ITEM_REPO}/issues/123"
 ISSUE_PROMPT = f"Resolve {ISSUE_URL}"
+PR_URL = f"https://github.com/{WORK_ITEM_REPO}/pull/77"
 PUBLISH_TOOL = "mcp__curie__publish_changes"
 PROGRESS_TOOL = "mcp__curie__report_progress"
 # A credential shape the shared redaction policy (curie_telemetry.redact
@@ -525,11 +526,12 @@ def test_the_unpublished_cause_follows_the_work_evidence(tools: frozenset[str], 
 
 
 class _PublicationApi:
-    def __init__(self) -> None:
+    def __init__(self, lineage: PublicationLineage | None = None) -> None:
         self.creates: list[object] = []
+        self.lineage = lineage
 
-    async def get_publication_lineage(self, *_args: object) -> None:
-        return None
+    async def get_publication_lineage(self, *_args: object) -> PublicationLineage | None:
+        return self.lineage
 
     async def get_publication_precheck_context(self, **_kwargs: object) -> None:
         return None
@@ -539,6 +541,59 @@ class _PublicationApi:
 
         self.creates.append(request)
         return CreatedPublication(id="publication-1", approval_id="approval-1", status="pending")
+
+
+def _revision_lineage(pr_url: str | None, conversation_id: str) -> PublicationLineage:
+    return PublicationLineage(
+        id=uuid.uuid4(),
+        deployment_id=DEPLOYMENT_ID,
+        conversation_id=conversation_id,
+        repo_full_name=WORK_ITEM_REPO,
+        base_sha="b" * 40,
+        branch="curie/thread-example",
+        pr_number=77,
+        pr_url=pr_url,
+        head_sha="a" * 40,
+        state="open",
+        version=2,
+        latest_revision=1,
+        has_pending_revision=False,
+        has_pending_outcome=False,
+        visible_outcome_revision=1,
+    )
+
+
+@pytest.mark.parametrize(
+    ("pr_url", "worked_cause"),
+    [
+        (PR_URL, "revision_unchanged"),
+        (None, "no_pull_request"),
+        ("", "no_pull_request"),
+        (" \t ", "no_pull_request"),
+    ],
+)
+@pytest.mark.parametrize("context_only", [False, True])
+def test_issue_4752_unpublished_revision_uses_the_recorded_pull_request(
+    make_harness, pr_url: str | None, worked_cause: str, context_only: bool
+) -> None:
+    async def exercise() -> None:
+        publications = _PublicationApi(_revision_lineage(pr_url, "1700000000.000001"))
+        detail = "checkout_changed_before_plan_approval"
+        opened, items, terminal = await _run_execute(
+            make_harness,
+            [[_tool("Read" if context_only else "Bash"), _done("Checking.")], [_done(detail)]],
+            publication_creator=publications,
+        )
+
+        assert len(opened) == 2
+        assert terminal
+        assert len(items.finishes) == 1
+        assert items.finishes[0]["outcome"] == "failed"
+        assert items.finishes[0]["cause"] == ("early_stop" if context_only else worked_cause)
+        assert items.finishes[0]["detail"] == detail
+        assert publications.creates == []
+
+    asyncio.run(exercise())
 
 
 def _patch_snapshot(h: object, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1543,13 +1598,21 @@ def test_publication_pending_on_an_early_stop_finish_settles_the_event(
 # --- W12: an approval-resume turn is never continued ---------------------------------
 
 
-def test_an_approval_resume_turn_is_not_continued(make_harness) -> None:
+@pytest.mark.parametrize(
+    ("pr_url", "cause"),
+    [(PR_URL, "revision_unchanged"), (None, "no_pull_request"), (" \t ", "no_pull_request")],
+)
+def test_an_approval_resume_turn_is_not_continued(
+    make_harness, pr_url: str | None, cause: str
+) -> None:
+    """#4752: approval resume keeps lineage and never opens an unpublished continuation."""
+
     async def exercise() -> None:
         async with make_harness(
             binding=_Binding(),
             workspace_factory=_Workspace,
             approvals=_Approvals(),
-            publication_creator=_PublicationApi(),
+            publication_creator=_PublicationApi(_revision_lineage(pr_url, "1700000000.000001")),
         ) as h:
             items = _WorkItems()
             h.kernel._work_items = items
@@ -1579,7 +1642,7 @@ def test_an_approval_resume_turn_is_not_continued(make_harness) -> None:
 
             assert len(h.runner.opened) == 2
             assert len(items.finishes) == 1
-            assert items.finishes[0]["cause"] == "no_pull_request"
+            assert items.finishes[0]["cause"] == cause
             assert items.finishes[0]["detail"] == "Resumed. Nothing to publish."
 
     asyncio.run(exercise())

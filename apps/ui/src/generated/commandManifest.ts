@@ -2216,7 +2216,7 @@ export const commandManifest = {
           ]
         },
         {
-          "about": "A protected hook's remediation policy: show it, apply a document, arm, disarm or remove it, or close an open circuit breaker. Writes run as the operator principal in CURIE_APPROVAL_PRINCIPAL_TOKEN",
+          "about": "A protected hook's remediation policy: show it, apply a document, arm, disarm or remove it, or close an open circuit breaker. Writes run as the operator principal in CURIE_APPROVAL_PRINCIPAL_TOKEN; apply and arm also need the remediation authority in CURIE_REMEDIATION_AUTHORITY_KEY",
           "hidden": false,
           "name": "remediation-policy",
           "subcommands": [
@@ -2263,7 +2263,7 @@ export const commandManifest = {
               "name": "show"
             },
             {
-              "about": "Bind or replace a hook's policy from a JSON document (`PUT`). The document is validated with the platform's rules before any request",
+              "about": "Bind or replace a hook's policy from a JSON document (`PUT`). The document is validated with the platform's rules before any request. Needs the remediation authority in CURIE_REMEDIATION_AUTHORITY_KEY",
               "args": [
                 {
                   "global": false,
@@ -2329,7 +2329,7 @@ export const commandManifest = {
               "name": "apply"
             },
             {
-              "about": "Arm the current policy so its automatic actions may run (`POST .../arm`)",
+              "about": "Arm the current policy so its automatic actions may run (`POST .../arm`). Needs the remediation authority in CURIE_REMEDIATION_AUTHORITY_KEY",
               "args": [
                 {
                   "global": false,
@@ -8313,7 +8313,7 @@ export const commandManifest = {
           ]
         },
         {
-          "about": "A protected hook's remediation policy: show it, apply a document, arm, disarm or remove it, or close an open circuit breaker. Writes run as the operator principal in CURIE_APPROVAL_PRINCIPAL_TOKEN",
+          "about": "A protected hook's remediation policy: show it, apply a document, arm, disarm or remove it, or close an open circuit breaker. Writes run as the operator principal in CURIE_APPROVAL_PRINCIPAL_TOKEN; apply and arm also need the remediation authority in CURIE_REMEDIATION_AUTHORITY_KEY",
           "hidden": false,
           "name": "remediation-policy",
           "subcommands": [
@@ -8380,7 +8380,7 @@ export const commandManifest = {
               "name": "show"
             },
             {
-              "about": "Bind or replace a hook's policy from a JSON document (`PUT`). The document is validated with the platform's rules before any request",
+              "about": "Bind or replace a hook's policy from a JSON document (`PUT`). The document is validated with the platform's rules before any request. Needs the remediation authority in CURIE_REMEDIATION_AUTHORITY_KEY",
               "args": [
                 {
                   "global": false,
@@ -8466,7 +8466,7 @@ export const commandManifest = {
               "name": "apply"
             },
             {
-              "about": "Arm the current policy so its automatic actions may run (`POST .../arm`)",
+              "about": "Arm the current policy so its automatic actions may run (`POST .../arm`). Needs the remediation authority in CURIE_REMEDIATION_AUTHORITY_KEY",
               "args": [
                 {
                   "global": false,

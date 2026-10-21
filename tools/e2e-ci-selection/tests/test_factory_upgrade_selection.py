@@ -55,22 +55,24 @@ def _selection(tmp_path: Path, *paths: str, **options: object) -> dict[str, str]
 
 
 @pytest.mark.parametrize("path", MIGRATION_PATHS)
-def test_factory_migration_pr_selects_real_released_upgrade(tmp_path: Path, path: str) -> None:
+def test_factory_migration_pr_selects_released_upgrade_smoke(tmp_path: Path, path: str) -> None:
     output = _selection(tmp_path, path)
     assert output["pytest"] == "true"
     assert output["cluster"] == "true"
     assert output["released_upgrade"] == "true"
-    assert output["released_upgrade_full"] == "true"
+    assert output["released_upgrade_full"] == "false"
+    SELECTION_TESTS._assert_upgrade_smoke_shards(tmp_path, output)
 
 
 @pytest.mark.parametrize("path", MIGRATION_DEPENDENCY_PATHS)
-def test_factory_migration_dependency_pr_selects_real_released_upgrade(
+def test_factory_migration_dependency_pr_selects_released_upgrade_smoke(
     tmp_path: Path, path: str
 ) -> None:
     output = _selection(tmp_path, path)
     assert output["pytest"] == "true"
     assert output["released_upgrade"] == "true"
-    assert output["released_upgrade_full"] == "true"
+    assert output["released_upgrade_full"] == "false"
+    SELECTION_TESTS._assert_upgrade_smoke_shards(tmp_path, output)
 
 
 @pytest.mark.parametrize("path", (*MIGRATION_PATHS, *MIGRATION_DEPENDENCY_PATHS))
@@ -111,12 +113,13 @@ def test_unrelated_paths_do_not_promote_full_upgrade(tmp_path: Path, path: str) 
     assert _selection(tmp_path, path)["released_upgrade_full"] == "false"
 
 
-def test_mixed_chart_and_factory_migration_pr_runs_full_upgrade(tmp_path: Path) -> None:
+def test_mixed_chart_and_factory_migration_pr_runs_upgrade_smoke(tmp_path: Path) -> None:
     output = _selection(
         tmp_path, "charts/curie/values.yaml", "cli/src/config_migrate.rs"
     )
     assert output["released_upgrade"] == "true"
-    assert output["released_upgrade_full"] == "true"
+    assert output["released_upgrade_full"] == "false"
+    SELECTION_TESTS._assert_upgrade_smoke_shards(tmp_path, output)
 
 
 def _collection_repository(tmp_path: Path) -> Path:

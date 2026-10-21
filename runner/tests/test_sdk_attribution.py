@@ -20,6 +20,7 @@ from typing import Any
 
 import pytest
 from curie_runner.adapter import build_options
+from runner_boot_session import initialized_session_sync
 
 # The current CLI attribution setting: each text defaults to the standard
 # trailer/footer and an empty string hides it. The deprecated boolean form
@@ -151,7 +152,7 @@ def test_reviewer_model_reaches_sdk_options_from_the_runner_boot_env(
             self.options = options
 
     monkeypatch.setattr(boot, "ClaudeAgentSession", CapturedSession)
-    session = boot.build_runner(config, sdk_env=spawn_env)._factory()
+    session = initialized_session_sync(boot.build_runner(config, sdk_env=spawn_env))
 
     assert isinstance(session, CapturedSession)
     assert session.options.env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == expected

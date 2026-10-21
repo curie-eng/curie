@@ -152,11 +152,17 @@ def _pull(
     mergeable: bool | None = None,
     mergeable_state: str | None = None,
     merged: bool | None = None,
+    state: str = "open",
 ) -> dict[str, Any]:
-    """The mergeability fields of GitHub's pull request payload:
+    """The mergeability and state fields of GitHub's pull request payload:
     https://docs.github.com/en/rest/pulls/pulls#get-a-pull-request"""
 
-    return {"mergeable": mergeable, "mergeable_state": mergeable_state, "merged": merged}
+    return {
+        "mergeable": mergeable,
+        "mergeable_state": mergeable_state,
+        "merged": merged,
+        "state": state,
+    }
 
 
 def _decide(
@@ -216,7 +222,7 @@ def test_bounds_are_the_planned_constants() -> None:
 
 def test_ci_causes_match_the_literal_set_in_workitems() -> None:
     assert factory_ci.CI_CAUSES == frozenset(
-        {"ci_failed", "ci_timeout", "ci_unverified", "merge_conflict"}
+        {"ci_failed", "ci_timeout", "ci_unverified", "merge_conflict", "pr_closed"}
     )
     assert "ci_fix_unpublished" not in factory_ci.CI_CAUSES
     source = ast.parse(inspect.getsource(lifecycle.terminalize_execution))
@@ -643,6 +649,37 @@ def test_merge_conflict_precedes_the_metadata_revision_wait() -> None:
     )
     assert verdict.kind == "merge_conflict"
     assert verdict.reason == "merge_conflict"
+
+
+@pytest.mark.parametrize("seconds", [0, 119, 121])
+def test_a_closed_unmerged_pull_is_pr_closed_without_checks(seconds: int) -> None:
+    pull = _pull(mergeable=True, mergeable_state="clean", merged=False, state="closed")
+    verdict = _decide(_detail(), seconds, pull=pull)
+    assert verdict.kind == "pr_closed"
+    assert verdict.reason == "pr_closed"
+
+
+@pytest.mark.parametrize(
+    "runs",
+    [
+        (_run("build"),),
+        (_run("build", conclusion="failure"),),
+        (_run("build", status="in_progress", conclusion=None),),
+    ],
+)
+def test_a_closed_unmerged_pull_is_pr_closed_whatever_its_checks(
+    runs: tuple[dict[str, Any], ...],
+) -> None:
+    pull = _pull(mergeable=False, mergeable_state="dirty", merged=False, state="closed")
+    verdict = _decide(_detail(*runs), 30, pull=pull)
+    assert verdict.kind == "pr_closed"
+    assert verdict.failing == []
+
+
+def test_a_merged_pull_is_never_pr_closed() -> None:
+    pull = _pull(mergeable=None, mergeable_state="clean", merged=True, state="closed")
+    assert _decide(_detail(_run("build")), 30, pull=pull).kind == "green"
+    assert _decide(_detail(), 121, pull=pull).kind == "no_ci"
 
 
 @pytest.mark.parametrize("mergeable", [None, False])

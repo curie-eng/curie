@@ -1267,6 +1267,21 @@ pub struct RemediationBreaker {
     pub close_reason: Option<String>,
 }
 
+// @spec AUTOMATED-REMEDIATION-3
+/// The header binding (`PUT`) and arming a remediation policy carry the
+/// remediation authority in (ADR 0231). Disarm, delete and breaker close never
+/// send it.
+pub const REMEDIATION_AUTHORITY_HEADER: &str = "X-Curie-Remediation-Authority";
+
+// @spec AUTOMATED-REMEDIATION-3
+/// Where the operator finds the remediation authority (ADR 0231): the value the
+/// API holds as `CURIE_REMEDIATION_AUTHORITY_KEY`.
+pub const REMEDIATION_AUTHORITY_FIX: &str =
+    "export the API's remediation authority as CURIE_REMEDIATION_AUTHORITY_KEY: in a cluster \
+     it is the remediationAuthorityKey entry of the release's <release>-secrets Secret \
+     (chart value api.remediationAuthorityKey); for the local stack it is \
+     CURIE_REMEDIATION_AUTHORITY_KEY in its .env (default curie-dev-remediation-authority)";
+
 // @spec AUTOMATED-REMEDIATION-3 @spec AUTOMATED-REMEDIATION-20 @spec AUTOMATED-REMEDIATION-22
 /// What a `404` from a remediation route tells the operator to check.
 const POLICY_NOT_FOUND_FIX: &str =
@@ -4295,14 +4310,15 @@ impl ApiClient {
 
     // @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-3
     /// Bind or replace a hook's policy: `PUT .../remediation-policy` with the
-    /// CAS pair and the document, on the platform key and the operator
-    /// principal.
+    /// CAS pair and the document, on the platform key, the operator principal
+    /// and the ADR 0231 remediation authority.
     pub async fn put_remediation_policy(
         &self,
         agent_id: &str,
         hook: &str,
         body: &RemediationPolicyWrite,
         principal_token: &str,
+        authority: &str,
     ) -> Result<RemediationPolicyGeneration> {
         let resp = self
             .send_request(
@@ -4313,6 +4329,7 @@ impl ApiClient {
                     ))
                     .header("X-API-Key", &self.api_key)
                     .header("X-Curie-Approval-Principal", principal_token)
+                    .header(REMEDIATION_AUTHORITY_HEADER, authority)
                     .json::<RemediationPolicyWrite>(body),
                 "PUT /agents/{id}/hooks/{hook}/remediation-policy",
             )
@@ -4325,13 +4342,15 @@ impl ApiClient {
     }
 
     // @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-3
-    /// Arm the current policy: `POST .../remediation-policy/arm`.
+    /// Arm the current policy: `POST .../remediation-policy/arm`, which also
+    /// needs the ADR 0231 remediation authority.
     pub async fn arm_remediation_policy(
         &self,
         agent_id: &str,
         hook: &str,
         body: &RemediationPolicyMutation,
         principal_token: &str,
+        authority: &str,
     ) -> Result<RemediationPolicyGeneration> {
         let resp = self
             .send_request(
@@ -4342,6 +4361,7 @@ impl ApiClient {
                     ))
                     .header("X-API-Key", &self.api_key)
                     .header("X-Curie-Approval-Principal", principal_token)
+                    .header(REMEDIATION_AUTHORITY_HEADER, authority)
                     .json::<RemediationPolicyMutation>(body),
                 "POST /agents/{id}/hooks/{hook}/remediation-policy/arm",
             )
@@ -4687,6 +4707,9 @@ impl ApiClient {
                 )
             }
             (StatusCode::NOT_FOUND, _) => CliError::failure(message).with_fix(not_found_fix),
+            (StatusCode::FORBIDDEN, Some("remediation_authority_required")) => {
+                CliError::failure(message).with_fix(REMEDIATION_AUTHORITY_FIX)
+            }
             (StatusCode::FORBIDDEN, _) => CliError::failure(message).with_fix(
                 "export an operator principal as CURIE_APPROVAL_PRINCIPAL_TOKEN (mint one with \
                  `curie <local|cluster> approvals <AGENT> --mint-operator-principal <SUBJECT>`)",

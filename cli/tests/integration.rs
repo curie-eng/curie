@@ -69,6 +69,7 @@ mod connector_lock;
 mod connector_mount_visibility;
 mod connector_rollout;
 mod connector_rollout_live;
+mod connector_secret_digest;
 mod connector_selection;
 mod connector_start_wait;
 mod connector_startup_events;

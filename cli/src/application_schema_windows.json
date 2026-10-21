@@ -188,6 +188,10 @@
       "schema_head": "0108",
       "schema_min": "0108"
     },
+    "0.13.2": {
+      "schema_head": "0108",
+      "schema_min": "0108"
+    },
     "0.8.0": {
       "schema_head": "0036",
       "schema_min": "0001"
