@@ -479,7 +479,9 @@ impl From<RemediationPolicyWriteArgs> for commands::PolicyWriteArgs {
 /// The `remediation-policy` verbs, shared by `local` and `cluster` so the two
 /// tiers cannot drift. `C` is the tier's connection flags, carried on each
 /// leaf so they parse after the verb's own arguments. Writes authenticate
-/// their operator with CURIE_APPROVAL_PRINCIPAL_TOKEN.
+/// their operator with CURIE_APPROVAL_PRINCIPAL_TOKEN; `apply` and `arm` also
+/// present the remediation authority from CURIE_REMEDIATION_AUTHORITY_KEY
+/// (ADR 0231).
 #[derive(Subcommand, Debug, Clone)]
 pub(crate) enum RemediationPolicyCommand<C: clap::Args> {
     /// Read a hook's current remediation policy generation
@@ -494,6 +496,7 @@ pub(crate) enum RemediationPolicyCommand<C: clap::Args> {
     },
     /// Bind or replace a hook's policy from a JSON document (`PUT`). The
     /// document is validated with the platform's rules before any request.
+    /// Needs the remediation authority in CURIE_REMEDIATION_AUTHORITY_KEY.
     Apply {
         /// Agent name or id.
         agent: String,
@@ -508,6 +511,7 @@ pub(crate) enum RemediationPolicyCommand<C: clap::Args> {
         conn: C,
     },
     /// Arm the current policy so its automatic actions may run (`POST .../arm`).
+    /// Needs the remediation authority in CURIE_REMEDIATION_AUTHORITY_KEY.
     Arm {
         /// Agent name or id.
         agent: String,
