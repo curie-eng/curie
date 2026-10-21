@@ -288,13 +288,22 @@ def test_rendered_rules_cover_every_container_list_and_fixed_object():
     assert again[3]["webhooks"][0]["rules"]
 
 
-@pytest.mark.parametrize(
-    "ca",
-    [certificate(), certificate(ca=False), CA.replace(b"\n", b"\r\n"), b"", b"not a pem"],
-)
-def test_render_refuses_a_ca_that_is_not_the_pinned_ca(ca):
+# Stable IDs: certificates are generated per run, so they must not name the case.
+CA_CASES = {
+    "another_ca": lambda: certificate(),
+    "not_a_ca": lambda: certificate(ca=False),
+    "crlf_pem": lambda: CA.replace(b"\n", b"\r\n"),
+    "empty": lambda: b"",
+    "not_pem": lambda: b"not a pem",
+}
+
+
+@pytest.mark.parametrize("case", sorted(CA_CASES))
+def test_render_refuses_a_ca_that_is_not_the_pinned_ca(case):
     with pytest.raises(cp.ControlProfileInvalid):
-        cp.render_control_objects(profile(), projection=projection(), server_ca_pem=ca)
+        cp.render_control_objects(
+            profile(), projection=projection(), server_ca_pem=CA_CASES[case]()
+        )
 
 
 def test_render_refuses_another_projection():
