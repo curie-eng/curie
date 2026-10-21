@@ -1497,8 +1497,6 @@ SCHEDULE_LEAD_MINUTES = 12
 F4_LEAD_MINUTES = 36
 F4_STAGGER_MINUTES = 2
 AUTHOR = "U-curie-message"
-PLATFORM_KEY_ENV = "CURIE_LOCAL_API_KEY"
-DEFAULT_PLATFORM_KEY = "curie-dev-key"
 STRIPPED_AUTH = (
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
@@ -1857,6 +1855,10 @@ class _Stack:
     ports: dict[str, dict[int, int]]
     stub_port: int
     stub_host: str
+    # The stack's platform API key: generated per stack, held in memory only,
+    # handed to `local up` and every inner CLI child as CURIE_API_KEY (which
+    # `local up` adopts instead of generating its own), never in argv or reports.
+    api_key: str = field(default_factory=lambda: secrets.token_hex(32), repr=False)
 
     @property
     def api_url(self) -> str:
@@ -2129,6 +2131,7 @@ class _Campaign:
         self.threads: set[str] = set()
         self.bind_errors = 0
         self.live_children = 0
+        self.platform_keys: list[str] = []
         self.windows: list[dict[str, Any]] = []
         self.f4_base: datetime | None = None
         self.synthetic: dict[str, Any] = {}
@@ -2174,6 +2177,7 @@ class _Campaign:
                 env[name] = os.environ[name]
         if self.stack is not None:
             env.update(self.stack.env(self.base_compose))
+            env["CURIE_API_KEY"] = self.stack.api_key
         env["CURIE_MODEL"] = ACTOR_MODEL
         if credentials and self.key:
             env["CURIE_CREDENTIALS"] = self.key
@@ -2181,8 +2185,9 @@ class _Campaign:
         return env
 
     def scrub(self, text: str) -> str:
-        if self.key:
-            text = text.replace(self.key, "[redacted]")
+        for secret in [self.key, *self.platform_keys]:
+            if secret:
+                text = text.replace(secret, "[redacted]")
         return _bounded(text)
 
     def cli(
@@ -2252,7 +2257,7 @@ class _Campaign:
             method=method,
             data=None if body is None else json.dumps(body).encode(),
             headers={
-                "X-API-Key": os.environ.get(PLATFORM_KEY_ENV, DEFAULT_PLATFORM_KEY),
+                "X-API-Key": self.stack.api_key,
                 "Content-Type": "application/json",
             },
         )
@@ -2487,6 +2492,7 @@ class _Campaign:
     def up(self, repetition: int) -> None:
         for attempt in range(2):
             self.stack = _new_stack(self.o.output_dir, self.run_id, repetition, self.stub_port)
+            self.platform_keys.append(self.stack.api_key)
             self.stack.write_override()
             assert self.stack is not None
             code, _, _, _, stderr = self.cli(
@@ -3713,6 +3719,8 @@ class _Campaign:
     def teardown(self) -> dict[str, Any]:
         problems: list[str] = []
         if self.stack is not None:
+            # `local down --wipe` runs for the same project, compose files and
+            # platform key that `local up` used for this stack.
             repetition = int(self.stack.project.rsplit("-r", 1)[-1])
             try:
                 self.down(repetition)
