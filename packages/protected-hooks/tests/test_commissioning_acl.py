@@ -398,6 +398,17 @@ def test_production_principals_reach_nothing_under_commissioning(
         # DRYRUN of a keyless EVAL only says the script may start; the real call decides.
         if actual or (dry and not operation.startswith("eval0"))
     ]
+    client = principals[role].raw(protocol=3)
+    try:
+        for family, (key, kind) in keys.items():
+            seed(pworker_service, key, kind)
+            for call in (("TYPE", key), ("EXISTS", key)):
+                dry = dryrun(pworker_service, principals[role].username, call)
+                actual = real(client, call)
+                if dry or actual:
+                    reached.append((call[0].lower(), family, dry, actual))
+    finally:
+        client.close()
     assert reached == []
 
 
@@ -440,15 +451,17 @@ ADMIN = (
     ("COPY", "protected:commissioning:permit:a", "protected:commissioning:permit:b"),
     ("ACL", "LOG"),
     ("ACL", "LIST"),
+    # The provisioner disables principals and kills their sessions; it never
+    # deletes a user, reads stored rules or password hashes, or lists clients.
+    ("ACL", "DELUSER", "probe-user"),
+    ("ACL", "GETUSER", "probe-user"),
+    ("ACL", "USERS"),
+    ("CLIENT", "LIST"),
     ("CLIENT", "PAUSE", "1"),
 )
 PROVISIONER_ONLY = (
     ("ACL", "SETUSER", "probe-user", "off"),
-    ("ACL", "DELUSER", "probe-user"),
-    ("ACL", "GETUSER", "probe-user"),
-    ("ACL", "USERS"),
     ("CLIENT", "KILL", "USER", "probe-user"),
-    ("CLIENT", "LIST"),
 )
 
 
@@ -462,6 +475,27 @@ def test_administrative_commands_stay_closed(pworker_service, principals, role) 
     for call in (("ACL", "WHOAMI"), ("TIME",), ("INFO", "server"), ("PING",)):
         assert dryrun(pworker_service, username, call), (role, call)
     assert dryrun(pworker_service, username, ("SCAN", "0")) == (role == "candidate_worker")
+
+
+def test_provisioner_reads_no_user_or_client_inventory(pworker_service, principals) -> None:
+    """Real calls, not only DRYRUN: the provisioner's administration is SETUSER and KILL."""
+    target = principals["candidate_worker"].username
+    client = principals["provisioner"].raw(protocol=3)
+    try:
+        for call in (
+            ("ACL", "GETUSER", target),
+            ("ACL", "DELUSER", target),
+            ("ACL", "USERS"),
+            ("ACL", "LIST"),
+            ("CLIENT", "LIST"),
+        ):
+            assert not real(client, call), call
+        assert target in {
+            u.decode() if isinstance(u, bytes) else u
+            for u in pworker_service.command("ACL", "USERS")
+        }
+    finally:
+        client.close()
 
 
 def test_identities_authenticate_as_themselves(pworker_service, principals) -> None:
@@ -526,16 +560,16 @@ def test_candidate_enqueue_reaches_only_its_campaign_stream(pworker_service, pri
         client.close()
 
 
-def test_production_worker_scan_lists_names_but_reads_no_values(
-    pworker_service, principals
-) -> None:
-    """Observed, unchanged production property: SCAN is keyless, so the unchanged
-    worker kernel's SCAN grant enumerates key names across the keyspace, including
-    commissioning names (digests of public identities). Values stay unreadable."""
+@pytest.mark.parametrize("role", ["production_worker", "candidate_worker"])
+def test_scan_lists_names_but_reads_no_values(pworker_service, principals, role) -> None:
+    """Observed property of the unchanged worker kernel inventory: SCAN is keyless, so
+    the production worker's SCAN grant, and the candidate worker's copy of that same
+    inventory, enumerate key names across the keyspace, including commissioning names
+    (digests of public identities). Values outside the role's families stay unreadable."""
     pworker_service.command("FLUSHDB")
-    key = "protected:commissioning:permit:example"
+    key = "protected:commissioning:reservation:example"
     pworker_service.command("SET", key, "seed")
-    client = principals["production_worker"].raw(protocol=3)
+    client = principals[role].raw(protocol=3)
     try:
         cursor, names = client.execute_command("SCAN", "0", "COUNT", "1000")
         assert key in {n.decode() if isinstance(n, bytes) else n for n in names}

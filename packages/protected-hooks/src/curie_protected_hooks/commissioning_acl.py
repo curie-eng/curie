@@ -9,9 +9,9 @@ family also holds the per-runtime campaign floor. Lua scripts run under the
 caller's rules: an ``EVAL`` selector only admits the declared keys, and each
 command the script issues is checked again, so declaring a key grants nothing.
 
-The provisioner administers ACL users. The pinned Valkey cannot scope
-``ACL SETUSER`` to named users, so that right is transitive; the guard
-configuration hashes every principal's rules, and a changed rule is observed.
+The provisioner disables principals and kills their sessions: ``ACL SETUSER``
+and ``CLIENT KILL`` only. The pinned Valkey cannot scope ``ACL SETUSER`` to named
+users, so that right is transitive; this is an open review point.
 """
 
 from __future__ import annotations
@@ -40,11 +40,7 @@ _PROVISIONER = (
     *_HANDSHAKE,
     *_IDENTITY,
     "+acl|setuser",
-    "+acl|deluser",
-    "+acl|getuser",
-    "+acl|users",
     "+client|kill",
-    "+client|list",
     "(+get +type " + _CONTROL_READ + " %R~" + JOURNAL + "*)",
     "(+set %W~protected:control:selection:* %W~protected:control:manifest:*)",
     "(+eval %RW~protected:control:selection:* %RW~protected:control:manifest:*)",
