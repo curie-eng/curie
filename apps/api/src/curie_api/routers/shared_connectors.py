@@ -15,14 +15,15 @@ material. A malformed key registration answers one fixed code.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Callable, Coroutine
-from typing import Annotated, Any, ClassVar
+from collections.abc import Callable, Coroutine, Iterator, Mapping
+from typing import Annotated, Any, ClassVar, get_args, get_origin
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Request, Response, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
+from pydantic import AliasChoices, AliasPath, BaseModel
 
 from ..auth import require_internal_worker_token, require_platform_key
 from ..deps import SessionDep
@@ -52,14 +53,90 @@ from ..schemas.shared_connectors import (
 from ..shared_connectors import database_roles, store
 from ..shared_connectors.store import NO_STORE, SharedRefusal
 
+_REQUEST_MODELS: tuple[type[BaseModel], ...] = (
+    SharedApplicationRegistration,
+    SharedBindingCheck,
+    SharedBindingImport,
+    SharedBindingReimport,
+    SharedDatabaseProvision,
+    SharedDatabaseRotate,
+    SharedDatabaseStatusReport,
+    SharedMembershipReplace,
+    SharedRecipientRegistration,
+)
+_LOC_ROOTS = frozenset({"body", "path", "query", "header", "cookie"})
+_REDACTED_LOC = "<redacted>"
+
+
+def _nested_models(annotation: object) -> Iterator[type[BaseModel]]:
+    """Every model named anywhere in a field type: lists, unions, optionals, Annotated."""
+
+    if (
+        get_origin(annotation) is None
+        and isinstance(annotation, type)
+        and issubclass(annotation, BaseModel)
+    ):
+        yield annotation
+    for argument in get_args(annotation):
+        yield from _nested_models(argument)
+
+
+def _alias_names(alias: object) -> Iterator[str]:
+    if isinstance(alias, str):
+        yield alias
+    elif isinstance(alias, AliasChoices):
+        for choice in alias.choices:
+            yield from _alias_names(choice)
+    elif isinstance(alias, AliasPath):
+        yield from (step for step in alias.path if isinstance(step, str))
+
+
+def _declared_field_names(models: tuple[type[BaseModel], ...]) -> frozenset[str]:
+    """Field names and aliases of ``models`` and of every model nested in them."""
+
+    names: set[str] = set()
+    seen: set[type[BaseModel]] = set()
+    pending = list(models)
+    while pending:
+        model = pending.pop()
+        if model in seen:
+            continue
+        seen.add(model)
+        for name, field in model.model_fields.items():
+            names.add(name)
+            for alias in (field.alias, field.validation_alias, field.serialization_alias):
+                names.update(_alias_names(alias))
+            pending.extend(_nested_models(field.annotation))
+    return frozenset(names)
+
+
+# Computed once: the only key names a 422 may repeat. Pydantic reports a rejected
+# key (``extra_forbidden``) by its name in ``loc``, and that name is request input.
+_DECLARED_LOC_NAMES = _declared_field_names(_REQUEST_MODELS)
+
+
+def _redacted_error(error: Mapping[str, Any], declared: frozenset[str]) -> dict[str, Any]:
+    """``type``, ``msg`` and a ``loc`` holding only names the server declared."""
+
+    safe_loc: list[str | int] = []
+    for index, segment in enumerate(error.get("loc", ())):
+        if index == 0:
+            keep = segment in _LOC_ROOTS
+        else:
+            keep = isinstance(segment, int) or segment in declared
+        safe_loc.append(segment if keep else _REDACTED_LOC)
+    return {"type": error.get("type"), "loc": safe_loc, "msg": error.get("msg")}
+
 
 class _SharedConnectorRoute(APIRoute):
     """No caching of any answer, and no submitted value in a 422.
 
     FastAPI's default 422 echoes ``input`` and ``ctx``; here that could be a
-    ciphertext or a private key sent by mistake. A route that sets
-    ``invalid_body_detail`` answers every body validation failure with that
-    one code instead of an error list.
+    ciphertext or a private key sent by mistake. Each error keeps ``type`` and
+    ``msg`` only, and its ``loc`` keeps indexes and the declared field or
+    parameter names, since a rejected key's own name is request input too. A
+    route that sets ``invalid_body_detail`` answers every body validation
+    failure with that one code instead of an error list.
     """
 
     invalid_body_detail: ClassVar[str | None] = None
@@ -67,6 +144,16 @@ class _SharedConnectorRoute(APIRoute):
     def get_route_handler(self) -> Callable[[Request], Coroutine[Any, Any, Response]]:
         handler = super().get_route_handler()
         fixed = self.invalid_body_detail
+        dependant = self.dependant
+        declared = _DECLARED_LOC_NAMES | frozenset(
+            parameter.alias
+            for parameter in (
+                *dependant.path_params,
+                *dependant.query_params,
+                *dependant.header_params,
+                *dependant.cookie_params,
+            )
+        )
 
         async def no_store_handler(request: Request) -> Response:
             try:
@@ -78,10 +165,7 @@ class _SharedConnectorRoute(APIRoute):
                 else:
                     content = {
                         "detail": jsonable_encoder(
-                            [
-                                {key: error[key] for key in ("type", "loc", "msg") if key in error}
-                                for error in errors
-                            ]
+                            [_redacted_error(error, declared) for error in errors]
                         )
                     }
                 response = JSONResponse(content, status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)

@@ -17,6 +17,7 @@ import base64
 import binascii
 import hashlib
 
+from nacl.exceptions import CryptoError
 from nacl.public import PublicKey, SealedBox
 
 ALGORITHM = "x25519-sealed-box"
@@ -43,11 +44,20 @@ def b64encode(raw: bytes) -> str:
 
 
 def public_key_bytes(value: str) -> bytes:
-    """The raw key a registration carries: 32 bytes and never the all-zero point."""
+    """The raw key a registration carries: 32 bytes libsodium can seal to.
+
+    The all-zero point and every other small-order point are refused here, by
+    a trial seal, so a key that would later fail DSN provisioning or rotation
+    is never stored. The refusal names neither the key nor libsodium's error.
+    """
 
     raw = strict_b64decode(value)
     if len(raw) != PUBLIC_KEY_BYTES or raw == bytes(PUBLIC_KEY_BYTES):
         raise ValueError("expected a 32-byte X25519 public key")
+    try:
+        SealedBox(PublicKey(raw)).encrypt(b"\x00")
+    except (CryptoError, ValueError, TypeError):
+        raise ValueError("expected a 32-byte X25519 public key") from None
     return raw
 
 

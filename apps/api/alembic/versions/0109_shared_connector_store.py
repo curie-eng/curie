@@ -608,6 +608,11 @@ def _membership_function(event: str, applications: str) -> str:
     SECURITY DEFINER because an agent-delete cascade fires this statement
     trigger as the outer statement's role; a non-owner would otherwise meet row
     level security on the applications table and silently bump nothing.
+
+    Executing a trigger function needs no EXECUTE privilege at firing time, so
+    PUBLIC's EXECUTE is revoked (``_create_triggers``) and a role cannot attach
+    this function to a table of its own. The scope check is the second layer: it
+    refuses, before reading a transition table, any table but the memberships.
     """
 
     return f"""
@@ -615,6 +620,11 @@ CREATE FUNCTION {SCHEMA}.{MEMBERSHIPS}_{event}() RETURNS trigger
 {DEFINER}
 AS $$
 BEGIN
+    IF TG_TABLE_SCHEMA IS DISTINCT FROM '{SCHEMA}'
+       OR TG_TABLE_NAME IS DISTINCT FROM '{MEMBERSHIPS}' THEN
+        RAISE EXCEPTION USING ERRCODE = '42501',
+            MESSAGE = 'shared_connector_trigger_scope';
+    END IF;
     UPDATE {SCHEMA}.{APPLICATIONS} a
     SET policy_generation = a.policy_generation + 1
     WHERE a.id IN ({applications});
@@ -667,6 +677,10 @@ def _create_triggers() -> None:
             f"REFERENCING {referencing} "
             f"FOR EACH STATEMENT EXECUTE FUNCTION {SCHEMA}.{MEMBERSHIPS}_{event}()"
         )
+    # A function is executable by PUBLIC unless revoked, and the membership ones
+    # run as their owner. Firing a trigger does not check EXECUTE.
+    for function in TRIGGER_FUNCTIONS:
+        op.execute(f"REVOKE ALL ON FUNCTION {SCHEMA}.{function}() FROM PUBLIC")
 
 
 # (table, the column naming its application). Every table but database_roles
