@@ -249,6 +249,11 @@ def _tail(text: str, lines: int = 40, limit: int = 6000) -> str:
     return kept if len(kept) <= limit else "..." + kept[-limit:]
 
 
+def _excerpt(text: str, limit: int = 200) -> str:
+    flat = " ".join(str(text).split())
+    return json.dumps(flat if len(flat) <= limit else flat[:limit] + "...")
+
+
 def _bounded(text: str) -> str:
     return text if len(text) <= MAX_STDERR else text[:MAX_STDERR] + "..."
 
@@ -1600,6 +1605,8 @@ class _Provider:
                     "temperature": 0,
                     "messages": [{"role": "user", "content": prompt}],
                     "usage": {"include": True},
+                    # Keep the 512-token budget for the verdict, not hidden reasoning.
+                    "reasoning": {"enabled": False},
                 },
             ),
             "completion",
@@ -1637,6 +1644,7 @@ class _Ledger:
         self.provider = provider
         self.baseline = provider.usage()
         self.last_usage = self.baseline
+        self.notes: list[str] = []
         self.sequence = 0
         self.closed: str | None = None
 
@@ -1647,17 +1655,25 @@ class _Ledger:
         ).fetchall()
         return sum((Decimal(row[0]) for row in rows), Decimal(0))
 
+    def observe(self, usage: Decimal) -> None:
+        """Keep a high-water mark of shared-key usage. The provider's counter is
+        eventually consistent and can read lower on a later poll; a decrease is an
+        accounting note, never a refund and never a reason to lower the mark."""
+
+        if usage < self.last_usage:
+            self.notes.append(
+                f"{_now()} provider usage read {usage} below the high-water mark {self.last_usage}"
+            )
+            return
+        self.last_usage = usage
+
     def charged(self) -> Decimal:
         return max(self.last_usage - self.baseline, self._sum("settled", "settled"))
 
     def admit(self, purpose: str, reserve: Decimal, scope: Mapping[str, Any]) -> str:
         if self.closed is not None:
             raise _Stop(f"admission is closed: {self.closed}")
-        usage = self.provider.usage()
-        if usage < self.last_usage:
-            self.closed = "provider usage decreased"
-            raise _Stop(self.closed)
-        self.last_usage = usage
+        self.observe(self.provider.usage())
         unresolved = self._sum("reserve", "reserved")
         if self.charged() + unresolved + reserve + SHUTDOWN_RESERVE > self.budget:
             self.closed = "budget exhausted before the next operation"
@@ -1677,11 +1693,10 @@ class _Ledger:
         while cost is None and usage <= before and time.monotonic() < deadline:
             time.sleep(2)
             usage = self.provider.usage()
-        if usage < self.last_usage:
-            self.closed = "provider usage decreased"
-            raise _Stop(self.closed)
-        self.last_usage = usage
-        settled = max(cost if cost is not None else Decimal(0), usage - before)
+        self.observe(usage)
+        settled = max(
+            cost if cost is not None else Decimal(0), max(Decimal(0), self.last_usage - before)
+        )
         self._db.execute(
             "UPDATE operations SET settled = ?, status = 'settled', generation_id = ? WHERE id = ?",
             (str(settled), generation, identity),
@@ -1738,6 +1753,7 @@ class _Ledger:
             "operations": self.operations(),
             "basis": "conservative-shared-key-upper-bound",
             "closed": self.closed,
+            "notes": list(self.notes),
         }
 
 
@@ -3201,7 +3217,10 @@ class _Campaign:
             )
             ok = sent["reply"].rstrip().endswith(str(probe["expected_suffix"]))
             self.record_control(
-                scope, str(probe["id"]), "PASS" if ok else "FAIL", "fresh-thread reply convention"
+                scope,
+                str(probe["id"]),
+                "PASS" if ok else "FAIL",
+                f"fresh-thread reply convention; reply: {_excerpt(sent['reply'])}",
             )
 
     def control_procedure(
@@ -3225,7 +3244,13 @@ class _Campaign:
         control = next(c for c in fixture["controls"] if c.get("id") == "removed-skill")
         heads = self.find(after[0], "skills", "slug", str(fixture["subject"]))
         if len(heads) != 1:
-            self.record_control(scope, "removed-skill", "FAIL", "no single learned skill")
+            self.record_control(
+                scope,
+                "removed-skill",
+                "FAIL",
+                f"no single learned skill; skills observed: "
+                f"{json.dumps([(r.get('id'), r.get('slug')) for r in after[0].get('skills', [])])}",
+            )
             return
         skill_id = str(heads[0]["id"])
         probes = {str(p["id"]): p for p in fixture["probes"]}
@@ -3348,7 +3373,7 @@ class _Campaign:
             scope,
             "cross-channel-retention",
             "PASS" if ok else "FAIL",
-            "fresh thread on the second channel",
+            f"fresh thread on the second channel; reply: {_excerpt(sent['reply'])}",
         )
         correction = next(c for c in fixture["controls"] if c.get("id") == "fact-correction")
         self.message(scope, str(correction["messages"][0]), self.channels[0], thread)
@@ -3363,7 +3388,8 @@ class _Campaign:
             scope,
             "fact-correction",
             "PASS" if corrected else "FAIL",
-            f"{len(live)} active facts for the subject after correction",
+            f"{len(live)} active facts for the subject after correction: "
+            f"{json.dumps([(f.get('id'), f.get('scope'), f.get('statement')) for f in live])}",
         )
         if not live:
             return
@@ -3424,7 +3450,9 @@ class _Campaign:
                 scope,
                 "real-clock-delivery",
                 "FAIL",
-                "the due or cancelled one-shot schedule was not created",
+                "the due or cancelled one-shot schedule was not created; observed due "
+                f"{json.dumps([(r.get('id'), r.get('state'), r.get('run_at')) for r in due])}, "
+                f"cancel-target {json.dumps([(r.get('id'), r.get('state')) for r in made])}",
             )
             return
         for row, token_value in ((due[0], token), (made[0], values["cancel_token"])):
@@ -3435,6 +3463,7 @@ class _Campaign:
                     "token": token_value,
                     "created": created,
                     "channel": self.channels[0],
+                    "row": dict(row),
                 }
             )
 
@@ -3467,14 +3496,34 @@ class _Campaign:
             and revised[0]["id"] == original[0]["id"]
             and revised[0].get("cron") == control["revised_cron"]
         )
-        self.message(scope, str(control["messages"][1]), self.channels[0], thread)
-        final = self.find(self.snapshot(scope)[0], "schedules", "prompt", values["revised_token"])
-        cancelled = bool(final) and all(r.get("state") == "cancelled" for r in final)
+        sent = self.message(scope, str(control["messages"][1]), self.channels[0], thread)
+        final, source = (None, "absent")
+        if original:
+            final, source = self.schedule_row(scope, str(original[0]["id"]))
+        state = None if final is None else final.get("state")
+        live = [
+            r
+            for r in self.find(
+                self.snapshot(scope)[0], "schedules", "prompt", values["revised_token"]
+            )
+            if r.get("state") == "active"
+        ]
+        cancelled = (
+            bool(original)
+            and not live
+            and (state == "cancelled" or (final is None and source == "absent"))
+        )
+        observed = {
+            "original": [(r["id"], r.get("state"), r.get("cron")) for r in original],
+            "revised": [(r["id"], r.get("state"), r.get("cron")) for r in revised],
+            "after_cancel": {"state": state, "source": source, "active_matches": len(live)},
+        }
         self.record_control(
             scope,
             "revise-and-cancel",
             "PASS" if same and cancelled else "FAIL",
-            f"revised in place {same}, cancelled {cancelled}",
+            f"revised in place {same}, cancelled {cancelled}; observed {json.dumps(observed)}; "
+            f"cancel reply: {_excerpt(sent['reply'])}",
         )
 
     def control_correction(
@@ -3497,7 +3546,7 @@ class _Campaign:
             scope,
             "corrected-procedure",
             "PASS" if ok else "FAIL",
-            "fresh-thread probe after correction",
+            f"fresh-thread probe after correction; reply: {_excerpt(sent['reply'])}",
         )
         heads = self.find(after[0], "skills", "slug", str(fixture["subject"]))
         revert = next(c for c in fixture["controls"] if c.get("id") == "revert")
@@ -3510,14 +3559,46 @@ class _Campaign:
             and int(restored[0].get("revision", 0)) > int(heads[0].get("revision", 0))
         )
         self.record_control(
-            scope, "revert", "PASS" if same else "FAIL", "same immutable skill with a new revision"
+            scope,
+            "revert",
+            "PASS" if same else "FAIL",
+            "same immutable skill with a new revision; before "
+            f"{json.dumps([(r.get('id'), r.get('revision')) for r in heads])}, after "
+            f"{json.dumps([(r.get('id'), r.get('revision')) for r in restored])}",
         )
         probe = probes["restored-procedure"]
         sent = self.message(scope, str(probe["input"]), self.channels[0], self.new_thread())
         ok = str(probe["expected"]) in sent["reply"]
         self.record_control(
-            scope, "restored-procedure", "PASS" if ok else "FAIL", "fresh-thread probe after revert"
+            scope,
+            "restored-procedure",
+            "PASS" if ok else "FAIL",
+            f"fresh-thread probe after revert; reply: {_excerpt(sent['reply'])}",
         )
+
+    def schedule_row(
+        self, scope: Mapping[str, Any], schedule_id: str
+    ) -> tuple[dict[str, Any] | None, str]:
+        """One agent schedule: from the agent_schedules list, else by its exact id.
+
+        A cancelled or finished schedule drops out of the list, so absence from the
+        list alone is not its state; `--show <id>` reads that one row.
+        """
+
+        bare = {k: scope[k] for k in ("repetition", "case_id", "agent_id")}
+        name = str(scope["agent_id"])
+        listed = _obj(self.must(["local", "schedules", "--agent", name], bare), "schedules")
+        for raw in _lst(listed.get("agent_schedules"), "agent_schedules"):
+            if str(_obj(raw, "schedule").get("id")) == schedule_id:
+                return dict(raw), "list"
+        code, parsed, _, _, _ = self.cli(
+            ["local", "schedules", "--agent", name, "--show", schedule_id], bare
+        )
+        if code == 0 and isinstance(parsed, dict):
+            row = parsed if "id" in parsed else parsed.get("schedule")
+            if isinstance(row, dict) and str(row.get("id")) == schedule_id:
+                return dict(row), "show"
+        return None, "absent"
 
     def open_window(self, repetition: int) -> datetime:
         """Bind the collector on port B once every message child of the repetition exited."""
@@ -3569,8 +3650,8 @@ class _Campaign:
         rows: dict[str, dict[str, Any]] = {}
         latest = datetime.now(UTC)
         for item in pending:
-            state = self.snapshot({**item["scope"]})[0]
-            row = next(r for r in state["schedules"] if str(r["id"]) == item["schedule_id"])
+            found, _ = self.schedule_row(item["scope"], item["schedule_id"])
+            row = found if found is not None else dict(item["row"])
             rows[item["schedule_id"]] = row
             due_at = _utc(row.get("run_at") or item["created"], "run_at")
             latest = max(latest, due_at + timedelta(seconds=DELIVERY_TOLERANCE_SECONDS))
@@ -3581,13 +3662,9 @@ class _Campaign:
         self.close_window()
         for item in pending:
             scope = item["scope"]
-            snapshot = self.must(["local", "schedules", "--agent", scope["agent_id"]], scope)
-            stored = [
-                r
-                for r in _lst(_obj(snapshot, "schedules").get("agent_schedules"), "rows")
-                if str(_obj(r, "row").get("id")) == item["schedule_id"]
-            ]
-            row = stored[0] if stored else rows[item["schedule_id"]]
+            found, source = self.schedule_row(scope, item["schedule_id"])
+            stored = [found] if found is not None else []
+            row = found if found is not None else rows[item["schedule_id"]]
             run_at = str(row.get("run_at") or "")
             due_at = _utc(run_at, "run_at") if run_at.endswith("Z") else datetime.now(UTC)
             start = _utc(item["created"], "created")
@@ -3622,7 +3699,7 @@ class _Campaign:
                         "worker_slack_api_port": self.stub_port,
                     },
                     "collector_receipts": mine,
-                    "cli_snapshot": {"agent_schedules": stored},
+                    "cli_snapshot": {"agent_schedules": stored, "source": source},
                 },
             )
             self.delivery_rows.append(
