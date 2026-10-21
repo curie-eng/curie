@@ -104,6 +104,7 @@ class CommissioningTuple:
             "control": b["control_identity"],
             "candidate_enqueue": b["candidate_credentials"]["enqueue"],
             "candidate_worker": b["candidate_credentials"]["worker"],
+            "qualification_publisher": b["qualification_publisher_identity"],
         }
         g = {
             "schema_version": 1,
