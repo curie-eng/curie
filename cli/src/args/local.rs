@@ -507,7 +507,8 @@ pub(crate) enum LocalAction {
     },
     /// A protected hook's remediation policy: show it, apply a document, arm,
     /// disarm or remove it, or close an open circuit breaker. Writes run as the
-    /// operator principal in CURIE_APPROVAL_PRINCIPAL_TOKEN.
+    /// operator principal in CURIE_APPROVAL_PRINCIPAL_TOKEN; apply and arm also
+    /// need the remediation authority in CURIE_REMEDIATION_AUTHORITY_KEY.
     RemediationPolicy {
         #[command(subcommand)]
         verb: RemediationPolicyCommand<LocalObservabilityConn>,
