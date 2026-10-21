@@ -67,6 +67,7 @@ from .commissioning_provisioner import (
 __all__ = [
     "BROKER_NAME",
     "BROKER_PORT",
+    "BROKER_TLS_SECRET",
     "INSTALLATION_PRINCIPALS",
     "VALKEY_VERSION",
     "BrokerMaterial",
@@ -75,6 +76,7 @@ __all__ = [
     "LocalBroker",
     "broker_objects",
     "check_guard_binding",
+    "namespace_object",
     "enable_candidates",
     "pinned_session",
     "broker_principals",
@@ -93,7 +95,8 @@ INSTALLATION_PRINCIPALS = ("provisioner",)
 CANDIDATE_IDLE = ("-@all", "resetkeys", "resetchannels", "clearselectors")
 # Valkey's default user holds the one-time installer password until enrollment ends.
 _INSTALLER_KEY = "password"
-_SECRET = BROKER_NAME + "-tls"
+BROKER_TLS_SECRET = BROKER_NAME + "-tls"
+_SECRET = BROKER_TLS_SECRET
 _APP_LABEL = "app.kubernetes.io/name"
 _VALKEY_UID = 999
 _CERT_DAYS = 30
@@ -293,6 +296,11 @@ def _b64(value: str | bytes) -> str:
     raw = value.encode("ascii") if type(value) is str else value
     assert type(raw) is bytes
     return base64.b64encode(raw).decode("ascii")
+
+
+def namespace_object(owner: str, namespace: str) -> dict[str, Any]:
+    """The protected namespace, Pod Security ``restricted``, @spec PROTECTED-COMMISSIONING-1."""
+    return _namespace(owner, namespace)
 
 
 def _namespace(owner: str, namespace: str) -> dict[str, Any]:
@@ -575,13 +583,6 @@ class LocalBroker:
     def __repr__(self) -> str:
         """@spec PROTECTED-COMMISSIONING-1."""
         return "LocalBroker()"
-
-    def install_namespace(self) -> None:
-        """The protected namespace, before any credential Secret exists in it.
-
-        @spec PROTECTED-COMMISSIONING-1.
-        """
-        self.cluster.create(_namespace(self.cluster.owner, self.namespace))
 
     def install(self, *, image: str, installer_secret: str) -> None:
         """Create the TLS Secret, Service and Pod, wait for TLS, open the forward.

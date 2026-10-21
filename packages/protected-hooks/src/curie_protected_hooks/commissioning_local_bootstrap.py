@@ -29,15 +29,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, NoReturn
 
+import yaml
 from redis.exceptions import AuthenticationError, ResponseError
 
 from .commissioning_acl import CANDIDATE_ROLES
 from .commissioning_local_broker import (
+    BROKER_TLS_SECRET,
     CANDIDATE_IDLE,
     INSTALLATION_PRINCIPALS,
     BrokerUser,
     LocalBroker,
     Principal,
+    namespace_object,
     pinned_session,
 )
 from .commissioning_local_installation import OWNER_LABEL, LocalCluster
@@ -46,6 +49,9 @@ from .commissioning_provisioner import GUARD_PRINCIPALS
 
 __all__ = [
     "INSTALLER_SECRET",
+    "PROVISIONER_ACCOUNT",
+    "PROVISIONER_KUBECONFIG",
+    "PROVISIONER_SECRETS",
     "WORKLOAD_PRINCIPALS",
     "AdministratorBootstrap",
     "BootstrapRefused",
@@ -54,11 +60,16 @@ __all__ = [
     "credential_secret_name",
     "enroll_users",
     "issue_credentials",
+    "provisioner_rbac",
     "read_baseline",
 ]
 
 # @spec PROTECTED-COMMISSIONING-1
 INSTALLER_SECRET = "commissioning-broker-installer"
+PROVISIONER_ACCOUNT = "commissioning-provisioner"
+PROVISIONER_KUBECONFIG = "provisioner-kubeconfig"
+# The only Secrets the provisioner's identity may read or delete by name.
+PROVISIONER_SECRETS = (BROKER_TLS_SECRET,)
 # Credentials the provisioner writes into the runtime files it renders, when G has them.
 WORKLOAD_PRINCIPALS = ("enqueue", "control_reader", "source_writer")
 _BASELINE = "acl-baseline.json"
@@ -97,10 +108,105 @@ class ProvisionerGrant:
     principals: Mapping[str, Principal]
     provisioner: BrokerUser = field(repr=False)
     workload: Mapping[str, BrokerUser] = field(repr=False)
+    # The provisioner's own Kubernetes identity: a ServiceAccount token kubeconfig.
+    kubeconfig: Path
 
     def __repr__(self) -> str:
         """@spec PROTECTED-COMMISSIONING-1."""
         return "ProvisionerGrant()"
+
+
+def provisioner_rbac(
+    owner: str, namespace: str, *, readable_secrets: tuple[str, ...]
+) -> list[dict[str, Any]]:
+    """The provisioner's ServiceAccount, Role and RoleBinding, @spec PROTECTED-COMMISSIONING-1.
+
+    The Role lets the provisioner create and remove its workloads, wait on
+    them and port-forward to them. It may create Secrets but reads or deletes
+    only the ones named in ``readable_secrets``: Kubernetes cannot restrict
+    ``create`` by name, but it can refuse ``get``, ``list`` and ``watch``, so
+    no credential Secret of another principal is readable with this identity.
+    """
+    labels = {OWNER_LABEL: owner}
+    meta = {"name": PROVISIONER_ACCOUNT, "namespace": namespace, "labels": labels}
+    rules = [
+        {
+            "apiGroups": [""],
+            "resources": ["pods", "services"],
+            "verbs": ["create", "get", "list", "watch", "delete"],
+        },
+        {"apiGroups": [""], "resources": ["pods/portforward"], "verbs": ["create"]},
+        {
+            "apiGroups": ["apps"],
+            "resources": ["deployments"],
+            "verbs": ["create", "get", "list", "watch", "delete"],
+        },
+        {"apiGroups": [""], "resources": ["secrets"], "verbs": ["create"]},
+    ]
+    if readable_secrets:
+        rules.append(
+            {
+                "apiGroups": [""],
+                "resources": ["secrets"],
+                "resourceNames": list(readable_secrets),
+                "verbs": ["get", "delete"],
+            }
+        )
+    return [
+        {
+            "apiVersion": "v1",
+            "kind": "ServiceAccount",
+            "metadata": dict(meta),
+            "automountServiceAccountToken": False,
+        },
+        {
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "Role",
+            "metadata": dict(meta),
+            "rules": rules,
+        },
+        {
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "RoleBinding",
+            "metadata": dict(meta),
+            "roleRef": {
+                "apiGroup": "rbac.authorization.k8s.io",
+                "kind": "Role",
+                "name": PROVISIONER_ACCOUNT,
+            },
+            "subjects": [
+                {"kind": "ServiceAccount", "name": PROVISIONER_ACCOUNT, "namespace": namespace}
+            ],
+        },
+    ]
+
+
+def _token_kubeconfig(admin: Path, *, owner: str, namespace: str, token: str) -> dict[str, Any]:
+    """A kubeconfig for the same API server and CA as ``admin``, with a token user."""
+    value = yaml.safe_load(admin.read_text())
+    clusters = [c for c in value["clusters"] if c["name"] == owner]
+    _require(len(clusters) == 1)
+    cluster = clusters[0]["cluster"]
+    _require(type(cluster.get("server")) is str and cluster["server"].startswith("https://"))
+    kept = {
+        k: cluster[k]
+        for k in ("server", "certificate-authority", "certificate-authority-data")
+        if k in cluster
+    }
+    _require("certificate-authority" in kept or "certificate-authority-data" in kept)
+    return {
+        "apiVersion": "v1",
+        "kind": "Config",
+        "clusters": [{"name": owner, "cluster": kept}],
+        "users": [{"name": PROVISIONER_ACCOUNT, "user": {"token": token}}],
+        "contexts": [
+            {
+                "name": owner,
+                "context": {"cluster": owner, "user": PROVISIONER_ACCOUNT, "namespace": namespace},
+            }
+        ],
+        "current-context": owner,
+    }
 
 
 def _b64(value: str) -> str:
@@ -190,6 +296,7 @@ class AdministratorBootstrap:
         self._baseline_dir = baseline_dir
         self.__credentials: dict[str, BrokerUser] = {}
         self.__installer: str | None = None
+        self._kubeconfig: Path | None = None
 
     def __repr__(self) -> str:
         """@spec PROTECTED-COMMISSIONING-1."""
@@ -203,7 +310,11 @@ class AdministratorBootstrap:
         _require(not self.__credentials and self.__installer is None)
         credentials = issue_credentials(self._principals)
         installer = secrets.token_urlsafe(32)
-        owned = {OWNER_LABEL: self._cluster.owner}
+        owner = self._cluster.owner
+        owned = {OWNER_LABEL: owner}
+        self._cluster.create(namespace_object(owner, self._namespace))
+        for item in provisioner_rbac(owner, self._namespace, readable_secrets=PROVISIONER_SECRETS):
+            self._cluster.create(item)
         for name, user in credentials.items():
             self._cluster.create(
                 {
@@ -234,14 +345,40 @@ class AdministratorBootstrap:
             }
         )
         self.__credentials, self.__installer = credentials, installer
+        self._kubeconfig = self._mint_kubeconfig()
+
+    def _mint_kubeconfig(self) -> Path:
+        """Mint the provisioner's ServiceAccount token into its own private kubeconfig."""
+        token = (
+            self._cluster.kubectl(
+                "create", "token", PROVISIONER_ACCOUNT, "--namespace", self._namespace,
+                "--duration", "24h",
+            )
+            .decode("ascii")
+            .strip()
+        )  # fmt: skip
+        _require(bool(token) and " " not in token)
+        value = _token_kubeconfig(
+            self._cluster.admin_kubeconfig(),
+            owner=self._cluster.owner,
+            namespace=self._namespace,
+            token=token,
+        )
+        path = self._cluster.ledger.root / PROVISIONER_KUBECONFIG
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+        with os.fdopen(os.open(path, flags, 0o600), "w", encoding="utf-8") as stream:
+            json.dump(value, stream)
+        return path
 
     def grant(self) -> ProvisionerGrant:
         """Usernames and rules, the provisioner's own credential, workload credentials.
 
         @spec PROTECTED-COMMISSIONING-1.
         """
-        _require(bool(self.__credentials))
+        _require(bool(self.__credentials) and self._kubeconfig is not None)
+        assert self._kubeconfig is not None
         return ProvisionerGrant(
+            kubeconfig=self._kubeconfig,
             principals=dict(self._principals),
             provisioner=self.__credentials["provisioner"],
             workload={

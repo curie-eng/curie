@@ -144,10 +144,11 @@ def test_the_provisioner_never_holds_another_principals_password(tmp_path: Path)
     from curie_protected_hooks.commissioning_local_installation import LocalCluster
     from curie_protected_hooks.commissioning_local_ownership import OwnershipLedger
 
-    from .test_commissioning_local_installation import FakeRunner
+    from .test_commissioning_local_installation import FakeRunner, write_admin_kubeconfig
 
     boot = bootstrap()
     ledger = OwnershipLedger.create(tmp_path / "run", owner=OWNER)
+    write_admin_kubeconfig(ledger.root)
     runner = FakeRunner(ledger)
     cluster = LocalCluster(ledger, runner=runner)
     admin = boot.AdministratorBootstrap(
@@ -556,10 +557,11 @@ def _broker_with_a_live_forward(tmp_path: Path) -> tuple[Any, Any, Any]:
     from curie_protected_hooks.commissioning_local_installation import LocalCluster
     from curie_protected_hooks.commissioning_local_ownership import OwnershipLedger
 
-    from .test_commissioning_local_installation import FakeRunner
+    from .test_commissioning_local_installation import FakeRunner, write_admin_kubeconfig
 
     api = module()
     ledger = OwnershipLedger.create(tmp_path / "run", owner=OWNER)
+    write_admin_kubeconfig(ledger.root)
     cluster = LocalCluster(ledger, runner=FakeRunner(ledger))
     broker = api.LocalBroker(cluster, namespace=NAMESPACE)
     with socket.socket() as probe:
@@ -597,3 +599,76 @@ def test_a_failed_enrollment_closes_the_forward(tmp_path: Path) -> None:
     with pytest.raises(bootstrap().BootstrapRefused):
         admin.enroll(broker)
     assert broker._forward is None and process.poll() is not None
+
+
+def test_the_provisioner_identity_cannot_read_other_credentials() -> None:
+    """Its Role reads and deletes Secrets only by name, and names only its own."""
+    boot = bootstrap()
+    account, role, binding = boot.provisioner_rbac(
+        OWNER, NAMESPACE, readable_secrets=boot.PROVISIONER_SECRETS
+    )
+    assert account["kind"] == "ServiceAccount" and account["automountServiceAccountToken"] is False
+    assert binding["roleRef"]["name"] == role["metadata"]["name"] == boot.PROVISIONER_ACCOUNT
+    secret_rules = [r for r in role["rules"] if "secrets" in r["resources"]]
+    assert {tuple(r["verbs"]) for r in secret_rules if "resourceNames" not in r} == {("create",)}
+    named = [r for r in secret_rules if "resourceNames" in r]
+    assert named == [
+        {
+            "apiGroups": [""],
+            "resources": ["secrets"],
+            "resourceNames": ["commissioning-broker-tls"],
+            "verbs": ["get", "delete"],
+        }
+    ]
+    for rule in role["rules"]:
+        assert "*" not in rule["verbs"] and "*" not in rule["resources"]
+        assert not ({"list", "watch"} & set(rule["verbs"]) and "secrets" in rule["resources"])
+    assert not any(
+        boot.credential_secret_name(n) in json.dumps(role) for n in ("observer", "provisioner")
+    )
+
+
+def test_the_minted_kubeconfig_is_a_token_identity_for_the_same_cluster(tmp_path: Path) -> None:
+    from curie_protected_hooks.commissioning_local_installation import LocalCluster
+    from curie_protected_hooks.commissioning_local_ownership import OwnershipLedger
+
+    from .test_commissioning_local_installation import FakeRunner, write_admin_kubeconfig
+
+    boot = bootstrap()
+    ledger = OwnershipLedger.create(tmp_path / "run", owner=OWNER)
+    write_admin_kubeconfig(ledger.root)
+    runner = FakeRunner(ledger)
+    admin = boot.AdministratorBootstrap(
+        LocalCluster(ledger, runner=runner),
+        namespace=NAMESPACE,
+        principals=principals(),
+        baseline_dir=tmp_path / "admin",
+    )
+    admin.issue()
+    grant = admin.grant()
+    assert grant.kubeconfig == ledger.root / boot.PROVISIONER_KUBECONFIG
+    assert oct(grant.kubeconfig.stat().st_mode & 0o777) == "0o600"
+    value = json.loads(grant.kubeconfig.read_text())
+    (cluster,) = value["clusters"]
+    assert cluster == {
+        "name": OWNER,
+        "cluster": {
+            "server": "https://127.0.0.1:50123",
+            "certificate-authority": "/fixture/ca.crt",
+        },
+    }
+    (user,) = value["users"]
+    assert user == {
+        "name": boot.PROVISIONER_ACCOUNT,
+        "user": {"token": "fixture-service-account-token"},
+    }
+    assert value["contexts"][0]["context"]["namespace"] == NAMESPACE
+    token = next(argv for argv, _ in runner.calls if argv[5:7] == ["create", "token"])
+    assert token[7:] == [boot.PROVISIONER_ACCOUNT, "--namespace", NAMESPACE, "--duration", "24h"]
+    created = [key for key in runner.objects]
+    assert created[:4] == [
+        f"v1/Namespace//{NAMESPACE}",
+        f"v1/ServiceAccount/{NAMESPACE}/{boot.PROVISIONER_ACCOUNT}",
+        f"rbac.authorization.k8s.io/v1/Role/{NAMESPACE}/{boot.PROVISIONER_ACCOUNT}",
+        f"rbac.authorization.k8s.io/v1/RoleBinding/{NAMESPACE}/{boot.PROVISIONER_ACCOUNT}",
+    ]

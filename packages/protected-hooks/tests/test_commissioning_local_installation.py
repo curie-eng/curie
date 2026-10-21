@@ -58,6 +58,8 @@ class FakeRunner:
         if argv[0] == "minikube":
             return b""
         verb = argv[5]
+        if verb == "create" and argv[6] == "token":
+            return b"fixture-service-account-token\n"
         if verb == "create":
             assert stdin is not None
             value = json.loads(stdin)
@@ -81,6 +83,19 @@ class FakeRunner:
                     del self.objects[key]
             return b""
         raise AssertionError(argv)
+
+
+def write_admin_kubeconfig(root: Path, owner: str = OWNER) -> None:
+    """What minikube writes: the profile's cluster with a client certificate user."""
+    (root / "kubeconfig").write_text(
+        "apiVersion: v1\nkind: Config\nclusters:\n"
+        f"- name: {owner}\n  cluster:\n    server: https://127.0.0.1:50123\n"
+        "    certificate-authority: /fixture/ca.crt\n"
+        f"users:\n- name: {owner}\n  user:\n    client-certificate: /fixture/client.crt\n"
+        "    client-key: /fixture/client.key\n"
+        f"contexts:\n- name: {owner}\n  context:\n    cluster: {owner}\n    user: {owner}\n"
+        f"current-context: {owner}\n"
+    )
 
 
 def installation(tmp_path: Path) -> tuple[Any, FakeRunner]:

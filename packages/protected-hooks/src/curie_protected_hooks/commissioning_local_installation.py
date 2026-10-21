@@ -200,14 +200,30 @@ class LocalCluster:
     minikube profile and the kubectl context to it. @spec PROTECTED-COMMISSIONING-5.
     """
 
-    def __init__(self, ledger: OwnershipLedger, *, runner: CommandRunner | None = None) -> None:
-        """@spec PROTECTED-COMMISSIONING-5."""
+    def __init__(
+        self,
+        ledger: OwnershipLedger,
+        *,
+        runner: CommandRunner | None = None,
+        kubeconfig: Path | None = None,
+    ) -> None:
+        """Bound to the profile's admin kubeconfig, or to a narrower identity's.
+
+        The administrator bootstrap uses the admin kubeconfig minikube writes;
+        the provisioner uses the ServiceAccount kubeconfig the bootstrap mints.
+        @spec PROTECTED-COMMISSIONING-5.
+        """
         _require(type(ledger) is OwnershipLedger and valid_owner(ledger.owner))
         self.ledger = ledger
         self.owner = ledger.owner
-        self.kubeconfig = ledger.root / _KUBECONFIG
+        self.kubeconfig = kubeconfig or ledger.root / _KUBECONFIG
+        _require(self.kubeconfig.parent == ledger.root)
         self.commands = ClusterCommands(self.owner, kubeconfig=self.kubeconfig)
         self.runner = runner or SubprocessRunner(self.commands, log=ledger.root / _LOG)
+
+    def admin_kubeconfig(self) -> Path:
+        """The kubeconfig minikube writes for this profile, @spec PROTECTED-COMMISSIONING-5."""
+        return self.ledger.root / _KUBECONFIG
 
     def __repr__(self) -> str:
         """@spec PROTECTED-COMMISSIONING-5."""

@@ -21,6 +21,7 @@ import pytest
 from curie_protected_hooks.authority_records import _BROKER, _object
 from curie_protected_hooks.commissioning_local_bootstrap import (
     INSTALLER_SECRET,
+    PROVISIONER_ACCOUNT,
     AdministratorBootstrap,
     ProvisionerGrant,
     credential_secret_name,
@@ -52,7 +53,9 @@ pytestmark = pytest.mark.skipif(
 
 @dataclass
 class Installed:
+    # The administrator's view of the profile: bootstrap and teardown only.
     cluster: LocalCluster
+    provisioner: LocalCluster
     broker: LocalBroker
     grant: ProvisionerGrant
     # The administrator's view, used here only to act as each principal.
@@ -72,30 +75,42 @@ def installed(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Installed]:
     ledger = OwnershipLedger.create(root, owner=owner)
     cluster = LocalCluster(ledger)
     namespace = owner + "-protected"
-    broker = LocalBroker(cluster, namespace=namespace)
+    broker: LocalBroker | None = None
     try:
         cluster.start()
         _, recipes = provisioned()
         principals = broker_principals(
             recipes, profile(), provisioner_id="commissioning/example-provisioner"
         )
-        broker.install_namespace()
         baseline_dir = root.parent / "admin"
         admin = AdministratorBootstrap(
             cluster, namespace=namespace, principals=principals, baseline_dir=baseline_dir
         )
         admin.issue()
+        grant = admin.grant()
+        # The provisioner works only through its own ServiceAccount identity.
+        provisioner = LocalCluster(ledger, kubeconfig=grant.kubeconfig)
+        broker = LocalBroker(provisioner, namespace=namespace)
         broker.install(image=IMAGE, installer_secret=INSTALLER_SECRET)
         baseline = admin.enroll(broker)
-        grant = admin.grant()
         identity = broker.observe(grant.provisioner)
         users = dict(admin.credentials())
         del admin
         yield Installed(
-            cluster, broker, grant, users, baseline, baseline_dir, identity, namespace, recipes
+            cluster,
+            provisioner,
+            broker,
+            grant,
+            users,
+            baseline,
+            baseline_dir,
+            identity,
+            namespace,
+            recipes,
         )
     finally:
-        broker.close()
+        if broker is not None:
+            broker.close()
         cluster.remove_all()
         assert ledger.all_removed()
         assert cluster.runner.probe(cluster.commands.minikube_argv("status"), timeout=60) == 85
@@ -128,8 +143,12 @@ def test_identity_is_the_live_pinned_broker(installed: Installed) -> None:
 def test_owned_objects_match_the_ledger_and_the_pinned_image(installed: Installed) -> None:
     keys = set(installed.cluster.objects())
     ns = installed.namespace
+    rbac = "rbac.authorization.k8s.io/v1"
     assert keys == {
         f"v1/Namespace//{ns}",
+        f"v1/ServiceAccount/{ns}/{PROVISIONER_ACCOUNT}",
+        f"{rbac}/Role/{ns}/{PROVISIONER_ACCOUNT}",
+        f"{rbac}/RoleBinding/{ns}/{PROVISIONER_ACCOUNT}",
         f"v1/Secret/{ns}/{BROKER_NAME}-tls",
         f"v1/Secret/{ns}/{INSTALLER_SECRET}",
         f"v1/Service/{ns}/{BROKER_NAME}",
@@ -165,12 +184,38 @@ def test_the_provisioner_side_never_holds_the_observer_or_publisher_password(
     installed: Installed,
 ) -> None:
     """Design decisions 7 and 8: the checker's and the publisher's secrets stay with the admin."""
-    held = repr(vars(installed.cluster)) + repr(vars(installed.broker))
+    held = repr(vars(installed.provisioner)) + repr(vars(installed.broker))
     held += repr({n: (u.username, u.password) for n, u in installed.grant.workload.items()})
     held += installed.grant.provisioner.password
     held += json.dumps(read_baseline(installed.baseline_dir))
     for name in ("observer", "qualification_publisher", "issuer", "control", *CANDIDATES):
         assert installed.users[name].password not in held, name
+
+
+def test_the_provisioner_identity_is_refused_other_principals_secrets(
+    installed: Installed,
+) -> None:
+    """Design decisions 7 and 8 in Kubernetes: the API server refuses the provisioner's
+    identity every credential Secret, and lets it read only its own broker TLS Secret."""
+    commands, runner = installed.provisioner.commands, installed.provisioner.runner
+
+    def readable(*args: str) -> bool:
+        argv = commands.kubectl_argv(*args, "--namespace", installed.namespace, "--output", "json")
+        return runner.probe(argv, timeout=60) == 0
+
+    for name in installed.users:
+        assert not readable("get", "secret/" + credential_secret_name(name)), name
+    assert not readable("get", "secret/" + INSTALLER_SECRET)
+    assert not readable("get", "secrets")
+    assert readable("get", "secret/" + BROKER_NAME + "-tls")
+    assert readable("get", "pods")
+    # The same reads succeed with the administrator's identity, so the refusal is RBAC.
+    admin = installed.cluster
+    observer = credential_secret_name("observer")
+    argv = admin.commands.kubectl_argv(
+        "get", "secret/" + observer, "--namespace", installed.namespace, "--output", "json"
+    )
+    assert admin.runner.probe(argv, timeout=60) == 0
 
 
 def test_the_baseline_is_what_the_observer_reads_and_holds_no_password(
