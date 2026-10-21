@@ -441,6 +441,9 @@ def test_guard_deployment_has_no_api_credential_and_pins_the_image():
     spec = deployment["spec"]["template"]["spec"]
     assert deployment["metadata"]["namespace"] == "acme-control"
     assert spec["automountServiceAccountToken"] is False
+    # The configuration is group-readable only; the guard's group must own it.
+    assert spec["volumes"][0]["secret"]["defaultMode"] == 0o440
+    assert spec["securityContext"]["fsGroup"] == spec["securityContext"]["runAsGroup"] == 1000
     (container,) = spec["containers"]
     assert container["image"] == profile.as_dict()["guard"]["image"]
     assert container["securityContext"]["readOnlyRootFilesystem"] is True

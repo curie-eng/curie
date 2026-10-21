@@ -504,6 +504,7 @@ def render_guard_deployment(profile: ControlProfile, *, config_secret: str) -> d
                             "runAsNonRoot": True,
                             "runAsUser": 1000,
                             "runAsGroup": 1000,
+                            "fsGroup": 1000,
                             "seccompProfile": {"type": "RuntimeDefault"},
                         },
                         "containers": [
