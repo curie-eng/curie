@@ -7686,6 +7686,57 @@ fn repository_runner_upgrade_missing_or_stale_template_fails_canary() {
     }
 }
 
+/// A fresh run that itself applied rebuilt receipt B must canary B. Here
+/// another Helm invocation restores receipt A and its matching template at the
+/// target chart version before Canary, so the served values and templates
+/// agree on A. Comparing template A against served receipt A would pass while
+/// the repository still runs on base A; Canary must check the admitted B.
+#[test]
+fn repository_runner_upgrade_fresh_canary_checks_the_applied_candidate_not_serving_values() {
+    let before = repository_runner_upgrade_values();
+    let fixture = repository_runner_upgrade_fixture(&before);
+    let output = fixture.local_env("healthy", &[("UPGRADE_SERVE_RETAINED_AFTER_APPLY", "1")]);
+    assert_eq!(
+        repository_runner_build_calls(&fixture).len(),
+        1,
+        "{:?}",
+        fixture.argv()
+    );
+    assert_eq!(fixture.helm_upgrades().len(), 1, "{:?}", fixture.argv());
+    let built_image = format!(
+        "{REPOSITORY_RUNNER_IMAGE}@{}",
+        repository_runner_digest('6')
+    );
+    let applied = values_doc(&fixture.values(1));
+    assert_eq!(
+        applied.pointer("/factory/bindings/0/repos/0/runner/image"),
+        Some(&Value::from(built_image.clone())),
+        "this run must apply rebuilt receipt B: {applied}"
+    );
+    let readback = Command::new(fixture.0.path().join("helm"))
+        .args(["get", "values", "rel", "-n", "ns", "-o", "json"])
+        .env("UPGRADE_DRIVER_ROOT", fixture.0.path())
+        .env("UPGRADE_DRIVER_SCENARIO", "healthy")
+        .env("UPGRADE_SERVE_RETAINED_AFTER_APPLY", "1")
+        .output()
+        .unwrap();
+    assert!(readback.status.success(), "{}", visible(&readback));
+    let served = values_doc(&stdout(&readback));
+    assert_eq!(
+        served["factory"]["bindings"][0]["repos"][0]["runner"],
+        before["factory"]["bindings"][0]["repos"][0]["runner"],
+        "the release must serve the restored receipt A: {served}"
+    );
+
+    assert!(!output.status.success(), "{}", visible(&output));
+    let body = json(&output);
+    assert_eq!(body["status"], "failed", "{body}");
+    assert_eq!(body["phase"], "canary", "{body}");
+    let text = visible(&output);
+    assert!(text.contains(CATALOG_RUNNER_REPO), "{text}");
+    assert!(text.contains(&built_image), "{text}");
+}
+
 /// Custom receipts still coexist with ordinary agent templates. A skipped
 /// Apply must obtain their installed fullname without a target chart lookup.
 #[test]

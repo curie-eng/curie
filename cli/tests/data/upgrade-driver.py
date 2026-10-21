@@ -19,6 +19,10 @@ A real release retains what was last handed to it, and that is what makes a
 second run a resume of the first rather than a replay of the same input.
 
 Behaviour is selected by ``$UPGRADE_DRIVER_SCENARIO`` from SCENARIOS below.
+``$UPGRADE_SERVE_RETAINED_AFTER_APPLY`` set makes ``helm get values`` and the
+rendered SandboxTemplates keep serving ``retained.json`` after an Apply, as if
+another Helm invocation restored the pre-upgrade values at the same chart.
+
 Optional per-test inputs read from the root directory:
   * ``retained.json`` -- the document ``helm get values`` returns (JSON is YAML)
   * ``checkpoint.json`` -- the complete upgrade checkpoint ConfigMap
@@ -873,6 +877,10 @@ def release_values(revision=None):
         if row["description"].startswith("Rollback to "):
             return copy.deepcopy(revision_values[row["description"].split()[-1]])
     applied = captured("values", ".yaml")
+    # Another Helm invocation restored the pre-upgrade values after this run's
+    # Apply, keeping the target chart version: serve retained.json throughout.
+    if os.environ.get("UPGRADE_SERVE_RETAINED_AFTER_APPLY"):
+        applied = []
     source = applied[-1] if applied else root / "retained.json"
     text = source.read_text() if source.exists() else "{}"
     return json.loads(text or "{}")
@@ -1196,7 +1204,7 @@ if program == "helm":
                 print(f"Error: {error}", file=sys.stderr)
                 sys.exit(1)
         applied_values = captured("values", ".yaml")
-        if applied_values:
+        if applied_values and not os.environ.get("UPGRADE_SERVE_RETAINED_AFTER_APPLY"):
             # The release retains the overlay it was last handed. A second run
             # therefore migrates the FIRST run's own output, which is the only
             # shape that can prove idempotence rather than repeat one input.
