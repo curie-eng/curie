@@ -151,7 +151,11 @@ def _result(base="F3-P1", *, repetition=1, expected=None, predicted=None, **chan
 
 
 def _inventory(repetitions=1):
-    return [_result(base, repetition=rep) for rep in range(1, repetitions + 1) for base in CASE_IDS]
+    return [
+        _result(base, repetition=rep, **({"decision_id": "correct"} if base[1] == "8" else {}))
+        for rep in range(1, repetitions + 1)
+        for base in CASE_IDS
+    ]
 
 
 def _summary(rows, *, repetitions=1, thresholds=DEFAULT_THRESHOLDS):
@@ -1253,7 +1257,7 @@ def test_summary_keeps_numeric_correction_duplicates_with_one_evaluated_correcti
     rows = [
         _result(base, status=CaseStatus.NOT_AVAILABLE, predicted=())
         if base[1] == "8" and base != "F8-P1"
-        else _result(base)
+        else _result(base, **({"decision_id": "correct"} if base[1] == "8" else {}))
         for base in CASE_IDS
     ]
     gate = _summary(rows)["gates"]["correction_duplicates"]

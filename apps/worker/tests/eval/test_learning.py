@@ -796,6 +796,7 @@ def frozen_report(tmp_path: Path) -> dict[str, Any]:
         "collector": {
             "port_b": 31002,
             "bind_errors": 0,
+            "recovered_bind_retries": 0,
             "delivery_windows": [
                 {
                     "repetition": 1,
@@ -1320,9 +1321,15 @@ def test_duplicate_limit_is_inclusive_at_zero_and_at_custom_limit(
 ) -> None:
     _check(tmp_path, frozen_report, passed=True)
     report = copy.deepcopy(frozen_report)
-    correction = report["decisions"][-1]
+    correction = next(
+        row
+        for row in reversed(report["decisions"])
+        if row["fixture_id"].startswith("F8-") and row["decision_id"] == "correct"
+    )
     correction["correction_duplicates"] = 1
-    _value(report, correction["evidence_ref"])["correction_duplicates"] = 1
+    # The F8 seed decision shares this evidence record; give the correction its own copy.
+    observation = {**_value(report, correction["evidence_ref"]), "correction_duplicates": 1}
+    correction["evidence_ref"] = _evidence(report, "teaching-observation", observation)
     _derive(report)
     _check(tmp_path, report, passed=False)
     report["thresholds"]["correction_duplicates"] = 1
@@ -2124,6 +2131,8 @@ class TestRecordedCampaign:
             if row["primary"]:
                 assert row["stub_port"] == collector["port_b"]
         assert collector["bind_errors"] == 0
+        assert isinstance(collector["recovered_bind_retries"], int)
+        assert collector["recovered_bind_retries"] >= 0
         assert collector["synthetic_transport_receipt"]["synthetic"] is True
         assert collector["synthetic_transport_receipt"]["received_at"]
         for repetition in range(1, report["repetitions"] + 1):
