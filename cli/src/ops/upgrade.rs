@@ -1595,6 +1595,11 @@ trait UpgradeDriver {
     fn repository_runner_plan_lines(&self) -> Vec<String> {
         Vec::new()
     }
+    /// Work Apply finishes before Helm runs (ADR 0216 repository runner
+    /// rebuilds). A failure here leaves the release unchanged.
+    fn prepare_apply(&mut self) -> Result<()> {
+        Ok(())
+    }
     /// Retire the SandboxClaims of every agent [`Self::runner_layer_plan`]
     /// rebinds or clears after Apply (#3422, #4321), so a live thread's next
     /// turn cold-starts on its new runner instead of keeping the old layer.
@@ -1905,6 +1910,19 @@ fn execute_phase<H: UpgradeDriver>(
         UpgradePhase::Checkpoint => Ok(PhaseOutcome::Continue),
         UpgradePhase::Migrate => Ok(PhaseOutcome::Continue),
         UpgradePhase::Apply => {
+            if let Err(error) = host.prepare_apply() {
+                // Nothing has reached Helm yet, so the release is unchanged and
+                // rollback is the wrong remedy: the operator reruns the upgrade.
+                record.fail_forward = Some(fail_forward_for(
+                    opts,
+                    false,
+                    &format!(
+                        "repository runner rebuild failed before Helm ran, so installed values are unchanged; fix the cause and rerun the upgrade: {}",
+                        truncate_reason(&host.redact(&format!("{error:#}")))
+                    ),
+                ));
+                return Ok(PhaseOutcome::Failed);
+            }
             if let Err(error) = host.apply_target(&opts.to) {
                 // A Helm render or apply error used to leave the checkpoint
                 // at migrate / in_progress (#3849). Store the same terminal
@@ -4392,8 +4410,10 @@ impl UpgradeDriver for LiveHost {
     fn drain_preflight_once(&mut self) -> Result<bool> {
         self.live_drain_preflight()
     }
+    fn prepare_apply(&mut self) -> Result<()> {
+        self.rebuild_repository_runners()
+    }
     fn apply_target(&mut self, to: &str) -> Result<()> {
-        self.rebuild_repository_runners()?;
         let fullname = self.release_fullname();
         let deployments =
             ["api", "worker", "ui"].map(|component| format!("{fullname}-{component}"));
