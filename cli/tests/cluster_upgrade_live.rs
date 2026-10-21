@@ -7446,6 +7446,148 @@ fn repository_runner_upgrade_resume_after_apply_does_not_rebuild_serving_receipt
     }
 }
 
+/// An operator who manages the full values document in a file passes the
+/// same `--values-file` to the resume. That file still carries the old base-A
+/// receipt, while Helm already serves the rebuilt receipt B. Apply is durable,
+/// so the resume must neither rebuild nor reapply, and its Canary must check
+/// the receipt the release actually serves.
+#[test]
+fn repository_runner_upgrade_resume_after_apply_with_full_values_file_passes_canary() {
+    let helm = Command::new("sh")
+        .args(["-c", "command -v helm"])
+        .output()
+        .unwrap();
+    assert!(
+        helm.status.success(),
+        "real Helm required to parse operator values"
+    );
+    let helm = String::from_utf8(helm.stdout).unwrap();
+    let before = repository_runner_upgrade_values();
+    let fixture = repository_runner_upgrade_fixture(&before);
+    let installed = repository_runner_installed_values(&fixture);
+    assert_eq!(
+        installed["factory"]["bindings"][0]["repos"][0]["runner"],
+        before["factory"]["bindings"][0]["repos"][0]["runner"],
+        "{installed}"
+    );
+    let file = fixture.0.path().join("operator-values.json");
+    fs::write(&file, installed.to_string()).unwrap();
+    let values_file = file.to_str().unwrap();
+
+    let first = fixture.run_with_env(
+        "healthy",
+        "0.9.0",
+        "charts/curie",
+        &["--values-file", values_file],
+        &[
+            ("VALUES_FILES_REAL_HELM", helm.trim()),
+            ("CURIE_UPGRADE_TEST_INTERRUPT_AFTER", "apply"),
+        ],
+    );
+    assert!(!first.status.success(), "{}", visible(&first));
+    assert!(
+        visible(&first).contains("interrupted after durable phase apply"),
+        "{}",
+        visible(&first)
+    );
+    assert_eq!(
+        repository_runner_build_calls(&fixture).len(),
+        1,
+        "{:?}",
+        fixture.argv()
+    );
+    assert_eq!(fixture.helm_upgrades().len(), 1, "{:?}", fixture.argv());
+    let checkpoint = fixture.last_record();
+    assert!(record_completed(&checkpoint, "apply"), "{checkpoint}");
+    let built_image = format!(
+        "{REPOSITORY_RUNNER_IMAGE}@{}",
+        repository_runner_digest('6')
+    );
+    let served = repository_runner_installed_values(&fixture);
+    assert_eq!(
+        served.pointer("/factory/bindings/0/repos/0/runner/image"),
+        Some(&Value::from(built_image.clone())),
+        "Helm must serve the rebuilt receipt B after the first run: {served}"
+    );
+
+    let calls_before_resume = fixture.argv().len();
+    let resumed = fixture.run_with_env(
+        "healthy",
+        "0.9.0",
+        "charts/curie",
+        &["--values-file", values_file],
+        &[("VALUES_FILES_REAL_HELM", helm.trim())],
+    );
+    assert!(resumed.status.success(), "{}", visible(&resumed));
+    let body = json(&resumed);
+    assert_eq!(body["resumed"], true, "{body}");
+    assert_eq!(body["status"], "succeeded", "{body}");
+    assert_eq!(body["canary"]["passed"], true, "{body}");
+    assert!(
+        !visible(&resumed).contains("but its retained runner receipt requires"),
+        "Canary compared the file's stale receipt A to served receipt B: {}",
+        visible(&resumed)
+    );
+    assert_eq!(
+        repository_runner_build_calls(&fixture).len(),
+        1,
+        "no rebuild after Helm served B: {:?}",
+        fixture.argv()
+    );
+    assert_eq!(
+        fixture.helm_upgrades().len(),
+        1,
+        "a durable Apply must not be reapplied: {:?}",
+        fixture.argv()
+    );
+    assert!(
+        fixture.argv()[calls_before_resume..]
+            .iter()
+            .any(|call| { argv_starts(call, &["kubectl", "-n", "ns", "get", SANDBOX_TEMPLATES]) }),
+        "the resumed canary must check serving repository templates"
+    );
+    assert_ownership_released(&fixture);
+}
+
+/// The chart schema accepts any digest-pinned repository for a catalog-only
+/// receipt, including a mirrored name. The rebuild still pushes to the
+/// builder's own `<registry>/curie-repo-runner` under the recorded registry.
+#[test]
+fn repository_runner_upgrade_rebuilds_catalog_receipt_with_custom_image_name() {
+    let mut before = repository_runner_upgrade_values();
+    before["factory"]["bindings"][0]["repos"][0]["runner"]["image"] = Value::from(format!(
+        "{REPOSITORY_RUNNER_REGISTRY}/mirrored-runner@{}",
+        repository_runner_digest('a')
+    ));
+    let fixture = repository_runner_upgrade_fixture(&before);
+    let output = fixture.local("healthy");
+    assert!(output.status.success(), "{}", visible(&output));
+    assert_eq!(json(&output)["status"], "succeeded", "{}", visible(&output));
+    assert_eq!(
+        repository_runner_build_calls(&fixture).len(),
+        1,
+        "{:?}",
+        fixture.argv()
+    );
+    assert_eq!(fixture.helm_upgrades().len(), 1, "{:?}", fixture.argv());
+
+    let applied = values_doc(&fixture.values(1));
+    let receipt = &applied["factory"]["bindings"][0]["repos"][0];
+    assert_eq!(receipt["path"], CATALOG_RUNNER_REPO, "{applied}");
+    let image = receipt["runner"]["image"]
+        .as_str()
+        .expect("rebuilt receipt image");
+    assert!(
+        image.starts_with(&format!("{REPOSITORY_RUNNER_IMAGE}@sha256:")),
+        "{applied}"
+    );
+    assert_eq!(
+        receipt["runner"]["base"],
+        index_digest(STOCK_BASE_INDEX),
+        "{applied}"
+    );
+}
+
 #[test]
 fn repository_runner_upgrade_known_good_rerun_does_not_resolve_or_rebuild() {
     let fixture = repository_runner_upgrade_fixture(&repository_runner_upgrade_values());
