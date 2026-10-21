@@ -28,7 +28,11 @@ reads as an escape hatch that silently does nothing (#488).
 
 from collections.abc import Iterable
 
-from .tool_names import CANVAS_READ_ONLY_TOOL_NAMES, CHANNEL_READ_TOOL_NAMES
+from .tool_names import (
+    CANVAS_READ_ONLY_TOOL_NAMES,
+    CHANNEL_READ_TOOL_NAMES,
+    STATE_READ_TOOL_NAMES,
+)
 
 # The platform's in-process approval-request tool (ADR-0010) is idempotent under
 # EVERY harness: it executes no real-world action (it only marks the turn
@@ -46,6 +50,8 @@ from .tool_names import CANVAS_READ_ONLY_TOOL_NAMES, CHANNEL_READ_TOOL_NAMES
 # through the platform, so a retry after one repeats no real-world action. The
 # canvas list and read tools (ADR 0200) only read too; ``edit_canvas_cell``
 # writes to the provider and is deliberately absent, so it stays a side effect.
+# The ``curie-state`` ``get`` and ``list`` tools only read the durable store; its
+# ``set``, ``append`` and ``delete`` change it and stay side effects.
 PLATFORM_IDEMPOTENT_TOOLS: frozenset[str] = (
     frozenset(
         {
@@ -57,6 +63,7 @@ PLATFORM_IDEMPOTENT_TOOLS: frozenset[str] = (
     )
     | CHANNEL_READ_TOOL_NAMES
     | CANVAS_READ_ONLY_TOOL_NAMES
+    | STATE_READ_TOOL_NAMES
 )
 
 # The Claude Code harness adapter's declared read-only tool set. Names match the
