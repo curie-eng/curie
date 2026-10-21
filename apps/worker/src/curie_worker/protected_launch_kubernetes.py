@@ -14,38 +14,24 @@ import json
 import re
 import ssl
 from dataclasses import dataclass, field
-from typing import Any, NoReturn, cast
+from typing import Any, cast
 from urllib.parse import quote, urlsplit
 
 import httpx
 
 from .protected_kubernetes_projection import Projection, extract_pod_projection
+from .protected_launch_documents import FINALIZER as FINALIZER
+from .protected_launch_documents import LaunchControlUnavailable as LaunchControlUnavailable
+from .protected_launch_documents import require as require
+from .protected_launch_documents import secret_document as secret_document
+from .protected_launch_documents import service_document as service_document
+from .protected_launch_documents import unavailable as unavailable
 from .protected_launch_records import IssuerPodBinding, canonical_json
 from .protected_launch_registry import TerminationObservation
 from .protected_substrate_facts import parse_kubernetes_runner_facts
 from .sandbox.types import SandboxHandle
 
-FINALIZER = "curietech.ai/protected-launch"
 OBSERVATION_CAP = 1048576
-
-
-class LaunchControlUnavailable(RuntimeError):
-    def __init__(self) -> None:
-        super().__init__("Protected launch control unavailable")
-
-
-def unavailable() -> NoReturn:
-    error = LaunchControlUnavailable()
-    try:
-        raise error from None
-    finally:
-        error.__context__ = None
-        error.__cause__ = None
-
-
-def require(condition: bool) -> None:
-    if not condition:
-        unavailable()
 
 
 def present[T](value: T | None) -> T:
@@ -405,33 +391,6 @@ async def observe_direct_pod(
         )
     except Exception:  # noqa: BLE001 - fixed fail-closed diagnostic
         unavailable()
-
-
-def secret_document(namespace: str, name: str, source: dict[str, str]) -> dict[str, Any]:
-    require(source.keys() == {"runner-token", "history-token", "model-credential"})
-    require(all(type(v) is str and v and len(v.encode()) <= 8192 for v in source.values()))
-    return {
-        "apiVersion": "v1",
-        "kind": "Secret",
-        "metadata": {"namespace": namespace, "name": name},
-        "type": "Opaque",
-        "immutable": True,
-        "data": {k: base64.b64encode(v.encode()).decode("ascii") for k, v in source.items()},
-    }
-
-
-def service_document(namespace: str, name: str, launch_id: str) -> dict[str, Any]:
-    return {
-        "apiVersion": "v1",
-        "kind": "Service",
-        "metadata": {"namespace": namespace, "name": name},
-        "spec": {
-            "type": "ClusterIP",
-            "clusterIP": "None",
-            "selector": {FINALIZER: launch_id},
-            "ports": [{"name": "http", "port": 8080, "targetPort": 8080, "protocol": "TCP"}],
-        },
-    }
 
 
 def sha256_text(value: str) -> str:

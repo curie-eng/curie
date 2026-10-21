@@ -197,6 +197,7 @@ source_modules = [
     "curie_worker.protected_kubernetes_projection",
     "curie_worker.protected_lane",
     "curie_worker.protected_launch_client",
+    "curie_worker.protected_launch_documents",
     "curie_worker.protected_launch_kubernetes",
     "curie_worker.protected_launch_mechanics",
     "curie_worker.protected_launch_records",
@@ -215,6 +216,7 @@ source_modules = [
     "curie_worker.protected_worker_bootstrap",
 ]
 forbidden_modules = [
+    "curie_worker.commissioning_control_admission",
     "curie_worker.commissioning_control_profile",
     "curie_worker.commissioning_control_slots",
 ]
@@ -223,6 +225,7 @@ forbidden_modules = [
 name = "The commissioning guard holds no launch authority"
 type = "forbidden"
 source_modules = [
+    "curie_worker.commissioning_control_admission",
     "curie_worker.commissioning_control_profile",
     "curie_worker.commissioning_control_slots",
 ]
@@ -232,6 +235,7 @@ forbidden_modules = [
     "curie_worker.protected_launch_mechanics",
     "curie_worker.protected_launch_server",
     "curie_worker.protected_launch_client",
+    "curie_worker.protected_launch_kubernetes",
     "curie_worker.protected_launch_registry",
 ]
 
