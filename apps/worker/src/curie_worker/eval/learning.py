@@ -800,7 +800,7 @@ def _check_cases(report: _Report) -> None:
         thread = argv[argv.index("--thread") + 1]
         _require(bool(THREAD_RE.fullmatch(thread)), "primary thread must be timestamp shaped")
         _require(invocation["cwd"] == data["output_dir"], "message cwd must be the output dir")
-        _require(invocation["exit_code"] == 0, "primary turn failed")
+        _require(invocation["exit_code"] == 0, f"{case['case_id']} primary turn failed")
         _require(case.get("reply_ref") == invocation["result_ref"], "reply binding")
         reply = _obj(report.value(case.get("reply_ref")).get("result"), "reply result")
         _require(reply.get("finalized") is True, f"{case['case_id']} did not finalize")
@@ -994,7 +994,7 @@ def _check_decisions(report: _Report, capabilities: Mapping[str, bool]) -> list[
         if status == "PASS":
             _require(expected in predicted, f"{case_id} passed without its class")
             _require(observation.get("deterministic") is True, f"{case_id} deterministic")
-            _require(observation.get("semantic", "PASS") == "PASS", f"{case_id} semantic")
+            _require(observation.get("semantic") == "PASS", f"{case_id} semantic")
         rows.append(row)
     _require(covered == set(report.cases), "every executed scenario needs a scored decision")
     missing = sorted(_required_decisions(report, capabilities) - seen)
@@ -1047,8 +1047,14 @@ def _check_judge_bindings(report: _Report, rows: list[dict[str, Any]]) -> None:
     }
     for row in rows:
         observation = report.value(row.get("evidence_ref"))
-        semantic = observation.get("semantic", "NOT_RUN")
-        if row["status"] == "NOT_AVAILABLE" or (semantic == "NOT_RUN" and "judge_ref" not in row):
+        _require("semantic" in observation, f"{row['case_id']} decision evidence lacks semantic")
+        semantic = observation["semantic"]
+        fixture = report.corpus[str(row["fixture_id"])]
+        spec = next(d for d in _fixture_decisions(fixture) if d["id"] == row["decision_id"])
+        # A decision with a fixture rubric that passed, or whose judge ran, binds its
+        # judge generation; a deterministic FAIL or ERROR before judging has none.
+        judged = bool(spec.get("rubric")) and (row["status"] == "PASS" or semantic != "NOT_RUN")
+        if row["status"] == "NOT_AVAILABLE" or not (judged or "judge_ref" in row):
             continue
         label = f"{row['case_id']} {row['decision_id']}"
         ref = _obj(row.get("judge_ref"), f"{label} judge reference")
@@ -1141,14 +1147,153 @@ def _verdict_failures(report: _Report, rows: list[dict[str, Any]]) -> list[str]:
         for row in rows
         if row["status"] in ("FAIL", "ERROR")
     ]
-    for raw in _lst(report.data.get("controls", []), "controls"):
+    for raw in _lst(report.data.get("controls"), "controls"):
         control = _obj(raw, "control")
         if control.get("status") in ("FAIL", "ERROR"):
             failures.append(
-                f"control {control.get('case_id')} {control.get('control')} is "
+                f"control {control.get('case_id')} {control.get('control_id')} is "
                 f"{control.get('status')}"
             )
     return failures
+
+
+# Controls whose outcome is an inventoried section of its own, so they carry no
+# separate control record requirement: the procedure probes, the consent
+# decisions, the memory negative and the delivery rows.
+AUX_CONTROLS = frozenset(
+    {"removed-skill", "consent", "deleted-fact", "real-clock-delivery", "cancelled-one-shot"}
+)
+# Required only when agent-scope memory is absent, which it never is on this base.
+UNINVENTORIED_CONTROLS = frozenset({"channel-fact-if-agent-scope-absent"})
+CONTROL_FIELDS = frozenset(
+    {"repetition", "case_id", "agent_id", "fixture_id", "control_id", "status", "evidence_ref"}
+)
+
+
+def _control_check(check: Mapping[str, Any]) -> bool:
+    """Recompute one recorded control check from the observation it carries."""
+
+    kind = check.get("kind")
+    if kind == "suffix":
+        return str(check["reply"]).rstrip().endswith(_text(check["expected_suffix"], "suffix"))
+    if kind == "contains":
+        return _text(check["expected"], "expected") in str(check["reply"])
+    if kind == "unchanged":
+        return not _state_diff(check["before"], check["after"])
+    if kind == "instruction-step":
+        rows = [_obj(r, "instruction row") for r in _lst(check["rows"], "instruction rows")]
+        identity, markers = check["identity"], _lst(check["markers"], "markers")
+        head = next((r for r in rows if identity is not None and str(r["id"]) == identity), None)
+        statement = "" if head is None else str(head.get("statement", ""))
+        others = [
+            r
+            for r in rows
+            if str(r["id"]) != identity
+            and any(str(m) in str(r.get("statement", "")) for m in markers)
+        ]
+        before = check["version_before"]
+        return (
+            head is not None
+            and str(check["want"]) in statement
+            and str(check["gone"]) not in statement
+            and _is_int(before)
+            and _is_int(head.get("version"))
+            and head["version"] > before
+            and not others
+        )
+    if kind == "revised-in-place":
+        original = _lst(check["original"], "original schedules")
+        revised = _lst(check["revised"], "revised schedules")
+        return (
+            len(original) == 1
+            and len(revised) == 1
+            and revised[0]["id"] == original[0]["id"]
+            and revised[0].get("cron") == check["revised_cron"]
+        )
+    if kind == "cancelled":
+        return (
+            bool(check["original_ids"])
+            and check["active_matches"] == 0
+            and (
+                check["final_state"] == "cancelled"
+                or (check["final_state"] is None and check["final_source"] == "absent")
+            )
+        )
+    if kind == "same-new-revision":
+        heads = _lst(check["before"], "skills before")
+        restored = _lst(check["after"], "skills after")
+        return (
+            len(heads) == 1
+            and len(restored) == 1
+            and restored[0]["id"] == heads[0]["id"]
+            and int(restored[0].get("revision", 0)) > int(heads[0].get("revision", 0))
+        )
+    if kind == "single-value":
+        rows = _lst(check["rows"], "fact rows")
+        return len(rows) == 1 and _text(check["value"], "value") in str(rows[0]["statement"])
+    if kind == "aux":
+        return check.get("section") in ("procedure_probes", "memory_negative", "deliveries")
+    # An "observed" check records a failure the harness saw (for example a failed
+    # CLI read); it can never support a PASS.
+    return False
+
+
+def _required_controls(
+    report: _Report, capabilities: Mapping[str, bool]
+) -> set[tuple[int, str, str]]:
+    """Every fixture control of every executed case whose capabilities are available."""
+
+    required: set[tuple[int, str, str]] = set()
+    for (repetition, case_id), case in report.cases.items():
+        fixture = report.corpus[case["fixture_id"]]
+        if not all(capabilities.get(str(k), False) for k in fixture.get("requires", [])):
+            continue
+        for control in fixture.get("controls", []):
+            control_id = str(control["id"])
+            if control_id not in AUX_CONTROLS | UNINVENTORIED_CONTROLS:
+                required.add((repetition, case_id, control_id))
+    return required
+
+
+def _check_controls(report: _Report, capabilities: Mapping[str, bool]) -> None:
+    live = report.data.get("data_origin") == "live-campaign"
+    seen: set[tuple[int, str, str]] = set()
+    for raw in _lst(report.data.get("controls"), "controls"):
+        row = _obj(raw, "control")
+        _require(set(row) == CONTROL_FIELDS, "control record fields")
+        case = report.scope_case(row)
+        _require(row["fixture_id"] == case["fixture_id"], "control fixture")
+        fixture = report.corpus[case["fixture_id"]]
+        allowed = {str(c["id"]) for c in fixture.get("controls", [])} | {
+            str(p["id"]) for p in fixture.get("probes", [])
+        }
+        control_id = _text(row["control_id"], "control id")
+        _require(control_id in allowed, f"{control_id} is not a fixture control or probe")
+        identity = (int(row["repetition"]), str(row["case_id"]), control_id)
+        _require(identity not in seen, f"duplicate control {identity}")
+        seen.add(identity)
+        status = row["status"]
+        _require(status in ("PASS", "FAIL", "ERROR", "NOT_AVAILABLE"), "control status")
+        observation = report.value(row["evidence_ref"], "control-observation")
+        _same_scope(observation, row, "control evidence")
+        _require(observation.get("control_id") == control_id, "control evidence binding")
+        _require(observation.get("status") == status, "control evidence status")
+        if status == "NOT_AVAILABLE":
+            _require(
+                not all(capabilities.get(str(k), False) for k in fixture.get("requires", [])),
+                f"{control_id} is unavailable without capability absence",
+            )
+            continue
+        if live or "checks" in observation:
+            checks = _lst(observation.get("checks"), f"{control_id} checks")
+            if status in ("PASS", "FAIL"):
+                passed = bool(checks) and all(_control_check(_obj(c, "check")) for c in checks)
+                _require(
+                    status == ("PASS" if passed else "FAIL"),
+                    f"{control_id} status is not recomputable from its observation",
+                )
+    missing = sorted(_required_controls(report, capabilities) - seen)
+    _require(not missing, f"fixture-derived controls are missing: {missing[:3]}")
 
 
 def _check_metrics(report: _Report, rows: list[dict[str, Any]]) -> list[str]:
@@ -1244,11 +1389,10 @@ def _check_generations_and_accounting(report: _Report) -> None:
         )
         if status == "unresolved":
             _require(amount == reserve, f"unknown-cost {identity} must keep its full reservation")
-            if "charged_usd" in operation:
-                _require(
-                    _decimal(operation.get("charged_usd"), "charged") == reserve,
-                    f"unknown-cost {identity} must stay charged at its full reservation",
-                )
+            _require(
+                _decimal(operation.get("charged_usd"), "charged") == reserve,
+                f"unknown-cost {identity} must stay charged at its full reservation",
+            )
         if status == "released":
             _require(amount == 0, f"released {identity} carries a charge")
             _require(
@@ -1256,6 +1400,15 @@ def _check_generations_and_accounting(report: _Report) -> None:
                 f"released {identity} is bound to a generation",
             )
         if status == "settled" and identity.startswith("actor-"):
+            # R4-1: only a turn that exited 0 and finalized may settle.
+            turn = report.invocation(operation.get("invocation_id"))
+            reply = report.value(turn["result_ref"]).get("result")
+            _require(
+                turn["exit_code"] == 0
+                and isinstance(reply, dict)
+                and reply.get("finalized") is True,
+                f"{identity} settled although its turn did not exit 0 and finalize",
+            )
             _check_actor_settlement(
                 operation, _decimal(accounting.get("baseline_usage_usd"), "baseline usage")
             )
@@ -1912,6 +2065,7 @@ def _report_checks(report: _Report) -> list[str]:
     _check_generations_and_accounting(report)
     _check_worker_and_schedules(report)
     _check_judge_bindings(report, rows)
+    _check_controls(report, capabilities)
     _check_collector_and_cleanup(report)
     failures += _check_procedures(report, capabilities["skill"])
     failures += _check_negative(report)
@@ -1973,6 +2127,10 @@ SHUTDOWN_RESERVE = Decimal("0.10")
 # fresh session can spend the whole cap: every actor turn and every expected
 # scheduled fire reserves the full cap plus one priced final-generation overshoot.
 AGENT_DAILY_USD = Decimal("0.75")
+# Lowered before a scenario's schedules can fire; it bounds each fire's session.
+FIRE_DAILY_USD = Decimal("0.15")
+FIRE_OUTPUT_TOKENS = 2000
+FIRE_CAP_MARGIN_SECONDS = 120
 AGENT_OUTPUT_TOKENS = 8000
 ACTOR_PROMPT_TOKENS_BOUND = 60000
 JUDGE_PROMPT_CHARS_PER_TOKEN = 2
@@ -2107,7 +2265,7 @@ class _Ledger:
         self._db.execute(
             "CREATE TABLE IF NOT EXISTS operations (id TEXT PRIMARY KEY, purpose TEXT, "
             "reserve TEXT, settled TEXT, status TEXT, generation_id TEXT, scope TEXT, "
-            "record_id TEXT, usage_polls TEXT)"
+            "record_id TEXT, usage_polls TEXT, meta TEXT)"
         )
         self._db.commit()
         self.budget = budget
@@ -2125,6 +2283,16 @@ class _Ledger:
             statuses,
         ).fetchall()
         return sum((Decimal(row[0]) for row in rows), Decimal(0))
+
+    def bind_record(self, identity: str, record: str) -> None:
+        self._db.execute("UPDATE operations SET record_id = ? WHERE id = ?", (record, identity))
+        self._db.commit()
+
+    def charge_of(self, identity: str) -> str:
+        row = self._db.execute(
+            "SELECT settled FROM operations WHERE id = ?", (identity,)
+        ).fetchone()
+        return str(row[0])
 
     def hold_unresolved(self, identity: str, reason: str) -> None:
         """Keep a reservation whose outcome can no longer be observed charged in
@@ -2167,7 +2335,7 @@ class _Ledger:
         self.sequence += 1
         identity = f"{purpose}-operation-{self.sequence}"
         self._db.execute(
-            "INSERT INTO operations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO operations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 identity,
                 purpose,
@@ -2178,6 +2346,7 @@ class _Ledger:
                 json.dumps(dict(scope)),
                 "",
                 "",
+                "{}",
             ),
         )
         self._db.commit()
@@ -2221,6 +2390,27 @@ class _Ledger:
         )
         self._db.commit()
         return str(settled)
+
+    def annotate(self, identity: str, **fields: Any) -> None:
+        """Attach report-visible facts to an operation (its invocation, finalization)."""
+
+        row = self._db.execute("SELECT meta FROM operations WHERE id = ?", (identity,)).fetchone()
+        meta = {**json.loads(row[0] or "{}"), **fields}
+        self._db.execute(
+            "UPDATE operations SET meta = ? WHERE id = ?", (json.dumps(meta), identity)
+        )
+        self._db.commit()
+
+    def resize(self, identity: str, reserve: Decimal, reason: str) -> None:
+        """Lower a still-held reservation once a smaller native cap bounds its work."""
+
+        self._db.execute(
+            "UPDATE operations SET reserve = ? WHERE id = ? AND status = 'reserved' "
+            "AND CAST(reserve AS REAL) > ?",
+            (str(reserve), identity, float(reserve)),
+        )
+        self._db.commit()
+        self.notes.append(f"{_now()} {identity} reservation lowered to {reserve}: {reason}")
 
     def fits(self, reserve: Decimal) -> bool:
         """Whether one more reservation fits the budget, without closing admission."""
@@ -2295,8 +2485,8 @@ class _Ledger:
 
     def operations(self) -> list[dict[str, Any]]:
         rows = self._db.execute(
-            "SELECT id, generation_id, reserve, settled, status, record_id, purpose, usage_polls "
-            "FROM operations ORDER BY rowid"
+            "SELECT id, generation_id, reserve, settled, status, record_id, purpose, usage_polls, "
+            "meta FROM operations ORDER BY rowid"
         ).fetchall()
         return [
             {
@@ -2309,6 +2499,7 @@ class _Ledger:
                 "charged_usd": r[3],
                 "status": r[4],
                 **({"usage_polls": json.loads(r[7])} if r[7] else {}),
+                **json.loads(r[8] or "{}"),
             }
             for r in rows
         ]
@@ -3150,6 +3341,64 @@ class _Campaign:
         for operation in self.unbound_fires.pop(agent, []):
             self.release_fire(operation, "the CLI shows no schedule created for it")
 
+    def lower_fire_cap(self, scope: Mapping[str, Any]) -> None:
+        """After the scenario's last ordinary turn, lower the agent's native cap so it
+        bounds every pending fire's session, read it back, then hold each fire due
+        later than the margin at that cap plus the overshoot. A fire due sooner, or
+        whose due time is unknown, keeps its full-cap reservation."""
+
+        assert self.ledger is not None
+        agent = str(scope["agent_id"])
+        held = {
+            sid: op
+            for (owner, sid), op in self.bound_fires.items()
+            if owner == agent and op in self.open_fires
+        }
+        if not held:
+            return
+        bare = {k: scope[k] for k in ("repetition", "case_id", "agent_id")}
+        caps = _obj(
+            self.must(
+                [
+                    "local",
+                    "budget",
+                    agent,
+                    "--limit",
+                    str(FIRE_DAILY_USD),
+                    "--output-tokens",
+                    str(FIRE_OUTPUT_TOKENS),
+                ],
+                bare,
+            ),
+            "budget",
+        )
+        cap = caps.get("max_usd_per_day")
+        if (
+            not isinstance(cap, (int, float, str))
+            or Decimal(str(cap)) != FIRE_DAILY_USD
+            or caps.get("max_output_tokens_per_run") != FIRE_OUTPUT_TOKENS
+        ):
+            raise _Stop(f"the lowered fire budget did not read back: {json.dumps(caps)}")
+        lowered_at = datetime.now(UTC)
+        self.agent_caps.setdefault(agent, {})["fire_cap"] = {
+            "max_usd_per_day": str(cap),
+            "max_output_tokens_per_run": FIRE_OUTPUT_TOKENS,
+            "lowered_at": _now(),
+        }
+        due = {
+            str(item["schedule_id"]): item["row"].get("run_at")
+            for item in self.pending
+            if item["scope"]["agent_id"] == agent
+        }
+        reserve = FIRE_DAILY_USD + self.overshoot()
+        for schedule_id, operation in held.items():
+            run_at = due.get(schedule_id)
+            if not isinstance(run_at, str) or not run_at.endswith("Z"):
+                continue
+            if _utc(run_at, "run_at") <= lowered_at + timedelta(seconds=FIRE_CAP_MARGIN_SECONDS):
+                continue
+            self.ledger.resize(operation, reserve, f"native cap lowered before {schedule_id} fires")
+
     def close_fires(self, reason: str) -> None:
         """A stack going down can no longer fire; an unobserved fire stays charged."""
 
@@ -3691,6 +3940,7 @@ class _Campaign:
                 break
             # The child failed binding its stub on B before it enqueued anything:
             # a proven pre-dispatch failure, so no paid work exists to charge.
+            self.ledger.annotate(operation, invocation_id=invocation, finalized=False)
             self.ledger.release(operation, "the message child could not bind the Slack stub")
             if attempt == 2:
                 # Only an unrecovered failure (the retry failed too) is a bind error.
@@ -3714,7 +3964,17 @@ class _Campaign:
             self.recovered_bind_retries += 1
         # The provider gives the harness no per-turn generation id for runner
         # traffic, so the row is labeled by its configured route, not an invented id.
-        settled = self.ledger.settle_stable(operation, before, record=operation)
+        result = parsed if isinstance(parsed, dict) else {}
+        finalized = code == 0 and result.get("finalized") is True
+        self.ledger.annotate(operation, invocation_id=invocation, finalized=finalized)
+        if finalized:
+            settled = self.ledger.settle_stable(operation, before, record=operation)
+        else:
+            # A failed or timed-out turn may still be running in the worker, so equal
+            # usage polls prove nothing: its full reservation stays charged.
+            self.ledger.hold_unresolved(operation, "the turn did not exit 0 and finalize")
+            self.ledger.bind_record(operation, operation)
+            settled = self.ledger.charge_of(operation)
         self.generations.append(
             {
                 "id": operation,
@@ -3736,8 +3996,7 @@ class _Campaign:
                 **bare,
             }
         )
-        result = parsed if isinstance(parsed, dict) else {}
-        if code != 0 or result.get("finalized") is not True:
+        if not finalized:
             self.failures.append(f"{scope['case_id']} turn did not finalize: {stderr[-300:]}")
         self.sweep_schedules(scope)
         return {
@@ -4149,20 +4408,43 @@ class _Campaign:
         if control is not None:
             control(scope, fixture, agent_id, thread, after, values)
         self.reconcile_fires(scope)
+        self.lower_fire_cap(scope)
 
     def record_control(
-        self, scope: Mapping[str, Any], control: str, status: str, detail: str
+        self,
+        scope: Mapping[str, Any],
+        control: str,
+        status: str | None,
+        detail: str,
+        checks: Sequence[Mapping[str, Any]] = (),
     ) -> None:
+        """One fixture-derived control record bound to a control-observation whose
+        checks recompute its status. ``status`` None derives PASS or FAIL from the
+        checks; NOT_AVAILABLE and ERROR are recorded as given."""
+
+        bare = {k: scope[k] for k in ("repetition", "case_id", "agent_id")}
+        recorded = [dict(c) for c in checks]
+        if status is None:
+            passed = bool(recorded) and all(_control_check(c) for c in recorded)
+            status = "PASS" if passed else "FAIL"
+        evidence = self.add(
+            "control-observation",
+            {**bare, "control_id": control, "status": status, "detail": detail, "checks": recorded},
+        )
         self.controls.append(
             {
-                **{k: scope[k] for k in ("repetition", "case_id", "agent_id")},
-                "control": control,
+                **bare,
+                "fixture_id": str(scope["case_id"]).rsplit("-R", 1)[0],
+                "control_id": control,
                 "status": status,
-                "detail": detail,
+                "evidence_ref": evidence,
             }
         )
         if status in ("FAIL", "ERROR"):
             self.failures.append(f"{scope['case_id']} control {control}: {detail}")
+
+    def observed(self, reason: str) -> dict[str, Any]:
+        return {"kind": "observed", "reason": reason}
 
     def find(
         self, state: Mapping[str, Any], store: str, field_name: str, needle: str
@@ -4180,15 +4462,19 @@ class _Campaign:
         values: Mapping[str, str],
     ) -> None:
         if not self.available("instruction"):
-            self.record_control(
-                scope,
-                "instruction-controls",
-                "NOT_AVAILABLE",
-                "instruction capability is absent; correction not exercised",
-            )
+            for item in fixture["controls"]:
+                self.record_control(
+                    scope, str(item["id"]), "NOT_AVAILABLE", "instruction capability is absent"
+                )
             return
         for probe in fixture.get("probes", []):
-            self.suffix_probe(scope, probe)
+            self.record_control(
+                scope,
+                str(probe["id"]),
+                None,
+                "fresh-thread reply convention",
+                [self.suffix_probe(scope, probe)],
+            )
         correction = next(
             (c for c in fixture["controls"] if c.get("id") == "instruction-correction"), None
         )
@@ -4200,25 +4486,27 @@ class _Campaign:
         if conflict is not None:
             before = self.snapshot(scope)[0]
             sent = self.message(scope, str(conflict["input"]), self.channels[0], self.new_thread())
-            changed = sorted(_state_diff(before, self.snapshot(scope)[0]))
+            after_state = self.snapshot(scope)[0]
+            changed = sorted(_state_diff(before, after_state))
             self.record_control(
                 scope,
                 "conflicting-request",
-                "FAIL" if changed else "PASS",
+                None,
                 f"durable changes {json.dumps(changed)}; reply: {_excerpt(sent['reply'])}",
+                [{"kind": "unchanged", "before": before, "after": after_state}],
             )
 
-    def suffix_probe(self, scope: Mapping[str, Any], probe: Mapping[str, Any]) -> None:
+    def suffix_probe(self, scope: Mapping[str, Any], probe: Mapping[str, Any]) -> dict[str, Any]:
         """A fresh thread on the probe's channel, so the reply reflects boot memory."""
 
         sent = self.message(scope, str(probe["input"]), str(probe["channel"]), self.new_thread())
-        ok = sent["reply"].rstrip().endswith(str(probe["expected_suffix"]))
-        self.record_control(
-            scope,
-            str(probe["id"]),
-            "PASS" if ok else "FAIL",
-            f"fresh-thread reply convention; reply: {_excerpt(sent['reply'])}",
-        )
+        return {
+            "kind": "suffix",
+            "probe_id": str(probe["id"]),
+            "reply": sent["reply"],
+            "expected_suffix": str(probe["expected_suffix"]),
+            "invocation_id": sent["invocation_id"],
+        }
 
     def instruction_correction(
         self,
@@ -4245,6 +4533,8 @@ class _Campaign:
         identity = str(found[0]["id"]) if len(found) == 1 else None
         version = found[0].get("version") if len(found) == 1 else None
         probes = {int(p["after_message"]): p for p in control.get("probes", [])}
+        checks: list[dict[str, Any]] = []
+        notes: list[str] = []
         for index, text in enumerate(control["messages"]):
             self.message(scope, str(text), self.channels[0], thread)
             rows = instructions(self.snapshot(scope)[0])
@@ -4266,20 +4556,30 @@ class _Campaign:
                 and isinstance(head.get("version"), int)
                 and head["version"] > version
             )
-            ok = identity is not None and want in statement and gone not in statement
-            ok = ok and raised and not others
-            self.record_control(
-                scope,
-                f"instruction-correction-{'change' if index == 0 else 'undo'}",
-                "PASS" if ok else "FAIL",
-                f"identity {identity} kept {head is not None}, version {version} -> "
+            del raised
+            checks.append(
+                {
+                    "kind": "instruction-step",
+                    "step": "change" if index == 0 else "undo",
+                    "rows": rows,
+                    "identity": identity,
+                    "version_before": version,
+                    "want": want,
+                    "gone": gone,
+                    "markers": [original, corrected],
+                }
+            )
+            notes.append(
+                f"{'change' if index == 0 else 'undo'}: identity {identity} kept "
+                f"{head is not None}, version {version} -> "
                 f"{None if head is None else head.get('version')}, statement "
-                f"{_excerpt(statement)!r}, other instructions {json.dumps(others)}",
+                f"{_excerpt(statement)!r}, other instructions {json.dumps(others)}"
             )
             if head is not None:
                 version = head.get("version")
             if index in probes:
-                self.suffix_probe(scope, probes[index])
+                checks.append(self.suffix_probe(scope, probes[index]))
+        self.record_control(scope, "instruction-correction", None, "; ".join(notes), checks)
 
     def control_procedure(
         self,
@@ -4292,23 +4592,18 @@ class _Campaign:
     ) -> None:
         if not self.available("skill"):
             self.record_control(
-                scope,
-                "removed-skill",
-                "NOT_AVAILABLE",
-                "learned skills are absent; no item to remove",
+                scope, "removed-skill", "NOT_AVAILABLE", "learned skills are absent"
             )
             return
         bare = {k: scope[k] for k in ("repetition", "case_id", "agent_id")}
         control = next(c for c in fixture["controls"] if c.get("id") == "removed-skill")
         heads = self.find(after[0], "skills", "slug", str(fixture["subject"]))
         if len(heads) != 1:
-            self.record_control(
-                scope,
-                "removed-skill",
-                "FAIL",
-                f"no single learned skill; skills observed: "
-                f"{json.dumps([(r.get('id'), r.get('slug')) for r in after[0].get('skills', [])])}",
+            detail = (
+                "no single learned skill; skills observed: "
+                f"{json.dumps([(r.get('id'), r.get('slug')) for r in after[0].get('skills', [])])}"
             )
+            self.record_control(scope, "removed-skill", "FAIL", detail, [self.observed(detail)])
             return
         skill_id = str(heads[0]["id"])
         probes = {str(p["id"]): p for p in fixture["probes"]}
@@ -4322,7 +4617,13 @@ class _Campaign:
                     ["local", "skills", str(scope["agent_id"]), "delete", skill_id], bare
                 )
                 if code != 0:
-                    self.record_control(scope, "removed-skill", "FAIL", f"delete: {stderr}")
+                    self.record_control(
+                        scope,
+                        "removed-skill",
+                        "FAIL",
+                        f"delete: {stderr}",
+                        [self.observed("delete")],
+                    )
                     return
             probe = probes[str(probe_id)]
             before_state = self.snapshot(scope)[0]
@@ -4363,7 +4664,13 @@ class _Campaign:
         for row in self.procedure_rows[-2:]:
             for ref in row["probe_ids"]:
                 self.evidence[ref]["value"]["deletion_invocation"] = deletion
-        self.record_control(scope, "removed-skill", "PASS", "probes recorded; gate recomputed")
+        self.record_control(
+            scope,
+            "removed-skill",
+            None,
+            "probes recorded; the gate is recomputed from procedure_probes",
+            [{"kind": "aux", "section": "procedure_probes"}],
+        )
 
     def retention_probe(
         self, scope: Mapping[str, Any], fact_id: str, value: str, text: str, agent_id: str
@@ -4426,12 +4733,18 @@ class _Campaign:
         subject = str(fixture["subject"])
         recall = fixture["probes"][0]
         sent = self.message(scope, str(recall["input"]), self.channels[1], self.new_thread())
-        ok = str(recall["required_value"]) in sent["reply"]
         self.record_control(
             scope,
             "cross-channel-retention",
-            "PASS" if ok else "FAIL",
+            None,
             f"fresh thread on the second channel; reply: {_excerpt(sent['reply'])}",
+            [
+                {
+                    "kind": "contains",
+                    "reply": sent["reply"],
+                    "expected": str(recall["required_value"]),
+                }
+            ],
         )
         correction = next(c for c in fixture["controls"] if c.get("id") == "fact-correction")
         self.message(scope, str(correction["messages"][0]), self.channels[0], thread)
@@ -4441,13 +4754,13 @@ class _Campaign:
             for f in self.find(state, "facts", "statement", subject)
             if f.get("archived") is not True
         ]
-        corrected = len(live) == 1 and values["corrected_value"] in str(live[0]["statement"])
         self.record_control(
             scope,
             "fact-correction",
-            "PASS" if corrected else "FAIL",
+            None,
             f"{len(live)} active facts for the subject after correction: "
             f"{json.dumps([(f.get('id'), f.get('scope'), f.get('statement')) for f in live])}",
+            [{"kind": "single-value", "rows": live, "value": values["corrected_value"]}],
         )
         if not live:
             return
@@ -4462,7 +4775,9 @@ class _Campaign:
             args += ["--channel", f"{channel['kind']}={channel['address']}"]
         code, _, invocation, result_ref, stderr = self.cli(args, bare)
         if code != 0:
-            self.record_control(scope, "deleted-fact", "FAIL", f"delete: {stderr}")
+            self.record_control(
+                scope, "deleted-fact", "FAIL", f"delete: {stderr}", [self.observed("delete")]
+            )
         after_ref = self.retention_probe(scope, fact_id, required, text, agent_id)
         record = next(r for r in self.invocations if r["invocation_id"] == invocation)
         self.negative_rows.append(
@@ -4492,9 +4807,10 @@ class _Campaign:
         values: Mapping[str, str],
     ) -> None:
         if not self.available("schedule"):
-            self.record_control(
-                scope, "real-clock-delivery", "NOT_AVAILABLE", "agent schedules are absent"
-            )
+            for item in fixture["controls"]:
+                self.record_control(
+                    scope, str(item["id"]), "NOT_AVAILABLE", "agent schedules are absent"
+                )
             return
         created = _now()
         token = values["schedule_token"]
@@ -4509,13 +4825,13 @@ class _Campaign:
             self.bind_fire(scope, str(made[0]["id"]))
         self.message(scope, str(cancel["messages"][1]), self.channels[0], thread)
         if len(due) != 1 or len(made) != 1:
-            self.record_control(
-                scope,
-                "real-clock-delivery",
-                "FAIL",
+            detail = (
                 "the due or cancelled one-shot schedule was not created; observed due "
                 f"{json.dumps([(r.get('id'), r.get('state'), r.get('run_at')) for r in due])}, "
-                f"cancel-target {json.dumps([(r.get('id'), r.get('state')) for r in made])}",
+                f"cancel-target {json.dumps([(r.get('id'), r.get('state')) for r in made])}"
+            )
+            self.record_control(
+                scope, "real-clock-delivery", "FAIL", detail, [self.observed(detail)]
             )
             return
         bare = {k: scope[k] for k in ("repetition", "case_id", "agent_id")}
@@ -4589,7 +4905,11 @@ class _Campaign:
         )
         if source == "error":
             self.record_control(
-                scope, "revise-and-cancel", "ERROR", "the schedule read after cancel failed"
+                scope,
+                "revise-and-cancel",
+                "ERROR",
+                "the schedule read after cancel failed",
+                [self.observed("schedule read failed")],
             )
             return
         if cancelled:
@@ -4605,9 +4925,24 @@ class _Campaign:
         self.record_control(
             scope,
             "revise-and-cancel",
-            "PASS" if same and cancelled else "FAIL",
+            None,
             f"revised in place {same}, cancelled {cancelled}; observed {json.dumps(observed)}; "
             f"cancel reply: {_excerpt(sent['reply'])}",
+            [
+                {
+                    "kind": "revised-in-place",
+                    "original": original,
+                    "revised": revised,
+                    "revised_cron": control["revised_cron"],
+                },
+                {
+                    "kind": "cancelled",
+                    "original_ids": [r["id"] for r in original],
+                    "final_state": state,
+                    "final_source": source,
+                    "active_matches": len(live),
+                },
+            ],
         )
 
     def control_correction(
@@ -4625,12 +4960,12 @@ class _Campaign:
         probes = {str(p["id"]): p for p in fixture["probes"]}
         corrected = probes["corrected-procedure"]
         sent = self.message(scope, str(corrected["input"]), self.channels[0], self.new_thread())
-        ok = str(corrected["expected"]) in sent["reply"]
         self.record_control(
             scope,
             "corrected-procedure",
-            "PASS" if ok else "FAIL",
+            None,
             f"fresh-thread probe after correction; reply: {_excerpt(sent['reply'])}",
+            [{"kind": "contains", "reply": sent["reply"], "expected": str(corrected["expected"])}],
         )
         heads = self.find(after[0], "skills", "slug", str(fixture["subject"]))
         revert = next(c for c in fixture["controls"] if c.get("id") == "revert")
@@ -4642,22 +4977,24 @@ class _Campaign:
             and restored[0]["id"] == heads[0]["id"]
             and int(restored[0].get("revision", 0)) > int(heads[0].get("revision", 0))
         )
+        del same
         self.record_control(
             scope,
             "revert",
-            "PASS" if same else "FAIL",
+            None,
             "same immutable skill with a new revision; before "
             f"{json.dumps([(r.get('id'), r.get('revision')) for r in heads])}, after "
             f"{json.dumps([(r.get('id'), r.get('revision')) for r in restored])}",
+            [{"kind": "same-new-revision", "before": heads, "after": restored}],
         )
         probe = probes["restored-procedure"]
         sent = self.message(scope, str(probe["input"]), self.channels[0], self.new_thread())
-        ok = str(probe["expected"]) in sent["reply"]
         self.record_control(
             scope,
             "restored-procedure",
-            "PASS" if ok else "FAIL",
+            None,
             f"fresh-thread probe after revert; reply: {_excerpt(sent['reply'])}",
+            [{"kind": "contains", "reply": sent["reply"], "expected": str(probe["expected"])}],
         )
 
     def schedule_row(
@@ -4915,6 +5252,8 @@ class _Campaign:
                 "local overrides, local memory --guidance-from, ordinary local message turns, "
                 "CLI state reads, controls",
                 "real-clock delivery observation",
+                "channel-fact-if-agent-scope-absent is skipped: it applies only when agent-scope "
+                "memory is absent, and this base always has agent scope",
                 "local down --wipe --yes",
                 "ownership absence check",
             ],
