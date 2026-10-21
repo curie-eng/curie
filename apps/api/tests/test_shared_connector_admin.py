@@ -17,6 +17,7 @@ connection made as the generated role.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -114,6 +115,17 @@ FUNCTION_SIGNATURES = (
     "curie.shared_connector_refresh_commit(text, uuid, bigint, text, bytea)",
     "curie.shared_connector_refresh_mark_recovery(text, uuid, bigint)",
     "curie.shared_connector_reseal(uuid, bigint, text, text, bytea)",
+)
+# The Curve25519 small-order points libsodium refuses (RFC 7748 section 6.1 and the
+# non-canonical encodings of 0 and 1) other than the all-zero key. A sealed box to
+# any of them has a shared secret an attacker can compute without a private key.
+LOW_ORDER_X25519_KEYS = (
+    "0100000000000000000000000000000000000000000000000000000000000000",
+    "e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800",
+    "5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157",
+    "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+    "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+    "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
 )
 
 
@@ -797,6 +809,77 @@ def test_malformed_requests_never_echo_secret_material(store: SharedStore) -> No
         assert sentinel not in response.text
 
 
+def _with_unknown_key(body: dict[str, Any], key: str, *path: str | int) -> dict[str, Any]:
+    """A copy of ``body`` with ``{key: "x"}`` merged into the object found at ``path``."""
+
+    mutated = copy.deepcopy(body)
+    target: Any = mutated
+    for step in path:
+        target = target[step]
+    target[key] = "x"
+    return mutated
+
+
+@pytest.mark.parametrize(
+    ("route", "path"),
+    [
+        ("binding-import", ()),
+        ("binding-import", ("credential",)),
+        ("binding-import", ("source",)),
+        ("membership-put", ()),
+        ("membership-put", ("aliases", 0)),
+        ("database-status", ()),
+    ],
+    ids=[
+        "binding-import",
+        "binding-import-credential",
+        "binding-import-source",
+        "membership-put",
+        "membership-put-alias",
+        "database-status",
+    ],
+)
+def test_an_unknown_key_named_like_a_secret_is_never_echoed_in_a_422(
+    store: SharedStore, route: str, path: tuple[str | int, ...]
+) -> None:
+    """A rejected key NAME is request input too: pydantic reports it in the error ``loc``.
+
+    Liveness: the same body without the extra key is accepted right after the refusal.
+    """
+
+    application_id = store.register_application()["application_id"]
+    recipient = store.register_recipient(application_id)
+    agent_id = store.create_agent()
+    valid: dict[str, Any]
+    send = store.operator
+    if route == "binding-import":
+        method, accepted_status = "POST", 201
+        route_path = f"/applications/{application_id}/bindings"
+        valid = store.binding_body(agent_id, recipient, _credential(), source=_source())
+    elif route == "membership-put":
+        method, accepted_status = "PUT", 200
+        route_path = f"/applications/{application_id}/members/{agent_id}"
+        valid = {"aliases": [{"alias": "primary", "tools": None}]}
+    else:
+        store.provision_bundled(application_id, recipient)
+        send = store.worker
+        method, accepted_status = "PUT", 200
+        route_path = f"/applications/{application_id}/database/status"
+        valid = {"status": "ready", "reason": None, "dsn_revision": 1}
+    sentinel = f"sk-live-LOC-SENTINEL-{secrets.token_hex(8)}"
+
+    refused = send(method, route_path, _with_unknown_key(valid, sentinel, *path))
+    assert_redacted_422(refused, sentinel)
+    assert_no_store(refused)
+    assert sentinel not in json.dumps(dict(refused.headers))
+    assert sentinel not in shared_table_text()
+    assert _memberships(application_id, agent_id) == {}
+
+    accepted = send(method, route_path, valid)
+    assert accepted.status_code == accepted_status, accepted.text
+    assert_no_store(accepted)
+
+
 # --- recipient keys ----------------------------------------------------------
 
 
@@ -916,6 +999,46 @@ def test_malformed_recipient_keys_are_refused(store: SharedStore) -> None:
         assert b64(bytes(recipient.private_key)) not in response.text
     assert store.application(application_id)["recipients"] == []
     store.register_recipient(application_id, recipient)
+
+
+@pytest.mark.parametrize("public_key_hex", LOW_ORDER_X25519_KEYS)
+def test_a_small_order_public_key_is_refused_even_with_a_correct_identity(
+    store: SharedStore, public_key_hex: str
+) -> None:
+    """Only the key is wrong: id and readback are the correct digest of these very bytes.
+
+    Liveness: a generated key registers right after (the same path
+    test_recipient_registration_is_worker_only_and_operator_routes_refuse_the_worker_token and
+    test_malformed_recipient_keys_are_refused end on).
+    """
+
+    application_id = store.register_application()["application_id"]
+    raw = bytes.fromhex(public_key_hex)
+    assert len(raw) == 32
+    digest = hashlib.sha256(raw).hexdigest()
+    body = {
+        "application_id": application_id,
+        "recipient_id": digest,
+        "public_key": {"algorithm": "x25519-sealed-box", "key": b64(raw)},
+        "readback": {"public_key_sha256": digest},
+    }
+
+    response = store.worker("POST", f"/applications/{application_id}/recipients", body)
+    assert response.status_code == 422, response.text
+    assert response.json() == {"detail": "shared_recipient_key_invalid"}, response.text
+    assert_no_store(response)
+    assert store.application(application_id)["recipients"] == []
+    assert (
+        sql_dicts(
+            "SELECT recipient_id FROM curie.shared_connector_recipients "
+            "WHERE application_id = :application",
+            {"application": uuid.UUID(application_id)},
+        )
+        == []
+    )
+
+    generated = store.register_recipient(application_id)
+    assert set(_recipients(store, application_id)) == {generated.recipient_id}
 
 
 def test_registering_a_new_recipient_keeps_the_previous_one_live(store: SharedStore) -> None:

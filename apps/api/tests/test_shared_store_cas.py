@@ -36,6 +36,7 @@ from _shared_connector_support import (
     COMMIT_SQL,
     MARK_RECOVERY_SQL,
     RESEAL_SQL,
+    SHARED_FUNCTIONS,
     SHARED_TABLES,
     SLOT,
     STATEMENT_WAIT_S,
@@ -45,6 +46,7 @@ from _shared_connector_support import (
     SharedCleanup,
     SharedStore,
     World,
+    application_row,
     assert_refused,
     assert_still_blocked,
     b64,
@@ -1129,3 +1131,109 @@ def test_a_committed_retirement_makes_later_writers_refuse_the_recipient(
     accepted = store.reimport(binding_id, 1, second, plaintext, source)
     assert accepted.status_code == 200, accepted.text
     assert accepted.json()["credential_revision"] == 2
+
+
+# --- 9. the store's trigger functions are not a back door --------------------
+
+# The membership triggers are SECURITY DEFINER: they raise the policy generation
+# of every application id in their transition tables as the function owner.
+TRIGGER_FUNCTIONS_SQL = r"""
+SELECT p.proname AS name,
+       has_function_privilege(current_user, p.oid, 'EXECUTE') AS executable
+FROM pg_proc p
+JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname = 'curie'
+  AND p.proname LIKE 'shared\_connector%'
+  AND p.prorettype = 'trigger'::regtype
+ORDER BY p.proname
+"""
+CAS_FUNCTIONS_SQL = """
+SELECT p.proname AS name,
+       has_function_privilege(current_user, p.oid, 'EXECUTE') AS executable
+FROM pg_proc p
+JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname = 'curie' AND p.proname = ANY($1::text[])
+ORDER BY p.proname
+"""
+# event -> (operation, REFERENCING clause, statement that fires the trigger)
+MEMBERSHIP_TRIGGER_SHAPES: dict[str, tuple[str, str, str]] = {
+    "inserted": (
+        "INSERT",
+        "NEW TABLE AS inserted_rows",
+        "INSERT INTO {table} VALUES ('{application}')",
+    ),
+    "updated": (
+        "UPDATE",
+        "OLD TABLE AS old_rows NEW TABLE AS new_rows",
+        "UPDATE {table} SET application_id = application_id",
+    ),
+    "deleted": ("DELETE", "OLD TABLE AS deleted_rows", "DELETE FROM {table}"),
+}
+
+
+def test_an_application_role_cannot_reuse_the_store_trigger_functions(
+    store: SharedStore, sessions: SessionPool
+) -> None:
+    """A role may not attach an owner-run trigger function to a table of its own.
+
+    Liveness: test_member_aliases_narrow_the_policy_and_raise_the_generation_only_on_change
+    and test_deleting_an_agent_removes_its_membership_and_binding_and_raises_the_generation
+    (test_shared_connector_admin.py) show real membership writes still raise the generation,
+    and the CAS functions asserted executable below are the ones the role does use.
+    """
+
+    mine, theirs = build_world(store), build_world(store)
+    role = sessions.open(mine.dsn)
+    their_application = uuid.UUID(theirs.application_id)
+    generation = application_row(theirs.application_id)["policy_generation"]
+
+    triggers = role.fetch(TRIGGER_FUNCTIONS_SQL)
+    assert "shared_connector_memberships_inserted" in {row["name"] for row in triggers}
+    assert [row["name"] for row in triggers if row["executable"]] == []
+    cas = role.fetch(CAS_FUNCTIONS_SQL, list(SHARED_FUNCTIONS))
+    assert {row["name"]: row["executable"] for row in cas} == dict.fromkeys(SHARED_FUNCTIONS, True)
+
+    # A temporary table dies with this session, which the pool closes at teardown.
+    table = f"hijack_{secrets.token_hex(4)}"
+    role.execute(f"CREATE TEMP TABLE {table} (application_id uuid)")
+    expect_sqlstate(
+        role,
+        "42501",
+        f"CREATE TRIGGER {table}_bump AFTER INSERT ON {table} "
+        "REFERENCING NEW TABLE AS inserted_rows FOR EACH STATEMENT "
+        "EXECUTE FUNCTION curie.shared_connector_memberships_inserted()",
+    )
+    role.execute(f"INSERT INTO {table} VALUES ($1)", their_application)
+    assert application_row(theirs.application_id)["policy_generation"] == generation
+
+
+@pytest.mark.parametrize("event", list(MEMBERSHIP_TRIGGER_SHAPES))
+def test_a_membership_trigger_function_refuses_to_run_for_any_other_table(
+    store: SharedStore, sessions: SessionPool, event: str
+) -> None:
+    """Defence in depth: even the owner cannot point a membership trigger at another table.
+
+    Liveness: test_member_aliases_narrow_the_policy_and_raise_the_generation_only_on_change
+    and test_deleting_an_agent_removes_its_membership_and_binding_and_raises_the_generation
+    (test_shared_connector_admin.py) show the same functions still fire for the real table.
+    """
+
+    application_id = store.register_application()["application_id"]
+    generation = application_row(application_id)["policy_generation"]
+    operation, referencing, statement = MEMBERSHIP_TRIGGER_SHAPES[event]
+
+    # A temporary table dies with this session, which the pool closes at teardown.
+    owner = sessions.owner()
+    table = f"scope_{secrets.token_hex(4)}"
+    owner.execute(f"CREATE TEMP TABLE {table} (application_id uuid)")
+    owner.execute(f"INSERT INTO {table} VALUES ('{application_id}')")
+    owner.execute(
+        f"CREATE TRIGGER {table}_scope AFTER {operation} ON {table} "
+        f"REFERENCING {referencing} FOR EACH STATEMENT "
+        f"EXECUTE FUNCTION curie.shared_connector_memberships_{event}()"
+    )
+    error = expect_sqlstate(
+        owner, "42501", statement.format(table=table, application=application_id)
+    )
+    assert str(error).startswith("shared_connector_trigger_scope"), str(error)
+    assert application_row(application_id)["policy_generation"] == generation
