@@ -514,3 +514,105 @@ def test_squatted_reply_refuses_and_sweep_removes_leftovers():
     }
     assert asyncio.run(responder.sweep()) >= 1
     assert store.objects == {}
+
+
+def _planting(store, requester, key, change=None):
+    """Answer each request with a reply signed over the request's real UID.
+
+    The planted reply is valid unless ``change`` alters it, so a refusal can
+    come only from the requester's check of the changed field.
+    """
+    m = product()
+
+    def plant(request):
+        response = store.handle(request)
+        name = json.loads(request.content)["metadata"]["name"] if request.method == "POST" else ""
+        if name.startswith("observation-request-"):
+            nonce = name[len("observation-request-") :]
+            uid = store.objects[name]["metadata"]["uid"]
+            content = DIGESTS | {"nonce": nonce, "channel": requester.channel}
+            raw, signature = signed(m, key, content | {"request_uid": uid})
+            reply = {
+                "metadata": {
+                    "name": "observation-reply-" + nonce,
+                    "uid": str(uuid4()),
+                    "labels": {m.CHANNEL_LABEL: requester.channel, m.KIND_LABEL: "reply"},
+                },
+                "immutable": True,
+                "data": {"observation": raw.decode(), "signature": signature},
+            }
+            if change is not None:
+                change(reply)
+            store.objects["observation-reply-" + nonce] = reply
+        return response
+
+    return plant
+
+
+def test_a_valid_reply_signed_over_the_request_uid_is_accepted():
+    store = Store()
+    requester, _, _, key = pair(store, timeout_s=0.5)
+    requester._api = api(store, _planting(store, requester, key))
+
+    asyncio.run(requester.require(DIGESTS))
+
+    assert requester.calls == 1 and store.objects == {}
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda r: r.update(immutable=False),
+        lambda r: r.pop("immutable"),
+        lambda r: r["data"].update(extra="x"),
+        lambda r: r["data"].pop("signature"),
+        lambda r: r["data"].update(observation=1),
+    ],
+    ids=["mutable", "no-immutable", "extra-data", "missing-signature", "observation-not-text"],
+)
+def test_requester_refuses_a_reply_that_is_not_immutable_or_not_closed(change):
+    m = product()
+    store = Store()
+    requester, _, _, key = pair(store, timeout_s=0.5)
+    requester._api = api(store, _planting(store, requester, key, change))
+
+    async def body():
+        with pytest.raises(m.ObservationChannelRefused):
+            await requester.require(DIGESTS)
+
+    asyncio.run(body())
+    assert requester.calls == 0 and store.objects == {}
+
+
+def test_a_reply_with_a_duplicate_json_member_never_verifies():
+    m = product()
+    key = Ed25519PrivateKey.generate()
+    channel, uid = str(uuid4()), str(uuid4())
+    expected = DIGESTS | {"nonce": str(uuid4()), "channel": channel}
+    raw, _ = signed(m, key, expected | {"request_uid": uid})
+    # The last duplicate wins in json.loads, so the parsed content still equals
+    # the expected content; only the canonical re-encoding can refuse it.
+    duplicated = b'{"channel":"' + str(uuid4()).encode() + b'",' + raw[1:]
+    signature = base64.b64encode(key.sign(m.SIGNATURE_DOMAIN + duplicated)).decode()
+
+    with pytest.raises(m.ObservationChannelRefused):
+        m.verify_reply(
+            duplicated, signature, expected=expected, request_uid=uid, key=key.public_key()
+        )
+
+
+def test_responder_rejects_a_request_with_a_duplicate_json_member_without_signing():
+    m = product()
+    store = Store()
+    _, responder, calls, _ = pair(store)
+
+    def duplicate(value):
+        raw = value["data"]["request"]
+        value["data"]["request"] = '{"channel":"' + str(uuid4()) + '",' + raw[1:]
+
+    async def run():
+        with pytest.raises(m.ObservationChannelRefused):
+            await responder.answer(_request(m, responder.channel, change=duplicate))
+
+    asyncio.run(run())
+    assert calls == [] and responder.answered == [] and store.created == []

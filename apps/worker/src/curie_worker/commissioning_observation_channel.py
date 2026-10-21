@@ -10,11 +10,13 @@ another request, channel or installation, or a changed binding cannot verify.
 Any refusal permanently fences that end. Nothing here creates a successful
 guard, acceptance, Qualification or Readiness by itself.
 
-Precondition: only the provisioner may create ConfigMaps in the control
-namespace (rendered control RBAC; candidate and ordinary principals are
-observed to be denied). Any other principal can cause only a fail-closed
-refusal: the signature binds the requester's own object UID and nonce, so a
-planted or squatted object never yields a positive observation.
+Precondition: exactly two principals may write ConfigMaps in the control
+namespace. The control process (requester) needs create, get and delete; the
+provisioner (responder) needs create, list and delete. Candidate and ordinary
+principals are observed to be denied (rendered control RBAC). Any other
+principal that can still write there can cause only a fail-closed refusal: the
+signature binds the requester's own object UID and nonce, so a planted or
+squatted object never yields a positive observation.
 
 The ConfigMap calls use the bounded transport of ``KubernetesLaunchAPI``
 directly. Its public methods are a closed launch allowlist (pods, services and
@@ -338,7 +340,12 @@ class ObservationResponder:
         )
 
     async def serve(self, stop: asyncio.Event, *, deadline_s: float) -> None:
-        """Finite loop; never answers from a cache. The caller joins it before teardown."""
+        """Finite loop; never answers from a cache. The caller joins it before teardown.
+
+        Run ``sweep()`` before each ``serve()``: a request whose requester failed
+        to delete it would otherwise be answered again, its reply create gets a
+        conflict, and this responder fences.
+        """
         _require(isinstance(stop, asyncio.Event))
         _require(type(deadline_s) in (int, float) and 0 < deadline_s <= 3600)
         seen: set[str] = set()
