@@ -567,6 +567,7 @@ class _LazyPulls:
         self.bad_last = bad_last
         self.served: list[int] = []
         self.hosts: list[str] = []
+        self.smallest = 1 << 60
 
     def item(self, page: int, index: int) -> Any:
         number = page * 1000 + index
@@ -576,6 +577,7 @@ class _LazyPulls:
                 f"curie/publication-{_hex(self.own[page])}",
                 login=TOKEN_USER,
                 kind="User",
+                body="x" * self.pad,
             )
         if index == 1 and page == self.pages and self.bad_last is not None:
             return self.bad_last
@@ -597,6 +599,7 @@ class _LazyPulls:
         page = int(params.get("page", "1"))
         self.served.append(page)
         items = [self.item(page, i) for i in range(self.per_page)]
+        self.smallest = min(self.smallest, *(len(json.dumps(i)) for i in items))
         headers = {}
         if page in self.next_override:
             headers["Link"] = f'<{self.next_override[page]}>; rel="next"'
@@ -636,7 +639,6 @@ def test_github_publication_listing_keeps_one_page(github: _GitHub) -> None:
     all 250 pages of 100 large items before filtering peaked at about 178 MiB."""
 
     fake = _LazyPulls(250, own={2: 1, 125: 2, 250: 3}, pad=4096)
-    assert len(json.dumps(fake.item(1, 5))) >= 4096
 
     tracemalloc.start()
     try:
@@ -648,6 +650,7 @@ def test_github_publication_listing_keeps_one_page(github: _GitHub) -> None:
 
     assert sorted(p.ref.number for p in listed) == ["125000", "2000", "250000"]
     assert fake.served == list(range(1, 251))
+    assert fake.smallest >= 4096
     assert peak < 32 * 1024 * 1024, f"peak {peak / 1024 / 1024:.1f} MiB"
 
 
