@@ -622,8 +622,10 @@ bound into M, while enabled state must change at activation (clause 6 step 2)
 and a credential rotation must not change M. Misuse of this right is therefore
 detected, not prevented.
 
-At installation the provisioner records, for every broker identity in the
-principals table, the set of password hashes and the enabled state. Every
+The administrator-run installation bootstrap, before any campaign, records the
+baseline: for every broker identity in the principals table, the set of
+password hashes and the enabled state. The provisioner never writes this
+reference. Every
 reobservation, meaning each guard call (refusal order step 5) and each
 Readiness issuance, then compares, for each commissioning and production
 principal:
@@ -634,6 +636,11 @@ principal:
   disabled after activation step 2).
 
 Any difference, or an unavailable observation, refuses.
+
+A legitimate credential rotation changes a password hash set. Only the
+administrator-run installation step that recorded the baseline updates it,
+never the provisioner at campaign time. Until the record is updated, every
+guard call and Readiness issuance refuses.
 
 A dedicated ACL observer principal reads this state. Its rules grant only
 `ACL GETUSER`: no `ACL SETUSER`, no other ACL subcommand, no key and no
