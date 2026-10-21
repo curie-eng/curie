@@ -6575,7 +6575,10 @@ fn repository_runner_upgrade_values() -> Value {
             "enabled": true,
             "sandboxEgress": {"acme-bot": true},
             "intake": "poll",
-            "trackers": [{"name": "github", "kind": "github", "label": "curie-factory"}],
+            "trackers": [
+                {"name": "github", "kind": "github", "label": "curie-factory"},
+                {"name": "jira", "kind": "jira_cloud", "host": "example.atlassian.net"}
+            ],
             "docker": {"daemonImage": format!(
                 "registry.example.com/acme/daemon@{}", repository_runner_digest('f')
             )},
