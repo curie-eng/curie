@@ -32,7 +32,7 @@ BROKER = Target(
     role_labels={ROLE: "broker"},
     allowed_sender_labels={ROLE: "broker-client"},
     port=16379,
-    protocols=("tcp",),
+    protocols=("tcp", "udp"),
     closed_port=16380,
     real_addresses=("10.96.0.10",),
 )
@@ -92,12 +92,20 @@ class ModelCluster:
         self.policy_reads = 0
         self.created = 0
         self.dropped: set[str] = set()  # addresses the environment drops for every pod
+        self.forgeries: list[dict[str, str]] = []
+        self.admit_forgery_roles: set[str] = set()
+        self.real_attempts: list[tuple[str, str]] = []
+        # Per node, the model time until which a sender's address and window are in use.
+        self.busy_until: dict[str, float] = {}
+        self.overlaps: list[str] = []
+        self.extra_bindings: list[dict[str, Any]] = []
 
     def clock(self) -> float:
         return self.now
 
     async def sleep(self, seconds: float) -> None:
         self.now += seconds
+        await asyncio.sleep(0)  # let other probes interleave, as real waits do
 
     def _ms(self) -> int:
         return int(self.now * 1000)
@@ -144,6 +152,9 @@ class ModelCluster:
         return False
 
     def _send(self, sender: dict[str, Any]) -> None:
+        node = sender["spec"]["nodeName"]
+        if self.busy_until.get(node, 0.0) > self.now:
+            self.overlaps.append(node)
         start = self._ms()
         results = []
         for phase in sender["argument"]["phases"]:
@@ -165,6 +176,7 @@ class ModelCluster:
                             }
                         )
                 elif address in real:
+                    self.real_attempts.append((address, item["proto"]))
                     delivered = not self.enforcing
                 elif address == PEER.address:
                     delivered = sender["metadata"]["labels"].get(ROLE) == "runner"
@@ -180,6 +192,11 @@ class ModelCluster:
                 results.append(dict(item, result=result, start=self._ms()))
                 self.now += 0.2
         self.now += 2.0
+        # A denial sender's address may be reused once it ends while its listener
+        # window still runs; no other probe pod may start on that node meanwhile.
+        template = sender["metadata"]["labels"]["curietech.ai/managed-cni-probe-template"]
+        if template in ("probe_sender", "protected_probe", "release_probe"):
+            self.busy_until[node] = self.now + 5.0
         self.logs[(sender["metadata"]["namespace"], sender["metadata"]["name"])].append(
             {"ev": "result", "start": start, "end": self._ms(), "attempts": results}
         )
@@ -207,6 +224,10 @@ class ModelCluster:
         self, namespace: str, document: dict[str, Any]
     ) -> tuple[int | None, str]:
         assert "curietech.ai/managed-cni-probe-template" not in document["metadata"]["labels"]
+        labels = document["metadata"]["labels"]
+        self.forgeries.append(labels)
+        if labels.get(ROLE) in self.admit_forgery_roles:
+            return (201, "")
         return self.dry_run
 
     async def access_review(
@@ -234,6 +255,7 @@ class ModelCluster:
                     "subjects": [{"kind": "Group", "name": "system:masters"}],
                 },
                 {"metadata": {"name": "dev"}, "subjects": [{"kind": "User", "name": "alice"}]},
+                *self.extra_bindings,
             ]
         if collection == "rolebindings":
             return [
@@ -383,3 +405,43 @@ def test_a_destination_nobody_can_reach_is_unavailable_not_pass() -> None:
         "destination_unreached",
     )
     assert result[(6, "internet", "ipv4", "none", "runner_policy")] == ("pass", "denied")
+
+
+def test_each_target_is_forged_separately_and_each_must_be_refused() -> None:
+    cluster = ModelCluster()
+    assert measure(cluster).refusal is None
+    roles = sorted(labels[ROLE] for labels in cluster.forgeries)
+    assert roles == ["broker", "mediator"]
+    admitted = ModelCluster()
+    admitted.admit_forgery_roles = {"broker"}
+    result = outcomes(measure(admitted))
+    assert result[(2, "guard_refusal", "none", "none", "none")] == ("fail", "guard_admitted")
+
+
+def test_a_malformed_binding_subject_is_unavailable_not_a_crash() -> None:
+    cluster = ModelCluster()
+    cluster.extra_bindings = [
+        {"metadata": {"name": "broken"}, "subjects": [{"kind": "ServiceAccount", "name": "x"}]}
+    ]
+    result = outcomes(measure(cluster))
+    for key in (
+        (2, "rbac_refusal", "none", "none", "none"),
+        (8, "rbac_policy", "none", "none", "none"),
+    ):
+        assert result[key] == ("unavailable", "review_unavailable")
+
+
+def test_no_two_senders_share_a_node_while_an_address_window_is_open() -> None:
+    cluster = ModelCluster()
+    measure(cluster)
+    assert cluster.overlaps == []
+
+
+def test_real_targets_are_probed_on_every_protocol_they_serve() -> None:
+    cluster = ModelCluster()
+    measure(cluster)
+    assert {proto for address, proto in cluster.real_attempts if address == "10.96.0.10"} == {
+        "tcp",
+        "udp",
+    }
+    assert {proto for address, proto in cluster.real_attempts if address == "10.96.0.11"} == {"tcp"}

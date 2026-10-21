@@ -304,7 +304,10 @@ def stand_in(name: str, node: str, labels: dict[str, str], port: int) -> list[di
         "metadata": {"name": name, "namespace": PROT},
         "spec": {
             "selector": {"app": name},
-            "ports": [{"name": "tcp", "port": port, "protocol": "TCP"}],
+            "ports": [
+                {"name": "tcp", "port": port, "protocol": "TCP"},
+                {"name": "udp", "port": port, "protocol": "UDP"},
+            ],
         },
     }
     return [pod, service]

@@ -121,6 +121,11 @@ REASONS = frozenset(
 # Clause 1, channel digests. The CNI digest is built from the fact (later slice).
 CHANNEL_CASES = {"network": (1, 6, 7, 8), "hostile": (2, 3, 4), "retained_peer": (5,)}
 _DIGEST = re.compile(r"[0-9a-f]{64}")
+_GUARD_REFUSAL = re.compile(
+    r'(?:[a-z.]+ "[a-z0-9.-]*" is forbidden: )?'
+    r'(?:admission webhook "(?P<webhook>[^"]+)" denied the request'
+    r"|ValidatingAdmissionPolicy '(?P<policy>[^']+)' with binding '[^']*' denied request)"
+)
 
 
 class ProbeKitRefused(RuntimeError):
@@ -342,12 +347,11 @@ def judge_guard_dry_run(status: int | None, message: str, guard_names: Sequence[
         return ("unavailable", "review_unavailable")
     if 200 <= status < 300:
         return ("fail", "guard_admitted")
-    for name in guard_names:
-        if (
-            f'admission webhook "{name}" denied the request' in message
-            or f"ValidatingAdmissionPolicy '{name}' with binding" in message
-        ):
-            return ("pass", "guard_refused")
+    # Only the API server's own prefix names the refusing controller; anything
+    # after it is that controller's free text and may quote any other name.
+    match = _GUARD_REFUSAL.match(message)
+    if match is not None and (match["webhook"] or match["policy"]) in guard_names:
+        return ("pass", "guard_refused")
     return ("fail", "refused_outside_guard")
 
 

@@ -72,10 +72,11 @@ def test_listener_records_nonces_and_sender_reports_each_attempt() -> None:
     assert results == {"a" * 32: "connected", "b" * 32: "timeout", "c" * 32: "refused"}
     record = parse_listener_log(out)
     assert record.ready
-    assert record.deliveries(nonces=["a" * 32], peers=[]) == 1
-    assert record.deliveries(nonces=["b" * 32], peers=[]) == 1
-    assert record.deliveries(nonces=["c" * 32], peers=[]) == 0
-    assert record.deliveries(nonces=[], peers=["127.0.0.2"]) == 0
+    start, end = sender.start_ms, sender.end_ms + 2000
+    assert record.deliveries(nonces=["a" * 32], peers=[], start_ms=start, end_ms=end) == 1
+    assert record.deliveries(nonces=["b" * 32], peers=[], start_ms=start, end_ms=end) == 1
+    assert record.deliveries(nonces=["c" * 32], peers=[], start_ms=start, end_ms=end) == 0
+    assert record.deliveries(nonces=[], peers=["127.0.0.2"], start_ms=start, end_ms=end) == 0
     sampled, covered, _moved = record.window(sender.start_ms, sender.end_ms)
     assert covered
     # Only a Linux network namespace exposes the socket table this samples.
@@ -105,7 +106,51 @@ def test_socket_entries_count_as_delivery_by_source_address() -> None:
         ]
     )
     record = parse_listener_log(log)
-    assert record.deliveries(nonces=[], peers=["10.0.0.9"]) == 1
+    assert record.deliveries(nonces=[], peers=["10.0.0.9"], start_ms=0, end_ms=10) == 1
+
+
+def test_source_address_matches_only_inside_the_probe_window() -> None:
+    # A pod that reuses the sender's address later, or another probe's own
+    # attempt, must not read as this probe's delivery.
+    log = "\n".join(
+        json.dumps(line)
+        for line in [
+            {"ev": "ready", "tcp": [1], "udp": [1], "t": 1},
+            {"ev": "sock", "peer": "10.0.0.9", "port": 1, "state": "01", "proto": "tcp", "t": 50},
+            {"ev": "tcp", "peer": "10.0.0.9", "port": 1, "nonce": "other", "t": 15},
+            {"ev": "tcp", "peer": "10.0.0.7", "port": 1, "nonce": "mine", "t": 90},
+        ]
+    )
+    record = parse_listener_log(log)
+    start, end = 10, 20
+    assert record.deliveries(nonces=[], peers=["10.0.0.9"], start_ms=start, end_ms=end) == 1
+    assert (
+        record.deliveries(
+            nonces=[], peers=["10.0.0.9"], foreign_nonces={"other"}, start_ms=start, end_ms=end
+        )
+        == 0
+    )
+    assert record.deliveries(nonces=[], peers=["10.0.0.9"], start_ms=10, end_ms=60) == 2
+    # A probe's own nonce is attributable at any time.
+    assert record.deliveries(nonces=["mine"], peers=[], start_ms=start, end_ms=end) == 1
+
+
+def test_a_sampling_gap_inside_a_tick_is_reported(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "argv", ["probe", json.dumps({"tcp": [], "udp": []})])
+    namespace: dict[str, Any] = {"__name__": "probe_under_test"}
+    exec(LISTENER_PROGRAM, namespace)  # noqa: S102 - the fixed program text under test
+    reads = iter([True, False, True, True, True, True, True, True, True, True, True])
+
+    def read() -> tuple[set[Any], int]:
+        if next(reads):
+            return set(), 0
+        raise OSError("gap")
+
+    sampler = namespace["Sampler"](read)
+    ticks = []
+    for step in range(11):
+        ticks += [doc for doc in sampler.poll(step / 10) if doc["ev"] == "tick"]
+    assert [doc["sockets"] for doc in ticks] == [True, False, True]
 
 
 @pytest.mark.parametrize("template", sorted(TEMPLATES))

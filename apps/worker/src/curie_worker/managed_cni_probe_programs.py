@@ -19,7 +19,7 @@ import hashlib
 import ipaddress
 import json
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping, Sequence, Set
 from dataclasses import dataclass
 from typing import Any
 
@@ -100,33 +100,45 @@ def overflow():
         rows = [line.split() for line in f if line.startswith("TcpExt:")]
     m = dict(zip(rows[0][1:], rows[1][1:]))
     return int(m.get("ListenOverflows", 0)) + int(m.get("ListenDrops", 0))
-def sample():
-    seen = set()
-    tick = 0.0
-    while True:
-        ok, now = True, set()
+def read_tables():
+    now = set()
+    for path in ("/proc/net/tcp", "/proc/net/tcp6"):
+        now.update(sockets(path, TCP, ("01", "03"), "tcp"))
+    for path in ("/proc/net/udp", "/proc/net/udp6"):
+        now.update(sockets(path, UDP, ("01", "07"), "udp"))
+    return now, overflow()
+class Sampler:
+    # A tick reports sockets true only if every sample since the last tick read
+    # the tables, so a gap inside a tick is never reported as sampled.
+    def __init__(self, read):
+        self.read, self.seen, self.last, self.ok, self.count = read, set(), None, True, None
+    def poll(self, now_s):
+        docs = []
         try:
-            for path in ("/proc/net/tcp", "/proc/net/tcp6"):
-                now.update(sockets(path, TCP, ("01", "03"), "tcp"))
-            for path in ("/proc/net/udp", "/proc/net/udp6"):
-                now.update(sockets(path, UDP, ("01", "07"), "udp"))
-            count = overflow()
+            now, self.count = self.read()
         except (OSError, ValueError, IndexError, StopIteration):
-            ok, count = False, None
-        for peer, port, state, proto in sorted(now - seen):
-            emit({"ev": "sock", "peer": peer, "port": port, "state": state, "proto": proto})
-        seen |= now
-        if time.time() - tick >= 0.5:
-            tick = time.time()
-            emit({"ev": "tick", "sockets": ok, "overflow": count})
+            now, self.ok, self.count = set(), False, None
+        for peer, port, state, proto in sorted(now - self.seen):
+            docs.append({"ev": "sock", "peer": peer, "port": port, "state": state, "proto": proto})
+        self.seen |= now
+        if self.last is None or now_s - self.last >= 0.5:
+            self.last = now_s
+            docs.append({"ev": "tick", "sockets": self.ok and self.count is not None,
+                         "overflow": self.count})
+            self.ok = True
+        return docs
+if __name__ == "__main__":
+    for port in TCP:
+        threading.Thread(target=tcp, args=(port,), daemon=True).start()
+    for port in UDP:
+        threading.Thread(target=udp, args=(port,), daemon=True).start()
+    time.sleep(0.2)
+    emit({"ev": "ready", "tcp": TCP, "udp": UDP})
+    sampler = Sampler(read_tables)
+    while True:
+        for doc in sampler.poll(time.time()):
+            emit(doc)
         time.sleep(0.1)
-for port in TCP:
-    threading.Thread(target=tcp, args=(port,), daemon=True).start()
-for port in UDP:
-    threading.Thread(target=udp, args=(port,), daemon=True).start()
-time.sleep(0.2)
-emit({"ev": "ready", "tcp": TCP, "udp": UDP})
-sample()
 """
 
 SENDER_PROGRAM = r"""
@@ -290,19 +302,39 @@ def probe_pod(
 @dataclass(frozen=True, slots=True)
 class ListenerRecord:
     ready: bool
-    # (event kind, peer, port, nonce or socket state)
-    events: tuple[tuple[str, str, int, str], ...]
+    # (event kind, peer, port, nonce or socket state, wall time ms)
+    events: tuple[tuple[str, str, int, str, int], ...]
     # (wall time ms, sockets sampled, overflow counter)
     ticks: tuple[tuple[int, bool, int | None], ...]
 
-    def deliveries(self, *, nonces: Sequence[str], peers: Sequence[str]) -> int:
-        """Events or socket entries for any of the probe's nonces or source addresses."""
+    def deliveries(
+        self,
+        *,
+        nonces: Sequence[str],
+        peers: Sequence[str],
+        start_ms: int,
+        end_ms: int,
+        foreign_nonces: Set[str] = frozenset(),
+    ) -> int:
+        """Events or socket entries for any of the probe's nonces or source addresses.
+
+        A nonce is the probe's own at any time. A source address is the probe's
+        only inside its own window: after the sender ends, another pod may hold
+        it. An event carrying another probe's nonce belongs to that probe.
+        """
         wanted_nonces, wanted_peers = set(nonces), {_canonical_ip(peer) for peer in peers}
-        return sum(
-            1
-            for kind, peer, _port, detail in self.events
-            if peer in wanted_peers or (kind in ("tcp", "udp") and detail in wanted_nonces)
-        )
+        count = 0
+        for kind, peer, _port, detail, at in self.events:
+            payload = kind in ("tcp", "udp")
+            if payload and detail in wanted_nonces:
+                count += 1
+            elif (
+                peer in wanted_peers
+                and start_ms <= at <= end_ms
+                and not (payload and detail in foreign_nonces)
+            ):
+                count += 1
+        return count
 
     def window(self, start_ms: int, end_ms: int) -> tuple[bool, bool, bool]:
         """(sampled throughout, covers the window, overflow moved) for [start, end]."""
@@ -350,7 +382,7 @@ def _lines(log: str) -> list[dict[str, Any]]:
 
 def parse_listener_log(log: str) -> ListenerRecord:
     ready = False
-    events: list[tuple[str, str, int, str]] = []
+    events: list[tuple[str, str, int, str, int]] = []
     ticks: list[tuple[int, bool, int | None]] = []
     for document in _lines(log):
         kind = document.get("ev")
@@ -363,6 +395,7 @@ def parse_listener_log(log: str) -> ListenerRecord:
                     _canonical_ip(document["peer"]),
                     int(document["port"]),
                     str(document["nonce"]),
+                    int(document["t"]),
                 )
             )
         elif kind == "sock":
@@ -372,6 +405,7 @@ def parse_listener_log(log: str) -> ListenerRecord:
                     _canonical_ip(document["peer"]),
                     int(document["port"]),
                     str(document["state"]),
+                    int(document["t"]),
                 )
             )
         elif kind == "tick":

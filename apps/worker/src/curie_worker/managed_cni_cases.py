@@ -257,6 +257,14 @@ class _Run:
     created: list[tuple[str, str, str]] = field(default_factory=list)
     evidence: list[dict[str, Any]] = field(default_factory=list)
     counter: int = 0
+    # Every nonce a denial probe or its control sent in this run.
+    nonces: set[str] = field(default_factory=set)
+    # One sender per node from creation until its listener window closes, so no
+    # other probe pod of this run can take over its address inside the window.
+    node_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
+
+    def node_lock(self, node: str) -> asyncio.Lock:
+        return self.node_locks.setdefault(node, asyncio.Lock())
 
 
 def _nonce() -> str:
@@ -448,40 +456,43 @@ async def _denial(
     destinations = [(twin_address, port, protocol) for protocol in target.protocols]
     if real:
         destinations += [
-            (address, target.port, "tcp")
+            (address, target.port, protocol)
             for address in target.real_addresses
             if address_family(address) == family
+            for protocol in target.protocols
         ]
     attempts, nonces = _attempts(destinations)
+    control_attempts, control_nonces = _attempts(
+        [(twin_address, target.port, protocol) for protocol in target.protocols]
+    )
+    run.nonces.update(nonces, control_nonces)
     try:
-        sender = await _start(
-            run,
-            template=source.template,
-            namespace=source.namespace,
-            node=node,
-            labels={},
-            argument=_sender_argument(attempts),
-            finished=True,
-        )
-        record = await _sender_record(run, sender)
-        window_end = (
-            0 if record is None else record.end_ms + PRODUCER_CONSTANTS["listener_window_ms"]
-        )
-        listener = await _listener_past(run, twin, window_end if record else None)
-        # The allowed control runs after the denial window, from the same node.
-        control_attempts, control_nonces = _attempts(
-            [(twin_address, target.port, protocol) for protocol in target.protocols]
-        )
-        control = await _start(
-            run,
-            template="allowed_sender",
-            namespace=layout.protected_namespace,
-            node=node,
-            labels=target.allowed_sender_labels,
-            argument=_sender_argument(control_attempts),
-            finished=True,
-        )
-        control_record = await _sender_record(run, control)
+        async with run.node_lock(node):
+            sender = await _start(
+                run,
+                template=source.template,
+                namespace=source.namespace,
+                node=node,
+                labels={},
+                argument=_sender_argument(attempts),
+                finished=True,
+            )
+            record = await _sender_record(run, sender)
+            window_end = (
+                0 if record is None else record.end_ms + PRODUCER_CONSTANTS["listener_window_ms"]
+            )
+            listener = await _listener_past(run, twin, window_end if record else None)
+            # The allowed control runs after the denial window, from the same node.
+            control = await _start(
+                run,
+                template="allowed_sender",
+                namespace=layout.protected_namespace,
+                node=node,
+                labels=target.allowed_sender_labels,
+                argument=_sender_argument(control_attempts),
+                finished=True,
+            )
+            control_record = await _sender_record(run, control)
         await run.sleep(_POLL_S)
         after = parse_listener_log(await run.cluster.pod_log(twin.namespace, twin.name))
     except ProbeKitRefused:
@@ -492,6 +503,8 @@ async def _denial(
         after.deliveries(
             nonces=[n for (_a, _p, proto, n, _r) in control_record.attempts if proto == protocol],
             peers=[],
+            start_ms=control_record.start_ms,
+            end_ms=control_record.end_ms,
         )
         > 0
         for protocol in target.protocols
@@ -507,7 +520,15 @@ async def _denial(
             listener_ready=listener.ready,
             on_requested_node=sender is not None and sender.node == node,
             family_address=sender is not None and sender.address(family) is not None,
-            listener_deliveries=after.deliveries(nonces=nonces, peers=sender_addresses),
+            listener_deliveries=0
+            if record is None
+            else after.deliveries(
+                nonces=nonces,
+                peers=sender_addresses,
+                start_ms=record.start_ms,
+                end_ms=window_end,
+                foreign_nonces=run.nonces - set(nonces),
+            ),
             sockets_sampled=sampled,
             window_covered=covered,
             overflow_moved=moved,
@@ -627,7 +648,11 @@ async def ordinary_identities(run: _Run) -> list[Subject] | None:
                 namespace = subject.get("namespace", "") if kind == "ServiceAccount" else ""
                 if kind == "ServiceAccount" and not namespace:
                     namespace = binding["metadata"].get("namespace", "")
-                subjects.add(Subject(kind, name, namespace))
+                try:
+                    subjects.add(Subject(kind, name, namespace))
+                except ProbeKitRefused:
+                    # An unresolvable subject leaves the identity set unknown.
+                    return None
     exclusions = run.layout.system_set | run.layout.excluded
     return sorted(subjects - exclusions, key=lambda item: (item.kind, item.namespace, item.name))
 
@@ -665,22 +690,28 @@ async def _reviews(
     return judge_reviews(list(results)), record
 
 
-def _forged_pod(layout: ProbeLayout) -> dict[str, Any]:
-    labels: dict[str, str] = {}
-    for target in layout.targets:
-        labels.update(target.role_labels)
+def _forged_pod(layout: ProbeLayout, target: Target) -> dict[str, Any]:
     pod = probe_pod(
         template="twin",
-        name=f"cni-{layout.campaign}-forged"[:63].rstrip("-"),
+        name=f"cni-{layout.campaign}-forged-{target.name}"[:63].rstrip("-"),
         namespace=layout.protected_namespace,
         node=layout.eligible_nodes[0],
         campaign=layout.campaign,
-        role_labels=labels,
+        role_labels=target.role_labels,
         argument={"tcp": [], "udp": []},
     )
     # Not one of the guard-admitted templates: no template label.
     del pod["metadata"]["labels"][TEMPLATE_LABEL]
     return pod
+
+
+def _combined(verdicts: Sequence[Verdict], clean: Verdict) -> Verdict:
+    """The first ``fail``, else the first ``unavailable``, else ``clean``."""
+    for outcome in ("fail", "unavailable"):
+        found = next((item for item in verdicts if item[0] == outcome), None)
+        if found is not None:
+            return found
+    return clean if verdicts else ("unavailable", "review_unavailable")
 
 
 async def case_two(
@@ -711,18 +742,24 @@ async def case_two(
             )
         ]
     )
-    try:
-        status, message = await run.cluster.dry_run_create_pod(
-            layout.protected_namespace, _forged_pod(layout)
-        )
-    except ProbeKitRefused:
-        status, message = None, ""
+    # One forgery per target, each with that target's own selected labels; the
+    # guard must refuse every one.
+    verdicts, forgeries = [], []
+    for target in layout.targets:
+        try:
+            status, message = await run.cluster.dry_run_create_pod(
+                layout.protected_namespace, _forged_pod(layout, target)
+            )
+        except ProbeKitRefused:
+            status, message = None, ""
+        verdicts.append(judge_guard_dry_run(status, message, layout.guard_names))
+        forgeries.append({"target": target.name, "status": status, "message": message[:1024]})
     entries.append(
         _entry(
             run,
             (2, "guard_refusal", *NONE),
-            verdict=judge_guard_dry_run(status, message, layout.guard_names),
-            evidence={"status": status, "message": message[:1024]},
+            verdict=_combined(verdicts, ("pass", "guard_refused")),
+            evidence={"forgeries": forgeries},
         )
     )
     namespace = layout.protected_namespace

@@ -267,6 +267,30 @@ def test_guard_refusal_must_name_the_guard() -> None:
         judge_guard_dry_run(400, webhook, ())
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        # Another webhook whose custom text quotes the guard's own denial.
+        'admission webhook "someone-else.example" denied the request: admission webhook '
+        '"curie-protected-guard.curietech.ai" denied the request: no',
+        "pods \"x\" is forbidden: ValidatingAdmissionPolicy 'other' with binding 'b' denied "
+        "request: ValidatingAdmissionPolicy 'curie-protected-guard.curietech.ai' with binding",
+        # A guard name that only starts with the configured one.
+        'admission webhook "curie-protected-guard.curietech.ai.evil" denied the request: no',
+    ],
+)
+def test_a_quoted_guard_name_is_not_the_guard(message: str) -> None:
+    assert judge_guard_dry_run(400, message, GUARDS) == ("fail", "refused_outside_guard")
+
+
+def test_the_api_server_prefix_before_the_guard_is_accepted() -> None:
+    message = (
+        'pods "x" is forbidden: admission webhook "curie-protected-guard.curietech.ai" '
+        "denied the request: not a probe template"
+    )
+    assert judge_guard_dry_run(403, message, GUARDS) == ("pass", "guard_refused")
+
+
 def test_policy_set_must_not_change_between_snapshots() -> None:
     first = frozenset({("networking.k8s.io", "p", "uid-1", "7")})
     assert judge_policy_sets([first, first]) == ("pass", "policy_set_unchanged")
