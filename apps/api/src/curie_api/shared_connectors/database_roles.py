@@ -18,7 +18,6 @@ the server's message. The plaintext DSN exists only long enough to be sealed.
 
 from __future__ import annotations
 
-import base64
 import hashlib
 import hmac
 import json
@@ -47,9 +46,9 @@ from ..schemas.shared_connectors import (
 )
 from . import sealing
 from .store import (
-    SEALED_DSN,
     SharedRefusal,
     current_recipient,
+    database_role,
     guarded_write,
     lock_application,
 )
@@ -93,10 +92,7 @@ def scram_verifier(password: str) -> str:
     client_key = hmac.new(salted, b"Client Key", hashlib.sha256).digest()
     stored_key = hashlib.sha256(client_key).digest()
     server_key = hmac.new(salted, b"Server Key", hashlib.sha256).digest()
-
-    def encoded(raw: bytes) -> str:
-        return base64.b64encode(raw).decode("ascii")
-
+    encoded = sealing.b64encode
     return (
         f"SCRAM-SHA-256${SCRAM_ITERATIONS}:{encoded(salt)}"
         f"${encoded(stored_key)}:{encoded(server_key)}"
@@ -291,36 +287,33 @@ async def _verify_role(session: AsyncSession, role: str) -> None:
         )
 
 
-async def _database_row(
-    session: AsyncSession, application_id: uuid.UUID, *, lock: bool = False
-) -> SharedConnectorDatabaseRole | None:
-    statement = (
-        select(SharedConnectorDatabaseRole)
-        .where(SharedConnectorDatabaseRole.application_id == application_id)
-        .options(SEALED_DSN)
-        .execution_options(populate_existing=True)
-    )
-    row: SharedConnectorDatabaseRole | None = await session.scalar(
-        statement.with_for_update() if lock else statement
-    )
-    return row
-
-
 async def _provisionable(
     session: AsyncSession, application_id: uuid.UUID, dsn_encoding: str
 ) -> SharedConnectorApplication:
     # NO KEY UPDATE serializes two provisionings of one application, so the
     # second sees the first's row instead of racing it to CREATE ROLE.
     application = await lock_application(session, application_id, "no_key_update")
-    if application is None:
-        raise SharedRefusal(status.HTTP_404_NOT_FOUND, "shared_application_not_found")
     if not application.enabled:
         raise SharedRefusal(status.HTTP_409_CONFLICT, "shared_application_disabled")
     if application.spec.get("dsn_encoding") != dsn_encoding:
         raise SharedRefusal(status.HTTP_409_CONFLICT, "shared_database_mode_mismatch")
-    if await _database_row(session, application_id) is not None:
+    if await database_role(session, application_id) is not None:
         raise SharedRefusal(status.HTTP_409_CONFLICT, "shared_database_already_provisioned")
     return application
+
+
+def _bundled_out(
+    application_id: uuid.UUID, role: str, recipient_id: str, revision: int, sealed: bytes
+) -> SharedBundledDatabaseOut:
+    return SharedBundledDatabaseOut(
+        application_id=application_id,
+        mode="bundled",
+        role_name=role,
+        status="provisioned",
+        recipient_id=recipient_id,
+        dsn_revision=revision,
+        sealed_dsn=sealing.b64encode(sealed),
+    )
 
 
 async def provision_database(
@@ -368,15 +361,7 @@ async def _provision_bundled(
         unique_conflict=(status.HTTP_409_CONFLICT, "shared_database_already_provisioned"),
     )
     await session.commit()
-    return SharedBundledDatabaseOut(
-        application_id=application_id,
-        mode="bundled",
-        role_name=role,
-        status="provisioned",
-        recipient_id=recipient.recipient_id,
-        dsn_revision=1,
-        sealed_dsn=sealing.b64encode(sealed),
-    )
+    return _bundled_out(application_id, role, recipient.recipient_id, 1, sealed)
 
 
 async def _provision_managed(
@@ -428,7 +413,7 @@ async def rotate_database(
     """
 
     await _require_role_admin(session)
-    row = await _database_row(session, application_id, lock=True)
+    row = await database_role(session, application_id, "update")
     if row is None:
         raise SharedRefusal(status.HTTP_404_NOT_FOUND, "shared_database_not_provisioned")
     if row.mode != "bundled":
@@ -470,15 +455,7 @@ async def rotate_database(
     if revision is None:
         raise SharedRefusal(status.HTTP_409_CONFLICT, "shared_database_revision_conflict")
     await session.commit()
-    return SharedBundledDatabaseOut(
-        application_id=application_id,
-        mode="bundled",
-        role_name=role,
-        status="provisioned",
-        recipient_id=recipient.recipient_id,
-        dsn_revision=int(revision),
-        sealed_dsn=sealing.b64encode(sealed),
-    )
+    return _bundled_out(application_id, role, recipient.recipient_id, int(revision), sealed)
 
 
 async def report_status(
@@ -486,7 +463,7 @@ async def report_status(
 ) -> SharedDatabaseStatusOut:
     """The worker's readiness report, fenced by the DSN revision it activated."""
 
-    row = await _database_row(session, application_id, lock=True)
+    row = await database_role(session, application_id, "update")
     if row is None:
         raise SharedRefusal(status.HTTP_404_NOT_FOUND, "shared_database_not_provisioned")
     if row.dsn_revision != body.dsn_revision:

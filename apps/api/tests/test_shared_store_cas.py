@@ -523,6 +523,41 @@ def test_refresh_begin_has_a_single_owner_and_commit_is_fenced_by_intent_and_epo
     }
 
 
+def test_concurrent_refresh_begins_admit_exactly_one_owner(
+    world: World, sessions: SessionPool
+) -> None:
+    epoch_before = intent_row(world.binding_id)["epoch"]
+    holder = sessions.owner()
+    holder.execute("BEGIN")
+    holder.fetch(
+        "SELECT grant_id FROM curie.shared_connector_refresh_intents "
+        "WHERE binding_id = $1 FOR UPDATE",
+        world.binding_uuid,
+    )
+    owners = [f"resolver-{index}" for index in range(3)]
+    pending = [
+        sessions.open(world.dsn).submit("fetchrow", BEGIN_SQL, world.grant_id, owner, 60)
+        for owner in owners
+    ]
+    assert_still_blocked(pending[-1], waiters=len(owners))
+    assert not any(future.done() for future in pending)
+    holder.execute("COMMIT")
+
+    rows = [future.result(timeout=STATEMENT_WAIT_S) for future in pending]
+    outcomes = [row["outcome"] for row in rows]
+    assert sorted(outcomes) == ["began", "busy", "busy"], outcomes
+    winner = outcomes.index("began")
+    for index, row in enumerate(rows):
+        if index != winner:
+            assert row["intent_id"] is None and row["ciphertext"] is None, dict(row)
+    assert rows[winner]["epoch"] == epoch_before + 1
+    intent = intent_row(world.binding_id)
+    assert intent["state"] == "refreshing"
+    assert intent["epoch"] == epoch_before + 1
+    assert intent["intent_id"] == rows[winner]["intent_id"]
+    assert intent["owner"] == owners[winner]
+
+
 def test_mark_recovery_blocks_every_begin_and_fences_the_old_intent(
     world: World, sessions: SessionPool
 ) -> None:

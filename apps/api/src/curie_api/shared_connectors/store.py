@@ -61,6 +61,7 @@ from ..schemas.shared_connectors import (
     SharedRecipientRegistered,
     SharedRecipientRegistration,
     SharedRecipientRetired,
+    SharedSourceMetadata,
 )
 from . import sealing
 
@@ -97,20 +98,6 @@ def _locked[S: Select[Any]](statement: S, lock: Lock | None) -> S:
     return statement
 
 
-def _sqlstate(error: DBAPIError) -> str | None:
-    """asyncpg's SQLSTATE, on SQLAlchemy's wrapper or one ``__cause__`` down."""
-
-    seen: set[int] = set()
-    candidate: object = error.orig
-    while candidate is not None and id(candidate) not in seen:
-        seen.add(id(candidate))
-        value = getattr(candidate, "sqlstate", None)
-        if value is not None:
-            return str(value)
-        candidate = getattr(candidate, "__cause__", None)
-    return None
-
-
 async def guarded_write(
     session: AsyncSession,
     statement: Insert | Update | Delete,
@@ -127,7 +114,11 @@ async def guarded_write(
     try:
         return await session.execute(statement)
     except DBAPIError as error:
-        conflict = isinstance(error, IntegrityError) and _sqlstate(error) == _UNIQUE_VIOLATION
+        # SQLAlchemy's asyncpg adapter copies the driver's SQLSTATE onto ``orig``.
+        conflict = (
+            isinstance(error, IntegrityError)
+            and getattr(error.orig, "sqlstate", None) == _UNIQUE_VIOLATION
+        )
         refusal = (
             unique_conflict
             if conflict and unique_conflict is not None
@@ -141,11 +132,13 @@ async def guarded_write(
 
 async def lock_application(
     session: AsyncSession, application_id: uuid.UUID, lock: Lock | None = None
-) -> SharedConnectorApplication | None:
+) -> SharedConnectorApplication:
     statement = select(SharedConnectorApplication).where(
         SharedConnectorApplication.id == application_id
     )
     application: SharedConnectorApplication | None = await session.scalar(_locked(statement, lock))
+    if application is None:
+        raise SharedRefusal(status.HTTP_404_NOT_FOUND, "shared_application_not_found")
     return application
 
 
@@ -178,29 +171,50 @@ async def current_recipient(
     return recipient
 
 
+async def _lock_recipient(
+    session: AsyncSession, application_id: uuid.UUID, recipient_id: str, lock: Lock
+) -> SharedConnectorRecipient | None:
+    statement = select(SharedConnectorRecipient).where(
+        SharedConnectorRecipient.application_id == application_id,
+        SharedConnectorRecipient.recipient_id == recipient_id,
+    )
+    row: SharedConnectorRecipient | None = await session.scalar(_locked(statement, lock))
+    return row
+
+
 async def _live_recipient(
     session: AsyncSession, application_id: uuid.UUID, recipient_id: str
 ) -> SharedConnectorRecipient | None:
     """The named recipient FOR SHARE, when it is live: the leaf lock, taken last."""
 
-    statement = select(SharedConnectorRecipient).where(
-        SharedConnectorRecipient.application_id == application_id,
-        SharedConnectorRecipient.recipient_id == recipient_id,
-    )
-    row: SharedConnectorRecipient | None = await session.scalar(_locked(statement, "share"))
+    row = await _lock_recipient(session, application_id, recipient_id, "share")
     return row if row is not None and row.retired_at is None else None
 
 
 async def _lock_binding(
     session: AsyncSession, binding_id: uuid.UUID, lock: Lock | None = None
-) -> SharedConnectorBinding | None:
+) -> SharedConnectorBinding:
     statement = (
         select(SharedConnectorBinding)
         .where(SharedConnectorBinding.id == binding_id)
         .options(SEALED_BINDING)
     )
     binding: SharedConnectorBinding | None = await session.scalar(_locked(statement, lock))
+    if binding is None:
+        raise SharedRefusal(status.HTTP_404_NOT_FOUND, "shared_binding_not_found")
     return binding
+
+
+async def database_role(
+    session: AsyncSession, application_id: uuid.UUID, lock: Lock | None = None
+) -> SharedConnectorDatabaseRole | None:
+    statement = (
+        select(SharedConnectorDatabaseRole)
+        .where(SharedConnectorDatabaseRole.application_id == application_id)
+        .options(SEALED_DSN)
+    )
+    row: SharedConnectorDatabaseRole | None = await session.scalar(_locked(statement, lock))
+    return row
 
 
 async def _lock_intent(
@@ -311,18 +325,15 @@ async def register_application(
             raise SharedRefusal(status.HTTP_409_CONFLICT, "shared_application_immutable")
     record = await application_record(session, application_id)
     await session.commit()
-    assert record is not None
     return record, inserted is not None
 
 
 async def application_record(
     session: AsyncSession, application_id: uuid.UUID
-) -> SharedApplicationOut | None:
+) -> SharedApplicationOut:
     """The operator view of one application: never ciphertext or a sealed DSN."""
 
     application = await lock_application(session, application_id)
-    if application is None:
-        return None
     recipients = (
         await session.scalars(
             _locked(
@@ -333,16 +344,10 @@ async def application_record(
             )
         )
     ).all()
+    # Ordered by ordinal, so the last live row is the current recipient.
     live = [row for row in recipients if row.retired_at is None]
-    current = max(live, key=lambda row: row.ordinal).recipient_id if live else None
-    database = await session.scalar(
-        _locked(
-            select(SharedConnectorDatabaseRole)
-            .where(SharedConnectorDatabaseRole.application_id == application_id)
-            .options(SEALED_DSN),
-            None,
-        )
-    )
+    current = live[-1].recipient_id if live else None
+    database = await database_role(session, application_id)
     return SharedApplicationOut.model_validate(
         {
             "application_id": application.id,
@@ -394,8 +399,6 @@ async def disable_application(
     """Disable under FOR UPDATE and commit; the caller acknowledges afterwards."""
 
     application = await lock_application(session, application_id, "update")
-    if application is None:
-        raise SharedRefusal(status.HTTP_404_NOT_FOUND, "shared_application_not_found")
     if application.enabled:
         await session.execute(
             update(SharedConnectorApplication)
@@ -410,10 +413,6 @@ async def disable_application(
 
 
 # --- members -------------------------------------------------------------------
-
-
-def _canonical_aliases(aliases: Sequence[SharedAliasIn]) -> dict[str, list[str] | None]:
-    return {item.alias: None if item.tools is None else sorted(item.tools) for item in aliases}
 
 
 async def _stored_aliases(
@@ -458,14 +457,12 @@ async def replace_members(
     # NO KEY UPDATE: the membership trigger updates this row, so take the
     # stronger lock now rather than upgrade a share lock later.
     application = await lock_application(session, application_id, "no_key_update")
-    if application is None:
-        raise SharedRefusal(status.HTTP_404_NOT_FOUND, "shared_application_not_found")
     if not agent_found:
         raise SharedRefusal(status.HTTP_404_NOT_FOUND, "shared_agent_not_found")
     if not application.enabled:
         raise SharedRefusal(status.HTTP_409_CONFLICT, "shared_application_disabled")
     allowed = set(application.policy["tools"])
-    requested = _canonical_aliases(aliases)
+    requested = {item.alias: None if item.tools is None else sorted(item.tools) for item in aliases}
     if any(tools is not None and not set(tools) <= allowed for tools in requested.values()):
         raise SharedRefusal(status.HTTP_422_UNPROCESSABLE_CONTENT, "shared_policy_widening")
     if await _stored_aliases(session, application_id, agent_id) != requested:
@@ -496,9 +493,7 @@ async def remove_member(
     session: AsyncSession, application_id: uuid.UUID, agent_id: uuid.UUID
 ) -> SharedMembershipOut:
     agent_found = await _lock_agent(session, agent_id)
-    application = await lock_application(session, application_id, "no_key_update")
-    if application is None:
-        raise SharedRefusal(status.HTTP_404_NOT_FOUND, "shared_application_not_found")
+    await lock_application(session, application_id, "no_key_update")
     removed: Sequence[Any] = []
     if agent_found:
         result = await session.execute(
@@ -531,8 +526,7 @@ async def register_recipient(
     and compared byte for byte before commit.
     """
 
-    if await lock_application(session, application_id) is None:
-        raise SharedRefusal(status.HTTP_404_NOT_FOUND, "shared_application_not_found")
+    await lock_application(session, application_id)
     if body.application_id != application_id:
         raise SharedRefusal(status.HTTP_409_CONFLICT, "shared_recipient_application_mismatch")
     key = body.public_key.raw()
@@ -591,15 +585,7 @@ async def retire_recipient(
     writer arriving later sees it retired.
     """
 
-    row = await session.scalar(
-        _locked(
-            select(SharedConnectorRecipient).where(
-                SharedConnectorRecipient.application_id == application_id,
-                SharedConnectorRecipient.recipient_id == recipient_id,
-            ),
-            "update",
-        )
-    )
+    row = await _lock_recipient(session, application_id, recipient_id, "update")
     if row is None:
         raise SharedRefusal(status.HTTP_404_NOT_FOUND, "shared_recipient_not_found")
     retired_at = row.retired_at
@@ -654,12 +640,8 @@ def _binding_out(
         None
         if binding.source_kind is None
         else {
-            "kind": binding.source_kind,
-            "namespace": binding.source_namespace,
-            "name": binding.source_name,
-            "uid": binding.source_uid,
-            "resource_version": binding.source_resource_version,
-            "fingerprint": binding.source_fingerprint,
+            field: getattr(binding, f"source_{field}")
+            for field in SharedSourceMetadata.model_fields
         }
     )
     refresh = (
@@ -692,8 +674,6 @@ def _binding_out(
 
 async def binding_record(session: AsyncSession, binding_id: uuid.UUID) -> SharedBindingOut:
     binding = await _lock_binding(session, binding_id)
-    if binding is None:
-        raise SharedRefusal(status.HTTP_404_NOT_FOUND, "shared_binding_not_found")
     return _binding_out(binding, await _lock_intent(session, binding_id))
 
 
@@ -711,8 +691,6 @@ async def import_binding(
     # FOR SHARE: a concurrent disable waits for this import, and two imports
     # into one application do not wait on each other.
     application = await lock_application(session, application_id, "share")
-    if application is None:
-        raise SharedRefusal(status.HTTP_404_NOT_FOUND, "shared_application_not_found")
     if not agent_found:
         raise SharedRefusal(status.HTTP_404_NOT_FOUND, "shared_agent_not_found")
     if not application.enabled:
@@ -761,7 +739,7 @@ async def import_binding(
         values |= {
             "recipient_id": body.credential.recipient_id,
             "ciphertext": body.credential.sealed(),
-            **_source_columns(body.source.model_dump()),
+            **_source_columns(body.source),
         }
     await guarded_write(
         session,
@@ -787,26 +765,8 @@ async def import_binding(
     return record
 
 
-def _source_columns(source: dict[str, str]) -> dict[str, str]:
-    return {
-        "source_kind": source["kind"],
-        "source_namespace": source["namespace"],
-        "source_name": source["name"],
-        "source_uid": source["uid"],
-        "source_resource_version": source["resource_version"],
-        "source_fingerprint": source["fingerprint"],
-    }
-
-
-async def _platform_binding(
-    session: AsyncSession, binding_id: uuid.UUID, lock: Lock | None
-) -> SharedConnectorBinding:
-    binding = await _lock_binding(session, binding_id, lock)
-    if binding is None:
-        raise SharedRefusal(status.HTTP_404_NOT_FOUND, "shared_binding_not_found")
-    if binding.custody != "platform":
-        raise SharedRefusal(status.HTTP_409_CONFLICT, "shared_binding_connector_custody")
-    return binding
+def _source_columns(source: SharedSourceMetadata) -> dict[str, str]:
+    return {f"source_{field}": value for field, value in source.model_dump().items()}
 
 
 async def reimport_binding(
@@ -821,8 +781,6 @@ async def reimport_binding(
     """
 
     binding = await _lock_binding(session, binding_id, "update")
-    if binding is None:
-        raise SharedRefusal(status.HTTP_404_NOT_FOUND, "shared_binding_not_found")
     if not binding.enabled:
         raise SharedRefusal(status.HTTP_409_CONFLICT, "shared_binding_disabled")
     if binding.custody != "platform":
@@ -845,7 +803,7 @@ async def reimport_binding(
             recipient_id=recipient_id,
             ciphertext=body.credential.sealed(),
             updated_at=func.now(),
-            **_source_columns(body.source.model_dump()),
+            **_source_columns(body.source),
         )
         .returning(SharedConnectorBinding.id)
         .execution_options(synchronize_session=False),
@@ -877,7 +835,9 @@ async def check_binding(
 ) -> SharedBindingCheckOut:
     """Compare the recorded source version; never reads or returns material."""
 
-    binding = await _platform_binding(session, binding_id, None)
+    binding = await _lock_binding(session, binding_id)
+    if binding.custody != "platform":
+        raise SharedRefusal(status.HTTP_409_CONFLICT, "shared_binding_connector_custody")
     recorded = {"uid": binding.source_uid, "resource_version": binding.source_resource_version}
     current = recorded == {"uid": body.source.uid, "resource_version": body.source.resource_version}
     return SharedBindingCheckOut.model_validate(
@@ -894,8 +854,6 @@ async def disable_binding(session: AsyncSession, binding_id: uuid.UUID) -> Share
     """Disable under FOR UPDATE and commit; the caller acknowledges afterwards."""
 
     binding = await _lock_binding(session, binding_id, "update")
-    if binding is None:
-        raise SharedRefusal(status.HTTP_404_NOT_FOUND, "shared_binding_not_found")
     if binding.enabled:
         await session.execute(
             update(SharedConnectorBinding)

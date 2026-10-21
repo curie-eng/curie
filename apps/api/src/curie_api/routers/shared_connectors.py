@@ -23,7 +23,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
-from pydantic import AliasChoices, AliasPath, BaseModel
+from pydantic import BaseModel
 
 from ..auth import require_internal_worker_token, require_platform_key
 from ..deps import SessionDep
@@ -51,7 +51,7 @@ from ..schemas.shared_connectors import (
     SharedRecipientRetired,
 )
 from ..shared_connectors import database_roles, store
-from ..shared_connectors.store import NO_STORE, SharedRefusal
+from ..shared_connectors.store import NO_STORE
 
 _REQUEST_MODELS: tuple[type[BaseModel], ...] = (
     SharedApplicationRegistration,
@@ -81,18 +81,8 @@ def _nested_models(annotation: object) -> Iterator[type[BaseModel]]:
         yield from _nested_models(argument)
 
 
-def _alias_names(alias: object) -> Iterator[str]:
-    if isinstance(alias, str):
-        yield alias
-    elif isinstance(alias, AliasChoices):
-        for choice in alias.choices:
-            yield from _alias_names(choice)
-    elif isinstance(alias, AliasPath):
-        yield from (step for step in alias.path if isinstance(step, str))
-
-
 def _declared_field_names(models: tuple[type[BaseModel], ...]) -> frozenset[str]:
-    """Field names and aliases of ``models`` and of every model nested in them."""
+    """Field names of ``models`` and of every model nested in them; none declares an alias."""
 
     names: set[str] = set()
     seen: set[type[BaseModel]] = set()
@@ -104,8 +94,6 @@ def _declared_field_names(models: tuple[type[BaseModel], ...]) -> frozenset[str]
         seen.add(model)
         for name, field in model.model_fields.items():
             names.add(name)
-            for alias in (field.alias, field.validation_alias, field.serialization_alias):
-                names.update(_alias_names(alias))
             pending.extend(_nested_models(field.annotation))
     return frozenset(names)
 
@@ -199,10 +187,6 @@ internal_router = APIRouter(
 RecipientId = Annotated[str, Path(pattern=HEX64_PATTERN)]
 
 
-def _not_found(code: str) -> SharedRefusal:
-    return SharedRefusal(status.HTTP_404_NOT_FOUND, code)
-
-
 # --- applications ----------------------------------------------------------------
 
 
@@ -224,10 +208,7 @@ async def register_shared_application(
 async def get_shared_application(
     application_id: uuid.UUID, session: SessionDep
 ) -> SharedApplicationOut:
-    record = await store.application_record(session, application_id)
-    if record is None:
-        raise _not_found("shared_application_not_found")
-    return record
+    return await store.application_record(session, application_id)
 
 
 @router.post("/applications/{application_id}/disable", response_model=SharedApplicationDisabled)

@@ -74,18 +74,6 @@ DEFINER_FUNCTIONS = (
     "shared_connector_refresh_mark_recovery(text, uuid, bigint)",
     "shared_connector_reseal(uuid, bigint, text, text, bytea)",
 )
-TRIGGER_FUNCTIONS = (
-    f"{APPLICATIONS}_pinned",
-    f"{RECIPIENTS}_pinned",
-    f"{DATABASE_ROLES}_pinned",
-    f"{BINDINGS}_pinned",
-    f"{REFRESH_INTENTS}_pinned",
-    f"{BINDINGS}_live_recipient",
-    f"{DATABASE_ROLES}_live_recipient",
-    f"{MEMBERSHIPS}_inserted",
-    f"{MEMBERSHIPS}_updated",
-    f"{MEMBERSHIPS}_deleted",
-)
 
 # SQLAlchemy's text() reads ``:name`` as a bind parameter, which would swallow
 # POSIX classes such as ``[:space:]``; ``\:`` is its escape for a literal colon.
@@ -112,6 +100,19 @@ CALLER_APPLICATION = f"""
 CIPHERTEXT_BOUNDS = """
     IF p_ciphertext IS NULL OR octet_length(p_ciphertext) NOT BETWEEN 49 AND 65536 THEN
         RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'shared_ciphertext_out_of_bounds';
+    END IF;"""
+
+# Unlocked: a grant's binding never changes, so it names the rows to lock.
+GRANT_BINDING = f"""
+    SELECT a.installation_id INTO v_installation
+    FROM {SCHEMA}.{APPLICATIONS} a WHERE a.id = v_application;
+    SELECT i.binding_id INTO v_binding
+    FROM {SCHEMA}.{REFRESH_INTENTS} i
+    WHERE i.installation_id = v_installation AND i.grant_id = p_grant_id
+      AND i.application_id = v_application;
+    IF NOT FOUND THEN
+        RETURN NEXT;
+        RETURN;
     END IF;"""
 
 DEFINER = """
@@ -653,6 +654,13 @@ MEMBERSHIP_TRIGGERS = (
         "SELECT DISTINCT o.application_id FROM deleted_rows o",
     ),
 )
+# (table, the column naming a recipient) for the decision 16 triggers.
+LIVE_RECIPIENT_COLUMNS = ((BINDINGS, "recipient_id"), (DATABASE_ROLES, "dsn_recipient_id"))
+TRIGGER_FUNCTIONS = (
+    *(f"{table}_pinned" for table in PINNED),
+    *(f"{table}_live_recipient" for table, _ in LIVE_RECIPIENT_COLUMNS),
+    *(f"{MEMBERSHIPS}_{event}" for event, *_ in MEMBERSHIP_TRIGGERS),
+)
 
 
 def _create_triggers() -> None:
@@ -662,7 +670,7 @@ def _create_triggers() -> None:
             f"CREATE TRIGGER {table}_pinned BEFORE UPDATE ON {SCHEMA}.{table} "
             f"FOR EACH ROW EXECUTE FUNCTION {SCHEMA}.{table}_pinned()"
         )
-    for table, column in ((BINDINGS, "recipient_id"), (DATABASE_ROLES, "dsn_recipient_id")):
+    for table, column in LIVE_RECIPIENT_COLUMNS:
         op.execute(_live_recipient_function(table, column))
         op.execute(
             f"CREATE TRIGGER {table}_live_recipient "
@@ -764,18 +772,7 @@ BEGIN
         RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'shared_refresh_lease_invalid';
     END IF;
     outcome := 'not_found';
-
-    -- Unlocked lookup. A grant's binding never changes, so it names the rows to lock.
-    SELECT a.installation_id INTO v_installation
-    FROM {SCHEMA}.{APPLICATIONS} a WHERE a.id = v_application;
-    SELECT i.binding_id INTO v_binding
-    FROM {SCHEMA}.{REFRESH_INTENTS} i
-    WHERE i.installation_id = v_installation AND i.grant_id = p_grant_id
-      AND i.application_id = v_application;
-    IF NOT FOUND THEN
-        RETURN NEXT;
-        RETURN;
-    END IF;
+{GRANT_BINDING}
 
     -- Plan decision 15, as separate statements. Application FOR SHARE.
     SELECT a.enabled INTO v_application_enabled
@@ -876,17 +873,7 @@ BEGIN
 {CALLER_APPLICATION}
 {CIPHERTEXT_BOUNDS}
     outcome := 'not_found';
-
-    SELECT a.installation_id INTO v_installation
-    FROM {SCHEMA}.{APPLICATIONS} a WHERE a.id = v_application;
-    SELECT i.binding_id INTO v_binding
-    FROM {SCHEMA}.{REFRESH_INTENTS} i
-    WHERE i.installation_id = v_installation AND i.grant_id = p_grant_id
-      AND i.application_id = v_application;
-    IF NOT FOUND THEN
-        RETURN NEXT;
-        RETURN;
-    END IF;
+{GRANT_BINDING}
 
     -- Plan decision 15. Binding FOR UPDATE, then intent FOR UPDATE; the binding
     -- trigger locks the recipient last.

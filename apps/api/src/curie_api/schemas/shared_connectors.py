@@ -18,7 +18,7 @@ import uuid
 from datetime import datetime
 from typing import Annotated, Any, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from ..shared_connectors import sealing
 
@@ -70,6 +70,11 @@ def _unique(values: list[str], what: str) -> list[str]:
     return values
 
 
+_DnsSubdomain = Annotated[str, AfterValidator(_dns_subdomain)]
+_SourceUid = Annotated[str, AfterValidator(lambda value: _opaque(value, 128))]
+_ResourceVersion = Annotated[str, AfterValidator(lambda value: _opaque(value, 64))]
+
+
 # --- requests -----------------------------------------------------------------
 
 
@@ -78,16 +83,11 @@ class SharedPolicy(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    tools: _Tools
+    tools: Annotated[_Tools, AfterValidator(lambda value: _unique(value, "policy tools"))]
     # "platform": the store holds sealed credentials, so the application must
     # declare at least one slot. "connector": identity-only admission for a
     # connector holding its own binding-indexed store, which declares none.
     custody: Custody = "platform"
-
-    @field_validator("tools")
-    @classmethod
-    def _distinct_tools(cls, value: list[str]) -> list[str]:
-        return _unique(value, "policy tools")
 
 
 class SharedApplicationRegistration(BaseModel):
@@ -105,12 +105,7 @@ class SharedAliasIn(BaseModel):
 
     alias: str = Field(pattern=DNS_LABEL_PATTERN)
     # Null admits every policy tool; a list may only narrow the policy.
-    tools: _Tools | None
-
-    @field_validator("tools")
-    @classmethod
-    def _distinct_tools(cls, value: list[str] | None) -> list[str] | None:
-        return None if value is None else _unique(value, "alias tools")
+    tools: Annotated[_Tools, AfterValidator(lambda value: _unique(value, "alias tools"))] | None
 
 
 class SharedMembershipReplace(BaseModel):
@@ -149,42 +144,17 @@ class SharedSourceMetadata(BaseModel):
 
     kind: Literal["kubernetes-secret"]
     namespace: str = Field(pattern=DNS_LABEL_PATTERN)
-    name: str
-    uid: str
-    resource_version: str
+    name: _DnsSubdomain
+    uid: _SourceUid
+    resource_version: _ResourceVersion
     fingerprint: str = Field(pattern=SOURCE_FINGERPRINT_PATTERN)
-
-    @field_validator("name")
-    @classmethod
-    def _subdomain(cls, value: str) -> str:
-        return _dns_subdomain(value)
-
-    @field_validator("uid")
-    @classmethod
-    def _uid(cls, value: str) -> str:
-        return _opaque(value, 128)
-
-    @field_validator("resource_version")
-    @classmethod
-    def _resource_version(cls, value: str) -> str:
-        return _opaque(value, 64)
 
 
 class SharedSourceVersion(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    uid: str
-    resource_version: str
-
-    @field_validator("uid")
-    @classmethod
-    def _uid(cls, value: str) -> str:
-        return _opaque(value, 128)
-
-    @field_validator("resource_version")
-    @classmethod
-    def _resource_version(cls, value: str) -> str:
-        return _opaque(value, 64)
+    uid: _SourceUid
+    resource_version: _ResourceVersion
 
 
 class SharedRefreshGrantIn(BaseModel):
