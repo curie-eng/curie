@@ -421,6 +421,20 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_CALLER_PROXY_GATED_TOOLS",
         "CURIE_CALLER_PROXY_CONNECTOR",
         "CURIE_CALLER_PROXY_GRANT_STORE",
+        # ResolverConfig.from_env reads these seven in the connector proxy container.
+        "CURIE_SHARED_INSTALLATION",
+        "CURIE_SHARED_APPLICATION",
+        "CURIE_SHARED_DSN_ENCODING",
+        "CURIE_SHARED_PROVIDER_ORIGINS",
+        "CURIE_SHARED_CREDENTIAL_SLOTS",
+        "CURIE_SHARED_ENCRYPTION_KEY_FILE",
+        "CURIE_SHARED_DATABASE_DSN_FILE",
+        # ResolverConfig reads the socket path in the proxy; the vendored
+        # reference SDK reads the same name in the connector server.
+        "CURIE_SHARED_RESOLVER_SOCKET",
+        # The snapshot seal file belongs only to the connector server.
+        # ResolverConfig.from_env refuses it when present.
+        "CURIE_SHARED_SNAPSHOT_SEAL_FILE",
         # runner-local harness selection (ADR-0060, #844); read by the runner from
         # its own env to pick the active harness, unset selects the built-in
         # Claude. Not a boot contract key.
