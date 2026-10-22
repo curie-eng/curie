@@ -22,6 +22,7 @@ from typing import Any
 from . import test_commissioning_bootstrap as _bootstrap_vectors
 from . import test_commissioning_operator_guard as _guard_vectors
 from . import test_commissioning_records as _permit_vectors
+from .test_measuring_identity_rbac import rbac_set as _measuring_rbac_set
 
 HOOK = "alerts"
 ROLES = ("issuer", "control", "candidate_enqueue", "candidate_worker")
@@ -114,7 +115,8 @@ class CommissioningTuple:
             "kind": "commissioning_guard_config",
             "bootstrap_digest": self.bootstrap.digest,
             "admission_policy_sha256": "a" * 64,
-            "rbac_sha256": "b" * 64,
+            # The measuring identity's RBAC set: the verifier reads its scope from it.
+            "rbac_sha256": hashlib.sha256(_measuring_rbac_set()).hexdigest(),
             "network_policy_sha256": "c" * 64,
             "broker_acl": {
                 name: {"credential": credentials[name], "rules_sha256": "d" * 64}

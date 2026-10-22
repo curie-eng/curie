@@ -42,6 +42,9 @@ from .admission_broker import FixtureSecret
 from .commissioning_tuple_broker import broker_now_ms, snapshot
 from .test_commissioning_records import permit_value
 from .test_commissioning_verifier import Producer
+from .test_measuring_identity_rbac import Reader as RbacReader
+from .test_measuring_identity_rbac import manifest as measuring_manifest
+from .test_measuring_identity_rbac import rbac_set as measuring_rbac_set
 
 pworker_service = wb.pworker_service
 
@@ -164,6 +167,7 @@ class Installation:
         self.profile = worker_profile(
             broker_identity=broker.manifest().as_dict()["broker_identity"],
             max_permit_ms="600000",
+            rbac_sha256=hashlib.sha256(measuring_rbac_set()).hexdigest(),
         )
         self.tuple = construct(self.profile, acl=GuardRecipes(profile_fields()["qualification_id"]))
         self.manifest, self.bootstrap = self.tuple.manifest, self.tuple.bootstrap
@@ -379,6 +383,7 @@ class Harness:
         from curie_protected_hooks.commissioning_verifier import (
             REQUIRED_CASES,
             CommissioningVerifier,
+            MeasuringIdentityCheck,
             PublicationInputs,
         )
         from curie_protected_hooks.worker_transport import WorkerCredential
@@ -478,6 +483,10 @@ class Harness:
             ),
         )
         self._verifier_class = CommissioningVerifier
+        # ADR 0238: the measuring identity's least privilege, read from the RBAC set G names.
+        self.verifier_args["measuring_identity"] = MeasuringIdentityCheck(
+            measuring_rbac_set(), RbacReader(measuring_manifest(release=False))
+        )
 
     def record_candidate_rules(self) -> None:
         """What the broker reports for each candidate once ``enable_candidates`` ran."""
