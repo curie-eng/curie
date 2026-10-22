@@ -44,5 +44,10 @@ has check runs.
 5. `ci` is derived from `github/`: the required contexts from the rules file
    and one check per check run.
 
+6. `runs.a.probe.cleanup` and `runs.b.probe.cleanup` (`holder_removed`,
+   `volume_absent`) are derived fields: both are true because the recording's
+   `holder-rm` and `volume-rm` exited 0 (the probe additionally verifies with
+   `docker ps -aq` and `docker volume ls -q` listings that print nothing).
+
 Failing envelopes are not stored here. Each failure case is a mutation of the
 passing envelope made inside `tests/test_docker_scenario.py`.

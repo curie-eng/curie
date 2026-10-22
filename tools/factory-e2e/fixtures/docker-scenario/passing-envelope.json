@@ -93,6 +93,10 @@
               "reachable": false
             }
           ]
+        },
+        "cleanup": {
+          "holder_removed": true,
+          "volume_absent": true
         }
       },
       "daemon": {
@@ -506,6 +510,10 @@
               "reachable": false
             }
           ]
+        },
+        "cleanup": {
+          "holder_removed": true,
+          "volume_absent": true
         }
       },
       "daemon": {

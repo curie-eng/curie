@@ -347,6 +347,80 @@ def test_ci_reason_names_the_check(envelope: dict[str, Any]) -> None:
     ) in reasons
 
 
+# review round 1 amendments (A1 to A4)
+
+
+@pytest.mark.parametrize(
+    "target",
+    ["kubernetes.default.svc:443", "10.96.0.1", "10.96.0.1:0", "10.96.0.1:65536", "::1:80", ""],
+)
+def test_judge_egress_target_must_be_an_ip_port(envelope: dict[str, Any], target: str) -> None:
+    _target(envelope, "a", "cluster-api")["target"] = target
+    reasons = _assert_prefix(envelope, "egress_probe_failed")
+    assert any("cluster-api" in r for r in reasons), reasons
+
+
+def test_judge_accepts_bracketed_ipv6_egress_target(envelope: dict[str, Any]) -> None:
+    _target(envelope, "a", "cluster-api")["target"] = "[fd00::1]:443"
+    assert docker_scenario.judge(envelope) == []
+
+
+@pytest.mark.parametrize("field", ["holder_removed", "volume_absent"])
+def test_judge_incomplete_probe_cleanup_names_the_run(envelope: dict[str, Any], field: str) -> None:
+    envelope["runs"]["b"]["probe"]["cleanup"][field] = False
+    reasons = _assert_prefix(envelope, "incomplete_cleanup")
+    assert any("run b probe" in r for r in reasons), reasons
+
+
+def test_judge_missing_probe_cleanup_fails(envelope: dict[str, Any]) -> None:
+    del envelope["runs"]["a"]["probe"]["cleanup"]
+    assert docker_scenario.judge(envelope) != []
+
+
+def test_judge_sub_second_gap_between_windows_is_not_concurrent(
+    envelope: dict[str, Any],
+) -> None:
+    envelope["runs"]["a"]["probe"]["window"] = [90.0, 100.2]
+    envelope["runs"]["b"]["probe"]["window"] = [100.3, 110.0]
+    _assert_prefix(envelope, "not_concurrent")
+
+
+def test_judge_sub_second_overlap_is_concurrent(envelope: dict[str, Any]) -> None:
+    envelope["runs"]["a"]["probe"]["window"] = [90.0, 100.4]
+    envelope["runs"]["b"]["probe"]["window"] = [100.3, 110.0]
+    assert docker_scenario.judge(envelope) == []
+
+
+@pytest.mark.parametrize("nonce", [None, "", 7, ["e8ce1a8c"]], ids=repr)
+def test_judge_requires_a_nonempty_string_nonce(envelope: dict[str, Any], nonce: Any) -> None:
+    envelope["nonce"] = nonce
+    reasons = docker_scenario.judge(envelope)
+    assert any(r.startswith("missing_observation: nonce") for r in reasons), reasons
+
+
+def test_judge_missing_nonce_key_is_missing_observation(envelope: dict[str, Any]) -> None:
+    del envelope["nonce"]
+    reasons = docker_scenario.judge(envelope)
+    assert any(r.startswith("missing_observation: nonce") for r in reasons), reasons
+
+
+def test_judge_event_without_the_label_key_is_foreign(envelope: dict[str, Any]) -> None:
+    del envelope["runs"]["a"]["daemon"]["events"][3]["Actor"]["Attributes"][
+        docker_scenario.NONCE_LABEL
+    ]
+    _assert_prefix(envelope, "events_foreign")
+
+
+def test_judge_nonce_and_every_label_removed_together_is_foreign(
+    envelope: dict[str, Any],
+) -> None:
+    del envelope["nonce"]
+    for run in envelope["runs"].values():
+        for event in run["daemon"]["events"]:
+            event["Actor"]["Attributes"].pop(docker_scenario.NONCE_LABEL, None)
+    _assert_prefix(envelope, "events_foreign")
+
+
 def test_empty_events_fail(envelope: dict[str, Any]) -> None:
     envelope["runs"]["a"]["daemon"]["events"] = []
     reasons = docker_scenario.judge(envelope)
@@ -537,16 +611,26 @@ def test_escape_result_keeps_the_last_400_characters() -> None:
 
 def test_egress_result_shapes() -> None:
     blocked = docker_scenario.egress_result(
-        "metadata", "169.254.169.254:80", _rc("egress-metadata")
+        "metadata", "169.254.169.254:80", _rc("egress-metadata"), _raw("egress-metadata")
     )
     assert blocked == {
         "name": "metadata",
         "target": "169.254.169.254:80",
         "exit_code": 1,
         "reachable": False,
+        "output_tail": _raw("egress-metadata")[-400:],
     }
-    public = docker_scenario.egress_result("public", "192.0.2.80:443", _rc("egress-public"))
+    public = docker_scenario.egress_result(
+        "public", "192.0.2.80:443", _rc("egress-public"), _raw("egress-public")
+    )
     assert public["reachable"] is True and public["exit_code"] == 0
+    assert docker_scenario.egress_result("metadata", "169.254.169.254:80", 1)["output_tail"] == ""
+
+
+def test_egress_result_keeps_the_last_400_characters() -> None:
+    output = "y" * 1000 + "nc: connect timed out\n"
+    result = docker_scenario.egress_result("metadata", "169.254.169.254:80", 1, output)
+    assert result["output_tail"] == output[-400:]
 
 
 def test_passing_envelope_run_a_is_the_recording(envelope: dict[str, Any]) -> None:
@@ -813,10 +897,54 @@ def test_first_head_ci_neutral_and_skipped_pass() -> None:
     assert fe.judge_first_head_ci(obs) == []
 
 
-def test_first_head_ci_rerun_green_counts() -> None:
-    checks = [_green("a", conclusion="failure"), _green("a")]
+def test_first_head_ci_success_and_failure_on_the_first_head_fails() -> None:
+    for checks in (
+        [_green("a", conclusion="failure"), _green("a")],
+        [_green("a"), _green("a", conclusion="failure")],
+    ):
+        obs = {"first_head": FIRST_HEAD, "required": ["a"], "checks": checks}
+        assert fe.judge_first_head_ci(obs) == [
+            "required check 'a' concluded 'failure' on the first head"
+        ]
+
+
+def test_first_head_ci_names_the_first_non_green_conclusion() -> None:
+    checks = [_green("a"), _green("a", conclusion="timed_out"), _green("a", conclusion="failure")]
     obs = {"first_head": FIRST_HEAD, "required": ["a"], "checks": checks}
-    assert fe.judge_first_head_ci(obs) == []
+    assert fe.judge_first_head_ci(obs) == [
+        "required check 'a' concluded 'timed_out' on the first head"
+    ]
+
+
+def test_first_head_ci_section_keeps_the_newest_status_per_context() -> None:
+    empty = {"total_count": 0, "check_runs": []}
+    newest_first = [
+        {"context": "legacy/status", "state": "success"},
+        {"context": "legacy/status", "state": "failure"},
+    ]
+    ci = docker_scenario.ci_section(FIRST_HEAD, None, empty, newest_first, ["legacy/status"])
+    assert [c["conclusion"] for c in ci["checks"]] == ["success"]
+    assert fe.judge_first_head_ci(ci) == []
+    ci = docker_scenario.ci_section(FIRST_HEAD, None, empty, newest_first[::-1], ["legacy/status"])
+    assert [c["conclusion"] for c in ci["checks"]] == ["failure"]
+    assert fe.judge_first_head_ci(ci) == [
+        "required check 'legacy/status' concluded 'failure' on the first head"
+    ]
+
+
+def test_first_head_ci_section_dedupes_statuses_across_contexts() -> None:
+    empty = {"total_count": 0, "check_runs": []}
+    statuses = [
+        {"context": "one", "state": "pending"},
+        {"context": "two", "state": "success"},
+        {"context": "one", "state": "success"},
+        {"context": "two", "state": "error"},
+    ]
+    ci = docker_scenario.ci_section(FIRST_HEAD, None, empty, statuses, ["one", "two"])
+    assert [(c["name"], c["status"], c["conclusion"]) for c in ci["checks"]] == [
+        ("one", "queued", None),
+        ("two", "completed", "success"),
+    ]
 
 
 def test_first_head_ci_status_context_counts() -> None:
@@ -914,11 +1042,20 @@ elif args[:2] == ["volume", "create"]:
     name = "escape-volume-driver-bind"
 elif args[:2] == ["volume", "rm"]:
     name = "volume-rm"
+elif args[:2] == ["volume", "ls"]:
+    sys.stdout.write(os.environ.get("FAKE_VOLUME_LS", ""))
+    sys.exit(0)
+elif args[:1] == ["ps"]:
+    sys.stdout.write(os.environ.get("FAKE_PS_OUT", ""))
+    sys.exit(0)
 elif args[:1] == ["exec"]:
     name = "escape-exec-privileged"
 elif args[:1] == ["rm"]:
     name = "holder-rm"
 elif args[:1] == ["run"] and "-d" in args:
+    if os.environ.get("FAKE_HOLDER_FAIL"):
+        sys.stderr.write("docker: Error response from daemon: holder create failed\n")
+        sys.exit(125)
     name = "holder"
 elif args[:1] == ["run"] and "--userns=host" in args:
     name = "escape-userns-host"
@@ -1004,9 +1141,16 @@ def test_probe_replays_recordings(tmp_path: Path, fake_bin: Path, envelope: dict
         (e["name"], e["exit_code"], e["rule"]) for e in recorded["escapes"]
     ]
     assert probe["egress"]["pull"] == recorded["egress"]["pull"]
-    assert probe["egress"]["targets"] == recorded["egress"]["targets"]
+    targets = [
+        {k: v for k, v in t.items() if k != "output_tail"} for t in probe["egress"]["targets"]
+    ]
+    assert targets == recorded["egress"]["targets"]
+    for target in probe["egress"]["targets"]:
+        raw = "egress-metadata" if target["name"] == "metadata" else "egress-testnet"
+        assert target["output_tail"] == _raw(raw)[-400:], target["name"]
     t0, t1 = probe["window"]
-    assert isinstance(t0, int) and isinstance(t1, int) and t0 <= t1
+    assert isinstance(t0, float) and isinstance(t1, float) and t0 <= t1
+    assert probe["cleanup"] == {"holder_removed": True, "volume_absent": True}
 
     calls = _logged(fake_bin)
     for _, argv, _ in docker_scenario.escape_commands(IMAGE, NONCE, HOLDER):
@@ -1014,8 +1158,79 @@ def test_probe_replays_recordings(tmp_path: Path, fake_bin: Path, envelope: dict
     assert ["info", "--format", "{{.ID}} {{.Name}}"] in calls
     holder_run = next(c for c in calls if c[:1] == ["run"] and "-d" in c)
     assert f"curie.fixture.nonce={NONCE}" in holder_run and holder_run[-2:] == ["sleep", "300"]
-    assert any(c[:2] == ["volume", "rm"] and f"curie-escape-{NONCE}" in c for c in calls)
-    assert any(c[:1] == ["rm"] and HOLDER in c for c in calls)
+    name = holder_run[holder_run.index("--name") + 1]
+    assert re.fullmatch(rf"curie-probe-{NONCE}-[0-9a-f]{{6}}", name), name
+    assert ["rm", "-f", name] in calls
+    assert ["volume", "rm", "-f", f"curie-escape-{NONCE}"] in calls
+    listings = [c for c in calls if c[:1] == ["ps"] or c[:2] == ["volume", "ls"]]
+    assert any(c[:1] == ["ps"] and f"name=^{name}$" in c for c in listings), listings
+    assert any(f"name=^curie-escape-{NONCE}$" in c for c in listings if c[:2] == ["volume", "ls"])
+
+
+def _probe_args(out: Path, **targets: str) -> list[str]:
+    given = {"cluster-api": "10.96.0.1:443", "api": "10.96.112.40:8080", **targets}
+    argv = ["probe", "--nonce", NONCE, "--image", IMAGE, "--out", str(out)]
+    for flag, value in given.items():
+        argv += [f"--{flag}", value]
+    return argv
+
+
+def test_probe_cleans_up_by_name_when_the_holder_never_starts(
+    tmp_path: Path, fake_bin: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FAKE_HOLDER_FAIL", "1")
+    docker_scenario.main(_probe_args(tmp_path / "probe.json"))
+    calls = _logged(fake_bin)
+    holder_run = next(c for c in calls if c[:1] == ["run"] and "-d" in c)
+    name = holder_run[holder_run.index("--name") + 1]
+    assert ["rm", "-f", name] in calls
+    assert ["volume", "rm", "-f", f"curie-escape-{NONCE}"] in calls
+
+
+@pytest.mark.parametrize(
+    ("env", "field"), [("FAKE_PS_OUT", "holder_removed"), ("FAKE_VOLUME_LS", "volume_absent")]
+)
+def test_probe_exits_1_when_cleanup_is_not_verified(
+    tmp_path: Path,
+    fake_bin: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    env: str,
+    field: str,
+) -> None:
+    monkeypatch.setenv(env, "9f8e7d6c5b4a\n")
+    out = tmp_path / "probe.json"
+    assert docker_scenario.main(_probe_args(out)) == 1
+    cleanup = json.loads(out.read_text())["cleanup"]
+    assert cleanup[field] is False
+    assert [v for k, v in cleanup.items() if k != field] == [True]
+
+
+@pytest.mark.parametrize("flag", ["cluster-api", "api", "metadata"])
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "kubernetes.default.svc:443",
+        "10.0.0.1",
+        "10.0.0.1:0",
+        "10.0.0.1:65536",
+        "10.0.0.1:x",
+        "::1:80",
+    ],
+)
+def test_probe_rejects_non_ip_targets(tmp_path: Path, fake_bin: Path, flag: str, bad: str) -> None:
+    with pytest.raises(SystemExit) as exc:
+        docker_scenario.main(_probe_args(tmp_path / "probe.json", **{flag: bad}))
+    assert exc.value.code == 2
+    assert not (tmp_path / "probe.json").exists()
+    assert not fake_bin.exists() or not _logged(fake_bin)
+
+
+def test_probe_accepts_ipv4_and_bracketed_ipv6_targets(tmp_path: Path, fake_bin: Path) -> None:
+    out = tmp_path / "probe.json"
+    argv = _probe_args(out, **{"cluster-api": "[fd00::1]:443", "metadata": "169.254.169.254:80"})
+    assert docker_scenario.main(argv) == 0
+    targets = {t["name"]: t["target"] for t in json.loads(out.read_text())["egress"]["targets"]}
+    assert targets["cluster-api"] == "[fd00::1]:443"
 
 
 def test_collect_replays_recordings(
@@ -1140,3 +1355,86 @@ def test_ci_with_explicit_required_skips_rules(
     assert code == 0
     assert json.loads(out.read_text())["required"] == ["E2E required", "CodeQL"]
     assert not any("/rules/" in path for path in requested)
+
+
+@pytest.fixture
+def paged_github_server() -> Iterator[tuple[str, list[str]]]:
+    """Check runs and statuses each split over two pages joined by Link headers."""
+
+    requested: list[str] = []
+    routes: dict[str, tuple[bytes, str]] = {}
+    commit = f"/repos/{CATALOG}/commits/{FIRST_HEAD}"
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            requested.append(self.path)
+            body, link = routes.get(self.path, (b'{"message": "Not Found"}', ""))
+            self.send_response(200 if self.path in routes else 404)
+            self.send_header("Content-Type", "application/json")
+            if link:
+                self.send_header("Link", link)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args: Any) -> None:
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    url = f"http://127.0.0.1:{server.server_address[1]}"
+    runs = json.loads((GITHUB / "check-runs.json").read_text())["check_runs"]
+
+    def page(rel_path: str, number: int) -> str:
+        return f"<{url}{rel_path}&page={number}>"
+
+    runs_path = f"{commit}/check-runs?per_page=100&filter=latest"
+    statuses_path = f"{commit}/statuses?per_page=100"
+    for path, first, second in (
+        (
+            runs_path,
+            {"total_count": len(runs), "check_runs": runs[:30]},
+            {"total_count": len(runs), "check_runs": runs[30:]},
+        ),
+        (
+            statuses_path,
+            [{"context": "legacy/one", "state": "success"}],
+            [{"context": "legacy/two", "state": "success"}],
+        ),
+    ):
+        routes[path] = (
+            json.dumps(first).encode(),
+            f'{page(path, 2)}; rel="next", {page(path, 2)}; rel="last"',
+        )
+        routes[f"{path}&page=2"] = (
+            json.dumps(second).encode(),
+            f'{page(path, 1)}; rel="prev", {page(path, 1)}; rel="first"',
+        )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield url, requested
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_ci_follows_link_headers_for_check_runs_and_statuses(
+    tmp_path: Path,
+    paged_github_server: tuple[str, list[str]],
+    envelope: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    url, requested = paged_github_server
+    out = tmp_path / "ci.json"
+    code = docker_scenario.main(
+        [
+            "ci", "--api-url", url, "--repo", CATALOG, "--base", "next", "--sha", FIRST_HEAD,
+            "--required", "E2E required", "--required", "legacy/two", "--out", str(out),
+        ]
+    )  # fmt: skip
+    assert code == 0
+    names = [c["name"] for c in json.loads(out.read_text())["checks"]]
+    expected = [c["name"] for c in envelope["ci"]["checks"]]
+    assert names == expected + ["legacy/one", "legacy/two"]
+    assert len(requested) == 4, requested
+    assert sum("page=2" in path for path in requested) == 2, requested
