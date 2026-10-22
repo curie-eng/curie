@@ -82,13 +82,8 @@ DELIVERED, DELIVERY = ("success", "daemon_death", "retained_next"), ("failed", "
 IDENTITY = ("kind", "name", "namespace", "uid")
 ROLES = ("daemon", "service", "ingress", "server-secret", "client-secret")
 IMAGE_NAMES = ("daemon", "platform", "catalog", "runner", "api", "worker")
-CLEANUP_KEYS = (
-    "helm_uninstalled",
-    "release_objects_absent",
-    "fixture_cleanup_complete",
-    "namespaces_absent",
-    "docker_assets_absent",
-)
+CLEANUP_KEYS: tuple[str, ...] = ("helm_uninstalled", "release_objects_absent")
+CLEANUP_KEYS += ("fixture_cleanup_complete", "namespaces_absent", "docker_assets_absent")
 TERMINAL = frozenset({"completed", "failed", "expired", "cancelled"})
 DOCKER_ENV = ("DOCKER_HOST", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH")
 CLIENT_FILES = ("ca.pem", "cert.pem", "key.pem")
@@ -121,9 +116,11 @@ KEY_CODE = (
     "'sealing':base64.b64encode(bytes(PrivateKey.generate())).decode()}))"
 )
 TRANSIENT = "inventory_unavailable"  # the fixture's get after one failed kubectl read
-STDERR_TAIL, MESSAGE_LIMIT, DIAGNOSTIC_LIMIT = 1500, 200, 40
+STDERR_TAIL, PROBE_TAIL, MESSAGE_LIMIT, DIAGNOSTIC_LIMIT = 1500, 1000, 200, 40
 _BASE64_RUN = re.compile(r"[A-Za-z0-9+/=_-]{40,}")
 _USERINFO_URL = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s/@]+@[^\s\"'<>]*")
+_PEM = re.compile(r"-----BEGIN [A-Z0-9 ]+-----.*?(-----END [A-Z0-9 ]+-----|\Z)", re.S)
+_IPV4 = re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])")
 
 EPILOG = """\
 usage: run --context <context> --namespace fd-proof-<nonce> --release fd-proof-<nonce>
@@ -472,7 +469,10 @@ def daemon_probe(payload: dict[str, Any]) -> dict[str, Any]:
 PROBE_SCRIPT = (
     "from __future__ import annotations\nimport json, sys\nfrom typing import Any\n"
     + inspect.getsource(daemon_probe)
-    + "\nprint(json.dumps(daemon_probe(json.load(sys.stdin))))\n"
+    + "\nprint(json.dumps(daemon_probe(json.load(sys.stdin))), flush=True)\n"
+    # The port-forward proxy threads outlive their streams; skipping interpreter
+    # finalization keeps a still-running daemon thread from aborting the exit.
+    + "import os\nos._exit(0)\n"
 )
 
 
@@ -483,9 +483,9 @@ def private_file(path: Path, content: str) -> None:
 
 
 def redact(text: str, callback: str) -> str:
-    """Drop base64-like runs, URLs carrying userinfo, and the callback address."""
-    text = _BASE64_RUN.sub("<redacted>", _USERINFO_URL.sub("<url>", text))
-    return text.replace(callback, "<callback>") if callback else text
+    """Drop PEM blocks, base64 runs, userinfo URLs, the callback and other IPv4 literals."""
+    text = _BASE64_RUN.sub("<redacted>", _USERINFO_URL.sub("<url>", _PEM.sub("<pem>", text)))
+    return _IPV4.sub("<ip>", text.replace(callback, "<callback>") if callback else text)
 
 
 def new_claim_name() -> str:
@@ -616,9 +616,8 @@ class Lifecycle:
         items: list[dict[str, Any]] = self.f.get(CLAIMS.format(ns=self.ns)).get("items", [])
         if digest is None:
             return items
-        return [
-            c for c in items if c["metadata"].get("labels", {}).get(THREAD_HASH_LABEL) == digest
-        ]
+        hashes = [c["metadata"].get("labels", {}).get(THREAD_HASH_LABEL) for c in items]
+        return [c for c, found in zip(items, hashes, strict=True) if found == digest]
 
     def new_claim(self, digest: str, before: set[str]) -> str:
         live = [c for c in self.claims(digest) if not c["metadata"].get("deletionTimestamp")]
@@ -666,11 +665,10 @@ class Lifecycle:
         for kind, role, meta in self.daemon_items(self.claim_selector(claim)):
             found.append(self.record(kind, role, meta))
             if kind == "Service":
-                self.daemon_labels = {
-                    key: value
-                    for key, value in meta.get("labels", {}).items()
-                    if key.startswith("app.kubernetes.io/") or key == MANAGED_BY_LABEL
-                }
+                labels = meta.get("labels", {})
+                prefixed = [k for k in labels if k.startswith("app.kubernetes.io/")]
+                wanted = [*prefixed, MANAGED_BY_LABEL]
+                self.daemon_labels = {key: labels[key] for key in wanted if key in labels}
         return found
 
     @staticmethod
@@ -707,8 +705,7 @@ class Lifecycle:
         return present, recreated
 
     def leaks(self, match: Callable[[str], bool]) -> list[str]:
-        """Kind/name of release daemon objects and app-namespace client Secrets (by name or
-        claim label) whose claim matches; terminating objects still count."""
+        """Kind/name of matching daemon objects and app client Secrets, terminating included."""
         found = set()
         selector = quote(f"{CLAIM_LABEL},{MANAGED},{INSTANCE_LABEL}={self.release}")
         for kind, prefix, plural, _ in DAEMON_KINDS:
@@ -774,12 +771,34 @@ class Lifecycle:
             try:
                 import curie_worker.sandbox  # noqa: F401 - only proves the package imports
             except ImportError:
-                snapshot = self.f.snapshot
-                argv = ["uv", "run", "--project", snapshot, "--frozen", "python3", "-c"]
-                argv.append(PROBE_SCRIPT)
-                result = self.fx.run(argv, data=json.dumps(payload), cwd=snapshot, timeout=300)
-                return dict(json.loads(result.stdout.strip().splitlines()[-1]))
-            return daemon_probe(payload)
+                return self.probe_subprocess(json.dumps(payload))
+            return daemon_probe(payload) | {"attempts": 1}
+
+    def probe_subprocess(self, data: str) -> dict[str, Any]:
+        """The probe under uv, retried once only when a crash left no result to judge."""
+        snapshot = str(self.f.snapshot)
+        argv = ["uv", "run", "--project", snapshot, "--frozen", "python3", "-c", PROBE_SCRIPT]
+        for attempt in (1, 2):
+            result = subprocess.run(
+                argv,
+                input=data,
+                text=True,
+                capture_output=True,
+                cwd=snapshot,
+                timeout=300,
+                check=False,
+            )
+            lines = result.stdout.strip().splitlines()
+            with contextlib.suppress(ValueError):
+                found = json.loads(lines[-1]) if lines else None
+                if isinstance(found, dict):
+                    return found | {"attempts": attempt}
+            if result.returncode:
+                tail = redact(result.stderr, self.args.callback_host)[-PROBE_TAIL:]
+                self.evidence["probe_stderr"] = tail
+            if attempt == 1:
+                time.sleep(5)
+        raise RuntimeError(f"probe_failed:{result.returncode}")
 
     def before(self, issue: int) -> tuple[set[str], set[str]]:
         names = {c["metadata"]["name"] for c in self.claims()}
@@ -817,6 +836,7 @@ class Lifecycle:
         texts = self.bounded(lambda: self.runner_outputs(runner), LIMIT_SECONDS, "runner_silent")
         turn["runner_docker"] = parse_runner_docker(*texts, self.nonce)
         own = self.probe(claim, turn["daemon"]["pod"], stranger=tls)
+        turn["probe_attempts"] = own.pop("attempts")
         self.fx.require(own["accepted"], "claim_client_refused")
         turn["daemon"].update(docker_id=own["id"], docker_name=own["name"])
         if tls:
@@ -827,8 +847,7 @@ class Lifecycle:
         return runner
 
     def settle(self, turn: dict[str, Any], fault: str, started: float) -> None:
-        """Time from injection until the request is terminal, every recorded object is
-        gone by uid and nothing carrying the claim label is left."""
+        """Until the request is terminal, recorded objects are gone by uid and nothing leaks."""
         turn["fault"] = fault
         row, present, leaked = {"status": "", "cause": ""}, [""], [""]
         recreated: list[str] = []
@@ -1110,13 +1129,10 @@ class Lifecycle:
     def install(self) -> None:
         started = time.monotonic()
         self.start_servers()
-        self.base_values = sk.scripted_values(
-            model_base_url=self.model.base_url,
-            github_api=self.stub.base_url + "/api/v3",
-            clone_base=self.stub.base_url,
-            ca_configmap="github-stub-ca",
-            runner_image=self.images["platform"]["ref"].split("@", 1)[0],
-        )
+        stub, platform = self.stub.base_url, self.images["platform"]["ref"].split("@", 1)[0]
+        scripted = {"model_base_url": self.model.base_url, "github_api": stub + "/api/v3"}
+        scripted |= {"clone_base": stub, "ca_configmap": "github-stub-ca", "runner_image": platform}
+        self.base_values = sk.scripted_values(**scripted)
         values = self.values(docker=True) | self.secret_inputs()
         values_file = self.f.work / "values.json"
         private_file(values_file, json.dumps(values))
@@ -1125,12 +1141,9 @@ class Lifecycle:
         self.k("label", "namespace", self.ns, "--overwrite", psa)
         self.f.note("app_namespace_psa", "baseline")
         self.install_attempted = True
-        self.helm(
-            "install",
-            *(str(self.f.snapshot / "charts/curie"), "-n", self.ns, "--skip-crds"),
-            *("-f", str(self.f.snapshot / "charts/curie/values-dev.yaml")),
-            *("-f", str(values_file), "--timeout", "15m"),
-        )
+        chart = str(self.f.snapshot / "charts/curie")
+        files = ("-f", chart + "/values-dev.yaml", "-f", str(values_file), "--timeout", "15m")
+        self.helm("install", chart, "-n", self.ns, "--skip-crds", *files)
         self.rollout("api", "worker")
         path = f"/apis/apps/v1/namespaces/{self.ns}/deployments/{self.full}-worker"
         containers = self.f.get(path)["spec"]["template"]["spec"]["containers"]
@@ -1400,11 +1413,9 @@ class Lifecycle:
                 out["diagnostics_error"] = type(exc).__name__
             print(json.dumps({"diagnostics": out.get("diagnostics", [])}), file=sys.stderr)
         if self.model is not None and self.model.unexpected:
-            host = self.args.callback_host
-            out["unexpected_model_keys"] = [
-                [str(part).replace(host, "<callback>") for part in item.get("key") or ()]
-                for item in self.model.unexpected
-            ]
+            host, cb = self.args.callback_host, "<callback>"
+            keys = [item.get("key") or () for item in self.model.unexpected]
+            out["unexpected_model_keys"] = [[str(p).replace(host, cb) for p in k] for k in keys]
         if self.stub is not None and self.stub.unknown_requests:
             out["unsupported_stub_requests"] = len(self.stub.unknown_requests)
         return out
@@ -1457,9 +1468,8 @@ class Lifecycle:
 def build_parser() -> argparse.ArgumentParser:
     description = "Live acceptance of per-run Docker daemon lifecycles (ADR 0216, ADR 0217)."
     raw = argparse.RawDescriptionHelpFormatter
-    parser = argparse.ArgumentParser(
-        prog="daemon_lifecycle.py", description=description, epilog=EPILOG, formatter_class=raw
-    )
+    parser = argparse.ArgumentParser("daemon_lifecycle.py", description=description, epilog=EPILOG)
+    parser.formatter_class = raw
     commands = parser.add_subparsers(dest="command", required=True)
     run = commands.add_parser("run", help="run every scenario once, then tear down and judge")
     flags = "context=<context> namespace=fd-proof-<nonce> daemon-namespace=fd-proof-d-<nonce> "
