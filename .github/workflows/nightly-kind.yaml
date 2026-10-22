@@ -119,14 +119,100 @@ jobs:
       - name: Wait for the dispatched CI result
         env:
           CI_RUN_ID: ${{ needs.dispatch.outputs.run_id }}
-        run: gh run watch "$CI_RUN_ID" --exit-status
+        # gh run watch refreshes every 3 seconds and exits on HTTP 403, so a
+        # long kind run spends the shared installation rate limit and the guard
+        # goes red while CI is green. Poll the run object slowly and wait out
+        # a rate-limit response for its Retry-After (or the reset time).
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import time
+
+          POLL_SECONDS = int(os.environ.get("KIND_POLL_INTERVAL_SECONDS", "120"))
+          FALLBACK_WAIT = int(os.environ.get("KIND_RATE_LIMIT_FALLBACK_SECONDS", "60"))
+
+
+          def split_response(stdout):
+              text = stdout.replace("\r\n", "\n")
+              if not text.startswith("HTTP/"):
+                  return 0, {}, text
+              head, separator, body = text.partition("\n\n")
+              if not separator:
+                  return 0, {}, text
+              lines = head.splitlines()
+              try:
+                  status = int(lines[0].split()[1])
+              except (IndexError, ValueError):
+                  return 0, {}, text
+              headers = {}
+              for line in lines[1:]:
+                  name, colon, value = line.partition(":")
+                  if colon:
+                      headers[name.strip().lower()] = value.strip()
+              return status, headers, body
+
+
+          def rate_limited(status, body, stderr):
+              blob = f"{body}\n{stderr}".lower()
+              if "rate limit" not in blob:
+                  return False
+              return status in (403, 429) or "403" in blob or "429" in blob
+
+
+          def wait_seconds(headers, stderr):
+              retry_after = headers.get("retry-after", "")
+              if retry_after.isdigit():
+                  return int(retry_after)
+              reset = headers.get("x-ratelimit-reset", "")
+              if reset.isdigit():
+                  return max(0, int(reset) - int(time.time()))
+              match = re.search(r"retry-after:\s*(\d+)", stderr, re.IGNORECASE)
+              if match:
+                  return int(match.group(1))
+              return FALLBACK_WAIT
+
+
+          def get_json(endpoint):
+              while True:
+                  proc = subprocess.run(
+                      ["gh", "api", "--include", endpoint],
+                      capture_output=True,
+                      text=True,
+                      check=False,
+                  )
+                  status, headers, body = split_response(proc.stdout)
+                  if rate_limited(status, body, proc.stderr):
+                      time.sleep(wait_seconds(headers, proc.stderr))
+                      continue
+                  if proc.returncode != 0 or status >= 400:
+                      detail = (proc.stderr or body).strip()
+                      raise SystemExit(detail or f"GitHub API failed ({status or proc.returncode})")
+                  return json.loads(body)
+
+
+          run_id = os.environ["CI_RUN_ID"]
+          if not run_id.isdigit() or int(run_id) <= 0:
+              raise SystemExit("Missing dispatched run id")
+          endpoint = f"repos/{os.environ['GH_REPO']}/actions/runs/{run_id}"
+          while True:
+              run = get_json(endpoint)
+              if run.get("status") == "completed":
+                  raise SystemExit(0 if run.get("conclusion") == "success" else 1)
+              time.sleep(POLL_SECONDS)
+          PY
 
   report:
     name: Report scheduled kind CI result
     needs: [dispatch, verify]
     if: ${{ always() }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    # Long enough to sleep until an hourly Actions token window resets, then
+    # still file or close the tracking issue. A 5 minute cap died on the same
+    # 403 that ended Verify, so the red guard run left no issue.
+    timeout-minutes: 75
     permissions:
       issues: write
       actions: read
@@ -146,7 +232,11 @@ jobs:
           python3 - <<'PY'
           import json
           import os
+          import re
           import subprocess
+          import time
+
+          FALLBACK_WAIT = int(os.environ.get("KIND_RATE_LIMIT_FALLBACK_SECONDS", "60"))
 
           repo = os.environ["GH_REPO"]
           target_ref = os.environ["TARGET_REF"]
@@ -159,13 +249,92 @@ jobs:
           title = f"{label} is failing"
           failed_conclusions = {"failure", "timed_out", "cancelled"}
 
+          def split_response(stdout):
+              text = stdout.replace("\r\n", "\n")
+              if not text.startswith("HTTP/"):
+                  return 0, {}, text
+              head, separator, body = text.partition("\n\n")
+              if not separator:
+                  return 0, {}, text
+              lines = head.splitlines()
+              try:
+                  status = int(lines[0].split()[1])
+              except (IndexError, ValueError):
+                  return 0, {}, text
+              headers = {}
+              for line in lines[1:]:
+                  name, colon, value = line.partition(":")
+                  if colon:
+                      headers[name.strip().lower()] = value.strip()
+              return status, headers, body
+
+          def rate_limited(status, body, stderr):
+              blob = f"{body}\n{stderr}".lower()
+              if "rate limit" not in blob:
+                  return False
+              return status in (403, 429) or "403" in blob or "429" in blob
+
+          def wait_seconds(headers, stderr):
+              retry_after = headers.get("retry-after", "")
+              if retry_after.isdigit():
+                  return int(retry_after)
+              reset = headers.get("x-ratelimit-reset", "")
+              if reset.isdigit():
+                  return max(0, int(reset) - int(time.time()))
+              match = re.search(r"retry-after:\s*(\d+)", stderr, re.IGNORECASE)
+              if match:
+                  return int(match.group(1))
+              return FALLBACK_WAIT
+
           def gh(*arguments, capture_output=False):
-              return subprocess.run(
-                  ["gh", *arguments], check=True, capture_output=capture_output, text=True)
+              while True:
+                  result = subprocess.run(
+                      ["gh", *arguments], capture_output=True, text=True, check=False)
+                  status, headers, body = split_response(result.stdout)
+                  if rate_limited(status, body, result.stderr):
+                      time.sleep(wait_seconds(headers, result.stderr))
+                      continue
+                  if result.returncode != 0:
+                      raise subprocess.CalledProcessError(
+                          result.returncode, ["gh", *arguments], result.stdout, result.stderr)
+                  if capture_output:
+                      return result
+                  return result
+
+          def next_page(headers):
+              for part in headers.get("link", "").split(","):
+                  if 'rel="next"' not in part:
+                      continue
+                  start = part.find("<")
+                  end = part.find(">")
+                  if start < 0 or end < start:
+                      continue
+                  url = part[start + 1:end]
+                  marker = "://api.github.com/"
+                  if marker in url:
+                      return url.split(marker, 1)[1]
+                  return url
+              return ""
 
           def read_pages(endpoint):
-              result = gh("api", "--paginate", "--slurp", endpoint, capture_output=True)
-              return json.loads(result.stdout)
+              # One page at a time so a 403 still exposes Retry-After. gh's
+              # --paginate wrapper hides that header and fails the whole list.
+              pages = []
+              current = endpoint
+              while current:
+                  proc = subprocess.run(
+                      ["gh", "api", "--include", current],
+                      capture_output=True, text=True, check=False)
+                  status, headers, body = split_response(proc.stdout)
+                  if rate_limited(status, body, proc.stderr):
+                      time.sleep(wait_seconds(headers, proc.stderr))
+                      continue
+                  if proc.returncode != 0 or status >= 400:
+                      raise subprocess.CalledProcessError(
+                          proc.returncode or status, ["gh", "api", current], body, proc.stderr)
+                  pages.append(json.loads(body))
+                  current = next_page(headers)
+              return pages
 
           issue_number = min(
               (issue["number"]
