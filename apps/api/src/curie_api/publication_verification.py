@@ -101,8 +101,7 @@ def stored_publication_base_ref(
     ):
         raise Unavailable("publication_base_branch_unproved")
     if (
-        work_item.trigger_label is None
-        and work_item.base_branch is None
+        work_item.base_branch is None
         and work_item.base_source is None
         and work_item.base_commit is None
     ):
