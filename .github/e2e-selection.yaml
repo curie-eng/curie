@@ -300,7 +300,7 @@ rules:
     # The only charts/curie/ci files the released-upgrade jobs run.
     charts/curie/ci/live_manifest_parity.py: [released-upgrade]
     charts/curie/ci/make-upgrade-mutants.py: [released-upgrade]
-    charts/curie/ci/released-upgrade-resource-profile-assertions.sh: [cluster, released-upgrade]
+    charts/curie/ci/scenarios/released-upgrade-resource-profile-assertions.sh: [cluster, released-upgrade]
     charts/curie/ci/fixtures/factory-resource-profile.yaml: [cluster, released-upgrade]
     apps/worker/src/curie_worker/approval_cards.py: [local, local-release, cluster, released-upgrade]
     apps/worker/src/curie_worker/config.py: [local, local-release, cluster, released-upgrade]

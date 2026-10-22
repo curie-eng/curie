@@ -5042,13 +5042,20 @@ jobs:
             --set-string agentSandbox.workspaceSizeLimits.acme-factory=18Gi \
             --set worker.image.repository=curie-worker --set worker.image.tag=upgrade-candidate --set worker.image.digest= --set worker.image.pullPolicy=Never \
             --timeout 15m
-          bash charts/curie/ci/released-upgrade-resource-profile-assertions.sh \
+          bash charts/curie/ci/scenarios/released-upgrade-resource-profile-assertions.sh \
             --context "$context" --namespace "$ns" --release "$release" \
             --agent acme-factory --workspace 18Gi
-          # A second ordinary retained-values candidate upgrade, no new values.
+      # A second ordinary retained-values candidate upgrade, with no new values,
+      # must keep the same envelope. Its own step, so each assertion runs once.
+      - name: Factory resource profile survives a plain retained-values upgrade (#4889)
+        run: |
+          set -euo pipefail
+          ns=curie-profile
+          release=curie-profile
+          context="$(kubectl config current-context)"
           helm upgrade "$release" charts/curie -n "$ns" \
             --reset-then-reuse-values --timeout 15m
-          bash charts/curie/ci/released-upgrade-resource-profile-assertions.sh \
+          bash charts/curie/ci/scenarios/released-upgrade-resource-profile-assertions.sh \
             --context "$context" --namespace "$ns" --release "$release" \
             --agent acme-factory --workspace 18Gi
           helm uninstall "$release" -n "$ns" --wait --timeout 5m
