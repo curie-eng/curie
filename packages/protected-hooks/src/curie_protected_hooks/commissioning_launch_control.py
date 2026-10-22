@@ -1,16 +1,19 @@
 """Campaign launch authority for the commissioning mediator, @spec PROTECTED-COMMISSIONING-7/8.
 
 The commissioning control principal verifies one campaign launch request
-against the journal's permit and the committed admission it names, consumes the
-request's launch reservation, and records broker ownership ``creating`` with
-the deterministic owned namespace and Pod name before the mediator creates
-anything. Later revisions follow the observed workload: ``bound`` with the
-create response's UID, ``retiring``, ``retired`` only after the mediator observed
-the exact recorded Pod absent, or ``uncertain``.
+against the journal's permit and the committed admission it names, charges the
+request's launch reservation before the mediator assigns anything to it, then
+consumes it and records broker ownership ``creating`` with the deterministic
+owned namespace and Pod name before the mediator creates anything. Later
+revisions follow the observed workload: ``bound`` with the create response's
+UID, ``retiring``, ``retired`` only after the mediator observed the exact
+recorded Pod absent, or ``uncertain``.
 
 The create operation ID of workload binding W is the launch reservation ID: one
-consumed launch reservation backs exactly one create. Nothing here creates,
-observes or deletes a Kubernetes object, and nothing grants a turn.
+consumed launch reservation backs exactly one create. The campaign supervisor
+reads the journal here and moves an expired or revoked campaign to
+``closing``. Nothing here creates, observes or deletes a Kubernetes object, and
+nothing grants a turn.
 """
 
 from __future__ import annotations
@@ -30,7 +33,7 @@ from .commissioning_campaign_records import (
     parse_campaign_admission,
     parse_campaign_launch_request,
 )
-from .commissioning_journal import CommissioningJournalRefused, CommissioningSession
+from .commissioning_journal import CommissioningJournalRefused, CommissioningSession, JournalState
 from .commissioning_reservations import CampaignReservations, Charge
 
 __all__ = ["CampaignLaunchControl", "CampaignLaunchPlan"]
@@ -193,6 +196,22 @@ class CampaignLaunchControl:
         except CampaignRecordInvalid:
             raise CommissioningJournalRefused("ownership") from None
 
+    async def reserve(self, plan: CampaignLaunchPlan) -> bool:
+        """Charge the launch once, before the mediator assigns anything to it.
+
+        A replay of the same plan returns the recorded charge and never a
+        second one. True while the reservation is undispatched, so a launch
+        whose assignment failed is retried on the same charge and is never
+        owned; a dispatched reservation is never assigned again.
+        @spec PROTECTED-COMMISSIONING-3/8.
+        """
+        if type(plan) is not CampaignLaunchPlan:
+            raise CommissioningJournalRefused("binding")
+        reservation = await self.__reservations.reserve(
+            plan.launch_reservation_id, "launch", plan.launch_request_digest, Charge(launches=1)
+        )
+        return reservation.status == "reserved"
+
     async def own(self, plan: CampaignLaunchPlan, *, namespace: str, pod_name: str) -> None:
         """Consume the launch reservation, then record ``creating`` ownership.
 
@@ -263,6 +282,20 @@ class CampaignLaunchControl:
         await self.__reservations.advance_ownership(
             current, proposed, trusted_guard_identity=guard, not_found=not_found
         )
+
+    async def status(self) -> JournalState:
+        """The campaign journal, read for the supervisor; available after expiry."""
+        return await self.__reservations.journal.status()
+
+    async def begin_close(self) -> None:
+        """Move a ``prepared`` or ``running`` campaign to ``closing``; otherwise inert.
+
+        @spec PROTECTED-COMMISSIONING-3.
+        """
+        journal = self.__reservations.journal
+        state = await journal.status()
+        if state.state in ("prepared", "running"):
+            await journal.begin_close(state.generation)
 
     async def unsettled(self) -> tuple[str, ...]:
         """Launch IDs whose durable ownership is not ``retired``, for restart cleanup."""

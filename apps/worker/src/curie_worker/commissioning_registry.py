@@ -49,6 +49,7 @@ from .protected_launch_registry import (
 )
 
 State = Literal["preparing", "idle", "retiring", "uncertain", "retired"]
+UnstartedEvidence = Literal["unscheduled", "terminal"]
 Kind = Literal["pod", "service", "secret"]
 _KINDS = frozenset({"pod", "service", "secret"})
 _MAX_REVISION = 2**63 - 1
@@ -128,6 +129,27 @@ class GuardCreateWitness:
 
 
 @_closed_record
+class UnstartedObservation:
+    """The mediator's observation that the owned Pod's runner never started.
+
+    Observed on the exact deleted Pod once no container can start any more:
+    ``unscheduled`` when it was never bound to a node (a terminating Pod cannot
+    be bound), ``terminal`` when the kubelet reported the deleted Pod in a
+    terminal phase. In both cases no container status carried an identity.
+    Construction supplies no proof. @spec PROTECTED-COMMISSIONING-8.
+    """
+
+    pod_uid: str
+    resource_version: str
+    evidence: UnstartedEvidence
+
+    def __post_init__(self) -> None:
+        _scalar(self.pod_uid, "uuid")
+        _scalar(self.resource_version, "version")
+        _require(type(self.evidence) is str and self.evidence in {"unscheduled", "terminal"})
+
+
+@_closed_record
 class CommissioningLaunchSnapshot:
     """Immutable observational row; cannot be used as a positive capability."""
 
@@ -142,6 +164,7 @@ class CommissioningLaunchSnapshot:
     assignment: AssignmentMetadata | None
     owned_epoch: None
     termination: TerminationObservation | None
+    unstarted: UnstartedObservation | None
     retirement_outcome: Literal["cleanup-recorded"] | None
 
 
@@ -180,6 +203,11 @@ CREATE TABLE IF NOT EXISTS terminations (
  launch_id TEXT PRIMARY KEY REFERENCES launches(launch_id), pod_uid TEXT NOT NULL,
  container_id TEXT NOT NULL, resource_version TEXT NOT NULL, exit_code INTEGER NOT NULL,
  finished_at TEXT NOT NULL
+) STRICT;
+CREATE TABLE IF NOT EXISTS unstarted (
+ launch_id TEXT PRIMARY KEY REFERENCES launches(launch_id), pod_uid TEXT NOT NULL,
+ resource_version TEXT NOT NULL,
+ evidence TEXT NOT NULL CHECK(evidence IN ('unscheduled','terminal'))
 ) STRICT;
 """
 
@@ -357,6 +385,9 @@ class CommissioningLaunchRegistry:
         termination = db.execute(
             "SELECT * FROM terminations WHERE launch_id=? LIMIT 1", (launch_id,)
         ).fetchone()
+        unstarted = db.execute(
+            "SELECT * FROM unstarted WHERE launch_id=? LIMIT 1", (launch_id,)
+        ).fetchone()
         return CommissioningLaunchSnapshot(
             launch_id=launch_id,
             worker_principal_id=row["worker_principal_id"],
@@ -378,6 +409,11 @@ class CommissioningLaunchRegistry:
             if termination is None
             else TerminationObservation(
                 **{field.name: termination[field.name] for field in fields(TerminationObservation)}
+            ),
+            unstarted=None
+            if unstarted is None
+            else UnstartedObservation(
+                **{field.name: unstarted[field.name] for field in fields(UnstartedObservation)}
             ),
             retirement_outcome=row["retirement_outcome"],
         )
@@ -652,7 +688,11 @@ class CommissioningLaunchRegistry:
             obj = db.execute(
                 "SELECT pod_uid,container_id FROM objects WHERE launch_id=? LIMIT 1", (launch_id,)
             ).fetchone()
-            if obj["pod_uid"] is None or obj["container_id"] is not None:
+            if (
+                obj["pod_uid"] is None
+                or obj["container_id"] is not None
+                or self._unstarted(db, launch_id)
+            ):
                 raise RegistryConflict()
             db.execute(
                 "UPDATE objects SET container_id=?,node_uid=? WHERE launch_id=?",
@@ -710,7 +750,7 @@ class CommissioningLaunchRegistry:
             existing = db.execute(
                 "SELECT launch_id FROM terminations WHERE launch_id=? LIMIT 1", (launch_id,)
             ).fetchone()
-            if existing is not None:
+            if existing is not None or self._unstarted(db, launch_id):
                 raise RegistryConflict()
             db.execute(
                 "INSERT INTO terminations VALUES(?,?,?,?,?,?)",
@@ -718,6 +758,51 @@ class CommissioningLaunchRegistry:
                     launch_id,
                     *(getattr(observation, f.name) for f in fields(TerminationObservation)),
                 ),
+            )
+            return self._bump(db, worker_principal_id, launch_id)
+
+    @staticmethod
+    def _unstarted(db: sqlite3.Connection, launch_id: str) -> bool:
+        found = db.execute("SELECT 1 FROM unstarted WHERE launch_id=? LIMIT 1", (launch_id,))
+        return found.fetchone() is not None
+
+    @_safe
+    def record_unstarted(
+        self,
+        worker_principal_id: str,
+        launch_id: str,
+        expected_revision: str,
+        observation: UnstartedObservation,
+    ) -> CommissioningLaunchSnapshot:
+        """Persist that the owned Pod's runner never started, before finalizer removal.
+
+        Only for a retiring row with every UID known and neither a recorded
+        container nor a termination: a recorded container is proved by its
+        own termination. @spec PROTECTED-COMMISSIONING-8.
+        """
+        _require(type(observation) is UnstartedObservation)
+        observation.__post_init__()
+        with self._transaction() as db:
+            row = self._cas(db, worker_principal_id, launch_id, expected_revision)
+            obj = db.execute(
+                "SELECT * FROM objects WHERE launch_id=? LIMIT 1", (launch_id,)
+            ).fetchone()
+            terminated = db.execute(
+                "SELECT 1 FROM terminations WHERE launch_id=? LIMIT 1", (launch_id,)
+            ).fetchone()
+            if (
+                row["state"] != "retiring"
+                or obj["service_uid"] is None
+                or obj["secret_uid"] is None
+                or obj["pod_uid"] != observation.pod_uid
+                or obj["container_id"] is not None
+                or terminated is not None
+                or self._unstarted(db, launch_id)
+            ):
+                raise RegistryConflict()
+            db.execute(
+                "INSERT INTO unstarted VALUES(?,?,?,?)",
+                (launch_id, *(getattr(observation, f.name) for f in fields(UnstartedObservation))),
             )
             return self._bump(db, worker_principal_id, launch_id)
 
@@ -729,7 +814,11 @@ class CommissioningLaunchRegistry:
         expected_revision: str,
         receipt: CleanupReceipt,
     ) -> CommissioningLaunchSnapshot:
-        """Retire only over exact known UIDs and the recorded runner termination."""
+        """Retire only over exact known UIDs and the recorded runner termination.
+
+        A runner that never started has its recorded never-started observation
+        instead; nothing else stands in for a termination.
+        """
         _require(type(receipt) is CleanupReceipt)
         receipt.__post_init__()
         with self._transaction() as db:
@@ -739,7 +828,9 @@ class CommissioningLaunchRegistry:
                 (launch_id,),
             ).fetchone()
             terminated = db.execute(
-                "SELECT pod_uid FROM terminations WHERE launch_id=? LIMIT 1", (launch_id,)
+                "SELECT pod_uid FROM terminations WHERE launch_id=? "
+                "UNION ALL SELECT pod_uid FROM unstarted WHERE launch_id=? LIMIT 1",
+                (launch_id, launch_id),
             ).fetchone()
             if (
                 row["state"] != "retiring"

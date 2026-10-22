@@ -198,7 +198,12 @@ source_modules = [
     "curie_worker.protected_launch_client",
     "curie_worker.protected_launch_server",
 ]
-forbidden_modules = ["curie_worker.commissioning_launch", "curie_worker.commissioning_registry"]
+forbidden_modules = [
+    "curie_worker.commissioning_cleanup",
+    "curie_worker.commissioning_launch",
+    "curie_worker.commissioning_registry",
+    "curie_worker.commissioning_supervisor",
+]
 ignore_imports = [
     "curie_worker.protected_launch_mechanics -> curie_worker.commissioning_launch",
     "curie_worker.protected_launch_mechanics -> curie_worker.commissioning_registry",

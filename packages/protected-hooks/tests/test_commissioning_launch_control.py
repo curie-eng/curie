@@ -236,3 +236,49 @@ def test_launch_control_refuses_a_bootstrap_the_permit_does_not_name(
                 )
 
     run(scenario())
+
+
+def test_a_launch_is_charged_before_assignment_and_owned_only_on_dispatch(
+    pworker_service, principals
+) -> None:
+    async def scenario() -> None:
+        context = Admitted(principals)
+        async with context as control:
+            plan = await control.plan(launch_request(context.admission))
+            before = (await context.journal.status()).counters["launches"]
+            assert await control.reserve(plan) is True
+            assert (await context.journal.status()).counters["launches"] == before + 1
+            assert (await context.reservations.read(LAUNCH_RESERVATION)).status == "reserved"
+            assert await context.reservations.read_ownership(LAUNCH) is None
+            assert await control.unsettled() == ()
+            # A retry after a failed assignment replays the charge, never a second one.
+            unchanged = snapshot(pworker_service)
+            assert await control.reserve(plan) is True
+            assert snapshot(pworker_service) == unchanged
+            await control.own(plan, namespace=NAMESPACE, pod_name=POD)
+            assert (await context.journal.status()).counters["launches"] == before + 1
+            assert (await context.reservations.read_ownership(LAUNCH)).state == "creating"
+            # A dispatched launch reservation is never assigned again.
+            assert await control.reserve(plan) is False
+
+    run(scenario())
+
+
+def test_launch_control_reads_and_closes_its_campaign(pworker_service, principals) -> None:
+    async def scenario() -> None:
+        context = Admitted(principals)
+        async with context as control:
+            state = await control.status()
+            assert state.state == "running" and state.exhausted is None
+            assert state.broker_time_ms > 0
+            await control.begin_close()
+            closing = await control.status()
+            assert closing.state == "closing" and closing.generation == state.generation + 1
+            unchanged = snapshot(pworker_service)
+            await control.begin_close()  # a closing campaign stays closing
+            assert snapshot(pworker_service) == unchanged
+            plan = await control.plan(launch_request(context.admission))
+            with refused("state"):
+                await control.reserve(plan)
+
+    run(scenario())

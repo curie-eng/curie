@@ -416,3 +416,47 @@ def test_binding_and_snapshot_are_closed_values() -> None:
 def test_module_imports_no_commissioning_record() -> None:
     source = Path(api().__file__).read_text(encoding="utf-8")
     assert "curie_protected_hooks" not in source
+
+
+def test_never_started_is_recorded_only_for_an_owned_retiring_pod(root):
+    with open_registry(root) as registry:
+        row = create(registry)
+        observation = api().UnstartedObservation(POD_UID, "7", "terminal")
+        # Unknown UIDs or a preparing row record nothing.
+        with pytest.raises(production().RegistryError):
+            registry.record_unstarted(OWNER, LAUNCH, row.revision, observation)
+        for kind, uid in (("secret", SECRET_UID), ("service", SERVICE_UID), ("pod", POD_UID)):
+            row = registry.record_object_uid(OWNER, LAUNCH, row.revision, kind, uid, "1")
+        with pytest.raises(production().RegistryError):
+            registry.record_unstarted(OWNER, LAUNCH, row.revision, observation)
+        row = registry.transition(OWNER, LAUNCH, row.revision, "retiring")
+        other = api().UnstartedObservation(NODE_UID, "7", "terminal")
+        with pytest.raises(production().RegistryError):
+            registry.record_unstarted(OWNER, LAUNCH, row.revision, other)
+        receipt = production().CleanupReceipt(POD_UID, SERVICE_UID, SECRET_UID)
+        with pytest.raises(production().RegistryError):
+            registry.record_cleanup_receipt(OWNER, LAUNCH, row.revision, receipt)
+        row = registry.record_unstarted(OWNER, LAUNCH, row.revision, observation)
+        assert row.unstarted == observation and row.termination is None
+        # Afterwards no container identity or termination appears, and it records once.
+        with pytest.raises(production().RegistryError):
+            registry.record_container_identity(OWNER, LAUNCH, row.revision, CONTAINER, NODE_UID)
+        with pytest.raises(production().RegistryError):
+            registry.record_unstarted(OWNER, LAUNCH, row.revision, observation)
+        row = registry.record_cleanup_receipt(OWNER, LAUNCH, row.revision, receipt)
+        assert row.state == "retired"
+    with open_registry(root, boot=NEXT_BOOT) as reopened:
+        assert reopened.get(OWNER, LAUNCH).unstarted == observation
+
+
+def test_a_recorded_container_never_becomes_never_started(root):
+    with open_registry(root) as registry:
+        row = create(registry)
+        for kind, uid in (("secret", SECRET_UID), ("service", SERVICE_UID), ("pod", POD_UID)):
+            row = registry.record_object_uid(OWNER, LAUNCH, row.revision, kind, uid, "1")
+        row = registry.record_container_identity(OWNER, LAUNCH, row.revision, CONTAINER, NODE_UID)
+        row = registry.transition(OWNER, LAUNCH, row.revision, "retiring")
+        with pytest.raises(production().RegistryError):
+            registry.record_unstarted(
+                OWNER, LAUNCH, row.revision, api().UnstartedObservation(POD_UID, "7", "terminal")
+            )
