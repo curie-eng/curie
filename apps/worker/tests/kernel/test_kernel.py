@@ -3610,7 +3610,7 @@ def test_first_eviction_survives_generic_failure_on_retry_in_terminal_and_factor
             h.kernel._work_items = items
             diagnoses = iter(
                 [
-                    SimpleNamespace(
+                    SandboxTermination(
                         reason="Evicted",
                         detail=(
                             'Usage of EmptyDir volume "workspace" exceeds the limit "1Gi". '
@@ -3623,7 +3623,7 @@ def test_first_eviction_survives_generic_failure_on_retry_in_terminal_and_factor
 
             def diagnose(
                 name: str, *, request_timeout_seconds: float, since: datetime
-            ) -> SimpleNamespace | None:
+            ) -> SandboxTermination | None:
                 h.fake_k8s.termination_queries.append(name)
                 return next(diagnoses)
 
