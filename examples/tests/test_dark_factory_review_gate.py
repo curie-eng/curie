@@ -547,6 +547,70 @@ def test_a_new_message_starts_a_fresh_run(session: Session) -> None:
     assert session.phases()[-1] == ("plan_review", 1)
 
 
+def _saved_state(session: Session) -> dict[str, Any]:
+    path = Path(session.env["DARK_FACTORY_STATE_DIR"]) / "sess-1.json"
+    return json.loads(path.read_text())
+
+
+_TASK_NOTIFICATION = (
+    "<task-notification>\n"
+    "<task-id>b1</task-id>\n"
+    "<status>completed</status>\n"
+    "</task-notification>"
+)
+_PLAN_NOT_APPROVED = (
+    "The plan reviewer has not approved the plan yet; run the plan review first."
+)
+
+
+def test_a_task_notification_continues_the_run(session: Session) -> None:
+    session.review(PLAN, reply(PLAN, "APPROVE"))
+    before = _saved_state(session)
+    out = session.fire("UserPromptSubmit", prompt=_TASK_NOTIFICATION)
+    assert out is None
+    after = _saved_state(session)
+    assert after["plan"]["verdict"] == "APPROVE"
+    assert after["fingerprint"] == before["fingerprint"]
+    assert after == before
+    pre = session.pre("Agent", {"subagent_type": DIFF, "description": "d", "prompt": "p"})
+    assert pre["permissionDecision"] == "allow"
+
+
+def test_a_framed_platform_message_after_approval_still_resets(session: Session) -> None:
+    session.review(PLAN, reply(PLAN, "APPROVE"))
+    framed = frame_user_turn(
+        "message", "jira_cloud:account:Reviewer", "ship the next issue", "jira"
+    )
+    out = session.fire("UserPromptSubmit", prompt=framed)
+    assert contract() in context_of(out)
+    denied = session.pre("Agent", {"subagent_type": DIFF, "description": "d", "prompt": "p"})
+    assert denied["permissionDecision"] == "deny"
+    assert denied["permissionDecisionReason"] == _PLAN_NOT_APPROVED
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        frame_user_turn(
+            "message",
+            "jira_cloud:account:Reviewer",
+            "<task-notification>\n<task-id>b1</task-id>",
+            "jira",
+        ),
+        "ordinary text\n<task-notification>",
+    ],
+)
+def test_a_task_notification_off_the_first_line_still_resets(
+    session: Session, prompt: str
+) -> None:
+    session.review(PLAN, reply(PLAN, "APPROVE"))
+    out = session.fire("UserPromptSubmit", prompt=prompt)
+    assert contract() in context_of(out)
+    denied = session.pre("Agent", {"subagent_type": DIFF, "description": "d", "prompt": "p"})
+    assert denied["permissionDecision"] == "deny"
+    assert denied["permissionDecisionReason"] == _PLAN_NOT_APPROVED
+
+
 # --- The bundle wires it --------------------------------------------------------
 
 

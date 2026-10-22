@@ -96,7 +96,12 @@ One script handles every hook event the bundle registers:
 ``UserPromptSubmit``
     A new message starts a new run: the reset state is saved, then the checkout
     fingerprint is taken under a deadline that also bounds hashing untracked
-    files. A CI fix round starts at ``implement``. A fresh run and a CI fix
+    files. A prompt whose first line is exactly ``<task-notification>`` (the
+    text before the first newline, compared with no stripping) continues the
+    current run: saved state is loaded and left as it is, the fingerprint is
+    not retaken, and the hook returns no additional context. Every other
+    prompt, including one that contains that line anywhere else, still starts
+    a new run. A CI fix round starts at ``implement``. A fresh run and a CI fix
     round both return the verification contract as additional context; an
     unreadable contract stops the run instead.
 
@@ -1019,11 +1024,29 @@ def pre_publish(state: dict[str, Any]) -> dict[str, Any]:
     return _allow("diff review approved")
 
 
+_TASK_NOTIFICATION_LINE = "<task-notification>"
+
+
+def _continues_current_run(prompt: str) -> bool:
+    """True when the CLI's own background-task wake opens the prompt.
+
+    The first line is the text before the first newline, compared exactly,
+    with no stripping. A platform message always opens with the sender frame,
+    so only the CLI's own framing can match.
+    """
+    first, _, _ = prompt.partition("\n")
+    return first == _TASK_NOTIFICATION_LINE
+
+
 def handle(data: dict[str, Any]) -> dict[str, Any] | None:
     event = data.get("hook_event_name", "")
     path = state_path(str(data.get("session_id") or ""))
     if event == "UserPromptSubmit":
-        state = _fresh(str(data.get("prompt") or ""))
+        prompt = str(data.get("prompt") or "")
+        if _continues_current_run(prompt):
+            load(path)
+            return None
+        state = _fresh(prompt)
         state["workspace"] = os.environ.get("DARK_FACTORY_WORKSPACE") or str(data.get("cwd") or "")
         ci_round = state["ci_round"]
         if not ci_round:
