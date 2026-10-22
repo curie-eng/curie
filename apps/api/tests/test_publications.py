@@ -19,6 +19,7 @@ import time
 import uuid
 from collections.abc import Iterable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from io import BytesIO
@@ -630,6 +631,97 @@ def _advance_lineage(
     if lease is None:
         owner = "api-test-worker"
         lease = (_claim_publication_lease(publication_id, owner), owner)
+    with _publication_commit_http(client, publication_id, head_sha):
+        return _patch_lineage(
+            client,
+            publication_id,
+            expected_version,
+            expected_head_sha,
+            head_sha,
+            state,
+            pr_number,
+            pr_url,
+            lease,
+        )
+
+
+@contextmanager
+def _publication_commit_http(
+    client: TestClient, publication_id: str, head_sha: str
+) -> Iterator[None]:
+    rows = _rows(
+        "SELECT expected_prior_head, repo_full_name FROM curie.publications WHERE id = :id",
+        {"id": uuid.UUID(publication_id)},
+    )
+    if not rows:
+        yield
+        return
+    row = rows[0]
+    parent = row["expected_prior_head"]
+    repo = row["repo_full_name"]
+    original = client.app.state.http_client
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        # https://docs.github.com/en/rest/git/commits#get-a-commit-object
+        # https://docs.github.com/en/rest/git/refs#get-a-reference
+        if f"/repos/{repo}/git/commits/" in path:
+            sha = path.rsplit("/", 1)[-1]
+            if sha == head_sha:
+                return httpx.Response(
+                    200,
+                    json={
+                        "sha": sha,
+                        "parents": [{"sha": parent}],
+                        "message": f"Publish\n\nCurie-Revision: {publication_id}\n",
+                    },
+                )
+            if sha == parent:
+                return httpx.Response(200, json={"sha": sha, "parents": [], "message": "Base"})
+            return httpx.Response(404, json={"message": "Unknown fixture commit"})
+        if f"/repos/{repo}/git/ref/heads/" in path:
+            branch = unquote(path.split("/git/ref/heads/", 1)[1])
+            return httpx.Response(
+                200,
+                json={
+                    "ref": f"refs/heads/{branch}",
+                    "object": {"type": "commit", "sha": parent},
+                },
+            )
+        if path.endswith(f"/repos/{repo}") and not get_settings().github_app_id:
+            return httpx.Response(
+                200,
+                json={
+                    "id": 9001,
+                    "full_name": repo,
+                    "default_branch": "main",
+                },
+            )
+        response = await original.send(request)
+        if path.endswith(f"/repos/{repo}") and response.status_code == 200:
+            return httpx.Response(200, json={"default_branch": "main", **response.json()})
+        return response
+
+    injected = httpx.AsyncClient(transport=httpx.MockTransport(handle))
+    client.app.state.http_client = injected
+    try:
+        yield
+    finally:
+        client.app.state.http_client = original
+        asyncio.run(injected.aclose())
+
+
+def _patch_lineage(
+    client: TestClient,
+    publication_id: str,
+    expected_version: int,
+    expected_head_sha: str | None,
+    head_sha: str,
+    state: str,
+    pr_number: int,
+    pr_url: str,
+    lease: tuple[int, str],
+) -> Any:
     return client.patch(
         f"/v1/internal/publications/{publication_id}/lineage",
         json={
@@ -6630,6 +6722,11 @@ class _PushedPullCodeHost:
         self.branch = branch
         self.calls: list[str] = []
 
+    def read_branch_head(self, _publication_id: uuid.UUID) -> Any:
+        from curie_worker.publication_loop import PublicationBranchHead
+
+        return PublicationBranchHead(head_sha=FIRST_REVISION_SHA, base_branch="main")
+
     def verify_revision_commit(
         self,
         _publication_id: uuid.UUID,
@@ -6637,10 +6734,12 @@ class _PushedPullCodeHost:
         *,
         revision_id: uuid.UUID,
         expected_parent: str,
-    ) -> str:
-        del revision_id, expected_parent
+    ) -> Any:
+        from curie_worker.publication_loop import PublicationRevisionCommit
+
+        del revision_id
         self.calls.append("verify_revision_commit")
-        return commit_sha
+        return PublicationRevisionCommit(commit_sha=commit_sha, parent_sha=expected_parent)
 
     def recover_pull_request(self, _publication_id: uuid.UUID, *, expected_head_sha: str) -> Any:
         from curie_worker.publication_loop import PublicationPullState
@@ -6767,7 +6866,8 @@ def test_worker_lineage_patch_captures_immutable_identity_in_real_postgres(
             lease_owner="lineage-patch-worker",
         )
 
-    work, cluster, transcript, replies = client.portal.call(reconcile)
+    with _publication_commit_http(client, publication["id"], FIRST_REVISION_SHA):
+        work, cluster, transcript, replies = client.portal.call(reconcile)
 
     assert truth["calls"]
     assert cluster.validations == 1
@@ -6978,7 +7078,8 @@ def test_terminal_patch_response_maps_to_the_worker_terminal_cas(
             lease_owner="terminal-lineage-worker",
         )
 
-    work, cluster, transcript, replies = client.portal.call(reconcile)
+    with _publication_commit_http(client, publication["id"], FIRST_REVISION_SHA):
+        work, cluster, transcript, replies = client.portal.call(reconcile)
 
     assert truth["calls"]
     assert cluster.validations == 1
@@ -6998,6 +7099,219 @@ def test_terminal_patch_response_maps_to_the_worker_terminal_cas(
         "code_host_pr_id": None,
         "base_ref": None,
     }
+
+
+@pytest.mark.parametrize("state", ["merged", "closed"])
+def test_headless_terminal_store_records_verified_first_parent_and_replay_compares_it(
+    clean_db: None,
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    state: str,
+) -> None:
+    from curie_worker.publication_store import PostgresPublicationStore, PublicationStoreError
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from apps.api.tests.test_workitem_outcomes import _first_parent_proof
+
+    client, _ = publication_stack
+    _, publication = _approved_revision(
+        client,
+        auth_headers,
+        conversation_id=f"terminal-moved-{state}",
+        dedupe_key=f"terminal-moved-{state}",
+    )
+    _reportable(publication["id"])
+    parent = "3" * 40
+
+    async def run() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            store = PostgresPublicationStore(
+                engine, schema="curie", lease_owner="terminal-parent-worker"
+            )
+            work = await store.claim_next()
+            assert work is not None and str(work.publication_id) == publication["id"]
+            async with AsyncSession(engine) as session:
+                proof = await _first_parent_proof(
+                    session, publication["id"], FIRST_REVISION_SHA, parent_sha=parent
+                )
+            facts = {
+                "publication_id": work.publication_id,
+                "expected_publication_version": work.version,
+                "lease_owner": work.lease_owner,
+                "expected_version": work.lineage_version,
+                "expected_stored_head": None,
+                "state": state,
+                "pr_number": PR_NUMBER,
+                "pr_url": PR_URL,
+                "head_sha": proof.commit_sha,
+                "first_parent_sha": proof.parent_sha,
+            }
+            await store.mark_lineage_terminal(work.lineage_id, **facts)
+            async with engine.connect() as connection:
+                before = (
+                    (
+                        await connection.execute(
+                            text(
+                                "SELECT base_sha, head_sha, status, version FROM "
+                                "curie.thread_publication_lineages "
+                                "WHERE id = :id"
+                            ),
+                            {"id": work.lineage_id},
+                        )
+                    )
+                    .mappings()
+                    .one()
+                )
+            assert dict(before) == {
+                "base_sha": parent,
+                "head_sha": FIRST_REVISION_SHA,
+                "status": state,
+                "version": work.lineage_version + 1,
+            }
+            await store.mark_lineage_terminal(work.lineage_id, **facts)
+            with pytest.raises(PublicationStoreError):
+                await store.mark_lineage_terminal(
+                    work.lineage_id, **{**facts, "first_parent_sha": BASE_SHA}
+                )
+            async with engine.connect() as connection:
+                after = (
+                    (
+                        await connection.execute(
+                            text(
+                                "SELECT base_sha, head_sha, status, version FROM "
+                                "curie.thread_publication_lineages "
+                                "WHERE id = :id"
+                            ),
+                            {"id": work.lineage_id},
+                        )
+                    )
+                    .mappings()
+                    .one()
+                )
+                original = (
+                    await connection.execute(
+                        text(
+                            "SELECT base_sha, expected_prior_head FROM curie.publications WHERE "
+                            "id = :id"
+                        ),
+                        {"id": work.publication_id},
+                    )
+                ).one()
+            assert dict(after) == dict(before)
+            assert original == (BASE_SHA, BASE_SHA)
+        finally:
+            await engine.dispose()
+
+    client.portal.call(run)
+
+
+@pytest.mark.parametrize("defect", ["missing-parent", "version", "lease", "lineage-version"])
+def test_headless_terminal_store_cannot_write_parent_with_absent_proof_or_stale_authority(
+    clean_db: None,
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    defect: str,
+) -> None:
+    from curie_worker.publication_store import PostgresPublicationStore, PublicationStoreError
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from apps.api.tests.test_workitem_outcomes import _first_parent_proof
+
+    client, _ = publication_stack
+    _, publication = _approved_revision(
+        client,
+        auth_headers,
+        conversation_id=f"terminal-stale-parent-{defect}",
+        dedupe_key=f"terminal-stale-parent-{defect}",
+    )
+    _reportable(publication["id"])
+
+    async def run() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            store = PostgresPublicationStore(
+                engine, schema="curie", lease_owner="terminal-parent-worker"
+            )
+            work = await store.claim_next()
+            assert work is not None and str(work.publication_id) == publication["id"]
+            async with AsyncSession(engine) as session:
+                proof = await _first_parent_proof(
+                    session, publication["id"], FIRST_REVISION_SHA, parent_sha="3" * 40
+                )
+            async with engine.begin() as connection:
+                if defect in {"version", "lease"}:
+                    assignment = (
+                        "version = version + 1"
+                        if defect == "version"
+                        else "lease_owner = 'another-worker'"
+                    )
+                    await connection.execute(
+                        text(f"UPDATE curie.publications SET {assignment} WHERE id = :id"),
+                        {"id": work.publication_id},
+                    )
+                elif defect == "lineage-version":
+                    await connection.execute(
+                        text(
+                            "UPDATE curie.thread_publication_lineages SET version = version + 1 "
+                            "WHERE id = :id"
+                        ),
+                        {"id": work.lineage_id},
+                    )
+                before = (
+                    (
+                        await connection.execute(
+                            text(
+                                "SELECT p.status, p.version, p.lease_owner, l.base_sha, "
+                                "l.head_sha, l.pr_number, "
+                                "l.status AS lineage_status, l.version AS lineage_version "
+                                "FROM curie.publications p JOIN curie.thread_publication_lineages "
+                                "l "
+                                "ON l.id = p.lineage_id WHERE p.id = :id"
+                            ),
+                            {"id": work.publication_id},
+                        )
+                    )
+                    .mappings()
+                    .one()
+                )
+            with pytest.raises(PublicationStoreError):
+                await store.mark_lineage_terminal(
+                    work.lineage_id,
+                    publication_id=work.publication_id,
+                    expected_publication_version=work.version,
+                    lease_owner=work.lease_owner,
+                    expected_version=work.lineage_version,
+                    expected_stored_head=None,
+                    state="merged",
+                    pr_number=PR_NUMBER,
+                    pr_url=PR_URL,
+                    head_sha=proof.commit_sha,
+                    first_parent_sha=None if defect == "missing-parent" else proof.parent_sha,
+                )
+            async with engine.connect() as connection:
+                after = (
+                    (
+                        await connection.execute(
+                            text(
+                                "SELECT p.status, p.version, p.lease_owner, l.base_sha, "
+                                "l.head_sha, l.pr_number, "
+                                "l.status AS lineage_status, l.version AS lineage_version "
+                                "FROM curie.publications p JOIN curie.thread_publication_lineages "
+                                "l "
+                                "ON l.id = p.lineage_id WHERE p.id = :id"
+                            ),
+                            {"id": work.publication_id},
+                        )
+                    )
+                    .mappings()
+                    .one()
+                )
+            assert dict(after) == dict(before)
+        finally:
+            await engine.dispose()
+
+    client.portal.call(run)
 
 
 def test_a_replay_matches_a_default_identity_a_later_migration_names(

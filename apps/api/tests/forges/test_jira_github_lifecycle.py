@@ -581,6 +581,10 @@ def _record_pull_request(
     """The publication Job's lineage advance, through the CRUD service its route calls."""
 
     from curie_api.crud import lineages as crud_lineages
+    from curie_api.crud import publication_queries
+    from curie_api.factory_rediscovery import publishing_code_host
+    from curie_api.publication_verification import publication_base_ref, verify_publication_commit
+    from curie_api.repository_access import lineage_repository
     from test_factory_ci_wait import _execute
 
     owner = "jira-lifecycle-publisher"
@@ -596,6 +600,19 @@ def _record_pull_request(
 
     async def advance() -> None:
         async with install.client.app.state.sessionmaker() as session:
+            stored = await publication_queries.get_publication(
+                session, uuid.UUID(publication["id"])
+            )
+            assert stored is not None and stored.lineage is not None
+            settings = get_settings()
+            repository = await lineage_repository(session, settings, stored.lineage)
+            code_host = publishing_code_host(
+                settings, install.client.app.state.http_client, repository
+            )
+            base_branch = await publication_base_ref(session, code_host, stored, repository)
+            proof = await verify_publication_commit(
+                code_host, repository, stored, commit_sha=pull["head_sha"], base_branch=base_branch
+            )
             await crud_lineages.advance_publication_lineage(
                 session,
                 uuid.UUID(publication["id"]),
@@ -618,6 +635,7 @@ def _record_pull_request(
                     base_ref="main",
                 ),
                 github_html_base=get_settings().github_html_base,
+                first_parent_proof=proof,
             )
 
     install.client.portal.call(advance)
@@ -757,7 +775,9 @@ def test_jira_github_lifecycle(install: Install, initial_label: bool) -> None:
     assert publication["body"].endswith(f"\n\n{reference}\n\n{marker}")
     assert publication["body"].count(reference) == 1
     _approve(publication["id"])
+    github.branches[publication["branch"]] = github.branches["main"]
     head = github.push_head(publication["branch"])
+    github.commits[head]["message"] += f"\n\nCurie-Revision: {publication['id']}\n"
     recovered = install.client.post(
         f"/v1/internal/publications/{publication['id']}/pull-request",
         json={"expected_head_sha": head},

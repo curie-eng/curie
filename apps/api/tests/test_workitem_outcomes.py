@@ -28,6 +28,7 @@ from curie_api import approval_principal, factory_ci, workitem_outcomes
 from curie_api.config import get_settings
 from curie_api.crud import approvals as crud_approvals
 from curie_api.crud import lineages as crud_lineages
+from curie_api.crud import publication_queries as crud_publication_queries
 from curie_api.forges.errors import NotFound, Unauthorized, Unavailable
 from curie_api.forges.github.ci import CiDetail
 from curie_api.forges.github.code_host import GitHubCodeHost
@@ -37,6 +38,7 @@ from curie_api.forges.types import (
     GITHUB,
     CheckState,
     CiRollup,
+    Commit,
     NormalizedCheck,
     PullRequestRef,
     ReplyTarget,
@@ -501,6 +503,7 @@ def _open_pr(client: TestClient, publication_id: str) -> None:
                     base_ref="main",
                 ),
                 github_html_base="https://github.com",
+                first_parent_proof=await _first_parent_proof(session, publication_id, HEAD_SHA),
             )
             assert (lineage.status, lineage.pr_number, lineage.pr_url) == (
                 "open",
@@ -513,6 +516,45 @@ def _open_pr(client: TestClient, publication_id: str) -> None:
             )
 
     client.portal.call(advance)
+
+
+async def _first_parent_proof(
+    session: AsyncSession, publication_id: str, head_sha: str, *, parent_sha: str | None = None
+) -> Any:
+    from curie_api.publication_verification import publication_base_ref, verify_publication_commit
+
+    publication = await crud_publication_queries.get_publication(session, uuid.UUID(publication_id))
+    assert publication is not None
+    parent = parent_sha or publication.expected_prior_head
+
+    class CodeHostGraph:
+        async def resolve_repository(self, project_id: str) -> RepositoryRef:
+            return RepositoryRef("github", "github.com", "101", REPO, default_branch="main")
+
+        async def branch_head(self, repository: RepositoryRef, branch: str) -> str:
+            assert repository.path == REPO
+            assert branch == "main"
+            return parent
+
+        async def read_commit(self, repository: RepositoryRef, sha: str) -> Commit:
+            assert repository.path == REPO
+            if sha == head_sha:
+                return Commit(
+                    sha=sha,
+                    parents=(parent,),
+                    message=f"Publish\n\nCurie-Revision: {publication.id}\n",
+                )
+            if sha == parent and parent != publication.base_sha:
+                return Commit(sha=sha, parents=(publication.base_sha,), message="Moved base")
+            assert sha == publication.base_sha
+            return Commit(sha=sha, parents=(), message="Approved base")
+
+    code_host = cast(Any, CodeHostGraph())
+    repository = RepositoryRef("github", "github.com", "101", REPO, default_branch="main")
+    base_branch = await publication_base_ref(session, code_host, publication, repository)
+    return await verify_publication_commit(
+        code_host, repository, publication, commit_sha=head_sha, base_branch=base_branch
+    )
 
 
 def _detail(
@@ -1067,6 +1109,7 @@ def test_verified_repository_identity_must_match_work_item_to_bind(
                 base_ref="main",
             ),
             github_html_base="https://github.com",
+            first_parent_proof=await _first_parent_proof(session, publication["id"], HEAD_SHA),
         )
         opened = await session.execute(
             text(

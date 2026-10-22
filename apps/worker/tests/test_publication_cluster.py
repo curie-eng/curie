@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import copy
 import dataclasses
 import os
 import ssl
 import time
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -16,7 +19,11 @@ from urllib.parse import quote
 import httpx
 import pytest
 from channel_protocol.reply import ReplyAck
-from curie_worker.publication_clients import PublicationLineageClient
+from curie_worker.publication_clients import (
+    PublicationCodeHostClient,
+    PublicationCredentialClient,
+    PublicationLineageClient,
+)
 from curie_worker.publication_k8s import (
     KubernetesPublicationCluster,
     PublicationJobSettings,
@@ -25,6 +32,7 @@ from curie_worker.publication_k8s import (
     PublicationTransport,
     build_publication_resources,
     job_transport,
+    publication_resource_names,
     validate_adopted_resource,
 )
 from curie_worker.publication_loop import (
@@ -36,7 +44,7 @@ from curie_worker.publication_loop import (
 from curie_worker.publication_store import PostgresPublicationStore
 from kubernetes import client as k8s_client
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
 OPT_IN = os.environ.get("CURIE_PUBLICATION_CLUSTER_PROOF") == "1"
 pytestmark = [pytest.mark.anyio]
@@ -133,6 +141,7 @@ def _payload(
         repo_full_name=REPO_FULL_NAME,
         clean_clone_url=f"{transport.origin}/{REPO_FULL_NAME}.git",
         base_sha=base_sha,
+        base_branch="main",
         expected_prior_head=base_sha,
         expected_remote_head=None,
         patch=patch,
@@ -346,15 +355,23 @@ class _Transcript:
         self.texts.append(text_value)
 
 
-async def _seed_failed_publication(engine: AsyncEngine, base_sha: str) -> None:
-    branch = f"curie/publication-{FAILURE_ID.hex}"
+async def _seed_failed_publication(
+    engine: AsyncEngine,
+    base_sha: str,
+    *,
+    publication_id: uuid.UUID = FAILURE_ID,
+    patch: bytes = b"this is not a unified diff\n",
+) -> uuid.UUID:
+    branch = f"curie/publication-{publication_id.hex}"
+    agent_id = uuid.uuid5(publication_id, "agent")
+    version_id = uuid.uuid5(publication_id, "version")
+    deployment_id = uuid.uuid5(publication_id, "deployment")
+    approval_id = uuid.uuid5(publication_id, "approval")
+    lineage_id = uuid.uuid5(publication_id, "lineage")
     async with engine.begin() as connection:
         await connection.execute(
-            text(
-                "INSERT INTO curie.agents (id, name, repo_full_name) "
-                "VALUES (:id, 'acme-bot', :repo)"
-            ),
-            {"id": AGENT_ID, "repo": REPO_FULL_NAME},
+            text("INSERT INTO curie.agents (id, name, repo_full_name) VALUES (:id, :name, :repo)"),
+            {"id": agent_id, "name": f"acme-bot-{publication_id.hex}", "repo": REPO_FULL_NAME},
         )
         await connection.execute(
             text(
@@ -362,7 +379,7 @@ async def _seed_failed_publication(engine: AsyncEngine, base_sha: str) -> None:
                 "(id, agent_id, version_label, created_by) "
                 "VALUES (:id, :agent_id, 'cluster-proof', 'fixture')"
             ),
-            {"id": VERSION_ID, "agent_id": AGENT_ID},
+            {"id": version_id, "agent_id": agent_id},
         )
         await connection.execute(
             text(
@@ -371,9 +388,9 @@ async def _seed_failed_publication(engine: AsyncEngine, base_sha: str) -> None:
                 "VALUES (:id, :agent_id, :version_id, 'dev', true, 'active')"
             ),
             {
-                "id": DEPLOYMENT_ID,
-                "agent_id": AGENT_ID,
-                "version_id": VERSION_ID,
+                "id": deployment_id,
+                "agent_id": agent_id,
+                "version_id": version_id,
             },
         )
         await connection.execute(
@@ -384,10 +401,10 @@ async def _seed_failed_publication(engine: AsyncEngine, base_sha: str) -> None:
                 "resolution_note, purpose) VALUES "
                 "(:id, :agent_id, '1700000000.000100', 'requester@example.test', "
                 "'Publish these repository changes?', 'slack', 'C0EXAMPLE1', "
-                "'1700000000.000200', 'publication-cluster-proof', 'approved', "
+                "'1700000000.000200', :dedupe, 'approved', "
                 "'U0APPROVE1', 'Approved fixture publication.', 'publication')"
             ),
-            {"id": APPROVAL_ID, "agent_id": AGENT_ID},
+            {"id": approval_id, "agent_id": agent_id, "dedupe": f"cluster-proof-{publication_id}"},
         )
         await connection.execute(
             text(
@@ -398,9 +415,9 @@ async def _seed_failed_publication(engine: AsyncEngine, base_sha: str) -> None:
                 ":repo, :base_sha, :branch, 'open', 1, 1)"
             ),
             {
-                "id": LINEAGE_ID,
-                "agent_id": AGENT_ID,
-                "deployment_id": DEPLOYMENT_ID,
+                "id": lineage_id,
+                "agent_id": agent_id,
+                "deployment_id": deployment_id,
                 "repo": REPO_FULL_NAME,
                 "base_sha": base_sha,
                 "branch": branch,
@@ -421,23 +438,26 @@ async def _seed_failed_publication(engine: AsyncEngine, base_sha: str) -> None:
                 "'1700000000.000200', now())"
             ),
             {
-                "id": FAILURE_ID,
-                "approval_id": APPROVAL_ID,
-                "deployment_id": DEPLOYMENT_ID,
-                "lineage_id": LINEAGE_ID,
+                "id": publication_id,
+                "approval_id": approval_id,
+                "deployment_id": deployment_id,
+                "lineage_id": lineage_id,
                 "base_sha": base_sha,
                 "repo": REPO_FULL_NAME,
-                "patch": b"this is not a unified diff\n",
+                "patch": patch,
                 "changed_paths": '["README.md"]',
             },
         )
+    return lineage_id
 
 
 class _NoBranchCodeHost:
     """The API's code host routes for a publication whose branch was never pushed."""
 
-    async def read_branch_head(self, publication_id: uuid.UUID) -> str | None:
-        return None
+    async def read_branch_head(self, publication_id: uuid.UUID) -> Any:
+        from curie_worker.publication_loop import PublicationBranchHead
+
+        return PublicationBranchHead(head_sha=None, base_branch="main")
 
     async def read_pull_request(
         self, publication_id: uuid.UUID, pr_number: int
@@ -451,7 +471,7 @@ class _NoBranchCodeHost:
         *,
         revision_id: uuid.UUID,
         expected_parent: str,
-    ) -> str:
+    ) -> Any:
         raise AssertionError("a failed Job has no revision commit to verify")
 
     async def recover_pull_request(
@@ -638,6 +658,363 @@ async def test_generated_script_only_pushes_the_marked_commit() -> None:
     assert state_response.json()["pull"] is None
 
 
+async def _fixture_post(path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    async with httpx.AsyncClient(verify=_ssl_context(), timeout=20) as client:
+        response = await client.post(
+            f"{_required('CURIE_PUBLICATION_FIXTURE_API')}{path}",
+            json=payload,
+            headers={"Authorization": AUTHORIZATION},
+        )
+    assert response.status_code == 200, response.text
+    return dict(response.json())
+
+
+async def _remove_scenario_resources(
+    cluster: KubernetesPublicationCluster, publication_id: uuid.UUID
+) -> None:
+    names = publication_resource_names(publication_id)
+    cluster.cleanup_credentials(names)
+    cluster.cleanup_terminal(names)
+    deadline = time.monotonic() + 30
+    while True:
+        pods = cluster._core.list_namespaced_pod(
+            _namespace(), label_selector=f"job-name={names.job}"
+        ).items
+        remaining = []
+        for read, name in (
+            (cluster._batch.read_namespaced_job, names.job),
+            (cluster._core.read_namespaced_config_map, names.config_map),
+            (cluster._core.read_namespaced_secret, names.secret),
+        ):
+            try:
+                read(name, _namespace())
+            except k8s_client.ApiException as exc:
+                if exc.status != 404:
+                    raise
+            else:
+                remaining.append(name)
+        if not pods and not remaining:
+            return
+        assert time.monotonic() < deadline, "scenario publication resources were not deleted"
+        await asyncio.sleep(0.25)
+
+
+@asynccontextmanager
+async def _moved_cluster_scenario(
+    monkeypatch: pytest.MonkeyPatch,
+) -> AsyncIterator[dict[str, Any]]:
+    from curie_api.config import get_settings
+    from curie_api.forges.registry import forges_registry
+    from curie_api.github_app import _RESOLVERS
+    from curie_api.routers import publication_code_host, publications
+    from fastapi import FastAPI
+
+    publication_id = uuid.uuid4()
+    branch = f"curie/publication-{publication_id.hex}"
+    engine = create_async_engine(_required("TEST_DATABASE_URL"))
+    cluster = _cluster()
+    scenario = await _fixture_post("/__fixture/scenario", {"branch": branch})
+    scenario_id = scenario["scenario_id"]
+    try:
+        for name, value in {
+            "DATABASE_URL": _required("TEST_DATABASE_URL"),
+            "INTERNAL_WORKER_TOKEN": "publication-cluster-worker",
+            "GITHUB_TOKEN": "fixture-token",
+            "GITHUB_APP_ID": "",
+            "GITHUB_APP_PRIVATE_KEY": "",
+            "GITHUB_API_URL": _origin(),
+            "GITHUB_CLONE_BASE": _origin(),
+            "GITHUB_REPO_ALLOWLIST": '["acme-corp/*"]',
+            "GITHUB_REVIEW_INGRESS_ENABLED": "false",
+            "CURIE_CODE_HOST_CA_BUNDLE": "",
+            "CURIE_FORGES": "{}",
+        }.items():
+            monkeypatch.setenv(name, value)
+        get_settings.cache_clear()
+        _RESOLVERS.clear()
+        lineage_id = await _seed_failed_publication(
+            engine,
+            scenario["original_base_sha"],
+            publication_id=publication_id,
+            patch=scenario["patch"].encode(),
+        )
+        agent_id = uuid.uuid5(publication_id, "agent")
+        deployment_id = uuid.uuid5(publication_id, "deployment")
+        binding_id = uuid.uuid5(publication_id, "binding")
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO curie.thread_workspaces "
+                    "(id, agent_id, selected_by_deployment_id, conversation_id, repo_full_name, "
+                    "selected_by) "
+                    "VALUES (:id, :agent, :deployment, 'slack:C0EXAMPLE1:1700000000.000100', "
+                    ":repo, 'fixture')"
+                ),
+                {
+                    "id": uuid.uuid4(),
+                    "agent": agent_id,
+                    "deployment": deployment_id,
+                    "repo": REPO_FULL_NAME,
+                },
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO curie.agent_channels (id, agent_id, kind, address, adapter, "
+                    "generation) "
+                    "VALUES (:id, :agent, 'slack', 'C0EXAMPLE1', 'default', 1)"
+                ),
+                {"id": binding_id, "agent": agent_id},
+            )
+            await connection.execute(
+                text(
+                    "UPDATE curie.thread_publication_lineages SET binding_id = :binding, "
+                    "binding_generation = 1, reply_conversation_id = '1700000000.000100' WHERE id "
+                    "= :id"
+                ),
+                {"id": lineage_id, "binding": binding_id},
+            )
+
+        async with httpx.AsyncClient(
+            verify=_ssl_context(),
+            timeout=10,
+            event_hooks={"request": [_forward_fixture_request]},
+        ) as external:
+            app = FastAPI()
+            app.state.sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
+            app.state.http_client = external
+            app.state.forges = forges_registry(get_settings())
+            app.include_router(publications.internal_router)
+            app.include_router(publication_code_host.router)
+            requests: list[tuple[str, str]] = []
+
+            async def record(request: httpx.Request) -> None:
+                requests.append((request.method, request.url.path))
+
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://api.example.test",
+                event_hooks={"request": [record]},
+            ) as internal:
+                store = PostgresPublicationStore(
+                    engine,
+                    schema="curie",
+                    lease_owner=f"publication-proof-{publication_id.hex}",
+                    lease_seconds=30,
+                )
+                replies, transcript = _Replies(), _Transcript()
+                reconciler = PublicationReconciler(
+                    store=store,
+                    credentials=PublicationCredentialClient(
+                        api_base_url="http://api.example.test",
+                        worker_token="publication-cluster-worker",
+                        client=internal,
+                    ),
+                    cluster=cluster,
+                    code_host=PublicationCodeHostClient(
+                        api_base_url="http://api.example.test",
+                        worker_token="publication-cluster-worker",
+                        client=internal,
+                    ),
+                    lineage=PublicationLineageClient(
+                        api_base_url="http://api.example.test",
+                        worker_token="publication-cluster-worker",
+                        client=internal,
+                    ),
+                    replies=replies,
+                    transcript=transcript,
+                    job_settings=_settings(),
+                )
+                yield {
+                    **scenario,
+                    "publication_id": publication_id,
+                    "lineage_id": lineage_id,
+                    "cluster": cluster,
+                    "store": store,
+                    "reconciler": reconciler,
+                    "engine": engine,
+                    "requests": requests,
+                    "replies": replies,
+                }
+    finally:
+        try:
+            await _remove_scenario_resources(cluster, publication_id)
+        finally:
+            try:
+                try:
+                    async with engine.begin() as connection:
+                        await connection.execute(
+                            text(
+                                "DELETE FROM curie.credential_redemption_audit_entries WHERE "
+                                "publication_id = :id"
+                            ),
+                            {"id": publication_id},
+                        )
+                        await connection.execute(
+                            text("DELETE FROM curie.agents WHERE id = :id"),
+                            {"id": uuid.uuid5(publication_id, "agent")},
+                        )
+                finally:
+                    restored = await _fixture_post(
+                        "/__fixture/restore", {"scenario_id": scenario_id}
+                    )
+                    assert restored == {
+                        "base_sha": scenario["original_base_sha"],
+                        "head_sha": None,
+                        "restored": True,
+                    }
+            finally:
+                await engine.dispose()
+                _RESOLVERS.clear()
+                get_settings.cache_clear()
+
+
+async def _scenario_sql(case: dict[str, Any]) -> dict[str, Any]:
+    async with case["engine"].connect() as connection:
+        result = await connection.execute(
+            text(
+                "SELECT p.base_sha AS approved_base, p.expected_prior_head, p.status, p.error, "
+                "p.result_url, p.patch_bytes, p.reconcile_attempts, l.base_sha AS lineage_base, "
+                "l.head_sha, l.pr_number, l.pr_url, l.version AS lineage_version "
+                "FROM curie.publications p JOIN curie.thread_publication_lineages l ON l.id = "
+                "p.lineage_id "
+                "WHERE p.id = :id"
+            ),
+            {"id": case["publication_id"]},
+        )
+        return dict(result.mappings().one())
+
+
+@requires_cluster
+async def test_moved_base_real_job_opens_pull_request_on_current_tip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _moved_cluster_scenario(monkeypatch) as case:
+        original = case["original_base_sha"]
+        moved = await _fixture_post("/__fixture/move-base", {"scenario_id": case["scenario_id"]})
+        parent = moved["tip_sha"]
+        assert moved["original_base_sha"] == original
+        assert parent != original
+        store, reconciler, cluster = case["store"], case["reconciler"], case["cluster"]
+        work = await store.claim_next()
+        assert work is not None and work.publication_id == case["publication_id"]
+        await reconciler.reconcile(work)
+        names = publication_resource_names(work.publication_id)
+        job = cluster._batch.read_namespaced_job(names.job, _namespace())
+        uid = job.metadata.uid
+        assert uid
+        assert job.spec.template.spec.containers[0].command == [
+            "/bin/bash",
+            "/publication/publish.sh",
+        ]
+        observation = await _wait_terminal(cluster, names.job)
+        assert observation.phase == "succeeded", observation.error
+        assert observation.commit_sha is not None and observation.transport is not None
+        pushed = observation.commit_sha
+        assert "CURIE_PR_" not in observation.logs
+
+        secret = cluster._core.read_namespaced_secret(names.secret, _namespace())
+        credential = base64.b64decode(secret.data["credential"], validate=True).decode()
+        expected = build_publication_resources(
+            _payload(
+                work.publication_id,
+                base_sha=original,
+                patch=case["patch"].encode(),
+                transport=observation.transport,
+            ),
+            credential=credential,
+            settings=_settings(),
+        )
+        assert (
+            cluster._core.read_namespaced_config_map(names.config_map, _namespace()).data[
+                "publish.sh"
+            ]
+            == expected.config_map["data"]["publish.sh"]
+        )
+        cluster.apply(expected)
+        cluster.validate_existing(expected)
+        assert cluster._batch.read_namespaced_job(names.job, _namespace()).metadata.uid == uid
+
+        later = await _fixture_post("/__fixture/move-base", {"scenario_id": case["scenario_id"]})
+        assert later["tip_sha"] not in {original, parent, pushed}
+        work = await store.claim_next()
+        assert work is not None and work.publication_id == case["publication_id"]
+        await reconciler.reconcile(work)
+
+        stored = await _scenario_sql(case)
+        assert stored["status"] == "succeeded", stored["error"]
+        assert stored["approved_base"] == stored["expected_prior_head"] == original
+        assert stored["lineage_base"] == parent
+        assert stored["head_sha"] == pushed
+        assert stored["pr_number"] == 1
+        assert stored["result_url"] == stored["pr_url"]
+        assert stored["patch_bytes"] is None
+        inspection = await _fixture_post("/__fixture/inspect", {"scenario_id": case["scenario_id"]})
+        assert inspection["commit"]["sha"] == pushed
+        assert inspection["commit"]["parents"] == [{"sha": parent}]
+        assert inspection["diff"] == case["patch"]
+        assert inspection["files"]["README.md"] == "published by moved base proof"
+        assert inspection["files"][".github/workflows/fixture.yaml"].startswith("name: Fixture 1\n")
+        assert inspection["pull"]["head"]["sha"] == pushed
+        assert inspection["pull"]["base"]["ref"] == "main"
+        assert inspection["pull"]["base"]["sha"] == later["tip_sha"]
+        assert inspection["pushes"] == inspection["pull_creations"] == 1
+
+        # Replay the pre-response work after SQL has committed, as after a lost response.
+        await reconciler.reconcile(work)
+        assert await _scenario_sql(case) == stored
+        assert (
+            await _fixture_post("/__fixture/inspect", {"scenario_id": case["scenario_id"]})
+            == inspection
+        )
+        assert (
+            case["requests"].count(
+                ("POST", f"/v1/internal/publications/{work.publication_id}/credential")
+            )
+            == 1
+        )
+        assert any(
+            method == "PATCH" and path.endswith("/lineage") for method, path in case["requests"]
+        )
+
+
+@requires_cluster
+async def test_moved_base_conflict_real_job_records_named_failure_without_branch_or_pr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _moved_cluster_scenario(monkeypatch) as case:
+        moved = await _fixture_post(
+            "/__fixture/move-base",
+            {
+                "scenario_id": case["scenario_id"],
+                "conflict": True,
+            },
+        )
+        store, reconciler, cluster = case["store"], case["reconciler"], case["cluster"]
+        work = await store.claim_next()
+        assert work is not None and work.publication_id == case["publication_id"]
+        await reconciler.reconcile(work)
+        observation = await _wait_terminal(
+            cluster, publication_resource_names(work.publication_id).job
+        )
+        assert observation.phase == "failed"
+        assert observation.commit_sha is None
+        assert "CURIE_COMMIT_SHA=" not in observation.logs
+        work = await store.claim_next()
+        assert work is not None and work.publication_id == case["publication_id"]
+        await reconciler.reconcile(work)
+        stored = await _scenario_sql(case)
+        assert stored["status"] == "failed"
+        assert "publication_base_moved_conflict" in stored["error"]
+        assert case["original_base_sha"] in stored["error"]
+        assert moved["tip_sha"] in stored["error"]
+        assert stored["lineage_base"] == stored["approved_base"] == case["original_base_sha"]
+        assert stored["head_sha"] is None and stored["pr_number"] is None
+        assert stored["reconcile_attempts"] == 0
+        inspection = await _fixture_post("/__fixture/inspect", {"scenario_id": case["scenario_id"]})
+        assert inspection["head_sha"] is None and inspection["pull"] is None
+        assert inspection["pushes"] == inspection["pull_creations"] == 0
+
+
 CONTRACT_CA_PEM = "-----BEGIN CERTIFICATE-----\nMIIBcontractonly\n-----END CERTIFICATE-----\n"
 
 
@@ -672,6 +1049,7 @@ def _contract_payload(transport: PublicationTransport) -> PublicationPayload:
         repo_full_name=REPO_FULL_NAME,
         clean_clone_url=f"{transport.origin}/{REPO_FULL_NAME}.git",
         base_sha="a" * 40,
+        base_branch="main",
         expected_prior_head="a" * 40,
         expected_remote_head=None,
         patch=b"diff --git a/README.md b/README.md\n",

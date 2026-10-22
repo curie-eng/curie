@@ -1,10 +1,8 @@
 """Contract for the worker lineage PATCH that verifies identity and settles one revision.
 
-The helpers and the `publication_stack` / `review_lineage_app` fixtures are
-reproduced from `apps/api/tests/test_publications.py` rather than imported:
-the suite runs under ``--import-mode=importlib`` with no ``__init__.py``, so
-one test module cannot import another by name (`apps/api/tests/conftest.py`
-states this), and that module belongs to the other implementation stream.
+The admission fixtures seed real Postgres and Valkey state. Shared external
+GitHub responses supply the commit objects required for settlement; the API
+verifies their ancestry and binds the resulting proof to the locked rows.
 """
 
 from __future__ import annotations
@@ -42,7 +40,7 @@ LINEAGE_OPERATION = "/v1/internal/publications/{publication_id}/lineage"
 GITHUB_UNAVAILABLE_CODE = "publication.github_unavailable"
 
 _LINEAGE_COLUMNS = (
-    "id, version, status, pr_number, pr_url, head_sha, latest_revision, binding_id, "
+    "id, version, status, base_sha, pr_number, pr_url, head_sha, latest_revision, binding_id, "
     "code_host_kind, code_host_host, repository_project_id, code_host_installation_id, "
     "code_host_pr_id, base_ref, updated_at"
 )
@@ -154,7 +152,7 @@ def review_lineage_app(
                 "state": truth["state"],
                 "merged": truth["merged"],
                 "head": {"sha": truth["head_sha"], "ref": truth["branch"], "repo": repo},
-                "base": {"repo": repo, "ref": "main"},
+                "base": {"repo": repo, "ref": truth.get("base_ref", "main")},
             },
         )
 
@@ -404,10 +402,42 @@ def _advance_lineage(
     pr_url: str = PR_URL,
     headers: Mapping[str, str] | None = WORKER_HEADERS,
 ) -> Any:
+    from test_publications import _publication_commit_http
+
     if expected_publication_version is None or lease_owner is None:
         expected_publication_version, lease_owner = _claim_publication_lease(
             publication_id, "lineage-identity-test-worker"
         )
+    with _publication_commit_http(client, publication_id, head_sha):
+        return _patch_lineage(
+            client,
+            publication_id,
+            expected_version=expected_version,
+            expected_head_sha=expected_head_sha,
+            expected_publication_version=expected_publication_version,
+            lease_owner=lease_owner,
+            head_sha=head_sha,
+            state=state,
+            pr_number=pr_number,
+            pr_url=pr_url,
+            headers=headers,
+        )
+
+
+def _patch_lineage(
+    client: TestClient,
+    publication_id: str,
+    *,
+    expected_version: int,
+    expected_head_sha: str | None,
+    expected_publication_version: int,
+    lease_owner: str,
+    head_sha: str,
+    state: str,
+    pr_number: int,
+    pr_url: str,
+    headers: Mapping[str, str] | None,
+) -> Any:
     return client.patch(
         f"/v1/internal/publications/{publication_id}/lineage",
         json={
@@ -719,3 +749,513 @@ def test_patch_404s_for_unknown_publication(
 
     assert response.status_code == 404, response.text
     assert response.json()["detail"] == "publication lineage not found"
+
+
+MOVED_PARENT_SHA = "3" * 40
+LATER_BASE_SHA = "4" * 40
+
+
+@contextmanager
+def _moved_base_graph(
+    client: TestClient,
+    publication: dict[str, Any],
+    *,
+    race: tuple[str, dict[str, Any]] | None = None,
+) -> Iterator[dict[str, Any]]:
+    graph: dict[str, Any] = {
+        "tip": MOVED_PARENT_SHA,
+        "raced": False,
+        "commits": {
+            BASE_SHA: {"sha": BASE_SHA, "parents": [], "message": "Original base"},
+            MOVED_PARENT_SHA: {
+                "sha": MOVED_PARENT_SHA,
+                "parents": [{"sha": BASE_SHA}],
+                "message": "Moved base",
+            },
+            LATER_BASE_SHA: {
+                "sha": LATER_BASE_SHA,
+                "parents": [{"sha": MOVED_PARENT_SHA}],
+                "message": "Base moved again after push",
+            },
+            FIRST_REVISION_SHA: {
+                "sha": FIRST_REVISION_SHA,
+                "parents": [{"sha": MOVED_PARENT_SHA}],
+                "message": f"Publish\n\nCurie-Revision: {publication['id']}\n",
+            },
+        },
+    }
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        assert request.headers["Authorization"] == "Bearer ghp_publication_operator"
+        path = request.url.path
+        # https://docs.github.com/en/rest/git/commits#get-a-commit-object
+        if path.startswith(f"/repos/{REPO}/git/commits/"):
+            sha = path.rsplit("/", 1)[-1]
+            if race is not None and not graph["raced"]:
+                graph["raced"] = True
+                engine = create_async_engine(get_settings().database_url)
+                try:
+                    async with engine.begin() as connection:
+                        await connection.execute(text(race[0]), race[1])
+                finally:
+                    await engine.dispose()
+            payload = graph["commits"].get(sha)
+            return httpx.Response(200, json=payload) if payload else httpx.Response(404)
+        if path.startswith(f"/repos/{REPO}/git/ref/heads/"):
+            return httpx.Response(
+                200,
+                json={
+                    "ref": "refs/heads/main",
+                    "object": {"type": "commit", "sha": graph["tip"]},
+                },
+            )
+        assert path == f"/repos/{REPO}", path
+        return httpx.Response(200, json={"id": 9001, "full_name": REPO, "default_branch": "main"})
+
+    original = client.app.state.http_client
+    injected = httpx.AsyncClient(transport=httpx.MockTransport(handle))
+    client.app.state.http_client = injected
+    try:
+        yield graph
+    finally:
+        client.app.state.http_client = original
+        asyncio.run(injected.aclose())
+
+
+def _publication_row(publication_id: str) -> dict[str, Any]:
+    return _rows(
+        "SELECT base_sha, expected_prior_head, status, version, patch_bytes, lease_owner, "
+        "lease_expires_at, terminal_at FROM curie.publications WHERE id = :id",
+        {"id": uuid.UUID(publication_id)},
+    )[0]
+
+
+def _settle_moved(
+    client: TestClient, publication: dict[str, Any], lease: tuple[int, str], **overrides: Any
+) -> Any:
+    data: dict[str, Any] = {
+        "expected_version": 1,
+        "expected_head_sha": None,
+        "expected_publication_version": lease[0],
+        "lease_owner": lease[1],
+        "head_sha": FIRST_REVISION_SHA,
+        "state": "open",
+        "pr_number": PR_NUMBER,
+        "pr_url": PR_URL,
+        "headers": WORKER_HEADERS,
+    }
+    data.update(overrides)
+    return _patch_lineage(client, publication["id"], **data)
+
+
+def test_first_settlement_records_actual_parent_with_head_and_keeps_approval_base(
+    clean_db: None, publication_stack: tuple[TestClient, str], auth_headers: dict[str, str]
+) -> None:
+    client, _ = publication_stack
+    deployment, publication = _approved_publication(client, auth_headers)
+    lease = _claim_publication_lease(publication["id"], "moved-base-worker")
+    with _moved_base_graph(client, publication) as graph:
+        graph["tip"] = LATER_BASE_SHA
+        response = _settle_moved(client, publication, lease)
+    assert response.status_code == 200, response.text
+    assert response.json()["base_sha"] == MOVED_PARENT_SHA
+    assert response.json()["head_sha"] == FIRST_REVISION_SHA
+    row = _lineage_row(publication["lineage_id"])
+    assert (row["base_sha"], row["head_sha"], row["version"]) == (
+        MOVED_PARENT_SHA,
+        FIRST_REVISION_SHA,
+        2,
+    )
+    settled = _publication_row(publication["id"])
+    assert settled["base_sha"] == settled["expected_prior_head"] == BASE_SHA
+    assert settled["status"] == "succeeded"
+    assert settled["lease_owner"] is None
+
+    # A later approved revision retains the first publication's actual base.
+    _mark_outcome_history_ready(publication["id"])
+    conversation = _rows(
+        "SELECT conversation_id FROM curie.approvals WHERE id = :id",
+        {"id": uuid.UUID(publication["approval_id"])},
+    )[0]["conversation_id"]
+    payload = _publication_payload(deployment["id"], conversation_id=conversation)
+    payload["base_sha"] = FIRST_REVISION_SHA
+    second = _create_publication(client, payload)
+    assert _resolve(client, auth_headers, second["approval_id"]).status_code == 200
+    advanced = _advance_lineage(
+        client,
+        second["id"],
+        expected_version=2,
+        expected_head_sha=FIRST_REVISION_SHA,
+        head_sha=SECOND_REVISION_SHA,
+    )
+    assert advanced.status_code == 200, advanced.text
+    assert _lineage_row(publication["lineage_id"])["base_sha"] == MOVED_PARENT_SHA
+
+    _mark_outcome_history_ready(second["id"])
+    third_payload = _publication_payload(deployment["id"], conversation_id=conversation)
+    third_payload["base_sha"] = SECOND_REVISION_SHA
+    third = _create_publication(client, third_payload)
+    assert _resolve(client, auth_headers, third["approval_id"]).status_code == 200
+    _execute(
+        "UPDATE curie.publications SET approval_card_reported_at = now() WHERE id = :id",
+        {"id": uuid.UUID(third["id"])},
+    )
+
+    async def close_established_lineage() -> None:
+        from curie_worker.publication_store import PostgresPublicationStore
+
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            store = PostgresPublicationStore(engine, schema="curie", lease_owner="terminal-worker")
+            work = await store.claim_next()
+            assert work is not None and str(work.publication_id) == third["id"]
+            await store.mark_lineage_terminal(
+                work.lineage_id,
+                publication_id=work.publication_id,
+                expected_publication_version=work.version,
+                lease_owner=work.lease_owner,
+                expected_version=work.lineage_version,
+                expected_stored_head=SECOND_REVISION_SHA,
+                state="closed",
+                pr_number=PR_NUMBER,
+                pr_url=PR_URL,
+                head_sha=SECOND_REVISION_SHA,
+                first_parent_sha=None,
+            )
+        finally:
+            await engine.dispose()
+
+    client.portal.call(close_established_lineage)
+    closed = _lineage_row(publication["lineage_id"])
+    assert (closed["status"], closed["base_sha"], closed["head_sha"]) == (
+        "closed",
+        MOVED_PARENT_SHA,
+        SECOND_REVISION_SHA,
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation", ["publication-version", "lineage-version", "lease", "revision", "expiry"]
+)
+def test_settlement_rechecks_stored_authority_after_remote_read_without_partial_mutation(
+    clean_db: None,
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    mutation: str,
+) -> None:
+    client, _ = publication_stack
+    _, publication = _approved_publication(client, auth_headers)
+    lease = _claim_publication_lease(publication["id"], "moved-base-worker")
+    statements = {
+        "publication-version": "UPDATE curie.publications SET version = version + 1 WHERE id = :id",
+        "lineage-version": (
+            "UPDATE curie.thread_publication_lineages SET version = version + 1 WHERE id = :id"
+        ),
+        "lease": (
+            "UPDATE curie.publications SET lease_owner = 'another-worker', "
+            "version = version + 1 WHERE id = :id"
+        ),
+        "revision": (
+            "UPDATE curie.thread_publication_lineages "
+            "SET latest_revision = latest_revision + 1 WHERE id = :id"
+        ),
+        "expiry": (
+            "UPDATE curie.publications SET status = 'expired', version = version + 1 WHERE id = :id"
+        ),
+    }
+    lineage_mutation = mutation in {"lineage-version", "revision"}
+    target = publication["lineage_id"] if lineage_mutation else publication["id"]
+    race = (statements[mutation], {"id": uuid.UUID(target)})
+    before_lineage = _lineage_row(publication["lineage_id"])
+    before_publication = _publication_row(publication["id"])
+    with _moved_base_graph(client, publication, race=race) as graph:
+        response = _settle_moved(client, publication, lease)
+    assert graph["raced"]
+    assert response.status_code == 409, response.text
+    after_lineage = _lineage_row(publication["lineage_id"])
+    after_publication = _publication_row(publication["id"])
+    if mutation == "lineage-version":
+        before_lineage["version"] += 1
+    elif mutation == "revision":
+        before_lineage["latest_revision"] += 1
+    else:
+        before_publication["version"] += 1
+        if mutation == "lease":
+            before_publication["lease_owner"] = "another-worker"
+        elif mutation == "expiry":
+            before_publication["status"] = "expired"
+    assert after_lineage == before_lineage
+    assert after_publication == before_publication
+
+
+def _real_proof(client: TestClient, publication_id: str, head_sha: str) -> Any:
+    from curie_api.crud import publication_queries
+    from curie_api.factory_rediscovery import publishing_code_host
+    from curie_api.publication_verification import publication_base_ref, verify_publication_commit
+    from curie_api.repository_access import lineage_repository
+
+    async def prove() -> Any:
+        async with client.app.state.sessionmaker() as session:
+            publication = await publication_queries.get_publication(
+                session, uuid.UUID(publication_id)
+            )
+            assert publication is not None and publication.lineage is not None
+            repository = await lineage_repository(session, get_settings(), publication.lineage)
+            code_host = publishing_code_host(
+                get_settings(), client.app.state.http_client, repository
+            )
+            branch = await publication_base_ref(session, code_host, publication, repository)
+            return await verify_publication_commit(
+                code_host, repository, publication, commit_sha=head_sha, base_branch=branch
+            )
+
+    return client.portal.call(prove)
+
+
+def _write_proof(client: TestClient, publication_id: str, proof: Any, **changes: Any) -> Any:
+    from curie_api.crud import lineages
+    from curie_api.schemas.publications import PublicationLineageAdvance
+
+    row = _publication_row(publication_id)
+    lineage = _rows(
+        "SELECT l.version, l.head_sha FROM curie.thread_publication_lineages l "
+        "JOIN curie.publications p ON p.lineage_id = l.id WHERE p.id = :id",
+        {"id": uuid.UUID(publication_id)},
+    )[0]
+    values = {
+        "expected_version": lineage["version"],
+        "expected_head_sha": lineage["head_sha"],
+        "expected_publication_version": row["version"],
+        "lease_owner": row["lease_owner"],
+        "state": "open",
+        "pr_number": PR_NUMBER,
+        "pr_url": PR_URL,
+        "head_sha": FIRST_REVISION_SHA,
+        "metadata_updated_at": None,
+    }
+    values.update(changes)
+
+    async def write() -> Any:
+        async with client.app.state.sessionmaker() as session:
+            return await lineages.advance_publication_lineage(
+                session,
+                uuid.UUID(publication_id),
+                PublicationLineageAdvance(**values),
+                github_html_base="https://github.com",
+                first_parent_proof=proof,
+            )
+
+    return client.portal.call(write)
+
+
+@pytest.mark.parametrize("changed_row", ["publication", "lineage"])
+def test_stale_verified_snapshot_cannot_be_rebound_to_fresh_outcome_versions(
+    clean_db: None,
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    changed_row: str,
+) -> None:
+    from curie_api.crud.errors import PublicationLineageConflict
+
+    client, _ = publication_stack
+    _, publication = _approved_publication(client, auth_headers)
+    _claim_publication_lease(publication["id"], "moved-base-worker")
+    with _moved_base_graph(client, publication):
+        proof = _real_proof(client, publication["id"], FIRST_REVISION_SHA)
+    table = "publications" if changed_row == "publication" else "thread_publication_lineages"
+    target = publication["id"] if changed_row == "publication" else publication["lineage_id"]
+    _execute(
+        f"UPDATE curie.{table} SET version = version + 1 WHERE id = :id", {"id": uuid.UUID(target)}
+    )
+    before = (_publication_row(publication["id"]), _lineage_row(publication["lineage_id"]))
+
+    with pytest.raises(PublicationLineageConflict):
+        _write_proof(client, publication["id"], proof)
+
+    assert (_publication_row(publication["id"]), _lineage_row(publication["lineage_id"])) == before
+
+
+@pytest.mark.parametrize("field", ["parent_sha", "first_parent_proof"])
+def test_headless_settlement_requires_verified_proof_and_refuses_worker_supplied_parent(
+    clean_db: None,
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    field: str,
+) -> None:
+    from curie_api.crud.errors import PublicationLineageConflict
+
+    client, _ = publication_stack
+    _, publication = _approved_publication(client, auth_headers)
+    lease = _claim_publication_lease(publication["id"], "moved-base-worker")
+    before = (_publication_row(publication["id"]), _lineage_row(publication["lineage_id"]))
+    with pytest.raises(PublicationLineageConflict):
+        _write_proof(client, publication["id"], None)
+    forged = client.patch(
+        LINEAGE_OPERATION.format(publication_id=publication["id"]),
+        headers=WORKER_HEADERS,
+        json={
+            "expected_version": 1,
+            "expected_head_sha": None,
+            "expected_publication_version": lease[0],
+            "lease_owner": lease[1],
+            "state": "open",
+            "pr_number": PR_NUMBER,
+            "pr_url": PR_URL,
+            "head_sha": FIRST_REVISION_SHA,
+            "metadata_updated_at": None,
+            field: MOVED_PARENT_SHA,
+        },
+    )
+    assert forged.status_code == 422, forged.text
+    assert (_publication_row(publication["id"]), _lineage_row(publication["lineage_id"])) == before
+
+
+def test_losing_publication_cas_rolls_back_parent_head_and_identity_together(
+    clean_db: None, publication_stack: tuple[TestClient, str], auth_headers: dict[str, str]
+) -> None:
+    client, _ = publication_stack
+    _, publication = _approved_publication(client, auth_headers)
+    lease = _claim_publication_lease(publication["id"], "moved-base-worker")
+    name = f"test_publication_cas_{uuid.uuid4().hex}"
+    _execute(
+        f"CREATE FUNCTION curie.{name}() RETURNS trigger LANGUAGE plpgsql AS $$ "
+        "BEGIN UPDATE curie.publications SET version = version + 1 "
+        f"WHERE id = '{publication['id']}'; "
+        "RETURN NEW; END; $$"
+    )
+    try:
+        _execute(
+            f"CREATE TRIGGER {name} BEFORE UPDATE ON curie.thread_publication_lineages "
+            f"FOR EACH ROW WHEN (OLD.id = '{publication['lineage_id']}'::uuid) "
+            f"EXECUTE FUNCTION curie.{name}()"
+        )
+        before = (_publication_row(publication["id"]), _lineage_row(publication["lineage_id"]))
+        with _moved_base_graph(client, publication):
+            response = _settle_moved(client, publication, lease)
+        assert response.status_code == 409, response.text
+        assert (
+            _publication_row(publication["id"]),
+            _lineage_row(publication["lineage_id"]),
+        ) == before
+    finally:
+        _execute(f"DROP TRIGGER IF EXISTS {name} ON curie.thread_publication_lineages")
+        _execute(f"DROP FUNCTION curie.{name}()")
+
+    with _moved_base_graph(client, publication):
+        healthy = _settle_moved(client, publication, lease)
+    assert healthy.status_code == 200, healthy.text
+
+
+def test_two_verified_contenders_cannot_settle_different_first_parents(
+    clean_db: None, publication_stack: tuple[TestClient, str], auth_headers: dict[str, str]
+) -> None:
+    from curie_api.crud import lineages
+    from curie_api.crud.errors import PublicationLineageConflict
+    from curie_api.schemas.publications import PublicationLineageAdvance
+
+    client, _ = publication_stack
+    _, publication = _approved_publication(client, auth_headers)
+    lease = _claim_publication_lease(publication["id"], "contending-worker")
+    with _moved_base_graph(client, publication) as graph:
+        first = _real_proof(client, publication["id"], FIRST_REVISION_SHA)
+        graph["tip"] = LATER_BASE_SHA
+        graph["commits"][SECOND_REVISION_SHA] = {
+            "sha": SECOND_REVISION_SHA,
+            "parents": [{"sha": LATER_BASE_SHA}],
+            "message": f"Publish\n\nCurie-Revision: {publication['id']}\n",
+        }
+        second = _real_proof(client, publication["id"], SECOND_REVISION_SHA)
+
+    async def settle(proof: Any) -> tuple[str, str]:
+        async with client.app.state.sessionmaker() as session:
+            try:
+                await lineages.advance_publication_lineage(
+                    session,
+                    uuid.UUID(publication["id"]),
+                    PublicationLineageAdvance(
+                        expected_version=1,
+                        expected_head_sha=None,
+                        expected_publication_version=lease[0],
+                        lease_owner=lease[1],
+                        state="open",
+                        pr_number=PR_NUMBER,
+                        pr_url=PR_URL,
+                        head_sha=proof.commit_sha,
+                        metadata_updated_at=None,
+                    ),
+                    github_html_base="https://github.com",
+                    first_parent_proof=proof,
+                )
+            except PublicationLineageConflict as exc:
+                return "refused", exc.code
+            return "accepted", proof.commit_sha
+
+    async def race() -> list[tuple[str, str]]:
+        return list(await asyncio.gather(settle(first), settle(second)))
+
+    results = client.portal.call(race)
+    assert sorted(result[0] for result in results) == ["accepted", "refused"]
+    row = _lineage_row(publication["lineage_id"])
+    assert (row["head_sha"], row["base_sha"]) in {
+        (FIRST_REVISION_SHA, MOVED_PARENT_SHA),
+        (SECOND_REVISION_SHA, LATER_BASE_SHA),
+    }
+    assert row["version"] == 2
+    assert _publication_row(publication["id"])["base_sha"] == BASE_SHA
+
+
+@pytest.mark.parametrize("mismatch", ["other-publication", "accepted-head", "lineage-base"])
+def test_valid_proof_cannot_authorize_another_publication_head_or_initial_base(
+    clean_db: None,
+    publication_stack: tuple[TestClient, str],
+    auth_headers: dict[str, str],
+    mismatch: str,
+) -> None:
+    from curie_api.crud.errors import PublicationLineageConflict
+
+    client, _ = publication_stack
+    deployment, publication = _approved_publication(client, auth_headers)
+    _claim_publication_lease(publication["id"], "moved-base-worker")
+    target = publication
+    if mismatch == "other-publication":
+        _, target = _approved_publication(client, auth_headers, deployment=deployment)
+        _claim_publication_lease(target["id"], "moved-base-worker")
+    with _moved_base_graph(client, target):
+        proof = _real_proof(client, target["id"], FIRST_REVISION_SHA)
+    if mismatch == "lineage-base":
+        _execute(
+            "UPDATE curie.thread_publication_lineages SET base_sha = :base WHERE id = :id",
+            {"base": LATER_BASE_SHA, "id": uuid.UUID(publication["lineage_id"])},
+        )
+    before = (_publication_row(publication["id"]), _lineage_row(publication["lineage_id"]))
+    with pytest.raises(PublicationLineageConflict):
+        _write_proof(
+            client,
+            publication["id"],
+            proof,
+            head_sha=SECOND_REVISION_SHA if mismatch == "accepted-head" else FIRST_REVISION_SHA,
+        )
+    assert (_publication_row(publication["id"]), _lineage_row(publication["lineage_id"])) == before
+
+
+def test_verified_pr_base_must_agree_with_the_authoritative_proof_branch(
+    review_lineage_app: tuple[TestClient, dict[str, Any], str],
+    auth_headers: dict[str, str],
+) -> None:
+    client, truth, _ = review_lineage_app
+    _, publication = _approved_publication(client, auth_headers, truth=truth)
+    lease = _claim_publication_lease(publication["id"], "branch-proof-worker")
+    truth["base_ref"] = "release/other"
+    before = (_publication_row(publication["id"]), _lineage_row(publication["lineage_id"]))
+
+    refused = _advance_lineage(
+        client, publication["id"], expected_publication_version=lease[0], lease_owner=lease[1]
+    )
+
+    assert refused.status_code == 409, refused.text
+    assert (_publication_row(publication["id"]), _lineage_row(publication["lineage_id"])) == before
+    truth["base_ref"] = "main"
+    healthy = _advance_lineage(
+        client, publication["id"], expected_publication_version=lease[0], lease_owner=lease[1]
+    )
+    assert healthy.status_code == 200, healthy.text
