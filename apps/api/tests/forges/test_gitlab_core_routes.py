@@ -73,7 +73,9 @@ def _opened(install: GitLabInstall) -> tuple[dict[str, Any], dict[str, Any], int
     assert created.status_code == 201, created.text
     publication = created.json()
     gl.approve(publication["id"])
-    head = install.fake.push(publication["branch"], "Fix the widget parser")
+    head = install.fake.push(
+        publication["branch"], f"Fix the widget parser\n\nCurie-Revision: {publication['id']}"
+    )
     recovered = gl.recover_pull_request(install, publication["id"], head)
     assert recovered.status_code == 200, recovered.text
     return item, request_row, int(recovered.json()["number"]), {**publication, "head": head}
