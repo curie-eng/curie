@@ -10,8 +10,10 @@ any unanswered review refuses.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib
 import importlib.util
+import json
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -49,7 +51,9 @@ def rule(groups: list[str], resources: list[str], verbs: list[str], **extra: Any
 SA = [{"kind": "ServiceAccount", "name": "measuring", "namespace": "control"}]
 
 
-def manifest(*, release: bool) -> list[tuple[str, str, str, list[dict[str, Any]]]]:
+def manifest(
+    *, release: bool, binding: str = "curie-release-probe-c1"
+) -> list[tuple[str, str, str, list[dict[str, Any]]]]:
     """(binding kind, namespace, role name, rules) as an administrator would install them."""
     probe = [
         rule([""], ["pods"], ["create", "get", "list", "watch", "patch", "delete"]),
@@ -126,7 +130,7 @@ def manifest(*, release: bool) -> list[tuple[str, str, str, list[dict[str, Any]]
             (
                 "Role",
                 "release",
-                "curie-release-probe-c1",
+                binding,
                 [
                     rule([""], ["pods"], ["create", "get", "list", "watch", "delete"]),
                     rule([""], ["pods/log"], ["get"]),
@@ -134,7 +138,7 @@ def manifest(*, release: bool) -> list[tuple[str, str, str, list[dict[str, Any]]
                         [RBAC],
                         ["rolebindings"],
                         ["delete"],
-                        resourceNames=["curie-release-probe-c1"],
+                        resourceNames=[binding],
                     ),
                 ],
             )
@@ -142,11 +146,76 @@ def manifest(*, release: bool) -> list[tuple[str, str, str, list[dict[str, Any]]
     return roles
 
 
+# Kubernetes' default bootstrap grants to the groups every ServiceAccount carries.
+DISCOVERY_URLS = [
+    "/api",
+    "/api/*",
+    "/apis",
+    "/apis/*",
+    "/healthz",
+    "/livez",
+    "/openapi",
+    "/openapi/*",
+    "/readyz",
+    "/version",
+    "/version/",
+]
+DEFAULT_GROUP_ROLES: list[tuple[str, str, list[dict[str, Any]]]] = [
+    (
+        "system:authenticated",
+        "system:basic-user",
+        [
+            rule(
+                ["authorization.k8s.io"],
+                ["selfsubjectaccessreviews", "selfsubjectrulesreviews"],
+                ["create"],
+            ),
+            rule(["authentication.k8s.io"], ["selfsubjectreviews"], ["create"]),
+        ],
+    ),
+    (
+        "system:authenticated",
+        "system:discovery",
+        [{"nonResourceURLs": DISCOVERY_URLS, "verbs": ["get"]}],
+    ),
+    (
+        "system:authenticated",
+        "system:public-info-viewer",
+        [
+            {
+                "nonResourceURLs": ["/healthz", "/livez", "/readyz", "/version", "/version/"],
+                "verbs": ["get"],
+            }
+        ],
+    ),
+    (
+        "system:serviceaccounts",
+        "system:service-account-issuer-discovery",
+        [
+            {
+                "nonResourceURLs": [
+                    "/.well-known/openid-configuration",
+                    "/.well-known/openid-configuration/",
+                    "/openid/v1/jwks",
+                    "/openid/v1/jwks/",
+                ],
+                "verbs": ["get"],
+            }
+        ],
+    ),
+]
+
+
 class Reader:
     """Answers reviews from its own bindings, like the API server's RBAC authorizer."""
 
     def __init__(self, roles: list[tuple[str, str, str, list[dict[str, Any]]]]) -> None:
         self.roles = roles
+        # Bindings by other subject forms: (subject, kind, namespace, ClusterRole, rules).
+        self.subject_roles: list[tuple[dict[str, str], str, str, str, list[dict[str, Any]]]] = [
+            ({"kind": "Group", "name": group}, "clusterrolebindings", "", name, rules)
+            for group, name, rules in DEFAULT_GROUP_ROLES
+        ]
         self.group_grants: set[tuple[str, str, str, str]] = set()
         self.unanswered: set[tuple[str, str, str, str]] = set()
         self.unavailable: set[str] = set()
@@ -165,6 +234,17 @@ class Reader:
                     "metadata": meta,
                     "roleRef": {"apiGroup": RBAC, "kind": role_kind, "name": name},
                     "subjects": SA,
+                }
+            )
+        for subject, binding_kind, namespace, name, _rules in self.subject_roles:
+            if binding_kind != kind:
+                continue
+            meta = {"name": "subject-" + name} | ({"namespace": namespace} if namespace else {})
+            items.append(
+                {
+                    "metadata": meta,
+                    "roleRef": {"apiGroup": RBAC, "kind": "ClusterRole", "name": name},
+                    "subjects": [subject],
                 }
             )
         items += [
@@ -190,6 +270,9 @@ class Reader:
     async def read_role(self, kind: str, namespace: str, name: str) -> dict[str, Any] | None:
         for role_kind, role_namespace, role_name, rules in self.roles:
             if (role_kind, role_namespace, role_name) == (kind, namespace, name):
+                return {"rules": rules}
+        for _subject, _kind, _ns, role_name, rules in self.subject_roles:
+            if (kind, namespace, role_name) == ("ClusterRole", "", name):
                 return {"rules": rules}
         return None
 
@@ -318,6 +401,17 @@ def test_a_wildcard_rule_refuses(wildcard: dict[str, Any]) -> None:
         ("default", "", "pods", "create"),
         ("kube-system", "", "pods", "create"),
         ("control", "", "pods", "create"),
+        ("probe-a", "apps", "deployments", "create"),
+        ("prot", "apps", "daemonsets", "create"),
+        ("default", "apps", "statefulsets", "patch"),
+        ("release", "apps", "replicasets", "create"),
+        ("probe-foreign", "batch", "jobs", "create"),
+        ("", "batch", "cronjobs", "create"),
+        ("kube-system", "", "replicationcontrollers", "update"),
+        ("prot", "", "serviceaccounts/token", "create"),
+        ("", "authentication.k8s.io", "uids", "impersonate"),
+        ("", "authentication.k8s.io", "userextras", "impersonate"),
+        ("probe-a", RBAC, "roles", "escalate"),
     ],
 )
 def test_a_group_granted_right_beyond_the_manifest_refuses(
@@ -468,3 +562,125 @@ def test_a_reader_that_raises_refuses(collection: str) -> None:
         "measuring_review_unavailable",
         "measuring_bindings_unavailable",
     )
+
+
+# --- Every subject form that names the identity -------------------------------
+
+
+SECRET_READ = [rule([""], ["secrets"], ["get"])]
+
+
+@pytest.mark.parametrize(
+    "subject",
+    [
+        {"kind": "User", "name": "system:serviceaccount:control:measuring"},
+        {"kind": "Group", "name": "system:serviceaccounts:control"},
+        {"kind": "Group", "name": "system:serviceaccounts"},
+        {"kind": "Group", "name": "system:authenticated"},
+    ],
+)
+def test_an_extra_right_bound_to_another_form_of_the_identity_refuses(
+    subject: dict[str, str],
+) -> None:
+    # The fake reviews do not see these grants: only the bindings half can refuse here.
+    reader = Reader(manifest(release=False))
+    reader.subject_roles.append((subject, "clusterrolebindings", "", "extra-secrets", SECRET_READ))
+    assert check(reader, release_allowed=True) == "measuring_bindings_differ"
+
+
+def test_a_group_binding_beyond_the_default_grants_refuses() -> None:
+    reader = Reader(manifest(release=False))
+    logs = [{"nonResourceURLs": ["/logs", "/metrics"], "verbs": ["get"]}]
+    reader.subject_roles.append(
+        ({"kind": "Group", "name": "system:authenticated"}, "clusterrolebindings", "", "logs", logs)
+    )
+    assert check(reader, release_allowed=True) == "measuring_bindings_differ"
+
+
+def test_a_manifest_role_bound_through_the_user_form_still_equals_the_manifest() -> None:
+    roles = manifest(release=False)
+    reviews = next(item for item in roles if item[2] == "curie-measuring-reviews")
+    reader = Reader([item for item in roles if item is not reviews])
+    reader.subject_roles.append(
+        (
+            {"kind": "User", "name": "system:serviceaccount:control:measuring"},
+            "clusterrolebindings",
+            "",
+            reviews[2],
+            reviews[3],
+        )
+    )
+    assert check(reader, release_allowed=True) is None
+
+
+def test_the_default_group_grants_alone_pass() -> None:
+    reader = Reader(manifest(release=False))
+    assert reader.subject_roles  # the defaults are present in every other test too
+    assert check(reader, release_allowed=True) is None
+
+
+# --- The scope comes from the installation's rendered RBAC set ------------------
+
+
+CAMPAIGN = "11111111-2222-4333-8444-555555555555"
+
+
+def rbac_set(**changes: Any) -> bytes:
+    document: dict[str, Any] = {
+        "service_account": "measuring",
+        "control_namespace": "control",
+        "protected_namespace": "prot",
+        "probe_namespaces": ["probe-a", "probe-foreign"],
+        "release_namespace": "release",
+        "channel_rules": [["", "configmaps", ["create", "get", "list", "watch"]]],
+        "cni_configmaps": [["kube-system", "calico-config"]],
+        "provider_policies": [["crd.projectcalico.org", "networkpolicies"]],
+    }
+    document.update(changes)
+    value = {"measuring_identity": document, "protected_lane": {"roles": []}}
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
+def test_the_scope_is_read_from_the_rbac_set_g_names() -> None:
+    raw = rbac_set()
+    bound = module().rbac_set_scope(
+        raw, rbac_sha256=hashlib.sha256(raw).hexdigest(), campaign_id=CAMPAIGN
+    )
+    assert bound == scope(release_binding="curie-release-probe-" + CAMPAIGN)
+    assert module().measuring_scope_document(bound) == json.loads(raw)["measuring_identity"]
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "digest",
+        "non-canonical",
+        "duplicate",
+        "missing-member",
+        "extra-member",
+        "no-member",
+        "release",
+    ],
+)
+def test_an_unbound_rbac_set_refuses(case: str) -> None:
+    raw = rbac_set()
+    digest = hashlib.sha256(raw).hexdigest()
+    if case == "digest":
+        raw = rbac_set(service_account="clean")
+    elif case == "non-canonical":
+        raw = json.dumps(json.loads(raw), indent=1).encode()
+    elif case == "duplicate":
+        raw = raw.replace(b'{"measuring_identity"', b'{"a":1,"a":2,"measuring_identity"')
+    elif case == "missing-member":
+        value = json.loads(raw)
+        del value["measuring_identity"]["release_namespace"]
+        raw = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    elif case == "extra-member":
+        raw = rbac_set(release_binding="curie-release-probe-other")
+    elif case == "no-member":
+        raw = json.dumps({"protected_lane": {}}, separators=(",", ":")).encode()
+    if case != "digest":
+        digest = hashlib.sha256(raw).hexdigest()
+    campaign = "Not-A-Campaign" if case == "release" else CAMPAIGN
+    with pytest.raises(module().MeasuringRbacRefused):
+        module().rbac_set_scope(raw, rbac_sha256=digest, campaign_id=campaign)

@@ -71,7 +71,13 @@ from .commissioning_provisioner import (
     verify_tuple,
 )
 from .commissioning_records import CommissioningPermit
-from .measuring_identity_rbac import MeasuringRbacReader, MeasuringScope, check_least_privilege
+from .measuring_identity_rbac import (
+    MeasuringRbacReader,
+    MeasuringRbacRefused,
+    MeasuringScope,
+    check_least_privilege,
+    rbac_set_scope,
+)
 from .qualification_publication import QualificationPublisher, ReadinessPublisher
 from .worker_transport import WorkerCredential
 
@@ -505,13 +511,18 @@ def _candidate_rules(
 
 @dataclass(frozen=True, slots=True)
 class MeasuringIdentityCheck:
-    """The measuring identity's clause 5 scope and the reader its reviews go through."""
+    """The installation's rendered RBAC set and the reader the reviews go through.
 
-    scope: MeasuringScope
+    The verifier reads the measuring identity's scope from ``rbac_set`` only
+    after its SHA-256 equals G's ``rbac_sha256``, so no caller can point the
+    check at another ServiceAccount.
+    """
+
+    rbac_set: bytes
     reader: MeasuringRbacReader
 
     def __post_init__(self) -> None:
-        _require(type(self.scope) is MeasuringScope)
+        _require(type(self.rbac_set) is bytes)
         _require(
             all(
                 callable(getattr(self.reader, name, None))
@@ -564,6 +575,14 @@ class CommissioningVerifier:
         _require(all(callable(getattr(p, "observe", None)) for p in tuple_producers))
         _require(callable(getattr(candidate_rules, "rules", None)))
         _require(type(measuring_identity) is MeasuringIdentityCheck)
+        try:
+            self._scope: MeasuringScope = rbac_set_scope(
+                measuring_identity.rbac_set,
+                rbac_sha256=parse_guard_config(guard_config)["rbac_sha256"],
+                campaign_id=self._tuple.campaign_id,
+            )
+        except (MeasuringRbacRefused, ProvisionerRefused):
+            _refuse()
         _require(type(publication) is PublicationInputs)
         _require(type(case_timeout_s) in (int, float) and 0 < case_timeout_s <= 900)
         self._bootstrap, self._guard_config = bootstrap, guard_config
@@ -590,7 +609,7 @@ class CommissioningVerifier:
         try:
             async with asyncio.timeout(self._timeout):
                 reason = await check_least_privilege(
-                    self._measuring.reader, self._measuring.scope, release_allowed=release_allowed
+                    self._measuring.reader, self._scope, release_allowed=release_allowed
                 )
         except Exception:  # noqa: BLE001 -- an unavailable review never passes.
             return "measuring-identity"

@@ -30,7 +30,7 @@ from .test_commissioning_provisioner import module as provisioner
 from .test_commissioning_records import permit_value
 from .test_measuring_identity_rbac import Reader as RbacReader
 from .test_measuring_identity_rbac import manifest as measuring_manifest
-from .test_measuring_identity_rbac import scope as measuring_scope
+from .test_measuring_identity_rbac import rbac_set as measuring_rbac_set
 
 EVIDENCE = "ab" * 32
 
@@ -103,8 +103,14 @@ def permit_value_for_templates() -> Any:
     return permit_for(built(), campaign_id="99999999-9999-4999-8999-999999999999")
 
 
+# The installation's rendered RBAC set (clause 6); G's ``rbac_sha256`` names it.
+RBAC_SET = measuring_rbac_set()
+
+
 def provision(*, evidence_ref: str | None = None, recipes: Recipes | None = None) -> Any:
-    changes = {} if evidence_ref is None else {"enforcement_evidence_ref": evidence_ref}
+    changes: dict[str, Any] = {"rbac_sha256": hashlib.sha256(RBAC_SET).hexdigest()}
+    if evidence_ref is not None:
+        changes["enforcement_evidence_ref"] = evidence_ref
     return provisioner().construct(profile(**changes), acl=recipes or Recipes())
 
 
@@ -345,7 +351,8 @@ class Harness:
         }
         self.reader = Rules(self)
         self.rbac = RbacReader(measuring_manifest(release=False))
-        self.measuring: Any = module().MeasuringIdentityCheck(measuring_scope(), self.rbac)
+        self.measuring: Any = module().MeasuringIdentityCheck(RBAC_SET, self.rbac)
+        self.release_binding = "curie-release-probe-" + self.tuple.campaign_id
         self.timeout = 2.0
         self.publication = publication(self.records)
 
@@ -1423,14 +1430,14 @@ def test_a_right_gained_during_the_campaign_refuses_the_decision(monkeypatch) ->
 
 def test_the_campaigns_release_binding_is_accepted_while_it_holds_it() -> None:
     h = Harness()
-    h.rbac.roles = measuring_manifest(release=True)
+    h.rbac.roles = measuring_manifest(release=True, binding=h.release_binding)
     assert h.decide().accepted
 
 
 def test_publication_requires_the_release_binding_revoked(monkeypatch) -> None:
     connections = Connections(monkeypatch)
     h = Harness()
-    h.rbac.roles = measuring_manifest(release=True)
+    h.rbac.roles = measuring_manifest(release=True, binding=h.release_binding)
 
     async def scenario() -> Any:
         verifier = h.verifier()
@@ -1446,7 +1453,7 @@ def test_publication_requires_the_release_binding_revoked(monkeypatch) -> None:
 def test_publication_after_the_release_binding_is_revoked(monkeypatch) -> None:
     connections = Connections(monkeypatch)
     h = Harness()
-    h.rbac.roles = measuring_manifest(release=True)
+    h.rbac.roles = measuring_manifest(release=True, binding=h.release_binding)
 
     async def scenario() -> Any:
         verifier = h.verifier()
@@ -1494,10 +1501,31 @@ def test_a_right_or_release_binding_after_publication_is_reported(monkeypatch) -
         await verifier.publish(verdict, h.acceptance(verdict))
         unchanged = await verifier.confirm_unchanged()
         # A release probe binding granted again after Readiness issuance.
-        h.rbac.roles = measuring_manifest(release=True)
+        h.rbac.roles = measuring_manifest(release=True, binding=h.release_binding)
         rebound = await verifier.confirm_unchanged()
         h.rbac.roles = measuring_manifest(release=False)
         h.rbac.group_grants.add(("", "", "nodes/proxy", "get"))
         return unchanged, rebound, await verifier.confirm_unchanged()
 
     assert run(scenario()) == (None, "measuring-identity", "measuring-identity")
+
+
+@pytest.mark.parametrize(
+    "rbac_set",
+    [
+        measuring_rbac_set(service_account="clean-but-other"),
+        measuring_rbac_set(control_namespace="elsewhere"),
+        RBAC_SET + b" ",
+    ],
+)
+def test_the_measuring_scope_comes_only_from_the_rbac_set_g_names(rbac_set: bytes) -> None:
+    h = Harness()
+    h.measuring = module().MeasuringIdentityCheck(rbac_set, h.rbac)
+    with pytest.raises(module().VerifierRefused):
+        h.verifier()
+
+
+def test_a_release_binding_named_for_another_campaign_refuses(monkeypatch) -> None:
+    h = Harness()
+    h.rbac.roles = measuring_manifest(release=True, binding="curie-release-probe-other")
+    refuses_without_publishers(monkeypatch, h, "measuring-identity")
