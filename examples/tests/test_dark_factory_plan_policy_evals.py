@@ -545,6 +545,31 @@ def test_each_control_prompt_fails_its_case(variant: str, case_id: str) -> None:
     )
 
 
+def stale_recordings(manifest_entries: dict[str, Any]) -> list[str]:
+    """Manifest keys whose stored prompt hash differs from the prompt rendered now."""
+    stale = []
+    for key, entry in manifest_entries.items():
+        variant, case_id = key.split("/", 1)
+        if entry["prompt_sha256"] != prompt_sha256(case_id, variant):
+            stale.append(key)
+    return sorted(stale)
+
+
+def test_stale_recordings_are_detected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))["responses"]
+    assert stale_recordings(manifest) == []
+    edited = {}
+    for actor, path in PROMPTS.items():
+        copy = tmp_path / f"{actor}.md"
+        copy.write_bytes(path.read_bytes() + b"\nan extra line\n")
+        edited[actor] = copy
+    monkeypatch.setattr(sys.modules[__name__], "PROMPTS", edited)
+    # The strict control renders a committed fixture, not a PROMPTS file.
+    affected = sorted(key for key in manifest if not key.startswith(f"{STRICT}/"))
+    assert affected
+    assert stale_recordings(manifest) == affected
+
+
 def test_every_recorded_response_is_anonymous_and_in_the_manifest() -> None:
     files = sorted(RESPONSES.glob("*/*.txt"))
     expected = {f"{CANDIDATE}/{c}" for c in CASE_IDS} | {
@@ -563,6 +588,13 @@ def test_every_recorded_response_is_anonymous_and_in_the_manifest() -> None:
         assert entry is not None, f"{key} has no manifest entry"
         assert re.fullmatch(r"[0-9a-f]{64}", entry["prompt_sha256"]), key
         datetime.date.fromisoformat(entry["recorded"])
+    stale = stale_recordings(manifest)
+    assert not stale, (
+        f"recorded responses no longer match the current prompts: {stale}. "
+        "Re-render each case with `uv run python "
+        "examples/tests/test_dark_factory_plan_policy_evals.py render CASE VARIANT`, "
+        "rerun it in a fresh child context, and re-record it with the `record` command."
+    )
 
 
 if __name__ == "__main__":
