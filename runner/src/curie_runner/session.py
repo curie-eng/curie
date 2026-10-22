@@ -1143,12 +1143,14 @@ class SessionRunner:
         ) as stream:
             async for line in stream:
                 # #4940: hand the root span the closed classification, never the text.
-                frame = parse_ndjson_line(line)
-                if isinstance(frame, ErrorEvent) and frame.classification:
-                    self._tracer.observe_error_classification(
-                        map_error_classification(frame.classification),
-                        output_ceiling=self._ceiling,
-                    )
+                # Only an error frame can carry one, so other lines skip the parse.
+                if '"type":"error"' in line:
+                    frame = parse_ndjson_line(line)
+                    if isinstance(frame, ErrorEvent) and frame.classification:
+                        self._tracer.observe_error_classification(
+                            map_error_classification(frame.classification),
+                            output_ceiling=self._ceiling,
+                        )
                 for scrubbed in redactor.push(line):
                     yield scrubbed
             pending = redactor.finish()

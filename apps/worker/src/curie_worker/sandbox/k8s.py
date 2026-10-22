@@ -298,13 +298,20 @@ def _recent(moment: object, *, since: datetime) -> bool:
     return isinstance(moment, datetime) and moment.tzinfo is not None and moment >= since
 
 
+def _terminated_exit_code(terminated: Any) -> int | None:
+    # A bool is an int subclass and is not an exit code.
+    exit_code = getattr(terminated, "exit_code", None)
+    return exit_code if type(exit_code) is int else None
+
+
 def _runner_exit_code(status: Any) -> int | None:
     for container in getattr(status, "container_statuses", None) or []:
         if getattr(container, "name", None) != "runner":
             continue
-        terminated = getattr(getattr(container, "state", None), "terminated", None)
-        exit_code = getattr(terminated, "exit_code", None)
-        if type(exit_code) is int:
+        exit_code = _terminated_exit_code(
+            getattr(getattr(container, "state", None), "terminated", None)
+        )
+        if exit_code is not None:
             return exit_code
     return None
 
@@ -333,7 +340,7 @@ def _pod_termination(pod: Any, *, since: datetime) -> SandboxTermination | None:
             continue
         exit_code = getattr(terminated, "exit_code", None)
         detail = f"exit code {exit_code}" if isinstance(exit_code, int) else None
-        code = exit_code if type(exit_code) is int else None
+        code = _terminated_exit_code(terminated)
         if deleting and getattr(terminated, "reason", None) != "OOMKilled":
             deleted_detail = detail
             deleted_exit_code = code
@@ -354,7 +361,7 @@ def _pod_termination(pod: Any, *, since: datetime) -> SandboxTermination | None:
         ):
             exit_code = getattr(terminated, "exit_code", None)
             detail = f"exit code {exit_code}" if isinstance(exit_code, int) else None
-            code = exit_code if type(exit_code) is int else None
+            code = _terminated_exit_code(terminated)
             return SandboxTermination("OOMKilled", detail, code)
 
     if deleting:
