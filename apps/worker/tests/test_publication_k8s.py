@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import importlib
 import json
 import os
@@ -85,6 +86,7 @@ def _payload(module: Any, patch: bytes = b"diff --git a/a b/a\n") -> Any:
         revision_number=1,
         repo_full_name="acme-corp/acme-bot",
         clean_clone_url=CLEAN_URL,
+        base_branch="main",
         base_sha="a" * 40,
         expected_prior_head="a" * 40,
         expected_remote_head=None,
@@ -813,21 +815,45 @@ def _run_generated_publish_script(
     path_prefix: Path | None = None,
     extra_env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    return _run_publish_script(
+        tmp_path,
+        script_text=resources.config_map["data"]["publish.sh"],
+        patch_bytes=base64.b64decode(resources.config_map["binaryData"]["changes.patch"]),
+        job_env=_job_env(resources),
+        remote=remote,
+        ordinal=ordinal,
+        credential=credential,
+        path_prefix=path_prefix,
+        extra_env=extra_env,
+    )
+
+
+def _run_publish_script(
+    tmp_path: Path,
+    *,
+    script_text: str,
+    patch_bytes: bytes,
+    job_env: dict[str, str],
+    remote: Path,
+    ordinal: str,
+    credential: str = BASIC_TEST_CREDENTIAL,
+    path_prefix: Path | None = None,
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     root = tmp_path / f"run-{ordinal}"
     root.mkdir()
     credential_file = root / "credential"
     credential_file.write_text(credential)
     patch = root / "changes.patch"
-    patch.write_bytes(base64.b64decode(resources.config_map["binaryData"]["changes.patch"]))
+    patch.write_bytes(patch_bytes)
     # In the pod /tmp is a private emptyDir. Here it is the host's shared /tmp,
     # so each run gets its own directory for the auth files; nothing else changes.
     private_tmp = root / "tmp"
     private_tmp.mkdir()
-    script_text = resources.config_map["data"]["publish.sh"]
     assert "/tmp/curie-git-auth.config" in script_text
     script = root / "publish.sh"
     script.write_text(script_text.replace("/tmp/curie-", f"{private_tmp}/curie-"))
-    env = _job_env(resources)
+    env = job_env
     env = {
         **os.environ,
         **env,
@@ -843,6 +869,13 @@ def _run_generated_publish_script(
         env["PATH"] = f"{path_prefix}{os.pathsep}{env['PATH']}"
     if extra_env is not None:
         env.update(extra_env)
+    for identity_key in (
+        "GIT_AUTHOR_NAME",
+        "GIT_AUTHOR_EMAIL",
+        "GIT_COMMITTER_NAME",
+        "GIT_COMMITTER_EMAIL",
+    ):
+        env.pop(identity_key, None)
     completed = subprocess.run(
         ["/bin/bash", str(script)],
         env=env,
@@ -875,6 +908,7 @@ def _publication_resources_for_commit(
             revision_number=revision_number,
             repo_full_name=repo_full_name,
             clean_clone_url=f"{transport.origin}/{repo_full_name}.git",
+            base_branch="main",
             base_sha=base_sha,
             expected_prior_head=base_sha,
             expected_remote_head=expected_remote_head,
@@ -902,6 +936,442 @@ def _commit_message(remote: Path, sha: str) -> str:
         capture_output=True,
         check=True,
     ).stdout
+
+
+def _repo_git(repository: Path, *args: str) -> str:
+    return subprocess.run(
+        [_git(), "-C", str(repository), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def _approved_patch(seed: Path) -> bytes:
+    (seed / "README.md").write_text("base\napproved\n")
+    patch = subprocess.run(
+        [_git(), "-C", str(seed), "diff", "--binary", "HEAD"],
+        check=True,
+        capture_output=True,
+    ).stdout
+    _repo_git(seed, "restore", "README.md")
+    return patch
+
+
+def _advance_seed(seed: Path, path: str, contents: str) -> str:
+    target = seed / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(contents)
+    _repo_git(seed, "add", path)
+    _repo_git(seed, "commit", "-m", "Advance fixture base")
+    _repo_git(seed, "push", "origin", "HEAD:refs/heads/main")
+    return _repo_git(seed, "rev-parse", "HEAD")
+
+
+def _assert_remote_publication(
+    remote: Path, *, parent: str, patch: bytes, revision_id: uuid.UUID = REVISION_ID
+) -> str:
+    head = _branch_head(remote)
+    assert _repo_git(remote, "rev-list", "--parents", "-n", "1", head).split() == [head, parent]
+    actual_patch = subprocess.run(
+        [_git(), "-C", str(remote), "diff", "--binary", parent, head],
+        check=True,
+        capture_output=True,
+    ).stdout
+    assert actual_patch == patch
+    assert _repo_git(remote, "rev-list", "--count", f"{parent}..{head}") == "1"
+    assert _commit_message(remote, head).rstrip("\n").splitlines() == [
+        "Update repository",
+        "",
+        f"Curie-Revision: {revision_id}",
+    ]
+    return head
+
+
+def _assert_no_publication(remote: Path, result: subprocess.CompletedProcess[str]) -> None:
+    assert result.returncode != 0
+    assert "CURIE_COMMIT_SHA=" not in result.stdout
+    ref = subprocess.run(
+        [_git(), "-C", str(remote), "show-ref", "--verify", f"refs/heads/{LINEAGE_BRANCH}"],
+        capture_output=True,
+        text=True,
+    )
+    assert ref.returncode == 128 or ref.returncode == 1
+    assert ref.stdout == ""
+
+
+def test_moved_base_first_publication_pushes_approved_patch_on_current_tip(
+    publication_k8s: Any, tmp_path: Path
+) -> None:
+    remote, original = _seed_remote(tmp_path)
+    seed = tmp_path / "seed"
+    patch = _approved_patch(seed)
+    workflow = "name: Fixture\non: workflow_dispatch\njobs: {}\n"
+    tip = _advance_seed(seed, ".github/workflows/example.yaml", workflow)
+
+    # #4943: execute the production script without the changing payload constructor
+    # so reversing the repair fails on the remote Git objects below.
+    result = _run_publish_script(
+        tmp_path,
+        script_text=publication_k8s._PUBLISH_SCRIPT,
+        patch_bytes=patch,
+        job_env={
+            "REPO_FULL_NAME": "acme-corp/acme-bot",
+            "CLEAN_CLONE_URL": CLEAN_URL,
+            "CODE_HOST_ORIGIN": ORIGIN,
+            "CODE_HOST_HEADER_FORM": "authorization_basic",
+            "BASE_SHA": original,
+            "BASE_BRANCH": "main",
+            "BRANCH": LINEAGE_BRANCH,
+            "REVISION_ID": str(REVISION_ID),
+            "REVISION_NUMBER": "1",
+            "EXPECTED_PRIOR_HEAD": original,
+            "EXPECTED_REMOTE_HEAD": "",
+            "COMMIT_TITLE": "Update repository",
+            "PUBLICATION_BRANCH_PREFIX": "",
+            "GIT_USER_NAME": "Curie Publisher",
+            "GIT_USER_EMAIL": "publisher@example.com",
+            "GIT_TIMEOUT_SECONDS": "60",
+        },
+        remote=remote,
+        ordinal="moved",
+        extra_env={"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull},
+    )
+
+    assert result.returncode == 0, result.stderr
+    head = _assert_remote_publication(remote, parent=tip, patch=patch)
+    assert _repo_git(remote, "show", f"{head}:.github/workflows/example.yaml") == workflow.strip()
+    assert _repo_git(remote, "show", f"{head}:README.md") == "base\napproved"
+    assert result.stdout.strip().splitlines()[-1] == f"CURIE_COMMIT_SHA={head}"
+
+
+def test_moved_base_conflict_pushes_nothing_and_names_both_shas(
+    publication_k8s: Any, tmp_path: Path
+) -> None:
+    remote, original = _seed_remote(tmp_path)
+    seed = tmp_path / "seed"
+    patch = _approved_patch(seed)
+    tip = _advance_seed(seed, "README.md", "conflicting replacement\n")
+    resources = _publication_resources_for_commit(
+        publication_k8s,
+        publication_id=PUBLICATION_ID,
+        revision_id=REVISION_ID,
+        revision_number=1,
+        base_sha=original,
+        expected_remote_head=None,
+        patch=patch,
+    )
+
+    result = _run_generated_publish_script(tmp_path, resources, remote=remote, ordinal="conflict")
+
+    _assert_no_publication(remote, result)
+    assert (
+        f"publication_base_moved_conflict: base branch main moved from {original} to {tip}; "
+        "approved patch does not apply to the new tip"
+    ) in result.stderr
+    assert _repo_git(remote, "rev-parse", "refs/heads/main") == tip
+
+    _advance_seed(seed, "README.md", "base\n")
+    valid_tip = _advance_seed(seed, "unrelated.txt", "healthy retry\n")
+    valid = _run_generated_publish_script(tmp_path, resources, remote=remote, ordinal="valid")
+    assert valid.returncode == 0, valid.stderr
+    _assert_remote_publication(remote, parent=valid_tip, patch=patch)
+
+
+def test_moved_base_unchanged_keeps_original_parent(publication_k8s: Any, tmp_path: Path) -> None:
+    remote, original = _seed_remote(tmp_path)
+    patch = _approved_patch(tmp_path / "seed")
+    resources = _publication_resources_for_commit(
+        publication_k8s,
+        publication_id=PUBLICATION_ID,
+        revision_id=REVISION_ID,
+        revision_number=1,
+        base_sha=original,
+        expected_remote_head=None,
+        patch=patch,
+    )
+    result = _run_generated_publish_script(tmp_path, resources, remote=remote, ordinal="unchanged")
+    assert result.returncode == 0, result.stderr
+    head = _assert_remote_publication(remote, parent=original, patch=patch)
+    assert result.stdout.strip().splitlines()[-1] == f"CURIE_COMMIT_SHA={head}"
+
+
+def test_moved_base_first_remote_publication_after_failed_revision(
+    publication_k8s: Any, tmp_path: Path
+) -> None:
+    remote, original = _seed_remote(tmp_path)
+    seed = tmp_path / "seed"
+    patch = _approved_patch(seed)
+    tip = _advance_seed(seed, "unrelated.txt", "advanced\n")
+    resources = _publication_resources_for_commit(
+        publication_k8s,
+        publication_id=PUBLICATION_ID,
+        revision_id=REVISION_ID,
+        revision_number=3,
+        base_sha=original,
+        expected_remote_head=None,
+        patch=patch,
+    )
+    result = _run_generated_publish_script(tmp_path, resources, remote=remote, ordinal="third")
+    assert result.returncode == 0, result.stderr
+    _assert_remote_publication(remote, parent=tip, patch=patch)
+
+
+def test_moved_base_is_fetched_after_constructing_the_approved_commit(
+    publication_k8s: Any, tmp_path: Path
+) -> None:
+    remote, original = _seed_remote(tmp_path)
+    seed = tmp_path / "seed"
+    patch = _approved_patch(seed)
+    tip = _advance_seed(seed, "unrelated.txt", "arrived while committing\n")
+    _repo_git(remote, "update-ref", "refs/heads/main", original)
+    _repo_git(remote, "update-ref", "refs/heads/future-base", tip)
+    hooks = tmp_path / "move-hooks"
+    hooks.mkdir()
+    hook = hooks / "post-commit"
+    hook.write_text(
+        '#!/bin/sh\nexec git --git-dir="$CURIE_TEST_REMOTE" update-ref refs/heads/main '
+        '"$CURIE_TEST_BASE_TIP"\n'
+    )
+    hook.chmod(0o700)
+    resources = _publication_resources_for_commit(
+        publication_k8s,
+        publication_id=PUBLICATION_ID,
+        revision_id=REVISION_ID,
+        revision_number=1,
+        base_sha=original,
+        expected_remote_head=None,
+        patch=patch,
+    )
+    result = _run_generated_publish_script(
+        tmp_path,
+        resources,
+        remote=remote,
+        ordinal="late-move",
+        extra_env={
+            "GIT_CONFIG_COUNT": "2",
+            "GIT_CONFIG_KEY_1": "core.hooksPath",
+            "GIT_CONFIG_VALUE_1": str(hooks),
+            "CURIE_TEST_REMOTE": str(remote),
+            "CURIE_TEST_BASE_TIP": tip,
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    assert _repo_git(remote, "rev-parse", "refs/heads/main") == tip
+    _assert_remote_publication(remote, parent=tip, patch=patch)
+
+
+@pytest.mark.parametrize("remote_state", ["exact", "missing", "moved"])
+def test_moved_base_revision_keeps_exact_pr_head(
+    publication_k8s: Any, tmp_path: Path, remote_state: str
+) -> None:
+    remote, original = _seed_remote(tmp_path)
+    seed = tmp_path / "seed"
+    first_resources = _publication_resources_for_commit(
+        publication_k8s,
+        publication_id=PUBLICATION_ID,
+        revision_id=REVISION_ID,
+        revision_number=1,
+        base_sha=original,
+        expected_remote_head=None,
+        patch=_FIRST_PATCH,
+    )
+    first = _run_generated_publish_script(tmp_path, first_resources, remote=remote, ordinal="first")
+    assert first.returncode == 0, first.stderr
+    prior_head = _branch_head(remote)
+    tip = _advance_seed(seed, "unrelated.txt", "base moved\n")
+    _repo_git(seed, "fetch", "origin", LINEAGE_BRANCH)
+    _repo_git(seed, "checkout", "--detach", prior_head)
+    patch = _approved_patch(seed)
+    if remote_state == "missing":
+        _repo_git(remote, "update-ref", "-d", f"refs/heads/{LINEAGE_BRANCH}")
+    elif remote_state == "moved":
+        _repo_git(remote, "update-ref", f"refs/heads/{LINEAGE_BRANCH}", tip)
+    resources = _publication_resources_for_commit(
+        publication_k8s,
+        publication_id=PUBLICATION_ID,
+        revision_id=REVISION_ID,
+        revision_number=2,
+        base_sha=prior_head,
+        expected_remote_head=prior_head,
+        patch=patch,
+    )
+    result = _run_generated_publish_script(tmp_path, resources, remote=remote, ordinal="revision")
+    if remote_state == "exact":
+        assert result.returncode == 0, result.stderr
+        head = _assert_remote_publication(remote, parent=prior_head, patch=patch)
+        assert _repo_git(remote, "ls-tree", "--name-only", head, "unrelated.txt") == ""
+    else:
+        assert result.returncode != 0
+        assert "publication branch head conflict" in result.stderr
+        assert "CURIE_COMMIT_SHA=" not in result.stdout
+        if remote_state == "missing":
+            _assert_no_publication(remote, result)
+        else:
+            assert _branch_head(remote) == tip
+        _repo_git(remote, "update-ref", f"refs/heads/{LINEAGE_BRANCH}", prior_head)
+        valid = _run_generated_publish_script(tmp_path, resources, remote=remote, ordinal="valid")
+        assert valid.returncode == 0, valid.stderr
+        _assert_remote_publication(remote, parent=prior_head, patch=patch)
+
+
+@pytest.mark.parametrize("case", ["unrelated", "rewound", "missing", "empty"])
+def test_moved_base_unproved_or_empty_replay_pushes_nothing_and_can_recover(
+    publication_k8s: Any, tmp_path: Path, case: str
+) -> None:
+    remote, root = _seed_remote(tmp_path)
+    seed = tmp_path / "seed"
+    original = _advance_seed(seed, "seed.txt", "approved base\n")
+    patch = _approved_patch(seed)
+    _repo_git(seed, "push", "origin", f"{original}:refs/heads/approved-base")
+    if case == "unrelated":
+        _repo_git(seed, "checkout", "--orphan", "unrelated")
+        _repo_git(seed, "rm", "-rf", ".")
+        (seed / "README.md").write_text("foreign base\n")
+        _repo_git(seed, "add", "README.md")
+        _repo_git(seed, "commit", "-m", "Unrelated fixture history")
+        tip = _repo_git(seed, "rev-parse", "HEAD")
+        _repo_git(seed, "push", "--force", "origin", "HEAD:refs/heads/main")
+    elif case == "rewound":
+        tip = root
+        _repo_git(remote, "update-ref", "refs/heads/main", tip)
+    elif case == "empty":
+        tip = _advance_seed(seed, "README.md", "base\napproved\n")
+    else:
+        tip = original
+        _repo_git(remote, "update-ref", "-d", "refs/heads/main")
+    resources = _publication_resources_for_commit(
+        publication_k8s,
+        publication_id=PUBLICATION_ID,
+        revision_id=REVISION_ID,
+        revision_number=1,
+        base_sha=original,
+        expected_remote_head=None,
+        patch=patch,
+    )
+    result = _run_generated_publish_script(tmp_path, resources, remote=remote, ordinal=case)
+    _assert_no_publication(remote, result)
+    if case in {"unrelated", "rewound", "empty"}:
+        reason = "empty" if case == "empty" else "unrelated"
+        assert f"publication_base_moved_{reason}" in result.stderr
+        assert original in result.stderr and tip in result.stderr
+        assert "publication_base_moved_conflict" not in result.stderr
+    _repo_git(seed, "checkout", "--detach", original)
+    _repo_git(remote, "update-ref", "refs/heads/main", original)
+    valid_tip = _advance_seed(seed, "healthy.txt", "healthy\n")
+    valid = _run_generated_publish_script(tmp_path, resources, remote=remote, ordinal="valid")
+    assert valid.returncode == 0, valid.stderr
+    _assert_remote_publication(remote, parent=valid_tip, patch=patch)
+
+
+def test_moved_base_publication_branch_created_before_push_keeps_the_lease(
+    publication_k8s: Any, tmp_path: Path
+) -> None:
+    remote, original = _seed_remote(tmp_path)
+    seed = tmp_path / "seed"
+    patch = _approved_patch(seed)
+    tip = _advance_seed(seed, "unrelated.txt", "advanced\n")
+    resources = _publication_resources_for_commit(
+        publication_k8s,
+        publication_id=PUBLICATION_ID,
+        revision_id=REVISION_ID,
+        revision_number=1,
+        base_sha=original,
+        expected_remote_head=None,
+        patch=patch,
+    )
+    wrapper_dir = tmp_path / "race-wrapper"
+    wrapper_dir.mkdir()
+    wrapper = wrapper_dir / "git"
+    wrapper.write_text(
+        """#!/usr/bin/env python3
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+real_git = os.environ["CURIE_TEST_REAL_GIT"]
+marker = Path(os.environ["CURIE_TEST_RACE_MARKER"])
+if "push" in sys.argv[1:] and not marker.exists():
+    marker.touch()
+    subprocess.run(
+        [real_git, "-C", os.environ["CURIE_TEST_REMOTE"], "update-ref",
+         os.environ["CURIE_TEST_RACE_REF"], os.environ["CURIE_TEST_RACE_SHA"]],
+        check=True,
+    )
+os.execv(real_git, [real_git, *sys.argv[1:]])
+"""
+    )
+    wrapper.chmod(0o700)
+    marker = tmp_path / "race-fired"
+    result = _run_generated_publish_script(
+        tmp_path,
+        resources,
+        remote=remote,
+        ordinal="race",
+        path_prefix=wrapper_dir,
+        extra_env={
+            "CURIE_TEST_REAL_GIT": _git(),
+            "CURIE_TEST_REMOTE": str(remote),
+            "CURIE_TEST_RACE_REF": f"refs/heads/{LINEAGE_BRANCH}",
+            "CURIE_TEST_RACE_SHA": original,
+            "CURIE_TEST_RACE_MARKER": str(marker),
+        },
+    )
+    assert marker.is_file()
+    assert result.returncode != 0
+    assert "CURIE_COMMIT_SHA=" not in result.stdout
+    assert _branch_head(remote) == original
+    assert _repo_git(remote, "rev-parse", "refs/heads/main") == tip
+    _repo_git(remote, "update-ref", "-d", f"refs/heads/{LINEAGE_BRANCH}")
+    valid = _run_generated_publish_script(tmp_path, resources, remote=remote, ordinal="valid")
+    assert valid.returncode == 0, valid.stderr
+    _assert_remote_publication(remote, parent=tip, patch=patch)
+
+
+def test_moved_base_replay_git_failure_is_not_reported_as_a_content_conflict(
+    publication_k8s: Any, tmp_path: Path
+) -> None:
+    remote, original = _seed_remote(tmp_path)
+    seed = tmp_path / "seed"
+    patch = _approved_patch(seed)
+    tip = _advance_seed(seed, "unrelated.txt", "advanced\n")
+    hooks = tmp_path / "git-hooks"
+    hooks.mkdir()
+    hook = hooks / "prepare-commit-msg"
+    hook.write_text(
+        '#!/bin/sh\nif test -f "$(git rev-parse --git-path CHERRY_PICK_HEAD)"; then\n'
+        '  echo "fixture replay commit refused" >&2\n  exit 1\nfi\n'
+    )
+    hook.chmod(0o700)
+    resources = _publication_resources_for_commit(
+        publication_k8s,
+        publication_id=PUBLICATION_ID,
+        revision_id=REVISION_ID,
+        revision_number=1,
+        base_sha=original,
+        expected_remote_head=None,
+        patch=patch,
+    )
+    result = _run_generated_publish_script(
+        tmp_path,
+        resources,
+        remote=remote,
+        ordinal="replay-failed",
+        extra_env={
+            "GIT_CONFIG_COUNT": "2",
+            "GIT_CONFIG_KEY_1": "core.hooksPath",
+            "GIT_CONFIG_VALUE_1": str(hooks),
+        },
+    )
+    _assert_no_publication(remote, result)
+    assert "fixture replay commit refused" in result.stderr
+    assert "publication_base_moved_replay_failed" in result.stderr
+    assert original in result.stderr and tip in result.stderr
+    assert "publication_base_moved_conflict" not in result.stderr
+    valid = _run_generated_publish_script(tmp_path, resources, remote=remote, ordinal="valid")
+    assert valid.returncode == 0, valid.stderr
+    _assert_remote_publication(remote, parent=tip, patch=patch)
 
 
 def test_generated_publish_script_keeps_one_lineage_and_refuses_lease_race(
@@ -1798,6 +2268,66 @@ def test_apiserver_omitempty_serialized_own_job_is_adopted(
     )
 
 
+def test_publication_payload_requires_an_explicit_base_branch(publication_k8s: Any) -> None:
+    fields = vars(_payload(publication_k8s)).copy()
+    del fields["base_branch"]
+    with pytest.raises(TypeError, match="base_branch"):
+        publication_k8s.PublicationPayload(**fields)
+
+
+@pytest.mark.parametrize("base_branch", ["main", "next", "release/example"])
+def test_base_branch_is_bound_to_every_immutable_resource_and_job_environment(
+    publication_k8s: Any, base_branch: str
+) -> None:
+    payload = replace(_payload(publication_k8s), base_branch=base_branch)
+    resources = _build(publication_k8s, payload)
+    assert _job_env(resources)["BASE_BRANCH"] == base_branch
+    annotation = "curietech.ai/publication-contract-sha256"
+    expected_hash = resources.job["metadata"]["annotations"][annotation]
+    for resource in (resources.config_map, resources.secret, resources.job):
+        assert resource["metadata"]["annotations"][annotation] == expected_hash
+    other = _build(publication_k8s, replace(payload, base_branch=f"{base_branch}-other"))
+    assert other.job["metadata"]["annotations"][annotation] != expected_hash
+    cluster, core, batch = _fake_cluster(publication_k8s)
+    cluster.apply(resources)
+    creates = (list(core.created), list(batch.created))
+    batch.jobs[resources.names.job] = _omitempty(batch.jobs[resources.names.job])
+    cluster.validate_existing(resources)
+    assert (core.created, batch.created) == creates
+
+
+@pytest.mark.parametrize("mutation", ["missing", "changed", "empty", "hash"])
+def test_adopted_job_cannot_supply_or_change_the_api_authoritative_base_branch(
+    publication_k8s: Any, mutation: str
+) -> None:
+    resources = _resources(publication_k8s)
+    cluster, core, batch = _fake_cluster(publication_k8s)
+    cluster.apply(resources)
+    creates = (list(core.created), list(batch.created))
+    job = batch.jobs[resources.names.job]
+    env = job["spec"]["template"]["spec"]["containers"][0]["env"]
+    branch_env = next(item for item in env if item["name"] == "BASE_BRANCH")
+    if mutation == "missing":
+        env.remove(branch_env)
+    elif mutation == "changed":
+        branch_env["value"] = "next"
+    elif mutation == "empty":
+        branch_env.pop("value")
+    else:
+        job["metadata"]["annotations"]["curietech.ai/publication-contract-sha256"] = "0" * 64
+    with pytest.raises(publication_k8s.PublicationResourceError):
+        cluster.validate_existing(resources)
+    assert (core.created, batch.created) == creates
+
+
+@pytest.mark.parametrize(
+    "base_branch", ["", "refs/heads/main", "../main", "main\nnext", "-main", "a" * 1025]
+)
+def test_builder_refuses_an_invalid_base_branch(publication_k8s: Any, base_branch: str) -> None:
+    with pytest.raises(publication_k8s.PublicationResourceError):
+        _build(publication_k8s, replace(_payload(publication_k8s), base_branch=base_branch))
+
+
 def test_omitempty_tolerance_still_refuses_non_empty_where_empty_expected(
     publication_k8s: Any,
 ) -> None:
@@ -2022,19 +2552,49 @@ def test_observe_failed_job_without_pod_says_logs_were_unavailable(
     assert "pod logs were unavailable" in error
 
 
-def test_a_publication_without_a_ca_keeps_its_contract_hash_across_the_ca_move(
+def test_a_job_without_the_base_branch_contract_is_refused_after_upgrade(
     publication_k8s: Any,
 ) -> None:
-    """A worker upgrade adopts the Jobs it left running only if their hash is unchanged.
-
-    The value is the annotation the worker wrote before the code host CA moved
-    into the Job's own ConfigMap (computed from that earlier source for this
-    exact payload and settings).
-    """
-
     resources = _resources(publication_k8s)
-
+    annotation = "curietech.ai/publication-contract-sha256"
+    contract = {
+        "publication_id": str(PUBLICATION_ID),
+        "revision_id": str(REVISION_ID),
+        "revision_number": 1,
+        "repo_full_name": "acme-corp/acme-bot",
+        "clean_clone_url": CLEAN_URL,
+        "origin": ORIGIN,
+        "header_form": "authorization_basic",
+        "ca_bundle_ref": None,
+        "ca_bundle_config_map": None,
+        "ca_bundle_key": None,
+        "base_branch": "main",
+        "base_sha": "a" * 40,
+        "expected_prior_head": "a" * 40,
+        "expected_remote_head": None,
+        "patch_sha256": hashlib.sha256(b"diff --git a/a b/a\n").hexdigest(),
+        "branch": LINEAGE_BRANCH,
+        "title": "Update repository",
+        "branch_prefix": None,
+        "runner_image": "ghcr.io/curie-eng/curie-runner:v0.7.0",
+        "service_account_name": "curie-publication",
+        "active_deadline_seconds": 300,
+        "git_timeout_seconds": 60,
+    }
     assert (
-        resources.job["metadata"]["annotations"]["curietech.ai/publication-contract-sha256"]
-        == "583ff66a400a55b143deff2f55935e6548680630568ace51c65280c11c00e22f"
+        resources.job["metadata"]["annotations"][annotation]
+        == hashlib.sha256(
+            json.dumps(contract, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    )
+    old_hash = "583ff66a400a55b143deff2f55935e6548680630568ace51c65280c11c00e22f"
+    assert resources.job["metadata"]["annotations"][annotation] != old_hash
+    previous_job = deepcopy(resources.job)
+    previous_job["metadata"]["annotations"][annotation] = old_hash
+    env = previous_job["spec"]["template"]["spec"]["containers"][0]["env"]
+    env[:] = [item for item in env if item["name"] != "BASE_BRANCH"]
+    with pytest.raises(publication_k8s.PublicationResourceError, match="metadata contract"):
+        publication_k8s.validate_adopted_resource("Job", resources.job, previous_job)
+    publication_k8s.validate_adopted_resource(
+        "Job", resources.job, _omitempty(deepcopy(resources.job))
     )

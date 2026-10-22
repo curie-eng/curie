@@ -16,11 +16,13 @@ from curie_worker.publication_clients import (
     PublicationTranscriptClient,
 )
 from curie_worker.publication_loop import (
+    PublicationBranchHead,
     PublicationCredential,
     PublicationIdentityUnavailable,
     PublicationLineageRefused,
     PublicationReconcileError,
     PublicationRemoteTerminalError,
+    PublicationRevisionCommit,
     PublicationTranscriptPermanentError,
 )
 
@@ -34,7 +36,7 @@ PUBLICATION_ID = uuid.UUID("22222222-2222-4222-8222-222222222222")
 LINEAGE_ID = uuid.UUID("55555555-5555-4555-8555-555555555555")
 LINEAGE_API_BASE = "https://api.example.com"
 LINEAGE_PATH = f"/v1/internal/publications/{PUBLICATION_ID}/lineage"
-WORKER_TOKEN = "remote-dev-publication-worker-token"
+WORKER_TOKEN = "publication-worker-test-token"
 
 pytestmark = pytest.mark.anyio
 
@@ -148,32 +150,83 @@ async def test_an_unreachable_api_is_a_reconcile_error() -> None:
 
 
 @pytest.mark.parametrize("head", [REVISION_HEAD, None])
-async def test_branch_head_is_read_for_the_publication(head: str | None) -> None:
+@pytest.mark.parametrize("base_branch", ["main", "next", "release/example"])
+async def test_branch_head_is_read_for_the_publication(head: str | None, base_branch: str) -> None:
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        return httpx.Response(200, json={"head_sha": head})
+        return httpx.Response(200, json={"head_sha": head, "base_branch": base_branch})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         observed = await _code_host(handler, client).read_branch_head(PUBLICATION_ID)
 
-    assert observed == head
+    assert observed == PublicationBranchHead(head_sha=head, base_branch=base_branch)
     assert [(r.method, r.url.path) for r in requests] == [
         ("GET", f"{CODE_HOST_PREFIX}/branch-head")
     ]
+    assert requests[0].headers["X-Curie-Worker-Token"] == WORKER_TOKEN
+    assert "authorization" not in requests[0].headers
 
 
 async def test_an_invalid_branch_head_is_refused() -> None:
     def handler(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"head_sha": "not-a-sha"})
+        return httpx.Response(200, json={"head_sha": "not-a-sha", "base_branch": "main"})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         with pytest.raises(PublicationReconcileError, match="invalid branch head"):
             await _code_host(handler, client).read_branch_head(PUBLICATION_ID)
 
 
-async def test_revision_commit_is_verified_by_the_api_with_the_revision_marker() -> None:
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"head_sha": None},
+        {"base_branch": "main"},
+        {"head_sha": None, "base_branch": None},
+        {"head_sha": None, "base_branch": ""},
+        {"head_sha": None, "base_branch": 123},
+        {"head_sha": None, "base_branch": "x" * 1025},
+        {"head_sha": None, "base_branch": "refs/heads/main"},
+        {"head_sha": None, "base_branch": PRIOR_HEAD},
+        {"head_sha": None, "base_branch": "main\nnext"},
+        {"head_sha": None, "base_branch": "../main"},
+        {"head_sha": REVISION_HEAD.upper(), "base_branch": "main"},
+        [],
+    ],
+)
+async def test_branch_context_requires_a_usable_authoritative_base(body: object) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=body)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(PublicationReconcileError):
+            await _code_host(handler, client).read_branch_head(PUBLICATION_ID)
+
+
+async def test_branch_context_recovers_after_an_api_outage() -> None:
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(503, json={"detail": "repository unavailable"})
+        return httpx.Response(200, json={"head_sha": None, "base_branch": "next"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        code_host = _code_host(handler, client)
+        with pytest.raises(PublicationReconcileError):
+            await code_host.read_branch_head(PUBLICATION_ID)
+        assert await code_host.read_branch_head(PUBLICATION_ID) == PublicationBranchHead(
+            head_sha=None, base_branch="next"
+        )
+
+
+@pytest.mark.parametrize("parent_sha", [PRIOR_HEAD, "c" * 40, "d" * 64])
+async def test_revision_commit_is_verified_by_the_api_with_the_revision_marker(
+    parent_sha: str,
+) -> None:
     bodies: list[dict[str, object]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -181,15 +234,17 @@ async def test_revision_commit_is_verified_by_the_api_with_the_revision_marker()
             "POST",
             f"{CODE_HOST_PREFIX}/revision-commit",
         )
+        assert request.headers["X-Curie-Worker-Token"] == WORKER_TOKEN
+        assert "authorization" not in request.headers
         bodies.append(json.loads(request.content))
-        return httpx.Response(200, json={"commit_sha": REVISION_HEAD})
+        return httpx.Response(200, json={"commit_sha": REVISION_HEAD, "parent_sha": parent_sha})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         verified = await _code_host(handler, client).verify_revision_commit(
             PUBLICATION_ID, REVISION_HEAD, revision_id=REVISION_ID, expected_parent=PRIOR_HEAD
         )
 
-    assert verified == REVISION_HEAD
+    assert verified == PublicationRevisionCommit(commit_sha=REVISION_HEAD, parent_sha=parent_sha)
     assert bodies == [
         {
             "commit_sha": REVISION_HEAD,
@@ -220,13 +275,50 @@ async def test_a_refused_revision_commit_carries_the_api_reason() -> None:
 
 async def test_a_different_verified_commit_is_refused() -> None:
     def handler(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"commit_sha": PRIOR_HEAD})
+        return httpx.Response(200, json={"commit_sha": PRIOR_HEAD, "parent_sha": "c" * 40})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         with pytest.raises(PublicationReconcileError, match="different commit"):
             await _code_host(handler, client).verify_revision_commit(
                 PUBLICATION_ID, REVISION_HEAD, revision_id=REVISION_ID, expected_parent=PRIOR_HEAD
             )
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"commit_sha": REVISION_HEAD},
+        {"parent_sha": PRIOR_HEAD},
+        {"commit_sha": REVISION_HEAD, "parent_sha": None},
+        {"commit_sha": REVISION_HEAD, "parent_sha": ""},
+        {"commit_sha": REVISION_HEAD, "parent_sha": "c" * 39},
+        {"commit_sha": REVISION_HEAD, "parent_sha": "c" * 65},
+        {"commit_sha": REVISION_HEAD, "parent_sha": "C" * 40},
+        {"commit_sha": REVISION_HEAD, "parent_sha": 123},
+        {"commit_sha": REVISION_HEAD.upper(), "parent_sha": PRIOR_HEAD},
+        [],
+    ],
+)
+async def test_revision_verification_requires_a_full_commit_and_actual_parent(body: object) -> None:
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            200,
+            json=body if calls == 1 else {"commit_sha": REVISION_HEAD, "parent_sha": "c" * 40},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        code_host = _code_host(handler, client)
+        with pytest.raises(PublicationReconcileError):
+            await code_host.verify_revision_commit(
+                PUBLICATION_ID, REVISION_HEAD, revision_id=REVISION_ID, expected_parent=PRIOR_HEAD
+            )
+        assert await code_host.verify_revision_commit(
+            PUBLICATION_ID, REVISION_HEAD, revision_id=REVISION_ID, expected_parent=PRIOR_HEAD
+        ) == PublicationRevisionCommit(commit_sha=REVISION_HEAD, parent_sha="c" * 40)
 
 
 @pytest.mark.parametrize("state", ["open", "closed", "merged"])
