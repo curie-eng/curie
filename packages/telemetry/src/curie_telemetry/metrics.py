@@ -282,6 +282,24 @@ _SLACK_SOCKET_IDENTITY_ATTRIBUTES = {
     "service.name": ["curie-dispatcher"],
     "state": ["configured", "connected"],
 }
+# A Slack identity name is an install-declared slug (ADR-0168 decision 1), and
+# an install declares a handful; past 16 they share ``other`` (#4960).
+_SLACK_IDENTITY_LABEL: Final = {
+    "kind": "bounded",
+    "ceiling": 16,
+    "reserved": ["other"],
+    "overflow": "other",
+    "pattern": r"^[a-z0-9]+(-[a-z0-9]+)*$",
+}
+_SLACK_SOCKET_ENVELOPE_ATTRIBUTES = {
+    "service.name": ["curie-dispatcher"],
+    "slack_identity": _SLACK_IDENTITY_LABEL,
+    "type": ["hello", "disconnect", "events_api", "interactive", "slash_commands", "other"],
+}
+_SLACK_DELIVERY_CANARY_ATTRIBUTES = {
+    "service.name": ["curie-dispatcher"],
+    "slack_identity": _SLACK_IDENTITY_LABEL,
+}
 _REPLY_ATTRIBUTES = {
     "service.name": ["curie-worker"],
     "operation": ["update", "post"],
@@ -858,6 +876,20 @@ _METRICS: dict[str, dict[str, Any]] = {
         "Slack identities the dispatcher serves, and those holding a live Socket Mode socket.",
         False,
         _SLACK_SOCKET_IDENTITY_ATTRIBUTES,
+    ),
+    "curie.slack.socket.envelopes": _definition(
+        "counter",
+        "{envelope}",
+        "Socket Mode frames Slack delivered, by Slack identity and frame type.",
+        True,
+        _SLACK_SOCKET_ENVELOPE_ATTRIBUTES,
+    ),
+    "curie.slack.delivery_canary": _definition(
+        "counter",
+        "{mention}",
+        "Delivery-canary mentions the dispatcher handled, by Slack identity.",
+        True,
+        _SLACK_DELIVERY_CANARY_ATTRIBUTES,
     ),
     "curie.reply.delivery": _definition(
         "counter", "{reply}", "Reply delivery outcomes.", True, _REPLY_ATTRIBUTES

@@ -380,7 +380,8 @@ def test_slack_identity_past_the_ceiling_or_not_a_slug_shares_other(
             for metric in scope_metrics.metrics:
                 if metric.name == "curie.slack.delivery_canary":
                     for point in metric.data.data_points:
-                        seen[str(dict(point.attributes or {})["slack_identity"])] = float(point.value)
+                        name = str(dict(point.attributes or {})["slack_identity"])
+                        seen[name] = float(point.value)
     reset_bounded_labels()
     assert seen == {**{f"bot-{index}": 1.0 for index in range(16)}, "other": 2.0}
 

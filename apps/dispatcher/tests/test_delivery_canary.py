@@ -82,9 +82,7 @@ def _configured(
     config: DispatcherConfig, monkeypatch: pytest.MonkeyPatch, channels: list[str]
 ) -> DispatcherConfig:
     monkeypatch.setenv("CURIE_SLACK_DELIVERY_CANARY_CHANNELS", json.dumps(channels))
-    return DispatcherConfig(
-        **config.model_dump(exclude={"slack_delivery_canary_channels"})
-    )
+    return DispatcherConfig(**config.model_dump(exclude={"slack_delivery_canary_channels"}))
 
 
 @pytest.mark.parametrize("bot_id", [None, "B9POSTER"], ids=["person", "bot"])
@@ -185,9 +183,7 @@ def test_canary_channels_parse_from_a_json_list(monkeypatch: pytest.MonkeyPatch)
     ["null", '"C0EXAMPLE1"', '["D0DIRECT"]', '["c0lower"]', '[""]', "not json"],
     ids=["null", "bare-string", "dm-id", "lowercase", "blank", "not-json"],
 )
-def test_malformed_canary_channels_refuse_boot(
-    monkeypatch: pytest.MonkeyPatch, raw: str
-) -> None:
+def test_malformed_canary_channels_refuse_boot(monkeypatch: pytest.MonkeyPatch, raw: str) -> None:
     """A typo must not silently disable the canary or swallow a DM."""
     monkeypatch.setenv("CURIE_SLACK_DELIVERY_CANARY_CHANNELS", raw)
     with pytest.raises((ValidationError, SettingsError, ValueError)):

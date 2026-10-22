@@ -98,7 +98,12 @@ def _wait_connected(conn: SocketModeConnection, timeout: float = 5.0) -> None:
 
 def _envelope(kind: str, envelope_id: str) -> dict[str, object]:
     # Slack's Socket Mode envelope: https://docs.slack.dev/apis/events-api/using-socket-mode/
-    return {"envelope_id": envelope_id, "type": kind, "payload": {}, "accepts_response_payload": False}
+    return {
+        "envelope_id": envelope_id,
+        "type": kind,
+        "payload": {},
+        "accepts_response_payload": False,
+    }
 
 
 def test_every_frame_is_counted_by_identity_and_type_before_any_listener(
@@ -204,9 +209,7 @@ def test_each_identity_built_by_run_counts_under_its_own_name(
         slack_bot_token="xoxb-test",
         approval_chat_attester_secret="dispatcher-attester-test-secret",
     )
-    secondary = SlackIdentityCredentials(
-        name="ops-bot", app_token="xapp-ops", bot_token="xoxb-ops"
-    )
+    secondary = SlackIdentityCredentials(name="ops-bot", app_token="xapp-ops", bot_token="xoxb-ops")
     connections = run.build_identity_connections(
         config,
         (
