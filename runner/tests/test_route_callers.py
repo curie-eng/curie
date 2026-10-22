@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -401,10 +402,13 @@ def test_a_boot_mounts_the_caller_as_a_relay_and_drops_the_tokens(
     monkeypatch.setattr(boot, "probe_mcp_tool_capability", probe)
     monkeypatch.setattr(boot, "ClaudeAgentSession", _CapturedSession)
     monkeypatch.setattr(boot, "route_caller_lock_library", lambda _env: "/opt/lock.so")
+    monkeypatch.setattr(route_callers_module, "proc_locked", lambda _pid: True)
     session = initialized_session_sync(build_runner(config, fake_model=False, sdk_env=spawn))
     assert isinstance(session, _CapturedSession)
     servers = session.options.mcp_servers
     assert servers["plugin:b:review-tools"]["type"] == "sdk"
+    # Started at boot, before the runner serves a turn.
+    assert servers["plugin:b:review-tools"]["instance"].pid is not None
     assert servers["plugin:b:notes"]["command"] == sys.executable
     assert ROUTE_TOKENS_ENV not in os.environ
     assert ROUTE_TOKENS_ENV not in spawn
@@ -423,3 +427,76 @@ def test_the_capability_probe_still_lists_a_callers_tools(tmp_path: Path) -> Non
     # ``notes`` is no MCP server at all; only the caller is under test.
     assert "review-tools" not in probe.failures
     assert "mcp__plugin_b_review-tools__inspect" in probe.observed_tools
+
+
+def _dead_relay(tmp_path: Path) -> CallerRelay:
+    from curie_runner.route_callers import CallerLaunch
+
+    launch = CallerLaunch(
+        command=sys.executable,
+        args=("-c", "pass"),
+        env={"PATH": os.environ.get("PATH", "")},
+        cwd=str(tmp_path),
+        routes_document=b"{}",
+    )
+    return CallerRelay("plugin:b:review-tools", launch)
+
+
+# @spec ADR-0240 d4: a caller that exited closes every later session at once.
+def test_a_session_on_an_exited_caller_ends_instead_of_hanging(tmp_path: Path) -> None:
+    relay = _dead_relay(tmp_path)
+    assert relay.start()
+    caller = relay._caller
+    deadline = time.monotonic() + 10
+    while not caller.failed and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert caller.failed
+
+    async def go() -> None:
+        bridge = SdkMcpBridge(relay.name, relay)  # type: ignore[arg-type]
+        try:
+            with anyio.fail_after(10), pytest.raises(Exception, match="session closed"):
+                await bridge.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        finally:
+            await bridge.aclose()
+
+    anyio.run(go)
+
+
+# @spec ADR-0240 d4: the first initialize answer is kept even when the
+# session that asked has gone, so no later session sends a second one.
+def test_the_first_initialize_answer_is_kept_after_its_session_left() -> None:
+    from curie_runner.route_callers import CallerLaunch, _Caller, _Session
+
+    caller = _Caller(
+        CallerLaunch(command="x", args=(), env={}, cwd=None, routes_document=b"{}"), None
+    )
+    sent: list[dict[str, Any]] = []
+    caller.send = sent.append  # type: ignore[method-assign]
+    session = _Session()
+    caller.attach(session)
+    caller.request(session, {"jsonrpc": "2.0", "id": 1, "method": "initialize"}, None)
+    caller.detach(session)
+    caller._route({"jsonrpc": "2.0", "id": sent[-1]["id"], "result": {"serverInfo": {}}})
+    assert caller.initialize_result == {"serverInfo": {}}
+    assert session.inbox.empty()
+
+
+# @spec ADR-0240 d4: sending never waits on the caller's stdin.
+def test_sending_to_a_caller_that_stops_reading_does_not_block(tmp_path: Path) -> None:
+    from curie_runner.route_callers import CallerLaunch
+
+    launch = CallerLaunch(
+        command=sys.executable,
+        args=("-c", "import time; time.sleep(30)"),
+        env={"PATH": os.environ.get("PATH", "")},
+        cwd=str(tmp_path),
+        routes_document=b"{}",
+    )
+    relay = CallerRelay("plugin:b:review-tools", launch)
+    assert relay.start()
+    started = time.monotonic()
+    big = {"jsonrpc": "2.0", "method": "notifications/x", "params": {"pad": "x" * 1_000_000}}
+    for _ in range(4):
+        relay._caller.send(big)
+    assert time.monotonic() - started < 2
