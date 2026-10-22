@@ -94,7 +94,9 @@ class Manifest:
     def __init__(self, value, raw):
         self.value = {"runner_image_digest": value["launch"]["runner_image_digest"],
                       "substrate": value["launch"]["substrate"],
-                      "execution_config_digest": hashlib.sha256(raw).hexdigest()}
+                      "execution_config_digest": hashlib.sha256(json.dumps(
+                          value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+                      ).encode("ascii")).hexdigest()}
     def as_dict(self):
         return dict(self.value)
 
@@ -221,8 +223,15 @@ def require_disposable_cluster() -> None:
     assert urlsplit(origin).hostname in ("127.0.0.1", "localhost", "::1"), origin
     nodes = json.loads(kubectl("get", "nodes", "-o", "json"))["items"]
     assert [node["metadata"]["name"] for node in nodes] == [PROFILE], "one-node owned profile"
-    calico = kubectl("get", "pods", "-n", "kube-system", "-l", "k8s-app=calico-node", "-o", "name")
-    assert calico.strip(), "Calico is required to make address reuse observable"
+    # A fresh profile reports ready before its CNI DaemonSet has Pods.
+    deadline = time.time() + 300
+    selector = ("-n", "kube-system", "-l", "k8s-app=calico-node")
+    while not kubectl("get", "pods", *selector, "-o", "name"):
+        assert time.time() < deadline, "Calico is required to make address reuse observable"
+        time.sleep(2)
+    kubectl(
+        "wait", *selector, "--for=condition=Ready", "pod", "--timeout=300s"
+    )  # fmt: skip
 
 
 def tls_material(root: Path) -> None:
@@ -238,6 +247,10 @@ def tls_material(root: Path) -> None:
         .not_valid_before(now - timedelta(minutes=1))
         .not_valid_after(now + timedelta(hours=2))
         .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .add_extension(
+            x509.KeyUsage(False, False, False, False, False, True, True, False, False), True
+        )
+        .add_extension(x509.SubjectKeyIdentifier.from_public_key(ca_key.public_key()), False)
         .sign(ca_key, hashes.SHA256())
     )
     key = ec.generate_private_key(ec.SECP256R1())
@@ -252,6 +265,12 @@ def tls_material(root: Path) -> None:
         .not_valid_after(now + timedelta(hours=2))
         .add_extension(x509.SubjectAlternativeName([x509.DNSName(n) for n in names]), False)
         .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), False)
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()), False
+        )
+        .add_extension(
+            x509.KeyUsage(True, False, False, False, False, False, False, False, False), True
+        )
         .sign(ca_key, hashes.SHA256())
     )
     (root / "ca.crt").write_bytes(ca.public_bytes(serialization.Encoding.PEM))
@@ -577,6 +596,13 @@ def test_gateway_identity_negatives_on_the_actual_substrate(tmp_path: Path) -> N
         assert gateway_log().count(f"AUTHORIZED commissioning {LAUNCH_A}") == before
         evidence["result"] = "every negative observed"
     finally:
+        if "result" not in evidence:
+            evidence["gateway_log"] = kubectl(
+                "logs", "-n", GATEWAY_NS, "provider-gateway", "--tail=40", check=False
+            )
+            evidence["gateway_pod"] = kubectl(
+                "get", "pod", "-n", GATEWAY_NS, "provider-gateway", "-o", "json", check=False
+            )[-4000:]
         evidence.setdefault("result", "incomplete")
         if EVIDENCE:
             Path(EVIDENCE).write_text(json.dumps(evidence, indent=2, sort_keys=True))
