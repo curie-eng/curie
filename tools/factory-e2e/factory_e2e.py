@@ -4156,9 +4156,9 @@ def agent_message_from_comment(body: str) -> str | None:
     """The agent's last message from a final issue comment, or None (#3128).
 
     Read only the contiguous quoted block immediately after the exact label.
-    Strip one quote prefix per line and reverse the API's HTML, image, mention
-    and comment-opener substitutions once, then decode ``&amp;`` last to
-    preserve literal entity text.
+    Strip one quote prefix and reverse the API's bracket, URL, backslash,
+    HTML, mention and comment-opener substitutions once, then decode ``&amp;``
+    last to preserve literal entity text.
     """
 
     lines = body.split("\n")
@@ -4179,7 +4179,9 @@ def agent_message_from_comment(body: str) -> str | None:
     return (
         "\n".join(quoted)
         .replace("@\u200b", "@")
-        .replace("!\\[", "![")
+        .replace("\\[", "[")
+        .replace("\\://", "://")
+        .replace("\\\\", "\\")
         .replace("&lt;", "<")
         .replace("<\u200b!--", "<!--")
         .replace("&amp;", "&")
