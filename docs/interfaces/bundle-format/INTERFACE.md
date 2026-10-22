@@ -126,7 +126,9 @@ files**, each absent from a bundle that needs none, all three invisible to Claud
   (`connectors.remote_has_routes`). A declared caller reads its routes once at start from the
   descriptor `CURIE_CONNECTOR_ROUTES_FD` names, a JSON object from connector name to `{url, token}`,
   and sends the token as `X-Curie-Caller` on the route; started without the name set, it has no
-  routes. A consumer built before the field refuses a bundle that sets it as an unknown key.
+  routes. Declare a caller as the program itself rather than a wrapper that forks (`sh -c`), since
+  the runner observes the lock only on the process it starts, and have it load what it needs at
+  start. A consumer built before the field refuses a bundle that sets it as an unknown key.
   Intake refuses any `sealed_secrets` declaration with
   `connectors.sealed_secrets_unsupported` until a decrypt path exists (see
   [sealed-credential](../sealed-credential/INTERFACE.md)). For a hosted (`image`/`build`) connector
