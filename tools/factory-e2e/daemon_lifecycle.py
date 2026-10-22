@@ -68,7 +68,6 @@ SCHEMA = "daemon-lifecycle/v1"
 CATALOG_BUILDER = "curie::repo_runner::catalog_dockerfile"
 LIMIT_SECONDS = 300
 CLAIM_TIMEOUT_SECONDS = 180
-YOUNG_CHECK_SECONDS = 120
 DAEMON_PORT = 2376
 REPO = "acme-corp/acme-bot"
 REPO_ID = "4401"  # the stub's fixed repository id (github_stub.py _repository_row)
@@ -77,6 +76,10 @@ MENTION = "curie-factory-bot"
 ISSUES = {"success": 4101, "daemon_death": 4102, "cancel": 4103, "worker_loss": 4104}
 CONTROL_ISSUE = 4105
 TURN_KEYS = ("success", "daemon_death", "retained_next", "cancel", "worker_loss")
+# Turns that run the script to its end: a factory turn that publishes nothing settles
+# failed/no_pull_request (kernel/completion.py); release on settle ignores outcome (#3075).
+DELIVERED, DELIVERY = ("success", "daemon_death", "retained_next"), ("failed", "no_pull_request")
+IDENTITY = ("kind", "name", "namespace", "uid")
 ROLES = ("daemon", "service", "ingress", "server-secret", "client-secret")
 IMAGE_NAMES = ("daemon", "platform", "catalog", "runner", "api", "worker")
 CLEANUP_KEYS = (
@@ -222,6 +225,8 @@ def _judge_objects(where: str, claim: object, objects: Any, roles: tuple[str, ..
     if len(named) != len(found) or sorted(named) != sorted(roles):
         reasons.append(f"missing_observation: {where} objects are not exactly {list(roles)}")
     for obj in objects or []:
+        if not all(obj.get(key) for key in IDENTITY):
+            reasons.append(f"missing_observation: {where} {obj.get('role')} lacks {IDENTITY}")
         if obj.get("claim_label") != claim:
             reasons.append(f"wrong_claim_label: {where} {obj.get('role')} names another claim")
     return reasons
@@ -244,15 +249,25 @@ def _judge_turn(
     ok = seen.get("ran") is True and bool(seen.get("id")) and bool(pod)
     ok = ok and seen.get("id") == daemon.get("docker_id") and seen.get("name") == pod
     ok = ok and daemon.get("docker_name") == pod and seen.get("container_nonce") == nonce
-    if not (ok and runner.get("docker_env") is True):
+    pods = [o for o in turn.get("objects") or [] if o.get("role") == "daemon"]
+    bound = [(o.get("name"), o.get("uid")) for o in pods] == [(pod, daemon.get("pod_uid"))]
+    if not (ok and bound and runner.get("docker_env") is True):
         reasons.append(f"identity_mismatch: {name} runner did not reach its own daemon")
     reasons += _judge_objects(f"turn {name}", turn.get("claim"), turn.get("objects"), ROLES)
     _judge_settled(f"turn {name}", turn, reasons)
-    if turn.get("successor_cleared") is False:
-        reasons.append(f"incomplete_cleanup: {name} owner-lost successor left objects")
+    if turn.get("leaked") != []:
+        reasons.append(f"incomplete_cleanup: {name} left claim objects {turn.get('leaked')}")
+    if name in DELIVERED and turn.get("turn_delivered") is not True:
+        reasons.append(f"missing_observation: {name} turn was not delivered")
+    recovery = turn.get("recovery_seconds")
+    recovered = _number(recovery) and 0 <= recovery <= LIMIT_SECONDS
+    if name == "worker_loss" and not (recovered and turn.get("successor_cleared") is True):
+        reasons.append(f"incomplete_cleanup: {name} did not recover within {LIMIT_SECONDS}s")
     state = turn.get("request_state")
-    if state not in TERMINAL or (name == "cancel" and state != "cancelled"):
+    if state not in TERMINAL:
         reasons.append(f"incomplete_cleanup: {name} request ended {state!r}")
+    if name == "cancel" and state != "cancelled":
+        reasons.append(f"missing_observation: {name} request ended {state!r}, not cancelled")
     _judge_image(f"{name} runner", runner.get("image_id"), allowed["runner"], reasons)
     _judge_image(f"{name} daemon", daemon.get("image_id"), allowed["daemon"], reasons)
     return reasons
@@ -267,6 +282,8 @@ def _judge_retained(turns: dict[str, Any]) -> list[str]:
         reasons.append("dead_daemon_reused: retained_next did not get a fresh claim and daemon")
     if fresh.get("thread") != dead.get("thread") or fresh.get("issue") != dead.get("issue"):
         reasons.append("retained_thread_mismatch: retained_next ran on another thread")
+    if dead.get("released_before_next") is not True:
+        reasons.append("retained_thread_mismatch: daemon_death was not released before next")
     return reasons
 
 
@@ -277,8 +294,10 @@ def _judge_tls(envelope: dict[str, Any]) -> list[str]:
         reasons.append("missing_observation: tls probed another claim")
     if tls.get("independent_client_refused") is not True:
         reasons.append("cross_claim_tls_accepted: an independently issued client was accepted")
-    if tls.get("claim_client_accepted") is False:
-        reasons.append("missing_observation: the claim's own client was refused")
+    if not all(
+        tls.get(key) is True for key in ("claim_client_accepted", "claim_client_accepted_after")
+    ):
+        reasons.append("tls_control_failed: the claim's own client was not accepted around it")
     return reasons
 
 
@@ -286,7 +305,9 @@ def _judge_orphan(envelope: dict[str, Any]) -> list[str]:
     orphan = envelope["orphan"]
     roles = ("service", "ingress")
     reasons = _judge_objects("orphan", orphan.get("claim"), orphan.get("objects"), roles)
-    if orphan.get("kept_while_young") is not True:
+    removed, gate = orphan.get("removed_after_seconds"), orphan.get("age_gate_seconds")
+    young = not (_number(removed) and _number(gate) and removed >= gate)
+    if orphan.get("kept_while_young") is not True or young:
         reasons.append("age_gate: the orphan was removed before the claim timeout")
     _judge_settled("orphan", orphan, reasons)
     return reasons
@@ -297,6 +318,8 @@ def _judge_control(envelope: dict[str, Any], allowed: dict[str, set[str]]) -> li
     reasons = []
     if control.get("completed") is not True:
         reasons.append("missing_observation: the control turn did not complete")
+    if control.get("turn_delivered") is not True:
+        reasons.append("missing_observation: the control turn was not delivered")
     clean = control["runner"].get("docker_env") is False and control.get("daemon_objects") == 0
     if not (clean and control.get("client_docker_files") is False):
         reasons.append("control_docker: a repository without the opt-in got Docker")
@@ -442,6 +465,7 @@ def daemon_probe(payload: dict[str, Any]) -> dict[str, Any]:
         mixed = {"ca.pem": files["ca.pem"]}
         mixed |= {key: issued.client_files[key] for key in ("cert.pem", "key.pem")}
         out["refused"] = not tool_daemon.ping(*target, mixed, 10.0)
+        out["accepted_after"] = tool_daemon.ping(*target, files, 10.0)
     return out
 
 
@@ -550,16 +574,19 @@ class Lifecycle:
 
     def requests(self, issue: int) -> list[dict[str, str]]:
         rows = self.sql(
-            "SELECT coalesce(json_agg(json_build_object('id', r.id, 'status', r.status) "
-            "ORDER BY r.created_at), '[]'::json) FROM curie.execution_requests r "
+            "SELECT coalesce(json_agg(json_build_object('id', r.id, 'status', r.status, "
+            "'cause', coalesce(r.terminal_cause, '')) ORDER BY r.created_at), '[]'::json) "
+            "FROM curie.execution_requests r "
             "JOIN curie.work_items w ON w.id = r.work_item_id "
             f"WHERE w.tracker_kind = 'github' AND w.tracker_scope_id = '{REPO_ID}' "
             f"AND w.tracker_issue_id = '{int(issue)}'"
         )
-        return [{"id": str(row["id"]), "status": str(row["status"])} for row in rows]
+        return [{key: str(row[key]) for key in ("id", "status", "cause")} for row in rows]
 
-    def request_status(self, issue: int, request_id: str) -> str:
-        return next((r["status"] for r in self.requests(issue) if r["id"] == request_id), "")
+    def request_row(self, issue: int, request_id: str) -> dict[str, str]:
+        """The request's status and terminal cause (curie.execution_requests.terminal_cause)."""
+        found = (r for r in self.requests(issue) if r["id"] == request_id)
+        return next(found, {"status": "", "cause": ""})
 
     def set_label(self, issue: int, on: bool) -> None:
         """A human labels (creating the issue if new) or unlabels a stub issue."""
@@ -594,20 +621,16 @@ class Lifecycle:
         ]
 
     def new_claim(self, digest: str, before: set[str]) -> str:
-        fresh = [
-            c
-            for c in self.claims(digest)
-            if c["metadata"]["name"] not in before and not c["metadata"].get("deletionTimestamp")
-        ]
+        live = [c for c in self.claims(digest) if not c["metadata"].get("deletionTimestamp")]
+        fresh = [c for c in live if c["metadata"]["name"] not in before]
         fresh.sort(key=lambda c: c["metadata"]["creationTimestamp"])
         return fresh[-1]["metadata"]["name"] if fresh else ""
 
     def first_pod(
         self, ns: str, selector: str, ready: Callable[[dict[str, Any]], bool]
     ) -> dict[str, Any]:
-        return next(
-            (p for p in self.items(f"/api/v1/namespaces/{ns}/pods", selector) if ready(p)), {}
-        )
+        pods = self.items(f"/api/v1/namespaces/{ns}/pods", selector)
+        return next((p for p in pods if ready(p)), {})
 
     def runner_pod(self, claim: str) -> dict[str, Any]:
         def running(pod: dict[str, Any]) -> bool:
@@ -617,11 +640,10 @@ class Lifecycle:
         return self.first_pod(self.ns, f"{CLAIM_LABEL}={claim}", running)
 
     def daemon_ready(self, claim: str) -> dict[str, Any]:
-        return self.first_pod(
-            self.dns,
-            self.claim_selector(claim),
-            lambda p: bool(container_status(p, "dockerd").get("ready")),
-        )
+        def ready(pod: dict[str, Any]) -> bool:
+            return bool(container_status(pod, "dockerd").get("ready"))
+
+        return self.first_pod(self.dns, self.claim_selector(claim), ready)
 
     def runner_info(self, pod: dict[str, Any], *, every: bool) -> dict[str, Any]:
         container = next(c for c in pod["spec"]["containers"] if c["name"] == "runner")
@@ -683,6 +705,23 @@ class Lifecycle:
             elif meta.get("labels", {}).get(CLAIM_LABEL) == obj["claim_label"]:
                 recreated.append(f"{obj['kind']}/{obj['name']}")
         return present, recreated
+
+    def leaks(self, match: Callable[[str], bool]) -> list[str]:
+        """Kind/name of release daemon objects and app-namespace client Secrets (by name or
+        claim label) whose claim matches; terminating objects still count."""
+        found = set()
+        selector = quote(f"{CLAIM_LABEL},{MANAGED},{INSTANCE_LABEL}={self.release}")
+        for kind, prefix, plural, _ in DAEMON_KINDS:
+            path = f"{prefix}/namespaces/{self.dns}/{plural}?labelSelector={selector}"
+            for item in self.f.get(path).get("items", []):
+                if match(item["metadata"]["labels"][CLAIM_LABEL]):
+                    found.add(f"{kind}/{item['metadata']['name']}")
+        for item in self.f.get(f"/api/v1/namespaces/{self.ns}/secrets").get("items", []):
+            name, labels = item["metadata"]["name"], item["metadata"].get("labels") or {}
+            tokens = name.endswith("-tokens") and match(name.removesuffix("-tokens"))
+            if tokens or (CLAIM_LABEL in labels and match(labels[CLAIM_LABEL])):
+                found.add(f"Secret/{name}")
+        return sorted(found)
 
     def runner_exec(self, pod: str, script: str) -> subprocess.CompletedProcess[str]:
         argv = ("-n", self.ns, "exec", pod, "-c", "runner", "--", "sh", "-c", script)
@@ -771,11 +810,8 @@ class Lifecycle:
         turn["objects"] = objects
         daemon = self.bounded(lambda: self.daemon_ready(claim), LIMIT_SECONDS, "daemon_not_ready")
         meta, status = daemon["metadata"], container_status(daemon, "dockerd")
-        turn["daemon"] = {
-            "pod": meta["name"],
-            "pod_uid": meta["uid"],
-            "image_id": image_digest(status),
-        }
+        identity = {"pod": meta["name"], "pod_uid": meta["uid"]}
+        turn["daemon"] = identity | {"image_id": image_digest(status)}
         runner = str(turn["runner"]["pod"])
         self.signal(runner, "go", self.nonce)
         texts = self.bounded(lambda: self.runner_outputs(runner), LIMIT_SECONDS, "runner_silent")
@@ -784,32 +820,38 @@ class Lifecycle:
         self.fx.require(own["accepted"], "claim_client_refused")
         turn["daemon"].update(docker_id=own["id"], docker_name=own["name"])
         if tls:
-            refused, accepted = own["refused"], own["accepted"]
-            tls_seen = {"independent_client_refused": refused, "claim_client_accepted": accepted}
+            tls_seen = {"independent_client_refused": own["refused"]}
+            tls_seen |= {"claim_client_accepted": own["accepted"]}
+            tls_seen["claim_client_accepted_after"] = own["accepted_after"]
             self.envelope["tls"] = {"claim": claim} | tls_seen
         return runner
 
     def settle(self, turn: dict[str, Any], fault: str, started: float) -> None:
-        """Time from injection until the request is terminal and every object is gone."""
+        """Time from injection until the request is terminal, every recorded object is
+        gone by uid and nothing carrying the claim label is left."""
         turn["fault"] = fault
-        state, present = "", [""]
+        row, present, leaked = {"status": "", "cause": ""}, [""], [""]
         recreated: list[str] = []
+        claim = turn["claim"]
         deadline = started + LIMIT_SECONDS
         while True:
             self.check_fixtures()
             try:
-                state = self.request_status(turn["issue"], turn["request_id"])
+                row = self.request_row(turn["issue"], turn["request_id"])
                 present, recreated = self.remaining(turn["objects"])
+                leaked = self.leaks(lambda label: label == claim)
             except RuntimeError as exc:
                 if not transient(exc) or time.monotonic() >= deadline:
                     raise
                 time.sleep(2)
                 continue
-            if (state in TERMINAL and not present) or time.monotonic() >= deadline:
+            settled = row["status"] in TERMINAL and not present and not leaked
+            if settled or time.monotonic() >= deadline:
                 break
             time.sleep(2)
         turn["settle_seconds"] = round(time.monotonic() - started, 1)
-        turn |= {"objects_absent": not present, "request_state": state}
+        turn |= {"objects_absent": not present, "request_state": row["status"]}
+        turn |= {"settle_cause": row["cause"], "leaked": leaked}
         if recreated:
             turn["recreated"] = recreated
 
@@ -821,17 +863,22 @@ class Lifecycle:
         turn, pod = self.acquire(issue, requests, claims)
         return turn, self.observe(turn, pod, tls=tls)
 
-    def fault(self, key: str, turn: dict[str, Any], fault: str, inject: Callable[[], Any]) -> None:
-        """Inject ``fault``, settle the turn from that instant, and record it."""
+    def fault(self, key: str, turn: dict[str, Any], fault: str, inject: Callable[[], Any]) -> float:
+        """Inject ``fault``, settle the turn from that instant, record it; return the instant."""
         started = time.monotonic()
         inject()
         self.settle(turn, fault, started)
+        if key in DELIVERED:
+            turn["turn_delivered"] = (turn["request_state"], turn["settle_cause"]) == DELIVERY
         self.envelope["turns"][key] = turn
+        return started
 
-    def bounded_flag(self, probe: Callable[[], Any], category: str) -> bool:
-        """``bounded`` over LIMIT_SECONDS, as False when only ``category`` expired."""
+    def bounded_flag(
+        self, probe: Callable[[], Any], category: str, seconds: float = LIMIT_SECONDS
+    ) -> bool:
+        """``bounded`` as False when only ``category`` expired."""
         try:
-            return bool(self.bounded(probe, LIMIT_SECONDS, category))
+            return bool(self.bounded(probe, seconds, category))
         except RuntimeError as exc:
             if str(exc) != category:
                 raise
@@ -848,6 +895,13 @@ class Lifecycle:
         pod = turn["daemon"]["pod"]
         delete = ("-n", self.dns, "delete", "pod", pod, "--wait=false")
         self.fault("daemon_death", turn, "daemon_pod_deleted", lambda: self.k(*delete))
+        claim = turn["claim"]
+
+        def released() -> bool:
+            gone = claim not in {c["metadata"]["name"] for c in self.claims()}
+            return gone and not self.leaks(lambda label: label == claim)
+
+        turn["released_before_next"] = self.bounded_flag(released, "claim_not_released")
         fresh, runner = self.docker_turn(issue, lambda: self.mention(issue))
         self.fault("retained_next", fresh, "release", lambda: self.signal(runner, "release"))
 
@@ -868,20 +922,22 @@ class Lifecycle:
         force = ("--grace-period=0", "--force", "--wait=false")
         delete = ("-n", self.ns, "delete", "pod", *pods, *force)
         turn["worker_deletion"] = "forced"
-        self.fault("worker_loss", turn, "worker_pod_deleted", lambda: self.k(*delete))
-        # Any owner-lost successor is cancelled by unlabel and must clear too.
+        started = self.fault("worker_loss", turn, "worker_pod_deleted", lambda: self.k(*delete))
+        # Any owner-lost successor is cancelled by unlabel and must clear too, within
+        # the same 300 s from the deletion as the original turn.
         self.set_label(issue, False)
         digest = thread_hash(turn["thread"])
+        prefix = f"curie-thread-{digest}-"
 
         def cleared() -> bool:
             states = {r["status"] for r in self.requests(issue)}
-            prefix = f"curie-thread-{digest}-"
-            found = self.daemon_items(f"{CLAIM_LABEL},{MANAGED}")
-            labels = [meta["labels"][CLAIM_LABEL] for _, _, meta in found]
-            leftovers = [label for label in labels if label.startswith(prefix)]
+            leftovers = self.leaks(lambda label: label.startswith(prefix))
             return states <= TERMINAL and not self.claims(digest) and not leftovers
 
-        turn["successor_cleared"] = self.bounded_flag(cleared, "successor_left")
+        left = max(0.0, started + LIMIT_SECONDS - time.monotonic())
+        turn["successor_cleared"] = self.bounded_flag(cleared, "successor_left", left)
+        if turn["successor_cleared"]:
+            turn["recovery_seconds"] = round(time.monotonic() - started, 1)
         self.rollout("worker")
 
     def scenario_orphan(self) -> None:
@@ -900,27 +956,30 @@ class Lifecycle:
         created = time.monotonic()
         objects = [create("Service", "service", "v1", service)]
         objects.append(create("NetworkPolicy", "ingress", "networking.k8s.io/v1", policy))
-        kept, observed = True, False
-        while time.monotonic() - created < YOUNG_CHECK_SECONDS:
+        # Young means every successful read before the age gate saw both objects.
+        kept, observed, removed = True, False, None
+        while True:
             self.check_fixtures()
+            age = time.monotonic() - created
             found, failing = self.attempt(lambda: self.remaining(objects)[0])
             if not failing:
-                kept, observed = kept and len(found or []) == len(objects), True
-            time.sleep(5)
-        self.fx.require(observed, TRANSIENT)
-        present: list[str] = ["unread"]
-        while time.monotonic() - created < LIMIT_SECONDS:
-            found, failing = self.attempt(lambda: self.remaining(objects)[0])
-            if not failing:
-                present = found or []
-            if not present:
+                observed = True
+                if not found:
+                    removed = round(age, 1)
+                    break
+                if age < CLAIM_TIMEOUT_SECONDS:
+                    kept = kept and len(found) == len(objects)
+            if age >= LIMIT_SECONDS:
                 break
             time.sleep(2)
-        self.fx.require(present != ["unread"], TRANSIENT)
+        self.fx.require(observed, TRANSIENT)
         orphan: dict[str, Any] = {"claim": claim, "age_gate_seconds": CLAIM_TIMEOUT_SECONDS}
         orphan["objects"] = objects
         orphan |= {"kept_while_young": kept, "settle_seconds": round(time.monotonic() - created, 1)}
-        self.envelope["orphan"] = orphan | {"objects_absent": not present}
+        orphan |= {"objects_absent": removed is not None}
+        if removed is not None:
+            orphan["removed_after_seconds"] = removed
+        self.envelope["orphan"] = orphan
 
     def scenario_control(self) -> None:
         control = self.values(docker=False)
@@ -944,22 +1003,21 @@ class Lifecycle:
         self.signal(runner, "go", self.nonce)
         self.signal(runner, "release")
 
+        row: dict[str, str] = {}
+
         def terminal() -> bool:
-            return self.request_status(issue, turn["request_id"]) in TERMINAL
+            row.update(self.request_row(issue, turn["request_id"]))
+            return row["status"] in TERMINAL
 
         result["completed"] = self.bounded_flag(terminal, "control_not_terminal")
+        result["settle_cause"] = row.get("cause", "")
+        result["turn_delivered"] = (row.get("status"), row.get("cause")) == DELIVERY
         self.envelope["control"] = result
 
     def values(self, *, docker: bool) -> dict[str, Any]:
-        return lifecycle_values(
-            self.base_values,
-            self.images,
-            nonce=self.nonce,
-            daemon_namespace=self.dns,
-            release=self.release,
-            docker=docker,
-            arch=self.f.arch,
-        )
+        names = {"nonce": self.nonce, "daemon_namespace": self.dns, "release": self.release}
+        names |= {"arch": self.f.arch}
+        return lifecycle_values(self.base_values, self.images, docker=docker, **names)
 
     def build_image(self, name: str) -> dict[str, str]:
         """API and worker images, built exactly as Fixture.images() builds its own."""
@@ -969,13 +1027,12 @@ class Lifecycle:
         request = uuid.uuid4().hex
         f.asset("tag_intent", tag, request)
         metadata = f.work / (name + "-build.json")
-        fx.run(
-            ["docker", "buildx", "build", "--builder", "default", "--platform", "linux/" + f.arch]
-            + ["--label", f"{fx.REQUEST}={request}", "--label", f"{fx.NONCE}={self.nonce}"]
-            + ["--provenance=false", "--push", "--metadata-file", str(metadata), "-t", tag]
-            + ["-f", str(f.snapshot / "apps" / name / "Dockerfile"), str(f.snapshot)],
-            timeout=7200,
-        )
+        argv = ["docker", "buildx", "build", "--builder", "default", "--platform"]
+        argv += ["linux/" + f.arch]
+        argv += ["--label", f"{fx.REQUEST}={request}", "--label", f"{fx.NONCE}={self.nonce}"]
+        argv += ["--provenance=false", "--push", "--metadata-file", str(metadata), "-t", tag]
+        argv += ["-f", str(f.snapshot / "apps" / name / "Dockerfile"), str(f.snapshot)]
+        fx.run(argv, timeout=7200)
         top = str(fx.loads(metadata.read_text())["containerimage.digest"])
         fx.require(re.fullmatch(SHA256, top), "invalid_image_digest")
         ref = tag.rsplit(":", 1)[0] + "@" + top
@@ -1022,13 +1079,8 @@ class Lifecycle:
 
     def helm(self, verb: str, *argv: str) -> None:
         """helm install or upgrade; a failure keeps a bounded, redacted stderr tail."""
-        result = subprocess.run(
-            ["helm", "--kube-context", self.args.context, verb, self.release, *argv],
-            text=True,
-            capture_output=True,
-            timeout=1000,
-            check=False,
-        )
+        command = ["helm", "--kube-context", self.args.context, verb, self.release, *argv]
+        result = subprocess.run(command, text=True, capture_output=True, timeout=1000, check=False)
         if result.returncode:
             tail = redact(result.stderr[-STDERR_TAIL:], self.args.callback_host)
             self.evidence["helm_stderr"] = tail
@@ -1107,12 +1159,9 @@ class Lifecycle:
     def github_token(self) -> str:
         context = ssl.create_default_context(cafile=str(self.stub.ca_file))
         body = {"repositories": ["acme-bot"], "permissions": {"issues": "read"}}
-        request = Request(
-            self.stub.base_url + "/api/v3/app/installations/5501/access_tokens",
-            data=json.dumps(body).encode(),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
+        url = self.stub.base_url + "/api/v3/app/installations/5501/access_tokens"
+        headers = {"Content-Type": "application/json"}
+        request = Request(url, data=json.dumps(body).encode(), headers=headers, method="POST")
         with urlopen(request, context=context, timeout=30) as response:
             return str(json.load(response)["token"])
 
@@ -1131,21 +1180,15 @@ class Lifecycle:
         env["CURIE_CONFIG_DIR"] = str(self.f.work / "curie-config")
         env["GITHUB_PERSONAL_ACCESS_TOKEN"] = self.github_token()
         platform = ["--platform", "linux/" + self.f.arch]
-        self.fx.run(
-            [self.curie, "build", "--plugin-dir", str(bundle), "--registry", self.f.registry]
-            + ["--runner-image", self.images["platform"]["ref"], *platform],
-            env=env,
-            timeout=1800,
-        )
-        self.fx.run(
-            [self.curie, "cluster", "--context", self.args.context, "deploy"]
-            + ["--plugin-dir", str(bundle), "--agent", AGENT, "--env", "prod"]
-            + ["--chart", str(self.f.snapshot / "charts/curie")]
-            + ["--secret", "GITHUB_PERSONAL_ACCESS_TOKEN", "--namespace", self.ns]
-            + ["--release", self.release, "--api-url", api_url],
-            env=env,
-            timeout=600,
-        )
+        build = [self.curie, "build", "--plugin-dir", str(bundle), "--registry", self.f.registry]
+        build += ["--runner-image", self.images["platform"]["ref"], *platform]
+        self.fx.run(build, env=env, timeout=1800)
+        deploy = [self.curie, "cluster", "--context", self.args.context, "deploy"]
+        deploy += ["--plugin-dir", str(bundle), "--agent", AGENT, "--env", "prod"]
+        deploy += ["--chart", str(self.f.snapshot / "charts/curie")]
+        deploy += ["--secret", "GITHUB_PERSONAL_ACCESS_TOKEN", "--namespace", self.ns]
+        deploy += ["--release", self.release, "--api-url", api_url]
+        self.fx.run(deploy, env=env, timeout=600)
 
     def stop_servers(self, errors: list[str]) -> None:
         if self.forward is not None:
