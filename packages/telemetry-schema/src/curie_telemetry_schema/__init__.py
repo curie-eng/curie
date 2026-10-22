@@ -42,6 +42,10 @@ class SpanAttributeKey(StrEnum):
     PHASE_END_KIND = "curie.phase.end_kind"
     TERMINAL_CAUSE = "curie.terminal.cause"
     TERMINAL_STATUS = "curie.terminal.status"
+    # #4940: a classified failure's closed classification, and the output token
+    # ceiling when that classification is budget-exceeded. Never message text.
+    TERMINAL_CLASSIFICATION = "curie.terminal.classification"
+    BUDGET_OUTPUT_CEILING = "curie.budget.output_ceiling"
     GENERATION_TTFT_MS = "curie.generation.ttft_ms"
     GENERATION_ROUND = "curie.generation.round"
     TOOL_CALL_INDEX = "curie.tool.call.index"
