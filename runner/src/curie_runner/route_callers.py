@@ -277,7 +277,9 @@ class _Caller:
         self._launch = launch
         self._lock_check = lock_check
         self._guard = threading.Lock()
-        self._write = threading.Lock()
+        # Lines for the caller's stdin, written by one thread so a caller that
+        # stops reading never blocks the runner's event loop.
+        self._outgoing: queue.Queue[bytes | None] = queue.Queue()
         self._process: subprocess.Popen[bytes] | None = None
         self.failed = False
         self._next_id = 0
@@ -300,6 +302,9 @@ class _Caller:
                 self.failed = True
                 return False
             threading.Thread(target=self._read, name="curie-route-caller", daemon=True).start()
+            threading.Thread(
+                target=self._write_lines, name="curie-route-caller-in", daemon=True
+            ).start()
             atexit.register(_kill_group, self._process)
             return True
 
@@ -347,6 +352,11 @@ class _Caller:
 
     def attach(self, session: _Session) -> None:
         with self._guard:
+            if self.failed:
+                # The caller already exited, so nothing would ever close this
+                # session: close it now.
+                session.deliver(_CLOSED)
+                return
             self._current = session
 
     def detach(self, session: _Session) -> None:
@@ -384,16 +394,19 @@ class _Caller:
         return owner[2] if owner is not None else None
 
     def send(self, message: dict[str, Any]) -> None:
-        process = self._process
-        if process is None or process.stdin is None:
+        if self._process is None or self.failed:
             return
-        line = (json.dumps(message, separators=(",", ":")) + "\n").encode("utf-8")
-        with self._write:
+        self._outgoing.put((json.dumps(message, separators=(",", ":")) + "\n").encode("utf-8"))
+
+    def _write_lines(self) -> None:
+        process = self._process
+        assert process is not None and process.stdin is not None
+        while (line := self._outgoing.get()) is not None:
             try:
                 process.stdin.write(line)
                 process.stdin.flush()
             except OSError:
-                self.failed = True
+                return
 
     def _read(self) -> None:
         process = self._process
@@ -409,8 +422,14 @@ class _Caller:
             if not isinstance(message, dict):
                 continue
             self._route(message)
-        self.failed = True
+        # Reap it and release its pipes; it is never restarted.
+        self._outgoing.put(None)
+        process.wait()
+        for pipe in (process.stdin, process.stdout):
+            if pipe is not None:
+                pipe.close()
         with self._guard:
+            self.failed = True
             sessions = {owner for owner, _original, _hook in self._pending.values()}
             if self._current is not None:
                 sessions.add(self._current)
@@ -423,13 +442,15 @@ class _Caller:
         relay_id = message.get("id")
         with self._guard:
             if "method" not in message and isinstance(relay_id, int):
+                # Kept even when its session is gone, so a later session never
+                # sends a second initialize to a caller that already has one.
+                if relay_id in self._initialize_ids and isinstance(message.get("result"), dict):
+                    self.initialize_result = message["result"]
                 owner = self._pending.pop(relay_id, None)
                 if owner is None:
                     return  # cancelled, or its session is gone
                 session, original, _hook = owner
                 self._by_original.pop((id(session), _key(original)), None)
-                if relay_id in self._initialize_ids and isinstance(message.get("result"), dict):
-                    self.initialize_result = message["result"]
                 target: _Session | None = session
                 message = {**message, "id": original}
             else:
@@ -473,6 +494,12 @@ class CallerRelay:
     def create_initialization_options(self) -> None:
         # The caller answers ``initialize`` itself; nothing is negotiated here.
         return None
+
+    def start(self) -> bool:
+        """Start the caller now. The runner calls this at boot, before it serves
+        any turn, so the caller exists before any turn's Bash does."""
+
+        return self._caller.ensure_started()
 
     @property
     def pid(self) -> int | None:

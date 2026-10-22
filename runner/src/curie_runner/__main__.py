@@ -1089,7 +1089,7 @@ def build_runner(
     # runs under the runner, not the CLI, and gets its route tokens on a pipe.
     declared_callers = route_callers(config.session.plugin_dir, agent=config.connector_agent)
     if declared_callers:
-        mount_route_callers(
+        route_relays = mount_route_callers(
             bundle_servers,
             callers=declared_callers,
             tokens=route_tokens,
@@ -1105,6 +1105,10 @@ def build_runner(
             # directory Bash writes.
             cwd=str(config.session.plugin_dir),
         )
+        # Started now, at boot, before the runner serves any turn, so no turn's
+        # Bash exists yet when a caller starts and reads its routes.
+        for key in sorted(route_relays):
+            bundle_servers[key]["instance"].start()
     # The route tokens are held values too: redact them like the caller token.
     held_secrets = held_secrets | frozenset(route_tokens.values())
 
