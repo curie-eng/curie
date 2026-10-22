@@ -3862,6 +3862,14 @@ class Preflight:
         )
         return body if status == 200 and isinstance(body, dict) else None
 
+    def work_item_usage(self, work_item_id: str) -> dict[str, Any] | None:
+        """`GET /work-items/{id}/usage`: the per-run cost, read before teardown (#4866)."""
+
+        status, body = self.api(
+            "GET", f"/work-items/{work_item_id}/usage", headers={"X-API-Key": self.api_key}
+        )
+        return body if status == 200 and isinstance(body, dict) else None
+
     def execution_request(self, request_id: str) -> dict[str, Any] | None:
         status, body = self.api(
             "GET",
@@ -3898,6 +3906,36 @@ class Preflight:
         env = {
             **os.environ,
             "CURIE_API_KEY": self.api_key,
+            "KUBECONFIG": str(self._kubeconfig),
+            "CURIE_CONFIG_DIR": str(self._curie_config_dir()),
+        }
+        result = subprocess.run(argv, capture_output=True, text=True, env=env, check=False)
+        return result.returncode, result.stdout
+
+    def cli_cluster_status(self) -> tuple[int, str]:
+        """The exit code and stdout of `curie cluster status --json` (#4866).
+
+        Status takes no `--api-url`: it discovers the release's api key from the
+        release secret itself, through the kubeconfig this env names, and
+        reads the credential expiries out of the release's computed values.
+        """
+
+        if self._kubeconfig is None:
+            self._kubeconfig = self._write_kubeconfig()
+        argv = [
+            self.config.curie_bin,
+            "cluster",
+            "--context",
+            self.config.kube_context,
+            "status",
+            "--json",
+            "--namespace",
+            self.namespace,
+            "--release",
+            self.release,
+        ]
+        env = {
+            **os.environ,
             "KUBECONFIG": str(self._kubeconfig),
             "CURIE_CONFIG_DIR": str(self._curie_config_dir()),
         }
@@ -6216,6 +6254,60 @@ def _await_work_item_merged(p: Preflight, work_item_id: str) -> dict[str, Any]:
         time.sleep(POLL_SECONDS)
 
 
+def _parse_cli_json(exit_code: int, stdout: str) -> dict[str, Any] | None:
+    """One `curie ... --json` stdout as an object; None unless it exited 0.
+
+    Pure. Stdout that is not a JSON object reads as no object, the same
+    silence ``parse_work_item_cli`` keeps.
+    """
+
+    if exit_code != 0:
+        return None
+    try:
+        parsed = json.loads(stdout)
+    except ValueError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _record_pre_teardown_reads(
+    p: Preflight, obs: dict[str, Any], work_item_id: str
+) -> None:
+    """Record the reads the evidence must carry while the install is up (#4866).
+
+    The usage route answers through the api port-forward the driver already
+    holds, and the CLI reads the release, so this runs once after the last
+    request ends and before ``main()`` tears the install down in its
+    ``finally`` — after the teardown the same reads would carry nothing. A
+    failed read stays honest: the missing value lands in ``obs`` and a
+    ``cli_failures`` entry the loop judge folds into the verdict.
+    """
+
+    obs["usage"] = p.work_item_usage(work_item_id)
+    status_code, status_stdout = p.cli_cluster_status()
+    status = _parse_cli_json(status_code, status_stdout)
+    if status is None:
+        obs.setdefault("cli_failures", []).append(
+            f"before teardown: cluster status exited {status_code}, expected 0"
+        )
+    obs["cluster_status"] = {"credentials": (status or {}).get("credentials")}
+    items_code, items_stdout = p.cli_work_items_raw(work_item_id)
+    items = _parse_cli_json(items_code, items_stdout)
+    if items is None:
+        obs.setdefault("cli_failures", []).append(
+            f"before teardown: work-items exited {items_code}, expected 0"
+        )
+    item = items.get("item") if isinstance(items, dict) else None
+    tracker = item.get("tracker") if isinstance(item, dict) else None
+    obs["work_items"] = [{"tracker": tracker}] if tracker is not None else []
+    _timeline(
+        obs,
+        "usage and credentials read before teardown",
+        cost_complete=(obs["usage"] or {}).get("cost_complete"),
+        work_items_read=len(obs["work_items"]),
+    )
+
+
 def run_loop(p: Preflight, driver: ForgeDriver) -> dict[str, Any]:
     """Drive one forge through the whole loop and judge it with judge_github_loop."""
 
@@ -6247,6 +6339,7 @@ def run_loop(p: Preflight, driver: ForgeDriver) -> dict[str, Any]:
         _timeline(obs, "request ended without a change", **obs["no_change"])
         obs["tracker"] = driver.tracker_evidence(None, work_item_id)
         _timeline(obs, "tracker evidence", **obs["tracker"])
+        _record_pre_teardown_reads(p, obs, work_item_id)
         return _finish(p, obs, judge_github_loop(obs) + driver.judge_tracker(obs["tracker"]))
     obs["change_number"] = change.number
     obs["change_url"] = change.url
@@ -6327,6 +6420,7 @@ def run_loop(p: Preflight, driver: ForgeDriver) -> dict[str, Any]:
     obs["tracker"] = driver.tracker_evidence(change, work_item_id)
     _timeline(obs, "tracker evidence", **obs["tracker"])
     p.cli_not_found_check(obs)
+    _record_pre_teardown_reads(p, obs, work_item_id)
     return _finish(p, obs, judge_github_loop(obs) + driver.judge_tracker(obs["tracker"]))
 
 

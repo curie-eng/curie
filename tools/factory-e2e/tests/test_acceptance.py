@@ -169,6 +169,23 @@ def test_dry_run_of_a_not_installed_pairing_lists_its_steps_and_says_so(key: str
         assert " ".join(step.command) in text
 
 
+@pytest.mark.parametrize("key", sorted(EXPECTED_PAIRINGS))
+def test_dry_run_lists_the_pre_teardown_assertions_of_every_pairing(key: str) -> None:
+    """#4866: every entry's listing carries the usage cost assertion and the
+    credential expiry assertion, installed or not, each with its own exit
+    status (the not-installed entry still lists its steps)."""
+
+    out = io.StringIO()
+    expected = fe.EXIT_SCENARIO if key in NOT_INSTALLED else 0
+    assert acceptance.dry_run(key, out) == expected
+    text = out.getvalue()
+    assert "scenario.usage.cost_complete == true" in text
+    assert (
+        "scenario.cluster_status.credentials == "
+        f"{json.dumps(acceptance.CREDENTIALS_EXPIRY_VALID)}"
+    ) in text
+
+
 def test_dry_run_fails_on_an_unset_step_field(monkeypatch: pytest.MonkeyPatch) -> None:
     broken = _with_step("github+github", deadline_seconds=None)
     monkeypatch.setitem(acceptance.PAIRINGS, "github+github", broken)
@@ -249,6 +266,22 @@ def _passing_evidence() -> dict[str, Any]:
     for step in acceptance.PAIRINGS["github+github"].steps:
         for field, expected in step.persisted_assertions:
             _set_path(evidence, field, expected)
+    # The credentials assertion (#4866) describes its predicate, so the
+    # derived value above is its text; the passing record carries real rows.
+    _set_path(
+        evidence,
+        "scenario.cluster_status.credentials",
+        [
+            {
+                "section": "code_host",
+                "name": "actor",
+                "type": "pat",
+                "authentication": "accepted",
+                "expiry": "known",
+                "expires_at": None,
+            }
+        ],
+    )
     evidence.update({"result": "passed", "teardown_clean": True, "namespace": NAMESPACE})
     return evidence
 
@@ -403,6 +436,55 @@ def test_real_run_fails_on_each_shortfall(
     assert summary["result"] == "failed", label
 
 
+# --- the credential expiry predicate (#4866) ------------------------------------------
+
+
+@pytest.mark.parametrize("expiry", acceptance.CREDENTIALS_EXPIRY_LABELS)
+def test_the_credentials_assertion_accepts_each_classified_expiry(expiry: str) -> None:
+    rows = [{"section": "code_host", "name": "actor", "type": "pat", "expiry": expiry}]
+    assert (
+        acceptance._credential_expiry_failures("scenario.cluster_status.credentials", rows) == []
+    )
+
+
+def test_the_credentials_assertion_accepts_a_release_with_no_credential() -> None:
+    assert acceptance._credential_expiry_failures("scenario.cluster_status.credentials", []) == []
+
+
+@pytest.mark.parametrize(
+    ("rows", "match"),
+    [
+        ([{"expiry": "soon"}], "expiry one of"),
+        (["actor token"], "expiry one of"),
+        ({}, "credential rows"),
+    ],
+    ids=["unclassified-expiry", "row-not-an-object", "not-a-list"],
+)
+def test_the_credentials_assertion_rejects_each_shortfall(rows: Any, match: str) -> None:
+    failures = acceptance._credential_expiry_failures("scenario.cluster_status.credentials", rows)
+    assert len(failures) == 1
+    assert "scenario.cluster_status.credentials" in failures[0]
+    assert match in failures[0]
+
+
+def test_the_credentials_assertion_rejects_a_missing_path() -> None:
+    failures = acceptance._credential_expiry_failures(
+        "scenario.cluster_status.credentials", acceptance._MISSING
+    )
+    assert len(failures) == 1
+    assert "is missing" in failures[0]
+
+
+def test_a_real_run_fails_on_an_unclassified_credential_expiry(tmp_path: Path) -> None:
+    evidence = _passing_evidence()
+    _set_path(evidence, "scenario.cluster_status.credentials", [{"expiry": "soon"}])
+    args = _args(tmp_path)
+    assert acceptance.run(args, runner=_Runner(evidence), kubectl=_Kubectl()) != 0
+    summary = json.loads((tmp_path / "summary.json").read_text())
+    failures = summary["steps"][0]["failures"]
+    assert any("scenario.cluster_status.credentials" in f for f in failures), failures
+
+
 @pytest.mark.parametrize(
     "stderr",
     [
@@ -514,6 +596,38 @@ def _github_loop_evidence() -> dict[str, Any]:
             "work_item_pr_status": "merged",
             "cli_pr_status": "merged",
             "change_numbers": [42],
+            # The reads run_loop records before teardown (#4866).
+            "usage": {
+                "work_item_id": "6f1c3a52-0000-4000-8000-000000000001",
+                "total_tokens": 1000,
+                "estimated_cost_usd": 0.42,
+                "cost_complete": True,
+                "requests_without_usage": 0,
+            },
+            "cluster_status": {
+                "credentials": [
+                    {
+                        "section": "code_host",
+                        "name": "actor",
+                        "type": "pat",
+                        "authentication": "accepted",
+                        "expiry": "known",
+                        "expires_at": "2026-10-23T00:00:00Z",
+                    }
+                ]
+            },
+            "work_items": [
+                {
+                    "tracker": {
+                        "kind": "github",
+                        "host": "https://github.com",
+                        "scope_id": "acme/fixture",
+                        "issue_id": "41",
+                        "display_key": "acme/fixture#41",
+                        "url": "https://github.com/acme/fixture/issues/41",
+                    }
+                }
+            ],
             "verdict": "passed",
             "failures": [],
         },
@@ -547,7 +661,10 @@ def test_independently_built_github_loop_evidence_satisfies_the_persisted_assert
         for field, expected in step.persisted_assertions:
             got = acceptance._get_path(evidence, field)
             assert got is not acceptance._MISSING, f"{field} is not in the harness evidence"
-            assert got == expected, (field, got, expected)
+            if expected == acceptance.CREDENTIALS_EXPIRY_VALID:
+                assert acceptance._credential_expiry_failures(field, got) == [], (field, got)
+            else:
+                assert got == expected, (field, got, expected)
 
 
 def test_real_run_passes_on_independently_built_evidence(tmp_path: Path) -> None:
@@ -798,7 +915,10 @@ def test_jira_entry_passes_on_a_complete_evidence_record(tmp_path: Path) -> None
     for field, expected in _persisted_map(JIRA).items():
         got = acceptance._get_path(evidence, field)
         assert got is not acceptance._MISSING, f"{field} is not in the harness evidence"
-        assert got == expected, (field, got, expected)
+        if expected == acceptance.CREDENTIALS_EXPIRY_VALID:
+            assert acceptance._credential_expiry_failures(field, got) == [], (field, got)
+        else:
+            assert got == expected, (field, got, expected)
     args = _args(tmp_path, JIRA)
     assert acceptance.run(args, runner=_Runner(evidence), kubectl=_Kubectl()) == 0
     summary = json.loads((tmp_path / "summary.json").read_text())
