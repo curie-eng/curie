@@ -203,12 +203,37 @@ source_modules = [
 forbidden_modules = [
     "curie_worker.commissioning_cleanup",
     "curie_worker.commissioning_launch",
+    "curie_worker.commissioning_probe_registry",
+    "curie_worker.commissioning_probe_runtime",
     "curie_worker.commissioning_registry",
     "curie_worker.commissioning_supervisor",
 ]
 ignore_imports = [
     "curie_worker.protected_launch_mechanics -> curie_worker.commissioning_launch",
     "curie_worker.protected_launch_mechanics -> curie_worker.commissioning_registry",
+]
+
+# @spec PROTECTED-COMMISSIONING-8: before a permit exists, the primitive probes
+# follow the campaign ownership rules in a registry of their own that grants no
+# campaign or production authority. They reuse the campaign registry's
+# termination and never-started facts, but reach no launch authorizer, launch
+# server or client, supervisor, provider gateway or API.
+[[tool.importlinter.contracts]]
+name = "Primitive probes hold no campaign or production launch authority"
+type = "forbidden"
+source_modules = [
+    "curie_worker.commissioning_probe_registry",
+    "curie_worker.commissioning_probe_runtime",
+]
+forbidden_modules = [
+    "curie_api",
+    "curie_worker.commissioning_launch",
+    "curie_worker.commissioning_provider_gateway",
+    "curie_worker.commissioning_supervisor",
+    "curie_worker.protected_entry",
+    "curie_worker.protected_launch_client",
+    "curie_worker.protected_launch_mechanics",
+    "curie_worker.protected_launch_server",
 ]
 
 # @spec PROTECTED-COMMISSIONING-8: the provider gateway is a permanent
