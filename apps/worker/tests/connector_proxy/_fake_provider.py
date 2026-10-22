@@ -9,6 +9,14 @@ method, path, Host, every Authorization header value and the client's peer
 port, and per path it can answer normally, fail, redirect, issue a token, or
 block inside the handler until the test releases it.
 
+Credential attribution: for every request it also records
+``authorization_sha256``, the hex SHA-256 of the exact Authorization value it
+received (UTF-8), or None when the request carried no Authorization header or
+more than one. An ordinary answer echoes that digest in its JSON body
+(``{"ok": true, "path": ..., "authorization_sha256": <hex or null>}``), so a
+corpus runner can check which credential each call actually sent without the
+credential itself ever appearing in a response.
+
 Nothing here imports the resolver, so ``conftest.py`` can load it while the
 production package does not exist yet.
 """
@@ -17,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import hashlib
 import ipaddress
 import json
 import secrets
@@ -50,6 +59,13 @@ class ProviderRequest:
     authorization: tuple[str, ...]
     peer_port: int
     body: bytes
+    authorization_sha256: str | None
+
+
+def authorization_digest(value: str) -> str:
+    """The hex SHA-256 of one Authorization header value, as the provider echoes it."""
+
+    return hashlib.sha256(value.encode("utf-8", "surrogateescape")).hexdigest()
 
 
 @dataclass
@@ -199,13 +215,16 @@ class FakeProvider:
     async def _handle(self, request: web.Request) -> web.Response:
         body = await request.read()
         peer = request.transport.get_extra_info("peername") if request.transport else None
+        authorization = tuple(request.headers.getall("Authorization", []))
+        digest = authorization_digest(authorization[0]) if len(authorization) == 1 else None
         record = ProviderRequest(
             method=request.method,
             path=request.path,
             host=request.headers.get("Host", ""),
-            authorization=tuple(request.headers.getall("Authorization", [])),
+            authorization=authorization,
             peer_port=int(peer[1]) if peer else -1,
             body=body,
+            authorization_sha256=digest,
         )
         with self._lock:
             self._requests.append(record)
@@ -239,7 +258,7 @@ class FakeProvider:
                 ).encode(),
                 content_type="application/json",
             )
-        return web.json_response({"ok": True, "path": request.path})
+        return web.json_response({"ok": True, "path": request.path, "authorization_sha256": digest})
 
     # --- controls ------------------------------------------------------------
 

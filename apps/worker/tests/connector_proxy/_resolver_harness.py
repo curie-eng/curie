@@ -394,6 +394,7 @@ class ResolverHarness:
         app: SharedApp,
         sources: SourceRegistry | None,
         handles: HandleRegistry | None,
+        start_options: Mapping[str, Any] | None = None,
     ) -> None:
         self.env = dict(env)
         self.directory = directory
@@ -406,7 +407,9 @@ class ResolverHarness:
         self._thread.start()
         try:
             self.runtime: ResolverRuntime = self._wait(
-                start_resolver(self.config, sources=sources, handles=handles)
+                start_resolver(
+                    self.config, sources=sources, handles=handles, **dict(start_options or {})
+                )
             )
         except BaseException:
             self._stop()
@@ -612,14 +615,22 @@ class Fleet:
         sources: SourceRegistry | None = None,
         handles: HandleRegistry | None = None,
         env: tuple[dict[str, str], Path] | None = None,
+        start_options: Mapping[str, Any] | None = None,
         **env_options: Any,
     ) -> ResolverHarness:
+        """Start a resolver; ``start_options`` are extra ``start_resolver`` keywords."""
+
         environment, directory = env if env is not None else self.env(app, **env_options)
         registry = handles or HandleRegistry(
             installation=app.installation, application=app.application_id
         )
         harness = ResolverHarness(
-            environment, directory=directory, app=app, sources=sources, handles=registry
+            environment,
+            directory=directory,
+            app=app,
+            sources=sources,
+            handles=registry,
+            start_options=start_options,
         )
         self._harnesses.append(harness)
         return harness

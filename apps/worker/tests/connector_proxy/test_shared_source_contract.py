@@ -41,10 +41,12 @@ Readings of the plan these tests settle (see also ``_resolver_harness``):
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import dataclasses
 import gzip
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -55,6 +57,7 @@ import time
 import uuid
 from typing import Any
 
+import asyncpg  # type: ignore[import-untyped]
 import pytest
 from _fake_provider import TOKEN_PATH, FakeProvider
 from _migration_support import sql_dicts
@@ -79,6 +82,7 @@ from _resolver_harness import (
     log_text,
     opened_fields,
     owner_dsn,
+    parse_raw,
     request_head,
     resolve_body,
     settle,
@@ -105,6 +109,7 @@ from _shared_connector_support import (
     secret_sentinel,
 )
 from curie_connector_proxy.resolver import handles as handles_module
+from curie_connector_proxy.resolver.admission import Admitted, admit
 from curie_connector_proxy.resolver.config import ResolverConfig
 from curie_connector_proxy.resolver.handles import (
     HANDLE_PREFIX,
@@ -115,6 +120,7 @@ from curie_connector_proxy.resolver.handles import (
     Principal,
     RegistryRefusal,
 )
+from curie_connector_proxy.resolver.refresh import RefreshCoordinator
 from curie_connector_proxy.resolver.sources import (
     ConnectorIdentitySource,
     SourceRefusal,
@@ -122,7 +128,11 @@ from curie_connector_proxy.resolver.sources import (
     StaticSource,
     default_registry,
 )
-from curie_connector_proxy.resolver.wire import MAX_REQUEST_BYTES, REFUSAL_STATUS
+from curie_connector_proxy.resolver.wire import (
+    MAX_REQUEST_BYTES,
+    REFUSAL_STATUS,
+    ResolveRefusal,
+)
 
 HANDLE_SHAPE = re.compile(r"^crh1\.[A-Za-z0-9_-]{43}$")
 # The request the wire tests pad and reshape; built per test from a live handle.
@@ -531,6 +541,96 @@ def test_wire_socket_lives_alone_in_its_own_directory(fleet: Fleet) -> None:
     assert not os.path.exists(socket_path)
 
 
+CONNECTION_CAP = 4
+BUSY_REFUSAL_S = 2.0
+
+
+def _busy_attempt(path: str, head: bytes, body: bytes) -> tuple[bytes, float]:
+    """Connect past the cap, send a whole request, read to EOF; answer the bytes and latency."""
+
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(BUSY_REFUSAL_S + 1.0)
+    started = time.monotonic()
+    chunks: list[bytes] = []
+    try:
+        sock.connect(path)
+        try:
+            sock.sendall(head + body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        while True:
+            try:
+                chunk = sock.recv(65536)
+            except ConnectionResetError:
+                break
+            except TimeoutError:
+                pytest.fail("a connection past the cap was neither refused nor closed")
+            if not chunk:
+                break
+            chunks.append(chunk)
+    finally:
+        sock.close()
+    return b"".join(chunks), time.monotonic() - started
+
+
+def test_wire_connection_cap_refuses_extra_connections_immediately(fleet: Fleet) -> None:
+    """Idle connections cannot exhaust the resolver (security review S5).
+
+    With ``max_connections=4`` and four connections that send nothing, a
+    fifth is refused at once: closed with no response, or a fixed 503
+    ``{"refusal": "busy"}``. Nothing it sent is admitted, and once the idle
+    connections close, an ordinary resolve is served again.
+    """
+
+    app = fleet.application()
+    member = app.add_member()
+    harness = fleet.launch(app, start_options={"max_connections": CONNECTION_CAP})
+    handle = harness.handle(member)
+    assert harness.resolve(handle).status == 200
+    body = resolve_body(handle, SLOT)
+    before = _counts(harness)
+
+    idle: list[socket.socket] = []
+    try:
+        for _ in range(CONNECTION_CAP):
+            held = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            held.settimeout(STATEMENT_WAIT_S)
+            held.connect(harness.socket_path)
+            idle.append(held)
+        # Let the server accept all four before the fifth arrives.
+        time.sleep(0.5)
+
+        data, elapsed = _busy_attempt(harness.socket_path, request_head(len(body)), body)
+        assert elapsed < BUSY_REFUSAL_S, elapsed
+        assert handle.encode() not in data
+        if data:
+            reply = parse_raw(data)
+            reply.refused(503, "busy")
+            assert REFUSAL_STATUS.get("busy") == 503
+        assert _counts(harness) == before, "a connection past the cap was admitted"
+    finally:
+        for held in idle:
+            held.close()
+
+    # Liveness: with the idle connections gone, the resolver serves again.
+    deadline = time.monotonic() + FAST_REPLY_S
+    while True:
+        try:
+            reply = harness.resolve(handle)
+        except (http.client.RemoteDisconnected, ConnectionResetError, BrokenPipeError):
+            assert time.monotonic() < deadline, "the cap never released"
+            time.sleep(0.1)
+            continue
+        if reply.status == 503 and reply.json == {"refusal": "busy"}:
+            assert time.monotonic() < deadline, "the cap never released"
+            time.sleep(0.1)
+            continue
+        break
+    assert reply.status == 200, reply.text
+    assert reply.json["binding"] == member.binding_id
+    assert _counts(harness) == (before[0] + 1, before[1] + 1)
+
+
 # =============================================================================
 # AC2: the invocation registry
 # =============================================================================
@@ -850,6 +950,18 @@ WIDENINGS = {
         "REVOKE {plain} FROM {role}",
         "role_inherits_membership",
     ),
+    # Any privilege outside the six shared tables and four functions is foreign
+    # authority, whether a table grant or schema CREATE (security review S3).
+    "select-on-agents": (
+        "GRANT SELECT ON curie.agents TO {role}",
+        "REVOKE SELECT ON curie.agents FROM {role}",
+        "role_foreign_authority",
+    ),
+    "create-on-schema": (
+        "GRANT CREATE ON SCHEMA curie TO {role}",
+        "REVOKE CREATE ON SCHEMA curie FROM {role}",
+        "role_foreign_authority",
+    ),
 }
 
 
@@ -1045,6 +1157,82 @@ def test_admission_share_lock_holds_off_a_membership_change(
     assert changed.json()["policy_generation"] > generation
     harness.resolve(old).refused(403, "policy_generation_mismatch")
     assert harness.resolve(harness.handle(member)).status == 200
+
+
+REVOCATIONS_WHILE_PARKED = {
+    "removed": (401, "handle_unknown"),
+    "session-closed": (401, "handle_unknown"),
+    "clock-expired": (401, "handle_expired"),
+    "left-alone": None,
+}
+
+
+@pytest.mark.parametrize("revocation", list(REVOCATIONS_WHILE_PARKED))
+def test_admission_revalidates_the_invocation_after_waiting_on_a_lock(
+    fleet: Fleet, sessions: SessionPool, revocation: str
+) -> None:
+    """A handle revoked while its resolve waits on a lock never releases (review F1).
+
+    The registry check before the database wait proves nothing about the
+    moment of release: the resolve must re-check the handle after every
+    blocking step and refuse with the registry's own code.
+    """
+
+    sentinel = secret_sentinel("PARKED")
+    now = [time.time()]
+    app = fleet.application()
+    member = app.add_member(fields={STATIC_FIELD: sentinel})
+    registry = HandleRegistry(
+        installation=app.installation, application=app.application_id, clock=lambda: now[0]
+    )
+    harness = fleet.launch(app, handles=registry)
+    principal = harness.principal(member)
+    registry.open_session("parked-session", principal)
+    expires_at = int(now[0]) + 600
+    invocation = harness.register(
+        member,
+        expires_at=expires_at,
+        session_id="parked-session" if revocation == "session-closed" else None,
+    )
+    handle = invocation.handle
+    assert harness.resolve(handle).status == 200
+
+    owner = sessions.owner()
+    owner.execute("BEGIN")
+    owner_pid = int(owner.fetchval("SELECT pg_backend_pid()"))
+    owner.fetch(f"SELECT id FROM {SHARED_BINDINGS} WHERE id = $1 FOR UPDATE", member.binding_uuid)
+    before = _counts(harness)
+    pending = in_background(lambda: harness.resolve(handle))
+    parked = wait_for_parked_resolver(app.role_name)
+    assert owner_pid in blocking_pids(parked)
+    assert not pending.done(), "the resolve finished while the binding lock was held"
+
+    if revocation == "removed":
+        assert registry.remove(handle) is True
+    elif revocation == "session-closed":
+        registry.close_session("parked-session")
+    elif revocation == "clock-expired":
+        now[0] = expires_at + 1
+    owner.execute("COMMIT")
+    reply = pending.result(timeout=STATEMENT_WAIT_S)
+
+    expected = REVOCATIONS_WHILE_PARKED[revocation]
+    if expected is None:
+        # Liveness: the same parked resolve, its handle untouched, is released.
+        assert reply.status == 200, reply.text
+        assert reply.json["credential"]["fields"][STATIC_FIELD] == {"text": sentinel}
+        assert harness.releases == before[1] + 1
+        return
+    reply.refused(*expected)
+    _no_secret(reply.text, sentinel, handle)
+    assert harness.releases == before[1], "a revoked handle released a credential"
+    assert harness.admissions >= before[0]
+
+    # Liveness: a fresh handle for the same member still releases.
+    now[0] = time.time()
+    fresh = harness.resolve(harness.handle(member, expires_at=int(now[0]) + 600))
+    assert fresh.status == 200, fresh.text
+    assert harness.releases == before[1] + 1
 
 
 def test_admission_key_unavailable_refuses_without_plaintext(
@@ -1357,6 +1545,111 @@ def test_seam_reimport_during_a_refresh_makes_it_stale_and_discards_the_token(
     follow = harness.resolve(harness.handle(member))
     assert _released_access(follow) == access
     assert issued not in follow.text
+
+
+async def _admitted_now(dsn: str, context: InvocationContext, slot: str) -> Admitted:
+    """An ``Admitted`` snapshot taken now, in our own transaction on the application role."""
+
+    connection = await asyncpg.connect(dsn, timeout=STATEMENT_WAIT_S)
+    try:
+        async with connection.transaction():
+            admitted: Admitted = await admit(connection, context, slot)
+            return admitted
+    finally:
+        await connection.close()
+
+
+async def _delayed_contender(
+    dsn: str, source: ProviderRefreshSource, admitted: Admitted, harness: ResolverHarness
+) -> str | None:
+    """The public coordinator, run with a stale ``Admitted``; answer the refusal code or None."""
+
+    pool = await asyncpg.create_pool(dsn=dsn, min_size=1, max_size=2)
+    try:
+        coordinator = RefreshCoordinator(owner=f"delayed-contender-{secrets.token_hex(4)}")
+        await coordinator.run(pool, source, admitted, SLOT, harness.config.keys)
+    except ResolveRefusal as refusal:
+        return refusal.code
+    finally:
+        await pool.close()
+    return None
+
+
+def _no_recovery(member: Member) -> None:
+    intent = intent_row(member.binding_id)
+    assert intent["state"] == "ready", intent
+    assert intent["recovery_reason"] is None, intent
+
+
+@pytest.mark.parametrize("moved_on_by", ["completed-refresh", "fresh-reimport"])
+def test_seam_a_delayed_contender_does_not_refresh_replaced_material(
+    fleet: Fleet, provider: FakeProvider, moved_on_by: str
+) -> None:
+    """A refresh begun on a revision that moved on re-reads the material first (review F2).
+
+    The ``Admitted`` is captured while the material is expired. Before the
+    contender begins, another resolve completes the refresh, or an operator
+    reimports fresh material. The begun row then carries material that no
+    longer needs a refresh, so the provider (whose refresh token may rotate)
+    must not be called, and the intent goes back to ``ready``.
+    """
+
+    app, member, harness, source, _ = _refreshing(fleet, provider, expires_in=-60)
+    stale = asyncio.run(_admitted_now(app.dsn, harness.context(member), SLOT))
+    assert stale.credential_revision == 1 and stale.refresh is not None
+
+    if moved_on_by == "completed-refresh":
+        current = _released_access(harness.resolve(harness.handle(member)))
+        assert provider.issued == [current]
+    else:
+        current = f"access-{secrets.token_hex(8)}"
+        material = refresh_material(
+            SLOT, current, expires_at=int(time.time()) + 3600, refresh=secret_sentinel("FRESH")
+        )
+        assert member.reimport(material, resource_version="101").status_code == 200
+    calls, refreshes = len(provider.calls(TOKEN_PATH)), source.refresh_calls
+    assert binding_row(member.binding_id)["credential_revision"] == 2
+
+    outcome = asyncio.run(_delayed_contender(app.dsn, source, stale, harness))
+    assert len(provider.calls(TOKEN_PATH)) == calls, f"the provider was called ({outcome})"
+    assert source.refresh_calls == refreshes
+    _no_recovery(member)
+    stored = binding_row(member.binding_id)
+    assert opened_fields(app.recipient, stored["ciphertext"])[ACCESS]["text"] == current
+
+    follow = harness.resolve(harness.handle(member))
+    assert _released_access(follow) == current
+    assert len(provider.calls(TOKEN_PATH)) == calls
+    _no_recovery(member)
+
+
+def test_seam_a_delayed_contender_still_refreshes_reimported_expired_material(
+    fleet: Fleet, provider: FakeProvider
+) -> None:
+    """Liveness for the case above: begun material that still needs a refresh gets one."""
+
+    app, member, harness, source, _ = _refreshing(fleet, provider, expires_in=-60)
+    stale = asyncio.run(_admitted_now(app.dsn, harness.context(member), SLOT))
+    expired = refresh_material(
+        SLOT,
+        f"access-{secrets.token_hex(8)}",
+        expires_at=int(time.time()) - 60,
+        refresh=secret_sentinel("STILL-EXPIRED"),
+    )
+    assert member.reimport(expired, resource_version="101").status_code == 200
+    assert provider.calls(TOKEN_PATH) == []
+
+    outcome = asyncio.run(_delayed_contender(app.dsn, source, stale, harness))
+    assert outcome is None, outcome
+    assert len(provider.calls(TOKEN_PATH)) == 1 and source.refresh_calls == 1
+    (issued,) = provider.issued
+    _no_recovery(member)
+    stored = binding_row(member.binding_id)
+    assert stored["credential_revision"] > 2
+    assert opened_fields(app.recipient, stored["ciphertext"])[ACCESS] == {"text": issued}
+
+    assert _released_access(harness.resolve(harness.handle(member))) == issued
+    assert len(provider.calls(TOKEN_PATH)) == 1
 
 
 def test_seam_recovery_refuses_fresh_material_before_any_source_runs(
