@@ -860,3 +860,47 @@ fn the_mirror_carries_readiness_path_and_resources_as_written() {
         "an unknown resources key must be refused"
     );
 }
+
+#[test]
+fn the_mirror_carries_routes_as_written() {
+    // ADR 0240 decision 1. The CLI carries `routes:` through as written;
+    // `plugin_format` owns the path, method, size and caller rules. The route
+    // block is strict, and its field names are frozen beside the rest.
+    let file = connector_build::parse_connectors(
+        "connectors:\n  reviewer:\n    image: ghcr.io/example/reviewer:1\n    routes:\n      \
+         - path: /v1/review\n        max_body_bytes: 67108864\n        \
+         callers: [review-tools]\n      - path: /v1/upload\n        methods: [PUT]\n        \
+         max_body_bytes: 1048576\n        callers: [upload-tools]\n",
+    )
+    .expect("routes are accepted");
+    let spec = serde_json::to_value(&file.connectors["reviewer"]).expect("serialize the mirror");
+    assert_eq!(spec["routes"][0]["path"], "/v1/review");
+    assert_eq!(spec["routes"][0]["methods"], serde_json::json!(["POST"]));
+    assert_eq!(spec["routes"][0]["max_body_bytes"], 67_108_864);
+    assert_eq!(spec["routes"][0]["callers"], serde_json::json!(["review-tools"]));
+    assert_eq!(spec["routes"][1]["methods"], serde_json::json!(["PUT"]));
+
+    let fields = vector_file("connector-fields.json");
+    let expect: BTreeSet<String> = fields["models"]["ConnectorRoute"]
+        .as_array()
+        .expect("ConnectorRoute is listed in the vector")
+        .iter()
+        .map(|v| v.as_str().expect("a field name").to_string())
+        .collect();
+    let keys: BTreeSet<String> = spec["routes"][0]
+        .as_object()
+        .expect("an object")
+        .keys()
+        .cloned()
+        .collect();
+    assert_eq!(keys, expect);
+
+    assert!(
+        connector_build::parse_connectors(
+            "connectors:\n  reviewer:\n    image: x:1\n    routes:\n      - path: /v1/review\n        \
+             max_body_bytes: 1\n        callers: [a]\n        stream: true\n"
+        )
+        .is_err(),
+        "an unknown route key must be refused"
+    );
+}

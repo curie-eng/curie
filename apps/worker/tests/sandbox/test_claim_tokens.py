@@ -24,6 +24,7 @@ from curie_worker.sandbox.claim_tokens import (
     CLAIM_LABEL,
     CLAIM_TOKEN_ENVS,
     DOCKER_CERT_DIR,
+    WORKER_TOKEN_ENVS,
     claim_object_names,
     claim_template_spec,
     split_claim_tokens,
@@ -129,8 +130,10 @@ def test_claim_token_envs_cover_every_boot_env_token() -> None:
         "connector_caller_token",
     ):
         assert BootEnv.env_key(field) in CLAIM_TOKEN_ENVS
-    # Every entry is a real boot-env key: a typo would strip nothing.
-    assert set(CLAIM_TOKEN_ENVS) <= set(BootEnv.env_keys())
+    # Every entry is a real boot-env key or a token the worker writes beside
+    # the render: a typo would strip nothing.
+    assert set(CLAIM_TOKEN_ENVS) - set(WORKER_TOKEN_ENVS) <= set(BootEnv.env_keys())
+    assert set(WORKER_TOKEN_ENVS).isdisjoint(BootEnv.env_keys())
     assert len(set(CLAIM_TOKEN_ENVS)) == len(CLAIM_TOKEN_ENVS)
 
 
@@ -559,3 +562,14 @@ def test_tool_daemon_mount_on_a_runner_with_no_mounts_or_volumes() -> None:
     assert cert_mount["mountPath"] == DOCKER_CERT_DIR and cert_mount["readOnly"] is True
     (volume,) = spec["podTemplate"]["spec"]["volumes"]
     assert volume["name"] == cert_mount["name"]
+
+
+# @spec ADR-0240 d2
+def test_route_tokens_leave_the_claim_for_the_per_claim_secret() -> None:
+    from curie_worker.binding import CONNECTOR_ROUTE_TOKENS_ENV
+
+    assert CONNECTOR_ROUTE_TOKENS_ENV in WORKER_TOKEN_ENVS
+    value = '{"reviewer":"ccr.payload.signature"}'
+    tokens, rest = split_claim_tokens({CONNECTOR_ROUTE_TOKENS_ENV: value, "CURIE_MODEL": "m"})
+    assert tokens == {CONNECTOR_ROUTE_TOKENS_ENV: value}
+    assert rest == {"CURIE_MODEL": "m"}
