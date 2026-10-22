@@ -1008,3 +1008,22 @@ def test_every_configmap_read_is_one_the_provider_entry_declares() -> None:
     reader = Reader(state)
     asyncio.run(observe_identity(reader, renamed, PLACEMENTS))
     assert set(reader.paths) <= renamed.paths()
+
+
+def test_the_client_reads_bootstrap_roles_whose_names_carry_colons() -> None:
+    client = ManagedIdentityAPI.__new__(ManagedIdentityAPI)
+
+    async def fake_json(method: str, path: str, value: Any = None) -> dict[str, Any]:
+        return {"path": path}
+
+    client._json = fake_json  # type: ignore[method-assign]
+    assert asyncio.run(client.read_role("ClusterRole", "", "system:basic-user")) == {
+        "path": "/apis/rbac.authorization.k8s.io/v1/clusterroles/system:basic-user"
+    }
+    assert asyncio.run(client.read_role("Role", "kube-system", "kubeadm:kubelet-config")) == {
+        "path": "/apis/rbac.authorization.k8s.io/v1/namespaces/kube-system/roles/"
+        + "kubeadm:kubelet-config"
+    }
+    for name in ("../secrets", "a/b", "a?b", ""):
+        with pytest.raises(ProbeKitRefused):
+            asyncio.run(client.read_role("ClusterRole", "", name))

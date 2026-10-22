@@ -77,6 +77,7 @@ _KUBE_PROXY_CHECKED = [
 DIGEST_IMAGE = re.compile(r".+@sha256:[0-9a-f]{64}")
 _IMAGE_DIGEST = re.compile(r"@(sha256:[0-9a-f]{64})$")
 _NAME = re.compile(r"[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?")
+_ROLE = re.compile(r"[A-Za-z0-9][A-Za-z0-9:._-]{0,252}")
 _SELECTOR = re.compile(r"[A-Za-z0-9./_-]+=[A-Za-z0-9._-]+(?:,[A-Za-z0-9./_-]+=[A-Za-z0-9._-]+)*")
 _MODE = re.compile(r'^\s*mode:\s*"?([A-Za-z]*)"?\s*$', re.MULTILINE)
 _TEMPLATE_HASH = "pod-template-hash"
@@ -815,7 +816,8 @@ class ManagedIdentityAPI(MeasuringIdentityAPI):
         return await self.access_review(user, groups, ResourceAttributes(**attributes))
 
     async def read_role(self, kind: str, namespace: str, name: str) -> dict[str, Any] | None:
-        require(_NAME.fullmatch(name) is not None)
+        # RBAC names are path segments; Kubernetes' bootstrap roles carry ``:``.
+        require(_ROLE.fullmatch(name) is not None)
         base = "/apis/rbac.authorization.k8s.io/v1/"
         if kind == "ClusterRole":
             require(namespace == "")
