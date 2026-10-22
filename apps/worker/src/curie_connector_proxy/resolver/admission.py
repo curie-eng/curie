@@ -17,8 +17,16 @@ binding):
 3. The agent's binding ``FOR SHARE``, without an ``enabled`` filter, so a
    binding disabled while this resolve waited on its lock is re-read and
    refused as disabled rather than skipped as missing.
-4. The refresh intent, unlocked: the refresh coordinator fences it with its
-   own CAS functions, never inside this transaction.
+4. The refresh intent, unlocked. That is safe because both transitions into
+   ``recovery_required`` (``shared_connector_refresh_mark_recovery`` and a
+   ``shared_connector_refresh_begin`` on a lapsed lease) lock the binding
+   ``FOR NO KEY UPDATE``, which conflicts with this transaction's binding
+   ``FOR SHARE``. A recovery therefore waits for an admission already holding
+   the binding to commit; and when a recovery committed first, this
+   transaction waited for it on the binding lock, and the intent read, a new
+   statement under READ COMMITTED after that lock was granted, sees it. The
+   coordinator's own CAS functions fence a refresh, never inside this
+   transaction.
 
 Nothing here writes. A refusal is a ``ResolveRefusal`` the caller turns into a
 rollback.
@@ -102,7 +110,9 @@ class Admitted:
     recipient_id: str | None
     ciphertext: bytes | None = field(repr=False)
     source_stale: bool
-    # Read without a lock; the coordinator's CAS is what fences a refresh.
+    # Read without a lock, after the binding FOR SHARE was granted. Every move
+    # into recovery_required locks that binding FOR NO KEY UPDATE, so it either
+    # waits for this transaction or committed before this read, which sees it.
     refresh: RefreshIntent | None
 
 

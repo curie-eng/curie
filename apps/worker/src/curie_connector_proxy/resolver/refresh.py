@@ -11,7 +11,10 @@ fresh (``release``) and performs the external exchange (``refresh``). It never
 touches the database. ``RefreshCoordinator`` owns the protocol over cp1's
 SECURITY DEFINER CAS functions, each step in its own short transaction on the
 application role and never inside the admission transaction, so no row lock is
-held across the provider call and an operator reimport never waits on it:
+held across the provider call and an operator reimport never waits on it.
+Begin and mark recovery (as migration 0124 replaced them) lock the binding
+``FOR NO KEY UPDATE``, so each waits for any admission transaction holding it;
+that is why the coordinator must never run inside one:
 
 1. ``shared_connector_refresh_begin`` takes the intent (``busy``,
    ``recovery_required``, ``disabled`` and ``not_found`` refuse) and answers the

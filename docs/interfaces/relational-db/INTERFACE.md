@@ -285,7 +285,14 @@ The resolver cannot read the source Secret, so the API check persists a version
 mismatch in this column and only an explicit reimport clears it; the API is the
 only writer. The application role reads it with its existing table SELECT and
 gains no UPDATE, so `lock_guard` stays the only column it may update. Existing
-rows read false, and the downgrade drops the constraint, then the column.
+rows read false. The same revision replaces `shared_connector_refresh_begin`
+and `shared_connector_refresh_mark_recovery` so both take the binding row `FOR
+NO KEY UPDATE`, which conflicts with the `FOR SHARE` an in-flight resolve holds
+on it: a move into `recovery_required` commits only after resolves already
+holding the binding commit, and later resolves see it. The lock order stays
+application, binding, intent, recipient last, and `CREATE OR REPLACE` keeps
+each function's owner and grants. The downgrade restores the 0123 function
+definitions, then drops the constraint, then the column.
 
 The candidate application serving window and ordered revision ancestry live in
 `packages/protected-hooks/src/curie_protected_hooks/schema_serving.json`,
