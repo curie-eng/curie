@@ -243,25 +243,6 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # IS a declared boot key. The key itself never enters a sandbox: holding
         # it, agent-authored code could mint a token naming any agent.
         "CURIE_CONNECTOR_CALLER_SIGNING_KEY",
-        # The Pod-local shared connector resolver's config (ADR 0239), read by
-        # curie_connector_proxy.resolver.config from the frozen render's env in
-        # the connector proxy container at resolver startup.
-        # CURIE_SHARED_RESOLVER_SOCKET is also read by connector servers through
-        # the reference SDK (resolver/sdk/curie_resolver_sdk.py) to find the
-        # socket. The resolver never reads CURIE_SHARED_SNAPSHOT_SEAL_FILE: it
-        # only refuses to start when the name is present (config.FORBIDDEN_ENV),
-        # because the snapshot sealing Secret belongs to the server container
-        # alone. None of these is ever a sandbox boot key, so none is declared
-        # on BootEnv.
-        "CURIE_SHARED_APPLICATION",
-        "CURIE_SHARED_CREDENTIAL_SLOTS",
-        "CURIE_SHARED_DATABASE_DSN_FILE",
-        "CURIE_SHARED_DSN_ENCODING",
-        "CURIE_SHARED_ENCRYPTION_KEY_FILE",
-        "CURIE_SHARED_INSTALLATION",
-        "CURIE_SHARED_PROVIDER_ORIGINS",
-        "CURIE_SHARED_RESOLVER_SOCKET",
-        "CURIE_SHARED_SNAPSHOT_SEAL_FILE",
         # The connector caller proxy's own config (ADR-0168 decision 7), read
         # by curie_connector_proxy.server from env the connector render writes
         # into the proxy container. It runs in a connector pod, never in a
@@ -440,6 +421,20 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_CALLER_PROXY_GATED_TOOLS",
         "CURIE_CALLER_PROXY_CONNECTOR",
         "CURIE_CALLER_PROXY_GRANT_STORE",
+        # ResolverConfig.from_env reads these seven in the connector proxy container.
+        "CURIE_SHARED_INSTALLATION",
+        "CURIE_SHARED_APPLICATION",
+        "CURIE_SHARED_DSN_ENCODING",
+        "CURIE_SHARED_PROVIDER_ORIGINS",
+        "CURIE_SHARED_CREDENTIAL_SLOTS",
+        "CURIE_SHARED_ENCRYPTION_KEY_FILE",
+        "CURIE_SHARED_DATABASE_DSN_FILE",
+        # ResolverConfig reads the socket path in the proxy; the vendored
+        # reference SDK reads the same name in the connector server.
+        "CURIE_SHARED_RESOLVER_SOCKET",
+        # The snapshot seal file belongs only to the connector server.
+        # ResolverConfig.from_env refuses it when present.
+        "CURIE_SHARED_SNAPSHOT_SEAL_FILE",
         # runner-local harness selection (ADR-0060, #844); read by the runner from
         # its own env to pick the active harness, unset selects the built-in
         # Claude. Not a boot contract key.
