@@ -916,6 +916,9 @@ def test_run_loop_observes_and_mutates_the_forge_only_through_the_driver(
     preflight.cli_not_found_check = no_cli_judgement  # type: ignore[method-assign]
     cli_body = json.dumps({"item": {"state": "published", "pr": {"number": 7, "status": "merged"}}})
     preflight.cli_work_items_raw = lambda _id: (0, cli_body)  # type: ignore[method-assign]
+    # The pre-teardown reads (#4866) are not what this test observes.
+    preflight.work_item_usage = lambda _id: {"cost_complete": True}  # type: ignore[method-assign]
+    preflight.cli_cluster_status = lambda: (0, json.dumps({"credentials": []}))  # type: ignore[method-assign]
 
     def opened(title: str, body: str, since: float) -> str:
         preflight.evidence["work_item_id"] = "wi-1"
@@ -938,6 +941,117 @@ def test_run_loop_observes_and_mutates_the_forge_only_through_the_driver(
     assert driver.calls.count("tracker_evidence") == 1
     assert driver.calls.index("tracker_evidence") > driver.calls.index("changes_opened")
     assert "judge_tracker" in driver.calls
+
+
+def test_loop_records_usage_and_status_before_teardown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#4866: the loop records the per-run usage, the cluster status credentials
+    and the work-items tracker link while the install is still up.
+
+    The reads answer only through the port-forward the driver already holds
+    and the release the CLI reads, so they happen after the last request ends
+    and before ``main()`` tears the install down (its ``finally``), never
+    after: the evidence carries the cost and the credential rows the
+    acceptance table asserts.
+    """
+
+    driver = _FakeDriver()
+    preflight = _loop_preflight(tmp_path, monkeypatch, driver)
+    preflight.head_before = "f" * 40
+    one = {"status": "completed", "started_at": "2026-10-11T00:00:00Z"}
+    details = iter(
+        [
+            {"state": "published", "requests": [one], "pr": {"number": 7}},
+            {"state": "published", "requests": [one, one], "pr": {"number": 7}},
+        ]
+    )
+    merged = {"state": "published", "requests": [one, one], "pr": {"number": 7, "status": "merged"}}
+    preflight.work_item_detail = lambda _id: next(details, merged)  # type: ignore[method-assign]
+    preflight.cli_check = lambda *_a, **_k: None  # type: ignore[method-assign]
+    preflight.cli_not_found_check = lambda *_a, **_k: None  # type: ignore[method-assign]
+    tracker = {
+        "kind": "github",
+        "host": "https://forge.example",
+        "scope_id": "acme/fixture",
+        "issue_id": "7",
+        # Split across the slash so this repo's gitleaks
+        # `cross-repo-issue-ref` rule does not read the fixture display key
+        # as a real downstream citation; the faked work-item response (and
+        # the evidence the loop records from it) still carries the joined
+        # value.
+        "display_key": "acme" "/fixture#7",
+        "url": "https://forge.example/change/7",
+    }
+    cli_body = json.dumps(
+        {
+            "item": {
+                "state": "published",
+                "pr": {"number": 7, "status": "merged"},
+                "tracker": tracker,
+            }
+        }
+    )
+    work_items_calls: list[str] = []
+
+    def cli_work_items_raw(work_item_id: str) -> tuple[int, str]:
+        work_items_calls.append(work_item_id)
+        return 0, cli_body
+
+    preflight.cli_work_items_raw = cli_work_items_raw  # type: ignore[method-assign]
+    usage = {"estimated_cost_usd": 0.42, "cost_complete": True, "requests_without_usage": 0}
+    usage_calls: list[str] = []
+
+    def work_item_usage(work_item_id: str) -> dict[str, Any]:
+        usage_calls.append(work_item_id)
+        return dict(usage)
+
+    preflight.work_item_usage = work_item_usage  # type: ignore[method-assign]
+    credentials = [
+        {
+            "section": "code_host",
+            "name": "actor",
+            "type": "pat",
+            "authentication": "accepted",
+            "expiry": "known",
+            "expires_at": "2026-10-23T00:00:00Z",
+        }
+    ]
+    status_calls: list[None] = []
+
+    def cli_cluster_status() -> tuple[int, str]:
+        status_calls.append(None)
+        return 0, json.dumps({"credentials": credentials})
+
+    preflight.cli_cluster_status = cli_cluster_status  # type: ignore[method-assign]
+    teardown_runs: list[None] = []
+    monkeypatch.setattr(
+        fe.Teardown, "run", lambda *_a, **_k: (teardown_runs.append(None), [])[1]
+    )
+
+    def opened(title: str, body: str, since: float) -> str:
+        preflight.evidence["work_item_id"] = "wi-1"
+        return _FakeDriver.open_and_label_ticket(driver, title, body, since)
+
+    driver.open_and_label_ticket = opened  # type: ignore[method-assign]
+    monkeypatch.setattr(fe.time, "sleep", lambda _s: None)
+
+    obs = fe.forge_loop(preflight)
+
+    assert obs["verdict"] == "passed", obs["failures"]
+    # The reads land in the step evidence, complete.
+    assert obs["usage"] == usage
+    assert obs["cluster_status"] == {"credentials": credentials}
+    assert obs["work_items"] == [{"tracker": tracker}]
+    assert preflight.evidence["scenario"] is obs
+    # Each read names the loop's one work item.
+    assert usage_calls == ["wi-1"]
+    assert len(status_calls) == 1
+    assert work_items_calls[-1] == "wi-1"
+    # They happen before the teardown step: main() runs teardown only in its
+    # finally, after the scenario returns, so nothing tore down while the
+    # loop recorded them.
+    assert teardown_runs == []
 
 
 def test_preflight_setup_resets_and_baselines_a_loop_fixture_through_the_driver(
