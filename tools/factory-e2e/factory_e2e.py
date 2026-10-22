@@ -141,6 +141,12 @@ samples are only judge tests.
 `curie dev factory-e2e judge-repo-runner --observation <file>` runs the offline
 judge with no credentials or cluster contact.
 
+`curie dev factory-e2e judge-docker --envelope <file>` runs docker_scenario.py's
+offline judge on a docker-scenario/v1 envelope (ADR 0216, ADR 0217): per-run
+daemon identity and events, refused escapes, blocked egress, cleanup, the
+non-opted control, the runner upgrade and required checks green on the first
+head. It needs no credentials or cluster contact.
+
 The App, fixture repository, mention author and model credentials come only
 from operator files or environment variables; nothing here names a real one.
 Standard library only, so it runs from a bare source checkout.
@@ -6172,6 +6178,47 @@ def judge_github_loop(obs: Mapping[str, Any]) -> list[str]:
     return failures
 
 
+FIRST_HEAD_GREEN = frozenset({"success", "neutral", "skipped"})
+
+
+def judge_first_head_ci(obs: Mapping[str, Any]) -> list[str]:
+    """Every required check not green on the first published head. Empty means passed. Pure.
+
+    judge_outcome ignores CI and judge_github_loop requires CI red on the first head,
+    so this is the judge for a change that must be green on its first published head.
+    obs is ``{"first_head", "required", "checks"}``; each check is ``{"name",
+    "head_sha", "status", "conclusion"}``. A required check passes when every one of its
+    results on the first head completed with success, neutral or skipped; results on
+    other heads never count.
+    """
+
+    head = obs.get("first_head")
+    if not head or not isinstance(head, str):
+        return ["no first published head was recorded"]
+    required = obs.get("required")
+    if not isinstance(required, list) or not required:
+        return ["no required checks were recorded"]
+    raw = obs.get("checks")
+    checks = [c for c in raw if isinstance(c, Mapping)] if isinstance(raw, list) else []
+    failures: list[str] = []
+    for name in required:
+        results = [c for c in checks if c.get("name") == name and c.get("head_sha") == head]
+        if not results:
+            failures.append(f"required check {name!r} has no result on the first head")
+            continue
+        bad = [
+            c
+            for c in results
+            if c.get("status") != "completed"
+            or not isinstance(c.get("conclusion"), str)
+            or c.get("conclusion") not in FIRST_HEAD_GREEN
+        ]
+        if bad:
+            conclusion = bad[0].get("conclusion") if bad[0].get("status") == "completed" else None
+            failures.append(f"required check {name!r} concluded {conclusion!r} on the first head")
+    return failures
+
+
 def await_work_item_change(p: Preflight, work_item_id: str) -> ChangeRef | None:
     """The change the WorkItem records, polled fast; None if the request ends without one.
 
@@ -6412,6 +6459,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     scenario.add_argument("--scenario", required=True, choices=tuple(SCENARIOS))
     judge = sub.add_parser("judge-repo-runner", help="judge repository runner observations offline")
     judge.add_argument("--observation", type=Path, required=True)
+    judge_docker = sub.add_parser(
+        "judge-docker", help="judge a docker-scenario/v1 envelope offline"
+    )
+    judge_docker.add_argument("--envelope", type=Path, required=True)
     scenario.add_argument(
         "--forge",
         choices=tuple(FORGES),
@@ -6955,6 +7006,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
     if args.mode == "judge-repo-runner":
         return int(load_repo_runner().main(["judge", str(args.observation)]))
+    if args.mode == "judge-docker":
+        return int(load_docker_scenario().main(["judge", str(args.envelope)]))
     if args.mode == "scripted":
         import importlib.util
 
@@ -7200,6 +7253,13 @@ def load_repo_runner() -> Any:
 
 
 SCENARIOS["repo-runner"] = load_repo_runner().drive
+
+
+def load_docker_scenario() -> Any:
+    """Load the docker scenario offline judge once."""
+
+    return _load_by_path("docker_scenario", Path(__file__).with_name("docker_scenario.py"))
+
 
 if __name__ == "__main__":
     sys.exit(main())
