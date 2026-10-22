@@ -18,7 +18,8 @@ reviewer subagents check it on a stronger model. The skill walks nine phases:
 3. `plan`: read the repository's own guidance, find its test commands, and
    write a plan.
 4. `plan_review`: [`agents/plan-reviewer.md`](agents/plan-reviewer.md)
-   approves the plan or sends it back to `plan`.
+   reviews the plan once. Either verdict, `APPROVE` or `CHANGES`, moves on to
+   `failing_test`; `CHANGES` findings are advice the agent must resolve.
 5. `failing_test`: write a failing test first where one is feasible.
 6. `implement`: make the smallest change and run the repository's own checks.
 7. `review_diff`: [`agents/diff-reviewer.md`](agents/diff-reviewer.md) reviews
@@ -43,9 +44,16 @@ does not enforce it, and a different bundle can choose differently.
 
 ## Review loops
 
-Each loop (`plan` and `plan_review`, `implement` and `review_diff`, and
-`wait_ci` back to `implement`) runs at most 3 rounds. When a reviewer still asks for changes on round 3, or a review
-call fails, the run publishes nothing. It ends its reply with `Could not complete:` and the
+The plan gets exactly one review per run. `VERDICT: CHANGES` on it is
+truthful advice, not a stop: the agent keeps every finding, fixes each
+blocking one during `implement`, and gives the diff reviewer each finding with
+its resolution. The diff reviewer treats an unresolved blocking plan finding
+as a blocking diff finding, and its final `VERDICT: APPROVE` stays mandatory
+for publication.
+
+Each remaining loop (`implement` and `review_diff`, and `wait_ci` back to
+`implement`) runs at most 3 rounds. When the diff reviewer still asks for
+changes on round 3, or a review call fails, the run publishes nothing. It ends its reply with `Could not complete:` and the
 reviewer's unresolved findings and open questions, and the platform's status
 comment on the issue carries that result.
 
@@ -60,7 +68,8 @@ approved. Notes never start another review round.
 [`hooks/review_gate.py`](hooks/review_gate.py) enforces this, because the main
 model does not follow the protocol reliably. It routes every sub-agent call to
 the right reviewer, strips `isolation` and `model`, forces
-`run_in_background: false`, refuses reviews out of order, counts rounds and
+`run_in_background: false`, refuses reviews out of order and a second plan
+review, counts rounds and
 applies the cap, stops the run on a reviewer reply without a verdict, and
 refuses `publish_changes` until the diff reviewer approves. It also writes the
 `plan_review` and `review_diff` phase lines, with the round, to the pod log.
@@ -75,7 +84,8 @@ Without the contract no review runs.
 
 The same hook gates repository edits. `Edit`, `Write`, `MultiEdit` and
 `NotebookEdit` are refused until the `dark-factory:implement-issue` skill is
-loaded and the plan reviewer approves. After approval only test edits may run:
+loaded and the plan review completes with either verdict. After it only test
+edits may run:
 an edit to a test file, or an edit to a source file that adds a test (an
 inline Rust `#[test]` module, a `def test_` function, and the like) beyond the
 ones the replaced text already held. The model writes the failing test (a
@@ -87,7 +97,7 @@ only: after a test edit it counts finished Bash commands and failed ones,
 never their text, and writes `test_edited`, `bash_after_test_edit` and
 `bash_failed_after_test_edit` on its `implement` phase line. It never claims
 a test ran. The hook fingerprints the checkout at the prompt and refuses the plan
-approval, stopping the run, if the checkout changed before it (for example
+review's verdict, stopping the run, if the checkout changed before it (for example
 through Bash). Its evidence lines share one `seq` counter per run:
 `curie_phase` lines carry `source: "hook"`, `curie_reported` lines record each
 `report_progress` call with the hook's last observed phase and `late: true`

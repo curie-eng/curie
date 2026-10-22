@@ -16,9 +16,10 @@ One script handles every hook event the bundle registers:
 ``PreToolUse`` on ``Edit``/``Write``/``MultiEdit``/``NotebookEdit``
     An edit under the workspace's root ``.github`` directory stops the run in
     every phase, matching the first path component case-insensitively. No
-    repository edit before the workflow is loaded and the plan reviewer
-    approved. Right after approval (phase ``failing_test``) only test edits may
-    run: an edit to a test file, or an edit that adds a test (an inline Rust
+    repository edit before the workflow is loaded and the one plan review
+    completed with ``VERDICT: APPROVE`` or ``VERDICT: CHANGES`` (CHANGES is
+    advice, not a block). Right after it (phase ``failing_test``) only test
+    edits may run: an edit to a test file, or an edit that adds a test (an inline Rust
     ``#[test]`` module, a ``def test_`` function, and so on): its inserted text
     holds more test markers than the text it replaces (for ``Write``, the file
     on disk), and a notebook cell outside a test path counts only when
@@ -51,8 +52,8 @@ One script handles every hook event the bundle registers:
     it names a reviewer, otherwise inferred from the description and prompt.
     ``isolation`` and ``model`` are stripped and ``run_in_background`` is forced
     to ``false``. The call is refused out of order: no diff review before the
-    plan is approved, and no plan review after it (a diff rejection returns to
-    implement, not to plan). Before a diff review, a changed or untracked root
+    plan review completed, and no second plan review in the run (a diff
+    rejection returns to implement, not to plan). Before a diff review, a changed or untracked root
     ``.github`` path stops the run; an unreadable git status lets review proceed.
     The hook numbers the round itself and writes the
     ``plan_review`` or ``review_diff`` phase line to the pod log. It appends
@@ -63,10 +64,13 @@ One script handles every hook event the bundle registers:
 
 ``PostToolUse`` / ``PostToolUseFailure`` on ``Agent``/``Task``
     Reads the reviewer's ``REVIEWER:`` and ``VERDICT:`` lines. A reply without
-    them, or a call that errored, fails the run. ``VERDICT: CHANGES`` on round
-    ``MAX_ROUNDS`` caps the loop. A plan ``APPROVE`` is refused, and the run
-    stops, when the checkout fingerprint differs from the one taken at the
-    prompt or cannot be computed. After a real verdict the reviewer's
+    them, or a call that errored, fails the run. Either plan verdict opens
+    phase ``failing_test``; a plan ``CHANGES`` is advice whose findings the
+    implementer keeps, fixes when blocking, and hands to the diff reviewer.
+    A diff ``VERDICT: CHANGES`` on round ``MAX_ROUNDS`` caps the diff loop.
+    Either plan verdict is refused, and the run stops, when the checkout
+    fingerprint differs from the one taken at the prompt or cannot be
+    computed. After a real verdict the reviewer's
     ``VERIFICATION:`` block is written as one ``curie_gate:
     verification_classified`` line (stage, round, verdict and each
     criterion's route); a reply without the block is recorded as absent. A
@@ -130,6 +134,10 @@ from typing import Any
 
 MAX_ROUNDS = 3
 PLAN, DIFF = "dark-factory:plan-reviewer", "dark-factory:diff-reviewer"
+# Either verdict from the one plan review opens phase failing_test; CHANGES is advice.
+ADVISORY_PLAN_VERDICTS = ("APPROVE", "CHANGES")
+# One plan review per run; the diff loop keeps its cap.
+ROUND_CAP = {PLAN: 1, DIFF: MAX_ROUNDS}
 PHASE = {PLAN: "plan_review", DIFF: "review_diff"}
 LOOP = {PLAN: "plan", DIFF: "diff"}
 BACK_TO = {PLAN: "plan", DIFF: "implement"}
@@ -254,8 +262,8 @@ def _fresh(prompt: str = "") -> dict[str, Any]:
     hook's own marker, written by the platform; the runner frames the message
     with its sender header first); a match anywhere else,
     including inside the untrusted CI JSON that follows, has no effect. A CI
-    fix round starts with the plan already approved (plan review already
-    happened), the workflow loaded, the stage at ``implement``, and the diff
+    fix round starts with the plan review already completed (stored as
+    ``APPROVE``), the workflow loaded, the stage at ``implement``, and the diff
     loop at round 0.
     """
     lines = _message_lines(prompt)
@@ -839,12 +847,14 @@ def pre_agent(state: dict[str, Any], tool_input: dict[str, Any]) -> dict[str, An
     if kind == DIFF and (path := _github_changed_path(state["workspace"])) is not None:
         return _deny(_stop_for_github_path(state, path))
     plan, diff = state["plan"], state["diff"]
-    if kind == DIFF and plan["verdict"] != "APPROVE":
-        return _deny("The plan reviewer has not approved the plan yet; run the plan review first.")
-    if kind == PLAN and plan["verdict"] == "APPROVE":
+    if kind == DIFF and not plan_reviewed(state):
+        return _deny("The plan review has not completed yet; run the plan review first.")
+    if kind == PLAN and plan_reviewed(state):
         return _deny(
-            "The plan is already approved. A diff review rejection returns to "
-            "implement, not to plan: fix the diff and call the diff reviewer."
+            "The one advisory plan review already completed with VERDICT: "
+            f"{plan['verdict']}. Carry its findings into phase failing_test. A diff "
+            "review rejection returns to implement, not to plan: fix the diff and "
+            "call the diff reviewer."
         )
     if kind == DIFF and diff["verdict"] == "APPROVE":
         return _deny("The diff reviewer already approved; go to publish.")
@@ -859,8 +869,8 @@ def pre_agent(state: dict[str, Any], tool_input: dict[str, Any]) -> dict[str, An
         return _deny(_stop_text(state["stopped"]))
     loop = state[LOOP[kind]]
     round_ = loop["round"] + 1
-    if round_ > MAX_ROUNDS:
-        state["stopped"] = f"The {PHASE[kind]} loop hit its {MAX_ROUNDS} round cap."
+    if round_ > ROUND_CAP[kind]:
+        state["stopped"] = f"The {PHASE[kind]} loop hit its {ROUND_CAP[kind]} round cap."
         return _deny(_stop_text(state["stopped"]))
     loop["round"] = round_
     loop["verdict"] = None
@@ -899,10 +909,11 @@ def pre_edit(state: dict[str, Any], tool: str, tool_input: dict[str, Any]) -> di
             "No repository edit before the workflow is loaded. Call the Skill tool "
             "with skill 'dark-factory:implement-issue' and follow it."
         )
-    elif state["plan"]["verdict"] != "APPROVE":
+    elif not plan_reviewed(state):
         reason = (
-            "No repository edit before plan review approves the plan. Finish phase "
-            f"plan and call {PLAN!r}; edits open after its VERDICT: APPROVE."
+            "No repository edit before the plan review completes. Finish phase "
+            f"plan and call {PLAN!r}; edits open after its completed verdict "
+            "(VERDICT: APPROVE or VERDICT: CHANGES)."
         )
     elif state["stage"] == "failing_test" and not is_test_edit(state, tool, path, tool_input):
         reason = (
@@ -958,8 +969,13 @@ def post_skill(state: dict[str, Any], tool_input: dict[str, Any]) -> None:
         emit_gate(state, "workflow_loaded", skill=tool_input["skill"])
 
 
+def plan_reviewed(state: dict[str, Any]) -> bool:
+    """Whether the one plan review completed with a recognized verdict."""
+    return state["plan"]["verdict"] in ADVISORY_PLAN_VERDICTS
+
+
 def refuse_approval(state: dict[str, Any]) -> str | None:
-    """The stop cause when the checkout moved before plan approval, else ``None``."""
+    """The stop cause when the checkout moved before the plan review completed, else ``None``."""
     now = fingerprint(state["workspace"])
     if state["fingerprint"] is None or now is None:
         cause = "checkout_unverifiable"
@@ -986,15 +1002,24 @@ def post_agent(
         )
         return _context(event, _stop_text(state["stopped"]))
     record_verification(state, kind, round_, verdict, response)
-    if kind == PLAN and verdict == "APPROVE":
+    if kind == PLAN and verdict in ADVISORY_PLAN_VERDICTS:
         cause = refuse_approval(state)
         if cause is not None:
             state["stopped"] = (
-                f"The plan approval on round {round_} is refused ({cause}): the "
-                "repository checkout must not change before the plan reviewer approves."
+                f"The plan review on round {round_} is refused ({cause}): the "
+                "repository checkout must not change before the plan review completes."
             )
             return _context(event, _stop_text(state["stopped"]))
         state["stage"] = "failing_test"
+        loop["verdict"] = verdict
+        if verdict == "CHANGES":
+            return _context(
+                event,
+                f"{PHASE[kind]} round {round_}: CHANGES. This was the one advisory plan "
+                "review. Go to phase failing_test. Keep every finding, fix each blocking "
+                "finding before the diff review, list each finding and its resolution in "
+                "the diff review prompt, and never run the plan review again.",
+            )
     loop["verdict"] = verdict
     if verdict == "APPROVE":
         nxt = "failing_test" if kind == PLAN else "publish"
