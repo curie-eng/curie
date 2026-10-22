@@ -28,6 +28,9 @@ from .test_commissioning_bootstrap import encoded
 from .test_commissioning_provisioner import PRINCIPALS, built, profile
 from .test_commissioning_provisioner import module as provisioner
 from .test_commissioning_records import permit_value
+from .test_measuring_identity_rbac import Reader as RbacReader
+from .test_measuring_identity_rbac import manifest as measuring_manifest
+from .test_measuring_identity_rbac import scope as measuring_scope
 
 EVIDENCE = "ab" * 32
 
@@ -341,6 +344,8 @@ class Harness:
             for role in self.usernames
         }
         self.reader = Rules(self)
+        self.rbac = RbacReader(measuring_manifest(release=False))
+        self.measuring: Any = module().MeasuringIdentityCheck(measuring_scope(), self.rbac)
         self.timeout = 2.0
         self.publication = publication(self.records)
 
@@ -358,6 +363,7 @@ class Harness:
             artifact_evidence=self.evidence,
             tuple_producers=self.facts,
             candidate_rules=self.reader,
+            measuring_identity=self.measuring,
             publication=self.publication,
             case_timeout_s=self.timeout,
         )
@@ -1365,3 +1371,114 @@ def test_a_candidate_rule_change_after_publication_is_reported(monkeypatch) -> N
         return await verifier.confirm_unchanged()
 
     assert run(scenario()) == "candidate-rules"
+
+
+# --- The measuring identity's least privilege: ADR 0238 ----------------------
+
+
+EXTRA_SECRET_READ = (
+    "Role",
+    "control",
+    "extra",
+    [{"apiGroups": [""], "resources": ["secrets"], "verbs": ["get"]}],
+)
+
+
+def test_an_over_privileged_measuring_identity_refuses_before_any_case(monkeypatch) -> None:
+    h = Harness()
+    h.rbac.roles.append(EXTRA_SECRET_READ)
+    verdict = refuses_without_publishers(monkeypatch, h, "measuring-identity")
+    assert verdict.observations == ()
+    assert all(producer.calls == [] for producer in h.producers.values())
+
+
+def test_a_group_granted_right_beyond_the_manifest_refuses(monkeypatch) -> None:
+    h = Harness()
+    h.rbac.group_grants.add(("kube-system", "", "secrets", "get"))
+    refuses_without_publishers(monkeypatch, h, "measuring-identity")
+
+
+def test_an_unanswered_least_privilege_review_refuses(monkeypatch) -> None:
+    h = Harness()
+    h.rbac.unanswered.add(("", "", "nodes/proxy", "get"))
+    refuses_without_publishers(monkeypatch, h, "measuring-identity")
+
+
+def test_a_right_gained_during_the_campaign_refuses_the_decision(monkeypatch) -> None:
+    h = Harness()
+
+    class Granting:
+        def __init__(self, inner: Any) -> None:
+            self.inner, self.calls = inner, inner.calls
+
+        async def observe(self, installation_digest: str, challenge: str) -> Any:
+            h.rbac.roles.append(EXTRA_SECRET_READ)
+            return await self.inner.observe(installation_digest, challenge)
+
+    last = module().REQUIRED_CASES[-1]
+    h.producers[last] = Granting(h.producers[last])
+    verdict = refuses_without_publishers(monkeypatch, h, "measuring-identity")
+    assert len(verdict.observations) == len(module().REQUIRED_CASES)
+
+
+def test_the_campaigns_release_binding_is_accepted_while_it_holds_it() -> None:
+    h = Harness()
+    h.rbac.roles = measuring_manifest(release=True)
+    assert h.decide().accepted
+
+
+def test_publication_requires_the_release_binding_revoked(monkeypatch) -> None:
+    connections = Connections(monkeypatch)
+    h = Harness()
+    h.rbac.roles = measuring_manifest(release=True)
+
+    async def scenario() -> Any:
+        verifier = h.verifier()
+        verdict = await verifier.decide()
+        assert verdict.accepted
+        return await verifier.publish(verdict, h.acceptance(verdict))
+
+    result = run(scenario())
+    assert result.outcome == "refused" and result.reason == "measuring-identity"
+    assert connections.events == []
+
+
+def test_publication_after_the_release_binding_is_revoked(monkeypatch) -> None:
+    connections = Connections(monkeypatch)
+    h = Harness()
+    h.rbac.roles = measuring_manifest(release=True)
+
+    async def scenario() -> Any:
+        verifier = h.verifier()
+        verdict = await verifier.decide()
+        assert verdict.accepted
+        h.rbac.roles = measuring_manifest(release=False)  # clause 8 cleanup
+        return await verifier.publish(verdict, h.acceptance(verdict))
+
+    result = run(scenario())
+    assert result.outcome == "published"
+    assert connections.events[0] == "connect-qualification"
+
+
+def test_a_right_gained_between_acceptance_and_publication_constructs_nothing(monkeypatch) -> None:
+    connections = Connections(monkeypatch)
+    h = Harness()
+
+    async def scenario() -> Any:
+        verifier = h.verifier()
+        verdict = await verifier.decide()
+        assert verdict.accepted
+        h.rbac.group_grants.add(("", "", "users", "impersonate"))
+        return await verifier.publish(verdict, h.acceptance(verdict))
+
+    result = run(scenario())
+    assert result.outcome == "refused" and result.reason == "measuring-identity"
+    assert connections.events == []
+
+
+@pytest.mark.parametrize("check", [None, object(), "measuring"])
+def test_a_measuring_identity_check_is_required(check: Any) -> None:
+    h = Harness()
+    h.measuring = check
+    with pytest.raises(module().VerifierRefused):
+        h.verifier()

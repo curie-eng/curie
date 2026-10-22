@@ -14,7 +14,11 @@ installation. It accepts only when:
   observer's reading of each candidate user's rules, which must equal the
   design decision 9 template G hashes, instantiated for this permit's lane;
 * revocation and the original workload's termination and absence were
-  observed, which are the last two cases.
+  observed, which are the last two cases;
+* the measuring identity holds exactly its ADR 0238 clause 5 manifest. The
+  verifier runs the least-privilege self-check itself before the first case,
+  after the last and again before publication, when the campaign's release
+  probe binding must already be revoked.
 
 Any missing, unavailable, skipped, timed-out, failed, foreign, stale or
 fake-model observation refuses, and so does any tuple or candidate rule
@@ -67,6 +71,7 @@ from .commissioning_provisioner import (
     verify_tuple,
 )
 from .commissioning_records import CommissioningPermit
+from .measuring_identity_rbac import MeasuringRbacReader, MeasuringScope, check_least_privilege
 from .qualification_publication import QualificationPublisher, ReadinessPublisher
 from .worker_transport import WorkerCredential
 
@@ -81,6 +86,7 @@ __all__ = [
     "CaseProducer",
     "CommissioningVerifier",
     "InstallationTuple",
+    "MeasuringIdentityCheck",
     "Publication",
     "PublicationInputs",
     "Verdict",
@@ -497,6 +503,23 @@ def _candidate_rules(
         _refuse()
 
 
+@dataclass(frozen=True, slots=True)
+class MeasuringIdentityCheck:
+    """The measuring identity's clause 5 scope and the reader its reviews go through."""
+
+    scope: MeasuringScope
+    reader: MeasuringRbacReader
+
+    def __post_init__(self) -> None:
+        _require(type(self.scope) is MeasuringScope)
+        _require(
+            all(
+                callable(getattr(self.reader, name, None))
+                for name in ("review", "list_items", "read_role")
+            )
+        )
+
+
 class CommissioningVerifier:
     """One decision for one installation tuple, then at most one publication."""
 
@@ -512,6 +535,7 @@ class CommissioningVerifier:
         artifact_evidence: bytes | None,
         tuple_producers: tuple[FactProducer, ...],
         candidate_rules: CandidateRuleReader,
+        measuring_identity: MeasuringIdentityCheck,
         publication: PublicationInputs,
         case_timeout_s: float = 120.0,
     ) -> None:
@@ -539,6 +563,7 @@ class CommissioningVerifier:
         _require(sorted(facts, key=str) == sorted(TUPLE_FACTS))
         _require(all(callable(getattr(p, "observe", None)) for p in tuple_producers))
         _require(callable(getattr(candidate_rules, "rules", None)))
+        _require(type(measuring_identity) is MeasuringIdentityCheck)
         _require(type(publication) is PublicationInputs)
         _require(type(case_timeout_s) in (int, float) and 0 < case_timeout_s <= 900)
         self._bootstrap, self._guard_config = bootstrap, guard_config
@@ -547,6 +572,7 @@ class CommissioningVerifier:
         self._producers, self._evidence = dict(producers), artifact_evidence
         self._tuple_producers = {_fact(producer): producer for producer in tuple_producers}
         self._rules, self._publication = candidate_rules, publication
+        self._measuring = measuring_identity
         self._timeout = float(case_timeout_s)
         self._decided = False
         self._accepted: Verdict | None = None
@@ -559,8 +585,19 @@ class CommissioningVerifier:
     def _refused(self, reason: str, observed: list[CaseObservation]) -> Verdict:
         return Verdict("refused", reason, self._tuple.digest, None, tuple(observed))
 
-    async def _current(self) -> str | None:
-        """Observe the tuple and the candidate rules now; the refusal reason, if any."""
+    async def _least_privilege(self, *, release_allowed: bool) -> str | None:
+        """ADR 0238: any right beyond the clause 5 manifest refuses the campaign."""
+        try:
+            async with asyncio.timeout(self._timeout):
+                reason = await check_least_privilege(
+                    self._measuring.reader, self._measuring.scope, release_allowed=release_allowed
+                )
+        except Exception:  # noqa: BLE001 -- an unavailable review never passes.
+            return "measuring-identity"
+        return None if reason is None else "measuring-identity"
+
+    async def _current(self, *, release_allowed: bool = True) -> str | None:
+        """Observe the tuple, the candidate rules and the measuring identity now."""
         try:
             async with asyncio.timeout(self._timeout):
                 names = tuple(self._tuple_producers)
@@ -579,7 +616,7 @@ class CommissioningVerifier:
                         return "candidate-rules"
         except Exception:  # noqa: BLE001
             return "candidate-rules"
-        return None
+        return await self._least_privilege(release_allowed=release_allowed)
 
     async def _observe(self, case: str, observed: list[CaseObservation]) -> str | None:
         """Observe one case; the refusal reason, or ``None`` when it passed."""
@@ -649,6 +686,9 @@ class CommissioningVerifier:
         for case in REQUIRED_CASES:
             if case not in self._producers and case not in reused:
                 return self._refused("missing:" + case, [])
+        reason = await self._least_privilege(release_allowed=True)
+        if reason is not None:
+            return self._refused(reason, [])
         for case in REQUIRED_CASES:
             if case in reused:
                 observed.append(self._reused(case, reused[case]))
@@ -726,7 +766,8 @@ class CommissioningVerifier:
 
     async def _publish(self) -> Publication:
         """The accepted branch: observe the tuple again, connect both writers, then write."""
-        reason = await self._current()
+        # Readiness issuance: the release probe binding is already revoked (clause 8).
+        reason = await self._current(release_allowed=False)
         if reason is not None:
             return Publication("refused", reason)
         p = self._publication
