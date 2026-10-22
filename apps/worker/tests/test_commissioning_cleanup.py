@@ -21,7 +21,7 @@ import pytest
 from aiohttp import web
 from curie_worker import commissioning_cleanup as cleanup
 from curie_worker.commissioning_registry import object_names
-from curie_worker.protected_launch_kubernetes import FINALIZER
+from curie_worker.protected_launch_kubernetes import FINALIZER, LaunchControlUnavailable
 from curie_worker.protected_launch_registry import RegistryError
 
 from .protected_launch_endpoint_helpers import context
@@ -198,3 +198,97 @@ def test_no_container_identity_absence_or_replacement_proves_never_started(tmp_p
 def test_the_never_started_observation_is_closed(evidence):
     with pytest.raises(RegistryError):
         cleanup.UnstartedObservation(POD_UID, "7", evidence)  # type: ignore[arg-type]
+
+
+def deleted_pod(**status: Any) -> dict[str, Any]:
+    return {
+        "metadata": {
+            "namespace": "acme-runtime",
+            "name": "pl-p-example",
+            "uid": POD_UID,
+            "resourceVersion": "7",
+            "finalizers": [FINALIZER],
+            "deletionTimestamp": "2026-10-12T00:00:01Z",
+        },
+        "spec": {"nodeName": "acme-node"},
+        "status": {
+            "phase": "Failed",
+            "containerStatuses": [
+                {
+                    "name": "runner",
+                    "restartCount": 0,
+                    "lastState": {},
+                    "started": False,
+                    "state": {"waiting": {"reason": "ContainerCreating"}},
+                    **status,
+                }
+            ],
+        },
+    }
+
+
+def observe(pod: Any, uid: str = POD_UID) -> Any:
+    return cleanup.unstarted_observation(
+        pod, namespace="acme-runtime", pod_name="pl-p-example", pod_uid=uid
+    )
+
+
+def test_the_never_started_fact_reads_only_the_exact_deleted_terminal_pod():
+    assert observe(deleted_pod()) == cleanup.UnstartedObservation(POD_UID, "7", "terminal")
+    unscheduled = deleted_pod()
+    del unscheduled["spec"]["nodeName"]
+    unscheduled["status"] = {"phase": "Pending"}
+    assert observe(unscheduled).evidence == "unscheduled"
+    no_id = deleted_pod(state={"terminated": {"exitCode": 137, "reason": "ContainerStatusUnknown"}})
+    assert observe(no_id).evidence == "terminal"
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "other-uid",
+        "container-id",
+        "terminated-container-id",
+        "started-at",
+        "running",
+        "restarted",
+        "last-state",
+        "started",
+        "pending",
+        "not-deleting",
+        "no-finalizer",
+        "init-container-id",
+    ],
+)
+def test_any_container_identity_or_live_state_refuses_never_started(change):
+    pod = deleted_pod()
+    status = pod["status"]["containerStatuses"][0]
+    uid = POD_UID
+    if change == "other-uid":
+        uid = "c0000000-0000-4000-8000-000000000009"
+    elif change == "container-id":
+        status["containerID"] = "containerd://" + "b" * 64
+    elif change == "terminated-container-id":
+        status["state"] = {"terminated": {"containerID": "containerd://" + "b" * 64}}
+    elif change == "started-at":
+        status["state"] = {"terminated": {"startedAt": "2026-10-12T00:00:00Z"}}
+    elif change == "running":
+        status["state"] = {"running": {"startedAt": "2026-10-12T00:00:00Z"}}
+    elif change == "restarted":
+        status["restartCount"] = 1
+    elif change == "last-state":
+        status["lastState"] = {"terminated": {"exitCode": 0}}
+    elif change == "started":
+        status["started"] = True
+    elif change == "pending":
+        pod["status"]["phase"] = "Pending"
+    elif change == "not-deleting":
+        del pod["metadata"]["deletionTimestamp"]
+    elif change == "no-finalizer":
+        pod["metadata"]["finalizers"] = []
+    else:
+        pod["status"]["initContainerStatuses"] = [
+            {"name": "init", "containerID": "containerd://" + "b" * 64}
+        ]
+    with pytest.raises(LaunchControlUnavailable):
+        observe(pod, uid)

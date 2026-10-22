@@ -155,14 +155,16 @@ def test_a_session_that_resists_cancellation_leaves_cleanup_incomplete():
                     continue
 
         task = sup.own(stubborn())
-        await asyncio.sleep(0)  # the session is running when it is cancelled
-        sup.revoke()
-        report = await asyncio.wait_for(sup.run(), 5)
-        # Workloads are still retired: their termination is observed independently.
-        assert ("CLOSE_CAMPAIGN",) in events
-        assert report.joined is False and report.complete is False
-        release.set()
-        await asyncio.gather(task, return_exceptions=True)
+        try:
+            await asyncio.sleep(0)  # the session is running when it is cancelled
+            sup.revoke()
+            report = await asyncio.wait_for(sup.run(), 5)
+            # Workloads are still retired: their termination is observed independently.
+            assert ("CLOSE_CAMPAIGN",) in events
+            assert report.joined is False and report.complete is False
+        finally:
+            release.set()
+            await asyncio.gather(task, return_exceptions=True)
 
     asyncio.run(scenario())
 
