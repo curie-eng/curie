@@ -163,6 +163,9 @@ cleanup() {
     local status=$? cleanup_status=0 remaining object crd
     trap - EXIT INT TERM
     set +e
+    if [[ -n "${CONTROL_POD:-}" ]]; then
+        control_diagnostics || log "control diagnostics could not be completed"
+    fi
     stop_message
     if (( INSTALL_STARTED )); then
         # Let the live controller release finalizers before Helm stops it.
@@ -501,6 +504,16 @@ with open(path, 'wb') as handle:
 print(os.stat(path).st_size)
 "
 }
+write_control_workspace() {
+    CONTROL_WRITE_STATUS=0
+    fill_workspace "$CONTROL_POD" >"$WORKDIR/control-write.log" 2>&1 || CONTROL_WRITE_STATUS=$?
+    log "control write exit status: $CONTROL_WRITE_STATUS"
+    cat "$WORKDIR/control-write.log"
+    printf '\n'
+    if (( CONTROL_WRITE_STATUS != 0 )); then
+        log "the control write ended with a nonzero exit (tolerated: the pod may be evicted mid-write)"
+    fi
+}
 pod_state() {
     local pod=$1
     kc get pod "$pod" -o json >"$WORKDIR/pod-$pod.json" || return 1
@@ -511,6 +524,81 @@ status = pod.get("status", {})
 restarts = next((c.get("restartCount", 0) for c in status.get("containerStatuses", []) if c["name"] == "runner"), -1)
 deleting = "deleting" if pod["metadata"].get("deletionTimestamp") else "live"
 print(pod["metadata"]["uid"], status.get("phase", "Unknown"), status.get("reason") or "-", deleting, restarts)
+PY
+}
+control_diagnostics() {
+    local state="" current_uid="" pod_status=0 workspace_status=not-attempted events_status=not-attempted
+    local file_bytes=""
+    log "Collecting original control pod diagnostics before cleanup"
+    state="$(pod_state "$CONTROL_POD" 2>/dev/null)" || pod_status=$?
+    read -r current_uid _ <<<"$state"
+    if [[ -n "${CONTROL_UID:-}" && "$current_uid" == "$CONTROL_UID" ]]; then
+        workspace_status=0
+        file_bytes="$(kc exec "$CONTROL_POD" -c runner -- python3 -c \
+            "import os; print(os.stat('$FILL_PATH').st_size)" 2>/dev/null)" || workspace_status=$?
+    fi
+    if [[ -n "${CONTROL_UID:-}" ]]; then
+        events_status=0
+        kc get events --field-selector "involvedObject.uid=$CONTROL_UID" -o json \
+            >"$WORKDIR/control-diagnostic-events.json" 2>/dev/null || events_status=$?
+    fi
+    python3 - "$WORKDIR" "$CONTROL_POD" "${CONTROL_UID:-}" "$pod_status" \
+        "$workspace_status" "$file_bytes" "$events_status" "${CONTROL_WRITE_STATUS:-not-run}" <<'PY'
+import json
+import pathlib
+import sys
+
+workdir, pod_name, uid, pod_status, workspace_status, file_bytes, events_status, write_status = sys.argv[1:]
+
+
+def read(name):
+    try:
+        return json.loads((pathlib.Path(workdir) / name).read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def exit_status(value):
+    return int(value) if value.isdigit() else None
+
+
+def termination(value):
+    return {key: value[key] for key in ("reason", "exitCode", "signal", "finishedAt") if key in value}
+
+
+pod = None
+snapshots = [(f"pod-{pod_name}.json", "live")] if pod_status == "0" else []
+snapshots += [("control-status.json", "last-observed"), ("control-pod.json", "initial")]
+for name, source in snapshots:
+    document = read(name)
+    if not uid or document.get("metadata", {}).get("uid") != uid:
+        continue
+    status = document.get("status", {})
+    pod = {key: status.get(key) for key in ("phase", "reason", "message")}
+    pod.update(uid=uid, source=source, deletionTimestamp=document["metadata"].get("deletionTimestamp"))
+    pod["containers"] = [
+        {"name": container.get("name"), "kind": kind, "restartCount": container.get("restartCount", 0),
+         "waitingReason": container.get("state", {}).get("waiting", {}).get("reason"),
+         "terminated": termination(container.get("state", {}).get("terminated", {})),
+         "lastTerminated": termination(container.get("lastState", {}).get("terminated", {}))}
+        for kind in ("containerStatuses", "initContainerStatuses", "ephemeralContainerStatuses")
+        for container in status.get(kind, [])
+    ]
+    break
+events = None
+if events_status == "0":
+    events = [
+        {key: event.get(key) for key in ("type", "reason", "message", "count", "firstTimestamp", "lastTimestamp")}
+        for event in read("control-diagnostic-events.json").get("items", [])
+        if uid and event.get("involvedObject", {}).get("uid") == uid
+    ]
+print("control diagnostics: " + json.dumps({
+    "original_uid": uid or None, "pod": pod, "pod_read_exit_status": exit_status(pod_status),
+    "write_exit_status": exit_status(write_status),
+    "workspace_file_bytes": int(file_bytes) if workspace_status == "0" and file_bytes.isdigit() else None,
+    "workspace_read_exit_status": exit_status(workspace_status),
+    "events": events, "events_read_exit_status": exit_status(events_status),
+}))
 PY
 }
 
@@ -581,6 +669,7 @@ start_turn "$CONTROL_AGENT" C0EXAMPLE2
 finish_turn "$CONTROL_AGENT"
 found="$(claimed_pod "$CONTROL_AGENT")" || fail "no bound SandboxClaim for $CONTROL_AGENT"
 read -r CONTROL_CLAIM CONTROL_POD <<<"$found"
+CONTROL_UID="$(kc get pod "$CONTROL_POD" -o jsonpath='{.metadata.uid}' 2>/dev/null)" || CONTROL_UID=""
 kc wait --for=condition=Ready "pod/$CONTROL_POD" --timeout=180s >/dev/null \
     || fail "the control runner pod did not become Ready"
 kc get pod "$CONTROL_POD" -o json >"$WORKDIR/control-pod.json"
@@ -589,8 +678,7 @@ state="$(pod_state "$CONTROL_POD")" || fail "could not read the control runner p
 read -r CONTROL_UID phase reason deleting restarts <<<"$state"
 [[ "$phase" == Running ]] || fail "the control runner pod is not Running before the write"
 log "Writing 1280Mi to $FILL_PATH in the control runner (claim $CONTROL_CLAIM); an exit from eviction is expected"
-fill_workspace "$CONTROL_POD" >"$WORKDIR/control-write.log" 2>&1 \
-    || log "the control write ended with a nonzero exit (tolerated: the pod may be evicted mid-write)"
+write_control_workspace
 # The kubelet measures emptyDir usage periodically, so poll the pod status and
 # its events (which outlive a pod the controller replaces) within a bound.
 deadline=$((SECONDS + EVICTION_WAIT_SECONDS))
