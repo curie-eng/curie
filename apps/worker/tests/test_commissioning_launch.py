@@ -72,6 +72,7 @@ class FakeControl:
     def __init__(self, events: list[Any], expires_at_ms: int) -> None:
         self.events, self.expires_at_ms = events, expires_at_ms
         self.ownership: dict[str, tuple[str, str | None]] = {}
+        self.charged: dict[str, str] = {}
         self.plans = 0
         self.owned = asyncio.Event()
         self.release = asyncio.Event()
@@ -87,8 +88,16 @@ class FakeControl:
             value["launch_reservation_id"],
         )
 
+    async def reserve(self, plan: Plan) -> bool:
+        if plan.launch_reservation_id not in self.charged:
+            self.events.append(("RESERVE", plan.launch_reservation_id))
+            self.charged[plan.launch_reservation_id] = "reserved"
+        return self.charged[plan.launch_reservation_id] == "reserved"
+
     async def own(self, plan: Plan, *, namespace: str, pod_name: str) -> None:
         assert plan.launch_id not in self.ownership
+        assert self.charged.get(plan.launch_reservation_id) == "reserved"
+        self.charged[plan.launch_reservation_id] = "dispatched"
         self.events.append(("OWN", namespace, pod_name))
         self.ownership[plan.launch_id] = ("creating", None)
         self.owned.set()
@@ -96,10 +105,11 @@ class FakeControl:
 
     async def advance(self, launch_id: str, state: str, pod_uid: str | None) -> None:
         current, uid = self.ownership[launch_id]
+        if (current, uid) == (state, pod_uid):
+            return  # a repeat of the current state is inert, as on the broker
         assert current != "retired" and (uid is None or uid == pod_uid)
-        if (current, uid) != (state, pod_uid):
-            self.events.append(("ADVANCE", state, pod_uid))
-            self.ownership[launch_id] = (state, pod_uid)
+        self.events.append(("ADVANCE", state, pod_uid))
+        self.ownership[launch_id] = (state, pod_uid)
 
     async def unsettled(self) -> tuple[str, ...]:
         return tuple(k for k, (s, _) in self.ownership.items() if s != "retired")
@@ -641,10 +651,16 @@ def test_the_candidate_identity_is_bound_by_the_provisioner_or_refuses(tmp_path,
     asyncio.run(scenario())
 
 
-def test_a_failed_assignment_retires_in_a_tracked_task(tmp_path):
+def test_a_failed_assignment_charges_once_and_owns_nothing(tmp_path):
     class Failing:
+        def __init__(self) -> None:
+            self.failures = 1
+
         async def assign(self, plan: Any, *, expires_at_ms: int) -> Any:
-            raise RuntimeError("assignment unavailable")
+            if self.failures:
+                self.failures -= 1
+                raise RuntimeError("assignment unavailable")
+            return await Assignments().assign(plan, expires_at_ms=expires_at_ms)
 
     async def scenario() -> None:
         cluster = Cluster()
@@ -655,14 +671,62 @@ def test_a_failed_assignment_retires_in_a_tracked_task(tmp_path):
             root,
         ):
             raw = request_bytes()
-            launch_id = json.loads(raw)["launch_id"]
+            value = json.loads(raw)
+            launch_id = value["launch_id"]
+            cluster.launch_id = launch_id
             async with httpx.AsyncClient(verify=context(root), trust_env=False) as http:
                 assert (await http.post(url + ROUTE, content=raw)).status_code == 503
-            tracked = set(server._background)
-            await asyncio.gather(*tracked, return_exceptions=True)
-            assert not server._background
-            # Nothing was created, so no UID is known and the create is uncertain.
-            assert server._registry.get(OWNER, launch_id).state == "uncertain"
-            assert control.ownership[launch_id] == ("uncertain", None)
+                # The launch is charged, but nothing is owned, recorded or created,
+                # so nothing is left uncertain.
+                assert control.charged == {value["launch_reservation_id"]: "reserved"}
+                assert control.ownership == {} and await control.unsettled() == ()
+                assert server._registry.find(OWNER, launch_id) is None
+                assert not [e for e in cluster.events if e[0] == "POST"]
+                # A retry replays the same charge and launches.
+                created = await http.post(url + ROUTE, content=raw)
+                assert created.status_code == 202, created.json()
+                await settled(server, launch_id)
+            assert [e for e in cluster.events if e[0] == "RESERVE"] == [
+                ("RESERVE", value["launch_reservation_id"])
+            ]
+            assert control.ownership[launch_id][0] == "bound"
+
+    asyncio.run(scenario())
+
+
+def test_concurrent_creates_of_one_launch_assign_once(tmp_path):
+    class Gated:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def assign(self, plan: Any, *, expires_at_ms: int) -> Any:
+            self.calls += 1
+            self.entered.set()
+            await self.release.wait()
+            return await Assignments().assign(plan, expires_at_ms=expires_at_ms)
+
+    async def scenario() -> None:
+        cluster = Cluster()
+        gated = Gated()
+        async with mediator(tmp_path, cluster, assignments=gated) as (server, control, url, root):
+            raw = request_bytes()
+            launch_id = json.loads(raw)["launch_id"]
+            cluster.launch_id = launch_id
+            async with httpx.AsyncClient(verify=context(root), trust_env=False) as http:
+                first = asyncio.create_task(http.post(url + ROUTE, content=raw))
+                await asyncio.wait_for(gated.entered.wait(), 5)
+                second = asyncio.create_task(http.post(url + ROUTE, content=raw))
+                await asyncio.sleep(0.2)
+                # The second request waits for the first instead of minting credentials.
+                assert gated.calls == 1 and not second.done()
+                gated.release.set()
+                answers = sorted([(await first).status_code, (await second).status_code])
+                await settled(server, launch_id)
+            assert set(answers) <= {200, 202} and gated.calls == 1
+            assert [e for e in cluster.events if e[0] == "RESERVE"] == [
+                ("RESERVE", json.loads(raw)["launch_reservation_id"])
+            ]
 
     asyncio.run(scenario())

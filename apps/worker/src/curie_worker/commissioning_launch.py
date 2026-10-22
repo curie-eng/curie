@@ -9,17 +9,21 @@ no later than the permit.
 
 Campaign authority stays behind ``LaunchControl``, implemented over the
 commissioning records outside this package: it verifies the campaign launch
-request and its committed admission, consumes the launch reservation, and
-records broker ownership ``creating`` with the deterministic owned namespace and
-Pod name before any create. The observed Pod UID is bound after the create
-response. Local cleanup facts live in ``CommissioningLaunchRegistry``.
+request and its committed admission and charges the launch reservation before
+anything is assigned; then it consumes the reservation and records broker
+ownership ``creating`` with the deterministic owned namespace and Pod name
+before any create. A failed assignment so owns nothing and its retry dispatches
+the same charge. The observed Pod UID is bound after the create response. Local
+cleanup facts live in ``CommissioningLaunchRegistry``; a Pod deleted before its
+runner started is finished by ``commissioning_cleanup``.
 
 An ambiguous create is resolved only by the exact recorded name, a known UID
 and the guard-owned witness of the UID it admitted for that create. A same-name
 object is never adopted: without a witness the ownership becomes ``uncertain``,
-which blocks acceptance. This slice launches, observes and retires; starting a
-turn, admission control and stop requests refuse until the supervisor and
-provider gateway slices compose them.
+which blocks acceptance. This mediator launches, observes and retires, and the
+campaign supervisor fences it and retires every owned launch on expiry,
+exhaustion, revocation or broker loss; starting a turn, admission control and
+stop requests refuse until the provider gateway slice composes them.
 """
 
 from __future__ import annotations
@@ -37,6 +41,7 @@ from aci_protocol import BootEnv
 from aiohttp import web
 from cryptography import x509
 
+from .commissioning_cleanup import retire_unstarted
 from .commissioning_registry import (
     CampaignLaunchBinding,
     CommissioningLaunchRegistry,
@@ -111,6 +116,10 @@ class LaunchControl(Protocol):
 
     async def plan(self, raw: bytes) -> LaunchPlan:
         """Verify one campaign launch request and its committed admission."""
+        ...
+
+    async def reserve(self, plan: LaunchPlan) -> bool:
+        """Charge the launch once; true while its reservation is undispatched."""
         ...
 
     async def own(self, plan: LaunchPlan, *, namespace: str, pod_name: str) -> None:
@@ -276,6 +285,7 @@ class CommissioningLaunchServer:
         self._live = self._mechanics.live
         self._settle_task: asyncio.Task[None] | None = None
         self._background: set[asyncio.Task[None]] = set()
+        self._fenced = False
         self._app = web.Application(client_max_size=65536, middlewares=[self._middleware])
         self._app.router.add_route("*", "/{tail:.*}", self._http)
         self._app.on_shutdown.append(self._shutdown)
@@ -399,16 +409,8 @@ class CommissioningLaunchServer:
         if plan.projection_digest != projection.digest:
             raise _Refusal("unauthorized", 403)
         launch_id = plan.launch_id
-        prior = self._registry.find(owner, launch_id)
-        if prior is not None:
-            live = self._live.get(launch_id)
-            if live is None or prior.state not in {"preparing", "idle"}:
-                raise _Refusal("retired", 409)
-            if prior.binding.launch_request_digest != plan.launch_request_digest:
-                raise _Refusal("conflict", 409)
-            return self._created(prior, live, retry=True)
         namespace = projection.as_dict()["namespace"]
-        pod_name = object_names(launch_id)[0]
+        pod_name, _service_name, secret_name = object_names(launch_id)
         guard = self._control.guard_identity
         # Workload binding W's create operation is the consumed launch reservation.
         binding = CampaignLaunchBinding(
@@ -422,7 +424,39 @@ class CommissioningLaunchServer:
             guard["config_sha256"],
         )
         budget = min(120, self._measured.execution_seconds)
+        # One create at a time from the replay check to the live launch, so
+        # concurrent requests for one launch never mint two assignments.
         async with self._mechanics.create_lock:
+            prior = self._registry.find(owner, launch_id)
+            if prior is not None:
+                live = self._live.get(launch_id)
+                if live is None or prior.state not in {"preparing", "idle"}:
+                    raise _Refusal("retired", 409)
+                if prior.binding.launch_request_digest != plan.launch_request_digest:
+                    raise _Refusal("conflict", 409)
+                return self._created(prior, live, retry=True)
+            if self._fenced:
+                raise _Refusal("unavailable", 503)
+            # The launch is charged before anything is assigned to it. A failed
+            # assignment leaves the charge undispatched and owns nothing, so it
+            # leaves no uncertain ownership and a retry dispatches the same charge.
+            if not await self._control.reserve(plan):
+                raise _Refusal("retired", 409)
+            capability, runner_token = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
+            now_ms = int(time.time() * 1000)
+            expiry_ms = min(
+                ((now_ms + self._measured.execution_seconds * 1000) // 1000) * 1000,
+                self._control.expires_at_ms,
+            )
+            require(expiry_ms > now_ms)
+            assignment = await self._assignments.assign(plan, expires_at_ms=expiry_ms)
+            require(type(assignment) is CampaignRunnerAssignment)
+            source = {
+                "runner-token": runner_token,
+                "history-token": assignment.history_token,
+                "model-credential": assignment.model_credential,
+            }
+            secret_document(namespace, secret_name, source)
             # Durable campaign ownership precedes the local row and every create.
             await self._control.own(plan, namespace=namespace, pod_name=pod_name)
             row = self._registry.create(
@@ -433,21 +467,6 @@ class CommissioningLaunchServer:
                 creation_budget_ms=budget * 1000,
             )
             try:
-                capability, runner_token = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
-                now_ms = int(time.time() * 1000)
-                expiry_ms = min(
-                    ((now_ms + self._measured.execution_seconds * 1000) // 1000) * 1000,
-                    self._control.expires_at_ms,
-                )
-                require(expiry_ms > now_ms)
-                assignment = await self._assignments.assign(plan, expires_at_ms=expiry_ms)
-                require(type(assignment) is CampaignRunnerAssignment)
-                source = {
-                    "runner-token": runner_token,
-                    "history-token": assignment.history_token,
-                    "model-credential": assignment.model_credential,
-                }
-                secret_document(namespace, present(row.objects.secret_name), source)
                 row = self._registry.record_assignment(
                     owner,
                     launch_id,
@@ -577,6 +596,19 @@ class CommissioningLaunchServer:
             if row.state == "retiring" and not self._unknown(row):
                 await self._mechanics.retire(owner, launch_id)
             row = self._registry.get(owner, launch_id)
+        if (
+            row.state == "retiring"
+            and not self._unknown(row)
+            and row.termination is None
+            and row.objects.container_id is None
+        ):
+            # A Pod deleted before its runner started has no container to prove.
+            async with self._mechanics.mutex(launch_id):
+                try:
+                    await retire_unstarted(self._kube, self._registry, owner, launch_id)
+                except Exception:  # noqa: BLE001 - incomplete proof stays retiring
+                    pass
+            row = self._registry.get(owner, launch_id)
         state = cast(OwnershipState, row.state)
         if state in {"retired", "retiring", "uncertain"}:
             await self._control.advance(launch_id, state, row.objects.pod_uid)
@@ -603,6 +635,38 @@ class CommissioningLaunchServer:
                     due.append(launch_id)
         for launch_id in due:
             await self._settle(self._principal, launch_id)
+
+    def fence(self) -> None:
+        """Refuse every later create; status, stop and retire stay available."""
+        self._fenced = True
+
+    async def close_campaign(self) -> tuple[str, ...]:
+        """Fence, retire every owned launch and return the ones not yet ``retired``.
+
+        For the campaign supervisor. A create already past the fence records
+        its ownership first, inside the create lock. This process's live
+        launches are retired from local facts even when the broker is gone;
+        then every launch in durable ownership is settled, including those an
+        earlier control process left. A broker refusal propagates: what is left
+        is then unknown, never assumed retired. @spec PROTECTED-COMMISSIONING-3/8.
+        """
+        self.fence()
+        async with self._mechanics.create_lock:
+            pass
+        await asyncio.gather(*tuple(self._background), return_exceptions=True)
+        for launch_id in tuple(self._live):
+            try:
+                await self._retire(self._principal, launch_id)
+            except Exception:  # noqa: BLE001 - durable ownership is settled below or later
+                pass
+        for launch_id in await self._control.unsettled():
+            row = self._registry.find(self._principal, launch_id)
+            if row is None:
+                # Ownership without a local row: no create is attributable.
+                await self._control.advance(launch_id, "uncertain", None)
+            else:
+                await self._retire(self._principal, launch_id)
+        return await self._control.unsettled()
 
     async def _settle_loop(self) -> None:
         while not self._mechanics.closing:
