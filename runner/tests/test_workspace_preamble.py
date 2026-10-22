@@ -15,6 +15,7 @@ from curie_runner import __main__ as boot
 from curie_runner.__main__ import build_runner
 from curie_runner.adapter import ClaudeAgentSession
 from curie_runner.progress import PROGRESS_TOKEN_ENV, PROGRESS_URL_ENV
+from runner_boot_session import initialized_session_sync
 
 
 @pytest.fixture(autouse=True)
@@ -49,7 +50,7 @@ def _plugin_config(tmp_path) -> RunnerConfig:
 
 def _real_session_prompt(tmp_path, **build_kw) -> str | None:
     runner = build_runner(_plugin_config(tmp_path), fake_model=False, **build_kw)
-    session = runner._factory()
+    session = initialized_session_sync(runner)
     assert isinstance(session, ClaudeAgentSession)
     return session._options.system_prompt
 

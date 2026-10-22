@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -22,6 +23,18 @@ if TYPE_CHECKING:
 
 from . import failures
 from .log import logger
+
+# #4777: the runner now passes its pod readiness probe before its verification
+# preflight and session connect finish, so a freshly Ready replacement can
+# still report ``ready: false``. The handoff re-reads its status at this
+# interval while every other attestation fact already matches.
+_CANDIDATE_READY_POLL_S = 0.25
+# Held back from the polling budget so the whole probe, including the last
+# status read and loop scheduling, ends strictly inside the coordinator bridge
+# in ``claim.run_status_probe``, which waits the same ceiling plus
+# ``constants._HANDOFF_REVALIDATION_BRIDGE_GRACE_S`` (1 s). Polling past the
+# bridge would surface as a bridge timeout instead of this probe's refusal.
+_CANDIDATE_READY_DEADLINE_MARGIN_S = 0.5
 
 
 def _workspace_inference_notice(repo: str | None) -> str | None:
@@ -219,7 +232,15 @@ async def _workspace_handoff_ready(
 async def _workspace_candidate_ready(
     self: Kernel, handle: SandboxHandle, *, remaining_s: float | None = None
 ) -> bool:
-    """Fail closed unless this exact candidate booted the managed checkout."""
+    """Fail closed unless this exact candidate booted the managed checkout.
+
+    The runner binds and passes its pod readiness probe before its
+    verification preflight and session connect finish (#4777), so a Ready
+    candidate can briefly report ``ready: false``. When that is the only
+    unmet fact, the status is re-read until it turns ready or the polling
+    deadline passes. Any other mismatch, a missing token, or an unreadable
+    status refuses at once.
+    """
 
     if not handle.token:
         logger.warning(
@@ -227,26 +248,50 @@ async def _workspace_candidate_ready(
             handle.base_url,
         )
         return False
-    try:
-        status = await self._runner.status(
-            handle.base_url,
-            token=handle.token,
-            remaining_s=remaining_s,
+    loop = asyncio.get_running_loop()
+    budget = self._config.runner_total_timeout_s
+    if remaining_s is not None:
+        budget = min(budget, remaining_s)
+    deadline = loop.time() + budget - _CANDIDATE_READY_DEADLINE_MARGIN_S
+    reported_not_ready = False
+    while True:
+        try:
+            status = await self._runner.status(
+                handle.base_url,
+                token=handle.token,
+                remaining_s=max(0.0, min(budget, deadline - loop.time())),
+            )
+        except Exception as exc:  # noqa: BLE001 - unreadable is never safe to expose
+            logger.warning(
+                "could not attest workspace handoff candidate at %s: %r",
+                handle.base_url,
+                exc,
+            )
+            return False
+        attested = (
+            status.get("session_id") == handle.session_id
+            and status.get("sandbox_id") == handle.sandbox_id
+            and status.get("managed_workspace") is True
+            and status.get("cwd") == "/workspace"
+            and status.get("turn_active") is False
+            and status.get("history_durable") is True
+            and status.get("status") == SessionStatus.IDLE_AWAITING_INPUT.value
         )
-    except Exception as exc:  # noqa: BLE001 - unreadable is never safe to expose
-        logger.warning(
-            "could not attest workspace handoff candidate at %s: %r",
-            handle.base_url,
-            exc,
-        )
-        return False
-    return (
-        status.get("session_id") == handle.session_id
-        and status.get("sandbox_id") == handle.sandbox_id
-        and status.get("managed_workspace") is True
-        and status.get("cwd") == "/workspace"
-        and status.get("ready") is True
-        and status.get("turn_active") is False
-        and status.get("history_durable") is True
-        and status.get("status") == SessionStatus.IDLE_AWAITING_INPUT.value
-    )
+        ready = status.get("ready")
+        if not attested or ready is not False:
+            return attested and ready is True
+        if not reported_not_ready:
+            reported_not_ready = True
+            logger.info(
+                "workspace handoff candidate at %s is not ready yet; polling its status",
+                handle.base_url,
+            )
+        # Re-read only when a full pause still leaves time for the read, so
+        # the last read never runs against an already spent deadline.
+        if deadline - loop.time() <= _CANDIDATE_READY_POLL_S:
+            logger.warning(
+                "workspace handoff candidate at %s did not become ready before its deadline",
+                handle.base_url,
+            )
+            return False
+        await asyncio.sleep(_CANDIDATE_READY_POLL_S)

@@ -21,7 +21,7 @@ import uuid
 from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any, NoReturn
 
 import aiohttp
 import pytest
@@ -70,6 +70,9 @@ from redis.backoff import NoBackoff
 from redis.maint_notifications import MaintNotificationsConfig
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+
+if TYPE_CHECKING:
+    from curie_worker.sandbox.types import ToolDaemonMount
 
 # ``sync_redis`` and ``names`` (the per-test-unique stream / group / key
 # prefixes on the shared Valkey) live in ``tests/conftest.py``: they are used
@@ -527,9 +530,12 @@ class FakeK8s:
         pool: str,
         env: dict[str, str] | None = None,
         labels: dict[str, str] | None = None,
+        deadline: float,
         runner_resources: dict[str, object] | None = None,
         agent_name: str | None = None,
+        tool_daemon: ToolDaemonMount | None = None,
     ) -> None:
+        assert deadline > 0 and tool_daemon is None
         self.claim_envs.append(env)
         sandbox_name = f"sbx-{name}"
         quota_rejection = self.quota_rejection
@@ -635,6 +641,23 @@ class FakeK8s:
         assert since.tzinfo is not None
         self.termination_queries.append(name)
         return self.termination
+
+    # No Docker repository pool is configured in this suite, so the substrate
+    # never reaches the tool-daemon seam (ADR 0217); any call is a test bug.
+    def create_daemon_object(self, *args: object, **kwargs: object) -> NoReturn:
+        raise AssertionError("no tool daemon is provisioned in this suite")
+
+    def list_daemon_objects(self, *args: object, **kwargs: object) -> NoReturn:
+        raise AssertionError("no tool daemon is listed in this suite")
+
+    def delete_daemon_object(self, *args: object, **kwargs: object) -> NoReturn:
+        raise AssertionError("no tool daemon is retired in this suite")
+
+    def get_daemon_pod(self, *args: object, **kwargs: object) -> NoReturn:
+        raise AssertionError("no tool daemon pod is read in this suite")
+
+    def open_daemon_stream(self, *args: object, **kwargs: object) -> NoReturn:
+        raise AssertionError("no tool daemon is pinged in this suite")
 
     def set_sandbox_mode(self, name: str, mode: str) -> None:
         self.sandboxes[name].operating_mode = mode

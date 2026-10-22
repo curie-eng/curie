@@ -394,7 +394,10 @@ AgentMail supplies no trusted positive aligned verdict, guarantees neither
 header provenance nor stripping, and permits DMARC failure under `p=none`;
 Curie refuses every message with `authentication_unverifiable`, including
 allowlisted senders and approval answers. A wildcard needs a separate boot opt
-in and never bypasses authentication. The provider evidence and complete gate
+in and never bypasses authentication. For another mail service, do not write a
+new email adapter: write a mail provider for `apps/mail-adapter` (ADR 0228, the
+[mail provider seam](../interfaces/mail-provider/INTERFACE.md)) and run its
+conformance kit. The provider evidence and complete gate
 contract are in [`apps/mail-adapter/README.md`](../../apps/mail-adapter/README.md).
 
 ## 7. Conformance floor

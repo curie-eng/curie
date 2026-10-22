@@ -63,12 +63,14 @@ updates `publications` / `approvals` under `FOR UPDATE ... SKIP LOCKED`). Table 
 column names are a second, ORM-independent coupling a conforming DB must honor.
 - **Migrations**: the target DB must apply the **whole Alembic chain in `apps/api/alembic/versions/`**, in revision order, ending at `alembic heads`. The chain grows with the product, so it is deliberately not enumerated here: `ls apps/api/alembic/versions/` is the list, and `alembic heads` is the tip a conforming DB must reach. A single head is the invariant — a fork means two branches each added a migration (rebase and merge the heads before swapping anything). Two recent expand revisions make authenticated review feedback part of this schema contract: `0042_review_lineage_authority.py` adds immutable App-observed authority to publication lineages and the `publication_review_reservations` concurrency table; `0043_github_review_feedback.py` adds the `github_review_deliveries` audit table and the `github_review_feedback` durable feedback/outbox table. The latter stores normalized feedback and a credential-free queued turn, never a raw webhook body or GitHub credential.
 
-The current application schema window is `schema_min: "0108"` and
-`schema_head: "0109"`, as recorded in
+The current application schema window is `schema_min: "0122"` and
+`schema_head: "0123"`, as recorded in
 `apps/api/src/curie_api/schema_compat.json`. Revision `0108` merges the `0107`
 and `0106` histories (`apps/api/alembic/versions/0108_merge_stable_reply_identity.py`);
-revision `0109` adds the shared connector store
-(`apps/api/alembic/versions/0109_shared_connector_store.py`).
+revisions `0120` through `0122` add team directory sync state, agent access
+policies and directory identity, and the floor is `0122`; revision `0123` adds
+the shared connector store
+(`apps/api/alembic/versions/0123_shared_connector_store.py`).
 These values describe this candidate, not a historical release window.
 
 The `channel_canvas_edits` table (`apps/api/src/curie_api/models.py::ChannelCanvasEdit`,
@@ -254,7 +256,7 @@ ADR-0198 decision 5) is additive: two new tables, whose active-link uniqueness
 is a partial unique index (`identity_links_active_native_key`,
 `WHERE revoked_at IS NULL`).
 
-Migration `0109_shared_connector_store.py` (shared connector applications,
+Migration `0123_shared_connector_store.py` (shared connector applications,
 ADR 0239) is additive: six tables (`shared_connector_applications`,
 `shared_connector_recipients`, `shared_connector_database_roles`,
 `shared_connector_memberships`, `shared_connector_bindings` and

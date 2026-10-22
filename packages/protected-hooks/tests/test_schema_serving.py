@@ -56,7 +56,11 @@ def graph_payload() -> dict[str, Any]:
         ("0101", False),
         ("0102", False),
         ("0103", False),
-        ("0108", True),
+        ("0108", False),
+        ("0122", True),
+        # The shared connector store (0123, ADR 0239) is expand-only above the
+        # minimum, so the candidate head is served.
+        ("0123", True),
         ("0000", True),
         ("future-expand", True),
     ],

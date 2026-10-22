@@ -1,6 +1,6 @@
 [package]
 name = "curie"
-version = "0.13.1"
+version = "0.14.0"
 edition = "2021"
 description = "Curie CLI: init/start/send/eval a plugin against a local runner (task I1)"
 # Every cli/tests/<name>.rs is a module of the one `integration` test crate
@@ -14,6 +14,10 @@ path = "src/main.rs"
 [[test]]
 name = "integration"
 path = "tests/integration.rs"
+
+[[test]]
+name = "dev_test_env"
+path = "tests/dev_test_env.rs"
 
 [dependencies]
 curie-aci-protocol = { path = "../packages/aci-protocol/generated/rust" }

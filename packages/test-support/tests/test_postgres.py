@@ -58,5 +58,9 @@ def test_pg_connect_or_skip_fails_for_an_unreachable_postgres_when_required(
     monkeypatch.setenv("CI_REQUIRE_POSTGRES_TESTS", "")
 
     with _bind_unlistening_port() as listener:
-        with pytest.raises(UNREACHABLE):
+        with pytest.raises(UNREACHABLE) as info:
             asyncio.run(_connect(_unreachable_url(listener)))
+        message = "\n".join(info.value.__notes__)
+        port = listener.getsockname()[1]
+        assert f"could not connect to Postgres at 127.0.0.1:{port}" in message
+        assert LEAK_MARKER not in message

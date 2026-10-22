@@ -2,7 +2,7 @@
 
 ``runner/tests/test_repo_toolchain_proof.py`` skips every container leg when
 the runner image is absent. The Python job does not build that image, so those
-legs were a silent skip on the merge gate. This file pins the dedicated job
+legs were a silent skip on the merge gate. This file pins the Toolchain group
 that loads the image and sets ``CURIE_REPO_TOOLCHAIN_PROOF`` to required.
 
 The two negative controls are driven through the same assertion the real check
@@ -20,14 +20,14 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CI_YAML = REPO_ROOT / ".github" / "workflows" / "ci.yaml"
-JOB_ID = "repo-toolchain-proof"
+JOB_ID = "image-proofs"
 REQUIRED_ASSIGNMENT = "CURIE_REPO_TOOLCHAIN_PROOF: required"
 HARNESS = "runner/tests/test_repo_toolchain_proof.py"
-LOAD_STEP = "Load the runner image built by the ci-images job"
-TAG_STEP = "Tag the runner image as the harness default (curie-runner)"
-PROOF_STEP = "Repository toolchain proof"
-ABSENT_IMAGE_STEP = "Absent image fails in required mode (negative control)"
-REQUIRED_STEP = "Required setting is present (negative control)"
+LOAD_STEP = "Toolchain: Load the runner image built by the ci-images job"
+TAG_STEP = "Toolchain: Tag the runner image as the harness default (curie-runner)"
+PROOF_STEP = "Toolchain: Repository toolchain proof"
+ABSENT_IMAGE_STEP = "Toolchain: Absent image fails in required mode (negative control)"
+REQUIRED_STEP = "Toolchain: Required setting is present (negative control)"
 ABSENT_IMAGE = "curie-runner-absent-2611"
 
 
@@ -36,11 +36,11 @@ def _workflow(raw: str | None = None) -> dict[str, Any]:
 
 
 def assert_proof_job_gates(doc: dict[str, Any]) -> None:
-    """The contract the dedicated CI job must keep, or the #2571 skip returns."""
+    """The contract the Toolchain group must keep, or the #2571 skip returns."""
 
     jobs = doc.get("jobs") or {}
     assert JOB_ID in jobs, (
-        "ci.yaml must keep the repo-toolchain-proof job; without it the "
+        "ci.yaml must keep the image-proofs job; without it the "
         "container legs of test_repo_toolchain_proof.py skip on the merge gate"
     )
     job = jobs[JOB_ID]
@@ -51,19 +51,19 @@ def assert_proof_job_gates(doc: dict[str, Any]) -> None:
     assert python_env.get("CURIE_REPO_TOOLCHAIN_PROOF") != "required", (
         "the Python job must not set CURIE_REPO_TOOLCHAIN_PROOF=required; it "
         "does not build curie-runner, so required mode would fail that job on "
-        "every run instead of gating in the dedicated job"
+        "every run instead of gating in image-proofs"
     )
 
     needs = job.get("needs")
     if isinstance(needs, str):
         needs = [needs]
     assert needs == ["changes", "ci-images"], (
-        "repo-toolchain-proof may wait on the path selector and the shared "
+        "image-proofs may wait on the path selector and the shared "
         "image build only; it must not serialise behind the Python suite"
     )
-    assert job.get("if") == "${{ needs.changes.outputs.images == 'true' }}", (
-        "repo-toolchain-proof runs when images are selected; a skip here is "
-        "not a merge-required check"
+    assert job.get("if") == (
+        "${{ !cancelled() && needs.changes.result == 'success' && "
+        "(needs.ci-images.result == 'success' || needs.ci-images.result == 'skipped') }}"
     )
 
     env = job.get("env") or {}
@@ -73,6 +73,15 @@ def assert_proof_job_gates(doc: dict[str, Any]) -> None:
     )
 
     steps = job.get("steps") or []
+    for step in steps:
+        if step.get("name", "").startswith("Toolchain: "):
+            gate = "!cancelled() && needs.changes.outputs.images == 'true'"
+            if step.get("name") in (
+                "Toolchain: Back off before retrying Install uv",
+                "Toolchain: Install uv (retry)",
+            ):
+                gate += " && steps.install_uv.outcome == 'failure'"
+            assert step.get("if") == "${{ " + gate + " }}"
     by_name = {step.get("name"): step for step in steps if step.get("name")}
 
     assert REQUIRED_STEP in by_name, (

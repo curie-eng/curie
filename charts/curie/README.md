@@ -1406,8 +1406,16 @@ requests default to `500m` CPU, `1Gi` memory and `10Gi` ephemeral storage; limit
 default to `2`, `4Gi` and `20Gi`. `factory.docker.storageSizeLimit` defaults to
 `20Gi`, `maxClaimLifetimeSeconds` to `86400` and `pingTimeoutSeconds` to `2`.
 Missing new leaves on retained releases receive these defaults. Namespace quota
-and LimitRange remain separate. This handoff configures future worker creation;
-daemon lifecycle and certificate issuance are not implemented here.
+and LimitRange remain separate. The worker
+(`apps/worker/src/curie_worker/sandbox/tool_daemon.py`) creates each Docker
+claim's daemon Pod, headless Service, ingress NetworkPolicy and per-claim mTLS
+Secret before the claim, reuses a retained route only after an authenticated
+ping, and deletes those objects on every retirement path, with an orphan sweep
+for objects older than the claim timeout. With `factory.docker.createNamespace`
+false, removing the last Docker repository also removes the worker's Role here,
+so daemon objects alive at that upgrade are left for the operator: each Pod
+stops at its `activeDeadlineSeconds`, while its Service, Secret and
+NetworkPolicy remain until deleted by hand.
 
 1. A daemon namespace, `factory.docker.namespace` or
    `<release-namespace>-<fullname>-docker` by default. The chart creates it
@@ -1416,7 +1424,7 @@ daemon lifecycle and certificate issuance are not implemented here.
    creates it with that label.
 2. A Role and RoleBinding there for the worker ServiceAccount: create, get,
    list and delete on pods, services and networkpolicies, get on pods/log,
-   create and delete on secrets.
+   create and get on pods/portforward, create and delete on secrets.
 3. A ResourceQuota from `factory.docker.quota.hard` and a Container LimitRange
    from `factory.docker.limitRange` (`max`, `min`, `default`,
    `defaultRequest`). All are required.

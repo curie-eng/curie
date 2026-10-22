@@ -575,7 +575,7 @@ print(json.dumps(graph))
         ));
         assert!(!declared_window_within_release(
             "sha-4498fa0",
-            &candidate_window("0108", "0109").unwrap()
+            &candidate_window("0122", "0123").unwrap()
         ));
     }
 
@@ -620,7 +620,7 @@ print(json.dumps(graph))
         // Ambiguous and uncatalogued versions are never named.
         let unnamed = [
             declared("0.8.9", 4, "0001", "0044"),
-            declared("sha-4498fa0", 5, "0108", "0109"),
+            declared("sha-4498fa0", 5, "0122", "0123"),
         ];
         assert_eq!(
             fix_for(&[], &unnamed, "0044"),
@@ -756,8 +756,8 @@ print(json.dumps(graph))
     fn candidate_window_tracks_the_catalog_without_changing_released_windows() {
         // @spec DEPLOY-NOTICE-RELEASE-1.
         let candidate = source_candidate_window();
-        assert_eq!(candidate.schema_min, "0108");
-        assert_eq!(candidate.schema_head, "0109");
+        assert_eq!(candidate.schema_min, "0122");
+        assert_eq!(candidate.schema_head, "0123");
         assert_eq!(
             candidate.schema_head.as_str(),
             catalog().revisions.last().unwrap()
@@ -773,8 +773,11 @@ print(json.dumps(graph))
         ] {
             assert!(!live_in_window(below, &current), "{below}");
         }
-        assert!(live_in_window("0108", &current));
-        assert!(live_in_window("0109", &current));
+        assert!(!live_in_window("0108", &current));
+        assert!(!live_in_window("0120", &current));
+        assert!(!live_in_window("0121", &current));
+        assert!(live_in_window("0122", &current));
+        assert!(live_in_window("0123", &current));
         assert!(!live_in_window("0075", &current));
         assert!(!live_in_window("0076", &current));
         let retained = window_for("0.12.0").expect("published foundation remains catalogued");
@@ -799,16 +802,26 @@ print(json.dumps(graph))
         for revision in ["0082", "0091a", "0098", "0099"] {
             assert!(!live_in_window(revision, &published_stable));
         }
-        // The released 0.13.0 window stays fixed while the expand-only shared
-        // connector store (0109, ADR 0239) moves the candidate head past it.
-        let candidate_release = window_for("0.13.0").expect("released 0.13.0 is catalogued");
-        assert_eq!(candidate_release.schema_min, candidate.schema_min);
+        // v0.13.0 is published: its window stays at the 0108 join while the
+        // candidate advances to agent access policies (0121, #4585), directory
+        // identity (0122) and the expand-only shared connector store (0123,
+        // ADR 0239).
+        let candidate_release = window_for("0.13.0").expect("published 0.13.0 is catalogued");
+        assert_eq!(candidate_release.schema_min, "0108");
         assert_eq!(candidate_release.schema_head, "0108");
         let patch_release = window_for("0.13.1").expect("released 0.13.1 is catalogued");
         assert_eq!(patch_release.schema_min, "0108");
         assert_eq!(patch_release.schema_head, "0108");
         assert!(live_in_window("0108", &candidate_release));
-        assert!(!live_in_window("0109", &candidate_release));
+        assert!(!live_in_window("0120", &candidate_release));
+        assert!(!live_in_window("0123", &candidate_release));
+        // The released 0.14.0 window stays fixed at 0122 while the shared
+        // connector store moves the candidate head past it.
+        let feature_release = window_for("0.14.0").expect("released 0.14.0 is catalogued");
+        assert_eq!(feature_release.schema_min, candidate.schema_min);
+        assert_eq!(feature_release.schema_head, "0122");
+        assert!(live_in_window("0122", &feature_release));
+        assert!(!live_in_window("0123", &feature_release));
         assert!(!live_in_window("0100", &candidate_release));
         assert!(!live_in_window("0075", &candidate_release));
         let published =

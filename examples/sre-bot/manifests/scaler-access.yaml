@@ -1,0 +1,98 @@
+# The credential for the opt-in scaler connector (connectors/scaler). Apply it
+# only when you opt in to that connector; the default install neither declares
+# the connector nor applies this file.
+#
+#     kubectl apply -f examples/sre-bot/manifests/scaler-access.yaml
+#
+# SEPARATE FROM manifests/kubernetes-access.yaml, and it must stay that way.
+# That identity reads most of the cluster and writes workloads in `sre-demo`;
+# this one can do exactly one thing: read and set the replica count of the
+# Deployments named below. Sharing either credential would widen the other.
+#
+# Why each verb is here
+# ---------------------
+# `get` on deployments/scale     -- the connector reads the count, uid and
+#                                   resourceVersion it seals before a write, and
+#                                   `observe_version` reads the same.
+# `update` on deployments/scale  -- the write itself: a PUT carrying the read's
+#                                   resourceVersion, so a concurrent change
+#                                   answers 409 instead of being overwritten.
+#
+# Deliberately absent:
+# `patch`                        -- the connector never patches; a PUT with a
+#                                   resourceVersion is the compare-and-swap.
+# anything on `deployments`      -- the subresource cannot reach an image, a
+#                                   command, an env var or a Secret reference.
+#                                   Reading the Deployment would expose its pod
+#                                   template, which this credential never needs.
+# `list` / `watch`               -- `resourceNames` cannot narrow them, and the
+#                                   connector reads only named objects.
+#
+# The `resourceNames` below and the connector's SCALER_DEPLOYMENTS are two
+# places on purpose: a ceiling stated once could move when someone edits the
+# other place. The Role is the ceiling even when the connector's list is wider.
+#
+# Verify the ceiling after applying:
+#
+#   kubectl auth can-i --as=system:serviceaccount:curie:sre-bot-scaler \
+#     update deployments/example-api --subresource=scale -n sre-demo   # yes
+#   kubectl auth can-i --as=system:serviceaccount:curie:sre-bot-scaler \
+#     get deployments/example-api --subresource=scale -n sre-demo      # yes
+#   kubectl auth can-i --as=system:serviceaccount:curie:sre-bot-scaler \
+#     update deployments/example-other --subresource=scale -n sre-demo # no
+#   kubectl auth can-i --as=system:serviceaccount:curie:sre-bot-scaler \
+#     patch deployments/example-api --subresource=scale -n sre-demo    # no
+#   kubectl auth can-i --as=system:serviceaccount:curie:sre-bot-scaler \
+#     get deployments/example-api -n sre-demo                          # no
+#   kubectl auth can-i --as=system:serviceaccount:curie:sre-bot-scaler \
+#     update deployments/example-api --subresource=scale -n curie      # no
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sre-bot-scaler
+  # The namespace the Curie release runs in, like the other connector identities.
+  namespace: curie
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sre-bot-scaler
+  # CHANGE ME with SCALER_NAMESPACE: the one namespace the connector acts in.
+  namespace: sre-demo
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale"]
+    resourceNames:
+      # CHANGE ME with SCALER_DEPLOYMENTS: the Deployments this connector may
+      # scale. A placeholder name grants nothing until such a Deployment exists.
+      - example-api
+    verbs: ["get", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: sre-bot-scaler
+  namespace: sre-demo
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: sre-bot-scaler
+subjects:
+  - kind: ServiceAccount
+    name: sre-bot-scaler
+    # Indented under `subjects`, not `metadata.namespace`. Getting it wrong does
+    # not fail `kubectl apply`; the binding simply grants nothing.
+    namespace: curie
+---
+# The connector reads a static file-mounted kubeconfig and cannot refresh a
+# projected token, so this mints the non-expiring token that kubeconfig holds.
+# Keep this credential out of bundle content.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: sre-bot-scaler-token
+  namespace: curie
+  annotations:
+    kubernetes.io/service-account.name: sre-bot-scaler
+type: kubernetes.io/service-account-token

@@ -17,6 +17,7 @@ from _migration_support import IsolatedMigrationDb, sql_dicts
 from curie_api.config import get_settings
 from curie_api.main import create_app
 from curie_api.schema_compat import assert_servable
+from curie_protected_hooks.schema_serving import load_window
 from fastapi.testclient import TestClient
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -51,7 +52,7 @@ def invoke() -> None:
     asyncio.run(asyncio.wait_for(assert_servable(), 35))
 
 
-@pytest.mark.parametrize("revision", ["0108", "future-expand"])
+@pytest.mark.parametrize("revision", [load_window().schema_head, "future-expand"])
 def test_actual_api_admits_known_or_future_with_readable_source_structure(
     startup_db: str, revision: str
 ) -> None:
@@ -89,7 +90,7 @@ def test_schema_built_at_0100_is_refused_without_migrating(
     assert sql_dicts("SELECT version_num FROM curie.alembic_version") == [{"version_num": "0100"}]
 
 
-@pytest.mark.parametrize("revision", ["0108", "future-expand"])
+@pytest.mark.parametrize("revision", [load_window().schema_head, "future-expand"])
 def test_compatible_stamp_without_actual_ledger_refuses(
     startup_db: str, revision: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -128,7 +129,9 @@ def test_required_projection_column_missing_refuses(
     sql_dicts(f"ALTER TABLE curie.{table} RENAME COLUMN {column} TO renamed_required_column")
     with pytest.raises(RuntimeError, match="schema_structure_unavailable"):
         invoke()
-    assert sql_dicts("SELECT version_num FROM curie.alembic_version") == [{"version_num": "0109"}]
+    assert sql_dicts("SELECT version_num FROM curie.alembic_version") == [
+        {"version_num": load_window().schema_head}
+    ]
 
 
 @pytest.mark.parametrize(
@@ -146,7 +149,9 @@ def test_incompatible_actual_column_type_refuses(
     sql_dicts(f"ALTER TABLE curie.{table} ALTER COLUMN {column} TYPE {kind}")
     with pytest.raises(RuntimeError, match="schema_structure_unavailable"):
         invoke()
-    assert sql_dicts("SELECT version_num FROM curie.alembic_version") == [{"version_num": "0109"}]
+    assert sql_dicts("SELECT version_num FROM curie.alembic_version") == [
+        {"version_num": load_window().schema_head}
+    ]
 
 
 @pytest.mark.parametrize("mode", ["multiple", "empty", "missing"])
@@ -196,7 +201,10 @@ def test_configured_metadata_schema_is_distinct_from_actual_curie_source_schema(
     schema = "metadata_" + uuid.uuid4().hex
     sql_dicts(f"CREATE SCHEMA {schema}")
     sql_dicts(f"CREATE TABLE {schema}.alembic_version(version_num varchar(32) PRIMARY KEY)")
-    sql_dicts(f"INSERT INTO {schema}.alembic_version VALUES ('0108')")
+    sql_dicts(
+        f"INSERT INTO {schema}.alembic_version VALUES (:revision)",
+        {"revision": load_window().schema_head},
+    )
     url = get_settings().database_url
     assert subprocess_probe(url=url, schema=schema) == {"ok": True}
     sql_dicts("DROP TABLE curie.hook_source_operations")

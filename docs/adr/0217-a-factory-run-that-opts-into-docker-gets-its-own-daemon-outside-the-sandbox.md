@@ -199,3 +199,6 @@ installs that need it.
 
 Acceptance authorizes implementation in follow-up pull requests into `next`.
 No code realizes this decision yet.
+
+Note: The ping transport is an API port-forward using the claim certificate.
+Maintainer approval 2026-10-21.

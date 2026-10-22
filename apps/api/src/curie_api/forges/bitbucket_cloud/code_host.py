@@ -427,8 +427,10 @@ class BitbucketCloudCodeHost:
         (``GET /2.0/user`` answers 403, see `bitbucket_cloud.comments`), so
         ownership cannot be checked here. Every same-repository pull request
         whose branch is publication shaped is listed, a writer's lookalike
-        included, and rediscovery drops every unverified publication, so it never treats one
-        as evidence and does not suppress a reinstall on Bitbucket Cloud.
+        included. Rediscovery never treats one as proof of the factory's own
+        work, but an open one naming the issue refuses admission as
+        ``unconfirmed`` and asks the operator to confirm it (#4747), so a
+        reinstall does not open a duplicate pull request.
 
         ``GET /repositories/{workspace}/{slug}/pullrequests`` with every
         ``state`` (https://developer.atlassian.com/cloud/bitbucket/rest/api-group-pullrequests/#api-repositories-workspace-repo-slug-pullrequests-get)

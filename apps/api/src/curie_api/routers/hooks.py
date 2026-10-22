@@ -84,7 +84,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from opentelemetry.trace import SpanKind, StatusCode
 from pydantic import BaseModel, ValidationError
-from redis.exceptions import RedisError
+from redis.exceptions import RedisError, ResponseError
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -93,8 +93,10 @@ from curie_api.crud import channels as crud_channels
 from curie_api.crud import workspaces as crud_workspaces
 from curie_api.graveyardwatcher import text
 
+from .. import hook_receipts
 from ..config import get_settings
 from ..delivery import (
+    DeliveryReceiptConflict,
     backlog_reservation,
     claim_delivery,
     duplicate_stream_id,
@@ -282,6 +284,7 @@ async def _duplicate_receipt(
     response: Response,
     event_id: str,
     tool_access: ToolAccess | None,
+    key: str,
 ) -> HookAccepted:
     """Attest the first delivery's policy, never relabel it from a retry.
 
@@ -299,7 +302,26 @@ async def _duplicate_receipt(
             tool_access=None,
             acceptance_status="pending",
         )
-    original = await _landed_turn(client, stream, current)
+    if current.startswith("pending:"):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "hook delivery tool access cannot be verified from the original turn",
+        )
+    # @spec HOOK-RECEIPT-3, HOOK-RECEIPT-4. Bad metadata never falls back to the queue.
+    try:
+        retained = await hook_receipts.read_receipt(client, key, current)
+    except DeliveryReceiptConflict as exc:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "hook delivery receipt cannot be verified"
+        ) from exc
+    original: hook_receipts.HookReceipt | QueuedTurn | None = retained
+    if original is None:
+        try:
+            original = await _landed_turn(client, stream, current)
+        except ValueError:
+            # @spec HOOK-RECEIPT-4: malformed legacy evidence is not acceptance.
+            # Redis failures remain infrastructure errors, not policy refusals.
+            original = None
     if original is None:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
@@ -862,6 +884,13 @@ async def ingest_hook(
         binding = _reply_binding(agent, kind, address, adapter)
 
         thread_id = conversation_id or hook_conversation_id(agent.id, hook, partition)
+        # @spec HOOK-RECEIPT-2: no claim, quota or workspace write precedes the bound.
+        try:
+            receipt_prefix = hook_receipts.receipt_prefix(thread_id, tool_access)
+        except (ValueError, UnicodeError) as exc:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY, "invalid hook receipt size or conversation"
+            ) from exc
         if mapping.selects_workspace and mapping.repository is not None:
             existing = await crud_workspaces.get_thread_workspace(
                 session, agent_id=agent.id, conversation_id=thread_id
@@ -913,7 +942,16 @@ async def ingest_hook(
         # have named its owner.
         for _attempt in range(2):
             await source.ensure_live()
-            if await claim_delivery(client, key, owner, settings.channel_delivery_lease_s):
+            try:
+                claimed = await claim_delivery(
+                    client, key, owner, settings.channel_delivery_lease_s,
+                    receipt_key=key + ":receipt",
+                )
+            except DeliveryReceiptConflict as exc:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT, "hook delivery receipt cannot be verified"
+                ) from exc
+            if claimed:
                 try:
                     await source.ensure_live()
                     if not await take_backlog_slot(
@@ -986,6 +1024,8 @@ async def ingest_hook(
                                         else None
                                     ),
                                     transport_value=carrier.get(TRACEPARENT_STREAM_FIELD),
+                                    receipt_key=key + ":receipt",
+                                    receipt_prefix=receipt_prefix,
                                 )
                             except Exception as exc:  # noqa: BLE001 - preserve enqueue failure across telemetry errors
                                 enqueue_error = exc
@@ -1012,6 +1052,10 @@ async def ingest_hook(
                             )
                         except Exception:  # noqa: BLE001 - metric failure must not mask the enqueue error
                             pass
+                        if isinstance(enqueue_error, DeliveryReceiptConflict):
+                            raise HTTPException(
+                                status.HTTP_409_CONFLICT, "hook delivery receipt cannot be verified"
+                            ) from enqueue_error
                         raise enqueue_error
                     assert enqueue_result is not None
                     enqueued, current = enqueue_result
@@ -1060,7 +1104,7 @@ async def ingest_hook(
                     # the delivery landed on is the one the WINNING turn named, whatever
                     # partition this body derives.
                     return await _duplicate_receipt(
-                        client, settings.runs_stream, current, response, event_id, tool_access
+                        client, settings.runs_stream, current, response, event_id, tool_access, key
                     )
                 except BaseException:
                     try:
@@ -1076,11 +1120,16 @@ async def ingest_hook(
                     except BaseException:  # noqa: BLE001 - cleanup details must not escape the original source refusal
                         pass
                     raise
-            held = await client.get(key)
-            if held is not None:
-                current = text(held)
+            try:
+                held = await client.get(key)
+                held_current = text(held) if held is not None else None
+            except (ResponseError, UnicodeError) as exc:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT, "hook delivery receipt cannot be verified"
+                ) from exc
+            if held_current is not None:
                 return await _duplicate_receipt(
-                    client, settings.runs_stream, current, response, event_id, tool_access
+                    client, settings.runs_stream, held_current, response, event_id, tool_access, key
                 )
 
         # Both attempts found the key absent after failing to claim it. Someone is

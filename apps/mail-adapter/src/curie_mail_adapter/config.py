@@ -33,6 +33,7 @@ Env mapping:
     CURIE_MAIL_ALLOW_ALL_SENDERS            -> allow_all_senders
     CURIE_MAIL_AGENTMAIL_EGRESS_CIDRS       -> agentmail_egress_cidrs
     CURIE_MAIL_DISCOVERY_UNREADY_AFTER_SECONDS -> discovery_unready_after_seconds
+    CURIE_MAIL_PROVIDER                     -> mail_provider
 
 The adapter holds no platform API key, queue credential, or platform database
 access: ``CURIE_CHANNEL_TOKEN`` and ``CURIE_EGRESS_SECRET`` are its Curie
@@ -165,6 +166,11 @@ class MailAdapterConfig(BaseSettings):
     discovery_unready_after_seconds: float = Field(
         default=120.0, validation_alias="CURIE_MAIL_DISCOVERY_UNREADY_AFTER_SECONDS"
     )
+
+    # The mail provider (ADR 0228). ``agentmail`` is the built-in; any other name
+    # is a provider package registered in the ``curie.mail_provider`` entry-point
+    # group, which reads its own settings from its own environment variables.
+    mail_provider: str = Field(default="agentmail", validation_alias="CURIE_MAIL_PROVIDER")
 
     @field_validator("agentmail_egress_cidrs", mode="before")
     @classmethod

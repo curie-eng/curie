@@ -74,7 +74,9 @@ def connector_deployments_api(*, kubeconfig: str | None = None) -> k8s_client.Ap
 
     Same credential as the reconciler. @spec ACTION-EXECUTOR-12: the recorder
     uses only ``read_namespaced_deployment`` on it, the ``get`` the chart grants
-    with the executor enabled -- never this module's ``list_owned``.
+    with the executor enabled -- never this module's ``list_owned``. The
+    executor loop builds it too, with the reconciler or, with the reconciler
+    off, under the executor's own connector reads (#4800).
     """
 
     _load_cluster_config(kubeconfig)

@@ -1,19 +1,50 @@
 # apps/mail-adapter
 
-The email channel adapter: an AgentMail inbox bridged to a Curie channel binding.
+The email channel adapter: one mailbox, reached through a mail provider, bridged
+to a Curie channel binding. AgentMail is the built-in provider; any other mail
+service plugs in as an out-of-tree provider (see "Mail providers").
 
 Two halves, and neither one knows anything about Slack:
 
-1. **Ingress.** It polls the inbox and rejects every AgentMail message with
-   `authentication_unverifiable`. AgentMail supplies no positive sender
-   authentication verdict that Curie can verify, so no message starts a turn or
-   resolves an approval. The channel ingress transport uses the AgentMail
-   `message_id` as the `delivery_id` so retries remain idempotent if a verified
-   authentication source becomes available.
+1. **Ingress.** It polls the inbox through the provider and applies the inbound
+   gate. A message that passes is fetched, turned into a turn (or read as an
+   approval answer) and posted to channel ingress, with the provider's message
+   id as the `delivery_id` so retries stay idempotent. Only a provider that
+   verifies senders can open this path. AgentMail cannot, so an AgentMail
+   install rejects every message with `authentication_unverifiable` before any
+   body fetch: no AgentMail message starts a turn or resolves an approval.
 2. **Egress.** It serves the neutral reply wire (`turn.status`, `reply.update`,
    `reply.post`, `turn.completed`), authenticating the platform on
    `X-Curie-Adapter-Secret` before any side effect, and sends one threaded
-   AgentMail reply per `turn.completed`.
+   reply through the provider per `turn.completed`.
+
+## Mail providers
+
+ADR 0228 puts every mail service behind one interface, `MailProvider` in
+`src/curie_mail_adapter/provider.py`. The neutral adapter keeps the channel
+protocol, delivery state, the inbound gate, the intake path and approvals by
+email; a provider lists and reads messages, replies in a thread, finds the reply
+marker in a thread, and reports the sender verdict. `CURIE_MAIL_PROVIDER`
+selects it: `agentmail` is built in and loaded by direct import; any other name
+is a package registered in the `curie.mail_provider` entry-point group, read from
+its own environment variables and installed into an image built `FROM` the
+published adapter image of the same release. The state file records its
+provider on first boot and refuses a different one later.
+
+The gate, in order, each refusal leaving the same id-only `rejected` receipt:
+
+1. Before any fetch, a provider that does not verify senders refuses every
+   message (`authentication_unverifiable`).
+2. Before any fetch, the listed From must be exactly one mailbox that passes
+   `CURIE_MAIL_ALLOWED_SENDERS`.
+3. After the fetch, that one From must pass the filter, the verdict must be
+   `verified`, and the verdict's domain must equal the From domain exactly (no
+   parent domain, no subdomain).
+
+`curie_mail_adapter.provider_conformance` is the kit an out-of-tree provider
+author runs from their own tests. Passing it does not make a provider
+trustworthy: the provider runs inside the approval trust boundary, and
+installing one is a decision equal to handing it `CURIE_ADAPTER_PRINCIPAL`.
 
 It holds no platform API key, no queue credential, and no platform database
 access. Binding is an operator action at deploy time. Delivery and reply
@@ -205,6 +236,7 @@ stray generic `PORT` or `POLL_INTERVAL` in the pod environment cannot reach one.
 | `CURIE_MAIL_ALLOW_ALL_SENDERS` | `false` | explicit opt in permitting a `*` entry at boot. Never bypasses sender authentication, so every current AgentMail message is still refused |
 | `CURIE_MAIL_AGENTMAIL_EGRESS_CIDRS` | "" | comma-separated CIDRs the egress policy admits for AgentMail. When set, the AgentMail client dials only addresses inside them (see below). Empty dials whatever DNS returns |
 | `CURIE_MAIL_DISCOVERY_UNREADY_AFTER_SECONDS` | `120` | how long a continuous discovery failure run lasts before `/readyz` reports 503. Must be greater than zero |
+| `CURIE_MAIL_PROVIDER` | `agentmail` | the mail provider (ADR 0228). `agentmail` is built in; any other name is a provider package registered in the `curie.mail_provider` entry-point group (see "Mail providers"). The state file records its provider on first boot, and a different provider refuses to start on it |
 
 ### Egress pinning and discovery readiness
 
