@@ -16,8 +16,10 @@ The tests grade the recorded replies: every candidate reply passes its case,
 and each control prompt (the old strict plan rule, or the skill without its
 final diff approval) produces a reply its case rejects. Every grader is also
 run against fixed counterexamples, so a grader that accepts anything fails.
-No test asserts a phrase of the production prompts; rendering relies only on
-the heading anchors and the literal deletions the control fixtures name.
+The strict control is the pre-#4929 skill, committed verbatim as a fixture.
+No test asserts a phrase of the production prompts; rendering the other
+control relies only on the heading anchors and literal replacements its
+fixture names.
 """
 
 from __future__ import annotations
@@ -37,7 +39,7 @@ BUNDLE = REPO_ROOT / "examples" / "dark-factory"
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "dark_factory_plan_policy"
 CASES_FILE = FIXTURES / "cases.json"
 CONTROLS = FIXTURES / "controls"
-STRICT_SECTION = CONTROLS / "strict-plan-section.md"
+STRICT_SKILL = CONTROLS / "strict-plan-SKILL.md"
 REMOVED_APPROVAL = CONTROLS / "removed-final-approval.json"
 RESPONSES = FIXTURES / "responses"
 MANIFEST = RESPONSES / "manifest.json"
@@ -58,9 +60,6 @@ PREAMBLE = (
 )
 PROMPT_OPEN, PROMPT_CLOSE = "<<<AGENT PROMPT>>>", "<<<END AGENT PROMPT>>>"
 CASE_OPEN, CASE_CLOSE = "<<<CASE>>>", "<<<END CASE>>>"
-
-STRICT_START = "## 4. Plan review (phase `plan_review`, same `round` as the plan)"
-STRICT_END = "## 5."
 
 # The control each case is expected to fail with.
 CONTROL_CASES = {STRICT: "impl-advisory-progress", REMOVED: "impl-publication"}
@@ -96,16 +95,8 @@ def _section_bounds(lines: list[str], start: str, end: str) -> tuple[int, int]:
     return first, ends[0]
 
 
-def strict_plan_control(text: str) -> str:
-    """The skill with its plan review section replaced by the old strict rule."""
-    lines = text.splitlines(keepends=True)
-    first, last = _section_bounds(lines, STRICT_START, STRICT_END)
-    replacement = STRICT_SECTION.read_text(encoding="utf-8")
-    return "".join([*lines[:first], replacement, *lines[last:]])
-
-
 def removed_final_approval_control(text: str) -> str:
-    """The skill without the diff review step or any diff-approval-before-publish rule."""
+    """The skill with the diff review removed from the whole workflow."""
     spec = json.loads(REMOVED_APPROVAL.read_text(encoding="utf-8"))
     for section in spec["remove_sections"]:
         lines = text.splitlines(keepends=True)
@@ -129,7 +120,7 @@ def prompt_text(actor: str, variant: str) -> str:
     if actor != "implementer":
         raise ValueError(f"variant {variant!r} applies to the implementer only")
     if variant == STRICT:
-        return strict_plan_control(text)
+        return STRICT_SKILL.read_bytes().decode("utf-8")
     return removed_final_approval_control(text)
 
 
@@ -394,10 +385,10 @@ def test_every_case_renders_the_prompt_file_and_the_case(case_id: str, variant: 
     else:
         assert body != prompt
     if variant == STRICT:
-        assert STRICT_SECTION.read_text(encoding="utf-8") in rendered
-        assert rendered.count(STRICT_START) == 1
+        assert body == STRICT_SKILL.read_bytes().decode("utf-8").rstrip("\n")
     if variant == REMOVED:
         assert not any(line.startswith("## 7. Diff review") for line in body.splitlines())
+        assert "review_diff" not in body and "diff-reviewer" not in body
         assert any(line.startswith("## Loop cap") for line in body.splitlines())
     assert render_prompt(case_id, variant) == rendered
     assert re.fullmatch(r"[0-9a-f]{64}", prompt_sha256(case_id, variant))
@@ -411,13 +402,9 @@ def test_controls_apply_to_the_implementer_only() -> None:
         render_prompt("impl-publication", "no-such-variant")
 
 
-def test_each_control_raises_when_an_anchor_is_missing() -> None:
+def test_the_removed_approval_control_raises_when_an_anchor_is_missing() -> None:
     skill = PROMPTS["implementer"].read_bytes().decode("utf-8")
-    assert strict_plan_control(skill) != skill
     assert removed_final_approval_control(skill) != skill
-    without_plan_heading = skill.replace(STRICT_START, "## 4. Something else")
-    with pytest.raises(ValueError):
-        strict_plan_control(without_plan_heading)
     without_diff_heading = skill.replace("## 7. Diff review", "## 7. Something else")
     with pytest.raises(ValueError):
         removed_final_approval_control(without_diff_heading)
