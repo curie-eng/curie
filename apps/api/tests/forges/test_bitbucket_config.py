@@ -44,6 +44,7 @@ EXPECTED_CAPABILITIES = {
     Operation.CI_DIAGNOSTICS: Support.UNSUPPORTED,
     Operation.RERUN_FAILED: Support.UNSUPPORTED,
     Operation.USER_CAN_WRITE: Support.UNSUPPORTED,
+    Operation.REQUIRED_CHECKS: Support.UNSUPPORTED,
 }
 
 KINDS = [

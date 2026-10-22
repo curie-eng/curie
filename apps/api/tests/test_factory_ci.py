@@ -2302,3 +2302,38 @@ def test_recorded_metadata_reruns_match_normalized_identity_not_display_name(
         fresh_after=PUBLISHED,
     )
     assert green.kind == "green"
+
+
+def test_required_checks_missing_stays_pending_then_unverified() -> None:
+    detail = _detail(_run("build"))
+    clean = _pull(mergeable=True)
+    pending = _decide(detail, 30, pull=clean, host_required_checks=("label-gate",))
+    assert pending.kind == "pending"
+    assert pending.reason == "required_check_absent"
+    expired = _decide(detail, 1200, pull=clean, host_required_checks=("label-gate",))
+    assert expired.kind == "unverified"
+    assert expired.reason == "required_check_absent"
+    assert expired.note is not None
+    assert "label-gate" in expired.note
+    assert "for example a label" in expired.note
+    summary = factory_ci.tried_summary([], expired, PR_URL)
+    assert "label-gate" in summary
+    assert "for example a label" in summary
+
+
+def test_required_checks_green_when_the_check_or_status_is_present() -> None:
+    by_run = _decide(_detail(_run("label-gate")), 30, host_required_checks=("label-gate",))
+    assert by_run.kind == "green"
+    by_status = _decide(
+        _detail(statuses=(_status("label-gate", "success"),)),
+        30,
+        host_required_checks=("label-gate",),
+    )
+    assert by_status.kind == "green"
+
+
+def test_required_checks_empty_set_keeps_todays_no_ci() -> None:
+    empty = _detail()
+    clean = _pull(mergeable=True)
+    assert _decide(empty, 130, pull=clean, host_required_checks=()).kind == "no_ci"
+    assert _decide(empty, 130, pull=clean, host_required_checks=None).kind == "no_ci"
