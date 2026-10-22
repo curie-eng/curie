@@ -552,6 +552,21 @@ def private_file(path: Path, content: str) -> None:
         handle.write(content)
 
 
+STDERR_TAIL = 1500
+MESSAGE_LIMIT = 200
+DIAGNOSTIC_LIMIT = 40
+_BASE64_RUN = re.compile(r"[A-Za-z0-9+/=_-]{40,}")
+_USERINFO_URL = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s/@]+@[^\s\"'<>]*")
+
+
+def redact(text: str, callback: str) -> str:
+    """Drop base64-like runs, URLs carrying userinfo, and the callback address."""
+
+    text = _USERINFO_URL.sub("<url>", text)
+    text = _BASE64_RUN.sub("<redacted>", text)
+    return text.replace(callback, "<callback>") if callback else text
+
+
 # -- the live run ------------------------------------------------------------------
 
 
@@ -582,6 +597,7 @@ class Lifecycle:
         self.seen_claims: set[str] = set()
         self.daemon_labels: dict[str, str] = {}
         self.timings: dict[str, float] = {}
+        self.evidence: dict[str, Any] = {}
         self.envelope: dict[str, Any] = {
             "schema": SCHEMA,
             "result": "failed",
@@ -1192,12 +1208,26 @@ class Lifecycle:
             timeout=330,
         )
 
-    def helm_upgrade(self, values: Path) -> None:
-        self.fx.run(
-            ["helm", "--kube-context", self.args.context, "upgrade", self.release]
-            + [str(self.f.snapshot / "charts/curie"), "-n", self.ns, "--reuse-values"]
-            + ["-f", str(values), "--timeout", "15m"],
+    def helm(self, verb: str, *argv: str) -> None:
+        """helm install or upgrade; a failure keeps a bounded, redacted stderr tail."""
+
+        result = subprocess.run(
+            ["helm", "--kube-context", self.args.context, verb, self.release, *argv],
+            text=True,
+            capture_output=True,
             timeout=1000,
+            check=False,
+        )
+        if result.returncode:
+            tail = redact(result.stderr[-STDERR_TAIL:], self.args.callback_host)
+            self.evidence["helm_stderr"] = tail
+            raise RuntimeError(f"helm_{verb}_failed")
+
+    def helm_upgrade(self, values: Path) -> None:
+        self.helm(
+            "upgrade",
+            *(str(self.f.snapshot / "charts/curie"), "-n", self.ns, "--reuse-values"),
+            *("-f", str(values), "--timeout", "15m"),
         )
         for component in ("api", "worker"):
             self.rollout(component)
@@ -1272,12 +1302,11 @@ class Lifecycle:
         )
         self.f.note("app_namespace_psa", "baseline")
         self.install_attempted = True
-        self.fx.run(
-            ["helm", "--kube-context", self.args.context, "install", self.release]
-            + [str(self.f.snapshot / "charts/curie"), "-n", self.ns, "--skip-crds"]
-            + ["-f", str(self.f.snapshot / "charts/curie/values-dev.yaml")]
-            + ["-f", str(values_file), "--timeout", "15m"],
-            timeout=1000,
+        self.helm(
+            "install",
+            *(str(self.f.snapshot / "charts/curie"), "-n", self.ns, "--skip-crds"),
+            *("-f", str(self.f.snapshot / "charts/curie/values-dev.yaml")),
+            *("-f", str(values_file), "--timeout", "15m"),
         )
         for component in ("api", "worker"):
             self.rollout(component)
@@ -1516,8 +1545,73 @@ class Lifecycle:
         self.scenario_orphan()
         self.scenario_control()
 
-    def failure_evidence(self) -> dict[str, Any]:
-        out: dict[str, Any] = {}
+    def diagnostics(self) -> list[dict[str, Any]]:
+        """Pod, Job and Warning Event state only: no env, Secret data or logs."""
+
+        def short(text: object) -> str:
+            return redact(str(text or ""), self.args.callback_host)[:MESSAGE_LIMIT]
+
+        namespaces = [self.ns, self.dns]
+        if self.publication_ns and self.publication_ns not in namespaces:
+            namespaces.append(self.publication_ns)
+        entries: list[dict[str, Any]] = []
+        for ns in namespaces:
+            if not self.f.get(f"/api/v1/namespaces/{ns}"):
+                continue
+            for pod in self.f.get(f"/api/v1/namespaces/{ns}/pods").get("items", []):
+                status = pod.get("status", {})
+                containers = []
+                for item in status.get("initContainerStatuses", []) + status.get(
+                    "containerStatuses", []
+                ):
+                    state = item.get("state", {})
+                    detail = state.get("waiting") or state.get("terminated") or {}
+                    containers.append(
+                        {
+                            "name": item.get("name"),
+                            "reason": detail.get("reason"),
+                            "exitCode": detail.get("exitCode"),
+                            "message": short(detail.get("message")),
+                        }
+                    )
+                entries.append(
+                    {
+                        "namespace": ns,
+                        "pod": pod["metadata"]["name"],
+                        "phase": status.get("phase"),
+                        "containers": containers,
+                    }
+                )
+            for job in self.f.get(f"/apis/batch/v1/namespaces/{ns}/jobs").get("items", []):
+                status = job.get("status", {})
+                entries.append(
+                    {"namespace": ns, "job": job["metadata"]["name"]}
+                    | {key: status.get(key, 0) for key in ("active", "failed", "succeeded")}
+                )
+            warnings = self.f.get(
+                f"/api/v1/namespaces/{ns}/events?fieldSelector={quote('type=Warning')}"
+            ).get("items", [])
+            for event in warnings:
+                involved = event.get("involvedObject", {})
+                entries.append(
+                    {
+                        "namespace": ns,
+                        "event": involved.get("kind"),
+                        "name": involved.get("name"),
+                        "reason": event.get("reason"),
+                        "message": short(event.get("message")),
+                    }
+                )
+        return entries[:DIAGNOSTIC_LIMIT]
+
+    def failure_evidence(self, failed: bool) -> dict[str, Any]:
+        out: dict[str, Any] = dict(self.evidence)
+        if failed and self.f is not None:
+            try:
+                out["diagnostics"] = self.diagnostics()
+            except (RuntimeError, OSError, KeyError, ValueError, subprocess.SubprocessError) as exc:
+                out["diagnostics_error"] = type(exc).__name__
+            print(json.dumps({"diagnostics": out.get("diagnostics", [])}), file=sys.stderr)
         if self.model is not None and self.model.unexpected:
             host = self.args.callback_host
             out["unexpected_model_keys"] = [
@@ -1542,7 +1636,7 @@ class Lifecycle:
             failures.append(str(exc))
         except Exception as exc:  # noqa: BLE001 - every failure is recorded by class, then torn down
             failures.append(type(exc).__name__)
-        evidence = self.failure_evidence()
+        evidence = self.failure_evidence(bool(failures))
         teardown_errors: list[str] = []
         try:
             self.envelope["cleanup"] = self.teardown(teardown_errors)
