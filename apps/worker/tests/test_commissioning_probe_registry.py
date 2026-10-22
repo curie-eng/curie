@@ -161,12 +161,24 @@ def test_uids_come_only_from_this_boots_create_responses(tmp_path):
             registry.transition(PROBE, row.revision, "live")
     with opened(tmp_path, boot=LATER_BOOT) as registry:
         row = registry.get(PROBE)
-        # A restart retires every live or preparing probe and never resumes creation.
-        assert row.state == "retiring"
+        # A restart never resumes creation; with a UID unrecorded it is uncertain.
+        assert row.state == "uncertain"
         with pytest.raises(RegistryConflict):
             registry.record_object_uid(PROBE, row.revision, "service", SERVICE, "7")
         with pytest.raises(RegistryRetired):
             registry.create(PROBE, namespace=NAMESPACE, create_operation_id=OPERATION)
+
+
+def test_a_restart_settles_a_preparing_probe_with_an_unrecorded_uid_uncertain(tmp_path):
+    with opened(tmp_path) as registry:
+        live(registry)
+        row = registry.create(OTHER, namespace=NAMESPACE, create_operation_id=PROBE)
+        registry.record_object_uid(OTHER, row.revision, "secret", SECRET, "7")
+    with opened(tmp_path, boot=LATER_BOOT) as registry:
+        assert registry.boot_id == LATER_BOOT
+        # Every UID recorded: retiring. A create that may have happened: uncertain.
+        assert registry.get(PROBE).state == "retiring"
+        assert registry.get(OTHER).state == "uncertain"
 
 
 def test_an_uncertain_probe_never_moves_on(tmp_path):

@@ -29,11 +29,13 @@ from curie_worker.protected_launch_documents import FINALIZER
 from curie_worker.protected_launch_kubernetes import LaunchControlUnavailable, unavailable
 
 from .protected_configuration_vectors import canonical
+from .test_commissioning_control_profile import profile
 from .test_protected_kubernetes_projection import projection_value
 
 BOOT = "b0000000-0000-4000-8000-000000000001"
 LATER_BOOT = "b0000000-0000-4000-8000-000000000002"
-SCOPE = "a" * 64
+PROFILE = profile()
+SCOPE = PROFILE.digest
 PROBES = ("10000000-0000-4000-8000-000000000001", "10000000-0000-4000-8000-000000000002")
 NODE = "40000000-0000-4000-8000-000000000001"
 NAMESPACE = "acme-runtime"
@@ -167,7 +169,7 @@ def runtime(tmp_path, api, *, boot=BOOT):
     path = tmp_path / "probes"
     path.mkdir(mode=0o700, exist_ok=True)
     registry = ProbeRegistry.open(str(path), boot_id=boot, scope_digest=SCOPE)
-    return PrimitiveProbeRuntime(registry, api, projection=projection(), namespace=NAMESPACE)
+    return PrimitiveProbeRuntime(registry, api, profile=PROFILE, projection=projection())
 
 
 def pod_name(probe_id):
@@ -352,7 +354,7 @@ def test_the_digest_binds_scope_and_completions(tmp_path):
         path = tmp_path / scope_dir
         path.mkdir(mode=0o700)
         registry = ProbeRegistry.open(str(path), boot_id=BOOT, scope_digest=SCOPE)
-        probes = PrimitiveProbeRuntime(registry, api, projection=projection(), namespace=NAMESPACE)
+        probes = PrimitiveProbeRuntime(registry, api, profile=PROFILE, projection=projection())
         await probes.launch(PROBES[0], ASSIGNMENT)
         api.run(pod_name(PROBES[0]))
         await probes.exercise(PROBES[0], Primitive(result))
@@ -364,10 +366,135 @@ def test_the_digest_binds_scope_and_completions(tmp_path):
     assert one != two
 
 
-def test_the_runtime_refuses_another_namespace(tmp_path):
+def test_the_runtime_is_bound_to_the_profile_its_registry_pins(tmp_path):
     path = tmp_path / "probes"
     path.mkdir(mode=0o700)
-    registry = ProbeRegistry.open(str(path), boot_id=BOOT, scope_digest=SCOPE)
+    registry = ProbeRegistry.open(str(path), boot_id=BOOT, scope_digest="b" * 64)
     with pytest.raises(LaunchControlUnavailable):
-        PrimitiveProbeRuntime(registry, Api(), projection=projection(), namespace="elsewhere")
+        PrimitiveProbeRuntime(registry, Api(), profile=PROFILE, projection=projection())
+    other = projection_value()
+    other["namespace"] = "elsewhere"
+    with pytest.raises(LaunchControlUnavailable):
+        PrimitiveProbeRuntime(
+            registry, Api(), profile=PROFILE, projection=parse_projection(canonical(other))
+        )
     assert repr(ASSIGNMENT) == "<ProbeAssignment>"
+
+
+class Hanging(Api):
+    """Pod creates and, once armed, reads never answer."""
+
+    def __init__(self, *, hang_create: bool = False) -> None:
+        super().__init__()
+        self.hang_create, self.hang_reads = hang_create, False
+
+    async def create(self, namespace: str, kind: str, document: dict[str, Any]) -> dict[str, Any]:
+        if kind == "pods" and self.hang_create:
+            # The API server persisted the Pod; its answer never arrives.
+            await super().create(namespace, kind, document)
+            await asyncio.Event().wait()
+        return await super().create(namespace, kind, document)
+
+    async def read(self, namespace: str, kind: str, name: str) -> dict[str, Any] | None:
+        if self.hang_reads:
+            await asyncio.Event().wait()
+        return await super().read(namespace, kind, name)
+
+
+def test_the_completions_fact_refuses_at_its_deadline(tmp_path, monkeypatch):
+    from curie_worker.managed_cni_probe_kit import PRODUCER_CONSTANTS
+
+    async def scenario() -> None:
+        api = Hanging()
+        probes = runtime(tmp_path, api)
+        await probes.launch(PROBES[0], ASSIGNMENT)
+        api.run(pod_name(PROBES[0]))
+        await probes.exercise(PROBES[0], Primitive())
+        assert await probes.retire(PROBES[0])
+        fact = PrimitiveCompletions(probes, PROBES[:1])
+        await fact.observe()
+        monkeypatch.setitem(PRODUCER_CONSTANTS, "per_call_deadline_ms", 50)
+        api.hang_reads = True
+        started = asyncio.get_running_loop().time()
+        with pytest.raises(LaunchControlUnavailable):
+            await fact.observe()
+        assert asyncio.get_running_loop().time() - started < 1
+
+    asyncio.run(scenario())
+
+
+def test_a_create_cancelled_in_flight_is_uncertain_and_only_fenced(tmp_path):
+    async def scenario() -> None:
+        api = Hanging(hang_create=True)
+        probes = runtime(tmp_path, api)
+        task = asyncio.create_task(probes.launch(PROBES[0], ASSIGNMENT))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        row = probes.registry.get(PROBES[0])
+        assert row.state == "uncertain" and row.objects.pod_uid is None
+        pod = pod_name(PROBES[0])
+        assert ("pods", pod) in api.objects
+        # Never retired; the Secret and Service are deleted by their recorded
+        # UIDs, and the Pod whose UID was never recorded is left untouched.
+        assert not await probes.retire_all()
+        assert probes.registry.get(PROBES[0]).state == "uncertain"
+        assert set(api.objects) == {("pods", pod)}
+        assert "deletionTimestamp" not in api.objects[("pods", pod)]["metadata"]
+
+    asyncio.run(scenario())
+
+
+def test_a_crash_after_a_create_leaves_the_probe_uncertain_after_restart(tmp_path):
+    async def scenario() -> None:
+        api = Api()
+        probes = runtime(tmp_path, api)
+        row = probes.registry.create(
+            PROBES[0], namespace=NAMESPACE, create_operation_id=str(uuid.uuid4())
+        )
+        # The create reached the API server; the process died before recording it.
+        secret = "pl-c-" + uuid.UUID(PROBES[0]).hex
+        await api.create(NAMESPACE, "secrets", {"metadata": {"name": secret}})
+        assert row.state == "preparing"
+        probes.registry.close()
+        restarted = runtime(tmp_path, api, boot=LATER_BOOT)
+        assert restarted.registry.get(PROBES[0]).state == "uncertain"
+        assert not await restarted.retire_all()
+        assert ("secrets", secret) in api.objects
+
+    asyncio.run(scenario())
+
+
+def test_a_retiring_probe_with_an_unrecorded_uid_settles_uncertain(tmp_path):
+    async def scenario() -> None:
+        api = Api()
+        probes = runtime(tmp_path, api)
+        row = probes.registry.create(
+            PROBES[0], namespace=NAMESPACE, create_operation_id=str(uuid.uuid4())
+        )
+        row = probes.registry.record_object_uid(
+            PROBES[0], row.revision, "secret", str(uuid.uuid4()), "1"
+        )
+        probes.registry.transition(PROBES[0], row.revision, "retiring")
+        assert not await probes.retire(PROBES[0])
+        assert probes.registry.get(PROBES[0]).state == "uncertain"
+
+    asyncio.run(scenario())
+
+
+def test_completions_from_an_earlier_boot_refuse(tmp_path):
+    async def scenario() -> None:
+        api = Api()
+        probes = runtime(tmp_path, api)
+        await probes.launch(PROBES[0], ASSIGNMENT)
+        api.run(pod_name(PROBES[0]))
+        await probes.exercise(PROBES[0], Primitive())
+        assert await probes.retire(PROBES[0])
+        await PrimitiveCompletions(probes, PROBES[:1]).observe()
+        probes.registry.close()
+        restarted = runtime(tmp_path, api, boot=LATER_BOOT)
+        with pytest.raises(LaunchControlUnavailable):
+            await PrimitiveCompletions(restarted, PROBES[:1]).observe()
+
+    asyncio.run(scenario())

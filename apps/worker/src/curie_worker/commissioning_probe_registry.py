@@ -138,7 +138,9 @@ class ProbeRegistry:
     The explicit private root must be owned by the control principal and hold
     no launch registry. Reopen moves every ``preparing`` or ``live`` probe to
     ``retiring``: a restarted control process never resumes a creation and
-    never exercises a probe it did not create on this boot.
+    never exercises a probe it did not create on this boot. A ``preparing``
+    probe with an unrecorded UID becomes ``uncertain`` instead: its create may
+    have happened.
     """
 
     __slots__ = ("_root", "_root_fd", "_lock_fd", "_db_fd", "_db", "_mutex", "_boot_id", "_scope")
@@ -194,6 +196,13 @@ class ProbeRegistry:
                     db.execute("INSERT INTO scope VALUES(1,?)", (scope_digest,))
                 elif pinned["scope_digest"] != scope_digest:
                     raise RegistryConflict()
+                # A create interrupted before its UID was recorded may have
+                # happened: that probe is uncertain, never retryable.
+                db.execute(
+                    "UPDATE probes SET state='uncertain',revision=revision+1 "
+                    "WHERE state='preparing' AND probe_id IN (SELECT probe_id FROM objects "
+                    "WHERE pod_uid IS NULL OR service_uid IS NULL OR secret_uid IS NULL)"
+                )
                 db.execute(
                     "UPDATE probes SET state='retiring',revision=revision+1 "
                     "WHERE state IN ('preparing','live')"
@@ -215,6 +224,10 @@ class ProbeRegistry:
     @property
     def scope_digest(self) -> str:
         return self._scope
+
+    @property
+    def boot_id(self) -> str:
+        return self._boot_id
 
     @_safe
     def close(self) -> None:

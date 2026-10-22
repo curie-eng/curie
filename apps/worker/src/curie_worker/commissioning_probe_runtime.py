@@ -32,7 +32,9 @@ from typing import Any, Protocol
 from uuid import uuid4
 
 from .commissioning_cleanup import unstarted_observation
+from .commissioning_control_profile import ControlProfile
 from .commissioning_probe_registry import Kind, ProbeRegistry, ProbeSnapshot
+from .managed_cni_probe_kit import PRODUCER_CONSTANTS
 from .protected_kubernetes_projection import Projection, render_pod
 from .protected_launch_documents import FINALIZER, secret_document, service_document
 from .protected_launch_kubernetes import (
@@ -114,10 +116,19 @@ class PrimitiveProbeRuntime:
         registry: ProbeRegistry,
         kubernetes: ProbeKubernetes,
         *,
+        profile: ControlProfile,
         projection: Projection,
-        namespace: str,
     ) -> None:
+        """Bound to one installation: the registry's scope is this control profile.
+
+        The profile names the projection the probes are rendered from and the
+        workload namespace they run in.
+        """
         require(type(registry) is ProbeRegistry and type(projection) is Projection)
+        require(type(profile) is ControlProfile and registry.scope_digest == profile.digest)
+        v = profile.as_dict()
+        require(v["projection_digest"] == projection.digest)
+        namespace = v["workload_namespace"]
         require(projection.as_dict()["namespace"] == namespace)
         _scalar(namespace, "name")
         self.registry, self._kube = registry, kubernetes
@@ -157,17 +168,17 @@ class PrimitiveProbeRuntime:
                 document, name = documents[kind], present(getattr(o, kind + "_name"))
                 try:
                     created = await self._kube.create(self._namespace, kind + "s", document)
-                except Exception:  # noqa: BLE001 - an unanswered create is ambiguous
-                    self.registry.mark_uncertain(probe_id, row.revision)
-                    unavailable()
-                try:
                     uid, version = object_identity(created, namespace=self._namespace, name=name)
                     row = self.registry.record_object_uid(
                         probe_id, row.revision, kind, uid, version
                     )
-                except Exception:  # noqa: BLE001 - an unreadable response is ambiguous too
+                except BaseException as error:
+                    # Unanswered, unreadable, unrecorded or cancelled while in
+                    # flight: the create may have happened, so it is uncertain.
                     self.registry.mark_uncertain(probe_id, self.registry.get(probe_id).revision)
-                    unavailable()
+                    if isinstance(error, Exception):
+                        unavailable()
+                    raise
             return self.registry.transition(probe_id, row.revision, "live")
 
     async def observe_runner(self, probe_id: str) -> ProbeTarget:
@@ -232,8 +243,10 @@ class PrimitiveProbeRuntime:
     async def retire(self, probe_id: str) -> bool:
         """Retire one probe; ``True`` only once its cleanup receipt is recorded.
 
-        Incomplete proof leaves the probe ``retiring``; an ``uncertain`` probe
-        is never retired here.
+        Incomplete proof leaves the probe ``retiring``. A probe with an
+        unrecorded UID becomes ``uncertain``: an object at that name may be
+        its own or another's, so it is never deleted by name. An ``uncertain``
+        probe is never retired; its objects with recorded UIDs are only fenced.
         """
         async with self._mutex(probe_id):
             try:
@@ -246,7 +259,13 @@ class PrimitiveProbeRuntime:
         row = self.registry.get(probe_id)
         if row.state == "retired":
             return
-        require(row.state != "uncertain")
+        if row.state != "uncertain" and any(
+            getattr(row.objects, kind + "_uid") is None for kind in _CREATE_ORDER
+        ):
+            row = self.registry.mark_uncertain(probe_id, row.revision)
+        if row.state == "uncertain":
+            await self._fence(row)
+            unavailable()
         if row.state != "retiring":
             row = self.registry.transition(probe_id, row.revision, "retiring")
         o = row.objects
@@ -311,6 +330,25 @@ class PrimitiveProbeRuntime:
         )
         return self.registry.record_termination(row.probe_id, row.revision, proof)
 
+    async def _fence(self, row: ProbeSnapshot) -> None:
+        """Delete each object of an uncertain probe whose UID is recorded, by that UID.
+
+        The UID precondition never touches a same-name object. The Pod keeps
+        its finalizer, so it terminates but is not released, and nothing is
+        recorded: the probe stays ``uncertain``.
+        """
+        for kind in _CREATE_ORDER:
+            name, uid = getattr(row.objects, kind + "_name"), getattr(row.objects, kind + "_uid")
+            if uid is None:
+                continue
+            doc = await self._kube.read(self._namespace, kind + "s", name)
+            if (
+                doc is not None
+                and object_identity(doc, namespace=self._namespace, name=name)[0] == uid
+                and doc["metadata"].get("deletionTimestamp") is None
+            ):
+                await self._kube.delete(self._namespace, kind + "s", name, uid)
+
     def _still_proved(self, row: ProbeSnapshot, pod: Any) -> str:
         o = row.objects
         ns, pod_name, pod_uid = self._namespace, present(o.pod_name), present(o.pod_uid)
@@ -329,16 +367,23 @@ class PrimitiveProbeRuntime:
 
     async def absent(self, row: ProbeSnapshot) -> bool:
         """Whether a read now finds none of this probe's objects at their recorded names."""
-        for kind in _CREATE_ORDER:
-            name = present(getattr(row.objects, kind + "_name"))
-            if await self._kube.read(self._namespace, kind + "s", name) is not None:
-                return False
-        return True
+        found = await asyncio.gather(
+            *(
+                self._kube.read(
+                    self._namespace, kind + "s", present(getattr(row.objects, kind + "_name"))
+                )
+                for kind in _CREATE_ORDER
+            )
+        )
+        return all(doc is None for doc in found)
 
     async def retire_all(self) -> bool:
-        """Retire every probe; ``True`` only when every row is retired."""
+        """Retire every probe; ``True`` only when every row is retired.
+
+        An ``uncertain`` probe is fenced, never retired, so it keeps this false.
+        """
         for row in self.registry.probes():
-            if row.state not in {"retired", "uncertain"}:
+            if row.state != "retired":
                 await self.retire(row.probe_id)
         return all(row.state == "retired" for row in self.registry.probes())
 
@@ -349,7 +394,9 @@ class PrimitiveCompletions:
     It refuses unless exactly the predeclared probes exist, each retired with a
     recorded completion and the termination of the runner that produced it,
     and a read now finds none of their objects. A probe whose runner never
-    started has no completion and refuses. The digest covers each probe's
+    started has no completion and refuses, and so does a probe created by an
+    earlier boot of the control process. The call is bounded by the producers'
+    per-call deadline. The digest covers each probe's
     completion, Pod UID and terminated container, bound to the registry's scope.
     """
 
@@ -365,21 +412,25 @@ class PrimitiveCompletions:
         return FACT
 
     async def observe(self) -> str:
+        """Bounded by the producers' per-call deadline; a missed deadline refuses."""
         try:
-            return await self._observe()
-        except Exception:  # noqa: BLE001 - an unavailable observation is a refusal
+            async with asyncio.timeout(PRODUCER_CONSTANTS["per_call_deadline_ms"] / 1000):
+                return await self._observe()
+        except Exception:  # noqa: BLE001 - an unavailable or late observation is a refusal
             unavailable()
 
     async def _observe(self) -> str:
         runtime = self._runtime
         rows = runtime.registry.probes()
         require(tuple(row.probe_id for row in rows) == self._probe_ids)
+        absent = await asyncio.gather(*(runtime.absent(row) for row in rows))
         entries = []
-        for row in rows:
+        for row, gone in zip(rows, absent, strict=True):
             # A completion needs a recorded runner, so its proof is a termination.
             require(row.state == "retired" and row.retirement_outcome == "cleanup-recorded")
             require(row.completion_digest is not None and row.termination is not None)
-            require(await runtime.absent(row))
+            # Completions are this control process's own: a restart invalidates them.
+            require(row.boot_id == runtime.registry.boot_id and gone)
             termination = present(row.termination)
             entries.append(
                 {
