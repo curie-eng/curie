@@ -18,7 +18,8 @@
       "pod": "curie-thread-7f1705e322-8c4ecc",
       "pod_uid": "c916b1e4-e158-4c4f-aa56-212071ac2c6b"
     },
-    "thread": "github:acme-corp%2Facme-bot:issue-4105"
+    "thread": "github:acme-corp%2Facme-bot:issue-4105",
+    "turn_delivered": true
   },
   "failures": [],
   "nonce": "1542b3e7",
@@ -45,6 +46,7 @@
       }
     ],
     "objects_absent": true,
+    "removed_after_seconds": 186.5,
     "settle_seconds": 186.5
   },
   "provenance": {
@@ -98,6 +100,7 @@
   "tls": {
     "claim": "curie-thread-bddc75485e-8f441f",
     "claim_client_accepted": true,
+    "claim_client_accepted_after": true,
     "independent_client_refused": true
   },
   "turns": {
@@ -112,6 +115,7 @@
       },
       "fault": "cancel",
       "issue": 4103,
+      "leaked": [],
       "objects": [
         {
           "claim_label": "curie-thread-cfe091e62e-e2059b",
@@ -183,6 +187,7 @@
       },
       "fault": "daemon_pod_deleted",
       "issue": 4102,
+      "leaked": [],
       "objects": [
         {
           "claim_label": "curie-thread-e458a485f7-050d0b",
@@ -226,6 +231,7 @@
         }
       ],
       "objects_absent": true,
+      "released_before_next": true,
       "request_id": "1c7740f0-2c0b-53ae-aec9-a751f97f253d",
       "request_state": "failed",
       "runner": {
@@ -240,8 +246,10 @@
         "name": "curie-thread-e458a485f7-050d0b",
         "ran": true
       },
+      "settle_cause": "no_pull_request",
       "settle_seconds": 3.0,
-      "thread": "github:acme-corp%2Facme-bot:issue-4102"
+      "thread": "github:acme-corp%2Facme-bot:issue-4102",
+      "turn_delivered": true
     },
     "retained_next": {
       "claim": "curie-thread-e458a485f7-8bc50d",
@@ -254,6 +262,7 @@
       },
       "fault": "release",
       "issue": 4102,
+      "leaked": [],
       "objects": [
         {
           "claim_label": "curie-thread-e458a485f7-8bc50d",
@@ -311,8 +320,10 @@
         "name": "curie-thread-e458a485f7-8bc50d",
         "ran": true
       },
+      "settle_cause": "no_pull_request",
       "settle_seconds": 5.5,
-      "thread": "github:acme-corp%2Facme-bot:issue-4102"
+      "thread": "github:acme-corp%2Facme-bot:issue-4102",
+      "turn_delivered": true
     },
     "success": {
       "claim": "curie-thread-bddc75485e-8f441f",
@@ -325,6 +336,7 @@
       },
       "fault": "release",
       "issue": 4101,
+      "leaked": [],
       "objects": [
         {
           "claim_label": "curie-thread-bddc75485e-8f441f",
@@ -382,8 +394,10 @@
         "name": "curie-thread-bddc75485e-8f441f",
         "ran": true
       },
+      "settle_cause": "no_pull_request",
       "settle_seconds": 5.3,
-      "thread": "github:acme-corp%2Facme-bot:issue-4101"
+      "thread": "github:acme-corp%2Facme-bot:issue-4101",
+      "turn_delivered": true
     },
     "worker_loss": {
       "claim": "curie-thread-233c597680-e0ea86",
@@ -396,6 +410,7 @@
       },
       "fault": "worker_pod_deleted",
       "issue": 4104,
+      "leaked": [],
       "objects": [
         {
           "claim_label": "curie-thread-233c597680-e0ea86",
@@ -439,6 +454,7 @@
         }
       ],
       "objects_absent": true,
+      "recovery_seconds": 141.0,
       "request_id": "ccfaac26-3f7b-5226-8508-3bcd7b0ec771",
       "request_state": "failed",
       "runner": {

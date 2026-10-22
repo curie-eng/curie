@@ -276,6 +276,95 @@ def test_missing_turn(envelope: dict[str, Any], turn: str) -> None:
     _assert_token(envelope, "missing_observation")
 
 
+# stricter judging
+
+MISSING = object()
+
+
+def _set(container: dict[str, Any], key: str, value: Any) -> None:
+    if value is MISSING:
+        container.pop(key, None)
+    else:
+        container[key] = value
+
+
+@pytest.mark.parametrize("turn", TURNS)
+def test_turn_leaked_objects(envelope: dict[str, Any], turn: str) -> None:
+    envelope["turns"][turn]["leaked"] = ["Secret/x"]
+    _assert_token(envelope, "incomplete_cleanup")
+
+
+@pytest.mark.parametrize("value", [False, MISSING], ids=["false", "missing"])
+@pytest.mark.parametrize("turn", ["success", "retained_next", "daemon_death"])
+def test_turn_not_delivered(envelope: dict[str, Any], turn: str, value: Any) -> None:
+    _set(envelope["turns"][turn], "turn_delivered", value)
+    _assert_token(envelope, "missing_observation")
+
+
+@pytest.mark.parametrize("value", [False, MISSING], ids=["false", "missing"])
+def test_control_turn_not_delivered(envelope: dict[str, Any], value: Any) -> None:
+    _set(envelope["control"], "turn_delivered", value)
+    _assert_token(envelope, "missing_observation")
+
+
+def test_cancel_request_failed(envelope: dict[str, Any]) -> None:
+    envelope["turns"]["cancel"]["request_state"] = "failed"
+    _assert_token(envelope, "missing_observation")
+
+
+@pytest.mark.parametrize("value", [False, MISSING], ids=["false", "missing"])
+def test_daemon_death_not_released_before_next(envelope: dict[str, Any], value: Any) -> None:
+    _set(envelope["turns"]["daemon_death"], "released_before_next", value)
+    _assert_token(envelope, "retained_thread_mismatch")
+
+
+@pytest.mark.parametrize("value", [301, MISSING], ids=["slow", "missing"])
+def test_worker_loss_recovery_seconds(envelope: dict[str, Any], value: Any) -> None:
+    _set(envelope["turns"]["worker_loss"], "recovery_seconds", value)
+    _assert_token(envelope, "incomplete_cleanup")
+
+
+@pytest.mark.parametrize("value", [False, MISSING], ids=["false", "missing"])
+def test_worker_loss_successor_not_cleared(envelope: dict[str, Any], value: Any) -> None:
+    _set(envelope["turns"]["worker_loss"], "successor_cleared", value)
+    _assert_token(envelope, "incomplete_cleanup")
+
+
+@pytest.mark.parametrize("value", [130, MISSING], ids=["young", "missing"])
+def test_orphan_removed_after_seconds(envelope: dict[str, Any], value: Any) -> None:
+    _set(envelope["orphan"], "removed_after_seconds", value)
+    _assert_token(envelope, "age_gate")
+
+
+@pytest.mark.parametrize("key", ["claim_client_accepted", "claim_client_accepted_after"])
+@pytest.mark.parametrize("value", [False, MISSING], ids=["false", "missing"])
+def test_tls_claim_client_not_accepted(envelope: dict[str, Any], key: str, value: Any) -> None:
+    _set(envelope["tls"], key, value)
+    _assert_token(envelope, "tls_control_failed")
+
+
+@pytest.mark.parametrize("value", ["", MISSING], ids=["empty", "missing"])
+@pytest.mark.parametrize("field", ["kind", "name", "namespace", "uid"])
+def test_turn_object_missing_identity_field(
+    envelope: dict[str, Any], field: str, value: Any
+) -> None:
+    _set(envelope["turns"]["success"]["objects"][1], field, value)
+    _assert_token(envelope, "missing_observation")
+
+
+def test_daemon_pod_uid_differs_from_daemon_object_uid(envelope: dict[str, Any]) -> None:
+    envelope["turns"]["success"]["daemon"]["pod_uid"] = "00000000-0000-0000-0000-000000000000"
+    _assert_token(envelope, "identity_mismatch")
+
+
+def test_daemon_pod_differs_from_daemon_object_name(envelope: dict[str, Any]) -> None:
+    turn = envelope["turns"]["success"]
+    turn["daemon"]["pod"] = "curie-thread-other"
+    turn["runner_docker"]["name"] = "curie-thread-other"
+    turn["daemon"]["docker_name"] = "curie-thread-other"
+    _assert_token(envelope, "identity_mismatch")
+
+
 # CLI
 
 
@@ -403,9 +492,9 @@ def _images() -> dict[str, dict[str, str]]:
 
 def _base() -> dict[str, Any]:
     return _load_kind().scripted_values(
-        model_base_url="http://10.1.2.3:8080",
-        github_api="https://10.9.9.9:8443/api/v3",
-        clone_base="https://10.9.9.9:8443",
+        model_base_url="http://192.0.2.20:8080",
+        github_api="https://198.51.100.7:8443/api/v3",
+        clone_base="https://198.51.100.7:8443",
         ca_configmap="github-stub-ca",
         runner_image="localhost:24111/curie-runner",
     )
