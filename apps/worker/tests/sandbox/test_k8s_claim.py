@@ -1440,6 +1440,43 @@ def test_evicted_pod_does_not_publish_unstructured_status_message() -> None:
     assert termination.detail is None
 
 
+def test_evicted_pod_carries_the_runner_exit_code_and_ignores_sidecars() -> None:
+    def termination_for(statuses: list[SimpleNamespace]) -> Any:
+        api = _FakeApi()
+        api.pod = SimpleNamespace(
+            metadata=SimpleNamespace(name="sbx-1", uid="pod-current"),
+            status=SimpleNamespace(
+                phase="Failed",
+                reason="Evicted",
+                message='Usage of EmptyDir volume "workspace" exceeds the limit "1Gi".',
+                container_statuses=statuses,
+            ),
+        )
+        return _client(api).pod_termination(
+            "sbx-1", request_timeout_seconds=0.5, since=datetime.now(UTC)
+        )
+
+    bare = termination_for([])
+    with_runner = termination_for([_runner_status(SimpleNamespace(reason="Error", exit_code=137))])
+    sidecar_only = termination_for(
+        [
+            SimpleNamespace(
+                name="sidecar",
+                state=SimpleNamespace(terminated=SimpleNamespace(reason="Error", exit_code=42)),
+                last_state=None,
+            )
+        ]
+    )
+
+    assert bare is not None and with_runner is not None and sidecar_only is not None
+    assert with_runner.reason == "Evicted"
+    assert with_runner.detail == bare.detail
+    assert with_runner.exit_code == 137
+    assert sidecar_only.reason == "Evicted"
+    assert sidecar_only.detail == bare.detail
+    assert sidecar_only.exit_code is None
+
+
 def test_failed_pod_reports_other_termination_reason() -> None:
     api = _FakeApi()
     api.pod = SimpleNamespace(

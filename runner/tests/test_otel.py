@@ -2419,20 +2419,23 @@ def test_budget_halt_root_carries_classification_and_output_ceiling() -> None:
     ceiling = 5
     canaries = _failure_canaries("budget")
     # Assistant usage crossing the ceiling mid-turn is the shape of test_session.py
-    # test_output_token_budget_failure_names_the_configured_limit. A budget halt
-    # has no provider error text of its own, so that canary rides the terminal
-    # result the halt never reads.
+    # test_output_token_budget_failure_names_the_configured_limit. The provider
+    # error canary rides an earlier errored assistant message, the recorded
+    # shape in test_translate.py (error="server_error" with the provider text as
+    # a TextBlock), so the no-canary assertion covers generation output too.
     script: list[object] = [
         *_canary_tool_round(canaries),
+        AssistantMessage(
+            content=[TextBlock(text=canaries["provider_error"])],
+            model="observed-model",
+            error="server_error",
+        ),
         AssistantMessage(
             content=[TextBlock(text="still working")],
             model="observed-model",
             usage={"input_tokens": 1, "output_tokens": ceiling + 10},
         ),
-        _result(
-            text=canaries["provider_error"],
-            terminal_reason=canaries["provider_error"],
-        ),
+        _result(),
     ]
     events, finished = _export_failed_turn(
         lambda: FakeModelSession(lambda: script),
@@ -2447,6 +2450,35 @@ def test_budget_halt_root_carries_classification_and_output_ceiling() -> None:
     assert _OUTPUT_CEILING in root.attributes
     assert type(root.attributes[_OUTPUT_CEILING]) is int
     assert root.attributes[_OUTPUT_CEILING] == ceiling
+
+
+def test_provider_error_text_is_never_generation_output() -> None:
+    canaries = _failure_canaries("generation")
+    normal_text = "normal-assistant-answer-PLACEHOLDER"
+    # Recorded shape: test_translate.py (error="server_error" with the provider
+    # text as the message's TextBlock), followed by an ordinary reply.
+    script: list[object] = [
+        AssistantMessage(
+            content=[TextBlock(text=canaries["provider_error"])],
+            model="observed-model",
+            error="server_error",
+        ),
+        AssistantMessage(
+            content=[TextBlock(text=normal_text)],
+            model="observed-model",
+            usage={"input_tokens": 1, "output_tokens": 1},
+        ),
+        _result(),
+    ]
+    _, finished = _export_failed_turn(
+        lambda: FakeModelSession(lambda: script),
+        Event(type="message", text=canaries["prompt"], user="U0EXAMPLE1", ts="1"),
+        ceiling=1000,
+    )
+
+    _assert_no_canary_exported(finished, canaries)
+    generations = _spans_by_name(finished)["llm.generation"]
+    assert any(normal_text in str(g.attributes.get(_OUTPUT, "")) for g in generations)
 
 
 def test_runner_error_root_carries_runner_error_classification() -> None:
