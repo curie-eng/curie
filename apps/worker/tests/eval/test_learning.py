@@ -819,6 +819,7 @@ def frozen_report(tmp_path: Path) -> dict[str, Any]:
         },
         "cleanup": {
             "verified": True,
+            "problems": [],
             "ownership_manifest": {
                 "project": "curie-check-example",
                 "daemon_id": "example-daemon",
@@ -2762,3 +2763,29 @@ def test_teardown_finalizes_when_the_post_down_observation_fails(
     cleanup = campaign.teardown()
     assert cleanup["verified"] is False
     assert any("after local down" in problem for problem in cleanup["problems"])
+
+
+@pytest.mark.parametrize("damage", ["none", "unverified", "problems-but-verified", "no-problems"])
+def test_cleanup_validator_fails_closed_on_recorded_incomplete_discovery(
+    tmp_path: Path,
+    frozen_report: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    damage: str,
+) -> None:
+    """With every recorded resource absent, a teardown that could not observe
+    everything it owned must still fail the cleanup validator."""
+
+    from curie_worker.eval import learning
+
+    monkeypatch.setattr(learning, "_check_cleanup_live", lambda _report: None)
+    report = copy.deepcopy(frozen_report)
+    cleanup = report["cleanup"]
+    missed = "ownership not observed after local down: timed out"
+    if damage == "unverified":
+        cleanup["verified"] = False
+        cleanup["problems"] = [missed]
+    elif damage == "problems-but-verified":
+        cleanup["problems"] = [missed]
+    elif damage == "no-problems":
+        cleanup.pop("problems")
+    _check(tmp_path, report, verify_cleanup, passed=damage == "none")

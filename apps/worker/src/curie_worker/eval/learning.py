@@ -2122,6 +2122,10 @@ def _calibration_checks(report: _Report) -> list[str]:
 
 
 def _cleanup_checks(report: _Report) -> list[str]:
+    cleanup = _obj(report.data.get("cleanup"), "cleanup")
+    # Absence of recorded resources proves nothing about what discovery missed.
+    _require(cleanup.get("problems") == [], "teardown recorded cleanup problems")
+    _require(cleanup.get("verified") is True, "cleanup was not verified")
     _check_cleanup_live(report)
     return []
 
