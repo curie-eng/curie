@@ -262,7 +262,9 @@ forbidden_modules = [
 # admission policy are installation objects, read by the guard and the
 # commissioning compositions only. No production composition imports them, and
 # they reach no launch authority, so the guard can decide admission but can
-# never itself create, reserve or authorize a launch. The guard modules live in
+# never itself create, reserve or authorize a launch. The control installation
+# that installs the guard and the control observer that reobserves it are held
+# to the same two contracts. The guard modules live in
 # `curie_worker`, so the first contract names every protected production module
 # explicitly: import-linter does not check a package against its own modules.
 [[tool.importlinter.contracts]]
@@ -300,6 +302,8 @@ source_modules = [
 ]
 forbidden_modules = [
     "curie_worker.commissioning_control_admission",
+    "curie_worker.commissioning_control_installation",
+    "curie_worker.commissioning_control_observer",
     "curie_worker.commissioning_control_profile",
     "curie_worker.commissioning_control_slots",
 ]
@@ -309,6 +313,8 @@ name = "The commissioning guard holds no launch authority"
 type = "forbidden"
 source_modules = [
     "curie_worker.commissioning_control_admission",
+    "curie_worker.commissioning_control_installation",
+    "curie_worker.commissioning_control_observer",
     "curie_worker.commissioning_control_profile",
     "curie_worker.commissioning_control_slots",
 ]
