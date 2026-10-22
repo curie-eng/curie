@@ -2566,6 +2566,10 @@ def test_ci_gate_applies_the_python_preflight_verdict_to_python_changes(
 
     # The gate reads CI through the code host, which reads it here.
     monkeypatch.setattr(ci, "read_ci_detail", green_ci)
+    monkeypatch.setattr(
+        "curie_api.forges.github.code_host.resolve_repository_credential",
+        lambda repo, *, html_base, credentials: (f"{html_base}/{repo}.git", "Bearer fixture-token"),
+    )
 
     async def settlement(session: AsyncSession) -> Any:
         return await workitems.claim_publication_settlement(session, exclude=frozenset())
@@ -2584,7 +2588,17 @@ def test_ci_gate_applies_the_python_preflight_verdict_to_python_changes(
         engine = create_async_engine(get_settings().database_url)
         maker = async_sessionmaker(engine, expire_on_commit=False)
         try:
-            async with httpx.AsyncClient() as client:
+            def _host(request: httpx.Request) -> httpx.Response:
+                # The CI read is patched. This answers only the required-check
+                # reads: no ruleset, and a branch with no protection.
+                path = request.url.path
+                if "/rules/branches/" in path:
+                    return httpx.Response(404, json={"message": "Not Found"})
+                if "/branches/" in path:
+                    return httpx.Response(200, json={"name": path.rsplit("/", 1)[-1]})
+                return httpx.Response(404, json={"message": "Not Found"})
+
+            async with httpx.AsyncClient(transport=httpx.MockTransport(_host)) as client:
                 return await factory_ci.gate(
                     maker,
                     cast(Any, EmptyValkey()),
