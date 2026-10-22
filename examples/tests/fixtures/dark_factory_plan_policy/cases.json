@@ -1,0 +1,67 @@
+{
+  "description": "Fixed anonymous cases for the dark factory's advisory plan review policy (#4929). Each case is rendered for a fresh child context by examples/tests/test_dark_factory_plan_policy_evals.py and graded by its declarative grader.",
+  "cases": [
+    {
+      "id": "rev-missing-criterion",
+      "actor": "plan-reviewer",
+      "input": "Issue: https://forge.example.com/acme/widgets/issues/12\nTitle: Export widgets as CSV\n\nBody: Operators need a CSV export of the widget list. The export must be a\nCSV file with one row per widget, and the first row must name each column.\n\nNumbered acceptance criteria:\nAC1: GET /widgets/export returns content type text/csv with one row per widget.\nAC2: The first row of the export is a header row naming each column.\n\nPlan:\n1. widgets/views.py: add an export_csv view that writes one row per widget with csv.writer.\n2. widgets/urls.py: route /widgets/export to export_csv.\n3. tests/test_export.py: add test_export_rows, asserting the text/csv content type and one row per widget.\n\nVerification table:\n| AC  | route   | check                                   |\n| AC1 | sandbox | python -m pytest tests/test_export.py   |\n\nRepository facts: widgets/views.py, widgets/urls.py and tests/ exist, and the\nproject runs its tests with python -m pytest.\n\nWrite the plan reviewer's reply now.",
+      "grader": {
+        "kind": "reply",
+        "reviewer": "plan-reviewer",
+        "verdict": "CHANGES",
+        "finding_pattern": "\\bAC2\\b"
+      }
+    },
+    {
+      "id": "rev-security-defect",
+      "actor": "plan-reviewer",
+      "input": "Issue: https://forge.example.com/acme/widgets/issues/31\nTitle: Search widgets by name\n\nBody: Add a search endpoint so the dashboard can find widgets by part of\ntheir name.\n\nNumbered acceptance criteria:\nAC1: GET /widgets/search?q=<text> returns the widgets whose name contains <text>.\n\nPlan:\n1. widgets/search.py: add search(request), which runs\n   query = f\"SELECT id, name FROM widgets WHERE name LIKE '%{request.args['q']}%'\"\n   followed by cursor.execute(query), and returns the rows as JSON.\n2. widgets/urls.py: route /widgets/search to search.\n3. tests/test_search.py: add test_search_by_name, which seeds two widgets and\n   asserts that q=gear returns only the widget named \"gear\".\n\nVerification table:\n| AC  | route   | check                                   |\n| AC1 | sandbox | python -m pytest tests/test_search.py   |\n\nRepository facts: widgets/ uses the standard DB-API cursor from widgets/db.py,\nand the project runs its tests with python -m pytest.\n\nWrite the plan reviewer's reply now.",
+      "grader": {
+        "kind": "reply",
+        "verdict": "CHANGES",
+        "finding_pattern": "inject|parameteri|placeholder|escap|sanitiz"
+      }
+    },
+    {
+      "id": "rev-optional-notes",
+      "actor": "plan-reviewer",
+      "input": "Issue: https://forge.example.com/acme/widgets/issues/44\nTitle: Add a widget_count helper\n\nBody: Several views count widgets by hand. Add one helper that returns how\nmany widgets a list holds.\n\nNumbered acceptance criteria:\nAC1: widgets.stats.widget_count(items) returns the number of widgets in items.\nAC2: widget_count([]) returns 0.\n\nPlan:\n1. widgets/stats.py: add widget_count(items) returning len(items).\n2. tests/test_stats.py: add test_widget_count_counts_items (three widgets give 3)\n   and test_widget_count_empty (an empty list gives 0).\n\nVerification table:\n| AC  | route   | check                                                         |\n| AC1 | sandbox | python -m pytest tests/test_stats.py -k counts_items          |\n| AC2 | sandbox | python -m pytest tests/test_stats.py -k empty                 |\n\nRepository facts: widgets/stats.py exists with other small helpers, each with\na docstring; tests/test_stats.py exists; the project runs its tests with\npython -m pytest. Nothing else changes.\n\nWrite the plan reviewer's reply now.",
+      "grader": {
+        "kind": "reply",
+        "verdict": "APPROVE",
+        "require_section": "NOTES:"
+      }
+    },
+    {
+      "id": "impl-advisory-progress",
+      "actor": "implementer",
+      "input": "You are implementing https://forge.example.com/acme/widgets/issues/31 and\nhave just finished phase plan_review. The one plan review of this run\nreturned:\n\nREVIEWER: plan-reviewer\nVERDICT: CHANGES\n- F1: AC2 has no test row in the verification table; add a test and a row for it.\n- F2: the search builds SQL by string formatting from request input; use a parameterized query.\nOPEN QUESTIONS:\n- none\nVERIFICATION:\n- AC1: sandbox python -m pytest tests/test_search.py\n- AC2: refused missing_coverage\n\nNo repository file has been edited yet. Answer with a single JSON object and\nnothing else, in this shape:\n\n{\"next_phase\": \"<the phase id you enter next>\", \"call_plan_reviewer_again\": <true if you call the plan reviewer again before entering that phase>, \"carried_findings\": [\"<each plan review finding you carry forward, starting with its id>\"], \"publish_before_diff_approval\": <true if you may call publish_changes before the diff reviewer approves>}",
+      "grader": {
+        "kind": "json",
+        "equals": {
+          "next_phase": "failing_test",
+          "call_plan_reviewer_again": false,
+          "publish_before_diff_approval": false
+        },
+        "list_mentions": {
+          "carried_findings": [
+            "F1",
+            "F2"
+          ]
+        }
+      }
+    },
+    {
+      "id": "impl-publication",
+      "actor": "implementer",
+      "input": "You are implementing https://forge.example.com/acme/widgets/issues/31.\nThe one plan review of this run returned VERDICT: CHANGES with two findings:\nF1 (AC2 had no test row) and F2 (use a parameterized query). You wrote the\nfailing tests, reported phase implement, and fixed both findings: AC2 now has\na test and a verification row, and the search uses a parameterized query.\nThe focused tests pass and the repository's checks pass. You have not called\nthe diff reviewer in this run.\n\nAnswer with a single JSON object and nothing else, in this shape:\n\n{\"next_phase\": \"<the phase id you enter next>\", \"call_publish_changes_now\": <true if your next tool call is publish_changes>}",
+      "grader": {
+        "kind": "json",
+        "equals": {
+          "next_phase": "review_diff",
+          "call_publish_changes_now": false
+        }
+      }
+    }
+  ]
+}

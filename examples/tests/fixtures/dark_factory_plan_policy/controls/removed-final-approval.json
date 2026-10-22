@@ -1,0 +1,20 @@
+{
+  "description": "Removes the diff review step and every sentence that requires the diff reviewer's approval before publishing. Each find string must occur exactly once in the candidate prompt.",
+  "remove_sections": [
+    {"start": "## 7. Diff review", "end": "## Loop cap"}
+  ],
+  "deletions": [
+    {
+      "find": ", and\nrefuses publication until the diff reviewer approves.",
+      "replace": "."
+    },
+    {
+      "find": "the diff reviewer approved and every criterion is met and verified;",
+      "replace": "every criterion is met and verified;"
+    },
+    {
+      "find": ", every available product check passes, and the\ndiff reviewer's latest verdict is `VERDICT: APPROVE`.",
+      "replace": ", and every available product check passes."
+    }
+  ]
+}
