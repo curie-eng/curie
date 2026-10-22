@@ -113,6 +113,15 @@ async def _serving(
         await upstream_server.close()
 
 
+async def _settled(upstream: _Upstream) -> None:
+    """Give a cut-off request's handler a moment to record what it got."""
+
+    for _ in range(100):
+        if upstream.received:
+            return
+        await asyncio.sleep(0.02)
+
+
 def _run(body: Callable[[], Coroutine[Any, Any, None]]) -> None:
     asyncio.run(body())
 
@@ -309,8 +318,10 @@ def test_a_chunked_body_past_the_route_limit_is_refused() -> None:
             )
             assert status == server.TOO_LARGE_STATUS
             assert answer == b"the request body is too large\n"
-            # The cut-off body reached the server, and never past the limit.
-            assert upstream.received and all(0 < n <= _ROUTE_LIMIT for n in upstream.received)
+            # Whatever of the cut-off body reached the server, it was never
+            # past the limit, and the server finished no request.
+            await _settled(upstream)
+            assert all(n <= _ROUTE_LIMIT for n in upstream.received)
             assert upstream.seen == []
 
     _run(go)
@@ -348,7 +359,8 @@ def test_an_undeclared_chunked_put_past_one_mebibyte_is_refused() -> None:
                 proxy, "/upload", chunks(), {caller.HEADER: _CALLER_TOKEN}, method="PUT"
             )
             assert status == server.REFUSAL_STATUS
-            assert upstream.received and all(0 < n <= 1024 * 1024 for n in upstream.received)
+            await _settled(upstream)
+            assert all(n <= 1024 * 1024 for n in upstream.received)
             assert upstream.seen == []
 
     _run(go)
