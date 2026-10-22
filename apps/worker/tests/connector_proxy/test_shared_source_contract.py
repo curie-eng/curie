@@ -53,6 +53,8 @@ import re
 import secrets
 import socket
 import stat
+import tempfile
+import threading
 import time
 import uuid
 from typing import Any
@@ -120,6 +122,7 @@ from curie_connector_proxy.resolver.handles import (
     Principal,
     RegistryRefusal,
 )
+from curie_connector_proxy.resolver.http import serve_unix
 from curie_connector_proxy.resolver.refresh import RefreshCoordinator
 from curie_connector_proxy.resolver.sources import (
     ConnectorIdentitySource,
@@ -631,6 +634,124 @@ def test_wire_connection_cap_refuses_extra_connections_immediately(fleet: Fleet)
     assert _counts(harness) == (before[0] + 1, before[1] + 1)
 
 
+STALLED_RESPONSE_BYTES = 8 * 1024 * 1024
+WRITE_DEADLINE_S = 0.5
+
+
+class _LargeResponseResolver:
+    """A stub resolver that answers one document far larger than any socket buffer."""
+
+    def __init__(self) -> None:
+        self.document = {"blob": "A" * STALLED_RESPONSE_BYTES}
+
+    async def resolve(self, handle: str, slot: str, purpose: str) -> dict[str, Any]:
+        return self.document
+
+
+def _read_available(sock: socket.socket) -> bytes:
+    """Read to EOF, a reset or the socket timeout; answer the bytes that arrived."""
+
+    chunks: list[bytes] = []
+    while True:
+        try:
+            chunk = sock.recv(1 << 20)
+        except (ConnectionResetError, TimeoutError):
+            break
+        if not chunk:
+            break
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def test_wire_a_stalled_reader_is_aborted_at_the_write_deadline_and_frees_its_slot() -> None:
+    """A peer that never reads cannot hold a connection slot past the write deadline.
+
+    This is a component test of the HTTP layer, so the resolver behind it is a
+    stub whose JSON response (about 8 MiB) is far above the Unix socket
+    buffers. With ``max_connections=1`` and ``write_timeout=0.5``, a client
+    sends a valid request and never reads. Within a bounded time the server
+    aborts that transport, so a second client is accepted and receives the
+    full response, while the stalled client sees an aborted connection with
+    less than the full body. A reading client's full response arrives intact.
+    """
+
+    resolver = _LargeResponseResolver()
+    body = resolve_body(HANDLE_PREFIX + "A" * 43, SLOT)
+    request = request_head(len(body)) + body
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    clients: list[socket.socket] = []
+
+    def on_loop(coroutine: Any) -> Any:
+        return asyncio.run_coroutine_threadsafe(coroutine, loop).result(STATEMENT_WAIT_S)
+
+    async def stop(server: asyncio.Server) -> None:
+        server.close()
+        await asyncio.wait_for(server.wait_closed(), STATEMENT_WAIT_S)
+
+    with tempfile.TemporaryDirectory(prefix="crs") as directory:
+        path = os.path.join(directory, "r.sock")
+        server: asyncio.Server | None = None
+        try:
+            server = on_loop(
+                serve_unix(
+                    resolver,  # type: ignore[arg-type]
+                    path,
+                    max_connections=1,
+                    write_timeout=WRITE_DEADLINE_S,
+                )
+            )
+            stalled = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            clients.append(stalled)
+            stalled.settimeout(FAST_REPLY_S)
+            stalled.connect(path)
+            stalled.sendall(request)
+            started = time.monotonic()
+
+            busy = 0
+            while True:
+                probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                clients.append(probe)
+                probe.settimeout(FAST_REPLY_S)
+                probe.connect(path)
+                try:
+                    probe.sendall(request)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                data = _read_available(probe)
+                probe.close()
+                if data:
+                    reply = parse_raw(data)
+                    if reply.status == 200:
+                        break
+                    reply.refused(503, "busy")
+                busy += 1
+                assert time.monotonic() - started < FAST_REPLY_S, (
+                    "the stalled reader's slot was never freed"
+                )
+                time.sleep(0.1)
+
+            # The slot was held while the reader stalled, then freed by the abort.
+            assert busy >= 1, "the stalled connection did not hold the only slot"
+            assert reply.json == resolver.document
+            assert len(data) > STALLED_RESPONSE_BYTES
+
+            # The stalled client was aborted: it gets less than the full response.
+            leftover = _read_available(stalled)
+            assert len(leftover) < len(data), "the stalled connection was never aborted"
+        finally:
+            for client in clients:
+                client.close()
+            try:
+                if server is not None:
+                    on_loop(stop(server))
+            finally:
+                loop.call_soon_threadsafe(loop.stop)
+                thread.join(STATEMENT_WAIT_S)
+                loop.close()
+
+
 # =============================================================================
 # AC2: the invocation registry
 # =============================================================================
@@ -984,6 +1105,39 @@ def test_admission_start_refuses_a_widened_role_and_starts_after_revert(
         wait_for_no_resolver_backends(app.role_name)
     finally:
         owner.execute(revert.format(**names))
+
+    harness = fleet.launch(app)
+    assert harness.resolve(harness.handle(member)).status == 200
+
+
+def test_admission_start_refuses_an_executable_definer_trigger_function(
+    fleet: Fleet, sessions: SessionPool
+) -> None:
+    """A SECURITY DEFINER trigger function is foreign authority too (code review r2).
+
+    A role that can execute one and create temp tables can attach it to its
+    own temp table and fire privileged writes, so the trigger return type
+    earns no exemption.
+    """
+
+    app = fleet.application()
+    member = app.add_member()
+    owner = sessions.owner()
+    function = f"curie.sca_definer_trigger_{secrets.token_hex(6)}"
+    role = quote_ident(app.role_name)
+
+    try:
+        owner.execute(
+            f"CREATE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql "
+            "SECURITY DEFINER AS $$ BEGIN RETURN NEW; END $$"
+        )
+        owner.execute(f"REVOKE ALL ON FUNCTION {function}() FROM PUBLIC")
+        owner.execute(f"GRANT EXECUTE ON FUNCTION {function}() TO {role}")
+        code, _ = fleet.start_refused(app)
+        assert code == "role_foreign_authority"
+        wait_for_no_resolver_backends(app.role_name)
+    finally:
+        owner.execute(f"DROP FUNCTION IF EXISTS {function}()")
 
     harness = fleet.launch(app)
     assert harness.resolve(harness.handle(member)).status == 200
