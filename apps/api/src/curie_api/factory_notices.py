@@ -152,7 +152,10 @@ _CAUSE_TEXT = {
     "publication_expired": (
         "the request to open the pull request expired before anyone approved it."
     ),
-    "publication_failed": "the pull request could not be opened.",
+    "publication_failed": (
+        "publishing the pull request failed. A branch or pull request from this run may still "
+        "exist; check the repository before retrying."
+    ),
     "publication_unrecorded": (
         "the agent tried to publish its change, but no valid publication was recorded. "
         "The Details line below gives the reason; the pull request, if any, is unchanged."

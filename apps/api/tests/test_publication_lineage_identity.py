@@ -461,6 +461,60 @@ def test_patch_captures_provider_identity_with_the_first_pr_facts(
     )
 
 
+def test_patch_refuses_foreign_repository_url_without_settlement_then_accepts_canonical(
+    review_lineage_app: tuple[TestClient, dict[str, Any], str],
+    auth_headers: dict[str, str],
+) -> None:
+    client, truth, _ = review_lineage_app
+    _, publication = _approved_publication(client, auth_headers, truth=truth)
+    version, owner = _claim_publication_lease(publication["id"], "lineage-identity-test-worker")
+    query = "SELECT * FROM curie.publications WHERE id = :id"
+    params = {"id": uuid.UUID(publication["id"])}
+    before = _rows(query, params)
+    lineage_before = _lineage_row(publication["lineage_id"])
+    assert lineage_before["pr_number"] is None
+    assert before[0]["status"] == "approved"
+    assert before[0]["result_url"] is None
+    assert before[0]["terminal_at"] is None
+
+    refused = _advance_lineage(
+        client,
+        publication["id"],
+        expected_publication_version=version,
+        lease_owner=owner,
+        pr_url=f"https://github.com/acme-corp/other-bot/pull/{PR_NUMBER}",
+    )
+
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"] == {
+        "code": "publication.lineage_stale",
+        "message": "pull request identity does not match the publication repository",
+    }
+    assert _rows(query, params) == before
+    assert _lineage_row(publication["lineage_id"]) == lineage_before
+
+    accepted = _advance_lineage(
+        client,
+        publication["id"],
+        expected_publication_version=version,
+        lease_owner=owner,
+        pr_url=PR_URL,
+    )
+
+    assert accepted.status_code == 200, accepted.text
+    lineage = _lineage_row(publication["lineage_id"])
+    assert (lineage["pr_number"], lineage["pr_url"], lineage["head_sha"]) == (
+        PR_NUMBER,
+        PR_URL,
+        FIRST_REVISION_SHA,
+    )
+    settled = _rows(query, params)[0]
+    assert (settled["status"], settled["result_url"]) == ("succeeded", PR_URL)
+    assert settled["patch_bytes"] is None
+    assert settled["lease_owner"] is None
+    assert settled["terminal_at"] is not None
+
+
 def test_patch_preserves_captured_identity_on_a_later_revision(
     review_lineage_app: tuple[TestClient, dict[str, Any], str],
     auth_headers: dict[str, str],
@@ -475,9 +529,7 @@ def test_patch_preserves_captured_identity_on_a_later_revision(
     )
     assert _advance_lineage(client, first["id"]).status_code == 200
     _mark_outcome_history_ready(first["id"])
-    second_payload = _publication_payload(
-        deployment["id"], conversation_id=conversation_id
-    )
+    second_payload = _publication_payload(deployment["id"], conversation_id=conversation_id)
     second_payload["base_sha"] = FIRST_REVISION_SHA
     second = _create_publication(client, second_payload)
     truth["branch"] = second["branch"]

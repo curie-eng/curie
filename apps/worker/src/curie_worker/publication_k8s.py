@@ -510,7 +510,6 @@ def build_publication_resources(
         "branch": payload.branch,
         "title": payload.title,
         "branch_prefix": payload.branch_prefix,
-        "runner_image": settings.runner_image,
         "service_account_name": settings.service_account_name,
         "active_deadline_seconds": settings.active_deadline_seconds,
         "git_timeout_seconds": settings.git_timeout_seconds,
@@ -702,6 +701,13 @@ def _expected_projection(observed: Any, expected: Any) -> Any:
     return observed
 
 
+def _image_repository(image: str) -> str:
+    repository = image.split("@", 1)[0]
+    if repository.rfind(":") > repository.rfind("/"):
+        repository = repository.rsplit(":", 1)[0]
+    return repository
+
+
 def validate_adopted_resource(
     kind: str,
     expected: dict[str, Any],
@@ -773,11 +779,21 @@ def validate_adopted_resource(
 
     if kind != "Job":
         raise PublicationResourceError(f"unknown publication resource kind {kind!r}")
+    pod_spec = ((actual.get("spec") or {}).get("template") or {}).get("spec") or {}
+    expected_containers = expected["spec"]["template"]["spec"]["containers"]
+    for container in pod_spec.get("containers") or []:
+        if container.get("name") != "publish":
+            continue
+        expected_image = next(
+            item["image"] for item in expected_containers if item["name"] == "publish"
+        )
+        image = container.get("image")
+        if isinstance(image, str) and _image_repository(image) == _image_repository(expected_image):
+            container["image"] = expected_image
     if _expected_projection(actual.get("spec"), expected["spec"]) != expected["spec"]:
         raise PublicationResourceError(
             f"refusing to adopt Job {expected_metadata['name']!r}: spec mismatch"
         )
-    pod_spec = ((actual.get("spec") or {}).get("template") or {}).get("spec") or {}
     for container in pod_spec.get("containers") or []:
         # The expected-shape projection ignores keys the expected side never
         # set, so an omitted literal env "value" tolerates any actual key on
@@ -1123,7 +1139,89 @@ class KubernetesPublicationCluster:
             logs=logs,
             error=error,
             transport=job_transport(job),
+            job_uid=str(job_uid),
         )
+
+    def rejected_job_quiescent(self, job_name: str, job_uid: str) -> bool:
+        def terminal(job: Any) -> bool:
+            return _field(_field(job, "metadata"), "uid") == job_uid and any(
+                _field(condition, "type") in {"Complete", "Failed"}
+                and _field(condition, "status") in ("True", True)
+                for condition in _field(_field(job, "status"), "conditions") or []
+            )
+
+        if not job_uid:
+            return False
+        try:
+            if not terminal(self._batch.read_namespaced_job(job_name, self.namespace)):
+                return False
+            inventory = self._core.list_namespaced_pod(self.namespace)
+            metadata = _field(inventory, "metadata")
+            if _field(metadata, "continue", "_continue") or _field(
+                metadata, "remainingItemCount", "remaining_item_count"
+            ) not in (None, 0):
+                return False
+            pods = _field(inventory, "items")
+            if not isinstance(pods, list):
+                return False
+            for pod in pods:
+                pod_metadata = _field(pod, "metadata")
+                if pod_metadata is None:
+                    return False
+                references = _field(pod_metadata, "ownerReferences", "owner_references") or []
+                owned = False
+                for reference in references:
+                    if _field(reference, "kind") != "Job":
+                        continue
+                    uid = _field(reference, "uid")
+                    if _field(reference, "name") == job_name and uid != job_uid:
+                        return False
+                    owned |= uid == job_uid
+                if not owned:
+                    continue
+                status, spec = _field(pod, "status"), _field(pod, "spec")
+                if _field(status, "phase") not in {"Succeeded", "Failed"} or spec is None:
+                    return False
+                for declared_key, status_key, status_attr in (
+                    ("containers", "containerStatuses", "container_statuses"),
+                    ("initContainers", "initContainerStatuses", "init_container_statuses"),
+                    (
+                        "ephemeralContainers",
+                        "ephemeralContainerStatuses",
+                        "ephemeral_container_statuses",
+                    ),
+                ):
+                    declared_attr = {
+                        "initContainers": "init_containers",
+                        "ephemeralContainers": "ephemeral_containers",
+                    }.get(declared_key, declared_key)
+                    declared = _field(spec, declared_key, declared_attr) or []
+                    statuses = _field(status, status_key, status_attr) or []
+                    if declared_key == "containers" and not declared:
+                        return False
+                    names = [_field(container, "name") for container in declared]
+                    observed_names = [_field(container, "name") for container in statuses]
+                    if (
+                        any(not isinstance(name, str) or not name for name in names)
+                        or len(set(names)) != len(names)
+                        or len(statuses) != len(names)
+                        or set(observed_names) != set(names)
+                    ):
+                        return False
+                    for container in statuses:
+                        state = _field(container, "state")
+                        terminated = _field(state, "terminated")
+                        exit_code = _field(terminated, "exitCode", "exit_code")
+                        if (
+                            terminated is None
+                            or type(exit_code) is not int
+                            or _field(state, "running") is not None
+                            or _field(state, "waiting") is not None
+                        ):
+                            return False
+            return terminal(self._batch.read_namespaced_job(job_name, self.namespace))
+        except Exception:  # noqa: BLE001 - incomplete control-plane proof is never authority
+            return False
 
     def cleanup_credentials(self, names: PublicationResourceNames) -> None:
         try:
