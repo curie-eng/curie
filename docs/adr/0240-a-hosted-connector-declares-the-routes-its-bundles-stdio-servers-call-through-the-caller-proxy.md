@@ -2,17 +2,19 @@
 
 Date: 2026-10-22
 
-Status: Draft
+Status: Accepted
 
-This ADR would amend [ADR-0168](0168-one-installation-hosts-several-bot-identities.md)
+Accepted on 2026-10-22 with explicit maintainer approval from Junwon Jung,
+before implementation.
+
+This ADR amends [ADR-0168](0168-one-installation-hosts-several-bot-identities.md)
 decision 7 and [ADR-0178](0178-the-connector-caller-token-names-the-run-and-work-item.md)
 decision 4. Under ADR-0168 decision 7, the `cct` caller token is the only
 credential the caller proxy admits. Under ADR-0178 decision 4, the proxy
 refuses any claim beyond `agent`, `exp`, `run` and `work_item`. This ADR keeps
 both rules for the `cct` token and adds a second token type that the proxy
-admits only on declared routes. A Draft does not authorize implementation, and
-neither ADR gains a back link until this one is Accepted
-([ADR-0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)).
+admits only on declared routes. Both ADRs carry a back link under
+[ADR-0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md).
 
 Tracked in [#4917](https://github.com/curie-eng/curie/issues/4917).
 
@@ -118,13 +120,20 @@ these claims:
 - `connector`, the name of the one hosted connector the token is good for.
 
 The worker mints one `ccr` per hosted connector that both declares `routes:`
-and is mounted for this agent under ADR-0168 decision 8. It mints none for any
-other connector, and none when it holds no caller key. The tokens travel with
-the other boot tokens as one new `BootEnv` field, rendered as
-`CURIE_CONNECTOR_ROUTE_TOKENS`, a JSON object from connector name to token.
-The name matches `CURIE_*TOKEN*`, so `platform_credential_names` already keeps
-it out of every shell and hook env, and `claim_tokens` carries it like the
-others. A `cct` and a `ccr` are never interchangeable. The proxy refuses a
+and is mounted for this agent under ADR-0168 decision 8. It reads those
+declarations from the version's stored bundle, as it already does for an
+action executor boot, and caches the answer by `bundle_ref`, because a stored
+bundle never changes. It mints none for any other connector, and none when it
+holds no caller key or cannot read the bundle. In that case the route is
+refused `missing`, which the caller sees, rather than the turn failing.
+
+The tokens travel as one env entry, `CURIE_CONNECTOR_ROUTE_TOKENS`, a JSON
+object from connector name to token. The worker writes it next to the
+`BootEnv` render, the way it writes `CURIE_CONNECTOR_TOOL_GRANT`, so the ACI
+contract does not change. The name matches `CURIE_*TOKEN*`, so
+`platform_credential_names` already keeps it out of every shell and hook env.
+`claim_tokens` lists it with the other claim tokens, so on Kubernetes it is
+delivered by the per-claim Secret and never stored on the claim. A `cct` and a `ccr` are never interchangeable. The proxy refuses a
 `cct` on a declared route and a `ccr` everywhere else (decision 3).
 
 ### 3. The proxy admits a `ccr` on declared routes only, and streams them
@@ -172,18 +181,20 @@ payload's `env` block would copy it into the CLI's configuration path and into
 whatever env the CLI gives its children. So a stdio server named in some
 route's `callers` is not given to the CLI as a stdio entry. Instead:
 
-- The runner spawns the server itself, with the same command, args, cwd and
-  `${VAR}` expansion it would have had, and the same env the CLI would have
-  given it. It also adds the environ lock library to `LD_PRELOAD`, so the
-  process is not dumpable and same-uid peers cannot read its environ or
-  memory.
+- The runner spawns the server itself, with the same command, args and
+  `${VAR}` expansion it would have had. Its env is the shell and hook env with
+  no platform credentials, plus its own expanded `env` block. That is the env
+  the runner's capability probe already gives the same server. The runner also
+  adds the environ lock library to `LD_PRELOAD`, so the process is not
+  dumpable and same-uid peers cannot read its environ or memory. Where the
+  library cannot be loaded, the caller is not mounted at all, rather than
+  mounted unlocked.
 - The runner mounts that process on the CLI as an in-process SDK MCP server,
   under the name the CLI would have used (`plugin:<bundle>:<server>`). The SDK
-  server relays `tools/list` and `tools/call` over the child's stdio. Tool
-  names, `toolPolicy`, approval routes and capability probing are unchanged.
-  The bridge relays tools only. A caller that also exposes resources or
-  prompts is refused at validation, until a later decision extends the
-  bridge.
+  server is a transparent JSON-RPC relay over the child's stdio. Every message
+  the CLI sends reaches the child, and every message the child sends comes
+  back, so the server keeps its whole MCP surface. Tool names, `toolPolicy`,
+  approval routes and capability probing are unchanged.
 - The route credentials reach the child on one inherited pipe, whose number is
   in `CURIE_CONNECTOR_ROUTES_FD`. The runner writes one JSON document and
   closes its end:
@@ -204,15 +215,16 @@ receives nothing. A bundle that declares no `routes:` boots exactly as today.
 ### 5. Contract change and rollout
 
 `routes:` changes the frozen `packages/plugin-format` contract and its Rust
-mirror (`ConnectorSpecDecl` in `cli/src/connector_build.rs`), and the new
-`BootEnv` field changes `aci-protocol`. Each lands as its own reviewed
-contract change under AGENTS.md "Frozen contracts". Both are additive, but
-`ConnectorSpec` forbids unknown keys, so a CLI or API from before the field
-refuses a bundle that sets it. The proxy that understands `ccr` and
-`CURIE_CALLER_PROXY_ROUTES` ships in a tagged release before any worker mints
-a `ccr`. This is the same order ADR-0178 decision 4 requires for its claims.
-A proxy from before this change refuses a `ccr` as `invalid`, which is
-correct.
+mirror (`ConnectorSpecDecl` in `cli/src/connector_build.rs`), as ADR-0229's
+`proxy_upstream_host` did. The field is additive, but `ConnectorSpec` forbids
+unknown keys, so a CLI or API from before the field refuses a bundle that sets
+it. `aci-protocol` does not change (decision 2).
+
+The proxy runs from the worker image, so the proxy that understands `ccr` and
+`CURIE_CALLER_PROXY_ROUTES` ships with the worker that mints a `ccr`. A worker
+mints one only for a bundle that declares `routes:`, and only an API that has
+the field can deploy that bundle. A proxy from before this change refuses a
+`ccr` as `invalid`, which is correct.
 
 ## Consequences
 
@@ -273,22 +285,24 @@ correct.
    peer in another pod. It cannot tell one sandbox process from another, so
    caller scoping has to be enforced where the processes are, in the runner.
 
-## Preconditions for acceptance
+## Measurements
 
-These are measurements against the pinned dependencies. They are not
-decisions, and the realizing work starts only after they are recorded here.
+These were measured before acceptance on `claude-agent-sdk` 0.2.163 with its
+bundled CLI 2.1.286, against a local stand-in for `/v1/messages`, with
+`strict_mcp_config` set as the runner sets it:
 
-- The pinned CLI and SDK accept an in-process SDK MCP server registered under
-  a `plugin:<bundle>:<server>` name, and expose its tools under the same
-  `mcp__` names the stdio mount produces today.
-- The SDK server can relay a long-running `tools/call`, which takes as long as
-  the connector takes to review the file, without a client timeout shorter
-  than the CLI's own stdio tool timeout.
+- An in-process SDK MCP server registered as `plugin:b:review-tools` is
+  offered to the model as `mcp__plugin_b_review-tools__review`. A stdio server
+  with the same name and tool is offered under exactly the same name.
+- A `tools/call` that takes 330 seconds completes and returns its result, on
+  the SDK server and on the stdio server alike. Neither mount imposes a
+  shorter timeout. The SDK's own 60 second default applies only to control
+  requests the SDK sends, not to the MCP messages it answers.
 
 ## Tracking
 
 [#4917](https://github.com/curie-eng/curie/issues/4917) carries the problem.
-The realizing paths, after acceptance, are `ConnectorSpec` and its Rust
+The realizing paths are `ConnectorSpec` and its Rust
 mirror, `connector_render._proxy_container`, `curie_connector_proxy.server`
 and `curie_connector_proxy.caller`, the worker's token minting in
 `curie_worker.binding`, `BootEnv` in `aci-protocol`, and the runner's

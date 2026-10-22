@@ -230,11 +230,12 @@ A bundle's own stdio server, its hooks and Bash never receive it, so bundle
 code cannot call a hosted connector's HTTP routes through the proxy. A stdio
 tool that sends a large file to its own hosted connector therefore fails twice
 behind the proxy: it is refused with `missing`, and with a token it would be
-refused for the body size. Draft
+refused for the body size.
 [ADR 0240](../../adr/0240-a-hosted-connector-declares-the-routes-its-bundles-stdio-servers-call-through-the-caller-proxy.md)
 proposes declared routes with per-route limits and a connector-scoped token
 for declared stdio callers
-([#4917](https://github.com/curie-eng/curie/issues/4917)). It is not built.
+([#4917](https://github.com/curie-eng/curie/issues/4917)). It is accepted and
+not yet built.
 
 A request the token check does not admit gets a 403 carrying a JSON-RPC error and no
 challenge, and never reaches the server; the shape is frozen in
