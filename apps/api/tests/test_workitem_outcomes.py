@@ -29,6 +29,7 @@ from curie_api.config import get_settings
 from curie_api.crud import approvals as crud_approvals
 from curie_api.crud import lineages as crud_lineages
 from curie_api.crud import publication_queries as crud_publication_queries
+from curie_api.factory_base import ResolvedBase
 from curie_api.forges.errors import NotFound, Unauthorized, Unavailable
 from curie_api.forges.github.ci import CiDetail
 from curie_api.forges.github.code_host import GitHubCodeHost
@@ -265,6 +266,7 @@ def _facts(
         "objective": OBJECTIVE,
         "requester": REQUESTER,
         "request_id": uuid.uuid4(),
+        "base": ResolvedBase(branch="main", source="default", commit=BASE_SHA),
         "trigger_label": None,
     }
     values.update(overrides)

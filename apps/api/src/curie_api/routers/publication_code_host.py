@@ -22,7 +22,7 @@ from sqlalchemy import select
 
 from curie_api.crud import publication_queries as crud_publication_queries
 from curie_api.factory_rediscovery import REFUSING, publishing_code_host, rediscover
-from curie_api.forges.errors import ForgeError, NotFound, Unauthorized, Unavailable
+from curie_api.forges.errors import ForgeError, NotFound
 from curie_api.forges.hosts import resolve_stored
 from curie_api.forges.ports import CodeHost
 from curie_api.forges.trackers import tracker_for_work_item
@@ -31,8 +31,12 @@ from curie_api.publication_pulls import (
     PullRequestContract,
     PullRequestRefused,
     adopt_or_open,
-    revision_refusal,
     update_metadata,
+)
+from curie_api.publication_verification import (
+    forge_failure,
+    publication_base_ref,
+    verify_publication_commit,
 )
 from curie_api.schemas.publications import (
     PublicationBranchHeadOut,
@@ -62,25 +66,6 @@ def _refuse(code: str, message: str) -> NoReturn:
     raise HTTPException(
         status.HTTP_409_CONFLICT,
         {"code": f"publication.{code}", "message": message},
-        headers={"Cache-Control": "no-store"},
-    )
-
-
-def _forge_failure(exc: ForgeError) -> HTTPException:
-    """A fixed, payload-free answer for a code host failure."""
-
-    reason = str(exc) or type(exc).__name__
-    if isinstance(exc, Unauthorized):
-        code, status_code = "code_host_credential_refused", status.HTTP_502_BAD_GATEWAY
-    elif isinstance(exc, NotFound):
-        code, status_code = "code_host_not_found", status.HTTP_404_NOT_FOUND
-    elif isinstance(exc, Unavailable):
-        code, status_code = "code_host_unavailable", status.HTTP_503_SERVICE_UNAVAILABLE
-    else:
-        code, status_code = "code_host_refused", status.HTTP_502_BAD_GATEWAY
-    return HTTPException(
-        status_code,
-        {"code": f"publication.{code}", "message": f"the code host answered {reason}"},
         headers={"Cache-Control": "no-store"},
     )
 
@@ -139,7 +124,7 @@ async def read_publication_pull_request(
     try:
         pull = await code_host.read_pull_request(PullRequestRef(repository, str(pr_number)))
     except ForgeError as exc:
-        raise _forge_failure(exc) from None
+        raise forge_failure(exc) from None
     return _out(pull)
 
 
@@ -153,13 +138,14 @@ async def read_publication_branch_head(
     """The deterministic lineage branch's head, creating nothing."""
 
     response.headers["Cache-Control"] = "no-store"
-    _publication, lineage = await _stored(session, publication_id)
+    publication, lineage = await _stored(session, publication_id)
     code_host, repository = await _code_host(request, session, lineage)
     try:
+        base_branch = await publication_base_ref(session, code_host, publication, repository)
         head = await code_host.branch_head(repository, lineage.branch)
     except ForgeError as exc:
-        raise _forge_failure(exc) from None
-    return PublicationBranchHeadOut(head_sha=head)
+        raise forge_failure(exc) from None
+    return PublicationBranchHeadOut(head_sha=head, base_branch=base_branch)
 
 
 @router.post("/{publication_id}/revision-commit", response_model=PublicationRevisionOut)
@@ -170,7 +156,7 @@ async def verify_publication_revision(
     session: SessionDep,
     response: Response,
 ) -> PublicationRevisionOut:
-    """Prove a remote commit is this revision's marked commit on its expected parent."""
+    """Prove the marked revision and its authoritative publication parent."""
 
     response.headers["Cache-Control"] = "no-store"
     publication, lineage = await _stored(session, publication_id)
@@ -180,37 +166,19 @@ async def verify_publication_revision(
         _refuse("revision_mismatch", "the verification names another publication revision")
     code_host, repository = await _code_host(request, session, lineage)
     try:
-        commit = await code_host.read_commit(repository, data.commit_sha)
-    except ForgeError as exc:
-        raise _forge_failure(exc) from None
-    refusal = revision_refusal(
-        commit,
-        commit_sha=data.commit_sha,
-        revision_id=publication.id,
-        expected_parent=data.expected_parent,
-    )
-    if refusal is not None:
-        _refuse("revision_mismatch", refusal)
-    return PublicationRevisionOut(commit_sha=commit.sha)
-
-
-async def _base_ref(
-    session: SessionDep, code_host: CodeHost, publication: Publication, repository: RepositoryRef
-) -> str:
-    """The admitted WorkItem's base, else the repository's default branch."""
-
-    if publication.execution_request_id is not None:
-        base = await session.scalar(
-            select(WorkItem.base_branch)
-            .join(ExecutionRequest, ExecutionRequest.work_item_id == WorkItem.id)
-            .where(ExecutionRequest.id == publication.execution_request_id)
+        base_branch = await publication_base_ref(session, code_host, publication, repository)
+        verified = await verify_publication_commit(
+            code_host,
+            repository,
+            publication,
+            commit_sha=data.commit_sha,
+            base_branch=base_branch,
         )
-        if base:
-            return base
-    default_branch = (await resolve_stored(code_host, repository)).default_branch
-    if not default_branch:
-        raise Unavailable("default_branch_unknown")
-    return default_branch
+    except PullRequestRefused as refused:
+        _refuse(refused.code, refused.message)
+    except ForgeError as exc:
+        raise forge_failure(exc) from None
+    return PublicationRevisionOut(commit_sha=verified.commit_sha, parent_sha=verified.parent_sha)
 
 
 def _no_other_publication(
@@ -307,9 +275,25 @@ async def recover_publication_pull_request(
         _refuse("lineage_terminal", "the pull request for this thread is merged or closed")
     code_host, repository = await _code_host(request, session, lineage)
     try:
+        base_branch = await publication_base_ref(session, code_host, publication, repository)
+        if lineage.head_sha is None or lineage.pr_number is None:
+            head = await code_host.branch_head(repository, lineage.branch)
+            if head is None:
+                return Response(status_code=204, headers={"Cache-Control": "no-store"})
+            if head != data.expected_head_sha:
+                _refuse(
+                    "branch_moved", "the publication branch no longer matches the expected commit"
+                )
+            await verify_publication_commit(
+                code_host,
+                repository,
+                publication,
+                commit_sha=data.expected_head_sha,
+                base_branch=base_branch,
+            )
         contract = PullRequestContract(
             branch=lineage.branch,
-            base=await _base_ref(session, code_host, publication, repository),
+            base=base_branch,
             title=publication.title,
             body=publication.body,
             draft=publication.open_as_draft,
@@ -324,7 +308,7 @@ async def recover_publication_pull_request(
     except PullRequestRefused as refused:
         _refuse(refused.code, refused.message)
     except ForgeError as exc:
-        raise _forge_failure(exc) from None
+        raise forge_failure(exc) from None
     if pull is None:
         return Response(status_code=204, headers={"Cache-Control": "no-store"})
     return _out(pull)
@@ -372,7 +356,7 @@ async def update_publication_pull_request_metadata(
         resolved = await resolve_stored(code_host, repository)
         contract = PullRequestContract(
             branch=lineage.branch,
-            base=await _base_ref(session, code_host, publication, resolved),
+            base=await publication_base_ref(session, code_host, publication, resolved),
             title=publication.title,
             body=publication.body,
             draft=publication.open_as_draft,
@@ -388,5 +372,5 @@ async def update_publication_pull_request_metadata(
     except PullRequestRefused as refused:
         _refuse(refused.code, refused.message)
     except ForgeError as exc:
-        raise _forge_failure(exc) from None
+        raise forge_failure(exc) from None
     return _out(pull)

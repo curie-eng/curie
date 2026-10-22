@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import ssl
 import subprocess
@@ -17,6 +18,9 @@ from urllib.parse import parse_qs, unquote, urlsplit
 REPO_FULL_NAME = "acme-corp/acme-bot"
 DEFAULT_BRANCH = "main"
 AUTHORIZATION = "Bearer fixture-token"
+# Observed GitHubCodeHost._token contract: REST uses this Git Basic header.
+# https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/authenticating-as-a-github-app-installation
+BASIC_AUTHORIZATION = "Basic " + base64.b64encode(b"x-access-token:fixture-token").decode("ascii")
 PULL_NUMBER = 1
 
 
@@ -225,6 +229,7 @@ class FixtureState:
             pushes = 0
             files: dict[str, str] = {}
             if commit:
+                assert head is not None, "a commit inspection requires an existing branch head"
                 pushes = len(
                     _git(
                         "--git-dir",
@@ -304,7 +309,13 @@ class FixtureHandler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _authorized(self) -> bool:
-        if self.headers.get("Authorization") == AUTHORIZATION:
+        authorization = self.headers.get("Authorization")
+        repo_path = f"/repos/{REPO_FULL_NAME}"
+        path = urlsplit(self.path).path
+        if authorization == AUTHORIZATION or (
+            authorization == BASIC_AUTHORIZATION
+            and (path == repo_path or path.startswith(f"{repo_path}/"))
+        ):
             return True
         self._json(HTTPStatus.UNAUTHORIZED, {"message": "fixture authorization required"})
         return False

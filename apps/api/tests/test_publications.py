@@ -660,12 +660,22 @@ def _publication_commit_http(
     parent = row["expected_prior_head"]
     repo = row["repo_full_name"]
     original = client.app.state.http_client
+    fixture_token = (
+        "fixture-publication-app-token"
+        if get_settings().github_app_id
+        else "ghp_publication_operator"
+    )
+    # Observed GitHubCodeHost._token contract: REST uses the Git Basic header.
+    adapter_authorization = (
+        "Basic " + base64.b64encode(f"x-access-token:{fixture_token}".encode()).decode("ascii")
+    )
 
     async def handle(request: httpx.Request) -> httpx.Response:
         path = request.url.path
         # https://docs.github.com/en/rest/git/commits#get-a-commit-object
         # https://docs.github.com/en/rest/git/refs#get-a-reference
         if f"/repos/{repo}/git/commits/" in path:
+            assert request.headers["authorization"] == adapter_authorization
             sha = path.rsplit("/", 1)[-1]
             if sha == head_sha:
                 return httpx.Response(
@@ -680,6 +690,7 @@ def _publication_commit_http(
                 return httpx.Response(200, json={"sha": sha, "parents": [], "message": "Base"})
             return httpx.Response(404, json={"message": "Unknown fixture commit"})
         if f"/repos/{repo}/git/ref/heads/" in path:
+            assert request.headers["authorization"] == adapter_authorization
             branch = unquote(path.split("/git/ref/heads/", 1)[1])
             return httpx.Response(
                 200,
@@ -689,6 +700,7 @@ def _publication_commit_http(
                 },
             )
         if path.endswith(f"/repos/{repo}") and not get_settings().github_app_id:
+            assert request.headers["authorization"] == adapter_authorization
             return httpx.Response(
                 200,
                 json={
@@ -697,10 +709,7 @@ def _publication_commit_http(
                     "default_branch": "main",
                 },
             )
-        response = await original.send(request)
-        if path.endswith(f"/repos/{repo}") and response.status_code == 200:
-            return httpx.Response(200, json={"default_branch": "main", **response.json()})
-        return response
+        return await original.send(request)
 
     injected = httpx.AsyncClient(transport=httpx.MockTransport(handle))
     client.app.state.http_client = injected
@@ -4496,9 +4505,11 @@ def _late_publication_link_case(
     _execute(
         "INSERT INTO curie.work_items (id, code_host_kind, code_host_host, "
         "tracker_kind, tracker_host, tracker_scope_id, repository_project_id, tracker_issue_id, "
-        "code_host_installation_id, agent_id, repository_path, conversation_id, version) "
+        "code_host_installation_id, agent_id, repository_path, conversation_id, version, "
+        "base_branch, base_source, base_commit) "
         "VALUES (:id, 'github', 'github.com', 'github', 'github.com', :repository, "
-        ":repository, '4298', :installation, :agent, :repo, :conversation, 7)",
+        ":repository, '4298', :installation, :agent, :repo, :conversation, 7, "
+        "'main', 'default', :base)",
         {
             "id": item_id,
             "agent": lineage["agent_id"],
@@ -4506,6 +4517,7 @@ def _late_publication_link_case(
             "installation": 42 if refusal == "installation_id" else 41,
             "repo": "acme-corp/other" if refusal == "repository" else REPO,
             "conversation": lineage["conversation_id"],
+            "base": publication["base_sha"],
         },
     )
     _execute(
@@ -5805,6 +5817,7 @@ def review_lineage_app(
     get_settings.cache_clear()
     truth: dict[str, Any] = {
         "repository_id": 9001,
+        "default_branch": "main",
         "installation_id": 41,
         "node_id": "PR_example_123",
         "branch": "pending",
@@ -5834,10 +5847,22 @@ def review_lineage_app(
                     "expires_at": "2999-01-01T00:00:00Z",
                 },
             )
-        assert request.headers["authorization"] == truth["authorization"]
+        # verify_publication_identity uses Bearer; GitHubCodeHost._token uses Basic for REST.
+        authorizations = {
+            "Bearer fixture-publication-app-token",
+            "Basic "
+            + base64.b64encode(b"x-access-token:fixture-publication-app-token").decode("ascii"),
+        }
+        assert truth["authorization"] in authorizations
+        assert request.headers["authorization"] in authorizations
         if truth["status"] != 200:
             return httpx.Response(truth["status"], json={"message": "fixture-unavailable"})
-        repo = {"id": truth["repository_id"], "full_name": REPO}
+        # https://docs.github.com/en/rest/repos/repos#get-a-repository
+        repo = {
+            "id": truth["repository_id"],
+            "full_name": REPO,
+            "default_branch": truth["default_branch"],
+        }
         if request.url.path.endswith(f"/repos/{REPO}"):
             return httpx.Response(200, json=repo)
         return httpx.Response(

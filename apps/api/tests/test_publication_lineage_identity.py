@@ -110,6 +110,7 @@ def review_lineage_app(
     get_settings.cache_clear()
     truth: dict[str, Any] = {
         "repository_id": 9001,
+        "default_branch": "main",
         "installation_id": 41,
         "node_id": "PR_example_123",
         "branch": "pending",
@@ -135,12 +136,22 @@ def review_lineage_app(
                     "expires_at": "2999-01-01T00:00:00Z",
                 },
             )
-        assert request.headers["authorization"] == "Bearer fixture-publication-app-token"
+        # verify_publication_identity uses Bearer; GitHubCodeHost._token uses Basic for REST.
+        assert request.headers["authorization"] in {
+            "Bearer fixture-publication-app-token",
+            "Basic "
+            + base64.b64encode(b"x-access-token:fixture-publication-app-token").decode("ascii"),
+        }
         if truth["transport_error"]:
             raise httpx.ReadTimeout("fixture github timeout", request=request)
         if truth["status"] != 200:
             return httpx.Response(truth["status"], json={"message": "fixture-unavailable"})
-        repo = {"id": truth["repository_id"], "full_name": REPO}
+        # https://docs.github.com/en/rest/repos/repos#get-a-repository
+        repo = {
+            "id": truth["repository_id"],
+            "full_name": REPO,
+            "default_branch": truth["default_branch"],
+        }
         if request.url.path == f"/repos/{REPO}":
             return httpx.Response(200, json=repo)
         return httpx.Response(
@@ -786,7 +797,10 @@ def _moved_base_graph(
     }
 
     async def handle(request: httpx.Request) -> httpx.Response:
-        assert request.headers["Authorization"] == "Bearer ghp_publication_operator"
+        # Observed GitHubCodeHost._token contract: REST uses the Git Basic header.
+        assert request.headers["Authorization"] == (
+            "Basic " + base64.b64encode(b"x-access-token:ghp_publication_operator").decode("ascii")
+        )
         path = request.url.path
         # https://docs.github.com/en/rest/git/commits#get-a-commit-object
         if path.startswith(f"/repos/{REPO}/git/commits/"):
