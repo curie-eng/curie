@@ -475,9 +475,7 @@ def test_patch_preserves_captured_identity_on_a_later_revision(
     )
     assert _advance_lineage(client, first["id"]).status_code == 200
     _mark_outcome_history_ready(first["id"])
-    second_payload = _publication_payload(
-        deployment["id"], conversation_id=conversation_id
-    )
+    second_payload = _publication_payload(deployment["id"], conversation_id=conversation_id)
     second_payload["base_sha"] = FIRST_REVISION_SHA
     second = _create_publication(client, second_payload)
     truth["branch"] = second["branch"]

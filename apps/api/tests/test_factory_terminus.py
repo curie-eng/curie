@@ -234,38 +234,6 @@ def test_revision_completed_notice_carries_the_no_ci_note() -> None:
 # from the entry the latest check-runs read popped.
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 def _request(number: int) -> dict[str, Any]:
     rows = _rows(
         "SELECT r.id, r.status, r.terminal_cause, r.version, w.id AS work_item_id, "
@@ -1218,7 +1186,9 @@ def _attach_publication(
                 )
                 approval_id, publication_id = uuid.uuid4(), uuid.uuid4()
                 pr_url = (
-                    None if pr is None else f"https://github.com/{item['repository_path']}/pull/{pr}"
+                    None
+                    if pr is None
+                    else f"https://github.com/{item['repository_path']}/pull/{pr}"
                 )
                 await conn.execute(
                     text(

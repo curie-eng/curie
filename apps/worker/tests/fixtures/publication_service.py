@@ -188,9 +188,7 @@ class FixtureHandler(BaseHTTPRequestHandler):
             query = parse_qs(parsed.query)
             requested_head = (query.get("head") or [""])[0]
             pull = self.server.state.pull_payload()
-            expected_head = (
-                f"acme-corp:{pull['head']['ref']}" if pull is not None else None
-            )
+            expected_head = f"acme-corp:{pull['head']['ref']}" if pull is not None else None
             rows = [pull] if pull is not None and requested_head == expected_head else []
             self._json(HTTPStatus.OK, rows)
             return

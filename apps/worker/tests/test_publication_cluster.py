@@ -143,9 +143,7 @@ def _payload(
 
 
 def _ssl_context() -> ssl.SSLContext:
-    return ssl.create_default_context(
-        cafile=_required("CURIE_PUBLICATION_FIXTURE_CA")
-    )
+    return ssl.create_default_context(cafile=_required("CURIE_PUBLICATION_FIXTURE_CA"))
 
 
 async def _forward_fixture_request(request: httpx.Request) -> None:
