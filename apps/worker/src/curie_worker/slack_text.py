@@ -28,7 +28,8 @@ class AnswerPart:
 def split_verbatim_answer(text: str) -> list[AnswerPart]:
     """Partition literal text without adding, removing or normalizing characters.
 
-    Slack documents a 3,000-character limit on a section's plain_text object:
+    The budget stays inside the 3,000-character limit Slack documents for a
+    text object:
     https://docs.slack.dev/reference/block-kit/composition-objects/text-object/
     Count UTF-8 bytes more conservatively, without splitting a code point.
     """
