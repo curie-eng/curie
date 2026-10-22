@@ -704,6 +704,80 @@ grep -q "acme-factory: volume workspace sizeLimit '1Gi', want '15Gi'" "$TMP/fp-m
   || { cat "$TMP/fp-mut.out" >&2; fail "(q) checker failed for the wrong reason"; }
 echo "  ok: (q) unknown profile, bad agent name, unresolved field and request above limit refuse the render"
 
+# (r) a nonpositive effective volume limit is refused. The kubelet enforces
+# only positive emptyDir sizeLimits, so "0" would be an unbounded volume
+# (ADR-0059). Each refusal sits beside a positive control that renders.
+render -f "$FIXTURE" --set-string agentSandbox.resourceProfiles.factory.workspaceSizeLimit=1Mi >/dev/null \
+  || fail "(r) liveness: a positive profile workspaceSizeLimit must render"
+expect_render_fail "agentSandbox.resourceProfiles.factory.workspaceSizeLimit" -f "$FIXTURE" \
+  --set-string agentSandbox.resourceProfiles.factory.workspaceSizeLimit=0
+render -f "$FIXTURE" --set-string agentSandbox.resourceProfiles.factory.homeSizeLimit=1Mi >"$TMP/fp-home1.yaml" \
+  || fail "(r) liveness: a positive profile homeSizeLimit must render"
+envcheck "(r) a positive factory homeSizeLimit lands on /home/runner" "$TMP/fp-home1.yaml" \
+  generic=STANDARD acme-factory=FACTORY acme-factory./home/runner=1Mi
+expect_render_fail "agentSandbox.resourceProfiles.factory.homeSizeLimit" -f "$FIXTURE" \
+  --set-string agentSandbox.resourceProfiles.factory.homeSizeLimit=0
+render -f "$FIXTURE" --set-string agentSandbox.resourceProfiles.standard.tmpSizeLimit=1Gi >/dev/null \
+  || fail "(r) liveness: a positive standard tmpSizeLimit must render"
+expect_render_fail "agentSandbox.resourceProfiles.standard.tmpSizeLimit" -f "$FIXTURE" \
+  --set-string agentSandbox.resourceProfiles.standard.tmpSizeLimit=0Gi
+render -f "$FIXTURE" --set-string agentSandbox.runner.hardening.writablePathSizeLimit=1Mi >/dev/null \
+  || fail "(r) liveness: a positive generic writablePathSizeLimit must render"
+expect_render_fail "agentSandbox.runner.hardening.writablePathSizeLimit" -f "$FIXTURE" \
+  --set-string agentSandbox.runner.hardening.writablePathSizeLimit=0
+render -f "$FIXTURE" --set-string agentSandbox.runner.workspace.sizeLimit=1Mi >/dev/null \
+  || fail "(r) liveness: a positive generic workspace sizeLimit must render"
+expect_render_fail "agentSandbox.runner.workspace.sizeLimit" -f "$FIXTURE" \
+  --set-string agentSandbox.runner.workspace.sizeLimit=0
+echo "  ok: (r) a zero emptyDir sizeLimit from any source refuses the render, naming the key"
+
+# (s) an explicit zero resource request is an explicit override (A1), whether
+# set numerically or quoted. The cpu pair then comes from the generic side with
+# the unset limit from standard; memory and ephemeral-storage keep their pairs.
+cat >"$TMP/zerocheck.py" <<'PY'
+"""zerocheck.py <render.yaml> -- explicit cpu request 0 on factory and generic."""
+import sys
+
+import yaml
+
+docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
+tpls = {d["metadata"]["name"]: d for d in docs if d.get("kind") == "SandboxTemplate"}
+errors = []
+
+def zero(v):
+    return str(v) in ("0", "0.0")
+
+def check(label, tpl, want_limit, extra):
+    spec = tpl["spec"]["podTemplate"]["spec"]
+    for c in spec["containers"] + spec.get("initContainers", []):
+        res = c["resources"]
+        got = res["requests"].get("cpu")
+        if not zero(got):
+            errors.append(f"{label}/{c['name']}: cpu request {got!r}, want 0")
+        if str(res["limits"].get("cpu")) != want_limit:
+            errors.append(f"{label}/{c['name']}: cpu limit {res['limits'].get('cpu')!r}, want {want_limit!r}")
+        for r, (rq, lm) in extra.items():
+            if (str(res["requests"].get(r)), str(res["limits"].get(r))) != (rq, lm):
+                errors.append(f"{label}/{c['name']}: {r} {res['requests'].get(r)!r}/{res['limits'].get(r)!r}, want {rq}/{lm}")
+
+factory = [t for n, t in tpls.items() if n.endswith("-agent-acme-factory-runner")]
+generic = [t for n, t in tpls.items() if "-agent-" not in n and n.endswith("-runner")]
+if len(factory) != 1 or len(generic) != 1:
+    sys.exit(f"want one factory and one generic template, got {len(factory)} and {len(generic)}")
+check("factory", factory[0], "1", {"memory": ("8Gi", "8Gi"), "ephemeral-storage": ("10Gi", "20Gi")})
+check("generic", generic[0], "1", {})
+if errors:
+    sys.exit("\n".join(errors))
+print("ok")
+PY
+for form in "--set" "--set-string"; do
+  render -f "$FIXTURE" "$form" agentSandbox.runner.resources.requests.cpu=0 >"$TMP/fp-zero.yaml" \
+    || fail "(s) explicit cpu request 0 ($form) render"
+  python3 "$TMP/zerocheck.py" "$TMP/fp-zero.yaml" >"$TMP/zerocheck.out" 2>&1 \
+    || { cat "$TMP/zerocheck.out" >&2; fail "(s) explicit cpu request 0 ($form) must stay 0 on factory and generic"; }
+done
+echo "  ok: (s) an explicit zero cpu request is an explicit override, numeric or quoted"
+
 echo
 echo "PASS: every emptyDir volume in the rendered sandbox pod (bundles, aws-config, and one per hardening.writablePaths entry, including a lengthened list) carries an explicit, operator-overridable sizeLimit."
 echo "PASS: agentSandbox.workspaceSizeLimits sets one agent's workspace sizeLimit and routes its claims to that pool."
