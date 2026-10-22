@@ -156,10 +156,30 @@ jobs:
 
 
           def rate_limited(status, body, stderr):
-              blob = f"{body}\n{stderr}".lower()
+              # GitHub documents a primary or secondary limit as HTTP 403 or 429
+              # with a message, and the GraphQL API as HTTP 200 whose errors
+              # text says the rate limit was exceeded. gh prints that text on
+              # stderr and often omits the status code.
+              # https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api
+              # https://docs.github.com/en/graphql/overview/rate-limits-and-node-limits-for-the-graphql-api
+              texts = [stderr]
+              try:
+                  parsed = json.loads(body) if body.strip() else None
+              except json.JSONDecodeError:
+                  parsed = None
+              if isinstance(parsed, dict):
+                  message = parsed.get("message")
+                  if isinstance(message, str):
+                      texts.append(message)
+                  for error in parsed.get("errors") or []:
+                      if isinstance(error, dict) and isinstance(error.get("message"), str):
+                          texts.append(error["message"])
+              blob = "\n".join(texts).lower()
               if "rate limit" not in blob:
                   return False
-              return status in (403, 429) or "403" in blob or "429" in blob
+              if status in (0, 200, 403, 429):
+                  return True
+              return "403" in blob or "429" in blob
 
 
           def wait_seconds(headers, stderr):
@@ -168,7 +188,9 @@ jobs:
                   return int(retry_after)
               reset = headers.get("x-ratelimit-reset", "")
               if reset.isdigit():
-                  return max(0, int(reset) - int(time.time()))
+                  delay = int(reset) - int(time.time())
+                  if delay > 0:
+                      return delay
               match = re.search(r"retry-after:\s*(\d+)", stderr, re.IGNORECASE)
               if match:
                   return int(match.group(1))
@@ -269,10 +291,26 @@ jobs:
               return status, headers, body
 
           def rate_limited(status, body, stderr):
-              blob = f"{body}\n{stderr}".lower()
+              # Same rule as Verify. A GraphQL limit is HTTP 200 plus an errors
+              # message, and gh often prints only that message.
+              texts = [stderr]
+              try:
+                  parsed = json.loads(body) if body.strip() else None
+              except json.JSONDecodeError:
+                  parsed = None
+              if isinstance(parsed, dict):
+                  message = parsed.get("message")
+                  if isinstance(message, str):
+                      texts.append(message)
+                  for error in parsed.get("errors") or []:
+                      if isinstance(error, dict) and isinstance(error.get("message"), str):
+                          texts.append(error["message"])
+              blob = "\n".join(texts).lower()
               if "rate limit" not in blob:
                   return False
-              return status in (403, 429) or "403" in blob or "429" in blob
+              if status in (0, 200, 403, 429):
+                  return True
+              return "403" in blob or "429" in blob
 
           def wait_seconds(headers, stderr):
               retry_after = headers.get("retry-after", "")
@@ -280,26 +318,39 @@ jobs:
                   return int(retry_after)
               reset = headers.get("x-ratelimit-reset", "")
               if reset.isdigit():
-                  return max(0, int(reset) - int(time.time()))
+                  delay = int(reset) - int(time.time())
+                  if delay > 0:
+                      return delay
               match = re.search(r"retry-after:\s*(\d+)", stderr, re.IGNORECASE)
               if match:
                   return int(match.group(1))
               return FALLBACK_WAIT
 
-          def gh(*arguments, capture_output=False):
+          def write_json(method, endpoint, payload):
+              # REST keeps Retry-After. gh issue uses GraphQL and hides it.
+              # https://docs.github.com/en/rest/issues/issues#create-an-issue
+              # https://docs.github.com/en/rest/issues/comments#create-an-issue-comment
+              # https://docs.github.com/en/rest/issues/issues#update-an-issue
               while True:
-                  result = subprocess.run(
-                      ["gh", *arguments], capture_output=True, text=True, check=False)
-                  status, headers, body = split_response(result.stdout)
-                  if rate_limited(status, body, result.stderr):
-                      time.sleep(wait_seconds(headers, result.stderr))
+                  proc = subprocess.run(
+                      ["gh", "api", "--include", "--method", method, "--input", "-", endpoint],
+                      input=json.dumps(payload),
+                      capture_output=True,
+                      text=True,
+                      check=False,
+                  )
+                  status, headers, body = split_response(proc.stdout)
+                  if rate_limited(status, body, proc.stderr):
+                      time.sleep(wait_seconds(headers, proc.stderr))
                       continue
-                  if result.returncode != 0:
+                  if proc.returncode != 0 or status >= 400:
                       raise subprocess.CalledProcessError(
-                          result.returncode, ["gh", *arguments], result.stdout, result.stderr)
-                  if capture_output:
-                      return result
-                  return result
+                          proc.returncode or status,
+                          ["gh", "api", "--method", method, endpoint],
+                          body,
+                          proc.stderr,
+                      )
+                  return json.loads(body) if body.strip() else {}
 
           def next_page(headers):
               for part in headers.get("link", "").split(","):
@@ -402,9 +453,16 @@ jobs:
                           lines.extend(["", hint])
               body = "\n".join(lines)
           if issue_number is None:
-              gh("issue", "create", "--repo", repo, "--title", title, "--body", body)
+              write_json(
+                  "POST", f"repos/{repo}/issues", {"title": title, "body": body})
           else:  # Reuse the existing bot tracking issue.
-              gh("issue", "comment", str(issue_number), "--repo", repo, "--body", body)
+              write_json(
+                  "POST",
+                  f"repos/{repo}/issues/{issue_number}/comments",
+                  {"body": body})
               if green:
-                  gh("issue", "close", str(issue_number), "--repo", repo, "--reason", "completed")
+                  write_json(
+                      "PATCH",
+                      f"repos/{repo}/issues/{issue_number}",
+                      {"state": "closed", "state_reason": "completed"})
           PY

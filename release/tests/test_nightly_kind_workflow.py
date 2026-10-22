@@ -6,6 +6,7 @@ import json
 import os
 import re
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TypedDict, cast
@@ -54,6 +55,7 @@ def _workflow(path: Path = WORKFLOW) -> dict[str, Any]:
 class GitHubCall(TypedDict):
     args: list[str]
     repo: str | None
+    body: str
 
 
 @dataclass
@@ -75,18 +77,33 @@ def github(tmp_path: Path) -> dict[str, str]:
         """#!/usr/bin/env python3
 import json
 import os
+import re
 import sys
 from urllib.parse import parse_qs, urlsplit
 
 args = sys.argv[1:]
+payload = ""
+if "--input" in args and args[args.index("--input") + 1] == "-":
+    payload = sys.stdin.read()
 with open(os.environ["TEST_GH_CALLS"], "a", encoding="utf-8") as calls:
-    calls.write(json.dumps({"args": args, "repo": os.environ.get("GH_REPO")}) + "\\n")
+    calls.write(json.dumps({
+        "args": args,
+        "repo": os.environ.get("GH_REPO"),
+        "body": payload,
+    }) + "\\n")
+
+def request_method():
+    if "--method" in args:
+        return args[args.index("--method") + 1]
+    return "GET"
+
 def rate_limit_applies():
     scope = os.environ.get("TEST_RATE_LIMIT_ON", "any")
-    if scope == "api":
-        return args[:1] == ["api"]
-    if scope == "issue":
-        return args[:1] == ["issue"]
+    if scope == "api" and args[:1] != ["api"]:
+        return False
+    wanted = os.environ.get("TEST_RATE_LIMIT_METHOD", "")
+    if wanted and request_method() != wanted:
+        return False
     return True
 
 def consume_rate_limit():
@@ -105,9 +122,19 @@ def consume_rate_limit():
     return True
 
 def emit_rate_limit():
-    sys.stderr.write("HTTP 403: API rate limit exceeded for installation\\nretry-after: 0\\n")
+    if os.environ.get("TEST_RATE_LIMIT_SHAPE") == "graphql":
+        sys.stderr.write("GraphQL: API rate limit exceeded for installation\\n")
+        sys.exit(1)
+    if os.environ.get("TEST_RATE_LIMIT_RESET"):
+        sys.stderr.write("HTTP 403: API rate limit exceeded for installation\\n")
+    else:
+        sys.stderr.write(
+            "HTTP 403: API rate limit exceeded for installation\\nretry-after: 0\\n"
+        )
     if "--include" in args:
-        sys.stdout.write("HTTP/2 403\\nretry-after: 0\\n\\n")
+        reset = os.environ.get("TEST_RATE_LIMIT_RESET", "")
+        header = f"x-ratelimit-reset: {reset}\\n" if reset else "retry-after: 0\\n"
+        sys.stdout.write("HTTP/2 403\\n" + header + "\\n")
         message = json.dumps({"message": "API rate limit exceeded for installation"})
         sys.stdout.write(message + "\\n")
     sys.exit(1)
@@ -137,6 +164,25 @@ if args[:1] == ["api"]:
         sys.exit(int(os.environ.get("TEST_DISPATCH_EXIT", "0")))
     if consume_rate_limit():
         emit_rate_limit()
+    issue_path = re.fullmatch(
+        r"repos/" + re.escape(repo) + r"/issues(?:/(\\d+)(?:/(comments))?)?", url.path)
+    if issue_path and request_method() in ("POST", "PATCH"):
+        number, comments = issue_path.groups()
+        if comments:
+            exit_name = "COMMENT"
+        elif number:
+            exit_name = "CLOSE"
+        else:
+            exit_name = "CREATE"
+        exit_code = int(os.environ.get(
+            "TEST_" + exit_name + "_EXIT", os.environ.get("TEST_ISSUE_EXIT", "0")))
+        if exit_code:
+            emit_included(500, json.dumps({"message": "write failed"}), [], exit_code)
+        if comments:
+            emit_included(201, json.dumps({"id": 1}), [])
+        if number:
+            emit_included(200, json.dumps({"number": int(number), "state": "closed"}), [])
+        emit_included(201, json.dumps({"number": 1}), [])
     run_path = f"repos/{repo}/actions/runs/7601"
     if url.path == run_path:
         if os.environ.get("TEST_RUN_EXIT"):
@@ -195,11 +241,6 @@ if args[:1] == ["api"]:
             + '>; rel="next"'
         )
     emit_included(200, json.dumps(page), headers, exit_code)
-if consume_rate_limit():
-    emit_rate_limit()
-if args[:2] in (["issue", "create"], ["issue", "comment"], ["issue", "close"]):
-    sys.exit(int(os.environ.get("TEST_" + args[1].upper() + "_EXIT",
-                               os.environ.get("TEST_ISSUE_EXIT", "0"))))
 if args[:2] == ["workflow", "run"]:
     print("Dispatched without observing the result")
     sys.exit(0)
@@ -306,13 +347,51 @@ def _calls(environment: dict[str, str], command: list[str]) -> list[GitHubCall]:
     ]
 
 
+def _endpoint(call: GitHubCall) -> str:
+    return next(arg for arg in call["args"] if arg.startswith("repos/"))
+
+
+def _request_method(call: GitHubCall) -> str:
+    args = call["args"]
+    if "--method" in args:
+        return args[args.index("--method") + 1]
+    return "GET"
+
+
+def _payload(call: GitHubCall) -> dict[str, Any]:
+    return cast(dict[str, Any], json.loads(call["body"] or "{}"))
+
+
+def _issue_creates(environment: dict[str, str]) -> list[GitHubCall]:
+    return [
+        call
+        for call in _calls(environment, ["api"])
+        if _request_method(call) == "POST" and _endpoint(call) == f"repos/{REPOSITORY}/issues"
+    ]
+
+
+def _issue_comments(environment: dict[str, str]) -> list[GitHubCall]:
+    return [
+        call
+        for call in _calls(environment, ["api"])
+        if _request_method(call) == "POST" and _endpoint(call).endswith("/comments")
+    ]
+
+
+def _issue_closes(environment: dict[str, str]) -> list[GitHubCall]:
+    return [
+        call
+        for call in _calls(environment, ["api"])
+        if _request_method(call) == "PATCH" and "/issues/" in _endpoint(call)
+    ]
+
+
 def _issue_body(environment: dict[str, str], target_ref: str) -> str:
-    issues = _calls(environment, ["issue", "create"])
+    issues = _issue_creates(environment)
     assert len(issues) == 1
-    arguments = issues[0]["args"]
-    assert arguments[arguments.index("--repo") + 1] == REPOSITORY
-    assert arguments[arguments.index("--title") + 1] == TRACKING_TITLES[target_ref]
-    body = arguments[arguments.index("--body") + 1]
+    payload = _payload(issues[0])
+    assert payload["title"] == TRACKING_TITLES[target_ref]
+    body = cast(str, payload["body"])
     assert f"{TRACKING_TITLES[target_ref].removesuffix(' is failing')} did not succeed." in body
     return body
 
@@ -827,8 +906,7 @@ def test_report_failed_night_creates_the_tracking_issue_with_failed_jobs(
         verify_result="failure",
     )
     assert report.returncode == 0, report.log
-    arguments = _calls(github, ["issue", "create"])[0]["args"]
-    assert arguments[arguments.index("--title") + 1] == TRACKING_TITLES[target_ref]
+    assert _payload(_issue_creates(github)[0])["title"] == TRACKING_TITLES[target_ref]
     body = _issue_body(github, target_ref)
     assert f"{TRACKING_TITLES[target_ref].removesuffix(' is failing')} did not succeed." in body
     assert f"Nightly workflow: {NIGHTLY_RUN_URL}" in body
@@ -840,8 +918,8 @@ def test_report_failed_night_creates_the_tracking_issue_with_failed_jobs(
     assert "2. Kind: Start cluster" in body
     assert "Formatting" not in body
     assert "Checkout" not in body
-    assert not _calls(github, ["issue", "comment"])
-    assert not _calls(github, ["issue", "close"])
+    assert not _issue_comments(github)
+    assert not _issue_closes(github)
 
 
 def test_report_failed_night_comments_on_the_open_tracking_issue(
@@ -879,17 +957,15 @@ def test_report_failed_night_comments_on_the_open_tracking_issue(
         verify_result="failure",
     )
     assert report.returncode == 0, report.log
-    comments = _calls(github, ["issue", "comment"])
+    comments = _issue_comments(github)
     assert len(comments) == 1
-    arguments = comments[0]["args"]
-    assert arguments[2] == "4"
-    assert arguments[arguments.index("--repo") + 1] == REPOSITORY
-    body = arguments[arguments.index("--body") + 1]
+    assert _endpoint(comments[0]).endswith("/issues/4/comments")
+    body = cast(str, _payload(comments[0])["body"])
     assert f"{title.removesuffix(' is failing')} did not succeed." in body
     assert NIGHTLY_RUN_URL in body
     assert CI_RUN_URL in body
-    assert not _calls(github, ["issue", "create"])
-    assert not _calls(github, ["issue", "close"])
+    assert not _issue_creates(github)
+    assert not _issue_closes(github)
 
 
 def test_report_ignores_same_title_issue_from_another_author(
@@ -901,10 +977,9 @@ def test_report_ignores_same_title_issue_from_another_author(
     )
     report = _run_job("report", tmp_path, github, needs_outputs={"target_ref": target_ref})
     assert report.returncode == 0, report.log
-    arguments = _calls(github, ["issue", "create"])[0]["args"]
-    assert arguments[arguments.index("--title") + 1] == title
+    assert _payload(_issue_creates(github)[0])["title"] == title
     assert NIGHTLY_RUN_URL in _issue_body(github, target_ref)
-    assert not _calls(github, ["issue", "comment"])
+    assert not _issue_comments(github)
 
 
 @pytest.mark.parametrize("title_change", ["suffix", "lowercase"])
@@ -919,7 +994,7 @@ def test_report_requires_an_exact_tracking_title(
     report = _run_job("report", tmp_path, github, needs_outputs={"target_ref": target_ref})
     assert report.returncode == 0, report.log
     assert NIGHTLY_RUN_URL in _issue_body(github, target_ref)
-    assert not _calls(github, ["issue", "comment"])
+    assert not _issue_comments(github)
 
 
 def test_report_green_night_closes_the_tracking_issue(
@@ -953,23 +1028,19 @@ def test_report_green_night_closes_the_tracking_issue(
         verify_result="success",
     )
     assert report.returncode == 0, report.log
-    writes = _calls(github, ["issue"])
-    assert [call["args"][:3] for call in writes] == [
-        ["issue", "comment", "8"],
-        ["issue", "close", "8"],
-    ]
-    for call in writes:
-        arguments = call["args"]
-        assert arguments[arguments.index("--repo") + 1] == REPOSITORY
-    comment_arguments = writes[0]["args"]
-    body = comment_arguments[comment_arguments.index("--body") + 1]
+    comments = _issue_comments(github)
+    closes = _issue_closes(github)
+    assert len(comments) == 1
+    assert len(closes) == 1
+    assert _endpoint(comments[0]).endswith("/issues/8/comments")
+    assert _endpoint(closes[0]).endswith("/issues/8")
+    body = cast(str, _payload(comments[0])["body"])
     assert f"{TRACKING_TITLES[target_ref].removesuffix(' is failing')} passed." in body
     assert f"Nightly workflow: {NIGHTLY_RUN_URL}" in body
     assert f"Dispatched CI run: {CI_RUN_URL}" in body
-    close_arguments = writes[1]["args"]
-    assert close_arguments[close_arguments.index("--reason") + 1] == "completed"
+    assert _payload(closes[0])["state_reason"] == "completed"
     api_calls = _calls(github, ["api"])
-    assert len(api_calls) == 2
+    assert len(api_calls) == 4
     assert all("/jobs" not in " ".join(call["args"]) for call in api_calls)
 
 
@@ -1020,7 +1091,8 @@ def test_report_dispatch_failure_has_no_job_list(
     assert CI_RUN_URL not in body
     assert "Dispatch error:" not in body
     assert "does not declare an input" not in body
-    assert len(_calls(github, ["api"])) == 1
+    assert len(_calls(github, ["api"])) == 2
+    assert all("/jobs" not in " ".join(call["args"]) for call in _calls(github, ["api"]))
 
 
 @pytest.mark.parametrize("stderr,expected,has_hint", DISPATCH_ERROR_CASES)
@@ -1175,9 +1247,15 @@ def test_report_issue_write_failure_fails_the_job(
         verify_result="success" if green else "failure",
     )
     assert report.returncode != 0, report.log
-    writes = _calls(github, ["issue"])
-    assert writes[-1]["args"][:2] == ["issue", operation]
-    assert len(writes) == (2 if operation == "close" else 1)
+    writes = {
+        "create": _issue_creates(github),
+        "comment": _issue_comments(github),
+        "close": _issue_closes(github),
+    }[operation]
+    assert writes
+    assert len(_issue_creates(github)) + len(_issue_comments(github)) + len(
+        _issue_closes(github)
+    ) == (2 if operation == "close" else 1)
 
 
 def test_reporting_is_independent_bounded_and_cannot_swallow_dispatch_failure() -> None:
@@ -1224,6 +1302,39 @@ def test_verify_waits_out_a_rate_limit_then_accepts_success(
     )
     assert verify.returncode == 0, verify.log
     assert len(_run_reads(github)) == 3
+
+
+def test_verify_retries_a_graphql_rate_limit_message(
+    tmp_path: Path, github: dict[str, str]
+) -> None:
+    github.update(TEST_RATE_LIMIT_BUDGET="1", TEST_RATE_LIMIT_SHAPE="graphql")
+    verify = _run_job(
+        "verify",
+        tmp_path,
+        github,
+        needs_outputs={"run_id": CI_RUN_ID, "run_url": CI_RUN_URL, "target_ref": "main"},
+    )
+    assert verify.returncode == 0, verify.log
+    assert len(_run_reads(github)) == 2
+
+
+def test_verify_uses_the_fallback_wait_when_the_reset_time_has_passed(
+    tmp_path: Path, github: dict[str, str]
+) -> None:
+    github.update(
+        TEST_RATE_LIMIT_BUDGET="1",
+        TEST_RATE_LIMIT_RESET="1",
+        KIND_RATE_LIMIT_FALLBACK_SECONDS="1",
+    )
+    started = time.monotonic()
+    verify = _run_job(
+        "verify",
+        tmp_path,
+        github,
+        needs_outputs={"run_id": CI_RUN_ID, "run_url": CI_RUN_URL, "target_ref": "main"},
+    )
+    assert verify.returncode == 0, verify.log
+    assert time.monotonic() - started >= 0.8
 
 
 def test_verify_does_not_retry_a_non_rate_limit_denial(
@@ -1283,22 +1394,22 @@ def test_report_files_the_issue_after_a_brief_rate_limit(
     )
     assert report.returncode == 0, report.log
     assert CI_RUN_URL in _issue_body(github, target_ref)
-    assert len(_calls(github, ["issue", "create"])) == 1
+    assert len(_issue_creates(github)) == 1
 
 
 def test_report_retries_issue_create_after_a_brief_rate_limit(
     tmp_path: Path, github: dict[str, str], target_ref: str
 ) -> None:
-    github.update(TEST_RATE_LIMIT_BUDGET="1", TEST_RATE_LIMIT_ON="issue")
+    github.update(TEST_RATE_LIMIT_BUDGET="1", TEST_RATE_LIMIT_METHOD="POST")
     report = _run_job("report", tmp_path, github, needs_outputs={"target_ref": target_ref})
     assert report.returncode == 0, report.log
-    assert len(_calls(github, ["issue", "create"])) == 2
+    assert len(_issue_creates(github)) == 2
 
 
 def test_report_closes_the_issue_after_a_brief_rate_limit(
     tmp_path: Path, github: dict[str, str], target_ref: str
 ) -> None:
-    github.update(TEST_RATE_LIMIT_BUDGET="1", TEST_RATE_LIMIT_ON="issue")
+    github.update(TEST_RATE_LIMIT_BUDGET="1", TEST_RATE_LIMIT_METHOD="PATCH")
     github["TEST_ISSUE_PAGES"] = json.dumps(
         [
             [
@@ -1319,9 +1430,6 @@ def test_report_closes_the_issue_after_a_brief_rate_limit(
         verify_result="success",
     )
     assert report.returncode == 0, report.log
-    writes = _calls(github, ["issue"])
-    assert [call["args"][:2] for call in writes] == [
-        ["issue", "comment"],
-        ["issue", "comment"],
-        ["issue", "close"],
-    ]
+    assert len(_issue_comments(github)) == 1
+    assert len(_issue_closes(github)) == 2
+    assert _payload(_issue_closes(github)[-1])["state"] == "closed"
