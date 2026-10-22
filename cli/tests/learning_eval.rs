@@ -145,11 +145,24 @@ fn learning_eval_dry_run_traverses_real_wrapper_and_captures_inner_stdout() {
     let output = fixture.dry_run(&[]);
     assert!(output.status.success(), "candidate dry run must succeed");
     let value = one_object(&output);
+    assert_eq!(value["budget_usd"], "7.50");
+    assert_eq!(value["cost_policy"]["campaign_budget_usd"], "7.50");
     let encoded = value.to_string();
     assert!(encoded.contains(fixture.output_dir().to_str().unwrap()));
     assert!(encoded.contains(binary().to_str().unwrap()));
     assert!(!encoded.contains("\"implementation_verification\":\"PASS\""));
     assert!(!encoded.contains("\"acceptance\":\"PASS\""));
+    fixture.assert_no_path_fallback();
+}
+
+#[test]
+fn learning_eval_dry_run_accepts_campaign_budget_cap() {
+    let fixture = Fixture::new();
+    let output = fixture.dry_run(&["--budget-usd", "7.50"]);
+    assert!(output.status.success(), "campaign budget cap dry run");
+    let plan = one_object(&output);
+    assert_eq!(plan["budget_usd"], "7.50");
+    assert_eq!(plan["cost_policy"]["campaign_budget_usd"], "7.50");
     fixture.assert_no_path_fallback();
 }
 
@@ -177,6 +190,7 @@ fn learning_eval_dry_run_accepts_n_and_all_custom_thresholds_without_credentials
     assert!(output.status.success(), "custom threshold dry run");
     let plan = one_object(&output);
     assert_eq!(plan["repetitions"], 3);
+    assert_eq!(plan["budget_usd"], "4.50");
     assert_eq!(plan["thresholds"]["precision"], 0.95);
     assert_eq!(plan["thresholds"]["recall"], 0.85);
     assert_eq!(plan["thresholds"]["falsewrite"], 0);
@@ -221,9 +235,10 @@ fn learning_eval_rejects_invalid_limits_before_starting_any_services() {
     for (flag, value) in [
         ("--repetitions", "0"),
         ("--budget-usd", "0"),
-        ("--budget-usd", "5.01"),
+        ("--budget-usd", "7.51"),
         ("--budget-usd", "NaN"),
         ("--budget-usd", "Infinity"),
+        ("--budget-usd", "not-an-amount"),
         ("--precision-threshold", "NaN"),
         ("--precision-threshold", "1.01"),
         ("--recall-threshold", "Infinity"),

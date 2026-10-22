@@ -808,7 +808,7 @@ def frozen_report(tmp_path: Path) -> dict[str, Any]:
         "schedule_reservations": [],
         "calibration": {"version": 1, "rows": [], "deterministic_controls": []},
         "accounting": {
-            "budget_usd": "5.00",
+            "budget_usd": "7.50",
             "baseline_usage_usd": "10.00",
             "end_usage_usd": "10.70",
             "charged_usd": "0.70",
@@ -2039,6 +2039,18 @@ def test_identical_calibration_prompts_remain_distinct_by_sequence(
 
 
 @pytest.mark.parametrize(
+    "budget,passed",
+    [("4.50", True), ("5.00", True), ("7.50", True), ("7.51", False)],
+)
+def test_report_campaign_budget_respects_task_cap(
+    tmp_path: Path, frozen_report: dict[str, Any], budget: str, passed: bool
+) -> None:
+    report = copy.deepcopy(frozen_report)
+    report["accounting"]["budget_usd"] = budget
+    _check(tmp_path, report, passed=passed)
+
+
+@pytest.mark.parametrize(
     "damage",
     [
         "unknown-cost",
@@ -2068,7 +2080,7 @@ def test_accounting_evidence_never_turns_unknown_or_shared_spend_into_free_calls
     elif damage == "counter-reset":
         accounting["end_usage_usd"] = "9.00"
     elif damage == "over-budget":
-        accounting["charged_usd"] = "5.01"
+        accounting["charged_usd"] = "7.51"
     elif damage == "repetition-budget-reset":
         accounting["budget_usd"] = "10.00"
     elif damage == "no-overshoot-margin":
@@ -2233,7 +2245,7 @@ class TestRecordedCampaign:
             assert start["compose_project"] == stop["compose_project"]
             assert start["compose_disable_env_file"] is True
             assert stop["compose_disable_env_file"] is True
-        assert Decimal(report["accounting"]["budget_usd"]) <= Decimal("5.00")
+        assert Decimal(report["accounting"]["budget_usd"]) <= Decimal("7.50")
         assert report["accounting"]["basis"] != "catalog-price-estimate"
 
     def test_cleanup_queries_actual_daemon_and_rejects_mismatched_daemon(
