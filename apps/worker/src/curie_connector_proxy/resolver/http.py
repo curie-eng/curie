@@ -42,6 +42,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import os
 import re
 import stat
@@ -221,23 +222,40 @@ def _refuse_busy(writer: asyncio.StreamWriter) -> None:
     transport.abort()
 
 
-async def _finish(writer: asyncio.StreamWriter, response: bytes) -> None:
-    """Write, drain and close under one deadline; abort the transport when it lapses."""
+def _valid_write_timeout(value: object) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value <= 0
+    ):
+        raise ValueError("write_timeout must be a positive number of seconds")
+    return float(value)
+
+
+async def _finish(writer: asyncio.StreamWriter, response: bytes, write_timeout: float) -> None:
+    """Write, drain and close under one deadline; abort the transport when it lapses.
+
+    No cleanup is awaited inside the deadline's cancellation: a graceful close
+    waits for buffered bytes a stalled peer never reads. The transport is
+    aborted first, so the caller's connection slot is released at the deadline.
+    """
 
     async def _write_and_close() -> None:
-        try:
-            with contextlib.suppress(OSError):
-                writer.write(response)
-                await writer.drain()
-        finally:
-            writer.close()
-            with contextlib.suppress(OSError):
-                await writer.wait_closed()
+        with contextlib.suppress(OSError):
+            writer.write(response)
+            await writer.drain()
+        writer.close()
+        with contextlib.suppress(OSError):
+            await writer.wait_closed()
 
     try:
-        await asyncio.wait_for(_write_and_close(), WRITE_TIMEOUT_S)
+        await asyncio.wait_for(_write_and_close(), write_timeout)
     except TimeoutError:
         writer.transport.abort()
+    except BaseException:
+        writer.transport.abort()
+        raise
 
 
 async def _serve(
@@ -245,6 +263,7 @@ async def _serve(
     gate: _ConnectionGate,
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
+    write_timeout: float,
 ) -> None:
     if gate.active >= gate.limit:
         _refuse_busy(writer)
@@ -256,7 +275,7 @@ async def _serve(
         except Exception as error:  # noqa: BLE001 - logged by class name only, answered closed
             logger.error("resolver request failed: %s", type(error).__name__)
             status, payload = _refused("internal_error")
-        await _finish(writer, _response(status, payload))
+        await _finish(writer, _response(status, payload), write_timeout)
     except BaseException:
         # Cancelled (shutdown): answer nothing and hold nothing open.
         writer.transport.abort()
@@ -266,20 +285,27 @@ async def _serve(
 
 
 async def serve_unix(
-    resolver: Resolver, path: str, *, max_connections: int = MAX_CONNECTIONS
+    resolver: Resolver,
+    path: str,
+    *,
+    max_connections: int = MAX_CONNECTIONS,
+    write_timeout: float = WRITE_TIMEOUT_S,
 ) -> asyncio.Server:
     """Serve ``resolver`` on a Unix socket at ``path``, mode 0666.
 
     The dedicated emptyDir directory is the access boundary, not the mode: the
     server container must be able to connect under its own UID. At most
-    ``max_connections`` connections are served at once.
+    ``max_connections`` connections are served at once, and a response that is
+    not written and closed within ``write_timeout`` seconds has its transport
+    aborted.
     """
 
     if type(max_connections) is not int or max_connections < 1:
         raise ValueError("max_connections must be a positive integer")
+    deadline = _valid_write_timeout(write_timeout)
     gate = _ConnectionGate(max_connections)
     server = await asyncio.start_unix_server(
-        partial(_serve, resolver, gate), path=path, limit=HEAD_LIMIT_BYTES
+        partial(_serve, resolver, gate, write_timeout=deadline), path=path, limit=HEAD_LIMIT_BYTES
     )
     try:
         os.chmod(path, SOCKET_MODE)
@@ -357,11 +383,13 @@ async def start_resolver(
     sources: SourceRegistry | None = None,
     handles: HandleRegistry | None = None,
     max_connections: int = MAX_CONNECTIONS,
+    write_timeout: float = WRITE_TIMEOUT_S,
 ) -> ResolverRuntime:
     """Connect as the application role, verify it, then bind the socket."""
 
     if type(max_connections) is not int or max_connections < 1:
         raise ValueError("max_connections must be a positive integer")
+    _valid_write_timeout(write_timeout)
     registry = (
         HandleRegistry(installation=config.installation, application=config.application)
         if handles is None
@@ -391,7 +419,12 @@ async def start_resolver(
         resolver = Resolver(config=config, handles=registry, sources=chosen, pool=pool)
         _clear_stale_socket(config.socket_path)
         try:
-            server = await serve_unix(resolver, config.socket_path, max_connections=max_connections)
+            server = await serve_unix(
+                resolver,
+                config.socket_path,
+                max_connections=max_connections,
+                write_timeout=write_timeout,
+            )
         except OSError:
             raise ResolverStartRefused("socket_unavailable") from None
     except BaseException:

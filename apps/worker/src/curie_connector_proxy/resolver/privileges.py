@@ -22,9 +22,11 @@ schema, CREATE on a non-system schema or on the current database, ownership of
 any relation, function, type or schema, or EXECUTE on any SECURITY DEFINER
 function other than the four. System schemas are ``pg_catalog``,
 ``information_schema``, ``pg_toast`` and the per-session temporary schemas.
-Trigger functions are not callable directly, so a SECURITY DEFINER trigger
-function grants nothing. Privileges count however they are held, PUBLIC
-included, because the ``has_*_privilege`` functions answer effective access.
+A SECURITY DEFINER trigger function counts too: with EXECUTE and TEMP a role
+can attach it to its own temporary table and fire its privileged writes (the
+migration revokes PUBLIC's EXECUTE on its own trigger functions). Privileges
+count however they are held, PUBLIC included, because the ``has_*_privilege``
+functions answer effective access.
 
 Catalog reads only, all as ``current_user``: ``pg_roles``, ``pg_auth_members``,
 ``pg_namespace``, ``pg_class``, ``pg_attribute``, ``pg_proc`` and ``pg_type``,
@@ -154,8 +156,6 @@ SELECT
     EXISTS (
         SELECT 1 FROM pg_catalog.pg_proc p JOIN ns ON ns.oid = p.pronamespace CROSS JOIN me
         WHERE p.prosecdef
-          AND p.prorettype NOT IN ('pg_catalog.trigger'::regtype,
-                                   'pg_catalog.event_trigger'::regtype)
           AND p.oid NOT IN (SELECT permitted.oid FROM permitted)
           AND has_function_privilege(me.oid, p.oid, 'EXECUTE')
     ) AS definer_execute
