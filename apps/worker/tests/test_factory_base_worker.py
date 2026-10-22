@@ -171,8 +171,12 @@ def test_an_explicit_lineage_branch_beats_the_recorded_base_branch(tmp_path: Pat
 
     clone = _call(commands, "clone")
     assert clone[clone.index("--branch") + 1] == LINEAGE_BRANCH
-    assert BASE_COMMIT not in " ".join(
-        " ".join(call.get("argv", [])) for call in commands.calls
+    fetch = _call(commands, "fetch")
+    assert "--depth=1" in fetch
+    assert fetch[-1] == BASE_COMMIT
+    assert not any(
+        "checkout" in call.get("argv", []) and BASE_COMMIT in call.get("argv", [])
+        for call in commands.calls
     )
 
 
@@ -301,3 +305,74 @@ def test_real_lineage_head_takes_precedence_over_the_recorded_base(tmp_path: Pat
 
     assert prepared.materialized_head == shas["lineage"]
     assert _version_in(objects, prepared.object_key) == "lineage-head"
+
+
+class _BaseObjectProbe(_LocalOriginCommands):
+    """Record whether the PR base commit is in the checkout object store.
+
+    The preparer deletes the scratch checkout when prepare returns, so the
+    probe runs at the same rev-parse the runner uses to record the head.
+    """
+
+    def __init__(self, workspace: Any, origin: Path, base_sha: str) -> None:
+        super().__init__(workspace, origin)
+        self._base_sha = base_sha
+        self.base_present: int | None = None
+
+    def run(
+        self,
+        argv: Any,
+        *,
+        cwd: Path | None = None,
+        env: dict[str, str] | None = None,
+        timeout_seconds: float,
+    ) -> Any:
+        # A filesystem path clone ignores --depth, so the shallow checkout the
+        # runner builds only exists when the origin is a file:// URL.
+        args = [str(part) for part in argv]
+        self.calls.append(args)
+        if "clone" in args or "fetch" in args:
+            file_origin = self._origin.resolve().as_uri()
+            args = [file_origin if part == CLEAN_URL else part for part in args]
+            env = {**(env or {}), "GIT_ALLOW_PROTOCOL": "file"}
+        result = self._real.run(args, cwd=cwd, env=env, timeout_seconds=timeout_seconds)
+        if cwd is not None and [str(part) for part in argv] == ["git", "rev-parse", "HEAD"]:
+            probe = subprocess.run(
+                ["git", "cat-file", "-e", f"{self._base_sha}^{{commit}}"],
+                cwd=cwd,
+                capture_output=True,
+                check=False,
+            )
+            self.base_present = probe.returncode
+        return result
+
+
+def test_review_revision_checkout_contains_the_pull_request_base_commit(
+    tmp_path: Path,
+) -> None:
+    """A review revision is the PR head, one commit past its base (#4920)."""
+
+    origin, shas = _origin(tmp_path)
+    workspace = importlib.import_module("curie_worker.workspace")
+    commands = _BaseObjectProbe(workspace, origin, shas["recorded"])
+    preparer = workspace.WorkspacePreparer(
+        credentials=_BaseCredentialClient(
+            workspace, base_branch="next", base_commit=shas["recorded"]
+        ),
+        commands=commands,
+        objects=_StreamingObjectStore(),
+        scratch_root=tmp_path / "clone-scratch",
+        limits=_limits(workspace),
+    )
+
+    prepared = preparer.prepare_lineage(
+        deployment_id=DEPLOYMENT_ID,
+        thread_key=THREAD,
+        generation="r3",
+        branch=LINEAGE_BRANCH,
+        expected_head=shas["lineage"],
+    )
+
+    assert prepared.materialized_head == shas["lineage"]
+    assert commands.base_present == 0
+    assert not any("--unshallow" in call for call in commands.calls)

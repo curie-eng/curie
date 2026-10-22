@@ -1292,6 +1292,29 @@ class WorkspacePreparer:
                                 self._real_remaining(real_started),
                             ),
                         )
+                    # A review revision clones the pull request branch at depth 1,
+                    # which omits the parent. Fetch the recorded base commit into
+                    # the object store without checking it out or unshallowing.
+                    base_pin = (
+                        credential.base_commit if _is_full_sha(credential.base_commit) else None
+                    )
+                    if base_pin is not None and base_pin != pin:
+                        self.commands.run(
+                            [
+                                "git",
+                                "fetch",
+                                "--depth=1",
+                                "--no-tags",
+                                "origin",
+                                base_pin,
+                            ],
+                            cwd=checkout,
+                            env=clone_env,
+                            timeout_seconds=min(
+                                self.limits.clone_timeout_seconds,
+                                self._real_remaining(real_started),
+                            ),
+                        )
                 except TimeoutError as exc:
                     raise WorkspaceStageTimeout("clone", self.limits.clone_timeout_seconds) from exc
                 except WorkspacePreparationError as exc:
