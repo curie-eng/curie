@@ -982,6 +982,152 @@ def test_a_source_check_reports_staleness_without_credential_material(world: Wor
     assert_refused(store.check(str(uuid.uuid4()), uid, version), 404, "shared_binding_not_found")
 
 
+def _check_body(world: World, status: str, revision: int = 1) -> dict[str, Any]:
+    """The unchanged check response for ``world``'s recorded source."""
+
+    return {
+        "binding_id": world.binding_id,
+        "status": status,
+        "credential_revision": revision,
+        "recorded_source": {
+            "uid": world.source["uid"],
+            "resource_version": world.source["resource_version"],
+        },
+    }
+
+
+def test_a_mismatched_check_persists_source_stale_for_every_later_check(world: World) -> None:
+    """The resolver cannot see a request; only the stored flag refuses for it (R1-8)."""
+
+    store = world.store
+    uid, version = world.source["uid"], world.source["resource_version"]
+    assert binding_row(world.binding_id)["source_stale"] is False
+
+    mismatched = store.check(world.binding_id, uid, "101")
+    assert mismatched.status_code == 200, mismatched.text
+    assert mismatched.json() == _check_body(world, "source_stale")
+    # The request has returned, so the flag was committed, not left in its session.
+    assert binding_row(world.binding_id)["source_stale"] is True
+
+    # A fresh request carrying the RECORDED source still reports the stored flag.
+    matching = store.check(world.binding_id, uid, version)
+    assert matching.status_code == 200, matching.text
+    assert matching.json() == _check_body(world, "source_stale")
+    assert binding_row(world.binding_id)["source_stale"] is True
+    assert store.binding(world.binding_id)["credential_revision"] == 1
+
+
+def test_reimport_clears_source_stale_and_a_never_checked_binding_reports_current(
+    world: World,
+) -> None:
+    store = world.store
+    uid, version = world.source["uid"], world.source["resource_version"]
+    assert store.check(world.binding_id, uid, "101").json()["status"] == "source_stale"
+    assert binding_row(world.binding_id)["source_stale"] is True
+
+    # A reimport that loses the CAS changes nothing, the flag included.
+    lost = store.reimport(
+        world.binding_id,
+        7,
+        world.recipient,
+        _credential("LOST"),
+        source_metadata(uid=uid, resource_version="101"),
+    )
+    assert_refused(lost, 409, "shared_binding_revision_conflict")
+    assert binding_row(world.binding_id)["source_stale"] is True
+
+    reimported = world.reimport(1, _credential("REIMPORTED"), resource_version="101")
+    assert reimported.status_code == 200, reimported.text
+    assert binding_row(world.binding_id)["source_stale"] is False
+    caught_up = store.check(world.binding_id, uid, "101")
+    assert caught_up.status_code == 200, caught_up.text
+    assert caught_up.json() == {
+        "binding_id": world.binding_id,
+        "status": "current",
+        "credential_revision": 2,
+        "recorded_source": {"uid": uid, "resource_version": "101"},
+    }
+    assert binding_row(world.binding_id)["source_stale"] is False
+
+    # Liveness: a binding that was never checked stale is current, with the flag unset.
+    untouched = build_world(store)
+    assert binding_row(untouched.binding_id)["source_stale"] is False
+    never = store.check(untouched.binding_id, untouched.source["uid"], version)
+    assert never.status_code == 200, never.text
+    assert never.json() == _check_body(untouched, "current")
+    assert binding_row(untouched.binding_id)["source_stale"] is False
+
+
+def test_a_matching_check_never_sets_source_stale_or_changes_the_row(world: World) -> None:
+    uid, version = world.source["uid"], world.source["resource_version"]
+    before = binding_row(world.binding_id)
+    assert before["source_stale"] is False
+    for _ in range(3):
+        current = world.store.check(world.binding_id, uid, version)
+        assert current.status_code == 200, current.text
+        assert current.json() == _check_body(world, "current")
+        assert binding_row(world.binding_id) == before
+
+
+def test_connector_custody_cannot_hold_source_stale(
+    store: SharedStore, sessions: SessionPool
+) -> None:
+    application_id = store.register_application(slots=(), custody="connector")["application_id"]
+    store.register_recipient(application_id)
+    created = store.post_binding(
+        application_id, store.binding_body(store.create_agent(), None, None)
+    )
+    assert created.status_code == 201, created.text
+    connector_id = created.json()["binding_id"]
+    before = binding_row(connector_id)
+    assert (before["custody"], before["source_stale"]) == ("connector", False)
+
+    owner = sessions.owner()
+    error = expect_sqlstate(
+        owner,
+        "23514",
+        "UPDATE curie.shared_connector_bindings SET source_stale = true WHERE id = $1",
+        uuid.UUID(connector_id),
+    )
+    assert error.constraint_name == "shared_connector_bindings_source_stale_ck", str(error)
+    assert binding_row(connector_id) == before
+
+    # Liveness: the same write is accepted for a platform binding.
+    platform = build_world(store)
+    flag = "UPDATE curie.shared_connector_bindings SET source_stale = $2 WHERE id = $1"
+    assert owner.execute(flag, platform.binding_uuid, True) == "UPDATE 1"
+    assert binding_row(platform.binding_id)["source_stale"] is True
+    assert owner.execute(flag, platform.binding_uuid, False) == "UPDATE 1"
+    assert binding_row(platform.binding_id)["source_stale"] is False
+
+
+def test_the_application_role_cannot_update_source_stale(
+    world: World, sessions: SessionPool
+) -> None:
+    assert world.store.check(world.binding_id, world.source["uid"], "101").json()["status"] == (
+        "source_stale"
+    )
+    before = binding_row(world.binding_id)
+    assert before["source_stale"] is True
+
+    role = sessions.open(world.dsn)
+    expect_sqlstate(
+        role,
+        "42501",
+        "UPDATE curie.shared_connector_bindings SET source_stale = false WHERE id = $1",
+        world.binding_uuid,
+    )
+    assert binding_row(world.binding_id) == before
+    # Reading the column stays allowed: the resolver observes the flag.
+    assert (
+        role.fetchval(
+            "SELECT source_stale FROM curie.shared_connector_bindings WHERE id = $1",
+            world.binding_uuid,
+        )
+        is True
+    )
+
+
 # --- 7. reseal ---------------------------------------------------------------
 
 

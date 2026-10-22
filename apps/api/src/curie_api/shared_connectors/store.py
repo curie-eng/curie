@@ -802,6 +802,7 @@ async def reimport_binding(
             credential_revision=SharedConnectorBinding.credential_revision + 1,
             recipient_id=recipient_id,
             ciphertext=body.credential.sealed(),
+            source_stale=False,
             updated_at=func.now(),
             **_source_columns(body.source),
         )
@@ -833,21 +834,36 @@ async def reimport_binding(
 async def check_binding(
     session: AsyncSession, binding_id: uuid.UUID, body: SharedBindingCheck
 ) -> SharedBindingCheckOut:
-    """Compare the recorded source version; never reads or returns material."""
+    """Compare the recorded source version and persist a mismatch.
 
-    binding = await _lock_binding(session, binding_id)
+    The resolver cannot read the source Secret, so the flag this sets is the only
+    way it refuses a stale binding; only a reimport clears it (ADR 0239 "Static
+    sources" 1). Never reads or returns material.
+    """
+
+    binding = await _lock_binding(session, binding_id, "no_key_update")
     if binding.custody != "platform":
         raise SharedRefusal(status.HTTP_409_CONFLICT, "shared_binding_connector_custody")
     recorded = {"uid": binding.source_uid, "resource_version": binding.source_resource_version}
     current = recorded == {"uid": body.source.uid, "resource_version": body.source.resource_version}
-    return SharedBindingCheckOut.model_validate(
+    stale = binding.source_stale or not current
+    if stale and not binding.source_stale:
+        await session.execute(
+            update(SharedConnectorBinding)
+            .where(SharedConnectorBinding.id == binding_id)
+            .values(source_stale=True, updated_at=func.now())
+            .execution_options(synchronize_session=False)
+        )
+    result = SharedBindingCheckOut.model_validate(
         {
             "binding_id": binding_id,
-            "status": "current" if current else "source_stale",
+            "status": "source_stale" if stale else "current",
             "credential_revision": binding.credential_revision,
             "recorded_source": recorded,
         }
     )
+    await session.commit()
+    return result
 
 
 async def disable_binding(session: AsyncSession, binding_id: uuid.UUID) -> SharedBindingDisabled:
