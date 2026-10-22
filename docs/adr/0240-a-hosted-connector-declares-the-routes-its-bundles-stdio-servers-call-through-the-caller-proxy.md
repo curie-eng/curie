@@ -165,6 +165,13 @@ For a request whose method and path match a declared route:
   claims, exactly as for a `cct` (ADR-0178 decision 5), and ADR-0229's
   declared `Host` applies the same way.
 
+A request on a declared route's path with a method the route does not
+declare, or on another spelling of that path, is refused `invalid` whatever
+token it carries. Another spelling is one a lenient server could route to the
+same handler: a percent encoding, a repeated or trailing slash, a dot segment,
+or another letter case. Without this, a `cct` could reach a route's handler
+through a server that merges slashes.
+
 For every other request, behavior is today's with one change. A `ccr` is
 `invalid` there, so a route token cannot reach `/mcp`, OAuth discovery, or an
 undeclared path. The 1 MiB limit now applies to the body of every method, not
@@ -182,22 +189,33 @@ whatever env the CLI gives its children. So a stdio server named in some
 route's `callers` is not given to the CLI as a stdio entry. Instead:
 
 - The runner spawns the server itself, with the same command, args and
-  `${VAR}` expansion it would have had. Its env is the shell and hook env with
-  no platform credentials, plus its own expanded `env` block. That is the env
-  the runner's capability probe already gives the same server. The runner also
-  adds the environ lock library to `LD_PRELOAD`, so the process is not
-  dumpable and same-uid peers cannot read its environ or memory. Where the
-  library cannot be loaded, the caller is not mounted at all, rather than
-  mounted unlocked.
+  `${VAR}` and `${VAR:-default}` expansion it would have had. The executable
+  is resolved at boot, and the process starts in the bundle root, never in a
+  directory Bash writes. Its env is the shell and hook env with no platform
+  credentials, plus its own expanded `env` block. That is the env the runner's
+  capability probe already gives the same server. The runner also adds the
+  environ lock library to `LD_PRELOAD`, so the process is not dumpable and
+  same-uid peers cannot read its environ or memory.
+- The runner starts the caller once, on the first session, which comes before
+  any turn's Bash can run, and keeps it for the runner's life. A later session
+  reuses it, and a repeated `initialize` is answered from the caller's first
+  answer, so the caller is never respawned while Bash could be waiting for it.
+  A caller that exits is not restarted, and its tools fail for the rest of the
+  runner's life.
 - The runner mounts that process on the CLI as an in-process SDK MCP server,
   under the name the CLI would have used (`plugin:<bundle>:<server>`). The SDK
-  server is a transparent JSON-RPC relay over the child's stdio. Every message
-  the CLI sends reaches the child, and every message the child sends comes
-  back, so the server keeps its whole MCP surface. Tool names, `toolPolicy`,
-  approval routes and capability probing are unchanged.
+  server is a JSON-RPC relay over the child's stdio. It remaps request ids, so
+  two sessions cannot collide, and it settles a request the CLI cancels. The
+  SDK's bridge drops what an in-process server sends on its own, its
+  notifications and its requests to the client, so a caller that relies on
+  them does not get them. Tool names, `toolPolicy`, approval routes and
+  capability probing are unchanged.
 - The route credentials reach the child on one inherited pipe, whose number is
-  in `CURIE_CONNECTOR_ROUTES_FD`. The runner writes one JSON document and
-  closes its end:
+  in `CURIE_CONNECTOR_ROUTES_FD`. The runner writes to it only after it has
+  observed the child locked: the kernel refuses `/proc/<pid>/environ` to a
+  same-uid reader exactly when the process is not dumpable. A caller never
+  observed locked, such as a static binary that ignores `LD_PRELOAD`, gets an
+  empty document. The runner writes one JSON document and closes its end:
   `{"<connector>": {"url": "<base URL>", "token": "ccr...."}}`. The document
   holds only the connectors whose routes list this server, and the base URL
   comes from the same `mcp_entry` derivation as the hosted entry, so the
@@ -212,7 +230,9 @@ route's `callers` is not given to the CLI as a stdio entry. Instead:
   caller's memory.
 
 A server that is not named as a caller is mounted exactly as today and
-receives nothing. A bundle that declares no `routes:` boots exactly as today.
+receives nothing, and so is a caller with no route this boot (no token, or no
+connector scope) or with no lock library to load, since then it holds nothing
+to protect. A bundle that declares no `routes:` boots exactly as today.
 
 ### 5. Contract change and rollout
 
@@ -242,6 +262,13 @@ the field can deploy that bundle. A proxy from before this change refuses a
 - Declared callers stop being CLI-spawned. The runner owns their lifecycle,
   so a crash or a hang in one surfaces as a connector capability failure
   through the runner's probe, as for any other mounted server.
+- A declared caller shares the sandbox's uid with Bash. The runner keeps the
+  token out of every env, argument and file Bash can read, writes it only to
+  a process it has observed locked, and starts that process before any turn's
+  Bash exists, from the bundle root. It cannot stop a same-uid process writing
+  files that the caller's runtime reads later on its own, such as a module it
+  imports lazily from a per-user directory. A caller should load what it needs
+  at start.
 - The bundle's code is trusted with the token once the child has read it.
   Nothing stops a declared caller from writing the token to a file or passing
   it to a subprocess. That is the bundle author's code, in the same way a
