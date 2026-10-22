@@ -31,7 +31,6 @@ an absent slot is ``slot_unbound``. Nothing raised here carries plaintext, and
 
 from __future__ import annotations
 
-import binascii
 import json
 import re
 from abc import ABC, abstractmethod
@@ -40,7 +39,7 @@ from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
 from .admission import Admitted
-from .keys import KeyRing, KeyUnavailable
+from .keys import KeyRing, KeyUnavailable, strict_b64decode
 from .wire import ResolveRefusal
 
 KIND_STATIC = "static"
@@ -126,8 +125,8 @@ class SourceRegistry:
 
 def _strict_b64(text: str) -> bytes:
     try:
-        return binascii.a2b_base64(text.encode("ascii"), strict_mode=True)
-    except (UnicodeEncodeError, binascii.Error):
+        return strict_b64decode(text)
+    except ValueError:
         raise SourceRefusal("source_unavailable") from None
 
 

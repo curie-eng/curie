@@ -37,6 +37,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from .wire import CodedError
+
 SCHEMA = "curie"
 SHARED_TABLES = (
     "shared_connector_applications",
@@ -168,15 +170,8 @@ WHERE d.role_name = current_user::text
 """
 
 
-class PrivilegeRefusal(Exception):
+class PrivilegeRefusal(CodedError):
     """The role is wider or narrower than an application role. ``str`` is the code."""
-
-    def __init__(self, code: str) -> None:
-        super().__init__(code)
-        self.code = code
-
-    def __str__(self) -> str:
-        return self.code
 
 
 async def verify_role(connection: Any, application: str) -> str:

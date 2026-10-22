@@ -135,7 +135,11 @@ class RefreshCoordinator:
         """Refresh ``admitted``'s grant and commit the replacement, or refuse."""
 
         lease = source.lease_seconds
-        if admitted.refresh is None or type(lease) is not int or not 1 <= lease <= 300:
+        if (
+            admitted.refresh is None
+            or type(lease) is not int
+            or not 1 <= lease <= MAX_LEASE_SECONDS
+        ):
             raise SourceRefusal("source_unavailable")
         grant_id = admitted.refresh.grant_id
         try:
@@ -156,10 +160,9 @@ class RefreshCoordinator:
             committed = await self._step(
                 pool, _COMMIT_SQL, grant_id, intent, epoch, recipient, sealed
             )
-        except asyncio.CancelledError:
-            # Shutdown: the lease lapses and the next begin records recovery.
-            raise
         except Exception:  # noqa: BLE001 - every failure here is an uncertain outcome
+            # Cancellation is a BaseException and is not caught: on shutdown the
+            # lease lapses and the next begin records recovery.
             marked = await self._mark_recovery(pool, grant_id, intent, epoch)
             if marked == "recovery_required":
                 raise SourceRefusal("recovery_required") from None

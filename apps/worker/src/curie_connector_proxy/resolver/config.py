@@ -25,6 +25,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .handles import installation_ok, uuid_ok
 from .keys import KeyRing, KeyUnavailable, strict_b64decode
 from .wire import SOCKET_ENV
 
@@ -42,10 +43,8 @@ DSN_ENCODINGS = frozenset({"bundled-sealed", "managed-raw"})
 _DSN_SCHEMES = ("postgresql://", "postgres://")
 # sockaddr_un.sun_path is 108 bytes including the terminating NUL.
 _MAX_SOCKET_PATH_BYTES = 107
-_MAX_INSTALLATION_BYTES = 128
 # Far above a sealed DSN or a key file; bounds what a mis-mounted file can cost.
 _MAX_FILE_BYTES = 65536
-_UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 _SLOT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 
 
@@ -58,9 +57,9 @@ def _required(env: Mapping[str, str], name: str) -> str:
 
 def _installation(env: Mapping[str, str]) -> str:
     value = _required(env, INSTALLATION_ENV)
-    if len(value.encode("utf-8")) > _MAX_INSTALLATION_BYTES or any(
-        char.isspace() or not char.isprintable() for char in value
-    ):
+    # The registry applies the same rule, so an installation the config accepts
+    # can never be refused by every request.
+    if not installation_ok(value):
         raise ValueError(f"{INSTALLATION_ENV} is not a valid installation ID")
     return value
 
@@ -150,7 +149,7 @@ class ResolverConfig:
                 raise ValueError(f"{name} must not be present in the resolver's environment")
         installation = _installation(env)
         application = _required(env, APPLICATION_ENV)
-        if _UUID.fullmatch(application) is None:
+        if not uuid_ok(application):
             raise ValueError(f"{APPLICATION_ENV} is not a canonical lowercase UUID")
         socket_path = _socket_path(env)
         encoding = _required(env, DSN_ENCODING_ENV)

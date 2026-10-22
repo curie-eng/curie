@@ -846,7 +846,8 @@ async def check_binding(
         raise SharedRefusal(status.HTTP_409_CONFLICT, "shared_binding_connector_custody")
     recorded = {"uid": binding.source_uid, "resource_version": binding.source_resource_version}
     current = recorded == {"uid": body.source.uid, "resource_version": body.source.resource_version}
-    if not current and not binding.source_stale:
+    stale = binding.source_stale or not current
+    if stale and not binding.source_stale:
         await session.execute(
             update(SharedConnectorBinding)
             .where(SharedConnectorBinding.id == binding_id)
@@ -856,7 +857,7 @@ async def check_binding(
     result = SharedBindingCheckOut.model_validate(
         {
             "binding_id": binding_id,
-            "status": "current" if current and not binding.source_stale else "source_stale",
+            "status": "source_stale" if stale else "current",
             "credential_revision": binding.credential_revision,
             "recorded_source": recorded,
         }

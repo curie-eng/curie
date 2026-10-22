@@ -62,8 +62,12 @@ REFUSAL_STATUS = {
 _REQUEST_KEYS = frozenset({"handle", "slot", "purpose"})
 
 
-class ResolveRefusal(Exception):
-    """A refusal on the wire. ``str(exc)`` is the code and nothing else."""
+class CodedError(Exception):
+    """An error whose only content is a fixed code: ``str(exc)`` is the code.
+
+    Every resolver refusal derives from it, so none can carry a handle, a
+    credential or any other value it refused.
+    """
 
     def __init__(self, code: str) -> None:
         super().__init__(code)
@@ -71,6 +75,10 @@ class ResolveRefusal(Exception):
 
     def __str__(self) -> str:
         return self.code
+
+
+class ResolveRefusal(CodedError):
+    """A refusal on the wire."""
 
 
 def status_for(code: str) -> int:
@@ -83,7 +91,13 @@ def refusal_body(code: str) -> bytes:
     """The fixed refusal body. A code outside the table answers ``internal_error``."""
 
     known = code if code in REFUSAL_STATUS else "internal_error"
-    return json.dumps({"refusal": known}, separators=(",", ":")).encode("ascii")
+    return encode_body({"refusal": known})
+
+
+def encode_body(document: object) -> bytes:
+    """The one wire encoding of a JSON body: compact separators, ASCII."""
+
+    return json.dumps(document, separators=(",", ":")).encode("ascii")
 
 
 def _no_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:

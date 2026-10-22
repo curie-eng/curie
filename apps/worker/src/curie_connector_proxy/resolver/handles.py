@@ -31,6 +31,8 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from .wire import CodedError
+
 MAX_INVOCATIONS = 1024
 MAX_SESSIONS = 4096
 HANDLE_PREFIX = "crh1."
@@ -53,15 +55,8 @@ _UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{1
 _ALIAS = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 
 
-class RegistryRefusal(Exception):
+class RegistryRefusal(CodedError):
     """A registry refusal. ``str(exc)`` is the code; it never carries a handle."""
-
-    def __init__(self, code: str) -> None:
-        super().__init__(code)
-        self.code = code
-
-    def __str__(self) -> str:
-        return self.code
 
 
 @dataclass(frozen=True)
@@ -92,7 +87,7 @@ def _is_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
-def _installation_ok(value: object) -> bool:
+def installation_ok(value: object) -> bool:
     if not isinstance(value, str) or not value:
         return False
     if len(value.encode("utf-8")) > _MAX_INSTALLATION_BYTES:
@@ -100,7 +95,7 @@ def _installation_ok(value: object) -> bool:
     return not any(char.isspace() or not char.isprintable() for char in value)
 
 
-def _uuid_ok(value: object) -> bool:
+def uuid_ok(value: object) -> bool:
     return isinstance(value, str) and _UUID.fullmatch(value) is not None
 
 
@@ -108,9 +103,9 @@ def _principal_ok(principal: object) -> bool:
     if not isinstance(principal, Principal):
         return False
     return (
-        _installation_ok(principal.installation)
-        and _uuid_ok(principal.application)
-        and _uuid_ok(principal.agent_id)
+        installation_ok(principal.installation)
+        and uuid_ok(principal.application)
+        and uuid_ok(principal.agent_id)
         and isinstance(principal.agent, str)
         and bool(principal.agent)
         and _is_int(principal.policy_generation)
@@ -172,9 +167,9 @@ class HandleRegistry:
         max_sessions: int = MAX_SESSIONS,
         clock: Callable[[], float] = time.time,
     ) -> None:
-        if not _installation_ok(installation):
+        if not installation_ok(installation):
             raise ValueError("the registry installation is not a valid installation ID")
-        if not _uuid_ok(application):
+        if not uuid_ok(application):
             raise ValueError("the registry application is not a canonical UUID")
         if not _is_int(max_invocations) or max_invocations < 1:
             raise ValueError("max_invocations must be a positive integer")
@@ -259,7 +254,7 @@ class HandleRegistry:
             return False
         if (context.run is None) != (context.work_item is None):
             return False
-        if context.run is not None and not (_uuid_ok(context.run) and _uuid_ok(context.work_item)):
+        if context.run is not None and not (uuid_ok(context.run) and uuid_ok(context.work_item)):
             return False
         return context.session_id is None or _session_id_ok(context.session_id)
 

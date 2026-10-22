@@ -40,7 +40,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 import logging
 import math
 import os
@@ -61,7 +60,9 @@ from .sources import SourceRegistry, default_registry
 from .wire import (
     MAX_REQUEST_BYTES,
     RESOLVE_PATH,
+    CodedError,
     ResolveRefusal,
+    encode_body,
     parse_request,
     refusal_body,
     status_for,
@@ -96,15 +97,8 @@ _DIGITS = re.compile(r"^[0-9]+$")
 _LENGTH_DIGITS = len(str(MAX_REQUEST_BYTES))
 
 
-class ResolverStartRefused(Exception):
+class ResolverStartRefused(CodedError):
     """The resolver refused to start. ``str`` is the code; nothing else is carried."""
-
-    def __init__(self, code: str) -> None:
-        super().__init__(code)
-        self.code = code
-
-    def __str__(self) -> str:
-        return self.code
 
 
 def _refused(code: str) -> tuple[int, bytes]:
@@ -183,7 +177,7 @@ async def _exchange(resolver: Resolver, reader: asyncio.StreamReader) -> tuple[i
         document = await resolver.resolve(handle, slot, purpose)
     except ResolveRefusal as refusal:
         return _refused(refusal.code)
-    return 200, json.dumps(document, separators=(",", ":")).encode("ascii")
+    return 200, encode_body(document)
 
 
 def _response(status: int, payload: bytes) -> bytes:
@@ -220,6 +214,12 @@ def _refuse_busy(writer: asyncio.StreamWriter) -> None:
     with contextlib.suppress(OSError, RuntimeError):
         writer.write(_response(*_refused("busy")))
     transport.abort()
+
+
+def _valid_max_connections(value: object) -> int:
+    if type(value) is not int or value < 1:
+        raise ValueError("max_connections must be a positive integer")
+    return value
 
 
 def _valid_write_timeout(value: object) -> float:
@@ -300,8 +300,7 @@ async def serve_unix(
     aborted.
     """
 
-    if type(max_connections) is not int or max_connections < 1:
-        raise ValueError("max_connections must be a positive integer")
+    _valid_max_connections(max_connections)
     deadline = _valid_write_timeout(write_timeout)
     gate = _ConnectionGate(max_connections)
     server = await asyncio.start_unix_server(
@@ -387,8 +386,7 @@ async def start_resolver(
 ) -> ResolverRuntime:
     """Connect as the application role, verify it, then bind the socket."""
 
-    if type(max_connections) is not int or max_connections < 1:
-        raise ValueError("max_connections must be a positive integer")
+    _valid_max_connections(max_connections)
     _valid_write_timeout(write_timeout)
     registry = (
         HandleRegistry(installation=config.installation, application=config.application)

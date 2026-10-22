@@ -201,8 +201,6 @@ class Resolver:
                     source, outcome = self._release(admitted, slot)
                     # After the lock waits, immediately before COMMIT.
                     self._revalidate(handle, context)
-        except ResolveRefusal:
-            raise
         except STORE_ERRORS:
             raise ResolveRefusal("store_unavailable") from None
         return admitted, source, outcome
