@@ -534,9 +534,13 @@ def _stored_state(publication: dict[str, Any]) -> dict[str, Any]:
             text(
                 "SELECT p.base_sha AS original_base, p.expected_prior_head, p.status, "
                 "p.version AS publication_version, p.patch_bytes, p.lease_owner, "
-                "l.base_sha, l.head_sha, l.pr_number, l.version AS lineage_version "
+                "l.base_sha, l.head_sha, l.pr_number, l.version AS lineage_version, "
+                "to_jsonb(p) AS publication, to_jsonb(l) AS lineage, "
+                "to_jsonb(r) AS execution_request, to_jsonb(w) AS work_item "
                 "FROM curie.publications p JOIN curie.thread_publication_lineages l "
-                "ON l.id = p.lineage_id WHERE p.id = :id"
+                "ON l.id = p.lineage_id "
+                "LEFT JOIN curie.execution_requests r ON r.id = p.execution_request_id "
+                "LEFT JOIN curie.work_items w ON w.id = r.work_item_id WHERE p.id = :id"
             ),
             {"id": uuid.UUID(publication["id"])},
         )
@@ -591,19 +595,28 @@ def test_branch_context_preserves_verified_lineage_base(seeded: Seeded) -> None:
     assert response.json()["base_branch"] == "release/stable"
 
 
-@pytest.mark.parametrize("branch", [None, "", "refs/heads/main", "bad..branch", "x" * 1025])
-def test_missing_or_malformed_admitted_base_cannot_use_repository_default(
-    factory_approved: Seeded, branch: str | None
+@pytest.mark.parametrize(
+    ("branch", "source", "commit"),
+    [
+        ("", "default", BASE_SHA),
+        ("refs/heads/main", "default", BASE_SHA),
+        ("bad..branch", "default", BASE_SHA),
+        ("x" * 1025, "default", BASE_SHA),
+        ("main", "default", "not-a-sha"),
+        ("main", "default", "A" * 40),
+    ],
+)
+def test_malformed_admitted_base_cannot_use_repository_default(
+    factory_approved: Seeded, branch: str, source: str, commit: str
 ) -> None:
     client, publication, code_host = factory_approved
     _execute(
-        "UPDATE curie.work_items SET base_branch = :branch, "
-        "base_source = CASE WHEN CAST(:branch AS text) IS NULL THEN NULL ELSE base_source END, "
-        "base_commit = CASE WHEN CAST(:branch AS text) IS NULL THEN NULL ELSE base_commit END "
+        "UPDATE curie.work_items SET base_branch = :branch, base_source = :source, "
+        "base_commit = :commit "
         "WHERE id = ("
         "SELECT r.work_item_id FROM curie.execution_requests r "
         "JOIN curie.publications p ON p.execution_request_id = r.id WHERE p.id = :id)",
-        {"id": uuid.UUID(publication["id"]), "branch": branch},
+        {"id": uuid.UUID(publication["id"]), "branch": branch, "source": source, "commit": commit},
     )
     before = _stored_state(publication)
 
@@ -625,6 +638,45 @@ def test_missing_or_malformed_admitted_base_cannot_use_repository_default(
     assert healthy.json()["base_branch"] == "main"
     verified = _verify(client, publication)
     assert verified.status_code == 200, verified.text
+
+
+@pytest.mark.parametrize(
+    ("branch", "source", "commit"),
+    [
+        (None, "default", BASE_SHA),
+        ("main", None, BASE_SHA),
+        ("main", "default", None),
+        (None, None, BASE_SHA),
+        (None, "default", None),
+        ("main", None, None),
+        ("main", "unknown", BASE_SHA),
+    ],
+)
+def test_partial_or_invalid_base_authority_cannot_use_repository_default(
+    factory_approved: Seeded, branch: str | None, source: str | None, commit: str | None
+) -> None:
+    from curie_api.models import ExecutionRequest, Publication, ThreadPublicationLineage, WorkItem
+    from curie_api.publication_verification import stored_publication_base_ref
+
+    _, publication, code_host = factory_approved
+    before = _stored_state(publication)
+
+    async def classify(session: Any) -> None:
+        stored = await session.get(Publication, uuid.UUID(publication["id"]))
+        assert stored is not None
+        execution = await session.get(ExecutionRequest, stored.execution_request_id)
+        assert execution is not None
+        item = await session.get(WorkItem, execution.work_item_id)
+        lineage = await session.get(ThreadPublicationLineage, stored.lineage_id)
+        assert item is not None and lineage is not None
+        item.base_branch, item.base_source, item.base_commit = branch, source, commit
+
+        with pytest.raises(Unavailable, match="publication_base_branch_unproved"):
+            stored_publication_base_ref(stored, lineage, execution, item)
+
+    with_session(classify)
+    assert code_host.opened == []
+    assert _stored_state(publication) == before
 
 
 @pytest.mark.parametrize("failure", ["empty", "malformed", "outage"])
@@ -893,7 +945,7 @@ def test_ancestry_read_budget_is_shared_by_both_proofs(approved: Seeded) -> None
 
     assert response.status_code == 503, response.text
     assert "publication_ancestry_unproved" in response.json()["detail"]["message"]
-    assert len(set(code_host.reads) - {HEAD_SHA}) <= 1024
+    assert len(code_host.reads) - code_host.reads.count(HEAD_SHA) <= 1024
     assert _stored_state(publication) == before
     assert code_host.opened == []
     code_host.base_head = BASE_SHA
@@ -919,6 +971,72 @@ def test_ancestry_has_a_whole_operation_deadline_and_can_retry(approved: Seeded)
     assert _stored_state(publication) == before
     code_host.read_delay = 0
     assert _verify(client, publication).status_code == 200
+
+
+@pytest.mark.parametrize("operation", ["revision-commit", "pull-request"])
+def test_paced_ancestry_obeys_wallclock_limit_below_read_cap_and_same_graph_retry_progresses(
+    approved: Seeded, operation: str
+) -> None:
+    client, publication, code_host = approved
+    cursor = BASE_SHA
+    graph: set[str] = set()
+    parent = BASE_SHA
+    for index in range(120):
+        cursor = _graph_commit(code_host, _sha(20000 + index), cursor)
+        graph.add(cursor)
+        if index == 59:
+            parent = cursor
+    code_host.base_head = cursor
+    _published_parent(publication, code_host, parent)
+    code_host.read_delay = 0.1
+    before = _stored_state(publication)
+    body = (
+        {"commit_sha": HEAD_SHA, "revision_id": publication["id"], "expected_parent": BASE_SHA}
+        if operation == "revision-commit"
+        else {"expected_head_sha": HEAD_SHA}
+    )
+    started = time.monotonic()
+
+    response = client.post(_url(publication["id"], operation), json=body, headers=WORKER_HEADERS)
+
+    elapsed = time.monotonic() - started
+    assert response.status_code == 503, response.text
+    assert elapsed <= 11.5, elapsed
+    assert response.json()["detail"]["code"] == "publication.code_host_unavailable"
+    assert "publication_ancestry_unproved" in response.json()["detail"]["message"]
+    assert len(code_host.reads) - code_host.reads.count(HEAD_SHA) <= 1024
+    assert code_host.opened == []
+    assert _stored_state(publication) == before
+
+    code_host.base_head = _graph_commit(code_host, _sha(21000), BASE_SHA)
+    _published_parent(publication, code_host, code_host.base_head)
+    code_host.reads.clear()
+    paced = client.post(_url(publication["id"], operation), json=body, headers=WORKER_HEADERS)
+
+    assert paced.status_code == 200, paced.text
+    assert code_host.reads == [HEAD_SHA, code_host.base_head]
+    if operation == "revision-commit":
+        assert paced.json() == {"commit_sha": HEAD_SHA, "parent_sha": code_host.base_head}
+    else:
+        assert len(code_host.opened) == 1
+    assert _stored_state(publication) == before
+
+    code_host.base_head = cursor
+    _published_parent(publication, code_host, parent)
+    code_host.read_delay = 0
+    code_host.reads.clear()
+    code_host.opened.clear()
+    healthy = client.post(_url(publication["id"], operation), json=body, headers=WORKER_HEADERS)
+
+    assert healthy.status_code == 200, healthy.text
+    assert set(code_host.reads) == graph | {HEAD_SHA}
+    if operation == "revision-commit":
+        assert healthy.json() == {"commit_sha": HEAD_SHA, "parent_sha": parent}
+        assert code_host.opened == []
+    else:
+        assert len(code_host.opened) == 1
+        assert code_host.opened[0]["base_ref"] == "main"
+    assert _stored_state(publication) == before
 
 
 def test_provider_outage_does_not_settle_or_open_and_retry_is_live(approved: Seeded) -> None:

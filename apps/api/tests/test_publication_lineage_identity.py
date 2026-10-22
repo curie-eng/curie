@@ -30,6 +30,21 @@ from fastapi.testclient import TestClient
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from apps.api.tests.forge_fakes.github import (
+    INSTALLATION_ID,
+    LABEL,
+    REPO_ID,
+    SENDER,
+    SENDER_ID,
+    GitHubRepositoryFake,
+)
+from apps.api.tests.test_github_factory_base import (
+    BaseGitHubAPI,
+    _label,
+    base_app,  # noqa: F401
+)
+from apps.api.tests.test_workitem_outcomes import with_session
+
 REPO = "acme-corp/acme-bot"
 WORKER_TOKEN = "remote-dev-publication-worker-token"
 WORKER_HEADERS = {"X-Curie-Worker-Token": WORKER_TOKEN}
@@ -43,6 +58,7 @@ GITHUB_UNAVAILABLE_CODE = "publication.github_unavailable"
 
 _LINEAGE_COLUMNS = (
     "id, version, status, base_sha, pr_number, pr_url, head_sha, latest_revision, binding_id, "
+    "binding_generation, "
     "code_host_kind, code_host_host, repository_project_id, code_host_installation_id, "
     "code_host_pr_id, base_ref, updated_at"
 )
@@ -288,6 +304,12 @@ def _create_deployment(
     )
     assert agent_response.status_code == 201, agent_response.text
     agent_id = agent_response.json()["id"]
+    return _deploy_agent(client, auth_headers, agent_id)
+
+
+def _deploy_agent(
+    client: TestClient, auth_headers: dict[str, str], agent_id: str
+) -> dict[str, Any]:
     version_response = client.post(
         f"/agents/{agent_id}/versions",
         json={"version_label": "v1", "created_by": "operator"},
@@ -400,6 +422,30 @@ def _approved_publication(
 ManualPublication = tuple[TestClient, dict[str, Any], dict[str, Any], dict[str, Any]]
 
 
+def _start_publication_request(
+    client: TestClient, request_id: str, wake: dict[str, Any]
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    acquired = client.post(
+        f"/v1/internal/work-items/requests/{request_id}/acquire",
+        json={"owner": "publication-worker", "generation": 1, "context": None, "wake": wake},
+        headers=WORKER_HEADERS,
+    )
+    assert acquired.status_code == 200, acquired.text
+    started = client.post(
+        f"/v1/internal/work-items/requests/{request_id}/start",
+        json={
+            "owner": "publication-worker",
+            "generation": 1,
+            "claim_name": "publication-claim",
+            "sandbox_name": "publication-sandbox",
+            "context": acquired.json()["context"],
+        },
+        headers=WORKER_HEADERS,
+    )
+    assert started.status_code == 200, started.text
+    return acquired.json(), started.json()
+
+
 @pytest.fixture
 def manual_publication(
     review_lineage_app: tuple[TestClient, dict[str, Any], str],
@@ -453,41 +499,21 @@ def manual_publication(
     )
     assert admitted.status_code == 200, admitted.text
     request_id = admitted.json()["request"]["id"]
-    acquired = client.post(
-        f"/v1/internal/work-items/requests/{request_id}/acquire",
-        json={
-            "owner": "manual-worker",
-            "generation": 1,
-            "context": None,
-            "wake": {
-                "kind": "slack",
-                "address": "C0EXAMPLE1",
-                "adapter": "default",
-                "conversation_id": conversation,
-            },
+    acquired, started = _start_publication_request(
+        client,
+        request_id,
+        {
+            "kind": "slack",
+            "address": "C0EXAMPLE1",
+            "adapter": "default",
+            "conversation_id": conversation,
         },
-        headers=WORKER_HEADERS,
     )
-    assert acquired.status_code == 200, acquired.text
-    started = client.post(
-        f"/v1/internal/work-items/requests/{request_id}/start",
-        json={
-            "owner": "manual-worker",
-            "generation": 1,
-            "claim_name": "manual-claim",
-            "sandbox_name": "manual-sandbox",
-            "context": acquired.json()["context"],
-        },
-        headers=WORKER_HEADERS,
-    )
-    assert started.status_code == 200, started.text
-    payload = _publication_payload(
-        deployment["id"], conversation_id=acquired.json()["conversation_id"]
-    )
+    payload = _publication_payload(deployment["id"], conversation_id=acquired["conversation_id"])
     payload.update(
         reply_conversation_id=conversation,
         work_item_request_id=request_id,
-        work_item_runtime_epoch=started.json()["runtime_epoch"],
+        work_item_runtime_epoch=started["runtime_epoch"],
     )
     publication = _create_publication(client, payload)
     assert _rows(
@@ -1017,6 +1043,275 @@ def _settle_moved(
     }
     data.update(overrides)
     return _patch_lineage(client, publication["id"], **data)
+
+
+def test_label_readmission_of_headless_all_null_base_uses_moved_repository_default_and_settles(
+    base_app: tuple[TestClient, BaseGitHubAPI],  # noqa: F811
+    auth_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from curie_api.workitems.lifecycle import WorkItemOutcome, link_publication_lineage
+
+    client, ingress = base_app
+    monkeypatch.setenv("INTERNAL_WORKER_TOKEN", WORKER_TOKEN)
+    get_settings.cache_clear()
+    repository = GitHubRepositoryFake()
+    repository.default_branch = "release/stable"
+    repository.branches = {"release/stable": BASE_SHA}
+    repository.commits = {
+        BASE_SHA: {"sha": BASE_SHA, "parents": [], "message": "Original base"},
+        MOVED_PARENT_SHA: {
+            "sha": MOVED_PARENT_SHA,
+            "parents": [{"sha": BASE_SHA}],
+            "message": "Moved base",
+        },
+        LATER_BASE_SHA: {
+            "sha": LATER_BASE_SHA,
+            "parents": [{"sha": MOVED_PARENT_SHA}],
+            "message": "Base moved after push",
+        },
+    }
+    calls: list[tuple[str, str]] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        calls.append((request.method, request.url.path))
+        if "/issues/" in request.url.path or "/collaborators/" in request.url.path:
+            return ingress.handle(request)
+        response = repository.handle(request)
+        if response.status_code not in {200, 201} or not (
+            "/pulls/" in request.url.path
+            or (response.status_code == 201 and request.url.path == f"/repos/{REPO}/pulls")
+        ):
+            return response
+        payload = response.json()
+        # https://docs.github.com/en/rest/pulls/pulls#get-a-pull-request
+        payload["node_id"] = f"PR_example_{payload['number']}"
+        payload["merged"] = False
+        for side in ("head", "base"):
+            payload[side]["repo"]["id"] = REPO_ID
+        return httpx.Response(response.status_code, json=payload)
+
+    original = client.app.state.http_client
+    injected = httpx.AsyncClient(transport=httpx.MockTransport(handle))
+    client.app.state.http_client = injected
+    try:
+        [agent] = _rows("SELECT id FROM curie.agents WHERE repo_full_name = :repo", {"repo": REPO})
+        agent_id = str(agent["id"])
+        policy = client.patch(
+            f"/agents/{agent_id}", json={"publication_policy": "auto"}, headers=auth_headers
+        )
+        assert policy.status_code == 200, policy.text
+        deployment = _deploy_agent(client, auth_headers, agent_id)
+        conversation = "issue-4943"
+        admitted = client.post(
+            "/v1/internal/work-items/admissions",
+            json={
+                "agent_id": agent_id,
+                "kind": "github",
+                "address": REPO,
+                "reply_conversation_id": conversation,
+                "tracker": {
+                    "kind": "github",
+                    "host": "github.com",
+                    "scope_id": str(REPO_ID),
+                    "issue_id": "4943",
+                },
+                "repository": {
+                    "code_host_kind": "github",
+                    "host": "github.com",
+                    "project_id": str(REPO_ID),
+                    "path": REPO,
+                },
+                "code_host_installation_id": INSTALLATION_ID,
+                "objective": "Implement the requested change",
+                "requester": f"github:{SENDER_ID}:{SENDER}",
+                "request_id": str(uuid.uuid4()),
+            },
+            headers=WORKER_HEADERS,
+        )
+        assert admitted.status_code == 200, admitted.text
+        request_id = admitted.json()["request"]["id"]
+        item_id = uuid.UUID(admitted.json()["work_item"]["id"])
+        acquired, started = _start_publication_request(
+            client,
+            request_id,
+            {"kind": "github", "address": REPO, "adapter": None, "conversation_id": conversation},
+        )
+        payload = _publication_payload(
+            deployment["id"], conversation_id=acquired["conversation_id"]
+        )
+        payload.update(
+            reply_kind="github",
+            reply_channel=REPO,
+            reply_placeholder="4943",
+            reply_conversation_id=conversation,
+            work_item_request_id=request_id,
+            work_item_runtime_epoch=started["runtime_epoch"],
+        )
+        publication = _create_publication(client, payload)
+        initial_lineage = _lineage_row(publication["lineage_id"])
+        assert initial_lineage["status"] == "open"
+        assert initial_lineage["head_sha"] is initial_lineage["pr_number"] is None
+        assert initial_lineage["binding_id"] is not None
+        versions = _rows(
+            "SELECT w.version AS item_version, r.version AS request_version "
+            "FROM curie.work_items w JOIN curie.execution_requests r ON r.work_item_id = w.id "
+            "WHERE r.id = :id",
+            {"id": uuid.UUID(request_id)},
+        )[0]
+
+        async def link(session: Any) -> None:
+            result = await link_publication_lineage(
+                session,
+                work_item_id=item_id,
+                request_id=uuid.UUID(request_id),
+                publication_lineage_id=uuid.UUID(publication["lineage_id"]),
+                expected_work_item_version=versions["item_version"],
+                expected_request_version=versions["request_version"],
+            )
+            assert isinstance(result, WorkItemOutcome), result
+
+        with_session(link)
+        finished = client.post(
+            f"/v1/internal/work-items/requests/{request_id}/finish",
+            json={
+                "runtime_epoch": started["runtime_epoch"],
+                "outcome": "failed",
+                "cause": "provider_error",
+            },
+            headers=WORKER_HEADERS,
+        )
+        assert finished.status_code == 200, finished.text
+        prior_item = _rows("SELECT * FROM curie.work_items WHERE id = :id", {"id": item_id})[0]
+        assert prior_item["trigger_label"] is None
+        assert all(
+            prior_item[column] is None for column in ("base_branch", "base_source", "base_commit")
+        )
+        calls.clear()
+
+        relabelled = _label(client, ingress, 4943, "base:next")
+
+        assert relabelled.status_code == 200, relabelled.text
+        assert relabelled.json()["status"] == "factory_admitted"
+        item = _rows("SELECT * FROM curie.work_items WHERE id = :id", {"id": item_id})[0]
+        assert item["trigger_label"] == LABEL
+        assert all(item[column] is None for column in ("base_branch", "base_source", "base_commit"))
+        for column in (
+            "agent_id",
+            "code_host_kind",
+            "code_host_host",
+            "repository_project_id",
+            "code_host_installation_id",
+            "publication_lineage_id",
+            "conversation_id",
+        ):
+            assert item[column] == prior_item[column]
+        requests = _rows(
+            "SELECT id, status, sequence FROM curie.execution_requests "
+            "WHERE work_item_id = :id ORDER BY sequence",
+            {"id": item_id},
+        )
+        assert [(row["status"], row["sequence"]) for row in requests] == [
+            ("failed", 1),
+            ("waiting", 2),
+        ]
+        assert requests[1]["id"] != uuid.UUID(request_id)
+        assert not any("/git/ref/heads/" in path for _, path in calls)
+        assert _lineage_row(publication["lineage_id"]) == initial_lineage
+        root = f"/v1/internal/publications/{publication['id']}"
+
+        context = client.get(f"{root}/branch-head", headers=WORKER_HEADERS)
+
+        assert context.status_code == 200, context.text
+        assert context.json() == {"head_sha": None, "base_branch": "release/stable"}
+        repository.branches[publication["branch"]] = FIRST_REVISION_SHA
+        repository.branches["release/stable"] = LATER_BASE_SHA
+        repository.commits[FIRST_REVISION_SHA] = {
+            "sha": FIRST_REVISION_SHA,
+            "parents": [{"sha": MOVED_PARENT_SHA}],
+            "message": f"Publish\n\nCurie-Revision: {publication['id']}\n",
+        }
+        lease = _claim_publication_lease(publication["id"], "recovery-worker")
+        before = (_publication_row(publication["id"]), _lineage_row(publication["lineage_id"]))
+        verified = client.post(
+            f"{root}/revision-commit",
+            json={
+                "commit_sha": FIRST_REVISION_SHA,
+                "revision_id": publication["id"],
+                "expected_parent": BASE_SHA,
+            },
+            headers=WORKER_HEADERS,
+        )
+        assert verified.status_code == 200, verified.text
+        assert verified.json() == {"commit_sha": FIRST_REVISION_SHA, "parent_sha": MOVED_PARENT_SHA}
+        opened = client.post(
+            f"{root}/pull-request",
+            json={"expected_head_sha": FIRST_REVISION_SHA},
+            headers=WORKER_HEADERS,
+        )
+        assert opened.status_code == 200, opened.text
+        number, url = opened.json()["number"], opened.json()["url"]
+        assert len(repository.pulls) == 1
+        assert repository.pulls[number]["base"] == "release/stable"
+        assert repository.pulls[number]["head"] == publication["branch"]
+        assert (
+            _publication_row(publication["id"]),
+            _lineage_row(publication["lineage_id"]),
+        ) == before
+        assert _rows("SELECT * FROM curie.work_items WHERE id = :id", {"id": item_id}) == [item]
+        for sha in (FIRST_REVISION_SHA, MOVED_PARENT_SHA, LATER_BASE_SHA):
+            assert ("GET", f"/repos/{REPO}/git/commits/{sha}") in calls
+        assert ("GET", f"/repos/{REPO}/git/ref/heads/release/stable") in calls
+        assert ("GET", f"/repos/{REPO}/git/ref/heads/next") not in calls
+        stale = _settle_moved(
+            client,
+            publication,
+            lease,
+            pr_number=number,
+            pr_url=url,
+            expected_publication_version=lease[0] - 1,
+        )
+        assert stale.status_code == 409, stale.text
+        assert (
+            _publication_row(publication["id"]),
+            _lineage_row(publication["lineage_id"]),
+        ) == before
+
+        settled = _settle_moved(client, publication, lease, pr_number=number, pr_url=url)
+
+        assert settled.status_code == 200, settled.text
+        lineage = _lineage_row(publication["lineage_id"])
+        assert (
+            lineage["base_sha"],
+            lineage["head_sha"],
+            lineage["pr_number"],
+            lineage["version"],
+        ) == (
+            MOVED_PARENT_SHA,
+            FIRST_REVISION_SHA,
+            number,
+            initial_lineage["version"] + 1,
+        )
+        assert lineage["binding_id"] == initial_lineage["binding_id"]
+        assert lineage["binding_generation"] == initial_lineage["binding_generation"]
+        assert _identity_columns(lineage) == (
+            "github",
+            "github.com",
+            str(REPO_ID),
+            INSTALLATION_ID,
+            f"PR_example_{number}",
+            "release/stable",
+        )
+        stored = _publication_row(publication["id"])
+        assert stored["base_sha"] == stored["expected_prior_head"] == BASE_SHA
+        assert stored["status"] == "succeeded"
+        assert stored["version"] == before[0]["version"] + 1
+        assert stored["terminal_at"] is not None
+        assert stored["lease_owner"] is stored["lease_expires_at"] is None
+        assert _rows("SELECT * FROM curie.work_items WHERE id = :id", {"id": item_id}) == [item]
+    finally:
+        client.app.state.http_client = original
+        client.portal.call(injected.aclose)
 
 
 @pytest.mark.parametrize("moved", [False, True], ids=["unchanged", "moved"])
