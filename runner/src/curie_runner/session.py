@@ -1178,8 +1178,7 @@ class SessionRunner:
                 tool_access=event.tool_access,
                 final_answer=(
                     FinalAnswerValidation(self._final_answer)
-                    if self._final_answer is not None
-                    else None
+                    if self._final_answer is not None else None
                 ),
             )
             self._active_state = state
@@ -2651,7 +2650,9 @@ class SessionRunner:
             accepted = isinstance(clean, Final) and clean.text == final.text
         if accepted:
             return final.model_copy(update={"text_mode": "verbatim"}), False
-        return Final(text=FINAL_ANSWER_DIAGNOSTIC, status=SessionStatus.CLASSIFIED_FAILURE), True
+        return Final(
+            text=FINAL_ANSWER_DIAGNOSTIC, status=SessionStatus.CLASSIFIED_FAILURE
+        ), True
 
     def _with_connector_notice(self, final: Final) -> Final:
         """Lead a DONE final's text with this turn's one-line connector notice.
