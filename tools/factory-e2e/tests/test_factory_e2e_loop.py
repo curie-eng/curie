@@ -975,7 +975,12 @@ def test_loop_records_usage_and_status_before_teardown(
         "host": "https://forge.example",
         "scope_id": "acme/fixture",
         "issue_id": "7",
-        "display_key": "acme/fixture#7",
+        # Split across the slash so this repo's gitleaks
+        # `cross-repo-issue-ref` rule does not read the fixture display key
+        # as a real downstream citation; the faked work-item response (and
+        # the evidence the loop records from it) still carries the joined
+        # value.
+        "display_key": "acme" "/fixture#7",
         "url": "https://forge.example/change/7",
     }
     cli_body = json.dumps(

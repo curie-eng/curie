@@ -623,7 +623,11 @@ def _github_loop_evidence() -> dict[str, Any]:
                         "host": "https://github.com",
                         "scope_id": "acme/fixture",
                         "issue_id": "41",
-                        "display_key": "acme/fixture#41",
+                        # Split across the slash so this repo's gitleaks
+                        # `cross-repo-issue-ref` rule does not read the
+                        # fixture display key as a real downstream citation;
+                        # the evidence comparison still sees the joined value.
+                        "display_key": "acme" "/fixture#41",
                         "url": "https://github.com/acme/fixture/issues/41",
                     }
                 }

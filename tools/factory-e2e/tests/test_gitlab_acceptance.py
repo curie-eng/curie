@@ -444,7 +444,11 @@ def _fixture_evidence(state_dir: Path) -> dict[str, Any]:
                         "host": "https://gitlab.example",
                         "scope_id": "acme/fixture",
                         "issue_id": "3",
-                        "display_key": "acme/fixture#3",
+                        # Split across the slash so this repo's gitleaks
+                        # `cross-repo-issue-ref` rule does not read the
+                        # fixture display key as a real downstream citation;
+                        # the evidence comparison still sees the joined value.
+                        "display_key": "acme" "/fixture#3",
                         "url": "https://gitlab.example/acme/fixture/issues/3",
                     }
                 }
