@@ -1327,3 +1327,41 @@ def test_a_verdict_is_a_report_not_authority() -> None:
     with pytest.raises(dataclasses.FrozenInstanceError):
         verdict.outcome = "refused"  # type: ignore[misc]
     assert "Verdict" in type(verdict).__name__
+
+
+# --- Clause 6: the re-read after the selection opens --------------------------
+
+
+def test_the_tuple_is_confirmed_unchanged_only_after_publication(monkeypatch) -> None:
+    Connections(monkeypatch)
+    h = Harness()
+
+    async def scenario() -> Any:
+        verifier = h.verifier()
+        verdict = await verifier.decide()
+        with pytest.raises(module().VerifierRefused):
+            await verifier.confirm_unchanged()
+        await verifier.publish(verdict, h.acceptance(verdict))
+        unchanged = await verifier.confirm_unchanged()
+        h.observed["manifest"] = "0" * 64
+        return unchanged, await verifier.confirm_unchanged()
+
+    unchanged, changed = run(scenario())
+    assert unchanged is None
+    assert changed == "changed-installation"
+    # Decide, publish and both re-reads each observed the tuple afresh.
+    assert h.observations == 4
+
+
+def test_a_candidate_rule_change_after_publication_is_reported(monkeypatch) -> None:
+    Connections(monkeypatch)
+    h = Harness()
+
+    async def scenario() -> Any:
+        verifier = h.verifier()
+        verdict = await verifier.decide()
+        await verifier.publish(verdict, h.acceptance(verdict))
+        h.candidate_rules[h.usernames["candidate_worker"]] = ("+@all",)
+        return await verifier.confirm_unchanged()
+
+    assert run(scenario()) == "candidate-rules"
