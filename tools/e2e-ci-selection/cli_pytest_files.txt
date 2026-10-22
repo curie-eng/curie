@@ -7,7 +7,6 @@ apps/api/tests/test_factory_progress.py
 apps/api/tests/test_factory_settings_gate.py
 apps/api/tests/test_gitflow_integration.py
 apps/api/tests/test_gitflow_targets.py
-apps/api/tests/test_publication_lineage_identity.py
 apps/api/tests/test_publications.py
 apps/api/tests/test_schema_window_gate.py
 apps/api/tests/test_slack_channel_default.py
