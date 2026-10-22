@@ -106,7 +106,7 @@ def scope() -> MeasuringScope:
         release_namespace=RELEASE,
         release_binding=RELEASE_BINDING,
         channel_rules=(("", "configmaps", ("create", "get", "list", "watch")),),
-        cni_configmaps=(("kube-system", "calico-config"),),
+        cni_configmaps=PROVIDER.configmaps,
         provider_policies=CALICO_GROUPS,
     )
 
@@ -124,7 +124,14 @@ def fixture() -> list[dict[str, Any]]:
         "Role",
         "curie-measuring-cni",
         "kube-system",
-        [rule([""], ["configmaps"], ["get"], resourceNames=["calico-config"])],
+        [
+            rule(
+                [""],
+                ["configmaps"],
+                ["get"],
+                resourceNames=[name for _ns, name in PROVIDER.configmaps],
+            )
+        ],
     )
     return documents
 

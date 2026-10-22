@@ -272,24 +272,31 @@ class ProviderEntry:
     policy_agent: tuple[WorkloadRef, ...]
     mode_keys: tuple[ModeKey, ...]
     addon_configmaps: tuple[tuple[str, str], ...]
-    kube_proxy_config: str = KUBE_PROXY_CONFIG
+    # kube-proxy's ConfigMap in kube-system; providers name it differently.
+    kube_proxy_config: str = "kube-proxy"
 
     def __post_init__(self) -> None:
         require(bool(self.provider) and bool(self.cni_plugin) and bool(self.policy_agent))
         require(bool(self.mode_keys))
         names = {ref.name for ref in (*self.cni_plugin, *self.policy_agent)}
         require(all(key.workload in names for key in self.mode_keys))
-        for namespace, name in self.addon_configmaps:
+        for namespace, name in self.configmaps:
             require(_NAME.fullmatch(namespace) is not None and _NAME.fullmatch(name) is not None)
+
+    @property
+    def configmaps(self) -> tuple[tuple[str, str], ...]:
+        """Every ConfigMap this entry reads. Clause 5 grants these by name and no others,
+        so the measuring identity's CNI ConfigMap Role is built from this list."""
+        return (*self.addon_configmaps, ("kube-system", self.kube_proxy_config))
 
     def paths(self) -> frozenset[str]:
         """Every path ``observe_identity`` reads with this entry."""
         refs = (*self.cni_plugin, *self.policy_agent)
         return frozenset(
-            {VERSION_PATH, KUBE_PROXY, KUBE_PROXY_PODS, self.kube_proxy_config}
+            {VERSION_PATH, KUBE_PROXY, KUBE_PROXY_PODS}
             | {ref.path for ref in refs}
             | {ref.pods_path for ref in refs}
-            | {f"/api/v1/namespaces/{ns}/configmaps/{name}" for ns, name in self.addon_configmaps}
+            | {f"/api/v1/namespaces/{ns}/configmaps/{name}" for ns, name in self.configmaps}
         )
 
 
@@ -569,7 +576,10 @@ async def observe_identity(
             data = _config_data(config)["data"]
             configmaps.append({"namespace": namespace, "name": name, "data": data})
         proxy = await observe_kube_proxy(
-            reader, eligible, config_path=provider.kube_proxy_config, exact=False
+            reader,
+            eligible,
+            config_path=_SYSTEM + "configmaps/" + provider.kube_proxy_config,
+            exact=False,
         )
         dataplane: dict[str, Any] = {"kube_proxy": None}
         if proxy is not None:

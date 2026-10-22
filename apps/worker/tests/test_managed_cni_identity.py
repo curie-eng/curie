@@ -807,3 +807,25 @@ def test_the_client_lists_namespaces_for_the_least_privilege_probe_list() -> Non
     client._json = fake_json  # type: ignore[method-assign]
     assert asyncio.run(client.list_items("namespaces")) == [{"metadata": {"name": "default"}}]
     assert seen == ["/api/v1/namespaces?limit=500"]
+
+
+def test_every_configmap_read_is_one_the_provider_entry_declares() -> None:
+    # Clause 5 grants ConfigMap reads only by the names the provider table lists.
+    configmaps = {path for path in PROVIDER.paths() if "/configmaps/" in path}
+    assert configmaps == {
+        f"/api/v1/namespaces/{ns}/configmaps/{name}" for ns, name in PROVIDER.configmaps
+    }
+    assert ("kube-system", "kube-proxy") in PROVIDER.configmaps
+    renamed = ProviderEntry(
+        provider="renamed",
+        cni_plugin=PROVIDER.cni_plugin,
+        policy_agent=PROVIDER.policy_agent,
+        mode_keys=PROVIDER.mode_keys,
+        addon_configmaps=(),
+        kube_proxy_config="kube-proxy-config",
+    )
+    state = installation()
+    state["/api/v1/namespaces/kube-system/configmaps/kube-proxy-config"] = state.pop(PROXY_CONFIG)
+    reader = Reader(state)
+    asyncio.run(observe_identity(reader, renamed, PLACEMENTS))
+    assert set(reader.paths) <= renamed.paths()
