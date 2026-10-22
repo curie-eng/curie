@@ -253,6 +253,15 @@ class CodeHost(Protocol):
         """Normalized checks on exactly ``head_sha``; never another commit's."""
         ...
 
+    async def required_checks(self, repository: RepositoryRef, branch: str) -> frozenset[str]:
+        """Optional: check names the code host requires on ``branch`` before merge.
+
+        GitHub unions ruleset contexts and branch protection contexts. Other
+        code hosts declare this unsupported. The factory does not apply labels
+        or start workflows to make a required check run.
+        """
+        ...
+
     async def list_review_feedback(
         self, pull_request: PullRequestRef, cursor: str | None
     ) -> FeedbackPage:

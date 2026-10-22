@@ -2879,3 +2879,83 @@ def test_a_failure_also_failing_on_the_base_completes_the_request(admitted: Any)
     body = _body(sink, published["id"])
     assert body.startswith(f"Completed: {published['pr_url']}")
     assert "Note: Also failing on the base branch, not caused by this change: pip-audit" in body
+
+
+
+def test_required_checks_missing_is_pending_then_unverified_at_the_deadline(admitted: Any) -> None:
+    client, github, sink = admitted
+    number = 9733
+    sink.ci_script = [ci_green()]
+    sink.rules["main"] = (
+        200,
+        [
+            {
+                "type": "required_status_checks",
+                "parameters": {"required_status_checks": [{"context": "label-gate"}]},
+            }
+        ],
+    )
+    published = _published(client, github, sink, number)
+    _set_base_ref(published["work_item_id"], "main")
+
+    _reconcile()
+
+    assert _terminal(number) == ("running", None)
+    assert _terminal_notices(published["id"]) == []
+
+    _reconcile_later(1300)
+
+    assert _terminal(number) == ("failed", "ci_unverified")
+    body = _body(sink, published["id"])
+    assert body.startswith("Could not complete:")
+    assert "label-gate" in body
+    assert "for example a label" in body
+    assert "Cause: ci_unverified" in body
+    assert "Completed:" not in body
+
+
+def test_required_checks_green_completes_when_the_named_check_passed(admitted: Any) -> None:
+    client, github, sink = admitted
+    number = 9734
+    sink.ci_script = [ci_green()]
+    sink.rules["main"] = (
+        200,
+        [
+            {
+                "type": "required_status_checks",
+                "parameters": {"required_status_checks": [{"context": "build"}]},
+            }
+        ],
+    )
+    published = _published(client, github, sink, number)
+    _set_base_ref(published["work_item_id"], "main")
+
+    _reconcile()
+
+    assert _terminal(number) == ("completed", "completed")
+    assert _body(sink, published["id"]).startswith("Completed:")
+
+
+def test_required_checks_not_found_on_rules_keeps_a_green_completion(admitted: Any) -> None:
+    client, github, sink = admitted
+    number = 9735
+    sink.ci_script = [ci_green()]
+    published = _published(client, github, sink, number)
+    _set_base_ref(published["work_item_id"], "main")
+
+    _reconcile()
+
+    assert _terminal(number) == ("completed", "completed")
+
+
+def test_required_checks_empty_rules_list_keeps_a_green_completion(admitted: Any) -> None:
+    client, github, sink = admitted
+    number = 9736
+    sink.ci_script = [ci_green()]
+    sink.rules["main"] = (200, [])
+    published = _published(client, github, sink, number)
+    _set_base_ref(published["work_item_id"], "main")
+
+    _reconcile()
+
+    assert _terminal(number) == ("completed", "completed")

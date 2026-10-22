@@ -548,7 +548,11 @@ class InMemoryCodeHost(_Declared):
         self.kind = kind
         self.host = host
         self.identity = identity
-        self.capabilities = _declared(capabilities, CODE_HOST_OPERATIONS)
+        declared = capabilities
+        if declared is None:
+            declared = all_supported(CODE_HOST_OPERATIONS)
+            declared[Operation.REQUIRED_CHECKS] = Support.UNSUPPORTED
+        self.capabilities = _declared(declared, CODE_HOST_OPERATIONS)
         self.ledger = ledger or WriteLedger()
         self.faults = faults or PageFaults()
         self._page_size = page_size
@@ -818,6 +822,11 @@ class InMemoryCodeHost(_Declared):
         self._gate(Operation.OBSERVE_CI)
         self._repository(repository)
         return CiRollup.on_head(head_sha, tuple(self._checks.get(head_sha, {}).values()))
+
+    async def required_checks(self, repository: RepositoryRef, branch: str) -> frozenset[str]:
+        self._gate(Operation.REQUIRED_CHECKS)
+        self._repository(repository)
+        return frozenset()
 
     async def list_review_feedback(
         self, pull_request: PullRequestRef, cursor: str | None
