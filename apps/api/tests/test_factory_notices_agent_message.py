@@ -537,6 +537,21 @@ def test_approval_create_refusal_with_hostile_characters_is_inert() -> None:
     assert "publication.required_python_ci_unselected" in body
 
 
+@pytest.mark.parametrize(
+    ("cause", "detail"),
+    [
+        ("budget_exceeded", "output token budget exceeded (max_output_tokens_per_run=4000)"),
+        ("runner_escalated", "runner error: Command failed with exit code -9"),
+    ],
+)
+def test_curie_and_runner_details_are_not_labeled_a_provider_message(
+    cause: str, detail: str
+) -> None:
+    body = result_section(cause, pr_url=None, detail=detail)
+    assert f"Details: {detail}\n" in body
+    assert "Provider message" not in body
+
+
 def test_a_ci_cause_still_labels_its_details() -> None:
     body = result_section("ci_failed", pr_url=None, detail="Rounds: 2")
     assert "Details: Rounds: 2\n" in body
@@ -573,7 +588,7 @@ def test_budget_notice_names_the_limit_and_its_matching_remedy(
     assert value in headline
     assert f"`{remedy}`" in headline
     assert other_remedy not in body
-    assert f"Provider message: {detail}\n" in body
+    assert f"Details: {detail}\n" in body
     assert body.endswith("Cause: budget_exceeded\nFailure class: budget-exceeded\n")
 
 
