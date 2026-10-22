@@ -53,8 +53,8 @@ for publication.
 
 Each remaining loop (`implement` and `review_diff`, and `wait_ci` back to
 `implement`) runs at most 3 rounds. When the diff reviewer still asks for
-changes on round 3, or a review call fails, the run publishes nothing. It ends its reply with `Could not complete:` and the
-reviewer's unresolved findings and open questions, and the platform's status
+changes on round 3, or a review call fails, the run publishes nothing. It
+ends its reply with `Could not complete:` and the reviewer's unresolved findings and open questions, and the platform's status
 comment on the issue carries that result.
 
 A reviewer tags every finding `blocking` (the change would be incorrect or
@@ -69,8 +69,7 @@ approved. Notes never start another review round.
 model does not follow the protocol reliably. It routes every sub-agent call to
 the right reviewer, strips `isolation` and `model`, forces
 `run_in_background: false`, refuses reviews out of order and a second plan
-review, counts rounds and
-applies the cap, stops the run on a reviewer reply without a verdict, and
+review, counts rounds and applies the cap, stops the run on a reviewer reply without a verdict, and
 refuses `publish_changes` until the diff reviewer approves. It also writes the
 `plan_review` and `review_diff` phase lines, with the round, to the pod log.
 It hands the agent and both reviewers the same verification contract,
@@ -85,8 +84,7 @@ Without the contract no review runs.
 The same hook gates repository edits. `Edit`, `Write`, `MultiEdit` and
 `NotebookEdit` are refused until the `dark-factory:implement-issue` skill is
 loaded and the plan review completes with either verdict. After it only test
-edits may run:
-an edit to a test file, or an edit to a source file that adds a test (an
+edits may run: an edit to a test file, or an edit to a source file that adds a test (an
 inline Rust `#[test]` module, a `def test_` function, and the like) beyond the
 ones the replaced text already held. The model writes the failing test (a
 test file, or an inline test that adds a test), runs it with Bash, then calls
@@ -96,9 +94,9 @@ event that opens source edits; no Bash command does. The hook records evidence
 only: after a test edit it counts finished Bash commands and failed ones,
 never their text, and writes `test_edited`, `bash_after_test_edit` and
 `bash_failed_after_test_edit` on its `implement` phase line. It never claims
-a test ran. The hook fingerprints the checkout at the prompt and refuses the plan
-review's verdict, stopping the run, if the checkout changed before it (for example
-through Bash). Its evidence lines share one `seq` counter per run:
+a test ran. The hook fingerprints the checkout at the prompt and refuses the
+plan review's verdict, stopping the run, if the checkout changed before it
+(for example through Bash). Its evidence lines share one `seq` counter per run:
 `curie_phase` lines carry `source: "hook"`, `curie_reported` lines record each
 `report_progress` call with the hook's last observed phase and `late: true`
 when the report trails it, and `curie_gate` lines record refusals.

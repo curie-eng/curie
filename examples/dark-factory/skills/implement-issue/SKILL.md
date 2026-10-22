@@ -47,13 +47,14 @@ in the foreground. Set `run_in_background` to `false` on every reviewer call.
 The bundle's review gate hook enforces the loops. It reports each review phase
 and its round, numbers the rounds, sends the call to the right reviewer in the
 foreground, refuses a review out of order or a second plan review, and
-refuses publication until the diff reviewer approves. Follow its instructions when a tool result or a
-refusal carries them.
+refuses publication until the diff reviewer approves. Follow its instructions
+when a tool result or a refusal carries them.
 
 Load this skill before any edit. The hook refuses `Edit`, `Write`,
 `MultiEdit` and `NotebookEdit` until the plan review completes with either
-verdict, `VERDICT: APPROVE` or `VERDICT: CHANGES`. After it the first edits are the failing test: a test file, or an inline
-test in a source file when the edit adds the test (a Rust `#[test]` or
+verdict, `VERDICT: APPROVE` or `VERDICT: CHANGES`. After it the first edits
+are the failing test: a test file, or an inline test in a source file when
+the edit adds the test (a Rust `#[test]` or
 `#[cfg(test)]` module, a `def test_` function, and the like). Write the
 failing test, run it with Bash, then call report_progress with phase
 `implement`, then edit source. Running a command does not open source edits;
@@ -172,8 +173,8 @@ its own, and say in the pull request description what you declined.
 
 An `APPROVE` verdict can carry a `NOTES:` list of non-blocking improvements,
 and approval ends that review loop. Carry the plan review's findings into
-`implement`: fix every blocking finding of a `VERDICT: CHANGES`, and apply the notes that are cheap and clearly
-right, and ignore the rest. Never apply diff-review notes to the code after
+`implement`: fix every blocking finding of a `VERDICT: CHANGES`, apply the
+notes that are cheap and clearly right, and ignore the rest. Never apply diff-review notes to the code after
 the diff reviewer approved; that approval covers the diff it read. List
 diff-review notes in the pull request body as notes you did not address.
 Never start another review round only to address notes.
@@ -437,8 +438,8 @@ repository's conventions win. Call `mcp__curie__publish_changes` once, with:
   checks you ran with their results, then the verification table with every
   delegated or blocked check, its cause and the evidence the verification
   contract requires, then the plan review's verdict and how each of its
-  findings was resolved, then the diff review rounds it took, then anything else you did not verify or deliberately declined, and
-  any reviewer `NOTES:` you did not address.
+  findings was resolved, then the diff review rounds it took, then anything
+  else you did not verify or deliberately declined, and any reviewer `NOTES:` you did not address.
 
 After calling it, end your turn and say that the publication request is
 pending. Do not report `wait_ci`; the platform reports it (step 9). Do not call it twice. Never push with git; the platform publishes
