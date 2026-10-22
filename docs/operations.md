@@ -1355,7 +1355,7 @@ configuration loaded. No separate Helm upgrade is needed.
        "enabled": true,
        "intake": "poll",
        "cardBaseUrl": "",
-       "ciWaitSeconds": 1200,
+       "ciWaitSeconds": 3600,
        "codeHosts": [
          {
            "name": "github",
@@ -1637,12 +1637,11 @@ check-backed verdicts do not depend on unknown mergeability.
 A factory Python publication needs in-sandbox verification evidence; beyond
 that it is judged on the repository's
 own checks unless the repository has a required Python CI policy (below).
-Checks still pending when the CI wait (by default 1200 s from the push, or the
-execution deadline if sooner) runs out end as `ci_timeout`. Set the wait with
-`factory.ciWaitSeconds` (API env `FACTORY_CI_WAIT_S`, default
-1200, 1 to 10800, checked at boot) when the repository's required checks take
-longer than 20 minutes; the wait still ends at the execution deadline if that
-comes first. CI that cannot be verified, including unreadable checks or missing
+Checks still pending when the CI wait (by default 3600 s, 60 minutes, from the
+push, or the execution deadline if sooner) runs out end as `ci_timeout`. Set
+the wait with `factory.ciWaitSeconds` (API env `FACTORY_CI_WAIT_S`, default
+3600, 1 to 10800, checked at boot). An explicit value, including 1200, is
+kept. The wait still ends at the execution deadline if that comes first. CI that cannot be verified, including unreadable checks or missing
 required evidence, ends as `ci_unverified`, which is never success. The notice's
 Reason line explains why. The pull request stays open. The work item detail route still
 reports CI as `unavailable` / `github_forbidden` without the permission.

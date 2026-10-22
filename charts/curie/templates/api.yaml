@@ -354,7 +354,7 @@ spec:
             - name: FACTORY_INTAKE
               value: {{ get (.Values.factory | default dict) "intake" | default "poll" | quote }}
             - name: FACTORY_CI_WAIT_S
-              value: {{ include "curie.factory.str" (get (.Values.factory | default dict) "ciWaitSeconds" | default 1200) | quote }}
+              value: {{ include "curie.factory.str" (get (.Values.factory | default dict) "ciWaitSeconds" | default 3600) | quote }}
             - name: CURIE_FORGES
               value: {{ include "curie.factory.forgesJson" . | quote }}
             - name: GITHUB_API_URL
