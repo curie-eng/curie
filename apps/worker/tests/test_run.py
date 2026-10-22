@@ -14,6 +14,7 @@ import logging
 import signal
 import socket
 import subprocess
+import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -393,7 +394,9 @@ def test_docker_runner_uses_its_network_specific_otlp_endpoint(
     )
     assert isinstance(client, DockerSandboxClient)
     monkeypatch.setattr(client, "_docker", docker._docker)
-    client.create_claim("acme-sandbox", pool="pool", env={"CURIE_FAKE_MODEL": "1"})
+    client.create_claim(
+        "acme-sandbox", pool="pool", env={"CURIE_FAKE_MODEL": "1"}, deadline=time.monotonic() + 300
+    )
     assert all(timeout > 0 for timeout in docker.timeouts)
     (runner_args,) = [
         args
@@ -447,6 +450,7 @@ def test_docker_runner_snapshot_checks_the_claims_code_host_origin(
             "CURIE_REPO_ORIGIN": origin,
             "CURIE_REPO_PATH": repo_name,
         },
+        deadline=time.monotonic() + 300,
     )
     assert all(timeout > 0 for timeout in docker.timeouts)
     (runner_args,) = [
@@ -1183,6 +1187,7 @@ def test_run_supervises_the_cron_loop_until_shutdown(
 
 def test_sigterm_stops_the_deploy_notice_consumer(
     monkeypatch: pytest.MonkeyPatch,
+    worker_db: Any,
 ) -> None:
     events: list[str] = []
     runtime = _FakeRuntime(_FakeCardStore(events), events)
@@ -1216,7 +1221,9 @@ def test_sigterm_stops_the_deploy_notice_consumer(
             "add_signal_handler",
             lambda sig, handler: handlers.__setitem__(sig, handler),
         )
-        await asyncio.wait_for(run._run(WorkerConfig(), {}), timeout=1)
+        await asyncio.wait_for(
+            run._run(WorkerConfig(database_url=worker_db[2]), {}), timeout=1
+        )
 
     def fake_build(config: WorkerConfig, env: Any, *, resources: Any) -> _FakeRuntime:
         _register_legacy_fake_transports(runtime, resources)

@@ -1,7 +1,7 @@
 ---
 seam: CLI output (agent-facing `--json`)
 kind: CLEAN
-impls: 72 outputs behind one trait
+impls: 75 outputs behind one trait
 grade: not separately graded
 epics:
   - "#456"
@@ -13,7 +13,7 @@ order: 18
 > Part of the Curie swappable-seam catalog — see the [seam index](../../interfaces.md).
 
 <!-- BEGIN GENERATED: header (curie dev docs-lint) -->
-> **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** 72 outputs behind one trait &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
+> **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** 75 outputs behind one trait &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
 <!-- END GENERATED: header -->
 
 **Kind legend:** CLEAN = a real `Protocol`/typed port class · SOFT = swap via env/URL/prefix/wire, no code interface · NONE = not built yet.
@@ -66,7 +66,7 @@ This is the catalog's first **Rust** seam. It is listed here because the agent-f
 
 ## Implementations today
 
-72 `CliOutput` implementations, all in the CLI crate, grouped by owning module:
+75 `CliOutput` implementations, all in the CLI crate, grouped by owning module:
 
 - **`DryRunPlan`** (`cli/src/ui.rs`) — the generic `--dry-run` plan; JSON is
   `{"dry_run":true,"plan":[lines]}` and the human render is the same lines verbatim,
@@ -82,7 +82,8 @@ This is the catalog's first **Rust** seam. It is listed here because the agent-f
   `BudgetOutput`, `ResetThreadOutput`,
   `DeleteOutput`, `VersionsOutput`, `MemoryOutput`, `MemoryGuidanceOutput`, `HookOutput`, `ApprovalsOutput`,
   `SkillApprovalsOutput`, `OverridesOutput`, `PublicationPolicyOutput`, `WorkItemsOutput`,
-  `SchedulesOutput`, `HookFireOutput`, `ChannelsOutput`, `CallersOutput`,
+  `SchedulesOutput`, `HookFireOutput`, `ChannelsOutput`, `CallersOutput`, `AccessPolicyOutput`,
+  `DirectoryOutput` (a directory administration plan or tenant/resource API receipt),
   `ActionsOutput` (the `local`/`cluster actions` verbs and the action executor receipt),
   `RemediationPolicyOutput` (the `local`/`cluster remediation-policy` verbs: one policy generation, the breaker `close-breaker` closed, or a hook's `breakers`),
   `RemediationOutput` (the `local`/`cluster remediation` receipt verbs: a nomination list or one nomination's receipt),
@@ -141,10 +142,10 @@ That set is not hand-maintained prose: `cli/schema/index.json` carries one
   result. This syntactic inventory does not prove that every verb returns a
   `CliOutput` or honors the one-object JSON contract.
 2. **Committed JSON Schemas with a drift gate (since #841).** Each `to_json` is no
-  longer schema-free: there are 73 committed schemas under `cli/schema/` with an
+  longer schema-free: there are 76 committed schemas under `cli/schema/` with an
   index (`cli/schema/index.json`), a `syn`-based inventory gate over every `impl
   CliOutput`, and per-family output validation — result families are validated
-  against real `to_json()` output across 84 tests in `cli/tests/json_contract.rs`.
+  against real `to_json()` output across 85 tests in `cli/tests/json_contract.rs`.
   The dark factory render receipt uses schema version 2. Its `runner_image`
   and `runner_note` fields are required and accept a string or `null`; the
   binary render tests validate the actual receipt against the committed schema.

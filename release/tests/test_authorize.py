@@ -1662,12 +1662,38 @@ class TestRequiredNamesMatchCiWorkflows:
             row.get("dockerfile") == "apps/docker-daemon/Dockerfile" for row in release_rows
         ), "release.yaml no longer builds the docker-daemon image; revisit this guard"
 
-        ci_name = yaml.safe_load(CI_YAML.read_text())["jobs"]["docker-daemon"]["name"]
+        ci_name = yaml.safe_load(CI_YAML.read_text())["jobs"]["image-proofs"]["name"]
 
         assert ci_name in authorize_module.REQUIRED_CHECK_NAMES, (
             f"ci.yaml job {ci_name!r} builds an image release.yaml publishes, so a red "
             "build would skip the manifest merge for every image; require it in "
             "release/authorize.py"
+        )
+
+    def test_combined_image_proof_replaces_all_former_required_names(self):
+        combined = "Image proofs (smoke, Docker daemon, toolchain)"
+        removed = {
+            "Docker daemon image (authz plugin + escape test)",
+            "Dispatcher image imports resolve",
+            "Mail adapter image imports resolve",
+            "UI image response headers are correct",
+            "Repository toolchain proof (runner image)",
+        }
+        assert combined in authorize_module.REQUIRED_CHECK_NAMES
+        assert not removed & authorize_module.REQUIRED_CHECK_NAMES
+        assert combined in ci_job_check_run_names()
+        assert not removed & ci_job_check_run_names()
+
+    @pytest.mark.parametrize("conclusion", [None, "failure", "cancelled", "skipped", "success"])
+    def test_combined_image_proof_must_be_present_and_successful(self, conclusion):
+        combined = "Image proofs (smoke, Docker daemon, toolchain)"
+        required = authorize_module.REQUIRED_CHECK_NAMES
+        runs = [{"name": name, "conclusion": "success"} for name in required - {combined}]
+        if conclusion is not None:
+            runs.append({"name": combined, "conclusion": conclusion})
+
+        assert authorize_module.missing_required_checks(runs, required) == (
+            set() if conclusion == "success" else {combined}
         )
 
 
@@ -1907,7 +1933,6 @@ class TestLegitimateSkips:
             if job.get("name") in authorize_module.REQUIRED_CHECK_NAMES
             and "if" in job
         }
-        images_if = "${{ needs.changes.outputs.images == 'true' }}"
         expected = {
             "ci-images": (
                 "${{ needs.changes.outputs.images == 'true' || "
@@ -1917,8 +1942,10 @@ class TestLegitimateSkips:
                 "needs.changes.outputs.cluster == 'true' || "
                 "needs.changes.outputs.released_upgrade == 'true' }}"
             ),
-            "dispatcher-image-smoke": images_if,
-            "repo-toolchain-proof": images_if,
+            "image-proofs": (
+                "${{ !cancelled() && needs.changes.result == 'success' && "
+                "(needs.ci-images.result == 'success' || needs.ci-images.result == 'skipped') }}"
+            ),
             "eval-falsifiability": "${{ needs.changes.outputs.skill == 'true' }}",
             "e2e-ladder": (
                 "${{ needs.changes.outputs.skill == 'true' || "

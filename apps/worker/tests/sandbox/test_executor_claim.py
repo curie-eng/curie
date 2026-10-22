@@ -167,6 +167,7 @@ def test_executor_claim_template_strips_the_credential_and_non_target_secrets() 
         labels={"curietech.ai/agent": _AGENT},
         agent_name=_AGENT,
         executor_secret_names=frozenset({_TARGET_SECRET}),
+        deadline=time.monotonic() + 300,
     )
 
     (template,) = _posted(api, "SandboxTemplate")
@@ -228,6 +229,7 @@ def test_executor_claim_with_an_empty_header_set_keeps_no_connector_secret() -> 
         labels={"curietech.ai/agent": _AGENT},
         agent_name=_AGENT,
         executor_secret_names=frozenset(),
+        deadline=time.monotonic() + 300,
     )
 
     (template,) = _posted(api, "SandboxTemplate")
@@ -250,6 +252,7 @@ def test_an_ordinary_claim_template_is_unchanged() -> None:
         env=_ordinary_env(),
         labels={"curietech.ai/agent": _AGENT},
         agent_name=_AGENT,
+        deadline=time.monotonic() + 300,
     )
 
     (template,) = _posted(api, "SandboxTemplate")
@@ -590,6 +593,7 @@ def test_executor_template_drops_every_model_credential_the_runner_refuses() -> 
         labels={"curietech.ai/agent": _AGENT},
         agent_name=_AGENT,
         executor_secret_names=frozenset({_TARGET_SECRET}),
+        deadline=time.monotonic() + 300,
     )
 
     (template,) = _posted(api, "SandboxTemplate")
@@ -623,6 +627,7 @@ def test_an_ordinary_claim_keeps_extra_env_model_credentials() -> None:
         env=_ordinary_env(),
         labels={"curietech.ai/agent": _AGENT},
         agent_name=_AGENT,
+        deadline=time.monotonic() + 300,
     )
 
     (template,) = _posted(api, "SandboxTemplate")
@@ -687,7 +692,12 @@ def test_fake_sandbox_client_matches_the_protocol_keyword() -> None:
     from .conftest import FakeSandboxClient
 
     fake = FakeSandboxClient()
-    fake.create_claim("c-exec", pool="p", executor_secret_names=frozenset({_TARGET_SECRET}))
-    fake.create_claim("c-turn", pool="p")
+    fake.create_claim(
+        "c-exec",
+        pool="p",
+        executor_secret_names=frozenset({_TARGET_SECRET}),
+        deadline=time.monotonic() + 300,
+    )
+    fake.create_claim("c-turn", pool="p", deadline=time.monotonic() + 300)
     assert fake.claims["c-exec"].executor_secret_names == frozenset({_TARGET_SECRET})
     assert fake.claims["c-turn"].executor_secret_names is None

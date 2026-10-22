@@ -629,7 +629,7 @@ and runs every target check before mutation.
 | `--to <version>` | Target Curie version. Required. |
 | `--chart` | Chart path or ref override. |
 | `--yes` | Skip the confirmation prompt. |
-| `--dry-run` | Print the redacted plan and exit without changing the installed release or downloading the default release chart archive. It still reads the installed release from the cluster, and retained-configuration checks always run. Available local charts and Helm refs also run target chart and schema checks; Helm may fetch an explicit repository or OCI ref for those metadata checks. A cold default release archive records those checks as pending until download. A plan that ends in a validate refusal exits nonzero, like the real run. The printed `helm upgrade` line is the command Apply runs, including `--install` and `-f <retained-values>` when it passes them. |
+| `--dry-run` | Print the redacted plan and exit without changing the installed release or downloading the default release chart archive. It still reads the installed release from the cluster, and retained-configuration checks always run. Available local charts and Helm refs also run target chart and schema checks; Helm may fetch an explicit repository or OCI ref for those metadata checks. A cold default release archive records those checks as pending until download; if its target runner is unobserved, stock layer rebind remains conditional until a live run downloads the chart and verifies it, with no refusal solely for that unobserved runner. A plan that ends in a validate refusal exits nonzero, like the real run. The printed `helm upgrade` line is the command Apply runs, including `--install` and `-f <retained-values>` when it passes them. |
 | `--forward-only` | Apply pending contract or irreversible schema migrations. Without this flag, Validate refuses those migrations before mutation so a patch rollback window stays intact. |
 | `--allow-stock-layer-clear` | Proceed when a stock dark factory runner layer cannot be rebound for `--to`: clear its binding so the agent runs the platform runner without its layer until it is rebound. Refused by default. |
 
@@ -1549,12 +1549,31 @@ evidence. The outcome is decided in this order:
 2. More than one open match: the issue is refused, and the status comment
    lists each of them. Close all but one to continue.
 3. A pull request whose author the code host cannot confirm is never
-   evidence and is ignored, with one info log line per check. Bitbucket Cloud
-   cannot read its own identity, and Bitbucket Data Center cannot when its
-   answers omit the `X-AUSERID` header, so on those hosts ownership cannot be
-   verified, rediscovery does not suppress, and a reinstall can still open one
-   duplicate pull request. When nothing matches, the issue is admitted
-   normally.
+   evidence and is ignored, with one info log line per check. Bitbucket Data
+   Center cannot confirm authorship when its answers omit the `X-AUSERID`
+   header, so there ownership cannot be verified, rediscovery does not
+   suppress, and a reinstall can still open one duplicate pull request. When
+   nothing matches, the issue is admitted normally.
+
+   Bitbucket Cloud cannot read its own identity either, so it cannot verify
+   who opened a pull request. It fails closed instead: if any open pull
+   request from a factory publication branch names the issue, a reinstall
+   after storage loss refuses admission, opens no second pull request, and
+   posts one issue comment asking the operator to confirm whether that pull
+   request is the factory's publication. The refusal is per issue: a
+   publication pull request for a different issue does not block it, and a
+   closed or merged one does not trigger it. While the pull request stays open
+   and the issue keeps its trigger label, every intake pass refuses again and
+   keeps that one comment. Closing or confirming the existing pull request
+   clears the block. To confirm it is the factory's, remove the trigger label
+   from the issue and review or merge the pull request as usual; Curie then
+   stops trying to admit the issue. The label has to come off because a merged
+   or declined pull request is ignored on Bitbucket Cloud, so a still-labelled
+   issue would run again. If it is not the factory's, close it: the tracker
+   sweep re-checks every still-labelled issue every
+   `FACTORY_RECONCILE_INTERVAL_S` and admits it on that later pass (re-apply
+   the label when that interval is 0). This is a bounded limitation, because
+   there is no ownership proof for Bitbucket Cloud publications yet.
 4. Only closed or merged matches: the old label is a replay of a run that
    already finished, so it is logged and nothing runs. A label added after the
    most recent close or merge is an intentional rerun and is admitted. When
@@ -1602,8 +1621,11 @@ counts. With no required check, zero checks after the 120 s grace complete with
 a note only when GitHub reports the pull request mergeable or already merged.
 A pull request with merge conflicts waits through that grace, then ends as
 `merge_conflict`, regardless of any checks, without a CI fix round. The pull
-request stays open for a person to resolve the conflicts. Unknown mergeability,
-including GitHub's `null` while it computes the result, keeps a zero-check run
+request stays open for a person to resolve the conflicts. A pull request a person
+closes without merging during the wait ends the run at once as `pr_closed`,
+whatever its checks say, and the issue gets `curie-factory:needs-human`; a
+pull request merged during the wait still completes on green or no-CI evidence.
+Unknown mergeability, including GitHub's `null` while it computes the result, keeps a zero-check run
 waiting with reason `mergeability_unknown` until the CI deadline, then ends as
 `ci_unverified` with that reason. Each observation reads mergeability again;
 check-backed verdicts do not depend on unknown mergeability.
@@ -1748,7 +1770,7 @@ resolved in the registry) and refuses a mismatch, or a runner it cannot
 determine, with the fix `curie build --plugin-dir <dir> --registry <ref>
 --runner-image <installed runner>`. `curie cluster upgrade` compares the current
 runner with the one the target release renders. When they differ, or either
-cannot be determined, it names every agent in `agentSandbox.runnerImages` before
+observed runner cannot be determined, it names every agent in `agentSandbox.runnerImages` before
 upgrading, in the plan and `--dry-run` output too, and clears those entries in
 the same `helm upgrade` by deleting the keys from the retained values document.
 It does not pass a null override. A null map entry is not a deletion, and the
@@ -1762,8 +1784,11 @@ to the project's published dark factory layer
 (`ghcr.io/curie-eng/curie-dark-factory-runner@...`) is instead rebound to the
 layer published for the target version when that layer's base is the target
 runner. The plan lists it separately, and its sandboxes are retired the same
-way. When it cannot be rebound (no published layer, another base, an
-unreachable registry, or an unknown target runner), the upgrade refuses at
+way. For a cold release chart with an unobserved target runner, stock rebind
+remains conditional pending chart download and verification by a live run;
+that unobserved runner alone causes no refusal or remediation notice.
+When it cannot be rebound (no published layer, another base, an
+unreachable registry, or an unknown observed target runner), the upgrade refuses at
 Validate with the reason and remediation. It is cleared only with
 `--allow-stock-layer-clear`; then the notice names `curie cluster factory
 --runner-image <agent>=<repository>@sha256:<digest>`, or `curie example
@@ -1868,9 +1893,11 @@ The reconciler creates it on its first pass after admission and then edits it
 in place; there is no separate final comment. While the run is live the
 comment shows a checklist of the phases the agent reports through
 `report_progress` and a `Status:` line (`QUEUED`, `RUNNING`, `PUBLISHING`,
-`STOPPING`). Its last edit adds the result, marks the comment final, and it is
-not edited again. A comment a person deletes is re-created once on the next
-pass; unlabel the issue to stop the run instead.
+`STOPPING`). A live checklist labels the current phase `in progress` and
+retains its round label when present. Its last edit adds the result, labels
+the current phase `stopped here` without a round label, marks the comment
+final, and it is not edited again. A comment a person deletes is re-created
+once on the next pass; unlabel the issue to stop the run instead.
 
 When publication succeeds, the result names the exact pull request
 URL. A follow-up that needs no change, including a relabel that continues the
@@ -1883,13 +1910,32 @@ When the model provider refused the run,
 a `Provider message:` line follows with the provider's own error text, redacted
 of keys and tokens. An execute turn that ends without publishing is prompted
 once more in the same session. If it still does not publish, it ends as
-`early_stop` (it called no work tool and never reported progress) or
-`no_pull_request`, and an `Agent's last message:` block carries the agent's
-final reply, redacted and shown inside a code fence so none of it renders.
+`early_stop` (it called no work tool and never reported progress). Otherwise it
+ends as `no_pull_request`. When the cause would be `no_pull_request` and a pull
+request is already recorded, it ends as `revision_unchanged` instead.
+An `Agent's last message:` block carries the agent's
+final reply as a neutralized Markdown quote. The reply is redacted before
+clipping to at most 4000 characters, including the trailing `...` when
+clipped. CRLF and bare CR line endings are normalized to LF. Before quoting,
+every `&` is escaped as `&amp;`, then HTML comment openers are broken by
+inserting U+200B after `<`, existing `<` characters are escaped as `&lt;`,
+`![` becomes `!\[`, and U+200B is inserted after every `@`. Emphasis, lists,
+and code marks remain. On GitHub, ordinary Markdown links and references work
+subject to this neutralization. At signs in link targets are also neutralized
+and may prevent navigation. HTML, images, and mentions, including
+entity-encoded mentions, are neutralized. CommonMark does not decode entities
+or backslash escapes inside inline code or fenced code blocks, so escaped characters there show
+their escape spellings. Every line is quoted with `> `; a blank line is
+quoted as `>`. A blank separator follows the quote before platform fields
+such as `Cause:` or `Usage:`.
+Jira's ADF blockquotes disallow headings, rules, and nested quotes. The
+converter decodes entities and backslash escapes only in prose after parsing,
+leaving code content escaped. Within blockquotes it converts headings to
+paragraphs, rules to literal `---` paragraphs, and flattens nested quote content.
 A last `Cause:` line names the platform cause code
 (`capacity_wait_expired`, `start_failed`, `execution_deadline`, `issue_cancelled`,
 `owner_lost`, `runner_escalated`, `unclassified`, `max_turns`, `runner_failed`,
-`no_pull_request`,
+`no_pull_request`, `revision_unchanged`,
 `early_stop`, `publication_denied`, `publication_expired`, `publication_failed`,
 `publication_unrecorded`, or a
 classified run failure: `model_credit_exhausted`, `model_usage_limited`,
@@ -2124,9 +2170,17 @@ default `no_pull_request` or `early_stop` for `--expect comment`, plus
 `execution_deadline` for `--expect any`. When `--expect comment` or `--expect
 any` accepts a `no_pull_request` or `early_stop` ending, the agent's final reply
 must separately contain `Could not complete:` followed by its reason. The reply
-is read from the final comment's `Agent's last message:` block, and from the
-thread transcript only when the comment has none. Each `--expect-reason` must
-match that reply, ignoring case. The platform
+is read from the final comment's `Agent's last message:` block. The parser
+accepts only the contiguous quote immediately after that label, strips one
+quote prefix from each line, and preserves quoted blank lines. It reverses
+each neutralization substitution once: remove U+200B after `@`, restore
+`!\[` to `![`, decode `&lt;` to `<`, and restore the broken HTML comment
+openers. It decodes `&amp;` to `&` last, without recursively decoding the
+result. Already escaped image openers and preexisting comment-breaking U+200B
+sequences are ambiguous under these substitutions, so their original spelling
+cannot always be recovered. It does not accept a code fence as a fallback.
+The existing thread transcript fallback applies only when no message is recovered from the
+comment. Each `--expect-reason` must match that reply, ignoring case. The platform
 cause does not establish the agent's reason. Only a comment the App posted with
 this run's execution request marker counts, and more than one fails. A rename out of
 `.github/` fails like a change inside it. A known secret or credential-shaped
@@ -2697,7 +2751,9 @@ supplies no trusted positive aligned authentication verdict that Curie can
 verify, guarantees neither header provenance nor stripping, and permits DMARC
 failure under `p=none`. Every message is refused with
 `authentication_unverifiable`; allowlisted senders, labels, missing rejection
-labels and provider supplied headers cannot bypass the gate. Any
+labels and provider supplied headers cannot bypass the gate. The gate opens only
+for a mail provider that verifies senders (ADR 0228, `CURIE_MAIL_PROVIDER`); the
+chart currently selects only the built-in AgentMail provider. Any
 `mailAdapter.allowedSenders` list containing `*` also fails boot unless
 `mailAdapter.allowAllSenders=true` is explicitly set, and that opt in never
 bypasses authentication. Provider evidence, parameter names, the full config
@@ -2753,12 +2809,17 @@ section is the administrator's.
   creates no generation. The platform key plus the operator principal is no
   longer enough; the principal is attribution only. Delete, disarm and breaker
   close keep the platform key plus the principal. The CLI `apply` and `arm`
-  verbs do not yet send the header (follow-up to #4225), so until then bind and
-  arm over the API with the header.
-- The protected worker is deployed. The capture of a nomination block from a
-  protected turn is its runner client wrapper (AUTOMATED-REMEDIATION-6); without
-  it no turn can submit a block, though the policy and qualification routes
-  work.
+  verbs read the key from `CURIE_REMEDIATION_AUTHORITY_KEY` in their own
+  environment and send it as the header; there is no flag, so the key never
+  appears in process arguments, and it is never printed. Without it they stop
+  with a usage error before any request. `disarm`, `remove` and
+  `close-breaker` never send it.
+- The protected worker is deployed. It captures a nomination block from a
+  protected turn in its runner client wrapper
+  ([`apps/worker/src/curie_worker/protected_nomination.py`](../apps/worker/src/curie_worker/protected_nomination.py),
+  AUTOMATED-REMEDIATION-6) and submits it to the API. A turn that is not run by
+  the protected worker submits nothing, though the policy and qualification
+  routes work.
 
 ### Policies
 
@@ -2768,16 +2829,23 @@ swapped on `--expected-generation` (`0` binds a hook with no policy) and made
 idempotent by `--operation-id`.
 
 ```bash
+export CURIE_APPROVAL_PRINCIPAL_TOKEN=<remediation operator principal>
+export CURIE_REMEDIATION_AUTHORITY_KEY=<remediation authority>  # apply and arm only
 curie cluster remediation-policy show <agent> <hook>
 curie cluster remediation-policy apply <agent> <hook> --file policy.json --expected-generation 0
 curie cluster remediation-policy arm <agent> <hook> --expected-generation <N>
 curie cluster remediation-policy disarm <agent> <hook> --expected-generation <N>
 curie cluster remediation-policy remove <agent> <hook> --expected-generation <N>
+curie cluster remediation-policy breakers <agent> <hook> [--state open|closed|all]
 curie cluster remediation-policy close-breaker <agent> <hook> <breaker id> --reason "<why>"
 ```
 
 `curie local remediation-policy` is the same group, for staging and inspecting
-a policy on a local stack; remediation executes on the cluster tier only. Every
+a policy on a local stack; remediation executes on the cluster tier only. Two
+sibling groups exist at both tiers: `curie cluster remediation list|show` reads
+nomination receipts ([Reading what happened](#reading-what-happened)), and
+`curie cluster remediation-qualification record|start-run|show-run` is the CLI
+form of the qualification routes in the drill order below. Every
 verb prints one JSON object under `--json`. `apply` validates the document with
 the platform's own rules first
 ([`cli/src/remediation_policy.rs`](../cli/src/remediation_policy.rs)),
@@ -2878,6 +2946,16 @@ ordinary approval path on a **disposable target inside the policy's bounds**:
      out of band after a forward drill and then asking for the undo;
    - an **idempotent** action: two `confirmed` approved forward executions with
      the same canonical arguments, the second leaving the same `post_version`.
+     The `post_version` is recorded only from a **sealed** reply: the acting
+     connector's write must answer with a sealed `prior` envelope, a valid
+     `version` and a `target` object, and the reply must not be redacted
+     ([`_snapshot`](../apps/worker/src/curie_worker/actions.py)). See
+     [Writing a connector the platform can undo](writing-a-reversible-connector.md#the-paired-verbs)
+     for the reply shape and the `SNAPSHOT_SEALING_KEY` custody.
+     A connector that answers in plain text, or with a cleartext `prior`,
+     leaves the ledger record without a `post_version`, so it cannot produce
+     this evidence: recording the qualification is refused
+     `evidence_not_idempotent` and the action cannot be made automatic.
 4. **Run the verifier twice** against a literal member of the action's allowed
    targets, with the target recovered (outcome `verified`) and not recovered
    (`not-recovered`), under the same verifier declaration:
@@ -2945,9 +3023,11 @@ curie cluster remediation-policy close-breaker <agent> <hook> <breaker id> \
   --reason "target repaired by hand, verifier checked"
 ```
 
-The reason is required and recorded with the closing operator. The breaker id is
-logged by the API when it opens (`remediation breaker opened breaker=<id>`) and
-is a `remediation_breakers` row; there is no list verb yet. Closing an already
+The reason is required and recorded with the closing operator. Find the breaker
+id with `curie cluster remediation-policy breakers <agent> <hook>` (`--state`
+is `open`, the default, `closed` or `all`; read only, newest first); the API
+also logs it when the breaker opens (`remediation breaker opened breaker=<id>`).
+Closing an already
 closed breaker changes nothing, and an id that is not under that hook's policy is
 `404`. Close a breaker only after you have looked at why the action did not
 recover.
@@ -2970,11 +3050,33 @@ in the policy route's approver set.
 `curie cluster actions list|show|undo|execution` read the ledger: a
 policy-executed record carries its authority, the generation, the delivery event
 and nomination ids, an `actor_kind` of `policy` and the verification outcome.
-Approval cards are posted by the worker to the route's card channel. Thread
-receipts for each nomination stage, a `remediation list|show` verb and the
-`curie.remediation.lifecycle` counter belong to plan task 13 and are not
-described here until they ship; until then read nomination rows from the
-database.
+Approval cards are posted by the worker to the route's card channel.
+
+`curie cluster remediation list [<agent>] [--state <state>] [--limit <N>]`
+(`curie local` at the local tier) and `curie cluster remediation show
+<nomination id>` read the operator receipt of each nomination, newest first
+(`GET /remediation-nominations`, `GET /remediation-nominations/{id}`). A receipt
+carries the nomination's state, its stage (`refused`, `nominated`,
+`approval_requested`, `executed`, the verification outcome, `escalated`,
+`undo_requested`, `undone`), its authority (`none`, `policy` or `approval`) and
+a code from the closed vocabulary
+([`apps/api/src/curie_api/remediation_receipts.py`](../apps/api/src/curie_api/remediation_receipts.py)).
+Reads use the platform key and need no operator principal, and a receipt never
+contains the arguments, the model's reason, a read result or the alert body.
+
+With remediation on, the worker also posts one **thread receipt** per stage
+reached, as separate messages in the protected delivery's thread after the
+investigation's reply
+([`apps/worker/src/curie_worker/remediation_receipts.py`](../apps/worker/src/curie_worker/remediation_receipts.py)).
+Each stage posts once across worker replicas and a failed post is retried. A
+message names only the stage, the action, the target key, the authority and a
+code, and names the action only when a policy generation of the hook declares
+it.
+
+Each posted receipt records the counter `curie.remediation.lifecycle` (closed
+attributes `stage`, `kind`, `authority` and `code`) and one span carrying the
+same attributes and the nomination id. No metric, span or log carries
+arguments, read values, the reason text or the alert body.
 
 ### The honest policy boundary
 
@@ -2997,7 +3099,7 @@ A chart upgrade is a **full** upgrade: anything the new chart does not render is
 deleted. For a Deployment that means a restart. For a StatefulSet it means the
 data too.
 
-### Connector action executor (0.13.0, unreleased)
+### Connector action executor (0.13.0)
 
 0.13.0 adds the connector action executor
 ([ARCHITECTURE.md](../ARCHITECTURE.md#the-action-ledger-and-the-connector-action-executor)):
@@ -3008,6 +3110,47 @@ path. It is off by default. `actionExecutor.enabled: true` (compose:
 worker; with the connector reconciler also on, the worker Role gains a
 single-object `get` on Deployments, and nothing else. Restores run on the
 cluster tier only.
+
+**Running the executor with the connector reconciler off.** The executor reads
+two things about the connector it acts through: that connector's Deployment, by
+name, and the digest the agent's in-force version renders it at (from the API).
+By default it reads them only beside the connector reconciler, so with
+`worker.connectorReconciler.enabled: false` every forward execution and restore
+is refused before dispatch. An installation that keeps the reconciler off on
+purpose, for example because its hosted connectors are pinned and managed
+outside Curie, can set:
+
+```yaml
+actionExecutor:
+  enabled: true
+  connectorReadsWithoutReconciler: true
+worker:
+  connectorReconciler:
+    enabled: false
+```
+
+The worker Role then gains one rule, `get` on `apps/deployments` in the release
+namespace, and none of the reconciler's `create`, `list`, `patch` or `delete`
+rules; the worker receives `CURIE_ACTION_EXECUTOR_CONNECTOR_READS=true` and
+`CURIE_CONNECTOR_APP_NAME`, and logs `connector reconcile loop off` when the
+executor starts. The reconcile loop is not started. With
+`worker.serviceAccount.create: false`, grant the same `get` to your own service
+account. The render fails with the executor off or the reconciler on, and the
+worker refuses to boot on the same combinations.
+
+The executor still acts only at the pinned digest. Your connector Deployment
+must carry the name and the pod template the API renders for the in-force
+version (`<release>-<agent>-mcp-<connector>`, the `server` image pinned by
+`@sha256:` and the caller proxy's gated set), and show a completed rollout. An
+execution is refused `connector_digest_unavailable`, with no sandbox claimed,
+when that Deployment cannot be read (a missing grant answers 403), is absent,
+is mid-rollout, or serves a different digest. A forward tool the caller proxy
+does not gate is refused `tool_not_grant_bound`.
+
+One thing stays tied to the reconciler: restore capability probes are requested
+from a reconcile pass, so in this mode none runs and no new restore capability
+is recorded: an action on a digest with no recorded capability is not undoable. Forward executions and the digest an
+action records do not depend on probes.
 
 **A connector tool named `restore` is unchanged unless the connector also
 serves `observe_version`.** A lone `restore` stays an ordinary tool: in the
@@ -3040,7 +3183,7 @@ What changes for existing installs:
 * `curie local actions` and `curie cluster actions` (`list`, `show`, `undo`,
   `execution`) are new; `execution <id>` is the receipt of a restore.
 
-### Automated remediation (0.13.0, unreleased)
+### Automated remediation (0.13.0)
 
 0.13.0 adds automated remediation for protected hooks
 ([Automated remediation](#automated-remediation),
@@ -3075,7 +3218,8 @@ below.
   `/agents/{agent}/hooks/{hook}/remediation-policy`, the qualification routes under
   `/agents/{agent}/remediation-qualifications/{id}`, the internal
   `POST /v1/internal/remediation/nominations` route, `POST /action-executions/{id}/samples`,
-  and `curie local|cluster remediation-policy`. The approvals `purpose` gains
+  and `curie local|cluster remediation-policy`, `remediation` and
+  `remediation-qualification`. The approvals `purpose` gains
   `remediation`, which resolves without waking a model.
 - **Nothing frozen changes.** `packages/aci-protocol` and `packages/plugin-format`
   are untouched, and no bundle needs to change.

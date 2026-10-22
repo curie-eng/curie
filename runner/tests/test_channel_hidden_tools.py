@@ -20,6 +20,7 @@ from curie_runner import __main__ as boot
 from curie_runner.__main__ import build_runner
 from curie_runner.config import CHANNEL_HIDDEN_TOOLS, RunnerConfig
 from curie_runner.fake import FakeModelSession
+from runner_boot_session import initialized_session_sync
 
 from .test_hosted_mcp_approval_catalog import (
     _HAS_CLAUDE_CLI,
@@ -47,7 +48,7 @@ def _config(tmp_path: Path, **extra: str) -> RunnerConfig:
 
 
 def _fake_denied(config: RunnerConfig) -> tuple[str, ...]:
-    session = build_runner(config, fake_model=True)._factory()
+    session = initialized_session_sync(build_runner(config, fake_model=True))
     assert isinstance(session, FakeModelSession)
     return session._disallowed_tools
 
@@ -60,7 +61,7 @@ def _sdk_denied(config: RunnerConfig, monkeypatch: pytest.MonkeyPatch) -> list[s
             captured.append(options)
 
     monkeypatch.setattr(boot, "ClaudeAgentSession", _Recorder)
-    build_runner(config, fake_model=False)._factory()
+    initialized_session_sync(build_runner(config, fake_model=False))
     assert len(captured) == 1
     return list(captured[0].disallowed_tools)
 

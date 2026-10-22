@@ -23,6 +23,7 @@ import pytest
 from _migration_support import IsolatedMigrationDb, alembic_config, sql_dicts, sql_rows
 from alembic import command
 from alembic.script import ScriptDirectory
+from curie_protected_hooks.schema_serving import load_window
 from sqlalchemy.exc import DBAPIError
 
 BELOW = "0093a"
@@ -72,12 +73,13 @@ def test_one_hand_written_revision_on_the_assumed_parent() -> None:
     """@spec AUTOMATED-REMEDIATION-22: one revision, ``HEAD`` on ``BELOW``; task 12's
     ``0095`` (remediation escalations) and task 16's ``0096`` (the tune
     refusal) are above it; ``0097`` (receipts) and ``0098`` (driver audit) follow it.
-    The shared connector store (``0109``, ADR 0239) is the single head.
+    The shared connector store (``0123``, ADR 0239), above directory identity
+    (``0122``), is the single head.
     """
 
     revision, down = _revision()
     assert (revision, down) == (HEAD, BELOW)
-    assert ScriptDirectory.from_config(alembic_config()).get_heads() == ["0109"]
+    assert ScriptDirectory.from_config(alembic_config()).get_heads() == [load_window().schema_head]
 
 
 def test_the_record_is_keyed_by_what_it_qualifies(

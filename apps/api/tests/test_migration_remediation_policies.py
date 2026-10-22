@@ -39,9 +39,10 @@ BELOW = "0086"
 # of the feature train follow the policy one, the OIDC login migration (#2908)
 # follows all of it, #2911's tenant scope (0101) follows that, #3831's reply
 # target (0102), tracker identity (0103) and the trigger label (0105) revisions
-# follow that, the train join revision (0108) follows them, and the shared
-# connector store (0109, ADR 0239) is last.
-HEAD = "0109"
+# follow that, the train join revision (0108) follows them, team sync state
+# (0120), agent access policies (0121) and directory identity (0122) follow
+# that, and the shared connector store (0123, ADR 0239) is last.
+HEAD = "0123"
 
 POLICY_COLUMNS = {"agent_id", "hook", "generation", "operation_id", "armed", "active", "updated_at"}
 GENERATION_COLUMNS = {

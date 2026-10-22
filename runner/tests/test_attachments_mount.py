@@ -41,6 +41,7 @@ from aiohttp import web
 from curie_runner import __main__ as boot
 from curie_runner.__main__ import build_runner
 from curie_runner.config import RunnerConfig
+from runner_boot_session import initialized_session_sync
 
 _BUDGET = '{"max_output_tokens_per_run": 10000, "max_usd_per_day": 1.0}'
 
@@ -143,7 +144,7 @@ def _options(
 ) -> Any:
     monkeypatch.setattr(boot, "ClaudeAgentSession", _CapturedSession)
     runner = build_runner(config, **kwargs)
-    session = runner._factory()  # noqa: SLF001 -- the boot wiring is the subject
+    session = initialized_session_sync(runner)  # noqa: SLF001 -- the boot wiring is the subject
     assert isinstance(session, _CapturedSession)
     return session.options
 

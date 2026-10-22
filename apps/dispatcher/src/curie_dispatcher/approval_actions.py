@@ -32,6 +32,7 @@ from slack_sdk.web import WebClient
 
 from .approval_principal import mint_chat_principal, mint_test_driver_principal
 from .config import DispatcherConfig
+from .identity import slack_evidence
 
 logger = logging.getLogger(__name__)
 
@@ -273,6 +274,19 @@ class NoteSubmission:
 _RESOLVE_TIMEOUT = httpx.Timeout(connect=0.4, read=1.4, write=0.3, pool=0.1)
 
 
+def approval_slack_evidence(body: dict[str, Any]) -> dict[str, Any] | None:
+    evidence = slack_evidence(body)
+    # Older payloads without sender-team evidence retain legacy behavior, but
+    # can never satisfy an IdP team. Never fill this from envelope team_id.
+    if evidence is None or not evidence.get("interaction_user_team_id"):
+        return None
+    return evidence
+
+
+def evidence_kwargs(evidence: dict[str, Any] | None) -> dict[str, Any]:
+    return {"slack": evidence} if evidence is not None else {}
+
+
 class ApprovalResolveClient:
     """Thin client for authenticated chat approval resolution."""
 
@@ -298,6 +312,7 @@ class ApprovalResolveClient:
         attested_channel: str,
         note: str | None = None,
         test_driver: bool = False,
+        slack: dict[str, Any] | None = None,
     ) -> ResolveOutcome:
         body: dict[str, Any] = {"decision": decision}
         # Only send the key when the approver typed something. The field is
@@ -306,17 +321,18 @@ class ApprovalResolveClient:
         # resolution_note the resume turn then interpolates as ``Note: .``.
         if note:
             body["note"] = note
-        headers = {
-            **self._headers,
-            "X-Curie-Approval-Principal": (
-                mint_test_driver_principal if test_driver else mint_chat_principal
-            )(
-                self._approval_chat_attester_secret,
-                subject=attested_user,
-                actor_channel=attested_channel,
-                approval_id=approval_id,
-            ),
+        mint_args: dict[str, Any] = {
+            "subject": attested_user,
+            "actor_channel": attested_channel,
+            "approval_id": approval_id,
         }
+        attestation = (
+            mint_test_driver_principal(self._approval_chat_attester_secret, **mint_args)
+            if test_driver else mint_chat_principal(
+                self._approval_chat_attester_secret, **mint_args, slack=slack
+            )
+        )
+        headers = {**self._headers, "X-Curie-Approval-Principal": attestation}
         inject_trace_context(headers)
         try:
             response = self._client.post(
@@ -714,6 +730,7 @@ def open_note_dialog(
         web_client=web_client,
         resolver=resolver,
         log=log,
+        slack=approval_slack_evidence(body),
     )
     # Every outcome is rendered, not just the success (#1085). The in-view error
     # channel the submit path uses cannot fire here -- there is no view, that is
@@ -788,6 +805,7 @@ def resolve_note_submission(
         attested_user=user,
         attested_channel=channel,
         note=note,
+        **evidence_kwargs(approval_slack_evidence(body)),
     )
     response_action = (
         None
@@ -956,6 +974,7 @@ def _resolve_and_render(
     web_client: WebClient,
     resolver: ApprovalResolveClient,
     log: logging.Logger,
+    slack: dict[str, Any] | None = None,
 ) -> ResolveOutcome:
     """Resolve one approval and hand the verdict to ``_render_outcome``.
 
@@ -972,6 +991,7 @@ def _resolve_and_render(
         attested_user=user,
         attested_channel=channel,
         note=note,
+        **evidence_kwargs(slack),
     )
     _render_outcome(
         approval_id=approval_id,
@@ -1115,6 +1135,7 @@ def resolve_approval_action(
         attested_user=user,
         attested_channel=channel,
         note=None,
+        **evidence_kwargs(approval_slack_evidence(body)),
     )
     return ImmediateClick(
         approval_id=approval_id,

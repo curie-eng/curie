@@ -405,6 +405,24 @@ _HTTP_OPERATIONS = [
     # Principal resolution and Slack identity reports (#2910, #3039, ADR 0198).
     "/identity/resolve",
     "/identity/slack-reports",
+    "/identity/admin/{tenant_id}/{resource}",
+    "/directory/binding",
+    "/directory/config/{tenant_id}",
+    "/directory/credentials",
+    "/directory/teams",
+    "/directory/teams/{team_id}",
+    "/directory/teams/{team_id}/snapshot",
+    "/directory/teams/{team_id}/attempt",
+    "/directory/people",
+    "/directory/people/status",
+    "/directory/namespaces",
+    "/identity/connect/{token}",
+    "/identity/connect/{token}/confirm",
+    # Team directory sync status (#4584, ADR 0220).
+    "/teams",
+    "/teams/metrics",
+    # An agent's invocation and approver teams (#4585, ADR 0220).
+    "/agents/{agent_id}/access-policy",
     # Shared connector store administration, operator and worker (ADR 0239).
     "/shared-connectors/applications",
     "/shared-connectors/applications/{application_id}",

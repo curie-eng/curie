@@ -26,12 +26,14 @@ import pytest
 from _migration_support import IsolatedMigrationDb, alembic_config, sql_dicts, sql_rows
 from alembic import command
 from alembic.script import ScriptDirectory
+from curie_protected_hooks.schema_serving import load_window
 from sqlalchemy.exc import IntegrityError
 
 BELOW = "0095"
 REVISION = "0096"
-# The shared connector store (0109, ADR 0239) is the single head.
-HEAD = "0109"
+# The application contract names the single compatible candidate head (the
+# shared connector store, 0123, ADR 0239).
+HEAD = load_window().schema_head
 TUNE_REFUSAL = "tune_execution_not_automated"
 REFUSAL_CHECK = "remediation_nominations_refusal_ck"
 

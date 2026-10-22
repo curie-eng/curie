@@ -202,7 +202,7 @@ parenthetical is what the Slack adapter maps onto each one:
 | `conversation_id` | canonical thread/conversation key (the thread ts) |
 | `author` | who authored the message (the Slack user id) |
 | `text` | message text |
-| `reply_handle` | where the reply is delivered: a `ReplyHandle` of `channel`, required nullable `placeholder`, and an optional per turn `endpoint`. It may be absent only on a cron turn with complete nonblank `hook_run` identity. Generated clients cannot enforce that cross field rule. The Slack adapter always supplies the ts of its already posted placeholder. The worker currently rejects targetless execution. |
+| `reply_handle` | where the reply is delivered: a `ReplyHandle` of `channel`, required nullable `placeholder`, and an optional per turn `endpoint`. It may be absent only on a cron turn with complete nonblank `hook_run` identity. Generated clients cannot enforce that cross field rule. The Slack adapter supplies the ts of its already posted placeholder, or `null` when posting the placeholder failed (see Dedupe below). The worker currently rejects targetless execution. |
 | `received_at` | ISO-8601 UTC timestamp the adapter received it |
 
 The worker reconstructs it with `from_stream_fields(fields)`, a module-level
@@ -223,6 +223,15 @@ acked, never re-posted, never re-enqueued). Chosen over stream-side dedupe becau
 it is O(1), TTL-bounded (no unbounded dedupe set to prune), and needs no Stream
 scan. Order is claim -> post placeholder -> `XADD`, so a duplicate never produces
 a second placeholder.
+
+A failed placeholder never costs the request. Bolt acks a Socket Mode envelope
+before the listener runs, so Slack does not normally redeliver an event whose
+handling failed. If posting the placeholder fails for any reason, the dispatcher
+logs a warning, keeps the claim, and still enqueues the turn with a `null`
+placeholder; the worker then posts the answer, or its failure notice, as a fresh
+reply in the thread. When the failure was ambiguous (a dropped connection,
+`fatal_error`), a placeholder may already be in the thread, and the answer then
+arrives as a separate reply below it.
 
 ## Reconnect supervision and shutdown
 

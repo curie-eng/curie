@@ -1,9 +1,10 @@
-"""Process entrypoint: read config, refuse to run half-configured, then serve.
+"""Process entrypoint: read config, load the provider, refuse to run half-configured.
 
 The boot gates require a deliberate sender filter, including explicit consent
-to a wildcard. That filter never authenticates a sender. Current AgentMail
-ingress is refused because Curie cannot verify a positive authentication
-verdict. In Kubernetes `CrashLoopBackOff` is the configuration error signal.
+to a wildcard. That filter never authenticates a sender: only a provider that
+verifies senders can open the channel (ADR 0228), and the built-in AgentMail
+provider does not, so an AgentMail install refuses all inbound mail. In
+Kubernetes `CrashLoopBackOff` is the configuration error signal.
 
 Run it with ``python -m curie_mail_adapter``.
 """
@@ -19,18 +20,38 @@ from curie_telemetry import bootstrap_service_telemetry
 
 from . import __version__
 from .adapter import MailAdapter
+from .agentmail import AgentMailProvider
 from .config import MailAdapterConfig
 from .egress import make_server
+from .provider import MailProvider, ProviderLoadError, provider_problems, resolve_factory
 
 logger = logging.getLogger(__name__)
 
 
+def load_provider(config: MailAdapterConfig) -> tuple[MailProvider | None, list[str]]:
+    """Build the configured mail provider, or say why it cannot boot.
+
+    Returns:
+        The provider, or None, and every problem found with it, each naming its
+        variable.
+    """
+    try:
+        factory = resolve_factory(config.mail_provider, lambda: AgentMailProvider(config))
+        provider = factory()
+    except ProviderLoadError as error:
+        return None, [str(error)]
+    except Exception as error:  # noqa: BLE001 - a broken factory is a boot error
+        return None, [
+            f"CURIE_MAIL_PROVIDER={config.mail_provider!r}: building the provider failed: "
+            f"{type(error).__name__}"
+        ]
+    return provider, provider_problems(provider)
+
+
 def boot_problems(config: MailAdapterConfig) -> list[str]:
-    """Every reason this configuration cannot be served, each naming its env var."""
+    """Every reason the neutral configuration cannot be served, each naming its env var."""
     problems = []
     for env_name, credential_value in (
-        ("AGENTMAIL_INBOX", config.agentmail_inbox),
-        ("AGENTMAIL_API_KEY", config.agentmail_api_key),
         ("CURIE_CHANNEL_TOKEN", config.channel_token),
         ("CURIE_EGRESS_SECRET", config.egress_secret),
     ):
@@ -84,8 +105,9 @@ def main() -> None:
     try:
         config = MailAdapterConfig()
 
-        problems = boot_problems(config)
-        if problems:
+        provider, problems = load_provider(config)
+        problems = problems + boot_problems(config)
+        if problems or provider is None:
             for problem in problems:
                 logger.error("%s", problem)
             # Inside the outer try on purpose: the outer `finally` force-flushes
@@ -93,12 +115,19 @@ def main() -> None:
             # the one log an operator most needs to have been exported.
             raise SystemExit(1)
 
-        adapter = MailAdapter(config)
+        try:
+            adapter = MailAdapter(config, provider=provider)
+        except RuntimeError as error:
+            # The state file belongs to another provider: ids from two mail
+            # services must never mix, so this is a configuration error.
+            logger.error("%s", error)
+            raise SystemExit(1) from error
         server = make_server(adapter, config.port)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         logger.info(
-            "mail adapter starting: kind=email port=%s ingress_enabled=%s",
+            "mail adapter starting: kind=email port=%s provider=%s ingress_enabled=%s",
             server.server_address[1],
+            provider.name,
             config.ingress_enabled,
         )
 

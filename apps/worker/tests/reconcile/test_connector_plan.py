@@ -8,6 +8,7 @@ that keeps the loop from rewriting the world forever.
 
 from __future__ import annotations
 
+import copy
 from typing import Any
 
 from curie_worker.connector_agent import own
@@ -149,6 +150,57 @@ def test_a_mixed_state_converges_in_one_plan() -> None:
 # The reconciler inherits the locked digest -- it never resolves a build
 # itself (ADR 0113, #1690)
 # --------------------------------------------------------------------------- #
+def test_cli_secret_digest_survives_adoption_then_converges() -> None:
+    """A CLI apply has no declaration hash and an extra pod-template annotation.
+
+    The first plan adopts it. Once the declaration hash matches, that
+    annotation is not drift. A real declared label change still is.
+    """
+
+    digest_key = "curie.dev/connector-secret-digest"
+    want = obj(
+        "Deployment",
+        "dep",
+        owner="a",
+        spec={
+            "replicas": 1,
+            "template": {"metadata": {"labels": {"app.kubernetes.io/component": "connector"}}},
+        },
+    )
+    want["metadata"]["labels"]["app.kubernetes.io/component"] = "connector"
+    created = obj(
+        "Deployment",
+        "dep",
+        owner="a",
+        spec={
+            "replicas": 1,
+            "template": {
+                "metadata": {
+                    "labels": {"app.kubernetes.io/component": "connector"},
+                    "annotations": {digest_key: "present"},
+                }
+            },
+        },
+    )
+    created["metadata"]["labels"]["app.kubernetes.io/component"] = "connector"
+    adoption = plan(desired=[want], live=[created], agent="a")
+    if not adoption.apply or ("Deployment", "dep") not in adoption.drifted:
+        raise AssertionError("a CLI object without a declaration hash was not adopted")
+
+    adopted = live(copy.deepcopy(want))
+    adopted["spec"]["template"]["metadata"]["annotations"] = {digest_key: "present"}
+    settled = plan(desired=[want], live=[adopted], agent="a")
+    if settled.apply or settled.drifted:
+        raise AssertionError("the undeclared pod-template annotation was treated as drift")
+
+    edited = live(copy.deepcopy(want))
+    edited["spec"]["template"]["metadata"]["annotations"] = {digest_key: "present"}
+    edited["metadata"]["labels"]["app.kubernetes.io/component"] = "edited"
+    corrected = plan(desired=[want], live=[edited], agent="a")
+    if not corrected.apply or corrected.drifted != [("Deployment", "dep")]:
+        raise AssertionError("declared label drift was not corrected")
+
+
 def test_a_built_connectors_desired_object_carries_the_locked_digest() -> None:
     """`apply_lock` is the single resolution point (Section 3,
     `connector_agent.py:62`: the worker "consumes what the API returns ...

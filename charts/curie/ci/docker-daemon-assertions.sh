@@ -214,12 +214,18 @@ for rule in role.get("rules", []):
                 triples.add((g, r, v))
 want_triples = set()
 for g, r, verbs in (("", "pods", "create get list delete"), ("", "pods/log", "get"),
+                    ("", "pods/portforward", "create get"),
                     ("", "services", "create get list delete"), ("", "secrets", "create delete"),
                     ("networking.k8s.io", "networkpolicies", "create get list delete")):
+    if r in ("pods/exec", "pods/proxy"):
+        fail(f"Role must not grant {r}")
     for v in verbs.split():
         want_triples.add((g, r, v))
 if triples != want_triples:
     fail(f"Role rules differ: extra {sorted(triples - want_triples)} missing {sorted(want_triples - triples)}")
+for absent in ("pods/exec", "pods/proxy"):
+    if any(resource == absent for _, resource, _ in triples):
+        fail(f"Role must not grant {absent}")
 binding = find("RoleBinding", role_name)
 in_ns(binding, ns)
 if binding["roleRef"] != {"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": role_name}:

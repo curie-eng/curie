@@ -261,7 +261,11 @@ def test_rejected_report_of_a_blocked_check_fails_boot_before_any_session(
     with pytest.raises(RuntimeError, match="preflight report was not accepted"):
         anyio.run(run)
 
-    assert observed.runner is None
+    # build_runner returns a runner; start() is what fails (#4777), so no model
+    # session was constructed or connected and the runner never became ready.
+    assert observed.runner is not None
+    assert observed.runner.ready is False
+    assert "model_started" not in observed.events
     assert observed.events == ["verification_posted"]
     assert observed.usage == []
 

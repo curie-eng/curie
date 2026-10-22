@@ -46,6 +46,7 @@ import json
 import logging
 import os
 import shutil
+import socket
 import subprocess
 import tarfile
 import tempfile
@@ -54,6 +55,7 @@ import urllib.error
 import urllib.request
 import uuid
 from collections.abc import Mapping
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -99,13 +101,19 @@ from .types import (
     MANAGED_BY_LABEL,
     MANAGED_BY_VALUE,
     ClaimView,
+    DaemonObjectKind,
+    DaemonObjectView,
+    ListableDaemonKind,
     OperatingMode,
     QuotaRejection,
     SandboxError,
     SandboxTermination,
     SandboxView,
+    ToolDaemonMount,
     filter_agent_child_env,
 )
+
+_NO_TOOL_DAEMON = "the Docker substrate runs no per-claim tool daemon (ADR 0217)"
 
 #: The overall deadline for redeeming one boot's attachment references,
 #: current and earlier files together, measured on ``time.monotonic``. Before
@@ -526,9 +534,13 @@ class DockerSandboxClient:
         env: dict[str, str] | None = None,
         labels: dict[str, str] | None = None,
         runner_resources: dict[str, Any] | None = None,
+        deadline: float,  # noqa: ARG002 -- each docker call carries its own timeout.
         agent_name: str | None = None,  # noqa: ARG002 -- naming is a cluster concern.
         executor_secret_names: frozenset[str] | None = None,
+        tool_daemon: ToolDaemonMount | None = None,
     ) -> None:
+        if tool_daemon is not None:
+            raise SandboxError(_NO_TOOL_DAEMON)
         env = filter_agent_child_env(env)
         executor = executor_secret_names is not None
         if executor_secret_names is not None:
@@ -759,6 +771,45 @@ class DockerSandboxClient:
             if view is not None:
                 views.append(view)
         return views
+
+    # The Docker substrate has no repository runner pools, so the substrate
+    # never provisions a per-claim tool daemon here (ADR 0217).
+
+    def create_daemon_object(
+        self, namespace: str, manifest: Mapping[str, Any], *, request_timeout_seconds: float
+    ) -> str:
+        raise SandboxError(_NO_TOOL_DAEMON)
+
+    def list_daemon_objects(
+        self,
+        namespace: str,
+        kind: ListableDaemonKind,
+        *,
+        label_selector: str,
+        request_timeout_seconds: float,
+    ) -> list[DaemonObjectView]:
+        raise SandboxError(_NO_TOOL_DAEMON)
+
+    def delete_daemon_object(
+        self,
+        namespace: str,
+        kind: DaemonObjectKind,
+        name: str,
+        *,
+        uid: str,
+        request_timeout_seconds: float,
+    ) -> None:
+        raise SandboxError(_NO_TOOL_DAEMON)
+
+    def get_daemon_pod(
+        self, namespace: str, name: str, *, request_timeout_seconds: float
+    ) -> DaemonObjectView | None:
+        raise SandboxError(_NO_TOOL_DAEMON)
+
+    def open_daemon_stream(
+        self, namespace: str, pod: str, port: int, *, timeout_seconds: float
+    ) -> AbstractContextManager[socket.socket]:
+        raise SandboxError(_NO_TOOL_DAEMON)
 
     def reap_claim_templates(self, *, keep: set[str], created_before: datetime) -> list[str]:
         removed: list[str] = []

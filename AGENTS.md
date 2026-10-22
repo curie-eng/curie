@@ -203,6 +203,10 @@ is an exception to the CLI entry point guidance in `CLAUDE.md`.
    choose unused custom ports and retry allocation on a bind collision, or let
    Docker allocate ports and discover them with `docker compose port` before
    starting consumers. Do not assume an unused port probe reserves the port.
+   Keep chosen ports below 49152: short-lived local listeners take ports in
+   the macOS ephemeral range (49152-65535), and one that lands on the local
+   reply stub port (`CURIE_LOCAL_STUB_PORT`) makes `curie local message`
+   refuse to start (#4823).
    For a full Python baseline, replace every published backing service port:
 
    ```yaml

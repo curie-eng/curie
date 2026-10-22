@@ -266,6 +266,8 @@ kc rollout status "deployment/$FULLNAME-worker" --timeout=300s >/dev/null
 # The driver captures credentials and arbitrary tool output privately. Only
 # fixed assertions and numeric observations can reach the public test log.
 cat >"$WORKDIR/driver.py" <<'PY'
+import calendar
+from datetime import datetime
 import json
 import os
 import pathlib
@@ -283,7 +285,22 @@ children = []
 
 def run(args, *, timeout=30):
     result = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
-    assert result.returncode == 0, "an owned runtime observation or setup command failed"
+    verb = " ".join(args[5:8]) if len(args) > 5 else "command"
+    detail = ""
+    for line in reversed((result.stderr or "").splitlines()):
+        text = line.strip()
+        if not text:
+            continue
+        cleaned = []
+        for character in text:
+            cleaned.append(character if character.isalnum() or character in " _.:=" else " ")
+        detail = " ".join("".join(cleaned).split())[:160]
+        break
+    assert result.returncode == 0, (
+        "an owned runtime observation or setup command failed: "
+        + verb + " exit " + str(result.returncode)
+        + ((" detail " + detail) if detail else "")
+    )
     return result.stdout
 
 
@@ -333,6 +350,20 @@ def probe():
     return json.loads(run([*kube, "exec", "deployment/" + fullname + "-worker", "--", "python3", "-c", probe_code]))
 
 
+def counts_against_quota(pod, now):
+    # Kubernetes v1.31 QuotaV1Pod also excludes pods past their deletion grace.
+    # https://github.com/kubernetes/kubernetes/blob/v1.31.0/pkg/quota/v1/evaluator/core/pods.go
+    if pod.get("status", {}).get("phase") in {"Failed", "Succeeded"}:
+        return False
+    metadata = pod["metadata"]
+    deleted = metadata.get("deletionTimestamp")
+    grace = metadata.get("deletionGracePeriodSeconds")
+    if deleted is not None and grace is not None:
+        if now > datetime.fromisoformat(deleted).timestamp() + grace:
+            return False
+    return True
+
+
 def observe():
     quota = get("resourcequota", fullname + "-sandbox-quota")
     assert quota["spec"]["hard"]["pods"] == "2", "sandbox pod quota changed from two"
@@ -341,12 +372,9 @@ def observe():
     priority = quota["spec"]["scopeSelector"]["matchExpressions"][0]["values"][0]
     pods = {pod["metadata"]["uid"]: pod for pod in get("pods")["items"]
             if pod["spec"].get("priorityClassName") == priority}
-    # Kubernetes' compute quota `pods` counts only nonterminal Pods; Failed
-    # and Succeeded objects can remain after they stop consuming quota.
-    # https://kubernetes.io/docs/concepts/policy/resource-quotas/#compute-resource-quota
     # Preserve every observed UID below for reclamation and active-route checks.
-    chargeable = [pod for pod in pods.values()
-                  if pod.get("status", {}).get("phase") not in {"Failed", "Succeeded"}]
+    now = time.time()
+    chargeable = [pod for pod in pods.values() if counts_against_quota(pod, now)]
     if len(chargeable) > 2:
         counts = {phase: 0 for phase in ("Pending", "Running", "Succeeded", "Failed", "Unknown", "other")}
         for pod in pods.values():
@@ -549,6 +577,122 @@ assert len(users) == 2 and users[0] == sys.argv[1] and users[1] == sys.argv[2], 
     print("OK: a reclaimed completed thread booted a new runner, resumed history, and retained both turns exactly once")
 
 
+def burst_sixteen():
+    started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    turns = [start(f"burst16-{index}", "held-open capacity probe burst16 " + str(index))
+             for index in range(16)]
+    def quota_pods():
+        quota = get("resourcequota", fullname + "-sandbox-quota")
+        assert quota["spec"]["hard"]["pods"] == "2", "sandbox pod quota changed from two"
+        quota_used = int(quota.get("status", {}).get("used", {}).get("pods", 0))
+        assert quota_used <= 2, "observed quota usage exceeded two"
+        priority = quota["spec"]["scopeSelector"]["matchExpressions"][0]["values"][0]
+        now = time.time()
+        pods = [pod for pod in get("pods")["items"]
+                if pod["spec"].get("priorityClassName") == priority
+                and counts_against_quota(pod, now)]
+        assert len(pods) <= 2, "observed more than two chargeable sandbox pods"
+
+    deadline = time.monotonic() + 320
+    while True:
+        completed = [finished(turn) for turn in turns]
+        quota_pods()
+        if all(completed):
+            break
+        assert time.monotonic() < deadline, "sixteen-thread burst exceeded its bounded runtime"
+        time.sleep(0.2)
+    last = None
+    for _attempt in range(5):
+        try:
+            observe()
+            break
+        except AssertionError as error:
+            last = error
+            if "command failed" not in str(error):
+                raise
+            time.sleep(2)
+    else:
+        raise last
+    logs = ""
+    last = None
+    for _attempt in range(5):
+        try:
+            logs = run([*kube, "logs", "deployment/" + fullname + "-worker", "--since-time=" + started], timeout=60)
+            break
+        except AssertionError as error:
+            last = error
+            time.sleep(2)
+    else:
+        raise last
+    parks, wakes = {}, {}
+    saw_capacity_text = False
+    for line in logs.splitlines():
+        if "capacity wait parked" not in line and "capacity wait woke" not in line:
+            continue
+        saw_capacity_text = True
+        start_json = line.find("{")
+        end_json = line.rfind("}")
+        if start_json < 0 or end_json <= start_json:
+            raise AssertionError("malformed capacity wait log")
+        try:
+            payload = json.loads(line[start_json:end_json + 1])
+        except json.JSONDecodeError as error:
+            raise AssertionError("malformed capacity wait log") from error
+        if not isinstance(payload, dict):
+            raise AssertionError("malformed capacity wait log")
+        stamp = payload.get("timestamp")
+        message = payload.get("message")
+        if not isinstance(stamp, str) or not isinstance(message, str) or "T" not in stamp:
+            raise AssertionError("malformed capacity wait timestamp")
+        parked_line = message.startswith("capacity wait parked event_id=")
+        woke_line = message.startswith("capacity wait woke event_id=")
+        if parked_line == woke_line:
+            raise AssertionError("malformed capacity wait event id")
+        event_id = message.split("event_id=", 1)[1].split()[0]
+        if not event_id or any(character.isspace() for character in event_id):
+            raise AssertionError("malformed capacity wait event id")
+        whole, _, fraction = stamp.partition(".")
+        try:
+            seconds = calendar.timegm(time.strptime(whole, "%Y-%m-%dT%H:%M:%S"))
+        except ValueError as error:
+            raise AssertionError("malformed capacity wait timestamp") from error
+        if fraction:
+            digits = ""
+            for character in fraction:
+                if character.isdigit():
+                    digits += character
+                else:
+                    break
+            if not digits:
+                raise AssertionError("malformed capacity wait timestamp")
+            seconds += int(digits[:6]) / 1_000_000
+        bucket = parks if parked_line else wakes
+        bucket.setdefault(event_id, []).append(seconds)
+    if saw_capacity_text and not parks:
+        raise AssertionError("malformed capacity wait log")
+    assert parks, "sixteen-thread burst recorded no park"
+    unmatched = 0
+    longest = 0.0
+    for event_id, park_times in parks.items():
+        wake_times = wakes.get(event_id, [])
+        cursor = 0
+        for park_time in park_times:
+            while cursor < len(wake_times) and wake_times[cursor] < park_time:
+                cursor += 1
+            if cursor >= len(wake_times):
+                unmatched += 1
+                continue
+            longest = max(longest, wake_times[cursor] - park_time)
+            cursor += 1
+    assert unmatched == 0, "a park had no later wake"
+    assert longest <= 12, "a park to wake interval exceeded 12 seconds"
+    print("parked_turn_burst_16")
+    print("finalized_16")
+    print("park_observed")
+    print("unmatched_parks_0")
+    print("max_park_wake_s")
+
+
 try:
     clean_turns, clean_routes, clean_pods = batch("clean", 6, expect_pressure=True)
     history_followup(clean_turns, clean_routes, clean_pods)
@@ -567,6 +711,8 @@ try:
     assert max(route["expires"] for route in stale.values()) < min(route["expires"] for route in reachable), "old unreadable routes do not precede the safe idle candidate"
     batch("stale", 6, stale=stale, expect_pressure=True)
     print("OK: at least four unreadable older routes remained intact ahead of safely reclaimed completed routes")
+    clear_owned_sandboxes()
+    burst_sixteen()
 except AssertionError as error:
     print("FAIL: " + str(error), file=sys.stderr)
     sys.exit(1)

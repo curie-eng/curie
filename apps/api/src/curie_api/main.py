@@ -26,6 +26,7 @@ from curie_telemetry import (
 )
 from fastapi import FastAPI, HTTPException, Request
 from opentelemetry.trace import SpanKind, StatusCode
+from starlette.responses import JSONResponse
 from starlette.routing import Match
 
 from curie_api.crud import agents as crud_agents
@@ -58,6 +59,7 @@ from .resumereconciler import ResumeReconciler
 from .routers import (
     action_executions,
     actions,
+    agent_access,
     agents,
     approval_recovery,
     approvals,
@@ -71,6 +73,7 @@ from .routers import (
     control,
     deploy_targets,
     deployments,
+    directory,
     evals,
     factory_status,
     forge_credential_health,
@@ -81,6 +84,8 @@ from .routers import (
     hook_source_policy,
     hooks,
     identity,
+    identity_admin,
+    identity_connect,
     memory,
     observability,
     provider_installations,
@@ -95,6 +100,7 @@ from .routers import (
     schedules,
     shared_connectors,
     state,
+    teams,
     thread_attachments,
     turn_progress,
     work_item_issue,
@@ -598,7 +604,12 @@ def create_app() -> FastAPI:
     app.include_router(channels.router)
     app.include_router(provider_installations.router)
     app.include_router(channel_identities.router)
+    app.include_router(identity_admin.router)
+    app.include_router(directory.router)
+    app.include_router(identity_connect.router)
     app.include_router(identity.router)
+    app.include_router(teams.router)
+    app.include_router(agent_access.router)
     # Shared connector applications, operator and worker halves (ADR 0239).
     app.include_router(shared_connectors.router)
     app.include_router(shared_connectors.internal_router)
@@ -639,7 +650,37 @@ def create_app() -> FastAPI:
             ) as span:
                 if diagnostic is not None:
                     span.add_event(diagnostic)
-                response = await call_next(request)
+                from . import identity_fence
+
+                fenced = False
+                if identity_fence.protects(request.method, request.url.path):
+                    try:
+                        fenced = await identity_fence.prepare(request)
+                    except TimeoutError:
+                        status_code = 408
+                        return JSONResponse(
+                            {"detail": "request body timeout"},
+                            status_code=408,
+                            headers={
+                                "Cache-Control": "private, no-store",
+                                "Referrer-Policy": "no-referrer",
+                            },
+                        )
+                    except HTTPException as error:
+                        status_code = error.status_code
+                        return JSONResponse(
+                            {"detail": error.detail},
+                            status_code=error.status_code,
+                            headers={
+                                "Cache-Control": "private, no-store",
+                                "Referrer-Policy": "no-referrer",
+                            },
+                        )
+                if fenced:
+                    async with identity_fence.mutation(app.state.sessionmaker, app.state.valkey):
+                        response = await call_next(request)
+                else:
+                    response = await call_next(request)
                 status_code = response.status_code
                 if status_code >= 500 and hasattr(span, "set_status"):
                     span.set_status(StatusCode.ERROR)

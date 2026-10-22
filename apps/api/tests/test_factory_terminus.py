@@ -96,6 +96,7 @@ def test_failed_comment_leads_with_a_plain_sentence_not_the_cause_code() -> None
         "runner_failed",
         "approval_create_failed",
         "no_pull_request",
+        "revision_unchanged",
         "execution_deadline",
         "capacity_wait_expired",
         "owner_lost",
@@ -108,6 +109,7 @@ def test_failed_comment_leads_with_a_plain_sentence_not_the_cause_code() -> None
         "ci_timeout",
         "ci_unverified",
         "merge_conflict",
+        "pr_closed",
         "ci_fix_unpublished",
     ],
 )
@@ -710,7 +712,10 @@ def test_credit_exhausted_finish_comments_the_redacted_provider_message(
     assert key not in body
 
 
-@pytest.mark.parametrize(("number", "cause"), [(9291, "early_stop"), (9292, "no_pull_request")])
+@pytest.mark.parametrize(
+    ("number", "cause"),
+    [(9291, "early_stop"), (9292, "no_pull_request"), (9300, "revision_unchanged")],
+)
 def test_an_unpublished_finish_comments_the_agents_redacted_last_message(
     admitted: Any, number: int, cause: str
 ) -> None:
@@ -749,7 +754,7 @@ def test_an_unpublished_finish_comments_the_agents_redacted_last_message(
     _assert_one_final_comment([c["body"] for c in sink.comments], row["id"])
 
 
-@pytest.mark.parametrize("cause", ["early_stop", "approval_create_failed"])
+@pytest.mark.parametrize("cause", ["early_stop", "approval_create_failed", "revision_unchanged"])
 def test_an_early_stop_finish_defers_to_an_in_flight_publication(admitted: Any, cause: str) -> None:
     """#3128: like ``no_pull_request``, publication owns the terminus."""
 
@@ -1637,7 +1642,7 @@ def _assert_one_final_comment(bodies: list[str], request_id: uuid.UUID) -> str:
     return marked[0]
 
 
-@pytest.mark.parametrize("cause", ["no_pull_request", "early_stop"])
+@pytest.mark.parametrize("cause", ["no_pull_request", "early_stop", "revision_unchanged"])
 @pytest.mark.parametrize("padding", ["", " \n"])
 def test_a_mention_with_no_changes_completes_naming_the_open_pull_request(
     admitted: Any, cause: str, padding: str
@@ -1695,7 +1700,7 @@ def test_a_mention_with_no_changes_completes_naming_the_open_pull_request(
     assert sink.ci_observations == []
 
 
-@pytest.mark.parametrize("cause", ["no_pull_request", "early_stop"])
+@pytest.mark.parametrize("cause", ["no_pull_request", "early_stop", "revision_unchanged"])
 def test_a_review_revision_with_no_changes_completes_in_its_thread(
     admitted: Any, cause: str
 ) -> None:
@@ -1736,7 +1741,7 @@ def test_a_review_revision_with_no_changes_completes_in_its_thread(
     assert len(_posts(sink)) == 1
 
 
-@pytest.mark.parametrize("cause", ["no_pull_request", "early_stop"])
+@pytest.mark.parametrize("cause", ["no_pull_request", "early_stop", "revision_unchanged"])
 @pytest.mark.parametrize(
     "case",
     [
@@ -1833,7 +1838,7 @@ def test_a_no_change_reply_outside_an_open_follow_up_still_fails(
     assert "curie-factory:pr-open" not in sink.issue_labels[number]
 
 
-@pytest.mark.parametrize("cause", ["no_pull_request", "early_stop"])
+@pytest.mark.parametrize("cause", ["no_pull_request", "early_stop", "revision_unchanged"])
 def test_a_relabel_with_no_changes_on_an_adopted_pull_request_completes(
     admitted: Any, cause: str
 ) -> None:
@@ -1981,7 +1986,7 @@ def test_a_relabel_revision_on_an_adopted_pull_request_settles_through_the_ci_ga
     assert {row["id"]: row for row in _requests(number)}[second["id"]]["status"] == "running"
 
 
-@pytest.mark.parametrize("cause", ["no_pull_request", "early_stop"])
+@pytest.mark.parametrize("cause", ["no_pull_request", "early_stop", "revision_unchanged"])
 def test_a_no_change_follow_up_defers_to_its_in_flight_publication(
     admitted: Any, cause: str
 ) -> None:
@@ -2006,7 +2011,7 @@ def test_a_no_change_follow_up_defers_to_its_in_flight_publication(
     assert all(notice["terminal_cause"] is None for notice in _notices(revision))
 
 
-@pytest.mark.parametrize("cause", ["no_pull_request", "early_stop"])
+@pytest.mark.parametrize("cause", ["no_pull_request", "early_stop", "revision_unchanged"])
 def test_a_no_change_follow_up_cannot_complete_after_its_execution_deadline(
     admitted: Any, cause: str
 ) -> None:
@@ -2053,7 +2058,10 @@ def test_a_no_change_follow_up_cannot_complete_after_its_execution_deadline(
 
 
 @pytest.mark.parametrize("stale", ["work_item", "request"])
-def test_a_no_change_follow_up_preserves_stale_version_fencing(admitted: Any, stale: str) -> None:
+@pytest.mark.parametrize("cause", ["no_pull_request", "revision_unchanged"])
+def test_a_no_change_follow_up_preserves_stale_version_fencing(
+    admitted: Any, stale: str, cause: str
+) -> None:
     """Both optimistic versions fence the unchanged completion at the state boundary."""
 
     from curie_api.workitems.lifecycle import WorkItemConflict, terminalize_execution
@@ -2082,7 +2090,7 @@ def test_a_no_change_follow_up_preserves_stale_version_fencing(admitted: Any, st
                     expected_work_item_version=versions["work_version"] - (stale == "work_item"),
                     expected_request_version=versions["request_version"] - (stale == "request"),
                     status="failed",
-                    cause="no_pull_request",
+                    cause=cause,
                     detail="No changes needed: the request is already covered.",
                     ci_fix_round=None,
                     extra_where=(),

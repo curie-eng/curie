@@ -29,6 +29,7 @@ from _support import (
     wait_until,
 )
 from curie_mail_adapter.adapter import MailAdapter
+from curie_mail_adapter.agentmail import AgentMailProvider
 
 FAILURE_PREFIX = "poll: list failed"
 
@@ -118,7 +119,17 @@ def test_a_long_credential_bearing_cause_is_redacted_and_truncated(
             f"so this test no longer exercises redaction: {leaked!r}"
         )
 
-    cause = adapter._transport_cause(0, {"error": leaked})
+    # Two layers (ADR 0228): the provider owes a bounded cause without its own
+    # credential, and the neutral adapter redacts its credentials and bounds it
+    # again before logging, in case a provider does not.
+    provider = adapter.provider
+    assert isinstance(provider, AgentMailProvider)
+    failure = provider._failure(0, {"error": leaked})
+    assert failure.kind == "unreachable"
+    assert AGENTMAIL_API_KEY not in failure.cause, (
+        f"the provider's own credential survived its redaction: {failure.cause!r}"
+    )
+    cause = adapter._bounded_cause(failure.cause)
 
     for credential in (AGENTMAIL_API_KEY, CHANNEL_TOKEN, EGRESS_SECRET):
         assert credential not in cause, f"a credential survived redaction: {cause!r}"
@@ -127,9 +138,13 @@ def test_a_long_credential_bearing_cause_is_redacted_and_truncated(
         f"the cause is unbounded at {len(cause)} characters: {cause!r}"
     )
     assert cause.endswith("..."), f"the character budget never truncated: {cause!r}"
-    assert adapter._transport_cause(500, {"error": leaked}) == "http_500", (
+    assert provider._failure(500, {"error": leaked}).cause == "http_500", (
         "a nonzero status was not rendered as its bounded status-only token"
     )
+    hostile = adapter._bounded_cause(f"{CHANNEL_TOKEN} {EGRESS_SECRET} " + "x" * 400)
+    for credential in (CHANNEL_TOKEN, EGRESS_SECRET):
+        assert credential not in hostile, f"the adapter's own pass let {credential!r} through"
+    assert len(hostile) <= adapter_module.CAUSE_MAX_CHARS + 3
 
 
 @pytest.mark.parametrize("http_status", [403, 500])
@@ -158,7 +173,11 @@ def test_a_provider_error_body_is_replaced_by_a_bounded_status_token(
     with caplog.at_level(logging.WARNING, logger="curie_mail_adapter.adapter"):
         observed_status = adapter.poll_once()
 
-    assert observed_status == http_status, (
+    # The provider maps the status to a neutral kind (a 4xx is ``refused``, a 5xx
+    # ``server_error``), and the discovery status stands for that kind; the
+    # exact HTTP code survives only as the bounded cause token below.
+    expected_status = 400 if 400 <= http_status < 500 else http_status
+    assert observed_status == expected_status, (
         f"the injected provider failure did not surface, got {observed_status}"
     )
     message = _failure_record(caplog)

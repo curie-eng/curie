@@ -1,6 +1,6 @@
-"""Migration 0109 adds the shared connector store (ADR 0239, AC1).
+"""Migration 0123 adds the shared connector store (ADR 0239, AC1).
 
-Expand only, on 0108. The upgrade creates six tables in ``curie`` with row
+Expand only, on 0122. The upgrade creates six tables in ``curie`` with row
 level security enabled (not forced, so the owning API role is unaffected), the
 four SECURITY DEFINER refresh and reseal functions with no PUBLIC execute, and
 triggers that refuse changes to pinned columns even from the owner. The
@@ -99,19 +99,19 @@ def _store_present() -> None:
     assert set(SHARED_FUNCTIONS) <= shared_function_names()
 
 
-def test_0109_is_an_expand_revision_on_0108() -> None:
-    revision = ScriptDirectory.from_config(alembic_config()).get_revision("0109")
+def test_0123_is_an_expand_revision_on_0122() -> None:
+    revision = ScriptDirectory.from_config(alembic_config()).get_revision("0123")
     assert revision is not None
-    assert revision.down_revision == "0108"
-    assert json.loads(REVISION_KINDS.read_text())["0109"] == "expand"
+    assert revision.down_revision == "0122"
+    assert json.loads(REVISION_KINDS.read_text())["0123"] == "expand"
 
 
 def test_upgrade_creates_the_store_with_row_level_security_policies_and_named_keys(
     isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
-    isolated_migration_db.at("0108")
+    isolated_migration_db.at("0122")
     _store_absent()
-    command.upgrade(alembic_config(), "0109")
+    command.upgrade(alembic_config(), "0123")
     _store_present()
 
     rows = sql_dicts(
@@ -198,7 +198,7 @@ def _exercise_pinned_columns(owner: PgSession) -> None:
         owner.execute(
             "INSERT INTO curie.agents (id, name) VALUES ($1, $2)",
             agent_id,
-            f"mig-0109-{agent_id.hex[:12]}",
+            f"mig-0123-{agent_id.hex[:12]}",
         )
     application = uuid.uuid4()
     installation = random_installation()
@@ -411,7 +411,7 @@ def test_downgrade_drops_the_store_and_its_bundled_roles_and_upgrade_restores_it
 
     config = alembic_config()
     try:
-        command.downgrade(config, "0108")
+        command.downgrade(config, "0122")
         _store_absent()
         assert not role_exists(role)
         assert role_exists(operator_role)
@@ -471,7 +471,7 @@ def test_a_non_superuser_owner_upgrades_provisions_and_downgrades(
         assert role_exists(bundled)
         assert connect_as(dsn) == bundled
 
-        command.downgrade(config, "0108")
+        command.downgrade(config, "0122")
         _store_absent()
         assert not role_exists(bundled)
 

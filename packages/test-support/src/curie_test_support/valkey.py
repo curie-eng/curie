@@ -71,6 +71,13 @@ def connect_or_skip(*, decode_responses: bool = True) -> redis.Redis:
         client.ping()
     except redis.exceptions.RedisError as exc:
         if "CI_REQUIRE_VALKEY_TESTS" in os.environ:
+            if isinstance(
+                exc, (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError)
+            ) and not isinstance(exc, redis.exceptions.AuthenticationError):
+                exc.add_note(
+                    f"could not connect to Valkey at {VALKEY_HOST}:{VALKEY_PORT}: "
+                    "start the compose stack"
+                )
             raise
         pytest.skip(f"Valkey not reachable at {VALKEY_HOST}:{VALKEY_PORT}: {exc}")
     return client

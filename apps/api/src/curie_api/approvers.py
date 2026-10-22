@@ -67,7 +67,7 @@ class ApproverSet(Protocol):
     """
 
     @property
-    def audit_name(self) -> str: ...
+    def audit_name(self) -> str | None: ...
 
     @property
     def operator_eligible(self) -> bool: ...
@@ -417,3 +417,37 @@ class ApproverSetSelector(Protocol):
     """
 
     def __call__(self, approval: Approval, binding: Any) -> ApproverSet: ...
+
+
+class IdpTeamApprovers:
+    """Current IdP team, intersected with an explicit route restriction.
+
+    Only a legacy restriction actually evaluated gets its historical name.
+    Team-only decisions leave it null and use the dedicated team audit columns.
+    """
+
+    operator_eligible = False
+    test_driver_eligible = False
+    console_eligible = True
+    adapter_eligible = True
+    chat_eligible = True
+    ineligible_reason = "this approval requires an active member of its IdP approver team"
+
+    def __init__(
+        self, *, allowed: bool, reason: str, restriction: ApproverSet | None = None
+    ) -> None:
+        self._allowed = allowed
+        self.audit_name = restriction.audit_name if allowed and restriction is not None else None
+        self._reason = reason
+        self._restriction = restriction
+
+    async def contains(self, actor: str, actor_channel: str | None) -> MembershipVerdict:
+        if not self._allowed:
+            return MembershipVerdict(
+                False,
+                reason=self.ineligible_reason,
+                evidence={"kind": "idp_team", "reason": self._reason},
+            )
+        if self._restriction is not None:
+            return await self._restriction.contains(actor, actor_channel)
+        return MembershipVerdict(True, evidence={"kind": "idp_team", "reason": "member"})

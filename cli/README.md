@@ -535,9 +535,34 @@ flag, or `CURIE_NAMESPACE` for namespace, still overrides the saved field.
 | `curie cluster hooks secret <agent>` | Deliberately print the derived signing secret on stdout. With `--json`, returns only `{"secret":"..."}`. `--dry-run` makes no API request and redacts the secret. All three cluster hook commands use the cluster API connection behavior described below. |
 | `curie cluster overrides <agent> [--model V\|--clear-model] [--thinking V\|--clear-thinking] [--execution-deadline SECONDS\|--clear-execution-deadline] [--runner-resources JSON\|--clear-runner-resources] [--memory-writes on\|off]` | Read or change the agent's nullable operator overrides via the platform API (`PATCH /agents/{id}`).<br>• With no change flags it INSPECTS and writes nothing.<br>• `--clear-<field>` sends explicit JSON null, restoring the platform default; an omitted field is left alone, which is a different request the API tells apart with `model_fields_set`.<br>• A blank value is refused rather than forwarded: an empty override skips the platform default instead of restoring it.<br>• `--execution-deadline` pins the agent's run deadline (`execution_deadline_seconds`, a JSON number) and is refused client-side outside 60-10800 seconds or for a non-integer value; the platform default is 1800s.<br>• `--runner-resources` pins cpu, memory, and ephemeral-storage requests and limits as one JSON object. Null means the chart block. The API refuses a value that cannot fit the sandbox quota.<br>• `--memory-writes on\|off` turns the agent's remember/update/forget memory tools on or off (`memory_writes`, a JSON boolean) from the next sandbox boot. Any other value is refused. The result always reports it (`memory_writes` in `--json`, `memory writes on\|off` in text), inspect included. |
 | `curie cluster callers <agent> --surface KIND=ADDRESS [--set ID,ID...\|--clear] [--adapter NAME]` | Show, set or clear who may talk to the bot through one surface via the platform API (`PUT /agents/{id}/channels/callers`, ADR 0175).<br>• With neither `--set` nor `--clear` it SHOWS the list and writes nothing; `allowed_callers` is `null` when everyone may talk to the bot.<br>• `--set` replaces the whole list with exact ids: Slack user or bot ids (`U`, `W`, `B`) for a Slack surface, bare email addresses for an email one. The API checks them against the surface's kind and refuses an empty list.<br>• `--clear` sends an explicit JSON null, so everyone may talk to the bot again.<br>• Anyone not on a list gets no reply at all. Editing the list does not bump the binding generation, so the surface's adapter token keeps working. |
+| `curie cluster access-policy <agent> [--invocation-team TEAM_ID\|--clear-invocation-team] [--approver-team TEAM_ID\|--clear-approver-team]` | Show or change which IdP teams may invoke the agent and approve for it via the platform API (`GET`/`PUT /agents/{id}/access-policy`, ADR 0220).<br>• With no team flag it SHOWS the policy and writes nothing; version 0 means none was set.<br>• A team is named by its id, as `GET /teams` lists it, and must be an IdP group team of the agent's tenant; the API refuses any other.<br>• A role left unmentioned keeps its team. `--clear-*` sends an explicit JSON null, so that role keeps today's behavior.<br>• The write sends back the version it just read as `expected_version`, so a concurrent change is refused (409) rather than overwritten.<br>• Nothing enforces the policy yet. |
 | `curie cluster channel-token <agent> --kind email --address <inbox> [--ttl 7d]` | Mint a scoped channel token (`POST /channels/token`), write it into the Secret the mail adapter actually reads (the chart Secret, or `mailAdapter.channelTokenExistingSecret` when that is set), roll the adapter, and print `exp`. Never prints the token and never writes it through helm values, so `helm get values` cannot undo the rotation. `--show-exp` is read-only: it reports the installed token's `exp` and whether the platform still accepts it, the same observation `curie doctor` uses. |
 | `curie cluster reset-thread <agent> --thread-key <key> --yes` | Force a stuck thread's sandbox to be released via the platform API (`POST /agents/{id}/threads/{thread_key}/reset`, #737).<br>• The worker's next maintenance tick releases the thread's claim and route, so its next message cold-creates a fresh sandbox; conversation history is not deleted.<br>• Waits for the worker to drain the request. When the key matched no route (a named bot's key carries its identity as its own segment, `kind:identity:channel:conversation`), nothing was released: the command says so and exits 2 instead of reporting `released`; `--json` adds `route_existed` when the API reported the outcome.<br>• Interrupts a live turn on the thread first, so it refuses without `--yes`. |
 | `curie cluster delete <agent> --yes` | End every active deployment, then delete the agent through the platform API. Destructive and irreversible: refuses without `--yes`.<br>• If the final agent deletion fails, the agent remains present but any deployments already ended stay ended. |
+
+`curie cluster upgrade` rebuilds catalog-only repository runners whose recorded
+base differs from the effective pinned target platform runner. It builds and
+probes both platforms, reads back every receipt, then validates all updated
+receipts in a final Helm render before the single Helm upgrade. A build,
+readback or final-render failure runs no Helm upgrade and leaves installed
+values unchanged. Same-base receipts are preserved without rebuilding.
+
+The target combines chart defaults with retained and operator values. Repository
+runners require a valid literal `agentSandbox.runner.digest`; an unknown,
+malformed or tag-only target is refused during Validate, including dry runs.
+If the installed values retain an old explicit digest, supply the new platform
+digest through `--values-file <values-file>` when upgrading. Keeping the old
+pin keeps that platform runner as the effective target even when chart defaults
+change.
+
+Custom Dockerfile receipts remain unchanged. After upgrading, rebuild and rebind
+them with `curie cluster --context <context> factory --repo-runner
+acme-corp/acme-bot=runner.yaml --registry registry.example.com/acme --namespace
+<namespace> --release <release>`, using a spec containing the retained tools,
+probes and Dockerfile declaration from its own directory. The upgrade plan
+provides the repository and release scope. Until rebuilt on the installed
+pinned platform runner, a mismatched receipt is refused by the worker as
+`stale_base`. An unpinned installation must pin its platform runner first.
 
 ##### Console login
 
@@ -861,6 +886,7 @@ release binary has no dev scripts.
 |---|---|
 | `curie dev contracts` | `bash scripts/check-contracts.sh` -- check the frozen contracts. |
 | `curie dev chart-check` | Discover the executable assertion scripts under `charts/curie/ci`, the same set helm-ci runs, run every one, report each result, and return aggregate failure after all scripts finish. |
+| `curie dev test-env run [--profile PROFILE] -- COMMAND` | Run a command with private backing services, discovered endpoints, and verified cleanup. |
 | `curie dev verify-fix-pin <CHANGE> <SELECTOR>` | Prove that a fix makes the selected test fail when only its product files are reversed. |
 | `curie dev e2e` | `bash cli/scripts/e2e.sh` -- the scripted CLI end-to-end test. |
 | `curie dev e2e-ladder` | `bash cli/scripts/e2e-ladder.sh` -- the cold-start parity ladder (skill, local, cluster rungs). |
@@ -870,6 +896,27 @@ release binary has no dev scripts.
 | `curie dev restore-drill` | `bash cli/scripts/restore-drill.sh` -- bounded synthetic restore of postgres, bundles, mail SQLite, and Valkey from a disposable compose install onto a distinct target (#2427). `--check-backup` is the completeness guard; `--negative` omits a required component and expects refusal. Not an RPO/RTO claim or a production backup product. |
 | `curie dev upgrade-drill` | `bash cli/scripts/upgrade-drill.sh` -- isolated retained-upgrade drill (#2426): published v0.8.6 CLI/chart/images on a task-owned kind install, candidate CLI upgrade, drain/apply interrupt recovery, leftover-hook non-quiesce, compatible rollback that serves a new turn, and incompatible 0.8.4 schema rollback refused before Helm mutates. `--also-predecessor` adds the published v0.8.7 happy path. Refuses the permanent soak. Live provider/channel rows fail closed when credential references are absent. |
 | `curie dev release-accept` | Read-only evaluator for the seven-day / 200-canary release gate (#2430). `--self-test` proves a synthetic qualifying ledger passes and that independently missing each criterion fails closed. `--ledger PATH` evaluates a private evidence file as a live result; fixture or source proof cannot qualify. Does not start a campaign, rotate credentials, or mutate the soak. |
+
+`curie dev test-env run --profile core|full -- COMMAND` creates a unique Compose
+project. The default `core` starts Postgres, Valkey, and RustFS and initializes
+the S3 buckets. `full` adds ClickHouse, Langfuse web and worker, and the OTel
+Collector, waiting for readiness. Neither starts application services or runs
+application database migrations. The child runs from the caller's directory.
+
+The caller's Docker endpoint is preserved. Ports bind to loopback on the Docker
+host; `CURIE_TEST_ENV_HOST` (default `127.0.0.1`) selects the reachable host used
+in endpoint URLs. Actual mapped ports populate `DATABASE_URL`/`TEST_DATABASE_URL`,
+`VALKEY_*`/`TEST_VALKEY_*`, and `S3_ENDPOINT_URL`/`TEST_S3_ENDPOINT_URL` directly
+in the child's environment, alongside the private Compose files, project, and
+runner network. `full` also supplies private Langfuse and OTel endpoints;
+`core` clears those endpoints.
+
+With `--json`, stdout contains one final report with the project, ports,
+networks, `child_exit_code`, and `cleanup_verified`; service logs and child
+stdout/stderr go to stderr. A child exit of 42 is recorded as
+`child_exit_code: 42` and returns CLI exit 1. Success, child failure, SIGINT,
+and SIGTERM all trigger child process group cleanup and verified removal of
+the run's containers, networks, and volumes. Cleanup failure returns CLI exit 3.
 
 Use `curie dev verify-fix-pin <CHANGE> <SELECTOR>` from a source checkout to
 verify a fix commit or pull request. `<CHANGE>` accepts a committed change
@@ -1117,8 +1164,10 @@ existing credential, provider, namespace, controller, gVisor, configuration and
 schema admission checks validate the final effective overlay. On upgrade, any
 derived stock runner layer rebind or stale binding removal becomes part of that
 final snapshot before schema compatibility and timeout metadata are rendered.
-All preflight renders and the actual Helm application use that same overlay and
-the same existing generated/inferred overrides. A file may not bypass a guard.
+All preflight renders use that overlay and the same existing generated/inferred
+overrides. During Apply, rebuilt repository receipts enter a cloned overlay;
+a final Helm render admits that complete candidate and supplies its timeout
+before the same candidate is applied. A file may not bypass a guard.
 
 `CLUSTER-VALUES-FILES c4`: file credentials use the existing private values-file
 lifecycle and stay out of previews, JSON plans, diagnostic contents and argument

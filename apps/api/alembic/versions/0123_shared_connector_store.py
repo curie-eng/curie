@@ -36,8 +36,12 @@ drops the role. It never uses ``DROP OWNED BY`` (a PG16 CREATEROLE creator holds
 ADMIN without INHERIT or SET, which that command rejects), so it also runs as a
 non-superuser owner. Managed role names belong to the operator and survive.
 
-Revision ID: 0109
-Revises: 0108
+The epic drafted this migration as 0109 on top of 0108. It was renumbered to
+0123 on top of ``next``'s 0122 when the epic merged ``next``, because the
+number right after 0108 belongs to the next stable fix.
+
+Revision ID: 0123
+Revises: 0122
 Create Date: 2026-10-21
 """
 
@@ -48,8 +52,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision: str = "0109"
-down_revision: str | None = "0108"
+revision: str = "0123"
+down_revision: str | None = "0122"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
