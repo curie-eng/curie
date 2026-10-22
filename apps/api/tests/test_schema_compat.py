@@ -149,6 +149,7 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0121",
             "0122",
             "0123",
+            "0124",
         } <= pending
         assert not pending & {"0091", "0092", "0093"}
     else:
@@ -169,8 +170,9 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0121",
             "0122",
             "0123",
+            "0124",
         }
-    assert current_revision() == "0123"
+    assert current_revision() == "0124"
     assert sql_rows("SELECT name FROM curie.agents WHERE id=:id", {"id": agent_id}) == [
         ("merge-example",)
     ]
@@ -253,11 +255,13 @@ def test_agent_reads_refuse_the_schema_before_deploy_notification_expand() -> No
     # The directory and connect ORM requires the new identity tables/columns.
     # Migration expand compatibility for older images does not mean this image
     # can serve an older database. The shared connector store (0123, ADR 0239)
-    # is expand-only and does not raise the floor.
-    for revision in sorted(known - {"0122", "0123"}):
+    # and its source_stale flag (0124, ADR 0239) are expand-only and do not
+    # raise the floor.
+    for revision in sorted(known - {"0122", "0123", "0124"}):
         assert can_serve(revision, window, known) is False
     assert can_serve("0122", window, known) is True
     assert can_serve("0123", window, known) is True
+    assert can_serve("0124", window, known) is True
 
 
 def test_planner_refuses_irreversible_before_mutation() -> None:
