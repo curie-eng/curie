@@ -365,6 +365,54 @@ def test_daemon_pod_differs_from_daemon_object_name(envelope: dict[str, Any]) ->
     _assert_token(envelope, "identity_mismatch")
 
 
+# orphan proof
+
+ORPHAN_ROLES = ["daemon", "service", "ingress", "server-secret"]
+
+
+def test_orphan_leaked_objects(envelope: dict[str, Any]) -> None:
+    envelope["orphan"]["leaked"] = ["Secret/x"]
+    _assert_token(envelope, "incomplete_cleanup")
+
+
+def test_orphan_leaked_missing(envelope: dict[str, Any]) -> None:
+    del envelope["orphan"]["leaked"]
+    _assert_token(envelope, "incomplete_cleanup")
+
+
+@pytest.mark.parametrize("role", ORPHAN_ROLES)
+def test_orphan_missing_a_role(envelope: dict[str, Any], role: str) -> None:
+    orphan = envelope["orphan"]
+    orphan["objects"] = [obj for obj in orphan["objects"] if obj["role"] != role]
+    _assert_token(envelope, "missing_observation")
+
+
+@pytest.mark.parametrize("value", [MISSING, "driver", ""], ids=["missing", "driver", "empty"])
+def test_orphan_not_provisioned_by_worker(envelope: dict[str, Any], value: Any) -> None:
+    _set(envelope["orphan"], "provisioned_by", value)
+    _assert_token(envelope, "missing_observation")
+
+
+# Docker client env
+
+
+# The runner env is built in apps/worker/src/curie_worker/sandbox/tool_daemon.py
+# (around line 390): DOCKER_HOST, DOCKER_PUBLISHED_HOST, DOCKER_TLS_VERIFY and
+# DOCKER_CERT_PATH.
+@pytest.mark.parametrize(
+    "name", ["DOCKER_HOST", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH", "DOCKER_PUBLISHED_HOST"]
+)
+def test_docker_env_present_for_each_injected_variable(name: str) -> None:
+    assert daemon_lifecycle.docker_env_present({"PATH": "/usr/bin", name: "x"}) is True
+
+
+@pytest.mark.parametrize(
+    "env", [{}, {"PATH": "/usr/bin", "HOME": "/workspace"}], ids=["empty", "unrelated"]
+)
+def test_docker_env_absent(env: dict[str, str]) -> None:
+    assert daemon_lifecycle.docker_env_present(env) is False
+
+
 # CLI
 
 

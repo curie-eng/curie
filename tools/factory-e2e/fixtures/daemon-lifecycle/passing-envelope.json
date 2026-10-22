@@ -28,7 +28,16 @@
     "age_gate_seconds": 180,
     "claim": "curie-thread-248a9e186b-3c2652",
     "kept_while_young": true,
+    "leaked": [],
     "objects": [
+      {
+        "claim_label": "curie-thread-248a9e186b-3c2652",
+        "kind": "Pod",
+        "name": "curie-thread-248a9e186b-3c2652",
+        "namespace": "fd-proof-d-f5b61e53",
+        "role": "daemon",
+        "uid": "573f476b-3b45-4d20-8fcc-d583e47a70d3"
+      },
       {
         "claim_label": "curie-thread-248a9e186b-3c2652",
         "kind": "Service",
@@ -44,9 +53,18 @@
         "namespace": "fd-proof-d-f5b61e53",
         "role": "ingress",
         "uid": "5803312d-cb4a-4de1-a123-018c59a83494"
+      },
+      {
+        "claim_label": "curie-thread-248a9e186b-3c2652",
+        "kind": "Secret",
+        "name": "curie-thread-248a9e186b-3c2652",
+        "namespace": "fd-proof-d-f5b61e53",
+        "role": "server-secret",
+        "uid": "86a2e173-7991-42e7-8b7a-87c6ec65de28"
       }
     ],
     "objects_absent": true,
+    "provisioned_by": "worker",
     "removed_after_seconds": 187.9,
     "settle_seconds": 188.0
   },
