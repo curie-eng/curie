@@ -102,7 +102,12 @@ curie cluster status --context <your-production-context>
    non-hook Deployments and StatefulSets. The agent-sandbox controller has no
    resource requests. Add **30m CPU and 48Mi memory per node** for the default
    runner-prewarm DaemonSet, and **50m CPU and 192Mi memory per live runner
-   sandbox**, with a **1 CPU / 768Mi limit** on each runner. Each distinct
+   sandbox**, with a **1 CPU / 768Mi limit** on each runner (the `standard`
+   resource profile). A factory agent uses the `factory` profile instead:
+   **8Gi memory request and limit**, so it needs a node with 8Gi of unrequested
+   allocatable memory, and the default quota admits one factory sandbox at a
+   time. See the chart README's
+   [resource profiles](../charts/curie/README.md#resource-profiles). Each distinct
    layered runner digest adds a prewarm container requesting another
    10m CPU and 16Mi memory per node.
 

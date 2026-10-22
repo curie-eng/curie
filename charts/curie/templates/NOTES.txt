@@ -127,19 +127,32 @@ Kernel isolation (gVisor, security.gvisor.mode={{ $gvisorMode }}):
        handler are installed on every node -- so install runsc and re-run `helm upgrade`,
        or set security.gvisor.mode=off to run real code without isolation knowingly.
 {{- end }}
+{{- $genericEnv := include "curie.sandboxEnvelope" (dict "root" . "agent" "") | fromJson }}
+{{- $differingEnvs := include "curie.sandboxEnvelope.differing" . | fromJsonArray }}
+
+Sandbox resource envelopes (request/limit; volume sizeLimits; agentSandbox.resourceProfiles, #4889):
+  - generic (profile {{ $genericEnv.profile }}): {{ include "curie.sandboxEnvelope.summary" (dict "root" . "env" $genericEnv) }}
+{{- range $differingEnvs }}
+  - agent {{ .agent }} (profile {{ .env.profile }}): {{ include "curie.sandboxEnvelope.summary" (dict "root" $ "env" .env) }}
+{{- end }}
 {{- if and .Values.resourceQuota.enabled (ne (toString .Values.resourceQuota.capacityReport) "false") }}
 {{- /* capacity-report-guard: every Node/Pod lookup stays inside this block.
      Empty under helm template / --dry-run: print nothing (#2949). */}}
 {{- $nodes := (lookup "v1" "Node" "" "").items | default list }}
 {{- if $nodes }}
 {{- $pods := (lookup "v1" "Pod" "" "").items | default list }}
-{{- $runnerRes := .Values.agentSandbox.runner.resources | default dict }}
+{{- $runnerRes := $genericEnv.resources }}
 {{- $perSandbox := $runnerRes.requests | default dict }}
 {{- $sandboxPlacement := fromYaml (include "curie.placement.class" (dict "root" . "class" "sandbox")) }}
 {{- $cap := include "curie.sandboxCapacity" (dict "nodes" $nodes "pods" $pods "perSandbox" $perSandbox "perSandboxLimits" ($runnerRes.limits | default dict) "sandboxPriorityClass" (.Values.resourceQuota.sandboxPriorityClassName | default .Values.priorityClasses.sandbox.name) "tolerations" $sandboxPlacement.tolerations "nodeSelector" $sandboxPlacement.nodeSelector "hard" .Values.resourceQuota.hard) | fromJson }}
 
 Sandbox capacity (resourceQuota vs. node allocatable):
 {{- include "curie.sandboxCapacity.notes" (dict "fits" $cap.fits "ceiling" $cap.ceiling "cpu" $perSandbox.cpu "memory" $perSandbox.memory "fullname" (include "curie.fullname" .) "namespace" .Release.Namespace) }}
+{{- range $differingEnvs }}
+{{- $agentRes := .env.resources }}
+{{- $agentCap := include "curie.sandboxCapacity" (dict "nodes" $nodes "pods" $pods "perSandbox" $agentRes.requests "perSandboxLimits" $agentRes.limits "sandboxPriorityClass" ($.Values.resourceQuota.sandboxPriorityClassName | default $.Values.priorityClasses.sandbox.name) "tolerations" $sandboxPlacement.tolerations "nodeSelector" $sandboxPlacement.nodeSelector "hard" $.Values.resourceQuota.hard) | fromJson }}
+  - agent {{ .agent }} (profile {{ .env.profile }}): quota admits {{ $agentCap.ceiling }}; nodes fit {{ $agentCap.fits }} (per sandbox cpu {{ $agentRes.requests.cpu }}, memory {{ $agentRes.requests.memory }}){{ if lt (int64 $agentCap.fits) 1 }} -- !! WARNING: no node has room for one of these sandboxes; its claims stay Pending{{ end }}.
+{{- end }}
 {{- if .Values.worker.deploy }}
 {{- $workerMaxConcurrency := dig "maxConcurrency" 16 .Values.worker }}
   - Worker turn slots: worker.replicas {{ .Values.worker.replicas }} x worker.maxConcurrency {{ $workerMaxConcurrency }} = {{ mul (int64 .Values.worker.replicas) (int64 $workerMaxConcurrency) }} concurrent turns; the sandbox quota admits {{ $cap.ceiling }}.

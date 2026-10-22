@@ -525,13 +525,15 @@ impl ExpectedSandboxInventory {
             Some(serde_json::Value::Bool(value)) => *value,
             Some(_) => anyhow::bail!("agentSandbox.deploy in Helm values is not a boolean"),
         };
-        // Mirrors every source in the chart's curie.agentSandboxPoolAgents.
+        // Mirrors every map source in the chart's curie.agentSandboxPoolAgents
+        // (agentResourceProfiles, #4889, included).
         let mut agents = Vec::new();
         for key in [
             "connectorSecrets",
             "registryEgress",
             "runnerImages",
             "workspaceSizeLimits",
+            "agentResourceProfiles",
         ] {
             match sandbox.and_then(|value| value.get(key)) {
                 None | Some(serde_json::Value::Null) => {}
