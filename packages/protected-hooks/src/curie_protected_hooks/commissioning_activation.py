@@ -25,11 +25,15 @@ compare and set and refuses. No pod template, image, mount, Secret reference,
 ACL rule, guard revision, measurement or bootstrap file is written here.
 
 Every failure refuses with the step it stopped at and leaves the earlier
-writes in place: a journal still ``closing`` blocks acceptance, and a closed
-journal with no acceptance or no Qualification leaves the selection closed,
-so a restart cannot activate the installation by replaying a partial run.
-Once the acceptance record is written the remaining steps run to completion
-even if the caller is cancelled.
+writes in place: a journal still ``closing`` blocks acceptance, and the
+selection opens only after the Qualification and Readiness exist. Activation
+starts only from ``closing``, so after any failure, restart or interruption
+past step 1 the ``closed`` journal refuses every later activation: no new
+verdict is ever tried for the same campaign. Steps 2 and 5 run only on a
+session whose ``ACL WHOAMI`` is the trusted provisioner on M's epoch. Once the
+acceptance record is written the remaining steps, including the re-read and
+any reverse compare and set, run to completion however often the caller is
+cancelled; the cancellation is raised afterwards.
 """
 
 from __future__ import annotations
@@ -57,7 +61,7 @@ from .commissioning_campaign_records import (
     parse_commissioning_acceptance,
 )
 from .commissioning_journal import campaign_keys
-from .commissioning_producers import PhaseExpectation
+from .commissioning_producers import PhaseExpectation, _usernames
 from .commissioning_records import CommissioningPermit
 from .commissioning_verifier import Publication
 
@@ -150,9 +154,15 @@ def _text(value: Any) -> str:
     return str(value)
 
 
-def _pinned(session: Redis, manifest: Manifest, step: str) -> dict[str, Any]:
-    """M as a dict, after the provisioner session shows M's live ``run_id``."""
-    _require(type(manifest) is Manifest, step)
+def _pinned(session: Redis, manifest: Manifest, step: str, username: str) -> dict[str, Any]:
+    """M as a dict, after the session proves it is the trusted provisioner on M's epoch.
+
+    ``ACL WHOAMI`` must name the provisioner and ``INFO server`` must show M's
+    live ``run_id``.
+    """
+    _require(type(manifest) is Manifest and type(username) is str and bool(username), step)
+    whoami = session.execute_command("ACL", "WHOAMI")  # type: ignore[no-untyped-call]
+    _require(whoami in (username, username.encode("ascii")), step)
     m = manifest.as_dict()
     _require(session.info("server").get("run_id") == m["broker_identity"]["run_id"], step)
     return m
@@ -162,16 +172,24 @@ def _ok(reply: Any) -> bool:
     return reply in (b"OK", "OK", True)
 
 
-def disable_candidates(session: Redis, bootstrap: CommissioningBootstrap) -> None:
+def disable_candidates(
+    session: Redis,
+    bootstrap: CommissioningBootstrap,
+    *,
+    manifest: Manifest,
+    provisioner_username: str,
+) -> None:
     """Clause 6 step 2 on a provisioner session: each candidate ``off``, sessions killed.
 
     ``off`` changes only the enabled state; the instantiated rules G's template
     measured stay as they are. The usernames are B's candidate credential IDs,
-    never caller supplied. Repeating the step is harmless.
+    never caller supplied. The session must be the trusted provisioner on M's
+    epoch. Repeating the step is harmless.
     @spec PROTECTED-COMMISSIONING-6.
     """
     try:
         _require(type(bootstrap) is CommissioningBootstrap, "candidates-disabled")
+        _pinned(session, manifest, "candidates-disabled", provisioner_username)
         credentials = bootstrap.as_dict()["candidate_credentials"]
         for name in ("enqueue", "worker"):
             username = credentials[name]["id"]
@@ -196,6 +214,7 @@ def open_admission(
     permit: CommissioningPermit,
     qualification_generation: str,
     trusted_max_readiness_ms: int,
+    provisioner_username: str,
 ) -> tuple[bytes, bytes]:
     """Clause 6 step 5 on a provisioner session: the selection's one predeclared switch.
 
@@ -213,7 +232,7 @@ def open_admission(
         _require(type(permit) is CommissioningPermit, step)
         _scalar(qualification_generation, "generation")
         _require(type(trusted_max_readiness_ms) is int and trusted_max_readiness_ms > 0, step)
-        m = _pinned(session, manifest, step)
+        m = _pinned(session, manifest, step, provisioner_username)
         key = _SELECTION + m["runtime_id"]
         _require(
             session.get("protected:control:manifest:" + manifest.digest)
@@ -275,7 +294,14 @@ def open_admission(
         _refuse(step)
 
 
-def close_admission(session: Redis, *, manifest: Manifest, closed: bytes, opened: bytes) -> None:
+def close_admission(
+    session: Redis,
+    *,
+    manifest: Manifest,
+    closed: bytes,
+    opened: bytes,
+    provisioner_username: str,
+) -> None:
     """The reverse compare and set, only from the exact bytes this activation wrote.
 
     @spec PROTECTED-COMMISSIONING-6.
@@ -283,7 +309,7 @@ def close_admission(session: Redis, *, manifest: Manifest, closed: bytes, opened
     step = "tuple-unchanged"
     try:
         _require(opened_selection(closed) == opened, step)
-        m = _pinned(session, manifest, step)
+        m = _pinned(session, manifest, step, provisioner_username)
         key = _SELECTION + m["runtime_id"]
         reply = session.execute_command(  # type: ignore[no-untyped-call]
             "EVAL", _SELECTION_CAS, 1, key, opened, closed
@@ -360,6 +386,7 @@ class CommissioningActivation:
         journal: Any,
         settled: Callable[[], Awaitable[None]],
         provisioner: Redis,
+        trusted_provisioner: str,
         acl: Any,
         issuer: Any,
         verifier: Any,
@@ -371,6 +398,10 @@ class CommissioningActivation:
             _require(type(trusted_max_readiness_ms) is int and trusted_max_readiness_ms > 0)
             _scalar(qualification_generation, "generation")
             _require(type(trusted_issuer) is dict and type(trusted_control) is dict)
+            # B names no provisioner credential: the administrator's grant does.
+            # It is never one of the principals the observer checks.
+            _require(type(trusted_provisioner) is str and bool(trusted_provisioner))
+            _require(trusted_provisioner not in _usernames(bootstrap).values())
             journal_permit = getattr(journal, "permit", None)
             _require(type(journal_permit) is CommissioningPermit)
             assert isinstance(journal_permit, CommissioningPermit)
@@ -401,6 +432,7 @@ class CommissioningActivation:
         self._generation = qualification_generation
         self._journal, self._settled = journal, settled
         self._provisioner, self._acl = provisioner, acl
+        self._provisioner_username = trusted_provisioner
         self._issuer, self._verifier = issuer, verifier
         self._started = False
 
@@ -414,16 +446,26 @@ class CommissioningActivation:
         await self._close_journal()
         await self._disable_candidates()
         verdict, acceptance = await self._accept()
-        # From here the writes run to completion even if the caller is cancelled.
+        # From here the writes run to completion even if the caller is
+        # cancelled, however often: a compare and set already sent to the broker
+        # must still be followed by the tuple re-read and, if needed, its reverse.
         task = asyncio.create_task(self._complete(verdict, acceptance))
-        try:
-            return await asyncio.shield(task)
-        except asyncio.CancelledError:
+        cancelled = False
+        while True:
             try:
-                await task
+                report = await asyncio.shield(task)
+                break
+            except asyncio.CancelledError:
+                if task.done():
+                    raise
+                cancelled = True
             except ActivationRefused:
-                pass
-            raise
+                if cancelled:
+                    raise asyncio.CancelledError() from None
+                raise
+        if cancelled:
+            raise asyncio.CancelledError()
+        return report
 
     async def _step(self, step: str, call: Awaitable[Any]) -> Any:
         try:
@@ -434,20 +476,33 @@ class CommissioningActivation:
             _refuse(step)
 
     async def _close_journal(self) -> None:
-        """Step 1. Activation never begins a close; the supervisor does."""
+        """Step 1, only from ``closing``.
+
+        Activation never begins a close; the supervisor does. A journal already
+        ``closed`` means an earlier activation passed step 1 and then failed or
+        was interrupted, so it refuses: clause 6 blocks activation after any
+        restart, and a retry would otherwise let new verdicts be tried until one
+        passes.
+        """
         step = "journal-closed"
         state = await self._step(step, self._journal.status())
-        _require(state.state in ("closing", "closed"), step)
+        _require(state.state == "closing", step)
         await self._step(step, self._settled())
-        if state.state == "closing":
-            state = await self._step(step, self._journal.confirm_closed(state.generation))
+        state = await self._step(step, self._journal.confirm_closed(state.generation))
         _require(state.state == "closed", step)
 
     async def _disable_candidates(self) -> None:
         """Step 2, then the decision 7 observation of the expected phase."""
         step = "candidates-disabled"
         await self._step(
-            step, asyncio.to_thread(disable_candidates, self._provisioner, self._bootstrap)
+            step,
+            asyncio.to_thread(
+                disable_candidates,
+                self._provisioner,
+                self._bootstrap,
+                manifest=self._manifest,
+                provisioner_username=self._provisioner_username,
+            ),
         )
         await self._step(step, self._acl.require(ACTIVATED))
 
@@ -485,6 +540,7 @@ class CommissioningActivation:
                 permit=self._permit,
                 qualification_generation=self._generation,
                 trusted_max_readiness_ms=self._max_readiness_ms,
+                provisioner_username=self._provisioner_username,
             ),
         )
         try:
@@ -500,6 +556,7 @@ class CommissioningActivation:
                     manifest=self._manifest,
                     closed=closed,
                     opened=opened,
+                    provisioner_username=self._provisioner_username,
                 ),
             )
             _refuse("tuple-unchanged")

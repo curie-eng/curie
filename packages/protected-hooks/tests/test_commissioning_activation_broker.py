@@ -518,6 +518,7 @@ class Harness:
             journal=c.journal,
             settled=settled,
             provisioner=c.i.provisioner,
+            trusted_provisioner=PROVISIONER,
             acl=self.acl,
             issuer=c.issuer,
             verifier=verifier,
@@ -805,6 +806,7 @@ def test_admission_never_opens_without_the_stored_qualification_and_readiness(
             permit=campaign.permit,
             qualification_generation=GENERATION,
             trusted_max_readiness_ms=MAX_READINESS_MS,
+            provisioner_username=PROVISIONER,
         )
     assert caught.value.step == "admission-open"
     assert snapshot(pworker_service) == before
@@ -845,9 +847,19 @@ def test_disabling_candidates_keeps_their_rules_and_ends_their_sessions(
         await campaign.start()
         users = [installed.usernames[r] for r in ("candidate_enqueue", "candidate_worker")]
         before = {u: pworker_service.command("ACL", "GETUSER", u) for u in users}
-        disable_candidates(installed.provisioner, installed.bootstrap)
+        disable_candidates(
+            installed.provisioner,
+            installed.bootstrap,
+            manifest=installed.manifest,
+            provisioner_username=PROVISIONER,
+        )
         # Repeating the step is harmless.
-        disable_candidates(installed.provisioner, installed.bootstrap)
+        disable_candidates(
+            installed.provisioner,
+            installed.bootstrap,
+            manifest=installed.manifest,
+            provisioner_username=PROVISIONER,
+        )
         for user in users:
             after = pworker_service.command("ACL", "GETUSER", user)
             assert rules_only(after) == rules_only(before[user])
@@ -953,6 +965,7 @@ def test_admission_never_opens_unless_closed_and_currently_qualified(
             permit=campaign.permit,
             qualification_generation=GENERATION,
             trusted_max_readiness_ms=MAX_READINESS_MS,
+            provisioner_username=PROVISIONER,
         )
     assert snapshot(pworker_service) == before
 
@@ -961,3 +974,41 @@ def campaign_journal(campaign: Campaign) -> str:
     from curie_protected_hooks.commissioning_journal import campaign_keys
 
     return campaign_keys(campaign.permit).journal
+
+
+def test_steps_2_and_5_refuse_a_session_that_is_not_the_trusted_provisioner(
+    pworker_service, installed
+) -> None:
+    """``run_id`` alone is not enough: the session must authenticate as the provisioner."""
+    from curie_protected_hooks.commissioning_activation import (
+        ActivationRefused,
+        disable_candidates,
+        open_admission,
+    )
+
+    campaign = Campaign(installed)
+    run(campaign.start())
+    run(campaign.close())
+    before, acl = snapshot(pworker_service), acl_state(pworker_service)
+    # The fixture administrator is pinned to the same broker epoch, holds every
+    # right, and is not the provisioner the installation trusts.
+    other = pworker_service.admin
+    with pytest.raises(ActivationRefused) as disabled:
+        disable_candidates(
+            other,
+            installed.bootstrap,
+            manifest=installed.manifest,
+            provisioner_username=PROVISIONER,
+        )
+    with pytest.raises(ActivationRefused) as opened:
+        open_admission(
+            other,
+            manifest=installed.manifest,
+            permit=campaign.permit,
+            qualification_generation=GENERATION,
+            trusted_max_readiness_ms=MAX_READINESS_MS,
+            provisioner_username=PROVISIONER,
+        )
+    assert (disabled.value.step, opened.value.step) == ("candidates-disabled", "admission-open")
+    assert snapshot(pworker_service) == before
+    assert acl_state(pworker_service) == acl

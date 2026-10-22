@@ -12,6 +12,7 @@ import asyncio
 import importlib
 import importlib.util
 import json
+import threading
 from typing import Any
 
 import pytest
@@ -19,6 +20,7 @@ import pytest
 from .test_commissioning_verifier import records, tuple_of
 
 EVIDENCE = "cd" * 32
+PROVISIONER = "commissioning/example-provisioner"
 COUNTERS = {
     "deliveries": 1,
     "launches": 1,
@@ -75,6 +77,8 @@ class Fakes:
         self.unchanged: str | None = None
         self.acceptance: Any = None
         self.phases: list[dict[str, bool]] = []
+        self.cas_gate = threading.Event()
+        self.cas_gate.set()
         fakes = self
 
         def check(name: str) -> None:
@@ -132,18 +136,22 @@ class Fakes:
             fakes.acceptance = acceptance
             check("issue_acceptance")
 
-        def disable_candidates(session: Any, bootstrap: Any) -> None:
+        def disable_candidates(session: Any, bootstrap: Any, **options: Any) -> None:
             assert session is fakes.provisioner
+            assert options["provisioner_username"] == PROVISIONER
             check("disable_candidates")
 
         def open_admission(session: Any, **options: Any) -> tuple[bytes, bytes]:
             assert session is fakes.provisioner
             assert options["qualification_generation"] == "1"
+            assert options["provisioner_username"] == PROVISIONER
             check("open_admission")
+            fakes.cas_gate.wait(5)
             closed = canonical(selection(fakes.records))
             return closed, canonical(selection(fakes.records, admission_open=True))
 
         def close_admission(session: Any, **options: Any) -> None:
+            assert options["provisioner_username"] == PROVISIONER
             check("close_admission")
 
         api = module()
@@ -169,6 +177,7 @@ class Fakes:
             "journal": self.journal,
             "settled": self.settled,
             "provisioner": self.provisioner,
+            "trusted_provisioner": PROVISIONER,
             "acl": self.acl,
             "issuer": self.issuer,
             "verifier": self.verifier,
@@ -236,10 +245,13 @@ def test_the_acceptance_record_names_this_campaign_evidence_and_qualification(
     }
 
 
-def test_an_already_closed_journal_is_not_closed_again(monkeypatch) -> None:
+def test_an_already_closed_journal_blocks_activation_after_a_restart(monkeypatch) -> None:
+    # Clause 6: a failure or uncertainty at any step blocks activation after any
+    # restart. A journal already ``closed`` means an earlier activation passed
+    # step 1, so a retry would let a new verdict be tried until one passes.
     fakes = Fakes(monkeypatch, state="closed")
-    run(fakes.activation().activate())
-    assert fakes.events == [e for e in ORDER if e != "confirm_closed"]
+    fakes.refused("journal-closed")
+    assert fakes.events == ["status"]
 
 
 @pytest.mark.parametrize("state", ["prepared", "running", "failed"])
@@ -348,6 +360,29 @@ def test_cancellation_after_publication_starts_still_finishes_the_transition(
     assert fakes.events == ORDER
 
 
+def test_repeated_cancellation_while_the_selection_opens_still_rereads_the_tuple(
+    monkeypatch,
+) -> None:
+    # The compare and set runs in a thread that a cancel cannot stop, so the
+    # re-read of the tuple (and its reverse compare and set) must still run.
+    fakes = Fakes(monkeypatch)
+    fakes.cas_gate.clear()
+
+    async def scenario() -> None:
+        task = asyncio.create_task(fakes.activation().activate())
+        while "open_admission" not in fakes.events:
+            await asyncio.sleep(0.01)
+        for _ in range(3):
+            task.cancel()
+            await asyncio.sleep(0.01)
+        fakes.cas_gate.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    run(scenario())
+    assert fakes.events == ORDER
+
+
 @pytest.mark.parametrize(
     "change",
     [
@@ -357,6 +392,9 @@ def test_cancellation_after_publication_starts_still_finishes_the_transition(
         {"settled": None},
         {"verifier": object()},
         {"permit": None},
+        {"trusted_provisioner": ""},
+        {"trusted_provisioner": None},
+        {"trusted_provisioner": "commissioning/example-issuer"},
     ],
 )
 def test_malformed_inputs_refuse_before_any_call(monkeypatch, change) -> None:
