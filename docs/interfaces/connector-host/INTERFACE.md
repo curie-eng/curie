@@ -217,9 +217,25 @@ missing grant store or a failed spend refuses the call. A body with two or more
 gated calls is refused before any grant is spent. The grant header is stripped
 before the forward. A refused grant check answers with the JSON-RPC refusal
 below, reason `grant_required`
-(`apps/worker/src/curie_connector_proxy/caller.py::GRANT_REQUIRED`). A body
+(`apps/worker/src/curie_connector_proxy/caller.py::GRANT_REQUIRED`). A POST body
 over 1 MiB is refused with a plain-text 403, not the JSON-RPC refusal, and never
-reaches the server.
+reaches the server. The limit is the same for every path and every connector.
+Only POST is read first: an admitted request with any other method is streamed
+to the server unread.
+
+Only the runner holds a caller token, and it gives the token only to the
+derived hosted entries
+(`runner/src/curie_runner/connectors.py::materialize_connector_caller_headers`).
+A bundle's own stdio server, its hooks and Bash never receive it, so bundle
+code cannot call a hosted connector's HTTP routes through the proxy. A stdio
+tool that sends a large file to its own hosted connector therefore fails twice
+behind the proxy: it is refused with `missing`, and with a token it would be
+refused for the body size.
+[ADR 0240](../../adr/0240-a-hosted-connector-declares-the-routes-its-bundles-stdio-servers-call-through-the-caller-proxy.md)
+proposes declared routes with per-route limits and a connector-scoped token
+for declared stdio callers
+([#4917](https://github.com/curie-eng/curie/issues/4917)). It is accepted and
+not yet built.
 
 A request the token check does not admit gets a 403 carrying a JSON-RPC error and no
 challenge, and never reaches the server; the shape is frozen in

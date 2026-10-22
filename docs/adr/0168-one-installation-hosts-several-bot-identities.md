@@ -21,6 +21,12 @@ from the route-less pair exclusivity; their overlap is refused by effective
 trigger label instead. Every other kind keeps that exclusivity. Everything
 else in this ADR stands.
 
+**Amended by [ADR-0240](0240-a-hosted-connector-declares-the-routes-its-bundles-stdio-servers-call-through-the-caller-proxy.md)**
+(back-link added under [ADR-0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+0240 amends decision 7 so a hosted connector may also admit a connector-scoped
+route token, on routes it declares, from the stdio servers its bundle names.
+Admission by `admits:` and the `cct` caller token stand as decided.
+
 This ADR builds on [ADR-0096](0096-port-adapters-are-deployed-services.md),
 [ADR-0118](0118-binding-cardinality-is-the-multi-surface-opt-in.md),
 [ADR-0155](0155-tenant-boundary-and-principal-identity-land-together.md),

@@ -259,4 +259,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0236 | [The commissioning operator splits provisioner and control processes](0236-the-commissioning-operator-splits-provisioner-and-control-processes.md) | Accepted |
 | 0237 | [Ordinary hook receipts preserve policy after stream retention](0237-ordinary-hook-receipts-preserve-policy-after-stream-retention.md) | Accepted |
 | 0238 | [A managed CNI installation qualifies through its own behavioral network producer](0238-a-managed-cni-installation-qualifies-through-its-own-behavioral-network-producer.md) | Accepted |
+| 0240 | [A hosted connector declares the routes its bundle's stdio servers call through the caller proxy](0240-a-hosted-connector-declares-the-routes-its-bundles-stdio-servers-call-through-the-caller-proxy.md) | Accepted |
 <!-- END GENERATED: adr-index -->
