@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import ssl
 import subprocess
@@ -39,6 +40,52 @@ class FixtureState:
         self.lock = threading.RLock()
         self.pull: dict[str, Any] | None = None
         self.base_sha = self._initialize_repository()
+        self.barriers = self.root / "barriers"
+        self.barriers.mkdir()
+        for stage in ("pre-receive", "post-receive"):
+            hook = self.bare_repo / "hooks" / stage
+            hook.write_text(
+                "#!/usr/bin/env python3\n"
+                "import hashlib, pathlib, sys, time\n"
+                f"root = pathlib.Path({str(self.barriers)!r})\n"
+                f"stage = {stage!r}\n"
+                "for update in sys.stdin:\n"
+                "    ref = update.split()[2]\n"
+                "    gate = root / hashlib.sha256(ref.encode()).hexdigest() / stage\n"
+                "    if not gate.exists():\n"
+                "        continue\n"
+                "    (gate / 'entered').touch()\n"
+                "    deadline = time.monotonic() + 60\n"
+                "    while not (gate / 'released').exists():\n"
+                "        if time.monotonic() >= deadline:\n"
+                "            sys.exit('fixture receive barrier timed out')\n"
+                "        time.sleep(0.05)\n"
+            )
+            hook.chmod(0o755)
+
+    def barrier(self, branch: str, action: str) -> dict[str, bool]:
+        if not branch.startswith("curie/") or action not in {"arm", "before", "after", "state"}:
+            raise ValueError("invalid receive barrier")
+        root = self.barriers / hashlib.sha256(f"refs/heads/{branch}".encode()).hexdigest()
+        for stage in ("pre-receive", "post-receive"):
+            gate = root / stage
+            if action == "arm":
+                gate.mkdir(parents=True)
+            elif action == {"pre-receive": "before", "post-receive": "after"}[stage]:
+                (gate / "released").touch()
+        return {
+            "before": (root / "pre-receive" / "entered").exists(),
+            "after": (root / "post-receive" / "entered").exists(),
+        }
+
+    def commit(self, sha: str) -> dict[str, Any]:
+        raw = _git("--git-dir", str(self.bare_repo), "show", "-s", "--format=%H%n%P%n%B", sha)
+        actual, parents, message = raw.split("\n", 2)
+        return {
+            "sha": actual,
+            "parents": [{"sha": parent} for parent in parents.split()],
+            "message": message,
+        }
 
     def _initialize_repository(self) -> str:
         work = self.root / "seed"
@@ -169,8 +216,19 @@ class FixtureHandler(BaseHTTPRequestHandler):
         if parsed.path == repo_path:
             self._json(
                 HTTPStatus.OK,
-                {"full_name": REPO_FULL_NAME, "default_branch": DEFAULT_BRANCH},
+                {"id": 1, "full_name": REPO_FULL_NAME, "default_branch": DEFAULT_BRANCH},
             )
+            return
+        commit_prefix = f"{repo_path}/git/commits/"
+        if parsed.path.startswith(commit_prefix):
+            sha = parsed.path[len(commit_prefix) :]
+            if len(sha) != 40 or any(char not in "0123456789abcdef" for char in sha):
+                self._json(HTTPStatus.BAD_REQUEST, {"message": "invalid commit"})
+                return
+            try:
+                self._json(HTTPStatus.OK, self.server.state.commit(sha))
+            except subprocess.CalledProcessError:
+                self._json(HTTPStatus.NOT_FOUND, {"message": "commit not found"})
             return
         ref_prefix = f"{repo_path}/git/ref/heads/"
         if parsed.path.startswith(ref_prefix):
@@ -214,6 +272,18 @@ class FixtureHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         parsed = urlsplit(self.path)
         if not self._authorized():
+            return
+        if parsed.path == "/__fixture/barrier":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 0 < length <= 4096:
+                    raise ValueError("invalid barrier payload")
+                payload = json.loads(self.rfile.read(length))
+                state = self.server.state.barrier(payload["branch"], payload["action"])
+            except (KeyError, TypeError, ValueError):
+                self._json(HTTPStatus.BAD_REQUEST, {"message": "invalid barrier payload"})
+            else:
+                self._json(HTTPStatus.OK, state)
             return
         if parsed.path != self._pulls_path():
             self._json(HTTPStatus.NOT_FOUND, {"message": "fixture route not found"})

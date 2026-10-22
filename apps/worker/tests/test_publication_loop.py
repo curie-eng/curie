@@ -654,6 +654,9 @@ class _Cluster:
         self.active_jobs: set[str] = set()
         self.observe_release: threading.Event | None = None
         self.observe_timed_out = False
+        self.quiescent = False
+        self.quiescence_error: Exception | None = None
+        self.quiescence_checks: list[tuple[str, str]] = []
 
     def apply(self, resources: Any) -> None:
         self.applied.append(resources)
@@ -668,6 +671,12 @@ class _Cluster:
         self.validated_existing.append(resources)
         if self.apply_error is not None:
             raise self.apply_error
+
+    def rejected_job_quiescent(self, job_name: str, job_uid: str) -> bool:
+        self.quiescence_checks.append((job_name, job_uid))
+        if self.quiescence_error is not None:
+            raise self.quiescence_error
+        return self.quiescent
 
     def observe(self, job_name: str) -> Any:
         self.observed.append(job_name)
@@ -719,6 +728,7 @@ class _CodeHost:
         self.state = "open"
         self.head_sha = PRIOR_HEAD
         self.pr_url = PR_URL
+        self.head_ref = LINEAGE_BRANCH
         # The stored pull request's state once a Job has pushed, when it was
         # merged or closed while the Job ran; None keeps ``state``.
         self.state_after_push: str | None = None
@@ -742,7 +752,7 @@ class _CodeHost:
             url=url,
             state=state,
             head_sha=head_sha,
-            head_ref=LINEAGE_BRANCH,
+            head_ref=self.head_ref,
         )
 
     def pushed(self, commit_sha: str) -> None:
@@ -2673,8 +2683,437 @@ async def test_unvalidated_terminal_marker_cannot_bypass_resource_adoption(
     assert credentials.calls == []
     assert cluster.applied == []
     assert store.completed == {}
-    assert len(store.retries) == 1
+    assert store.retries == []
+    assert store.releases == [PUBLICATION_ID]
     assert replies.events == []
+
+
+def _rejected_job(
+    module: Any, phase: str = "running", *, job_uid: str | None = "old-job-uid"
+) -> Any:
+    return SimpleNamespace(
+        phase=phase,
+        logs=f"CURIE_COMMIT_SHA={'e' * 40}\nCURIE_PR_URL={PR_URL}\n",
+        commit_sha="e" * 40,
+        exists=True,
+        error=None,
+        transport=None,
+        job_uid=job_uid,
+    )
+
+
+def _reject_existing_job(module: Any, cluster: _Cluster, *, phase: str = "running") -> None:
+    k8s = importlib.import_module("curie_worker.publication_k8s")
+    cluster.code_host = None
+    cluster.preexisting_observation = _rejected_job(module, phase)
+    cluster.apply_error = k8s.PublicationResourceError("old publication resource contract")
+
+
+def _assert_rejected_job_waits(
+    store: _Store,
+    credentials: _Credentials,
+    cluster: _Cluster,
+    github: _CodeHost,
+    replies: _Replies,
+) -> None:
+    assert store.completed == {}
+    assert store.failures == []
+    assert store.retries == []
+    assert store.pending == {}
+    assert store.cleanup_pending == set()
+    assert credentials.calls == []
+    assert github.calls == []
+    assert cluster.applied == []
+    assert cluster.credentials_cleaned == []
+    assert cluster.terminals_cleaned == []
+    assert replies.events == []
+
+
+async def test_mismatched_existing_job_is_proven_through_github_without_charging(
+    publication: Any,
+) -> None:
+    loop, store, credentials, cluster, github, replies = _loop(publication)
+    _reject_existing_job(publication, cluster)
+    cluster.preexisting_observation = _rejected_job(publication)
+    cluster.preexisting_observation.logs = ""
+    cluster.preexisting_observation.commit_sha = None
+    cluster.preexisting_observation.transport = _transport()
+    store.retry_terminal_after = 1
+    work = _work(publication)
+    assert github.branch_head is None
+
+    for _ in range(3):
+        await loop.reconcile(work)
+        _assert_rejected_job_waits(store, credentials, cluster, github, replies)
+    assert len(cluster.validated_existing) == 3
+
+    github.pushed(REVISION_HEAD)
+    await loop.reconcile(work)
+    _assert_rejected_job_waits(store, credentials, cluster, github, replies)
+
+    cluster.preexisting_observation = _rejected_job(publication, "succeeded")
+    await loop.reconcile(work)
+    _assert_rejected_job_waits(store, credentials, cluster, github, replies)
+    assert store.releases == [PUBLICATION_ID] * 5
+    job_name = publication.publication_resource_names(PUBLICATION_ID).job
+    assert cluster.quiescence_checks == [(job_name, "old-job-uid")] * 5
+
+    cluster.quiescent = True
+    await loop.reconcile(work)
+
+    assert credentials.calls == [PUBLICATION_ID]
+    assert github.branch_calls == [PUBLICATION_ID]
+    assert github.verify_calls == [(PUBLICATION_ID, REVISION_HEAD, REVISION_ID, PRIOR_HEAD)]
+    assert github.recover_calls == [(PUBLICATION_ID, REVISION_HEAD)]
+    assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
+    assert store.retries == []
+    assert store.failures == []
+    assert cluster.applied == []
+    assert len(cluster.credentials_cleaned) == 1
+    assert len(cluster.terminals_cleaned) == 1
+    assert len(loop._lineage.advances) == 1
+    assert loop._lineage.advances[0]["head_sha"] == REVISION_HEAD
+    assert loop._lineage.advances[0]["pr_url"] == PR_URL
+    assert len(replies.events) == 1
+    assert PR_URL in replies.events[0][0].text
+
+    await loop.reconcile(work)
+    assert github.recover_calls == [(PUBLICATION_ID, REVISION_HEAD)]
+    assert len(replies.events) == 1
+    assert cluster.applied == []
+    assert len(cluster.terminals_cleaned) == 1
+
+
+@pytest.mark.parametrize("job_uid", [None, ""])
+async def test_rejected_job_without_a_uid_waits_uncharged(
+    publication: Any, job_uid: str | None
+) -> None:
+    loop, store, credentials, cluster, github, replies = _loop(publication)
+    _reject_existing_job(publication, cluster, phase="succeeded")
+    cluster.preexisting_observation = _rejected_job(publication, "succeeded", job_uid=job_uid)
+    cluster.quiescent = True
+
+    await loop.reconcile(_work(publication))
+
+    _assert_rejected_job_waits(store, credentials, cluster, github, replies)
+    assert cluster.quiescence_checks == []
+    assert store.releases == [PUBLICATION_ID]
+
+
+@pytest.mark.parametrize("error", [None, RuntimeError("control-plane observation unavailable")])
+async def test_rejected_job_without_quiescence_proof_waits_uncharged(
+    publication: Any, error: Exception | None
+) -> None:
+    loop, store, credentials, cluster, github, replies = _loop(publication)
+    _reject_existing_job(publication, cluster, phase="succeeded")
+    cluster.quiescence_error = error
+    store.retry_terminal_after = 1
+    github.pushed(REVISION_HEAD)
+
+    for _ in range(3):
+        await loop.reconcile(_work(publication))
+        _assert_rejected_job_waits(store, credentials, cluster, github, replies)
+
+    assert store.releases == [PUBLICATION_ID] * 3
+    job_name = publication.publication_resource_names(PUBLICATION_ID).job
+    assert cluster.quiescence_checks == [(job_name, "old-job-uid")] * 3
+
+
+async def test_quiescent_rejected_job_with_nothing_pushed_fails_once(publication: Any) -> None:
+    loop, store, credentials, cluster, github, replies = _loop(publication)
+    _reject_existing_job(publication, cluster, phase="failed")
+    cluster.quiescent = True
+    github.recovered_pr_url = None
+    work = _work(publication)
+    error = "publication resources were created by a different Curie release and nothing was pushed"
+
+    await loop.reconcile(work)
+    await loop.reconcile(work)
+
+    assert store.completed == {PUBLICATION_ID: ("failed", None)}
+    assert store.failures == [(PUBLICATION_ID, error)]
+    assert store.retries == []
+    assert credentials.calls == [PUBLICATION_ID]
+    assert github.calls == ["read_branch_head"]
+    assert cluster.applied == []
+    assert len(cluster.credentials_cleaned) == 1
+    assert len(cluster.terminals_cleaned) == 1
+    assert len(replies.events) == 1
+    assert replies.events[0][0].text == f"Publication failed safely after approval: {error}"
+    assert loop._lineage.advances == []
+
+
+@pytest.mark.parametrize("allow_launch", [False, True])
+async def test_rejected_job_checks_remote_branch_when_the_stored_pull_has_the_prior_head(
+    publication: Any, allow_launch: bool
+) -> None:
+    loop, store, credentials, cluster, github, replies = _loop(publication)
+    _reject_existing_job(publication, cluster)
+    work = _lineage_work(publication)
+
+    await loop.reconcile(work, allow_launch=allow_launch)
+    _assert_rejected_job_waits(store, credentials, cluster, github, replies)
+    assert store.releases == [PUBLICATION_ID]
+
+    cluster.preexisting_observation = _rejected_job(publication, "succeeded")
+    cluster.quiescent = True
+    github.branch_head = REVISION_HEAD
+    github.head_sha = PRIOR_HEAD
+
+    await loop.reconcile(work, allow_launch=allow_launch)
+
+    assert github.number_calls == [(PUBLICATION_ID, 123)]
+    assert github.branch_calls == [PUBLICATION_ID]
+    assert github.verify_calls == [(PUBLICATION_ID, REVISION_HEAD, REVISION_ID, PRIOR_HEAD)]
+    assert github.recover_calls == [(PUBLICATION_ID, REVISION_HEAD)]
+    assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
+    assert store.retries == []
+    assert store.failures == []
+    assert credentials.calls == [PUBLICATION_ID]
+    assert cluster.applied == []
+    assert len(replies.events) == 1
+
+
+async def test_ended_run_with_a_rejected_job_still_requires_quiescence_before_absence(
+    publication: Any,
+) -> None:
+    loop, store, credentials, cluster, github, replies = _loop(publication)
+    _reject_existing_job(publication, cluster)
+    work = _work(publication)
+
+    await loop.reconcile(work, allow_launch=False)
+    _assert_rejected_job_waits(store, credentials, cluster, github, replies)
+
+    cluster.preexisting_observation = _rejected_job(publication, "failed")
+    cluster.quiescent = True
+    await loop.reconcile(work, allow_launch=False)
+
+    assert credentials.calls == [PUBLICATION_ID]
+    assert github.branch_calls == [PUBLICATION_ID]
+    assert cluster.applied == []
+    assert store.failures == [
+        (
+            PUBLICATION_ID,
+            "publication resources were created by a different Curie release "
+            "and nothing was pushed",
+        )
+    ]
+    assert store.retries == []
+    assert len(replies.events) == 1
+
+
+@pytest.mark.parametrize("stored_pull", [False, True])
+@pytest.mark.parametrize("failure_site", ["read", "verify", "recover"])
+async def test_quiescent_rejected_job_remote_errors_are_never_absence(
+    publication: Any, monkeypatch: pytest.MonkeyPatch, stored_pull: bool, failure_site: str
+) -> None:
+    loop, store, credentials, cluster, github, replies = _loop(publication)
+    _reject_existing_job(publication, cluster, phase="succeeded")
+    cluster.quiescent = True
+    github.pushed(REVISION_HEAD)
+    work = _lineage_work(publication) if stored_pull else _work(publication)
+    if failure_site == "recover" and stored_pull:
+        work = _work(publication)
+    method = {
+        "read": "read_pull_request" if stored_pull else "read_branch_head",
+        "verify": "verify_revision_commit",
+        "recover": "recover_pull_request",
+    }[failure_site]
+
+    def unavailable(*_args: Any, **_kwargs: Any) -> Any:
+        raise publication.PublicationReconcileError("remote observation unavailable")
+
+    monkeypatch.setattr(github, method, unavailable)
+    await loop.reconcile(work)
+
+    assert credentials.calls == [PUBLICATION_ID]
+    assert len(store.retries) == 1
+    assert "nothing was pushed" not in store.retries[0][1]
+    assert store.completed == {}
+    assert store.failures == []
+    assert loop._lineage.advances == []
+    assert cluster.applied == []
+    assert cluster.credentials_cleaned == []
+    assert cluster.terminals_cleaned == []
+    assert replies.events == []
+
+
+@pytest.mark.parametrize("stored_pull", [False, True])
+async def test_quiescent_rejected_job_refuses_foreign_credential_repository(
+    publication: Any, monkeypatch: pytest.MonkeyPatch, stored_pull: bool
+) -> None:
+    loop, store, credentials, cluster, github, replies = _loop(publication)
+    _reject_existing_job(publication, cluster, phase="succeeded")
+    github.pushed(REVISION_HEAD)
+    work = _lineage_work(publication) if stored_pull else _work(publication)
+    credential = replace(
+        _credential(publication, "Basic publication-write-credential-value"),
+        clean_clone_url=f"{ORIGIN}/acme-corp/other-bot.git",
+    )
+
+    def redeem(publication_id: uuid.UUID) -> Any:
+        credentials.calls.append(publication_id)
+        return credential
+
+    monkeypatch.setattr(credentials, "redeem", redeem)
+
+    await loop.reconcile(work)
+    _assert_rejected_job_waits(store, credentials, cluster, github, replies)
+    job_name = publication.publication_resource_names(PUBLICATION_ID).job
+    assert cluster.quiescence_checks == [(job_name, "old-job-uid")]
+
+    cluster.quiescent = True
+    await loop.reconcile(work)
+
+    assert cluster.quiescence_checks == [(job_name, "old-job-uid")] * 2
+    assert credentials.calls == [PUBLICATION_ID]
+    assert store.retries == [
+        (PUBLICATION_ID, "publication clone URL does not match the requested repository")
+    ]
+    assert store.completed == {}
+    assert store.failures == []
+    assert store.pending == {}
+    assert store.cleanup_pending == set()
+    assert loop._lineage.advances == []
+    assert github.calls == []
+    assert cluster.applied == []
+    assert cluster.credentials_cleaned == []
+    assert cluster.terminals_cleaned == []
+    assert replies.events == []
+
+
+@pytest.mark.parametrize("stored_pull", [False, True])
+@pytest.mark.parametrize("foreign", ["repository", "branch", "head", "revision", "parent"])
+async def test_quiescent_rejected_job_refuses_foreign_remote_identity(
+    publication: Any, monkeypatch: pytest.MonkeyPatch, foreign: str, stored_pull: bool
+) -> None:
+    loop, store, credentials, cluster, github, replies = _loop(publication)
+    _reject_existing_job(publication, cluster, phase="succeeded")
+    cluster.quiescent = True
+    github.pushed(REVISION_HEAD)
+    work = _lineage_work(publication) if stored_pull else _work(publication)
+    if foreign == "repository":
+        advance = loop._lineage.advance
+        refusal = (
+            "publication lineage advance was refused: "
+            "pull request identity does not match the publication repository"
+        )
+
+        def advance_authorized_identity(publication_id: uuid.UUID, **identity: Any) -> None:
+            # curie_api.crud.lineages.publication_lineage_outcome_conflict compares
+            # the supplied URL with the authorized lineage's canonical URL.
+            if identity["pr_url"].casefold() != PR_URL.casefold():
+                raise PublicationLineageRefused(refusal)
+            advance(publication_id, **identity)
+
+        monkeypatch.setattr(loop._lineage, "advance", advance_authorized_identity)
+        github.pr_url = "https://github.com/acme-corp/other-bot/pull/123"
+        github.recovered_pr_url = github.pr_url
+    elif foreign == "branch":
+        github.head_ref = "curie/another-lineage"
+    elif foreign == "head":
+        github.head_sha = "c" * 40
+        github.recovered_head_sha = "c" * 40
+    elif foreign == "revision":
+        github.allowed_revisions = {(REVISION_HEAD, uuid.UUID(int=99), PRIOR_HEAD)}
+    else:
+        github.allowed_revisions = {(REVISION_HEAD, REVISION_ID, "c" * 40)}
+
+    await loop.reconcile(work)
+
+    assert credentials.calls == [PUBLICATION_ID]
+    assert len(store.retries) == 1
+    assert "nothing was pushed" not in store.retries[0][1]
+    assert store.completed == {}
+    assert store.failures == []
+    assert store.pending == {}
+    assert store.cleanup_pending == set()
+    assert loop._lineage.advances == []
+    assert cluster.applied == []
+    assert cluster.credentials_cleaned == []
+    assert cluster.terminals_cleaned == []
+    assert replies.events == []
+    if foreign in {"revision", "parent"}:
+        assert github.verify_calls == [(PUBLICATION_ID, REVISION_HEAD, REVISION_ID, PRIOR_HEAD)]
+        assert github.recover_calls == []
+    elif foreign == "repository" and not stored_pull:
+        assert github.recover_calls == [(PUBLICATION_ID, REVISION_HEAD)]
+        assert store.retries == [(PUBLICATION_ID, refusal)]
+
+    if foreign == "repository":
+        github.pr_url = PR_URL
+        github.recovered_pr_url = PR_URL
+        await loop.reconcile(work)
+
+        assert credentials.calls == [PUBLICATION_ID] * 2
+        assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
+        assert len(store.retries) == 1
+        assert store.failures == []
+        assert cluster.applied == []
+        assert len(cluster.credentials_cleaned) == 1
+        assert len(cluster.terminals_cleaned) == 1
+        assert len(loop._lineage.advances) == 1
+        assert loop._lineage.advances[0]["pr_url"] == PR_URL
+        assert loop._lineage.advances[0]["head_sha"] == REVISION_HEAD
+        assert len(replies.events) == 1
+        assert PR_URL in replies.events[0][0].text
+
+
+@pytest.mark.parametrize("stored_pull", [False, True])
+async def test_quiescent_rejected_job_recovers_api_approved_bitbucket_dc_identity(
+    publication: Any, monkeypatch: pytest.MonkeyPatch, stored_pull: bool
+) -> None:
+    loop, store, credentials, cluster, github, replies = _loop(publication)
+    _reject_existing_job(publication, cluster, phase="succeeded")
+    github.pushed(REVISION_HEAD)
+    # curie_api.forges.bitbucket_dc.connection.BitbucketDcConnection uses /scm.
+    # Clone and web paths follow forge_fakes/bitbucket_dc_captures/pull-request.json.
+    origin = "https://bitbucket.example.com/scm"
+    repository = "ACME/acme-bot"
+    clone_url = f"{origin}/{repository}.git"
+    pr_url = "https://bitbucket.example.com/projects/ACME/repos/acme-bot/pull-requests/123"
+    credential = publication.PublicationCredential(
+        clean_clone_url=clone_url,
+        authorization_header="Bearer publication-write-credential-value",
+        origin=origin,
+        header_form="authorization_bearer",
+    )
+
+    def redeem(publication_id: uuid.UUID) -> Any:
+        credentials.calls.append(publication_id)
+        return credential
+
+    monkeypatch.setattr(credentials, "redeem", redeem)
+    github.pr_url = pr_url
+    github.recovered_pr_url = pr_url
+    work = replace(
+        _lineage_work(publication, pr_url=pr_url) if stored_pull else _work(publication),
+        repo_full_name=repository,
+    )
+
+    await loop.reconcile(work)
+    _assert_rejected_job_waits(store, credentials, cluster, github, replies)
+
+    cluster.quiescent = True
+    await loop.reconcile(work)
+
+    assert credentials.calls == [PUBLICATION_ID]
+    assert github.branch_calls == [PUBLICATION_ID]
+    assert github.verify_calls == [(PUBLICATION_ID, REVISION_HEAD, REVISION_ID, PRIOR_HEAD)]
+    assert github.number_calls == ([(PUBLICATION_ID, 123)] if stored_pull else [])
+    assert github.recover_calls == ([] if stored_pull else [(PUBLICATION_ID, REVISION_HEAD)])
+    assert store.completed == {PUBLICATION_ID: ("published", pr_url)}
+    assert store.failures == []
+    assert store.retries == []
+    assert store.releases == [PUBLICATION_ID]
+    assert cluster.applied == []
+    assert len(cluster.credentials_cleaned) == 1
+    assert len(cluster.terminals_cleaned) == 1
+    assert len(loop._lineage.advances) == 1
+    assert loop._lineage.advances[0]["head_sha"] == REVISION_HEAD
+    assert loop._lineage.advances[0]["pr_url"] == pr_url
+    assert len(replies.events) == 1
+    assert pr_url in replies.events[0][0].text
 
 
 @pytest.mark.parametrize(
@@ -3292,22 +3731,20 @@ async def test_adopting_an_existing_job_validates_its_transport_without_redeemin
     assert store.releases == [PUBLICATION_ID]
 
 
-async def test_existing_job_without_a_transport_is_bounded_without_redeeming(
+async def test_existing_job_without_a_transport_waits_uncharged_without_redeeming(
     publication: Any,
 ) -> None:
-    loop, store, credentials, cluster, github, _ = _loop(publication)
+    loop, store, credentials, cluster, github, replies = _loop(publication)
     cluster.preexisting_observation = publication.PublicationJobObservation(
         phase="succeeded", logs=f"CURIE_COMMIT_SHA={REVISION_HEAD}\n"
     )
 
     await loop.reconcile(_work(publication))
 
-    assert credentials.calls == []
+    _assert_rejected_job_waits(store, credentials, cluster, github, replies)
     assert cluster.validated_existing == []
-    assert github.calls == []
-    assert store.retries == [
-        (PUBLICATION_ID, "existing publication Job names no code host transport")
-    ]
+    assert cluster.quiescence_checks == []
+    assert store.releases == [PUBLICATION_ID]
 
 
 async def test_terminal_lineage_response_uses_the_worker_terminal_cas(

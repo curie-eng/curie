@@ -130,6 +130,20 @@ _PUBLICATION_UNRECORDED_SENTENCE = (
 )
 
 
+_PUBLICATION_FAILED_SENTENCE = (
+    "publishing the pull request failed. A branch or pull request from this run may still "
+    "exist; check the repository before retrying."
+)
+
+
+def test_publication_failed_result_section_warns_that_remote_work_may_exist() -> None:
+    body = result_section("publication_failed", pr_url=None)
+
+    assert cause_text("publication_failed") == _PUBLICATION_FAILED_SENTENCE
+    assert body.splitlines()[0] == f"Could not complete: {_PUBLICATION_FAILED_SENTENCE}"
+    assert "Cause: publication_failed" in body
+
+
 def test_publication_unrecorded_result_section_labels_its_details() -> None:
     detail = "The publication record did not match the requested repository."
     body = result_section("publication_unrecorded", pr_url=None, detail=detail)
@@ -1111,6 +1125,9 @@ def test_publication_expiry_and_failure_each_post_one_comment(admitted: Any) -> 
         assert (row["status"], row["terminal_cause"]) == ("failed", cause)
         assert sum(cause in body for body in bodies) == 1
         assert len(_notices(row["id"])) == 1
+        if cause == "publication_failed":
+            body = next(body for body in bodies if "Cause: publication_failed" in body)
+            assert f"Could not complete: {_PUBLICATION_FAILED_SENTENCE}" in body
 
 
 def test_failure_and_opened_pull_request_each_post_one_final_comment(
