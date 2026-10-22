@@ -196,9 +196,9 @@ route's `callers` is not given to the CLI as a stdio entry. Instead:
   capability probe already gives the same server. The runner also adds the
   environ lock library to `LD_PRELOAD`, so the process is not dumpable and
   same-uid peers cannot read its environ or memory.
-- The runner starts the caller once, on the first session, which comes before
-  any turn's Bash can run, and keeps it for the runner's life. A later session
-  reuses it, and a repeated `initialize` is answered from the caller's first
+- The runner starts the caller once, at boot, before it serves any turn, so no
+  turn's Bash exists yet. It keeps the caller for the runner's life. Every
+  session reuses it, and a repeated `initialize` is answered from the caller's first
   answer, so the caller is never respawned while Bash could be waiting for it.
   A caller that exits is not restarted, and its tools fail for the rest of the
   runner's life.
@@ -267,8 +267,11 @@ the field can deploy that bundle. A proxy from before this change refuses a
   a process it has observed locked, and starts that process before any turn's
   Bash exists, from the bundle root. It cannot stop a same-uid process writing
   files that the caller's runtime reads later on its own, such as a module it
-  imports lazily from a per-user directory. A caller should load what it needs
-  at start.
+  imports lazily from a per-user directory, so a caller should load what it
+  needs at start. The lock is observed on the process the runner starts. A
+  caller declared through a wrapper that forks, such as `sh -c`, hands the
+  pipe to a process the runner never observed, so a caller should be declared
+  as the program itself.
 - The bundle's code is trusted with the token once the child has read it.
   Nothing stops a declared caller from writing the token to a file or passing
   it to a subprocess. That is the bundle author's code, in the same way a
