@@ -143,6 +143,8 @@ volumes = [v for v in spec.get("volumes", []) or [] if "projected" in v and any(
 mounts = [m for m in container.get("volumeMounts", []) or [] if m["mountPath"] == MOUNT]
 
 if mode == "default":
+    if value("FACTORY_CI_WAIT_S") != "3600":
+        fail("the chart default CI wait must render as 3600, got %s" % value("FACTORY_CI_WAIT_S"))
     if value("FACTORY_ENABLED") != "false":
         fail("the factory must default off")
     if forges.get("code_hosts") or forges.get("trackers") or forges.get("bindings"):
@@ -256,6 +258,25 @@ refused() {
 # Liveness and shape ------------------------------------------------------------
 render | check default
 render -f "$WORK/factory.yaml" | check factory
+
+# #4674: omitted ciWaitSeconds uses the template fallback; an explicit 1200 is kept.
+ci_wait() {
+  helm template rel "$CHART" -f "$CHART/values-dev.yaml" "$@" | python3 -c '
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(sys.stdin.read()) if d]
+api = next(d for d in docs if d.get("kind") == "Deployment" and d["metadata"]["name"].endswith("-curie-api"))
+container = next(c for c in api["spec"]["template"]["spec"]["containers"] if c["name"] == "api")
+env = {e["name"]: e.get("value") for e in container.get("env") or []}
+print(env["FACTORY_CI_WAIT_S"])
+'
+}
+omitted=$(ci_wait --set-json 'factory.ciWaitSeconds=null')
+explicit=$(ci_wait --set 'factory.ciWaitSeconds=1200')
+if [[ "$omitted" != "3600" || "$explicit" != "1200" ]]; then
+  echo "FAIL: omitted CI wait rendered ${omitted}, explicit 1200 rendered ${explicit}" >&2
+  exit 1
+fi
+echo "  ok: omitted ciWaitSeconds renders 3600 and explicit 1200 is kept"
 
 # Repository tool declarations select the sole factory agent's runner pools.
 python3 - "$WORK/factory.yaml" "$WORK/tools.yaml" <<'PY'

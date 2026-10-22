@@ -141,8 +141,9 @@ without it, check summaries remain available but logs/reruns can be unavailable.
 GitLab uses pipeline status on the merge-request head; GitHub Actions log and
 rerun behavior does not apply to it. Jira Cloud with GitHub uses GitHub CI.
 
-The default CI wait is 1200 seconds from the push, bounded by the remaining
-execution deadline. Unreadable checks, missing required evidence, and a wait
+The default CI wait is 3600 seconds (60 minutes) from the push. An explicit
+operator value, including 1200 seconds, is kept. The wait is still bounded by
+the remaining execution deadline. Unreadable checks, missing required evidence, and a wait
 that expires produce unverified or timed-out results. A merge conflict is
 reported for human resolution. Zero checks complete only after the 120-second
 no-check grace, with no required check missing, and a PR that the code host

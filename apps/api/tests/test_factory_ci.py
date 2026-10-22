@@ -284,9 +284,35 @@ def test_marker_is_the_bundle_contract() -> None:
         assert factory_ci.MARKER.match(line) is None
 
 
-def test_the_ci_wait_is_an_operator_setting_defaulting_to_1200() -> None:
-    assert Settings().factory_ci_wait_s == 1200
-    assert Settings(FACTORY_CI_WAIT_S=3600).factory_ci_wait_s == 3600
+def test_the_ci_wait_is_an_operator_setting_defaulting_to_3600() -> None:
+    assert Settings().factory_ci_wait_s == 3600
+    assert Settings(FACTORY_CI_WAIT_S=1200).factory_ci_wait_s == 1200
+    assert Settings(FACTORY_CI_WAIT_S=10800).factory_ci_wait_s == 10800
+
+
+def test_default_ci_wait_budget_keeps_1500_pending() -> None:
+    """The unset budget is Settings.factory_ci_wait_s. An explicit 1200 stays on _decide."""
+    wait = Settings().factory_ci_wait_s
+    assert wait == 3600
+    long_deadline = PUBLISHED + timedelta(seconds=10800)
+    pending_detail = _detail(_run("build", status="in_progress"))
+    pending = _decide(
+        pending_detail, 1500, execution_deadline=long_deadline, ci_wait_seconds=wait
+    )
+    assert pending.kind == "pending"
+    green = _decide(
+        _detail(_run("build")), 1800, execution_deadline=long_deadline, ci_wait_seconds=wait
+    )
+    assert green.kind == "green"
+    timed_out = _decide(
+        pending_detail, 3600, execution_deadline=long_deadline, ci_wait_seconds=wait
+    )
+    assert timed_out.kind == "timed_out"
+    early = PUBLISHED + timedelta(seconds=600)
+    assert (
+        _decide(pending_detail, 600, execution_deadline=early, ci_wait_seconds=wait).kind
+        == "timed_out"
+    )
 
 
 @pytest.mark.parametrize("value", [0, -1, 10801])

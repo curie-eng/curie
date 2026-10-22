@@ -1297,7 +1297,7 @@ factory:
   enabled: false
   intake: poll  # or webhook
   cardBaseUrl: ""
-  ciWaitSeconds: 1200
+  ciWaitSeconds: 3600
   codeHosts: []
   trackers: []
   bindings: []
