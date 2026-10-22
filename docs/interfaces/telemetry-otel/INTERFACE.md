@@ -180,20 +180,29 @@ keys:
   `curie.phase`, `curie.phase.start_kind`, `curie.phase.end_kind`,
   `curie.terminal.cause`, `curie.terminal.status`, `curie.generation.ttft_ms`,
   `curie.generation.round`, `curie.tool.call.index`, and `curie.tool.outcome`.
+  Failure telemetry adds two optional v1 keys on the `agent.run` root (#4940):
+  `curie.terminal.classification`, set only when `curie.terminal.cause` is
+  `classified_failure`, with a value from `PLATFORM_ERROR_CLASSIFICATIONS`
+  (`runner/src/curie_runner/translate.py::PLATFORM_ERROR_CLASSIFICATIONS`) or
+  `unclassified` (the last ErrorEvent classification of the turn; no classification
+  when the turn emitted none), and `curie.budget.output_ceiling`, the output token
+  ceiling from 1 to 1000000, set only when that classification is `budget-exceeded`.
+  Neither carries message text.
   Generation content adds `langfuse.observation.input` and `langfuse.observation.output`
   (#3128), on `llm.generation` spans only, redacted and then clipped to 8000 characters.
   Input is a `[user prompt: N chars]` placeholder (never the prompt text) or the names
   of the tool results that opened the round
   (`[tool_result NAME]`, `[tool_result NAME error]`); output is assistant text and
-  `[tool_use NAME]` markers. Tool arguments and tool results are never recorded.
+  `[tool_use NAME]` markers. The text of an assistant message reporting a provider
+  error is never recorded. Tool arguments and tool results are never recorded.
   `curie.usage.scope` marks the ResultMessage usage fallback: when no generation in the
   turn received nonzero per-message usage, the turn total is stamped on the final generation
   with scope `turn`, earlier generations receive none of that total, and if no generation is active
   at the result the root gets scope `unrecorded`. Per-message usage sets no scope key.
   `SPAN_ATTRIBUTE_VALUE_TYPES`
   (`runner/src/curie_runner/otel.py::SPAN_ATTRIBUTE_VALUE_TYPES`) declares each key's
-  value type: the four usage counts, generation TTFT, generation round, and bounded tool
-  call index are `int`; every other key is `str`.
+  value type: the four usage counts, generation TTFT, generation round, bounded tool
+  call index, and output token ceiling are `int`; every other key is `str`.
 - **The schema is versioned.** `SCHEMA_VERSION`
   (`runner/src/curie_runner/otel.py::SCHEMA_VERSION`) is `v1`, stamped on the resource as
   `schema.version`, and bumps only when a key is removed, renamed, or retyped; a new

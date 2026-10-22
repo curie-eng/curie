@@ -297,12 +297,27 @@ def _recent(moment: object, *, since: datetime) -> bool:
     return isinstance(moment, datetime) and moment.tzinfo is not None and moment >= since
 
 
+def _runner_exit_code(status: Any) -> int | None:
+    for container in getattr(status, "container_statuses", None) or []:
+        if getattr(container, "name", None) != "runner":
+            continue
+        terminated = getattr(getattr(container, "state", None), "terminated", None)
+        exit_code = getattr(terminated, "exit_code", None)
+        if type(exit_code) is int:
+            return exit_code
+    return None
+
+
 def _pod_termination(pod: Any, *, since: datetime) -> SandboxTermination | None:
     status = getattr(pod, "status", None)
     phase = getattr(status, "phase", None)
     reason = getattr(status, "reason", None)
     if phase == "Failed" and reason == "Evicted":
-        return SandboxTermination("Evicted", _safe_pod_message(getattr(status, "message", None)))
+        return SandboxTermination(
+            "Evicted",
+            _safe_pod_message(getattr(status, "message", None)),
+            _runner_exit_code(status),
+        )
 
     # A graceful delete surfaces as a generic Error or Completed runner exit.
     # On a deleting pod only OOMKilled outranks the deletion itself.
