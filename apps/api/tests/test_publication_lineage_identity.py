@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
+import json
 import uuid
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
@@ -58,6 +60,7 @@ def publication_stack(
     monkeypatch.setenv("INTERNAL_WORKER_TOKEN", WORKER_TOKEN)
     monkeypatch.setenv("APPROVAL_SWEEP_INTERVAL_S", "0")
     monkeypatch.setenv("RESUME_RECONCILER_ENABLED", "false")
+    monkeypatch.setenv("CURIE_WORK_ITEM_RECONCILER_ENABLED", "false")
     monkeypatch.setenv("DEAD_LETTER_WATCH_INTERVAL_S", "0")
     monkeypatch.setenv("GITHUB_TOKEN", "ghp_publication_operator")
     monkeypatch.setenv("GITHUB_REPO_ALLOWLIST", '["acme-corp/*"]')
@@ -121,6 +124,14 @@ def review_lineage_app(
         "merged": False,
         "transport_error": False,
         "calls": [],
+        "branches": {},
+        "commits": {},
+        "pull_exists": False,
+        "opened": [],
+        "updated": [],
+        "title": "Old title",
+        "body": "Old body",
+        "updated_at": "2026-10-05T12:00:00Z",
     }
     real_client = httpx.Client
 
@@ -154,18 +165,49 @@ def review_lineage_app(
         }
         if request.url.path == f"/repos/{REPO}":
             return httpx.Response(200, json=repo)
-        return httpx.Response(
-            200,
-            json={
-                "number": PR_NUMBER,
-                "html_url": truth["html_url"],
-                "node_id": truth["node_id"],
-                "state": truth["state"],
-                "merged": truth["merged"],
-                "head": {"sha": truth["head_sha"], "ref": truth["branch"], "repo": repo},
-                "base": {"repo": repo, "ref": truth.get("base_ref", "main")},
-            },
-        )
+        # https://docs.github.com/en/rest/git/refs#get-a-reference
+        if request.url.path.startswith(f"/repos/{REPO}/git/ref/heads/"):
+            branch = request.url.path.removeprefix(f"/repos/{REPO}/git/ref/heads/")
+            sha = truth["branches"].get(branch)
+            if sha is None:
+                return httpx.Response(404)
+            return httpx.Response(
+                200, json={"ref": f"refs/heads/{branch}", "object": {"type": "commit", "sha": sha}}
+            )
+        # https://docs.github.com/en/rest/git/commits#get-a-commit-object
+        if request.url.path.startswith(f"/repos/{REPO}/git/commits/"):
+            commit = truth["commits"].get(request.url.path.rsplit("/", 1)[-1])
+            return httpx.Response(200, json=commit) if commit else httpx.Response(404)
+        # https://docs.github.com/en/rest/pulls/pulls
+        if request.method == "POST" and request.url.path == f"/repos/{REPO}/pulls":
+            fields = json.loads(request.content)
+            truth["opened"].append(fields)
+            truth.update(
+                branch=fields["head"],
+                base_ref=fields["base"],
+                title=fields["title"],
+                body=fields["body"],
+                pull_exists=True,
+            )
+        if request.method == "PATCH" and request.url.path == f"/repos/{REPO}/pulls/{PR_NUMBER}":
+            fields = json.loads(request.content)
+            truth["updated"].append(fields)
+            truth.update(fields)
+        pull = {
+            "number": PR_NUMBER,
+            "html_url": truth["html_url"],
+            "node_id": truth["node_id"],
+            "state": truth["state"],
+            "merged": truth["merged"],
+            "head": {"sha": truth["head_sha"], "ref": truth["branch"], "repo": repo},
+            "base": {"repo": repo, "ref": truth.get("base_ref", "main")},
+            "title": truth["title"],
+            "body": truth["body"],
+            "updated_at": truth["updated_at"],
+        }
+        if request.method == "GET" and request.url.path == f"/repos/{REPO}/pulls":
+            return httpx.Response(200, json=[pull] if truth["pull_exists"] else [])
+        return httpx.Response(201 if request.method == "POST" else 200, json=pull)
 
     monkeypatch.setattr(
         "curie_api.github_app.httpx.Client",
@@ -285,6 +327,8 @@ def _publication_payload(deployment_id: str, *, conversation_id: str) -> dict[st
 
 
 def _workspace_identity(payload: Mapping[str, Any]) -> str:
+    if payload.get("reply_conversation_id") is not None:
+        return str(payload["conversation_id"])
     return channel_protocol.scoped_conversation_id(
         str(payload["reply_kind"]),
         str(payload["reply_channel"]),
@@ -351,6 +395,119 @@ def _approved_publication(
     resolved = _resolve(client, auth_headers, publication["approval_id"])
     assert resolved.status_code == 200, resolved.text
     return deployment, publication
+
+
+ManualPublication = tuple[TestClient, dict[str, Any], dict[str, Any], dict[str, Any]]
+
+
+@pytest.fixture
+def manual_publication(
+    review_lineage_app: tuple[TestClient, dict[str, Any], str],
+    auth_headers: dict[str, str],
+) -> ManualPublication:
+    """Admit a request without base fields through the supported internal API (#4943)."""
+
+    client, truth, _ = review_lineage_app
+    truth.update(default_branch="release/stable", base_ref="release/stable")
+    truth["branches"]["release/stable"] = BASE_SHA
+    truth["commits"] = {
+        BASE_SHA: {"sha": BASE_SHA, "parents": [], "message": "Original base"},
+        MOVED_PARENT_SHA: {
+            "sha": MOVED_PARENT_SHA,
+            "parents": [{"sha": BASE_SHA}],
+            "message": "Base moved before publication",
+        },
+        LATER_BASE_SHA: {
+            "sha": LATER_BASE_SHA,
+            "parents": [{"sha": MOVED_PARENT_SHA}],
+            "message": "Base moved again after push",
+        },
+    }
+    deployment = _create_deployment(client, auth_headers)
+    conversation = f"manual-{uuid.uuid4().hex[:8]}"
+    admitted = client.post(
+        "/v1/internal/work-items/admissions",
+        json={
+            "agent_id": deployment["agent_id"],
+            "kind": "slack",
+            "address": "C0EXAMPLE1",
+            "reply_conversation_id": conversation,
+            "tracker": {
+                "kind": "github",
+                "host": "github.com",
+                "scope_id": "9001",
+                "issue_id": "4943",
+            },
+            "repository": {
+                "code_host_kind": "github",
+                "host": "github.com",
+                "project_id": "9001",
+                "path": REPO,
+            },
+            "code_host_installation_id": 41,
+            "objective": "Implement the requested repository change",
+            "requester": "U0REQUEST1",
+            "request_id": str(uuid.uuid4()),
+        },
+        headers=WORKER_HEADERS,
+    )
+    assert admitted.status_code == 200, admitted.text
+    request_id = admitted.json()["request"]["id"]
+    acquired = client.post(
+        f"/v1/internal/work-items/requests/{request_id}/acquire",
+        json={
+            "owner": "manual-worker",
+            "generation": 1,
+            "context": None,
+            "wake": {
+                "kind": "slack",
+                "address": "C0EXAMPLE1",
+                "adapter": "default",
+                "conversation_id": conversation,
+            },
+        },
+        headers=WORKER_HEADERS,
+    )
+    assert acquired.status_code == 200, acquired.text
+    started = client.post(
+        f"/v1/internal/work-items/requests/{request_id}/start",
+        json={
+            "owner": "manual-worker",
+            "generation": 1,
+            "claim_name": "manual-claim",
+            "sandbox_name": "manual-sandbox",
+            "context": acquired.json()["context"],
+        },
+        headers=WORKER_HEADERS,
+    )
+    assert started.status_code == 200, started.text
+    payload = _publication_payload(
+        deployment["id"], conversation_id=acquired.json()["conversation_id"]
+    )
+    payload.update(
+        reply_conversation_id=conversation,
+        work_item_request_id=request_id,
+        work_item_runtime_epoch=started.json()["runtime_epoch"],
+    )
+    publication = _create_publication(client, payload)
+    assert _rows(
+        "SELECT execution_request_id FROM curie.publications WHERE id = :id",
+        {"id": uuid.UUID(publication["id"])},
+    )[0]["execution_request_id"] == uuid.UUID(request_id)
+    truth.update(branch=publication["branch"], title=publication["title"], body=publication["body"])
+    resolved = _resolve(client, auth_headers, publication["approval_id"])
+    assert resolved.status_code == 200, resolved.text
+    return client, truth, payload, publication
+
+
+def _manual_first_commit(truth: dict[str, Any], publication: dict[str, Any], parent: str) -> None:
+    truth["branches"][publication["branch"]] = FIRST_REVISION_SHA
+    truth["branches"]["release/stable"] = BASE_SHA if parent == BASE_SHA else LATER_BASE_SHA
+    truth["commits"][FIRST_REVISION_SHA] = {
+        "sha": FIRST_REVISION_SHA,
+        "parents": [{"sha": parent}],
+        "message": f"Publish\n\nCurie-Revision: {publication['id']}\n",
+    }
 
 
 # --- canonical worker lineage PATCH helpers -----------------------------------
@@ -860,6 +1017,208 @@ def _settle_moved(
     }
     data.update(overrides)
     return _patch_lineage(client, publication["id"], **data)
+
+
+@pytest.mark.parametrize("moved", [False, True], ids=["unchanged", "moved"])
+def test_manual_admission_without_base_can_open_first_publication(
+    manual_publication: ManualPublication, moved: bool
+) -> None:
+    client, truth, _, publication = manual_publication
+    root = f"/v1/internal/publications/{publication['id']}"
+    context = client.get(f"{root}/branch-head", headers=WORKER_HEADERS)
+    assert context.status_code == 200, context.text
+    assert context.json() == {"head_sha": None, "base_branch": "release/stable"}
+    parent = MOVED_PARENT_SHA if moved else BASE_SHA
+    _manual_first_commit(truth, publication, parent)
+    before = (_publication_row(publication["id"]), _lineage_row(publication["lineage_id"]))
+
+    verified = client.post(
+        f"{root}/revision-commit",
+        json={
+            "commit_sha": FIRST_REVISION_SHA,
+            "revision_id": publication["id"],
+            "expected_parent": BASE_SHA,
+        },
+        headers=WORKER_HEADERS,
+    )
+    assert verified.status_code == 200, verified.text
+    assert verified.json() == {"commit_sha": FIRST_REVISION_SHA, "parent_sha": parent}
+    opened = client.post(
+        f"{root}/pull-request",
+        json={"expected_head_sha": FIRST_REVISION_SHA},
+        headers=WORKER_HEADERS,
+    )
+    assert opened.status_code == 200, opened.text
+    assert (opened.json()["number"], opened.json()["url"]) == (PR_NUMBER, PR_URL)
+    [fields] = truth["opened"]
+    assert fields["base"] == "release/stable"
+    assert fields["head"] == publication["branch"]
+    assert ("GET", f"/repos/{REPO}/git/ref/heads/release/stable") in truth["calls"]
+    assert ("GET", f"/repos/{REPO}/git/ref/heads/main") not in truth["calls"]
+    assert (_publication_row(publication["id"]), _lineage_row(publication["lineage_id"])) == before
+
+
+@pytest.mark.parametrize("moved", [False, True], ids=["unchanged", "moved"])
+def test_manual_admission_without_base_persists_parent_then_revises_same_pr_and_metadata(
+    manual_publication: ManualPublication, auth_headers: dict[str, str], moved: bool
+) -> None:
+    client, truth, payload, publication = manual_publication
+    parent = MOVED_PARENT_SHA if moved else BASE_SHA
+    _manual_first_commit(truth, publication, parent)
+    truth["pull_exists"] = True
+    lease = _claim_publication_lease(publication["id"], "manual-publication-worker")
+
+    settled = _settle_moved(client, publication, lease)
+
+    assert settled.status_code == 200, settled.text
+    row = _lineage_row(publication["lineage_id"])
+    identity = _identity_columns(row)
+    assert identity == ("github", "github.com", "9001", 41, "PR_example_123", "release/stable")
+    assert (row["base_sha"], row["head_sha"], row["pr_number"], row["version"]) == (
+        parent,
+        FIRST_REVISION_SHA,
+        PR_NUMBER,
+        2,
+    )
+    stored = _publication_row(publication["id"])
+    assert stored["base_sha"] == stored["expected_prior_head"] == BASE_SHA
+    assert stored["status"] == "succeeded"
+    assert _rows(
+        "SELECT w.publication_lineage_id FROM curie.work_items w "
+        "JOIN curie.execution_requests r ON r.work_item_id = w.id WHERE r.id = :id",
+        {"id": uuid.UUID(payload["work_item_request_id"])},
+    )[0]["publication_lineage_id"] == uuid.UUID(publication["lineage_id"])
+
+    _mark_outcome_history_ready(publication["id"])
+    second = _create_publication(
+        client, {**payload, "base_sha": FIRST_REVISION_SHA, "dedupe_key": uuid.uuid4().hex}
+    )
+    assert second["lineage_id"] == publication["lineage_id"]
+    resolved = _resolve(client, auth_headers, second["approval_id"])
+    assert resolved.status_code == 200, resolved.text
+    truth["default_branch"] = "different-default"
+    truth["head_sha"] = SECOND_REVISION_SHA
+    truth["branches"][publication["branch"]] = SECOND_REVISION_SHA
+    truth["commits"][SECOND_REVISION_SHA] = {
+        "sha": SECOND_REVISION_SHA,
+        "parents": [{"sha": LATER_BASE_SHA}],
+        "message": f"Revise\n\nCurie-Revision: {second['id']}\n",
+    }
+    root = f"/v1/internal/publications/{second['id']}"
+    verify_body = {
+        "commit_sha": SECOND_REVISION_SHA,
+        "revision_id": second["id"],
+        "expected_parent": FIRST_REVISION_SHA,
+    }
+    refused = client.post(f"{root}/revision-commit", json=verify_body, headers=WORKER_HEADERS)
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["code"] == "publication.revision_mismatch"
+    truth["commits"][SECOND_REVISION_SHA]["parents"] = [{"sha": FIRST_REVISION_SHA}]
+    verified = client.post(f"{root}/revision-commit", json=verify_body, headers=WORKER_HEADERS)
+    assert verified.status_code == 200, verified.text
+    assert verified.json() == {"commit_sha": SECOND_REVISION_SHA, "parent_sha": FIRST_REVISION_SHA}
+    advanced = _settle_moved(
+        client,
+        second,
+        _claim_publication_lease(second["id"], "manual-revision-worker"),
+        expected_version=2,
+        expected_head_sha=FIRST_REVISION_SHA,
+        head_sha=SECOND_REVISION_SHA,
+    )
+    assert advanced.status_code == 200, advanced.text
+    row = _lineage_row(publication["lineage_id"])
+    assert _identity_columns(row) == identity
+    assert (row["base_sha"], row["head_sha"], row["pr_number"], row["version"]) == (
+        parent,
+        SECOND_REVISION_SHA,
+        PR_NUMBER,
+        3,
+    )
+
+    _mark_outcome_history_ready(second["id"])
+    metadata = _create_publication(
+        client,
+        {
+            **payload,
+            "base_sha": SECOND_REVISION_SHA,
+            "dedupe_key": uuid.uuid4().hex,
+            "patch_b64": "",
+            "changed_paths": [],
+            "title": "Reviewed manual title",
+            "body": "Reviewed manual body",
+            "observed_title": truth["title"],
+            "observed_body_sha256": hashlib.sha256(truth["body"].encode()).hexdigest(),
+            "observed_lineage_id": publication["lineage_id"],
+            "observed_lineage_version": 3,
+        },
+    )
+    resolved = _resolve(client, auth_headers, metadata["approval_id"])
+    assert resolved.status_code == 200, resolved.text
+    observed_body = truth["body"]
+    truth["body"] = "An edit after approval"
+    metadata_url = f"/v1/internal/publications/{metadata['id']}/pull-request/metadata"
+    refused = client.post(metadata_url, headers=WORKER_HEADERS)
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["code"] == "publication.metadata_changed"
+    assert truth["updated"] == []
+    truth["body"] = observed_body
+    updated = client.post(metadata_url, headers=WORKER_HEADERS)
+    assert updated.status_code == 200, updated.text
+    assert (updated.json()["number"], updated.json()["head_sha"]) == (
+        PR_NUMBER,
+        SECOND_REVISION_SHA,
+    )
+    assert updated.json()["updated_at"] is not None
+    assert truth["updated"] == [{"title": "Reviewed manual title", "body": "Reviewed manual body"}]
+    assert truth["opened"] == []
+    assert _lineage_row(publication["lineage_id"]) == row
+
+
+@pytest.mark.parametrize("defect", ["off-branch", "unrelated", "rewound", "marker", "merge"])
+def test_manual_admission_without_base_still_requires_ancestry_and_revision_identity(
+    manual_publication: ManualPublication, defect: str
+) -> None:
+    client, truth, _, publication = manual_publication
+    _manual_first_commit(truth, publication, MOVED_PARENT_SHA)
+    if defect == "off-branch":
+        truth["commits"][LATER_BASE_SHA]["parents"] = [{"sha": BASE_SHA}]
+    elif defect == "unrelated":
+        truth["commits"][MOVED_PARENT_SHA]["parents"] = []
+    elif defect == "rewound":
+        truth["branches"]["release/stable"] = BASE_SHA
+    elif defect == "marker":
+        truth["commits"][FIRST_REVISION_SHA]["message"] = f"Curie-Revision: {uuid.uuid4()}"
+    else:
+        truth["commits"][FIRST_REVISION_SHA]["parents"].append({"sha": BASE_SHA})
+    lease = _claim_publication_lease(publication["id"], "manual-refusal-worker")
+    before = (_publication_row(publication["id"]), _lineage_row(publication["lineage_id"]))
+    root = f"/v1/internal/publications/{publication['id']}"
+    responses = [
+        client.post(
+            f"{root}/revision-commit",
+            json={
+                "commit_sha": FIRST_REVISION_SHA,
+                "revision_id": publication["id"],
+                "expected_parent": BASE_SHA,
+            },
+            headers=WORKER_HEADERS,
+        ),
+        client.post(
+            f"{root}/pull-request",
+            json={"expected_head_sha": FIRST_REVISION_SHA},
+            headers=WORKER_HEADERS,
+        ),
+        _settle_moved(client, publication, lease),
+    ]
+    code = "revision_mismatch" if defect in {"marker", "merge"} else "base_ancestry_mismatch"
+    for response in responses:
+        assert response.status_code == 409, response.text
+        assert response.json()["detail"]["code"] == f"publication.{code}"
+    assert truth["opened"] == []
+    assert (_publication_row(publication["id"]), _lineage_row(publication["lineage_id"])) == before
+    _manual_first_commit(truth, publication, BASE_SHA)
+    healthy = _settle_moved(client, publication, lease)
+    assert healthy.status_code == 200, healthy.text
 
 
 def test_first_settlement_records_actual_parent_with_head_and_keeps_approval_base(

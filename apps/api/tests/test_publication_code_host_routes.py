@@ -167,9 +167,10 @@ def _seed(
     monkeypatch: pytest.MonkeyPatch,
     *,
     open_pr: bool,
+    trigger_label: str | None = None,
 ) -> Seeded:
     agent = _agent(client, auth_headers)
-    _completed(client, agent)
+    _completed(client, agent, trigger_label=trigger_label)
     publication = _publish(client, agent["deployment_id"])
     _resolve(client, auth_headers, publication["approval_id"])
     if open_pr:
@@ -213,6 +214,15 @@ def approved(
     """An approved publication whose pull request was never recorded: the recovery case."""
 
     return _seed(stack, auth_headers, monkeypatch, open_pr=False)
+
+
+@pytest.fixture
+def factory_approved(
+    stack: TestClient,  # noqa: F811
+    auth_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> Seeded:
+    return _seed(stack, auth_headers, monkeypatch, open_pr=False, trigger_label="curie:implement")
 
 
 def _url(publication_id: object, suffix: str) -> str:
@@ -583,13 +593,14 @@ def test_branch_context_preserves_verified_lineage_base(seeded: Seeded) -> None:
 
 @pytest.mark.parametrize("branch", [None, "", "refs/heads/main", "bad..branch", "x" * 1025])
 def test_missing_or_malformed_admitted_base_cannot_use_repository_default(
-    approved: Seeded, branch: str | None
+    factory_approved: Seeded, branch: str | None
 ) -> None:
-    client, publication, code_host = approved
+    client, publication, code_host = factory_approved
     _execute(
         "UPDATE curie.work_items SET base_branch = :branch, "
-        "base_source = CASE WHEN :branch IS NULL THEN NULL ELSE base_source END, "
-        "base_commit = CASE WHEN :branch IS NULL THEN NULL ELSE base_commit END WHERE id = ("
+        "base_source = CASE WHEN CAST(:branch AS text) IS NULL THEN NULL ELSE base_source END, "
+        "base_commit = CASE WHEN CAST(:branch AS text) IS NULL THEN NULL ELSE base_commit END "
+        "WHERE id = ("
         "SELECT r.work_item_id FROM curie.execution_requests r "
         "JOIN curie.publications p ON p.execution_request_id = r.id WHERE p.id = :id)",
         {"id": uuid.UUID(publication["id"]), "branch": branch},
@@ -601,6 +612,102 @@ def test_missing_or_malformed_admitted_base_cannot_use_repository_default(
     assert response.status_code in (409, 503), response.text
     assert code_host.opened == []
     assert _stored_state(publication) == before
+
+    _execute(
+        "UPDATE curie.work_items SET base_branch = 'main', base_source = 'default', "
+        "base_commit = :base WHERE id = ("
+        "SELECT r.work_item_id FROM curie.execution_requests r "
+        "JOIN curie.publications p ON p.execution_request_id = r.id WHERE p.id = :id)",
+        {"id": uuid.UUID(publication["id"]), "base": BASE_SHA},
+    )
+    healthy = client.get(_url(publication["id"], "branch-head"), headers=WORKER_HEADERS)
+    assert healthy.status_code == 200, healthy.text
+    assert healthy.json()["base_branch"] == "main"
+    verified = _verify(client, publication)
+    assert verified.status_code == 200, verified.text
+
+
+@pytest.mark.parametrize("failure", ["empty", "malformed", "outage"])
+def test_repository_default_base_failure_can_retry(approved: Seeded, failure: str) -> None:
+    client, publication, code_host = approved
+    _execute(
+        "UPDATE curie.work_items SET base_branch = NULL, base_source = NULL, "
+        "base_commit = NULL WHERE id = ("
+        "SELECT r.work_item_id FROM curie.execution_requests r "
+        "JOIN curie.publications p ON p.execution_request_id = r.id WHERE p.id = :id)",
+        {"id": uuid.UUID(publication["id"])},
+    )
+    code_host.default_branch = {"empty": "", "malformed": "bad..branch", "outage": "trunk"}[failure]
+    if failure == "outage":
+        code_host.fail = Unavailable("github_unavailable")
+    before = _stored_state(publication)
+
+    refused = client.get(_url(publication["id"], "branch-head"), headers=WORKER_HEADERS)
+
+    assert refused.status_code == 503, refused.text
+    assert code_host.opened == []
+    assert _stored_state(publication) == before
+    code_host.default_branch, code_host.fail = "trunk", None
+    healthy = client.get(_url(publication["id"], "branch-head"), headers=WORKER_HEADERS)
+    assert healthy.status_code == 200, healthy.text
+    assert healthy.json() == {"head_sha": HEAD_SHA, "base_branch": "trunk"}
+    verified = _verify(client, publication)
+    assert verified.status_code == 200, verified.text
+
+
+@pytest.mark.parametrize("missing", ["execution-request", "work-item"])
+def test_missing_execution_relation_cannot_use_repository_default(
+    approved: Seeded, missing: str
+) -> None:
+    client, publication, code_host = approved
+    original = with_session(
+        lambda session: session.scalar(
+            text("SELECT execution_request_id FROM curie.publications WHERE id = :id"),
+            {"id": uuid.UUID(publication["id"])},
+        )
+    )
+    assert original is not None
+    query = (
+        "UPDATE curie.publications SET execution_request_id = :missing WHERE id = :id"
+        if missing == "execution-request"
+        else "UPDATE curie.execution_requests SET work_item_id = :missing WHERE id = :request"
+    )
+    work_item_id = with_session(
+        lambda session: session.scalar(
+            text("SELECT work_item_id FROM curie.execution_requests WHERE id = :id"),
+            {"id": original},
+        )
+    )
+
+    async def break_relation(session: Any) -> None:
+        # Inject a dangling persisted relation, without replacing the reader (#4943).
+        await session.execute(text("SET LOCAL session_replication_role = replica"))
+        await session.execute(
+            text(query),
+            {"id": uuid.UUID(publication["id"]), "request": original, "missing": uuid.uuid4()},
+        )
+        await session.commit()
+
+    with_session(break_relation)
+    before = _stored_state(publication)
+    try:
+        response = client.get(_url(publication["id"], "branch-head"), headers=WORKER_HEADERS)
+        assert response.status_code in (409, 503), response.text
+        assert code_host.opened == []
+        assert _stored_state(publication) == before
+    finally:
+        if missing == "execution-request":
+            _execute(
+                "UPDATE curie.publications SET execution_request_id = :request WHERE id = :id",
+                {"id": uuid.UUID(publication["id"]), "request": original},
+            )
+        else:
+            _execute(
+                "UPDATE curie.execution_requests SET work_item_id = :item WHERE id = :request",
+                {"item": work_item_id, "request": original},
+            )
+    healthy = client.get(_url(publication["id"], "branch-head"), headers=WORKER_HEADERS)
+    assert healthy.status_code == 200, healthy.text
 
 
 @pytest.mark.parametrize("scenario", ["unchanged", "moved", "moved-again", "merge-parent"])
