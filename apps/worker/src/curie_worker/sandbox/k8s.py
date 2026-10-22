@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import re
 import time
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -1069,6 +1070,8 @@ class KubernetesSandboxClient:
         if event_termination is not None and (
             event_termination.reason == "Evicted" or pod is None or status_termination is not None
         ):
+            if status_termination is not None and status_termination.exit_code is not None:
+                return replace(event_termination, exit_code=status_termination.exit_code)
             return event_termination
         if pod_missing:
             return SandboxTermination("Deleted")
