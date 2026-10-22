@@ -21,14 +21,16 @@ offline (empty means passed):
 2. cleanup: success, cancel, worker_kill and orphan_sweep each removed the daemon's
    Pod, Service, NetworkPolicy and Secret within 300 s.
 3. control: a run without the opt-in had no Docker environment, daemon or files.
-4. upgrade: the upgrade plan lines and the runner image of each repository before and
-   after, from the chart values (written by ``upgrade``).
+4. upgrade: the upgrade plan lines, the runner image of each repository before and
+   after, from the chart values, and the reply of a turn on the custom repository after
+   the upgrade, which must be repo_runner's stale_base refusal (written by ``upgrade``).
 5. ci: the base branch's required checks and the head's check runs and statuses
    (written by ``ci``), judged by ``factory_e2e.judge_first_head_ci``.
 
 cleanup and control are not collected here: ``from_lifecycle`` maps them from a
 ``daemon-lifecycle/v1`` envelope written by daemon_lifecycle.py from a real cluster
-run. Live use of this module is the w2 waypoint and acceptance.
+run, together with a ``lifecycle`` section holding that envelope's own judge failures.
+Live use of this module is the w2 waypoint and acceptance.
 """
 
 from __future__ import annotations
@@ -36,6 +38,7 @@ from __future__ import annotations
 import argparse
 import ipaddress
 import json
+import math
 import os
 import re
 import secrets
@@ -52,6 +55,10 @@ from urllib.request import Request, urlopen
 import factory_e2e as fe
 
 Obj = dict[str, Any]
+
+daemon_lifecycle = fe._load_by_path(
+    "daemon_lifecycle", Path(__file__).with_name("daemon_lifecycle.py")
+)
 
 SCHEMA = "docker-scenario/v1"
 LIFECYCLE_SCHEMA = "daemon-lifecycle/v1"
@@ -96,7 +103,9 @@ envelope (docker-scenario/v1) sections:
   runs     a and b: claim, daemon_pod, probe (from `probe`), daemon (from `collect`)
   cleanup  success, cancel, worker_kill, orphan_sweep, from the daemon-lifecycle envelope
   control  the non-opted run, from the daemon-lifecycle envelope
-  upgrade  plan lines and runner images before and after (from `upgrade`)
+  lifecycle  the daemon-lifecycle envelope's own judge failures (must be empty)
+  upgrade  plan lines, runner images before and after, and the custom repository's
+           refusal reply (from `upgrade`, which needs --custom-reply)
   ci       required checks on the first published head (from `ci`)
 `probe` runs where DOCKER_HOST names the run's daemon, takes IP:port egress targets
 (no DNS names) and exits 1 unless its holder and volume are verified gone; `collect`
@@ -223,7 +232,12 @@ def runner_image(values: Obj, repo: str) -> str:
 
 
 def upgrade_section(
-    plan_text: str, before: Obj, after: Obj, catalog_repo: str, custom_repo: str
+    plan_text: str,
+    before: Obj,
+    after: Obj,
+    catalog_repo: str,
+    custom_repo: str,
+    custom_reply: str = "",
 ) -> Obj:
     def images(repo: str) -> Obj:
         before_image, after_image = runner_image(before, repo), runner_image(after, repo)
@@ -232,7 +246,7 @@ def upgrade_section(
     return {
         "plan_lines": [line.strip() for line in plan_text.splitlines() if line.strip()],
         "catalog": images(catalog_repo),
-        "custom": images(custom_repo),
+        "custom": {**images(custom_repo), "reply": custom_reply.strip()},
     }
 
 
@@ -302,6 +316,10 @@ def from_lifecycle(evidence: Obj) -> Obj:
     control = evidence["control"]
     return {
         "cleanup": cleanup,
+        "lifecycle": {
+            "schema": evidence["schema"],
+            "failures": daemon_lifecycle.judge(evidence),
+        },
         "control": {
             "docker_env": control["runner"]["docker_env"],
             "daemon_objects": control["daemon_objects"],
@@ -332,11 +350,17 @@ def _section(name: str, check: Callable[[], list[str]]) -> list[str]:
         return [f"missing_observation: {name}"]
 
 
-def _window(probe: Obj) -> tuple[float, float]:
-    t0, t1 = probe["window"]
-    if not all(isinstance(t, int | float) and not isinstance(t, bool) for t in (t0, t1)):
-        raise TypeError("window is not two numbers")
-    return t0, t1
+def _window(probe: Obj) -> tuple[float, float] | None:
+    """The probe window when it is two finite real numbers with t0 <= t1, else None."""
+
+    window = probe["window"]
+    if not isinstance(window, list) or len(window) != 2:
+        return None
+    t0, t1 = window
+    for t in (t0, t1):
+        if not isinstance(t, int | float) or isinstance(t, bool) or not math.isfinite(t):
+            return None
+    return (t0, t1) if t0 <= t1 else None
 
 
 def _judge_identity(where: str, run: Obj) -> list[str]:
@@ -440,9 +464,15 @@ def _judge_concurrency(a: Obj, b: Obj) -> list[str]:
     for what, (left, right) in pairs.items():
         if left == right:
             reasons.append(f"concurrency_shared_daemon: runs a and b share {what} {left}")
-    (a0, a1), (b0, b1) = _window(a["probe"]), _window(b["probe"])
-    if not (a0 < b1 and b0 < a1):
-        reasons.append(f"not_concurrent: windows {[a0, a1]} and {[b0, b1]} do not overlap")
+    windows = {"a": _window(a["probe"]), "b": _window(b["probe"])}
+    for name, window in windows.items():
+        if window is None:
+            reasons.append(f"missing_observation: run {name} window")
+    first, second = windows["a"], windows["b"]
+    if first is not None and second is not None:
+        (a0, a1), (b0, b1) = first, second
+        if not (a0 < b1 and b0 < a1):
+            reasons.append(f"not_concurrent: windows {[a0, a1]} and {[b0, b1]} do not overlap")
     return reasons
 
 
@@ -487,6 +517,18 @@ def _judge_control(control: Obj) -> list[str]:
     return [f"control_docker: the non-opted run saw Docker: {control}"]
 
 
+def _judge_lifecycle(lifecycle: Obj) -> list[str]:
+    failures = lifecycle["failures"]
+    if not isinstance(failures, list):
+        raise TypeError("lifecycle failures is not a list")
+    reasons = []
+    if lifecycle["schema"] != LIFECYCLE_SCHEMA:
+        reasons.append(f"incomplete_cleanup: lifecycle schema is not {LIFECYCLE_SCHEMA}")
+    if failures:
+        reasons.append(f"incomplete_cleanup: lifecycle evidence failed its own judge: {failures}")
+    return reasons
+
+
 def _judge_upgrade(upgrade: Obj) -> list[str]:
     lines, catalog, custom = upgrade["plan_lines"], upgrade["catalog"], upgrade["custom"]
     if not isinstance(lines, list) or not all(isinstance(line, str) for line in lines):
@@ -514,6 +556,17 @@ def _judge_upgrade(upgrade: Obj) -> list[str]:
         reasons.append(f"upgrade_custom_not_refused: no preserved plan line for {custom['repo']}")
     if any(line.startswith(REBUILD_PREFIX) and f" {custom['repo']} " in line for line in lines):
         reasons.append(f"upgrade_custom_not_refused: the plan rebuilds {custom['repo']}")
+    reply = custom.get("reply")
+    pool_refusal = fe.load_repo_runner()._POOL_REFUSAL_REPLY
+    match = pool_refusal.fullmatch(reply) if isinstance(reply, str) else None
+    if (
+        match is None
+        or match.group("repository") != custom["repo"]
+        or match.group("stale") != "stale_base"
+    ):
+        reasons.append(
+            f"upgrade_custom_not_refused: no stale_base refusal reply for {custom['repo']}"
+        )
     return reasons
 
 
@@ -556,6 +609,7 @@ def judge(envelope: Obj) -> list[str]:
     judges: dict[str, Callable[[Obj], list[str]]] = {
         "cleanup": _judge_cleanup,
         "control": _judge_control,
+        "lifecycle": _judge_lifecycle,
         "upgrade": _judge_upgrade,
         "ci": lambda ci: [f"ci_not_green_first_head: {r}" for r in fe.judge_first_head_ci(ci)],
     }
@@ -751,6 +805,13 @@ def build_parser() -> argparse.ArgumentParser:
     upgrade_cmd.add_argument("--after", required=True, type=Path, metavar="VALUES.json")
     upgrade_cmd.add_argument("--catalog-repo", required=True)
     upgrade_cmd.add_argument("--custom-repo", required=True)
+    upgrade_cmd.add_argument(
+        "--custom-reply",
+        required=True,
+        type=Path,
+        metavar="FILE",
+        help="reply text of a turn on the custom repository after the upgrade",
+    )
 
     ci_cmd = commands.add_parser("ci", help="required checks on the first head (GITHUB_TOKEN)")
     for flag in ("api-url", "repo", "base", "sha"):
@@ -821,7 +882,10 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "upgrade":
             before, after = _read_json(args.before), _read_json(args.after)
             plan = args.plan.read_text()
-            section = upgrade_section(plan, before, after, args.catalog_repo, args.custom_repo)
+            reply = args.custom_reply.read_text()
+            section = upgrade_section(
+                plan, before, after, args.catalog_repo, args.custom_repo, reply
+            )
         elif args.command == "ci":
             section = collect_ci(args.api_url, args.repo, args.base, args.sha, args.required)
         else:
