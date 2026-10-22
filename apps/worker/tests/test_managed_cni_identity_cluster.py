@@ -30,7 +30,11 @@ import time
 from typing import Any
 
 import pytest
-from curie_protected_hooks.measuring_identity_rbac import MeasuringScope, check_least_privilege
+from curie_protected_hooks.measuring_identity_rbac import (
+    MeasuringScope,
+    check_least_privilege,
+    probe_attributes,
+)
 from curie_worker.managed_cni_identity import (
     CniIdentityFact,
     ManagedIdentityAPI,
@@ -207,14 +211,37 @@ def test_identity_and_least_privilege_on_a_local_cluster() -> None:
             }
         ]
         apply(group)
+        # Group bindings may carry only Kubernetes' default grants.
         evidence["least_privilege_group_extra"] = least()
-        assert evidence["least_privilege_group_extra"] == "measuring_review_allowed"
+        assert evidence["least_privilege_group_extra"] == "measuring_bindings_differ"
         kubectl("delete", "-n", "default", "rolebinding/e3-group", "role/e3-group")
+        user = role("Role", "e3-user", "default", [rule(["apps"], ["deployments"], ["create"])])
+        user[1]["subjects"] = [
+            {
+                "kind": "User",
+                "name": f"system:serviceaccount:{CONTROL}:{MEASURING}",
+                "apiGroup": "rbac.authorization.k8s.io",
+            }
+        ]
+        apply(user)
+        evidence["least_privilege_user_form_extra"] = least()
+        assert evidence["least_privilege_user_form_extra"] == "measuring_bindings_differ"
+        kubectl("delete", "-n", "default", "rolebinding/e3-user", "role/e3-user")
+        namespaces = json.loads(kubectl("get", "namespaces", "-o", "json"))["items"]
+        evidence["least_privilege_reviews"] = len(
+            probe_attributes(
+                scope(), [item["metadata"]["name"] for item in namespaces], release=True
+            )
+        )
         assert least() is None
 
         # 2. The identity is stable and reobserves within the per-call deadline.
         campaign = identity()
         evidence["identity"] = campaign.document
+        # Calico installs its CNI binary from an init container; it is in the identity.
+        containers = {item["container"] for item in campaign.document["cni_plugin_images"]}
+        assert "install-cni" in containers, containers
+        assert campaign.document["dataplane_mode"]["kube_proxy"]["form"] == "daemonset"
         evidence["identity_digest"] = campaign.digest
         assert identity().digest == campaign.digest
 
