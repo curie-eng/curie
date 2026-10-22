@@ -166,7 +166,10 @@ bootstrap installs (clause 6). Each template has no Secret volume, no projected
 service account token (`automountServiceAccountToken: false`), no host
 namespace, no host path, no privileged container, read-only root filesystem,
 and a pinned probe image by digest. The only capability any template may add
-is `NET_RAW`, and only the spoofing template in `probe-a` adds it. The
+is `NET_RAW`, and only the spoofing template in `probe-a` adds it. Kubernetes
+sets no ambient capabilities, so a non-root process loses an added capability
+when it starts; the spoofing template alone therefore runs as uid 0, with
+`NET_RAW` as its only capability and privilege escalation disallowed. The
 measuring identity chooses only the node (by `nodeName`), the labels the
 template allows, the probe arguments, and, for the kubelet-probe template of
 case 7, the probe's target host and port.

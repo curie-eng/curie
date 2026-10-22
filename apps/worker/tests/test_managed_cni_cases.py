@@ -24,7 +24,7 @@ from curie_worker.managed_cni_cases import (
     Target,
     required_entries,
 )
-from curie_worker.managed_cni_probe_kit import Measurement, accepts
+from curie_worker.managed_cni_probe_kit import Measurement, ProbeKitRefused, accepts
 
 ROLE = "curietech.ai/policy-role"
 PROBE_ROLE = "curietech.ai/managed-cni-probe-role"
@@ -140,6 +140,9 @@ class ModelCluster:
         self.created_templates: list[tuple[str, str]] = []
         # Any ordinary identity allowed node-capable rights, by (identity, resource).
         self.extra_pods: list[dict[str, Any]] = []
+        # Seconds a created pod stays Pending (container creating). Until then the
+        # API reports no address and refuses its log, as a real API server does.
+        self.container_start_s = 0.0
 
     def clock(self) -> float:
         return self.now
@@ -185,6 +188,7 @@ class ModelCluster:
             "status": {"phase": "Running", "podIPs": [{"ip": ip}]},
             "program": self._program(argument),
             "argument": argument,
+            "starts_at": self.now + self.container_start_s,
         }
         self.pods[(namespace, name)] = pod
         self.ip_owner[ip] = (namespace, name)
@@ -370,10 +374,16 @@ class ModelCluster:
             finish = state["established_ms"] + len(state["nonces"]) * state["interval"]
             if self._ms() >= finish:
                 self._finalize_retained(key)
-        return self.pods.get(key)
+        pod = self.pods.get(key)
+        if pod is not None and self.now < pod["starts_at"]:
+            return {**pod, "status": {"phase": "Pending"}}
+        return pod
 
     async def pod_log(self, namespace: str, name: str) -> str:
         pod = self.pods[(namespace, name)]
+        if self.now < pod["starts_at"]:
+            # HTTP 400: container "probe" is waiting to start: ContainerCreating.
+            raise ProbeKitRefused
         lines = list(self.logs[(namespace, name)])
         if pod["program"] == "listener":
             first = lines[0]["t"]
@@ -923,6 +933,55 @@ def test_spoof_terminated_refuses_a_stale_address() -> None:
     assert result[(3, "spoof_terminated", "ipv4", "same_node", "raw_socket")] == (
         "unavailable",
         "address_reassigned",
+    )
+
+
+def test_case_five_waits_for_a_sender_whose_container_is_still_starting() -> None:
+    # A real API server refuses the log of a pod whose container is still being
+    # created. Case 5 launches its retained sender without waiting for a phase, so
+    # that refusal means "not yet", not a timeout; the established flow must still
+    # be measured and an enforcing cluster must pass.
+    cluster = ModelCluster()
+    cluster.container_start_s = 3.0
+    result = outcomes(measure(cluster))
+    for placement in ("same_node", "cross_node"):
+        assert result[(5, "policy_changed", "ipv4", placement, "retained_peer")] == (
+            "pass",
+            "denied",
+        )
+        assert result[(5, "workload_replaced", "ipv4", placement, "retained_peer")] == (
+            "unavailable",
+            "sequence_state_unavailable",
+        )
+
+
+def test_a_retained_sender_deleted_before_it_starts_is_unavailable() -> None:
+    # The wait ends when the sender pod is gone, not only at the phase deadline.
+    from curie_worker.managed_cni_timing import _await_log
+
+    cluster = ModelCluster()
+    cluster.container_start_s = 30.0
+    run = _run_for(cluster)
+
+    async def go() -> tuple[bool, float]:
+        created = await cluster.create_pod("probe-a", _retained_document())
+        uid = created["metadata"]["uid"]
+        await cluster.delete_pod("probe-a", "s", uid)
+        start = cluster.now
+        found = await _await_log(run, "probe-a", "s", uid, "established", start + 120)
+        return found, cluster.now - start
+
+    found, waited = asyncio.run(go())
+    assert found is False and waited < 2
+
+
+def _retained_document() -> dict[str, Any]:
+    from curie_worker.managed_cni_probe_programs import probe_pod
+
+    return probe_pod(
+        template="retained_sender", name="s", namespace="probe-a", node="n1", campaign="c1",
+        role_labels={}, argument={"addr": "10.0.0.1", "port": 1, "nonces": ["a" * 32],
+                                  "interval_ms": 100, "timeout_ms": 2000},
     )
 
 
