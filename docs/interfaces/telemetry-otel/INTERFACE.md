@@ -62,7 +62,12 @@ than an open bag of `gen_ai.*` names.
   parentage and honest status for platform operations. Its caller vocabulary is closed
   to `service.name`, `operation`, `role`, `source`, `outcome`, `retry_class`, and
   `event_id`; custom keys export only as `curie.operation`, `curie.role`, `curie.source`,
-  `curie.outcome`, `curie.retry_class`, and `curie.channel.event_id`. `event_id` is the
+  `curie.outcome`, `curie.retry_class`, and `curie.channel.event_id`. The worker's turn
+  span may also carry `termination_reason` and `termination_exit_code`, exported as
+  `curie.sandbox.termination.reason` and `curie.sandbox.termination.exit_code`, only for
+  a confirmed runner pod termination; the reason is one of `OOMKilled`, `Evicted`,
+  `Deleted`, or `Unknown`, the exit code is an int from 0 to 255, and termination detail
+  text is never exported. `event_id` is the
   one correlation identifier the vocabulary admits, and it is admitted on spans only:
   the metric catalog stays closed to it, because `record_metric` enumerates a value
   domain per attribute and an identifier has none. Spans describing the turn's own
@@ -175,20 +180,29 @@ keys:
   `curie.phase`, `curie.phase.start_kind`, `curie.phase.end_kind`,
   `curie.terminal.cause`, `curie.terminal.status`, `curie.generation.ttft_ms`,
   `curie.generation.round`, `curie.tool.call.index`, and `curie.tool.outcome`.
+  Failure telemetry adds two optional v1 keys on the `agent.run` root (#4940):
+  `curie.terminal.classification`, set only when `curie.terminal.cause` is
+  `classified_failure`, with a value from `PLATFORM_ERROR_CLASSIFICATIONS`
+  (`runner/src/curie_runner/translate.py::PLATFORM_ERROR_CLASSIFICATIONS`) or
+  `unclassified` (the last ErrorEvent classification of the turn; no classification
+  when the turn emitted none), and `curie.budget.output_ceiling`, the output token
+  ceiling from 1 to 1000000, set only when that classification is `budget-exceeded`.
+  Neither carries message text.
   Generation content adds `langfuse.observation.input` and `langfuse.observation.output`
   (#3128), on `llm.generation` spans only, redacted and then clipped to 8000 characters.
   Input is a `[user prompt: N chars]` placeholder (never the prompt text) or the names
   of the tool results that opened the round
   (`[tool_result NAME]`, `[tool_result NAME error]`); output is assistant text and
-  `[tool_use NAME]` markers. Tool arguments and tool results are never recorded.
+  `[tool_use NAME]` markers. The text of an assistant message reporting a provider
+  error is never recorded. Tool arguments and tool results are never recorded.
   `curie.usage.scope` marks the ResultMessage usage fallback: when no generation in the
   turn received nonzero per-message usage, the turn total is stamped on the final generation
   with scope `turn`, earlier generations receive none of that total, and if no generation is active
   at the result the root gets scope `unrecorded`. Per-message usage sets no scope key.
   `SPAN_ATTRIBUTE_VALUE_TYPES`
   (`runner/src/curie_runner/otel.py::SPAN_ATTRIBUTE_VALUE_TYPES`) declares each key's
-  value type: the four usage counts, generation TTFT, generation round, and bounded tool
-  call index are `int`; every other key is `str`.
+  value type: the four usage counts, generation TTFT, generation round, bounded tool
+  call index, and output token ceiling are `int`; every other key is `str`.
 - **The schema is versioned.** `SCHEMA_VERSION`
   (`runner/src/curie_runner/otel.py::SCHEMA_VERSION`) is `v1`, stamped on the resource as
   `schema.version`, and bumps only when a key is removed, renamed, or retyped; a new

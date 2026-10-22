@@ -72,7 +72,7 @@ def test_the_factory_defaults_off_with_no_forges() -> None:
 
     assert settings.factory_enabled is False
     assert settings.factory_intake == "poll"
-    assert settings.factory_ci_wait_s == 1200
+    assert settings.factory_ci_wait_s == 3600
     assert settings.factory_reconcile_interval_s == 300.0
     assert settings.factory_reconcile_grace_s == 300.0
     assert (settings.forges.code_hosts, settings.forges.trackers) == ((), ())
@@ -265,9 +265,12 @@ def test_factory_ci_wait_is_refused_outside_its_bounds(
         Settings(_env_file=None)
 
 
-def test_factory_ci_wait_is_read_from_its_env_name(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("FACTORY_CI_WAIT_S", "10800")
-    assert Settings(_env_file=None).factory_ci_wait_s == 10800
+@pytest.mark.parametrize("value", ["1200", "10800"])
+def test_factory_ci_wait_is_read_from_its_env_name(
+    value: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FACTORY_CI_WAIT_S", value)
+    assert Settings(_env_file=None).factory_ci_wait_s == int(value)
 
 
 # CURIE_FORGES from the real environment --------------------------------------------------

@@ -1297,7 +1297,7 @@ factory:
   enabled: false
   intake: poll  # or webhook
   cardBaseUrl: ""
-  ciWaitSeconds: 1200
+  ciWaitSeconds: 3600
   codeHosts: []
   trackers: []
   bindings: []
@@ -2689,18 +2689,66 @@ agentSandbox:
   #       CLAUDE_CODE_MAX_OUTPUT_TOKENS: "16000"
   runnerEnv: {}
   # Per-agent workspace ceiling (#3523): agent name -> the sizeLimit of that
-  # agent's `workspace` emptyDir, replacing agentSandbox.runner.workspace.sizeLimit
-  # (default 1Gi) for that agent only. Each listed agent gets its own
-  # SandboxTemplate and warm pool; every other agent keeps the runner default.
-  # A build-heavy agent needs this: a checkout of curie-eng/curie plus the cargo
-  # target directory of `cargo test` for cli/ outgrew a 10Gi workspace and the
-  # pod was evicted. emptyDir usage also counts against the pod's
-  # ephemeral-storage limit, so raise that agent's runner resources
-  # `ephemeral-storage` limit (runner.resources, or the agent's runner
-  # resources) to at least this value plus the home scratch.
+  # agent's `workspace` emptyDir. It beats both agentSandbox.runner.workspace.sizeLimit
+  # and the agent's resource profile workspaceSizeLimit, for that agent only.
+  # Each listed agent gets its own SandboxTemplate and warm pool. emptyDir usage
+  # also counts against the pod's ephemeral-storage limit, so keep the agent's
+  # profile (or explicit runner.resources) ephemeral-storage limit at least
+  # this value plus the home and tmp scratch it actually fills.
   #   workspaceSizeLimits:
   #     dark-factory: 24Gi
   workspaceSizeLimits: {}
+  # Sandbox resource profiles (#4889; ADR-0059: every ceiling is an
+  # operator-overridable value). Agent name -> profile name (a key of
+  # resourceProfiles below). Overrides the derived selection: an agent with
+  # factory.sandboxEgress.<agent>: true while factory.enabled is true uses
+  # `factory`; every other agent, and the generic template, uses `standard`.
+  # Each listed agent gets its own SandboxTemplate and warm pool.
+  #   agentResourceProfiles:
+  #     dark-factory: standard   # opt a factory agent out
+  #     big-builder: factory     # opt any agent in
+  agentResourceProfiles: {}
+  # Complete sandbox envelopes. A profile field applies only where no explicit
+  # value supplies it:
+  #   resources, per pair (cpu, memory, ephemeral-storage): setting either
+  #     agentSandbox.runner.resources.requests.<r> or .limits.<r> takes that pair
+  #     from the generic keys for EVERY template (the unset side from
+  #     `standard`); otherwise the selected profile supplies both sides.
+  #   workspace: workspaceSizeLimits.<agent> > runner.workspace.sizeLimit >
+  #     the profile workspaceSizeLimit.
+  #   writable paths: runner.hardening.writablePathSizeLimit (every path) >
+  #     homeSizeLimit for runner.hardening.home, tmpSizeLimit for /tmp,
+  #     writablePathSizeLimit for any other writablePaths entry.
+  # The render refuses a needed field that resolves to nothing, and a memory or
+  # ephemeral-storage request above its limit (bare integer or Ki/Mi/Gi/Ti
+  # quantities only; other forms are left to the API server).
+  #
+  # factory sizing: the 15Gi workspace, 15Gi home and 4Gi tmp are independent
+  # volume ceilings (15 + 15 + 4 = 34Gi of upper bounds, not reservations); the
+  # 20Gi ephemeral-storage limit is an additional shared bound on all of them,
+  # and the scheduler reserves only the 10Gi request. The 8Gi memory request
+  # equals resourceQuota.hard.requestsMemory, so the default quota admits one
+  # factory sandbox at a time and a node needs 8Gi of unrequested memory to
+  # schedule it. Raise resourceQuota.hard.requestsMemory / limitsMemory per
+  # extra concurrent factory sandbox. Existing pods keep their envelope; a new
+  # sandbox picks up a change.
+  resourceProfiles:
+    standard:
+      resources:
+        requests: { cpu: 50m, memory: 192Mi, ephemeral-storage: 512Mi }
+        limits: { cpu: "1", memory: 768Mi, ephemeral-storage: 4Gi }
+      workspaceSizeLimit: 1Gi
+      homeSizeLimit: 512Mi
+      tmpSizeLimit: 512Mi
+      writablePathSizeLimit: 512Mi
+    factory:
+      resources:
+        requests: { cpu: 50m, memory: 8Gi, ephemeral-storage: 10Gi }
+        limits: { cpu: "2", memory: 8Gi, ephemeral-storage: 20Gi }
+      workspaceSizeLimit: 15Gi
+      homeSizeLimit: 15Gi
+      tmpSizeLimit: 4Gi
+      writablePathSizeLimit: 512Mi
   # Agents that get a labeled sandbox template and warm pool so connector
   # ingress can select curietech.ai/agent=<name>. A list of agent name strings.
   # Empty by default. Agents already covered by connectorSecrets, registryEgress,
@@ -2828,7 +2876,10 @@ agentSandbox:
     workspace:
       enabled: true
       mountPath: /workspace
-      sizeLimit: 1Gi
+      # Unset: the agent's resource profile workspaceSizeLimit (standard 1Gi,
+      # factory 15Gi). A value here applies to every agent;
+      # agentSandbox.workspaceSizeLimits.<agent> still wins for that agent.
+      sizeLimit:
       fetchTimeoutSeconds: 45
       extractTimeoutSeconds: 45
     # Inbound attachments arrive the same way a workspace does: a claim-scoped,
@@ -2919,9 +2970,14 @@ agentSandbox:
     # keeps a node from being overcommitted) and the limit (the periodic-
     # measurement backstop) are required and do different jobs (decision 2);
     # raise either per agent/workload via a values override.
+    #
+    # #4889: the numbers live in agentSandbox.resourceProfiles (standard for
+    # the generic template). Leave a pair unset to take the selected profile's
+    # values; set either side of a pair (e.g. limits.memory) and that pair
+    # applies to EVERY template, its unset side taken from `standard`.
     resources:
-      requests: { cpu: 50m, memory: 192Mi, ephemeral-storage: 512Mi }
-      limits: { cpu: "1", memory: 768Mi, ephemeral-storage: 4Gi }
+      requests: {}
+      limits: {}
     # --- security rails on the runner surface ---
     # Rail 3: container hardening. non-root + read-only rootfs + dropped caps +
     # no privilege escalation + RuntimeDefault seccomp. readOnlyRootFilesystem
@@ -2951,7 +3007,12 @@ agentSandbox:
       # bundleFetch.sizeLimit above: the kubelet samples usage rather than
       # capping writes inline, so this is a fast, attributable backstop (the
       # offending pod is evicted, not the node degraded), not a hard quota.
-      writablePathSizeLimit: 512Mi
+      #
+      # #4889: unset takes the agent's resource profile per path: the `home`
+      # path gets homeSizeLimit, `/tmp` gets tmpSizeLimit, and any other path
+      # gets writablePathSizeLimit. A value here is one ceiling for every path
+      # on every template (the pre-profile semantics).
+      writablePathSizeLimit:
     # Rail 4 (gVisor kernel isolation) is controlled by security.gvisor.mode
     # below -- the effective pod runtimeClassName is computed from that tri-state,
     # not set here.
@@ -3224,10 +3285,13 @@ resourceQuota:
   # that then sit Pending until the claim times out.
   #
   #   quota ceiling = min(sandboxPodCount,
-  #                       requestsCpu    / agentSandbox.runner.resources.requests.cpu,
-  #                       requestsMemory / agentSandbox.runner.resources.requests.memory,
-  #                       limitsCpu      / agentSandbox.runner.resources.limits.cpu,
-  #                       limitsMemory   / agentSandbox.runner.resources.limits.memory)
+  #                       requestsCpu    / per-sandbox requests.cpu,
+  #                       requestsMemory / per-sandbox requests.memory,
+  #                       limitsCpu      / per-sandbox limits.cpu,
+  #                       limitsMemory   / per-sandbox limits.memory)
+  #   where per-sandbox is the generic (standard) envelope: agentSandbox.resourceProfiles.standard
+  #   unless agentSandbox.runner.resources sets the pair. NOTES also reports
+  #   each agent whose profile differs (a factory sandbox requests 8Gi).
   #   (a term whose per-sandbox value is unset or 0 is skipped). With the
   #   shipped defaults: min(50, 4/50m=80, 8Gi/192Mi=42, 8/1=8, 16Gi/768Mi=21)
   #   = 8, so limitsCpu is the binding term.

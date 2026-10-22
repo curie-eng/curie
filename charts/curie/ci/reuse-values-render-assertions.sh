@@ -35,6 +35,11 @@
 # Each profile is first rendered with the RELEASED chart, so a profile the
 # release itself rejects fails here instead of quietly testing nothing.
 #
+# On the newest source it also proves the sandbox resource profiles (#4889):
+# released values keep the released generic envelope for every template,
+# candidate values give a factory agent the full factory profile, and explicit
+# overrides win on both.
+#
 # Negative control: reverting #3544's nil guard on `connectorCaller` in a copy
 # of the candidate must make the v0.10.3 render fail with a nil dereference.
 # If it renders, this gate cannot see the bug class and fails.
@@ -260,6 +265,170 @@ if helm template acme "$CHART" --is-upgrade --set-string "agentSandbox.runnerIma
 fi
 grep -q "agentSandbox.runnerImages.acme-bot" "$TMP/layered-null.err" || fail "null digest refusal does not name the binding"
 echo "OK: v$LATEST_VERSION layered binding upgrades when the stale key is removed"
+
+# --- sandbox resource profiles across the upgrade paths (#4889) ---------------
+# The candidate adds agentSandbox.resourceProfiles / agentResourceProfiles and
+# leaves the generic runner.resources, workspace.sizeLimit and
+# writablePathSizeLimit unset so the selected profile fills them. A release
+# made by an older chart stores none of that: under --reuse-values its
+# values.yaml still carries the old generic numbers, which then read as
+# explicit. Proves, on the newest release's values:
+#   * released values (helm upgrade --reuse-values from that release): the
+#     generic template renders byte for byte what the released chart renders,
+#     and the factory agent resolves the released generic envelope instead of
+#     failing; explicit per-agent workspace and cpu overrides still win.
+#   * candidate values (helm upgrade --reset-then-reuse-values, curie cluster
+#     upgrade, and a later --reuse-values once the release runs the candidate):
+#     the factory agent gets the full factory profile, explicit overrides win,
+#     and a release without the factory keeps only the standard generic
+#     template (non-factory control).
+PROFILE_FIXTURE="$SCRIPT_DIR/fixtures/factory-resource-profile.yaml"
+[[ -f "$PROFILE_FIXTURE" ]] || fail "factory resource profile fixture is missing: $PROFILE_FIXTURE"
+python3 - "$PROFILE_FIXTURE" "$TMP/profile-overrides.json" <<'PY'
+import json, sys, yaml
+doc = yaml.safe_load(open(sys.argv[1]))
+doc["agentSandbox"] = {
+    "workspaceSizeLimits": {"acme-factory": "18Gi"},
+    "runner": {"resources": {"limits": {"cpu": "3"}}},
+}
+json.dump(doc, open(sys.argv[2], "w"))
+PY
+PROFILE_SHAPE="$TMP/profile-shape.py"
+cat > "$PROFILE_SHAPE" <<'PY'
+"""profile-shape.py <render> <key> (<want-json> | same <render2> <key2>)
+
+<key> is `generic` or an agent name; `none` asserts the render has no
+per-agent SandboxTemplate. <want-json> maps cpu/memory/ephemeral-storage to
+[request, limit] and workspace, /tmp, /home/runner to sizeLimits. `same`
+compares the runner and init container resources and every emptyDir volume
+with another render's template."""
+import json
+import sys
+
+import yaml
+
+
+def templates(path):
+    return {d["metadata"]["name"]: d for d in yaml.safe_load_all(open(path))
+            if d and d.get("kind") == "SandboxTemplate"}
+
+
+def find(path, key):
+    names = templates(path)
+    if key == "generic":
+        hits = [n for n in names if "-agent-" not in n]
+    else:
+        hits = [n for n in names if n.endswith(f"-agent-{key}-runner")]
+    if len(hits) != 1:
+        sys.exit(f"{path}: want one {key} SandboxTemplate, got {sorted(names)}")
+    return names[hits[0]]["spec"]["podTemplate"]["spec"]
+
+
+def shape(spec):
+    runner = next(c for c in spec["containers"] if c["name"] == "runner")
+    mounts = {m["name"]: m["mountPath"] for m in runner.get("volumeMounts", [])}
+    res = {c["name"]: {side: {k: str(v) for k, v in (c.get("resources") or {}).get(side, {}).items()}
+                       for side in ("requests", "limits")}
+           for c in [runner] + list(spec.get("initContainers") or [])}
+    vols = {}
+    for v in spec.get("volumes", []):
+        if "emptyDir" in v:
+            label = mounts.get(v["name"], v["name"]) if v["name"].startswith("writable-") else v["name"]
+            vols[label] = str(v["emptyDir"].get("sizeLimit"))
+    return res, vols
+
+
+path, key = sys.argv[1], sys.argv[2]
+if key == "none":
+    agents = sorted(n for n in templates(path) if "-agent-" in n)
+    if agents:
+        sys.exit(f"{path}: expected no per-agent SandboxTemplate, got {agents}")
+    raise SystemExit(0)
+res, vols = shape(find(path, key))
+if sys.argv[3] == "same":
+    other = shape(find(sys.argv[4], sys.argv[5]))
+    if (res, vols) != other:
+        sys.exit(f"{key} in {path} differs from {sys.argv[5]} in {sys.argv[4]}:\n  {(res, vols)}\n  {other}")
+    raise SystemExit(0)
+want = json.loads(sys.argv[3])
+errors = []
+for name, got in res.items():
+    for r in ("cpu", "memory", "ephemeral-storage"):
+        pair = [got["requests"].get(r), got["limits"].get(r)]
+        if pair != want[r]:
+            errors.append(f"{key}: container {name} {r} {pair}, want {want[r]}")
+for label in ("workspace", "/tmp", "/home/runner"):
+    if vols.get(label) != want[label]:
+        errors.append(f"{key}: volume {label} sizeLimit {vols.get(label)!r}, want {want[label]!r}")
+if errors:
+    sys.exit("\n".join(errors))
+PY
+shape_is() { # shape_is <label> <render> <key> <want-json | same render2 key2 | ->
+  local label="$1"; shift
+  python3 "$PROFILE_SHAPE" "$@" > "$TMP/profile-shape.out" 2>&1 \
+    || { sed 's/^/    /' "$TMP/profile-shape.out" >&2; fail "$label"; }
+}
+std_env() { # std_env [cpu-limit] [workspace]
+  printf '{"cpu":["50m","%s"],"memory":["192Mi","768Mi"],"ephemeral-storage":["512Mi","4Gi"],"workspace":"%s","/tmp":"512Mi","/home/runner":"512Mi"}' \
+    "${1:-1}" "${2:-1Gi}"
+}
+factory_env() { # factory_env [cpu-limit] [workspace]
+  printf '{"cpu":["50m","%s"],"memory":["8Gi","8Gi"],"ephemeral-storage":["10Gi","20Gi"],"workspace":"%s","/tmp":"4Gi","/home/runner":"15Gi"}' \
+    "${1:-2}" "${2:-15Gi}"
+}
+profile_render() { # profile_render <label> <mode> <chart> <out> [values]
+  local label="$1"; shift
+  render "$@" || { sed 's/^/    /' "$3.err" >&2; fail "$label refused to render"; }
+}
+
+released="$TMP/released-$LATEST_VERSION/curie"
+profile_reuse="$TMP/profile-reuse-$LATEST_VERSION"
+reuse_chart "$LATEST_VERSION" "$profile_reuse"
+profile_render "v$LATEST_VERSION factory fixture" install "$released" "$TMP/profile-released.yaml" "$PROFILE_FIXTURE"
+profile_render "v$LATEST_VERSION factory fixture with overrides" install "$released" "$TMP/profile-released-ovr.yaml" "$TMP/profile-overrides.json"
+
+# Released values (helm upgrade --reuse-values from v$LATEST_VERSION).
+profile_render "--reuse-values from v$LATEST_VERSION with the factory fixture" \
+  upgrade "$profile_reuse" "$TMP/profile-reuse.yaml" "$PROFILE_FIXTURE"
+shape_is "released values: the generic template changed under --reuse-values" \
+  "$TMP/profile-reuse.yaml" generic same "$TMP/profile-released.yaml" generic
+shape_is "released values: the factory agent did not resolve the released generic envelope" \
+  "$TMP/profile-reuse.yaml" acme-factory same "$TMP/profile-released.yaml" generic
+shape_is "released values: the factory agent envelope is not the standard one" \
+  "$TMP/profile-reuse.yaml" acme-factory "$(std_env)"
+profile_render "--reuse-values from v$LATEST_VERSION with explicit overrides" \
+  upgrade "$profile_reuse" "$TMP/profile-reuse-ovr.yaml" "$TMP/profile-overrides.json"
+shape_is "released values: explicit workspace and cpu overrides lost" \
+  "$TMP/profile-reuse-ovr.yaml" acme-factory "$(std_env 3 18Gi)"
+shape_is "released values: generic template changed under explicit overrides" \
+  "$TMP/profile-reuse-ovr.yaml" generic same "$TMP/profile-released-ovr.yaml" generic
+echo "OK: v$LATEST_VERSION --reuse-values keeps the released generic envelope for every template and honors explicit overrides"
+
+# Candidate values (--reset-then-reuse-values, curie cluster upgrade).
+profile_render "candidate upgrade with the factory fixture" upgrade "$CHART" "$TMP/profile-cand.yaml" "$PROFILE_FIXTURE"
+shape_is "candidate values: factory agent lacks the factory profile" \
+  "$TMP/profile-cand.yaml" acme-factory "$(factory_env)"
+shape_is "candidate values: generic template is not standard" "$TMP/profile-cand.yaml" generic "$(std_env)"
+profile_render "candidate upgrade with explicit overrides" upgrade "$CHART" "$TMP/profile-cand-ovr.yaml" "$TMP/profile-overrides.json"
+shape_is "candidate values: explicit overrides did not win over the factory profile" \
+  "$TMP/profile-cand-ovr.yaml" acme-factory "$(factory_env 3 18Gi)"
+shape_is "candidate values: generic template lost the explicit cpu limit" \
+  "$TMP/profile-cand-ovr.yaml" generic "$(std_env 3)"
+profile_render "candidate upgrade without the factory" upgrade "$CHART" "$TMP/profile-cand-none.yaml"
+shape_is "candidate values (non-factory control): generic template is not standard" \
+  "$TMP/profile-cand-none.yaml" generic "$(std_env)"
+shape_is "candidate values (non-factory control): a per-agent template appeared" \
+  "$TMP/profile-cand-none.yaml" none
+
+# Candidate to candidate (--reuse-values once the release runs the candidate):
+# Helm reuses the candidate's own values.yaml plus the stored user values.
+profile_c2c="$TMP/profile-c2c"
+rm -rf "$profile_c2c"
+cp -R "$CHART" "$profile_c2c"
+profile_render "candidate to candidate --reuse-values" upgrade "$profile_c2c" "$TMP/profile-c2c.yaml" "$TMP/profile-overrides.json"
+shape_is "candidate to candidate --reuse-values lost the factory envelope or an override" \
+  "$TMP/profile-c2c.yaml" acme-factory "$(factory_env 3 18Gi)"
+echo "OK: candidate values give the factory agent the full factory profile with explicit overrides; a release without the factory stays standard"
 
 # --- negative control: revert #3544's connectorCaller guard ------------------
 # #3544 turned `.Values.connectorCaller.<field>` into

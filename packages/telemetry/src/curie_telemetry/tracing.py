@@ -110,6 +110,10 @@ PLATFORM_SPAN_ATTRIBUTE_KEYS = {
     "authority": "curie.remediation.authority",
     "code": "curie.remediation.code",
     "nomination_id": "curie.remediation.nomination_id",
+    # #4940: a confirmed runner pod termination, closed reason and exit code
+    # only, admitted on spans only (never detail text, events, or metrics).
+    "termination_reason": "curie.sandbox.termination.reason",
+    "termination_exit_code": "curie.sandbox.termination.exit_code",
 }
 PLATFORM_EVENT_ATTRIBUTE_KEYS = {
     "outcome": "curie.outcome",
