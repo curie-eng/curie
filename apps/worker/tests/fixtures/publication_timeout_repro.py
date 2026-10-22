@@ -282,14 +282,23 @@ def _start_postgres() -> tuple[str, str]:
     api_root = os.path.abspath(
         os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "apps", "api")
     )
-    upgraded = subprocess.run(
-        [sys.executable, "-m", "alembic", "upgrade", "head"],
-        cwd=api_root,
-        env={**os.environ, "DATABASE_URL": async_url},
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    remaining = _SCENARIO_BUDGET_SECONDS - (time.monotonic() - _DB_READY_AT)
+    if remaining <= 0:
+        _cleanup_owned()
+        _fail("migration exceeded the scenario budget after database ready")
+    try:
+        upgraded = subprocess.run(
+            [sys.executable, "-m", "alembic", "upgrade", "head"],
+            cwd=api_root,
+            env={**os.environ, "DATABASE_URL": async_url},
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=remaining,
+        )
+    except subprocess.TimeoutExpired:
+        _cleanup_owned()
+        _fail("migration exceeded the scenario budget after database ready")
     if upgraded.returncode != 0:
         detail = (upgraded.stderr or upgraded.stdout or "alembic failed").strip()
         _fail(f"migration failed: {detail[:2000]}")
