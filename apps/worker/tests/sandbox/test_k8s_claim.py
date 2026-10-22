@@ -1593,6 +1593,59 @@ def test_recent_eviction_event_explains_a_still_running_pod() -> None:
     assert termination.reason == "Evicted"
 
 
+def test_recent_eviction_event_carries_the_volume_and_limit() -> None:
+    api = _FakeApi()
+    api.pod = SimpleNamespace(
+        metadata=SimpleNamespace(name="sbx-1", uid="pod-current"),
+        status=SimpleNamespace(phase="Running", reason=None, container_statuses=[]),
+    )
+    api.events = [
+        SimpleNamespace(
+            reason="Evicted",
+            message=(
+                'Usage of EmptyDir volume "writable-1" exceeds the limit "384Mi"'
+                ", node has other pressure"
+            ),
+            involved_object=SimpleNamespace(kind="Pod", name="sbx-1", uid="pod-current"),
+            last_timestamp=datetime.now(UTC),
+        )
+    ]
+
+    termination = _client(api).pod_termination(
+        "sbx-1", request_timeout_seconds=0.5, since=datetime.now(UTC) - timedelta(seconds=5)
+    )
+
+    assert termination is not None
+    assert termination.reason == "Evicted"
+    assert (
+        termination.detail == 'Usage of EmptyDir volume "writable-1" exceeds the limit "384Mi"'
+    )
+
+
+def test_eviction_event_with_an_unstructured_message_has_no_detail() -> None:
+    api = _FakeApi()
+    api.pod = SimpleNamespace(
+        metadata=SimpleNamespace(name="sbx-1", uid="pod-current"),
+        status=SimpleNamespace(phase="Running", reason=None, container_statuses=[]),
+    )
+    api.events = [
+        SimpleNamespace(
+            reason="Evicted",
+            message="The node needed the pod gone for an unstructured reason.",
+            involved_object=SimpleNamespace(kind="Pod", name="sbx-1", uid="pod-current"),
+            last_timestamp=datetime.now(UTC),
+        )
+    ]
+
+    termination = _client(api).pod_termination(
+        "sbx-1", request_timeout_seconds=0.5, since=datetime.now(UTC) - timedelta(seconds=5)
+    )
+
+    assert termination is not None
+    assert termination.reason == "Evicted"
+    assert termination.detail is None
+
+
 def test_oom_event_alone_does_not_identify_runner_in_running_pod() -> None:
     api = _FakeApi()
     api.pod = SimpleNamespace(
