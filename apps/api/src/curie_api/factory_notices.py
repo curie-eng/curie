@@ -181,17 +181,16 @@ _CAUSE_TEXT = {
     ),
 }
 
-# Infrastructure and CI causes carry details, not a provider message.
-_DETAIL_CAUSES = frozenset(
+# The detail of these causes is text returned by the model service; every other
+# cause that prints a detail labels it "Details".
+_PROVIDER_MESSAGE_CAUSES = frozenset(
     {
-        "sandbox_terminated",
-        "ci_failed",
-        "ci_timeout",
-        "ci_unverified",
-        "merge_conflict",
-        "pr_closed",
-        "approval_create_failed",
-        "publication_unrecorded",
+        "model_credit_exhausted",
+        "model_usage_limited",
+        "model_credential_rejected",
+        "model_rate_limited",
+        "model_error",
+        "model_unreachable",
     }
 )
 # A run that ended without publishing carries the agent's own last message
@@ -498,7 +497,7 @@ def result_section(
             and detail is not None
             and detail.strip()
         ):
-            label = "Details" if cause in _DETAIL_CAUSES else "Provider message"
+            label = "Provider message" if cause in _PROVIDER_MESSAGE_CAUSES else "Details"
             text += f"{label}: {detail.strip()}\n"
         text += f"Cause: {cause}\n"
         if cause == "pull_request_not_adopted" and isinstance(pr_url, str) and pr_url.strip():

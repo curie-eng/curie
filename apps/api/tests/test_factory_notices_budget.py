@@ -75,7 +75,7 @@ def test_usd_stop_below_cap_names_recorded_spend(priced: Any) -> None:  # noqa: 
         "provider price, so raising the cap only delays the stop. To raise it "
         "anyway, run `curie cluster budget <agent> --limit <usd>`, then retry."
     )
-    assert f"Provider message: {USD_DETAIL}\n" in body
+    assert f"Details: {USD_DETAIL}\n" in body
     assert "Failure class: budget-exceeded\n" in body
     assert "total at least $1.33" in body
     assert "Last progress note:" not in body

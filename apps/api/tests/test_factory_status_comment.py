@@ -1333,7 +1333,8 @@ def test_a_failure_patches_the_plain_reason_and_needs_a_human(admitted: Any) -> 
     (comment,) = _marked(sink, request_id)
     body = comment["body"]
     assert body.startswith("Could not complete:")
-    assert "Provider message: the tool call kept failing" in body
+    assert "Details: the tool call kept failing" in body
+    assert "Provider message" not in body
     assert "Cause: runner_escalated" in body
     assert "Status: NEEDS HUMAN" in body
     assert "Status: FAILED" not in body
@@ -1595,7 +1596,8 @@ def test_budget_failure_comment_identifies_the_limit_or_admits_it_is_unknown(
         assert f"`{remedy}`" in headline
         other_remedy = "--limit" if field == "max_output_tokens_per_run" else "--output-tokens"
         assert other_remedy not in body
-    assert f"Provider message: {detail}" in body
+    assert f"Details: {detail}" in body
+    assert "Provider message" not in body
     assert "Cause: budget_exceeded" in body
     assert "Status: NEEDS HUMAN" in body
     assert "Status: FAILED" not in body
