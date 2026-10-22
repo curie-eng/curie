@@ -877,7 +877,10 @@ fn the_mirror_carries_routes_as_written() {
     assert_eq!(spec["routes"][0]["path"], "/v1/review");
     assert_eq!(spec["routes"][0]["methods"], serde_json::json!(["POST"]));
     assert_eq!(spec["routes"][0]["max_body_bytes"], 67_108_864);
-    assert_eq!(spec["routes"][0]["callers"], serde_json::json!(["review-tools"]));
+    assert_eq!(
+        spec["routes"][0]["callers"],
+        serde_json::json!(["review-tools"])
+    );
     assert_eq!(spec["routes"][1]["methods"], serde_json::json!(["PUT"]));
 
     let fields = vector_file("connector-fields.json");
