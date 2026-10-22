@@ -423,6 +423,14 @@ def lifecycle_values(
             "digest": image["digest"],
             "pullPolicy": "IfNotPresent",
         }
+    # PriorityClasses are cluster-scoped with fixed names another release may own
+    # (docker-daemon-config-runtime render()); the tenant quota is scoped to the
+    # sandbox class, so it goes with them.
+    values["priorityClasses"] = {
+        "platform": {"create": False, "name": ""},
+        "sandbox": {"create": False, "name": ""},
+    }
+    values["resourceQuota"] = {"enabled": False}
     values.setdefault("ui", {})["deploy"] = False
     values["worker"]["claimTimeoutSeconds"] = CLAIM_TIMEOUT_SECONDS
     sandbox = values["agentSandbox"]
