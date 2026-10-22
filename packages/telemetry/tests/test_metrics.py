@@ -300,8 +300,9 @@ def test_completion_outbox_inventory_is_bounded_and_has_no_identity_labels() -> 
 def test_slack_socket_identities_has_one_series_per_state_and_no_identity_label() -> None:
     """Two series per dispatcher, so ``connected < configured`` is one comparison.
 
-    Which identity is down stays in the dispatcher's own log; a Slack identity
-    name is an identifier and never a metric attribute.
+    Which identity is down stays in the dispatcher's own log; this gauge
+    carries no identity. The delivery counters below are where a bounded
+    identity dimension lives (#4960).
     """
     definition = _read(_MANIFEST)["metrics"]["curie.slack.socket.identities"]
     assert definition["type"] == "gauge"
@@ -310,6 +311,78 @@ def test_slack_socket_identities_has_one_series_per_state_and_no_identity_label(
         "state": ["configured", "connected"],
     }
     assert definition["cardinality_bound"] == 2
+
+
+_SLACK_IDENTITY_DIMENSION = {
+    "kind": "bounded",
+    "ceiling": 16,
+    "reserved": ["other"],
+    "overflow": "other",
+    "pattern": r"^[a-z0-9]+(-[a-z0-9]+)*$",
+}
+
+
+def test_slack_socket_envelopes_counts_frames_by_bounded_identity_and_type() -> None:
+    """Every frame Slack hands an identity's client, by Socket Mode type (#4960).
+
+    The identity is bounded like ``connector``: 16 slugs, then ``other``. Red on
+    an unbounded identity, a type value renamed or dropped, or a non-monotonic
+    instrument; an alert compares one identity's ``events_api`` rate with its
+    canary count.
+    """
+    definition = _read(_MANIFEST)["metrics"]["curie.slack.socket.envelopes"]
+    assert definition == {
+        "type": "counter",
+        "unit": "{envelope}",
+        "description": "Socket Mode frames Slack delivered, by Slack identity and frame type.",
+        "monotonic": True,
+        "attributes": {
+            "service.name": ["curie-dispatcher"],
+            "slack_identity": _SLACK_IDENTITY_DIMENSION,
+            "type": ["hello", "disconnect", "events_api", "interactive", "slash_commands", "other"],
+        },
+        "cardinality_bound": 17 * 6,
+    }
+
+
+def test_slack_delivery_canary_counts_handled_canary_mentions_by_identity() -> None:
+    definition = _read(_MANIFEST)["metrics"]["curie.slack.delivery_canary"]
+    assert definition == {
+        "type": "counter",
+        "unit": "{mention}",
+        "description": "Delivery-canary mentions the dispatcher handled, by Slack identity.",
+        "monotonic": True,
+        "attributes": {
+            "service.name": ["curie-dispatcher"],
+            "slack_identity": _SLACK_IDENTITY_DIMENSION,
+        },
+        "cardinality_bound": 17,
+    }
+
+
+def test_slack_identity_past_the_ceiling_or_not_a_slug_shares_other(
+    metrics: tuple[MeterProvider, InMemoryMetricReader],
+) -> None:
+    provider, reader = metrics
+    reset_bounded_labels()
+    names = [f"bot-{index}" for index in range(17)] + ["Not A Slug"]
+    for name in names:
+        record_metric(
+            "curie.slack.delivery_canary",
+            attributes={"service.name": "curie-dispatcher", "slack_identity": name},
+        )
+    assert provider.force_flush(timeout_millis=5000)
+    seen: dict[str, float] = {}
+    data = reader.get_metrics_data()
+    assert data is not None
+    for resource_metrics in data.resource_metrics:
+        for scope_metrics in resource_metrics.scope_metrics:
+            for metric in scope_metrics.metrics:
+                if metric.name == "curie.slack.delivery_canary":
+                    for point in metric.data.data_points:
+                        seen[str(dict(point.attributes or {})["slack_identity"])] = float(point.value)
+    reset_bounded_labels()
+    assert seen == {**{f"bot-{index}": 1.0 for index in range(16)}, "other": 2.0}
 
 
 def test_last_success_age_has_one_series_across_failure_and_recovery(
