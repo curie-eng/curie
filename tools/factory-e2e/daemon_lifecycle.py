@@ -54,7 +54,7 @@ import uuid
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import ModuleType
-from typing import Any
+from typing import Any, TypeGuard
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
@@ -216,7 +216,7 @@ def parse_run(argv: list[str], env: dict[str, str] | os._Environ[str]) -> argpar
 
     fx = fixture_module()
     try:
-        args = fx.arguments(argv=argv)
+        args: argparse.Namespace = fx.arguments(argv=argv)
     except RuntimeError as exc:
         raise IntakeError(str(exc)) from None
     except SystemExit as exc:
@@ -232,7 +232,7 @@ def parse_run(argv: list[str], env: dict[str, str] | os._Environ[str]) -> argpar
 # -- judge -------------------------------------------------------------------------
 
 
-def _number(value: object) -> bool:
+def _number(value: object) -> TypeGuard[int | float]:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
@@ -266,7 +266,9 @@ def _judge_image(where: str, image_id: object, allowed: set[str], reasons: list[
 def _judge_objects(where: str, claim: object, objects: Any, roles: tuple[str, ...]) -> list[str]:
     reasons = []
     found = [obj.get("role") for obj in objects or [] if isinstance(obj, dict)]
-    if sorted(found) != sorted(roles):
+    named = [role for role in found if isinstance(role, str)]
+    # A missing or non-text role is a missing observation, never a sort error.
+    if len(named) != len(found) or sorted(named) != sorted(roles):
         reasons.append(f"missing_observation: {where} objects are not exactly {list(roles)}")
     for obj in objects or []:
         if obj.get("claim_label") != claim:
@@ -657,7 +659,8 @@ class Lifecycle:
             time.sleep(2)
 
     def k(self, *argv: str, **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        return self.f.k(*argv, **kwargs)
+        result: subprocess.CompletedProcess[str] = self.f.k(*argv, **kwargs)
+        return result
 
     def items(self, path: str, selector: str) -> list[dict[str, Any]]:
         found = self.f.get(f"{path}?labelSelector={quote(selector)}").get("items", [])
@@ -731,7 +734,8 @@ class Lifecycle:
     # -- cluster observations --
 
     def claims(self) -> list[dict[str, Any]]:
-        return self.f.get(CLAIMS.format(ns=self.ns)).get("items", [])
+        items: list[dict[str, Any]] = self.f.get(CLAIMS.format(ns=self.ns)).get("items", [])
+        return items
 
     def new_claim(self, digest: str, before: set[str]) -> str:
         fresh = [
@@ -789,7 +793,8 @@ class Lifecycle:
         }
 
     def client_secret(self, claim: str) -> dict[str, Any]:
-        return self.f.get(f"/api/v1/namespaces/{self.ns}/secrets/{claim}-tokens")
+        secret: dict[str, Any] = self.f.get(f"/api/v1/namespaces/{self.ns}/secrets/{claim}-tokens")
+        return secret
 
     def turn_objects(self, claim: str) -> list[dict[str, Any]] | None:
         found = self.daemon_objects(claim)
@@ -948,7 +953,7 @@ class Lifecycle:
             "pod_uid": daemon["metadata"]["uid"],
             "image_id": image_digest(container_status(daemon, "dockerd")),
         }
-        runner = turn["runner"]["pod"]
+        runner = str(turn["runner"]["pod"])
         self.signal(runner, "go", self.nonce)
         texts = self.bounded(lambda: self.runner_outputs(runner), LIMIT_SECONDS, "runner_silent")
         turn["runner_docker"] = parse_runner_docker(*texts, self.nonce)
@@ -967,7 +972,8 @@ class Lifecycle:
         """Time from injection until the request is terminal and every object is gone."""
 
         turn["fault"] = fault
-        state, present, recreated = "", [""], []
+        state, present = "", [""]
+        recreated: list[str] = []
         deadline = started + LIMIT_SECONDS
         while True:
             self.check_fixtures()
