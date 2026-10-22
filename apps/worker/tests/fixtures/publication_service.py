@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import ssl
@@ -17,6 +18,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 REPO_FULL_NAME = "acme-corp/acme-bot"
 DEFAULT_BRANCH = "main"
 AUTHORIZATION = "Bearer fixture-token"
+REST_AUTHORIZATION = "Basic " + base64.b64encode(b"x-access-token:fixture-token").decode()
 PULL_NUMBER = 1
 
 
@@ -196,8 +198,9 @@ class FixtureHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _authorized(self) -> bool:
-        if self.headers.get("Authorization") == AUTHORIZATION:
+    def _authorized(self, path: str) -> bool:
+        authorization = REST_AUTHORIZATION if path.startswith("/repos/") else AUTHORIZATION
+        if self.headers.get("Authorization") == authorization:
             return True
         self._json(HTTPStatus.UNAUTHORIZED, {"message": "fixture authorization required"})
         return False
@@ -210,7 +213,7 @@ class FixtureHandler(BaseHTTPRequestHandler):
         if parsed.path == "/health":
             self._json(HTTPStatus.OK, {"status": "ok"})
             return
-        if not self._authorized():
+        if not self._authorized(parsed.path):
             return
         repo_path = f"/repos/{REPO_FULL_NAME}"
         if parsed.path == repo_path:
@@ -271,7 +274,7 @@ class FixtureHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlsplit(self.path)
-        if not self._authorized():
+        if not self._authorized(parsed.path):
             return
         if parsed.path == "/__fixture/barrier":
             try:

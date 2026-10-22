@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import copy
 import dataclasses
 import hashlib
@@ -53,6 +54,7 @@ REPO_FULL_NAME = "acme-corp/acme-bot"
 OWNER_NAME = "publication-owner"
 SERVICE_ACCOUNT = "publication-runner"
 AUTHORIZATION = "Bearer fixture-token"
+REST_AUTHORIZATION = "Basic " + base64.b64encode(b"x-access-token:fixture-token").decode()
 ADOPT_ID = uuid.UUID("20000001-2222-4222-8222-000000000001")
 MISMATCH_ID = uuid.UUID("20000002-2222-4222-8222-000000000002")
 FAILURE_ID = uuid.UUID("20000003-2222-4222-8222-000000000003")
@@ -159,10 +161,11 @@ async def _forward_fixture_request(request: httpx.Request) -> None:
 
 
 async def _fixture_get(path: str) -> httpx.Response:
+    authorization = REST_AUTHORIZATION if path.startswith("/repos/") else AUTHORIZATION
     async with httpx.AsyncClient(verify=_ssl_context(), timeout=10) as client:
         response = await client.get(
             f"{_required('CURIE_PUBLICATION_FIXTURE_API')}{path}",
-            headers={"Authorization": AUTHORIZATION},
+            headers={"Authorization": authorization},
         )
     return response
 
@@ -202,6 +205,40 @@ def _live_objects(
     for item in (config_map, secret, job):
         item["metadata"]["ownerReferences"][0]["uid"] = live_uid
     return config_map, secret, job
+
+
+@requires_cluster
+async def test_fixture_rest_and_control_routes_require_their_exact_auth_contracts() -> None:
+    # Observed 2026-10-22: a public GitHub repository's exact GET
+    # /repos/{owner}/{repo}/git/ref/heads/main with Basic x-access-token returned
+    # 200 and authenticated X-RateLimit-Limit=5000. Replay this consumer's
+    # exact Basic contract; this does not claim GitHub rejects Bearer generally.
+    base_sha = await _base_sha()
+    branch = await _fixture_get(f"/repos/{REPO_FULL_NAME}/git/ref/heads/main")
+    assert branch.status_code == 200, branch.text
+    assert branch.json() == {"ref": "refs/heads/main", "object": {"sha": base_sha}}
+
+    origin = _required("CURIE_PUBLICATION_FIXTURE_API")
+    async with httpx.AsyncClient(verify=_ssl_context(), timeout=10) as client:
+        for authorization in (
+            None,
+            "Basic " + base64.b64encode(b"x-access-token:wrong-token").decode(),
+            "Basic " + base64.b64encode(b"wrong-user:fixture-token").decode(),
+            AUTHORIZATION,
+            "Bearer wrong-token",
+        ):
+            response = await client.get(
+                f"{origin}/repos/{REPO_FULL_NAME}/git/ref/heads/main",
+                headers={"Authorization": authorization} if authorization is not None else {},
+            )
+            assert response.status_code == 401, response.text
+
+        for authorization in (None, REST_AUTHORIZATION, "Bearer wrong-token"):
+            response = await client.get(
+                f"{origin}/__fixture/state",
+                headers={"Authorization": authorization} if authorization is not None else {},
+            )
+            assert response.status_code == 401, response.text
 
 
 @requires_cluster
