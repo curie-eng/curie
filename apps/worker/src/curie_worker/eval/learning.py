@@ -3722,8 +3722,10 @@ class _Campaign:
             self.failures.append(f"local down failed: {stderr}")
         # A turn still queued in the worker can start a claim runner while compose
         # stops the stack; record it so the leftover sweep removes it.
-        with contextlib.suppress(_Invalid):
+        try:
             self.ownership.observe(self.stack)
+        except (_Invalid, OSError, subprocess.SubprocessError) as exc:
+            self.failures.append(f"ownership not observed after local down: {exc}")
         if self.ledger is not None:
             self.close_fires("stack torn down before the fire was observed")
         self.stack = None

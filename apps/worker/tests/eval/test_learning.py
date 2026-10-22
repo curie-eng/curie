@@ -2702,3 +2702,46 @@ def test_teardown_records_a_runner_started_while_the_stack_stops(
     assert campaign.ownership.volumes == {"curie-input-late": project}
     assert campaign.ownership.networks == {"runner-network": project}
     assert campaign.stack is None
+
+
+def test_teardown_finalizes_when_the_post_down_observation_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from curie_worker.eval import learning
+
+    after_down = {"value": False}
+    closed: list[str] = []
+
+    def docker_lines(*args: str) -> list[str]:
+        if after_down["value"]:
+            raise subprocess.TimeoutExpired(["docker", *args], 240)
+        return []
+
+    monkeypatch.setattr(learning, "_docker_lines", docker_lines)
+    campaign = object.__new__(learning._Campaign)
+    campaign.ownership = learning._Ownership(project_prefix="curie-learning-abc")
+    campaign.stack = learning._Stack(
+        project="curie-learning-abc-r1a1",
+        tag="learning-abc",
+        override=tmp_path / "override.yaml",
+        ports={},
+        stub_port=0,
+        stub_host="127.0.0.1",
+        repetition=1,
+    )
+    campaign.failures = []
+    campaign.ledger = object()
+
+    def local_down(*_args: Any, **_kwargs: Any) -> tuple[int, str, str, str, str]:
+        after_down["value"] = True
+        return 0, "", "", "", ""
+
+    monkeypatch.setattr(campaign, "cli", local_down)
+    monkeypatch.setattr(campaign, "compose_argv", lambda *args: list(args))
+    monkeypatch.setattr(campaign, "compose_extra", lambda: {})
+    monkeypatch.setattr(campaign, "close_fires", closed.append)
+    campaign.down(1)
+
+    assert closed == ["stack torn down before the fire was observed"]
+    assert campaign.stack is None
+    assert any("after local down" in failure for failure in campaign.failures)
