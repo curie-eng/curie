@@ -969,7 +969,8 @@
     "custom": {
       "repo": "acme-corp/acme-tools",
       "before": "registry.example.com/acme-corp/runner-acme-tools@sha256:3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e",
-      "after": "registry.example.com/acme-corp/runner-acme-tools@sha256:3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e"
+      "after": "registry.example.com/acme-corp/runner-acme-tools@sha256:3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e",
+      "reply": "This agent cannot start: repository acme-corp/acme-tools runner image was built on platform runner registry.example.com/curie/curie-runner@sha256:abababababababababababababababababababababababababababababababab, not this installation's sha256:4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c (stale_base); rebuild and rebind it on the installed pinned platform runner with `curie cluster factory --repo-runner acme-corp/acme-tools=<spec> --registry <registry> --namespace <namespace> --release <release> --context <context>`; use a repository runner spec containing its retained tools, probes and Dockerfile declaration. An operator has to make that change."
     }
   },
   "ci": {
@@ -1377,5 +1378,9 @@
         "conclusion": "success"
       }
     ]
+  },
+  "lifecycle": {
+    "schema": "daemon-lifecycle/v1",
+    "failures": []
   }
 }

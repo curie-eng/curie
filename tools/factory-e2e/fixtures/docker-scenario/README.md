@@ -51,3 +51,15 @@ has check runs.
 
 Failing envelopes are not stored here. Each failure case is a mutation of the
 passing envelope made inside `tests/test_docker_scenario.py`.
+
+7. `upgrade.custom.reply` (and `custom-reply.txt`, the file the `upgrade` CLI test
+   passes as `--custom-reply`) is the reply of a turn on the custom repository
+   after the upgrade. It is composed from the format strings in
+   `apps/worker/src/curie_worker/kernel/attempt.py` ("This agent cannot start:
+   {exc}. An operator has to make that change.") and the pinned-platform
+   `stale_base` message of `RepoRunnerPoolRefused` in
+   `apps/worker/src/curie_worker/sandbox/types.py`, with placeholder registry,
+   namespace, release and context values.
+8. `lifecycle` is `{"schema": "daemon-lifecycle/v1", "failures": []}`, what
+   `from_lifecycle` returns for the committed daemon-lifecycle passing envelope
+   (whose own judge reports no failures).

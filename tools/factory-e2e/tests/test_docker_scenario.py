@@ -36,6 +36,7 @@ FIRST_HEAD = "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c"
 LATER_HEAD = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d"
 CATALOG = "acme-corp/acme-bot"
 CUSTOM = "acme-corp/acme-tools"
+CUSTOM_REPLY = FIXTURES / "custom-reply.txt"
 SECTIONS = ("runs", "cleanup", "control", "upgrade", "ci")
 EXPECTED_RULES = {
     "userns-host": "host-namespace",
@@ -700,6 +701,7 @@ def test_from_lifecycle_matches_the_envelope(
     assert docker_scenario.from_lifecycle(lifecycle) == {
         "cleanup": envelope["cleanup"],
         "control": envelope["control"],
+        "lifecycle": envelope["lifecycle"],
     }
 
 
@@ -773,8 +775,181 @@ def test_upgrade_section_from_plan_and_values(envelope: dict[str, Any]) -> None:
         _values(upgrade["catalog"]["after"], upgrade["custom"]["after"]),
         CATALOG,
         CUSTOM,
+        custom_reply=f"\n  {upgrade['custom']['reply']}  \n",
     )
     assert section == upgrade
+
+
+def test_upgrade_section_custom_reply_defaults_to_empty() -> None:
+    section = docker_scenario.upgrade_section("", _values("", ""), _values("", ""), CATALOG, CUSTOM)
+    assert section["custom"]["reply"] == ""
+
+
+def test_cli_upgrade_carries_the_custom_reply(tmp_path: Path, envelope: dict[str, Any]) -> None:
+    upgrade = envelope["upgrade"]
+    plan = tmp_path / "plan.txt"
+    plan.write_text("\n".join(upgrade["plan_lines"]) + "\n")
+    before, after = tmp_path / "before.json", tmp_path / "after.json"
+    before.write_text(
+        json.dumps(_values(upgrade["catalog"]["before"], upgrade["custom"]["before"]))
+    )
+    after.write_text(json.dumps(_values(upgrade["catalog"]["after"], upgrade["custom"]["after"])))
+    args = [
+        str(SCRIPT), "upgrade", "--plan", str(plan), "--before", str(before),
+        "--after", str(after), "--catalog-repo", CATALOG, "--custom-repo", CUSTOM,
+    ]  # fmt: skip
+    missing = _run(*args)
+    assert missing.returncode == 2
+    assert "--custom-reply" in missing.stderr
+    out = tmp_path / "upgrade.json"
+    done = _run(*args, "--custom-reply", str(CUSTOM_REPLY), "--out", str(out))
+    assert done.returncode == 0, done.stderr
+    assert json.loads(out.read_text()) == upgrade
+
+
+# custom runner refusal reply (A7)
+
+
+def test_custom_reply_fixture_is_the_envelope_reply(envelope: dict[str, Any]) -> None:
+    assert CUSTOM_REPLY.read_text().strip() == envelope["upgrade"]["custom"]["reply"]
+
+
+def _other_repo_reply(reply: str) -> str:
+    return reply.replace(CUSTOM, CATALOG)
+
+
+MISSING_POOL_REPLY = (
+    f"This agent cannot start: repository {CUSTOM} is bound to runner pool runner-acme-tools, "
+    "but SandboxWarmPool runner-acme-tools was not rendered (missing_pool); redeploy its "
+    f"runner with `curie cluster factory --repo {CUSTOM}`. An operator has to make that change."
+)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        _other_repo_reply,
+        lambda reply: MISSING_POOL_REPLY,
+        lambda reply: "",
+        lambda reply: reply + " Please retry later.",
+        lambda reply: "Sorry. " + reply,
+    ],
+    ids=["other-repo", "missing-pool", "empty", "trailing-text", "leading-text"],
+)
+def test_judge_custom_reply_must_be_the_stale_base_refusal(
+    envelope: dict[str, Any], mutate: Callable[[str], str]
+) -> None:
+    envelope["upgrade"]["custom"]["reply"] = mutate(envelope["upgrade"]["custom"]["reply"])
+    _assert_prefix(envelope, "upgrade_custom_not_refused")
+
+
+@pytest.mark.parametrize("missing", [True, False], ids=["absent", "null"])
+def test_judge_missing_custom_reply_is_not_refused(envelope: dict[str, Any], missing: bool) -> None:
+    if missing:
+        del envelope["upgrade"]["custom"]["reply"]
+    else:
+        envelope["upgrade"]["custom"]["reply"] = None
+    _assert_prefix(envelope, "upgrade_custom_not_refused")
+
+
+# lifecycle evidence (A8)
+
+
+def test_from_lifecycle_reports_the_lifecycle_judge(lifecycle: dict[str, Any]) -> None:
+    assert docker_scenario.from_lifecycle(lifecycle)["lifecycle"] == {
+        "schema": "daemon-lifecycle/v1",
+        "failures": [],
+    }
+
+
+def _failing_lifecycle(lifecycle: dict[str, Any]) -> dict[str, Any]:
+    lifecycle = copy.deepcopy(lifecycle)
+    lifecycle["turns"]["cancel"]["request_state"] = "completed"
+    return lifecycle
+
+
+def test_from_lifecycle_lists_the_lifecycle_failures(lifecycle: dict[str, Any]) -> None:
+    result = docker_scenario.from_lifecycle(_failing_lifecycle(lifecycle))["lifecycle"]
+    assert result["schema"] == "daemon-lifecycle/v1"
+    assert result["failures"]
+    assert all(isinstance(f, str) for f in result["failures"])
+
+
+def test_judge_assembled_failing_lifecycle_is_incomplete_cleanup(
+    envelope: dict[str, Any], lifecycle: dict[str, Any]
+) -> None:
+    assembled = docker_scenario.assemble(
+        NONCE, envelope["runs"], _failing_lifecycle(lifecycle), envelope["upgrade"], envelope["ci"]
+    )
+    reasons = _assert_prefix(assembled, "incomplete_cleanup")
+    assert any(r.startswith("incomplete_cleanup: ") and "lifecycle" in r for r in reasons)
+
+
+def test_judge_lifecycle_failures_are_incomplete_cleanup(envelope: dict[str, Any]) -> None:
+    envelope["lifecycle"]["failures"] = ["turns.cancel: request ended completed"]
+    reasons = _assert_prefix(envelope, "incomplete_cleanup")
+    assert any("lifecycle" in r for r in reasons if r.startswith("incomplete_cleanup: "))
+
+
+@pytest.mark.parametrize(
+    "value", [None, "text", [], {}, {"schema": "daemon-lifecycle/v1"}], ids=repr
+)
+def test_judge_non_dict_or_failureless_lifecycle_is_missing_observation(
+    envelope: dict[str, Any], value: Any
+) -> None:
+    envelope["lifecycle"] = value
+    _assert_prefix(envelope, "missing_observation")
+    assert any(
+        r.startswith("missing_observation: lifecycle") for r in docker_scenario.judge(envelope)
+    )
+
+
+def test_judge_absent_lifecycle_is_missing_observation(envelope: dict[str, Any]) -> None:
+    del envelope["lifecycle"]
+    reasons = docker_scenario.judge(envelope)
+    assert any(r.startswith("missing_observation: lifecycle") for r in reasons), reasons
+
+
+@pytest.mark.parametrize("failures", [None, "none", {"a": 1}, 0], ids=repr)
+def test_judge_non_list_lifecycle_failures_is_missing_observation(
+    envelope: dict[str, Any], failures: Any
+) -> None:
+    envelope["lifecycle"]["failures"] = failures
+    reasons = docker_scenario.judge(envelope)
+    assert any(r.startswith("missing_observation: lifecycle") for r in reasons), reasons
+
+
+# probe windows (A9)
+
+
+@pytest.mark.parametrize(
+    "window",
+    [
+        [20, 10],
+        [float("nan"), 1],
+        [1, float("inf")],
+        [True, 2],
+        [1],
+        [1, 2, 3],
+        "10-20",
+        None,
+    ],
+    ids=repr,
+)
+@pytest.mark.parametrize("run", ["a", "b"])
+def test_judge_invalid_window_is_missing_observation(
+    envelope: dict[str, Any], run: str, window: Any
+) -> None:
+    envelope["runs"][run]["probe"]["window"] = window
+    reasons = docker_scenario.judge(envelope)
+    assert any(r.startswith(f"missing_observation: run {run} window") for r in reasons), reasons
+    assert not any(r.startswith("not_concurrent") for r in reasons), reasons
+
+
+def test_judge_zero_length_window_is_valid(envelope: dict[str, Any]) -> None:
+    envelope["runs"]["a"]["probe"]["window"] = [5, 5]
+    envelope["runs"]["b"]["probe"]["window"] = [0, 10]
+    assert docker_scenario.judge(envelope) == []
 
 
 # ci section
