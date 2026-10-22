@@ -1297,9 +1297,78 @@ explicit `sizeLimit`:
 |---|---|---|
 | `bundles` (fetched archive + extracted plugin dir) | `agentSandbox.runner.bundleFetch.sizeLimit` | `2Gi` |
 | `aws-config` (init only AWS CLI path addressing config) | `agentSandbox.runner.bundleFetch.awsConfigSizeLimit` | `16Mi` |
-| One per `agentSandbox.runner.hardening.writablePaths` entry (`/tmp`, `/home/runner` by default) | `agentSandbox.runner.hardening.writablePathSizeLimit` | `512Mi` |
-| `workspace` (the managed repository checkout at `/workspace`) | `agentSandbox.runner.workspace.sizeLimit`, or per agent `agentSandbox.workspaceSizeLimits.<agent>` | `1Gi`; per agent: none, the agent inherits the default |
+| One per `agentSandbox.runner.hardening.writablePaths` entry (`/tmp`, `/home/runner` by default) | `agentSandbox.resourceProfiles.<profile>.<field>`, or the generic `agentSandbox.runner.hardening.writablePathSizeLimit` (sets every writable path) | `standard`: `512Mi` each; `factory`: home `15Gi`, tmp `4Gi`, other paths `512Mi` |
+| `workspace` (the managed repository checkout at `/workspace`) | per agent `agentSandbox.workspaceSizeLimits.<agent>`, the generic `agentSandbox.runner.workspace.sizeLimit`, or the profile's workspace field | `standard`: `1Gi`; `factory`: `15Gi`; per agent: none |
 | `attachments` (one turn's inbound attachments) | `agentSandbox.runner.attachments.sizeLimit` | `512Mi` |
+
+### Resource profiles
+
+`agentSandbox.resourceProfiles` defines two named envelopes. The generic keys
+`agentSandbox.runner.resources`, `agentSandbox.runner.workspace.sizeLimit` and
+`agentSandbox.runner.hardening.writablePathSizeLimit` are empty by default, so
+the selected profile supplies the values.
+
+| Field | `standard` | `factory` |
+|---|---|---|
+| Memory request / limit | `192Mi` / `768Mi` | `8Gi` / `8Gi` |
+| CPU request / limit | `50m` / `1` | `50m` / `2` |
+| Ephemeral storage request / limit | `512Mi` / `4Gi` | `10Gi` / `20Gi` |
+| Workspace volume | `1Gi` | `15Gi` |
+| Home volume | `512Mi` | `15Gi` |
+| Tmp volume | `512Mi` | `4Gi` |
+| Other writable paths | `512Mi` | `512Mi` |
+
+An agent with `factory.sandboxEgress.<agent>: true` while `factory.enabled` is
+true uses `factory`. The generic template and every other agent use `standard`.
+`agentSandbox.agentResourceProfiles.<agent>: standard|factory` overrides that
+choice, either to opt a factory agent back to the lightweight envelope or to opt
+another agent in. The dark-factory example values select `factory` for
+`dark-factory` explicitly.
+
+Precedence, highest first:
+
+1. `agentSandbox.workspaceSizeLimits.<agent>`, which sets that agent's workspace
+   only.
+2. An explicitly set generic key. For `agentSandbox.runner.resources` this works
+   per resource pair: setting either the request or the limit of cpu, memory or
+   ephemeral-storage takes that resource's pair from the generic side, with the
+   unset side filled from `standard`. `agentSandbox.runner.workspace.sizeLimit`
+   sets the workspace. `agentSandbox.runner.hardening.writablePathSizeLimit`
+   sets every writable path.
+3. The selected profile's field, which you can change with
+   `agentSandbox.resourceProfiles.<profile>.<field>`.
+
+The worker's per-agent API override, `curie cluster overrides <agent>
+--runner-resources`, still applies on top of the rendered envelope at claim time.
+
+Read the factory envelope as five separate bounds: RAM (the 8Gi memory limit),
+the workspace volume, the home volume, the tmp volume, and aggregate ephemeral
+disk (the 20Gi ephemeral-storage limit). The volume ceilings are independent
+upper bounds, not reservations. Their sum, 15 + 15 + 4 = 34Gi, can exceed the
+shared 20Gi ephemeral-storage limit, which is an additional constraint on their
+combined use. The 10Gi ephemeral-storage request is what the scheduler reserves.
+A pod is evicted when any single volume passes its own ceiling or when the total
+passes 20Gi, and the eviction message names the volume.
+
+Capacity consequences of the factory profile:
+
+1. The 8Gi memory request means a factory sandbox needs a node with 8Gi of
+   unrequested allocatable memory.
+2. The default `resourceQuota.hard.requestsMemory` of `8Gi` admits exactly one
+   factory sandbox at a time. Raise `resourceQuota.hard.*` for concurrency, or
+   opt the agent to `standard` with `agentSandbox.agentResourceProfiles` on a
+   small trial cluster.
+3. Existing sandbox pods keep the volume limits and resources they were created
+   with. Kubernetes cannot resize an `emptyDir` `sizeLimit` in place, so new
+   limits apply to sandboxes created after the upgrade.
+4. `helm upgrade --reuse-values` from a release made by an older chart carries
+   that chart's computed defaults forward as values, so the factory agent keeps
+   the old envelope on that path. `curie cluster upgrade` (or
+   `--reset-then-reuse-values`) picks up the profile, and explicit operator
+   values survive `curie cluster upgrade`.
+
+`helm install` prints every effective envelope together in the NOTES under
+"Sandbox resource envelopes".
 
 `agentSandbox.workspaceSizeLimits` maps an agent name to that agent's workspace
 ceiling, for example `dark-factory: 24Gi`, so one build-heavy agent can compile

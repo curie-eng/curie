@@ -296,6 +296,19 @@ CHART_SCENARIOS: dict[str, _ChartScenario] = {
         ],
         "leg": "workload",
     },
+    "factory-resource-profile": {
+        "step": "Factory resource profile runtime (#4889)",
+        "inputs": [
+            "charts/curie/ci/runtime/factory-resource-profile-runtime.sh",
+            "charts/curie/values.yaml",
+            "charts/curie/values.schema.json",
+            "charts/curie/templates/agent-sandbox.yaml",
+            "charts/curie/templates/_sandbox_envelope.tpl",
+            "charts/curie/templates/_helpers.tpl",
+            *CHART_IMAGE_INPUTS,
+        ],
+        "leg": "workload",
+    },
 }
 CHART_IDS = tuple(sorted(CHART_SCENARIOS))
 
@@ -307,6 +320,7 @@ WORKLOAD_SCENARIOS = frozenset(
         "quota-progress",
         "connector-secret-rotation",
         "failed-first-install-retry",
+        "factory-resource-profile",
     }
 )
 
@@ -1838,6 +1852,7 @@ def test_mixed_root_documentation_and_runtime_diff_selects_runtime_tiers(
         pytest_deselect=ALL_CONDITIONAL,
         chart_scenarios=(
             "connector-secret-rotation",
+            "factory-resource-profile",
             "quota-progress",
             "workspace-diagnostic",
         ),
@@ -4141,7 +4156,8 @@ WORKLOAD_STAGING_IF = (
     "(contains(fromJSON(needs.changes.outputs.chart_scenarios), 'workspace-diagnostic') "
     "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') "
     "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-secret-rotation') "
-    "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'failed-first-install-retry')) }}"
+    "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'failed-first-install-retry') "
+    "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'factory-resource-profile')) }}"
 )
 
 
@@ -4240,6 +4256,33 @@ def test_failed_first_install_retry_reuses_the_chart_cluster_and_candidate_artif
     )
     assert steps.index(stage) < steps.index(retry)
 
+
+def test_factory_resource_profile_runs_on_the_workload_leg() -> None:
+    chart = yaml.safe_load(WORKFLOW.read_text())["jobs"][CHART_JOB]
+    steps = chart["steps"]
+    name = CHART_SCENARIOS["factory-resource-profile"]["step"]
+    matches = [step for step in steps if step.get("name") == name]
+    assert len(matches) == 1
+    profile = matches[0]
+    workspace = next(
+        step for step in steps if step.get("if") == _chart_step_if("workspace-diagnostic")
+    )
+    assert profile["if"] == _chart_step_if("factory-resource-profile")
+    assert profile["timeout-minutes"] == 30
+    assert "continue-on-error" not in profile
+    assert profile["env"] == workspace["env"]
+    commands = profile["run"].replace("\\\n", " ")
+    assert [" ".join(line.split()) for line in commands.splitlines() if line.strip()] == [
+        "set -euo pipefail",
+        "bash tools/runtime-assertion-gate/run.sh "
+        "charts/curie/ci/runtime/factory-resource-profile-runtime.sh",
+    ]
+    stage = next(
+        step
+        for step in steps
+        if step.get("name") == "Stage the workspace diagnostic images in kind"
+    )
+    assert steps.index(stage) < steps.index(profile)
 
 def test_quota_progress_runs_on_the_workload_leg() -> None:
     chart = yaml.safe_load(WORKFLOW.read_text())["jobs"][CHART_JOB]
@@ -5134,7 +5177,12 @@ def test_controller_preflight_upgrade_scenario_runs_on_chart_pull_requests() -> 
             ("apps/api/src/curie_api/main.py",),
             False,
             False,
-            ("connector-secret-rotation", "quota-progress", "workspace-diagnostic"),
+            (
+                "connector-secret-rotation",
+                "factory-resource-profile",
+                "quota-progress",
+                "workspace-diagnostic",
+            ),
         ),
         (("charts/curie/templates/agent-sandbox.yaml",), False, False, CHART_IDS),
         (
@@ -5156,6 +5204,7 @@ def test_controller_preflight_upgrade_scenario_runs_on_chart_pull_requests() -> 
             (
                 "connector-readiness",
                 "connector-secret-rotation",
+                "factory-resource-profile",
                 "quota-progress",
                 "workspace-diagnostic",
             ),
@@ -5167,6 +5216,7 @@ def test_controller_preflight_upgrade_scenario_runs_on_chart_pull_requests() -> 
             (
                 "connector-readiness",
                 "connector-secret-rotation",
+                "factory-resource-profile",
                 "quota-progress",
                 "workspace-diagnostic",
             ),
@@ -5231,7 +5281,12 @@ def test_chart_scenarios_follow_changed_inputs_and_final_tiers(
         ("charts/curie/ci/postgres-readiness-delay.Dockerfile", ("langfuse-postgres-readiness",)),
         (
             "apps/worker/src/curie_worker/connector_k8s.py.bak",
-            ("connector-secret-rotation", "quota-progress", "workspace-diagnostic"),
+            (
+                "connector-secret-rotation",
+                "factory-resource-profile",
+                "quota-progress",
+                "workspace-diagnostic",
+            ),
         ),
         ("charts/curie/ci/runtime/connector-readiness-runtime.sh.bak", ()),
         ("charts/curie/ci/runtime/connector-readiness-runtime.sh/child", ("connector-readiness",)),
@@ -5279,6 +5334,7 @@ def test_chart_scenario_union_is_sorted_and_deduplicated(tmp_path: Path) -> None
     assert json.loads(_outputs_of(output)["chart_scenarios"]) == [
         "connector-readiness",
         "connector-secret-rotation",
+        "factory-resource-profile",
         "quota-progress",
         "workspace-diagnostic",
     ]
@@ -5579,7 +5635,12 @@ def test_unregistered_chart_scenario_fails_closed_in_each_selection_mode(
     expected = (
         CHART_IDS
         if mode in {"push", "revisions"}
-        else ("connector-secret-rotation", "quota-progress", "workspace-diagnostic")
+        else (
+                "connector-secret-rotation",
+                "factory-resource-profile",
+                "quota-progress",
+                "workspace-diagnostic",
+            )
     )
     assert json.loads(_outputs_of(output)["chart_scenarios"]) == sorted((*expected, "unregistered"))
     # An unregistered step has no leg condition, so it must run in every leg.
