@@ -6206,18 +6206,14 @@ def judge_first_head_ci(obs: Mapping[str, Any]) -> list[str]:
         if not results:
             failures.append(f"required check {name!r} has no result on the first head")
             continue
-        bad = next(
-            (
-                c
-                for c in results
-                if c.get("status") != "completed" or c.get("conclusion") not in FIRST_HEAD_GREEN
-            ),
-            None,
-        )
-        if bad is None:
-            continue
-        conclusion = bad.get("conclusion") if bad.get("status") == "completed" else None
-        failures.append(f"required check {name!r} concluded {conclusion!r} on the first head")
+        bad = [
+            c
+            for c in results
+            if c.get("status") != "completed" or c.get("conclusion") not in FIRST_HEAD_GREEN
+        ]
+        if bad:
+            conclusion = bad[0].get("conclusion") if bad[0].get("status") == "completed" else None
+            failures.append(f"required check {name!r} concluded {conclusion!r} on the first head")
     return failures
 
 

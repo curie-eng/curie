@@ -48,7 +48,7 @@ import time
 from collections.abc import Callable
 from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeGuard
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
@@ -56,9 +56,20 @@ import factory_e2e as fe
 
 Obj = dict[str, Any]
 
-daemon_lifecycle = fe._load_by_path(
-    "daemon_lifecycle", Path(__file__).with_name("daemon_lifecycle.py")
-)
+
+def _lifecycle() -> Any:
+    """The daemon_lifecycle module, loaded on first use."""
+
+    return fe._load_by_path("daemon_lifecycle", Path(__file__).with_name("daemon_lifecycle.py"))
+
+
+def _real(value: object) -> TypeGuard[int | float]:
+    """A real number, not a bool; floats must be finite (ints always are)."""
+
+    return bool(_lifecycle()._number(value)) and (
+        not isinstance(value, float) or math.isfinite(value)
+    )
+
 
 SCHEMA = "docker-scenario/v1"
 LIFECYCLE_SCHEMA = "daemon-lifecycle/v1"
@@ -252,7 +263,7 @@ def upgrade_section(
 
 def ci_section(
     first_head: str,
-    rules: list[Any] | None,
+    rules: list[Any],
     check_runs: Obj,
     statuses: list[Any],
     required: list[str] | None = None,
@@ -261,7 +272,7 @@ def ci_section(
 
     if required is None:
         required = []
-        for rule in rules or []:
+        for rule in rules:
             if rule.get("type") != "required_status_checks":
                 continue
             for check in rule["parameters"]["required_status_checks"]:
@@ -284,7 +295,7 @@ def ci_section(
                 "conclusion": state,
             }
         )
-    return {"first_head": first_head, "required": list(required), "checks": checks}
+    return {"first_head": first_head, "required": required, "checks": checks}
 
 
 def _cleanup_path(section: Obj) -> Obj:
@@ -318,7 +329,7 @@ def from_lifecycle(evidence: Obj) -> Obj:
         "cleanup": cleanup,
         "lifecycle": {
             "schema": evidence["schema"],
-            "failures": daemon_lifecycle.judge(evidence),
+            "failures": _lifecycle().judge(evidence),
         },
         "control": {
             "docker_env": control["runner"]["docker_env"],
@@ -357,9 +368,8 @@ def _window(probe: Obj) -> tuple[float, float] | None:
     if not isinstance(window, list) or len(window) != 2:
         return None
     t0, t1 = window
-    for t in (t0, t1):
-        if not isinstance(t, int | float) or isinstance(t, bool) or not math.isfinite(t):
-            return None
+    if not (_real(t0) and _real(t1)):
+        return None
     return (t0, t1) if t0 <= t1 else None
 
 
@@ -464,13 +474,12 @@ def _judge_concurrency(a: Obj, b: Obj) -> list[str]:
     for what, (left, right) in pairs.items():
         if left == right:
             reasons.append(f"concurrency_shared_daemon: runs a and b share {what} {left}")
-    windows = {"a": _window(a["probe"]), "b": _window(b["probe"])}
-    for name, window in windows.items():
+    wa, wb = _window(a["probe"]), _window(b["probe"])
+    for name, window in (("a", wa), ("b", wb)):
         if window is None:
             reasons.append(f"missing_observation: run {name} window")
-    first, second = windows["a"], windows["b"]
-    if first is not None and second is not None:
-        (a0, a1), (b0, b1) = first, second
+    if wa is not None and wb is not None:
+        (a0, a1), (b0, b1) = wa, wb
         if not (a0 < b1 and b0 < a1):
             reasons.append(f"not_concurrent: windows {[a0, a1]} and {[b0, b1]} do not overlap")
     return reasons
@@ -488,8 +497,7 @@ def _judge_cleanup_path(path: str, entry: Obj) -> list[str]:
     if entry["remaining"] != []:
         reasons.append(f"incomplete_cleanup: {path} left {entry['remaining']}")
     settle = entry["settle_seconds"]
-    number = isinstance(settle, int | float) and not isinstance(settle, bool)
-    if not number or not 0 <= settle <= LIMIT_SECONDS:
+    if not _real(settle) or not 0 <= settle <= LIMIT_SECONDS:
         reasons.append(f"incomplete_cleanup: {path} settled in {settle!r}s, limit {LIMIT_SECONDS}")
     return reasons
 
@@ -584,14 +592,14 @@ def judge(envelope: Obj) -> list[str]:
     runs = envelope.get("runs")
     if not isinstance(runs, dict):
         reasons.append("missing_observation: runs")
-        runs = {}
-    elif not all(isinstance(runs.get(name), dict) for name in ("a", "b")):
-        missing = [name for name in ("a", "b") if not isinstance(runs.get(name), dict)]
-        reasons.append(f"missing_observation: runs {', '.join(missing)}")
-    for name in ("a", "b"):
-        run = runs.get(name)
-        if not isinstance(run, dict):
-            continue
+        runs, present = {}, []
+    else:
+        present = [name for name in ("a", "b") if isinstance(runs.get(name), dict)]
+        if len(present) < 2:
+            missing = [name for name in ("a", "b") if name not in present]
+            reasons.append(f"missing_observation: runs {', '.join(missing)}")
+    for name in present:
+        run = runs[name]
         where = f"run {name}"
         reasons += _section(f"runs {name} identity", partial(_judge_identity, where, run))
         reasons += _section(f"runs {name} events", partial(_judge_events, where, run, nonce))
@@ -604,7 +612,7 @@ def judge(envelope: Obj) -> list[str]:
         reasons += _section(
             f"runs {name} cleanup", partial(_judge_run_probe, _judge_probe_cleanup, where, run)
         )
-    if all(isinstance(runs.get(name), dict) for name in ("a", "b")):
+    if len(present) == 2:
         reasons += _section("runs concurrency", lambda: _judge_concurrency(runs["a"], runs["b"]))
     judges: dict[str, Callable[[Obj], list[str]]] = {
         "cleanup": _judge_cleanup,
@@ -657,7 +665,9 @@ def probe(nonce: str, image: str, targets: list[tuple[str, str]]) -> Obj:
     t0 = time.time()
     name = f"curie-probe-{nonce}-{secrets.token_hex(3)}"
     label = f"{NONCE_LABEL}={nonce}"
-    cleanup: Obj = {"holder_removed": False, "volume_absent": False}
+    info, holder, holder_code, pull_code = "", "", -1, -1
+    escapes: list[Obj] = []
+    egress: list[Obj] = []
     try:
         _, info, _ = _command(["docker", "info", "--format", INFO_FORMAT])
         pull_code, _, _ = _command(["docker", "pull", image], timeout=PULL_TIMEOUT)
@@ -666,11 +676,9 @@ def probe(nonce: str, image: str, targets: list[tuple[str, str]]) -> Obj:
         )
         lines = holder_out.strip().splitlines()
         holder = lines[-1] if holder_code == 0 and lines else ""
-        escapes = []
         for esc, argv, _ in escape_commands(image, nonce, holder):
             code, out, err = _command(argv)
             escapes.append(escape_result(esc, code, out + err))
-        egress = []
         for target_name, target in targets:
             host, port = split_target(target) or ("", "")
             argv = ["docker", "run", "--rm", "--label", label, image, "nc", "-z", "-w", "5"]
@@ -743,13 +751,16 @@ def _github_pages(api_url: str, path: str, token: str | None) -> list[Any]:
 
 def collect_ci(api_url: str, repo: str, base: str, sha: str, required: list[str] | None) -> Obj:
     token = os.environ.get("GITHUB_TOKEN") or None
-    rules = None if required else _github(api_url, f"/repos/{repo}/rules/branches/{base}", token)[0]
+    required = required or None
+    rules = (
+        _github(api_url, f"/repos/{repo}/rules/branches/{base}", token)[0] if not required else []
+    )
     commit = f"/repos/{repo}/commits/{sha}"
     run_pages = _github_pages(api_url, f"{commit}/check-runs?per_page=100&filter=latest", token)
     runs = {"check_runs": [run for page in run_pages for run in page["check_runs"]]}
     status_pages = _github_pages(api_url, f"{commit}/statuses?per_page=100", token)
     statuses = [status for page in status_pages for status in page]
-    return ci_section(sha, rules, runs, statuses, required or None)
+    return ci_section(sha, rules, runs, statuses, required)
 
 
 # CLI
