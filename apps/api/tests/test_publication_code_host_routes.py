@@ -702,10 +702,18 @@ def test_missing_execution_relation_cannot_use_repository_default(
                 {"id": uuid.UUID(publication["id"]), "request": original},
             )
         else:
-            _execute(
-                "UPDATE curie.execution_requests SET work_item_id = :item WHERE id = :request",
-                {"item": work_item_id, "request": original},
-            )
+            async def restore_relation(session: Any) -> None:
+                await session.execute(text("SET LOCAL session_replication_role = replica"))
+                await session.execute(
+                    text(
+                        "UPDATE curie.execution_requests SET work_item_id = :item "
+                        "WHERE id = :request"
+                    ),
+                    {"item": work_item_id, "request": original},
+                )
+                await session.commit()
+
+            with_session(restore_relation)
     healthy = client.get(_url(publication["id"], "branch-head"), headers=WORKER_HEADERS)
     assert healthy.status_code == 200, healthy.text
 
