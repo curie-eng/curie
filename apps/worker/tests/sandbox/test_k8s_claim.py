@@ -1660,6 +1660,61 @@ def test_recent_eviction_event_carries_the_volume_and_limit() -> None:
     )
 
 
+def _event_diagnosed_termination(
+    reason: str, message: str, statuses: list[SimpleNamespace], phase: str
+) -> Any:
+    api = _FakeApi()
+    api.pod = SimpleNamespace(
+        metadata=SimpleNamespace(name="sbx-1", uid="pod-current"),
+        status=SimpleNamespace(phase=phase, reason=None, container_statuses=statuses),
+    )
+    api.events = [
+        SimpleNamespace(
+            reason=reason,
+            message=message,
+            involved_object=SimpleNamespace(kind="Pod", name="sbx-1", uid="pod-current"),
+            last_timestamp=datetime.now(UTC),
+        )
+    ]
+    return _client(api).pod_termination(
+        "sbx-1", request_timeout_seconds=0.5, since=datetime.now(UTC) - timedelta(seconds=5)
+    )
+
+
+@pytest.mark.parametrize("reason", ["Evicted", "OOMKilled"])
+def test_event_diagnosis_keeps_the_runner_exit_code_from_pod_status(reason: str) -> None:
+    message = 'Usage of EmptyDir volume "writable-1" exceeds the limit "384Mi"'
+    # What the event alone reports, with no runner container status to read.
+    baseline = _event_diagnosed_termination(reason, message, [], "Failed")
+    assert baseline is not None
+    assert baseline.exit_code is None
+
+    termination = _event_diagnosed_termination(
+        reason,
+        message,
+        [_runner_status(SimpleNamespace(reason="Error", exit_code=137))],
+        "Running",
+    )
+
+    assert termination is not None
+    assert termination.reason == reason
+    assert termination.detail == baseline.detail
+    assert termination.exit_code == 137
+
+
+def test_eviction_event_without_a_runner_termination_still_has_no_exit_code() -> None:
+    termination = _event_diagnosed_termination(
+        "Evicted",
+        'Usage of EmptyDir volume "writable-1" exceeds the limit "384Mi"',
+        [_runner_status(None)],
+        "Running",
+    )
+
+    assert termination is not None
+    assert termination.reason == "Evicted"
+    assert termination.exit_code is None
+
+
 def test_eviction_event_with_an_unstructured_message_has_no_detail() -> None:
     api = _FakeApi()
     api.pod = SimpleNamespace(
