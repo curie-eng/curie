@@ -2838,6 +2838,15 @@ class _Ownership:
         for item in _docker_lines("volume", "ls", "--filter", label, "--format", "{{.Name}}"):
             self.volumes[item] = stack.project
         for item in _docker_lines(
+            "volume",
+            "ls",
+            "--filter",
+            f"label=curietech.ai/stack={stack.project}_runner",
+            "--format",
+            "{{.Name}}",
+        ):
+            self.volumes[item] = stack.project
+        for item in _docker_lines(
             "network", "ls", "--no-trunc", "--filter", label, "--format", "{{.ID}}"
         ):
             self.networks[item] = stack.project
@@ -3711,6 +3720,10 @@ class _Campaign:
         )
         if code != 0:
             self.failures.append(f"local down failed: {stderr}")
+        # A turn still queued in the worker can start a claim runner while compose
+        # stops the stack; record it so the leftover sweep removes it.
+        with contextlib.suppress(_Invalid):
+            self.ownership.observe(self.stack)
         if self.ledger is not None:
             self.close_fires("stack torn down before the fire was observed")
         self.stack = None

@@ -2647,3 +2647,58 @@ def test_calibration_pass_needs_nonempty_refs_naming_keys_in_its_evidence(
         if generation["id"] == row["generation_id"]:
             generation["completion_sha256"] = row["completion_sha256"]
     _check(tmp_path, report, validator, passed=False)
+
+
+def test_teardown_records_a_runner_started_while_the_stack_stops(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A turn still queued in the worker can start a claim runner while compose
+    stops the stack; `down` re-observes so the leftover sweep owns and removes it."""
+
+    from curie_worker.eval import learning
+
+    project = "curie-learning-abc-r1a1"
+    started = {"runner": False}
+    issued: list[tuple[str, ...]] = []
+
+    def docker_lines(*args: str) -> list[str]:
+        issued.append(args)
+        joined = " ".join(args)
+        if not started["runner"]:
+            return []
+        if "network=" + project + "_runner" in joined:
+            return ["late-runner"]
+        if args[:2] == ("volume", "ls") and f"curietech.ai/stack={project}_runner" in joined:
+            return ["curie-input-late"]
+        if args[:2] == ("network", "ls") and "com.docker.compose.project" in joined:
+            return ["runner-network"]
+        return []
+
+    monkeypatch.setattr(learning, "_docker_lines", docker_lines)
+    campaign = object.__new__(learning._Campaign)
+    campaign.ownership = learning._Ownership(project_prefix="curie-learning-abc")
+    campaign.stack = learning._Stack(
+        project=project,
+        tag="learning-abc",
+        override=tmp_path / "override.yaml",
+        ports={},
+        stub_port=0,
+        stub_host="127.0.0.1",
+        repetition=1,
+    )
+    campaign.failures = []
+    campaign.ledger = None
+
+    def local_down(*_args: Any, **_kwargs: Any) -> tuple[int, str, str, str, str]:
+        started["runner"] = True
+        return 0, "", "", "", ""
+
+    monkeypatch.setattr(campaign, "cli", local_down)
+    monkeypatch.setattr(campaign, "compose_argv", lambda *args: list(args))
+    monkeypatch.setattr(campaign, "compose_extra", lambda: {})
+    campaign.down(1)
+
+    assert campaign.ownership.runners == {"late-runner": project}
+    assert campaign.ownership.volumes == {"curie-input-late": project}
+    assert campaign.ownership.networks == {"runner-network": project}
+    assert campaign.stack is None
