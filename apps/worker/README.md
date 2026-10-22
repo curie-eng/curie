@@ -301,7 +301,7 @@ Rules (detailed-architecture 2b), each with an integration test that provokes it
   confirmed sandbox termination. When Kubernetes confirms that the sandbox pod
   terminated during the stream, the worker classifies the failure as
   `sandbox-terminated`; the terminal notice includes the Kubernetes termination
-  reason so an operator can diagnose it before retrying.
+  reason so an operator can diagnose it before retrying. The worker waits up to 10 s for Kubernetes to confirm a termination before it classifies a dropped stream.
   `workspace-error` is a managed-workspace preparation FAULT before the turn was
   ever accepted (#2004): the clone, the archive, or the upload. It is told apart
   from `runner-error` for the same
