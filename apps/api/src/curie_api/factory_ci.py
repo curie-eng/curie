@@ -733,6 +733,24 @@ def decide(
     ):
         return Verdict(kind="unverified", reason="delegated_ci_failed_on_base", pending=pending)
 
+    if host_required_checks:
+        present = {check.key for check in (*check_runs, *statuses)}
+        missing = sorted(
+            name
+            for name in dict.fromkeys(host_required_checks)
+            if name not in present and status_key(name) not in present
+        )
+        if missing:
+            # Before the Python-CI missing return. A required check that never
+            # started stays pending until the CI deadline even when that name
+            # is also the repository's Python check.
+            return Verdict(
+                kind="unverified" if expired else "pending",
+                pending=pending,
+                reason="required_check_absent",
+                note=_required_absent_note(missing),
+            )
+
     if requires_python_ci and not required_python_runs:
         has_unrelated_checks = bool(check_runs or statuses)
         # Shard jobs stay in the list after they complete, and the aggregate
@@ -763,21 +781,6 @@ def decide(
             pending=pending,
             reason="delegated_ci_missing",
         )
-
-    if host_required_checks:
-        present = {check.key for check in (*check_runs, *statuses)}
-        missing = sorted(
-            name
-            for name in dict.fromkeys(host_required_checks)
-            if name not in present and status_key(name) not in present
-        )
-        if missing:
-            return Verdict(
-                kind="unverified" if expired else "pending",
-                pending=pending,
-                reason="required_check_absent",
-                note=_required_absent_note(missing),
-            )
 
     if not check_runs and not statuses:
         in_grace = now < published_at + timedelta(seconds=CI_GRACE_SECONDS)
@@ -1269,11 +1272,13 @@ async def gate(
             try:
                 host_required = await code_host.required_checks(repository, lineage.base_ref)
             except ForgeError as failure:
-                if view.reason is None:
-                    view = replace(
-                        view,
-                        reason=str(failure) or type(failure).__name__.lower(),
-                    )
+                reason = str(failure) or type(failure).__name__.lower()
+                # A permanent required-check failure is immediate. It is not
+                # hidden behind a transient check-run read.
+                if view.reason is None or (
+                    view.reason in TRANSIENT and reason not in TRANSIENT
+                ):
+                    view = replace(view, reason=reason)
         if metadata_only and fresh_after is None:
             verdict = Verdict(kind="unverified", reason="metadata_update_unverified")
         else:

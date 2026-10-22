@@ -2337,3 +2337,29 @@ def test_required_checks_empty_set_keeps_todays_no_ci() -> None:
     clean = _pull(mergeable=True)
     assert _decide(empty, 130, pull=clean, host_required_checks=()).kind == "no_ci"
     assert _decide(empty, 130, pull=clean, host_required_checks=None).kind == "no_ci"
+
+
+def test_required_checks_missing_python_check_stays_pending_with_its_name() -> None:
+    policy = conversion_python_ci()
+    detail = _detail(_run("lint"))
+    pending = _decide(
+        detail,
+        30,
+        changed_paths=["unitconv/convert.py"],
+        python_ci=policy,
+        host_required_checks=("Unit conversion suite",),
+    )
+    assert pending.kind == "pending"
+    assert pending.reason == "required_check_absent"
+    assert pending.note is not None
+    assert "Unit conversion suite" in pending.note
+    expired = _decide(
+        detail,
+        1200,
+        changed_paths=["unitconv/convert.py"],
+        python_ci=policy,
+        host_required_checks=("Unit conversion suite",),
+    )
+    assert expired.kind == "unverified"
+    assert expired.note is not None
+    assert "for example a label" in expired.note
