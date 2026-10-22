@@ -88,8 +88,25 @@ def test_a_bundle_without_valid_connectors_names_none() -> None:
     assert route_tokens.read_route_connectors(reader, "bad", "acme-dev", _LIMITS) == frozenset()
 
 
-def _kernel(reader: _Bundles | None) -> SimpleNamespace:
-    return SimpleNamespace(_bundles=reader, _bundle_routes={}, _config=WorkerConfig())
+_SEED = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+
+
+def _kernel(reader: _Bundles | None, *, key: str = _SEED) -> SimpleNamespace:
+    return SimpleNamespace(
+        _bundles=reader,
+        _bundle_routes={},
+        _config=WorkerConfig(connector_caller_signing_key=key),
+    )
+
+
+# @spec ADR-0240 d2: no caller key mints nothing, so the bundle is not read.
+def test_without_a_caller_key_the_bundle_is_never_read() -> None:
+    reader = _Bundles({"b1": _zip({"connectors.yaml": _CONNECTORS})})
+    found = asyncio.run(
+        route_tokens.route_connectors(_kernel(reader, key=""), "b1", "acme-dev")  # type: ignore[arg-type]
+    )
+    assert found == frozenset()
+    assert reader.reads == []
 
 
 # @spec ADR-0240 d2

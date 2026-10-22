@@ -76,7 +76,13 @@ def read_route_connectors(
 async def route_connectors(self: Kernel, bundle_ref: str | None, agent: str) -> frozenset[str]:
     """``read_route_connectors`` off the event loop, bounded and cached."""
 
-    if not bundle_ref or not agent or self._bundles is None:
+    # Without a caller key nothing is minted, so the bundle is never read.
+    if (
+        not bundle_ref
+        or not agent
+        or self._bundles is None
+        or not self._config.connector_caller_signing_key.strip()
+    ):
         return frozenset()
     key = (bundle_ref, agent)
     cached = self._bundle_routes.get(key)
