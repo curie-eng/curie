@@ -1,453 +1,462 @@
 {
-  "schema": "daemon-lifecycle/v1",
-  "result": "passed",
-  "nonce": "0123abcd",
-  "provenance": {
-    "candidate": "0123456789abcdef0123456789abcdef01234567",
-    "catalog_builder": "curie::repo_runner::catalog_dockerfile",
-    "images": {
-      "daemon": {
-        "ref": "localhost:5000/fd-0123abcd/daemon@sha256:1111111111111111111111111111111111111111111111111111111111111111",
-        "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
-        "manifest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
-        "config": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-      },
-      "platform": {
-        "ref": "localhost:5000/fd-0123abcd/platform@sha256:2222222222222222222222222222222222222222222222222222222222222222",
-        "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
-        "manifest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
-        "config": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-      },
-      "catalog": {
-        "ref": "localhost:5000/fd-0123abcd/catalog@sha256:3333333333333333333333333333333333333333333333333333333333333333",
-        "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
-        "manifest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
-        "config": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-      },
-      "runner": {
-        "ref": "localhost:5000/fd-0123abcd/runner@sha256:4444444444444444444444444444444444444444444444444444444444444444",
-        "digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
-        "manifest": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
-        "config": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-      },
-      "api": {
-        "ref": "localhost:5000/fd-0123abcd/api@sha256:5555555555555555555555555555555555555555555555555555555555555555",
-        "digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
-        "manifest": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
-        "config": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-      },
-      "worker": {
-        "ref": "localhost:5000/fd-0123abcd/worker@sha256:6666666666666666666666666666666666666666666666666666666666666666",
-        "digest": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
-        "manifest": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
-        "config": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-      }
-    }
+  "cleanup": {
+    "docker_assets_absent": true,
+    "fixture_cleanup_complete": true,
+    "helm_uninstalled": true,
+    "namespaces_absent": true,
+    "release_objects_absent": true
   },
-  "timings": {
-    "build_seconds": 210.5,
-    "install_seconds": 95.25
+  "control": {
+    "claim": "curie-thread-7f1705e322-8c4ecc",
+    "client_docker_files": false,
+    "completed": true,
+    "daemon_objects": 0,
+    "issue": 4105,
+    "runner": {
+      "docker_env": false,
+      "image_id": "sha256:7402b8c22ec3db23cb651cf7e7b18451b6164ba2db32fca19a4240ca17553db5",
+      "pod": "curie-thread-7f1705e322-8c4ecc",
+      "pod_uid": "c916b1e4-e158-4c4f-aa56-212071ac2c6b"
+    },
+    "thread": "github:acme-corp%2Facme-bot:issue-4105"
   },
-  "turns": {
-    "success": {
-      "issue": 1,
-      "thread": "thread-1",
-      "claim": "factory-e2e-aaaa0001",
-      "runner": {
-        "pod": "runner-factory-e2e-aaaa0001",
-        "pod_uid": "00000000-0000-0000-0000-000000001001",
-        "image_id": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
-        "docker_env": true
-      },
-      "daemon": {
-        "pod": "daemon-factory-e2e-aaaa0001",
-        "pod_uid": "00000000-0000-0000-0000-000000001002",
-        "image_id": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
-        "docker_id": "ABCD:EFGH:IJKL:MNOP:1",
-        "docker_name": "daemon-factory-e2e-aaaa0001"
-      },
-      "runner_docker": {
-        "ran": true,
-        "id": "ABCD:EFGH:IJKL:MNOP:1",
-        "name": "daemon-factory-e2e-aaaa0001",
-        "container_nonce": "0123abcd"
-      },
-      "objects": [
-        {
-          "kind": "Pod",
-          "role": "daemon",
-          "name": "daemon-factory-e2e-aaaa0001",
-          "namespace": "fd-proof-d-0123abcd",
-          "uid": "00000000-0000-0000-0000-000000001003",
-          "claim_label": "factory-e2e-aaaa0001"
-        },
-        {
-          "kind": "Service",
-          "role": "service",
-          "name": "factory-e2e-aaaa0001",
-          "namespace": "fd-proof-d-0123abcd",
-          "uid": "00000000-0000-0000-0000-000000001004",
-          "claim_label": "factory-e2e-aaaa0001"
-        },
-        {
-          "kind": "NetworkPolicy",
-          "role": "ingress",
-          "name": "factory-e2e-aaaa0001",
-          "namespace": "fd-proof-d-0123abcd",
-          "uid": "00000000-0000-0000-0000-000000001005",
-          "claim_label": "factory-e2e-aaaa0001"
-        },
-        {
-          "kind": "Secret",
-          "role": "server-secret",
-          "name": "factory-e2e-aaaa0001-server",
-          "namespace": "fd-proof-d-0123abcd",
-          "uid": "00000000-0000-0000-0000-000000001006",
-          "claim_label": "factory-e2e-aaaa0001"
-        },
-        {
-          "kind": "Secret",
-          "role": "client-secret",
-          "name": "factory-e2e-aaaa0001-tokens",
-          "namespace": "fd-proof-0123abcd",
-          "uid": "00000000-0000-0000-0000-000000001007",
-          "claim_label": "factory-e2e-aaaa0001"
-        }
-      ],
-      "fault": "release",
-      "settle_seconds": 13.5,
-      "objects_absent": true,
-      "request_state": "completed"
-    },
-    "daemon_death": {
-      "issue": 2,
-      "thread": "thread-2",
-      "claim": "factory-e2e-aaaa0002",
-      "runner": {
-        "pod": "runner-factory-e2e-aaaa0002",
-        "pod_uid": "00000000-0000-0000-0000-000000001008",
-        "image_id": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
-        "docker_env": true
-      },
-      "daemon": {
-        "pod": "daemon-factory-e2e-aaaa0002",
-        "pod_uid": "00000000-0000-0000-0000-000000001009",
-        "image_id": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
-        "docker_id": "ABCD:EFGH:IJKL:MNOP:2",
-        "docker_name": "daemon-factory-e2e-aaaa0002"
-      },
-      "runner_docker": {
-        "ran": true,
-        "id": "ABCD:EFGH:IJKL:MNOP:2",
-        "name": "daemon-factory-e2e-aaaa0002",
-        "container_nonce": "0123abcd"
-      },
-      "objects": [
-        {
-          "kind": "Pod",
-          "role": "daemon",
-          "name": "daemon-factory-e2e-aaaa0002",
-          "namespace": "fd-proof-d-0123abcd",
-          "uid": "00000000-0000-0000-0000-00000000100a",
-          "claim_label": "factory-e2e-aaaa0002"
-        },
-        {
-          "kind": "Service",
-          "role": "service",
-          "name": "factory-e2e-aaaa0002",
-          "namespace": "fd-proof-d-0123abcd",
-          "uid": "00000000-0000-0000-0000-00000000100b",
-          "claim_label": "factory-e2e-aaaa0002"
-        },
-        {
-          "kind": "NetworkPolicy",
-          "role": "ingress",
-          "name": "factory-e2e-aaaa0002",
-          "namespace": "fd-proof-d-0123abcd",
-          "uid": "00000000-0000-0000-0000-00000000100c",
-          "claim_label": "factory-e2e-aaaa0002"
-        },
-        {
-          "kind": "Secret",
-          "role": "server-secret",
-          "name": "factory-e2e-aaaa0002-server",
-          "namespace": "fd-proof-d-0123abcd",
-          "uid": "00000000-0000-0000-0000-00000000100d",
-          "claim_label": "factory-e2e-aaaa0002"
-        },
-        {
-          "kind": "Secret",
-          "role": "client-secret",
-          "name": "factory-e2e-aaaa0002-tokens",
-          "namespace": "fd-proof-0123abcd",
-          "uid": "00000000-0000-0000-0000-00000000100e",
-          "claim_label": "factory-e2e-aaaa0002"
-        }
-      ],
-      "fault": "daemon_pod_deleted",
-      "settle_seconds": 14.5,
-      "objects_absent": true,
-      "request_state": "completed"
-    },
-    "retained_next": {
-      "issue": 2,
-      "thread": "thread-2",
-      "claim": "factory-e2e-aaaa0003",
-      "runner": {
-        "pod": "runner-factory-e2e-aaaa0003",
-        "pod_uid": "00000000-0000-0000-0000-00000000100f",
-        "image_id": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
-        "docker_env": true
-      },
-      "daemon": {
-        "pod": "daemon-factory-e2e-aaaa0003",
-        "pod_uid": "00000000-0000-0000-0000-000000001010",
-        "image_id": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
-        "docker_id": "ABCD:EFGH:IJKL:MNOP:3",
-        "docker_name": "daemon-factory-e2e-aaaa0003"
-      },
-      "runner_docker": {
-        "ran": true,
-        "id": "ABCD:EFGH:IJKL:MNOP:3",
-        "name": "daemon-factory-e2e-aaaa0003",
-        "container_nonce": "0123abcd"
-      },
-      "objects": [
-        {
-          "kind": "Pod",
-          "role": "daemon",
-          "name": "daemon-factory-e2e-aaaa0003",
-          "namespace": "fd-proof-d-0123abcd",
-          "uid": "00000000-0000-0000-0000-000000001011",
-          "claim_label": "factory-e2e-aaaa0003"
-        },
-        {
-          "kind": "Service",
-          "role": "service",
-          "name": "factory-e2e-aaaa0003",
-          "namespace": "fd-proof-d-0123abcd",
-          "uid": "00000000-0000-0000-0000-000000001012",
-          "claim_label": "factory-e2e-aaaa0003"
-        },
-        {
-          "kind": "NetworkPolicy",
-          "role": "ingress",
-          "name": "factory-e2e-aaaa0003",
-          "namespace": "fd-proof-d-0123abcd",
-          "uid": "00000000-0000-0000-0000-000000001013",
-          "claim_label": "factory-e2e-aaaa0003"
-        },
-        {
-          "kind": "Secret",
-          "role": "server-secret",
-          "name": "factory-e2e-aaaa0003-server",
-          "namespace": "fd-proof-d-0123abcd",
-          "uid": "00000000-0000-0000-0000-000000001014",
-          "claim_label": "factory-e2e-aaaa0003"
-        },
-        {
-          "kind": "Secret",
-          "role": "client-secret",
-          "name": "factory-e2e-aaaa0003-tokens",
-          "namespace": "fd-proof-0123abcd",
-          "uid": "00000000-0000-0000-0000-000000001015",
-          "claim_label": "factory-e2e-aaaa0003"
-        }
-      ],
-      "fault": "release",
-      "settle_seconds": 15.5,
-      "objects_absent": true,
-      "request_state": "completed"
-    },
-    "cancel": {
-      "issue": 3,
-      "thread": "thread-3",
-      "claim": "factory-e2e-aaaa0004",
-      "runner": {
-        "pod": "runner-factory-e2e-aaaa0004",
-        "pod_uid": "00000000-0000-0000-0000-000000001016",
-        "image_id": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
-        "docker_env": true
-      },
-      "daemon": {
-        "pod": "daemon-factory-e2e-aaaa0004",
-        "pod_uid": "00000000-0000-0000-0000-000000001017",
-        "image_id": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
-        "docker_id": "ABCD:EFGH:IJKL:MNOP:4",
-        "docker_name": "daemon-factory-e2e-aaaa0004"
-      },
-      "runner_docker": {
-        "ran": true,
-        "id": "ABCD:EFGH:IJKL:MNOP:4",
-        "name": "daemon-factory-e2e-aaaa0004",
-        "container_nonce": "0123abcd"
-      },
-      "objects": [
-        {
-          "kind": "Pod",
-          "role": "daemon",
-          "name": "daemon-factory-e2e-aaaa0004",
-          "namespace": "fd-proof-d-0123abcd",
-          "uid": "00000000-0000-0000-0000-000000001018",
-          "claim_label": "factory-e2e-aaaa0004"
-        },
-        {
-          "kind": "Service",
-          "role": "service",
-          "name": "factory-e2e-aaaa0004",
-          "namespace": "fd-proof-d-0123abcd",
-          "uid": "00000000-0000-0000-0000-000000001019",
-          "claim_label": "factory-e2e-aaaa0004"
-        },
-        {
-          "kind": "NetworkPolicy",
-          "role": "ingress",
-          "name": "factory-e2e-aaaa0004",
-          "namespace": "fd-proof-d-0123abcd",
-          "uid": "00000000-0000-0000-0000-00000000101a",
-          "claim_label": "factory-e2e-aaaa0004"
-        },
-        {
-          "kind": "Secret",
-          "role": "server-secret",
-          "name": "factory-e2e-aaaa0004-server",
-          "namespace": "fd-proof-d-0123abcd",
-          "uid": "00000000-0000-0000-0000-00000000101b",
-          "claim_label": "factory-e2e-aaaa0004"
-        },
-        {
-          "kind": "Secret",
-          "role": "client-secret",
-          "name": "factory-e2e-aaaa0004-tokens",
-          "namespace": "fd-proof-0123abcd",
-          "uid": "00000000-0000-0000-0000-00000000101c",
-          "claim_label": "factory-e2e-aaaa0004"
-        }
-      ],
-      "fault": "cancel",
-      "settle_seconds": 16.5,
-      "objects_absent": true,
-      "request_state": "cancelled"
-    },
-    "worker_loss": {
-      "issue": 4,
-      "thread": "thread-4",
-      "claim": "factory-e2e-aaaa0005",
-      "runner": {
-        "pod": "runner-factory-e2e-aaaa0005",
-        "pod_uid": "00000000-0000-0000-0000-00000000101d",
-        "image_id": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
-        "docker_env": true
-      },
-      "daemon": {
-        "pod": "daemon-factory-e2e-aaaa0005",
-        "pod_uid": "00000000-0000-0000-0000-00000000101e",
-        "image_id": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
-        "docker_id": "ABCD:EFGH:IJKL:MNOP:5",
-        "docker_name": "daemon-factory-e2e-aaaa0005"
-      },
-      "runner_docker": {
-        "ran": true,
-        "id": "ABCD:EFGH:IJKL:MNOP:5",
-        "name": "daemon-factory-e2e-aaaa0005",
-        "container_nonce": "0123abcd"
-      },
-      "objects": [
-        {
-          "kind": "Pod",
-          "role": "daemon",
-          "name": "daemon-factory-e2e-aaaa0005",
-          "namespace": "fd-proof-d-0123abcd",
-          "uid": "00000000-0000-0000-0000-00000000101f",
-          "claim_label": "factory-e2e-aaaa0005"
-        },
-        {
-          "kind": "Service",
-          "role": "service",
-          "name": "factory-e2e-aaaa0005",
-          "namespace": "fd-proof-d-0123abcd",
-          "uid": "00000000-0000-0000-0000-000000001020",
-          "claim_label": "factory-e2e-aaaa0005"
-        },
-        {
-          "kind": "NetworkPolicy",
-          "role": "ingress",
-          "name": "factory-e2e-aaaa0005",
-          "namespace": "fd-proof-d-0123abcd",
-          "uid": "00000000-0000-0000-0000-000000001021",
-          "claim_label": "factory-e2e-aaaa0005"
-        },
-        {
-          "kind": "Secret",
-          "role": "server-secret",
-          "name": "factory-e2e-aaaa0005-server",
-          "namespace": "fd-proof-d-0123abcd",
-          "uid": "00000000-0000-0000-0000-000000001022",
-          "claim_label": "factory-e2e-aaaa0005"
-        },
-        {
-          "kind": "Secret",
-          "role": "client-secret",
-          "name": "factory-e2e-aaaa0005-tokens",
-          "namespace": "fd-proof-0123abcd",
-          "uid": "00000000-0000-0000-0000-000000001023",
-          "claim_label": "factory-e2e-aaaa0005"
-        }
-      ],
-      "fault": "worker_pod_deleted",
-      "settle_seconds": 17.5,
-      "objects_absent": true,
-      "request_state": "completed"
-    }
-  },
-  "tls": {
-    "claim": "factory-e2e-aaaa0001",
-    "independent_client_refused": true
-  },
+  "failures": [],
+  "nonce": "1542b3e7",
   "orphan": {
-    "claim": "factory-e2e-bbbb0001",
     "age_gate_seconds": 180,
+    "claim": "curie-thread-393b8062b5-57b094",
     "kept_while_young": true,
     "objects": [
       {
+        "claim_label": "curie-thread-393b8062b5-57b094",
         "kind": "Service",
+        "name": "curie-thread-393b8062b5-57b094",
+        "namespace": "fd-proof-d-1542b3e7",
         "role": "service",
-        "name": "factory-e2e-bbbb0001",
-        "namespace": "fd-proof-d-0123abcd",
-        "uid": "00000000-0000-0000-0000-000000001024",
-        "claim_label": "factory-e2e-bbbb0001"
+        "uid": "eee9df27-8a35-4115-8abe-49de1f132ea2"
       },
       {
+        "claim_label": "curie-thread-393b8062b5-57b094",
         "kind": "NetworkPolicy",
+        "name": "curie-thread-393b8062b5-57b094",
+        "namespace": "fd-proof-d-1542b3e7",
         "role": "ingress",
-        "name": "factory-e2e-bbbb0001",
-        "namespace": "fd-proof-d-0123abcd",
-        "uid": "00000000-0000-0000-0000-000000001025",
-        "claim_label": "factory-e2e-bbbb0001"
+        "uid": "81011632-16dc-4d0a-afba-421cdc5a517b"
       }
     ],
-    "settle_seconds": 40.0,
-    "objects_absent": true
+    "objects_absent": true,
+    "settle_seconds": 186.5
   },
-  "control": {
-    "issue": 5,
-    "thread": "thread-5",
-    "claim": "factory-e2e-cccc0001",
-    "runner": {
-      "pod": "runner-factory-e2e-cccc0001",
-      "pod_uid": "00000000-0000-0000-0000-000000001026",
-      "image_id": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
-      "docker_env": false
+  "provenance": {
+    "candidate": "36fc631dd4e633f7e3dee2145265b3cea204dd37",
+    "catalog_builder": "curie::repo_runner::catalog_dockerfile",
+    "images": {
+      "api": {
+        "config": "sha256:bef20a92ec675b551a9b6199c28ff83fd443a9d02369dda3bc5294628e3521aa",
+        "digest": "sha256:c67c32b4abdc658a959b38225b6e5570df4d7c398368a71bfe67bd1b0a96a846",
+        "manifest": "sha256:c67c32b4abdc658a959b38225b6e5570df4d7c398368a71bfe67bd1b0a96a846",
+        "ref": "localhost:32806/fd-1542b3e7/api@sha256:c67c32b4abdc658a959b38225b6e5570df4d7c398368a71bfe67bd1b0a96a846"
+      },
+      "catalog": {
+        "config": "sha256:e833599771b55470cf2e0c29f035907be46538609df6cee134a6533038235dcb",
+        "digest": "sha256:c5d958d15b7b56ba09efbce1df9ee230642fb84548aaf1e35db1884bd2f28ab7",
+        "manifest": "sha256:c5d958d15b7b56ba09efbce1df9ee230642fb84548aaf1e35db1884bd2f28ab7",
+        "ref": "localhost:32806/fd-1542b3e7/catalog@sha256:c5d958d15b7b56ba09efbce1df9ee230642fb84548aaf1e35db1884bd2f28ab7"
+      },
+      "daemon": {
+        "config": "sha256:ebca6febe3ed8fd650e702cdadc41756de856da5ae39e6331e775de25073bd00",
+        "digest": "sha256:b2f042de0b30c76022a4e3df6bfa72ed9d77c12296f561808210dd60b37e71f2",
+        "manifest": "sha256:b2f042de0b30c76022a4e3df6bfa72ed9d77c12296f561808210dd60b37e71f2",
+        "ref": "localhost:32806/fd-1542b3e7/daemon@sha256:b2f042de0b30c76022a4e3df6bfa72ed9d77c12296f561808210dd60b37e71f2"
+      },
+      "platform": {
+        "config": "sha256:b673667ab59e33a4564ddb2f090743ddb72caa852efa580d98d1668759ccda78",
+        "digest": "sha256:7bd3b7465fe4bf95091ff5d11894632c54c5469b7f34b9d37fee0fa39b9829b3",
+        "manifest": "sha256:7bd3b7465fe4bf95091ff5d11894632c54c5469b7f34b9d37fee0fa39b9829b3",
+        "ref": "localhost:32806/fd-1542b3e7/platform@sha256:7bd3b7465fe4bf95091ff5d11894632c54c5469b7f34b9d37fee0fa39b9829b3"
+      },
+      "runner": {
+        "config": "sha256:cf5542f92fe75bddc7dfee3a21329fadee666f762bef9a26f8dbd5b579402c79",
+        "digest": "sha256:7402b8c22ec3db23cb651cf7e7b18451b6164ba2db32fca19a4240ca17553db5",
+        "manifest": "sha256:7402b8c22ec3db23cb651cf7e7b18451b6164ba2db32fca19a4240ca17553db5",
+        "ref": "localhost:32806/fd-1542b3e7/runner@sha256:7402b8c22ec3db23cb651cf7e7b18451b6164ba2db32fca19a4240ca17553db5"
+      },
+      "worker": {
+        "config": "sha256:aa565f8f961c18811d2b148a59da68eb4bc308ad8d381c4505927d4f75454342",
+        "digest": "sha256:6d082a5164bb1c08b14090d13e94da798e122e1b24576ce9b5a9ed9e74532291",
+        "manifest": "sha256:6d082a5164bb1c08b14090d13e94da798e122e1b24576ce9b5a9ed9e74532291",
+        "ref": "localhost:32806/fd-1542b3e7/worker@sha256:6d082a5164bb1c08b14090d13e94da798e122e1b24576ce9b5a9ed9e74532291"
+      }
+    }
+  },
+  "result": "passed",
+  "schema": "daemon-lifecycle/v1",
+  "timings": {
+    "build_seconds": 465.1,
+    "install_seconds": 228.8
+  },
+  "tls": {
+    "claim": "curie-thread-bddc75485e-8f441f",
+    "claim_client_accepted": true,
+    "independent_client_refused": true
+  },
+  "turns": {
+    "cancel": {
+      "claim": "curie-thread-cfe091e62e-e2059b",
+      "daemon": {
+        "docker_id": "40422134-e97f-45ef-80fe-ad8d7c8aea3a",
+        "docker_name": "curie-thread-cfe091e62e-e2059b",
+        "image_id": "sha256:b2f042de0b30c76022a4e3df6bfa72ed9d77c12296f561808210dd60b37e71f2",
+        "pod": "curie-thread-cfe091e62e-e2059b",
+        "pod_uid": "b4dd9d72-a31c-4a08-8609-48633d6920e3"
+      },
+      "fault": "cancel",
+      "issue": 4103,
+      "objects": [
+        {
+          "claim_label": "curie-thread-cfe091e62e-e2059b",
+          "kind": "Pod",
+          "name": "curie-thread-cfe091e62e-e2059b",
+          "namespace": "fd-proof-d-1542b3e7",
+          "role": "daemon",
+          "uid": "b4dd9d72-a31c-4a08-8609-48633d6920e3"
+        },
+        {
+          "claim_label": "curie-thread-cfe091e62e-e2059b",
+          "kind": "Service",
+          "name": "curie-thread-cfe091e62e-e2059b",
+          "namespace": "fd-proof-d-1542b3e7",
+          "role": "service",
+          "uid": "25ab2347-2220-4c2f-a028-234f348f3454"
+        },
+        {
+          "claim_label": "curie-thread-cfe091e62e-e2059b",
+          "kind": "NetworkPolicy",
+          "name": "curie-thread-cfe091e62e-e2059b",
+          "namespace": "fd-proof-d-1542b3e7",
+          "role": "ingress",
+          "uid": "38047572-6b09-4fbf-a93a-5e014e739a09"
+        },
+        {
+          "claim_label": "curie-thread-cfe091e62e-e2059b",
+          "kind": "Secret",
+          "name": "curie-thread-cfe091e62e-e2059b",
+          "namespace": "fd-proof-d-1542b3e7",
+          "role": "server-secret",
+          "uid": "a329bab9-bba4-495c-91e4-2aca38ddae75"
+        },
+        {
+          "claim_label": "curie-thread-cfe091e62e-e2059b",
+          "kind": "Secret",
+          "name": "curie-thread-cfe091e62e-e2059b-tokens",
+          "namespace": "fd-proof-1542b3e7",
+          "role": "client-secret",
+          "uid": "89e95724-4f11-4c1e-a38a-510f7eeeb1d8"
+        }
+      ],
+      "objects_absent": true,
+      "request_id": "20b7e9e1-0d74-56b0-8b15-ebf41f641dad",
+      "request_state": "cancelled",
+      "runner": {
+        "docker_env": true,
+        "image_id": "sha256:7402b8c22ec3db23cb651cf7e7b18451b6164ba2db32fca19a4240ca17553db5",
+        "pod": "curie-thread-cfe091e62e-e2059b",
+        "pod_uid": "7cd99678-fc9e-44d4-8ad8-97f6f5848a19"
+      },
+      "runner_docker": {
+        "container_nonce": "1542b3e7",
+        "id": "40422134-e97f-45ef-80fe-ad8d7c8aea3a",
+        "name": "curie-thread-cfe091e62e-e2059b",
+        "ran": true
+      },
+      "settle_seconds": 10.1,
+      "thread": "github:acme-corp%2Facme-bot:issue-4103"
     },
-    "daemon_objects": 0,
-    "client_docker_files": false,
-    "completed": true
-  },
-  "cleanup": {
-    "helm_uninstalled": true,
-    "release_objects_absent": true,
-    "fixture_cleanup_complete": true,
-    "namespaces_absent": true,
-    "docker_assets_absent": true
+    "daemon_death": {
+      "claim": "curie-thread-e458a485f7-050d0b",
+      "daemon": {
+        "docker_id": "c635a4e0-e23c-4c67-80ca-6b651fd1f9f8",
+        "docker_name": "curie-thread-e458a485f7-050d0b",
+        "image_id": "sha256:b2f042de0b30c76022a4e3df6bfa72ed9d77c12296f561808210dd60b37e71f2",
+        "pod": "curie-thread-e458a485f7-050d0b",
+        "pod_uid": "78ac580f-426e-4aeb-a60d-8d67daa4c6f0"
+      },
+      "fault": "daemon_pod_deleted",
+      "issue": 4102,
+      "objects": [
+        {
+          "claim_label": "curie-thread-e458a485f7-050d0b",
+          "kind": "Pod",
+          "name": "curie-thread-e458a485f7-050d0b",
+          "namespace": "fd-proof-d-1542b3e7",
+          "role": "daemon",
+          "uid": "78ac580f-426e-4aeb-a60d-8d67daa4c6f0"
+        },
+        {
+          "claim_label": "curie-thread-e458a485f7-050d0b",
+          "kind": "Service",
+          "name": "curie-thread-e458a485f7-050d0b",
+          "namespace": "fd-proof-d-1542b3e7",
+          "role": "service",
+          "uid": "02cc1265-f6c5-4bcd-85ff-8ea2caa0b760"
+        },
+        {
+          "claim_label": "curie-thread-e458a485f7-050d0b",
+          "kind": "NetworkPolicy",
+          "name": "curie-thread-e458a485f7-050d0b",
+          "namespace": "fd-proof-d-1542b3e7",
+          "role": "ingress",
+          "uid": "0fa89f6f-8325-42c7-9e75-61d855df16cd"
+        },
+        {
+          "claim_label": "curie-thread-e458a485f7-050d0b",
+          "kind": "Secret",
+          "name": "curie-thread-e458a485f7-050d0b",
+          "namespace": "fd-proof-d-1542b3e7",
+          "role": "server-secret",
+          "uid": "428a47a6-b485-42bf-a4c1-6c5ae077e871"
+        },
+        {
+          "claim_label": "curie-thread-e458a485f7-050d0b",
+          "kind": "Secret",
+          "name": "curie-thread-e458a485f7-050d0b-tokens",
+          "namespace": "fd-proof-1542b3e7",
+          "role": "client-secret",
+          "uid": "b5a139b9-9b35-4989-8d03-0b9519541594"
+        }
+      ],
+      "objects_absent": true,
+      "request_id": "1c7740f0-2c0b-53ae-aec9-a751f97f253d",
+      "request_state": "failed",
+      "runner": {
+        "docker_env": true,
+        "image_id": "sha256:7402b8c22ec3db23cb651cf7e7b18451b6164ba2db32fca19a4240ca17553db5",
+        "pod": "curie-thread-e458a485f7-050d0b",
+        "pod_uid": "9c3c17b2-f936-4a4f-8948-f62bed8f2dd0"
+      },
+      "runner_docker": {
+        "container_nonce": "1542b3e7",
+        "id": "c635a4e0-e23c-4c67-80ca-6b651fd1f9f8",
+        "name": "curie-thread-e458a485f7-050d0b",
+        "ran": true
+      },
+      "settle_seconds": 3.0,
+      "thread": "github:acme-corp%2Facme-bot:issue-4102"
+    },
+    "retained_next": {
+      "claim": "curie-thread-e458a485f7-8bc50d",
+      "daemon": {
+        "docker_id": "39292883-1962-4f0b-8a2c-f93ce823e47e",
+        "docker_name": "curie-thread-e458a485f7-8bc50d",
+        "image_id": "sha256:b2f042de0b30c76022a4e3df6bfa72ed9d77c12296f561808210dd60b37e71f2",
+        "pod": "curie-thread-e458a485f7-8bc50d",
+        "pod_uid": "bf834eaa-293d-4d8c-ac01-3eb43d11e552"
+      },
+      "fault": "release",
+      "issue": 4102,
+      "objects": [
+        {
+          "claim_label": "curie-thread-e458a485f7-8bc50d",
+          "kind": "Pod",
+          "name": "curie-thread-e458a485f7-8bc50d",
+          "namespace": "fd-proof-d-1542b3e7",
+          "role": "daemon",
+          "uid": "bf834eaa-293d-4d8c-ac01-3eb43d11e552"
+        },
+        {
+          "claim_label": "curie-thread-e458a485f7-8bc50d",
+          "kind": "Service",
+          "name": "curie-thread-e458a485f7-8bc50d",
+          "namespace": "fd-proof-d-1542b3e7",
+          "role": "service",
+          "uid": "ac935018-2776-49a6-8cc0-e7be3864167b"
+        },
+        {
+          "claim_label": "curie-thread-e458a485f7-8bc50d",
+          "kind": "NetworkPolicy",
+          "name": "curie-thread-e458a485f7-8bc50d",
+          "namespace": "fd-proof-d-1542b3e7",
+          "role": "ingress",
+          "uid": "b2326843-dee7-4b62-a61d-ea8f32f99af6"
+        },
+        {
+          "claim_label": "curie-thread-e458a485f7-8bc50d",
+          "kind": "Secret",
+          "name": "curie-thread-e458a485f7-8bc50d",
+          "namespace": "fd-proof-d-1542b3e7",
+          "role": "server-secret",
+          "uid": "77294a03-0afd-4d34-9853-3c2692ab7e6f"
+        },
+        {
+          "claim_label": "curie-thread-e458a485f7-8bc50d",
+          "kind": "Secret",
+          "name": "curie-thread-e458a485f7-8bc50d-tokens",
+          "namespace": "fd-proof-1542b3e7",
+          "role": "client-secret",
+          "uid": "13eea91c-0164-43d1-8bb1-0e93c02a30b5"
+        }
+      ],
+      "objects_absent": true,
+      "request_id": "80ce381e-e2f7-555b-860e-fab4f927a16f",
+      "request_state": "failed",
+      "runner": {
+        "docker_env": true,
+        "image_id": "sha256:7402b8c22ec3db23cb651cf7e7b18451b6164ba2db32fca19a4240ca17553db5",
+        "pod": "curie-thread-e458a485f7-8bc50d",
+        "pod_uid": "653b4a13-5da6-4cec-94dd-007e39536a27"
+      },
+      "runner_docker": {
+        "container_nonce": "1542b3e7",
+        "id": "39292883-1962-4f0b-8a2c-f93ce823e47e",
+        "name": "curie-thread-e458a485f7-8bc50d",
+        "ran": true
+      },
+      "settle_seconds": 5.5,
+      "thread": "github:acme-corp%2Facme-bot:issue-4102"
+    },
+    "success": {
+      "claim": "curie-thread-bddc75485e-8f441f",
+      "daemon": {
+        "docker_id": "7edb23c9-de60-4845-8256-3eea664bf5f3",
+        "docker_name": "curie-thread-bddc75485e-8f441f",
+        "image_id": "sha256:b2f042de0b30c76022a4e3df6bfa72ed9d77c12296f561808210dd60b37e71f2",
+        "pod": "curie-thread-bddc75485e-8f441f",
+        "pod_uid": "abb517c8-9529-462f-8dce-cb424a3510c0"
+      },
+      "fault": "release",
+      "issue": 4101,
+      "objects": [
+        {
+          "claim_label": "curie-thread-bddc75485e-8f441f",
+          "kind": "Pod",
+          "name": "curie-thread-bddc75485e-8f441f",
+          "namespace": "fd-proof-d-1542b3e7",
+          "role": "daemon",
+          "uid": "abb517c8-9529-462f-8dce-cb424a3510c0"
+        },
+        {
+          "claim_label": "curie-thread-bddc75485e-8f441f",
+          "kind": "Service",
+          "name": "curie-thread-bddc75485e-8f441f",
+          "namespace": "fd-proof-d-1542b3e7",
+          "role": "service",
+          "uid": "e2ebd539-74ed-4ce9-ba66-3af088aaca1f"
+        },
+        {
+          "claim_label": "curie-thread-bddc75485e-8f441f",
+          "kind": "NetworkPolicy",
+          "name": "curie-thread-bddc75485e-8f441f",
+          "namespace": "fd-proof-d-1542b3e7",
+          "role": "ingress",
+          "uid": "2ae10f3a-2d83-4951-bde4-dfe5bf5b07a4"
+        },
+        {
+          "claim_label": "curie-thread-bddc75485e-8f441f",
+          "kind": "Secret",
+          "name": "curie-thread-bddc75485e-8f441f",
+          "namespace": "fd-proof-d-1542b3e7",
+          "role": "server-secret",
+          "uid": "7dce8d40-3116-41d6-9cf4-a3b57cdf13ec"
+        },
+        {
+          "claim_label": "curie-thread-bddc75485e-8f441f",
+          "kind": "Secret",
+          "name": "curie-thread-bddc75485e-8f441f-tokens",
+          "namespace": "fd-proof-1542b3e7",
+          "role": "client-secret",
+          "uid": "bb2ebaa2-8c1b-4530-aa44-2a9a0f102e09"
+        }
+      ],
+      "objects_absent": true,
+      "request_id": "d0df8449-2d15-5d3d-99c7-3cf73446dd9e",
+      "request_state": "failed",
+      "runner": {
+        "docker_env": true,
+        "image_id": "sha256:7402b8c22ec3db23cb651cf7e7b18451b6164ba2db32fca19a4240ca17553db5",
+        "pod": "curie-thread-bddc75485e-8f441f",
+        "pod_uid": "3e4cac9f-e063-45cf-993f-0b8c16734a5c"
+      },
+      "runner_docker": {
+        "container_nonce": "1542b3e7",
+        "id": "7edb23c9-de60-4845-8256-3eea664bf5f3",
+        "name": "curie-thread-bddc75485e-8f441f",
+        "ran": true
+      },
+      "settle_seconds": 5.3,
+      "thread": "github:acme-corp%2Facme-bot:issue-4101"
+    },
+    "worker_loss": {
+      "claim": "curie-thread-233c597680-e0ea86",
+      "daemon": {
+        "docker_id": "8e66f29b-363f-4669-b2dc-2278e82aa8bd",
+        "docker_name": "curie-thread-233c597680-e0ea86",
+        "image_id": "sha256:b2f042de0b30c76022a4e3df6bfa72ed9d77c12296f561808210dd60b37e71f2",
+        "pod": "curie-thread-233c597680-e0ea86",
+        "pod_uid": "d9205567-2a12-403d-af0b-93e03f9d06c8"
+      },
+      "fault": "worker_pod_deleted",
+      "issue": 4104,
+      "objects": [
+        {
+          "claim_label": "curie-thread-233c597680-e0ea86",
+          "kind": "Pod",
+          "name": "curie-thread-233c597680-e0ea86",
+          "namespace": "fd-proof-d-1542b3e7",
+          "role": "daemon",
+          "uid": "d9205567-2a12-403d-af0b-93e03f9d06c8"
+        },
+        {
+          "claim_label": "curie-thread-233c597680-e0ea86",
+          "kind": "Service",
+          "name": "curie-thread-233c597680-e0ea86",
+          "namespace": "fd-proof-d-1542b3e7",
+          "role": "service",
+          "uid": "2472c5b8-2a19-4cfc-bbe6-194d54979c38"
+        },
+        {
+          "claim_label": "curie-thread-233c597680-e0ea86",
+          "kind": "NetworkPolicy",
+          "name": "curie-thread-233c597680-e0ea86",
+          "namespace": "fd-proof-d-1542b3e7",
+          "role": "ingress",
+          "uid": "1b846bd6-225d-4d4e-a6da-39d6b97638d9"
+        },
+        {
+          "claim_label": "curie-thread-233c597680-e0ea86",
+          "kind": "Secret",
+          "name": "curie-thread-233c597680-e0ea86",
+          "namespace": "fd-proof-d-1542b3e7",
+          "role": "server-secret",
+          "uid": "40b4f464-3fb6-4c8e-9fe0-47fad845bc83"
+        },
+        {
+          "claim_label": "curie-thread-233c597680-e0ea86",
+          "kind": "Secret",
+          "name": "curie-thread-233c597680-e0ea86-tokens",
+          "namespace": "fd-proof-1542b3e7",
+          "role": "client-secret",
+          "uid": "9cd8cc52-ca8f-49ef-979a-8608dedd66d9"
+        }
+      ],
+      "objects_absent": true,
+      "request_id": "ccfaac26-3f7b-5226-8508-3bcd7b0ec771",
+      "request_state": "failed",
+      "runner": {
+        "docker_env": true,
+        "image_id": "sha256:7402b8c22ec3db23cb651cf7e7b18451b6164ba2db32fca19a4240ca17553db5",
+        "pod": "curie-thread-233c597680-e0ea86",
+        "pod_uid": "5ba00281-acd7-4b75-adc4-01a99e1c783a"
+      },
+      "runner_docker": {
+        "container_nonce": "1542b3e7",
+        "id": "8e66f29b-363f-4669-b2dc-2278e82aa8bd",
+        "name": "curie-thread-233c597680-e0ea86",
+        "ran": true
+      },
+      "settle_seconds": 88.2,
+      "successor_cleared": true,
+      "thread": "github:acme-corp%2Facme-bot:issue-4104",
+      "worker_deletion": "forced"
+    }
   }
 }
