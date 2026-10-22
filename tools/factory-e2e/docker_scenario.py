@@ -12,10 +12,12 @@ offline (empty means passed):
 
 1. runs: per run ``a`` and ``b``, the claim, its daemon pod, the ``probe`` section
    (written by ``probe`` inside the runner turn, where DOCKER_HOST names the run's
-   daemon: docker info, a labelled holder container, eight escape attempts, egress
-   probes and an image pull) and the ``daemon`` section (written by ``collect`` from
-   the daemon pod through kubectl: pod uid, docker info, nonce-labelled events). The
-   two runs must use distinct claims and daemons with overlapping windows.
+   daemon: docker info, a named and labelled holder container, eight escape attempts,
+   egress probes to IP:port targets and an image pull, then a verified cleanup)
+   and the ``daemon`` section (written by ``collect`` from the daemon pod through
+   kubectl: pod uid, docker info, nonce-labelled events). The
+   two runs must use distinct claims and daemons with overlapping windows (float
+   seconds, never rounded).
 2. cleanup: success, cancel, worker_kill and orphan_sweep each removed the daemon's
    Pod, Service, NetworkPolicy and Secret within 300 s.
 3. control: a run without the opt-in had no Docker environment, daemon or files.
@@ -32,10 +34,11 @@ run. Live use of this module is the w2 waypoint and acceptance.
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
-import math
 import os
 import re
+import secrets
 import subprocess
 import sys
 import time
@@ -95,8 +98,9 @@ envelope (docker-scenario/v1) sections:
   control  the non-opted run, from the daemon-lifecycle envelope
   upgrade  plan lines and runner images before and after (from `upgrade`)
   ci       required checks on the first published head (from `ci`)
-`probe` runs where DOCKER_HOST names the run's daemon; `collect` needs an explicit
---context. Live use is the w2 waypoint and acceptance; `judge` is offline.
+`probe` runs where DOCKER_HOST names the run's daemon, takes IP:port egress targets
+(no DNS names) and exits 1 unless its holder and volume are verified gone; `collect`
+needs an explicit --context. Live use is the w2 waypoint and acceptance; `judge` is offline.
 """
 
 
@@ -166,8 +170,41 @@ def escape_result(name: str, exit_code: int, output: str) -> Obj:
     }
 
 
-def egress_result(name: str, target: str, exit_code: int) -> Obj:
-    return {"name": name, "target": target, "exit_code": exit_code, "reachable": exit_code == 0}
+def egress_result(name: str, target: str, exit_code: int, output: str = "") -> Obj:
+    return {
+        "name": name,
+        "target": target,
+        "exit_code": exit_code,
+        "reachable": exit_code == 0,
+        "output_tail": output[-400:],
+    }
+
+
+def split_target(target: object) -> tuple[str, str] | None:
+    """(host, port) of ``<IPv4 or [IPv6]>:<port 1-65535>``; None for anything else."""
+
+    if not isinstance(target, str):
+        return None
+    host, _, port = target.rpartition(":")
+    try:
+        if host.startswith("[") and host.endswith("]"):
+            ipaddress.IPv6Address(host[1:-1])
+            host = host[1:-1]
+        else:
+            ipaddress.IPv4Address(host)
+    except ValueError:
+        return None
+    if not (port.isascii() and port.isdigit() and 1 <= int(port) <= 65535):
+        return None
+    return host, port
+
+
+def ip_target(text: str) -> str:
+    """argparse ``type=`` for an egress target."""
+
+    if split_target(text) is None:
+        raise argparse.ArgumentTypeError(f"expected IPv4:PORT or [IPv6]:PORT, got {text!r}")
+    return text
 
 
 def runner_image(values: Obj, repo: str) -> str:
@@ -220,7 +257,10 @@ def ci_section(
         {key: run[key] for key in ("name", "head_sha", "status", "conclusion")}
         for run in check_runs.get("check_runs", [])
     ]
-    for status in statuses:
+    newest: dict[str, Obj] = {}
+    for status in statuses:  # newest first; keep the first row per context
+        newest.setdefault(status["context"], status)
+    for status in newest.values():
         state = GREEN_STATES.get(status["state"])
         checks.append(
             {
@@ -314,7 +354,14 @@ def _judge_events(where: str, run: Obj, nonce: object) -> list[str]:
     events = run["daemon"]["events"]
     if not isinstance(events, list) or not events:
         return [f"events_missing: {where} recorded no daemon events"]
-    foreign = sum(1 for e in events if e["Actor"]["Attributes"].get(NONCE_LABEL) != nonce)
+    valid = isinstance(nonce, str) and bool(nonce)
+    foreign = sum(
+        1
+        for e in events
+        if not valid
+        or NONCE_LABEL not in e["Actor"]["Attributes"]
+        or e["Actor"]["Attributes"][NONCE_LABEL] != nonce
+    )
     reasons = [f"events_foreign: {where} {foreign} event(s) lack nonce {nonce}"] if foreign else []
     holder = run["probe"]["holder"]["id"]
     actions = {e["Action"] for e in events if holder and e["Actor"]["ID"] == holder}
@@ -358,11 +405,25 @@ def _judge_egress(where: str, probe: Obj) -> list[str]:
             reasons.append(f"missing_observation: {where} egress target {name}")
         for target in seen:
             code = target["exit_code"]
-            if code == 0:
+            if split_target(target["target"]) is None:
+                reasons.append(
+                    f"egress_probe_failed: {where} {name} target {target['target']!r} "
+                    "is not an IP:port"
+                )
+            elif code == 0:
                 reasons.append(f"egress_reachable: {where} {name} {target['target']} answered")
             elif code != 1:
                 reasons.append(f"egress_probe_failed: {where} {name} probe exited {code}")
     return reasons
+
+
+def _judge_probe_cleanup(where: str, probe: Obj) -> list[str]:
+    cleanup = probe["cleanup"]
+    return [
+        f"incomplete_cleanup: {where} probe {what} was not verified"
+        for key, what in (("holder_removed", "holder removal"), ("volume_absent", "volume removal"))
+        if cleanup[key] is not True
+    ]
 
 
 def _judge_run_probe(check: Callable[[str, Obj], list[str]], where: str, run: Obj) -> list[str]:
@@ -465,6 +526,8 @@ def judge(envelope: Obj) -> list[str]:
     if envelope.get("schema") != SCHEMA:
         reasons.append(f"schema: expected {SCHEMA}")
     nonce = envelope.get("nonce")
+    if not isinstance(nonce, str) or not nonce:
+        reasons.append("missing_observation: nonce")
     runs = envelope.get("runs")
     if not isinstance(runs, dict):
         reasons.append("missing_observation: runs")
@@ -484,6 +547,9 @@ def judge(envelope: Obj) -> list[str]:
         )
         reasons += _section(
             f"runs {name} egress", partial(_judge_run_probe, _judge_egress, where, run)
+        )
+        reasons += _section(
+            f"runs {name} cleanup", partial(_judge_run_probe, _judge_probe_cleanup, where, run)
         )
     if all(isinstance(runs.get(name), dict) for name in ("a", "b")):
         reasons += _section("runs concurrency", lambda: _judge_concurrency(runs["a"], runs["b"]))
@@ -517,37 +583,54 @@ def _command(argv: list[str], timeout: int = COMMAND_TIMEOUT) -> tuple[int, str,
     return done.returncode, done.stdout, done.stderr
 
 
+def _cleanup(name: str, nonce: str) -> Obj:
+    """Remove the holder and escape volume by name, then verify both are gone."""
+
+    volume = escape_volume(nonce)
+    _command(["docker", "rm", "-f", name])
+    _command(["docker", "volume", "rm", "-f", volume])
+    ps_code, ps_out, _ = _command(["docker", "ps", "-aq", "--filter", f"name=^{name}$"])
+    ls_code, ls_out, _ = _command(["docker", "volume", "ls", "-q", "--filter", f"name=^{volume}$"])
+    return {
+        "holder_removed": ps_code == 0 and not ps_out.strip(),
+        "volume_absent": ls_code == 0 and not ls_out.strip(),
+    }
+
+
 def probe(nonce: str, image: str, targets: list[tuple[str, str]]) -> Obj:
     """The probe section, run against the daemon DOCKER_HOST names; always cleans up."""
 
-    t0 = int(time.time())
-    _, info, _ = _command(["docker", "info", "--format", INFO_FORMAT])
-    pull_code, _, _ = _command(["docker", "pull", image], timeout=PULL_TIMEOUT)
+    t0 = time.time()
+    name = f"curie-probe-{nonce}-{secrets.token_hex(3)}"
     label = f"{NONCE_LABEL}={nonce}"
-    holder_code, holder_out, _ = _command(
-        ["docker", "run", "-d", "--label", label, image, "sleep", "300"]
-    )
-    holder = holder_out.strip().splitlines()[-1] if holder_code == 0 and holder_out.strip() else ""
+    cleanup: Obj = {"holder_removed": False, "volume_absent": False}
     try:
+        _, info, _ = _command(["docker", "info", "--format", INFO_FORMAT])
+        pull_code, _, _ = _command(["docker", "pull", image], timeout=PULL_TIMEOUT)
+        holder_code, holder_out, _ = _command(
+            ["docker", "run", "-d", "--name", name, "--label", label, image, "sleep", "300"]
+        )
+        lines = holder_out.strip().splitlines()
+        holder = lines[-1] if holder_code == 0 and lines else ""
         escapes = []
-        for name, argv, _ in escape_commands(image, nonce, holder):
+        for esc, argv, _ in escape_commands(image, nonce, holder):
             code, out, err = _command(argv)
-            escapes.append(escape_result(name, code, out + err))
+            escapes.append(escape_result(esc, code, out + err))
         egress = []
-        for name, target in targets:
-            host, _, port = target.rpartition(":")
+        for target_name, target in targets:
+            host, port = split_target(target) or ("", "")
             argv = ["docker", "run", "--rm", "--label", label, image, "nc", "-z", "-w", "5"]
-            egress.append(egress_result(name, target, _command([*argv, host, port])[0]))
+            code, out, err = _command([*argv, host, port])
+            egress.append(egress_result(target_name, target, code, out + err))
     finally:
-        if holder:
-            _command(["docker", "rm", "-f", holder])
-        _command(["docker", "volume", "rm", "-f", escape_volume(nonce)])
+        cleanup = _cleanup(name, nonce)
     return {
-        "window": [t0, math.ceil(time.time())],
+        "window": [t0, time.time()],
         "info": parse_info(info),
         "holder": {"id": holder, "exit_code": holder_code},
         "escapes": escapes,
         "egress": {"pull": {"image": image, "exit_code": pull_code}, "targets": egress},
+        "cleanup": cleanup,
     }
 
 
@@ -574,24 +657,44 @@ def collect(context: str, namespace: str, pod: str, nonce: str, since: str, unti
     return {"pod": pod, "pod_uid": uid, "info": parse_info(info), "events": parse_events(events)}
 
 
-def _github(api_url: str, path: str, token: str | None) -> Any:
-    request = Request(f"{api_url.rstrip('/')}{path}")
+NEXT_LINK = re.compile(r'<([^>]+)>\s*;\s*rel="next"')
+
+
+def _github(api_url: str, path: str, token: str | None) -> tuple[Any, str | None]:
+    """(JSON body, the ``rel="next"`` URL from the Link header)."""
+
+    url = path if path.startswith("http") else f"{api_url.rstrip('/')}{path}"
+    request = Request(url)
     request.add_header("Accept", "application/vnd.github+json")
     if token:
         request.add_header("Authorization", f"Bearer {token}")
     try:
         with urlopen(request, timeout=COMMAND_TIMEOUT) as response:
-            return json.load(response)
+            match = NEXT_LINK.search(response.headers.get("Link") or "")
+            return json.load(response), match.group(1) if match else None
     except URLError as exc:
         raise CommandError(f"GET {path} failed: {exc}") from None
 
 
+def _github_pages(api_url: str, path: str, token: str | None) -> list[Any]:
+    """Every page's body, following Link rel="next"."""
+
+    pages = []
+    next_url: str | None = path
+    while next_url:
+        body, next_url = _github(api_url, next_url, token)
+        pages.append(body)
+    return pages
+
+
 def collect_ci(api_url: str, repo: str, base: str, sha: str, required: list[str] | None) -> Obj:
     token = os.environ.get("GITHUB_TOKEN") or None
-    rules = None if required else _github(api_url, f"/repos/{repo}/rules/branches/{base}", token)
+    rules = None if required else _github(api_url, f"/repos/{repo}/rules/branches/{base}", token)[0]
     commit = f"/repos/{repo}/commits/{sha}"
-    runs = _github(api_url, f"{commit}/check-runs?per_page=100&filter=latest", token)
-    statuses = _github(api_url, f"{commit}/statuses?per_page=100", token)
+    run_pages = _github_pages(api_url, f"{commit}/check-runs?per_page=100&filter=latest", token)
+    runs = {"check_runs": [run for page in run_pages for run in page["check_runs"]]}
+    status_pages = _github_pages(api_url, f"{commit}/statuses?per_page=100", token)
+    statuses = [status for page in status_pages for status in page]
     return ci_section(sha, rules, runs, statuses, required or None)
 
 
@@ -632,9 +735,11 @@ def build_parser() -> argparse.ArgumentParser:
     probe_cmd = commands.add_parser("probe", help="probe the daemon DOCKER_HOST names")
     probe_cmd.add_argument("--nonce", required=True)
     probe_cmd.add_argument("--image", required=True)
-    probe_cmd.add_argument("--cluster-api", required=True, metavar="HOST:PORT")
-    probe_cmd.add_argument("--api", required=True, metavar="HOST:PORT", help="the Curie API")
-    probe_cmd.add_argument("--metadata", default=METADATA, metavar="HOST:PORT")
+    probe_cmd.add_argument("--cluster-api", required=True, type=ip_target, metavar="IP:PORT")
+    probe_cmd.add_argument(
+        "--api", required=True, type=ip_target, metavar="IP:PORT", help="the Curie API"
+    )
+    probe_cmd.add_argument("--metadata", default=METADATA, type=ip_target, metavar="IP:PORT")
 
     collect_cmd = commands.add_parser("collect", help="read the daemon pod through kubectl")
     for flag in ("context", "namespace", "pod", "nonce", "since", "until"):
@@ -705,6 +810,10 @@ def main(argv: list[str] | None = None) -> int:
                 ("metadata", args.metadata),
             ]
             section = probe(args.nonce, args.image, targets)
+            if not all(section["cleanup"].values()):
+                _emit(section, args.out)
+                print(f"probe: cleanup not verified: {section['cleanup']}", file=sys.stderr)
+                return 1
         elif args.command == "collect":
             section = collect(
                 args.context, args.namespace, args.pod, args.nonce, args.since, args.until

@@ -6187,7 +6187,7 @@ def judge_first_head_ci(obs: Mapping[str, Any]) -> list[str]:
     judge_outcome ignores CI and judge_github_loop requires CI red on the first head,
     so this is the judge for a change that must be green on its first published head.
     obs is ``{"first_head", "required", "checks"}``; each check is ``{"name",
-    "head_sha", "status", "conclusion"}``. A required check passes when any of its
+    "head_sha", "status", "conclusion"}``. A required check passes when every one of its
     results on the first head completed with success, neutral or skipped; results on
     other heads never count.
     """
@@ -6206,13 +6206,17 @@ def judge_first_head_ci(obs: Mapping[str, Any]) -> list[str]:
         if not results:
             failures.append(f"required check {name!r} has no result on the first head")
             continue
-        if any(
-            c.get("status") == "completed" and c.get("conclusion") in FIRST_HEAD_GREEN
-            for c in results
-        ):
+        bad = next(
+            (
+                c
+                for c in results
+                if c.get("status") != "completed" or c.get("conclusion") not in FIRST_HEAD_GREEN
+            ),
+            None,
+        )
+        if bad is None:
             continue
-        last = results[-1]
-        conclusion = last.get("conclusion") if last.get("status") == "completed" else None
+        conclusion = bad.get("conclusion") if bad.get("status") == "completed" else None
         failures.append(f"required check {name!r} concluded {conclusion!r} on the first head")
     return failures
 
