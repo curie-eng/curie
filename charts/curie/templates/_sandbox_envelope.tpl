@@ -41,6 +41,15 @@ still refuses request > limit at pod create.
 {{- end -}}
 
 {{/*
+curie.sandboxEnvelope.nonpositive: a quantity -> "true" when its numeric part
+is zero or it starts with "-", else "".
+*/}}
+{{- define "curie.sandboxEnvelope.nonpositive" -}}
+{{- $q := toString . -}}
+{{- if or (hasPrefix "-" $q) (regexMatch "^\\+?(0+\\.?0*|\\.0+)([eE][+-]?[0-9]+|[A-Za-z]*)$" $q) -}}true{{- end -}}
+{{- end -}}
+
+{{/*
 curie.sandboxEnvelope: (dict "root" $ "agent" <name or "">) -> JSON
   {"profile", "resources": {"requests", "limits"}, "workspaceSizeLimit",
    "writable": [one sizeLimit per runner.hardening.writablePaths entry]}
@@ -87,21 +96,26 @@ template, the profile and the keys to set.
        (an extended resource, hugepages) still reaches every container. */ -}}
 {{- $out := dict "requests" (deepCopy $genSides.requests) "limits" (deepCopy $genSides.limits) -}}
 {{- range $r := list "cpu" "memory" "ephemeral-storage" -}}
-{{- $genPair := or (ne (toString (get $genSides.requests $r | default "")) "") (ne (toString (get $genSides.limits $r | default "")) "") -}}
+{{- $gr := get $genSides.requests $r -}}
+{{- $gl := get $genSides.limits $r -}}
+{{- $genPair := or (and (hasKey $genSides.requests $r) (not (kindIs "invalid" $gr)) (ne (toString $gr) "")) (and (hasKey $genSides.limits $r) (not (kindIs "invalid" $gl)) (ne (toString $gl) "")) -}}
 {{- $val := dict -}}
 {{- $src := dict -}}
 {{- range $side := list "requests" "limits" -}}
 {{- $v := "" -}}
 {{- $k := "" -}}
 {{- if $genPair -}}
-{{- $v = get (get $genSides $side) $r | default "" -}}
+{{- $v = get (get $genSides $side) $r -}}
+{{- if kindIs "invalid" $v }}{{ $v = "" }}{{ end -}}
 {{- $k = printf "agentSandbox.runner.resources.%s.%s" $side $r -}}
 {{- if eq (toString $v) "" -}}
-{{- $v = get (get $stdSides $side) $r | default "" -}}
+{{- $v = get (get $stdSides $side) $r -}}
+{{- if kindIs "invalid" $v }}{{ $v = "" }}{{ end -}}
 {{- $k = printf "agentSandbox.resourceProfiles.standard.resources.%s.%s" $side $r -}}
 {{- end -}}
 {{- else -}}
-{{- $v = get (get $profSides $side) $r | default "" -}}
+{{- $v = get (get $profSides $side) $r -}}
+{{- if kindIs "invalid" $v }}{{ $v = "" }}{{ end -}}
 {{- $k = printf "%s.resources.%s.%s" $pkey $side $r -}}
 {{- end -}}
 {{- if eq (toString $v) "" -}}
@@ -125,31 +139,49 @@ template, the profile and the keys to set.
 {{- $wf := $runner.workspace | default dict -}}
 {{- if $wf.enabled -}}
 {{- $k := "" -}}
-{{- if and $agent (ne (toString (get ($sb.workspaceSizeLimits | default dict) $agent | default "")) "") -}}
-{{- $ws = get $sb.workspaceSizeLimits $agent -}}
-{{- else if ne (toString (get $wf "sizeLimit" | default "")) "" -}}
-{{- $ws = get $wf "sizeLimit" -}}
+{{- $wa := "" -}}
+{{- if $agent }}{{ $wa = get ($sb.workspaceSizeLimits | default dict) $agent }}{{ end -}}
+{{- if kindIs "invalid" $wa }}{{ $wa = "" }}{{ end -}}
+{{- $wg := get $wf "sizeLimit" -}}
+{{- if kindIs "invalid" $wg }}{{ $wg = "" }}{{ end -}}
+{{- if ne (toString $wa) "" -}}
+{{- $ws = $wa -}}
+{{- $k = printf "agentSandbox.workspaceSizeLimits.%s" $agent -}}
+{{- else if ne (toString $wg) "" -}}
+{{- $ws = $wg -}}
+{{- $k = "agentSandbox.runner.workspace.sizeLimit" -}}
 {{- else -}}
-{{- $ws = get $profile "workspaceSizeLimit" | default "" -}}
+{{- $ws = get $profile "workspaceSizeLimit" -}}
+{{- if kindIs "invalid" $ws }}{{ $ws = "" }}{{ end -}}
 {{- $k = printf "%s.workspaceSizeLimit" $pkey -}}
 {{- end -}}
 {{- if eq (toString $ws) "" -}}
 {{- fail (printf "sandbox workspace for the %s (profile %s) resolves to no sizeLimit; set %s, agentSandbox.runner.workspace.sizeLimit for every template, or agentSandbox.workspaceSizeLimits.<agent> (ADR-0059 requires a finite sizeLimit on every writable emptyDir)" $who $name $k) -}}
 {{- end -}}
+{{- if include "curie.sandboxEnvelope.nonpositive" $ws -}}
+{{- fail (printf "sandbox workspace sizeLimit %v for the %s (profile %s) from %s is not a positive quantity; the kubelet does not enforce a zero or negative emptyDir sizeLimit (ADR-0059 requires a finite sizeLimit)" $ws $who $name $k) -}}
+{{- end -}}
 {{- end -}}
 {{- $writable := list -}}
 {{- $h := $runner.hardening | default dict -}}
 {{- if $h.enabled -}}
-{{- $gw := get $h "writablePathSizeLimit" | default "" -}}
+{{- $gw := get $h "writablePathSizeLimit" -}}
+{{- if kindIs "invalid" $gw }}{{ $gw = "" }}{{ end -}}
 {{- range $p := $h.writablePaths | default list -}}
 {{- $v := $gw -}}
+{{- $vk := "agentSandbox.runner.hardening.writablePathSizeLimit" -}}
 {{- if eq (toString $v) "" -}}
 {{- $field := "writablePathSizeLimit" -}}
 {{- if eq (toString $p) (toString (get $h "home" | default "")) }}{{ $field = "homeSizeLimit" }}{{ else if eq (toString $p) "/tmp" }}{{ $field = "tmpSizeLimit" }}{{ end -}}
-{{- $v = get $profile $field | default "" -}}
+{{- $v = get $profile $field -}}
+{{- if kindIs "invalid" $v }}{{ $v = "" }}{{ end -}}
+{{- $vk = printf "%s.%s" $pkey $field -}}
 {{- if eq (toString $v) "" -}}
 {{- fail (printf "sandbox writable path %s for the %s (profile %s) resolves to no sizeLimit; set %s.%s, or agentSandbox.runner.hardening.writablePathSizeLimit for every path and template (ADR-0059 requires a finite sizeLimit on every writable emptyDir)" $p $who $name $pkey $field) -}}
 {{- end -}}
+{{- end -}}
+{{- if include "curie.sandboxEnvelope.nonpositive" $v -}}
+{{- fail (printf "sandbox writable path %s sizeLimit %v for the %s (profile %s) from %s is not a positive quantity; the kubelet does not enforce a zero or negative emptyDir sizeLimit (ADR-0059 requires a finite sizeLimit)" $p $v $who $name $vk) -}}
 {{- end -}}
 {{- $writable = append $writable $v -}}
 {{- end -}}
