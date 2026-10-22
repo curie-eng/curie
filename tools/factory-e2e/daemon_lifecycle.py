@@ -163,6 +163,15 @@ bounds and evidence:
 """
 
 
+TRANSIENT = "inventory_unavailable"
+
+
+def transient(exc: RuntimeError) -> bool:
+    """A single failed cluster read (the fixture's get), retried inside a wait."""
+
+    return str(exc) == TRANSIENT
+
+
 class IntakeError(ValueError):
     """The run's arguments or environment are unsafe; nothing was touched."""
 
@@ -634,11 +643,17 @@ class Lifecycle:
         while True:
             if audit:
                 self.check_fixtures()
-            value = probe()
+            failing = False
+            try:
+                value = probe()
+            except RuntimeError as exc:
+                if not transient(exc):
+                    raise
+                value, failing = None, True
             if value:
                 return value
             if time.monotonic() >= deadline:
-                raise RuntimeError(category)
+                raise RuntimeError(TRANSIENT if failing else category)
             time.sleep(2)
 
     def k(self, *argv: str, **kwargs: Any) -> subprocess.CompletedProcess[str]:
@@ -956,8 +971,14 @@ class Lifecycle:
         deadline = started + LIMIT_SECONDS
         while True:
             self.check_fixtures()
-            state = self.request_status(turn["issue"], turn["request_id"])
-            present, recreated = self.remaining(turn["objects"])
+            try:
+                state = self.request_status(turn["issue"], turn["request_id"])
+                present, recreated = self.remaining(turn["objects"])
+            except RuntimeError as exc:
+                if not transient(exc) or time.monotonic() >= deadline:
+                    raise
+                time.sleep(2)
+                continue
             if (state in TERMINAL and not present) or time.monotonic() >= deadline:
                 break
             time.sleep(2)
@@ -1020,7 +1041,13 @@ class Lifecycle:
         pods = self.worker_pods()
         self.fx.require(pods, "worker_pod_missing")
         started = time.monotonic()
-        self.k("-n", self.ns, "delete", "pod", *pods, "--wait=false")
+        # A graceful delete lets the worker drain the held turn for its whole
+        # grace period; a forced delete models a crash.
+        self.k(
+            *("-n", self.ns, "delete", "pod", *pods),
+            *("--grace-period=0", "--force", "--wait=false"),
+        )
+        turn["worker_deletion"] = "forced"
         self.settle(turn, "worker_pod_deleted", started)
         # Any owner-lost successor is cancelled by unlabel and must clear too.
         self.unlabel(issue)
@@ -1082,17 +1109,28 @@ class Lifecycle:
             self.record("Service", "service", self.f.create(service)["metadata"]),
             self.record("NetworkPolicy", "ingress", self.f.create(policy)["metadata"]),
         ]
-        kept = True
+        kept, observed = True, False
         while time.monotonic() - created < YOUNG_CHECK_SECONDS:
             self.check_fixtures()
-            kept = kept and len(self.remaining(objects)[0]) == len(objects)
+            try:
+                kept = kept and len(self.remaining(objects)[0]) == len(objects)
+                observed = True
+            except RuntimeError as exc:
+                if not transient(exc):
+                    raise
             time.sleep(5)
-        present: list[str] = []
+        self.fx.require(observed, TRANSIENT)
+        present: list[str] = ["unread"]
         while time.monotonic() - created < LIMIT_SECONDS:
-            present = self.remaining(objects)[0]
+            try:
+                present = self.remaining(objects)[0]
+            except RuntimeError as exc:
+                if not transient(exc):
+                    raise
             if not present:
                 break
             time.sleep(2)
+        self.fx.require(present != ["unread"], TRANSIENT)
         self.envelope["orphan"] = {
             "claim": claim,
             "age_gate_seconds": CLAIM_TIMEOUT_SECONDS,
@@ -1435,19 +1473,17 @@ class Lifecycle:
                     errors.append(f"server_close:{type(exc).__name__}")
 
     def release_objects(self) -> list[str]:
+        """Cluster-scoped objects of this release, as kind/name.
+
+        Helm leaves hook resources and PVCs in the release namespace on purpose;
+        those namespaced objects are covered by the owned namespaces' deletion,
+        which ``namespaces_absent`` verifies after fixture cleanup.
+        """
+
         selector = f"{INSTANCE_LABEL}={self.release}"
-        found: list[str] = []
-        for scope in ((self.ns, NAMESPACED_RELEASE_KINDS), (self.dns, NAMESPACED_RELEASE_KINDS)):
-            result = self.k(
-                "-n", scope[0], "get", scope[1], "-l", selector, "-o", "name", check=False
-            )
-            self.fx.require(
-                result.returncode == 0 or "NotFound" in result.stderr, "release_inventory"
-            )
-            found += result.stdout.split()
         result = self.k("get", CLUSTER_RELEASE_KINDS, "-l", selector, "-o", "name", check=False)
-        self.fx.require(result.returncode == 0, "release_inventory")
-        return found + result.stdout.split()
+        self.fx.require(result.returncode == 0, TRANSIENT)
+        return result.stdout.split()
 
     def uninstall(self, errors: list[str]) -> dict[str, bool]:
         out = {"helm_uninstalled": True, "release_objects_absent": True}
@@ -1462,14 +1498,21 @@ class Lifecycle:
         if result.returncode and "not found" not in result.stderr.lower():
             out["helm_uninstalled"] = False
             errors.append("helm_uninstall_failed")
+        remaining: list[str] = []
+
+        def gone() -> bool:
+            remaining[:] = self.release_objects()
+            return not remaining
+
         try:
-            self.bounded(
-                lambda: not self.release_objects(), 180, "release_objects_remain", audit=False
-            )
+            self.bounded(gone, 180, "release_objects_remain", audit=False)
             self.clear_publication_namespace()
         except RuntimeError as exc:
             out["release_objects_absent"] = False
             errors.append(str(exc))
+            if str(exc) == "publication_namespace_remains":
+                remaining.append(f"namespace/{self.publication_ns}")
+            self.evidence["release_objects_remaining"] = remaining[:DIAGNOSTIC_LIMIT]
         return out
 
     def clear_publication_namespace(self) -> None:
@@ -1500,6 +1543,36 @@ class Lifecycle:
         return [t for t in tags if t.startswith(self.f.registry + "/") and t not in owned]
 
     def teardown(self, errors: list[str]) -> dict[str, bool]:
+        try:
+            return self.release_everything(errors)
+        finally:
+            self.scrub_work(errors)
+
+    def scrub_work(self, errors: list[str]) -> None:
+        """Delete key material from the work dir once the stub is closed, on any outcome.
+
+        Kept: evidence.json, evidence.sqlite, the *-build.json metadata, the
+        Dockerfiles and the candidate snapshot, none of which holds a key.
+        """
+
+        if self.f is None:
+            return
+        work = self.f.work
+        files = [work / name for name in ("values.json", "control.values.json", "app.pem")]
+        files += list(work.glob("worker-*.kubeconfig"))
+        try:
+            for path in files:
+                path.unlink(missing_ok=True)
+            for directory in ("github", "curie-config", "cargo-cli", "bundle"):
+                shutil.rmtree(work / directory, ignore_errors=True)
+            left = [p.name for p in files if p.exists()]
+            left += [d for d in ("github", "curie-config") if (work / d).exists()]
+            if left:
+                errors.append("work_dir_key_material_remains")
+        except OSError as exc:
+            errors.append(f"work_dir_scrub:{type(exc).__name__}")
+
+    def release_everything(self, errors: list[str]) -> dict[str, bool]:
         cleanup = dict.fromkeys(CLEANUP_KEYS, False)
         self.stop_servers(errors)
         if self.f is None:
@@ -1526,8 +1599,6 @@ class Lifecycle:
         cleanup["fixture_cleanup_complete"] = complete
         cleanup["docker_assets_absent"] = complete and not extra
         cleanup["namespaces_absent"] = self.namespaces_absent(errors)
-        for path in (self.f.work / "cargo-cli", self.f.work / "bundle"):
-            shutil.rmtree(path, ignore_errors=True)
         return cleanup
 
     def namespaces_absent(self, errors: list[str]) -> bool:
@@ -1564,53 +1635,63 @@ class Lifecycle:
             namespaces.append(self.publication_ns)
         entries: list[dict[str, Any]] = []
         for ns in namespaces:
-            if not self.f.get(f"/api/v1/namespaces/{ns}"):
-                continue
-            for pod in self.f.get(f"/api/v1/namespaces/{ns}/pods").get("items", []):
-                status = pod.get("status", {})
-                containers = []
-                for item in status.get("initContainerStatuses", []) + status.get(
-                    "containerStatuses", []
-                ):
-                    state = item.get("state", {})
-                    detail = state.get("waiting") or state.get("terminated") or {}
-                    containers.append(
-                        {
-                            "name": item.get("name"),
-                            "reason": detail.get("reason"),
-                            "exitCode": detail.get("exitCode"),
-                            "message": short(detail.get("message")),
-                        }
-                    )
-                entries.append(
-                    {
-                        "namespace": ns,
-                        "pod": pod["metadata"]["name"],
-                        "phase": status.get("phase"),
-                        "containers": containers,
-                    }
-                )
-            for job in self.f.get(f"/apis/batch/v1/namespaces/{ns}/jobs").get("items", []):
-                status = job.get("status", {})
-                entries.append(
-                    {"namespace": ns, "job": job["metadata"]["name"]}
-                    | {key: status.get(key, 0) for key in ("active", "failed", "succeeded")}
-                )
-            warnings = self.f.get(
-                f"/api/v1/namespaces/{ns}/events?fieldSelector={quote('type=Warning')}"
-            ).get("items", [])
-            for event in warnings:
-                involved = event.get("involvedObject", {})
-                entries.append(
-                    {
-                        "namespace": ns,
-                        "event": involved.get("kind"),
-                        "name": involved.get("name"),
-                        "reason": event.get("reason"),
-                        "message": short(event.get("message")),
-                    }
-                )
+            try:
+                if self.f.get(f"/api/v1/namespaces/{ns}"):
+                    entries += self.namespace_diagnostics(ns, short)
+            except (RuntimeError, KeyError, ValueError, subprocess.SubprocessError) as exc:
+                category = str(exc) if isinstance(exc, RuntimeError) else type(exc).__name__
+                entries.append({"namespace": ns, "error": category})
         return entries[:DIAGNOSTIC_LIMIT]
+
+    def namespace_diagnostics(
+        self, ns: str, short: Callable[[object], str]
+    ) -> list[dict[str, Any]]:
+        entries: list[dict[str, Any]] = []
+        for pod in self.f.get(f"/api/v1/namespaces/{ns}/pods").get("items", []):
+            status = pod.get("status", {})
+            containers = []
+            for item in status.get("initContainerStatuses", []) + status.get(
+                "containerStatuses", []
+            ):
+                state = item.get("state", {})
+                detail = state.get("waiting") or state.get("terminated") or {}
+                containers.append(
+                    {
+                        "name": item.get("name"),
+                        "reason": detail.get("reason"),
+                        "exitCode": detail.get("exitCode"),
+                        "message": short(detail.get("message")),
+                    }
+                )
+            entries.append(
+                {
+                    "namespace": ns,
+                    "pod": pod["metadata"]["name"],
+                    "phase": status.get("phase"),
+                    "containers": containers,
+                }
+            )
+        for job in self.f.get(f"/apis/batch/v1/namespaces/{ns}/jobs").get("items", []):
+            status = job.get("status", {})
+            entries.append(
+                {"namespace": ns, "job": job["metadata"]["name"]}
+                | {key: status.get(key, 0) for key in ("active", "failed", "succeeded")}
+            )
+        warnings = self.f.get(
+            f"/api/v1/namespaces/{ns}/events?fieldSelector={quote('type=Warning')}"
+        ).get("items", [])
+        for event in warnings:
+            involved = event.get("involvedObject", {})
+            entries.append(
+                {
+                    "namespace": ns,
+                    "event": involved.get("kind"),
+                    "name": involved.get("name"),
+                    "reason": event.get("reason"),
+                    "message": short(event.get("message")),
+                }
+            )
+        return entries
 
     def failure_evidence(self, failed: bool) -> dict[str, Any]:
         out: dict[str, Any] = dict(self.evidence)
@@ -1650,6 +1731,8 @@ class Lifecycle:
             self.envelope["cleanup"] = self.teardown(teardown_errors)
         except Exception as exc:  # noqa: BLE001 - teardown failure fails the run
             teardown_errors.append(type(exc).__name__)
+        for key, value in self.evidence.items():
+            evidence.setdefault(key, value)
         self.envelope["timings"] = self.timings
         reasons = judge(self.envelope)
         failures += teardown_errors
