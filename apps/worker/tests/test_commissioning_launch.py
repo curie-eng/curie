@@ -692,3 +692,41 @@ def test_a_failed_assignment_charges_once_and_owns_nothing(tmp_path):
             assert control.ownership[launch_id][0] == "bound"
 
     asyncio.run(scenario())
+
+
+def test_concurrent_creates_of_one_launch_assign_once(tmp_path):
+    class Gated:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def assign(self, plan: Any, *, expires_at_ms: int) -> Any:
+            self.calls += 1
+            self.entered.set()
+            await self.release.wait()
+            return await Assignments().assign(plan, expires_at_ms=expires_at_ms)
+
+    async def scenario() -> None:
+        cluster = Cluster()
+        gated = Gated()
+        async with mediator(tmp_path, cluster, assignments=gated) as (server, control, url, root):
+            raw = request_bytes()
+            launch_id = json.loads(raw)["launch_id"]
+            cluster.launch_id = launch_id
+            async with httpx.AsyncClient(verify=context(root), trust_env=False) as http:
+                first = asyncio.create_task(http.post(url + ROUTE, content=raw))
+                await asyncio.wait_for(gated.entered.wait(), 5)
+                second = asyncio.create_task(http.post(url + ROUTE, content=raw))
+                await asyncio.sleep(0.2)
+                # The second request waits for the first instead of minting credentials.
+                assert gated.calls == 1 and not second.done()
+                gated.release.set()
+                answers = sorted([(await first).status_code, (await second).status_code])
+                await settled(server, launch_id)
+            assert set(answers) <= {200, 202} and gated.calls == 1
+            assert [e for e in cluster.events if e[0] == "RESERVE"] == [
+                ("RESERVE", json.loads(raw)["launch_reservation_id"])
+            ]
+
+    asyncio.run(scenario())

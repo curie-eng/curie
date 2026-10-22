@@ -10,8 +10,12 @@ authorizer only; the production path is unchanged.
 It records that the runner never started, observed on the exact owned Pod UID
 after its deletion and only once no container can start any more: the Pod was
 never bound to a node (a terminating Pod cannot be bound), or the kubelet
-reported the deleted Pod in a terminal phase. No container status may carry a
-container ID, a restart or a running state. That fact is durable before the
+reported the deleted Pod in a terminal phase. Every container status must be
+``waiting`` with no container ID, restart or previous state. The kubelet's
+statuses are trusted only that far: a terminated status without a container
+ID (``ContainerStatusUnknown``) can describe a runner that ran and was lost
+before the mediator recorded its identity, so it refuses and the launch stays
+``retiring``. That fact is durable before the
 finalizer-only update, the Pod is then confirmed absent, and the Service and
 Secret are deleted by UID before the cleanup receipt. Absence alone, a pending
 kubelet, another UID or any container identity never pass; the launch stays
@@ -44,15 +48,11 @@ def _never_started(status: Any) -> bool:
         return False
     if status.get("restartCount", 0) != 0 or status.get("started") is True:
         return False
+    # Only ``waiting`` reads as never started. A terminated state without a
+    # container ID (``ContainerStatusUnknown``) is also what the kubelet
+    # reports for a runner that ran and was then lost, so it refuses.
     state = status.get("state") or {}
-    if type(state) is not dict or not set(state) <= {"waiting", "terminated"}:
-        return False
-    terminated = state.get("terminated")
-    return terminated is None or (
-        type(terminated) is dict
-        and not terminated.get("containerID")
-        and not terminated.get("startedAt")
-    )
+    return type(state) is dict and set(state) <= {"waiting"}
 
 
 def unstarted_observation(

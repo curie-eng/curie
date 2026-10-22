@@ -239,8 +239,6 @@ def test_the_never_started_fact_reads_only_the_exact_deleted_terminal_pod():
     del unscheduled["spec"]["nodeName"]
     unscheduled["status"] = {"phase": "Pending"}
     assert observe(unscheduled).evidence == "unscheduled"
-    no_id = deleted_pod(state={"terminated": {"exitCode": 137, "reason": "ContainerStatusUnknown"}})
-    assert observe(no_id).evidence == "terminal"
 
 
 @pytest.mark.parametrize(
@@ -258,6 +256,7 @@ def test_the_never_started_fact_reads_only_the_exact_deleted_terminal_pod():
         "not-deleting",
         "no-finalizer",
         "init-container-id",
+        "status-unknown",
     ],
 )
 def test_any_container_identity_or_live_state_refuses_never_started(change):
@@ -286,6 +285,9 @@ def test_any_container_identity_or_live_state_refuses_never_started(change):
         del pod["metadata"]["deletionTimestamp"]
     elif change == "no-finalizer":
         pod["metadata"]["finalizers"] = []
+    elif change == "status-unknown":
+        # What the kubelet reports for a runner it can no longer locate.
+        status["state"] = {"terminated": {"exitCode": 137, "reason": "ContainerStatusUnknown"}}
     else:
         pod["status"]["initContainerStatuses"] = [
             {"name": "init", "containerID": "containerd://" + "b" * 64}

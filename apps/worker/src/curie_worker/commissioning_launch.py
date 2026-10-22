@@ -409,16 +409,6 @@ class CommissioningLaunchServer:
         if plan.projection_digest != projection.digest:
             raise _Refusal("unauthorized", 403)
         launch_id = plan.launch_id
-        prior = self._registry.find(owner, launch_id)
-        if prior is not None:
-            live = self._live.get(launch_id)
-            if live is None or prior.state not in {"preparing", "idle"}:
-                raise _Refusal("retired", 409)
-            if prior.binding.launch_request_digest != plan.launch_request_digest:
-                raise _Refusal("conflict", 409)
-            return self._created(prior, live, retry=True)
-        if self._fenced:
-            raise _Refusal("unavailable", 503)
         namespace = projection.as_dict()["namespace"]
         pod_name, _service_name, secret_name = object_names(launch_id)
         guard = self._control.guard_identity
@@ -434,32 +424,39 @@ class CommissioningLaunchServer:
             guard["config_sha256"],
         )
         budget = min(120, self._measured.execution_seconds)
-        # The launch is charged before anything is assigned to it. A failed
-        # assignment leaves the charge undispatched and owns nothing, so it
-        # leaves no uncertain ownership and a retry dispatches the same charge.
-        if not await self._control.reserve(plan):
-            raise _Refusal("retired", 409)
-        capability, runner_token = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
-        now_ms = int(time.time() * 1000)
-        expiry_ms = min(
-            ((now_ms + self._measured.execution_seconds * 1000) // 1000) * 1000,
-            self._control.expires_at_ms,
-        )
-        require(expiry_ms > now_ms)
-        assignment = await self._assignments.assign(plan, expires_at_ms=expiry_ms)
-        require(type(assignment) is CampaignRunnerAssignment)
-        source = {
-            "runner-token": runner_token,
-            "history-token": assignment.history_token,
-            "model-credential": assignment.model_credential,
-        }
-        secret_document(namespace, secret_name, source)
+        # One create at a time from the replay check to the live launch, so
+        # concurrent requests for one launch never mint two assignments.
         async with self._mechanics.create_lock:
-            # A fence or a concurrent create of this launch won while assigning.
+            prior = self._registry.find(owner, launch_id)
+            if prior is not None:
+                live = self._live.get(launch_id)
+                if live is None or prior.state not in {"preparing", "idle"}:
+                    raise _Refusal("retired", 409)
+                if prior.binding.launch_request_digest != plan.launch_request_digest:
+                    raise _Refusal("conflict", 409)
+                return self._created(prior, live, retry=True)
             if self._fenced:
                 raise _Refusal("unavailable", 503)
-            if self._registry.find(owner, launch_id) is not None:
-                raise _Refusal("conflict", 409)
+            # The launch is charged before anything is assigned to it. A failed
+            # assignment leaves the charge undispatched and owns nothing, so it
+            # leaves no uncertain ownership and a retry dispatches the same charge.
+            if not await self._control.reserve(plan):
+                raise _Refusal("retired", 409)
+            capability, runner_token = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
+            now_ms = int(time.time() * 1000)
+            expiry_ms = min(
+                ((now_ms + self._measured.execution_seconds * 1000) // 1000) * 1000,
+                self._control.expires_at_ms,
+            )
+            require(expiry_ms > now_ms)
+            assignment = await self._assignments.assign(plan, expires_at_ms=expiry_ms)
+            require(type(assignment) is CampaignRunnerAssignment)
+            source = {
+                "runner-token": runner_token,
+                "history-token": assignment.history_token,
+                "model-credential": assignment.model_credential,
+            }
+            secret_document(namespace, secret_name, source)
             # Durable campaign ownership precedes the local row and every create.
             await self._control.own(plan, namespace=namespace, pod_name=pod_name)
             row = self._registry.create(
