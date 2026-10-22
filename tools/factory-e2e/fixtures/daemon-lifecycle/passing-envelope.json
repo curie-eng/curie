@@ -209,6 +209,7 @@
       "fault": "daemon_pod_deleted",
       "issue": 4102,
       "leaked": [],
+      "model_transport_failures": 1,
       "objects": [
         {
           "claim_label": "curie-thread-e458a485f7-161cd7",
@@ -253,25 +254,15 @@
       ],
       "objects_absent": true,
       "probe_attempts": 1,
-      "released_before_next": true,
-      "request_id": "1c7740f0-2c0b-53ae-aec9-a751f97f253d",
-      "request_state": "failed",
+      "request_id": "80ce381e-e2f7-555b-860e-fab4f927a16f",
       "runner": {
         "docker_env": true,
         "image_id": "sha256:055c2aa967c38cb645cc28b2c68ee55646a878ac73ff3abce13c9d80ee2efa42",
         "pod": "curie-thread-e458a485f7-161cd7",
         "pod_uid": "35dc0a5b-953c-48cb-8e09-36048b69cb8c"
       },
-      "runner_docker": {
-        "container_nonce": "f5b61e53",
-        "id": "7a9d26ea-b487-4ef5-bbca-3b254185fe81",
-        "name": "curie-thread-e458a485f7-161cd7",
-        "ran": true
-      },
-      "settle_cause": "no_pull_request",
       "settle_seconds": 5.7,
-      "thread": "github:acme-corp%2Facme-bot:issue-4102",
-      "turn_delivered": true
+      "thread": "github:acme-corp%2Facme-bot:issue-4102"
     },
     "retained_next": {
       "claim": "curie-thread-e458a485f7-8090a0",

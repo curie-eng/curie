@@ -295,7 +295,7 @@ def test_turn_leaked_objects(envelope: dict[str, Any], turn: str) -> None:
 
 
 @pytest.mark.parametrize("value", [False, MISSING], ids=["false", "missing"])
-@pytest.mark.parametrize("turn", ["success", "retained_next", "daemon_death"])
+@pytest.mark.parametrize("turn", ["success", "retained_next"])
 def test_turn_not_delivered(envelope: dict[str, Any], turn: str, value: Any) -> None:
     _set(envelope["turns"][turn], "turn_delivered", value)
     _assert_token(envelope, "missing_observation")
@@ -312,10 +312,56 @@ def test_cancel_request_failed(envelope: dict[str, Any]) -> None:
     _assert_token(envelope, "missing_observation")
 
 
-@pytest.mark.parametrize("value", [False, MISSING], ids=["false", "missing"])
-def test_daemon_death_not_released_before_next(envelope: dict[str, Any], value: Any) -> None:
-    _set(envelope["turns"]["daemon_death"], "released_before_next", value)
+# retained route health check inside one delivery
+
+
+def test_daemon_death_needs_no_docker_run(envelope: dict[str, Any]) -> None:
+    death = envelope["turns"]["daemon_death"]
+    for key in ["runner_docker", "turn_delivered", "settle_cause", "released_before_next"]:
+        assert key not in death
+    assert _reasons(envelope) == []
+
+
+@pytest.mark.parametrize("value", ["other-request", MISSING], ids=["different", "missing"])
+def test_retained_next_request_id_differs(envelope: dict[str, Any], value: Any) -> None:
+    _set(envelope["turns"]["retained_next"], "request_id", value)
     _assert_token(envelope, "retained_thread_mismatch")
+
+
+def test_daemon_death_request_id_missing(envelope: dict[str, Any]) -> None:
+    del envelope["turns"]["daemon_death"]["request_id"]
+    _assert_token(envelope, "retained_thread_mismatch")
+
+
+@pytest.mark.parametrize("value", [0, 2, MISSING], ids=["zero", "two", "missing"])
+def test_daemon_death_model_transport_failures(envelope: dict[str, Any], value: Any) -> None:
+    _set(envelope["turns"]["daemon_death"], "model_transport_failures", value)
+    _assert_token(envelope, "missing_observation")
+
+
+def test_daemon_death_cleanup_over_limit(envelope: dict[str, Any]) -> None:
+    envelope["turns"]["daemon_death"]["settle_seconds"] = 301
+    _assert_token(envelope, "incomplete_cleanup")
+
+
+def test_daemon_death_settle_seconds_missing(envelope: dict[str, Any]) -> None:
+    del envelope["turns"]["daemon_death"]["settle_seconds"]
+    _assert_token(envelope, "incomplete_cleanup")
+
+
+def test_daemon_death_leaked_objects(envelope: dict[str, Any]) -> None:
+    envelope["turns"]["daemon_death"]["leaked"] = ["Secret/x"]
+    _assert_token(envelope, "incomplete_cleanup")
+
+
+def test_daemon_death_docker_name_differs_from_pod(envelope: dict[str, Any]) -> None:
+    envelope["turns"]["daemon_death"]["daemon"]["docker_name"] = "other-daemon"
+    _assert_token(envelope, "identity_mismatch")
+
+
+def test_daemon_death_pod_uid_differs_from_daemon_object_uid(envelope: dict[str, Any]) -> None:
+    envelope["turns"]["daemon_death"]["daemon"]["pod_uid"] = "00000000-0000-0000-0000-000000000000"
+    _assert_token(envelope, "identity_mismatch")
 
 
 @pytest.mark.parametrize("value", [301, MISSING], ids=["slow", "missing"])
