@@ -8,8 +8,10 @@ A repository may serve several trigger labels, one per surface (#4361 decision
 14). The pass still makes one repository read and mints one installation token
 per repository, then lists open issues once per effective label under the ETag
 key ``issues:<label>``. A repository with open WorkItems and no surface left is
-walked for cancellation only: nothing serves it, so nothing is listed or
-admitted there.
+walked for cancellation. If it also hosts another tracker's open pull requests
+it is walked for review feedback too (conversation comments, review comments
+and reviews on owned pull requests), but nothing serves it, so no issue intake
+is listed or admitted there (#4910).
 
 Cursors live in ``curie.factory_poll_cursors``, keyed by tracker scope. ``since`` moves only to the
 newest timestamp on a page that was applied, because GitHub's ``since`` is
@@ -209,7 +211,8 @@ async def _poll_repository(
     """One repository's pass. ``serves`` is False for a repository no surface
     binds any more: it gets the cancellation pass alone, plus the review
     feedback pass when ``feedback`` (it hosts another tracker's open pull
-    requests, #4358 plan D10)."""
+    requests, #4358 plan D10). Feedback includes pull request conversation
+    comments; issue mentions are admitted only when ``serves`` (#4910)."""
 
     now = datetime.now(UTC)
     registry = forges_registry(settings)
@@ -277,21 +280,21 @@ async def _poll_repository(
     if not feedback:
         await _save_cursor(sessionmaker, scope, cursor)
         return
-    if serves:
-        await _admit_mentions(
-            sessionmaker,
-            settings,
-            client,
-            cursor,
-            tracker,
-            now=now,
-            api=api,
-            token=token,
-            repo_path=repo_path,
-            installation_id=installation_id,
-            repository=repository,
-            verified=verified,
-        )
+    await _admit_mentions(
+        sessionmaker,
+        settings,
+        client,
+        cursor,
+        tracker,
+        now=now,
+        api=api,
+        token=token,
+        repo_path=repo_path,
+        installation_id=installation_id,
+        repository=repository,
+        verified=verified,
+        serves=serves,
+    )
     owned = await open_pulls(
         sessionmaker, repository_ref(settings, path=repo, project_id=repository_id)
     )
@@ -496,14 +499,20 @@ async def _admit_mentions(
     installation_id: int,
     repository: dict[str, Any],
     verified: VerifiedRepository,
+    serves: bool,
 ) -> None:
+    """Walk issue comments since the cursor. A comment on an owned open pull
+    request is review feedback, read wherever ``feedback`` is (#4910); a
+    mention on a factory issue is intake, read only where a surface serves the
+    repository."""
+
     repo, repository_id = tracker.repo_full_name, tracker.repository_id
     listed, etag = await tracker.issue_comments_since(
         since_param(cursor.comments_since, now), cursor.etags.get("issue-comments")
     )
     if listed is None:
         return
-    factory_issues = await _issue_numbers(sessionmaker, tracker)
+    factory_issues = await _issue_numbers(sessionmaker, tracker) if serves else set()
     owned_pulls = set(
         await open_pulls(
             sessionmaker, repository_ref(settings, path=repo, project_id=repository_id)
