@@ -374,7 +374,12 @@ def _event_termination(
             continue
         reason = getattr(event, "reason", None)
         if reason in {"Evicted", "OOMKilled", "OOMKilling"}:
-            matches.append(SandboxTermination(_safe_termination_reason(reason)))
+            matches.append(
+                SandboxTermination(
+                    _safe_termination_reason(reason),
+                    _safe_pod_message(getattr(event, "message", None)),
+                )
+            )
     for preferred in ("Evicted", "OOMKilled", "OOMKilling"):
         for match in matches:
             if match.reason == preferred:
