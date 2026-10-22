@@ -550,14 +550,6 @@ async def advance_publication_lineage(
             raise PublicationLineageConflict(
                 "publication.lineage_stale", "the authoritative publication base branch changed"
             )
-        if lineage.base_ref is None and work_item is not None and identity is not None:
-            verified = identity.lineage_values()
-            if any(
-                getattr(work_item, column) != verified[column] for column in _IDENTITY_COLUMNS[:4]
-            ):
-                raise PublicationLineageConflict(
-                    "publication.lineage_stale", "the publication repository identity changed"
-                )
         if first_publication:
             if (
                 lineage.base_sha != publication.base_sha

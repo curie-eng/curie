@@ -98,18 +98,6 @@ def stored_publication_base_ref(
         or execution_request.work_item_id != work_item.id
         or lineage is None
         or lineage.id != publication.lineage_id
-        or work_item.agent_id != lineage.agent_id
-        or work_item.conversation_id != lineage.conversation_id
-        or work_item.repository_path.casefold() != publication.repo_full_name.casefold()
-        or work_item.repository_path.casefold() != lineage.repo_full_name.casefold()
-        or work_item.publication_lineage_id not in (None, lineage.id)
-        or (
-            lineage.repository_project_id is not None
-            and (
-                work_item.repository != lineage.repository
-                or work_item.code_host_installation_id != lineage.code_host_installation_id
-            )
-        )
     ):
         raise Unavailable("publication_base_branch_unproved")
     if (
@@ -152,11 +140,6 @@ async def publication_base_ref(
         row = result.one_or_none()
         if row is not None:
             execution_request, work_item = row
-            if (
-                work_item.repository != repository
-                or work_item.repository_path.casefold() != repository.path.casefold()
-            ):
-                raise Unavailable("publication_base_branch_unproved")
     branch = stored_publication_base_ref(publication, lineage, execution_request, work_item)
     if branch is None:
         branch = (await resolve_stored(code_host, repository)).default_branch
