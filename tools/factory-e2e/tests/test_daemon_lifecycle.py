@@ -10,9 +10,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
-import pytest
-
 import daemon_lifecycle
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "fixtures" / "daemon-lifecycle"
