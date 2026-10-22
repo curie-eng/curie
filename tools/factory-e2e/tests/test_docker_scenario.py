@@ -1008,7 +1008,32 @@ def test_ci_section_normalizes_statuses() -> None:
     assert ci["required"] == []
 
 
+def test_ci_section_without_rules_reads_no_required_checks() -> None:
+    empty: dict[str, Any] = {"check_runs": []}
+    assert docker_scenario.ci_section("h", None, empty, []) == {
+        "first_head": "h",
+        "required": [],
+        "checks": [],
+    }
+    assert docker_scenario.ci_section("h", None, empty, [], required=["x"])["required"] == ["x"]
+
+
 # first-head CI judge (selected by -k first_head)
+
+
+def test_first_head_ci_survives_unhashable_conclusion(envelope: dict[str, Any]) -> None:
+    checks = [
+        {"name": "a", "head_sha": "h", "status": "completed", "conclusion": "failure"},
+        {"name": "a", "head_sha": "h", "status": "completed", "conclusion": []},
+    ]
+    obs = {"first_head": "h", "required": ["a"], "checks": checks}
+    assert fe.judge_first_head_ci(obs) == [
+        "required check 'a' concluded 'failure' on the first head"
+    ]
+    envelope["ci"]["checks"] = checks
+    reasons = docker_scenario.judge(envelope)
+    assert any(r.startswith("ci_not_green_first_head: ") for r in reasons), reasons
+    assert not any(r.startswith("missing_observation: ci") for r in reasons), reasons
 
 
 def _green(name: str, head: str = FIRST_HEAD, conclusion: str = "success") -> dict[str, Any]:
