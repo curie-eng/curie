@@ -50,7 +50,7 @@ ACTOR_MODEL = "anthropic/claude-haiku-5.5"
 JUDGE_MODEL = "anthropic/claude-sonnet-5.5"
 PROVIDER_HOST = "openrouter.ai"
 OPENROUTER_API = "https://openrouter.ai/api/v1"
-MAX_BUDGET = Decimal("5.00")
+MAX_BUDGET = Decimal("7.50")
 # The pinned judge endpoint refuses disabled reasoning, so reasoning gets its
 # own 512-token budget inside a 1536-token completion ceiling.
 JUDGE_MAX_TOKENS = 1536
@@ -1469,7 +1469,7 @@ def _check_generations_and_accounting(report: _Report) -> None:
         actor = case.get("actor_generation_id") or case.get("actor_record_id")
         _require(actor in seen, "actor generation is unrecorded")
     budget = _decimal(accounting.get("budget_usd"), "budget")
-    _require(0 < budget <= MAX_BUDGET, "campaign budget must be within (0, 5.00]")
+    _require(0 < budget <= MAX_BUDGET, "campaign budget must be within (0, 7.50]")
     baseline = _decimal(accounting.get("baseline_usage_usd"), "baseline usage")
     end = _decimal(accounting.get("end_usage_usd"), "end usage")
     _require(end >= baseline, "a shared-key usage decrease is never a refund")
@@ -5625,7 +5625,7 @@ def _run_options(args: argparse.Namespace) -> _Options:
     except InvalidOperation as exc:
         raise _Usage("--budget-usd must be a decimal amount") from exc
     if not budget.is_finite() or not Decimal(0) < budget <= MAX_BUDGET:
-        raise _Usage("--budget-usd must be within (0, 5.00]")
+        raise _Usage("--budget-usd must be within (0, 7.50]")
     thresholds: dict[str, Any] = {}
     for name, flag in (
         ("precision", "precision_threshold"),
@@ -5666,7 +5666,7 @@ def _parser() -> argparse.ArgumentParser:
     run = commands.add_parser("run", allow_abbrev=False)
     run.add_argument("--curie-bin", required=True)
     run.add_argument("--repetitions", type=int, default=1)
-    run.add_argument("--budget-usd", default="5.00")
+    run.add_argument("--budget-usd", default="7.50")
     run.add_argument("--precision-threshold", default="0.9")
     run.add_argument("--recall-threshold", default="0.8")
     run.add_argument("--falsewrite-threshold", default="0.05")

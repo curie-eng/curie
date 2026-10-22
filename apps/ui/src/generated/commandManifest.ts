@@ -11060,10 +11060,10 @@ export const commandManifest = {
             },
             {
               "default_values": [
-                "5.00"
+                "7.50"
               ],
               "global": false,
-              "help": "Campaign budget in USD for every paid call, at most 5.00",
+              "help": "Campaign budget in USD for every paid call, at most 7.50",
               "id": "budget_usd",
               "long": "budget-usd",
               "positional": false,

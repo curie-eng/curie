@@ -141,8 +141,8 @@ pub(crate) enum DevAction {
         /// Number of fresh repetitions of the 24-scenario corpus.
         #[arg(long, default_value_t = 1)]
         repetitions: u32,
-        /// Campaign budget in USD for every paid call, at most 5.00.
-        #[arg(long, default_value = "5.00")]
+        /// Campaign budget in USD for every paid call, at most 7.50.
+        #[arg(long, default_value = "7.50")]
         budget_usd: String,
         /// Minimum per-class precision with complete six-class coverage.
         #[arg(long, default_value_t = 0.9)]
