@@ -161,6 +161,7 @@ forbidden_modules = [
     "curie_protected_hooks.commissioning_bootstrap",
     "curie_protected_hooks.commissioning_campaign_records",
     "curie_protected_hooks.commissioning_encoding",
+    "curie_protected_hooks.commissioning_gateway_control",
     "curie_protected_hooks.commissioning_journal",
     "curie_protected_hooks.commissioning_launch_control",
     "curie_protected_hooks.commissioning_local_bootstrap",
@@ -202,6 +203,28 @@ forbidden_modules = ["curie_worker.commissioning_launch", "curie_worker.commissi
 ignore_imports = [
     "curie_worker.protected_launch_mechanics -> curie_worker.commissioning_launch",
     "curie_worker.protected_launch_mechanics -> curie_worker.commissioning_registry",
+]
+
+# @spec PROTECTED-COMMISSIONING-8: the provider gateway is a permanent
+# installation component named by the execution configuration's model base URL.
+# It selects its production or commissioning authorizer only from the launch
+# identity a trusted registrar recorded, so it never reaches the launch
+# mechanics, the commissioning launch path or a launch server, and its campaign
+# authority arrives only through the protocol the control implements outside
+# `curie_worker` (covered by the first contract).
+[[tool.importlinter.contracts]]
+name = "The provider gateway reaches no launch mechanics"
+type = "forbidden"
+source_modules = [
+    "curie_worker.commissioning_provider_gateway",
+    "curie_worker.provider_identity",
+]
+forbidden_modules = [
+    "curie_worker.commissioning_launch",
+    "curie_worker.commissioning_registry",
+    "curie_worker.protected_launch_client",
+    "curie_worker.protected_launch_mechanics",
+    "curie_worker.protected_launch_server",
 ]
 
 # @spec PROTECTED-COMMISSIONING-8: the guard's control profile, slots and
