@@ -1340,6 +1340,30 @@ def test_the_boot_tells_the_gate_which_connectors_are_proxied(
     assert gate.proxied_connector_servers == frozenset(expected)
 
 
+# @spec ADR-0168 d7
+def test_a_bundle_stdio_server_cannot_ask_for_the_caller_token(tmp_path: Path) -> None:
+    # The starting point ADR 0240 (Draft) records: naming the token in a bundle
+    # stdio server's env gets it nothing. Only the derived hosted entry is
+    # expanded, and the name is gone from every env before the CLI spawns the
+    # server (#3550).
+    from curie_runner.connectors import materialize_connector_caller_headers
+
+    derived = derive_mcp_servers(_bundle(tmp_path, HOSTED), **SCOPE, caller_header=True)
+    stdio = {
+        "type": "stdio",
+        "command": "review-tools",
+        "env": {"CALLER": _CALLER_PLACEHOLDER},
+    }
+    servers = build_mcp_servers({}, {**derived, "plugin:b:review-tools": stdio})
+    process_env = {"CURIE_CONNECTOR_CALLER_TOKEN": "cct.payload.signature"}
+    spawn_env = dict(process_env)
+    materialize_connector_caller_headers(servers, spawn_env, process_env)
+    assert servers["grafana"]["headers"][_CALLER_HEADER] == "cct.payload.signature"
+    assert servers["plugin:b:review-tools"]["env"] == {"CALLER": _CALLER_PLACEHOLDER}
+    assert "CURIE_CONNECTOR_CALLER_TOKEN" not in spawn_env
+    assert "CURIE_CONNECTOR_CALLER_TOKEN" not in process_env
+
+
 def test_a_fallback_url_never_receives_the_caller_token(tmp_path: Path) -> None:
     servers = derive_mcp_servers(
         _bundle(tmp_path, HOSTED_WITH_FALLBACK),
