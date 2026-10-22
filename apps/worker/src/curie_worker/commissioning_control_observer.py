@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import re
+import threading
 from collections.abc import Callable, Mapping
 from typing import Any, NoReturn, Protocol
 
@@ -41,6 +42,7 @@ from .commissioning_control_profile import (
     ControlProfile,
     require_supported_version,
 )
+from .managed_cni_probe_kit import PRODUCER_CONSTANTS
 from .protected_kubernetes_projection import Projection
 from .protected_launch_records import canonical_json
 
@@ -48,6 +50,10 @@ __all__ = ["FACT", "ControlObserver", "ControlReader"]
 
 FACT = "control_profile"
 _CONTAINER = r"(?:containerd|cri-o|docker)://[0-9a-f]{64}"
+
+
+def _deadline() -> float:
+    return float(PRODUCER_CONSTANTS["per_call_deadline_ms"]) / 1000
 
 
 def _refuse() -> NoReturn:
@@ -60,7 +66,18 @@ def _require(condition: bool) -> None:
 
 
 class ControlReader(Protocol):
-    """Reads under the provisioner's observer identity; every reply is a fresh read."""
+    """Reads under the provisioner's observer identity; every reply is a fresh read.
+
+    Each request gives up after ``request_timeout`` seconds on its own. The
+    observer's deadline bounds the call, but a blocking read cannot be
+    interrupted from outside its thread, so the reader's own timeout is what
+    ends that thread.
+    """
+
+    @property
+    def request_timeout(self) -> float:
+        """Seconds after which one request raises; at most the per-call deadline."""
+        ...
 
     def read(self, key: str) -> dict[str, Any] | None:
         """The live object at an ``object_key``, or ``None`` when absent."""
@@ -151,6 +168,66 @@ _DEFAULTS: dict[str, dict[tuple[str, ...], Allowed]] = {
 }
 
 
+_TEMPLATE = ("spec", "template", "spec")
+# The guard Pod's spec is its template's, plus the template defaults above and
+# what the scheduler and admission add to a controller-created Pod, measured on
+# Kubernetes 1.35: the node, the default service account, the default
+# priority and the not-ready and unreachable tolerations.
+_POD_DEFAULTS: dict[tuple[str, ...], Allowed] = {
+    path[len(_TEMPLATE) :]: allowed
+    for path, allowed in _DEFAULTS["Deployment"].items()
+    if path[: len(_TEMPLATE)] == _TEMPLATE
+}
+_POD_DEFAULTS.update(
+    {
+        ("nodeName",): lambda value: type(value) is str and 0 < len(value) <= 253,
+        ("serviceAccount",): _equals("default"),
+        ("serviceAccountName",): _equals("default"),
+        ("priority",): _equals(0),
+        ("preemptionPolicy",): _equals("PreemptLowerPriority"),
+        ("tolerations",): _equals(
+            [
+                {
+                    "effect": "NoExecute",
+                    "key": key,
+                    "operator": "Exists",
+                    "tolerationSeconds": 300,
+                }
+                for key in ("node.kubernetes.io/not-ready", "node.kubernetes.io/unreachable")
+            ]
+        ),
+    }
+)
+# A controller-created Pod's metadata members; any other member refuses.
+_POD_METADATA = frozenset(
+    {
+        "creationTimestamp",
+        "generateName",
+        "generation",
+        "labels",
+        "managedFields",
+        "name",
+        "namespace",
+        "ownerReferences",
+        "resourceVersion",
+        "uid",
+    }
+)
+
+
+def _controller(meta: dict[str, Any], kind: str) -> dict[str, Any]:
+    """The one owner reference: the controlling ``apps/v1`` object of ``kind``."""
+    references: list[Any] = meta.get("ownerReferences") or []
+    _require(type(references) is list and len(references) == 1)
+    reference: dict[str, Any] = references[0]
+    _require(
+        reference.get("apiVersion") == "apps/v1"
+        and reference.get("kind") == kind
+        and reference.get("controller") is True
+    )
+    return reference
+
+
 def _match(
     observed: Any,
     rendered: Any,
@@ -206,20 +283,43 @@ class ControlObserver:
             raise
         except Exception:  # noqa: BLE001 - no document detail
             _refuse()
+        timeout: Any = getattr(reader, "request_timeout", None)
+        _require(type(timeout) in (int, float) and 0 < timeout <= _deadline())
         self._reader, self._profile, self._projection = reader, profile, projection
         self._roster, self._installed = roster, installed
         self._template = template
+        self._busy = threading.Lock()
 
     @property
     def fact(self) -> str:
         return FACT
 
     async def observe(self) -> str:
-        """Lowercase SHA-256 of this observation; refuses on any difference."""
-        try:
-            return await asyncio.to_thread(self._observe)
-        except Exception:  # noqa: BLE001 - an unavailable observation is a refusal
+        """Lowercase SHA-256 of this observation; refuses on any difference.
+
+        Bounded by the producers' per-call deadline. The reads run in one
+        worker thread that holds this observer while it lives: a call made
+        while an earlier, timed-out read is still running refuses at once
+        instead of starting another thread.
+        """
+        if not self._busy.acquire(blocking=False):
             _refuse()
+        try:
+            worker = asyncio.to_thread(self._observe_and_release)
+        except BaseException:
+            self._busy.release()
+            raise
+        try:
+            async with asyncio.timeout(_deadline()):
+                return await worker
+        except Exception:  # noqa: BLE001 - an unavailable or late observation is a refusal
+            _refuse()
+
+    def _observe_and_release(self) -> str:
+        try:
+            return self._observe()
+        finally:
+            self._busy.release()
 
     def _observe(self) -> str:
         v = self._profile.as_dict()
@@ -252,24 +352,37 @@ class ControlObserver:
         return hashlib.sha256(canonical_json(document)).hexdigest()
 
     def _guard_pod(self, v: dict[str, Any]) -> dict[str, Any]:
-        """The one guard Pod, running the rendered container, ready and unrestarted."""
+        """The one guard Pod: its template's spec, created by the installed Deployment.
+
+        The spec is compared closed against the rendered template, like the
+        roster: an added member such as ``hostNetwork`` refuses. The Pod's
+        controller must be a ReplicaSet whose controller is the installed
+        Deployment, so a Pod created by anyone else and adopted by label is
+        refused unless it is indistinguishable from the template.
+        """
+        namespace = v["control_namespace"]
         selector = {GUARD_SERVER_LABEL: self._profile.digest[:32]}
-        pods = self._reader.pods(v["control_namespace"], selector)
+        pods = self._reader.pods(namespace, selector)
         _require(type(pods) is list and len(pods) == 1)
         pod = pods[0]
-        meta, spec, status = pod["metadata"], pod["spec"], pod["status"]
-        _require(meta.get("deletionTimestamp") is None and meta.get("labels") == selector)
-        expected = self._template["spec"]
-        _require(spec.get("automountServiceAccountToken") is False)
-        _require(not spec.get("initContainers") and not spec.get("ephemeralContainers"))
-        _require(spec["volumes"] == expected["volumes"])
-        _require(spec["securityContext"] == expected["securityContext"])
-        _require(len(spec["containers"]) == 1)
-        container, rendered = spec["containers"][0], expected["containers"][0]
-        for member in ("name", "image", "command", "volumeMounts", "securityContext"):
-            _require(container.get(member) == rendered[member])
-        _require(not container.get("args") and not container.get("env"))
-        _require(not container.get("envFrom"))
+        meta, status = pod["metadata"], pod["status"]
+        _require(set(meta) <= _POD_METADATA and meta.get("namespace") == namespace)
+        replica_set = _controller(meta, "ReplicaSet")
+        owner = self._reader.read(
+            "/".join(("apps/v1", "ReplicaSet", namespace, replica_set["name"]))
+        )
+        _require(type(owner) is dict)
+        assert owner is not None
+        owner_meta = owner["metadata"]
+        _require(owner_meta.get("uid") == replica_set.get("uid"))
+        _require(owner_meta.get("deletionTimestamp") is None)
+        deployment = _controller(owner_meta, "Deployment")
+        deployment_key = object_key(self._roster[4])
+        _require(deployment.get("uid") == self._installed.uid(deployment_key))
+        _require(deployment.get("name") == self._roster[4]["metadata"]["name"])
+        template_hash = owner_meta["labels"]["pod-template-hash"]
+        _require(meta.get("labels") == {**selector, "pod-template-hash": template_hash})
+        _match(pod["spec"], self._template["spec"], _POD_DEFAULTS)
         _require(status.get("phase") == "Running")
         _require(not status.get("initContainerStatuses"))
         _require(not status.get("ephemeralContainerStatuses"))

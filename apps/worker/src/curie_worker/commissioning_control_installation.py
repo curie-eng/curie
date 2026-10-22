@@ -26,6 +26,7 @@ installation's qualification.
 from __future__ import annotations
 
 import base64
+import datetime
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -103,16 +104,27 @@ class ControlMaterial:
         return "<ControlMaterial>"
 
     def check(self, profile: ControlProfile) -> None:
-        """The CA is the profile's pin and directly issued the serving certificate."""
+        """The CA is the profile's pin and directly issued a current serving certificate.
+
+        The certificate names the guard Service's DNS name, which the API
+        server dials, and its key is the one supplied.
+        """
         try:
             _require(type(profile) is ControlProfile)
-            pinned = profile.as_dict()["guard"]["server_ca_sha256"]
+            v = profile.as_dict()
+            pinned = v["guard"]["server_ca_sha256"]
             _require(server_ca_digest(self.server_ca_pem) == pinned)
             certificate = x509.load_pem_x509_certificate(self.certificate_pem)
             _require(certificate.public_bytes(Encoding.PEM) == self.certificate_pem)
             certificate.verify_directly_issued_by(
                 x509.load_pem_x509_certificate(self.server_ca_pem)
             )
+            now = datetime.datetime.now(datetime.UTC)
+            _require(certificate.not_valid_before_utc <= now < certificate.not_valid_after_utc)
+            names = certificate.extensions.get_extension_for_class(
+                x509.SubjectAlternativeName
+            ).value.get_values_for_type(x509.DNSName)
+            _require(f"{v['guard']['service_name']}.{v['control_namespace']}.svc" in names)
             key = serialization.load_pem_private_key(self.key_pem, password=None)
             _require(
                 key.public_key().public_bytes(
@@ -224,9 +236,11 @@ class InstalledControl:
         return canonical_json([list(pair) for pair in self.uids])
 
 
-def _guard_ready(document: dict[str, Any] | None) -> bool:
+def _guard_ready(document: dict[str, Any] | None, uid: str) -> bool:
     if document is None:
         return False
+    # Readiness of the installed Deployment only, never of a replacement.
+    _require(document["metadata"].get("uid") == uid)
     status = document.get("status") or {}
     generation = document["metadata"].get("generation")
     return (
@@ -277,7 +291,7 @@ class ControlInstallation:
             uids.append((object_key(document), self._create(document)))
         deployment = object_key(self._roster[4])
         deadline = self._clock() + ready_timeout
-        while not _guard_ready(self._cluster.read(deployment)):
+        while not _guard_ready(self._cluster.read(deployment), uids[4][1]):
             _require(self._clock() < deadline)
             self._sleep(2)
         uids.append((object_key(self._roster[-1]), self._create(self._roster[-1])))

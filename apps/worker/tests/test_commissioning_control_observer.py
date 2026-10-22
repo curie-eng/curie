@@ -22,6 +22,9 @@ from .test_commissioning_control_profile import projection
 
 GUARD_IMAGE_DIGEST = PROFILE.as_dict()["guard"]["image"].rsplit("@", 1)[1]
 POD_UID = "50000000-0000-4000-8000-000000000001"
+RS_UID = "60000000-0000-4000-8000-000000000001"
+RS_NAME = "acme-guard-55dc4bcbb"
+RS_KEY = "apps/v1/ReplicaSet/acme-control/" + RS_NAME
 CONTAINER = "containerd://" + "a" * 64
 
 
@@ -94,15 +97,67 @@ class Reader:
             for (key, uid), document in zip(INSTALLED.uids, ROSTER, strict=True)
         }
         self.server = {"major": "1", "minor": "35", "gitVersion": "v1.35.1"}
-        template = deepcopy(ROSTER[4]["spec"]["template"])
-        spec = template["spec"]
-        spec.update(serviceAccountName="default", nodeName="node-a", dnsPolicy="ClusterFirst")
+        self.request_timeout = 1.0
+        self.hang = False
+        self.hung = 0
+        # The guard Pod and its ReplicaSet as a Kubernetes 1.35 controller made them.
+        served_template = self.objects[ci.object_key(ROSTER[4])]["spec"]["template"]
+        spec = deepcopy(served_template["spec"])
+        spec.update(
+            nodeName="node-a",
+            serviceAccount="default",
+            serviceAccountName="default",
+            priority=0,
+            preemptionPolicy="PreemptLowerPriority",
+            tolerations=[
+                {
+                    "effect": "NoExecute",
+                    "key": "node.kubernetes.io/" + key,
+                    "operator": "Exists",
+                    "tolerationSeconds": 300,
+                }
+                for key in ("not-ready", "unreachable")
+            ],
+        )
+        labels = {**served_template["metadata"]["labels"], "pod-template-hash": "55dc4bcbb"}
+        self.objects[RS_KEY] = {
+            "metadata": {
+                "name": RS_NAME,
+                "namespace": "acme-control",
+                "uid": RS_UID,
+                "labels": dict(labels),
+                "ownerReferences": [
+                    {
+                        "apiVersion": "apps/v1",
+                        "kind": "Deployment",
+                        "name": "acme-guard",
+                        "uid": INSTALLED.uid(ci.object_key(ROSTER[4])),
+                        "controller": True,
+                        "blockOwnerDeletion": True,
+                    }
+                ],
+            }
+        }
         self.guard = {
             "metadata": {
-                "name": "acme-guard-6d4f-x2x9z",
+                "name": "acme-guard-55dc4bcbb-x2x9z",
+                "generateName": "acme-guard-55dc4bcbb-",
+                "generation": 1,
                 "namespace": "acme-control",
                 "uid": POD_UID,
-                "labels": dict(template["metadata"]["labels"]),
+                "resourceVersion": "392",
+                "creationTimestamp": "2026-10-22T22:13:21Z",
+                "labels": labels,
+                "ownerReferences": [
+                    {
+                        "apiVersion": "apps/v1",
+                        "kind": "ReplicaSet",
+                        "name": RS_NAME,
+                        "uid": RS_UID,
+                        "controller": True,
+                        "blockOwnerDeletion": True,
+                    }
+                ],
             },
             "spec": spec,
             "status": {
@@ -131,7 +186,7 @@ class Reader:
                         "targetRef": {
                             "kind": "Pod",
                             "namespace": "acme-control",
-                            "name": "acme-guard-6d4f-x2x9z",
+                            "name": "acme-guard-55dc4bcbb-x2x9z",
                             "uid": POD_UID,
                         },
                     }
@@ -140,6 +195,12 @@ class Reader:
         ]
 
     def read(self, key: str) -> dict[str, Any] | None:
+        if self.hang:
+            import time
+
+            self.hung += 1
+            time.sleep(self.request_timeout)
+            raise TimeoutError
         value = self.objects.get(key)
         return None if value is None else deepcopy(value)
 
@@ -304,6 +365,33 @@ def _server(version):
         pytest.param(_endpoint("targetRef", {"kind": "Pod", "uid": "x"}), id="foreign-endpoint"),
         pytest.param(_endpoint("conditions", {"ready": False}), id="endpoint-not-ready"),
         pytest.param(_endpoint("addresses", ["10.244.0.99"]), id="endpoint-address"),
+        pytest.param(_pod(("spec", "hostNetwork"), True), id="adopted-host-network-pod"),
+        pytest.param(_pod(("spec", "hostPID"), True), id="guard-host-pid"),
+        pytest.param(_pod(("spec", "serviceAccountName"), "admin"), id="guard-service-account"),
+        pytest.param(
+            _pod(("spec", "containers", 0, "imagePullPolicy"), "Always"), id="guard-pull-policy"
+        ),
+        pytest.param(_pod(("spec", "containers", 0, "ports"), []), id="guard-ports"),
+        pytest.param(_pod(("spec", "containers", 0, "readinessProbe"), None), id="guard-probe"),
+        pytest.param(_pod(("spec", "enableServiceLinks"), True), id="guard-service-links"),
+        pytest.param(
+            _pod(("spec", "tolerations"), [{"operator": "Exists"}]), id="guard-tolerates-everything"
+        ),
+        pytest.param(_pod(("metadata", "annotations"), {"x": "y"}), id="guard-annotated-pod"),
+        pytest.param(_pod(("metadata", "ownerReferences"), []), id="bare-pod"),
+        pytest.param(_pod(("metadata", "ownerReferences", 0, "uid"), "x"), id="foreign-replicaset"),
+        pytest.param(
+            _pod(("metadata", "labels", "pod-template-hash"), "other"), id="other-template-hash"
+        ),
+        pytest.param(
+            _set(
+                RS_KEY,
+                ("metadata", "ownerReferences", 0, "uid"),
+                "70000000-0000-4000-8000-000000000001",
+            ),
+            id="replicaset-of-another-deployment",
+        ),
+        pytest.param(_delete(RS_KEY), id="replicaset-gone"),
     ],
 )
 def test_any_drift_refuses(mutate):
@@ -343,3 +431,51 @@ def test_the_observer_binds_the_installed_roster():
             roster=ROSTER,
             installed=ci.InstalledControl(INSTALLED.uids[::-1]),
         )
+
+
+def test_a_foreign_pod_adopted_by_the_guard_replicaset_refuses():
+    """Created in the control namespace (outside the webhook) with the guard label,
+    the pinned image and host networking; the ReplicaSet adopted it and the
+    original was scaled away."""
+    reader = Reader()
+    reader.guard["metadata"]["name"] = "intruder"
+    reader.guard["metadata"].pop("generateName")
+    reader.guard["spec"]["hostNetwork"] = True
+    with pytest.raises(ci.ControlInstallationRefused):
+        observe(reader)
+
+
+def test_a_hanging_reader_refuses_at_the_deadline_and_never_piles_up(monkeypatch):
+    from curie_worker.managed_cni_probe_kit import PRODUCER_CONSTANTS
+
+    reader = Reader()
+    reader.request_timeout = 0.3
+    producer = observer(reader)
+    monkeypatch.setitem(PRODUCER_CONSTANTS, "per_call_deadline_ms", 100)
+    reader.hang = True
+
+    async def scenario() -> None:
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        with pytest.raises(ci.ControlInstallationRefused):
+            await producer.observe()
+        assert loop.time() - started < 0.25
+        # The first thread is still inside its read: refuse without a second one.
+        with pytest.raises(ci.ControlInstallationRefused):
+            await producer.observe()
+        await asyncio.sleep(0.05)
+        assert reader.hung == 1
+        await asyncio.sleep(0.4)
+        reader.hang = False
+        monkeypatch.setitem(PRODUCER_CONSTANTS, "per_call_deadline_ms", 4000)
+        assert len(await producer.observe()) == 64
+
+    asyncio.run(scenario())
+
+
+def test_a_reader_without_a_bounded_request_timeout_refuses():
+    for timeout in (None, 0, 5.0, "1"):
+        reader = Reader()
+        reader.request_timeout = timeout  # type: ignore[assignment]
+        with pytest.raises(ci.ControlInstallationRefused):
+            observer(reader)
