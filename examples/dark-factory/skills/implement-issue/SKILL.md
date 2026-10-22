@@ -174,9 +174,10 @@ its own, and say in the pull request description what you declined.
 An `APPROVE` verdict can carry a `NOTES:` list of non-blocking improvements,
 and approval ends that review loop. Carry the plan review's findings into
 `implement`: fix every blocking finding of a `VERDICT: CHANGES`, apply the
-notes that are cheap and clearly right, and ignore the rest. Never apply diff-review notes to the code after
-the diff reviewer approved; that approval covers the diff it read. List
-diff-review notes in the pull request body as notes you did not address.
+notes that are cheap and clearly right, and ignore the rest. Never apply
+diff-review notes to the code after the diff reviewer approved; that approval
+covers the diff it read. List diff-review notes in the pull request body as
+notes you did not address.
 Never start another review round only to address notes.
 
 ## Verification contract
