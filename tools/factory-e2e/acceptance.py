@@ -41,7 +41,11 @@ The GitLab entries are driven by the gitlab driver with `--forge-target`.
 node's address and removes it, and its teardown check reads the fixture's
 state directory as gone; it also asserts that a Reporter's label admits
 nothing. `@saas` reads its gitlab.com test project and token files from the
-environment, and its live run fails before any step when one is unset.
+environment, and its live run fails before any step when one is unset. Both
+GitLab entries also assert that the issue shows the in-progress label
+(`curie-factory:running`) within one tracker poll interval of the labeler's
+label, and that exactly one factory status note on the issue links the merge
+request (#4867).
 """
 
 from __future__ import annotations
@@ -328,6 +332,8 @@ def _gitlab_step(target: str) -> Step:
     tracker: tuple[tuple[str, Any], ...] = (
         ("scenario.tracker.closes_issue", True),
         ("scenario.tracker.thread_replies", 1),
+        # #4867 decision 2: exactly one factory note on the issue links the MR.
+        ("scenario.tracker.status_note_links_mr", True),
     )
     teardown_steps: tuple[str, ...] = (
         "reset fixture repository",
@@ -344,9 +350,14 @@ def _gitlab_step(target: str) -> Step:
         )
         remote = (
             "GitLab shows one new issue opened and labelled by developer through Sudo",
+            "the issue shows the in-progress label (curie-factory:running) within one "
+            "tracker poll interval of the developer's label "
+            "(scenario.tracker.in_progress_label_seconds)",
             "a second issue labelled by reporter admits no WorkItem and gets no state label",
             "GitLab shows exactly one merge request opened by the factory whose description "
             "carries Closes #<iid>",
+            "the issue gets exactly one factory status note that links the merge request "
+            "(scenario.tracker.status_note_links_mr)",
             "the merge request's first head carries a failing external commit status from "
             "developer (CI red)",
             "a later head pushed by the factory has passing checks (CI green)",
@@ -371,8 +382,13 @@ def _gitlab_step(target: str) -> Step:
         )
         remote = (
             "gitlab.com shows one new issue opened and labelled by the human Owner",
+            "the issue shows the in-progress label (curie-factory:running) within one "
+            "tracker poll interval of the Owner's label "
+            "(scenario.tracker.in_progress_label_seconds)",
             "gitlab.com shows exactly one merge request opened by the factory whose "
             "description carries Closes #<iid>",
+            "the issue gets exactly one factory status note that links the merge request "
+            "(scenario.tracker.status_note_links_mr)",
             "the merge request's first head carries a failing external commit status from "
             "the human Owner (CI red)",
             "a later head pushed by the factory has passing checks (CI green)",

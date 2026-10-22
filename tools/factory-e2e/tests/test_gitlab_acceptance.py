@@ -15,9 +15,10 @@ The production contract the fakes below rely on:
    "forge-loop", "--forge", "gitlab", "--forge-target", <target>]``, under the
    shared deadline. Its persisted assertions are the forge-loop ones with
    ``forge == scenario.forge == "gitlab"`` and ``scenario.pairing == <key>``,
-   plus ``scenario.tracker.closes_issue == True`` and
-   ``scenario.tracker.thread_replies == 1``; ``@fixture`` adds
-   ``scenario.tracker.reporter_label_admitted == False`` and
+   plus ``scenario.tracker.closes_issue == True``,
+   ``scenario.tracker.thread_replies == 1`` and
+   ``scenario.tracker.status_note_links_mr == True`` (#4867); ``@fixture``
+   adds ``scenario.tracker.reporter_label_admitted == False`` and
    ``scenario.tracker.reporter_state_labels == []``.
 3. ``@fixture`` teardown checks are ``TEARDOWN_CLEAN``, ``NAMESPACE_GONE`` and
    ``acceptance.FIXTURE_GONE``; ``FIXTURE_GONE`` passes only when the evidence
@@ -26,9 +27,13 @@ The production contract the fakes below rely on:
    compose project remains). ``@saas`` has no fixture check.
 4. ``@fixture`` inputs name ``--advertise-host``; its remote assertions name the
    ``reporter`` label that admits nothing, the ``Closes #<iid>`` merge request,
-   the one thread reply and the merge as ``root``. ``@saas`` inputs name each
-   of ``CURIE_FACTORY_GITLAB_PROJECT``, ``CURIE_FACTORY_GITLAB_FACTORY_TOKEN_FILE``
-   and ``CURIE_FACTORY_GITLAB_HUMAN_TOKEN_FILE``, and nothing names a reporter.
+   the one thread reply and the merge as ``root``. Both entries also name the
+   ``curie-factory:running`` in-progress label within one poll interval of the
+   labeler's label (``scenario.tracker.in_progress_label_seconds``) and the one
+   factory status note that links the merge request (#4867). ``@saas`` inputs
+   name each of ``CURIE_FACTORY_GITLAB_PROJECT``,
+   ``CURIE_FACTORY_GITLAB_FACTORY_TOKEN_FILE`` and
+   ``CURIE_FACTORY_GITLAB_HUMAN_TOKEN_FILE``, and nothing names a reporter.
 5. ``acceptance.run`` on ``@saas`` with any of those variables unset returns
    ``fe.EXIT_CONFIG`` with the first unset name on stderr, before any step
    runs or any request is sent. ``--dry-run`` needs none of them.
@@ -194,6 +199,24 @@ def test_the_saas_entry_has_no_reporter_step() -> None:
     step = _step(SAAS)
     text = " ".join([*step.remote_assertions, *step.inputs.values()]).lower()
     assert "reporter" not in text
+
+
+@pytest.mark.parametrize("key", GITLAB_KEYS)
+def test_each_gitlab_entry_asserts_the_in_progress_label_and_the_status_note(key: str) -> None:
+    """#4867: both GitLab entries assert the in-progress state label within one
+    poll interval of the labeler's label (``scenario.tracker.
+    in_progress_label_seconds``, a remote assertion the driver bounds) and the
+    status note linking the merge request (``scenario.tracker.
+    status_note_links_mr``, persisted true)."""
+
+    persisted = _persisted(key)
+    assert persisted["scenario.tracker.status_note_links_mr"] is True
+    assert "scenario.tracker.in_progress_label_seconds" not in persisted
+    remote = [item.lower() for item in _step(key).remote_assertions]
+    assert any(
+        "in-progress label" in item and "curie-factory:running" in item for item in remote
+    ), remote
+    assert any("status note" in item and "merge request" in item for item in remote), remote
 
 
 def test_the_fixture_entry_checks_the_namespace_and_the_fixture_are_gone() -> None:
@@ -405,6 +428,8 @@ def _fixture_evidence(state_dir: Path) -> dict[str, Any]:
                 "iid": 3,
                 "closes_issue": True,
                 "thread_replies": 1,
+                "in_progress_label_seconds": 21.0,
+                "status_note_links_mr": True,
                 "reporter_label_admitted": False,
                 "reporter_state_labels": [],
             },
@@ -486,6 +511,7 @@ def test_fixture_run_fails_when_the_evidence_names_no_fixture(tmp_path: Path) ->
     [
         ("scenario.tracker.reporter_label_admitted", True),
         ("scenario.tracker.reporter_state_labels", ["curie-factory:in-progress"]),
+        ("scenario.tracker.status_note_links_mr", False),
         ("scenario.tracker.closes_issue", False),
         ("scenario.tracker.thread_replies", 2),
         ("scenario.pairing", SAAS),
