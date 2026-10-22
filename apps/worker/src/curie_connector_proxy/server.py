@@ -6,10 +6,13 @@ public key, unexpired, and names an agent on the connector's rendered
 request is refused in the shape ``tests/vectors/connector-caller-refusal.json``
 freezes, without contacting the server.
 
-Paths are not special-cased. The bundled Claude CLI sends the header on its
-OAuth discovery and registration requests as well as on ``/mcp``, so those are
-checked and forwarded like any other; an admitted caller reaches whatever the
-server serves, and a refused one reaches nothing.
+Paths are not special-cased, except a route the connector declares (ADR
+0240). The bundled Claude CLI sends the header on its OAuth discovery and
+registration requests as well as on ``/mcp``, so those are checked and
+forwarded like any other; an admitted caller reaches whatever the server
+serves, and a refused one reaches nothing. A declared route admits only a
+``ccr`` route token for this connector, streams its body under the route's own
+limit, and is the only place such a token is admitted.
 """
 
 from __future__ import annotations
@@ -41,11 +44,18 @@ ADMITS_ENV = "CURIE_CALLER_PROXY_ADMITS"
 GATED_TOOLS_ENV = "CURIE_CALLER_PROXY_GATED_TOOLS"
 CONNECTOR_ENV = "CURIE_CALLER_PROXY_CONNECTOR"
 GRANT_STORE_ENV = "CURIE_CALLER_PROXY_GRANT_STORE"
+ROUTES_ENV = "CURIE_CALLER_PROXY_ROUTES"
 
 GRANT_HEADER = "X-Curie-Connector-Grant"
 REFUSAL_STATUS = 403
 _REFUSAL_CODE = -32000
 _MAX_BODY_BYTES = 1024 * 1024
+TOO_LARGE_STATUS = 413
+# plugin_format.connectors.ROUTE_MAX_BODY_BYTES_CEILING, which this package
+# cannot import. A render past it is refused at startup.
+_ROUTE_MAX_BODY_BYTES_CEILING = 256 * 1024 * 1024
+_ROUTE_METHODS = frozenset({"POST", "PUT"})
+_RELAY_CHUNK_BYTES = 64 * 1024
 _REFUSAL_MESSAGES = {
     caller.MISSING: "no caller token was presented",
     caller.INVALID: "the caller token is not valid",
@@ -212,6 +222,47 @@ def _gated_tools(env: Mapping[str, str]) -> tuple[str, ...]:
 
 
 @dataclass(frozen=True)
+class RouteConfig:
+    """One declared route (ADR 0240 decision 3): matched exactly, never buffered."""
+
+    path: str
+    methods: frozenset[str]
+    max_body_bytes: int
+
+
+def _routes(env: Mapping[str, str]) -> tuple[RouteConfig, ...]:
+    raw = env.get(ROUTES_ENV, "")
+    if not raw:
+        return ()
+    problem = f"{ROUTES_ENV} must be a JSON list of {{path, methods, max_body_bytes}}"
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        raise ValueError(problem) from None
+    if not isinstance(parsed, list):
+        raise ValueError(problem)
+    routes: list[RouteConfig] = []
+    for item in parsed:
+        if not isinstance(item, dict) or set(item) != {"path", "methods", "max_body_bytes"}:
+            raise ValueError(problem)
+        path, methods, limit = item["path"], item["methods"], item["max_body_bytes"]
+        if (
+            not isinstance(path, str)
+            or not path.startswith("/")
+            or not isinstance(methods, list)
+            or not methods
+            or not all(method in _ROUTE_METHODS for method in methods)
+            or type(limit) is not int
+            or not 0 < limit <= _ROUTE_MAX_BODY_BYTES_CEILING
+        ):
+            raise ValueError(problem)
+        routes.append(RouteConfig(path=path, methods=frozenset(methods), max_body_bytes=limit))
+    if len({route.path for route in routes}) != len(routes):
+        raise ValueError(f"{ROUTES_ENV} declares one path twice")
+    return tuple(routes)
+
+
+@dataclass(frozen=True)
 class ProxyConfig:
     listen_port: int
     upstream_port: int
@@ -223,6 +274,8 @@ class ProxyConfig:
     # ADR 0229: the Host presented on admitted requests. None forwards
     # the caller's Host unchanged.
     upstream_host: str | None = None
+    # ADR 0240: the routes a ``ccr`` token is admitted on.
+    routes: tuple[RouteConfig, ...] = ()
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> ProxyConfig:
@@ -269,6 +322,7 @@ class ProxyConfig:
             connector=env.get(CONNECTOR_ENV, ""),
             grant_store=_ValkeyGrantStore(store_url) if store_url else None,
             upstream_host=upstream_host,
+            routes=_routes(env),
         )
 
 
@@ -466,6 +520,70 @@ def _decide(request: web.Request) -> caller.Decision:
     )
 
 
+def _route(request: web.Request) -> RouteConfig | None:
+    """The declared route this request is for. Exact on the raw path and the method."""
+
+    path = request.rel_url.raw_path
+    for route in request.app[_CONFIG].routes:
+        if route.path == path and request.method in route.methods:
+            return route
+    return None
+
+
+class _BodyTooLarge(Exception):
+    """A streamed body passed its limit while it was being relayed."""
+
+
+class _CountedBody:
+    """Relay a request body as it arrives, refusing it past ``limit`` bytes."""
+
+    def __init__(self, request: web.Request, limit: int) -> None:
+        self._request = request
+        self._limit = limit
+        self.exceeded = False
+
+    async def chunks(self) -> AsyncIterator[bytes]:
+        seen = 0
+        async for chunk in self._request.content.iter_chunked(_RELAY_CHUNK_BYTES):
+            seen += len(chunk)
+            if seen > self._limit:
+                self.exceeded = True
+                raise _BodyTooLarge
+            yield chunk
+
+
+def _declared_too_large(request: web.Request, limit: int) -> bool:
+    length = request.content_length
+    return length is not None and length > limit
+
+
+def _decide_route(request: web.Request) -> caller.Decision:
+    config = request.app[_CONFIG]
+    tokens = request.headers.getall(caller.HEADER, [])
+    if len(tokens) > 1:
+        return caller.Decision(agent=None, refusal=caller.INVALID)
+    return caller.decide_route(
+        config.public_keys,
+        tokens[0] if tokens else None,
+        connector=config.connector,
+        admits=config.admits,
+        now=int(request.app[_CLOCK]()),
+    )
+
+
+def _too_large(request: web.Request, agent: str | None, route: RouteConfig | None) -> web.Response:
+    logger.info(
+        "caller=%s outcome=too_large method=%s path=%r%s",
+        agent or "-",
+        request.method,
+        request.path,
+        f" route={route.path!r}" if route is not None else "",
+    )
+    if route is not None:
+        return web.Response(status=TOO_LARGE_STATUS, text="the request body is too large\n")
+    return web.Response(status=REFUSAL_STATUS, text="the request body is too large\n")
+
+
 @web.middleware
 async def _handle(request: web.Request, handler: Handler) -> web.StreamResponse:
     del handler  # Every request is decided and answered here; never delegated.
@@ -476,23 +594,27 @@ async def _handle(request: web.Request, handler: Handler) -> web.StreamResponse:
     # asked about answering as though it had been. A middleware runs around
     # routing's result either way, so every request, matched or not, is
     # decided and never silently let through to the router's default.
-    decision = _decide(request)
+    route = _route(request)
+    # ADR 0240 decision 3: a declared route admits only a ``ccr``, and every
+    # other path only a ``cct``, so neither token reaches the other's paths.
+    decision = _decide_route(request) if route is not None else _decide(request)
     refusal = decision.refusal
     grant_reason: str | None = None
     body: bytes | None = None
     buffered = False
-    if refusal is None and request.method == "POST" and request.body_exists:
+    counted: _CountedBody | None = None
+    if refusal is None and route is not None:
+        # Never buffered: a declared route takes files, and the limit is its own.
+        if _declared_too_large(request, route.max_body_bytes):
+            return _too_large(request, decision.agent, route)
+        if request.body_exists:
+            counted = _CountedBody(request, route.max_body_bytes)
+    elif refusal is None and request.method == "POST" and request.body_exists:
         try:
             body = await request.read()
         except web.HTTPRequestEntityTooLarge:
             # A body over 1 MiB is refused rather than forwarded unread.
-            logger.info(
-                "caller=%s outcome=too_large method=%s path=%r",
-                decision.agent or "-",
-                request.method,
-                request.path,
-            )
-            return web.Response(status=REFUSAL_STATUS, text="the request body is too large\n")
+            return _too_large(request, decision.agent, None)
         buffered = True
         grant_reason = (
             GRANT_BODY_TOO_LARGE
@@ -501,16 +623,23 @@ async def _handle(request: web.Request, handler: Handler) -> web.StreamResponse:
         )
         if grant_reason is not None:
             refusal = caller.GRANT_REQUIRED
+    elif refusal is None and request.body_exists:
+        # ADR 0240 decision 3: an undeclared path keeps the 1 MiB limit for
+        # every method. Other methods stay streamed, but they are counted.
+        if _declared_too_large(request, _MAX_BODY_BYTES):
+            return _too_large(request, decision.agent, None)
+        counted = _CountedBody(request, _MAX_BODY_BYTES)
     # The path is decoded, so it is quoted: an encoded newline in it stays
     # `\n` inside this line rather than starting a line of its own.
     # ``grant=`` names which grant check refused, from a fixed set, and is
     # absent otherwise; it is never a claim value.
     logger.info(
-        "caller=%s outcome=%s method=%s path=%r%s",
+        "caller=%s outcome=%s method=%s path=%r%s%s",
         decision.agent or "-",
         refusal or "admitted",
         request.method,
         request.path,
+        f" route={route.path!r}" if route is not None else "",
         f" grant={grant_reason}" if grant_reason is not None else "",
     )
     if refusal is not None:
@@ -540,22 +669,32 @@ async def _handle(request: web.Request, handler: Handler) -> web.StreamResponse:
     if decision.run is not None and decision.work_item is not None:
         forwarded.add(caller.RUN_HEADER, decision.run)
         forwarded.add(caller.WORK_ITEM_HEADER, decision.work_item)
+    data: object
+    if buffered:
+        data = body
+    elif counted is not None:
+        data = counted.chunks()
+    else:
+        data = request.content if request.body_exists else None
     try:
         answer = await request.app[_UPSTREAM].request(
             request.method,
             target,
             headers=forwarded,
-            data=(
-                body
-                if buffered
-                else request.content
-                if request.body_exists
-                else None
-            ),
+            data=data,
             allow_redirects=False,
         )
+    except _BodyTooLarge:
+        return _too_large(request, decision.agent, route)
     except ClientError:
+        if counted is not None and counted.exceeded:
+            return _too_large(request, decision.agent, route)
         return web.Response(status=502, text="the connector server is unreachable\n")
+    if counted is not None and counted.exceeded:
+        # The server answered before the body ran past the limit. What it
+        # answered was about a truncated body, so the caller never sees it.
+        answer.release()
+        return _too_large(request, decision.agent, route)
     try:
         response = web.StreamResponse(
             status=answer.status, reason=answer.reason, headers=_forwardable(answer.headers)

@@ -54,6 +54,7 @@ from . import (
     lifecycle,
     memory,
     publication,
+    route_tokens,
     routing,
     sweep_slices,
     work_items,
@@ -181,6 +182,9 @@ class Kernel:
         # The grant each bundle declares, by bundle ref (a stored bundle is
         # write once). Cleared past 4096 entries.
         self._bundle_grants: dict[str, bool] = {}
+        # ADR 0240: the hosted connectors each (bundle, agent) declares routes
+        # on, read from the same stored bundle. Cleared past 4096 entries.
+        self._bundle_routes: dict[tuple[str, str], frozenset[str]] = {}
         # Keyed by request id, never thread key: a steered follow-up shares the
         # thread and must not see or remove this run.
         self._work_item_runs: dict[uuid.UUID, WorkItemRun] = {}
@@ -314,6 +318,7 @@ class Kernel:
     _record_turn_deadline = memory._record_turn_deadline
     _settle_memory_turns = memory._settle_memory_turns
     _close_memory_turns = memory._close_memory_turns
+    _route_connectors = route_tokens.route_connectors
     _with_channel_read = channel_read._with_channel_read
     _steer_channel_read = channel_read._steer_channel_read
     _settle_channel_read = channel_read._settle_channel_read
