@@ -203,7 +203,9 @@ route's `callers` is not given to the CLI as a stdio entry. Instead:
   comes from the same `mcp_entry` derivation as the hosted entry, so the
   author writes no URL. The child reads the pipe once at start. After that the
   pipe is empty, and nothing the child execs can read a value from the env or
-  the descriptor.
+  the descriptor. A caller started any other way, such as by the runner's
+  capability probe or on a tier with no connector scope, finds the name unset
+  and has no routes, so it must start without them.
 - The runner removes `CURIE_CONNECTOR_ROUTE_TOKENS` from every env mapping in
   the same step as `materialize_connector_caller_headers`. The token's only
   copies in the sandbox are then the runner's memory and the declared
