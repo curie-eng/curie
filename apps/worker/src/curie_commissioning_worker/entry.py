@@ -68,7 +68,7 @@ from curie_worker.config import WorkerConfig
 from curie_worker.protected_worker_bootstrap import _read
 from pydantic import AliasChoices
 
-from .consumer import CommissioningConsumer, Verdict
+from .consumer import RECHECK_INTERVAL_S, CommissioningConsumer, Verdict
 
 __all__ = [
     "COMPOSITION",
@@ -224,6 +224,7 @@ async def open_commissioning_worker(
     *,
     guard: ChannelCampaignGuard | None = None,
     consumer_name: str = "commissioning-consumer-1",
+    recheck_interval_s: float = RECHECK_INTERVAL_S,
 ) -> CommissioningWorker:
     """Open the worker over ``directory`` in refusal order, @spec PROTECTED-COMMISSIONING-4."""
     client: AuthenticatedWorkerClient | None = None
@@ -270,7 +271,9 @@ async def open_commissioning_worker(
         _require(guard_measured_for(bound, d.bootstrap, d.manifest, permit))
         await bound.require_current()
         config = _campaign_config(permit, consumer_name)
-        consumer = CommissioningConsumer(client=client, gate=gate, config=config)
+        consumer = CommissioningConsumer(
+            client=client, gate=gate, config=config, recheck_interval_s=recheck_interval_s
+        )
         return CommissioningWorker(client, consumer, config)
     except Exception:  # noqa: BLE001  The refusal names only the deciding step.
         if client is not None:
