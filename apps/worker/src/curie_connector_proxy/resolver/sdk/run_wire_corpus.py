@@ -26,7 +26,12 @@ Case kinds:
 3. ``provider``: one ``ProviderClient.request``, all of them on ONE
    ``ProviderClient`` and ONE ``PartitionedCache`` for the whole run, so the
    R1-6 sequence proves that nothing carries authority from one call to the
-   next.
+   next. A case expecting a ``response`` also checks credential attribution:
+   the provider echoes ``authorization_sha256`` (the hex SHA-256 of the
+   Authorization value it received) in its JSON body, and that must equal the
+   fixture's ``authorization_sha256[<role>][<phase>]``, where the phase is
+   ``before_reimport`` until the ``reimport`` barrier has run and
+   ``after_reimport`` from then on. Digests are compared, never printed.
 4. ``barrier``: prints ``{"barrier": "<name>"}``, flushes, and blocks on one
    stdin line; the driver performs the named action (``reimport``,
    ``disable``) and writes ``go``.
@@ -43,6 +48,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import gzip
+import hmac
 import importlib.util
 import json
 import socket
@@ -58,6 +64,8 @@ FIXTURE_VERSION = 1
 DEFAULT_PURPOSE = "wire corpus conformance"
 RAW_TIMEOUT_S = 30.0
 RAW_MAX_REPLY_BYTES = 1 << 20
+PHASE_BEFORE_REIMPORT = "before_reimport"
+PHASE_AFTER_REIMPORT = "after_reimport"
 
 
 class CaseFailed(Exception):
@@ -97,6 +105,8 @@ class Run:
         self._resolvers: dict[str, Any] = {}
         self.resolutions: dict[str, Any] = {}
         self.responses: dict[str, Any] = {}
+        # Which credential each role must send; switched by the reimport barrier.
+        self.phase = PHASE_BEFORE_REIMPORT
 
     # --- fixture lookups ------------------------------------------------------
 
@@ -460,6 +470,32 @@ def run_provider(run: Run, case: Mapping[str, Any]) -> None:
             _require(response.partition != earlier.partition, "two partitions are equal")
         run.responses[case["id"]] = response
     run_cache(run, case, response)
+    if outcome == "response":
+        # Last, so a wrong credential fails this case alone and later cases
+        # that name its response or partition still run.
+        check_attribution(run, case, response)
+
+
+def check_attribution(run: Run, case: Mapping[str, Any], response: Any) -> None:
+    """The provider received exactly this role's credential at this phase."""
+
+    digests = run.fixture.get("authorization_sha256", {}).get(case.get("role"), {})
+    expected = digests.get(run.phase)
+    _require(
+        isinstance(expected, str) and bool(expected),
+        "the fixture names no authorization digest for this role and phase",
+    )
+    try:
+        document = json.loads(response.body)
+    except ValueError:
+        raise CaseFailed("the provider answer is not JSON") from None
+    echoed = document.get("authorization_sha256") if isinstance(document, dict) else None
+    if not isinstance(echoed, str):
+        raise CaseFailed("the provider echoed no authorization digest")
+    _require(
+        hmac.compare_digest(echoed.lower().encode("ascii", "replace"), expected.lower().encode()),
+        "the provider received another credential than this role's at this phase",
+    )
 
 
 # --- barrier ------------------------------------------------------------------
@@ -467,6 +503,8 @@ def run_provider(run: Run, case: Mapping[str, Any]) -> None:
 
 def run_barrier(run: Run, case: Mapping[str, Any]) -> None:
     emit({"barrier": case["barrier"]})
+    if case["barrier"] == "reimport":
+        run.phase = PHASE_AFTER_REIMPORT
     line = sys.stdin.readline()
     _require(line.strip() == "go", "the driver did not answer the barrier with go")
 

@@ -15,10 +15,17 @@ point of this module:
 3. The binding's source releases inside that transaction, and the success body
    is built only after the transaction COMMITs: the commit is the admission
    boundary ("Bundle" 5). Nothing is cached between calls.
-4. A refresh-capable source may instead ask for a refresh. The admission
-   transaction ends first, the coordinator runs its own fenced steps, and the
-   call is re-admitted from scratch, handle included, before the new token can
-   leave. A second request to refresh refuses ``refresh_failed``.
+4. The handle is re-checked against the registry after every database wait:
+   once the pooled connection is acquired, again after the admission reads
+   and the source ran (immediately before COMMIT), and once more after COMMIT
+   before the body is built. A handle removed, expired or session-closed while
+   the call waited on a lock refuses with the registry's own code, the
+   transaction rolls back, and nothing is released.
+5. A refresh-capable source may instead ask for a refresh. The admission
+   transaction ends first, the handle is re-checked, the coordinator runs its
+   own fenced steps, and the call is re-admitted from scratch, handle
+   included, before the new token can leave. A second request to refresh
+   refuses ``refresh_failed``.
 
 Every database failure, timeout and pool exhaustion is ``store_unavailable``.
 The audit line names the binding, revision and agent, and the purpose only by
@@ -116,10 +123,7 @@ class Resolver:
 
         if not handle:
             raise ResolveRefusal("handle_missing")
-        try:
-            context = self._handles.admit(handle)
-        except RegistryRefusal as refusal:
-            raise ResolveRefusal(refusal.code) from None
+        context = self._registry_context(handle)
         principal = context.principal
         if (
             principal.installation != self._config.installation
@@ -130,17 +134,40 @@ class Resolver:
             raise ResolveRefusal("slot_unknown")
         return context
 
+    def _registry_context(self, handle: str) -> InvocationContext:
+        """The registry's current answer for ``handle``, refused with its own code."""
+
+        try:
+            return self._handles.admit(handle)
+        except RegistryRefusal as refusal:
+            raise ResolveRefusal(refusal.code) from None
+
+    def _revalidate(self, handle: str, context: InvocationContext) -> None:
+        """Re-check ``handle`` after a wait: it must still name exactly ``context``.
+
+        The registry check before a database wait proves nothing about the
+        moment of release; a handle can be removed, expire or lose its session
+        while the call is parked on a lock.
+        """
+
+        if self._registry_context(handle) != context:
+            raise ResolveRefusal("handle_unknown")
+
     async def _resolve(self, handle: str, slot: str, purpose: str) -> dict[str, object]:
         context = self._context(handle, slot)
-        admitted, source, outcome = await self._admit_once(context, slot)
+        admitted, source, outcome = await self._admit_once(handle, context, slot)
         if isinstance(outcome, RefreshNeeded):
             assert isinstance(source, RefreshCapableSource)
+            # No refresh begins for a handle revoked while admission waited.
+            self._revalidate(handle, context)
             await self._coordinator.run(self._pool, source, admitted, slot, self._config.keys)
             # From scratch: the handle may have been removed while the provider ran.
             context = self._context(handle, slot)
-            admitted, source, outcome = await self._admit_once(context, slot)
+            admitted, source, outcome = await self._admit_once(handle, context, slot)
             if isinstance(outcome, RefreshNeeded):
                 raise ResolveRefusal("refresh_failed")
+        # COMMIT itself is a database wait; the last check before anything leaves.
+        self._revalidate(handle, context)
         self.releases += 1
         body = self._body(context, admitted, slot, outcome.fields)
         digest, size = purpose_digest(purpose)
@@ -157,16 +184,23 @@ class Resolver:
         return body
 
     async def _admit_once(
-        self, context: InvocationContext, slot: str
+        self, handle: str, context: InvocationContext, slot: str
     ) -> tuple[Admitted, CredentialSource, Release | RefreshNeeded]:
-        """One admission transaction; answers only after it committed."""
+        """One admission transaction; answers only after it committed.
+
+        A refusal raised inside the transaction, including a failed handle
+        re-check, rolls it back.
+        """
 
         self.admissions += 1
         try:
             async with self._pool.acquire(timeout=ACQUIRE_TIMEOUT_S) as connection:
+                self._revalidate(handle, context)
                 async with connection.transaction():
                     admitted = await admit(connection, context, slot)
                     source, outcome = self._release(admitted, slot)
+                    # After the lock waits, immediately before COMMIT.
+                    self._revalidate(handle, context)
         except ResolveRefusal:
             raise
         except STORE_ERRORS:

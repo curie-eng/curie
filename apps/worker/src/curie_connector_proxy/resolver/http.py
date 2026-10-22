@@ -19,6 +19,12 @@ small enough to read whole:
    than ``application/json`` 415, and exactly one all-digit ``Content-Length``
    is required (400 otherwise, 413 above 64 KiB, "Bundle" 6).
 5. The body is read with ``readexactly`` under a 10 second timeout.
+6. At most ``max_connections`` (default 256) connections are served at once.
+   One past the cap is answered a fixed 503 ``{"refusal": "busy"}`` and
+   aborted as it is accepted, before any of its bytes is read, so idle
+   connections cannot exhaust the resolver.
+7. The response write, drain and close share a 10 second deadline; a reader
+   that stops reading has its transport aborted when it expires.
 
 Every response is fixed JSON the server builds (``{"refusal": <code>}`` or the
 success body) with ``Cache-Control: no-store``. No exception text, header value
@@ -66,6 +72,8 @@ HEAD_LIMIT_BYTES = 8192
 HEAD_TIMEOUT_S = 10.0
 BODY_TIMEOUT_S = 10.0
 CLOSE_TIMEOUT_S = 5.0
+WRITE_TIMEOUT_S = 10.0
+MAX_CONNECTIONS = 256
 APPLICATION_NAME = "curie-shared-resolver"
 # The role's CONNECTION LIMIT is 32; leave room for an operator's session.
 POOL_MAX_SIZE = 8
@@ -189,33 +197,89 @@ def _response(status: int, payload: bytes) -> bytes:
     return head.encode("ascii") + payload
 
 
+class _ConnectionGate:
+    """Counts the connections being served; one past the cap is refused."""
+
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self.active = 0
+
+
+def _refuse_busy(writer: asyncio.StreamWriter) -> None:
+    """Answer the fixed busy refusal without reading anything, then abort.
+
+    The response is small enough that the socket transport sends it at once
+    on an empty buffer; whatever it could not send is dropped with the abort,
+    so a refused connection holds nothing open.
+    """
+
+    transport = writer.transport
+    with contextlib.suppress(Exception):
+        transport.pause_reading()  # type: ignore[attr-defined]
+    with contextlib.suppress(OSError, RuntimeError):
+        writer.write(_response(*_refused("busy")))
+    transport.abort()
+
+
+async def _finish(writer: asyncio.StreamWriter, response: bytes) -> None:
+    """Write, drain and close under one deadline; abort the transport when it lapses."""
+
+    async def _write_and_close() -> None:
+        try:
+            with contextlib.suppress(OSError):
+                writer.write(response)
+                await writer.drain()
+        finally:
+            writer.close()
+            with contextlib.suppress(OSError):
+                await writer.wait_closed()
+
+    try:
+        await asyncio.wait_for(_write_and_close(), WRITE_TIMEOUT_S)
+    except TimeoutError:
+        writer.transport.abort()
+
+
 async def _serve(
-    resolver: Resolver, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    resolver: Resolver,
+    gate: _ConnectionGate,
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
 ) -> None:
+    if gate.active >= gate.limit:
+        _refuse_busy(writer)
+        return
+    gate.active += 1
     try:
         try:
             status, payload = await _exchange(resolver, reader)
         except Exception as error:  # noqa: BLE001 - logged by class name only, answered closed
             logger.error("resolver request failed: %s", type(error).__name__)
             status, payload = _refused("internal_error")
-        with contextlib.suppress(OSError):
-            writer.write(_response(status, payload))
-            await writer.drain()
+        await _finish(writer, _response(status, payload))
+    except BaseException:
+        # Cancelled (shutdown): answer nothing and hold nothing open.
+        writer.transport.abort()
+        raise
     finally:
-        writer.close()
-        with contextlib.suppress(OSError):
-            await writer.wait_closed()
+        gate.active -= 1
 
 
-async def serve_unix(resolver: Resolver, path: str) -> asyncio.Server:
+async def serve_unix(
+    resolver: Resolver, path: str, *, max_connections: int = MAX_CONNECTIONS
+) -> asyncio.Server:
     """Serve ``resolver`` on a Unix socket at ``path``, mode 0666.
 
     The dedicated emptyDir directory is the access boundary, not the mode: the
-    server container must be able to connect under its own UID.
+    server container must be able to connect under its own UID. At most
+    ``max_connections`` connections are served at once.
     """
 
+    if type(max_connections) is not int or max_connections < 1:
+        raise ValueError("max_connections must be a positive integer")
+    gate = _ConnectionGate(max_connections)
     server = await asyncio.start_unix_server(
-        partial(_serve, resolver), path=path, limit=HEAD_LIMIT_BYTES
+        partial(_serve, resolver, gate), path=path, limit=HEAD_LIMIT_BYTES
     )
     try:
         os.chmod(path, SOCKET_MODE)
@@ -292,9 +356,12 @@ async def start_resolver(
     *,
     sources: SourceRegistry | None = None,
     handles: HandleRegistry | None = None,
+    max_connections: int = MAX_CONNECTIONS,
 ) -> ResolverRuntime:
     """Connect as the application role, verify it, then bind the socket."""
 
+    if type(max_connections) is not int or max_connections < 1:
+        raise ValueError("max_connections must be a positive integer")
     registry = (
         HandleRegistry(installation=config.installation, application=config.application)
         if handles is None
@@ -324,7 +391,7 @@ async def start_resolver(
         resolver = Resolver(config=config, handles=registry, sources=chosen, pool=pool)
         _clear_stale_socket(config.socket_path)
         try:
-            server = await serve_unix(resolver, config.socket_path)
+            server = await serve_unix(resolver, config.socket_path, max_connections=max_connections)
         except OSError:
             raise ResolverStartRefused("socket_unavailable") from None
     except BaseException:

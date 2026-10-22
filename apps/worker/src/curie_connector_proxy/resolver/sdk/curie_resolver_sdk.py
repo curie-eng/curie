@@ -32,8 +32,20 @@ Why the shape is what it is:
    reimport (a new revision) or another member (another binding) starts
    empty instead of reading state built under different credentials.
 
-Secrets stay out of diagnostics: no exception message, ``repr`` or log line
-here carries the invocation handle or credential material.
+6. The request authority comes only from the checked origin. A caller (or
+   an ``authorize`` callback) that sets ``Host`` gets ``ValueError`` before
+   the resolve, so no header can point the request at another authority.
+7. Every header name and value is checked before anything is sent: names
+   are HTTP tokens, values are Latin-1 with no control character other than
+   horizontal tab (so no CR or LF). A bad header raises ``ValueError`` with a
+   fixed message that never quotes the value; ``http.client`` would
+   otherwise quote it, Authorization included. A transport failure
+   (``http.client``, ``ssl``, ``socket``) raises ``ProviderTransportError``
+   naming only the failure's class, with no chained exception.
+
+Secrets stay out of diagnostics: no exception message, ``repr``, chained
+exception or log line here carries the invocation handle or credential
+material.
 ``Resolution.fields`` and every ``Field`` value are excluded from ``repr``.
 There is no module-level mutable state; every client owns what it uses.
 """
@@ -67,7 +79,12 @@ _HTTPS = "https"
 _HTTPS_DEFAULT_PORT = 443
 _REFUSAL_CODE = re.compile(r"[a-z][a-z0-9_]{0,63}")
 _HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
-_HEADER_VALUE_FORBIDDEN = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
+# A sendable header value: Latin-1, horizontal tab allowed, no other C0 or C1
+# control character (so no CR or LF) and no DEL.
+_HEADER_VALUE = re.compile(r"[\t\x20-\x7e\xa0-\xff]*")
+# A sendable request target: printable ASCII without spaces.
+_REQUEST_TARGET = re.compile(r"[\x21-\x7e]+")
+_HOST_HEADER = "host"
 
 
 class ResolverRefused(Exception):
@@ -100,6 +117,19 @@ class RedirectRefused(Exception):
         super().__init__(f"provider answered {status}; redirects are never followed")
         self.status = status
         self.location = location
+
+
+class ProviderTransportError(Exception):
+    """The provider call failed in transport (connection, TLS, HTTP framing).
+
+    The message names only the failure's class; the underlying exception is
+    not chained, because ``http.client`` and ``ssl`` messages can quote
+    request data.
+    """
+
+    def __init__(self, kind: str) -> None:
+        super().__init__(f"the provider call failed in transport ({kind})")
+        self.kind = kind
 
 
 class _Immutable:
@@ -519,24 +549,42 @@ def bearer(resolution: Resolution, headers: Mapping[str, str]) -> dict[str, str]
     if len(values) != 1 or values[0].text is None:
         raise ValueError("bearer needs exactly one text field")
     token = values[0].text
-    if not token or _HEADER_VALUE_FORBIDDEN.search(token) or "\t" in token:
+    if not token or "\t" in token or _HEADER_VALUE.fullmatch(token) is None:
         raise ValueError("the credential field is not a valid bearer token")
     authorized = {name: value for name, value in headers.items() if name.lower() != "authorization"}
     authorized["Authorization"] = f"Bearer {token}"
     return authorized
 
 
-def _checked_headers(headers: Mapping[str, str]) -> dict[str, str]:
-    # http.client rejects bad header values with a message that quotes the
-    # value; checking first keeps a credential out of that message.
+def _checked_headers(headers: Mapping[str, str], source: str) -> dict[str, str]:
+    """``headers`` if every one is sendable as is, else ``ValueError``.
+
+    ``http.client`` rejects a bad value with a message (or a
+    ``UnicodeEncodeError``) that quotes the value, Authorization included;
+    checking first, with messages that name only ``source`` and the already
+    validated header name, keeps the value out of every diagnostic. ``Host``
+    is refused in any case: the authority comes only from the checked origin.
+    """
+
     checked: dict[str, str] = {}
     for name, value in headers.items():
         if not isinstance(name, str) or _HEADER_NAME.fullmatch(name) is None:
-            raise ValueError("a request header has an invalid name")
-        if not isinstance(value, str) or _HEADER_VALUE_FORBIDDEN.search(value):
-            raise ValueError(f"request header {name} has an invalid value")
+            raise ValueError(f"a header from {source} has an invalid name")
+        if name.lower() == _HOST_HEADER:
+            raise ValueError(f"{source} may not set Host; it comes from the checked origin")
+        if not isinstance(value, str) or _HEADER_VALUE.fullmatch(value) is None:
+            raise ValueError(
+                f"header {name} from {source} is not Latin-1 without control characters"
+            )
         checked[name] = value
     return checked
+
+
+def _authority(host: str, port: int) -> str:
+    """The Host value for a checked origin: IPv6 bracketed, port 443 implied."""
+
+    shown = f"[{host}]" if ":" in host else host
+    return shown if port == _HTTPS_DEFAULT_PORT else f"{shown}:{port}"
 
 
 type Authorize = Callable[[Resolution, Mapping[str, str]], dict[str, str]]
@@ -545,9 +593,12 @@ type Authorize = Callable[[Resolution, Mapping[str, str]], dict[str, str]]
 class ProviderClient:
     """Provider calls authorized by one fresh resolve each.
 
-    ``request`` resolves the handle, checks the URL origin against the origins
-    that resolve returned, authorizes the headers, and sends over a fresh
-    ``HTTPSConnection`` closed afterwards. A 3xx raises ``RedirectRefused``.
+    ``request`` checks the caller's headers, resolves the handle, checks the
+    URL origin against the origins that resolve returned, authorizes the
+    headers, checks them again, and sends over a fresh ``HTTPSConnection``
+    closed afterwards, with ``Host`` set from the checked origin. A 3xx
+    raises ``RedirectRefused``; a transport failure raises
+    ``ProviderTransportError``.
     """
 
     def __init__(
@@ -587,29 +638,50 @@ class ProviderClient:
         path = parts.path or "/"
         if parts.query:
             path = f"{path}?{parts.query}"
+        if not isinstance(method, str) or _HEADER_NAME.fullmatch(method) is None:
+            raise ValueError("the request method is not an HTTP token")
+        if _REQUEST_TARGET.fullmatch(path) is None:
+            raise ValueError("the URL path or query is not printable ASCII")
+        # Refused before the resolve: a bad caller header never costs an admission.
+        caller = _checked_headers(dict(headers or {}), "the caller")
 
         resolution = self.resolver.resolve(handle, self.slot, purpose)
         if target not in _declared(resolution):
             raise OriginRefused()
-        prepared = _checked_headers(self._authorize(resolution, dict(headers or {})))
+        prepared = _checked_headers(self._authorize(resolution, caller), "authorize")
 
         _, host, port = target
+        prepared["Host"] = _authority(host, port)
         connection = http.client.HTTPSConnection(
             host, port, timeout=self._timeout, context=self._ssl_context
         )
+        failure: str | None = None
+        location: str | None = None
+        status = 0
+        payload = b""
+        received: dict[str, str] = {}
         try:
-            connection.request(method, path, body=body, headers=prepared)
-            response = connection.getresponse()
-            status = response.status
-            if 300 <= status <= 399:
-                raise RedirectRefused(status, response.getheader("Location"))
-            payload = response.read()
-            received: dict[str, str] = {}
-            for name, value in response.getheaders():
-                key = name.lower()
-                received[key] = f"{received[key]}, {value}" if key in received else value
+            try:
+                connection.request(method, path, body=body, headers=prepared)
+                response = connection.getresponse()
+                status = response.status
+                if 300 <= status <= 399:
+                    location = response.getheader("Location")
+                else:
+                    payload = response.read()
+                    for name, value in response.getheaders():
+                        key = name.lower()
+                        received[key] = f"{received[key]}, {value}" if key in received else value
+            except (OSError, http.client.HTTPException) as exc:
+                failure = type(exc).__name__
         finally:
             connection.close()
+        if failure is not None:
+            # Raised outside the handler and ``from None``: no context or cause
+            # carries the original message, which can quote request data.
+            raise ProviderTransportError(failure) from None
+        if 300 <= status <= 399:
+            raise RedirectRefused(status, location)
         return ProviderResponse(
             status=status,
             headers=received,

@@ -15,8 +15,20 @@ it names the first failed check as a code, because the operator needs to know
 what to fix. The connection limit and the INHERIT flag are not checked here; a
 managed role may differ there harmlessly, and membership itself is refused.
 
-Catalog reads only, all as ``current_user``: ``pg_roles``, ``pg_auth_members``
-and the ``has_*_privilege`` functions over ``pg_class`` and ``pg_attribute``.
+The last check looks past the shared objects: any authority the role holds
+outside them is ``role_foreign_authority``. That is a privilege on any other
+table, view, materialized view, foreign table or sequence in a non-system
+schema, CREATE on a non-system schema or on the current database, ownership of
+any relation, function, type or schema, or EXECUTE on any SECURITY DEFINER
+function other than the four. System schemas are ``pg_catalog``,
+``information_schema``, ``pg_toast`` and the per-session temporary schemas.
+Trigger functions are not callable directly, so a SECURITY DEFINER trigger
+function grants nothing. Privileges count however they are held, PUBLIC
+included, because the ``has_*_privilege`` functions answer effective access.
+
+Catalog reads only, all as ``current_user``: ``pg_roles``, ``pg_auth_members``,
+``pg_namespace``, ``pg_class``, ``pg_attribute``, ``pg_proc`` and ``pg_type``,
+and the ``has_*_privilege`` functions over them; one bounded query per check.
 """
 
 from __future__ import annotations
@@ -91,6 +103,64 @@ SELECT coalesce(bool_and(coalesce(
 FROM unnest($1::text[]) AS f
 """
 
+# Every authority outside the shared objects, in one catalog pass. $1 is the
+# schema of the six shared tables, $2 their names, $3 the four permitted
+# functions' qualified signatures.
+_FOREIGN_SQL = r"""
+WITH me AS (
+    SELECT r.oid FROM pg_catalog.pg_roles r WHERE r.rolname = current_user
+),
+ns AS (
+    SELECT n.oid, n.nspname, n.nspowner
+    FROM pg_catalog.pg_namespace n
+    WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+      AND n.nspname !~ '^pg_(toast_)?temp_[0-9]+$'
+),
+permitted AS (
+    SELECT to_regprocedure(f)::oid AS oid
+    FROM unnest($3::text[]) AS f
+    WHERE to_regprocedure(f) IS NOT NULL
+)
+SELECT
+    EXISTS (
+        SELECT 1 FROM pg_catalog.pg_class c JOIN ns ON ns.oid = c.relnamespace CROSS JOIN me
+        WHERE NOT (ns.nspname = $1 AND c.relname::text = ANY($2::text[]))
+          AND (
+              (c.relkind = 'S'
+               AND has_sequence_privilege(me.oid, c.oid, 'USAGE, SELECT, UPDATE'))
+              OR (c.relkind IN ('r', 'p', 'v', 'm', 'f')
+                  AND (has_table_privilege(me.oid, c.oid,
+                           'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER')
+                       OR has_any_column_privilege(me.oid, c.oid,
+                           'SELECT, INSERT, UPDATE, REFERENCES')))
+          )
+    ) AS relation_privilege,
+    EXISTS (
+        SELECT 1 FROM ns CROSS JOIN me WHERE has_schema_privilege(me.oid, ns.oid, 'CREATE')
+    ) OR has_database_privilege(current_user, current_database(), 'CREATE') AS can_create,
+    EXISTS (SELECT 1 FROM ns CROSS JOIN me WHERE ns.nspowner = me.oid)
+    OR EXISTS (
+        SELECT 1 FROM pg_catalog.pg_class c JOIN ns ON ns.oid = c.relnamespace CROSS JOIN me
+        WHERE c.relowner = me.oid
+    )
+    OR EXISTS (
+        SELECT 1 FROM pg_catalog.pg_proc p JOIN ns ON ns.oid = p.pronamespace CROSS JOIN me
+        WHERE p.proowner = me.oid
+    )
+    OR EXISTS (
+        SELECT 1 FROM pg_catalog.pg_type t JOIN ns ON ns.oid = t.typnamespace CROSS JOIN me
+        WHERE t.typowner = me.oid
+    ) AS owns,
+    EXISTS (
+        SELECT 1 FROM pg_catalog.pg_proc p JOIN ns ON ns.oid = p.pronamespace CROSS JOIN me
+        WHERE p.prosecdef
+          AND p.prorettype NOT IN ('pg_catalog.trigger'::regtype,
+                                   'pg_catalog.event_trigger'::regtype)
+          AND p.oid NOT IN (SELECT permitted.oid FROM permitted)
+          AND has_function_privilege(me.oid, p.oid, 'EXECUTE')
+    ) AS definer_execute
+"""
+
 _MAPPING_SQL = """
 SELECT d.application_id::text AS application_id
 FROM curie.shared_connector_database_roles d
@@ -148,9 +218,15 @@ async def verify_role(connection: Any, application: str) -> str:
     if guarded - updatable:
         raise PrivilegeRefusal("role_lock_guard_missing")
 
-    executable = await connection.fetchval(
-        _FUNCTIONS_SQL, [f"{SCHEMA}.{signature}" for signature in SHARED_FUNCTIONS]
-    )
+    qualified = [f"{SCHEMA}.{signature}" for signature in SHARED_FUNCTIONS]
+    executable = await connection.fetchval(_FUNCTIONS_SQL, qualified)
     if executable is not True:
         raise PrivilegeRefusal("role_missing_execute")
+
+    foreign = await connection.fetchrow(_FOREIGN_SQL, SCHEMA, list(SHARED_TABLES), qualified)
+    if foreign is None or any(
+        foreign[name] is not False
+        for name in ("relation_privilege", "can_create", "owns", "definer_execute")
+    ):
+        raise PrivilegeRefusal("role_foreign_authority")
     return str(role["rolname"])

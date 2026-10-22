@@ -23,6 +23,17 @@ held across the provider call and an operator reimport never waits on it:
    means a reimport or another writer moved the row on, so the provider's token
    is dropped, never stored and never released.
 
+A begin can land after the admitted revision moved on: another resolve
+committed a refresh, or an operator reimported, while this call waited. The
+begun row's ``credential_revision`` then differs from the admitted one, and the
+source re-evaluates the begun material before any provider call. Material that
+no longer needs a refresh (or that the source refuses outright) must not be
+exchanged: a rotating refresh token may already have been replaced. cp1 has no
+abort primitive for a begun intent, so ownership is handed back by committing
+the begun material unchanged, resealed to the current recipient; the revision
+advances by one with identical plaintext and the intent returns to ``ready``.
+The service then re-admits and releases from scratch as after any refresh.
+
 Anything that fails after ``began`` and before a definite commit outcome may
 have consumed a rotating refresh token at the provider, so it is marked
 ``recovery_required`` (``uncertain_outcome``). When the database is
@@ -38,13 +49,14 @@ honored before the new token leaves the resolver.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import uuid
 from abc import abstractmethod
 from typing import Any, ClassVar
 
 from .admission import ACQUIRE_TIMEOUT_S, STORE_ERRORS, Admitted
 from .keys import KeyRing, KeyUnavailable, seal
-from .sources import KIND_REFRESH, CredentialSource, SourceRefusal
+from .sources import KIND_REFRESH, CredentialSource, RefreshNeeded, SourceRefusal
 
 MAX_LEASE_SECONDS = 300
 _MAX_OWNER_BYTES = 128
@@ -138,7 +150,9 @@ class RefreshCoordinator:
         epoch = int(began["epoch"])
 
         try:
-            sealed, recipient = await self._exchange(pool, source, admitted, slot, keys, began)
+            sealed, recipient, handed_back = await self._exchange(
+                pool, source, admitted, slot, keys, began
+            )
             committed = await self._step(
                 pool, _COMMIT_SQL, grant_id, intent, epoch, recipient, sealed
             )
@@ -156,6 +170,10 @@ class RefreshCoordinator:
         if result == "committed":
             return
         if result == "stale":
+            if handed_back:
+                # No provider call was made, so nothing was lost; the service
+                # re-admits whatever moved the row on.
+                return
             raise SourceRefusal("refresh_stale")
         marked = await self._mark_recovery(pool, grant_id, intent, epoch)
         if marked == "recovery_required" or result == "recipient_unknown":
@@ -170,20 +188,55 @@ class RefreshCoordinator:
         slot: str,
         keys: KeyRing,
         began: Any,
-    ) -> tuple[bytes, str]:
-        """Steps 2 and 3: the provider exchange, then the seal to the current recipient."""
+    ) -> tuple[bytes, str, bool]:
+        """Steps 2 and 3: the provider exchange, then the seal to the current recipient.
+
+        Answers the sealed replacement, its recipient, and whether it is the
+        begun material handed back unchanged (no provider call was made).
+        """
 
         try:
             material = keys.open(str(began["recipient_id"]), bytes(began["ciphertext"]))
         except (KeyUnavailable, TypeError) as error:
             raise _Uncertain("the material does not open") from error
-        replacement = await asyncio.wait_for(
-            source.refresh(admitted, slot, material), timeout=source.lease_seconds
-        )
+        handed_back = not _still_needs_refresh(source, admitted, slot, keys, began)
+        if handed_back:
+            replacement = material
+        else:
+            replacement = await asyncio.wait_for(
+                source.refresh(admitted, slot, material), timeout=source.lease_seconds
+            )
         if not isinstance(replacement, bytes) or not 0 < len(replacement) <= _MAX_PLAINTEXT_BYTES:
             raise _Uncertain("the replacement is not a storable plaintext")
         current = await self._step(pool, _CURRENT_RECIPIENT_SQL, uuid.UUID(admitted.application))
         if current is None or not keys.holds(str(current["recipient_id"])):
             raise _Uncertain("the current recipient is not held")
         recipient = str(current["recipient_id"])
-        return seal(keys.public_key(recipient), replacement), recipient
+        return seal(keys.public_key(recipient), replacement), recipient, handed_back
+
+
+def _still_needs_refresh(
+    source: RefreshCapableSource, admitted: Admitted, slot: str, keys: KeyRing, began: Any
+) -> bool:
+    """Whether the begun material still needs the provider.
+
+    Unchanged revision: the admission already decided it does. A moved-on
+    revision is re-evaluated by the source on the begun row; anything but
+    ``RefreshNeeded``, a refusal included, means no provider call. The
+    service's re-admission then releases or refuses that material itself.
+    """
+
+    revision = int(began["credential_revision"])
+    if revision == admitted.credential_revision:
+        return True
+    begun = dataclasses.replace(
+        admitted,
+        credential_revision=revision,
+        recipient_id=str(began["recipient_id"]),
+        ciphertext=bytes(began["ciphertext"]),
+    )
+    try:
+        outcome = source.release(begun, slot, keys)
+    except Exception:  # noqa: BLE001 - a refusing source is not exchanged at the provider
+        return False
+    return isinstance(outcome, RefreshNeeded)

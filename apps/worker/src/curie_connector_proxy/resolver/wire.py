@@ -56,6 +56,7 @@ REFUSAL_STATUS = {
     "key_unavailable": 503,
     "source_unavailable": 503,
     "refresh_failed": 503,
+    "busy": 503,
 }
 
 _REQUEST_KEYS = frozenset({"handle", "slot", "purpose"})

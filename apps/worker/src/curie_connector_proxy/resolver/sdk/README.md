@@ -50,6 +50,15 @@ Rules the SDK enforces, and that any other client must enforce too:
    `ProviderResponse.partition`, so a reimport or another member starts empty.
 6. Never log the handle or credential fields. `Resolution` and `Field` keep
    them out of `repr`, and SDK exceptions never include them.
+7. Never let a caller choose the request authority. A `Host` header (any
+   case) raises `ValueError` before the resolve; the SDK sets `Host` from the
+   checked origin.
+8. Check every header before sending it. Names must be HTTP tokens and
+   values Latin-1 with no control character other than tab, so no CR or LF;
+   a bad header, the built Authorization included, raises `ValueError` with a
+   fixed message that never quotes the value. Transport failures raise
+   `ProviderTransportError`, which names only the failure's class and chains
+   nothing, because `http.client` and `ssl` messages can quote request data.
 
 A connector-custody application releases identity only: request the empty
 slot `""` and use the binding and account to select the credential your
@@ -60,7 +69,9 @@ connector manages.
 The runner needs a live world: a resolver for a platform-custody application
 with two members holding single text field `token` credentials, a second
 connector-custody application with its own resolver, and an HTTPS provider
-that answers 200 on the allowed path and 302 on the redirect path. It reads
+that answers 302 on the redirect path and 200 on the allowed path with a JSON
+body whose `authorization_sha256` is the hex SHA-256 of the Authorization
+value it received (null when there was none). It reads
 that world from a fixture JSON file whose schema is documented in the module
 docstring of `apps/worker/tests/connector_proxy/test_resolver_sdk_corpus.py`.
 That test builds the world against a real API, Postgres and a fake provider
@@ -77,6 +88,14 @@ python3.12 -I -B run_wire_corpus.py \
 The runner prints one JSON line per case, `{"id", "kind", "passed"}` with a
 `detail` on failure, and a final summary line carrying `python`, `total`,
 `passed` and `failed`. It exits 0 only when every case passed.
+
+Every provider case that expects a response also checks credential
+attribution: the echoed digest must equal the fixture's
+`authorization_sha256[<role>][<phase>]`, the SHA-256 of `"Bearer " + <that
+role's token>`, where the phase is `before_reimport` until the `reimport`
+barrier has run and `after_reimport` from then on. A copy that sends a
+credential cached from an earlier call, or another member's, fails those
+cases. The runner compares digests and never prints them.
 
 `barrier` cases pause the run: the runner prints `{"barrier": "<name>"}` and
 waits for one line on stdin. Whoever drives the run performs the action
