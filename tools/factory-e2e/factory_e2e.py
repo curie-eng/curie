@@ -6209,7 +6209,9 @@ def judge_first_head_ci(obs: Mapping[str, Any]) -> list[str]:
         bad = [
             c
             for c in results
-            if c.get("status") != "completed" or c.get("conclusion") not in FIRST_HEAD_GREEN
+            if c.get("status") != "completed"
+            or not isinstance(c.get("conclusion"), str)
+            or c.get("conclusion") not in FIRST_HEAD_GREEN
         ]
         if bad:
             conclusion = bad[0].get("conclusion") if bad[0].get("status") == "completed" else None

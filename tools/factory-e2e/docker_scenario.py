@@ -263,7 +263,7 @@ def upgrade_section(
 
 def ci_section(
     first_head: str,
-    rules: list[Any],
+    rules: list[Any] | None,
     check_runs: Obj,
     statuses: list[Any],
     required: list[str] | None = None,
@@ -272,7 +272,7 @@ def ci_section(
 
     if required is None:
         required = []
-        for rule in rules:
+        for rule in rules or []:
             if rule.get("type") != "required_status_checks":
                 continue
             for check in rule["parameters"]["required_status_checks"]:
