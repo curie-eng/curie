@@ -1319,8 +1319,8 @@ factory:
     # when the operator creates it; it must then carry
     # pod-security.kubernetes.io/enforce: privileged.
     createNamespace: true
-    # The daemon's mutual TLS port. The Rail 1 sandbox allow opens only this
-    # port toward the daemon namespace.
+    # The daemon's mutual TLS API port. Rail 1 opens TCP 1 through 65535 to
+    # this release's daemons; each daemon admits only its own claim's runner.
     port: 2376
     # Individual daemon Pod sizing, separate from namespace quota and limits.
     resources:
