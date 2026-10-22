@@ -62,7 +62,12 @@ than an open bag of `gen_ai.*` names.
   parentage and honest status for platform operations. Its caller vocabulary is closed
   to `service.name`, `operation`, `role`, `source`, `outcome`, `retry_class`, and
   `event_id`; custom keys export only as `curie.operation`, `curie.role`, `curie.source`,
-  `curie.outcome`, `curie.retry_class`, and `curie.channel.event_id`. `event_id` is the
+  `curie.outcome`, `curie.retry_class`, and `curie.channel.event_id`. The worker's turn
+  span may also carry `termination_reason` and `termination_exit_code`, exported as
+  `curie.sandbox.termination.reason` and `curie.sandbox.termination.exit_code`, only for
+  a confirmed runner pod termination; the reason is one of `OOMKilled`, `Evicted`,
+  `Deleted`, or `Unknown`, the exit code is an int from 0 to 255, and termination detail
+  text is never exported. `event_id` is the
   one correlation identifier the vocabulary admits, and it is admitted on spans only:
   the metric catalog stays closed to it, because `record_metric` enumerates a value
   domain per attribute and an identifier has none. Spans describing the turn's own

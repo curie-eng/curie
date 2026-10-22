@@ -308,6 +308,7 @@ def _pod_termination(pod: Any, *, since: datetime) -> SandboxTermination | None:
     # On a deleting pod only OOMKilled outranks the deletion itself.
     deleting = getattr(getattr(pod, "metadata", None), "deletion_timestamp", None) is not None
     deleted_detail: str | None = None
+    deleted_exit_code: int | None = None
     for container in getattr(status, "container_statuses", None) or []:
         if getattr(container, "name", None) != "runner":
             continue
@@ -316,11 +317,13 @@ def _pod_termination(pod: Any, *, since: datetime) -> SandboxTermination | None:
             continue
         exit_code = getattr(terminated, "exit_code", None)
         detail = f"exit code {exit_code}" if isinstance(exit_code, int) else None
+        code = exit_code if type(exit_code) is int else None
         if deleting and getattr(terminated, "reason", None) != "OOMKilled":
             deleted_detail = detail
+            deleted_exit_code = code
             break
         return SandboxTermination(
-            _safe_termination_reason(getattr(terminated, "reason", None)), detail
+            _safe_termination_reason(getattr(terminated, "reason", None)), detail, code
         )
 
     # A restarted runner can be Running by the time the drop is diagnosed.
@@ -335,10 +338,11 @@ def _pod_termination(pod: Any, *, since: datetime) -> SandboxTermination | None:
         ):
             exit_code = getattr(terminated, "exit_code", None)
             detail = f"exit code {exit_code}" if isinstance(exit_code, int) else None
-            return SandboxTermination("OOMKilled", detail)
+            code = exit_code if type(exit_code) is int else None
+            return SandboxTermination("OOMKilled", detail, code)
 
     if deleting:
-        return SandboxTermination("Deleted", deleted_detail)
+        return SandboxTermination("Deleted", deleted_detail, deleted_exit_code)
     if phase in {"Failed", "Succeeded"}:
         return SandboxTermination(
             _safe_termination_reason(
