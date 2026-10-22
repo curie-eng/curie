@@ -3,7 +3,7 @@
 import os
 import time
 from collections import defaultdict
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterator
 from typing import Any
 
 import anyio
@@ -15,6 +15,7 @@ from aci_protocol import (
     Final,
     OtelConfig,
     SessionStatus,
+    ToolAccess,
     parse_ndjson,
     parse_ndjson_line,
 )
@@ -2298,3 +2299,239 @@ def test_an_echoed_user_prompt_is_replaced_in_the_generation_output() -> None:
     assert prompt not in _span_wire_material(finished)
     output = generation.attributes[_OUTPUT]
     assert f"You asked: {placeholder}. Answer: sunny" in output
+
+
+# #4940: a classified failure names its closed classification on the root span.
+_CLASSIFICATION = "curie.terminal.classification"
+_OUTPUT_CEILING = "curie.budget.output_ceiling"
+_CAUSE = "curie.terminal.cause"
+
+
+def _failure_canaries(kind: str) -> dict[str, str]:
+    return {
+        "prompt": f"private-prompt-{kind}-PLACEHOLDER",
+        "tool_argument": f"private-tool-arg-{kind}-PLACEHOLDER",
+        "tool_result": f"private-tool-output-{kind}-PLACEHOLDER",
+        "tool_call_id": f"private-call-id-{kind}-PLACEHOLDER",
+        "provider_error": f"private-provider-error-{kind}-PLACEHOLDER",
+    }
+
+
+def _canary_tool_round(canaries: dict[str, str]) -> list[object]:
+    # Tool call and result shapes from
+    # test_generations_record_the_prompt_output_and_tool_names_only above.
+    return [
+        AssistantMessage(
+            content=[
+                ToolUseBlock(
+                    id=canaries["tool_call_id"],
+                    name="Bash",
+                    input={"command": canaries["tool_argument"]},
+                )
+            ],
+            model="observed-model",
+            usage={"input_tokens": 1, "output_tokens": 1},
+        ),
+        _tool_result(canaries["tool_call_id"], content=canaries["tool_result"]),
+    ]
+
+
+def _export_failed_turn(
+    session_factory: Callable[[], Any],
+    event: Event,
+    *,
+    ceiling: int = 0,
+) -> tuple[list[object], list[ReadableSpan]]:
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    runner = SessionRunner(
+        max_usd_per_day=None,
+        held_secrets=frozenset(),
+        session_factory=session_factory,
+        ceiling=ceiling,
+        tracer=RunTracer(provider),
+        classifier=SideEffectClassifier(),
+        trace_name="curie-run:test",
+        model="configured-model",
+    )
+
+    async def go() -> list[object]:
+        await runner.start()
+        try:
+            lines = [line async for line in runner.run_turn(event)]
+            return parse_ndjson("".join(lines))
+        finally:
+            await runner.close()
+
+    events = anyio.run(go)
+    return events, list(exporter.get_finished_spans())
+
+
+def _assert_no_canary_exported(finished: list[ReadableSpan], canaries: dict[str, str]) -> None:
+    # Span names, attribute keys and values, event names and attributes, and
+    # status descriptions of every exported span.
+    material = _span_wire_material(finished)
+    leaked = sorted(name for name, value in canaries.items() if value in material)
+    assert not leaked, f"canaries exported to OTel: {leaked}"
+
+
+def _classified_root(
+    events: list[object], finished: list[ReadableSpan], classification: str
+) -> ReadableSpan:
+    errors = [event for event in events if isinstance(event, ErrorEvent)]
+    assert errors and errors[-1].classification == classification
+    assert isinstance(events[-1], Final)
+    assert events[-1].status is SessionStatus.CLASSIFIED_FAILURE
+    [root] = _spans_by_name(finished)["agent.run"]
+    assert root.attributes[_CAUSE] == "classified_failure"
+    return root
+
+
+def test_credential_rejection_root_carries_classification_without_output_ceiling() -> None:
+    canaries = _failure_canaries("credential")
+    # The rejection shape is test_session.py
+    # test_auth_rejection_fails_fast_not_retried: AssistantMessage.error
+    # "authentication_failed" (session.py _is_auth_rejection), here with the
+    # provider's own text as the assistant TextBlock.
+    script: list[object] = [
+        *_canary_tool_round(canaries),
+        AssistantMessage(
+            content=[TextBlock(text=canaries["provider_error"])],
+            model="observed-model",
+            error="authentication_failed",
+        ),
+        _result(),
+    ]
+    events, finished = _export_failed_turn(
+        lambda: FakeModelSession(lambda: script),
+        Event(type="message", text=canaries["prompt"], user="U0EXAMPLE1", ts="1"),
+        ceiling=1000,
+    )
+
+    root = _classified_root(events, finished, "model-credential-rejected")
+    _assert_no_canary_exported(finished, canaries)
+    assert root.attributes.get(_CLASSIFICATION) == "model-credential-rejected"
+    assert _OUTPUT_CEILING not in root.attributes
+
+
+def test_budget_halt_root_carries_classification_and_output_ceiling() -> None:
+    ceiling = 5
+    canaries = _failure_canaries("budget")
+    # Assistant usage crossing the ceiling mid-turn is the shape of test_session.py
+    # test_output_token_budget_failure_names_the_configured_limit. A budget halt
+    # has no provider error text of its own, so that canary rides the terminal
+    # result the halt never reads.
+    script: list[object] = [
+        *_canary_tool_round(canaries),
+        AssistantMessage(
+            content=[TextBlock(text="still working")],
+            model="observed-model",
+            usage={"input_tokens": 1, "output_tokens": ceiling + 10},
+        ),
+        _result(
+            text=canaries["provider_error"],
+            terminal_reason=canaries["provider_error"],
+        ),
+    ]
+    events, finished = _export_failed_turn(
+        lambda: FakeModelSession(lambda: script),
+        Event(type="message", text=canaries["prompt"], user="U0EXAMPLE1", ts="1"),
+        ceiling=ceiling,
+    )
+
+    root = _classified_root(events, finished, "budget-exceeded")
+    _assert_no_canary_exported(finished, canaries)
+    assert _CLASSIFICATION in root.attributes
+    assert root.attributes[_CLASSIFICATION] == "budget-exceeded"
+    assert _OUTPUT_CEILING in root.attributes
+    assert type(root.attributes[_OUTPUT_CEILING]) is int
+    assert root.attributes[_OUTPUT_CEILING] == ceiling
+
+
+def test_runner_error_root_carries_runner_error_classification() -> None:
+    canaries = _failure_canaries("runner")
+
+    def raising_script() -> Iterator[object]:
+        # A raised SDK/transport error mid-turn becomes the runner-error
+        # ErrorEvent (session.py _run_turn ``except Exception``), as in
+        # test_caught_runner_failure_sets_explicit_error_status, here after a
+        # completed tool round.
+        yield from _canary_tool_round(canaries)
+        raise RuntimeError(canaries["provider_error"])
+
+    events, finished = _export_failed_turn(
+        lambda: FakeModelSession(raising_script),  # type: ignore[arg-type]
+        Event(type="message", text=canaries["prompt"], user="U0EXAMPLE1", ts="1"),
+        ceiling=1000,
+    )
+
+    root = _classified_root(events, finished, "runner-error")
+    _assert_no_canary_exported(finished, canaries)
+    assert root.attributes.get(_CLASSIFICATION) == "runner-error"
+    assert _OUTPUT_CEILING not in root.attributes
+
+
+def test_abandoned_turn_carries_no_failure_classification() -> None:
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    # A non-terminal provider error (translate.py ``server_error`` ->
+    # ``server-error``) reaches the consumer before it walks away, so the turn
+    # did emit a classified ErrorEvent that must still not be stamped.
+    script: list[object] = [
+        AssistantMessage(content=[], model="observed-model", error="server_error"),
+        AssistantMessage(content=[TextBlock(text="retrying")], model="observed-model"),
+        _result(),
+    ]
+    runner = SessionRunner(
+        max_usd_per_day=None,
+        held_secrets=frozenset(),
+        session_factory=lambda: FakeModelSession(lambda: script),
+        ceiling=5,
+        tracer=RunTracer(provider),
+        classifier=SideEffectClassifier(),
+        trace_name="curie-run:test",
+        model="configured-model",
+    )
+    seen: list[object] = []
+
+    async def go() -> None:
+        await runner.start()
+        turn = runner.run_turn(Event(type="message", text="go", user="U0EXAMPLE1", ts="1"))
+        async for line in turn:
+            seen.append(parse_ndjson_line(line))
+            if isinstance(seen[-1], ErrorEvent):
+                break
+        await turn.aclose()
+        await runner.close()
+
+    anyio.run(go)
+    assert not any(isinstance(event, Final) for event in seen)
+    assert any(
+        isinstance(event, ErrorEvent) and event.classification == "server-error" for event in seen
+    )
+    [root] = _spans_by_name(list(exporter.get_finished_spans()))["agent.run"]
+    assert root.attributes[_CAUSE] == "abandoned"
+    assert _CLASSIFICATION not in root.attributes
+    assert _OUTPUT_CEILING not in root.attributes
+
+
+def test_out_of_set_classification_exports_unclassified() -> None:
+    # A restricted turn this runner cannot enforce is refused with
+    # ``tool-access-unenforced`` (session.py _tool_access_refusal,
+    # tool_access.py), which is outside PLATFORM_ERROR_CLASSIFICATIONS.
+    events, finished = _export_failed_turn(
+        FakeModelSession,
+        Event(
+            type="message",
+            text="go",
+            user="U0EXAMPLE1",
+            ts="1",
+            tool_access=ToolAccess.READ_ONLY,
+        ),
+    )
+
+    root = _classified_root(events, finished, "tool-access-unenforced")
+    assert root.attributes.get(_CLASSIFICATION) == "unclassified"
+    assert _OUTPUT_CEILING not in root.attributes

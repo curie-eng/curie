@@ -3283,7 +3283,7 @@ def test_pod_termination_cause_reaches_terminal_notice(
 ) -> None:
     async def go() -> None:
         async with make_harness(max_attempts=1) as h:
-            h.fake_k8s.termination = SimpleNamespace(reason=reason, detail=detail)
+            h.fake_k8s.termination = SandboxTermination(reason, detail)
             h.runner.default_script = [TextDelta(text="partial")]
             h.runner.abort_after_frames = True
             event = qevent("go")
@@ -3330,9 +3330,7 @@ def test_pod_termination_cause_reaches_factory_finish_detail(make_harness) -> No
         ) as h:
             items = _WorkItems()
             h.kernel._work_items = items
-            h.fake_k8s.termination = SimpleNamespace(
-                reason="Evicted", detail="The node was low on memory."
-            )
+            h.fake_k8s.termination = SandboxTermination("Evicted", "The node was low on memory.")
             h.runner.default_script = [TextDelta(text="partial")]
             h.runner.abort_after_frames = True
             event = _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
@@ -5971,9 +5969,7 @@ def test_approval_resume_capacity_keeps_an_earlier_pod_termination(
                 h.fake_k8s.sandboxes.clear()
                 return found
 
-            h.fake_k8s.termination = SimpleNamespace(
-                reason="Evicted", detail="The node was low on memory."
-            )
+            h.fake_k8s.termination = SandboxTermination("Evicted", "The node was low on memory.")
             monkeypatch.setattr(h.fake_k8s, "pod_termination", evicted_then_full)
             h.runner.default_script = [TextDelta(text="partial")]
             h.runner.abort_after_frames = True

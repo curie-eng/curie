@@ -77,3 +77,12 @@ def test_oomkilled_detail_names_the_memory_limit() -> None:
         _sandbox_termination_detail(SandboxTermination("Deleted", "exit code 143"))
         == "Kubernetes pod terminated: Deleted (exit code 143)."
     )
+
+
+def test_exit_code_rides_the_termination_without_changing_its_detail() -> None:
+    with_code = SandboxTermination("OOMKilled", "exit code 137", 137)
+    assert with_code.exit_code == 137
+    assert SandboxTermination("OOMKilled", "exit code 137").exit_code is None
+    assert _sandbox_termination_detail(with_code) == _sandbox_termination_detail(
+        SandboxTermination("OOMKilled", "exit code 137")
+    )

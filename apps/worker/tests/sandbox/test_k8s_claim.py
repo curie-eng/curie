@@ -1487,6 +1487,7 @@ def test_oom_killed_runner_reports_container_termination() -> None:
     assert termination.reason == "OOMKilled"
     assert termination.detail is not None
     assert termination.detail == "exit code 137"
+    assert termination.exit_code == 137
     assert len(api.request_timeouts) == 1
     assert api.request_timeouts[0][0] == "get:pods:test-ns:sbx-1"
     assert 0 < api.request_timeouts[0][1] <= 0.5
@@ -1697,6 +1698,7 @@ def test_terminated_sidecar_does_not_hide_runner_state() -> None:
     )
     assert termination is not None
     assert termination.reason == "OOMKilled"
+    assert termination.exit_code == 137
 
 
 @pytest.mark.parametrize("recent", [True, False])
@@ -1730,6 +1732,7 @@ def test_only_recent_oom_last_state_explains_a_running_pod(recent: bool) -> None
         assert termination is not None
         assert termination.reason == "OOMKilled"
         assert termination.detail == "exit code 137"
+        assert termination.exit_code == 137
     else:
         assert termination is None
 
@@ -2554,6 +2557,7 @@ def test_deleting_pod_with_generic_runner_exit_reports_deleted_with_exit_code() 
     assert termination is not None
     assert termination.reason == "Deleted"
     assert termination.detail == "exit code 143"
+    assert termination.exit_code == 143
 
 
 def test_deleting_pod_with_oom_runner_reports_oom_killed() -> None:
@@ -2572,6 +2576,7 @@ def test_deleting_pod_with_oom_runner_reports_oom_killed() -> None:
     assert termination is not None
     assert termination.reason == "OOMKilled"
     assert termination.detail == "exit code 137"
+    assert termination.exit_code == 137
 
 
 def test_deleting_pod_keeps_deleted_despite_recent_current_uid_oom_event() -> None:
@@ -2595,6 +2600,7 @@ def test_deleting_pod_keeps_deleted_despite_recent_current_uid_oom_event() -> No
     assert termination is not None
     assert termination.reason == "Deleted"
     assert termination.detail == "exit code 143"
+    assert termination.exit_code == 143
 
 
 def test_deleting_running_pod_without_terminated_runner_reports_deleted() -> None:
@@ -2637,6 +2643,7 @@ def test_deleting_pod_with_recent_last_state_oom_reports_oom_killed() -> None:
     assert termination is not None
     assert termination.reason == "OOMKilled"
     assert termination.detail == "exit code 137"
+    assert termination.exit_code == 137
 
 
 def test_deleting_pod_with_stale_last_state_oom_reports_deleted() -> None:
