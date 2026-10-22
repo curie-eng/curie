@@ -4037,7 +4037,9 @@ class SharedConnectorBinding(Base):
     metadata; connector custody holds neither. There is no plaintext column.
     At most one enabled binding exists per (application, agent). Identity
     columns never change, ``credential_revision`` only rises, and ``enabled``
-    only goes false; the application role may update ``lock_guard`` alone.
+    only goes false; ``source_stale`` is written by the API alone (the check sets
+    it, a reimport clears it, migration 0124) and only platform custody may hold
+    it. The application role may update ``lock_guard`` alone.
     """
 
     __tablename__ = "shared_connector_bindings"
@@ -4077,6 +4079,10 @@ class SharedConnectorBinding(Base):
             "AND source_uid IS NULL AND source_resource_version IS NULL "
             "AND source_fingerprint IS NULL AND credential_revision = 1)",
             name="shared_connector_bindings_custody_shape_ck",
+        ),
+        CheckConstraint(
+            "NOT source_stale OR custody = 'platform'",
+            name="shared_connector_bindings_source_stale_ck",
         ),
         ForeignKeyConstraint(
             ["application_id", "custody"],
@@ -4141,6 +4147,7 @@ class SharedConnectorBinding(Base):
     source_uid: Mapped[str | None] = mapped_column(Text, default=None)
     source_resource_version: Mapped[str | None] = mapped_column(Text, default=None)
     source_fingerprint: Mapped[str | None] = mapped_column(Text, default=None)
+    source_stale: Mapped[bool] = mapped_column(server_default=text("false"))
     lock_guard: Mapped[int] = mapped_column(SmallInteger, server_default="0")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(

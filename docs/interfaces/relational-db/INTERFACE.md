@@ -64,13 +64,15 @@ column names are a second, ORM-independent coupling a conforming DB must honor.
 - **Migrations**: the target DB must apply the **whole Alembic chain in `apps/api/alembic/versions/`**, in revision order, ending at `alembic heads`. The chain grows with the product, so it is deliberately not enumerated here: `ls apps/api/alembic/versions/` is the list, and `alembic heads` is the tip a conforming DB must reach. A single head is the invariant — a fork means two branches each added a migration (rebase and merge the heads before swapping anything). Two recent expand revisions make authenticated review feedback part of this schema contract: `0042_review_lineage_authority.py` adds immutable App-observed authority to publication lineages and the `publication_review_reservations` concurrency table; `0043_github_review_feedback.py` adds the `github_review_deliveries` audit table and the `github_review_feedback` durable feedback/outbox table. The latter stores normalized feedback and a credential-free queued turn, never a raw webhook body or GitHub credential.
 
 The current application schema window is `schema_min: "0122"` and
-`schema_head: "0123"`, as recorded in
+`schema_head: "0124"`, as recorded in
 `apps/api/src/curie_api/schema_compat.json`. Revision `0108` merges the `0107`
 and `0106` histories (`apps/api/alembic/versions/0108_merge_stable_reply_identity.py`);
 revisions `0120` through `0122` add team directory sync state, agent access
 policies and directory identity, and the floor is `0122`; revision `0123` adds
 the shared connector store
-(`apps/api/alembic/versions/0123_shared_connector_store.py`).
+(`apps/api/alembic/versions/0123_shared_connector_store.py`) and revision
+`0124` adds its persisted source staleness flag
+(`apps/api/alembic/versions/0124_shared_connector_source_stale.py`).
 These values describe this candidate, not a historical release window.
 
 The `channel_canvas_edits` table (`apps/api/src/curie_api/models.py::ChannelCanvasEdit`,
@@ -274,6 +276,16 @@ setting. Triggers refuse changes to pinned columns, serialize recipient
 retirement against writers, and raise an application's `policy_generation`
 whenever its membership rows change. The downgrade drops the store and the
 bundled roles the API created; operator-managed role names survive.
+
+Migration `0124_shared_connector_source_stale.py` (ADR 0239 "Static sources" 1)
+is additive: `shared_connector_bindings.source_stale boolean NOT NULL DEFAULT
+false`, with the check `shared_connector_bindings_source_stale_ck` (`NOT
+source_stale OR custody = 'platform'`) so connector custody never carries it.
+The resolver cannot read the source Secret, so the API check persists a version
+mismatch in this column and only an explicit reimport clears it; the API is the
+only writer. The application role reads it with its existing table SELECT and
+gains no UPDATE, so `lock_guard` stays the only column it may update. Existing
+rows read false, and the downgrade drops the constraint, then the column.
 
 The candidate application serving window and ordered revision ancestry live in
 `packages/protected-hooks/src/curie_protected_hooks/schema_serving.json`,
