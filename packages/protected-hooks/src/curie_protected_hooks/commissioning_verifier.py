@@ -714,6 +714,16 @@ class CommissioningVerifier:
             await task
             raise
 
+    async def confirm_unchanged(self) -> str | None:
+        """Clause 6, after the selection opens: observe the tuple again.
+
+        Only after this verifier published. Returns ``None`` when every tuple
+        fact and candidate rule still equals the premeasured value, otherwise
+        the refusal reason.
+        """
+        _require(self._published)
+        return await self._current()
+
     async def _publish(self) -> Publication:
         """The accepted branch: observe the tuple again, connect both writers, then write."""
         reason = await self._current()

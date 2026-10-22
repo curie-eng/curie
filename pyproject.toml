@@ -157,6 +157,7 @@ source_modules = ["curie_api", "curie_worker"]
 forbidden_modules = [
     "curie_protected_hooks.commissioning_acceptance_writer",
     "curie_protected_hooks.commissioning_acl",
+    "curie_protected_hooks.commissioning_activation",
     "curie_protected_hooks.commissioning_admissions",
     "curie_protected_hooks.commissioning_bootstrap",
     "curie_protected_hooks.commissioning_campaign_records",
@@ -167,6 +168,7 @@ forbidden_modules = [
     "curie_protected_hooks.commissioning_local_broker",
     "curie_protected_hooks.commissioning_local_installation",
     "curie_protected_hooks.commissioning_local_ownership",
+    "curie_protected_hooks.commissioning_local_worker",
     "curie_protected_hooks.commissioning_local_workloads",
     "curie_protected_hooks.commissioning_operator_guard",
     "curie_protected_hooks.commissioning_operator_protocol",
