@@ -315,9 +315,7 @@ def _replace(argv: list[str], flag: str, value: str) -> list[str]:
 
 
 UNSAFE = [
-    pytest.param(
-        _replace(VALID_ARGV, "--namespace", "fd-other-zz"), VALID_ENV, id="namespace"
-    ),
+    pytest.param(_replace(VALID_ARGV, "--namespace", "fd-other-zz"), VALID_ENV, id="namespace"),
     pytest.param(_replace(VALID_ARGV, "--candidate", "main"), VALID_ENV, id="candidate"),
     pytest.param(VALID_ARGV, {}, id="stub-host-unset"),
     pytest.param(VALID_ARGV, {"CURIE_LOCAL_STUB_HOST": "stub.example"}, id="stub-host-name"),
