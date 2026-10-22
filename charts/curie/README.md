@@ -1438,10 +1438,14 @@ NetworkPolicy remain until deleted by hand.
    egress lists.
 5. With Rail 1 on, `<fullname>-runner-allow-docker-daemon` lets the factory
    agent's runner sandboxes (`curietech.ai/agent` set to the one factory agent
-   repository runners belong to) dial daemon pods on `factory.docker.port`
-   (2376). Other agents' sandboxes get no such allow. Daemon ingress
-   stays default-deny until the worker's per-run policy admits that run's
-   sandbox, so a sandbox reaches only its own daemon.
+   repository runners belong to) dial daemon pods on the full TCP range 1
+   through 65535 (`port: 1`, `endPort: 65535`). Other agents' sandboxes get no
+   such allow. Daemon ingress stays default-deny until the worker's per-run
+   policy admits the sandbox with the same `curietech.ai/sandbox-claim`
+   value, so a sandbox reaches only its own daemon. The runner uses
+   `DOCKER_PUBLISHED_HOST` to reach ports published by containers on its
+   daemon. The Docker API remains on `factory.docker.port` (2376) with
+   unchanged per-claim mTLS.
 6. Three ValidatingAdmissionPolicies with Deny bindings, which need
    Kubernetes 1.30 or newer:
    `<fullname>-docker-daemon-pods` admits only a worker-created pod with one
@@ -1462,13 +1466,18 @@ NetworkPolicy remain until deleted by hand.
    `activeDeadlineSeconds`.
    `<fullname>-docker-daemon-objects` holds the worker's Services to
    ClusterIP, its Secrets to Opaque or TLS, and its NetworkPolicies to
-   ingress-only policies selecting their own claim, whose every peer is a
-   runner sandbox of this release in the release namespace selected by a
-   label key outside the release selector keys (`name`, `instance`,
-   `component`), with no `ipBlock`, on TCP `factory.docker.port` with no
-   `endPort` range.
+   ingress-only policies selecting their own claim. Every peer must be in
+   the release namespace, with `app.kubernetes.io/component: runner-sandbox`,
+   this release's `app.kubernetes.io/instance`, and
+   `curietech.ai/sandbox-claim` exactly equal to the policy's metadata claim
+   label. Each ingress rule requires nonempty peer and port lists, no
+   `ipBlock`, and TCP `port: 1` with `endPort: 65535`.
    `<fullname>-docker-daemon-cleanup` lets the worker delete only
    NetworkPolicies labelled `curietech.ai/sandbox-claim`, never the chart's.
+
+**Upgrade note.** Existing claims retain their old ingress policies until
+reclaimed. New admission refuses older workers' ingress policies until the
+worker rollout completes.
 
 Opting a repository into Docker widens that repository's egress to what its
 class allows. Runner admission is unchanged.

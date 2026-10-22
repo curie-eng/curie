@@ -171,6 +171,15 @@
         "expected": "(?is)^\\W*no\\b.{0,500}\\b(keep|retain)\\s+(the\\s+)?new(\\s+behavioral)?\\s+test\\b.{0,500}(restor|revert|checkout).{0,120}(source|implementation).{0,500}(bug|behavior|assertion)",
         "case_sensitive": false
       }
+    },
+    {
+      "id": "plan-changes-goes-to-failing-test",
+      "input": "The plan reviewer replied VERDICT: CHANGES with two blocking findings on the one plan review. Do you run another plan review before writing the failing test? Begin your answer with Yes or No.",
+      "grader": {
+        "kind": "regex",
+        "expected": "(?is)^\\W*no\\b",
+        "case_sensitive": false
+      }
     }
   ]
 }

@@ -215,8 +215,7 @@ def _selector(config: ToolDaemonConfig, claim: str | None) -> str:
 
 
 def _network_policy(config: ToolDaemonConfig, claim: str, release_namespace: str) -> dict[str, Any]:
-    # The peer's extra key is the runner pod's own claim label, so only this
-    # claim's runner reaches this claim's daemon, and only on the daemon port.
+    # Only this claim's runner can reach its daemon API and published TCP ports.
     peer = {
         "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": release_namespace}},
         "podSelector": {
@@ -234,7 +233,9 @@ def _network_policy(config: ToolDaemonConfig, claim: str, release_namespace: str
         "spec": {
             "podSelector": {"matchLabels": {CLAIM_LABEL: claim}},
             "policyTypes": ["Ingress"],
-            "ingress": [{"from": [peer], "ports": [{"protocol": "TCP", "port": config.port}]}],
+            "ingress": [
+                {"from": [peer], "ports": [{"protocol": "TCP", "port": 1, "endPort": 65535}]}
+            ],
         },
     }
 

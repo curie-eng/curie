@@ -420,22 +420,14 @@ def _objects_admission(obj: Mapping[str, Any], kind: str) -> list[str]:
                 check(pods.get("app.kubernetes.io/component") == "runner-sandbox", "runner")
                 check(pods.get("app.kubernetes.io/instance") == INSTANCE, "this release")
                 check(
-                    any(
-                        key
-                        not in {
-                            "app.kubernetes.io/name",
-                            "app.kubernetes.io/instance",
-                            "app.kubernetes.io/component",
-                        }
-                        for key in pods
-                    ),
-                    "a label beyond the release selector keys",
+                    pods.get(CLAIM_LABEL) == labels.get(CLAIM_LABEL),
+                    "peer selects the policy's own claim",
                 )
             ports = rule.get("ports") or []
             check(bool(ports), "every rule names ports")
             for port in ports:
-                check(port.get("port") == PORT, "daemon port only")
-                check("endPort" not in port, "no endPort")
+                check(port.get("port") == 1, "TCP range starts at 1")
+                check(port.get("endPort") == 65535, "TCP range ends at 65535")
                 check(port.get("protocol", "TCP") == "TCP", "TCP")
     if kind == "Secret":
         check(obj.get("type", "Opaque") in ("Opaque", "kubernetes.io/tls"), "secret type")
@@ -660,11 +652,10 @@ def test_service_policy_and_secret_pass_the_charts_object_admission(
         assert _objects_admission(objects[kind].manifest, kind) == [], kind
 
     policy = objects["NetworkPolicy"].manifest["spec"]
-    # The extra peer key is the runner pod's own claim label, so only this
-    # claim's runner reaches this claim's daemon.
     (rule,) = policy["ingress"]
     (peer,) = rule["from"]
     assert peer["podSelector"]["matchLabels"][CLAIM_LABEL] == claim
+    assert rule["ports"] == [{"protocol": "TCP", "port": 1, "endPort": 65535}]
     service = objects["Service"].manifest["spec"]
     assert service["clusterIP"] == "None"
     assert label_selector_matches(
@@ -672,9 +663,74 @@ def test_service_policy_and_secret_pass_the_charts_object_admission(
     )
     assert service["selector"][CLAIM_LABEL] == claim
     assert PORT in {port["port"] for port in service["ports"]}
-    broken = json.loads(json.dumps(objects["NetworkPolicy"].manifest))
-    broken["spec"]["egress"] = [{}]
-    assert _objects_admission(broken, "NetworkPolicy") != []
+    mutations: tuple[Callable[[dict[str, Any]], object], ...] = (
+        lambda p: p["ingress"][0]["from"][0]["podSelector"]["matchLabels"].pop(CLAIM_LABEL),
+        lambda p: p["ingress"][0]["from"][0]["podSelector"]["matchLabels"].__setitem__(
+            CLAIM_LABEL, "another-claim"
+        ),
+        lambda p: p["ingress"][0].__setitem__("from", [{"ipBlock": {"cidr": "192.0.2.0/24"}}]),
+        lambda p: p["ingress"][0]["from"][0]["namespaceSelector"]["matchLabels"].__setitem__(
+            "kubernetes.io/metadata.name", "another-namespace"
+        ),
+        lambda p: p["ingress"][0]["from"][0]["podSelector"]["matchLabels"].__setitem__(
+            "app.kubernetes.io/component", "another-component"
+        ),
+        lambda p: p["ingress"][0]["from"][0]["podSelector"]["matchLabels"].__setitem__(
+            "app.kubernetes.io/instance", "another-release"
+        ),
+        lambda p: p["ingress"][0].pop("from"),
+        lambda p: p["ingress"][0].pop("ports"),
+        lambda p: p["ingress"][0]["ports"][0].pop("endPort"),
+        lambda p: p["ingress"][0]["ports"][0].__setitem__("port", 2),
+        lambda p: p["ingress"][0]["ports"][0].__setitem__("endPort", 65534),
+        lambda p: p["ingress"][0]["ports"][0].__setitem__("protocol", "UDP"),
+        lambda p: p.__setitem__("egress", [{}]),
+    )
+    for mutate in mutations:
+        broken = json.loads(json.dumps(objects["NetworkPolicy"].manifest))
+        broken["spec"]["ingress"][0]["from"][0]["podSelector"]["matchLabels"][
+            "example.com/unrelated"
+        ] = "present"
+        mutate(broken["spec"])
+        assert _objects_admission(broken, "NetworkPolicy") != []
+    assert _objects_admission(objects["NetworkPolicy"].manifest, "NetworkPolicy") == []
+
+
+@pytest.mark.parametrize("api_port", [PORT, 2443])
+def test_claim_daemon_published_ports(
+    fake_k8s: FakeSandboxClient,
+    affinity: AffinityStore,
+    config: SubstrateConfig,
+    api_port: int,
+) -> None:
+    substrate = _substrate(fake_k8s, affinity, config, {REPO: _entry(daemon={"port": api_port})})
+    claim = substrate.claim("T-published-ports", workspace_repo=REPO).claim_name
+    policy = fake_k8s.daemon_objects_of(claim)["NetworkPolicy"].manifest
+    assert policy["metadata"]["labels"][CLAIM_LABEL] == claim
+    assert policy["spec"] == {
+        "podSelector": {"matchLabels": {CLAIM_LABEL: claim}},
+        "policyTypes": ["Ingress"],
+        "ingress": [
+            {
+                "from": [
+                    {
+                        "namespaceSelector": {
+                            "matchLabels": {"kubernetes.io/metadata.name": RELEASE_NS}
+                        },
+                        "podSelector": {
+                            "matchLabels": {
+                                "app.kubernetes.io/component": "runner-sandbox",
+                                "app.kubernetes.io/instance": INSTANCE,
+                                CLAIM_LABEL: claim,
+                            }
+                        },
+                    }
+                ],
+                "ports": [{"protocol": "TCP", "port": 1, "endPort": 65535}],
+            }
+        ],
+    }
+    assert _objects_admission(policy, "NetworkPolicy") == []
 
 
 @pytest.mark.parametrize(

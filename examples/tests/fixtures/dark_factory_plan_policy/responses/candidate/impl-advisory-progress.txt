@@ -1,0 +1,1 @@
+{"next_phase": "failing_test", "call_plan_reviewer_again": false, "carried_findings": ["F1: AC2 has no test row in the verification table; add a test and a row for it.", "F2: the search builds SQL by string formatting from request input; use a parameterized query."], "publish_before_diff_approval": false}
