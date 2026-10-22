@@ -52,6 +52,7 @@ _SEED_ATTEMPTS = 9
 _DEFAULT_CAP = 10
 _SCENARIO_BUDGET_SECONDS = 120
 _OWNED: dict[str, str | None] = {"container": None}
+_DB_READY_AT = 0.0
 
 _JOB_SETTINGS = PublicationJobSettings(
     namespace="publication-timeout-qualification",
@@ -77,7 +78,7 @@ def _cleanup_owned() -> None:
     if not name:
         return
     subprocess.run(
-        ["docker", "rm", "-f", name],
+        ["docker", "rm", "-f", "-v", name],
         check=False,
         capture_output=True,
         text=True,
@@ -91,7 +92,12 @@ def _container_absent(name: str) -> bool:
         capture_output=True,
         text=True,
     )
-    return inspected.returncode != 0
+    if inspected.returncode == 0:
+        return False
+    detail = (inspected.stderr or inspected.stdout or "").lower()
+    if "no such object" in detail or "not found" in detail:
+        return True
+    raise RuntimeError(detail.strip()[:300] or "docker inspect failed")
 
 
 atexit.register(_cleanup_owned)
@@ -110,9 +116,27 @@ class Peer:
     timeout_class: str | None = None
     timeout_cause: str | None = None
     requests: list[str] = field(default_factory=list)
+    original_request_pending: bool = False
+    completed_by_original_request: bool = False
+
+    def _pull(self) -> dict[str, object]:
+        return {
+            "number": _PR_NUMBER,
+            "url": f"https://code.example/acme/widget/pull/{_PR_NUMBER}",
+            "state": "open",
+            "head_sha": self.head,
+            "head_ref": self.branch,
+            "updated_at": "2026-01-01T00:00:00+00:00",
+        }
 
     def release(self) -> None:
+        """Finish the request the caller already timed out, without a new POST."""
+
         self.released = True
+        if self.original_request_pending and not self.prs:
+            self.prs.append(self._pull())
+            self.completed_by_original_request = True
+            self.original_request_pending = False
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
@@ -132,23 +156,14 @@ class Peer:
             return httpx.Response(200, json={"commit_sha": observed})
         if path.endswith("/pull-request") and request.method == "POST":
             if self.scenario == "delayed-success-after-cap" and not self.released:
+                self.original_request_pending = True
                 exc = httpx.ReadTimeout("simulated read timeout", request=request)
                 self.timeout_class = type(exc).__name__
                 self.timeout_cause = str(exc)
                 raise exc
-            if self.prs:
-                row = self.prs[0]
-            else:
-                row = {
-                    "number": _PR_NUMBER,
-                    "url": f"https://code.example/acme/widget/pull/{_PR_NUMBER}",
-                    "state": "open",
-                    "head_sha": self.head,
-                    "head_ref": self.branch,
-                    "updated_at": "2026-01-01T00:00:00+00:00",
-                }
-                self.prs.append(row)
-            return httpx.Response(200, json=row)
+            if not self.prs:
+                self.prs.append(self._pull())
+            return httpx.Response(200, json=self.prs[0])
         if path.endswith("/lineage") and request.method == "PATCH":
             return httpx.Response(200, json={"ok": True})
         return httpx.Response(404, json={"detail": "unhandled simulated route"})
@@ -213,27 +228,30 @@ def _start_postgres() -> tuple[str, str]:
     token = uuid.uuid4().hex[:12]
     name = f"publication-timeout-{token}"
     _OWNED["container"] = name
-    started = subprocess.run(
-        [
-            "docker",
-            "run",
-            "-d",
-            "--name",
-            name,
-            "-e",
-            "POSTGRES_USER=postgres",
-            "-e",
-            "POSTGRES_PASSWORD=postgres",
-            "-e",
-            "POSTGRES_DB=postgres",
-            "-p",
-            "5432",
-            _POSTGRES_IMAGE,
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        started = subprocess.run(
+            [
+                "docker",
+                "run",
+                "-d",
+                "--name",
+                name,
+                "-e",
+                "POSTGRES_USER=postgres",
+                "-e",
+                "POSTGRES_PASSWORD=postgres",
+                "-e",
+                "POSTGRES_DB=postgres",
+                "-p",
+                "5432",
+                _POSTGRES_IMAGE,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        _fail("docker executable was unavailable")
     if started.returncode != 0:
         _fail(f"postgres container start failed: {started.stderr.strip()[:400]}")
     mapped = subprocess.run(
@@ -258,6 +276,8 @@ def _start_postgres() -> tuple[str, str]:
         time.sleep(0.5)
     else:
         _fail("postgres did not become ready")
+    global _DB_READY_AT
+    _DB_READY_AT = time.monotonic()
     async_url = f"postgresql+asyncpg://postgres:postgres@127.0.0.1:{port}/postgres"
     api_root = os.path.abspath(
         os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "apps", "api")
@@ -454,6 +474,8 @@ async def _run_scenario(scenario: str, async_url: str) -> dict[str, Any]:
                 if after_reconcile["status"] != "failed" or not after_reconcile["patch_cleared"]:
                     raise RuntimeError("cap did not terminalize and clear the patch")
                 peer.release()
+                if not peer.completed_by_original_request or len(peer.prs) != 1:
+                    raise RuntimeError("delayed success was not the original timed-out request")
                 remote_after_terminal = {
                     "pull": None,
                     "exception_class": None,
@@ -486,6 +508,9 @@ async def _run_scenario(scenario: str, async_url: str) -> dict[str, Any]:
                 engine, schema="curie", lease_owner="qualification-follower"
             )
             reclaimed = await follower.claim_next()
+            if reclaimed is not None:
+                await reconciler.reconcile(reclaimed)
+                reclaimed = await follower.claim_next()
         stored = await _read_row(engine, publication_id)
         adopted = (
             stored["status"] == "succeeded"
@@ -514,6 +539,7 @@ async def _run_scenario(scenario: str, async_url: str) -> dict[str, Any]:
             "after_reconcile": after_reconcile,
             "claim_eligible_after": reclaimed is not None,
             "remote_pr_count": len(peer.prs),
+            "completed_by_original_request": peer.completed_by_original_request,
             "remote_after_terminal": remote_after_terminal,
             "exception_class": "PublicationReconcileError" if stored["error"] else None,
             "exception_cause": peer.timeout_class,
@@ -606,28 +632,43 @@ def main() -> None:
     if args.scenario == "prerequisite-failure":
         asyncio.run(_prerequisite_failure())
         return
-    container, async_url = _start_postgres()
-    ready = time.monotonic()
+    try:
+        container, async_url = _start_postgres()
+    except SystemExit:
+        _cleanup_owned()
+        raise
+    ready = _DB_READY_AT or time.monotonic()
 
     async def bounded() -> dict[str, Any]:
+        remaining = _SCENARIO_BUDGET_SECONDS - (time.monotonic() - ready)
+        if remaining <= 0:
+            raise TimeoutError
         return await asyncio.wait_for(
             _run_scenario(args.scenario, async_url),
-            timeout=_SCENARIO_BUDGET_SECONDS,
+            timeout=remaining,
         )
 
     try:
         report = asyncio.run(bounded())
     except TimeoutError:
+        _cleanup_owned()
         _fail(f"scenario exceeded {_SCENARIO_BUDGET_SECONDS}s after database ready")
     except SystemExit:
+        _cleanup_owned()
         raise
     except Exception as exc:  # noqa: BLE001 - harness failures stay exit 2
+        _cleanup_owned()
         _fail(f"{type(exc).__name__}: {exc}")
     elapsed = time.monotonic() - ready
     report["elapsed_seconds_after_db_ready"] = round(elapsed, 3)
     report["budget_seconds"] = _SCENARIO_BUDGET_SECONDS
     _cleanup_owned()
-    absent = _container_absent(container)
+    try:
+        absent = _container_absent(container) if container else True
+    except RuntimeError as exc:
+        report["cleanup"] = {"container_absent": False, "error": str(exc)}
+        print(json.dumps(report, default=str), flush=True)
+        raise SystemExit(2) from exc
     report["cleanup"] = {"container_absent": absent, "container": container}
     print(json.dumps(report, default=str), flush=True)
     if not absent:
