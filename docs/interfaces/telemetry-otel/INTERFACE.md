@@ -103,7 +103,8 @@ than an open bag of `gen_ai.*` names.
   transcript-capacity, capacity waits (`curie.capacity.wait`), state mutations,
   legacy state-token use (`curie.state.legacy_token`), supervised-task restarts,
   work-item reconciler step failures (`curie.work_item.reconciler.step.failure`), tool
-  results, and Slack Socket Mode connection state.
+  results, Slack Socket Mode connection state, and Slack Socket Mode delivery
+  per identity (`curie.slack.socket.envelopes`, `curie.slack.delivery_canary`).
   `record_metric`
   (`packages/telemetry/src/curie_telemetry/metrics.py::record_metric`) rejects undeclared
   instruments, attribute keys, and enum values. Its allowlisted dimensions describe
