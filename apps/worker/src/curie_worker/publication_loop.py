@@ -108,6 +108,18 @@ class PublicationPullState:
 
 
 @dataclass(frozen=True)
+class PublicationBranchHead:
+    head_sha: str | None
+    base_branch: str
+
+
+@dataclass(frozen=True)
+class PublicationRevisionCommit:
+    commit_sha: str
+    parent_sha: str
+
+
+@dataclass(frozen=True)
 class PublicationJobObservation:
     phase: str
     logs: str
@@ -200,6 +212,10 @@ class PublicationStore(Protocol):
         pr_number: int,
         pr_url: str,
         head_sha: str,
+        publication_id: uuid.UUID,
+        expected_publication_version: int,
+        lease_owner: str,
+        first_parent_sha: str | None,
     ) -> None | Awaitable[None]: ...
 
 
@@ -261,9 +277,11 @@ class PublicationCodeHost(Protocol):
         *,
         revision_id: uuid.UUID,
         expected_parent: str,
-    ) -> str | Awaitable[str]: ...
+    ) -> PublicationRevisionCommit | Awaitable[PublicationRevisionCommit]: ...
 
-    def read_branch_head(self, publication_id: uuid.UUID) -> str | None | Awaitable[str | None]: ...
+    def read_branch_head(
+        self, publication_id: uuid.UUID
+    ) -> PublicationBranchHead | Awaitable[PublicationBranchHead]: ...
 
     def recover_pull_request(
         self, publication_id: uuid.UUID, *, expected_head_sha: str
@@ -756,12 +774,17 @@ class PublicationReconciler:
                 )
             )
         except PublicationRemoteTerminalError as terminal:
+            first_parent_sha = None
+            if work.expected_remote_head is None:
+                verified = await self._verify_revision(work, new_head)
+                first_parent_sha = verified.parent_sha
             await self._mark_lineage_terminal(
                 work,
                 terminal.state,
                 pr_number=pr_number,
                 pr_url=pr_url,
                 head_sha=new_head,
+                first_parent_sha=first_parent_sha,
             )
             raise PublicationReconcileError(str(terminal)) from None
         except PublicationLineageRefused:
@@ -779,6 +802,7 @@ class PublicationReconciler:
         pr_number: int,
         pr_url: str,
         head_sha: str,
+        first_parent_sha: str | None,
     ) -> None:
         await _resolve(
             self._store.mark_lineage_terminal(
@@ -789,6 +813,10 @@ class PublicationReconciler:
                 pr_number=pr_number,
                 pr_url=pr_url,
                 head_sha=head_sha,
+                publication_id=work.publication_id,
+                expected_publication_version=work.version,
+                lease_owner=work.lease_owner,
+                first_parent_sha=first_parent_sha,
             )
         )
 
@@ -842,13 +870,16 @@ class PublicationReconciler:
         await self.deliver_pending_result(work.publication_id)
 
     @staticmethod
-    def _payload(work: PublicationWork, transport: PublicationTransport) -> PublicationPayload:
+    def _payload(
+        work: PublicationWork, transport: PublicationTransport, *, base_branch: str
+    ) -> PublicationPayload:
         return PublicationPayload(
             publication_id=work.publication_id,
             revision_id=work.revision_id,
             revision_number=work.revision_number,
             repo_full_name=work.repo_full_name,
             clean_clone_url=f"{transport.origin}/{work.repo_full_name}.git",
+            base_branch=base_branch,
             base_sha=work.base_sha,
             expected_prior_head=work.expected_prior_head,
             expected_remote_head=work.expected_remote_head,
@@ -878,6 +909,28 @@ class PublicationReconciler:
             )
         return pull
 
+    async def _verify_revision(
+        self, work: PublicationWork, commit_sha: str
+    ) -> PublicationRevisionCommit:
+        verified = await _resolve(
+            self._code_host.verify_revision_commit(
+                work.publication_id,
+                commit_sha,
+                revision_id=work.revision_id,
+                expected_parent=work.expected_prior_head,
+            )
+        )
+        if verified.commit_sha != commit_sha:
+            raise PublicationReconcileError("revision verification returned a different commit")
+        if (
+            re.fullmatch(r"[0-9a-f]{40,64}", verified.commit_sha) is None
+            or re.fullmatch(r"[0-9a-f]{40,64}", verified.parent_sha) is None
+        ):
+            raise PublicationReconcileError(
+                "revision verification returned an invalid commit proof"
+            )
+        return verified
+
     async def _record_terminal_pull(
         self, work: PublicationWork, pull: PublicationPullState
     ) -> None:
@@ -891,27 +944,19 @@ class PublicationReconciler:
 
         assert pull.state != "open"
         trusted_head = work.expected_remote_head
+        first_parent_sha = None
         if pull.head_sha != trusted_head:
             try:
-                verified_head = await _resolve(
-                    self._code_host.verify_revision_commit(
-                        work.publication_id,
-                        pull.head_sha,
-                        revision_id=work.revision_id,
-                        expected_parent=work.expected_prior_head,
-                    )
-                )
-                if verified_head != pull.head_sha:
-                    raise PublicationReconcileError(
-                        "revision verification returned a different commit"
-                    )
+                verified = await self._verify_revision(work, pull.head_sha)
             except PublicationReconcileError:
                 if trusted_head is None:
                     raise PublicationReconcileError(
                         "terminal pull request head has no trusted lineage commit"
                     ) from None
             else:
-                trusted_head = verified_head
+                trusted_head = verified.commit_sha
+                if work.expected_remote_head is None:
+                    first_parent_sha = verified.parent_sha
         if trusted_head is None:
             raise PublicationReconcileError(
                 "terminal pull request head has no trusted lineage commit"
@@ -922,6 +967,7 @@ class PublicationReconciler:
             pr_number=pull.number,
             pr_url=_checked_pr_url(pull.url, pull.number),
             head_sha=trusted_head,
+            first_parent_sha=first_parent_sha,
         )
         raise PublicationReconcileError(f"pull request lineage is {pull.state}; start a new thread")
 
@@ -932,6 +978,7 @@ class PublicationReconciler:
         *,
         pushed_head: str,
         names: PublicationResourceNames,
+        verified_commit: PublicationRevisionCommit | None,
         metadata_updated_at: datetime | None = None,
     ) -> None:
         """Publish ``pushed_head`` on ``pull``, or record the pull request terminal.
@@ -949,12 +996,20 @@ class PublicationReconciler:
             raise PublicationReconcileError("the API returned a different stored pull request")
         if pull.state != "open":
             if pull.head_sha == pushed_head:
+                first_parent_sha = None
+                if work.expected_remote_head is None:
+                    if verified_commit is None or verified_commit.commit_sha != pushed_head:
+                        raise PublicationReconcileError(
+                            "terminal pull request head has no verified first parent"
+                        )
+                    first_parent_sha = verified_commit.parent_sha
                 await self._mark_lineage_terminal(
                     work,
                     pull.state,
                     pr_number=pull.number,
                     pr_url=url,
                     head_sha=pushed_head,
+                    first_parent_sha=first_parent_sha,
                 )
                 raise PublicationReconcileError(
                     f"pull request lineage is {pull.state}; start a new thread"
@@ -984,14 +1039,7 @@ class PublicationReconciler:
         before anything is recorded.
         """
 
-        await _resolve(
-            self._code_host.verify_revision_commit(
-                work.publication_id,
-                commit_sha,
-                revision_id=work.revision_id,
-                expected_parent=work.expected_prior_head,
-            )
-        )
+        verified = await self._verify_revision(work, commit_sha)
         if work.pr_number is None:
             pull = await _resolve(
                 self._code_host.recover_pull_request(
@@ -1005,7 +1053,9 @@ class PublicationReconciler:
         else:
             pull = await self._read_stored_pull(work)
             assert pull is not None
-        await self._settle_pull(work, pull, pushed_head=commit_sha, names=names)
+        await self._settle_pull(
+            work, pull, pushed_head=commit_sha, names=names, verified_commit=verified
+        )
 
     async def _finish_observation(
         self,
@@ -1067,6 +1117,7 @@ class PublicationReconciler:
                 pull,
                 pushed_head=work.base_sha,
                 names=names,
+                verified_commit=None,
                 metadata_updated_at=pull.updated_at if pull.state == "open" else None,
             )
         except PublicationIdentityUnavailable as identity_exc:
@@ -1116,7 +1167,11 @@ class PublicationReconciler:
             return
 
         try:
+            branch_context = await _resolve(self._code_host.read_branch_head(work.publication_id))
             observation = await _cluster_call(self._cluster.observe, names.job)
+        except PublicationIdentityUnavailable as identity_exc:
+            await self._identity_unavailable(work, identity_exc)
+            return
         except Exception as exc:  # noqa: BLE001 - broad catch kept at a failure boundary
             await self._bounded_setup_failure(work, exc)
             return
@@ -1135,7 +1190,9 @@ class PublicationReconciler:
                         "existing publication Job names no code host transport"
                     )
                 probe_resources = build_publication_resources(
-                    self._payload(work, observation.transport),
+                    self._payload(
+                        work, observation.transport, base_branch=branch_context.base_branch
+                    ),
                     credential="validation-placeholder",
                     settings=self._job_settings,
                 )
@@ -1196,18 +1253,18 @@ class PublicationReconciler:
             credential = await _resolve(self._credentials.redeem(work.publication_id))
             pull = await self._read_stored_pull(work)
             if pull is None:
-                branch_head = await _resolve(self._code_host.read_branch_head(work.publication_id))
+                recovery_context = await _resolve(
+                    self._code_host.read_branch_head(work.publication_id)
+                )
+                if recovery_context.base_branch != branch_context.base_branch:
+                    raise PublicationReconcileError(
+                        "authoritative publication base branch changed during setup"
+                    )
+                branch_head = recovery_context.head_sha
                 if branch_head is not None:
                     # A lost Job or result: the branch already holds a pushed
                     # revision. Prove it is this one, then settle its pull request.
-                    await _resolve(
-                        self._code_host.verify_revision_commit(
-                            work.publication_id,
-                            branch_head,
-                            revision_id=work.revision_id,
-                            expected_parent=work.expected_prior_head,
-                        )
-                    )
+                    verified = await self._verify_revision(work, branch_head)
                     recovered = await _resolve(
                         self._code_host.recover_pull_request(
                             work.publication_id, expected_head_sha=branch_head
@@ -1217,20 +1274,19 @@ class PublicationReconciler:
                         raise PublicationReconcileError(
                             "verified publication branch has no recoverable pull request"
                         )
-                    await self._settle_pull(work, recovered, pushed_head=branch_head, names=names)
+                    await self._settle_pull(
+                        work,
+                        recovered,
+                        pushed_head=branch_head,
+                        names=names,
+                        verified_commit=verified,
+                    )
                     return
             if pull is not None and pull.state != "open":
                 await self._record_terminal_pull(work, pull)
             if pull is not None and pull.head_sha != work.expected_prior_head:
                 try:
-                    await _resolve(
-                        self._code_host.verify_revision_commit(
-                            work.publication_id,
-                            pull.head_sha,
-                            revision_id=work.revision_id,
-                            expected_parent=work.expected_prior_head,
-                        )
-                    )
+                    await self._verify_revision(work, pull.head_sha)
                 except Exception as exc:  # noqa: BLE001 - broad catch kept at a failure boundary
                     raise PublicationReconcileError(
                         "pull request head no longer matches the stored lineage head"
@@ -1310,7 +1366,7 @@ class PublicationReconciler:
 
         try:
             resources = build_publication_resources(
-                self._payload(work, credential.transport),
+                self._payload(work, credential.transport, base_branch=branch_context.base_branch),
                 credential=credential.authorization_header,
                 settings=self._job_settings,
             )
@@ -1336,6 +1392,7 @@ class PublicationReconciler:
                 observation = await _cluster_call(self._cluster.observe, resources.names.job)
                 in_flight = False
                 if observation.exists:
+                    await _cluster_call(self._cluster.validate_existing, resources)
                     if await self._finish_observation(work, observation, resources.names):
                         return
                     in_flight = observation.phase in {"pending", "running"}
