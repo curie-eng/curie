@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import concurrent.futures
 import dataclasses
 import gzip
 import hashlib
@@ -65,6 +66,7 @@ from _fake_provider import TOKEN_PATH, FakeProvider
 from _migration_support import sql_dicts
 from _refresh_source import (
     ACCESS,
+    PausingRefreshSource,
     ProviderRefreshSource,
     ShortLeaseRefreshSource,
     refresh_material,
@@ -92,6 +94,7 @@ from _resolver_harness import (
     wait_for_backend_blocked_by,
     wait_for_no_resolver_backends,
     wait_for_parked_resolver,
+    wait_for_resolver_in_transaction,
 )
 from _shared_connector_support import (
     BEGIN_SQL,
@@ -1462,6 +1465,192 @@ def test_admission_another_applications_binding_is_invisible(
     assert harness.resolve(harness.handle(own)).json["binding"] == own.binding_id
     other = fleet.launch(theirs)
     assert other.resolve(other.handle(stranger)).json["binding"] == stranger.binding_id
+
+
+# --- transitions into recovery serialize with in-flight admissions -------------
+
+
+def _wait_for_lapsed_lease(member: Member) -> None:
+    deadline = time.monotonic() + LOCK_WAIT_S
+    while not sql_dicts(
+        "SELECT now() > lease_expires_at AS lapsed "
+        "FROM curie.shared_connector_refresh_intents WHERE binding_id = :id",
+        {"id": member.binding_uuid},
+    )[0]["lapsed"]:
+        assert time.monotonic() < deadline, "the one-second lease never lapsed"
+        time.sleep(0.1)
+
+
+def _waits_on_the_resolve(
+    transition: concurrent.futures.Future[Any], waiter_pid: int, resolver_pid: int, name: str
+) -> None:
+    """``transition`` must be a lock waiter blocked by the paused resolve, and stay one."""
+
+    deadline = time.monotonic() + LOCK_WAIT_S
+    while resolver_pid not in blocking_pids(waiter_pid):
+        if transition.done():
+            answer = transition.exception() or transition.result()
+            answer = answer["outcome"] if hasattr(answer, "keys") else answer
+            raise AssertionError(
+                f"{name} completed while a resolve held the binding (answered {answer!r})"
+            )
+        assert time.monotonic() < deadline, f"{name} neither waited on the resolve nor completed"
+        time.sleep(0.05)
+    time.sleep(1.0)
+    assert not transition.done(), f"{name} completed while a resolve held the binding"
+
+
+def _paused_resolve_against(
+    fleet: Fleet,
+    provider: FakeProvider,
+    sessions: SessionPool,
+    *,
+    lapsed: bool,
+    transition: Any,
+    name: str,
+) -> tuple[Member, ResolverHarness, str, Any]:
+    """A resolve paused inside its source while ``transition`` runs on another connection.
+
+    The intent is ``refreshing`` under another owner (begun through the
+    application role) and the material is fresh, so the resolve is admitted and
+    its source runs; the source then holds inside the admission transaction,
+    after the application and binding locks. ``transition(session, began)``
+    submits the transition into ``recovery_required`` on a second
+    application-role connection, which must wait for the resolve's commit.
+    ``lapsed`` begins with a one-second lease and lets it expire before the
+    resolve starts. Answers the member, the harness, the released access token and the
+    transition's result.
+    """
+
+    app, member, harness, source, access = _refreshing(
+        fleet, provider, expires_in=3600, source_type=PausingRefreshSource
+    )
+    assert isinstance(source, PausingRefreshSource)
+    began = sessions.open(app.dsn).fetchrow(
+        BEGIN_SQL, member.grant_id, "crashed-owner", 1 if lapsed else 60
+    )
+    assert began is not None and began["outcome"] == "began"
+    if lapsed:
+        _wait_for_lapsed_lease(member)
+    contender = sessions.open(app.dsn)
+    contender_pid = int(contender.fetchval("SELECT pg_backend_pid()"))
+    handle = harness.handle(member)
+
+    source.arm()
+    pending = in_background(lambda: harness.resolve(handle))
+    try:
+        source.wait_entered(LOCK_WAIT_S)
+        resolver_pid = wait_for_resolver_in_transaction(app.role_name)
+        transitioned = transition(contender, member, began)
+        _waits_on_the_resolve(transitioned, contender_pid, resolver_pid, name)
+    finally:
+        source.open()
+    # The resolve committed before the recovery did, so its release was admitted.
+    assert _released_access(pending.result(timeout=STATEMENT_WAIT_S)) == access
+    return member, harness, access, transitioned.result(timeout=STATEMENT_WAIT_S)
+
+
+def test_admission_a_resolve_in_flight_holds_off_mark_recovery(
+    fleet: Fleet, provider: FakeProvider, sessions: SessionPool
+) -> None:
+    """Marking recovery waits for an in-flight resolve to commit (review F-pkg-r1).
+
+    ADR 0239 "Static sources" 5 and 6: once ``recovery_required`` has
+    committed, no resolve may release the grant's token. A resolve admitted on
+    an intent read before the mark must therefore commit before the mark can,
+    or the credential leaves after recovery began. The mark serializes through
+    the binding row the resolve holds ``FOR SHARE``.
+    """
+
+    member, harness, access, marked = _paused_resolve_against(
+        fleet,
+        provider,
+        sessions,
+        lapsed=False,
+        transition=lambda session, member, began: session.submit(
+            "fetchval", MARK_RECOVERY_SQL, member.grant_id, began["intent_id"], began["epoch"]
+        ),
+        name="mark_recovery",
+    )
+    assert marked == "recovery_required"
+    intent = intent_row(member.binding_id)
+    assert (intent["state"], intent["recovery_reason"]) == (
+        "recovery_required",
+        "uncertain_outcome",
+    )
+    after = harness.resolve(harness.handle(member))
+    after.refused(409, "recovery_required")
+    assert access not in after.text
+
+
+def test_admission_a_resolve_in_flight_holds_off_a_lapsed_lease_turning_into_recovery(
+    fleet: Fleet, provider: FakeProvider, sessions: SessionPool
+) -> None:
+    """The other path into recovery, a begin on an expired lease, waits the same way."""
+
+    member, harness, access, begun = _paused_resolve_against(
+        fleet,
+        provider,
+        sessions,
+        lapsed=True,
+        transition=lambda session, member, began: session.submit(
+            "fetchrow", BEGIN_SQL, member.grant_id, "next-owner", 60
+        ),
+        name="refresh_begin",
+    )
+    assert begun is not None and begun["outcome"] == "recovery_required", begun
+    intent = intent_row(member.binding_id)
+    assert (intent["state"], intent["recovery_reason"]) == ("recovery_required", "lease_expired")
+    after = harness.resolve(harness.handle(member))
+    after.refused(409, "recovery_required")
+    assert access not in after.text
+
+
+def test_admission_begin_and_mark_recovery_do_not_wait_without_a_resolve_in_flight(
+    fleet: Fleet, provider: FakeProvider, sessions: SessionPool
+) -> None:
+    """Liveness for the two cases above: only an in-flight admission holds a transition off.
+
+    A resolve that already committed holds nothing, so after one, a begin on a
+    ``ready`` intent still answers ``began``, and both paths into recovery
+    answer at once. (The mark's sequential refusal is also covered by
+    ``test_seam_recovery_refuses_fresh_material_before_any_source_runs``.)
+    """
+
+    app, marked, harness, source, access = _refreshing(fleet, provider, expires_in=3600)
+    lapsing = app.add_member(
+        plaintext=refresh_material(
+            SLOT, access, expires_at=int(time.time()) + 3600, refresh=secret_sentinel("LAPSING")
+        ),
+        refresh_grant=True,
+    )
+    for member in (marked, lapsing):
+        assert _released_access(harness.resolve(harness.handle(member))) == access
+    role = sessions.open(app.dsn)
+
+    def prompt(method: str, sql: str, *args: Any) -> Any:
+        return role.submit(method, sql, *args).result(timeout=FAST_REPLY_S)
+
+    began = prompt("fetchrow", BEGIN_SQL, marked.grant_id, "owner-one", 60)
+    assert began is not None and began["outcome"] == "began", began
+    assert (
+        prompt("fetchval", MARK_RECOVERY_SQL, marked.grant_id, began["intent_id"], began["epoch"])
+        == "recovery_required"
+    )
+
+    first = prompt("fetchrow", BEGIN_SQL, lapsing.grant_id, "owner-two", 1)
+    assert first is not None and first["outcome"] == "began", first
+    _wait_for_lapsed_lease(lapsing)
+    second = prompt("fetchrow", BEGIN_SQL, lapsing.grant_id, "owner-three", 60)
+    assert second is not None and second["outcome"] == "recovery_required", second
+
+    for member, reason in ((marked, "uncertain_outcome"), (lapsing, "lease_expired")):
+        intent = intent_row(member.binding_id)
+        assert (intent["state"], intent["recovery_reason"]) == ("recovery_required", reason)
+        reply = harness.resolve(harness.handle(member))
+        reply.refused(409, "recovery_required")
+        assert access not in reply.text
+    assert source.release_calls == 2
 
 
 # =============================================================================

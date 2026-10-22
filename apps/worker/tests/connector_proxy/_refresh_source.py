@@ -24,6 +24,7 @@ from typing import ClassVar
 import aiohttp
 from _fake_provider import TOKEN_PATH, FakeProvider
 from _resolver_harness import envelope
+from _shared_connector_support import LOCK_WAIT_S
 from curie_connector_proxy.resolver.admission import Admitted
 from curie_connector_proxy.resolver.keys import KeyRing, KeyUnavailable
 from curie_connector_proxy.resolver.refresh import RefreshCapableSource
@@ -95,3 +96,47 @@ class ShortLeaseRefreshSource(ProviderRefreshSource):
     """Two-second lease, so a crashed refresh's lease expires within a test."""
 
     lease_seconds: ClassVar[int] = 2
+
+
+class PausingRefreshSource(ProviderRefreshSource):
+    """Holds one armed ``release`` at a gate, inside the admission transaction.
+
+    ``release`` runs after admission took the application and binding locks
+    and before COMMIT, so a test can act from another connection while a
+    resolve is in flight. ``release`` is synchronous, so the gate blocks the
+    resolver's event loop; the wait is bounded by ``hold_s`` and a gate that is
+    never opened refuses the resolve (``source_unavailable``) instead of
+    hanging it.
+    """
+
+    hold_s: ClassVar[float] = LOCK_WAIT_S
+
+    def __init__(self, provider: FakeProvider) -> None:
+        super().__init__(provider)
+        self._armed = False
+        self._entered = threading.Event()
+        self._opened = threading.Event()
+
+    def arm(self) -> None:
+        """Hold the next ``release`` until ``open`` (or ``hold_s``)."""
+
+        with self._lock:
+            self._armed = True
+            self._entered.clear()
+            self._opened.clear()
+
+    def wait_entered(self, timeout: float) -> None:
+        if not self._entered.wait(timeout):
+            raise AssertionError("no resolve reached the armed source")
+
+    def open(self) -> None:
+        self._opened.set()
+
+    def release(self, admitted: Admitted, slot: str, keys: KeyRing) -> Release | RefreshNeeded:
+        with self._lock:
+            held, self._armed = self._armed, False
+        if held:
+            self._entered.set()
+            if not self._opened.wait(self.hold_s):
+                raise RuntimeError("the paused source was never opened")
+        return super().release(admitted, slot, keys)

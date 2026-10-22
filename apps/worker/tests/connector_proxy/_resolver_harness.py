@@ -689,6 +689,21 @@ def wait_for_parked_resolver(role: str, timeout: float = LOCK_WAIT_S) -> int:
         time.sleep(0.05)
 
 
+def wait_for_resolver_in_transaction(role: str, timeout: float = LOCK_WAIT_S) -> int:
+    """The pid of the one resolver backend holding an open transaction."""
+
+    deadline = time.monotonic() + timeout
+    while True:
+        backends = resolver_backends(role)
+        held = [row for row in backends if row["state"] == "idle in transaction"]
+        if held:
+            assert len(held) == 1, held
+            return int(held[0]["pid"])
+        if time.monotonic() > deadline:
+            raise AssertionError(f"no resolver backend holds a transaction: {backends}")
+        time.sleep(0.05)
+
+
 def blocking_pids(pid: int) -> set[int]:
     (row,) = sql_dicts("SELECT pg_blocking_pids(:pid) AS blockers", {"pid": pid})
     return {int(blocker) for blocker in row["blockers"]}
