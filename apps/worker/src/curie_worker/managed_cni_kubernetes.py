@@ -32,6 +32,7 @@ _NAME = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 _PROVIDER = re.compile(r"/apis/[a-z0-9.-]+/v[0-9a-z]+/[a-z0-9]+")
 _LISTS = {
     "nodes": "/api/v1/nodes",
+    "namespaces": "/api/v1/namespaces",  # clause 5 (the least-privilege probe list)
     "pods": "/api/v1/pods",  # cluster-wide, clause 5 (case 7 running_node_capability)
     "rolebindings": "/apis/rbac.authorization.k8s.io/v1/rolebindings",
     "clusterrolebindings": "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings",

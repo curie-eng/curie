@@ -355,7 +355,7 @@ async def check_least_privilege(
     """
     try:
         bound = await _bound_atoms(reader, scope)
-    except (MeasuringRbacRefused, KeyError, TypeError, AttributeError):
+    except Exception:  # noqa: BLE001 -- unreadable or unparseable bindings never pass.
         return "measuring_bindings_unavailable"
     shapes = [manifest_atoms(scope, release=False)]
     if release_allowed:
@@ -363,7 +363,10 @@ async def check_least_privilege(
     if bound not in shapes:
         return "measuring_bindings_differ"
     release = release_allowed and bound == shapes[-1]
-    namespaces = await reader.list_items("namespaces")
+    try:
+        namespaces = await reader.list_items("namespaces")
+    except Exception:  # noqa: BLE001 -- an unreadable namespace list is unavailable.
+        namespaces = None
     if namespaces is None:
         return "measuring_review_unavailable"
     try:

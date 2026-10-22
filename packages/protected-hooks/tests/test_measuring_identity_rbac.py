@@ -452,3 +452,19 @@ def test_the_probe_list_covers_clause_5() -> None:
 def test_an_invalid_scope_refuses(changes: dict[str, Any]) -> None:
     with pytest.raises(module().MeasuringRbacRefused):
         scope(**changes)
+
+
+@pytest.mark.parametrize("collection", ["namespaces", "rolebindings"])
+def test_a_reader_that_raises_refuses(collection: str) -> None:
+    reader = Reader(manifest(release=False))
+
+    async def raising(name: str) -> Any:
+        if name == collection:
+            raise RuntimeError("refused by the bounded client")
+        return await Reader.list_items(reader, name)
+
+    reader.list_items = raising  # type: ignore[method-assign]
+    assert check(reader, release_allowed=True) in (
+        "measuring_review_unavailable",
+        "measuring_bindings_unavailable",
+    )

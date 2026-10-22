@@ -794,3 +794,16 @@ def test_the_client_reads_only_the_provider_entrys_paths() -> None:
         asyncio.run(client.read_role("ClusterRole", "kube-system", "reads"))
     with pytest.raises(ProbeKitRefused):
         asyncio.run(client.read_role("Secret", "kube-system", "reads"))
+
+
+def test_the_client_lists_namespaces_for_the_least_privilege_probe_list() -> None:
+    client = ManagedIdentityAPI.__new__(ManagedIdentityAPI)
+    seen: list[str] = []
+
+    async def fake_json(method: str, path: str, value: Any = None) -> dict[str, Any]:
+        seen.append(path)
+        return {"items": [{"metadata": {"name": "default"}}], "metadata": {}}
+
+    client._json = fake_json  # type: ignore[method-assign]
+    assert asyncio.run(client.list_items("namespaces")) == [{"metadata": {"name": "default"}}]
+    assert seen == ["/api/v1/namespaces?limit=500"]
