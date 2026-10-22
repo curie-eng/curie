@@ -866,7 +866,7 @@ async def test_job_from_another_runner_image_is_adopted_through_github(
                             .one()
                         )
                     assert dict(row) == {
-                        "status": "approved",
+                        "status": "launching",
                         "reconcile_attempts": 0,
                         "terminal_at": None,
                         "lease_owner": None,
