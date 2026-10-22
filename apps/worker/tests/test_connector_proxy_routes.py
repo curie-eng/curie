@@ -23,6 +23,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestServer
 from curie_connector_proxy import caller, server
 from curie_worker import caller_token
+from yarl import URL
 
 _ROOT = Path(__file__).resolve().parents[3]
 _TOKENS = json.loads(
@@ -53,11 +54,28 @@ class _Upstream:
 
     def __init__(self) -> None:
         self.seen: list[dict[str, Any]] = []
+        # Bytes each request delivered before it ended, recorded even when the
+        # body was cut off, so a refused upload's reach is observed.
+        self.received: list[int] = []
         self.app = web.Application(client_max_size=1024**3)
+        self.app.router.add_post("/early", self._early)
         self.app.router.add_route("*", "/{tail:.*}", self._echo)
 
+    async def _early(self, request: web.Request) -> web.Response:
+        # Answers without reading the body, as a server refusing it would.
+        del request
+        return web.Response(status=401, body=b"early")
+
     async def _echo(self, request: web.Request) -> web.Response:
-        body = await request.read()
+        count = 0
+        chunks: list[bytes] = []
+        try:
+            async for chunk in request.content.iter_any():
+                count += len(chunk)
+                chunks.append(chunk)
+        finally:
+            self.received.append(count)
+        body = b"".join(chunks)
         self.seen.append(
             {
                 "method": request.method,
@@ -102,8 +120,11 @@ def _run(body: Callable[[], Coroutine[Any, Any, None]]) -> None:
 async def _post(
     proxy: TestServer, path: str, data: object, headers: dict[str, str], method: str = "POST"
 ) -> tuple[int, bytes, Any]:
+    # Sent as written: the client would otherwise merge dot segments and
+    # decode unreserved escapes before the proxy saw them.
+    url = URL(f"http://{proxy.host}:{proxy.port}{path}", encoded=True)
     async with aiohttp.ClientSession() as client:
-        async with client.request(method, proxy.make_url(path), data=data, headers=headers) as a:
+        async with client.request(method, url, data=data, headers=headers) as a:
             return a.status, await a.read(), a.headers
 
 
@@ -200,19 +221,54 @@ def test_a_route_token_reaches_no_other_path(path: str) -> None:
     _run(go)
 
 
-def test_a_route_path_with_an_undeclared_method_is_an_ordinary_path() -> None:
-    # @spec ADR-0240 d3: the route is the method and the path together.
+@pytest.mark.parametrize(
+    "path",
+    ["/v1/review", "/v1//review", "/v1/review/", "/v1/./review", "/V1/Review", "/v1/%72eview"],
+)
+@pytest.mark.parametrize("method", ["POST", "PUT"])
+def test_no_token_reaches_another_spelling_or_method_of_a_route(path: str, method: str) -> None:
+    # @spec ADR-0240 d3: a route's path, however it is spelled, is reachable
+    # only as the declared route, so a lenient server cannot route a cct
+    # request to the route's handler.
+    if path == "/v1/review" and method == "POST":
+        return
+
     async def go() -> None:
         async with _serving() as (upstream, proxy):
-            status, _, _ = await _post(
-                proxy, "/v1/review", b"{}", {caller.HEADER: _route_token()}, method="PUT"
+            for token in (_CALLER_TOKEN, _route_token()):
+                status, answer, _ = await _post(
+                    proxy, path, b"{}", {caller.HEADER: token}, method=method
+                )
+                assert status == server.REFUSAL_STATUS, (path, method, token[:3])
+                assert json.loads(answer) == server.refusal_body(caller.INVALID)
+            assert upstream.seen == []
+
+    _run(go)
+
+
+def test_a_server_that_answers_before_the_body_ends_is_relayed() -> None:
+    # @spec ADR-0240 d3: the limit refuses what the proxy would still send; a
+    # server that answered first (here, refusing) is answered as it said.
+    chunk = b"x" * 65536
+
+    async def chunks() -> AsyncIterator[bytes]:
+        for _ in range(_ROUTE_LIMIT // len(chunk) + 2):
+            yield chunk
+
+    early = server.RouteConfig(
+        path="/early", methods=frozenset({"POST"}), max_body_bytes=_ROUTE_LIMIT
+    )
+
+    async def go() -> None:
+        async with _serving(routes=(early,)) as (upstream, proxy):
+            status, answer, _ = await _post(
+                proxy, "/early", chunks(), {caller.HEADER: _route_token()}
             )
-            assert status == server.REFUSAL_STATUS
-            status, _, _ = await _post(
-                proxy, "/v1/review", b"{}", {caller.HEADER: _CALLER_TOKEN}, method="PUT"
-            )
-            assert status == 201
-            assert [seen["method"] for seen in upstream.seen] == ["PUT"]
+            assert (status, answer) in {
+                (401, b"early"),
+                (server.TOO_LARGE_STATUS, b"the request body is too large\n"),
+            }
+            assert upstream.received == []
 
     _run(go)
 
@@ -253,7 +309,9 @@ def test_a_chunked_body_past_the_route_limit_is_refused() -> None:
             )
             assert status == server.TOO_LARGE_STATUS
             assert answer == b"the request body is too large\n"
-            assert all(len(seen["body"]) <= _ROUTE_LIMIT for seen in upstream.seen)
+            # The cut-off body reached the server, and never past the limit.
+            assert upstream.received and all(0 < n <= _ROUTE_LIMIT for n in upstream.received)
+            assert upstream.seen == []
 
     _run(go)
 
@@ -290,7 +348,8 @@ def test_an_undeclared_chunked_put_past_one_mebibyte_is_refused() -> None:
                 proxy, "/upload", chunks(), {caller.HEADER: _CALLER_TOKEN}, method="PUT"
             )
             assert status == server.REFUSAL_STATUS
-            assert all(len(seen["body"]) <= 1024 * 1024 for seen in upstream.seen)
+            assert upstream.received and all(0 < n <= 1024 * 1024 for n in upstream.received)
+            assert upstream.seen == []
 
     _run(go)
 

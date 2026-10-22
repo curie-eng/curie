@@ -34,6 +34,8 @@ report = {
     "env_names": sorted(os.environ),
     "ld_preload": os.environ.get("LD_PRELOAD", ""),
     "cwd": os.getcwd(),
+    "pid": os.getpid(),
+    "initialize_count": 0,
 }
 
 
@@ -49,6 +51,7 @@ for line in sys.stdin:
     if request_id is None:
         continue
     if method == "initialize":
+        report["initialize_count"] = int(str(report["initialize_count"])) + 1
         send(
             {
                 "jsonrpc": "2.0",

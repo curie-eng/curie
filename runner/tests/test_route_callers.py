@@ -19,6 +19,7 @@ from aci_protocol import BootEnv, Budget
 from claude_agent_sdk._internal.sdk_mcp_bridge import SdkMcpBridge
 from curie_runner import RunnerConfig
 from curie_runner import __main__ as boot
+from curie_runner import route_callers as route_callers_module
 from curie_runner.__main__ import build_runner
 from curie_runner.mcp_tool_capability import McpToolCapabilityProbe
 from curie_runner.plugin import bundle_mcp_servers
@@ -159,31 +160,52 @@ def test_only_declared_callers_are_replaced_by_a_relay(tmp_path: Path) -> None:
     assert servers["plugin:b:notes"] == notes
 
 
-# @spec ADR-0240 d4: an unlocked caller is not mounted at all.
-def test_without_the_lock_library_a_caller_is_not_mounted(tmp_path: Path) -> None:
+# @spec ADR-0240 d4: nothing to protect, so the CLI starts the caller as before.
+@pytest.mark.parametrize("missing", ["lock", "tokens", "scope"])
+def test_a_caller_with_no_routes_this_boot_stays_a_plain_stdio_server(
+    tmp_path: Path, missing: str
+) -> None:
     root = _bundle(tmp_path)
     servers = bundle_mcp_servers(str(root))
+    before = dict(servers["plugin:b:review-tools"])
     mounted = mount_route_callers(
+        servers,
+        callers=route_callers(root, agent="acme-dev"),
+        tokens={} if missing == "tokens" else _TOKENS,
+        connector_urls={} if missing == "scope" else connector_urls(root, **_SCOPE),
+        source_env={},
+        lock_library=None if missing == "lock" else "/opt/libproc_dumpable.so",
+        cwd=None,
+    )
+    assert mounted == frozenset()
+    assert servers["plugin:b:review-tools"] == before
+
+
+def _relay(tmp_path: Path, **env: str) -> CallerRelay:
+    root = _bundle(tmp_path)
+    servers = bundle_mcp_servers(str(root))
+    mount_route_callers(
         servers,
         callers=route_callers(root, agent="acme-dev"),
         tokens=_TOKENS,
         connector_urls=connector_urls(root, **_SCOPE),
-        source_env={},
-        lock_library=None,
-        cwd=None,
+        source_env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), **env},
+        # The real library is Linux only; see the Linux test below.
+        lock_library="/nonexistent/libproc_dumpable.so",
+        cwd=str(root),
     )
-    assert mounted == frozenset()
-    assert "plugin:b:review-tools" not in servers
-    assert "plugin:b:notes" in servers
+    relay = servers["plugin:b:review-tools"]["instance"]
+    assert isinstance(relay, CallerRelay)
+    return relay
 
 
-async def _call(relay: CallerRelay) -> dict[str, Any]:
+async def _call(relay: CallerRelay, request_id: int = 1) -> dict[str, Any]:
     bridge = SdkMcpBridge(relay.name, relay)  # type: ignore[arg-type]
     try:
         initialized = await bridge.handle(
             {
                 "jsonrpc": "2.0",
-                "id": 1,
+                "id": request_id,
                 "method": "initialize",
                 "params": {
                     "protocolVersion": "2025-06-18",
@@ -193,15 +215,19 @@ async def _call(relay: CallerRelay) -> dict[str, Any]:
             }
         )
         assert initialized is not None
+        assert initialized["id"] == request_id
         assert initialized["result"]["serverInfo"]["name"] == "review-tools"
         await bridge.handle({"jsonrpc": "2.0", "method": "notifications/initialized"})
-        listed = await bridge.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+        listed = await bridge.handle(
+            {"jsonrpc": "2.0", "id": request_id + 1, "method": "tools/list"}
+        )
         assert listed is not None
+        assert listed["id"] == request_id + 1
         assert [tool["name"] for tool in listed["result"]["tools"]] == ["inspect"]
         called = await bridge.handle(
             {
                 "jsonrpc": "2.0",
-                "id": 3,
+                "id": request_id + 2,
                 "method": "tools/call",
                 "params": {"name": "inspect", "arguments": {}},
             }
@@ -214,25 +240,21 @@ async def _call(relay: CallerRelay) -> dict[str, Any]:
 
 
 # @spec ADR-0240 d4
-def test_the_relay_hands_the_caller_its_routes_on_a_pipe(tmp_path: Path) -> None:
-    root = _bundle(tmp_path)
-    servers = bundle_mcp_servers(str(root))
-    mount_route_callers(
-        servers,
-        callers=route_callers(root, agent="acme-dev"),
-        tokens=_TOKENS,
-        connector_urls=connector_urls(root, **_SCOPE),
-        source_env={
-            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-            "CURIE_STATE_TOKEN": "sbx.state",
-            ROUTE_TOKENS_ENV: json.dumps(_TOKENS),
-        },
-        # A real library is Linux-only; the child only needs to start here.
-        lock_library="/nonexistent/libproc_dumpable.so",
-        cwd=str(tmp_path),
+def test_the_relay_writes_the_routes_once_the_caller_is_locked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    observed: list[int] = []
+
+    def locked(pid: int) -> bool:
+        observed.append(pid)
+        return True
+
+    monkeypatch.setattr(route_callers_module, "proc_locked", locked)
+    relay = _relay(
+        tmp_path, CURIE_STATE_TOKEN="sbx.state", **{ROUTE_TOKENS_ENV: json.dumps(_TOKENS)}
     )
-    relay = servers["plugin:b:review-tools"]["instance"]
     report = anyio.run(_call, relay)
+    assert observed and set(observed) == {report["pid"]}
     assert report["routes"] == {"reviewer": {"url": _REVIEWER_URL, "token": _TOKENS["reviewer"]}}
     assert ROUTES_FD_ENV in report["env_names"]
     assert ROUTE_TOKENS_ENV not in report["env_names"]
@@ -241,8 +263,35 @@ def test_the_relay_hands_the_caller_its_routes_on_a_pipe(tmp_path: Path) -> None
     assert Path(report["cwd"]).resolve() == tmp_path.resolve()
 
 
-# @spec ADR-0240 d4: each session starts its own caller with a fresh pipe.
-def test_a_second_session_gets_the_routes_again(tmp_path: Path) -> None:
+# @spec ADR-0240 d4: a caller never observed locked never gets the routes.
+def test_a_caller_never_observed_locked_gets_no_routes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(route_callers_module, "proc_locked", lambda _pid: False)
+    monkeypatch.setattr(route_callers_module, "_LOCK_WAIT_S", 0.2)
+    report = anyio.run(_call, _relay(tmp_path))
+    assert report["routes"] == {}
+
+
+# @spec ADR-0240 d4: one caller for the runner's life, started before any
+# turn's Bash, so a later session never respawns it.
+def test_a_later_session_reuses_the_caller_and_its_first_initialize(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(route_callers_module, "proc_locked", lambda _pid: True)
+    relay = _relay(tmp_path)
+    first = anyio.run(_call, relay, 1)
+    second = anyio.run(_call, relay, 1)
+    assert first["pid"] == second["pid"] == relay.pid
+    assert second["initialize_count"] == 1
+    assert second["routes"] == first["routes"] != {}
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="the environ lock is Linux only")
+def test_the_lock_library_makes_the_caller_unreadable_to_its_peers(tmp_path: Path) -> None:
+    # @spec ADR-0240 d4: the real library, the real /proc check, no stand-in.
+    from curie_runner.subprocess_env import proc_dumpable_library
+
     root = _bundle(tmp_path)
     servers = bundle_mcp_servers(str(root))
     mount_route_callers(
@@ -251,17 +300,57 @@ def test_a_second_session_gets_the_routes_again(tmp_path: Path) -> None:
         tokens=_TOKENS,
         connector_urls=connector_urls(root, **_SCOPE),
         source_env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
-        lock_library="/nonexistent/libproc_dumpable.so",
-        cwd=None,
+        lock_library=proc_dumpable_library(os.environ),
+        cwd=str(root),
     )
     relay = servers["plugin:b:review-tools"]["instance"]
-    first = anyio.run(_call, relay)
-    second = anyio.run(_call, relay)
-    assert (
-        first["routes"]
-        == second["routes"]
-        == {"reviewer": {"url": _REVIEWER_URL, "token": _TOKENS["reviewer"]}}
+    report = anyio.run(_call, relay)
+    assert report["routes"] == {"reviewer": {"url": _REVIEWER_URL, "token": _TOKENS["reviewer"]}}
+    with pytest.raises(PermissionError):
+        Path(f"/proc/{report['pid']}/environ").read_bytes()
+
+
+# @spec ADR-0240 d4: a cancelled request is settled and a late answer dropped.
+def test_a_cancelled_request_is_settled_and_its_late_answer_dropped() -> None:
+    from curie_runner.route_callers import CallerLaunch, _Caller, _Session
+
+    caller = _Caller(
+        CallerLaunch(command="x", args=(), env={}, cwd=None, routes_document=b"{}"), None
     )
+    sent: list[dict[str, Any]] = []
+    caller.send = sent.append  # type: ignore[method-assign]
+    session = _Session()
+    caller.attach(session)
+    settled: list[str] = []
+
+    async def hook() -> None:
+        settled.append("settled")
+
+    caller.request(session, {"jsonrpc": "2.0", "id": "a", "method": "tools/call"}, hook)
+    relay_id = sent[-1]["id"]
+    returned = caller.cancel(
+        session,
+        {"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": "a"}},
+    )
+    assert returned is hook
+    assert sent[-1]["params"]["requestId"] == relay_id
+    caller._route({"jsonrpc": "2.0", "id": relay_id, "result": {}})
+    assert session.inbox.empty()
+
+
+# @spec ADR-0240 d4: the CLI's own `${NAME:-default}` form, and an absolute
+# executable resolved at boot.
+def test_a_caller_launch_expands_defaults_and_resolves_its_executable(tmp_path: Path) -> None:
+    launch = caller_launch(
+        {"command": "python3", "args": ["${SCRIPT:-review.py}"], "env": {"MODE": "${MODE:-fast}"}},
+        routes={},
+        source_env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+        lock_library="/opt/lock.so",
+        cwd=None,
+    )
+    assert launch.args == ("review.py",)
+    assert launch.env["MODE"] == "fast"
+    assert Path(launch.command).is_absolute()
 
 
 class _CapturedSession:

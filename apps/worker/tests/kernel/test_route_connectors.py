@@ -95,6 +95,7 @@ def _kernel(reader: _Bundles | None, *, key: str = _SEED) -> SimpleNamespace:
     return SimpleNamespace(
         _bundles=reader,
         _bundle_routes={},
+        _bundle_route_lookups={},
         _config=WorkerConfig(connector_caller_signing_key=key),
     )
 
@@ -136,3 +137,32 @@ def test_an_unreadable_bundle_names_no_connector_and_is_not_cached() -> None:
 
     asyncio.run(go())
     assert kernel._bundle_routes == {}
+
+
+# @spec ADR-0240 d2: a slow store is read once, not once per turn.
+def test_a_timed_out_lookup_is_awaited_again_rather_than_restarted(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    import threading
+
+    release = threading.Event()
+
+    class _Slow(_Bundles):
+        def get(self, key: str) -> bytes:
+            self.reads.append(key)
+            release.wait(5)
+            return _zip({"connectors.yaml": _CONNECTORS})
+
+    reader = _Slow({})
+    kernel = _kernel(reader)
+    monkeypatch.setattr(route_tokens, "_LOOKUP_TIMEOUT_S", 0.05)
+
+    async def go() -> None:
+        assert await route_tokens.route_connectors(kernel, "b1", "acme-dev") == frozenset()
+        assert await route_tokens.route_connectors(kernel, "b1", "acme-dev") == frozenset()
+        release.set()
+        monkeypatch.setattr(route_tokens, "_LOOKUP_TIMEOUT_S", 5.0)
+        assert await route_tokens.route_connectors(kernel, "b1", "acme-dev") == frozenset(
+            {"reviewer"}
+        )
+
+    asyncio.run(go())
+    assert reader.reads == ["b1"]
