@@ -606,11 +606,19 @@ async def _launch(
 async def _await_log(
     run: _Run, namespace: str, name: str, uid: str, needle: str, deadline: float
 ) -> bool:
+    """Wait for ``needle`` in a launched pod's log until ``deadline``.
+
+    The API server refuses the log of a pod whose container is still being created
+    (HTTP 400), so a Pending pod is polled again rather than read.
+    """
     while run.clock() < deadline:
         try:
             pod = await run.cluster.read_pod(namespace, name)
             if pod is None or pod["metadata"]["uid"] != uid:
                 return False
+            if pod.get("status", {}).get("phase") == "Pending":
+                await run.sleep(1.0)
+                continue
             if needle in await run.cluster.pod_log(namespace, name):
                 return True
         except ProbeKitRefused:

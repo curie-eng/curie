@@ -8,9 +8,11 @@ kit digest covers them.
 
 Every template has no Secret volume, no service account token, no host
 namespace, no host path, no privileged container and a read-only root
-filesystem, and it drops every capability. No template here adds ``NET_RAW``:
-the spoofing template belongs to a later slice. The measuring identity chooses
-only the node, the labels the template allows and the probe arguments.
+filesystem, and it drops every capability. Only the spoofing template adds
+``NET_RAW``, and it alone runs as uid 0, because Kubernetes sets no ambient
+capabilities and a non-root process cannot use an added one. The measuring
+identity chooses only the node, the labels the template allows and the probe
+arguments.
 """
 
 from __future__ import annotations
@@ -457,6 +459,12 @@ def probe_pod(
         "runAsGroup": 65534,
         "seccompProfile": {"type": "RuntimeDefault"},
     }
+    if template in NET_RAW_TEMPLATES:
+        # Kubernetes sets no ambient capabilities, so a non-root process loses an
+        # added capability at exec. Only uid 0 keeps NET_RAW effective; it holds no
+        # other capability (bounding set is NET_RAW alone) and cannot escalate.
+        pod_security["runAsNonRoot"] = False
+        pod_security["runAsUser"] = 0
     if program_kind in ("listener", "retained_sender"):
         # A namespaced safe sysctl, so a twin can hold a target's low port, and a
         # retained sender can bind the original low source port, unprivileged.

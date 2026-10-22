@@ -214,6 +214,36 @@ def test_spoofing_is_the_only_template_that_adds_a_capability() -> None:
     assert adders == ["spoofing"]
 
 
+def test_only_the_spoofing_template_runs_as_root_so_net_raw_is_effective() -> None:
+    # Kubernetes puts added capabilities in the bounding and permitted sets but not
+    # the ambient set, so a non-root process loses them at exec and its raw send
+    # fails with PermissionError. The spoofing container therefore runs as uid 0
+    # with every capability but NET_RAW dropped and no privilege escalation; every
+    # other template stays non-root with no capability at all.
+    for template in TEMPLATES:
+        pod = probe_pod(
+            template=template,
+            name="p",
+            namespace="probe-a",
+            node="n",
+            campaign="c1",
+            role_labels={},
+            argument=VALID_ARGUMENT,
+        )
+        identity = pod["spec"]["securityContext"]
+        (container,) = pod["spec"]["containers"]
+        security = container["securityContext"]
+        if template == "spoofing":
+            assert (identity["runAsNonRoot"], identity["runAsUser"]) == (False, 0)
+            assert security["capabilities"] == {"drop": ["ALL"], "add": ["NET_RAW"]}
+        else:
+            assert (identity["runAsNonRoot"], identity["runAsUser"]) == (True, 65534)
+            assert security["capabilities"] == {"drop": ["ALL"]}
+        assert identity["runAsGroup"] == 65534
+        assert (security["privileged"], security["allowPrivilegeEscalation"]) == (False, False)
+        assert security["readOnlyRootFilesystem"] is True
+
+
 def test_kubelet_probe_carries_a_tcp_readiness_probe_to_the_twin() -> None:
     pod = probe_pod(
         template="kubelet_probe",
