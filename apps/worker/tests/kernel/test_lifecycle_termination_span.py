@@ -1,61 +1,49 @@
 """A confirmed runner pod termination is a closed reason on the turn span (#4940).
 
-The ``curie.turn.process`` lifecycle span carries the termination reason as one
-of ``OOMKilled``, ``Evicted``, ``Deleted`` or ``Unknown``, plus the exit code
-when it is a real 0..255 int. Kubelet message text never reaches the span.
+The exported ``curie.turn.process`` lifecycle span carries the termination
+reason as one of ``OOMKilled``, ``Evicted``, ``Deleted`` or ``Unknown``, plus
+the exit code when it is a real 0..255 int. Kubelet message text never reaches
+any exported span. These tests drive the real ``operation_span`` through an SDK
+tracer provider, so they see exactly what is exported.
 """
 
 from __future__ import annotations
 
 import asyncio
 import sys
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
 from aci_protocol import QueuedTurn, TextDelta
-from curie_worker import consumer as consumer_module
-from curie_worker import runner_client as runner_client_module
-from curie_worker import stream_consumer as stream_consumer_module
-from curie_worker import threadlock as threadlock_module
-from curie_worker.kernel import log as kernel_log
-from curie_worker.sandbox import substrate as substrate_module
+from curie_telemetry.tracing import configure_tracer_provider
 from curie_worker.sandbox.types import SandboxTermination
+from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 # importlib import mode does not add the tests directory to sys.path.
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-import otel_fixtures  # noqa: E402
-from otel_fixtures import Probe, SpanCall, install  # noqa: E402
 from queue_fixtures import qevent  # noqa: E402
 
-_REASON_KEY = "curie.sandbox.termination.reason"
-_EXIT_CODE_KEY = "curie.sandbox.termination.exit_code"
 
-
-def _install(monkeypatch: pytest.MonkeyPatch) -> Probe:
-    probe = install(
-        monkeypatch,
-        consumer_module,
-        stream_consumer_module,
-        kernel_log,
-        threadlock_module,
-        runner_client_module,
-        substrate_module,
-    )
-
-    # The shared probe stringifies attribute values; keep the raw value so the
-    # exit code's int type is observable.
-    def set_attribute(self: otel_fixtures.ProbeSpan, name: str, value: Any) -> None:
-        self._call.attributes[name] = value
-
-    monkeypatch.setattr(otel_fixtures.ProbeSpan, "set_attribute", set_attribute)
-    return probe
+@pytest.fixture
+def exporter() -> Iterator[InMemorySpanExporter]:
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    configure_tracer_provider(provider)
+    try:
+        yield exporter
+    finally:
+        configure_tracer_provider(None)
+        provider.shutdown()
 
 
 def _qevent(text: str, **overrides: Any) -> QueuedTurn:
-    overrides.setdefault("thread", "thread-termination-span")
     return qevent(
         text,
         channel="C0EXAMPLE1",
@@ -64,36 +52,33 @@ def _qevent(text: str, **overrides: Any) -> QueuedTurn:
     )
 
 
-def _spans(probe: Probe, name: str) -> list[SpanCall]:
-    return [span for span in probe.spans if span.name == name]
+def _turn_span(exporter: InMemorySpanExporter) -> ReadableSpan:
+    [span] = [s for s in exporter.get_finished_spans() if s.name == "curie.turn.process"]
+    return span
 
 
-async def _drop_stream(
-    h, probe: Probe, termination: SandboxTermination | None, thread: str
-) -> SpanCall:
+async def _drop_stream(h, termination: SandboxTermination | None, thread: str) -> None:
     h.fake_k8s.termination = termination
     h.runner.default_script = [TextDelta(text="partial")]
     h.runner.abort_after_frames = True
     await h.kernel.process_event(_qevent("go", thread=thread))
     assert h.runner.opened == ["go"]
     assert h.fake_k8s.termination_queries
-    [span] = _spans(probe, "curie.turn.process")
-    return span
 
 
 def test_oomkilled_termination_stamps_reason_and_int_exit_code(
-    make_harness, monkeypatch: pytest.MonkeyPatch
+    make_harness, exporter: InMemorySpanExporter
 ) -> None:
     async def go() -> None:
-        probe = _install(monkeypatch)
         async with make_harness(max_attempts=1) as h:
-            span = await _drop_stream(
-                h, probe, SandboxTermination("OOMKilled", "exit code 137", 137), "thread-oom"
+            await _drop_stream(
+                h, SandboxTermination("OOMKilled", "exit code 137", 137), "thread-oom"
             )
 
             assert "sandbox-terminated" in (h.sink.last_text or "")
-            assert span.attributes.get("curie.sandbox.termination.reason") == "OOMKilled"
-            exit_code = span.attributes.get("curie.sandbox.termination.exit_code")
+            attributes = _turn_span(exporter).attributes or {}
+            assert attributes.get("curie.sandbox.termination.reason") == "OOMKilled"
+            exit_code = attributes.get("curie.sandbox.termination.exit_code")
             assert exit_code == 137
             assert type(exit_code) is int
 
@@ -101,64 +86,60 @@ def test_oomkilled_termination_stamps_reason_and_int_exit_code(
 
 
 def test_unlisted_termination_reason_is_exported_as_unknown(
-    make_harness, monkeypatch: pytest.MonkeyPatch
+    make_harness, exporter: InMemorySpanExporter
 ) -> None:
     async def go() -> None:
-        probe = _install(monkeypatch)
         async with make_harness(max_attempts=1) as h:
-            span = await _drop_stream(
-                h, probe, SandboxTermination("NodeLost", "node went away"), "thread-nodelost"
-            )
+            await _drop_stream(h, SandboxTermination("NodeLost", "node went away"), "thread-lost")
 
             assert "sandbox-terminated" in (h.sink.last_text or "")
-            assert span.attributes.get("curie.sandbox.termination.reason") == "Unknown"
-            assert "curie.sandbox.termination.exit_code" not in span.attributes
+            attributes = _turn_span(exporter).attributes or {}
+            assert attributes.get("curie.sandbox.termination.reason") == "Unknown"
+            assert "curie.sandbox.termination.exit_code" not in attributes
 
     asyncio.run(go())
 
 
 def test_evicted_termination_keeps_kubelet_message_off_the_span(
-    make_harness, monkeypatch: pytest.MonkeyPatch
+    make_harness, exporter: InMemorySpanExporter
 ) -> None:
     canary = "CANARY-4940-kubelet-detail-7f3a"
     message = 'Usage of EmptyDir volume "workspace" exceeds the limit "1Gi".'
     detail = f"{message} {canary}"
 
     async def go() -> None:
-        probe = _install(monkeypatch)
         async with make_harness(max_attempts=1) as h:
-            span = await _drop_stream(
-                h, probe, SandboxTermination("Evicted", detail), "thread-evicted"
-            )
+            await _drop_stream(h, SandboxTermination("Evicted", detail), "thread-evicted")
 
-            # The terminal notice still carries the detail; only the span is closed.
+            # The terminal notice still carries the detail; only spans are closed.
             assert canary in (h.sink.last_text or "")
-            assert span.attributes.get("curie.sandbox.termination.reason") == "Evicted"
-            assert "curie.sandbox.termination.exit_code" not in span.attributes
+            attributes = _turn_span(exporter).attributes or {}
+            assert attributes.get("curie.sandbox.termination.reason") == "Evicted"
+            assert "curie.sandbox.termination.exit_code" not in attributes
 
-            for turn_span in _spans(probe, "curie.turn.process"):
-                values = [str(value) for value in turn_span.attributes.values()]
-                for _name, event_attributes in turn_span.events:
-                    values.extend(str(value) for value in event_attributes.values())
+            for span in exporter.get_finished_spans():
+                values = [str(value) for value in (span.attributes or {}).values()]
+                for event in span.events:
+                    values.extend(str(value) for value in (event.attributes or {}).values())
                 for value in values:
-                    assert canary not in value
-                    assert message not in value
-                    assert "EmptyDir" not in value
+                    assert canary not in value, span.name
+                    assert message not in value, span.name
+                    assert "EmptyDir" not in value, span.name
 
     asyncio.run(go())
 
 
 def test_stream_drop_without_pod_termination_sets_neither_key(
-    make_harness, monkeypatch: pytest.MonkeyPatch
+    make_harness, exporter: InMemorySpanExporter
 ) -> None:
     async def go() -> None:
-        probe = _install(monkeypatch)
         async with make_harness(max_attempts=1) as h:
-            span = await _drop_stream(h, probe, None, "thread-plain-drop")
+            await _drop_stream(h, None, "thread-plain-drop")
 
             assert "runner-error" in (h.sink.last_text or "")
             assert "sandbox-terminated" not in (h.sink.last_text or "")
-            assert "curie.sandbox.termination.reason" not in span.attributes
-            assert "curie.sandbox.termination.exit_code" not in span.attributes
+            attributes = _turn_span(exporter).attributes or {}
+            assert "curie.sandbox.termination.reason" not in attributes
+            assert "curie.sandbox.termination.exit_code" not in attributes
 
     asyncio.run(go())
