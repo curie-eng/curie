@@ -138,6 +138,11 @@ fn a_rendered_bundle_includes_its_runner_environment_overlay() {
         Some(&serde_json::json!("16000")),
         "the rendered overlay configures the selected agent's process environment"
     );
+    assert_eq!(
+        values.pointer("/agentSandbox/agentResourceProfiles/dark-factory"),
+        Some(&serde_json::json!("factory")),
+        "the manual recipe runs `curie cluster factory` without --forge-egress, so the overlay selects the factory sandbox profile itself (#4889)"
+    );
     assert!(
         values.pointer("/agentSandbox/runnerImages").is_none(),
         "the output ceiling must also work with the platform runner"

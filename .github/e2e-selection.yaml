@@ -231,6 +231,26 @@ chart_scenarios:
         - packages
         - pyproject.toml
         - uv.lock
+    # #4889: the chart files that generate the factory sandbox envelope are
+    # named even though shared_inputs already covers them, so the scenario
+    # still runs if shared_inputs is ever narrowed.
+    factory-resource-profile:
+      step: Factory resource profile runtime (#4889)
+      leg: workload
+      inputs:
+        - charts/curie/ci/runtime/factory-resource-profile-runtime.sh
+        - charts/curie/values.yaml
+        - charts/curie/values.schema.json
+        - charts/curie/templates/agent-sandbox.yaml
+        - charts/curie/templates/_sandbox_envelope.tpl
+        - charts/curie/templates/_helpers.tpl
+        - apps/api
+        - apps/worker
+        - runner
+        - cli
+        - packages
+        - pyproject.toml
+        - uv.lock
 rules:
   exact:
     compose.dev.yaml: [local]
@@ -280,6 +300,8 @@ rules:
     # The only charts/curie/ci files the released-upgrade jobs run.
     charts/curie/ci/live_manifest_parity.py: [released-upgrade]
     charts/curie/ci/make-upgrade-mutants.py: [released-upgrade]
+    charts/curie/ci/released-upgrade-resource-profile-assertions.sh: [cluster, released-upgrade]
+    charts/curie/ci/fixtures/factory-resource-profile.yaml: [cluster, released-upgrade]
     apps/worker/src/curie_worker/approval_cards.py: [local, local-release, cluster, released-upgrade]
     apps/worker/src/curie_worker/config.py: [local, local-release, cluster, released-upgrade]
     apps/worker/src/curie_worker/consumer_liveness.py: [local, local-release, cluster, released-upgrade]
