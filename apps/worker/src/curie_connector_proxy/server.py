@@ -20,12 +20,14 @@ from __future__ import annotations
 import ipaddress
 import json
 import logging
+import posixpath
 import re
 import time
 from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from typing import Protocol
+from urllib.parse import unquote
 
 from aiohttp import ClientError, ClientSession, ClientTimeout, TCPConnector, web
 from aiohttp.typedefs import Handler
@@ -90,7 +92,8 @@ logger = logging.getLogger("curie_connector_proxy")
 # aiohttp's parse-error log quotes the bytes it refused, which can be a token
 # cut anywhere.
 _TOKEN_TEXT = re.compile(
-    rf"(?:{caller.PREFIX}|{caller.GRANT_PREFIX})\.[A-Za-z0-9_.-]*|[A-Za-z0-9_-]{{32,}}"
+    rf"(?:{caller.PREFIX}|{caller.GRANT_PREFIX}|{caller.ROUTE_PREFIX})\.[A-Za-z0-9_.-]*"
+    r"|[A-Za-z0-9_-]{32,}"
 )
 _REDACTED = "<redacted>"
 
@@ -530,6 +533,27 @@ def _route(request: web.Request) -> RouteConfig | None:
     return None
 
 
+def _spelling(path: str) -> str:
+    """A path as a lenient server might route it: decoded, slashes merged, dot
+    segments resolved, no trailing slash, case folded."""
+
+    decoded = unquote(path)
+    merged = re.sub(r"/+", "/", decoded)
+    resolved = posixpath.normpath(merged) if merged else "/"
+    return resolved.rstrip("/").casefold() or "/"
+
+
+def _shadows_route(request: web.Request) -> bool:
+    """Whether this path is another spelling of a declared route (ADR 0240 d3).
+
+    A ``cct`` is refused on a route, so it is refused on any spelling a server
+    could route to the same handler, too.
+    """
+
+    spelled = _spelling(request.rel_url.raw_path)
+    return any(spelled == _spelling(route.path) for route in request.app[_CONFIG].routes)
+
+
 class _BodyTooLarge(Exception):
     """A streamed body passed its limit while it was being relayed."""
 
@@ -597,7 +621,11 @@ async def _handle(request: web.Request, handler: Handler) -> web.StreamResponse:
     route = _route(request)
     # ADR 0240 decision 3: a declared route admits only a ``ccr``, and every
     # other path only a ``cct``, so neither token reaches the other's paths.
-    decision = _decide_route(request) if route is not None else _decide(request)
+    # Another spelling of a route is neither: it is refused outright.
+    if route is None and _shadows_route(request):
+        decision = caller.Decision(agent=None, refusal=caller.INVALID)
+    else:
+        decision = _decide_route(request) if route is not None else _decide(request)
     refusal = decision.refusal
     grant_reason: str | None = None
     body: bytes | None = None

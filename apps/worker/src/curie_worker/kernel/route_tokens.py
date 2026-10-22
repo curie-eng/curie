@@ -93,14 +93,24 @@ async def route_connectors(self: Kernel, bundle_ref: str | None, agent: str) -> 
         self._config.bundle_max_compression_ratio,
         self._config.bundle_max_members,
     )
-    try:
-        found = await asyncio.wait_for(
-            asyncio.to_thread(read_route_connectors, self._bundles, bundle_ref, agent, limits),
-            timeout=_LOOKUP_TIMEOUT_S,
+    # One lookup per key at a time: a timed-out read keeps running, and the
+    # next turn waits on it instead of starting another extraction.
+    lookup = self._bundle_route_lookups.get(key)
+    if lookup is None:
+        lookup = asyncio.ensure_future(
+            asyncio.to_thread(read_route_connectors, self._bundles, bundle_ref, agent, limits)
         )
+        self._bundle_route_lookups[key] = lookup
+    try:
+        found = await asyncio.wait_for(asyncio.shield(lookup), timeout=_LOOKUP_TIMEOUT_S)
+    except TimeoutError:
+        logger.warning("connector routes unread from the bundle: the lookup timed out")
+        return frozenset()
     except (Exception, yaml.YAMLError) as exc:  # noqa: BLE001 -- no token, not a failed turn
+        self._bundle_route_lookups.pop(key, None)
         logger.warning("connector routes unreadable from the bundle: %s", type(exc).__name__)
         return frozenset()
+    self._bundle_route_lookups.pop(key, None)
     if len(self._bundle_routes) >= _CACHE_MAX:
         self._bundle_routes.clear()
     self._bundle_routes[key] = found

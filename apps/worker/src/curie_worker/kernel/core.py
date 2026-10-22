@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import uuid
 
 from ..actions import ActionRecorder
@@ -185,6 +186,7 @@ class Kernel:
         # ADR 0240: the hosted connectors each (bundle, agent) declares routes
         # on, read from the same stored bundle. Cleared past 4096 entries.
         self._bundle_routes: dict[tuple[str, str], frozenset[str]] = {}
+        self._bundle_route_lookups: dict[tuple[str, str], asyncio.Future[frozenset[str]]] = {}
         # Keyed by request id, never thread key: a steered follow-up shares the
         # thread and must not see or remove this run.
         self._work_item_runs: dict[uuid.UUID, WorkItemRun] = {}

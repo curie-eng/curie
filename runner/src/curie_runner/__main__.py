@@ -1101,8 +1101,12 @@ def build_runner(
             ),
             source_env=os.environ,
             lock_library=route_caller_lock_library(os.environ),
-            cwd=str(mounted_workspace) if mounted_workspace is not None else None,
+            # The bundle root, as the capability probe uses, never a
+            # directory Bash writes.
+            cwd=str(config.session.plugin_dir),
         )
+    # The route tokens are held values too: redact them like the caller token.
+    held_secrets = held_secrets | frozenset(route_tokens.values())
 
     real_options: ClaudeAgentOptions | None = None
     build_real_options: Callable[[str | None], ClaudeAgentOptions] | None = None
