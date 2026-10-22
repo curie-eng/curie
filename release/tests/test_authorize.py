@@ -1295,6 +1295,42 @@ class TestVersionOnlyProof:
         with pytest.raises(authorize_module.AuthorizationError, match="required check-run"):
             self._authorize(git_repo, tagged, own_runs, fetcher)
 
+    def test_a_superseded_failure_does_not_block_the_proof_walk(self, git_repo):
+        # CI passed on a later attempt. CodeQL is still running, so the
+        # commit's own checks are incomplete and the version-only parent
+        # may stand in. The earlier CI failure is not contrary evidence.
+        parent, tagged = self._prep(git_repo)
+        failed = check_run("CI", "failure", OTHER_RUN_ID, "61")
+        failed["completed_at"] = "2026-10-21T19:04:55Z"
+        passed = check_run("CI", "success", "29811600002", "63")
+        passed["completed_at"] = "2026-10-21T19:35:45Z"
+        pending = check_run("CodeQL", None, OTHER_RUN_ID, "62")
+        pending["started_at"] = "2026-10-21T19:40:00Z"
+        fetcher = FakeProofFetcher({parent: green_runs()})
+
+        proof = self._authorize(
+            git_repo, tagged, [GATE_OWN_IN_PROGRESS, failed, passed, pending], fetcher
+        )
+
+        assert proof == parent
+        assert fetcher.calls == [parent]
+
+    def test_a_later_failure_still_blocks_the_proof_walk(self, git_repo):
+        parent, tagged = self._prep(git_repo)
+        passed = check_run("CI", "success", OTHER_RUN_ID, "61")
+        passed["completed_at"] = "2026-10-21T18:00:00Z"
+        failed = check_run("CI", "failure", "29811600002", "63")
+        failed["completed_at"] = "2026-10-21T19:00:00Z"
+        pending = check_run("CodeQL", None, OTHER_RUN_ID, "62")
+        pending["started_at"] = "2026-10-21T19:10:00Z"
+        fetcher = FakeProofFetcher({parent: green_runs()})
+
+        with pytest.raises(authorize_module.AuthorizationError, match="required check-run"):
+            self._authorize(
+                git_repo, tagged, [GATE_OWN_IN_PROGRESS, passed, failed, pending], fetcher
+            )
+        assert fetcher.calls == []
+
     def test_no_tag_means_no_proof_fallback(self, git_repo):
         parent, tagged = self._prep(git_repo)
         fetcher = FakeProofFetcher({parent: green_runs()})

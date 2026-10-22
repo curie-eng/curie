@@ -229,6 +229,26 @@ def commit_is_on_reviewed_branch(
     )
 
 
+def _current_attempts(
+    runs: list[dict[str, object]],
+) -> list[dict[str, object]] | None:
+    """The latest attempts of one name, or None when they cannot be ordered.
+
+    None means at least one payload has no `completed_at` and no
+    `started_at`. Callers then fail closed instead of guessing which
+    attempt is current.
+    """
+    recencies = [_check_run_recency(run) for run in runs]
+    if any(recency is None for recency in recencies):
+        return None
+    latest = max(recencies)
+    return [
+        run
+        for run, recency in zip(runs, recencies, strict=True)
+        if recency == latest
+    ]
+
+
 def _check_run_recency(run: dict[str, object]) -> str | None:
     """When this check-run became the current attempt, if the payload says.
 
@@ -292,19 +312,9 @@ def missing_required_checks(
         if not runs:
             missing.add(name)
             continue
-        recencies = [_check_run_recency(run) for run in runs]
-        if any(recency is None for recency in recencies):
-            conclusions = [run.get("conclusion") for run in runs]
-            if any(conclusion not in PASSING_CONCLUSIONS for conclusion in conclusions):
-                missing.add(name)
-            continue
-        latest = max(recencies)
-        current = [
-            run
-            for run, recency in zip(runs, recencies, strict=True)
-            if recency == latest
-        ]
-        if any(run.get("conclusion") not in PASSING_CONCLUSIONS for run in current):
+        current = _current_attempts(runs)
+        considered = runs if current is None else current
+        if any(run.get("conclusion") not in PASSING_CONCLUSIONS for run in considered):
             missing.add(name)
     return missing
 
@@ -357,17 +367,34 @@ def _git_output(args: Sequence[str], *, cwd: Path | None, purpose: str) -> str:
 def _has_contrary_required_evidence(
     check_runs: list[dict[str, object]], required_names: frozenset[str]
 ) -> bool:
-    """Did any required check-run on the commit itself conclude non-passing?
+    """Did the current attempt of a required name conclude non-passing?
 
+    Uses the same attempt selection as `missing_required_checks`. An earlier
+    failure, cancellation, or skip is not contrary once a later attempt of
+    that name passed, so a version-only proof walk can still borrow an
+    ancestor when some other required name is absent or still running. A
+    later non-passing attempt is contrary and blocks that walk (issue #811).
     A null conclusion (still running) is not evidence either way. `skipped`
-    counts as contrary, matching `missing_required_checks` (issue #1470).
+    counts as contrary when it is current, or when the attempts cannot be
+    ordered (issue #1470).
     """
-    return any(
-        run.get("name") in required_names
-        and run.get("conclusion") is not None
-        and run.get("conclusion") not in PASSING_CONCLUSIONS
-        for run in check_runs
-    )
+    grouped: dict[str, list[dict[str, object]]] = {name: [] for name in required_names}
+    for run in check_runs:
+        name = run.get("name")
+        if isinstance(name, str) and name in grouped:
+            grouped[name].append(run)
+    for runs in grouped.values():
+        if not runs:
+            continue
+        current = _current_attempts(runs)
+        considered = runs if current is None else current
+        if any(
+            run.get("conclusion") is not None
+            and run.get("conclusion") not in PASSING_CONCLUSIONS
+            for run in considered
+        ):
+            return True
+    return False
 
 
 def find_version_only_proof(
