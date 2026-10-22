@@ -1482,3 +1482,22 @@ def test_a_measuring_identity_check_is_required(check: Any) -> None:
     h.measuring = check
     with pytest.raises(module().VerifierRefused):
         h.verifier()
+
+
+def test_a_right_or_release_binding_after_publication_is_reported(monkeypatch) -> None:
+    Connections(monkeypatch)
+    h = Harness()
+
+    async def scenario() -> Any:
+        verifier = h.verifier()
+        verdict = await verifier.decide()
+        await verifier.publish(verdict, h.acceptance(verdict))
+        unchanged = await verifier.confirm_unchanged()
+        # A release probe binding granted again after Readiness issuance.
+        h.rbac.roles = measuring_manifest(release=True)
+        rebound = await verifier.confirm_unchanged()
+        h.rbac.roles = measuring_manifest(release=False)
+        h.rbac.group_grants.add(("", "", "nodes/proxy", "get"))
+        return unchanged, rebound, await verifier.confirm_unchanged()
+
+    assert run(scenario()) == (None, "measuring-identity", "measuring-identity")

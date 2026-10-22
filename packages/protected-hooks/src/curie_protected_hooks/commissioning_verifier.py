@@ -762,7 +762,8 @@ class CommissioningVerifier:
         the refusal reason.
         """
         _require(self._published)
-        return await self._current()
+        # After Readiness issuance the release probe binding stays revoked (clause 8).
+        return await self._current(release_allowed=False)
 
     async def _publish(self) -> Publication:
         """The accepted branch: observe the tuple again, connect both writers, then write."""
