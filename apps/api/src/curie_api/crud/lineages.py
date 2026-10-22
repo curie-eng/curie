@@ -13,6 +13,7 @@ from sqlalchemy.sql.elements import ColumnElement
 from curie_api.schemas.publications import PublicationLineageAdvance, ReviewRevisionReserve
 
 from ..config import get_settings
+from ..forges.errors import Unavailable
 from ..forges.types import GITHUB
 from ..models import (
     AgentChannel,
@@ -25,7 +26,7 @@ from ..models import (
     WorkItem,
 )
 from ..publication_authority import CodeHostPublicationIdentity, PublicationIdentity
-from ..publication_verification import VerifiedPublicationCommit
+from ..publication_verification import VerifiedPublicationCommit, stored_publication_base_ref
 from ..repository_access import thread_repository
 from ..threadkeys import route_thread_key_matches, thread_key_forms
 from ..workspace_policy import repository_allowed
@@ -473,15 +474,19 @@ async def advance_publication_lineage(
             "publication.lineage_absent",
             "publication has no thread pull request lineage",
         )
+    execution_request: ExecutionRequest | None = None
     work_item: WorkItem | None = None
     if publication.execution_request_id is not None:
-        work_item = await session.scalar(
-            select(WorkItem)
+        result = await session.execute(
+            select(WorkItem, ExecutionRequest)
             .join(ExecutionRequest, ExecutionRequest.work_item_id == WorkItem.id)
             .where(ExecutionRequest.id == publication.execution_request_id)
-            .with_for_update(of=WorkItem)
+            .with_for_update(of=(WorkItem, ExecutionRequest))
             .execution_options(populate_existing=True)
         )
+        row = result.one_or_none()
+        if row is not None:
+            work_item, execution_request = row
     lineage = await session.scalar(
         select(ThreadPublicationLineage)
         .where(ThreadPublicationLineage.id == publication.lineage_id)
@@ -533,17 +538,26 @@ async def advance_publication_lineage(
             raise PublicationLineageConflict(
                 "publication.lineage_stale", "verified publication commit proof is stale"
             )
-        base_branch = lineage.base_ref
-        if base_branch is None and publication.execution_request_id is not None:
-            base_branch = work_item.base_branch if work_item is not None else None
-            if base_branch is None:
-                raise PublicationLineageConflict(
-                    "publication.lineage_stale", "the admitted publication base is absent"
-                )
+        try:
+            base_branch = stored_publication_base_ref(
+                publication, lineage, execution_request, work_item
+            )
+        except Unavailable:
+            raise PublicationLineageConflict(
+                "publication.lineage_stale", "the persisted publication base is unproved"
+            ) from None
         if base_branch is not None and base_branch != proof.base_branch:
             raise PublicationLineageConflict(
                 "publication.lineage_stale", "the authoritative publication base branch changed"
             )
+        if lineage.base_ref is None and work_item is not None and identity is not None:
+            verified = identity.lineage_values()
+            if any(
+                getattr(work_item, column) != verified[column] for column in _IDENTITY_COLUMNS[:4]
+            ):
+                raise PublicationLineageConflict(
+                    "publication.lineage_stale", "the publication repository identity changed"
+                )
         if first_publication:
             if (
                 lineage.base_sha != publication.base_sha

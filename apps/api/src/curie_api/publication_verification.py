@@ -16,7 +16,7 @@ from .forges.errors import ForgeError, NotFound, Unauthorized, Unavailable
 from .forges.hosts import resolve_stored
 from .forges.ports import CodeHost
 from .forges.types import Commit, RepositoryRef
-from .models import ExecutionRequest, Publication, WorkItem
+from .models import ExecutionRequest, Publication, ThreadPublicationLineage, WorkItem
 from .publication_pulls import PullRequestRefused, revision_refusal
 
 _COMMIT_SHA = re.compile(r"[0-9a-f]{40,64}")
@@ -77,25 +77,88 @@ def _valid_base_ref(branch: str | None) -> bool:
     )
 
 
+def stored_publication_base_ref(
+    publication: Publication,
+    lineage: ThreadPublicationLineage | None,
+    execution_request: ExecutionRequest | None,
+    work_item: WorkItem | None,
+) -> str | None:
+    """Classify persisted authority; None requires server-side repository resolution."""
+
+    if lineage is not None and lineage.base_ref is not None:
+        if not _valid_base_ref(lineage.base_ref):
+            raise Unavailable("publication_base_branch_unproved")
+        return lineage.base_ref
+    if publication.execution_request_id is None:
+        return None
+    if (
+        execution_request is None
+        or work_item is None
+        or execution_request.id != publication.execution_request_id
+        or execution_request.work_item_id != work_item.id
+        or lineage is None
+        or lineage.id != publication.lineage_id
+        or work_item.agent_id != lineage.agent_id
+        or work_item.conversation_id != lineage.conversation_id
+        or work_item.repository_path.casefold() != publication.repo_full_name.casefold()
+        or work_item.repository_path.casefold() != lineage.repo_full_name.casefold()
+        or work_item.publication_lineage_id not in (None, lineage.id)
+        or (
+            lineage.repository_project_id is not None
+            and (
+                work_item.repository != lineage.repository
+                or work_item.code_host_installation_id != lineage.code_host_installation_id
+            )
+        )
+    ):
+        raise Unavailable("publication_base_branch_unproved")
+    if (
+        work_item.trigger_label is None
+        and work_item.base_branch is None
+        and work_item.base_source is None
+        and work_item.base_commit is None
+    ):
+        return None
+    if (
+        not _valid_base_ref(work_item.base_branch)
+        or work_item.base_source not in ("label", "default")
+        or not isinstance(work_item.base_commit, str)
+        or _COMMIT_SHA.fullmatch(work_item.base_commit) is None
+    ):
+        raise Unavailable("publication_base_branch_unproved")
+    return work_item.base_branch
+
+
 async def publication_base_ref(
     session: AsyncSession,
     code_host: CodeHost,
     publication: Publication,
     repository: RepositoryRef,
 ) -> str:
-    """Resolve the verified lineage base, admitted base, or ordinary repository default."""
+    """Resolve the verified lineage base, recorded base, or authoritative repository default."""
 
     lineage = publication.lineage
-    branch: str | None
-    if lineage is not None and lineage.base_ref is not None:
-        branch = lineage.base_ref
-    elif publication.execution_request_id is not None:
-        branch = await session.scalar(
-            select(WorkItem.base_branch)
-            .join(ExecutionRequest, ExecutionRequest.work_item_id == WorkItem.id)
+    execution_request: ExecutionRequest | None = None
+    work_item: WorkItem | None = None
+    if (
+        lineage is None or lineage.base_ref is None
+    ) and publication.execution_request_id is not None:
+        result = await session.execute(
+            select(ExecutionRequest, WorkItem)
+            .join(WorkItem, ExecutionRequest.work_item_id == WorkItem.id)
             .where(ExecutionRequest.id == publication.execution_request_id)
+            .execution_options(populate_existing=True)
         )
-    else:
+        row = result.one_or_none()
+        if row is not None:
+            execution_request, work_item = row
+            if (
+                work_item.repository != repository
+                or work_item.repository_path.casefold() != repository.path.casefold()
+            ):
+                raise Unavailable("publication_base_branch_unproved")
+    branch = stored_publication_base_ref(publication, lineage, execution_request, work_item)
+    if branch is None:
         branch = (await resolve_stored(code_host, repository)).default_branch
     if not _valid_base_ref(branch):
         raise Unavailable("publication_base_branch_unproved")
