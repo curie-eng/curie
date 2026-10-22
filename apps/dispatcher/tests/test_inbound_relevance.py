@@ -447,6 +447,8 @@ class Row:
     caller_list: tuple[str, tuple[str, ...]] | None = None
     #: ADR 0175: the fake platform API answers every admission question 503.
     api_down: bool = False
+    #: #4960: channels whose mentions are delivery canaries for this row.
+    canary_channels: tuple[str, ...] = ()
 
 
 MATRIX: tuple[Row, ...] = (
@@ -1005,6 +1007,18 @@ MATRIX: tuple[Row, ...] = (
         api_down=True,
         dedupe_id="Ev-api-down",
     ),
+    Row(
+        name="mention_in_a_delivery_canary_channel",
+        expected=DropReason.DELIVERY_CANARY,
+        why=(
+            "#4960: C123 is listed as a delivery canary, so the mention only proves "
+            "Slack still delivers to this identity. It is counted and refused before "
+            "relevance, admission and the dedupe claim; no placeholder, no turn."
+        ),
+        request=_events_api_request("env-canary", "Ev-canary", _mention(text="<@U0BOT> canary")),
+        canary_channels=("C123",),
+        dedupe_id="Ev-canary",
+    ),
 )
 
 
@@ -1043,6 +1057,10 @@ def test_every_inbound_payload_is_enqueued_or_refused_with_a_named_reason(
         address, callers = row.caller_list
         admission_api.lists[(address, "default")] = set(callers)
     admission_api.down = row.api_down
+    if row.canary_channels:
+        config = config.model_copy(
+            update={"slack_delivery_canary_channels": row.canary_channels}
+        )
 
     before = len(_stream_entries(redis_client, config))
     harness = _build_harness(config, redis_client)
