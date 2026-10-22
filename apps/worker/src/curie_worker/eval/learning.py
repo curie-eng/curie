@@ -2745,6 +2745,11 @@ class _Stack:
             # One attempt per ordinary turn: a reservation covers one session, and
             # the kernel would otherwise retry a failed turn up to three times.
             "CURIE_MAX_ATTEMPTS": "1",
+            # A contended Docker engine can take longer than the 90 s default to
+            # start a runner, which fails the turn before the model is called.
+            # The claim deadline must stay below the per-thread lock TTL.
+            "CURIE_CLAIM_TIMEOUT_SECONDS": "240",
+            "LOCK_TTL_MS": "360000",
         }
         lines += ["  curie-worker:", "    environment:"]
         lines += [f"      {key}: {json.dumps(value)}" for key, value in worker.items()]

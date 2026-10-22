@@ -2789,3 +2789,31 @@ def test_cleanup_validator_fails_closed_on_recorded_incomplete_discovery(
     elif damage == "no-problems":
         cleanup.pop("problems")
     _check(tmp_path, report, verify_cleanup, passed=damage == "none")
+
+
+def test_private_worker_claim_deadline_stays_below_its_lock_ttl(tmp_path: Path) -> None:
+    from curie_worker.eval import learning
+
+    stack = learning._Stack(
+        project="curie-learning-abc-r1a1",
+        tag="learning-abc",
+        override=tmp_path / "override.yaml",
+        ports={
+            "postgres": {5432: 41001},
+            "valkey": {6379: 41002},
+            "rustfs": {9000: 41003},
+            "otel-collector": {4318: 41004},
+            "curie-api": {8000: 41005},
+        },
+        stub_port=41006,
+        stub_host="127.0.0.1",
+    )
+    stack.write_override()
+    text = stack.override.read_text(encoding="utf-8")
+    worker = text.split("  curie-worker:", 1)[1].split("\nnetworks:", 1)[0]
+    claim = re.search(r'CURIE_CLAIM_TIMEOUT_SECONDS: "(\d+)"', worker)
+    lock = re.search(r'LOCK_TTL_MS: "(\d+)"', worker)
+    assert claim is not None and lock is not None
+    assert int(claim.group(1)) > 90
+    assert int(claim.group(1)) * 1000 < int(lock.group(1))
+    assert 'CURIE_MAX_ATTEMPTS: "1"' in worker
