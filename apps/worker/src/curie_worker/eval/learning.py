@@ -2810,6 +2810,8 @@ class _Ownership:
     tags: set[str] = field(default_factory=set)
     unrelated: dict[str, list[str]] = field(default_factory=dict)
     removals: list[dict[str, str]] = field(default_factory=list)
+    # Discovery that failed partway: cleanup cannot be verified over what it missed.
+    incomplete: list[str] = field(default_factory=list)
 
     def remove(self, kind: str, identity: str, *args: str) -> None:
         """Every removal the harness issues targets one recorded owned identity."""
@@ -3725,7 +3727,9 @@ class _Campaign:
         try:
             self.ownership.observe(self.stack)
         except (_Invalid, OSError, subprocess.SubprocessError) as exc:
-            self.failures.append(f"ownership not observed after local down: {exc}")
+            missed = f"ownership not observed after local down: {exc}"
+            self.ownership.incomplete.append(missed)
+            self.failures.append(missed)
         if self.ledger is not None:
             self.close_fires("stack torn down before the fire was observed")
         self.stack = None
@@ -5396,6 +5400,7 @@ class _Campaign:
             except (_Stop, _Invalid, OSError, subprocess.SubprocessError) as exc:
                 problems.append(f"local down: {self.scrub(str(exc))}")
         self.close_window()
+        problems += self.ownership.incomplete
         try:
             problems += self.ownership.remove_leftovers()
         except _Invalid as exc:

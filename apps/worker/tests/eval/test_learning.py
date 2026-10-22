@@ -2745,3 +2745,20 @@ def test_teardown_finalizes_when_the_post_down_observation_fails(
     assert closed == ["stack torn down before the fire was observed"]
     assert campaign.stack is None
     assert any("after local down" in failure for failure in campaign.failures)
+    # Partial discovery must also keep cleanup from being declared verified.
+    assert campaign.ownership.incomplete
+    monkeypatch.setattr(campaign, "close_window", lambda: None)
+    monkeypatch.setattr(campaign.ownership, "remove_leftovers", lambda: [])
+    monkeypatch.setattr(learning, "_check_cleanup_live", lambda _report: None)
+    campaign.o = learning._Options(
+        curie_bin=tmp_path / "curie",
+        repetitions=1,
+        budget=Decimal("1"),
+        output_dir=tmp_path,
+        thresholds={},
+        dry_run=False,
+        json=False,
+    )
+    cleanup = campaign.teardown()
+    assert cleanup["verified"] is False
+    assert any("after local down" in problem for problem in cleanup["problems"])
