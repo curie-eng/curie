@@ -234,6 +234,13 @@ WORKER_LOCAL_DISPLAY_CLASSIFICATIONS = frozenset(
 
 _ESCALATION_DETAIL_MAX = 300
 
+# After a ClientError stream drop, re-read pod termination until kubelet posts
+# it. A non-positive window is one read, which the kernel harness uses so
+# unrelated stream-drop tests do not wait.
+POD_TERMINATION_WAIT_S = 10.0
+POD_TERMINATION_INTERVAL_S = 0.5
+POD_TERMINATION_READ_TIMEOUT_S = 3.0
+
 # The factory terminus cause for a classified escalation (#3073). Each cause has
 # its own operator sentence on the issue; anything unnamed stays the generic
 # ``runner_escalated``.
