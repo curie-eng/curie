@@ -109,7 +109,7 @@ than an open bag of `gen_ai.*` names.
   (`packages/telemetry/src/curie_telemetry/metrics.py::record_metric`) rejects undeclared
   instruments, attribute keys, and enum values. Its allowlisted dimensions describe
   operation classes and outcomes, not event, run, session, sandbox, user, or
-  deployment identifiers. Two bounded identifier dimensions are declared:
+  deployment identifiers. Three bounded identifier dimensions are declared:
   `curie.agent.turn.completed`, whose
   `agent` label admits at most 32 distinct slugs per process and folds the rest,
   plus any name that is not a 1 to 63 character slug, into `other`
@@ -122,6 +122,12 @@ than an open bag of `gen_ai.*` names.
   agent identifier. `curie.action_executor.execution` admits at most 16 distinct connector
   slugs per process through its `connector` dimension, folding invalid names and
   overflow into `other` (`packages/telemetry/src/curie_telemetry/metrics.py`).
+  `curie.slack.socket.envelopes` and `curie.slack.delivery_canary` admit at most
+  16 distinct Slack identity names per process through their `slack_identity`
+  dimension, folding names that are not an identity slug, and overflow, into
+  `other`. An install declares a handful of identities, and a silent identity
+  can only be found by name. `curie.slack.socket.identities` keeps no identity
+  dimension.
   The application-defined series space remains bounded.
   Standard resource identity still contributes one anonymous `service.instance.id` per
   running process. It is independent of turn input and adds at most one resource series
