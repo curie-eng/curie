@@ -1154,6 +1154,15 @@ def test_manual_admission_without_base_persists_parent_then_revises_same_pr_and_
     )
     resolved = _resolve(client, auth_headers, metadata["approval_id"])
     assert resolved.status_code == 200, resolved.text
+    before_metadata = _lineage_row(publication["lineage_id"])
+    assert _identity_columns(before_metadata) == identity
+    assert (
+        before_metadata["base_sha"],
+        before_metadata["head_sha"],
+        before_metadata["pr_number"],
+        before_metadata["pr_url"],
+    ) == (parent, SECOND_REVISION_SHA, PR_NUMBER, PR_URL)
+    assert (before_metadata["latest_revision"], before_metadata["version"]) == (3, 3)
     observed_body = truth["body"]
     truth["body"] = "An edit after approval"
     metadata_url = f"/v1/internal/publications/{metadata['id']}/pull-request/metadata"
@@ -1161,6 +1170,7 @@ def test_manual_admission_without_base_persists_parent_then_revises_same_pr_and_
     assert refused.status_code == 409, refused.text
     assert refused.json()["detail"]["code"] == "publication.metadata_changed"
     assert truth["updated"] == []
+    assert _lineage_row(publication["lineage_id"]) == before_metadata
     truth["body"] = observed_body
     updated = client.post(metadata_url, headers=WORKER_HEADERS)
     assert updated.status_code == 200, updated.text
@@ -1171,7 +1181,7 @@ def test_manual_admission_without_base_persists_parent_then_revises_same_pr_and_
     assert updated.json()["updated_at"] is not None
     assert truth["updated"] == [{"title": "Reviewed manual title", "body": "Reviewed manual body"}]
     assert truth["opened"] == []
-    assert _lineage_row(publication["lineage_id"]) == row
+    assert _lineage_row(publication["lineage_id"]) == before_metadata
 
 
 @pytest.mark.parametrize("defect", ["off-branch", "unrelated", "rewound", "marker", "merge"])
