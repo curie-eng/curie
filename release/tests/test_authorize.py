@@ -1754,19 +1754,19 @@ class TestHelmCiWorkflowTriggers:
 
 
 class TestMixedPassFailRequiredCheck:
-    """A required name with any non-passing run is not satisfied (issue #811).
+    """The current attempt of a required name is what authorizes (issue #811).
 
-    The set logic only tracks names that have at least one *passing* run, so a
-    required check that ran twice -- once green, once red (a re-run that failed)
-    -- has its name in the passing set and is silently treated as satisfied.
-    For a fail-closed release gate that masks a genuinely failing required
-    check. These use the `required_names` override so they exercise the logic
-    independent of the production constant.
+    GitHub keeps every attempt. A later failure after a success is still a
+    failing required check and must block. An earlier failure or cancellation
+    that a later success superseded is history, not the current conclusion.
+    Runs with no timestamps cannot be ordered and still fail closed. These
+    use the `required_names` override so they exercise the logic independent
+    of the production constant.
     """
 
     MIXED_CI = [
         {"name": "CI", "conclusion": "success"},
-        {"name": "CI", "conclusion": "failure"},  # a re-run that failed
+        {"name": "CI", "conclusion": "failure"},  # unordered, so fail closed
         {"name": "CodeQL", "conclusion": "success"},
     ]
 
@@ -1812,6 +1812,79 @@ class TestMixedPassFailRequiredCheck:
                 cwd=git_repo,
                 required_names=TEST_REQUIRED_NAMES,
             )
+
+    def test_a_later_failure_still_blocks_after_an_earlier_success(self):
+        runs = [
+            {
+                "name": "CI",
+                "conclusion": "success",
+                "completed_at": "2026-10-21T18:00:00Z",
+            },
+            {
+                "name": "CI",
+                "conclusion": "failure",
+                "completed_at": "2026-10-21T19:00:00Z",
+            },
+            {
+                "name": "CodeQL",
+                "conclusion": "success",
+                "completed_at": "2026-10-21T19:00:00Z",
+            },
+        ]
+
+        assert authorize_module.missing_required_checks(runs, TEST_REQUIRED_NAMES) == {
+            "CI"
+        }
+
+    def test_an_earlier_failure_does_not_block_a_later_success(self, git_repo):
+        # The v0.14.0 chart index publish hit this: a cancelled or failed
+        # attempt of each required name stayed on the commit after a later
+        # attempt of the same name succeeded.
+        sha = run_git(git_repo, "rev-parse", "HEAD")
+        runs = [
+            {
+                "name": "CI",
+                "conclusion": "failure",
+                "completed_at": "2026-10-21T19:04:55Z",
+            },
+            {
+                "name": "CI",
+                "conclusion": "cancelled",
+                "completed_at": "2026-10-21T19:04:22Z",
+            },
+            {
+                "name": "CI",
+                "conclusion": "success",
+                "completed_at": "2026-10-21T19:35:45Z",
+            },
+            {
+                "name": "CodeQL",
+                "conclusion": "success",
+                "completed_at": "2026-10-21T19:16:27Z",
+            },
+        ]
+
+        assert authorize_module.missing_required_checks(runs, TEST_REQUIRED_NAMES) == set()
+        authorize_module.authorize(
+            sha, runs, ("main",), cwd=git_repo, required_names=TEST_REQUIRED_NAMES
+        )
+
+    def test_a_later_in_progress_attempt_blocks_an_earlier_success(self):
+        runs = [
+            {
+                "name": "CI",
+                "conclusion": "success",
+                "completed_at": "2026-10-21T19:00:00Z",
+            },
+            {
+                "name": "CI",
+                "conclusion": None,
+                "started_at": "2026-10-21T19:10:00Z",
+            },
+            {"name": "CodeQL", "conclusion": "success", "completed_at": "2026-10-21T19:00:00Z"},
+        ]
+
+        assert "CI" in authorize_module.missing_required_checks(runs, TEST_REQUIRED_NAMES)
 
 
 class TestSkippedRequiredCheck:
@@ -1874,8 +1947,8 @@ class TestSkippedRequiredCheck:
     def test_a_required_name_with_both_a_success_and_a_skipped_run_is_refused(
         self, git_repo
     ):
-        # Fail-closed, consistent with the mixed pass/fail behavior above: one
-        # green run does not excuse a same-named run that never executed.
+        # Unordered runs fail closed: one green run does not excuse a
+        # same-named run that never executed when the payload has no times.
         sha = run_git(git_repo, "rev-parse", "HEAD")
         runs = [
             {"name": "CI", "conclusion": "success"},

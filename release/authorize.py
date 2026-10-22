@@ -229,30 +229,50 @@ def commit_is_on_reviewed_branch(
     )
 
 
+def _check_run_recency(run: dict[str, object]) -> str | None:
+    """When this check-run became the current attempt, if the payload says.
+
+    A finished run is ordered by `completed_at`. A run that has not finished
+    is ordered by `started_at`, so a later attempt that is still going blocks
+    an earlier success, and an earlier unfinished run does not outrank a
+    later finished one. Payloads with neither field cannot be ordered.
+    """
+    completed = run.get("completed_at")
+    if isinstance(completed, str) and completed:
+        return completed
+    started = run.get("started_at")
+    if isinstance(started, str) and started:
+        return started
+    return None
+
+
 def missing_required_checks(
     check_runs: list[dict[str, object]],
     required_names: frozenset[str] | None = None,
 ) -> set[str]:
-    """Which `required_names` have no passing check-run for this commit?
+    """Which `required_names` are not satisfied by their current check-run?
 
-    A name only counts as satisfied if some check-run with that exact `name`
-    concluded `success`/`neutral` AND no check-run with that name is
-    still running, failed, skipped, or otherwise non-passing. `skipped` is not
-    a pass for a required name (issue #1470): GitHub records that conclusion
-    both when a job-level `if:` excludes the job and when a job in its
-    `needs:` failed, so treating it as passing authorized releases whose chart
-    was never rendered, linted, or kubeconform-validated, and whose ladder
-    jobs never ran because their upstream build failed. A required name with two
-    check-runs -- one success and one failure (a re-run with mixed states) --
-    is left in the returned set: for a fail-closed release gate any non-passing
-    run of a required name masks nothing and blocks the tag. A same-named entry
-    that is still running, failed, or never ran at all thus leaves its name in
-    the returned set. Names outside `required_names` are ignored entirely -- an
-    unrelated check-run, passing or not, has no bearing on this gate (issue
-    #733): the point is asserting the checks that matter actually ran and
-    passed, not that everything present happened to be green. That still holds
-    for a `skipped` NON-required check-run, which is ignored like any other
-    non-required entry; only a skipped *required* name blocks.
+    The current check-run for a name is the latest one that payload can
+    order, by `completed_at` or else `started_at`. That run must have
+    concluded `success` or `neutral`. An earlier failure, cancellation, or
+    skip does not block once a later run of the same name passed: GitHub
+    keeps every attempt, and a release push re-runs CI on the same commit.
+    The latest attempt is what "current and green" means. A later failure
+    after an earlier success still blocks (issue #811). `skipped` is not a
+    pass when it is the current conclusion (issue #1470): a job-level `if:`
+    or a failed `needs:` job records that conclusion, and a chart that was
+    never rendered must not authorize a release.
+
+    When any run of a required name has no `completed_at` and no
+    `started_at`, that name cannot be ordered. It then fails closed: any
+    non-passing run of the name blocks, and so does a name with no passing
+    run at all.
+
+    Names outside `required_names` are ignored entirely. An unrelated
+    check-run, passing or not, has no bearing on this gate (issue #733).
+    A `skipped` non-required check-run is ignored the same way. Only a
+    skipped required name blocks, and only when that skip is current or
+    the runs cannot be ordered.
 
     `required_names` defaults to the module-level `REQUIRED_CHECK_NAMES`,
     looked up here rather than bound as the parameter's default value so that
@@ -261,18 +281,32 @@ def missing_required_checks(
     """
     if required_names is None:
         required_names = REQUIRED_CHECK_NAMES
-    passed_names = {
-        run.get("name") for run in check_runs if run.get("conclusion") in PASSING_CONCLUSIONS
-    }
-    non_passing_required = {
-        name
-        for name in required_names
-        if any(
-            run.get("name") == name and run.get("conclusion") not in PASSING_CONCLUSIONS
-            for run in check_runs
-        )
-    }
-    return (set(required_names) - passed_names) | non_passing_required
+    grouped: dict[str, list[dict[str, object]]] = {name: [] for name in required_names}
+    for run in check_runs:
+        name = run.get("name")
+        if isinstance(name, str) and name in grouped:
+            grouped[name].append(run)
+
+    missing: set[str] = set()
+    for name, runs in grouped.items():
+        if not runs:
+            missing.add(name)
+            continue
+        recencies = [_check_run_recency(run) for run in runs]
+        if any(recency is None for recency in recencies):
+            conclusions = [run.get("conclusion") for run in runs]
+            if any(conclusion not in PASSING_CONCLUSIONS for conclusion in conclusions):
+                missing.add(name)
+            continue
+        latest = max(recencies)
+        current = [
+            run
+            for run, recency in zip(runs, recencies, strict=True)
+            if recency == latest
+        ]
+        if any(run.get("conclusion") not in PASSING_CONCLUSIONS for run in current):
+            missing.add(name)
+    return missing
 
 
 def exclude_current_workflow_run(
