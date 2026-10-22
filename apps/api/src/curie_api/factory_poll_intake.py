@@ -8,8 +8,10 @@ A repository may serve several trigger labels, one per surface (#4361 decision
 14). The pass still makes one repository read and mints one installation token
 per repository, then lists open issues once per effective label under the ETag
 key ``issues:<label>``. A repository with open WorkItems and no surface left is
-walked for cancellation only: nothing serves it, so nothing is listed or
-admitted there.
+walked for cancellation. If it also hosts another tracker's open pull requests
+it is walked for review feedback too (conversation comments, review comments
+and reviews on owned pull requests), but nothing serves it, so no issue intake
+is listed or admitted there (#4910).
 
 Cursors live in ``curie.factory_poll_cursors``, keyed by tracker scope. ``since`` moves only to the
 newest timestamp on a page that was applied, because GitHub's ``since`` is
