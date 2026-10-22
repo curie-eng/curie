@@ -20,7 +20,7 @@ the guard.
 import re
 from typing import Final
 
-PROTOCOL_VERSION: Final = "0.5.23"
+PROTOCOL_VERSION: Final = "0.5.24"
 
 # The wire field carrying the protocol version on every outbound event. Both
 # exporters special-case this field by name; do not rename without updating them.
