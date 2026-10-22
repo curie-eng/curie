@@ -65,6 +65,15 @@ VERSION_PATH = "/version"
 KUBE_PROXY = _APPS + "daemonsets/kube-proxy"
 KUBE_PROXY_PODS = _SYSTEM + "pods?labelSelector=k8s-app%3Dkube-proxy"
 KUBE_PROXY_CONFIG = _SYSTEM + "configmaps/kube-proxy"
+# The other forms kube-proxy takes: a DaemonSet under another name, and static pods.
+KUBE_PROXY_SETS = _APPS + "daemonsets?labelSelector=k8s-app%3Dkube-proxy"
+KUBE_PROXY_STATIC = _SYSTEM + "pods?labelSelector=component%3Dkube-proxy"
+_KUBE_PROXY_CHECKED = [
+    "daemonset:kube-system/kube-proxy",
+    "daemonsets:k8s-app=kube-proxy",
+    "pods:component=kube-proxy",
+    "pods:k8s-app=kube-proxy",
+]
 DIGEST_IMAGE = re.compile(r".+@sha256:[0-9a-f]{64}")
 _IMAGE_DIGEST = re.compile(r"@(sha256:[0-9a-f]{64})$")
 _NAME = re.compile(r"[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?")
@@ -189,30 +198,22 @@ def _config_data(config: dict[str, Any] | None) -> dict[str, Any]:
     return {"uid": config["metadata"]["uid"], "data": data}
 
 
-async def observe_kube_proxy(
-    reader: WorkloadReader,
-    names: Sequence[str],
-    *,
-    config_path: str = KUBE_PROXY_CONFIG,
-    exact: bool = True,
-) -> dict[str, Any] | None:
-    """kube-proxy's dataplane, or ``None`` when neither it nor any of its pods exists.
-
-    ``exact`` requires one pod on exactly ``names``; otherwise it must cover them.
-    """
+async def observe_kube_proxy(reader: WorkloadReader, names: Sequence[str]) -> dict[str, Any] | None:
+    """kube-proxy's dataplane on exactly ``names``, or ``None`` when neither it nor any of
+    its pods exists. The local Cilium producer's reading; the managed identity reads
+    every form kube-proxy takes (``_kube_proxy_dataplane``)."""
     daemonset = await reader.read(KUBE_PROXY)
     pods = await reader.read(KUBE_PROXY_PODS)
     if daemonset is None:
         require(pods is not None and not pods["items"])
         return None
-    workload = rolled_out("kube-proxy", daemonset, len(names) if exact else None, pinned=False)
-    found = running_pods(pods, "DaemonSet", workload["uid"], names if exact else None)
-    placed = [item["node"] for item in found]
-    require(placed == list(names) if exact else set(names) <= set(placed))
+    workload = rolled_out("kube-proxy", daemonset, len(names), pinned=False)
+    found = running_pods(pods, "DaemonSet", workload["uid"], names)
+    require([item["node"] for item in found] == list(names))
     return {
         "workload": workload,
         "pods": found,
-        "config": _config_data(await reader.read(config_path)),
+        "config": _config_data(await reader.read(KUBE_PROXY_CONFIG)),
     }
 
 
@@ -274,6 +275,11 @@ class ProviderEntry:
     addon_configmaps: tuple[tuple[str, str], ...]
     # kube-proxy's ConfigMap in kube-system; providers name it differently.
     kube_proxy_config: str = "kube-proxy"
+    # Where the provider exposes them only through its cloud API, the add-on
+    # configuration and the node image IDs come from the read-only describe
+    # call. A declared source that is missing refuses; nothing falls back.
+    cloud_addon: bool = False
+    cloud_node_images: bool = False
 
     def __post_init__(self) -> None:
         require(bool(self.provider) and bool(self.cni_plugin) and bool(self.policy_agent))
@@ -293,7 +299,7 @@ class ProviderEntry:
         """Every path ``observe_identity`` reads with this entry."""
         refs = (*self.cni_plugin, *self.policy_agent)
         return frozenset(
-            {VERSION_PATH, KUBE_PROXY, KUBE_PROXY_PODS}
+            {VERSION_PATH, KUBE_PROXY, KUBE_PROXY_PODS, KUBE_PROXY_SETS, KUBE_PROXY_STATIC}
             | {ref.path for ref in refs}
             | {ref.pods_path for ref in refs}
             | {f"/api/v1/namespaces/{ns}/configmaps/{name}" for ns, name in self.configmaps}
@@ -428,6 +434,42 @@ def _image_digest(image_id: str) -> str:
     return match[1]
 
 
+def _pod_digests(
+    items: Iterable[Mapping[str, Any]], containers: Sequence[str] = ()
+) -> list[dict[str, str]]:
+    """One digest per container across the pods, init and ephemeral containers included.
+
+    A CNI often installs its plugin binary from an init container, so a rollout
+    that changes only that image changes the identity. A completed init
+    container must have succeeded; a sidecar init container runs.
+    """
+    digests: dict[str, set[str]] = {}
+    for pod in items:
+        status = pod["status"]
+        for item in status.get("initContainerStatuses") or []:
+            state = item["state"]
+            require(
+                state.get("terminated", {}).get("exitCode") == 0
+                or (set(state) == {"running"} and item.get("ready") is True)
+            )
+        statuses = [
+            *status["containerStatuses"],
+            *(status.get("initContainerStatuses") or []),
+            *(status.get("ephemeralContainerStatuses") or []),
+        ]
+        for item in statuses:
+            require(type(item["imageID"]) is str)
+            digests.setdefault(item["name"], set()).add(_image_digest(item["imageID"]))
+    if containers:
+        require(set(containers) <= set(digests))
+        digests = {name: found for name, found in digests.items() if name in containers}
+    # Every pod of a rolled-out workload runs one digest per container.
+    require(bool(digests) and all(len(found) == 1 for found in digests.values()))
+    return [
+        {"container": name, "image_digest": next(iter(found))} for name, found in digests.items()
+    ]
+
+
 async def _workload_images(
     reader: WorkloadReader, ref: WorkloadRef, eligible: Sequence[str]
 ) -> tuple[list[dict[str, str]], dict[str, Any]]:
@@ -449,18 +491,9 @@ async def _workload_images(
         }
         require(len(hashes) == 1 and None not in hashes)
         require(len(pods) == value["spec"].get("replicas", 1))
-    digests: dict[str, set[str]] = {}
-    for pod in pods:
-        for name, image_id, _restarts in pod["containers"]:
-            digests.setdefault(name, set()).add(_image_digest(image_id))
-    if ref.containers:
-        require(set(ref.containers) <= set(digests))
-        digests = {name: found for name, found in digests.items() if name in ref.containers}
-    # Every pod of a rolled-out workload runs one digest per container.
-    require(all(len(found) == 1 for found in digests.values()))
+    assert listed is not None
     images = [
-        {"workload": ref.name, "container": name, "image_digest": next(iter(found))}
-        for name, found in digests.items()
+        {"workload": ref.name} | item for item in _pod_digests(listed["items"], ref.containers)
     ]
     return images, value["spec"]["template"]["spec"]
 
@@ -487,7 +520,9 @@ def _mode_value(template: Mapping[str, Any], key: ModeKey) -> Any:
     return values[0] if values else None
 
 
-def _node_identity(node: Mapping[str, Any], images: Mapping[str, str]) -> dict[str, Any]:
+def _node_identity(
+    node: Mapping[str, Any], images: Mapping[str, str], *, described: bool
+) -> dict[str, Any]:
     meta, info = node["metadata"], node["status"]["nodeInfo"]
     # Serverless pod runtimes and Windows nodes refuse until a producer measures them.
     require(info["operatingSystem"] == "linux")
@@ -496,7 +531,8 @@ def _node_identity(node: Mapping[str, Any], images: Mapping[str, str]) -> dict[s
     return {
         "node_name": meta["name"],
         "node_uid": meta["uid"],
-        "node_image": images.get(meta["name"], info["osImage"]),
+        # A declared cloud node image never falls back to the Node's osImage.
+        "node_image": images[meta["name"]] if described else info["osImage"],
         "kernel_version": info["kernelVersion"],
         "kubelet_version": info["kubeletVersion"],
         "container_runtime_version": info["containerRuntimeVersion"],
@@ -531,6 +567,96 @@ class CloudDescriber(Protocol):
     async def describe(self) -> tuple[dict[str, Any], dict[str, str]]: ...
 
 
+async def _described(
+    provider: ProviderEntry, cloud: CloudDescriber | None, eligible: Sequence[str]
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """The cloud describe the provider entry declares: exactly that, or a refusal."""
+    declared = provider.cloud_addon or provider.cloud_node_images
+    require((cloud is not None) == declared)
+    if cloud is None:
+        return {}, {}
+    try:
+        addon, node_images = await cloud.describe()
+    except Exception:  # noqa: BLE001 -- an unavailable describe is a refusal.
+        refuse()
+    require(type(addon) is dict and type(node_images) is dict)
+    require(bool(addon) == provider.cloud_addon)
+    if provider.cloud_node_images:
+        require(set(eligible) <= set(node_images))
+        require(all(type(node_images[name]) is str and node_images[name] for name in eligible))
+    else:
+        require(not node_images)
+    return addon, node_images
+
+
+def _proxy_modes(values: Iterable[str]) -> str:
+    modes = set(values)
+    require(len(modes) <= 1)
+    return next(iter(modes), "")
+
+
+def _flag_values(command: Sequence[str], flag: str) -> list[str]:
+    found = []
+    for index, arg in enumerate(command):
+        if arg.startswith(flag + "="):
+            found.append(arg.split("=", 1)[1])
+        elif arg == flag:
+            require(index + 1 < len(command))
+            found.append(command[index + 1])
+    return found
+
+
+async def _kube_proxy_dataplane(
+    reader: WorkloadReader, provider: ProviderEntry, eligible: Sequence[str]
+) -> dict[str, Any]:
+    """kube-proxy in whichever form it runs; ``absent`` only after every form was checked."""
+    named = await reader.read(KUBE_PROXY)
+    labelled = await reader.read(KUBE_PROXY_SETS)
+    app_pods = await reader.read(KUBE_PROXY_PODS)
+    static = await reader.read(KUBE_PROXY_STATIC)
+    for listed in (labelled, app_pods, static):
+        require(listed is not None and not listed.get("metadata", {}).get("continue"))
+    assert labelled is not None and app_pods is not None and static is not None
+    sets = {item["metadata"]["uid"]: item for item in labelled["items"]}
+    if named is not None:
+        sets[named["metadata"]["uid"]] = named
+    require(len(sets) <= 1)
+    if sets:
+        # One form only: a DaemonSet beside static kube-proxy pods is ambiguous.
+        require(not static["items"])
+        workload = rolled_out("kube-proxy", next(iter(sets.values())), None, pinned=False)
+        pods = running_pods(app_pods, "DaemonSet", workload["uid"], None)
+        require(set(eligible) <= {item["node"] for item in pods})
+        config = await reader.read(_SYSTEM + "configmaps/" + provider.kube_proxy_config)
+        data = _config_data(config)["data"]
+        return {
+            "form": "daemonset",
+            "images": _sorted(_pod_digests(app_pods["items"])),
+            "mode": _proxy_modes(found for v in data.values() for found in _MODE.findall(v)),
+            "configuration_digest": sha256_canonical(data),
+        }
+    if static["items"]:
+        # Static pods are mirror pods owned by their Node; their flags are the configuration.
+        uids = {item["metadata"]["uid"] for item in static["items"]}
+        require(all(item["metadata"]["uid"] in uids for item in app_pods["items"]))
+        pods = running_pods(static, "Node", None, None)
+        require(set(eligible) <= {item["node"] for item in pods})
+        commands = []
+        for item in static["items"]:
+            for container in item["spec"]["containers"]:
+                commands.append([*(container.get("command") or []), *(container.get("args") or [])])
+        return {
+            "form": "static",
+            "images": _sorted(_pod_digests(static["items"])),
+            "mode": _proxy_modes(
+                value for command in commands for value in _flag_values(command, "--proxy-mode")
+            ),
+            "configuration_digest": sha256_canonical(sorted(commands)),
+        }
+    require(not app_pods["items"])
+    return {"form": "absent", "checked": list(_KUBE_PROXY_CHECKED)}
+
+
 async def observe_identity(
     reader: WorkloadReader,
     provider: ProviderEntry,
@@ -547,8 +673,7 @@ async def observe_identity(
         require(bool(eligible_items))
         eligible = sorted(item["metadata"]["name"] for item in eligible_items)
         require(len(eligible) == len(set(eligible)))
-        addon, node_images = ({}, {}) if cloud is None else await cloud.describe()
-        require(type(addon) is dict and type(node_images) is dict)
+        addon, node_images = await _described(provider, cloud, eligible)
         roles: dict[str, list[dict[str, str]]] = {
             "cni_plugin_images": [],
             "policy_agent_images": [],
@@ -575,32 +700,7 @@ async def observe_identity(
             config = await reader.read(f"/api/v1/namespaces/{namespace}/configmaps/{name}")
             data = _config_data(config)["data"]
             configmaps.append({"namespace": namespace, "name": name, "data": data})
-        proxy = await observe_kube_proxy(
-            reader,
-            eligible,
-            config_path=_SYSTEM + "configmaps/" + provider.kube_proxy_config,
-            exact=False,
-        )
-        dataplane: dict[str, Any] = {"kube_proxy": None}
-        if proxy is not None:
-            data = proxy["config"]["data"]
-            modes = {found for value in data.values() for found in _MODE.findall(value)}
-            require(len(modes) <= 1)
-            proxy_images: dict[str, set[str]] = {}
-            for pod in proxy["pods"]:
-                for name, image_id, _restarts in pod["containers"]:
-                    proxy_images.setdefault(name, set()).add(_image_digest(image_id))
-            require(all(len(found) == 1 for found in proxy_images.values()))
-            dataplane["kube_proxy"] = {
-                "images": _sorted(
-                    [
-                        {"container": name, "image_digest": next(iter(found))}
-                        for name, found in proxy_images.items()
-                    ]
-                ),
-                "mode": next(iter(modes), ""),
-                "configuration_digest": sha256_canonical(data),
-            }
+        dataplane = {"kube_proxy": await _kube_proxy_dataplane(reader, provider, eligible)}
         version = api_version(await reader.read(VERSION_PATH))
         document = {
             "cni_plugin_images": _sorted(roles["cni_plugin_images"]),
@@ -616,7 +716,10 @@ async def observe_identity(
             },
             "ip_families": _served_families(eligible_items),
             "eligible_nodes": sorted(
-                (_node_identity(node, node_images) for node in eligible_items),
+                (
+                    _node_identity(node, node_images, described=provider.cloud_node_images)
+                    for node in eligible_items
+                ),
                 key=lambda item: str(item["node_name"]),
             ),
         }

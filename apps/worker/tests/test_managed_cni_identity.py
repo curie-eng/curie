@@ -55,6 +55,11 @@ CONFIG = "/api/v1/namespaces/kube-system/configmaps/calico-config"
 PROXY_DS = "/apis/apps/v1/namespaces/kube-system/daemonsets/kube-proxy"
 PROXY_PODS = "/api/v1/namespaces/kube-system/pods?labelSelector=k8s-app%3Dkube-proxy"
 PROXY_CONFIG = "/api/v1/namespaces/kube-system/configmaps/kube-proxy"
+PROXY_DS_BY_LABEL = (
+    "/apis/apps/v1/namespaces/kube-system/daemonsets?labelSelector=k8s-app%3Dkube-proxy"
+)
+STATIC_PROXY_PODS = "/api/v1/namespaces/kube-system/pods?labelSelector=component%3Dkube-proxy"
+INSTALL_CNI = "docker.io/calico/cni@sha256:" + "1" * 64
 CONTROL_PLANE = "node-role.kubernetes.io/control-plane"
 GUARD = "d" * 64
 
@@ -162,7 +167,7 @@ def installation() -> dict[str, Any]:
         "args": ["--enabled=node,policy"],
     }
     proxy_container = {"name": "kube-proxy", "image": "registry.k8s.io/kube-proxy:v1.35.1"}
-    return {
+    state: dict[str, Any] = {
         "nodes": [node(name) for name in NODES],
         "/version": {"gitVersion": "v1.35.1", "gitCommit": "x", "platform": "linux/arm64"},
         PLUGIN_DS: workload("DaemonSet", PLUGIN_UID, "calico-node", plugin_container, 2),
@@ -190,7 +195,22 @@ def installation() -> dict[str, Any]:
             "metadata": {"uid": "proxy-cfg"},
             "data": {"config.conf": 'mode: "iptables"\nclusterCIDR: 10.244.0.0/16\n'},
         },
+        STATIC_PROXY_PODS: {"items": []},
     }
+    state[PROXY_DS]["metadata"]["labels"] = {"k8s-app": "kube-proxy"}
+    state[PROXY_DS_BY_LABEL] = {"items": [copy.deepcopy(state[PROXY_DS])]}
+    # Calico's CNI plugin binary comes from the install-cni init container.
+    for item in state[PLUGIN_PODS]["items"]:
+        item["status"]["initContainerStatuses"] = [
+            {
+                "name": "install-cni",
+                "ready": True,
+                "restartCount": 0,
+                "state": {"terminated": {"exitCode": 0, "reason": "Completed"}},
+                "imageID": "docker-pullable://" + INSTALL_CNI,
+            }
+        ]
+    return state
 
 
 class Reader:
@@ -221,9 +241,12 @@ class Cloud:
 
 
 def observe(
-    state: dict[str, Any], cloud: Cloud | None = None, placements: Any = PLACEMENTS
+    state: dict[str, Any],
+    cloud: Cloud | None = None,
+    placements: Any = PLACEMENTS,
+    provider: ProviderEntry = PROVIDER,
 ) -> CniIdentity:
-    return asyncio.run(observe_identity(Reader(state), PROVIDER, placements, cloud=cloud))
+    return asyncio.run(observe_identity(Reader(state), provider, placements, cloud=cloud))
 
 
 def refuses(state: dict[str, Any], **options: Any) -> None:
@@ -239,12 +262,17 @@ def test_the_identity_holds_exactly_the_clause_1_members() -> None:
     assert sorted(identity.document) == sorted(IDENTITY_MEMBERS)
     assert identity.digest == sha256_canonical(identity.document)
     doc = identity.document
-    assert doc["cni_plugin_images"] == [
+    assert sorted(doc["cni_plugin_images"], key=lambda item: item["container"]) == [
         {
             "workload": "calico-node",
             "container": "calico-node",
             "image_digest": "sha256:" + "a" * 64,
-        }
+        },
+        {
+            "workload": "calico-node",
+            "container": "install-cni",
+            "image_digest": "sha256:" + "1" * 64,
+        },
     ]
     assert doc["policy_agent_images"] == [
         {
@@ -257,6 +285,7 @@ def test_the_identity_holds_exactly_the_clause_1_members() -> None:
         "FELIX_DEFAULTENDPOINTTOHOSTACTION": "ACCEPT",
         "--enabled": "node,policy",
     }
+    assert doc["dataplane_mode"]["kube_proxy"]["form"] == "daemonset"
     assert doc["dataplane_mode"]["kube_proxy"]["mode"] == "iptables"
     assert doc["dataplane_mode"]["kube_proxy"]["images"] == [
         {"container": "kube-proxy", "image_digest": "sha256:" + "c" * 64}
@@ -334,8 +363,31 @@ def _env(value: str) -> Callable[[dict[str, Any]], None]:
     return change
 
 
+def _init_image(digit: str) -> Callable[[dict[str, Any]], None]:
+    def change(state: dict[str, Any]) -> None:
+        for item in state[PLUGIN_PODS]["items"]:
+            status = item["status"]["initContainerStatuses"][0]
+            status["imageID"] = "docker.io/calico/cni@sha256:" + digit * 64
+
+    return change
+
+
+def _ephemeral(state: dict[str, Any]) -> None:
+    state[PLUGIN_PODS]["items"][0]["status"]["ephemeralContainerStatuses"] = [
+        {
+            "name": "debugger",
+            "ready": False,
+            "restartCount": 0,
+            "state": {"running": {}},
+            "imageID": "docker.io/library/busybox@sha256:" + "3" * 64,
+        }
+    ]
+
+
 INPUT_CHANGES: dict[str, tuple[Callable[[dict[str, Any]], None], str]] = {
     "plugin image": (lambda s: _image(s, PLUGIN_PODS, "e"), "cni_plugin_images_changed"),
+    "plugin init image": (_init_image("2"), "cni_plugin_images_changed"),
+    "ephemeral container": (_ephemeral, "cni_plugin_images_changed"),
     "agent image": (lambda s: _image(s, AGENT_PODS, "e"), "policy_agent_images_changed"),
     "mode env": (_env("DROP"), "enforcement_mode_changed"),
     "mode env removed": (
@@ -362,7 +414,11 @@ INPUT_CHANGES: dict[str, tuple[Callable[[dict[str, Any]], None], str]] = {
     ),
     "kube-proxy image": (lambda s: _image(s, PROXY_PODS, "f"), "dataplane_mode_changed"),
     "kube-proxy removed": (
-        lambda s: (s.pop(PROXY_DS), s[PROXY_PODS].update(items=[])),
+        lambda s: (
+            s.pop(PROXY_DS),
+            s[PROXY_PODS].update(items=[]),
+            s[PROXY_DS_BY_LABEL].update(items=[]),
+        ),
         "dataplane_mode_changed",
     ),
     "control plane version": (
@@ -400,14 +456,15 @@ def test_each_identity_input_changing_invalidates(name: str) -> None:
 
 
 def test_a_cloud_reported_addon_or_node_image_change_invalidates() -> None:
-    state, cloud = installation(), Cloud()
-    before = observe(state, cloud)
+    state, cloud = installation(), described()
+    before = observe(state, cloud, provider=CLOUD_PROVIDER)
     cloud.addon["configuration"]["enableNetworkPolicy"] = "false"
-    assert identity_change(before, observe(state, cloud)) == "addon_configuration_digest_changed"
-    cloud = Cloud()
-    before = observe(state, cloud)
+    after = observe(state, cloud, provider=CLOUD_PROVIDER)
+    assert identity_change(before, after) == "addon_configuration_digest_changed"
+    cloud = described()
+    before = observe(state, cloud, provider=CLOUD_PROVIDER)
     cloud.images["n2"] = "ami-0123"
-    after = observe(state, cloud)
+    after = observe(state, cloud, provider=CLOUD_PROVIDER)
     assert after.document["eligible_nodes"][1]["node_image"] == "ami-0123"
     assert identity_change(before, after) == "eligible_nodes_changed"
 
@@ -600,7 +657,24 @@ UNBINDABLE: dict[str, Callable[[dict[str, Any]], Any]] = {
         status="False"
     ),
     "no eligible node": lambda s: s.update(nodes=[]),
-    "kube-proxy pods without daemonset": lambda s: s.pop(PROXY_DS),
+    "kube-proxy pods without daemonset": lambda s: (
+        s.pop(PROXY_DS),
+        s[PROXY_DS_BY_LABEL].update(items=[]),
+    ),
+    "init image without digest": lambda s: s[PLUGIN_PODS]["items"][0]["status"][
+        "initContainerStatuses"
+    ][0].update(imageID="docker.io/calico/cni:v3"),
+    "init container failed": lambda s: s[PLUGIN_PODS]["items"][0]["status"][
+        "initContainerStatuses"
+    ][0].update(state={"terminated": {"exitCode": 1}}),
+    "kube-proxy daemonset and static pods": lambda s: s[STATIC_PROXY_PODS]["items"].append(
+        static_proxy("n1")
+    ),
+    "two kube-proxy daemonsets": lambda s: s[PROXY_DS_BY_LABEL]["items"].append(
+        s[PROXY_DS] | {"metadata": {"name": "kube-proxy-2", "uid": "other", "generation": 2}}
+    ),
+    "kube-proxy daemonset list unavailable": lambda s: s.pop(PROXY_DS_BY_LABEL),
+    "static kube-proxy list unavailable": lambda s: s.pop(STATIC_PROXY_PODS),
     "kube-proxy two modes": lambda s: s[PROXY_CONFIG]["data"].update(other='mode: "ipvs"\n'),
     "terminating plugin": lambda s: s[PLUGIN_DS]["metadata"].update(deletionTimestamp="now"),
 }
@@ -613,11 +687,116 @@ def test_an_unbindable_identity_refuses(name: str) -> None:
     refuses(state)
 
 
-def test_an_absent_kube_proxy_is_its_own_identity() -> None:
-    state = installation()
+def static_proxy(node_name: str, mode: str = "ipvs") -> dict[str, Any]:
+    """A kube-proxy static pod: a mirror pod owned by its Node."""
+    value = pod(
+        f"kube-proxy-{node_name}", node_name, "Node", "uid-" + node_name, "kube-proxy", PROXY
+    )
+    value["metadata"]["labels"] = {"component": "kube-proxy", "tier": "node"}
+    value["spec"]["containers"] = [
+        {"name": "kube-proxy", "command": ["kube-proxy", f"--proxy-mode={mode}"]}
+    ]
+    return value
+
+
+def _without_daemonset(state: dict[str, Any]) -> None:
     state.pop(PROXY_DS)
     state[PROXY_PODS]["items"] = []
-    assert observe(state).document["dataplane_mode"] == {"kube_proxy": None}
+    state[PROXY_DS_BY_LABEL]["items"] = []
+
+
+def test_kube_proxy_is_absent_only_after_every_known_form_was_checked() -> None:
+    state = installation()
+    _without_daemonset(state)
+    assert observe(state).document["dataplane_mode"] == {
+        "kube_proxy": {
+            "form": "absent",
+            "checked": [
+                "daemonset:kube-system/kube-proxy",
+                "daemonsets:k8s-app=kube-proxy",
+                "pods:component=kube-proxy",
+                "pods:k8s-app=kube-proxy",
+            ],
+        }
+    }
+
+
+def test_static_kube_proxy_pods_are_their_own_form() -> None:
+    state = installation()
+    _without_daemonset(state)
+    state[STATIC_PROXY_PODS]["items"] = [static_proxy(n) for n in NODES]
+    proxy = observe(state).document["dataplane_mode"]["kube_proxy"]
+    assert proxy["form"] == "static" and proxy["mode"] == "ipvs"
+    assert proxy["images"] == [{"container": "kube-proxy", "image_digest": "sha256:" + "c" * 64}]
+    before = observe(state)
+    state[STATIC_PROXY_PODS]["items"] = [static_proxy(n, "nftables") for n in NODES]
+    assert identity_change(before, observe(state)) == "dataplane_mode_changed"
+
+
+def test_static_kube_proxy_must_cover_every_eligible_node() -> None:
+    state = installation()
+    _without_daemonset(state)
+    state[STATIC_PROXY_PODS]["items"] = [static_proxy("n1")]
+    refuses(state)
+
+
+def test_a_kube_proxy_daemonset_found_only_by_label_is_measured() -> None:
+    state = installation()
+    named = state.pop(PROXY_DS)
+    renamed = named | {"metadata": named["metadata"] | {"name": "kube-proxy-managed"}}
+    state[PROXY_DS_BY_LABEL]["items"] = [renamed]
+    assert observe(state).document["dataplane_mode"]["kube_proxy"]["form"] == "daemonset"
+
+
+# --- The cloud describe is declared, never silently skipped -------------------
+
+
+CLOUD_PROVIDER = ProviderEntry(
+    provider="cloud-fixture",
+    cni_plugin=PROVIDER.cni_plugin,
+    policy_agent=PROVIDER.policy_agent,
+    mode_keys=PROVIDER.mode_keys,
+    addon_configmaps=PROVIDER.addon_configmaps,
+    cloud_addon=True,
+    cloud_node_images=True,
+)
+
+
+def described() -> Cloud:
+    cloud = Cloud()
+    cloud.images = {name: "image-" + name for name in NODES}
+    return cloud
+
+
+def test_a_cloud_entry_reads_the_addon_and_node_images_from_the_describe() -> None:
+    identity = observe(installation(), described(), provider=CLOUD_PROVIDER)
+    assert [n["node_image"] for n in identity.document["eligible_nodes"]] == [
+        "image-n1",
+        "image-n2",
+    ]
+
+
+@pytest.mark.parametrize("case", ["no describer", "empty addon", "node missing", "describe fails"])
+def test_a_required_cloud_describe_that_is_missing_refuses(case: str) -> None:
+    cloud: Cloud | None = described()
+    assert cloud is not None
+    if case == "no describer":
+        cloud = None
+    elif case == "empty addon":
+        cloud.addon = {}
+    elif case == "node missing":
+        del cloud.images["n2"]
+    else:
+
+        async def failing() -> Any:
+            raise RuntimeError("describe failed")
+
+        cloud.describe = failing  # type: ignore[method-assign]
+    refuses(installation(), cloud=cloud, provider=CLOUD_PROVIDER)
+
+
+def test_a_describe_the_entry_does_not_declare_refuses() -> None:
+    refuses(installation(), cloud=described())
 
 
 # --- Reobservation on every guard call ----------------------------------------
