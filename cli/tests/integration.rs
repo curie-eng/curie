@@ -163,6 +163,7 @@ mod schedules;
 mod schema_inventory;
 mod sealing_key_custody;
 mod sealing_key_custody_cli;
+mod shared_render_caller_keys;
 mod shipped_bundle_runner_layers;
 mod skill_bundle_snapshot;
 mod skill_check;

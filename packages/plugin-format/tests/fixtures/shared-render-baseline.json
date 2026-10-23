@@ -1,0 +1,289 @@
+{
+  "comment": "The shared application render before CURIE_CALLER_PROXY_PUBLIC_KEYS was added (recorded at epic/shared-connectors 0f7d6a0991f2c03895a823cb66bd763fc46a00f3). Each sha256 is of json.dumps(render_application(application), sort_keys=True, separators=(',', ':')). The amended render, with that one proxy env entry removed, must reproduce every digest.",
+  "cases": [
+    {
+      "name": "pod-selected bundled database",
+      "application": {
+        "installation": "opaque:installation/1",
+        "application": "12345678-1234-4234-8234-123456789abc",
+        "release": "acme",
+        "namespace": "acme",
+        "app_name": "curie",
+        "server_image": "example.com/acme/server@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "proxy_image": "example.com/acme/proxy@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "server_port": 8000,
+        "proxy_port": 8480,
+        "server_args": [
+          "--transport",
+          "streamable-http"
+        ],
+        "server_env": {
+          "MODE": "read"
+        },
+        "resolver_socket": "/run/curie-resolver/resolver.sock",
+        "encryption_key": {
+          "name": "acme-encryption",
+          "key": "private"
+        },
+        "database_dsn": {
+          "name": "acme-database",
+          "key": "dsn"
+        },
+        "dsn_encoding": "bundled-sealed",
+        "grant_store": {
+          "name": "acme-grants",
+          "key": "url"
+        },
+        "provider_origins": [
+          "https://api.example.com"
+        ],
+        "credential_slots": [
+          "access_token"
+        ],
+        "database_target": {
+          "namespace": "acme-data",
+          "pod_labels": {
+            "curietech.ai/shared-application": "12345678-1234-4234-8234-123456789abc",
+            "app.kubernetes.io/component": "database"
+          },
+          "cidrs": [],
+          "port": 5432
+        },
+        "snapshot_seal": null,
+        "server_resources": {
+          "requests": {
+            "cpu": "10m",
+            "memory": "64Mi"
+          },
+          "limits": {
+            "cpu": "500m",
+            "memory": "256Mi"
+          }
+        },
+        "proxy_resources": {
+          "requests": {
+            "cpu": "25m",
+            "memory": "128Mi"
+          },
+          "limits": {
+            "cpu": "1000m",
+            "memory": "512Mi"
+          }
+        }
+      },
+      "sha256": "d4f803104cc756f55d1c0b23f7de4a48d42003b254a7dc7427ca54358aaf2398"
+    },
+    {
+      "name": "snapshot seal mounted into the server",
+      "application": {
+        "installation": "opaque:installation/1",
+        "application": "12345678-1234-4234-8234-123456789abc",
+        "release": "acme",
+        "namespace": "acme",
+        "app_name": "curie",
+        "server_image": "example.com/acme/server@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "proxy_image": "example.com/acme/proxy@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "server_port": 8000,
+        "proxy_port": 8480,
+        "server_args": [
+          "--transport",
+          "streamable-http"
+        ],
+        "server_env": {
+          "MODE": "read"
+        },
+        "resolver_socket": "/run/curie-resolver/resolver.sock",
+        "encryption_key": {
+          "name": "acme-encryption",
+          "key": "private"
+        },
+        "database_dsn": {
+          "name": "acme-database",
+          "key": "dsn"
+        },
+        "dsn_encoding": "bundled-sealed",
+        "grant_store": {
+          "name": "acme-grants",
+          "key": "url"
+        },
+        "provider_origins": [
+          "https://api.example.com"
+        ],
+        "credential_slots": [
+          "access_token"
+        ],
+        "database_target": {
+          "namespace": "acme-data",
+          "pod_labels": {
+            "curietech.ai/shared-application": "12345678-1234-4234-8234-123456789abc",
+            "app.kubernetes.io/component": "database"
+          },
+          "cidrs": [],
+          "port": 5432
+        },
+        "snapshot_seal": {
+          "name": "acme-snapshot",
+          "key": "seal"
+        },
+        "server_resources": {
+          "requests": {
+            "cpu": "10m",
+            "memory": "64Mi"
+          },
+          "limits": {
+            "cpu": "500m",
+            "memory": "256Mi"
+          }
+        },
+        "proxy_resources": {
+          "requests": {
+            "cpu": "25m",
+            "memory": "128Mi"
+          },
+          "limits": {
+            "cpu": "1000m",
+            "memory": "512Mi"
+          }
+        }
+      },
+      "sha256": "e367374e8e23e5ff0e4e9dbc17d60b2e39bae6b6e5fe3401d30d9e3ecbc5e723"
+    },
+    {
+      "name": "managed CIDR database, two origins and slots, custom ports and resources",
+      "application": {
+        "installation": "opaque:installation/1",
+        "application": "12345678-1234-4234-8234-123456789abc",
+        "release": "acme",
+        "namespace": "acme",
+        "app_name": "curie",
+        "server_image": "example.com/acme/server@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "proxy_image": "example.com/acme/proxy@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "server_port": 9000,
+        "proxy_port": 9480,
+        "server_args": [],
+        "server_env": {},
+        "resolver_socket": "/run/custom-resolver/r.sock",
+        "encryption_key": {
+          "name": "acme-encryption",
+          "key": "private"
+        },
+        "database_dsn": {
+          "name": "acme-database",
+          "key": "dsn"
+        },
+        "dsn_encoding": "managed-raw",
+        "grant_store": {
+          "name": "acme-grants",
+          "key": "url"
+        },
+        "provider_origins": [
+          "https://api.example.com",
+          "https://auth.example.com:8443"
+        ],
+        "credential_slots": [
+          "access_token",
+          "client_secret"
+        ],
+        "database_target": {
+          "namespace": null,
+          "pod_labels": null,
+          "cidrs": [
+            "10.20.0.0/16",
+            "fd00::/64"
+          ],
+          "port": 6432
+        },
+        "snapshot_seal": null,
+        "server_resources": {
+          "requests": {
+            "cpu": "100m",
+            "memory": "128Mi"
+          },
+          "limits": {
+            "cpu": "1",
+            "memory": "512Mi"
+          }
+        },
+        "proxy_resources": {
+          "requests": {
+            "cpu": "50m",
+            "memory": "192Mi"
+          },
+          "limits": {
+            "cpu": "2",
+            "memory": "1Gi"
+          }
+        }
+      },
+      "sha256": "e1b1c65d52e783a83707c75a13f9b223e2ab9ecf9167d7bf9e9f35bc94d9eeac"
+    },
+    {
+      "name": "long opaque installation, empty origins",
+      "application": {
+        "installation": "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ",
+        "application": "12345678-1234-4234-8234-123456789abc",
+        "release": "acme",
+        "namespace": "acme",
+        "app_name": "curie",
+        "server_image": "example.com/acme/server@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "proxy_image": "example.com/acme/proxy@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "server_port": 8000,
+        "proxy_port": 8480,
+        "server_args": [
+          "--transport",
+          "streamable-http"
+        ],
+        "server_env": {
+          "MODE": "read"
+        },
+        "resolver_socket": "/run/curie-resolver/resolver.sock",
+        "encryption_key": {
+          "name": "acme-encryption",
+          "key": "private"
+        },
+        "database_dsn": {
+          "name": "acme-database",
+          "key": "dsn"
+        },
+        "dsn_encoding": "bundled-sealed",
+        "grant_store": {
+          "name": "acme-grants",
+          "key": "url"
+        },
+        "provider_origins": [],
+        "credential_slots": [],
+        "database_target": {
+          "namespace": "acme-data",
+          "pod_labels": {
+            "curietech.ai/shared-application": "12345678-1234-4234-8234-123456789abc",
+            "app.kubernetes.io/component": "database"
+          },
+          "cidrs": [],
+          "port": 5432
+        },
+        "snapshot_seal": null,
+        "server_resources": {
+          "requests": {
+            "cpu": "10m",
+            "memory": "64Mi"
+          },
+          "limits": {
+            "cpu": "500m",
+            "memory": "256Mi"
+          }
+        },
+        "proxy_resources": {
+          "requests": {
+            "cpu": "25m",
+            "memory": "128Mi"
+          },
+          "limits": {
+            "cpu": "1000m",
+            "memory": "512Mi"
+          }
+        }
+      },
+      "sha256": "7c50e65bcb816bc8ecfaa6cb06ef5393e53bf3f024852422627f9fdc1af0bfda"
+    }
+  ]
+}

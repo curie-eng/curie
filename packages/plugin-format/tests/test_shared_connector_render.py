@@ -19,6 +19,12 @@ AGENT = "22345678-1234-4234-8234-123456789abc"
 OTHER_AGENT = "32345678-1234-4234-8234-123456789abc"
 SERVER_IMAGE = "example.com/acme/server@sha256:" + "a" * 64
 PROXY_IMAGE = "example.com/acme/proxy@sha256:" + "b" * 64
+# The caller public verify keys every render takes: the current key, then the
+# previous one, as frozen in tests/vectors/shared-render-caller-keys.json.
+CALLER_KEYS = (
+    "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
+    "Kay64UG8yvCyLhqU000LxzYeUm0L/hLIl5S8kyKWbdc=",
+)
 DB_LABELS = {
     "curietech.ai/shared-application": APPLICATION,
     "app.kubernetes.io/component": "database",
@@ -94,7 +100,7 @@ def test_shared_application_isolates_proxy_secrets_and_snapshot(
         snapshot_seal=({"name": "acme-snapshot", "key": "seal"} if snapshot else None),
     )
     before = application.model_dump_json()
-    objects = render_application(application)
+    objects = render_application(application, caller_public_keys=CALLER_KEYS)
     assert application.model_dump_json() == before
     pod = _object(objects, "Deployment")["spec"]["template"]["spec"]
     assert len(pod["containers"]) == 2
@@ -165,7 +171,7 @@ def test_shared_application_default_deny_service_and_database_target(managed: bo
     application = _application(
         database_target=target, dsn_encoding=("managed-raw" if managed else "bundled-sealed")
     )
-    objects = render_application(application)
+    objects = render_application(application, caller_public_keys=CALLER_KEYS)
     assert sorted(item["kind"] for item in objects) == [
         "Deployment",
         "NetworkPolicy",
@@ -225,7 +231,7 @@ def test_shared_application_default_deny_service_and_database_target(managed: bo
 
 def test_member_reach_is_exact_and_leaves_application_template_unchanged() -> None:
     application = _application()
-    original = render_application(application)
+    original = render_application(application, caller_public_keys=CALLER_KEYS)
     template = json.dumps(_object(original, "Deployment")["spec"]["template"], sort_keys=True)
     selector = _object(original, "Deployment")["spec"]["selector"]
     names = set()
@@ -253,10 +259,12 @@ def test_member_reach_is_exact_and_leaves_application_template_unchanged() -> No
         assert len(new_names) == 2 and names.isdisjoint(new_names)
         names.update(new_names)
         assert template == json.dumps(
-            _object(render_application(application), "Deployment")["spec"]["template"],
+            _object(
+                render_application(application, caller_public_keys=CALLER_KEYS), "Deployment"
+            )["spec"]["template"],
             sort_keys=True,
         )
-    assert render_application(application) == original
+    assert render_application(application, caller_public_keys=CALLER_KEYS) == original
 
 
 @pytest.mark.parametrize("release", ["r" * 63, "1" + "r" * 62])
@@ -269,15 +277,15 @@ def test_shared_names_are_bounded_deterministic_and_identity_scoped(release: str
         {"installation": "é" * 64},
     ):
         application = _application(release=release, app_name="a" * 63, **changes)
-        objects = render_application(application) + render_member_reach(
-            application, _member(application)
-        )
+        objects = render_application(
+            application, caller_public_keys=CALLER_KEYS
+        ) + render_member_reach(application, _member(application))
         names = {item["metadata"]["name"] for item in objects}
         assert len(names) == len(objects)
         assert all(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", name) for name in names)
-        assert objects == render_application(application) + render_member_reach(
-            application, _member(application)
-        )
+        assert objects == render_application(
+            application, caller_public_keys=CALLER_KEYS
+        ) + render_member_reach(application, _member(application))
         assert all(names.isdisjoint(previous) for previous in name_sets)
         name_sets.append(names)
 
@@ -288,7 +296,8 @@ def test_shared_resources_preserve_explicit_bounds() -> None:
         "limits": {"cpu": "200m", "memory": "192Mi"},
     }
     objects = render_application(
-        _application(server_resources=resources, proxy_resources=resources)
+        _application(server_resources=resources, proxy_resources=resources),
+        caller_public_keys=CALLER_KEYS,
     )
     containers = _object(objects, "Deployment")["spec"]["template"]["spec"]["containers"]
     assert all(container["resources"] == resources for container in containers)
@@ -328,7 +337,9 @@ def test_shared_resource_quantities_accept_adjacent_bounds(cpu: str, memory: str
     resources = {"requests": {"cpu": cpu, "memory": memory},
                  "limits": {"cpu": cpu, "memory": memory}}
     application = _application(server_resources=resources, proxy_resources=resources)
-    pod = _object(render_application(application), "Deployment")["spec"]["template"]["spec"]
+    pod = _object(
+        render_application(application, caller_public_keys=CALLER_KEYS), "Deployment"
+    )["spec"]["template"]["spec"]
     assert all(container["resources"] == resources for container in pod["containers"])
 
 
@@ -355,7 +366,9 @@ def test_resolver_socket_accepts_safe_byte_limit() -> None:
     directory = "/run/acme-resolver/"
     path = directory + "s" * (107 - len(directory))
     application = _application(resolver_socket=path)
-    pod = _object(render_application(application), "Deployment")["spec"]["template"]["spec"]
+    pod = _object(
+        render_application(application, caller_public_keys=CALLER_KEYS), "Deployment"
+    )["spec"]["template"]["spec"]
     assert all(any(mount["mountPath"] == directory.rstrip("/")
                    for mount in container["volumeMounts"]) for container in pod["containers"])
 
@@ -377,7 +390,9 @@ def test_server_env_and_args_reject_reserved_or_nul_literals(
 def test_server_env_and_args_accept_nonreserved_literals() -> None:
     env = {"CURIEISH_MODE": "read", "SHAREDISH_MODE": "read"}
     application = _application(server_env=env, server_args=("--mode", "read"))
-    pod = _object(render_application(application), "Deployment")["spec"]["template"]["spec"]
+    pod = _object(
+        render_application(application, caller_public_keys=CALLER_KEYS), "Deployment"
+    )["spec"]["template"]["spec"]
     server = next(
         container for container in pod["containers"] if container["image"] == SERVER_IMAGE
     )
@@ -413,7 +428,8 @@ def test_database_target_rejects_complete_cidr_unions(cidrs: tuple[str, ...]) ->
 def test_database_target_accepts_adjacent_subnet_union() -> None:
     cidrs = ("192.0.2.0/25", "192.0.2.128/25")
     application = _application(database_target={"cidrs": cidrs, "port": 5432})
-    policies = [item["spec"] for item in render_application(application)
+    policies = [item["spec"]
+                for item in render_application(application, caller_public_keys=CALLER_KEYS)
                 if item["kind"] == "NetworkPolicy" and item["spec"]["policyTypes"] == ["Egress"]]
     assert len(policies) == 1
     assert policies[0]["egress"] == [{
@@ -434,13 +450,19 @@ def test_shared_outputs_omit_dedicated_prune_ownership() -> None:
             for child in value:
                 check(child)
 
-    check(render_application(application) + render_member_reach(application, _member(application)))
+    check(
+        render_application(application, caller_public_keys=CALLER_KEYS)
+        + render_member_reach(application, _member(application))
+    )
 
 
 @pytest.mark.parametrize("invalid", ["runner-selector", "snapshot-overlap", "secret-ref"])
 def test_render_revalidates_mutable_and_unvalidated_inputs(invalid: str) -> None:
     neighbor = _application()
-    expected = render_application(neighbor), render_member_reach(neighbor, _member(neighbor))
+    expected = (
+        render_application(neighbor, caller_public_keys=CALLER_KEYS),
+        render_member_reach(neighbor, _member(neighbor)),
+    )
     application = _application()
     member = _member(application)
     if invalid == "runner-selector":
@@ -454,11 +476,11 @@ def test_render_revalidates_mutable_and_unvalidated_inputs(invalid: str) -> None
         )
         application = application.model_copy(update={field: reference})
         with pytest.raises(ValueError):
-            render_application(application)
+            render_application(application, caller_public_keys=CALLER_KEYS)
     with pytest.raises(ValueError):
         render_member_reach(application, member)
     assert (
-        render_application(neighbor),
+        render_application(neighbor, caller_public_keys=CALLER_KEYS),
         render_member_reach(neighbor, _member(neighbor)),
     ) == expected
 
