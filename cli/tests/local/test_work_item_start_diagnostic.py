@@ -382,11 +382,16 @@ class Harness:
 
     def __init__(self) -> None:
         self.run = _Run(argparse.Namespace(record=False, transcript=None, build_images=False))
-        # ScriptedRun forces DOCKER_CONTEXT=default. The endpoint must be the
-        # caller's own configuration, so restore exactly what the caller set.
-        self.run.env.pop("DOCKER_CONTEXT", None)
-        if "DOCKER_CONTEXT" in os.environ:
-            self.run.env["DOCKER_CONTEXT"] = os.environ["DOCKER_CONTEXT"]
+        # ScriptedRun.__init__ overrides the caller's Docker selection
+        # (DOCKER_CONTEXT=default, BUILDX_BUILDER=default). Every subprocess
+        # here must see the caller's environment exactly, so the env is
+        # rebuilt from it, minus only the recording credential this
+        # regression must never pass on. Values added later are run-scoped
+        # (KUBECONFIG, CURIE_CONFIG_DIR, and the API URL, API key and forge
+        # token ScriptedRun.deploy hands its own curie calls).
+        self.run.env = {
+            key: value for key, value in os.environ.items() if key != "CURIE_FACTORY_RECORD_KEY"
+        }
         self.tag = f"fx4930-{self.run.run_id}"
         self.images = {
             component: f"curie-{component}:{self.tag}" for component in ("api", "worker", "runner")
