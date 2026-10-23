@@ -1088,7 +1088,9 @@ def build_runner(
     # ADR 0240 decision 4: a stdio server a connector route names as a caller
     # runs under the runner, not the CLI, and gets its route tokens on a pipe.
     declared_callers = route_callers(config.session.plugin_dir, agent=config.connector_agent)
-    if declared_callers:
+    # Fake-model boots never execute bundle servers, including startup code
+    # that could call an external service before the first tool invocation.
+    if declared_callers and not fake_model:
         route_relays = mount_route_callers(
             bundle_servers,
             callers=declared_callers,

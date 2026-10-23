@@ -415,6 +415,53 @@ def test_a_boot_mounts_the_caller_as_a_relay_and_drops_the_tokens(
     assert spawn["CURIE_MODEL"] == "claude-sonnet-5"
 
 
+def test_fake_boot_never_executes_a_declared_route_caller(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A scoped fake boot must keep bundle startup side effects offline."""
+    monkeypatch.delenv("CURIE_STATE_URL", raising=False)
+    root = _bundle(tmp_path)
+    marker = root / "caller-started"
+    (root / ".mcp.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "review-tools": {
+                        "command": sys.executable,
+                        "args": [
+                            "-c",
+                            "from pathlib import Path; Path('caller-started').touch()",
+                        ],
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    env = BootEnv.render_worker(
+        plugin_dir=str(root),
+        session_id="agent-abc-thread-1",
+        budget=Budget(max_output_tokens_per_run=4096, max_usd_per_day=5.0),
+        connector_release="curie",
+        connector_agent="acme-dev",
+        connector_namespace="curie",
+        connector_caller_token="cct.payload.signature",
+        memory_ref=None,
+        history_ref=None,
+        fake_model=True,
+    ) | {"CURIE_SANDBOX_ID": "sbx-1", "CURIE_RUNNER_PORT": "8080"}
+    spawn = {ROUTE_TOKENS_ENV: json.dumps(_TOKENS)}
+    monkeypatch.setenv(ROUTE_TOKENS_ENV, json.dumps(_TOKENS))
+    monkeypatch.setattr(boot, "route_caller_lock_library", lambda _env: "/nonexistent/lock.so")
+    # The lock is not needed by a fake boot. On the broken path this gives the
+    # real child time to finish its startup side effect before boot returns.
+    monkeypatch.setattr(route_callers_module, "_LOCK_WAIT_S", 1.0)
+    build_runner(RunnerConfig.from_env(env), fake_model=True, sdk_env=spawn)
+    assert not marker.exists(), "fake-model boot executed the bundle's stdio command"
+    assert ROUTE_TOKENS_ENV not in os.environ
+    assert ROUTE_TOKENS_ENV not in spawn
+
+
 # @spec ADR-0240 d4: the capability probe dials the caller's own declaration,
 # with no descriptor, and the caller still lists its tools.
 def test_the_capability_probe_still_lists_a_callers_tools(tmp_path: Path) -> None:
