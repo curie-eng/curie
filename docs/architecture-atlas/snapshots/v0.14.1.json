@@ -4,8 +4,8 @@
   "repository": {
     "name": "curie-eng/curie",
     "branch": "main",
-    "commit": "ee82f0f8f45a7b13319df96bbc62b5c1875fa56e",
-    "shortCommit": "ee82f0f8",
+    "commit": "f1f3bafdbbc7d2ae2610f229a06a446a11fe98d2",
+    "shortCommit": "f1f3bafd",
     "release": "v0.14.1"
   },
   "title": "Curie architecture atlas",
