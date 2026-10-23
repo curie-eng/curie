@@ -1523,3 +1523,123 @@ def test_http_reply_scrubs_base64_of_a_held_secret(
     assert unrelated in raw
     assert unrelated in assistant
     assert frames[-1]["status"] == "done"
+
+
+# ADR 0239 identity contract 2: the caller token wire is now ``cct2.``. Built by
+# concatenation, never by the worker's minter, so each runner boundary is checked
+# against the shape the shared rule must cover. The legacy ``cct.`` shape stays
+# redacted too.
+FAKE_CONNECTOR_CALLER_TOKEN_V2 = "cct2." + "ZXhhbXBsZWNhbGxlcnBheWxvYWQ." + "FAKEFAKEFAKESIG0000"
+_CALLER_TOKENS = pytest.mark.parametrize(
+    "token",
+    [FAKE_CONNECTOR_CALLER_TOKEN_V2, FAKE_CONNECTOR_CALLER_TOKEN],
+    ids=["cct2", "legacy_cct"],
+)
+
+
+@_CALLER_TOKENS
+def test_redact_caller_token_at_stdout_and_in_spans(token: str) -> None:
+    placeholder = _placeholder("connector_caller_token")
+    vector = f"runner output carrying {token} in context"
+
+    for out in (_log_through_stdout(vector), _log_through_stdout("runner emitted t=%s", vector)):
+        assert token not in out
+        assert placeholder in out
+
+    spans = _span_attributes(vector)
+    for value in (
+        spans["agent.run"]["langfuse.trace.name"],
+        spans["llm.generation"]["gen_ai.request.model"],
+        spans["execute_tool"]["gen_ai.tool.name"],
+    ):
+        assert isinstance(value, str)
+        assert token not in value
+        assert placeholder in value
+
+
+@_CALLER_TOKENS
+def test_redact_caller_token_in_the_reply_and_tool_result_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, token: str
+) -> None:
+    placeholder = _placeholder("connector_caller_token")
+    vector = f"the connector saw {token} in its header"
+    raw, frames = _http_reply(
+        _boot_reply_runner(tmp_path, monkeypatch, _reply_script(vector, {"observed": vector}))
+    )
+    assert token not in raw
+    assert token.split(".")[1] not in raw
+    assert placeholder in _assistant_text(frames)
+    closing = next(frame for frame in frames if frame.get("result") is not None)
+    assert placeholder in closing["result"]["observed"]
+    assert token not in closing["result"]["observed"]
+    assert closing["redacted"] is True
+
+
+def test_redact_leaves_cct2_near_matches_untouched() -> None:
+    for line in ("caller=cct2-acme", "release cct2-acme-example ready", "cct2.payload"):
+        assert redact_text(line) == line
+
+
+def _frozen_caller_token() -> str:
+    """The admitted cct2 token of one frozen decision, joined from its segments.
+
+    Read from the corpus rather than written here, so no whole token is a
+    literal in this file. Its payload is not ``eyJ``, so no JWT rule can
+    redact it in the caller rule's place.
+    """
+
+    corpus = json.loads(
+        (
+            Path(__file__).resolve().parents[2]
+            / "tests"
+            / "vectors"
+            / "connector-caller-token.json"
+        ).read_text(encoding="utf-8")
+    )
+    [entry] = [
+        d for d in corpus["decisions"] if d["name"] == "whitespace_in_the_payload_is_still_accepted"
+    ]
+    segments = entry["token"]
+    assert isinstance(segments, list) and all(isinstance(s, str) for s in segments), segments
+    assert entry["refusal"] is None
+    return ".".join(segments)
+
+
+_DOTTED_SUFFIX_TOKENS = [
+    pytest.param("connector_caller_token", _frozen_caller_token(), id="frozen_cct2"),
+    pytest.param("sandbox_token", FAKE_SANDBOX_TOKEN, id="sbx"),
+    pytest.param("channel_read_token", FAKE_CHANNEL_READ_TOKEN, id="chr"),
+]
+
+
+def _assert_token_redacted(out: str, rule: str, token: str) -> None:
+    _, payload, signature = token.split(".")
+    assert payload not in out
+    assert signature not in out
+    assert f"[REDACTED:{rule}]" in out
+
+
+@pytest.mark.parametrize(("rule", "token"), _DOTTED_SUFFIX_TOKENS)
+def test_a_whole_token_followed_by_a_dotted_suffix_is_redacted_on_runner_stdout(
+    rule: str, token: str
+) -> None:
+    _assert_token_redacted(_log_through_stdout("runner observed %s.next", token), rule, token)
+
+
+@pytest.mark.parametrize(("rule", "token"), _DOTTED_SUFFIX_TOKENS)
+def test_a_whole_token_followed_by_a_dotted_suffix_is_redacted_from_replies_and_tool_results(
+    rule: str, token: str
+) -> None:
+    text = "observed " + token + ".next"
+    redactor = OutboundRedactor(frozenset())
+    reply = [*redactor.push(json.dumps({"type": "text_delta", "text": text}))]
+    tool = redactor.push(
+        json.dumps({"type": "side_effect_flag", "call_id": "call", "result": {"observed": text}})
+    )
+    final = redactor.push(json.dumps({"type": "final", "status": "done", "text": text}))
+
+    frames = [json.loads(line) for line in [*reply, *tool, *final]]
+    _assert_token_redacted(_assistant_text(frames), rule, token)
+    [flag] = [frame for frame in frames if frame["type"] == "side_effect_flag"]
+    _assert_token_redacted(json.dumps(flag["result"]), rule, token)
+    _assert_token_redacted(frames[-1]["text"], rule, token)

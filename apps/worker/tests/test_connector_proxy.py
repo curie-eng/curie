@@ -9,6 +9,7 @@ tests/vectors/connector-caller-refusal.json, which the runner reads too.
 from __future__ import annotations
 
 import asyncio
+import base64
 import gzip
 import json
 import logging
@@ -27,6 +28,15 @@ from curie_connector_proxy import __main__ as proxy_main
 from curie_connector_proxy import caller, server
 
 _ROOT = Path(__file__).resolve().parents[3]
+
+
+def _token(value: object) -> str:
+    """A frozen token, stored as its "."-separated segments, joined back."""
+
+    assert isinstance(value, list) and all(isinstance(s, str) for s in value), value
+    return ".".join(value)
+
+
 _TOKENS = json.loads(
     (_ROOT / "tests" / "vectors" / "connector-caller-token.json").read_text(encoding="utf-8")
 )
@@ -34,8 +44,8 @@ _REFUSAL = json.loads(
     (_ROOT / "tests" / "vectors" / "connector-caller-refusal.json").read_text(encoding="utf-8")
 )
 _VECTOR = next(v for v in _TOKENS["vectors"] if v["name"] == "a_plain_agent_name")
-_TOKEN = str(_VECTOR["minted"])
-_BEFORE_EXPIRY = int(_VECTOR["exp"]) - 10
+_TOKEN = _token(_VECTOR["minted"])
+_BEFORE_EXPIRY = int(_VECTOR["claims"]["exp"]) - 10
 _GRANT_SEED = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
 _GATED_TOOLS = ("github/merge_pull_request",)
 _CONNECTOR = "github"
@@ -76,7 +86,7 @@ def _mint_grant(tool: str, arguments: dict[str, Any], *, jti: str) -> str:
         connector=_CONNECTOR,
         tool=tool,
         args=_canonical(arguments),
-        exp=int(_VECTOR["exp"]),
+        exp=int(_VECTOR["claims"]["exp"]),
         jti=jti,
     )
     prefix, _payload, _signature = token.split(".")
@@ -199,11 +209,18 @@ def test_the_refusal_vector_carries_only_known_keys() -> None:
         "status",
         "content_type",
         "unpaired",
+        "duplicate_header",
         "vectors",
     }
     unpaired = _REFUSAL["unpaired"]
     assert set(unpaired) == {"why", "token", "refusal"}
     assert unpaired["refusal"] == caller.INVALID
+    assert _token(unpaired["token"]).startswith("cct2.")
+    duplicate = _REFUSAL["duplicate_header"]
+    assert set(duplicate) == {"why", "tokens", "admits", "now", "refusal"}
+    assert duplicate["refusal"] == caller.INVALID
+    assert len(duplicate["tokens"]) == 2
+    assert all(_token(token).startswith("cct2.") for token in duplicate["tokens"])
     assert [v["refusal"] for v in _REFUSAL["vectors"]] == list(caller.REFUSALS)
     assert caller.REFUSALS[-1] == caller.GRANT_REQUIRED == "grant_required"
     assert server.GRANT_HEADER == "X-Curie-Connector-Grant"
@@ -221,7 +238,7 @@ def test_each_refusal_answers_the_frozen_body_and_never_reaches_the_server(
     refusal = vector["refusal"]
     headers = {} if refusal == caller.MISSING else {caller.HEADER: _TOKEN}
     if refusal == caller.INVALID:
-        headers = {caller.HEADER: "cct.not.valid"}
+        headers = {caller.HEADER: "cct2.not.valid"}
     # An empty gate does not refuse, and {"x": 1} is not a tools/call, so this
     # refusal is armed only by a gated tools/call with no grant header.
     gated = refusal == "grant_required"
@@ -231,7 +248,7 @@ def test_each_refusal_answers_the_frozen_body_and_never_reaches_the_server(
             admits=frozenset({"someone-else"})
             if refusal == caller.NOT_ADMITTED
             else frozenset({"acme-dev"}),
-            clock=int(_VECTOR["exp"]) if refusal == caller.EXPIRED else _BEFORE_EXPIRY,
+            clock=int(_VECTOR["claims"]["exp"]) if refusal == caller.EXPIRED else _BEFORE_EXPIRY,
             gated_tools=_GATED_TOOLS if gated else (),
             connector=_CONNECTOR if gated else "",
         ) as (upstream, proxy):
@@ -302,7 +319,7 @@ def test_a_run_token_sets_identity_headers_and_drops_forged_ones() -> None:
                     proxy.make_url("/mcp"),
                     data=b"{}",
                     headers={
-                        caller.HEADER: str(run_vector["minted"]),
+                        caller.HEADER: _token(run_vector["minted"]),
                         caller.RUN_HEADER: "forged-run",
                         caller.WORK_ITEM_HEADER: "forged-item",
                         caller.AGENT_HEADER: "forged-agent",
@@ -311,8 +328,8 @@ def test_a_run_token_sets_identity_headers_and_drops_forged_ones() -> None:
                     assert answer.status == 201
             [seen] = upstream.seen
             assert seen["headers"][caller.AGENT_HEADER] == "acme-dev"
-            assert seen["headers"][caller.RUN_HEADER] == run_vector["run"]
-            assert seen["headers"][caller.WORK_ITEM_HEADER] == run_vector["work_item"]
+            assert seen["headers"][caller.RUN_HEADER] == run_vector["claims"]["run"]
+            assert seen["headers"][caller.WORK_ITEM_HEADER] == run_vector["claims"]["work_item"]
             assert caller.HEADER not in seen["headers"]
             assert "forged-run" not in seen["headers"].values()
 
@@ -330,7 +347,7 @@ def test_an_unpaired_run_claim_is_the_invalid_refusal() -> None:
                 async with client.post(
                     proxy.make_url("/mcp"),
                     data=b"{}",
-                    headers={caller.HEADER: str(unpaired["token"])},
+                    headers={caller.HEADER: _token(unpaired["token"])},
                 ) as answer:
                     assert answer.status == _REFUSAL["status"]
                     assert await answer.json() == invalid
@@ -381,6 +398,105 @@ def test_two_caller_headers_are_invalid() -> None:
             assert upstream.seen == []
 
     _run(go)
+
+
+# @spec ADR-0239
+def test_the_duplicate_header_refusal_vector_is_invalid_through_the_proxy() -> None:
+    duplicate = _REFUSAL["duplicate_header"]
+    tokens = [_token(token) for token in duplicate["tokens"]]
+    invalid = next(v["body"] for v in _REFUSAL["vectors"] if v["refusal"] == caller.INVALID)
+
+    admits = frozenset(str(name) for name in duplicate["admits"])
+
+    async def go() -> None:
+        async with _serving(admits=admits, clock=int(duplicate["now"])) as (upstream, proxy):
+            async with aiohttp.ClientSession() as client:
+                # Not vacuous: each token alone is admitted.
+                for token in tokens:
+                    async with client.get(
+                        proxy.make_url("/mcp"), headers={caller.HEADER: token}
+                    ) as alone:
+                        assert alone.status == 201
+                async with client.get(
+                    proxy.make_url("/mcp"),
+                    headers=[(caller.HEADER, tokens[0]), (caller.HEADER, tokens[1])],
+                ) as answer:
+                    assert answer.status == _REFUSAL["status"]
+                    assert answer.content_type == _REFUSAL["content_type"]
+                    assert await answer.json() == invalid
+            assert len(upstream.seen) == len(tokens)
+
+    _run(go)
+
+
+def _legacy_token() -> str:
+    """A v1 ``cct.`` token signed with PyNaCl under the corpus's first seed."""
+
+    from nacl.signing import SigningKey
+
+    payload = base64.urlsafe_b64encode(
+        json.dumps(
+            {"agent": "acme-dev", "exp": int(_VECTOR["claims"]["exp"])},
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("ascii")
+    ).rstrip(b"=")
+    head = b"cct." + payload
+    signature = SigningKey(base64.b64decode(str(_VECTOR["seed"]))).sign(head).signature
+    return (head + b"." + base64.urlsafe_b64encode(signature).rstrip(b"=")).decode("ascii")
+
+
+# @spec ADR-0239
+def test_a_legacy_cct_token_is_refused_as_invalid() -> None:
+    invalid = next(v["body"] for v in _REFUSAL["vectors"] if v["refusal"] == caller.INVALID)
+
+    async def go() -> None:
+        async with _serving() as (upstream, proxy):
+            async with aiohttp.ClientSession() as client:
+                async with client.post(
+                    proxy.make_url("/mcp"), data=b"{}", headers={caller.HEADER: _legacy_token()}
+                ) as answer:
+                    assert answer.status == _REFUSAL["status"]
+                    assert await answer.json() == invalid
+            assert upstream.seen == []
+
+    _run(go)
+
+
+# @spec ADR-0239
+def test_the_proxy_log_redacts_cct2_token_text_on_every_outcome(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    unpaired = _token(_REFUSAL["unpaired"]["token"])
+    duplicate = [_token(token) for token in _REFUSAL["duplicate_header"]["tokens"]]
+    presented = [_TOKEN, unpaired, *duplicate]
+
+    async def go() -> None:
+        async with _serving() as (_upstream, proxy):
+            async with aiohttp.ClientSession() as client:
+                for headers in (
+                    [(caller.HEADER, _TOKEN)],
+                    [(caller.HEADER, unpaired)],
+                    [(caller.HEADER, duplicate[0]), (caller.HEADER, duplicate[1])],
+                ):
+                    async with client.get(proxy.make_url("/mcp"), headers=headers):
+                        pass
+        async with _serving(admits=frozenset({"someone-else"})) as (_upstream, proxy):
+            async with aiohttp.ClientSession() as client:
+                async with client.get(proxy.make_url("/mcp"), headers={caller.HEADER: _TOKEN}):
+                    pass
+
+    with caplog.at_level(logging.DEBUG):
+        _run(go)
+    text = caplog.text
+    assert "caller=acme-dev outcome=admitted" in text
+    assert "caller=acme-dev outcome=not_admitted" in text
+    assert f"outcome={caller.INVALID}" in text
+    assert "cct2." not in text
+    for token in presented:
+        assert token not in text
+        for segment in token.split(".")[1:]:
+            assert segment[:16] not in text
 
 
 # @spec ADR-0168 d7
@@ -596,6 +712,8 @@ def test_a_request_the_parser_refuses_logs_no_caller_token(
         _run(go)
     # Not vacuous: the parser's refusal was logged, only without the token.
     assert any("Error handling request" in r.getMessage() for r in caplog.records)
+    assert _TOKEN.startswith("cct2.")
+    assert "cct2." not in caplog.text
     assert "cct." not in caplog.text
     for segment in _TOKEN.split(".")[1:]:
         assert segment[:16] not in caplog.text
@@ -895,7 +1013,7 @@ def _other_agent_grant() -> str:
         connector=_CONNECTOR,
         tool="merge_pull_request",
         args=_canonical({"n": 1}),
-        exp=int(_VECTOR["exp"]),
+        exp=int(_VECTOR["claims"]["exp"]),
         jti="jti-agent",
     )
 

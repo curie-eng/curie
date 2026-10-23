@@ -29,12 +29,21 @@ from aiohttp.test_utils import TestServer
 from curie_connector_proxy import caller, server
 
 _ROOT = Path(__file__).resolve().parents[3]
+
+
+def _token(value: object) -> str:
+    """A frozen token, stored as its "."-separated segments, joined back."""
+
+    assert isinstance(value, list) and all(isinstance(s, str) for s in value), value
+    return ".".join(value)
+
+
 _TOKENS = json.loads(
     (_ROOT / "tests" / "vectors" / "connector-caller-token.json").read_text(encoding="utf-8")
 )
 _VECTOR = next(v for v in _TOKENS["vectors"] if v["name"] == "a_plain_agent_name")
-_TOKEN = str(_VECTOR["minted"])
-_BEFORE_EXPIRY = int(_VECTOR["exp"]) - 10
+_TOKEN = _token(_VECTOR["minted"])
+_BEFORE_EXPIRY = int(_VECTOR["claims"]["exp"]) - 10
 # What the sandbox dials: the connector's Service, never loopback.
 _SERVICE_HOST = "curie-acme-bot-mcp-kubernetes:8000"
 _INITIALIZE = b'{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
@@ -158,7 +167,7 @@ def test_an_admitted_request_presents_the_declared_host(declared: str, presented
 # @spec ADR-0229 d3, d4
 @pytest.mark.parametrize(
     "headers",
-    [{}, {caller.HEADER: "cct.not.a-token"}],
+    [{}, {caller.HEADER: "cct2.not.a-token"}],
     ids=["no_token", "bad_token"],
 )
 def test_a_refused_request_never_reaches_the_server(headers: dict[str, str]) -> None:

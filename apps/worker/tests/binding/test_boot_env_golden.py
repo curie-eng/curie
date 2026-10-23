@@ -31,6 +31,7 @@ import json
 import time
 import uuid
 
+import pytest
 from curie_internal.sandbox_token import verify
 from curie_worker.binding import (
     SANDBOX_TOKEN_TTL_SECONDS,
@@ -406,23 +407,65 @@ def _claims(token: str) -> dict[str, object]:
     return claims
 
 
-def test_a_scoped_boot_carries_a_caller_token_signed_for_its_agent() -> None:
+# ADR 0239 identity contract 2: the installation the worker runs in, carried as
+# opaque text. A cluster's generated id, a Kubernetes Secret UID (uppercase is
+# kept, never folded as a UUID), and a dedicated standalone worker's blank.
+_INSTALLATIONS = [
+    "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA",
+    "9F1C2A7E-3B4D-4E5F-8A6B-7C8D9E0F1A2B",
+    "",
+]
+
+
+# @spec ADR-0239
+@pytest.mark.parametrize("installation", _INSTALLATIONS, ids=["generated", "secret_uid", "blank"])
+def test_a_scoped_boot_carries_a_cct2_caller_token_signed_for_its_identity(
+    installation: str,
+) -> None:
     seed = _caller_seed()
+    config = WorkerConfig(
+        connector_caller_signing_key=seed, installation_id=installation, **_SCOPED
+    )
     before = int(time.time())
-    env = _boot_env(WorkerConfig(connector_caller_signing_key=seed, **_SCOPED), _resolved())
+    env = _boot_env(config, _resolved())
     after = int(time.time())
 
     token = env["CURIE_CONNECTOR_CALLER_TOKEN"]
     prefix, payload, signature = token.split(".")
+    assert prefix == "cct2"
     SigningKey(base64.b64decode(seed)).verify_key.verify(
         f"{prefix}.{payload}".encode("ascii"), _b64url_decode(signature)
     )
     claims = _claims(token)
+    assert set(claims) == {"installation", "agent_id", "agent", "exp"}
+    assert claims["installation"] == config.installation_id == installation
+    assert claims["agent_id"] == str(_AGENT)
     # The agent NAME, because `admits:` lists names.
     assert claims["agent"] == "test-agent"
     exp = claims["exp"]
-    assert isinstance(exp, int)
+    assert type(exp) is int
     assert before + SANDBOX_TOKEN_TTL_SECONDS <= exp <= after + SANDBOX_TOKEN_TTL_SECONDS
+
+
+def test_the_caller_token_carries_the_display_name_and_the_agent_uuid_verbatim() -> None:
+    agent_id = uuid.UUID("abcdef01-2345-4678-89ab-cdef01234567")
+    env = _boot_env(
+        WorkerConfig(connector_caller_signing_key=_caller_seed(), **_SCOPED),
+        _resolved(agent_name="Acme Caf\u00e9 \U0001f680", agent_id=agent_id),
+    )
+    claims = _claims(env["CURIE_CONNECTOR_CALLER_TOKEN"])
+    assert claims["agent"] == "Acme Caf\u00e9 \U0001f680"
+    assert claims["agent_id"] == str(agent_id) == "abcdef01-2345-4678-89ab-cdef01234567"
+
+
+def test_a_boot_with_an_installation_the_wire_refuses_fails_closed() -> None:
+    # A whitespace installation id cannot be signed; the boot refuses rather
+    # than minting a token the shared verifier could misread.
+    config = WorkerConfig(
+        connector_caller_signing_key=_caller_seed(), installation_id="acme install", **_SCOPED
+    )
+    with pytest.raises(ValueError):
+        _boot_env(config, _resolved())
 
 
 def test_the_caller_token_keeps_the_day_cap_when_state_tokens_do_not() -> None:
@@ -461,13 +504,16 @@ def test_an_unscoped_boot_carries_no_caller_token_even_with_a_key() -> None:
     assert "CURIE_CONNECTOR_CALLER_TOKEN" not in env
 
 
-def test_a_work_item_boot_signs_the_run_pair_and_caps_exp() -> None:
+@pytest.mark.parametrize("installation", _INSTALLATIONS, ids=["generated", "secret_uid", "blank"])
+def test_a_work_item_boot_signs_the_run_pair_and_caps_exp(installation: str) -> None:
     seed = _caller_seed()
     run = "11111111-1111-4111-8111-111111111111"
     work_item = "22222222-2222-4222-8222-222222222222"
     ceiling = int(time.time()) + 90
     resolver = BindingResolver.__new__(BindingResolver)
-    resolver._config = WorkerConfig(connector_caller_signing_key=seed, **_SCOPED)  # type: ignore[attr-defined]
+    resolver._config = WorkerConfig(  # type: ignore[attr-defined]
+        connector_caller_signing_key=seed, installation_id=installation, **_SCOPED
+    )
     env = resolver.boot_env(
         _resolved(),
         _THREAD,
@@ -475,7 +521,13 @@ def test_a_work_item_boot_signs_the_run_pair_and_caps_exp() -> None:
         caller_work_item=work_item,
         caller_exp_ceiling=ceiling,
     )
-    claims = _claims(env["CURIE_CONNECTOR_CALLER_TOKEN"])
+    token = env["CURIE_CONNECTOR_CALLER_TOKEN"]
+    assert token.startswith("cct2.")
+    claims = _claims(token)
+    assert set(claims) == {"installation", "agent_id", "agent", "exp", "run", "work_item"}
+    assert claims["installation"] == installation
+    assert claims["agent_id"] == str(_AGENT)
+    assert claims["agent"] == "test-agent"
     assert claims["run"] == run
     assert claims["work_item"] == work_item
     assert claims["exp"] == ceiling

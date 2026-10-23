@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import io
+import json
 import logging
+from pathlib import Path
 
 import pytest
 from curie_telemetry.redact import RedactingLogFilter, redact_text
@@ -489,6 +491,8 @@ PRESERVED_CASES = [
                 "chr.payload",
                 "sbx..signature",
                 "cct.payload.",
+                "cct2.payload",
+                "cct2.payload.",
                 "sandbox=sbx-acme-example caller=cct-acme-example",
             )
         )
@@ -718,3 +722,145 @@ def test_oidc_callback_query_is_private_even_when_login_is_disabled():
     assert "synthetic-state" not in redacted
     assert "/console/oidc/callback?[REDACTED:oidc_callback_query]" in redacted
     assert redact_text(redacted) == redacted
+
+
+# ADR 0239 identity contract 2: the caller token wire is now ``cct2.`` with the
+# same two unpadded base64url segments. Built here by concatenation, never by
+# the minter, so the rule is checked against the shape and not one minter's output.
+FAKE_CONNECTOR_CALLER_TOKEN_V2 = "cct2." + "ZXhhbXBsZWNhbGxlcnBheWxvYWQ." + "FAKEFAKEFAKESIG0000"
+_CALLER_PLACEHOLDER = "[REDACTED:connector_caller_token]"
+
+
+@pytest.mark.parametrize(
+    "token",
+    [FAKE_CONNECTOR_CALLER_TOKEN_V2, FAKE_CONNECTOR_CALLER_TOKEN],
+    ids=["cct2", "legacy_cct"],
+)
+def test_redact_connector_caller_token_in_a_log_line(token: str) -> None:
+    line = f"proxy refused caller {token} for acme-dev"
+    assert redact_text(line) == f"proxy refused caller {_CALLER_PLACEHOLDER} for acme-dev"
+    assert redact_text(redact_text(line)) == redact_text(line)
+
+
+@pytest.mark.parametrize(
+    "token",
+    [FAKE_CONNECTOR_CALLER_TOKEN_V2, FAKE_CONNECTOR_CALLER_TOKEN],
+    ids=["cct2", "legacy_cct"],
+)
+def test_redact_connector_caller_token_through_the_installed_filter(
+    token: str, request: pytest.FixtureRequest
+) -> None:
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.addFilter(RedactingLogFilter())
+    logger = logging.getLogger(f"curie.telemetry.redact.caller.{request.node.callspec.id}")
+    logger.handlers.clear()
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    try:
+        logger.info("runner presented %s upstream", token)
+    finally:
+        logger.removeHandler(handler)
+
+    assert stream.getvalue() == f"runner presented {_CALLER_PLACEHOLDER} upstream\n"
+
+
+def test_redact_connector_caller_token_in_a_transcript_record() -> None:
+    import json
+
+    record = {
+        "role": "tool",
+        "tool_use_id": "call-1",
+        "content": [
+            {"type": "text", "text": f"env carried {FAKE_CONNECTOR_CALLER_TOKEN_V2} at boot"},
+            {"type": "text", "text": f"legacy ({FAKE_CONNECTOR_CALLER_TOKEN})"},
+        ],
+    }
+    redacted = redact_text(json.dumps(record))
+    assert FAKE_CONNECTOR_CALLER_TOKEN_V2 not in redacted
+    assert FAKE_CONNECTOR_CALLER_TOKEN not in redacted
+    parsed = json.loads(redacted)
+    assert parsed["content"][0]["text"] == f"env carried {_CALLER_PLACEHOLDER} at boot"
+    assert parsed["content"][1]["text"] == f"legacy ({_CALLER_PLACEHOLDER})"
+    assert parsed["role"] == "tool" and parsed["tool_use_id"] == "call-1"
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "caller=cct2-acme",
+        "release cct2-acme-example ready",
+        "cct2.payload",
+        "cct2.payload.",
+        "cct2..signature",
+        "xcct2.payload.signature",
+    ],
+)
+def test_redact_leaves_cct2_near_matches_untouched(line: str) -> None:
+    assert redact_text(line) == line
+
+
+def _frozen_caller_token() -> str:
+    """The admitted cct2 token of one frozen decision, joined from its segments.
+
+    Read from the corpus rather than written here, so no whole token is a
+    literal in this file. Its payload is not ``eyJ``, so no JWT rule can
+    redact it in the caller rule's place.
+    """
+
+    corpus = json.loads(
+        (
+            Path(__file__).resolve().parents[3]
+            / "tests"
+            / "vectors"
+            / "connector-caller-token.json"
+        ).read_text(encoding="utf-8")
+    )
+    [entry] = [
+        d for d in corpus["decisions"] if d["name"] == "whitespace_in_the_payload_is_still_accepted"
+    ]
+    segments = entry["token"]
+    assert isinstance(segments, list) and all(isinstance(s, str) for s in segments), segments
+    assert entry["refusal"] is None
+    return ".".join(segments)
+
+
+_DOTTED_SUFFIX_TOKENS = [
+    pytest.param("connector_caller_token", _frozen_caller_token(), id="frozen_cct2"),
+    pytest.param("connector_caller_token", FAKE_CONNECTOR_CALLER_TOKEN_V2, id="fake_cct2"),
+    pytest.param("sandbox_token", FAKE_SANDBOX_TOKEN, id="sbx"),
+    pytest.param("channel_read_token", FAKE_CHANNEL_READ_TOKEN, id="chr"),
+]
+
+
+def _assert_token_redacted(out: str, rule: str, token: str) -> None:
+    _, payload, signature = token.split(".")
+    assert payload not in out
+    assert signature not in out
+    assert f"[REDACTED:{rule}]" in out
+
+
+@pytest.mark.parametrize(("rule", "token"), _DOTTED_SUFFIX_TOKENS)
+def test_a_whole_token_followed_by_a_dotted_suffix_is_redacted(rule: str, token: str) -> None:
+    _assert_token_redacted(redact_text("observed " + token + ".next"), rule, token)
+
+
+@pytest.mark.parametrize(("rule", "token"), _DOTTED_SUFFIX_TOKENS)
+def test_a_whole_token_followed_by_a_dotted_suffix_is_redacted_through_the_filter(
+    rule: str, token: str, request: pytest.FixtureRequest
+) -> None:
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.addFilter(RedactingLogFilter())
+    logger = logging.getLogger(f"curie.telemetry.redact.suffix.{request.node.callspec.id}")
+    logger.handlers.clear()
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    try:
+        logger.info("observed %s.next", token)
+    finally:
+        logger.removeHandler(handler)
+
+    _assert_token_redacted(stream.getvalue(), rule, token)

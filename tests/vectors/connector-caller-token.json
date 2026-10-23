@@ -1,55 +1,3241 @@
 {
-  "comment": "The connector caller token wire (ADR-0168 decision 7, extended by ADR 0178). The worker mints one per sandbox boot (apps/worker/src/curie_worker/caller_token.py) and the runner presents it to each hosted connector in the X-Curie-Caller header. A verifier holds only the public half, so what it checks must be exactly what the worker signs, and this file freezes that. The token is `cct.<payload>.<signature>`: payload is the base64url, unpadded, of the compact JSON object {agent, exp} with optional {run, work_item} (both or neither), sorted keys and ASCII escapes; signature is the base64url, unpadded, of the 64-byte Ed25519 signature over the ASCII bytes of `cct.<payload>`. `agent` is the stored agent name, verbatim. `exp` is absolute unix seconds. `run` and `work_item` are lowercase hyphenated UUIDs. Each vector carries `seed` (standard base64 of the 32-byte Ed25519 seed the chart's Secret holds), `public` (standard base64 of its 32-byte public key), the claims, and `minted`. Ed25519 signing is deterministic, so a minter must reproduce `minted` byte for byte. Read by apps/worker/tests/test_connector_caller_token.py, which rejects an unknown key so a key added for one reader cannot pass vacuously.",
-  "prefix": "cct",
+  "comment": "The connector caller token wire, cct2 (ADR 0239 'Bundle, identity and request contract' item 2; the run and work_item pair and the deadline bound stand from ADR 0178; cross-language parity per ADR 0194). The worker mints one per sandbox boot (apps/worker/src/curie_worker/caller_token.py), the runner presents it in the X-Curie-Caller header, and the caller proxy verifies it (apps/worker/src/curie_connector_proxy/caller.py); cli/src/connector_caller.rs mirrors both halves in Rust. Readers: apps/worker/tests/test_connector_caller_token.py, apps/worker/tests/test_connector_caller_verify.py, apps/worker/tests/test_connector_proxy.py, apps/worker/tests/test_connector_proxy_upstream_host.py, cli/tests/connector_caller_token.rs and cli/tests/connector_caller_keys.rs; each rejects an unknown key so a key added for one reader cannot pass vacuously. Token: `cct2.<payload>.<signature>`. payload is the unpadded base64url of json.dumps(claims, separators=(',', ':'), sort_keys=True) with ensure_ascii (lowercase \\u escapes, surrogate pairs above the BMP); signature is the unpadded base64url of the 64-byte Ed25519 signature over the ASCII bytes of `cct2.<payload>`. Claims are exactly {agent, agent_id, exp, installation} or that plus {run, work_item}. installation is opaque text, blank (dedicated standalone execution only) or 1 to `max_installation_bytes` UTF-8 bytes that contain no surrogate and no code point in `installation_forbidden` (ADR 0239: general category Cc plus Unicode White_Space, written out as inclusive [first, last] code point ranges so no reader depends on a Unicode table version; U+FEFF, which is Cf, is accepted); the resolver's installation_ok applies the same rule. It is compared exactly, with no normalization, and never parsed as a UUID. agent_id, run and work_item are lowercase hyphenated UUIDs. agent is the nonempty display name, verbatim. exp is a JSON integer in 0..=2**63-1, absolute unix seconds; a token is valid while exp > now. No string claim carries a lone surrogate. Verification order: length <= `max_token_chars` and ASCII; three segments with prefix exactly cct2; canonical unpadded base64url segments; a 64-byte signature verified by any configured key before anything is parsed; ASCII payload bytes; JSON with duplicate keys and NaN/Infinity refused; exact key set; field rules. Dedicated mode: missing, invalid, expired, then not_admitted against an exact admits list; installation is not compared and may be blank. Shared mode: missing; a blank or invalid configured installation refuses every token as invalid; invalid; a blank claim installation is invalid; a different installation is not_admitted; then expired. `vectors` are minted byte for byte by every minter (Ed25519 is deterministic); `seed` and `public` are standard base64 of the 32-byte seed and public key the chart's Secret holds. `decisions` give `public` (configured keys), `token` (null for no header), `mode`, `now`, the expected `refusal` (null when admitted) and, when admitted, the exact `claims`. Every decision token is validly signed by a vector seed unless the case is about the signature, key or token text, so only the named rule refuses it. `mint_refusals` give claims every minter must refuse; the text <U+D800> in a string stands for a lone U+D800 the reader substitutes (JSON readers cannot carry one), and an exp outside a reader's integer type is refused at that type's boundary. Generated independently with PyNaCl, not with the code under test. Every token (`minted` and decision `token`) is stored as its \".\"-separated segments, exactly token.split(\".\"), so no single high-entropy token string appears in the corpus, and readers join them with \".\".",
+  "prefix": "cct2",
+  "max_token_chars": 4096,
+  "max_installation_bytes": 128,
+  "installation_forbidden": [
+    [
+      0,
+      32
+    ],
+    [
+      127,
+      160
+    ],
+    [
+      5760,
+      5760
+    ],
+    [
+      8192,
+      8202
+    ],
+    [
+      8232,
+      8233
+    ],
+    [
+      8239,
+      8239
+    ],
+    [
+      8287,
+      8287
+    ],
+    [
+      12288,
+      12288
+    ]
+  ],
   "vectors": [
     {
       "name": "a_plain_agent_name",
-      "why": "The common case: a deploy.yaml-shaped agent name and a far expiry.",
+      "why": "The common case: a cluster installation id (32 alphanumerics, the chart's generated value), the agent UUID, a deploy.yaml-shaped agent name and a far expiry.",
       "seed": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
       "public": "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
-      "agent": "acme-dev",
-      "exp": 1790000000,
-      "minted": "cct.eyJhZ2VudCI6ImFjbWUtZGV2IiwiZXhwIjoxNzkwMDAwMDAwfQ.8ks6uoMW7jnu0d4jBXc01ZELdx0dS57EodIPOCvUsL8vQO3A1eJd1fXJ_TLJTc-I9pd37bawfwTkmm923KkrDQ"
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA"
+      },
+      "minted": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIn0",
+        "74l_wg1og5TWkfkxmZCSOse4EwwqxfG0xRcJ1fiihUpOm9F6wNG1BQ3X26PRXQWaDF-QyFu5I9VPnYM1PrthAQ"
+      ]
     },
     {
       "name": "the_same_claims_under_another_seed",
       "why": "The payload is identical and only the signature moves, so a verifier that checked the payload and skipped the signature would accept both.",
       "seed": "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=",
       "public": "Kay64UG8yvCyLhqU000LxzYeUm0L/hLIl5S8kyKWbdc=",
-      "agent": "acme-dev",
-      "exp": 1790000000,
-      "minted": "cct.eyJhZ2VudCI6ImFjbWUtZGV2IiwiZXhwIjoxNzkwMDAwMDAwfQ.teUNDdQXEDLtbAut3QmdwhPoK8Q23Eds9F2sri57rLKmonkTtJH1FQXeHLtlWYPkClFsak4PNwKFS8vGzBscAQ"
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA"
+      },
+      "minted": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIn0",
+        "vERspqDNuTiblV2eDpCxjSU8v2YIY56wLm5pjx0pC0UzqgVq2LihUArolAWLjJhb3g3x96HAZvrwoI09-QXjDw"
+      ]
     },
     {
       "name": "a_stored_name_outside_the_bundle_shape_is_carried_verbatim",
-      "why": "The API stores agent names wider than deploy.yaml accepts. The claim carries the stored name as it is, and the JSON escapes pin one encoding of it.",
+      "why": "The API stores agent names wider than deploy.yaml accepts. The claim carries the stored display name as it is, and the lowercase \\u escapes pin one encoding of it.",
       "seed": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
       "public": "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
-      "agent": "Acme Café",
-      "exp": 1790000000,
-      "minted": "cct.eyJhZ2VudCI6IkFjbWUgQ2FmXHUwMGU5IiwiZXhwIjoxNzkwMDAwMDAwfQ.199INA_vpUCEox4gfZt2cwG0r_sTxQjrNl0v4HALgpJHTFlX2DjnAks8ojQ-khUAqU9V244TbBIUrxzbIhLdDg"
+      "claims": {
+        "agent": "Acme Café",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA"
+      },
+      "minted": [
+        "cct2",
+        "eyJhZ2VudCI6IkFjbWUgQ2FmXHUwMGU5IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIn0",
+        "S8tWWR0Jnlfmj0VUYPW8szSO5Kn502bGKqXn39GR4McOJ3LMrUWua4NK9UEtQ3DabuQ00XzroiEHnz0dveYxCw"
+      ]
+    },
+    {
+      "name": "an_astral_display_name_is_escaped_as_a_surrogate_pair",
+      "why": "Python's ensure_ascii writes a character above the BMP as a lowercase surrogate pair escape; a hand-written minter must produce the same bytes.",
+      "seed": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+      "public": "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
+      "claims": {
+        "agent": "Acme 🚀 Bot",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA"
+      },
+      "minted": [
+        "cct2",
+        "eyJhZ2VudCI6IkFjbWUgXHVkODNkXHVkZTgwIEJvdCIsImFnZW50X2lkIjoiNDQ0NDQ0NDQtNDQ0NC00NDQ0LTg0NDQtNDQ0NDQ0NDQ0NDQ0IiwiZXhwIjoxNzkwMDAwMDAwLCJpbnN0YWxsYXRpb24iOiJacThtWDJ2TjdrUDR0Ujl3TDNzQjZ5SDFjRjVnSjBkQSJ9",
+        "rpTLWSFRyHJ7jH8_RB3y8c1gSk74XHc6NAQRK3AjzjXU19Cp3XGkAUjbs6JNb9Dh1Txxzh23CKmoRYGBR5bnAQ"
+      ]
+    },
+    {
+      "name": "a_display_name_with_json_short_escapes",
+      "why": "Quote, backslash and the control characters Python writes as short escapes (\\b \\f \\n \\r \\t), other control characters and DEL written as lowercase \\u00XX, and slash written raw. Pins the canonical escaping a hand-written minter must copy.",
+      "seed": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+      "public": "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
+      "claims": {
+        "agent": "Acme \"Ops\"\\Bot/\b\f\n\r\t\u0001",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA"
+      },
+      "minted": [
+        "cct2",
+        "eyJhZ2VudCI6IkFjbWUgXCJPcHNcIlxcQm90L1xiXGZcblxyXHRcdTAwMDFcdTAwN2YiLCJhZ2VudF9pZCI6IjQ0NDQ0NDQ0LTQ0NDQtNDQ0NC04NDQ0LTQ0NDQ0NDQ0NDQ0NCIsImV4cCI6MTc5MDAwMDAwMCwiaW5zdGFsbGF0aW9uIjoiWnE4bVgydk43a1A0dFI5d0wzc0I2eUgxY0Y1Z0owZEEifQ",
+        "SxLkln1S-cgqfl_1815REycESv-j7OgK7XNDXYTnZTK-DS1T4U7tbV6rJCcUmbcRgPXjL0TXkpKlS4HGJ_lKAw"
+      ]
     },
     {
       "name": "a_work_item_run",
-      "why": "ADR 0178: run and work_item ride with agent and exp. A verifier that skipped run would not see this payload differ from the next vector.",
+      "why": "ADR 0178: run and work_item ride with the identity claims as a pair. A verifier that skipped run would not see this payload differ from the next vector.",
       "seed": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
       "public": "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
-      "agent": "acme-dev",
-      "exp": 1790000000,
-      "run": "11111111-1111-4111-8111-111111111111",
-      "work_item": "22222222-2222-4222-8222-222222222222",
-      "minted": "cct.eyJhZ2VudCI6ImFjbWUtZGV2IiwiZXhwIjoxNzkwMDAwMDAwLCJydW4iOiIxMTExMTExMS0xMTExLTQxMTEtODExMS0xMTExMTExMTExMTEiLCJ3b3JrX2l0ZW0iOiIyMjIyMjIyMi0yMjIyLTQyMjItODIyMi0yMjIyMjIyMjIyMjIifQ.BDcRmdqBhTRKOD_kS3imT11EeWJhYLXdP2tlEKXw--ZAYQi9r_MGyl_n5-vC5FX5MgYaPDCTkcR_qUUwBROiAg"
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA",
+        "run": "11111111-1111-4111-8111-111111111111",
+        "work_item": "22222222-2222-4222-8222-222222222222"
+      },
+      "minted": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIiwicnVuIjoiMTExMTExMTEtMTExMS00MTExLTgxMTEtMTExMTExMTExMTExIiwid29ya19pdGVtIjoiMjIyMjIyMjItMjIyMi00MjIyLTgyMjItMjIyMjIyMjIyMjIyIn0",
+        "tkHQmP81hM-mbVpL9IwVFwxb4qBLitskewg15huAvp0BYm0hOIb_anlVz2PClCfPciCyIYmgRqemSKqGQK09Aw"
+      ]
     },
     {
       "name": "the_same_work_item_under_another_run",
-      "why": "The payload differs from a_work_item_run only in run, so a verifier that ignored the new claim would accept both.",
+      "why": "The payload differs from a_work_item_run only in run, so a verifier that ignored that claim would accept both as one.",
       "seed": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
       "public": "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
-      "agent": "acme-dev",
-      "exp": 1790000000,
-      "run": "33333333-3333-4333-8333-333333333333",
-      "work_item": "22222222-2222-4222-8222-222222222222",
-      "minted": "cct.eyJhZ2VudCI6ImFjbWUtZGV2IiwiZXhwIjoxNzkwMDAwMDAwLCJydW4iOiIzMzMzMzMzMy0zMzMzLTQzMzMtODMzMy0zMzMzMzMzMzMzMzMiLCJ3b3JrX2l0ZW0iOiIyMjIyMjIyMi0yMjIyLTQyMjItODIyMi0yMjIyMjIyMjIyMjIifQ.ZJbjCmR5rAClzPfwVJ76pVno0Hev6cbfuczXVvr0ipdD1OX9b3Rw3iKn67KQxQZ5ZZl7voMIoGseOoLsXw8uBg"
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA",
+        "run": "33333333-3333-4333-8333-333333333333",
+        "work_item": "22222222-2222-4222-8222-222222222222"
+      },
+      "minted": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIiwicnVuIjoiMzMzMzMzMzMtMzMzMy00MzMzLTgzMzMtMzMzMzMzMzMzMzMzIiwid29ya19pdGVtIjoiMjIyMjIyMjItMjIyMi00MjIyLTgyMjItMjIyMjIyMjIyMjIyIn0",
+        "RAS8SKoatRy-AyArazWOlqU2_Pj6CJ0iCBodDm5ZLVgl3ESMWO6nx2yWxy07vypG-oeUps-hSVB-tSoOzsToCg"
+      ]
+    },
+    {
+      "name": "a_blank_installation_for_a_dedicated_standalone_worker",
+      "why": "A dedicated standalone worker has installation_id \"\". The minter accepts it and the dedicated verifier admits it; the shared verifier refuses it as invalid.",
+      "seed": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+      "public": "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": ""
+      },
+      "minted": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IiJ9",
+        "oDNsvGuGICNuMXKIbeXDUX7iSvUA4e-6SuTLuDM0D74Fot2h-zElcx8UT-LAwhHgKAWL8gXIz66E4XYTowjfCw"
+      ]
+    },
+    {
+      "name": "an_uppercase_uuid_shaped_secret_uid_installation_is_opaque_text",
+      "why": "A Kubernetes Secret UID can be the installation id. It is never parsed or lowercased as a UUID: the claim carries it byte for byte.",
+      "seed": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+      "public": "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "9F1C2A7E-3B4D-4E5F-8A6B-7C8D9E0F1A2B"
+      },
+      "minted": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IjlGMUMyQTdFLTNCNEQtNEU1Ri04QTZCLTdDOEQ5RTBGMUEyQiJ9",
+        "o9nO_Tel2VgWKux1l5ifxcmvM64IshQzY_cPzpeOtNEDtx8U0KMtMzkjv1zVU6kh6rGeQkt-oZLkdbiMn0RGAA"
+      ]
+    },
+    {
+      "name": "an_installation_of_exactly_128_ascii_characters",
+      "why": "The installation bound is 128 UTF-8 bytes, inclusive: 128 ASCII characters, punctuation included, compared exactly.",
+      "seed": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+      "public": "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "Acme-Install_0.9:x/y@z~Acme-Install_0.9:x/y@z~Acme-Install_0.9:x/y@z~Acme-Install_0.9:x/y@z~Acme-Install_0.9:x/y@z~Acme-Install_"
+      },
+      "minted": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IkFjbWUtSW5zdGFsbF8wLjk6eC95QHp-QWNtZS1JbnN0YWxsXzAuOTp4L3lAen5BY21lLUluc3RhbGxfMC45OngveUB6fkFjbWUtSW5zdGFsbF8wLjk6eC95QHp-QWNtZS1JbnN0YWxsXzAuOTp4L3lAen5BY21lLUluc3RhbGxfIn0",
+        "wVrU_jpqpdPlNGplX1euASlKq7ZmXnfrKRZfSRx_pRjKAjA75xjyC2gtGXeEuYKwGnK-K-dojqhsC3a7jvQ9CA"
+      ]
+    },
+    {
+      "name": "an_installation_with_an_nfc_e_acute",
+      "why": "U+00E9 in NFC is neither Cc nor White_Space; the installation is not limited to ASCII.",
+      "seed": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+      "public": "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "acme-é"
+      },
+      "minted": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6ImFjbWUtXHUwMGU5In0",
+        "REDECzk6lZNnSXLivEII_nQHTga0W6ZJHdSe6mThuo4Rb_QPcUO631oLRtiPP-Y6pwZkFNFXFVysIbSHxGCOAw"
+      ]
+    },
+    {
+      "name": "an_installation_with_an_astral_character",
+      "why": "U+10000 is above the BMP and neither Cc nor White_Space; ensure_ascii writes it as a lowercase surrogate pair escape.",
+      "seed": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+      "public": "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "acme𐀀"
+      },
+      "minted": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6ImFjbWVcdWQ4MDBcdWRjMDAifQ",
+        "98sd9sk2exAWjwCKEFAmU3gSx6g2ZvRhbEymgbdY2Fk88SoNIDXV16u1zIFVoC9OKlQaRfpcQ3iH1gVk9cc_Aw"
+      ]
+    },
+    {
+      "name": "an_installation_with_u_1c89",
+      "why": "U+1C89 is accepted because the rule is an enumerated set, not a printability table that Python and Rust disagree on.",
+      "seed": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+      "public": "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "acmeᲉinstall"
+      },
+      "minted": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6ImFjbWVcdTFjODlpbnN0YWxsIn0",
+        "Sp5KVr9TeLW8vFLcKVqW91sdLC_qHl9Hv_aenSzg5Ca4iSvVI5TS2XHVJcEs8uKTsxiFPWYuEHlmAEZCG6HJAw"
+      ]
+    },
+    {
+      "name": "an_installation_with_a_byte_order_mark_u_feff",
+      "why": "U+FEFF is Cf, neither Cc nor White_Space, so the ADR's rule accepts it.",
+      "seed": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+      "public": "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "acme﻿install"
+      },
+      "minted": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6ImFjbWVcdWZlZmZpbnN0YWxsIn0",
+        "FToptk1-qRZ8x_FVZMTw5-PTe1YmCE0VK8xYY9srZtO0K_ALS7ld-CbzoTSlnK8EqlqRoXTqb08_kR2ljnR3Ag"
+      ]
+    },
+    {
+      "name": "an_installation_of_128_multibyte_utf8_bytes",
+      "why": "64 copies of U+00E9 are exactly 128 UTF-8 bytes, the inclusive bound.",
+      "seed": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+      "public": "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"
+      },
+      "minted": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6Ilx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOSJ9",
+        "bena3B3tORgyHOnxTkTgpw1fL-ypxY8GQgjfPiumzsTUQ9irUXIQLsXX0k9e_4_vdCtwdnvFDL6tCRiUpoymCg"
+      ]
+    }
+  ],
+  "decisions": [
+    {
+      "name": "admitted_dedicated",
+      "why": "The baseline: a validly signed token, an admitted agent, before expiry.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIn0",
+        "74l_wg1og5TWkfkxmZCSOse4EwwqxfG0xRcJ1fiihUpOm9F6wNG1BQ3X26PRXQWaDF-QyFu5I9VPnYM1PrthAQ"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": null,
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA"
+      }
+    },
+    {
+      "name": "admitted_shared",
+      "why": "The same token in shared mode: the claim installation equals the configured one exactly.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIn0",
+        "74l_wg1og5TWkfkxmZCSOse4EwwqxfG0xRcJ1fiihUpOm9F6wNG1BQ3X26PRXQWaDF-QyFu5I9VPnYM1PrthAQ"
+      ],
+      "mode": {
+        "kind": "shared",
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA"
+      },
+      "now": 1789999999,
+      "refusal": null,
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA"
+      }
+    },
+    {
+      "name": "admitted_shared_with_a_run_pair",
+      "why": "A run pair rides through the shared verifier untouched.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIiwicnVuIjoiMTExMTExMTEtMTExMS00MTExLTgxMTEtMTExMTExMTExMTExIiwid29ya19pdGVtIjoiMjIyMjIyMjItMjIyMi00MjIyLTgyMjItMjIyMjIyMjIyMjIyIn0",
+        "tkHQmP81hM-mbVpL9IwVFwxb4qBLitskewg15huAvp0BYm0hOIb_anlVz2PClCfPciCyIYmgRqemSKqGQK09Aw"
+      ],
+      "mode": {
+        "kind": "shared",
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA"
+      },
+      "now": 1789999999,
+      "refusal": null,
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA",
+        "run": "11111111-1111-4111-8111-111111111111",
+        "work_item": "22222222-2222-4222-8222-222222222222"
+      }
+    },
+    {
+      "name": "admitted_under_either_configured_key",
+      "why": "Two configured keys overlap a rotation: a token signed by the second seed is admitted.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
+        "Kay64UG8yvCyLhqU000LxzYeUm0L/hLIl5S8kyKWbdc="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIn0",
+        "vERspqDNuTiblV2eDpCxjSU8v2YIY56wLm5pjx0pC0UzqgVq2LihUArolAWLjJhb3g3x96HAZvrwoI09-QXjDw"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": null,
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA"
+      }
+    },
+    {
+      "name": "exp_at_the_signed_64_bit_maximum_is_admitted",
+      "why": "exp 2**63-1 is the top of the closed range both Python and a Rust i64 reader hold losslessly.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjkyMjMzNzIwMzY4NTQ3NzU4MDcsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIn0",
+        "YAsmhLkTYWj2x3lYBdOXKEO7XkJ_SQEMSHpFwjEE_CcvrtnetyiIoRyz8ywMcL1u-r1mRLQdjXWCIkXKks6ACQ"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1790000000,
+      "refusal": null,
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 9223372036854775807,
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA"
+      }
+    },
+    {
+      "name": "a_blank_installation_is_admitted_by_the_dedicated_verifier",
+      "why": "Dedicated execution does not compare installation, and a standalone worker signs it blank.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IiJ9",
+        "oDNsvGuGICNuMXKIbeXDUX7iSvUA4e-6SuTLuDM0D74Fot2h-zElcx8UT-LAwhHgKAWL8gXIz66E4XYTowjfCw"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": null,
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": ""
+      }
+    },
+    {
+      "name": "a_token_of_exactly_4096_chars_is_admitted",
+      "why": "The 4096-character bound is inclusive: this validly signed token sits on it.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSIsImFnZW50X2lkIjoiNDQ0NDQ0NDQtNDQ0NC00NDQ0LTg0NDQtNDQ0NDQ0NDQ0NDQ0IiwiZXhwIjoxNzkwMDAwMDAwLCJpbnN0YWxsYXRpb24iOiJacThtWDJ2TjdrUDR0Ujl3TDNzQjZ5SDFjRjVnSjBkQSJ9",
+        "cuKZly8_zz48GMhByu4S2_BGtEO41OB8gKRC-poniLx9jO_WCQOssPkZe9_41-hQe_NuPpzqPDLgRli1Ea6DAg"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": null,
+      "claims": {
+        "agent": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA"
+      }
+    },
+    {
+      "name": "a_validly_signed_token_over_4096_chars_is_invalid",
+      "why": "The length bound applies before any decoding, even to a token whose signature verifies.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWEiLCJhZ2VudF9pZCI6IjQ0NDQ0NDQ0LTQ0NDQtNDQ0NC04NDQ0LTQ0NDQ0NDQ0NDQ0NCIsImV4cCI6MTc5MDAwMDAwMCwiaW5zdGFsbGF0aW9uIjoiWnE4bVgydk43a1A0dFI5d0wzc0I2eUgxY0Y1Z0owZEEifQ",
+        "V67u3m8-0iw5qZp24W2RULFa426Le9RX_dl3WyQcxJb743RFJI0aRKraK7kt2PWtvMh5jfZ8KcDCiWCh1terAw"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "no_token_is_missing",
+      "why": "No header at all.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": null,
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "missing"
+    },
+    {
+      "name": "an_empty_token_is_missing",
+      "why": "An empty header value is no token.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        ""
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "missing"
+    },
+    {
+      "name": "no_token_is_missing_in_shared_mode_even_with_a_blank_configured_installation",
+      "why": "Missing is decided before the configured installation is checked.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": null,
+      "mode": {
+        "kind": "shared",
+        "installation": ""
+      },
+      "now": 1789999999,
+      "refusal": "missing"
+    },
+    {
+      "name": "a_blank_configured_installation_refuses_every_token",
+      "why": "Shared execution fails closed when its own installation is blank.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IiJ9",
+        "oDNsvGuGICNuMXKIbeXDUX7iSvUA4e-6SuTLuDM0D74Fot2h-zElcx8UT-LAwhHgKAWL8gXIz66E4XYTowjfCw"
+      ],
+      "mode": {
+        "kind": "shared",
+        "installation": ""
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "a_blank_configured_installation_refuses_a_nonblank_token",
+      "why": "Shared execution fails closed when its own installation is blank.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIn0",
+        "74l_wg1og5TWkfkxmZCSOse4EwwqxfG0xRcJ1fiihUpOm9F6wNG1BQ3X26PRXQWaDF-QyFu5I9VPnYM1PrthAQ"
+      ],
+      "mode": {
+        "kind": "shared",
+        "installation": ""
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "an_invalid_configured_installation_refuses_every_token",
+      "why": "A configured installation that breaks the rule (a space) fails closed, even against a token carrying the same text.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6ImFjbWUgaW5zdGFsbCJ9",
+        "h7hWq9v21KXtemWFRZMTGpv_GgFCzxQPee0rp3CFhGHUoAKMpGeWSfiUAHaI3HRBW1V_9wcQ6wjq7RsvzgYZAw"
+      ],
+      "mode": {
+        "kind": "shared",
+        "installation": "acme install"
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "a_blank_claim_installation_is_invalid_in_shared_mode",
+      "why": "Blank installation is only meaningful for dedicated standalone execution.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IiJ9",
+        "oDNsvGuGICNuMXKIbeXDUX7iSvUA4e-6SuTLuDM0D74Fot2h-zElcx8UT-LAwhHgKAWL8gXIz66E4XYTowjfCw"
+      ],
+      "mode": {
+        "kind": "shared",
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA"
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "a_foreign_installation_is_not_admitted",
+      "why": "Another installation's validly signed token.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIn0",
+        "74l_wg1og5TWkfkxmZCSOse4EwwqxfG0xRcJ1fiihUpOm9F6wNG1BQ3X26PRXQWaDF-QyFu5I9VPnYM1PrthAQ"
+      ],
+      "mode": {
+        "kind": "shared",
+        "installation": "Qw3eR5tY7uI9oP1aS2dF4gH6jK8lZ0xC"
+      },
+      "now": 1789999999,
+      "refusal": "not_admitted"
+    },
+    {
+      "name": "a_uuid_shaped_installation_is_compared_exactly_not_lowercased",
+      "why": "The configured value is the lowercase spelling of the signed uppercase Secret UID; no UUID folding.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IjlGMUMyQTdFLTNCNEQtNEU1Ri04QTZCLTdDOEQ5RTBGMUEyQiJ9",
+        "o9nO_Tel2VgWKux1l5ifxcmvM64IshQzY_cPzpeOtNEDtx8U0KMtMzkjv1zVU6kh6rGeQkt-oZLkdbiMn0RGAA"
+      ],
+      "mode": {
+        "kind": "shared",
+        "installation": "9f1c2a7e-3b4d-4e5f-8a6b-7c8d9e0f1a2b"
+      },
+      "now": 1789999999,
+      "refusal": "not_admitted"
+    },
+    {
+      "name": "a_uuid_shaped_installation_matching_exactly_is_admitted",
+      "why": "The same uppercase text configured is admitted.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IjlGMUMyQTdFLTNCNEQtNEU1Ri04QTZCLTdDOEQ5RTBGMUEyQiJ9",
+        "o9nO_Tel2VgWKux1l5ifxcmvM64IshQzY_cPzpeOtNEDtx8U0KMtMzkjv1zVU6kh6rGeQkt-oZLkdbiMn0RGAA"
+      ],
+      "mode": {
+        "kind": "shared",
+        "installation": "9F1C2A7E-3B4D-4E5F-8A6B-7C8D9E0F1A2B"
+      },
+      "now": 1789999999,
+      "refusal": null,
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "9F1C2A7E-3B4D-4E5F-8A6B-7C8D9E0F1A2B"
+      }
+    },
+    {
+      "name": "a_128_character_installation_matching_exactly_is_admitted_in_shared_mode",
+      "why": "An installation at the bound compares byte for byte.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IkFjbWUtSW5zdGFsbF8wLjk6eC95QHp-QWNtZS1JbnN0YWxsXzAuOTp4L3lAen5BY21lLUluc3RhbGxfMC45OngveUB6fkFjbWUtSW5zdGFsbF8wLjk6eC95QHp-QWNtZS1JbnN0YWxsXzAuOTp4L3lAen5BY21lLUluc3RhbGxfIn0",
+        "wVrU_jpqpdPlNGplX1euASlKq7ZmXnfrKRZfSRx_pRjKAjA75xjyC2gtGXeEuYKwGnK-K-dojqhsC3a7jvQ9CA"
+      ],
+      "mode": {
+        "kind": "shared",
+        "installation": "Acme-Install_0.9:x/y@z~Acme-Install_0.9:x/y@z~Acme-Install_0.9:x/y@z~Acme-Install_0.9:x/y@z~Acme-Install_0.9:x/y@z~Acme-Install_"
+      },
+      "now": 1789999999,
+      "refusal": null,
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "Acme-Install_0.9:x/y@z~Acme-Install_0.9:x/y@z~Acme-Install_0.9:x/y@z~Acme-Install_0.9:x/y@z~Acme-Install_0.9:x/y@z~Acme-Install_"
+      }
+    },
+    {
+      "name": "a_foreign_installation_outranks_expiry_in_shared_mode",
+      "why": "Shared order: installation mismatch is decided before expiry.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIn0",
+        "74l_wg1og5TWkfkxmZCSOse4EwwqxfG0xRcJ1fiihUpOm9F6wNG1BQ3X26PRXQWaDF-QyFu5I9VPnYM1PrthAQ"
+      ],
+      "mode": {
+        "kind": "shared",
+        "installation": "Qw3eR5tY7uI9oP1aS2dF4gH6jK8lZ0xC"
+      },
+      "now": 1790000010,
+      "refusal": "not_admitted"
+    },
+    {
+      "name": "shared_mode_has_no_admits_list",
+      "why": "A display name no dedicated list names is still admitted when the installation matches.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6IkFjbWUgQ2FmXHUwMGU5IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIn0",
+        "S8tWWR0Jnlfmj0VUYPW8szSO5Kn502bGKqXn39GR4McOJ3LMrUWua4NK9UEtQ3DabuQ00XzroiEHnz0dveYxCw"
+      ],
+      "mode": {
+        "kind": "shared",
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA"
+      },
+      "now": 1789999999,
+      "refusal": null,
+      "claims": {
+        "agent": "Acme Café",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA"
+      }
+    },
+    {
+      "name": "shared_mode_expired",
+      "why": "Shared mode refuses a token at its expiry.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIn0",
+        "74l_wg1og5TWkfkxmZCSOse4EwwqxfG0xRcJ1fiihUpOm9F6wNG1BQ3X26PRXQWaDF-QyFu5I9VPnYM1PrthAQ"
+      ],
+      "mode": {
+        "kind": "shared",
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA"
+      },
+      "now": 1790000000,
+      "refusal": "expired"
+    },
+    {
+      "name": "an_agent_off_the_list_is_not_admitted",
+      "why": "Dedicated admission is the admits list.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIn0",
+        "74l_wg1og5TWkfkxmZCSOse4EwwqxfG0xRcJ1fiihUpOm9F6wNG1BQ3X26PRXQWaDF-QyFu5I9VPnYM1PrthAQ"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "someone-else"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "not_admitted"
+    },
+    {
+      "name": "the_admits_match_is_exact",
+      "why": "No case folding: ACME-DEV does not admit acme-dev.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIn0",
+        "74l_wg1og5TWkfkxmZCSOse4EwwqxfG0xRcJ1fiihUpOm9F6wNG1BQ3X26PRXQWaDF-QyFu5I9VPnYM1PrthAQ"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "ACME-DEV"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "not_admitted"
+    },
+    {
+      "name": "an_empty_admits_list_admits_nobody",
+      "why": "An empty list admits no one.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIn0",
+        "74l_wg1og5TWkfkxmZCSOse4EwwqxfG0xRcJ1fiihUpOm9F6wNG1BQ3X26PRXQWaDF-QyFu5I9VPnYM1PrthAQ"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": []
+      },
+      "now": 1789999999,
+      "refusal": "not_admitted"
+    },
+    {
+      "name": "dedicated_expiry_outranks_admission",
+      "why": "Dedicated order: expired is decided before admission.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIn0",
+        "74l_wg1og5TWkfkxmZCSOse4EwwqxfG0xRcJ1fiihUpOm9F6wNG1BQ3X26PRXQWaDF-QyFu5I9VPnYM1PrthAQ"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "someone-else"
+        ]
+      },
+      "now": 1790000000,
+      "refusal": "expired"
+    },
+    {
+      "name": "dedicated_mode_ignores_installation",
+      "why": "A foreign-looking installation is not compared in dedicated mode.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlF3M2VSNXRZN3VJOW9QMWFTMmRGNGdINmpLOGxaMHhDIn0",
+        "gEV3JQqRRAz1XmL-a_8YTtSPtT21nGcFEIIGGDcvtF6vSFH5emw1dMyAeMCf7-RD47aVKD6slKE1dUs405fgDQ"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": null,
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "Qw3eR5tY7uI9oP1aS2dF4gH6jK8lZ0xC"
+      }
+    },
+    {
+      "name": "exp_equal_to_now_is_expired",
+      "why": "Valid only while exp > now.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIn0",
+        "74l_wg1og5TWkfkxmZCSOse4EwwqxfG0xRcJ1fiihUpOm9F6wNG1BQ3X26PRXQWaDF-QyFu5I9VPnYM1PrthAQ"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1790000000,
+      "refusal": "expired"
+    },
+    {
+      "name": "exp_before_now_is_expired",
+      "why": "Past its expiry.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIn0",
+        "74l_wg1og5TWkfkxmZCSOse4EwwqxfG0xRcJ1fiihUpOm9F6wNG1BQ3X26PRXQWaDF-QyFu5I9VPnYM1PrthAQ"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1790000001,
+      "refusal": "expired"
+    },
+    {
+      "name": "exp_zero_at_now_zero_is_expired",
+      "why": "exp 0 is in range, and 0 > 0 is false.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIn0",
+        "6XkQFjtaDlxEA0hKZWwS4iPFRwSFuO8rfV_KEMwPevOBartzfg449L1xLtRajhLUOeoWZu6aANclKQb9AnxECg"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 0,
+      "refusal": "expired"
+    },
+    {
+      "name": "exp_two_to_the_63_is_invalid",
+      "why": "One past the signed 64-bit maximum.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjkyMjMzNzIwMzY4NTQ3NzU4MDgsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIn0",
+        "AEopVGzikZNEzbq99Yfp8UNd0GWonDlZDR3rMsE_sNO6ZJmi_quciDgybToSoWcfucA8EgMKuKQz2jbYzisJBA"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "exp_two_to_the_64_is_invalid",
+      "why": "Out of range.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE4NDQ2NzQ0MDczNzA5NTUxNjE2LCJpbnN0YWxsYXRpb24iOiJacThtWDJ2TjdrUDR0Ujl3TDNzQjZ5SDFjRjVnSjBkQSJ9",
+        "F58s8S5fdflFhhjyNZbt-u43Fidtn1tEeWulfjAlye_cC-p8y2dSWyME5v6cXienvPg0l6-coll2p9z1MltJDg"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "exp_two_to_the_64_plus_one_is_invalid",
+      "why": "Out of range; also past u64.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE4NDQ2NzQ0MDczNzA5NTUxNjE3LCJpbnN0YWxsYXRpb24iOiJacThtWDJ2TjdrUDR0Ujl3TDNzQjZ5SDFjRjVnSjBkQSJ9",
+        "sWhLD2ehRn9x5TP3DQimqgk7-tK6ogxUw7JAzhO7kFBF8D7LqiyTS6IFsHavcFxDtsCNvYZGCAZLOw_m6q6kCQ"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "exp_negative_is_invalid",
+      "why": "The range starts at 0.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOi0xLCJpbnN0YWxsYXRpb24iOiJacThtWDJ2TjdrUDR0Ujl3TDNzQjZ5SDFjRjVnSjBkQSJ9",
+        "mnTT0udlS1Knq_NbSMJaq4LnDV3Tf8e3o5GTG05AzGBiF-q7IGxUVkT6nqzpRNmYuT7pZNPnr3w04slBhjErBQ"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "exp_negative_zero_is_invalid",
+      "why": "Python reads -0 as integer 0 and serde_json as a float; both readers refuse any integer literal starting with a minus.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOi0wLCJpbnN0YWxsYXRpb24iOiJacThtWDJ2TjdrUDR0Ujl3TDNzQjZ5SDFjRjVnSjBkQSJ9",
+        "Q0HKRDsKdTGD5Z8ssr5hnIFQ7fc1XJ4m-tiwUD-OAeNcyQ6so5eP9eziAH1E4PtsOH7PiD9fRk7EN08-OnVyDw"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "exp_in_exponent_form_is_invalid",
+      "why": "1e3 is a JSON number but not an integer literal.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjFlMywiaW5zdGFsbGF0aW9uIjoiWnE4bVgydk43a1A0dFI5d0wzc0I2eUgxY0Y1Z0owZEEifQ",
+        "NOfFAXI1sZ7QZUpZWJm-Q0X6d0s54IG8yCWjOXOpgJKLmMK_l6WVlqAFe5n8zkec_K_56A9ntnrBKMoAVCVbAQ"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "exp_nan_is_invalid",
+      "why": "NaN is not JSON; Python's parse_constant must refuse it.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOk5hTiwiaW5zdGFsbGF0aW9uIjoiWnE4bVgydk43a1A0dFI5d0wzc0I2eUgxY0Y1Z0owZEEifQ",
+        "o8g_OglB604kzvo2SqYjMjTU--FUcJ-qCBfncztNnv014VsA9VnMjEDIZow0hCBTDJyNMqGU0cgUUfonX0liAQ"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "exp_as_a_string_is_invalid",
+      "why": "A string is not an integer.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOiIxNzkwMDAwMDAwIiwiaW5zdGFsbGF0aW9uIjoiWnE4bVgydk43a1A0dFI5d0wzc0I2eUgxY0Y1Z0owZEEifQ",
+        "Ug3PDr5Tp0c4F4QLjKyFVZdvDyXNCeP0OD4AyX9aPl_YnPxVNfgVsfSsOBxGYWpAdu5pnCmDP5a4Jkjt5HG1CA"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "exp_as_a_float_is_invalid",
+      "why": "1790000000.0 is not an integer literal.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAuMCwiaW5zdGFsbGF0aW9uIjoiWnE4bVgydk43a1A0dFI5d0wzc0I2eUgxY0Y1Z0owZEEifQ",
+        "KcT4VVN6iXrQ45Xn7OQ2C2ywd6RKj1Ngdz4qxxJiIRi7jBSXtIoFyJMjbLyGXo-b1dsGJjg1t9RLCh-3AuuEBg"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "exp_as_a_bool_is_invalid",
+      "why": "true is not an integer, though Python's bool subclasses int.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOnRydWUsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIn0",
+        "iC81o2HUtrcwNVKCG33CdRgfRVlQy4wrPhkyPdfl7Z22b9U8H6BomQOCmwlpbPbUkYzmQeVpvIqriaeC8zBzAA"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "an_unknown_field_is_invalid",
+      "why": "The key set is exact.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJhdWQiOiJ4IiwiZXhwIjoxNzkwMDAwMDAwLCJpbnN0YWxsYXRpb24iOiJacThtWDJ2TjdrUDR0Ujl3TDNzQjZ5SDFjRjVnSjBkQSJ9",
+        "GhgcYnNdPZjV4z8RrroR3GR9yGQI1tB6fCFAsO4lj9cEPMu3aLQ_lwoEMBMijMgJyj8IG7daw1d99xHUil7tAw"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "a_missing_agent_is_invalid",
+      "why": "agent is mandatory.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudF9pZCI6IjQ0NDQ0NDQ0LTQ0NDQtNDQ0NC04NDQ0LTQ0NDQ0NDQ0NDQ0NCIsImV4cCI6MTc5MDAwMDAwMCwiaW5zdGFsbGF0aW9uIjoiWnE4bVgydk43a1A0dFI5d0wzc0I2eUgxY0Y1Z0owZEEifQ",
+        "s12PYXAWzhCMhlhUt5i2kZrmSqvHdHgRzvoa3XR4rv4ph4otnOFfc1SPaGq1Gm_9NaguBfOOMIU90i0THW9tCw"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "a_missing_agent_id_is_invalid",
+      "why": "agent_id is mandatory.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiZXhwIjoxNzkwMDAwMDAwLCJpbnN0YWxsYXRpb24iOiJacThtWDJ2TjdrUDR0Ujl3TDNzQjZ5SDFjRjVnSjBkQSJ9",
+        "GMjiOBZsUNBOG5mk_a4hnegEM0h33ErAIpndtGSRPfcQCgVZWoQay44i_e4WcFZj9Hsa7nxfGQ2D5rijfI2BAg"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "a_missing_exp_is_invalid",
+      "why": "exp is mandatory.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJpbnN0YWxsYXRpb24iOiJacThtWDJ2TjdrUDR0Ujl3TDNzQjZ5SDFjRjVnSjBkQSJ9",
+        "p0BK1Wimz9Ng5Gpgh5Pd_B_fZag4dltEQ3rV8pDpTsVTv0X7A9vZU73iQCufBl9jZrgFFdIzLIzbdUTJOOkvDw"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "a_missing_installation_is_invalid",
+      "why": "installation is mandatory.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDB9",
+        "6HhiPTdsuzZLYqJtDaUele9LXDj9qiu7WPZ043dSYDrEg69wBnAK73brpshPC4udpaY83J8NhraOpXPm5xT-AA"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "a_lone_run_is_invalid",
+      "why": "run and work_item are a pair (ADR 0178).",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIiwicnVuIjoiMTExMTExMTEtMTExMS00MTExLTgxMTEtMTExMTExMTExMTExIn0",
+        "KOrKbKU1KYDZvFMpPhuVUGKUeVZBZQwbTKaVzb2Bsp_HZOmolIs6Pn1YHpp1SXXMXrWxee4etnqRLZEawrE5BQ"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "a_lone_work_item_is_invalid",
+      "why": "run and work_item are a pair (ADR 0178).",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIiwid29ya19pdGVtIjoiMjIyMjIyMjItMjIyMi00MjIyLTgyMjItMjIyMjIyMjIyMjIyIn0",
+        "rjVTUsAA6UGW-gFKQrpXPIlnI7ThrIpp5p0DrZKOm2Rjft48lvdp2Ps9qLaf68nLpxXmE2pSHaBqiwu4qpZMCg"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "a_null_run_is_invalid",
+      "why": "A present run must be a UUID string.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIiwicnVuIjpudWxsLCJ3b3JrX2l0ZW0iOiIyMjIyMjIyMi0yMjIyLTQyMjItODIyMi0yMjIyMjIyMjIyMjIifQ",
+        "oazL_MM-2EMqxJFGkGTU71KNHP3e9pzYIvoUE1Yr8ZF5y16B1kqyz2Z6w3gplip4YcJmi8wy7G1go77ZTjqaCg"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "an_uppercase_agent_id_is_invalid",
+      "why": "One spelling: lowercase hyphenated.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiJBQUFBNDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIn0",
+        "MbkjsgqGzSp410uJnv0hrAxJIn14MA3p6pbZyKafi8rrK1JAV_aMx442-w1Q0HCgH68iKDwMtRPt0FyJRELqAA"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "an_unhyphenated_agent_id_is_invalid",
+      "why": "One spelling: lowercase hyphenated.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NDQ0NDQ0NDQ0ODQ0NDQ0NDQ0NDQ0NDQ0NCIsImV4cCI6MTc5MDAwMDAwMCwiaW5zdGFsbGF0aW9uIjoiWnE4bVgydk43a1A0dFI5d0wzc0I2eUgxY0Y1Z0owZEEifQ",
+        "dF7CWPalBoFTiHgzx_T0UMkCYWhFZK872LdfuoZ9i03Kg9UbIBXrs56-IVtw1FQwIBIjUt9N7qJZYh0tQG8UBA"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "a_blank_agent_id_is_invalid",
+      "why": "agent_id is a UUID, never blank.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiIiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIn0",
+        "OmTFqkmkKd3Vuj8ngw6W-8IqcFr1iam5Ph7Lqgu9j9-tugkbBDZi29CG98M7hQ6mV8_rt7QImyKusnPmDn_LCw"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "a_non_string_agent_id_is_invalid",
+      "why": "agent_id is a string.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOjcsImV4cCI6MTc5MDAwMDAwMCwiaW5zdGFsbGF0aW9uIjoiWnE4bVgydk43a1A0dFI5d0wzc0I2eUgxY0Y1Z0owZEEifQ",
+        "uU7BjmQNYoCIFWxScuq0SPtt0RtyguWUCwaUT7Ti5-GotQmQFnThB0ATFN7uByX4fY2m7Q6R8Aep7PPE8nT_CA"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "an_uppercase_run_is_invalid",
+      "why": "One spelling: lowercase hyphenated.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIiwicnVuIjoiQUFBQTExMTEtMTExMS00MTExLTgxMTEtMTExMTExMTExMTExIiwid29ya19pdGVtIjoiMjIyMjIyMjItMjIyMi00MjIyLTgyMjItMjIyMjIyMjIyMjIyIn0",
+        "zA4cuh2sKb0A6mdbUZz2HWIZXivtK0OdkEH4c0Y3EOGlNeBG-bv-42kmiO8kYzLTq4SbxtsJorTxdhtJjO8RDQ"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "an_unhyphenated_work_item_is_invalid",
+      "why": "One spelling: lowercase hyphenated.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIiwicnVuIjoiMTExMTExMTEtMTExMS00MTExLTgxMTEtMTExMTExMTExMTExIiwid29ya19pdGVtIjoiMjIyMjIyMjIyMjIyNDIyMjgyMjIyMjIyMjIyMjIyMjIifQ",
+        "gIqqMi7EP7ClMHWdGkD434vE9CI6c7u5-dUafzAtINYkiqybM4ay-xOfVoHoHsAEfcRFHyXDa07aD49UTHS3Cg"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "a_blank_agent_is_invalid",
+      "why": "agent is a nonempty display name.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6IiIsImFnZW50X2lkIjoiNDQ0NDQ0NDQtNDQ0NC00NDQ0LTg0NDQtNDQ0NDQ0NDQ0NDQ0IiwiZXhwIjoxNzkwMDAwMDAwLCJpbnN0YWxsYXRpb24iOiJacThtWDJ2TjdrUDR0Ujl3TDNzQjZ5SDFjRjVnSjBkQSJ9",
+        "D-LEsiKhCLwXaMWaptcBtiF59L3U8PKwoPxMyInGM9HBaLJjUrCBWOyLHEfapHnoS6XL25j6U4JurQ7jr797Bw"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "a_non_string_agent_is_invalid",
+      "why": "agent is a string.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6NywiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIn0",
+        "8erJPSK_vfGlGCIeLv9daX0OvLCpAyNQdWa4N1CQlxmYropG3tkDtSLUv5NqR2OMuqSPop803j2Bx7L7EOJQAQ"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "an_agent_with_an_escaped_lone_surrogate_is_invalid",
+      "why": "Python json decodes \\ud800 to a lone surrogate; serde_json refuses it at parse. Both are invalid.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWVcdWQ4MDBkZXYiLCJhZ2VudF9pZCI6IjQ0NDQ0NDQ0LTQ0NDQtNDQ0NC04NDQ0LTQ0NDQ0NDQ0NDQ0NCIsImV4cCI6MTc5MDAwMDAwMCwiaW5zdGFsbGF0aW9uIjoiWnE4bVgydk43a1A0dFI5d0wzc0I2eUgxY0Y1Z0owZEEifQ",
+        "L8xFGdgXIr21ELqIzKY5Azr7F-s0CmBHFI5yWMuwm3njQkpeEGk9No4ldkqMADiVXA-EHhEXX0lNeWB8daTCAg"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "an_installation_of_129_ascii_characters_is_invalid",
+      "why": "One byte over the 128 UTF-8 byte bound.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IkFjbWUtSW5zdGFsbF8wLjk6eC95QHp-QWNtZS1JbnN0YWxsXzAuOTp4L3lAen5BY21lLUluc3RhbGxfMC45OngveUB6fkFjbWUtSW5zdGFsbF8wLjk6eC95QHp-QWNtZS1JbnN0YWxsXzAuOTp4L3lAen5BY21lLUluc3RhbGxfYSJ9",
+        "9H3Uz9KcYPC3rs9l5HcPDZDI0aJTiB_sNBtU69hwsiUGT36EEDU17sZIc-BRIKQjVXYHOC5mdCewL0ZJgO2kDQ"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "an_installation_of_129_ascii_characters_is_invalid_in_shared_mode",
+      "why": "One byte over the 128 UTF-8 byte bound. Shared mode, configured with the same text.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IkFjbWUtSW5zdGFsbF8wLjk6eC95QHp-QWNtZS1JbnN0YWxsXzAuOTp4L3lAen5BY21lLUluc3RhbGxfMC45OngveUB6fkFjbWUtSW5zdGFsbF8wLjk6eC95QHp-QWNtZS1JbnN0YWxsXzAuOTp4L3lAen5BY21lLUluc3RhbGxfYSJ9",
+        "9H3Uz9KcYPC3rs9l5HcPDZDI0aJTiB_sNBtU69hwsiUGT36EEDU17sZIc-BRIKQjVXYHOC5mdCewL0ZJgO2kDQ"
+      ],
+      "mode": {
+        "kind": "shared",
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA"
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "an_installation_with_an_nfc_e_acute_is_admitted",
+      "why": "U+00E9 in NFC is neither Cc nor White_Space; the installation is not limited to ASCII.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6ImFjbWUtXHUwMGU5In0",
+        "REDECzk6lZNnSXLivEII_nQHTga0W6ZJHdSe6mThuo4Rb_QPcUO631oLRtiPP-Y6pwZkFNFXFVysIbSHxGCOAw"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": null,
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "acme-é"
+      }
+    },
+    {
+      "name": "an_installation_with_an_nfc_e_acute_is_admitted_in_shared_mode",
+      "why": "U+00E9 in NFC is neither Cc nor White_Space; the installation is not limited to ASCII. Shared mode, configured with the same text.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6ImFjbWUtXHUwMGU5In0",
+        "REDECzk6lZNnSXLivEII_nQHTga0W6ZJHdSe6mThuo4Rb_QPcUO631oLRtiPP-Y6pwZkFNFXFVysIbSHxGCOAw"
+      ],
+      "mode": {
+        "kind": "shared",
+        "installation": "acme-é"
+      },
+      "now": 1789999999,
+      "refusal": null,
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "acme-é"
+      }
+    },
+    {
+      "name": "an_installation_with_an_astral_character_is_admitted",
+      "why": "U+10000 is above the BMP and neither Cc nor White_Space; ensure_ascii writes it as a lowercase surrogate pair escape.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6ImFjbWVcdWQ4MDBcdWRjMDAifQ",
+        "98sd9sk2exAWjwCKEFAmU3gSx6g2ZvRhbEymgbdY2Fk88SoNIDXV16u1zIFVoC9OKlQaRfpcQ3iH1gVk9cc_Aw"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": null,
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "acme𐀀"
+      }
+    },
+    {
+      "name": "an_installation_with_an_astral_character_is_admitted_in_shared_mode",
+      "why": "U+10000 is above the BMP and neither Cc nor White_Space; ensure_ascii writes it as a lowercase surrogate pair escape. Shared mode, configured with the same text.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6ImFjbWVcdWQ4MDBcdWRjMDAifQ",
+        "98sd9sk2exAWjwCKEFAmU3gSx6g2ZvRhbEymgbdY2Fk88SoNIDXV16u1zIFVoC9OKlQaRfpcQ3iH1gVk9cc_Aw"
+      ],
+      "mode": {
+        "kind": "shared",
+        "installation": "acme𐀀"
+      },
+      "now": 1789999999,
+      "refusal": null,
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "acme𐀀"
+      }
+    },
+    {
+      "name": "an_installation_with_u_1c89_is_admitted",
+      "why": "U+1C89 is accepted because the rule is an enumerated set, not a printability table that Python and Rust disagree on.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6ImFjbWVcdTFjODlpbnN0YWxsIn0",
+        "Sp5KVr9TeLW8vFLcKVqW91sdLC_qHl9Hv_aenSzg5Ca4iSvVI5TS2XHVJcEs8uKTsxiFPWYuEHlmAEZCG6HJAw"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": null,
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "acmeᲉinstall"
+      }
+    },
+    {
+      "name": "an_installation_with_u_1c89_is_admitted_in_shared_mode",
+      "why": "U+1C89 is accepted because the rule is an enumerated set, not a printability table that Python and Rust disagree on. Shared mode, configured with the same text.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6ImFjbWVcdTFjODlpbnN0YWxsIn0",
+        "Sp5KVr9TeLW8vFLcKVqW91sdLC_qHl9Hv_aenSzg5Ca4iSvVI5TS2XHVJcEs8uKTsxiFPWYuEHlmAEZCG6HJAw"
+      ],
+      "mode": {
+        "kind": "shared",
+        "installation": "acmeᲉinstall"
+      },
+      "now": 1789999999,
+      "refusal": null,
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "acmeᲉinstall"
+      }
+    },
+    {
+      "name": "an_installation_with_a_byte_order_mark_u_feff_is_admitted",
+      "why": "U+FEFF is Cf, neither Cc nor White_Space, so the ADR's rule accepts it.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6ImFjbWVcdWZlZmZpbnN0YWxsIn0",
+        "FToptk1-qRZ8x_FVZMTw5-PTe1YmCE0VK8xYY9srZtO0K_ALS7ld-CbzoTSlnK8EqlqRoXTqb08_kR2ljnR3Ag"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": null,
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "acme﻿install"
+      }
+    },
+    {
+      "name": "an_installation_with_a_byte_order_mark_u_feff_is_admitted_in_shared_mode",
+      "why": "U+FEFF is Cf, neither Cc nor White_Space, so the ADR's rule accepts it. Shared mode, configured with the same text.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6ImFjbWVcdWZlZmZpbnN0YWxsIn0",
+        "FToptk1-qRZ8x_FVZMTw5-PTe1YmCE0VK8xYY9srZtO0K_ALS7ld-CbzoTSlnK8EqlqRoXTqb08_kR2ljnR3Ag"
+      ],
+      "mode": {
+        "kind": "shared",
+        "installation": "acme﻿install"
+      },
+      "now": 1789999999,
+      "refusal": null,
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "acme﻿install"
+      }
+    },
+    {
+      "name": "an_installation_of_128_multibyte_utf8_bytes_is_admitted",
+      "why": "64 copies of U+00E9 are exactly 128 UTF-8 bytes, the inclusive bound.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6Ilx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOSJ9",
+        "bena3B3tORgyHOnxTkTgpw1fL-ypxY8GQgjfPiumzsTUQ9irUXIQLsXX0k9e_4_vdCtwdnvFDL6tCRiUpoymCg"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": null,
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"
+      }
+    },
+    {
+      "name": "an_installation_of_128_multibyte_utf8_bytes_is_admitted_in_shared_mode",
+      "why": "64 copies of U+00E9 are exactly 128 UTF-8 bytes, the inclusive bound. Shared mode, configured with the same text.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6Ilx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOSJ9",
+        "bena3B3tORgyHOnxTkTgpw1fL-ypxY8GQgjfPiumzsTUQ9irUXIQLsXX0k9e_4_vdCtwdnvFDL6tCRiUpoymCg"
+      ],
+      "mode": {
+        "kind": "shared",
+        "installation": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"
+      },
+      "now": 1789999999,
+      "refusal": null,
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"
+      }
+    },
+    {
+      "name": "an_nfd_installation_is_not_admitted_against_its_nfc_configured_spelling",
+      "why": "Comparison is exact with no normalization: the token carries NFD acme-e plus U+0301 and the configured installation is NFC acme-é.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6ImFjbWUtZVx1MDMwMSJ9",
+        "lNt5qN-eZ6UT-xZKD9q7cg2sAKVDZH-kRh4E8HAEZjTlz4vQDhufAyPKaL7Us5J2MPXgLb_rh2oqfan-qrpKDg"
+      ],
+      "mode": {
+        "kind": "shared",
+        "installation": "acme-é"
+      },
+      "now": 1789999999,
+      "refusal": "not_admitted"
+    },
+    {
+      "name": "an_nfc_installation_matching_its_nfc_configured_spelling_is_admitted",
+      "why": "The same NFC acme-é signed and configured is admitted.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6ImFjbWUtXHUwMGU5In0",
+        "REDECzk6lZNnSXLivEII_nQHTga0W6ZJHdSe6mThuo4Rb_QPcUO631oLRtiPP-Y6pwZkFNFXFVysIbSHxGCOAw"
+      ],
+      "mode": {
+        "kind": "shared",
+        "installation": "acme-é"
+      },
+      "now": 1789999999,
+      "refusal": null,
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "acme-é"
+      }
+    },
+    {
+      "name": "an_installation_with_nul_is_invalid",
+      "why": "U+0000 is Cc.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6ImFjbWVcdTAwMDBpbnN0YWxsIn0",
+        "Thn5hFOkbrs3uU9Oo_dceiqpKnmdxeS5FyE-5W99RqpCwtyLedn89iMxeQJhptOODxK-JsnY9pKu1H0CtOYlAA"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "an_installation_with_nul_is_invalid_in_shared_mode",
+      "why": "U+0000 is Cc. Shared mode, against a valid configured installation.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6ImFjbWVcdTAwMDBpbnN0YWxsIn0",
+        "Thn5hFOkbrs3uU9Oo_dceiqpKnmdxeS5FyE-5W99RqpCwtyLedn89iMxeQJhptOODxK-JsnY9pKu1H0CtOYlAA"
+      ],
+      "mode": {
+        "kind": "shared",
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA"
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "an_installation_with_u_0080_is_invalid",
+      "why": "U+0080 is Cc.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6ImFjbWVcdTAwODBpbnN0YWxsIn0",
+        "ZFXBb84fdpVFCpJbuHxFPpBDUer9WOmUGmh0wOo3O7WrJcE1rLF6x-3VoX40L7cpBAPpmlbhbu38UyJjNZw1Bg"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "an_installation_with_u_0080_is_invalid_in_shared_mode",
+      "why": "U+0080 is Cc. Shared mode, against a valid configured installation.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6ImFjbWVcdTAwODBpbnN0YWxsIn0",
+        "ZFXBb84fdpVFCpJbuHxFPpBDUer9WOmUGmh0wOo3O7WrJcE1rLF6x-3VoX40L7cpBAPpmlbhbu38UyJjNZw1Bg"
+      ],
+      "mode": {
+        "kind": "shared",
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA"
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "an_installation_with_next_line_u_0085_is_invalid",
+      "why": "U+0085 is Cc and White_Space.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6ImFjbWVcdTAwODVpbnN0YWxsIn0",
+        "L0YvhS2yKBEIoJdgNczgJGn2GjJeKCTJQ7kCTNrB11g9Y0oAQDs7OeGv4lgJEDP9L6FYlPCOh7exSONlm-eLCQ"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "an_installation_with_next_line_u_0085_is_invalid_in_shared_mode",
+      "why": "U+0085 is Cc and White_Space. Shared mode, against a valid configured installation.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6ImFjbWVcdTAwODVpbnN0YWxsIn0",
+        "L0YvhS2yKBEIoJdgNczgJGn2GjJeKCTJQ7kCTNrB11g9Y0oAQDs7OeGv4lgJEDP9L6FYlPCOh7exSONlm-eLCQ"
+      ],
+      "mode": {
+        "kind": "shared",
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA"
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "an_installation_with_ogham_space_mark_u_1680_is_invalid",
+      "why": "U+1680 is White_Space.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6ImFjbWVcdTE2ODBpbnN0YWxsIn0",
+        "aYkD9UCXVUz-Zjm4XoI5HMr-h4bIbfHzUxS7RvSHnQscm8N-j0MFZY3tIcmXOF3XzrdGLwZNFRhjhuo-DmFPAw"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "an_installation_with_ogham_space_mark_u_1680_is_invalid_in_shared_mode",
+      "why": "U+1680 is White_Space. Shared mode, against a valid configured installation.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6ImFjbWVcdTE2ODBpbnN0YWxsIn0",
+        "aYkD9UCXVUz-Zjm4XoI5HMr-h4bIbfHzUxS7RvSHnQscm8N-j0MFZY3tIcmXOF3XzrdGLwZNFRhjhuo-DmFPAw"
+      ],
+      "mode": {
+        "kind": "shared",
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA"
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "an_installation_with_line_separator_u_2028_is_invalid",
+      "why": "U+2028 is White_Space.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6ImFjbWVcdTIwMjhpbnN0YWxsIn0",
+        "2w7REYt2Y7YE1N6gOtvhCNE_0De0GLhw7vloCKY22cjukz9PsOIHnTUEomFvzhaQaZi-ygyRaF5L_hq05GF8CA"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "an_installation_with_line_separator_u_2028_is_invalid_in_shared_mode",
+      "why": "U+2028 is White_Space. Shared mode, against a valid configured installation.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6ImFjbWVcdTIwMjhpbnN0YWxsIn0",
+        "2w7REYt2Y7YE1N6gOtvhCNE_0De0GLhw7vloCKY22cjukz9PsOIHnTUEomFvzhaQaZi-ygyRaF5L_hq05GF8CA"
+      ],
+      "mode": {
+        "kind": "shared",
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA"
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "an_installation_with_ideographic_space_u_3000_is_invalid",
+      "why": "U+3000 is White_Space.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6ImFjbWVcdTMwMDBpbnN0YWxsIn0",
+        "trr4u2W8iRokPPCTa5i-sj_HnFfo3xfb93VczS11RgT95T3-N9eKnFiQLEoZRiltmg6F4kOUerO--eC-Mlg_BQ"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "an_installation_with_ideographic_space_u_3000_is_invalid_in_shared_mode",
+      "why": "U+3000 is White_Space. Shared mode, against a valid configured installation.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6ImFjbWVcdTMwMDBpbnN0YWxsIn0",
+        "trr4u2W8iRokPPCTa5i-sj_HnFfo3xfb93VczS11RgT95T3-N9eKnFiQLEoZRiltmg6F4kOUerO--eC-Mlg_BQ"
+      ],
+      "mode": {
+        "kind": "shared",
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA"
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "an_installation_of_129_multibyte_utf8_bytes_is_invalid",
+      "why": "64 copies of U+00E9 and one ASCII character are 129 UTF-8 bytes, one over the bound.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6Ilx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOWEifQ",
+        "-ReClMcQLZOR_haCUjsjiCZ3I70R5GfhHP7UQfeLWN7OFbin8WDDJsKeMyx2tROVGqWAJhuK23MOUc5oQLT2Dg"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "an_installation_of_129_multibyte_utf8_bytes_is_invalid_in_shared_mode",
+      "why": "64 copies of U+00E9 and one ASCII character are 129 UTF-8 bytes, one over the bound. Shared mode, against a valid configured installation.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6Ilx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOVx1MDBlOWEifQ",
+        "-ReClMcQLZOR_haCUjsjiCZ3I70R5GfhHP7UQfeLWN7OFbin8WDDJsKeMyx2tROVGqWAJhuK23MOUc5oQLT2Dg"
+      ],
+      "mode": {
+        "kind": "shared",
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA"
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "an_installation_with_del_is_invalid",
+      "why": "U+007F (DEL) is Cc.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6ImFjbWVcdTAwN2ZpbnN0YWxsIn0",
+        "vKGT8GPbT62-JY2r4J0VtL7O_0vBo-nMbuxL6HOkSLmmT2A2mlhnDxmznXxYmTp1YXOjxYUjQKXNMNy8c4SpDA"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "an_installation_with_del_is_invalid_in_shared_mode",
+      "why": "U+007F (DEL) is Cc. Shared mode, configured with the same text.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6ImFjbWVcdTAwN2ZpbnN0YWxsIn0",
+        "vKGT8GPbT62-JY2r4J0VtL7O_0vBo-nMbuxL6HOkSLmmT2A2mlhnDxmznXxYmTp1YXOjxYUjQKXNMNy8c4SpDA"
+      ],
+      "mode": {
+        "kind": "shared",
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA"
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "an_installation_that_is_a_single_space_is_invalid",
+      "why": "A single space is nonblank, but U+0020 is White_Space.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IiAifQ",
+        "UYeCHOJmmbm3YLmnUOKIDeEhZ3ecyKUgvuJHXVSkJmT3UnR70Gd8RpUN6U2IGkZaruDDB4oj-TK3ii9gUHkNCA"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "an_installation_that_is_a_single_space_is_invalid_in_shared_mode",
+      "why": "A single space is nonblank, but U+0020 is White_Space. Shared mode, configured with the same text.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IiAifQ",
+        "UYeCHOJmmbm3YLmnUOKIDeEhZ3ecyKUgvuJHXVSkJmT3UnR70Gd8RpUN6U2IGkZaruDDB4oj-TK3ii9gUHkNCA"
+      ],
+      "mode": {
+        "kind": "shared",
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA"
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "an_installation_with_a_space_is_invalid",
+      "why": "No whitespace.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6ImFjbWUgaW5zdGFsbCJ9",
+        "h7hWq9v21KXtemWFRZMTGpv_GgFCzxQPee0rp3CFhGHUoAKMpGeWSfiUAHaI3HRBW1V_9wcQ6wjq7RsvzgYZAw"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "an_installation_with_a_space_is_invalid_in_shared_mode",
+      "why": "No whitespace. Shared mode, configured with the same text.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6ImFjbWUgaW5zdGFsbCJ9",
+        "h7hWq9v21KXtemWFRZMTGpv_GgFCzxQPee0rp3CFhGHUoAKMpGeWSfiUAHaI3HRBW1V_9wcQ6wjq7RsvzgYZAw"
+      ],
+      "mode": {
+        "kind": "shared",
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA"
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "an_installation_with_a_tab_is_invalid",
+      "why": "No whitespace.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6ImFjbWVcdGluc3RhbGwifQ",
+        "7YNPUpbaSHAQE4emg6U1h05A0JcZapvNJA4Os0I5psLkDEwaSvVXFQJt9V4NBVvXe_0O798PvFZyyPIhKoJPAQ"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "an_installation_with_a_tab_is_invalid_in_shared_mode",
+      "why": "No whitespace. Shared mode, configured with the same text.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6ImFjbWVcdGluc3RhbGwifQ",
+        "7YNPUpbaSHAQE4emg6U1h05A0JcZapvNJA4Os0I5psLkDEwaSvVXFQJt9V4NBVvXe_0O798PvFZyyPIhKoJPAQ"
+      ],
+      "mode": {
+        "kind": "shared",
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA"
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "an_installation_with_a_control_character_is_invalid",
+      "why": "U+0001 is Cc.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6ImFjbWVcdTAwMDFpbnN0YWxsIn0",
+        "GEcxOHHjSU09F5kozQ7nQiOznvnZFBkeoNX1ZI_m6wBj6F7OCZ_HScRqVP11bglGz2cg7H1Iu5EYnWzo29CUBQ"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "an_installation_with_a_control_character_is_invalid_in_shared_mode",
+      "why": "U+0001 is Cc. Shared mode, configured with the same text.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6ImFjbWVcdTAwMDFpbnN0YWxsIn0",
+        "GEcxOHHjSU09F5kozQ7nQiOznvnZFBkeoNX1ZI_m6wBj6F7OCZ_HScRqVP11bglGz2cg7H1Iu5EYnWzo29CUBQ"
+      ],
+      "mode": {
+        "kind": "shared",
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA"
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "an_installation_with_a_no_break_space_is_invalid",
+      "why": "U+00A0 (no-break space) is White_Space.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6ImFjbWVcdTAwYTBpbnN0YWxsIn0",
+        "EXyb-GScXfszZPBmp2fU3JbvZ-Jilslkxaqet_qQurzY2KIeKscMrpQ1cYLE19Wz62Edb5lMFWGtyPtRUbF_DQ"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "an_installation_with_a_no_break_space_is_invalid_in_shared_mode",
+      "why": "U+00A0 (no-break space) is White_Space. Shared mode, configured with the same text.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6ImFjbWVcdTAwYTBpbnN0YWxsIn0",
+        "EXyb-GScXfszZPBmp2fU3JbvZ-Jilslkxaqet_qQurzY2KIeKscMrpQ1cYLE19Wz62Edb5lMFWGtyPtRUbF_DQ"
+      ],
+      "mode": {
+        "kind": "shared",
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA"
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "a_non_string_installation_is_invalid",
+      "why": "installation is a string.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6N30",
+        "pSP8H0jpt1c_hD014MFnhgMJnj9ttzFfQlEk9h2qg3N_NQY0EnECeXgN4FHCpbI7luJpJV9p7MkPOLlTmFgoCQ"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "a_null_installation_is_invalid",
+      "why": "installation is a string.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6bnVsbH0",
+        "hsYBeFzKN7GhVmh7i4kCqhOG7KBtcldNxxDUEjskM-yBWgH-AxayZa3FYuLGiIFG2G8zDxn0EBgsPo5bYfmaCg"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "an_installation_with_an_escaped_lone_surrogate_is_invalid",
+      "why": "The installation check never raises on an unencodable string: it refuses.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6ImFjbWVcdWRjMDB4In0",
+        "zFYnV_xlke6oOnfaOdN_qK4V3Zd9I5G7np7wfcq0_szlVDPW_RYexuxzT-mO5yra7uWRiqoB1KQUk1IIpdGNBQ"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "an_installation_with_an_escaped_lone_surrogate_is_invalid_in_shared_mode",
+      "why": "The installation check never raises on an unencodable string: it refuses.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6ImFjbWVcdWRjMDB4In0",
+        "zFYnV_xlke6oOnfaOdN_qK4V3Zd9I5G7np7wfcq0_szlVDPW_RYexuxzT-mO5yra7uWRiqoB1KQUk1IIpdGNBQ"
+      ],
+      "mode": {
+        "kind": "shared",
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA"
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "a_payload_with_a_utf8_bom_is_invalid",
+      "why": "Payload bytes must be ASCII; Python json.loads(bytes) would strip a BOM.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "77u_eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIn0",
+        "TFsWPp80NtfiVIYlNakcgHjPupuqo2E8xnBh6XYFFGV_XSGoH3Bo4ASF_r1R1iPGAU_UQsc07SwuYhVDTUv4DA"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "a_utf16_payload_is_invalid",
+      "why": "Payload bytes must be ASCII; Python json.loads(bytes) would detect UTF-16.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "ewAiAGEAZwBlAG4AdAAiADoAIgBhAGMAbQBlAC0AZABlAHYAIgAsACIAYQBnAGUAbgB0AF8AaQBkACIAOgAiADQANAA0ADQANAA0ADQANAAtADQANAA0ADQALQA0ADQANAA0AC0AOAA0ADQANAAtADQANAA0ADQANAA0ADQANAA0ADQANAA0ACIALAAiAGUAeABwACIAOgAxADcAOQAwADAAMAAwADAAMAAwACwAIgBpAG4AcwB0AGEAbABsAGEAdABpAG8AbgAiADoAIgBaAHEAOABtAFgAMgB2AE4ANwBrAFAANAB0AFIAOQB3AEwAMwBzAEIANgB5AEgAMQBjAEYANQBnAEoAMABkAEEAIgB9AA",
+        "D-LnJZ1W5tG7p3egAj6hvSbJtiCTHfpMEUOGaeKkRFektSOJtp0-RTrK9oE2945y8yUJtt7sghjRnyCJbq-WAg"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "a_raw_utf8_non_ascii_payload_is_invalid",
+      "why": "The minter writes \\u escapes; raw UTF-8 bytes are refused even when signed.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6IkFjbWUgQ2Fmw6kiLCJhZ2VudF9pZCI6IjQ0NDQ0NDQ0LTQ0NDQtNDQ0NC04NDQ0LTQ0NDQ0NDQ0NDQ0NCIsImV4cCI6MTc5MDAwMDAwMCwiaW5zdGFsbGF0aW9uIjoiWnE4bVgydk43a1A0dFI5d0wzc0I2eUgxY0Y1Z0owZEEifQ",
+        "amvHnYsJ24FnnLA6_iyUsjDneAVy00rWYRU6c5cZK2XDLgMpp-aMqnL-NSLIMbkDf1hAPhJLb_ZshYHZ1RjPDQ"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "Acme Café"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "a_duplicate_key_is_invalid",
+      "why": "Duplicate keys refuse; neither first nor last wins.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6InNvbWVvbmUtZWxzZSIsImFnZW50IjoiYWNtZS1kZXYiLCJhZ2VudF9pZCI6IjQ0NDQ0NDQ0LTQ0NDQtNDQ0NC04NDQ0LTQ0NDQ0NDQ0NDQ0NCIsImV4cCI6MTc5MDAwMDAwMCwiaW5zdGFsbGF0aW9uIjoiWnE4bVgydk43a1A0dFI5d0wzc0I2eUgxY0Y1Z0owZEEifQ",
+        "Xgt3xAZrp_DDIrLoFNyZ3EzErDRVIQyJ08Euigcb0xQGPu1nsM4Ny4Teru-Q2LRP8ZQuRzwWqZyIx1QnSFZ-Dw"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev",
+          "someone-else"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "a_payload_that_is_a_json_array_is_invalid",
+      "why": "The payload is a JSON object.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "WyJhY21lLWRldiIsMTc5MDAwMDAwMF0",
+        "TLk0gN5gynWj0lwF_eHxMiMIyusb_GtqvG33GC1hEK1InKw-OLx2tArhyfBjVXLRFHVHxBJgdPoHHivhXB9VDA"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "a_payload_that_is_not_json_is_invalid",
+      "why": "Signed garbage is still garbage.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "YWNtZS1kZXY",
+        "h93hMlq5qvqMRB9PFOj1dfZKf0APpT9Fg4Ry_jbUWDogGN8c7Spou34kTkVWFkg0TG1GAs2JxLdIA7kNBFdYAg"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "whitespace_in_the_payload_is_still_accepted",
+      "why": "Nothing is re-serialized: the signature authenticates the received bytes, so a validly signed non-canonical layout is admitted.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "ewogImFnZW50IjogImFjbWUtZGV2IiwKICJhZ2VudF9pZCI6ICI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLAogImV4cCI6IDE3OTAwMDAwMDAsCiAiaW5zdGFsbGF0aW9uIjogIlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIgp9",
+        "U3Mx516rTuz-7ZW5Jsa4Q5Jm3Mz9VEdIN4Zmr5sJEnNnxEkeiwI5HhYGg5itEbhDUM-DIU1F_c2fnU43mBRwAw"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": null,
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA"
+      }
+    },
+    {
+      "name": "a_legacy_cct_token_is_invalid",
+      "why": "The v1 wire, validly signed by the vector seed. No legacy acceptance path.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiZXhwIjoxNzkwMDAwMDAwfQ",
+        "8ks6uoMW7jnu0d4jBXc01ZELdx0dS57EodIPOCvUsL8vQO3A1eJd1fXJ_TLJTc-I9pd37bawfwTkmm923KkrDQ"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "a_cct_prefixed_token_with_v2_claims_is_invalid",
+      "why": "Only the prefix is legacy.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIn0",
+        "9v2e44RZ1ofQ9IlDjegri2R-4BAO_T4ISai3nFZ5PuhwKtO0Iw9Q57opRGJcIKRCAJBkZDaYN5sS7cKxSc4HAA"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "a_cct3_token_is_invalid",
+      "why": "An unknown later version.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct3",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIn0",
+        "vdq_CXIXa7G8063OGtRS1mOMYPlLokLa2QWr6g46GcbKSOFRtS23kiUHFwynH4EXPbzRRhG4LSM1allujHiyCQ"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "an_uppercase_prefix_is_invalid",
+      "why": "The prefix is exactly cct2.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "CCT2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIn0",
+        "OGffK6Hqh8wa27qGCaXTo4ryPTU5bGwpTlOuP-Kyt_XpGZ7N1ecp0CYBt4kuAGAJXc8rOI1LwfxOWMoR9hAUCQ"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "a_ccg_grant_prefix_is_invalid",
+      "why": "A grant is not a caller token.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "ccg",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIn0",
+        "mwVvgu9bebiKc_7q8daXaXWYlnDPod7gRGgb8BZt6VJoL7u0wh5NCgqsPyUhflQvFRW52k1Z5byOlQD0J9wIBA"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "signed_as_cct2_presented_as_cct3_is_invalid",
+      "why": "The signature covers the prefix.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct3",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIn0",
+        "74l_wg1og5TWkfkxmZCSOse4EwwqxfG0xRcJ1fiihUpOm9F6wNG1BQ3X26PRXQWaDF-QyFu5I9VPnYM1PrthAQ"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "signed_as_cct_presented_as_cct2_is_invalid",
+      "why": "The signature covers the prefix.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIn0",
+        "9v2e44RZ1ofQ9IlDjegri2R-4BAO_T4ISai3nFZ5PuhwKtO0Iw9Q57opRGJcIKRCAJBkZDaYN5sS7cKxSc4HAA"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "one_flipped_signature_byte_is_invalid",
+      "why": "A bad signature.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIn0",
+        "7ol_wg1og5TWkfkxmZCSOse4EwwqxfG0xRcJ1fiihUpOm9F6wNG1BQ3X26PRXQWaDF-QyFu5I9VPnYM1PrthAQ"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "a_token_signed_by_an_unconfigured_key_is_invalid",
+      "why": "Only configured public keys verify.",
+      "public": [
+        "Kay64UG8yvCyLhqU000LxzYeUm0L/hLIl5S8kyKWbdc="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIn0",
+        "74l_wg1og5TWkfkxmZCSOse4EwwqxfG0xRcJ1fiihUpOm9F6wNG1BQ3X26PRXQWaDF-QyFu5I9VPnYM1PrthAQ"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "a_signature_segment_with_stray_trailing_bits_is_invalid",
+      "why": "Same decoded bytes, different text: one spelling per byte string.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIn0",
+        "74l_wg1og5TWkfkxmZCSOse4EwwqxfG0xRcJ1fiihUpOm9F6wNG1BQ3X26PRXQWaDF-QyFu5I9VPnYM1PrthAR"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "a_payload_segment_with_stray_trailing_bits_is_invalid",
+      "why": "Validly signed over its non-canonical text, so only the spelling rule refuses it.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIn1",
+        "HqjO0TtKVG1vzbpuh58-kDiU9CKW7AwM0GldVUOcxRMWKJBMsAhVGRxH1xrt_WcA-mVsmG6u510PeJAzG6ybCQ"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "a_padded_payload_segment_is_invalid",
+      "why": "Unpadded only; signed over the padded text so only padding refuses it.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIn0=",
+        "WrcoywKYlIDPJRkxcO45sqWQX4DtBdBpeg19tr1Xte5JpQLOCfXPgQNdccB7jQqVxsd2RINo11kzlc3EkKHaBw"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "a_padded_signature_segment_is_invalid",
+      "why": "Unpadded only.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIn0",
+        "74l_wg1og5TWkfkxmZCSOse4EwwqxfG0xRcJ1fiihUpOm9F6wNG1BQ3X26PRXQWaDF-QyFu5I9VPnYM1PrthAQ=="
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "a_standard_alphabet_signature_is_invalid",
+      "why": "base64url only.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIn0",
+        "74l/wg1og5TWkfkxmZCSOse4EwwqxfG0xRcJ1fiihUpOm9F6wNG1BQ3X26PRXQWaDF+QyFu5I9VPnYM1PrthAQ"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "a_truncated_signature_is_invalid",
+      "why": "The signature is 64 bytes.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIn0",
+        "74l_wg1og5TWkfkxmZCSOse4EwwqxfG0xRcJ1fiihUpOm9F6wNG1BQ3X26PRXQWaDF-QyFu5I9VPnYM1Pr"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "a_missing_segment_is_invalid",
+      "why": "Exactly three segments.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIn0"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "an_extra_segment_is_invalid",
+      "why": "Exactly three segments.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIn0",
+        "74l_wg1og5TWkfkxmZCSOse4EwwqxfG0xRcJ1fiihUpOm9F6wNG1BQ3X26PRXQWaDF-QyFu5I9VPnYM1PrthAQ",
+        "x"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    },
+    {
+      "name": "a_non_ascii_token_is_invalid",
+      "why": "The token text is ASCII.",
+      "public": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIn0",
+        "74l_wg1og5TWkfkxmZCSOse4EwwqxfG0xRcJ1fiihUpOm9F6wNG1BQ3X26PRXQWaDF-QyFu5I9VPnYM1PrthAé"
+      ],
+      "mode": {
+        "kind": "dedicated",
+        "admits": [
+          "acme-dev"
+        ]
+      },
+      "now": 1789999999,
+      "refusal": "invalid"
+    }
+  ],
+  "mint_refusals": [
+    {
+      "name": "an_installation_with_a_space",
+      "why": "No whitespace.",
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "acme install"
+      }
+    },
+    {
+      "name": "an_installation_with_a_tab",
+      "why": "No whitespace.",
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "acme\tinstall"
+      }
+    },
+    {
+      "name": "an_installation_with_a_control_character",
+      "why": "U+0001 is Cc.",
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "acme\u0001install"
+      }
+    },
+    {
+      "name": "an_installation_with_a_no_break_space",
+      "why": "U+00A0 (no-break space) is White_Space.",
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "acme install"
+      }
+    },
+    {
+      "name": "an_installation_of_129_ascii_characters",
+      "why": "One byte over the 128 UTF-8 byte bound.",
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "Acme-Install_0.9:x/y@z~Acme-Install_0.9:x/y@z~Acme-Install_0.9:x/y@z~Acme-Install_0.9:x/y@z~Acme-Install_0.9:x/y@z~Acme-Install_a"
+      }
+    },
+    {
+      "name": "an_installation_with_nul",
+      "why": "U+0000 is Cc.",
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "acme\u0000install"
+      }
+    },
+    {
+      "name": "an_installation_with_u_0080",
+      "why": "U+0080 is Cc.",
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "acmeinstall"
+      }
+    },
+    {
+      "name": "an_installation_with_next_line_u_0085",
+      "why": "U+0085 is Cc and White_Space.",
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "acmeinstall"
+      }
+    },
+    {
+      "name": "an_installation_with_ogham_space_mark_u_1680",
+      "why": "U+1680 is White_Space.",
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "acme install"
+      }
+    },
+    {
+      "name": "an_installation_with_line_separator_u_2028",
+      "why": "U+2028 is White_Space.",
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "acme install"
+      }
+    },
+    {
+      "name": "an_installation_with_ideographic_space_u_3000",
+      "why": "U+3000 is White_Space.",
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "acme　install"
+      }
+    },
+    {
+      "name": "an_installation_of_129_multibyte_utf8_bytes",
+      "why": "64 copies of U+00E9 and one ASCII character are 129 UTF-8 bytes, one over the bound.",
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "ééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééa"
+      }
+    },
+    {
+      "name": "an_installation_with_del",
+      "why": "U+007F (DEL) is Cc.",
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "acmeinstall"
+      }
+    },
+    {
+      "name": "an_installation_that_is_a_single_space",
+      "why": "U+0020 is White_Space.",
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": " "
+      }
+    },
+    {
+      "name": "an_installation_that_is_not_a_string",
+      "why": "installation is a string.",
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": 7
+      }
+    },
+    {
+      "name": "an_installation_with_a_lone_surrogate",
+      "why": "<U+D800> stands for a lone U+D800 the reader substitutes.",
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "acme<U+D800>x"
+      }
+    },
+    {
+      "name": "an_uppercase_agent_id",
+      "why": "One spelling.",
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "AAAAAAAA-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA"
+      }
+    },
+    {
+      "name": "an_unhyphenated_agent_id",
+      "why": "One spelling.",
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444444444448444444444444444",
+        "exp": 1790000000,
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA"
+      }
+    },
+    {
+      "name": "a_blank_agent_id",
+      "why": "agent_id is a UUID.",
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "",
+        "exp": 1790000000,
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA"
+      }
+    },
+    {
+      "name": "an_agent_id_that_is_not_a_string",
+      "why": "agent_id is a string.",
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": 7,
+        "exp": 1790000000,
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA"
+      }
+    },
+    {
+      "name": "a_blank_agent",
+      "why": "agent is nonempty.",
+      "claims": {
+        "agent": "",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA"
+      }
+    },
+    {
+      "name": "an_agent_that_is_not_a_string",
+      "why": "agent is a string.",
+      "claims": {
+        "agent": 7,
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA"
+      }
+    },
+    {
+      "name": "an_agent_with_a_lone_surrogate",
+      "why": "<U+D800> stands for a lone U+D800 the reader substitutes.",
+      "claims": {
+        "agent": "acme<U+D800>dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA"
+      }
+    },
+    {
+      "name": "exp_negative",
+      "why": "The range starts at 0.",
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": -1,
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA"
+      }
+    },
+    {
+      "name": "exp_two_to_the_63",
+      "why": "Past the signed 64-bit maximum.",
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 9223372036854775808,
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA"
+      }
+    },
+    {
+      "name": "exp_two_to_the_64",
+      "why": "Past the signed 64-bit maximum.",
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 18446744073709551616,
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA"
+      }
+    },
+    {
+      "name": "exp_two_to_the_64_plus_one",
+      "why": "Past the signed 64-bit maximum.",
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 18446744073709551617,
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA"
+      }
+    },
+    {
+      "name": "exp_as_a_bool",
+      "why": "bool is not an integer here.",
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": true,
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA"
+      }
+    },
+    {
+      "name": "exp_as_a_float",
+      "why": "A float is not an integer.",
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000.5,
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA"
+      }
+    },
+    {
+      "name": "exp_as_a_string",
+      "why": "A string is not an integer.",
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": "1790000000",
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA"
+      }
+    },
+    {
+      "name": "a_lone_run",
+      "why": "A pair or neither.",
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA",
+        "run": "11111111-1111-4111-8111-111111111111"
+      }
+    },
+    {
+      "name": "a_lone_work_item",
+      "why": "A pair or neither.",
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA",
+        "work_item": "22222222-2222-4222-8222-222222222222"
+      }
+    },
+    {
+      "name": "an_uppercase_run",
+      "why": "One spelling.",
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA",
+        "run": "AAAA1111-1111-4111-8111-111111111111",
+        "work_item": "22222222-2222-4222-8222-222222222222"
+      }
+    },
+    {
+      "name": "an_unhyphenated_work_item",
+      "why": "One spelling.",
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA",
+        "run": "11111111-1111-4111-8111-111111111111",
+        "work_item": "22222222222242228222222222222222"
+      }
+    },
+    {
+      "name": "a_blank_run",
+      "why": "One spelling.",
+      "claims": {
+        "agent": "acme-dev",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "exp": 1790000000,
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA",
+        "run": "",
+        "work_item": "22222222-2222-4222-8222-222222222222"
+      }
     }
   ]
 }
