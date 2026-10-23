@@ -501,6 +501,7 @@ pub(super) async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput>
         org: opts.org.clone(),
         execution_deadline_seconds: opts.execution_deadline_seconds,
         budget_usd: opts.budget_usd,
+        output_tokens: opts.output_tokens,
         chart: opts.chart.clone(),
         credential_in_env,
         release_has_real_model,
@@ -869,6 +870,7 @@ async fn execute(
                 repos,
                 deadline_seconds,
                 budget_usd,
+                output_tokens,
                 agent,
                 label,
                 bundle,
@@ -959,6 +961,7 @@ async fn execute(
                     release,
                     *deadline_seconds,
                     *budget_usd,
+                    *output_tokens,
                 ) {
                     run_self(&args, step, None, None).await?;
                 }
@@ -980,6 +983,7 @@ async fn execute(
                         runner_image: image,
                         deadline_seconds: *deadline_seconds,
                         budget_usd: *budget_usd,
+                        output_tokens: *output_tokens,
                         credit_remaining_usd,
                     });
                 }
@@ -1017,6 +1021,7 @@ async fn execute(
                     trigger_label: label.clone(),
                     deadline_seconds: *deadline_seconds,
                     budget_usd: *budget_usd,
+                    output_tokens: *output_tokens,
                     credit_remaining_usd,
                 });
             }

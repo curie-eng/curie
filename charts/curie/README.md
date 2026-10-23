@@ -1370,6 +1370,18 @@ Capacity consequences of the factory profile:
 `helm install` prints every effective envelope together in the NOTES under
 "Sandbox resource envelopes".
 
+The profiles also carry one install-wide field, `apiMemoryLimit`: the API
+container's memory limit, which the schema-migrate Job shares. It is `512Mi` in
+`standard` and `2Gi` in `factory`, and the install uses `factory` when
+`factory.enabled` is true, else `standard`. It applies only while
+`api.resources.limits.memory` is unset, which is the chart default. Any explicit
+`api.resources.limits.memory`, including `512Mi`, wins for every install, and a
+release made by an older chart keeps the `512Mi` it stored when upgraded with
+`--reuse-values`. The API memory request (`256Mi`) and CPU (`100m` / `1`) do
+not change with the profile. The factory `2Gi` is headroom, not a measured
+need: after #4895 the factory publication listing over 231 pages peaked near
+170 MB under both a `512Mi` and a `2Gi` limit.
+
 `agentSandbox.workspaceSizeLimits` maps an agent name to that agent's workspace
 ceiling, for example `dark-factory: 24Gi`, so one build-heavy agent can compile
 in its checkout without enlarging every sandbox. Each listed agent gets its own
