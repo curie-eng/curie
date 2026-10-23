@@ -260,9 +260,12 @@ def test_drive_by_or_malformed_sender_association_cannot_authorize_feedback(asso
 def test_signed_member_associations_are_retained_and_verified(association: str) -> None:
     payload = feedback_payload()
     payload["comment"]["author_association"] = association
-    assert parse_feedback(
-        "issue_comment", payload, DELIVERY, github_html_base="https://github.com"
-    ).author_association == association
+    assert (
+        parse_feedback(
+            "issue_comment", payload, DELIVERY, github_html_base="https://github.com"
+        ).author_association
+        == association
+    )
 
 
 def test_review_ingress_is_disabled_by_default_and_refuses_incomplete_enablement() -> None:
@@ -376,9 +379,7 @@ class GitHubTruth:
             if self.comment_post_failure == "after":
                 return httpx.Response(503, json={"message": "Service unavailable"})
             return httpx.Response(201, json=created)
-        if path == (
-            f"/repos/{REPO}/collaborators/example-reviewer/permission"
-        ):
+        if path == (f"/repos/{REPO}/collaborators/example-reviewer/permission"):
             return httpx.Response(200, json=self.permission)
         return httpx.Response(
             self.feedback_status,
@@ -466,9 +467,7 @@ def test_current_app_repo_pr_and_human_feedback_must_independently_agree(
         )
     else:
         truth.payload["pull_request"]["html_url"] = f"{html_base}/{REPO}/pull/17"
-    truth.feedback = parse_feedback(
-        event, truth.payload, DELIVERY, github_html_base=html_base
-    )
+    truth.feedback = parse_feedback(event, truth.payload, DELIVERY, github_html_base=html_base)
     truth.pr["html_url"] = f"{html_base}/{REPO}/pull/17"
     truth.comment.update(
         html_url=feedback["html_url"],
@@ -890,9 +889,7 @@ def _review_stack(
     # The canonical event identity becomes a Valkey key, shared across workers.
     # Keep each fixture's identity consistent across the webhook and GitHub read.
     feedback_id = uuid.uuid4().int >> 80
-    fragment = truth.feedback.url.rsplit("#", 1)[1].removesuffix(
-        str(truth.feedback.feedback_id)
-    )
+    fragment = truth.feedback.url.rsplit("#", 1)[1].removesuffix(str(truth.feedback.feedback_id))
     payload_feedback = truth.payload["review" if event == "pull_request_review" else "comment"]
     for feedback in (payload_feedback, truth.comment):
         feedback["id"] = feedback_id
@@ -922,20 +919,22 @@ def _review_stack(
         )
         monkeypatch.setenv(
             "CURIE_SLACK_IDENTITIES",
-            json.dumps([
-                {
-                    "name": "default",
-                    "app_token_env": "SLACK_APP_TOKEN",
-                    "bot_token_env": "SLACK_BOT_TOKEN",
-                    "signing_secret_env": "SLACK_SIGNING_SECRET",
-                },
-                {
-                    "name": reply_identity,
-                    "app_token_env": "CURIE_SLACK_APP_TOKEN__0",
-                    "bot_token_env": "CURIE_SLACK_BOT_TOKEN__0",
-                    "signing_secret_env": None,
-                },
-            ]),
+            json.dumps(
+                [
+                    {
+                        "name": "default",
+                        "app_token_env": "SLACK_APP_TOKEN",
+                        "bot_token_env": "SLACK_BOT_TOKEN",
+                        "signing_secret_env": "SLACK_SIGNING_SECRET",
+                    },
+                    {
+                        "name": reply_identity,
+                        "app_token_env": "CURIE_SLACK_APP_TOKEN__0",
+                        "bot_token_env": "CURIE_SLACK_BOT_TOKEN__0",
+                        "signing_secret_env": None,
+                    },
+                ]
+            ),
         )
     stream = f"test:curie:github-review:{uuid.uuid4().hex}"
     held_index = f"{stream}:held"
@@ -969,6 +968,7 @@ def _review_stack(
         owned.callback(get_settings.cache_clear)
         owned.callback(_RESOLVERS.clear)
         owned.callback(valkey.close)
+
         def cleanup_worker_markers() -> None:
             keys = list(valkey.scan_iter(match=f"{stream}:worker:*"))
             if keys:
@@ -1099,14 +1099,16 @@ def _review_stack(
             "SELECT code_host_kind, code_host_host, repository_project_id, "
             "code_host_installation_id, code_host_pr_id, base_ref "
             "FROM curie.thread_publication_lineages"
-        ) == [{
-            "code_host_kind": "github",
-            "code_host_host": "github.com",
-            "repository_project_id": "21",
-            "code_host_installation_id": 11,
-            "code_host_pr_id": "PR_example_17",
-            "base_ref": "main",
-        }]
+        ) == [
+            {
+                "code_host_kind": "github",
+                "code_host_host": "github.com",
+                "repository_project_id": "21",
+                "code_host_installation_id": 11,
+                "code_host_pr_id": "PR_example_17",
+                "base_ref": "main",
+            }
+        ]
         truth.calls.clear()  # Attribute subsequent reads to the ingress under test.
         yield client, truth, valkey, stream
 
@@ -1289,13 +1291,15 @@ def test_named_cluster_message_lineage_binds_its_identity_and_refuses_a_default_
             "JOIN curie.agent_channels c ON c.id = l.binding_id "
             "JOIN curie.publications p ON p.lineage_id = l.id "
             "JOIN curie.approvals a ON a.id = p.approval_id"
-        ) == [{
-            "adapter": "acme-named",
-            "conversation_id": "slack:acme-named:C0LOCALDEV:1700000000.000001",
-            "publication_identity": "acme-named",
-            "approval_identity": "acme-named",
-            "current": True,
-        }]
+        ) == [
+            {
+                "adapter": "acme-named",
+                "conversation_id": "slack:acme-named:C0LOCALDEV:1700000000.000001",
+                "publication_identity": "acme-named",
+                "approval_identity": "acme-named",
+                "current": True,
+            }
+        ]
         response = post_review(client, truth)
         assert response.status_code == 200, response.text
         assert response.json()["status"] == "feedback_queued"
@@ -1374,18 +1378,20 @@ def test_worker_publication_success_stamps_verified_identity_on_the_lineage(
         "l.code_host_pr_id, l.base_ref, p.status, p.lease_owner "
         "FROM curie.thread_publication_lineages l "
         "JOIN curie.publications p ON p.lineage_id = l.id"
-    ) == [{
-        "pr_number": 17,
-        "head_sha": HEAD,
-        "code_host_kind": "github",
-        "code_host_host": "github.com",
-        "repository_project_id": "21",
-        "code_host_installation_id": 11,
-        "code_host_pr_id": "PR_example_17",
-        "base_ref": "main",
-        "status": "succeeded",
-        "lease_owner": None,
-    }]
+    ) == [
+        {
+            "pr_number": 17,
+            "head_sha": HEAD,
+            "code_host_kind": "github",
+            "code_host_host": "github.com",
+            "repository_project_id": "21",
+            "code_host_installation_id": 11,
+            "code_host_pr_id": "PR_example_17",
+            "base_ref": "main",
+            "status": "succeeded",
+            "lease_owner": None,
+        }
+    ]
 
 
 def test_worker_publication_accepts_github_canonical_repository_casing(
@@ -1414,23 +1420,25 @@ def test_worker_publication_with_mismatched_github_identity_is_refused(
         "l.code_host_pr_id, l.base_ref, p.status, p.reconcile_attempts, p.error "
         "FROM curie.thread_publication_lineages l "
         "JOIN curie.publications p ON p.lineage_id = l.id"
-    ) == [{
-        "pr_number": None,
-        "head_sha": None,
-        "code_host_kind": None,
-        "code_host_host": None,
-        "repository_project_id": None,
-        "code_host_installation_id": None,
-        "code_host_pr_id": None,
-        "base_ref": None,
-        "status": "launching",
-        "reconcile_attempts": 1,
-        "error": (
-            "publication lineage advance was refused: "
-            '{"detail":{"code":"publication.lineage_stale",'
-            '"message":"current GitHub publication identity was refused"}}'
-        ),
-    }]
+    ) == [
+        {
+            "pr_number": None,
+            "head_sha": None,
+            "code_host_kind": None,
+            "code_host_host": None,
+            "repository_project_id": None,
+            "code_host_installation_id": None,
+            "code_host_pr_id": None,
+            "base_ref": None,
+            "status": "launching",
+            "reconcile_attempts": 1,
+            "error": (
+                "publication lineage advance was refused: "
+                '{"detail":{"code":"publication.lineage_stale",'
+                '"message":"current GitHub publication identity was refused"}}'
+            ),
+        }
+    ]
     valkey.delete(stream)
     truth.repo["id"] = 21
     response = post_review(client, truth)
@@ -1473,12 +1481,26 @@ def test_binding_quota_refuses_new_feedback_and_keeps_an_observable_row(review_s
     assert valkey.xlen(stream) == 0
 
 
-@pytest.mark.parametrize("permission_case", [
-    "member", "allowed", "revoked", "wrong_id", "bad_login", "http404", "http403", "timeout",
-    "reserve_unavailable", "http403_cap", "reserve_cap",
-])
+@pytest.mark.parametrize(
+    "permission_case",
+    [
+        "member",
+        "allowed",
+        "revoked",
+        "wrong_id",
+        "bad_login",
+        "http404",
+        "http403",
+        "timeout",
+        "reserve_unavailable",
+        "http403_cap",
+        "reserve_cap",
+    ],
+)
 def test_real_review_consumer_waits_for_active_turn_and_revalidates_before_new_turn(
-    review_stack, tmp_path, permission_case,
+    review_stack,
+    tmp_path,
+    permission_case,
 ) -> None:
     """Actual API/DB/Valkey/consumer/RunnerClient; GitHub and ACI peer are fixtures.
 
@@ -1512,9 +1534,9 @@ def test_real_review_consumer_waits_for_active_turn_and_revalidates_before_new_t
     reservation_fault_installed = False
     reservation_fault_name = f"review_reservation_{uuid.uuid4().hex}"
     permission_path = f"/repos/{REPO}/collaborators/example-reviewer/permission"
-    lineage_authorization = "Basic " + base64.b64encode(
-        b"x-access-token:fixture-app-token-private-sentinel"
-    ).decode()
+    lineage_authorization = (
+        "Basic " + base64.b64encode(b"x-access-token:fixture-app-token-private-sentinel").decode()
+    )
     if permission_case != "member":
         from dataclasses import replace
 
@@ -1542,19 +1564,27 @@ def test_real_review_consumer_waits_for_active_turn_and_revalidates_before_new_t
         return httpx.Response(permission_status, json=permission)
 
     settings = get_settings()
-    names = {"stream": stream, "group": f"{stream}:group",
-             "prefix": settings.worker_key_prefix, "sandbox_prefix": f"{stream}:sandbox"}
+    names = {
+        "stream": stream,
+        "group": f"{stream}:group",
+        "prefix": settings.worker_key_prefix,
+        "sandbox_prefix": f"{stream}:sandbox",
+    }
     original = QueuedTurn(
-        event_id=f"ordinary-{uuid.uuid4()}", conversation_id="1700000000.000001",
-        author="U0REQUEST1", text="Continue the existing work.",
+        event_id=f"ordinary-{uuid.uuid4()}",
+        conversation_id="1700000000.000001",
+        author="U0REQUEST1",
+        text="Continue the existing work.",
         reply_handle=ReplyHandle(kind="slack", channel="C0EXAMPLE1", placeholder=None),
         received_at="2026-09-05T01:00:00+00:00",
     )
     thread_key = scoped_conversation_id("slack", "C0EXAMPLE1", original.conversation_id)
     bucket = f"review-consumer-{uuid.uuid4().hex}"
     objects_client = build_s3_client(
-        endpoint_url=settings.s3_endpoint_url, access_key=settings.s3_access_key,
-        secret_key=settings.s3_secret_key, region=settings.s3_region,
+        endpoint_url=settings.s3_endpoint_url,
+        access_key=settings.s3_access_key,
+        secret_key=settings.s3_secret_key,
+        region=settings.s3_region,
     )
     objects_client.create_bucket(Bucket=bucket)
 
@@ -1571,9 +1601,9 @@ def test_real_review_consumer_waits_for_active_turn_and_revalidates_before_new_t
             RETURNS trigger LANGUAGE plpgsql AS $$
             BEGIN RAISE EXCEPTION 'task-owned reservation failure'; END $$
         """)
-        origin = str(literal(truth.feedback.event_id).compile(
-            compile_kwargs={"literal_binds": True}
-        ))
+        origin = str(
+            literal(truth.feedback.event_id).compile(compile_kwargs={"literal_binds": True})
+        )
         review_rows(f"""
             CREATE TRIGGER {reservation_fault_name}
             BEFORE INSERT ON curie.publication_review_reservations
@@ -1608,12 +1638,17 @@ def test_real_review_consumer_waits_for_active_turn_and_revalidates_before_new_t
                     await asyncio.sleep(0.01)
             async with httpx.AsyncClient() as http:
                 publication_client = ApprovalClient(
-                    api_base_url=api_url, api_key="", client=http,
-                    worker_token="fixture-review-worker-token", read_timeout_s=2.0,
+                    api_base_url=api_url,
+                    api_key="",
+                    client=http,
+                    worker_token="fixture-review-worker-token",
+                    read_timeout_s=2.0,
                 )
-                lineage = (await asyncio.to_thread(
-                    review_rows, "SELECT deployment_id FROM curie.thread_publication_lineages"
-                ))[0]
+                lineage = (
+                    await asyncio.to_thread(
+                        review_rows, "SELECT deployment_id FROM curie.thread_publication_lineages"
+                    )
+                )[0]
                 lineage_response = await http.get(
                     f"{api_url}/v1/internal/publications/lineage",
                     params={
@@ -1636,24 +1671,33 @@ def test_real_review_consumer_waits_for_active_turn_and_revalidates_before_new_t
                             ),
                             commands=SubprocessCommands(),
                             objects=WorkspaceObjectStore(client=objects_client, bucket=bucket),
-                            scratch_root=tmp_path, limits=WorkspaceLimits(),
+                            scratch_root=tmp_path,
+                            limits=WorkspaceLimits(),
                         ),
                         substrate=substrate,
                     )
 
                 async with kernel_harness(
-                    names, valkey, binding=BindingResolver(engine, make_config(names)),
-                    publication_creator=publication_client, workspace_factory=workspace,
-                    max_delivery=2, reclaim_min_idle_ms=1,
+                    names,
+                    valkey,
+                    binding=BindingResolver(engine, make_config(names)),
+                    publication_creator=publication_client,
+                    workspace_factory=workspace,
+                    max_delivery=2,
+                    reclaim_min_idle_ms=1,
                 ) as h:
                     await asyncio.to_thread(
-                        h.substrate.claim, thread_key,
+                        h.substrate.claim,
+                        thread_key,
                         env={"CURIE_RUNNER_TOKEN": "example-review-route-token"},
-                        workspace_repo=REPO, workspace_materialized_head=HEAD,
+                        workspace_repo=REPO,
+                        workspace_materialized_head=HEAD,
                         publication_visible_outcome_revision=1,
                     )
                     consumer = Consumer(
-                        redis=h.async_redis, kernel=h.kernel, config=h.config,
+                        redis=h.async_redis,
+                        kernel=h.kernel,
+                        config=h.config,
                         leases=DeliveryLeaseStore(h.async_redis, h.config),
                     )
                     await consumer.ensure_group()
@@ -1664,8 +1708,10 @@ def test_real_review_consumer_waits_for_active_turn_and_revalidates_before_new_t
 
                     async def dispatch_new():
                         rows = await h.async_redis.xreadgroup(
-                            h.config.consumer_group, h.config.consumer_name,
-                            {stream: ">"}, count=1,
+                            h.config.consumer_group,
+                            h.config.consumer_name,
+                            {stream: ">"},
+                            count=1,
                         )
                         assert rows
                         entry_id, fields = rows[0][1][0]
@@ -1686,9 +1732,12 @@ def test_real_review_consumer_waits_for_active_turn_and_revalidates_before_new_t
                                     "initial ordinary delivery ended before a model turn opened"
                                 )
                                 await asyncio.sleep(0.01)
-                        ordinary_steer = original.model_copy(update={
-                            "event_id": f"ordinary-{uuid.uuid4()}", "text": "Also cover the edge."
-                        })
+                        ordinary_steer = original.model_copy(
+                            update={
+                                "event_id": f"ordinary-{uuid.uuid4()}",
+                                "text": "Also cover the edge.",
+                            }
+                        )
                         await h.async_redis.xadd(stream, to_stream_fields(ordinary_steer))
                         steer_id, _ = await dispatch_new()
                         await handler_done(steer_id)
@@ -1699,9 +1748,12 @@ def test_real_review_consumer_waits_for_active_turn_and_revalidates_before_new_t
                         await handler_done(review_id)
                         assert h.runner.opened == [original.text]
                         assert h.runner.steers == [ordinary_steer.text]
-                        assert await asyncio.to_thread(
-                            review_rows, "SELECT id FROM curie.publication_review_reservations"
-                        ) == []
+                        assert (
+                            await asyncio.to_thread(
+                                review_rows, "SELECT id FROM curie.publication_review_reservations"
+                            )
+                            == []
+                        )
                         pending = await h.async_redis.xpending_range(
                             stream, h.config.consumer_group, review_id, review_id, 1
                         )
@@ -1731,12 +1783,19 @@ def test_real_review_consumer_waits_for_active_turn_and_revalidates_before_new_t
                         if permission_case in {"revoked", "wrong_id", "bad_login"}:
                             assert h.runner.opened == [original.text]
                             assert h.runner.steers == [ordinary_steer.text]
-                            assert await asyncio.to_thread(
-                                review_rows, "SELECT id FROM curie.publication_review_reservations"
-                            ) == []
-                            assert await h.async_redis.xpending_range(
-                                stream, h.config.consumer_group, review_id, review_id, 1
-                            ) == []
+                            assert (
+                                await asyncio.to_thread(
+                                    review_rows,
+                                    "SELECT id FROM curie.publication_review_reservations",
+                                )
+                                == []
+                            )
+                            assert (
+                                await h.async_redis.xpending_range(
+                                    stream, h.config.consumer_group, review_id, review_id, 1
+                                )
+                                == []
+                            )
                             reconciler = client.app.state.github_review_reconciler
                             assert await reconciler.reconcile_terminal() == 1
                             code = {
@@ -1750,16 +1809,29 @@ def test_real_review_consumer_waits_for_active_turn_and_revalidates_before_new_t
                             ) == [{"status": "refused", "error_code": code}]
                             return
                         if permission_case in {
-                            "http404", "http403", "timeout", "reserve_unavailable",
-                            "http403_cap", "reserve_cap",
+                            "http404",
+                            "http403",
+                            "timeout",
+                            "reserve_unavailable",
+                            "http403_cap",
+                            "reserve_cap",
                         }:
                             assert h.runner.opened == [original.text]
-                            assert len(await h.async_redis.xpending_range(
-                                stream, h.config.consumer_group, review_id, review_id, 1
-                            )) == 1
-                            assert await asyncio.to_thread(
-                                review_rows, "SELECT id FROM curie.publication_review_reservations"
-                            ) == []
+                            assert (
+                                len(
+                                    await h.async_redis.xpending_range(
+                                        stream, h.config.consumer_group, review_id, review_id, 1
+                                    )
+                                )
+                                == 1
+                            )
+                            assert (
+                                await asyncio.to_thread(
+                                    review_rows,
+                                    "SELECT id FROM curie.publication_review_reservations",
+                                )
+                                == []
+                            )
                             assert await asyncio.to_thread(
                                 review_rows,
                                 "SELECT status,error_code FROM curie.github_review_feedback",
@@ -1769,13 +1841,20 @@ def test_real_review_consumer_waits_for_active_turn_and_revalidates_before_new_t
                             assert await consumer._dead_letter_over_cap() == set()
                             if permission_case.endswith("_cap"):
                                 await h.async_redis.xclaim(
-                                    stream, h.config.consumer_group, h.config.consumer_name,
-                                    min_idle_time=0, message_ids=[review_id], idle=1000,
+                                    stream,
+                                    h.config.consumer_group,
+                                    h.config.consumer_name,
+                                    min_idle_time=0,
+                                    message_ids=[review_id],
+                                    idle=1000,
                                 )
                                 assert await consumer._dead_letter_over_cap() == {review_id}
-                                assert await h.async_redis.xpending_range(
-                                    stream, h.config.consumer_group, review_id, review_id, 1
-                                ) == []
+                                assert (
+                                    await h.async_redis.xpending_range(
+                                        stream, h.config.consumer_group, review_id, review_id, 1
+                                    )
+                                    == []
+                                )
                                 dead = await h.async_redis.xrange(
                                     h.config.dead_letter_stream_name()
                                 )
@@ -1789,10 +1868,12 @@ def test_real_review_consumer_waits_for_active_turn_and_revalidates_before_new_t
                                 assert await asyncio.to_thread(
                                     review_rows,
                                     "SELECT status,error_code FROM curie.github_review_feedback",
-                                ) == [{
-                                    "status": "dead_lettered",
-                                    "error_code": "delivery_dead_lettered",
-                                }]
+                                ) == [
+                                    {
+                                        "status": "dead_lettered",
+                                        "error_code": "delivery_dead_lettered",
+                                    }
+                                ]
                                 assert h.runner.opened == [original.text]
                                 return
                             permission_status, permission_timeout = 200, False
@@ -1805,9 +1886,12 @@ def test_real_review_consumer_waits_for_active_turn_and_revalidates_before_new_t
                         assert h.runner.steers == [ordinary_steer.text]
                         assert f"/repos/{REPO}/pulls/17" in truth.calls
                         assert permission_path in truth.calls
-                        assert await h.async_redis.xpending_range(
-                            stream, h.config.consumer_group, review_id, review_id, 1
-                        ) == []
+                        assert (
+                            await h.async_redis.xpending_range(
+                                stream, h.config.consumer_group, review_id, review_id, 1
+                            )
+                            == []
+                        )
                         assert await asyncio.to_thread(
                             review_rows,
                             "SELECT origin_key,status FROM curie.publication_review_reservations",
@@ -1900,12 +1984,10 @@ def test_reserved_review_keeps_ordinary_slack_routing(
         "sandbox_prefix": f"{stream}:sandbox",
     }
     conversation_id = "1700000000.000001"
-    thread_key = scoped_conversation_id(
-        "slack", "C0EXAMPLE1", conversation_id
+    thread_key = scoped_conversation_id("slack", "C0EXAMPLE1", conversation_id)
+    lineage_authorization = (
+        "Basic " + base64.b64encode(b"x-access-token:fixture-app-token-private-sentinel").decode()
     )
-    lineage_authorization = "Basic " + base64.b64encode(
-        b"x-access-token:fixture-app-token-private-sentinel"
-    ).decode()
 
     def github(request):
         if (
@@ -1952,6 +2034,7 @@ def test_reserved_review_keeps_ordinary_slack_routing(
                     worker_token="fixture-review-worker-token",
                     read_timeout_s=2.0,
                 )
+
                 def workspace(substrate):
                     return WorkspaceClaimCoordinator(
                         preparer=WorkspacePreparer(
@@ -1995,9 +2078,7 @@ def test_reserved_review_keeps_ordinary_slack_routing(
                     review_hold = asyncio.Event()
                     h.runner.hold = review_hold
                     h.runner.default_script = [TextDelta(text="review working")]
-                    h.runner.tail = [
-                        Final(text="review complete", status=SessionStatus.DONE)
-                    ]
+                    h.runner.tail = [Final(text="review complete", status=SessionStatus.DONE)]
 
                     async def dispatch_new() -> tuple[str, dict[str, str]]:
                         rows = await h.async_redis.xreadgroup(
@@ -2099,17 +2180,19 @@ def test_reserved_review_keeps_ordinary_slack_routing(
                             assert h.runner.steers == []
                             assert h.runner.opened == [review_text, followup.text]
                         await handler_done(review_id)
-                        assert await h.async_redis.xpending_range(
-                            stream,
-                            h.config.consumer_group,
-                            review_id,
-                            followup_id,
-                            2,
-                        ) == []
+                        assert (
+                            await h.async_redis.xpending_range(
+                                stream,
+                                h.config.consumer_group,
+                                review_id,
+                                followup_id,
+                                2,
+                            )
+                            == []
+                        )
                         assert await asyncio.to_thread(
                             review_rows,
-                            "SELECT origin_key,status "
-                            "FROM curie.publication_review_reservations",
+                            "SELECT origin_key,status FROM curie.publication_review_reservations",
                         ) == [
                             {
                                 "origin_key": truth.feedback.event_id,
@@ -2189,12 +2272,10 @@ def test_review_history_capacity_failure_posts_one_pr_notice_end_to_end(
         "prefix": settings.worker_key_prefix,
         "sandbox_prefix": f"{stream}:sandbox",
     }
-    thread_key = scoped_conversation_id(
-        "slack", "C0EXAMPLE1", "1700000000.000001"
+    thread_key = scoped_conversation_id("slack", "C0EXAMPLE1", "1700000000.000001")
+    lineage_authorization = (
+        "Basic " + base64.b64encode(b"x-access-token:fixture-app-token-private-sentinel").decode()
     )
-    lineage_authorization = "Basic " + base64.b64encode(
-        b"x-access-token:fixture-app-token-private-sentinel"
-    ).decode()
 
     def github(request: httpx.Request) -> httpx.Response:
         if (
@@ -2245,9 +2326,7 @@ def test_review_history_capacity_failure_posts_one_pr_notice_end_to_end(
                                 worker_token="fixture-review-worker-token",
                             ),
                             commands=SubprocessCommands(),
-                            objects=WorkspaceObjectStore(
-                                client=objects_client, bucket=bucket
-                            ),
+                            objects=WorkspaceObjectStore(client=objects_client, bucket=bucket),
                             scratch_root=tmp_path,
                             limits=WorkspaceLimits(),
                         ),
@@ -2286,9 +2365,7 @@ def test_review_history_capacity_failure_posts_one_pr_notice_end_to_end(
 
                     admitted = await asyncio.to_thread(post_review, client, truth)
                     assert admitted.status_code == 200, admitted.text
-                    assert admitted.json()["status"] in {
-                        "feedback_waiting", "feedback_queued"
-                    }
+                    assert admitted.json()["status"] in {"feedback_waiting", "feedback_queued"}
                     if admitted.json()["status"] == "feedback_waiting":
                         await asyncio.to_thread(
                             review_rows,
@@ -2296,9 +2373,12 @@ def test_review_history_capacity_failure_posts_one_pr_notice_end_to_end(
                             "WHERE event_id=:event_id",
                             {"event_id": truth.feedback.event_id},
                         )
-                        assert await client.app.state.github_review_reconciler.reconcile_once(
-                            truth.feedback.event_id
-                        ) == 1
+                        assert (
+                            await client.app.state.github_review_reconciler.reconcile_once(
+                                truth.feedback.event_id
+                            )
+                            == 1
+                        )
                     assert await asyncio.to_thread(
                         review_rows,
                         "SELECT status FROM curie.github_review_feedback",
@@ -2317,15 +2397,17 @@ def test_review_history_capacity_failure_posts_one_pr_notice_end_to_end(
                         while entry_id in consumer._inflight_ids:
                             await asyncio.sleep(0.01)
                     assert h.runner.opened == [json.loads(fields["payload"])["text"]]
-                    assert await h.async_redis.get(
-                        h.config.done_key(truth.feedback.event_id)
-                    ) == "history_capacity"
-                    assert await h.async_redis.ttl(
-                        h.config.done_key(truth.feedback.event_id)
-                    ) == -1
-                    assert await h.async_redis.xpending_range(
-                        stream, h.config.consumer_group, entry_id, entry_id, 1
-                    ) == []
+                    assert (
+                        await h.async_redis.get(h.config.done_key(truth.feedback.event_id))
+                        == "history_capacity"
+                    )
+                    assert await h.async_redis.ttl(h.config.done_key(truth.feedback.event_id)) == -1
+                    assert (
+                        await h.async_redis.xpending_range(
+                            stream, h.config.consumer_group, entry_id, entry_id, 1
+                        )
+                        == []
+                    )
 
                     reconciler = client.app.state.github_review_reconciler
                     assert await reconciler.reconcile_terminal() == 1
@@ -2372,9 +2454,7 @@ def test_review_history_capacity_failure_posts_one_pr_notice_end_to_end(
             cleanup.callback(objects_client.delete_bucket, Bucket=bucket)
             contents = objects_client.list_objects_v2(Bucket=bucket).get("Contents", [])
             for obj in contents:
-                cleanup.callback(
-                    objects_client.delete_object, Bucket=bucket, Key=obj["Key"]
-                )
+                cleanup.callback(objects_client.delete_object, Bucket=bucket, Key=obj["Key"])
 
 
 def test_real_enqueue_refusal_backs_off_then_recovers_without_second_quota(review_stack) -> None:
@@ -2520,9 +2600,7 @@ def test_production_worker_client_uses_actual_api_without_github_or_slack_author
             assert reserved == await worker.reserve_review_feedback(turn, deployment_id, verified)
             assert await asyncio.to_thread(
                 review_rows, "SELECT origin_key FROM curie.publication_review_reservations"
-            ) == [
-                {"origin_key": turn.event_id}
-            ]
+            ) == [{"origin_key": turn.event_id}]
             truth.feedback_status = 404
             with pytest.raises(ApprovalBackendError):
                 await worker.verify_review_feedback(turn, deployment_id)
@@ -2641,10 +2719,11 @@ def test_real_queue_receipt_survives_database_commit_failure_without_second_turn
 @pytest.mark.parametrize(
     ("mutation", "code"),
     [
-        ("UPDATE curie.agent_channels SET generation=generation+1",
-         "binding_no_longer_authorized"),
-        ("UPDATE curie.thread_publication_lineages SET version=version+1",
-         "binding_or_lineage_changed"),
+        ("UPDATE curie.agent_channels SET generation=generation+1", "binding_no_longer_authorized"),
+        (
+            "UPDATE curie.thread_publication_lineages SET version=version+1",
+            "binding_or_lineage_changed",
+        ),
     ],
 )
 def test_before_model_recheck_refuses_stale_binding_or_lineage_version(
@@ -2672,10 +2751,16 @@ def test_before_model_recheck_refuses_stale_binding_or_lineage_version(
     [
         ("delivery", None, None),
         ("mutator", None, None),
-        ("delivery", "UPDATE curie.agent_channels SET generation=generation+1",
-         "binding_no_longer_authorized"),
-        ("delivery", "UPDATE curie.thread_publication_lineages SET version=version+1",
-         "binding_or_lineage_changed"),
+        (
+            "delivery",
+            "UPDATE curie.agent_channels SET generation=generation+1",
+            "binding_no_longer_authorized",
+        ),
+        (
+            "delivery",
+            "UPDATE curie.thread_publication_lineages SET version=version+1",
+            "binding_or_lineage_changed",
+        ),
     ],
     ids=["audit-reference", "competing-mutator", "stale-binding", "stale-lineage"],
 )
@@ -2709,35 +2794,61 @@ def test_review_outbox_recovers_under_delivery_reference_without_racing_mutators
                     # A real child FK reference holds KEY SHARE on its parent
                     # until commit, just like settling a concurrent audit row.
                     # It must not prevent the outbox's non-key state update.
-                    await holder.execute(text("""
+                    await holder.execute(
+                        text("""
                         INSERT INTO curie.github_review_deliveries (
                           delivery_id,event_kind,action,body_sha256,sender_type,
                           author_association,status,event_id
                         ) SELECT :delivery,event_kind,action,body_sha256,sender_type,
                           author_association,status,event_id
                           FROM curie.github_review_deliveries WHERE delivery_id=:original
-                    """), {"delivery": uuid.uuid4(), "original": uuid.UUID(DELIVERY)})
-                    assert await holder.scalar(text(
-                        "SELECT count(*) FROM curie.github_review_deliveries WHERE event_id=:event"
-                    ), {"event": event_id}) == 2
+                    """),
+                        {"delivery": uuid.uuid4(), "original": uuid.UUID(DELIVERY)},
+                    )
+                    assert (
+                        await holder.scalar(
+                            text(
+                                "SELECT count(*) FROM curie.github_review_deliveries "
+                                "WHERE event_id=:event"
+                            ),
+                            {"event": event_id},
+                        )
+                        == 2
+                    )
                 else:
-                    assert await holder.scalar(text(
-                        "SELECT event_id FROM curie.github_review_feedback "
-                        "WHERE event_id=:event FOR NO KEY UPDATE"
-                    ), {"event": event_id}) == event_id
+                    assert (
+                        await holder.scalar(
+                            text(
+                                "SELECT event_id FROM curie.github_review_feedback "
+                                "WHERE event_id=:event FOR NO KEY UPDATE"
+                            ),
+                            {"event": event_id},
+                        )
+                        == event_id
+                    )
                 async with asyncio.timeout(5):
                     enqueued = await reconciler.reconcile_once(event_id)
                 if holder_kind == "mutator":
                     assert enqueued == 0
                     assert valkey.xlen(stream) == 0
-                    assert await holder.scalar(text(
-                        "SELECT status FROM curie.github_review_feedback WHERE event_id=:event"
-                    ), {"event": event_id}) == "waiting"
+                    assert (
+                        await holder.scalar(
+                            text(
+                                "SELECT status FROM curie.github_review_feedback "
+                                "WHERE event_id=:event"
+                            ),
+                            {"event": event_id},
+                        )
+                        == "waiting"
+                    )
                 else:
                     assert enqueued == (0 if refusal else 1)
-                    assert await holder.scalar(text(
-                        "SELECT status FROM curie.github_review_feedback WHERE event_id=:event"
-                    ), {"event": event_id}) == ("refused" if refusal else "queued")
+                    assert await holder.scalar(
+                        text(
+                            "SELECT status FROM curie.github_review_feedback WHERE event_id=:event"
+                        ),
+                        {"event": event_id},
+                    ) == ("refused" if refusal else "queued")
                 # Explicit release is part of the control: a real competing
                 # mutator must block this pass, then allow the next one through.
                 await transaction.rollback()
@@ -2785,14 +2896,15 @@ def test_concurrent_distinct_delivery_headers_for_one_feedback_enqueue_once(revi
     entries = valkey.xrange(stream)
     assert len(entries) == 1
     assert review_rows(
-        "SELECT event_id,status,stream_id,enqueue_attempts "
-        "FROM curie.github_review_feedback"
-    ) == [{
-        "event_id": truth.feedback.event_id,
-        "status": "queued",
-        "stream_id": entries[0][0],
-        "enqueue_attempts": 1,
-    }]
+        "SELECT event_id,status,stream_id,enqueue_attempts FROM curie.github_review_feedback"
+    ) == [
+        {
+            "event_id": truth.feedback.event_id,
+            "status": "queued",
+            "stream_id": entries[0][0],
+            "enqueue_attempts": 1,
+        }
+    ]
 
 
 def test_legacy_name_only_lineage_cannot_override_verified_github_owner(
@@ -2818,8 +2930,10 @@ def test_legacy_name_only_lineage_cannot_override_verified_github_owner(
     assert valkey.xlen(stream) == 1
     # A name/number-only historical row cannot become review authority when the
     # verified owner is no longer open. Keep the valid queued receipt untouched.
-    review_rows("UPDATE curie.thread_publication_lineages SET status='closed' "
-                "WHERE repository_project_id IS NOT NULL")
+    review_rows(
+        "UPDATE curie.thread_publication_lineages SET status='closed' "
+        "WHERE repository_project_id IS NOT NULL"
+    )
     truth.payload["comment"].update(
         id=72, html_url=f"https://github.com/{REPO}/pull/17#issuecomment-72"
     )
@@ -2834,20 +2948,30 @@ def test_legacy_name_only_lineage_cannot_override_verified_github_owner(
 @pytest.mark.parametrize(
     ("mutation", "code"),
     [
-        ("UPDATE curie.thread_publication_lineages SET code_host_installation_id=12",
-         "lineage_authority_unproved"),
+        (
+            "UPDATE curie.thread_publication_lineages SET code_host_installation_id=12",
+            "lineage_authority_unproved",
+        ),
         # Migration 0042 makes GitHub identity all-or-nothing, so the only
         # identity-less lineage is a historical one with none of it.
-        ("UPDATE curie.thread_publication_lineages SET code_host_kind=NULL,"
-         "code_host_host=NULL,repository_project_id=NULL,"
-         "code_host_installation_id=NULL,code_host_pr_id=NULL,base_ref=NULL",
-         "lineage_absent_or_ambiguous"),
-        ("UPDATE curie.thread_publication_lineages SET binding_id=NULL",
-         "lineage_authority_unproved"),
-        ("UPDATE curie.thread_publication_lineages SET binding_generation=NULL",
-         "lineage_authority_unproved"),
-        ("UPDATE curie.thread_publication_lineages SET reply_conversation_id=NULL",
-         "lineage_authority_unproved"),
+        (
+            "UPDATE curie.thread_publication_lineages SET code_host_kind=NULL,"
+            "code_host_host=NULL,repository_project_id=NULL,"
+            "code_host_installation_id=NULL,code_host_pr_id=NULL,base_ref=NULL",
+            "lineage_absent_or_ambiguous",
+        ),
+        (
+            "UPDATE curie.thread_publication_lineages SET binding_id=NULL",
+            "lineage_authority_unproved",
+        ),
+        (
+            "UPDATE curie.thread_publication_lineages SET binding_generation=NULL",
+            "lineage_authority_unproved",
+        ),
+        (
+            "UPDATE curie.thread_publication_lineages SET reply_conversation_id=NULL",
+            "lineage_authority_unproved",
+        ),
         ("DELETE FROM curie.thread_workspaces", "workspace_no_longer_authorized"),
         ("allowlist", "workspace_no_longer_authorized"),
     ],
@@ -3142,9 +3266,7 @@ def test_final_reserve_rereads_provider_head_before_creating_reservation(
 ) -> None:
     client, truth, valkey, stream = review_stack
     base, payload, headers = _review_reserve_request(review_stack)
-    lineage_before = review_rows(
-        "SELECT head_sha,version FROM curie.thread_publication_lineages"
-    )
+    lineage_before = review_rows("SELECT head_sha,version FROM curie.thread_publication_lineages")
 
     # Only provider truth moves after preliminary verification. The persisted
     # lineage and caller's verified version/head remain byte-for-byte current,
@@ -3156,9 +3278,10 @@ def test_final_reserve_rereads_provider_head_before_creating_reservation(
     assert result.status_code == 409, result.text
     assert result.json()["detail"]["code"] == "stale_feedback_head"
     assert f"/repos/{REPO}/pulls/17" in truth.calls
-    assert review_rows(
-        "SELECT head_sha,version FROM curie.thread_publication_lineages"
-    ) == lineage_before
+    assert (
+        review_rows("SELECT head_sha,version FROM curie.thread_publication_lineages")
+        == lineage_before
+    )
     assert review_rows("SELECT id FROM curie.publication_review_reservations") == []
     assert valkey.xlen(stream) == 1
 
@@ -3168,9 +3291,7 @@ def test_final_reserve_provider_timeout_is_retryable_without_reservation(
 ) -> None:
     client, truth, valkey, stream = review_stack
     base, payload, headers = _review_reserve_request(review_stack)
-    lineage_before = review_rows(
-        "SELECT head_sha,version FROM curie.thread_publication_lineages"
-    )
+    lineage_before = review_rows("SELECT head_sha,version FROM curie.thread_publication_lineages")
     pull_path = f"/repos/{REPO}/pulls/17"
 
     def provider_timeout(request: httpx.Request) -> httpx.Response:
@@ -3191,13 +3312,12 @@ def test_final_reserve_provider_timeout_is_retryable_without_reservation(
 
     assert result.status_code == 503, result.text
     assert pull_path in truth.calls
-    assert review_rows(
-        "SELECT head_sha,version FROM curie.thread_publication_lineages"
-    ) == lineage_before
+    assert (
+        review_rows("SELECT head_sha,version FROM curie.thread_publication_lineages")
+        == lineage_before
+    )
     assert review_rows("SELECT id FROM curie.publication_review_reservations") == []
-    assert review_rows("SELECT status FROM curie.github_review_feedback") == [
-        {"status": "queued"}
-    ]
+    assert review_rows("SELECT status FROM curie.github_review_feedback") == [{"status": "queued"}]
     assert valkey.xlen(stream) == 1
 
 
@@ -3213,9 +3333,9 @@ def test_production_worker_reserve_deadline_cancels_stalled_provider_without_lat
     client, truth, valkey, stream = review_stack
     assert post_review(client, truth).json()["status"] == "feedback_queued"
     turn = parse_queued_turn(valkey.xrange(stream)[0][1]["payload"])
-    deployment_id = review_rows(
-        "SELECT deployment_id FROM curie.thread_publication_lineages"
-    )[0]["deployment_id"]
+    deployment_id = review_rows("SELECT deployment_id FROM curie.thread_publication_lineages")[0][
+        "deployment_id"
+    ]
 
     async def exercise() -> None:
         provider_started = asyncio.Event()
@@ -3243,9 +3363,7 @@ def test_production_worker_reserve_deadline_cancels_stalled_provider_without_lat
             def __init__(self) -> None:
                 self.inner = httpx.ASGITransport(app=client.app)
 
-            async def handle_async_request(
-                self, request: httpx.Request
-            ) -> httpx.Response:
+            async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
                 response = await self.inner.handle_async_request(request)
                 api_statuses.append(response.status_code)
                 return response
@@ -3253,9 +3371,7 @@ def test_production_worker_reserve_deadline_cancels_stalled_provider_without_lat
             async def aclose(self) -> None:
                 await self.inner.aclose()
 
-        injected_provider = httpx.AsyncClient(
-            transport=httpx.MockTransport(stalled_provider)
-        )
+        injected_provider = httpx.AsyncClient(transport=httpx.MockTransport(stalled_provider))
         previous_provider = client.app.state.http_client
         try:
             async with httpx.AsyncClient(
@@ -3284,20 +3400,26 @@ def test_production_worker_reserve_deadline_cancels_stalled_provider_without_lat
             assert provider_started.is_set()
             assert provider_cancelled.is_set()
             assert not provider_returned.is_set()
-            assert await asyncio.to_thread(
-                review_rows,
-                "SELECT id FROM curie.publication_review_reservations",
-            ) == []
+            assert (
+                await asyncio.to_thread(
+                    review_rows,
+                    "SELECT id FROM curie.publication_review_reservations",
+                )
+                == []
+            )
 
             # Releasing a cancelled provider cannot resume the timed-out reserve
             # coroutine and create a reservation after its 503 response.
             provider_release.set()
             await asyncio.sleep(0)
             assert not provider_returned.is_set()
-            assert await asyncio.to_thread(
-                review_rows,
-                "SELECT id FROM curie.publication_review_reservations",
-            ) == []
+            assert (
+                await asyncio.to_thread(
+                    review_rows,
+                    "SELECT id FROM curie.publication_review_reservations",
+                )
+                == []
+            )
         finally:
             client.app.state.http_client = previous_provider
             await injected_provider.aclose()
@@ -3309,9 +3431,11 @@ def test_review_reservation_is_one_atomic_origin_after_concurrent_replays(review
     client, _, valkey, stream = review_stack
     base, payload, headers = _review_reserve_request(review_stack)
     with ThreadPoolExecutor(max_workers=4) as pool:
-        responses = list(pool.map(
-            lambda _: client.post(base + "/reserve", json=payload, headers=headers), range(4)
-        ))
+        responses = list(
+            pool.map(
+                lambda _: client.post(base + "/reserve", json=payload, headers=headers), range(4)
+            )
+        )
     assert all(response.status_code == 200 for response in responses)
     ids = {response.json()["reservation_id"] for response in responses}
     assert len(ids) == 1
@@ -3350,31 +3474,35 @@ def _write_actual_fenced_review_terminal(
         store = DeliveryLeaseStore(valkey, config)
         lease = await store.acquire(stream, group, entry_id, consumer="fixture")
         try:
-            assert await Markers(valkey, config).settle_fenced(
-                event_id,
-                CompletionRecord(
-                    event_id=event_id,
-                    event=TurnCompleted(
-                        version=REPLY_WIRE_VERSION,
-                        event="turn.completed",
-                        target=ReplyTarget(
-                            kind="slack", address="C0EXAMPLE1",
-                            conversation_id="1700000000.000001",
-                            reply_ref=None,
-                        ),
+            assert (
+                await Markers(valkey, config).settle_fenced(
+                    event_id,
+                    CompletionRecord(
                         event_id=event_id,
-                        outcome=outcome,
+                        event=TurnCompleted(
+                            version=REPLY_WIRE_VERSION,
+                            event="turn.completed",
+                            target=ReplyTarget(
+                                kind="slack",
+                                address="C0EXAMPLE1",
+                                conversation_id="1700000000.000001",
+                                reply_ref=None,
+                            ),
+                            event_id=event_id,
+                            outcome=outcome,
+                        ),
+                        route=TargetRoute(),
+                        created_at=time.time(),
                     ),
-                    route=TargetRoute(),
-                    created_at=time.time(),
-                ),
-                stream=stream,
-                group=lease.group,
-                entry_id=entry_id,
-                owner=lease.owner,
-                generation=lease.generation,
-                marker_value="1",
-            ) is not None
+                    stream=stream,
+                    group=lease.group,
+                    entry_id=entry_id,
+                    owner=lease.owner,
+                    generation=lease.generation,
+                    marker_value="1",
+                )
+                is not None
+            )
         finally:
             await store.release(
                 stream, lease.group, entry_id, owner=lease.owner, resume_event_id=None
@@ -3400,12 +3528,13 @@ def _admit_queued_review(client: TestClient, truth: GitHubTruth, valkey: Any, st
             "UPDATE curie.github_review_feedback SET next_attempt_at=NULL WHERE event_id=:event_id",
             {"event_id": truth.feedback.event_id},
         )
-        assert client.portal.call(
-            client.app.state.github_review_reconciler.reconcile_once, truth.feedback.event_id
-        ) == 1
-    assert review_rows("SELECT status FROM curie.github_review_feedback") == [
-        {"status": "queued"}
-    ]
+        assert (
+            client.portal.call(
+                client.app.state.github_review_reconciler.reconcile_once, truth.feedback.event_id
+            )
+            == 1
+        )
+    assert review_rows("SELECT status FROM curie.github_review_feedback") == [{"status": "queued"}]
     assert valkey.xlen(stream) == 1
 
 
@@ -3432,17 +3561,13 @@ def test_human_comment_with_predictable_marker_cannot_suppress_capacity_notice(
     review_stack,
 ) -> None:
     client, truth, valkey, stream = review_stack
-    planted_marker = (
-        f"<!-- curie-review-history-capacity:{truth.feedback.event_id} -->"
-    )
+    planted_marker = f"<!-- curie-review-history-capacity:{truth.feedback.event_id} -->"
     truth.issue_comments.append({"id": 801, "body": planted_marker})
     _admit_queued_review(client, truth, valkey, stream)
     _write_review_history_capacity_terminal(client, valkey, truth.feedback.event_id, stream)
 
     assert client.portal.call(client.app.state.github_review_reconciler.reconcile_terminal) == 1
-    row = review_rows(
-        "SELECT status,error_code,notice_marker FROM curie.github_review_feedback"
-    )[0]
+    row = review_rows("SELECT status,error_code,notice_marker FROM curie.github_review_feedback")[0]
     assert row["status"] == "refused"
     assert row["error_code"] == "history_capacity_notified"
     assert isinstance(row["notice_marker"], uuid.UUID)
@@ -3457,8 +3582,7 @@ def test_human_comment_with_predictable_marker_cannot_suppress_capacity_notice(
 def test_capacity_notice_scan_persists_page_after_five_full_pages(review_stack) -> None:
     client, truth, valkey, stream = review_stack
     truth.issue_comments.extend(
-        {"id": 1000 + index, "body": f"Earlier PR comment {index}"}
-        for index in range(500)
+        {"id": 1000 + index, "body": f"Earlier PR comment {index}"} for index in range(500)
     )
     _admit_queued_review(client, truth, valkey, stream)
     _write_review_history_capacity_terminal(client, valkey, truth.feedback.event_id, stream)
@@ -3469,19 +3593,21 @@ def test_capacity_notice_scan_persists_page_after_five_full_pages(review_stack) 
     assert truth.comment_posts == []
     assert review_rows(
         "SELECT status,error_code,notice_scan_page FROM curie.github_review_feedback"
-    ) == [{
-        "status": "refused",
-        "error_code": "history_capacity",
-        "notice_scan_page": 6,
-    }]
+    ) == [
+        {
+            "status": "refused",
+            "error_code": "history_capacity",
+            "notice_scan_page": 6,
+        }
+    ]
 
     assert client.portal.call(reconciler.reconcile_terminal) == 0
     assert truth.comment_get_pages == [1, 2, 3, 4, 5, 6]
     assert len(truth.comment_posts) == 1
     assert len(truth.issue_comments) == 501
-    assert review_rows(
-        "SELECT status,error_code FROM curie.github_review_feedback"
-    ) == [{"status": "refused", "error_code": "history_capacity_notified"}]
+    assert review_rows("SELECT status,error_code FROM curie.github_review_feedback") == [
+        {"status": "refused", "error_code": "history_capacity_notified"}
+    ]
     assert client.portal.call(reconciler.reconcile_terminal) == 0
     assert len(truth.comment_posts) == 1
 
@@ -3501,10 +3627,7 @@ def test_concurrent_capacity_observers_preserve_notified_marker_and_one_comment(
         release = asyncio.Event()
 
         async def github(request: httpx.Request) -> httpx.Response:
-            if (
-                request.method == "POST"
-                and request.url.path == f"/repos/{REPO}/issues/17/comments"
-            ):
+            if request.method == "POST" and request.url.path == f"/repos/{REPO}/issues/17/comments":
                 posting.set()
                 await release.wait()
             return truth.handle(request)
@@ -3528,8 +3651,7 @@ def test_concurrent_capacity_observers_preserve_notified_marker_and_one_comment(
             assert await asyncio.wait_for(first, 10) == 1
             notified = await asyncio.to_thread(
                 review_rows,
-                "SELECT status,error_code,notice_marker "
-                "FROM curie.github_review_feedback",
+                "SELECT status,error_code,notice_marker FROM curie.github_review_feedback",
             )
             assert len(notified) == 1
             assert notified[0]["status"] == "refused"
@@ -3538,11 +3660,13 @@ def test_concurrent_capacity_observers_preserve_notified_marker_and_one_comment(
             assert isinstance(marker, uuid.UUID)
             assert str(marker) in truth.comment_posts[0]
             assert await observers[1].reconcile_terminal() == 0
-            assert await asyncio.to_thread(
-                review_rows,
-                "SELECT status,error_code,notice_marker "
-                "FROM curie.github_review_feedback",
-            ) == notified
+            assert (
+                await asyncio.to_thread(
+                    review_rows,
+                    "SELECT status,error_code,notice_marker FROM curie.github_review_feedback",
+                )
+                == notified
+            )
             assert len(truth.issue_comments) == 1
             assert len(truth.comment_posts) == 1
 
@@ -3563,8 +3687,7 @@ def test_other_review_terminal_does_not_post_a_capacity_failure(review_stack, te
 
     expected = 1 if terminal == "ordinary" else 0
     assert (
-        client.portal.call(client.app.state.github_review_reconciler.reconcile_terminal)
-        == expected
+        client.portal.call(client.app.state.github_review_reconciler.reconcile_terminal) == expected
     )
     assert truth.issue_comments == []
     assert truth.comment_posts == []
@@ -3632,7 +3755,8 @@ def test_review_cleanup_requires_own_fenced_terminal_and_keeps_origin_tombstone(
 
 @pytest.mark.parametrize("trim", [False, True])
 def test_review_graveyard_cursor_survives_restart_and_never_treats_absence_as_terminal(
-    review_stack, trim,
+    review_stack,
+    trim,
 ) -> None:
     from curie_api.github_review_store import GitHubReviewReconciler
 
@@ -3685,13 +3809,21 @@ def test_actual_consumer_dead_letter_settles_only_the_matching_review_origin(rev
     client, truth, valkey, stream = review_stack
     base, payload, headers = _review_reserve_request(review_stack)
     assert client.post(base + "/reserve", json=payload, headers=headers).status_code == 200
-    names = {"stream": stream, "group": f"{stream}:dead-group",
-             "prefix": get_settings().worker_key_prefix, "sandbox_prefix": f"{stream}:sandbox"}
+    names = {
+        "stream": stream,
+        "group": f"{stream}:dead-group",
+        "prefix": get_settings().worker_key_prefix,
+        "sandbox_prefix": f"{stream}:sandbox",
+    }
 
     async def exercise():
         async with kernel_harness(
-            names, valkey, max_delivery=2, reclaim_min_idle_ms=1,
-            delivery_lease_ttl_s=1.0, delivery_lease_heartbeat_s=0.3,
+            names,
+            valkey,
+            max_delivery=2,
+            reclaim_min_idle_ms=1,
+            delivery_lease_ttl_s=1.0,
+            delivery_lease_heartbeat_s=0.3,
         ) as h:
             leases = DeliveryLeaseStore(h.async_redis, h.config)
             consumer = Consumer(
@@ -3706,18 +3838,28 @@ def test_actual_consumer_dead_letter_settles_only_the_matching_review_origin(rev
             )
             entry_id, fields = rows[0][1][0]
             await h.async_redis.xclaim(
-                stream, h.config.consumer_group, h.config.consumer_name,
-                min_idle_time=0, message_ids=[entry_id], idle=1000,
+                stream,
+                h.config.consumer_group,
+                h.config.consumer_name,
+                min_idle_time=0,
+                message_ids=[entry_id],
+                idle=1000,
             )
             async with consumer._delivery_lease(entry_id, fields) as stale:
                 assert stale is not None
                 assert await leases.release(
-                    stream, h.config.consumer_group, entry_id, owner=stale.owner,
+                    stream,
+                    h.config.consumer_group,
+                    entry_id,
+                    owner=stale.owner,
                     resume_event_id=None,
                 )
                 await h.async_redis.xclaim(
-                    stream, h.config.consumer_group, "replacement",
-                    min_idle_time=0, message_ids=[entry_id],
+                    stream,
+                    h.config.consumer_group,
+                    "replacement",
+                    min_idle_time=0,
+                    message_ids=[entry_id],
                 )
                 current = await leases.acquire(
                     stream, h.config.consumer_group, entry_id, consumer="replacement"
@@ -3732,17 +3874,27 @@ def test_actual_consumer_dead_letter_settles_only_the_matching_review_origin(rev
                     assert await client.app.state.github_review_reconciler.reconcile_terminal() == 0
                 finally:
                     await leases.release(
-                        stream, h.config.consumer_group, entry_id, owner=current.owner,
+                        stream,
+                        h.config.consumer_group,
+                        entry_id,
+                        owner=current.owner,
                         resume_event_id=None,
                     )
             await h.async_redis.xclaim(
-                stream, h.config.consumer_group, h.config.consumer_name,
-                min_idle_time=0, message_ids=[entry_id], idle=1000,
+                stream,
+                h.config.consumer_group,
+                h.config.consumer_name,
+                min_idle_time=0,
+                message_ids=[entry_id],
+                idle=1000,
             )
             assert await consumer._dead_letter_over_cap() == {entry_id}
-            assert await h.async_redis.xpending_range(
-                stream, h.config.consumer_group, entry_id, entry_id, 1
-            ) == []
+            assert (
+                await h.async_redis.xpending_range(
+                    stream, h.config.consumer_group, entry_id, entry_id, 1
+                )
+                == []
+            )
             assert await client.app.state.github_review_reconciler.reconcile_terminal() == 1
             assert h.runner.opened == []
 
@@ -3774,9 +3926,15 @@ def test_concurrent_review_observers_settle_once_and_malformed_match_keeps_curso
     valkey.xadd(dead, {"dl_original_id": original_id, "payload": json.dumps(payload["turn"])})
 
     async def competing():
-        observers = [GitHubReviewReconciler(
-            reconciler._sessionmaker, reconciler._valkey, reconciler._settings, reconciler._client
-        ) for _ in range(4)]
+        observers = [
+            GitHubReviewReconciler(
+                reconciler._sessionmaker,
+                reconciler._valkey,
+                reconciler._settings,
+                reconciler._client,
+            )
+            for _ in range(4)
+        ]
         return await asyncio.gather(*(observer.reconcile_terminal() for observer in observers))
 
     assert sum(client.portal.call(competing)) == 1
@@ -3787,51 +3945,63 @@ def test_concurrent_review_observers_settle_once_and_malformed_match_keeps_curso
 
 @pytest.mark.parametrize("stale_verifier", [False, True])
 def test_review_terminal_observer_never_cancels_consumed_publication_or_reuses_approval(
-    review_stack, stale_verifier,
+    review_stack,
+    stale_verifier,
 ):
     client, truth, _, stream = review_stack
     base, payload, headers = _review_reserve_request(review_stack)
     reserved = client.post(base + "/reserve", json=payload, headers=headers)
     assert reserved.status_code == 200, reserved.text
     original_approvals = review_rows("SELECT id FROM curie.approvals")
-    publication = client.post("/v1/internal/publications", headers=headers, json={
-        "deployment_id": payload["deployment_id"],
-        "conversation_id": scoped_conversation_id(
-            "slack", "C0EXAMPLE1", payload["turn"]["conversation_id"]
-        ),
-        "repo_full_name": REPO, "author": payload["turn"]["author"],
-        "summary": "Review revision fixture", "reply_kind": "slack",
-        "reply_channel": "C0EXAMPLE1",
-        "reply_conversation_id": payload["turn"]["conversation_id"],
-        "reply_placeholder": "1700000000.000003",
-        "dedupe_key": f"review-publication-{uuid.uuid4()}",
-        "review_origin_key": truth.feedback.event_id,
-        "base_sha": HEAD, "patch_b64": base64.b64encode(b"diff --git a/a b/a\n").decode(),
-        "changed_paths": ["a"], "expires_in_seconds": 600,
-    })
+    publication = client.post(
+        "/v1/internal/publications",
+        headers=headers,
+        json={
+            "deployment_id": payload["deployment_id"],
+            "conversation_id": scoped_conversation_id(
+                "slack", "C0EXAMPLE1", payload["turn"]["conversation_id"]
+            ),
+            "repo_full_name": REPO,
+            "author": payload["turn"]["author"],
+            "summary": "Review revision fixture",
+            "reply_kind": "slack",
+            "reply_channel": "C0EXAMPLE1",
+            "reply_conversation_id": payload["turn"]["conversation_id"],
+            "reply_placeholder": "1700000000.000003",
+            "dedupe_key": f"review-publication-{uuid.uuid4()}",
+            "review_origin_key": truth.feedback.event_id,
+            "base_sha": HEAD,
+            "patch_b64": base64.b64encode(b"diff --git a/a b/a\n").decode(),
+            "changed_paths": ["a"],
+            "expires_in_seconds": 600,
+        },
+    )
     assert publication.status_code == 201, publication.text
     assert publication.json()["id"] == reserved.json()["reservation_id"]
     assert publication.json()["approval_id"] not in {str(row["id"]) for row in original_approvals}
     if stale_verifier:
-        refused = client.post(base + "/verify", json={
-            "turn": payload["turn"], "deployment_id": payload["deployment_id"],
-        }, headers=headers)
+        refused = client.post(
+            base + "/verify",
+            json={
+                "turn": payload["turn"],
+                "deployment_id": payload["deployment_id"],
+            },
+            headers=headers,
+        )
         assert refused.status_code == 409
         assert refused.json()["detail"]["code"] == "feedback_revision_not_executable"
     _write_actual_fenced_review_terminal(client, truth.feedback.event_id, stream)
     assert client.portal.call(client.app.state.github_review_reconciler.reconcile_terminal) == 1
-    assert review_rows("SELECT status FROM curie.github_review_feedback") == [
-        {"status": "settled"}
-    ]
+    assert review_rows("SELECT status FROM curie.github_review_feedback") == [{"status": "settled"}]
     assert review_rows("SELECT status FROM curie.publication_review_reservations") == [
         {"status": "consumed"}
     ]
-    assert review_rows("SELECT status FROM curie.publications WHERE id=:id", {
-        "id": publication.json()["id"]
-    }) == [{"status": "pending"}]
-    assert review_rows("SELECT status FROM curie.approvals WHERE id=:id", {
-        "id": publication.json()["approval_id"]
-    }) == [{"status": "pending"}]
+    assert review_rows(
+        "SELECT status FROM curie.publications WHERE id=:id", {"id": publication.json()["id"]}
+    ) == [{"status": "pending"}]
+    assert review_rows(
+        "SELECT status FROM curie.approvals WHERE id=:id", {"id": publication.json()["approval_id"]}
+    ) == [{"status": "pending"}]
 
 
 def test_consumed_review_history_capacity_still_posts_pr_failure(review_stack) -> None:
@@ -3864,24 +4034,24 @@ def test_consumed_review_history_capacity_still_posts_pr_failure(review_stack) -
     )
     assert publication.status_code == 201, publication.text
     assert publication.json()["id"] == reserved.json()["reservation_id"]
-    assert review_rows(
-        "SELECT status FROM curie.publication_review_reservations"
-    ) == [{"status": "consumed"}]
+    assert review_rows("SELECT status FROM curie.publication_review_reservations") == [
+        {"status": "consumed"}
+    ]
 
     _write_review_history_capacity_terminal(client, valkey, truth.feedback.event_id, stream)
     reconciler = client.app.state.github_review_reconciler
     assert client.portal.call(reconciler.reconcile_terminal) == 1
-    assert review_rows(
-        "SELECT status,error_code FROM curie.github_review_feedback"
-    ) == [{"status": "settled", "error_code": "history_capacity_notified"}]
+    assert review_rows("SELECT status,error_code FROM curie.github_review_feedback") == [
+        {"status": "settled", "error_code": "history_capacity_notified"}
+    ]
     assert len(truth.issue_comments) == 1
     assert truth.feedback.event_id in truth.issue_comments[0]["body"]
     assert truth.feedback.url in truth.issue_comments[0]["body"]
     assert client.portal.call(reconciler.reconcile_terminal) == 0
     assert len(truth.comment_posts) == 1
-    assert review_rows(
-        "SELECT status FROM curie.publication_review_reservations"
-    ) == [{"status": "consumed"}]
+    assert review_rows("SELECT status FROM curie.publication_review_reservations") == [
+        {"status": "consumed"}
+    ]
     assert review_rows(
         "SELECT status FROM curie.publications WHERE id=:id",
         {"id": publication.json()["id"]},
@@ -3905,16 +4075,14 @@ def test_history_capacity_with_lost_reservation_identity_still_posts_pr_failure(
         "WHERE id=:reservation_id",
         {"origin_key": unrelated_origin, "reservation_id": reserved.json()["reservation_id"]},
     )
-    assert review_rows(
-        "SELECT origin_key,status FROM curie.publication_review_reservations"
-    ) == [{"origin_key": unrelated_origin, "status": "reserved"}]
+    assert review_rows("SELECT origin_key,status FROM curie.publication_review_reservations") == [
+        {"origin_key": unrelated_origin, "status": "reserved"}
+    ]
 
     _write_review_history_capacity_terminal(client, valkey, truth.feedback.event_id, stream)
     reconciler = client.app.state.github_review_reconciler
     assert client.portal.call(reconciler.reconcile_terminal) == 1
-    row = review_rows(
-        "SELECT status,error_code,notice_marker FROM curie.github_review_feedback"
-    )[0]
+    row = review_rows("SELECT status,error_code,notice_marker FROM curie.github_review_feedback")[0]
     assert row["status"] in {"refused", "settled"}
     assert row["error_code"] == "history_capacity_notified"
     assert isinstance(row["notice_marker"], uuid.UUID)
@@ -3923,9 +4091,9 @@ def test_history_capacity_with_lost_reservation_identity_still_posts_pr_failure(
     assert truth.feedback.url in truth.comment_posts[0]
     assert client.portal.call(reconciler.reconcile_terminal) == 0
     assert len(truth.comment_posts) == 1
-    assert review_rows(
-        "SELECT origin_key,status FROM curie.publication_review_reservations"
-    ) == [{"origin_key": unrelated_origin, "status": "reserved"}]
+    assert review_rows("SELECT origin_key,status FROM curie.publication_review_reservations") == [
+        {"origin_key": unrelated_origin, "status": "reserved"}
+    ]
 
 
 def test_history_capacity_with_reserved_publication_still_posts_pr_failure(
@@ -3965,16 +4133,14 @@ def test_history_capacity_with_reserved_publication_still_posts_pr_failure(
         "WHERE id=:reservation_id",
         {"reservation_id": reserved.json()["reservation_id"]},
     )
-    assert review_rows(
-        "SELECT status FROM curie.publication_review_reservations"
-    ) == [{"status": "reserved"}]
+    assert review_rows("SELECT status FROM curie.publication_review_reservations") == [
+        {"status": "reserved"}
+    ]
 
     _write_review_history_capacity_terminal(client, valkey, truth.feedback.event_id, stream)
     reconciler = client.app.state.github_review_reconciler
     assert client.portal.call(reconciler.reconcile_terminal) == 1
-    row = review_rows(
-        "SELECT status,error_code,notice_marker FROM curie.github_review_feedback"
-    )[0]
+    row = review_rows("SELECT status,error_code,notice_marker FROM curie.github_review_feedback")[0]
     assert row["status"] in {"refused", "settled"}
     assert row["error_code"] == "history_capacity_notified"
     assert isinstance(row["notice_marker"], uuid.UUID)
@@ -4015,9 +4181,9 @@ def test_review_before_lineage_identity_is_held_then_admitted_when_identity_land
     assert held.status_code == 200, held.text
     assert held.json()["status"] == "feedback_held"
     assert review_rows("SELECT event_id FROM curie.github_review_feedback") == []
-    assert review_rows(
-        "SELECT status, reason, event_id FROM curie.github_review_deliveries"
-    ) == [{"status": "retryable", "reason": "lineage_identity_pending", "event_id": None}]
+    assert review_rows("SELECT status, reason, event_id FROM curie.github_review_deliveries") == [
+        {"status": "retryable", "reason": "lineage_identity_pending", "event_id": None}
+    ]
     assert valkey.zrange(HELD_INDEX, 0, -1) == [truth.feedback.event_id]
     stored = [json.loads(valkey.get(f"{HELD_INDEX}:{truth.feedback.event_id}"))]
     assert valkey.smembers(f"{HELD_INDEX}:{truth.feedback.event_id}:deliveries") == {DELIVERY}
@@ -4053,10 +4219,13 @@ def test_review_before_lineage_identity_is_held_then_admitted_when_identity_land
     assert queued[0]["status"] == "queued"
     assert queued[0]["turn"]["event_id"] == truth.feedback.event_id
     assert all(part.isdigit() for part in queued[0]["stream_id"].split("-"))
-    assert review_rows(
-        "SELECT status, reason, event_id FROM curie.github_review_deliveries "
-        "ORDER BY delivery_id"
-    ) == [{"status": "accepted", "reason": None, "event_id": truth.feedback.event_id}] * 2
+    assert (
+        review_rows(
+            "SELECT status, reason, event_id FROM curie.github_review_deliveries "
+            "ORDER BY delivery_id"
+        )
+        == [{"status": "accepted", "reason": None, "event_id": truth.feedback.event_id}] * 2
+    )
     assert valkey.exists(f"{HELD_INDEX}:{truth.feedback.event_id}:deliveries") == 0
 
 
@@ -4108,9 +4277,10 @@ def test_held_review_whose_hold_expires_is_rejected_by_the_reconciler(
     assert valkey.get(key) is None
     assert valkey.zrange(HELD_INDEX, 0, -1) == []
     assert review_rows("SELECT event_id FROM curie.github_review_feedback") == []
-    assert review_rows(
-        "SELECT status, reason FROM curie.github_review_deliveries"
-    ) == [{"status": "rejected", "reason": "lineage_absent_or_ambiguous"}] * 2
+    assert (
+        review_rows("SELECT status, reason FROM curie.github_review_deliveries")
+        == [{"status": "rejected", "reason": "lineage_absent_or_ambiguous"}] * 2
+    )
 
 
 def test_receipt_of_a_lost_hold_is_rejected_not_left_retryable(
@@ -4130,6 +4300,6 @@ def test_receipt_of_a_lost_hold_is_rejected_not_left_retryable(
     )
     client.portal.call(client.app.state.github_review_reconciler.reconcile_once)
     assert valkey.zrange(HELD_INDEX, 0, -1) == []
-    assert review_rows(
-        "SELECT status, reason FROM curie.github_review_deliveries"
-    ) == [{"status": "rejected", "reason": "lineage_absent_or_ambiguous"}]
+    assert review_rows("SELECT status, reason FROM curie.github_review_deliveries") == [
+        {"status": "rejected", "reason": "lineage_absent_or_ambiguous"}
+    ]

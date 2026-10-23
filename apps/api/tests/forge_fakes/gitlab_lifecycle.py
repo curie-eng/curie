@@ -600,7 +600,10 @@ def start_request(request_id: uuid.UUID) -> int:
         try:
             async with AsyncSession(engine) as session:
                 acquired = await acquire(
-                    session, request_id, owner="gitlab-owner", generation=generation,
+                    session,
+                    request_id,
+                    owner="gitlab-owner",
+                    generation=generation,
                     wake=await factory_wake(session, request_id),
                     context=None,
                 )
