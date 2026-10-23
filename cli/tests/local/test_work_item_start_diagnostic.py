@@ -21,10 +21,12 @@ The scenario:
    admitted on that commit. The worker's fixture-only archive cap (1 MiB,
    chart value ``worker.workspace.maxArchiveBytes``) fails its workspace
    archive before any sandbox is claimed.
-3. The fixture input is repaired by setting the worker's archive cap back to
-   the chart default, which also replaces the worker pod (a rolling update: the
-   old pod keeps draining the holder). The new worker prepares the workspace,
-   meets the full quota and defers the target for capacity twice.
+3. The fixture input is repaired by setting the archive cap back to the chart
+   default in both places the chart rendered it: the base sandbox templates'
+   workspace fetch, and the worker Deployment. The Deployment change replaces
+   the worker pod (a rolling update: the old pod keeps draining the holder).
+   The new worker prepares the workspace, meets the full quota and defers the
+   target for capacity twice.
 4. Both the internal request read and ``GET /work-items/{id}`` must still show
    the archive failure beside the capacity wait. Releasing the holder lets the
    target start, and the start clears the diagnostic.
@@ -88,6 +90,17 @@ START_DEFERRAL_LIMIT = 5
 ARCHIVE_ENV = "CURIE_WORKSPACE_MAX_ARCHIVE_BYTES"
 # A held Messages request is answered only at release or teardown.
 GATE_HOLD_SECONDS = 4 * 3600
+SANDBOX_TEMPLATES = "sandboxtemplates.extensions.agents.x-k8s.io"
+SANDBOX_CLAIMS = "sandboxclaims.extensions.agents.x-k8s.io"
+SANDBOXES = "sandboxes.agents.x-k8s.io"
+# The worker labels the per-claim template it clones for one claim
+# (apps/worker/src/curie_worker/sandbox/claim_tokens.py CLAIM_LABEL).
+CLAIM_TEMPLATE_LABEL = "curietech.ai/sandbox-claim"
+# The chart renders worker.workspace.maxArchiveBytes a second time, into the
+# sandbox workspace-init fetch (charts/curie/templates/agent-sandbox.yaml), as
+# a bare number Helm may print in float form (1.048576e+06).
+_FETCH_CAP = re.compile(r"(if size > )([0-9][0-9.e+]*)(:)")
+DIAGNOSTIC_LIMIT = 24000
 
 _URL = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s\"'<>]+")
 _IPV4 = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
@@ -98,7 +111,7 @@ def _chart_default_archive_bytes() -> int:
     return int(values["worker"]["workspace"]["maxArchiveBytes"])
 
 
-def _safe(value: Any, secrets: list[str | None]) -> str:
+def _safe(value: Any, secrets: list[str | None], limit: int = 4000) -> str:
     """Anonymous text for failure messages: no secrets, addresses or home paths."""
 
     text = value if isinstance(value, str) else json.dumps(value, default=str, sort_keys=True)
@@ -108,7 +121,7 @@ def _safe(value: Any, secrets: list[str | None]) -> str:
     home = str(Path.home())
     if home not in {"", "/"}:
         text = text.replace(home, "~")
-    return text[:4000]
+    return text[:limit]
 
 
 class GatedModel:
@@ -250,6 +263,8 @@ class Harness:
         self.worker_token = ""
         self.sandbox_priority_class = ""
         self.previous_sigterm: Any = None
+        # Request ids whose worker log lines diagnostics always keep.
+        self.watched: list[str] = []
 
     # Output and failure text -------------------------------------------------
 
@@ -593,6 +608,7 @@ class Harness:
         try:
             if self.run.cluster_attempted:
                 self.run.capture_failure_diagnostics()
+                self.snapshot("failure")
             unknown = list(self.stub.unknown_requests) if self.stub is not None else []
             unexpected = list(self.gate.unexpected) if self.gate is not None else []
             print(
@@ -605,6 +621,163 @@ class Harness:
             )
         except Exception as exc:  # noqa: BLE001 - diagnostics never block teardown
             print(f"fx4930 diagnostics unavailable: {type(exc).__name__}", file=sys.stderr)
+
+    def snapshot(self, label: str) -> None:
+        """Scrubbed, bounded cluster state on stderr. Never raises.
+
+        Pod and claim specs carry boot env, so those are summarized from
+        status only; nothing prints an environment.
+        """
+
+        def emit(title: str, value: Any) -> None:
+            print(
+                f"fx4930 snapshot [{label}] {title}\n"
+                + _safe(value, self.run.secrets, DIAGNOSTIC_LIMIT),
+                file=sys.stderr,
+                flush=True,
+            )
+
+        def read(*argv: str, timeout: float = 30) -> str:
+            try:
+                return self.run.kubectl(*argv, timeout=timeout)
+            except Exception as exc:  # noqa: BLE001 - one missing view must not hide the rest
+                return f"unavailable ({type(exc).__name__})"
+
+        def guarded(title: str, produce: Callable[[], Any]) -> None:
+            try:
+                emit(title, produce())
+            except Exception as exc:  # noqa: BLE001 - one missing view must not hide the rest
+                emit(title, f"unavailable ({type(exc).__name__})")
+
+        def status_view(item: dict[str, Any]) -> dict[str, Any]:
+            status = item.get("status") or {}
+            view: dict[str, Any] = {
+                "kind": item.get("kind"),
+                "namespace": item["metadata"].get("namespace"),
+                "name": item["metadata"].get("name"),
+                "labels": item["metadata"].get("labels"),
+                "deleting": item["metadata"].get("deletionTimestamp") is not None,
+                "phase": status.get("phase"),
+                "conditions": status.get("conditions"),
+            }
+            containers = (status.get("initContainerStatuses") or []) + (
+                status.get("containerStatuses") or []
+            )
+            if containers:
+                view["containers"] = [
+                    {
+                        "name": container.get("name"),
+                        "ready": container.get("ready"),
+                        "restarts": container.get("restartCount"),
+                        "state": container.get("state"),
+                        "last_state": container.get("lastState"),
+                    }
+                    for container in containers
+                ]
+            return view
+
+        emit("pods -A -o wide", read("get", "pods", "-A", "-o", "wide"))
+        guarded("worker pods", self.worker_pods)
+        try:
+            worker_names = [pod["name"] for pod in self.worker_pods()]
+        except Exception:  # noqa: BLE001 - the pod list above already reported it
+            worker_names = []
+        for name in worker_names:
+            for previous in (False, True):
+                flags = ("--previous",) if previous else ()
+                text = read(
+                    "-n", NAMESPACE, "logs", name, "-c", WORKER_CONTAINER, *flags, timeout=60
+                )
+                lines = text.splitlines()
+                tail_start = max(0, len(lines) - 400)
+                kept = [
+                    line
+                    for index, line in enumerate(lines)
+                    if index >= tail_start or any(watched in line for watched in self.watched)
+                ]
+                emit(
+                    f"worker logs {name}{' --previous' if previous else ''} "
+                    "(last 400 lines plus watched request lines)",
+                    "\n".join(kept)[-DIAGNOSTIC_LIMIT:],
+                )
+        emit(
+            "sandbox claims and sandboxes",
+            read("get", f"{SANDBOX_CLAIMS},{SANDBOXES}", "-A", "-o", "wide"),
+        )
+        guarded(
+            "sandbox claim and sandbox status",
+            lambda: [
+                status_view(item)
+                for item in json.loads(
+                    self.run.kubectl(
+                        "get", f"{SANDBOX_CLAIMS},{SANDBOXES}", "-A", "-o", "json", timeout=30
+                    )
+                )["items"]
+            ],
+        )
+        guarded(
+            "sandbox pod status",
+            lambda: [
+                status_view(pod)
+                for pod in json.loads(self.run.kubectl("get", "pods", "-A", "-o", "json"))["items"]
+                if pod.get("spec", {}).get("priorityClassName") == self.sandbox_priority_class
+            ],
+        )
+        guarded("sandbox template archive caps", self.template_caps)
+        emit("resourcequota -A -o yaml", read("get", "resourcequota", "-A", "-o", "yaml"))
+        events = read("get", "events", "-A", "--sort-by=.lastTimestamp").splitlines()
+        emit("events -A (latest 150)", "\n".join(events[-150:]))
+
+    # Sandbox templates -------------------------------------------------------
+
+    def sandbox_templates(self) -> list[dict[str, Any]]:
+        return json.loads(self.run.kubectl("get", SANDBOX_TEMPLATES, "-A", "-o", "json"))["items"]
+
+    def template_caps(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "namespace": template["metadata"].get("namespace"),
+                "name": template["metadata"].get("name"),
+                "per_claim": CLAIM_TEMPLATE_LABEL in (template["metadata"].get("labels") or {}),
+                "fetch_caps": [
+                    float(match.group(2))
+                    for match in _FETCH_CAP.finditer(json.dumps(template.get("spec") or {}))
+                ],
+            }
+            for template in self.sandbox_templates()
+        ]
+
+    def repair_sandbox_templates(self, cap: int) -> list[str]:
+        """Set the base templates' workspace fetch cap to ``cap``.
+
+        A per-claim template belongs to a claim that already booted (the
+        holder's), so it is left exactly as that sandbox started. Later claims
+        clone the repaired base template.
+        """
+
+        assert self.workdir is not None
+        repaired: list[str] = []
+        for template in self.sandbox_templates():
+            metadata = template["metadata"]
+            if CLAIM_TEMPLATE_LABEL in (metadata.get("labels") or {}):
+                continue
+            spec_text = json.dumps(template.get("spec") or {})
+            caps = [float(match.group(2)) for match in _FETCH_CAP.finditer(spec_text)]
+            if not caps:
+                continue
+            self.check(
+                all(value == FIXTURE_ARCHIVE_CAP for value in caps),
+                f"sandbox template {metadata.get('name')} fetch caps are {caps}, "
+                f"want the fixture cap {FIXTURE_ARCHIVE_CAP}",
+            )
+            template["spec"] = json.loads(
+                _FETCH_CAP.sub(lambda match: f"{match.group(1)}{cap}{match.group(3)}", spec_text)
+            )
+            path = self.workdir / f"sandbox-template-{metadata['name']}.json"
+            path.write_text(json.dumps(template))
+            self.run.kubectl("replace", "-f", str(path))
+            repaired.append(f"{metadata.get('namespace')}/{metadata['name']}")
+        return repaired
 
     def teardown(self) -> None:
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
@@ -929,6 +1102,7 @@ def _scenario(h: Harness) -> None:
     h.set_label(HOLDER_ISSUE, True)
     holder_ref = h.poll("the holder request", _single_request(h, HOLDER_ISSUE), timeout=600)
     holder_id = holder_ref["request_id"]
+    h.watched.append(holder_id)
 
     def holder_running() -> tuple[bool, Any]:
         row = h.internal(holder_id)
@@ -962,6 +1136,7 @@ def _scenario(h: Harness) -> None:
     target_ref = h.poll("the target request", _single_request(h, TARGET_ISSUE), timeout=600)
     target_id = target_ref["request_id"]
     target_item = target_ref["work_item_id"]
+    h.watched.append(target_id)
 
     def first_start_failure() -> tuple[bool, Any]:
         row = h.internal(target_id)
@@ -989,6 +1164,17 @@ def _scenario(h: Harness) -> None:
     h.check(
         old_worker["archive_cap"] == str(FIXTURE_ARCHIVE_CAP),
         f"the original worker runs with archive cap {old_worker['archive_cap']!r}",
+    )
+    # The chart value also caps the sandbox workspace fetch. A repair of the
+    # worker alone would let the new worker prepare the archive and then
+    # fail every sandbox boot, so the base templates are repaired first; the
+    # new worker reads them only after it starts.
+    repaired = h.repair_sandbox_templates(chart_default)
+    h.check(bool(repaired), "no base sandbox template carried the fixture archive cap")
+    base_caps = [view for view in h.template_caps() if not view["per_claim"]]
+    h.check(
+        all(cap == chart_default for view in base_caps for cap in view["fetch_caps"]),
+        f"base sandbox template fetch caps after repair: {base_caps}",
     )
     h.run.kubectl(
         "-n",
@@ -1104,6 +1290,7 @@ def _scenario(h: Harness) -> None:
 
     # 8. Release the holder; the target starts and its start clears the detail.
     h.set_label(HOLDER_ISSUE, False)
+    h.snapshot("holder released")
 
     def holder_released() -> tuple[bool, Any]:
         row = h.internal(holder_id)
