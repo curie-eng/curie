@@ -4,6 +4,9 @@ Date: 2026-09-16
 
 Status: Accepted
 
+Partially amended by [ADR 0243](0243-attachments-are-fetched-on-demand-through-scoped-platform-tools.md)
+for opt-in on-demand per-file delivery instead of eager complete-set handoff.
+
 **Partially amended by [ADR 0205](0205-an-attachment-belongs-to-its-thread.md)**
 (back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
 a file reaches every sandbox that boots for its thread, not only the one for

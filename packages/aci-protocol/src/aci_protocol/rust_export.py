@@ -20,6 +20,7 @@ from typing import Any, Literal, Union, get_args, get_origin
 from pydantic import BaseModel
 
 from .events import (
+    AttachmentAccessCapability,
     ChannelReadCapability,
     ErrorEvent,
     Event,
@@ -202,7 +203,7 @@ def _struct(model: type[BaseModel]) -> str:
     # dropping it only loosens the read path we mean to loosen.
     derives = (
         "#[derive(Clone, PartialEq, Default, Serialize, Deserialize)]"
-        if model is ChannelReadCapability
+        if model in (ChannelReadCapability, AttachmentAccessCapability)
         else _STRUCT_DERIVES
     )
     lines = [derives, f"pub struct {model.__name__} {{"]
@@ -317,6 +318,32 @@ _CHANNEL_READ_DEBUG = """impl std::fmt::Debug for ChannelReadCapability {
 }"""
 
 
+_ATTACHMENT_ACCESS_TESTS = """#[cfg(test)]
+mod attachment_access_tests {
+    use super::*;
+
+    #[test]
+    fn optional_attachment_context_roundtrips_without_debug_disclosure() {
+        let mut frame = serde_json::json!({
+            "kind": "event", "type": "message", "text": "Inspect the file",
+            "user": "U0EXAMPLE1", "ts": "1.0"
+        });
+        let old: InboundMessage = serde_json::from_value(frame.clone()).unwrap();
+        assert!(matches!(old, InboundMessage::Event { attachment_access: None, .. }));
+        frame["attachment_access"] = serde_json::json!({
+            "url": "https://api.example.com/attachment-access",
+            "token": "attachment.example.signature-sentinel"
+        });
+        let current: InboundMessage = serde_json::from_value(frame.clone()).unwrap();
+        let output = serde_json::to_value(&current).unwrap();
+        assert_eq!(output["attachment_access"], frame["attachment_access"]);
+        assert!(!format!("{current:?}").contains("signature-sentinel"));
+        frame["attachment_access"] = serde_json::json!({"url": "https://api.example.com"});
+        assert!(serde_json::from_value::<InboundMessage>(frame).is_err());
+    }
+}"""
+
+
 _TESTS = """#[cfg(test)]
 mod tests {
     use super::*;
@@ -377,6 +404,7 @@ mod tests {
             tool_access: Some(ToolAccess::ReadOnly),
             memory_token: None,
             channel_read: None,
+            attachment_access: None,
         };
         let encoded = serde_json::to_string(&message).unwrap();
         assert!(encoded.contains(r#""tool_access":"read-only""#));
@@ -409,6 +437,7 @@ mod tests {
             tool_access: None,
             memory_token: None,
             channel_read: Some(capability),
+            attachment_access: None,
         };
         for rendered in [format!("{:?}", message), format!("{:#?}", message)] {
             assert!(!rendered.contains(token));
@@ -617,6 +646,8 @@ def render_rust() -> str:
         _struct(PublicationContext),
         _struct(ChannelReadCapability),
         _CHANNEL_READ_DEBUG,
+        _struct(AttachmentAccessCapability),
+        _CHANNEL_READ_DEBUG.replace("ChannelReadCapability", "AttachmentAccessCapability"),
         _tagged_enum("InboundMessage", "kind", (Event, Interrupt)),
         _tagged_enum(
             "OutboundEvent",
@@ -624,6 +655,7 @@ def render_rust() -> str:
             (TextDelta, ToolNote, Final, ErrorEvent, SideEffectFlag),
         ),
         _TESTS.rstrip("\n"),
+        _ATTACHMENT_ACCESS_TESTS,
         _version_tests().rstrip("\n"),
     ]
     return "\n\n".join(blocks) + "\n"

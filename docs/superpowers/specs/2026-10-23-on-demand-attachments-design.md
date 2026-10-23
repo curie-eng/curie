@@ -2,15 +2,16 @@
 
 Date: 2026-10-23
 
-Status: Proposed; awaiting approval of the written design
+Status: Approved by Junwon Jung on 2026-10-23
 
 ## Intent and authorization
 
 The maintainer selected removal of both per-file and per-thread byte ceilings,
 then selected on-demand retrieval with streaming and caching instead of eagerly
 downloading every attachment before an agent starts. This replaces the earlier
-proposal that removed byte ceilings while preserving eager delivery. Approval
-of the written design and its new ADR remains pending.
+proposal that removed byte ceilings while preserving eager delivery. The
+maintainer approved this written design and coordinated ADR acceptance
+alongside implementation on 2026-10-23.
 
 The agent starts with a catalog, downloads only files it needs, and reuses
 verified local copies. File size alone does not reject or omit a catalog entry.

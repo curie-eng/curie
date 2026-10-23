@@ -223,6 +223,28 @@
       "title": "Attachment",
       "type": "object"
     },
+    "AttachmentAccessCapability": {
+      "description": "Platform attachment authority for one admitted logical turn (ADR 0243).\n\nOnly the kernel sends this on authenticated event/steer requests after the\nrunner advertises enforcement. The URL is a trusted configured platform\nfacade, never a channel or arbitrary download destination. Implementations\nverify the origin independently of HTTP syntax. The capability authorizes\nonly catalog membership and requested reads for its agent, canonical thread,\nactive logical turn, current sandbox route generation and finite lifetime.\n\nA steer renews the opener's logical authority without extending file scope.\nMissing/null context clears local authority; a new logical turn replaces\nit. Completion from an older turn must not clear its successor. Terminal,\nreset and route-replacement paths revoke reads, including local-cache hits.\nProvider credentials remain in the worker. Tokens never enter environment,\nmodel/tool text, subprocesses, logs, transcripts or persisted checkpoints.\nThese transport models implement none of those authorization behaviors.",
+      "properties": {
+        "token": {
+          "minLength": 1,
+          "title": "Token",
+          "type": "string"
+        },
+        "url": {
+          "format": "uri",
+          "minLength": 1,
+          "title": "Url",
+          "type": "string"
+        }
+      },
+      "required": [
+        "token",
+        "url"
+      ],
+      "title": "AttachmentAccessCapability",
+      "type": "object"
+    },
     "BootEnv": {
       "description": "The full worker-to-runner boot env: the ACI session plus platform ops.\n\n``session`` COMPOSES the frozen ``SessionConfig`` rather than extending it.\nThat nesting is the ACI-vs-platform boundary: a runner token, approval\nplumbing, and a history port are Curie platform operations, not the\ninterface a third-party ACI-conformant runner implements. Inheriting would\ntell every future implementer otherwise (ADR-0049).\n\n**Multiple producers, one consumer.** The boot env is assembled by the worker\nbinding, the worker kernel's resume overlay, the substrate (chart/docker),\nand the operator; only the runner consumes it. So ``from_env`` is the single\nconsumer parse of the whole union, while rendering is per-producer: there is\ndeliberately no whole-model ``to_env`` on the wire path. ``render_worker`` is\nthe one real render surface; ``to_env`` exists for round-trip checks only.\n\n**Authority, not arity, is the invariant.** ``CURIE_SANDBOX_ID`` and\n``CURIE_RUNNER_PORT`` are substrate-authoritative: identity derives from\nthe pod name (``fieldRef: metadata.name``), and because the chart sets\n``envVarsInjectionPolicy: Overrides`` a worker write would REPLACE it and\nbreak the \"pod name IS the sandbox id\" invariant that trace stamping relies\non. ``ANTHROPIC_BASE_URL`` is also multi-producer, but there the worker is\nauthoritative and worker-wins is the intended layering: the chart branch is a\nbaked template default, the worker's value is per-agent model routing. Do not\ncollapse either producer list to a single value.",
       "properties": {
@@ -325,6 +347,23 @@
             "kernel"
           ],
           "title": "Approval Resumed Kind"
+        },
+        "attachment_access_enabled": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "env": "CURIE_ATTACHMENT_ACCESS_ENABLED",
+          "producer": [
+            "worker",
+            "substrate"
+          ],
+          "title": "Attachment Access Enabled"
         },
         "attachments_manifest": {
           "anyOf": [
@@ -1158,6 +1197,17 @@
     "Event": {
       "description": "An inbound event delivered into a live session (initial or follow-up).\n\n``session_id`` and ``history_ref`` carry conversation-scoped identity to a\nrunner after its sandbox is bound. Both remain optional so older producers\ncan omit them and tolerant consumers can adopt the additive wire shape.\n\n``tool_access`` asks a server to restrict what this turn may execute\n(TOOL-ACCESS-1, TOOL-ACCESS-3); null is an unrestricted turn. It is sent\nonly to a server that advertises the value under\n``TOOL_ACCESS_STATUS_FIELD`` (TOOL-ACCESS-4), because a server that does\nnot enforce it ignores it.\n\n``memory_token`` is the per-turn signed state credential the runner's\nmemory tools present for writes (MEMORY-TOKEN-1). Null means the turn\ncarries no write credential. It is never a BootEnv key or an env var, and\nit is sent only on the runner POST (``/v1/event``, ``/v1/steer``;\nMEMORY-TOKEN-2). ``repr=False`` keeps the value out of ``repr(event)`` and\nlog ``%r``; a consumer must not place it in env, logs, hook or subprocess\ninput, or persisted state (MEMORY-TOKEN-3).\n\n``channel_read`` pairs a trusted platform proxy URL with a dedicated\nephemeral signed credential for one logical turn. Only the kernel sends it\non authenticated ``/v1/event`` and ``/v1/steer`` requests after the server\nadvertises actual enforcement under ``CHANNEL_READ_STATUS_FIELD``. Missing\nor null means no capability, and a steer clears any previous capability.\nIt is not a BootEnv or SessionConfig field and reuses no other credential.\nThe nested type defines the required scope and lifecycle; these models do\nnot advertise enforcement or implement that lifecycle.",
       "properties": {
+        "attachment_access": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AttachmentAccessCapability"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "channel_read": {
           "anyOf": [
             {
@@ -2051,6 +2101,6 @@
   },
   "$id": "https://curietech.ai/schemas/aci-protocol.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "protocolVersion": "0.5.23",
-  "title": "ACI Protocol v0.5.23"
+  "protocolVersion": "0.5.24",
+  "title": "ACI Protocol v0.5.24"
 }

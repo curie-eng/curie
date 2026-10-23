@@ -2,10 +2,12 @@
 
 Date: 2026-10-23
 
-Status: Draft
+Status: Accepted
 
-The maintainer selected the product direction; acceptance of this written
-decision is pending. This Draft does not authorize implementation.
+Accepted 2026-10-23 with explicit maintainer approval from Junwon Jung
+(jw3329) of the written design and coordinated acceptance alongside the
+realizing implementation. Runtime qualification remains subject to the
+specification's evidence; acceptance does not claim implementation is complete.
 
 The frozen-ACI dependency is tracked in
 [#5005](https://github.com/curie-eng/curie/issues/5005).
