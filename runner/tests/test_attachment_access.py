@@ -146,7 +146,7 @@ async def test_stream_above_old_limit_and_verified_cache(rig: Any) -> None:
     assert Path(first["path"]).is_absolute()
     assert Path(first["path"]).stat().st_size == platform.size
     assert platform.reads == 1
-    assert platform.requests.count("authorize") == 2
+    assert platform.requests.count("authorize") == 4
     assert (await access.list({}))["files"][0]["cached"] is True
 
 
@@ -818,3 +818,236 @@ async def test_local_cache_hash_stops_with_original_operation_authority(
     assert platform.reads == (2 if operation == "download" else 1), (
         "Verification cancellation must never trigger a provider retry"
     )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("phase", ["write", "file_sync", "directory_sync"])
+@pytest.mark.parametrize("stop", ["turn_end", "deadline"])
+async def test_slow_filesystem_keeps_event_loop_responsive_and_joins_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+    stop: str,
+) -> None:
+    import os
+    import stat
+    import threading
+    import time
+
+    import curie_runner.attachment_access as module
+
+    platform = Platform(64 * 1024 + 1)
+    app = web.Application()
+    app.router.add_post("/attachment-access/{operation}", platform.handle)
+    started, finished = threading.Event(), threading.Event()
+    entered: list[float] = []
+    real_fdopen, real_sync = os.fdopen, os.fsync
+
+    def pause() -> None:
+        entered.append(time.monotonic())
+        started.set()
+        time.sleep(0.3)
+
+    class SlowWriter:
+        def __init__(self, stream: Any) -> None:
+            self.stream = stream
+
+        def __enter__(self) -> SlowWriter:
+            self.stream.__enter__()
+            return self
+
+        def __exit__(self, *args: Any) -> Any:
+            return self.stream.__exit__(*args)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self.stream, name)
+
+        def write(self, data: bytes) -> int:
+            if not started.is_set():
+                pause()
+                try:
+                    return self.stream.write(data)
+                finally:
+                    finished.set()
+            return self.stream.write(data)
+
+    def controlled_writer(fd: int, mode: str) -> Any:
+        stream = real_fdopen(fd, mode)
+        return SlowWriter(stream) if mode == "wb" else stream
+
+    def controlled_sync(fd: int) -> None:
+        directory = stat.S_ISDIR(os.fstat(fd).st_mode)
+        if not started.is_set() and directory == (phase == "directory_sync"):
+            pause()
+            try:
+                real_sync(fd)
+            finally:
+                finished.set()
+        else:
+            real_sync(fd)
+
+    if phase == "write":
+        monkeypatch.setattr(module.os, "fdopen", controlled_writer)
+    else:
+        monkeypatch.setattr(module.os, "fsync", controlled_sync)
+    if stop == "deadline":
+        monkeypatch.setattr(module, "TRANSFER_SECONDS", 0.1)
+    failures: list[AttachmentAccessError] = []
+    async with TestServer(app) as server:
+        base = str(server.make_url("")).rstrip("/")
+        turn = AttachmentAccessTurn(trusted_origin=url_origin(base))
+        turn.begin(event(base))
+        access = AttachmentAccess(turn, tmp_path)
+
+        async def fetch() -> None:
+            try:
+                await access.fetch({"id": "ref-1"})
+            except AttachmentAccessError as exc:
+                failures.append(exc)
+
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(fetch)
+            with anyio.fail_after(2):
+                while not started.is_set():
+                    await anyio.sleep(0.001)
+            try:
+                assert time.monotonic() - entered[0] < 0.15
+                assert not finished.is_set(), "Revoke must dispatch while the syscall is running"
+            finally:
+                if stop == "turn_end":
+                    turn.end()
+        assert finished.is_set(), "Cleanup must join the writer before unlinking or closing its fd"
+        assert failures
+        assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("cached", [True, False])
+@pytest.mark.parametrize("revocation", ["refused", "digest", "size", "identity"])
+async def test_platform_revocation_during_local_verification_cannot_return_path(
+    rig: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    cached: bool,
+    revocation: str,
+) -> None:
+    import threading
+    import time
+
+    import curie_runner.attachment_access as module
+
+    platform, access, _, _ = rig
+    if cached:
+        await access.fetch({"id": "ref-1"})
+    real_fdopen = module.os.fdopen
+    started = threading.Event()
+
+    class ControlledReader:
+        def __init__(self, stream: Any) -> None:
+            self.stream = stream
+
+        def __enter__(self) -> ControlledReader:
+            self.stream.__enter__()
+            return self
+
+        def __exit__(self, *args: Any) -> Any:
+            return self.stream.__exit__(*args)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self.stream, name)
+
+        def read(self, size: int) -> bytes:
+            started.set()
+            time.sleep(0.02)
+            return self.stream.read(size)
+
+        def readinto(self, buffer: Any) -> int:
+            started.set()
+            time.sleep(0.02)
+            return self.stream.readinto(buffer)
+
+    def controlled_reader(fd: int, mode: str) -> Any:
+        stream = real_fdopen(fd, mode)
+        return ControlledReader(stream) if mode == "rb" else stream
+
+    monkeypatch.setattr(module.os, "fdopen", controlled_reader)
+    failures: list[AttachmentAccessError] = []
+
+    async def fetch() -> None:
+        try:
+            await access.fetch({"id": "ref-1"})
+        except AttachmentAccessError as exc:
+            failures.append(exc)
+
+    async with anyio.create_task_group() as tasks:
+        tasks.start_soon(fetch)
+        with anyio.fail_after(2):
+            while not started.is_set():
+                await anyio.sleep(0.001)
+        if revocation == "refused":
+            platform.status = 403
+        elif revocation == "digest":
+            platform.digest = "0" * 64
+        elif revocation == "size":
+            platform.size += 1
+        else:
+            original = platform.descriptor
+            monkeypatch.setattr(platform, "descriptor", lambda: {**original(), "id": "other-ref"})
+    assert failures, "Remote revocation during verification must refuse the final path"
+    assert platform.reads == 1, "Cache revalidation must not fetch another provider body"
+
+
+@pytest.mark.anyio
+async def test_direct_task_cancellation_joins_inflight_sync_before_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+    import contextlib
+    import os
+    import threading
+    import time
+
+    import curie_runner.attachment_access as module
+
+    platform = Platform(64 * 1024 + 1)
+    app = web.Application()
+    app.router.add_post("/attachment-access/{operation}", platform.handle)
+    started, finished = threading.Event(), threading.Event()
+    real_sync = os.fsync
+
+    def controlled_sync(fd: int) -> None:
+        started.set()
+        time.sleep(0.3)
+        try:
+            real_sync(fd)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(module.os, "fsync", controlled_sync)
+    async with TestServer(app) as server:
+        base = str(server.make_url("")).rstrip("/")
+        turn = AttachmentAccessTurn(trusted_origin=url_origin(base))
+        turn.begin(event(base))
+        task = asyncio.create_task(AttachmentAccess(turn, tmp_path).fetch({"id": "ref-1"}))
+        try:
+            with anyio.fail_after(2):
+                while not started.is_set():
+                    await anyio.sleep(0.001)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert finished.is_set(), (
+                "A raw task cancellation must not detach a live filesystem worker"
+            )
+            assert list(tmp_path.iterdir()) == []
+        finally:
+            turn.end()
+            if not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+            # Bound failure cleanup to this controlled syscall, never let an
+            # owned background operation bleed into another test's resources.
+            with anyio.CancelScope(shield=True), anyio.fail_after(2):
+                while not finished.is_set():
+                    await anyio.sleep(0.001)

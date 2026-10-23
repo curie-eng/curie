@@ -6,17 +6,18 @@ expiry on every operation, including cache reuse; no provider URL enters here.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
 import re
 import stat
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import IO, Any, cast
 from urllib.parse import urlsplit
 
 import aiohttp
@@ -184,6 +185,149 @@ class _Cached:
     size: int
 
 
+async def _filesystem[DiskResult](operation: Callable[..., DiskResult], *args: Any) -> DiskResult:
+    """Join on every cancellation path, including direct asyncio task cancel.
+
+    The caller keeps its original deadline. Its cancellation is forwarded to
+    the worker scope, whose cooperative checks run between filesystem syscalls.
+    """
+    scope = anyio.CancelScope()
+
+    async def run() -> tuple[bool, Any]:
+        # Keep failures as values until the caller joins: Python's shield can
+        # otherwise log a late worker exception after its waiter is cancelled.
+        try:
+            with scope:
+                return True, await anyio.to_thread.run_sync(operation, *args)
+        except BaseException as exc:  # noqa: BLE001 - preserve worker failure until joined
+            return False, exc
+        return False, AttachmentAccessError("Attachment filesystem operation was cancelled.")
+
+    task = asyncio.create_task(run())
+    try:
+        succeeded, value = await asyncio.shield(task)
+        if not succeeded:
+            raise value
+        return cast(DiskResult, value)
+    except BaseException:
+        scope.cancel()
+        with anyio.CancelScope(shield=True):
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    # Even a second direct Task.cancel must not race cleanup
+                    # against a still-running worker using the same descriptor.
+                    continue
+                except BaseException:  # noqa: BLE001 - joined worker; preserve caller failure
+                    break
+            if not task.cancelled():
+                task.exception()
+        raise
+
+
+class _StagedFile:
+    """Sequential, joined worker operations own the file until cleanup completes.
+
+    A kernel filesystem syscall cannot be interrupted safely. Each operation
+    checks cancellation around it; the event loop stays free while it runs.
+    """
+
+    def __init__(self, directory: int, name: str) -> None:
+        self.directory, self.name = directory, name
+        self.published: str | None = None
+        self.output: IO[bytes] | None = None
+        self.fd: int | None = None
+        self.created = False
+
+    def open(self) -> None:
+        anyio.from_thread.check_cancelled()
+        self.fd = os.open(
+            self.name,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=self.directory,
+        )
+        self.created = True
+        self.output = os.fdopen(self.fd, "wb")
+        anyio.from_thread.check_cancelled()
+
+    def write(self, chunk: bytes) -> None:
+        assert self.output is not None
+        anyio.from_thread.check_cancelled()
+        written = self.output.write(chunk)
+        anyio.from_thread.check_cancelled()
+        if written != len(chunk):
+            raise AttachmentAccessError("Attachment cache write was incomplete.")
+
+    def finish(self) -> os.stat_result:
+        assert self.output is not None
+        anyio.from_thread.check_cancelled()
+        self.output.flush()
+        anyio.from_thread.check_cancelled()
+        os.fsync(self.output.fileno())
+        anyio.from_thread.check_cancelled()
+        staged = os.fstat(self.output.fileno())
+        self.output.close()
+        anyio.from_thread.check_cancelled()
+        return staged
+
+    def publish(self, candidate: str, staged: os.stat_result, root: Path) -> None:
+        anyio.from_thread.check_cancelled()
+        current, opened = os.stat(root, follow_symlinks=False), os.fstat(self.directory)
+        if not stat.S_ISDIR(current.st_mode) or (current.st_dev, current.st_ino) != (
+            opened.st_dev,
+            opened.st_ino,
+        ):
+            raise AttachmentAccessError("Attachment cache directory changed.")
+        entry = os.stat(self.name, dir_fd=self.directory, follow_symlinks=False)
+        if (entry.st_dev, entry.st_ino, entry.st_size, entry.st_nlink) != (
+            staged.st_dev,
+            staged.st_ino,
+            staged.st_size,
+            1,
+        ):
+            raise AttachmentAccessError("Attachment staging file changed.")
+        anyio.from_thread.check_cancelled()
+        os.link(
+            self.name,
+            candidate,
+            src_dir_fd=self.directory,
+            dst_dir_fd=self.directory,
+            follow_symlinks=False,
+        )
+        # Record ownership in the worker immediately after exclusive link
+        # succeeds, even if cancellation arrives before this call returns.
+        self.published = candidate
+        anyio.from_thread.check_cancelled()
+        os.unlink(self.name, dir_fd=self.directory)
+        anyio.from_thread.check_cancelled()
+        os.fsync(self.directory)
+        anyio.from_thread.check_cancelled()
+
+    def cleanup(self) -> None:
+        # Called shielded only after the previous worker operation joins. Never
+        # race an outstanding write/fsync with unlink or reuse its descriptor.
+        try:
+            if self.output is not None:
+                self.output.close()
+            elif self.fd is not None:
+                os.close(self.fd)
+        finally:
+            try:
+                if self.published is not None:
+                    self._unlink(self.published)
+            finally:
+                if self.created:
+                    self._unlink(self.name)
+
+    def _unlink(self, name: str) -> None:
+        try:
+            os.unlink(name, dir_fd=self.directory)
+        except FileNotFoundError:
+            pass
+
+
 class AttachmentAccess:
     """Bounded streaming, durable integrity completion, then exclusive publication."""
 
@@ -242,9 +386,9 @@ class AttachmentAccess:
         )
 
     def _verified(self, directory: int, cached: _Cached) -> bool:
-        # All callers run in an AnyIO worker under the original operation's
-        # authority and fail_after scope. Cooperative checks observe both even
-        # though run_sync shields its await while the worker releases the fd.
+        # Joined workers receive the caller's original deadline and authority
+        # cancellation through their worker scope, including direct task cancel.
+        # Keep the descriptor owned until cancellation has stopped the worker.
         anyio.from_thread.check_cancelled()
         try:
             fd = os.open(
@@ -312,9 +456,7 @@ class AttachmentAccess:
                     if cached is not None and cached.digest == value["sha256"]:
                         directory = self._directory()
                         try:
-                            value["cached"] = await anyio.to_thread.run_sync(
-                                self._verified, directory, cached
-                            )
+                            value["cached"] = await _filesystem(self._verified, directory, cached)
                         finally:
                             os.close(directory)
                 return {"files": files, "next_cursor": page.get("next_cursor")}
@@ -351,18 +493,15 @@ class AttachmentAccess:
                             if (
                                 cached is not None
                                 and descriptor["sha256"] == cached.digest
-                                and await anyio.to_thread.run_sync(
-                                    self._verified, directory, cached
-                                )
+                                and await _filesystem(self._verified, directory, cached)
                             ):
                                 if self.turn.current() is not active:
                                     raise AttachmentAccessError(
                                         "Attachment access ended before completion."
                                     )
-                                return {
-                                    "path": str(self.root / cached.filename),
-                                    "size_bytes": cached.size,
-                                }
+                                return await self._authorized_path(
+                                    client, active, identifier, cached
+                                )
                             return await self._download(client, active, directory, descriptor)
                         finally:
                             os.close(directory)
@@ -370,6 +509,27 @@ class AttachmentAccess:
             raise AttachmentAccessError(
                 "Attachment fetch failed; no complete path is available."
             ) from exc
+
+    async def _authorized_path(
+        self,
+        client: aiohttp.ClientSession,
+        active: _Authority,
+        identifier: str,
+        cached: _Cached,
+    ) -> dict[str, Any]:
+        # Remote lease/binding revocation may happen during disk verification.
+        # This final network check stays under the original operation deadline.
+        descriptor = _descriptor(
+            await self._metadata(client, active, "authorize", {"id": identifier})
+        )
+        if (
+            descriptor["id"] != identifier
+            or descriptor["sha256"] != cached.digest
+            or descriptor["size_bytes"] != cached.size
+            or self.turn.current() is not active
+        ):
+            raise AttachmentAccessError("Attachment authority or integrity changed before access.")
+        return {"path": str(self.root / cached.filename), "size_bytes": cached.size}
 
     async def _download(
         self,
@@ -379,29 +539,24 @@ class AttachmentAccess:
         descriptor: dict[str, Any],
     ) -> dict[str, Any]:
         staging = ".attachment-" + uuid.uuid4().hex
-        fd = os.open(
-            staging, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600, dir_fd=directory
-        )
-        published: str | None = None
+        owned = _StagedFile(directory, staging)
         try:
+            await _filesystem(owned.open)
             digest, size = hashlib.sha256(), 0
-            with os.fdopen(fd, "wb") as output:
-                async with client.post(
-                    active.capability.url + "/fetch",
-                    json={"id": descriptor["id"]},
-                    headers={"X-Curie-Attachment-Access": active.capability.token},
-                    allow_redirects=False,
-                ) as response:
-                    transfer = response.headers.get("X-Curie-Transfer-ID")
-                    if response.status != 200 or not _text(transfer, 256):
-                        raise AttachmentAccessError("Attachment stream was refused.")
-                    async for chunk in response.content.iter_chunked(CHUNK_BYTES):
-                        output.write(chunk)
-                        digest.update(chunk)
-                        size += len(chunk)
-                output.flush()
-                os.fsync(output.fileno())
-                staged = os.fstat(output.fileno())
+            async with client.post(
+                active.capability.url + "/fetch",
+                json={"id": descriptor["id"]},
+                headers={"X-Curie-Attachment-Access": active.capability.token},
+                allow_redirects=False,
+            ) as response:
+                transfer = response.headers.get("X-Curie-Transfer-ID")
+                if response.status != 200 or not _text(transfer, 256):
+                    raise AttachmentAccessError("Attachment stream was refused.")
+                async for chunk in response.content.iter_chunked(CHUNK_BYTES):
+                    await _filesystem(owned.write, chunk)
+                    digest.update(chunk)
+                    size += len(chunk)
+            staged = await _filesystem(owned.finish)
             assert isinstance(transfer, str)
             completion = await self._completion(client, active, transfer)
             actual = digest.hexdigest()
@@ -415,52 +570,24 @@ class AttachmentAccess:
                 or (descriptor["sha256"] is not None and descriptor["sha256"] != actual)
             ):
                 raise AttachmentAccessError("Attachment integrity completion failed.")
-            if self.turn.current() is not active or not self._same_directory(directory):
-                raise AttachmentAccessError("Attachment authority or cache directory changed.")
-            entry = os.stat(staging, dir_fd=directory, follow_symlinks=False)
-            if (entry.st_dev, entry.st_ino, entry.st_size, entry.st_nlink) != (
-                staged.st_dev,
-                staged.st_ino,
-                size,
-                1,
-            ):
-                raise AttachmentAccessError("Attachment staging file changed.")
-            # A random final name plus an exclusive link never overwrites a
-            # model-created file or follows a symlink. Both names share the mount.
+            if self.turn.current() is not active:
+                raise AttachmentAccessError("Attachment authority changed before publication.")
             extension = Path(descriptor["name"]).suffix
             if not re.fullmatch(r"\.[A-Za-z0-9_-]{1,24}", extension):
                 extension = ""
             identifier = hashlib.sha256(descriptor["id"].encode()).hexdigest()
             candidate = f"{identifier}-{uuid.uuid4().hex}{extension}"
-            os.link(
-                staging,
-                candidate,
-                src_dir_fd=directory,
-                dst_dir_fd=directory,
-                follow_symlinks=False,
-            )
-            # Ownership starts only after exclusive publication succeeds. A
-            # collision must never make cleanup delete the pre-existing entry.
-            published = candidate
-            os.unlink(staging, dir_fd=directory)
-            os.fsync(directory)
-            cached = _Cached(published, actual, size)
-            verified = await anyio.to_thread.run_sync(self._verified, directory, cached)
+            await _filesystem(owned.publish, candidate, staged, self.root)
+            cached = _Cached(candidate, actual, size)
+            verified = await _filesystem(self._verified, directory, cached)
             if not verified or self.turn.current() is not active:
                 raise AttachmentAccessError(
                     "Attachment authority or cache changed before publication."
                 )
+            result = await self._authorized_path(client, active, descriptor["id"], cached)
             self._cached[descriptor["id"]] = cached
-            return {"path": str(self.root / published), "size_bytes": size}
+            return result
         except BaseException:
-            if published is not None:
-                try:
-                    os.unlink(published, dir_fd=directory)
-                except FileNotFoundError:
-                    pass
+            with anyio.CancelScope(shield=True):
+                await _filesystem(owned.cleanup)
             raise
-        finally:
-            try:
-                os.unlink(staging, dir_fd=directory)
-            except FileNotFoundError:
-                pass

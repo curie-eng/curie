@@ -550,13 +550,22 @@ Notices describe remote references until a fetch returns a verified absolute
 path. A fetch accepts only a catalog ID and returns the complete selected file,
 without per-file or thread-total application byte ceilings. Actual sandbox
 storage, a 300-second total operation deadline, and at most two concurrent
-transfers remain finite. A failed or cancelled transfer removes its partial file.
+transfers remain finite. The runner's 300-second ceiling still applies when the
+broker/chart `transferTimeoutSeconds` setting is higher. A failed or cancelled
+transfer removes its partial file.
+
+Filesystem writes and synchronization run in joined workers so the event loop
+can process interruption and expiry while disk work is pending. An already
+running kernel syscall cannot be forcibly cancelled: cleanup waits for it to
+finish, which can extend past the deadline, and returns no successful path for
+a cancelled or expired operation.
 
 Listing reads metadata only. Fetching streams chunks of at most 1 MiB, checks
 the platform's durable integrity completion, and publishes the cache entry
 atomically without overwriting an existing path. Reuse reauthorizes the ID and
-hashes the local file; a revoked route cannot use a cache hit. The cache belongs
-to the sandbox and downloads no unrequested file. Fetch remains conservatively
+hashes the local file, then reauthorizes immediately before returning a path;
+a route revoked during verification cannot use a cache hit or a fresh transfer.
+The cache belongs to the sandbox and downloads no unrequested file. Fetch remains conservatively
 side-effecting because it binds catalog integrity and publishes a local file.
 
 These two tools receive no platform-name approval or tool-policy exemption.
