@@ -11,6 +11,7 @@ import socket
 import subprocess
 import sys
 import time
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -168,6 +169,14 @@ VALID_ARGUMENT: dict[str, Any] = {
 }
 
 
+def _argument(template: str) -> dict[str, Any]:
+    if template.startswith("fresh_"):
+        vectors = (Path(__file__).resolve().parents[3]
+                   / "tests/vectors/managed-cni-fresh-arguments.json")
+        return json.loads(vectors.read_text())[template]
+    return VALID_ARGUMENT
+
+
 @pytest.mark.parametrize("template", sorted(TEMPLATES))
 def test_every_template_is_unprivileged_and_tokenless(template: str) -> None:
     pod = probe_pod(
@@ -177,7 +186,7 @@ def test_every_template_is_unprivileged_and_tokenless(template: str) -> None:
         node="node-a",
         campaign="c1",
         role_labels={"curietech.ai/role": "x"},
-        argument=VALID_ARGUMENT,
+        argument=_argument(template),
     )
     spec = pod["spec"]
     assert spec["automountServiceAccountToken"] is False
@@ -208,7 +217,7 @@ def test_spoofing_is_the_only_template_that_adds_a_capability() -> None:
             node="n",
             campaign="c1",
             role_labels={},
-            argument=VALID_ARGUMENT,
+            argument=_argument(template),
         )["spec"]["containers"][0]["securityContext"]["capabilities"].get("add")
     ]
     assert adders == ["spoofing"]
@@ -228,7 +237,7 @@ def test_only_the_spoofing_template_runs_as_root_so_net_raw_is_effective() -> No
             node="n",
             campaign="c1",
             role_labels={},
-            argument=VALID_ARGUMENT,
+            argument=_argument(template),
         )
         identity = pod["spec"]["securityContext"]
         (container,) = pod["spec"]["containers"]

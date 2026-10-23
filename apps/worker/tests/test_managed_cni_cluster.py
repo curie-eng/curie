@@ -14,11 +14,10 @@ the clause 5 rules this slice uses. The kit then runs under that
 ServiceAccount's short-lived token only.
 
 ``CURIE_MANAGED_CNI_EXPECT=enforcing``: case 1 passes in every placement and no
-enforcement entry fails except case 5 ``policy_changed``; the provider
-destinations a local cluster lacks are ``unavailable``. Case 3 ``spoof_live``
-(IPv4) must pass, and case 5 ``policy_changed`` must produce a measured verdict:
-``pass``, or ``fail retained_flow`` on a dataplane that keeps conntrack-established
-flows after a policy change (Calico's iptables dataplane does).
+enforcement entry fails; the provider destinations a local cluster lacks are
+``unavailable``. Case 3 ``spoof_live`` (IPv4) must pass. Case 5 uses the finite
+fresh-connection predicate of Accepted ADR 0243; old conntrack retention is
+neither a permitted fresh leak nor evidence of a fresh denial.
 ``CURIE_MANAGED_CNI_EXPECT=absent``: case 1 fails with
 ``enforcement_absent`` and no other case runs.
 ``CURIE_MANAGED_CNI_EXPECT=spoof_allowed``: for a CNI that enforces policy by
@@ -605,20 +604,22 @@ def test_probe_kit_on_a_local_cluster() -> None:
         assert ("fail", "delivered") in spoofed.values(), summary
         assert measurement.refusal is not None, summary
         return
-    # The raw-socket sender and the retained flow now measure: a real verdict, not
+    # The raw-socket sender and fresh connections now measure: actual verdicts, not
     # an unavailable that would hide a send failure or a launch race.
     spoof_live = {
-        item.outcome for item in measurement.entries
+        item.outcome
+        for item in measurement.entries
         if (item.case, item.sub_case, item.family) == (3, "spoof_live", "ipv4")
     }
     assert spoof_live == {"pass"}, summary
     retained = {
-        item.key: (item.outcome, item.reason) for item in measurement.entries
+        item.key: (item.outcome, item.reason)
+        for item in measurement.entries
         if (item.case, item.sub_case, item.family) == (5, "policy_changed", "ipv4")
     }
-    assert retained and set(retained.values()) <= {("pass", "denied"), ("fail", "retained_flow")}, (
-        summary
-    )
+    assert retained and all(
+        outcome in ("pass", "unavailable") for outcome, _reason in retained.values()
+    ), summary
     # The probe kit produced exactly the required entry set, once each.
     assert set(required_entries(layout)) == {item.key for item in measurement.entries}
     not_passed = {item.key: item.reason for item in measurement.entries if item.outcome != "pass"}
@@ -636,25 +637,35 @@ def test_probe_kit_on_a_local_cluster() -> None:
     # a leak there would be a real finding, not a local limitation. Only
     # unavailable (a case this local cluster could not provoke) is allowed.
     leaks = [
-        item for item in measurement.entries if item.case in (1, 2, 3, 4, 5, 6)
-        and item.outcome == "fail" and item.key not in retained
+        item
+        for item in measurement.entries
+        if item.case in (1, 2, 3, 4, 5, 6) and item.outcome == "fail"
     ]
     assert leaks == [], summary
     # Every non-pass is an honest unavailable with a known reason. Timing cases a
     # local cluster cannot provoke (address reuse, a recently terminated address,
     # node-local kubelet reach) are unavailable, never a pass.
     allowed_unavailable = {
-        "destination_unknown", "destination_unreached", "reuse_not_provoked",
-        "transport_unavailable", "node_probe_unavailable", "phase_timeout",
-        "single_eligible_node", "no_family_address", "control_failed", "review_unavailable",
-        "address_reassigned", "sequence_state_unavailable",
+        "destination_unknown",
+        "destination_unreached",
+        "reuse_not_provoked",
+        "transport_unavailable",
+        "node_probe_unavailable",
+        "phase_timeout",
+        "single_eligible_node",
+        "no_family_address",
+        "control_failed",
+        "review_unavailable",
+        "address_reassigned",
+        "trigger_unconfirmed",
+        "listener_incomplete",
     }
-    assert all(item.outcome == "unavailable" for item in measurement.entries
-               if item.outcome != "pass" and item.key not in retained), summary
-    assert set(not_passed.values()) <= allowed_unavailable | {"retained_flow"}, summary
+    assert all(
+        item.outcome == "unavailable" for item in measurement.entries if item.outcome != "pass"
+    ), summary
+    assert set(not_passed.values()) <= allowed_unavailable, summary
     # Case 7 may legitimately refuse (ordinary identities with node-capable rights);
     # that is a node-authority finding, recorded, not a CNI leak.
     assert measurement.refusal is None or measurement.refusal in (
-        allowed_unavailable
-        | {"separate_authority_domain_required", "node_capable_pod", "retained_flow"}
+        allowed_unavailable | {"separate_authority_domain_required", "node_capable_pod"}
     ), summary

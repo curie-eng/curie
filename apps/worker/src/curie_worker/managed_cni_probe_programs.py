@@ -25,6 +25,7 @@ from collections.abc import Mapping, Sequence, Set
 from dataclasses import dataclass
 from typing import Any
 
+from .managed_cni_fresh_programs import FRESH_PROGRAMS, FRESH_TEMPLATES, validate_fresh_argument
 from .managed_cni_probe_kit import canonical_json, refuse, require
 
 # The repository's pinned Python base image, by digest.
@@ -361,6 +362,7 @@ TEMPLATES: dict[str, tuple[str, str]] = {
     "spoofing": ("spoof", "probe"),
     "retained_sender": ("retained_sender", "protected"),
     "kubelet_probe": ("idle", "probe"),
+    **FRESH_TEMPLATES,
 }
 # Only the spoofing template adds a capability, and only NET_RAW (clause 2).
 NET_RAW_TEMPLATES = frozenset({"spoofing"})
@@ -370,15 +372,17 @@ _PROGRAMS = {
     "spoof": SPOOF_PROGRAM,
     "retained_sender": RETAINED_SENDER_PROGRAM,
     "idle": IDLE_PROGRAM,
+    **FRESH_PROGRAMS,
 }
 _NAME = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 _NODE = re.compile(r"[a-z0-9][a-z0-9.-]{0,252}")
 
 
 def probe_kit_digest() -> str:
-    """sha256 over the probe image and every program, recorded with the evidence."""
+    """sha256 over the image, programs and fixed template dispatch, recorded with evidence."""
     return hashlib.sha256(
-        canonical_json({"image": PROBE_IMAGE, "programs": dict(sorted(_PROGRAMS.items()))})
+        canonical_json({"image": PROBE_IMAGE, "programs": dict(sorted(_PROGRAMS.items())),
+                        "templates": dict(sorted(TEMPLATES.items()))})
     ).hexdigest()
 
 
@@ -447,6 +451,8 @@ def probe_pod(
     require(bool(_NAME.fullmatch(campaign)) and bool(_NODE.fullmatch(node)))
     require(all(key not in (TEMPLATE_LABEL, PROBE_LABEL, CAMPAIGN_LABEL) for key in role_labels))
     program_kind = TEMPLATES[template][0]
+    if template in FRESH_TEMPLATES:
+        validate_fresh_argument(template, dict(argument))
     labels = {
         **dict(role_labels),
         TEMPLATE_LABEL: template,
@@ -465,7 +471,7 @@ def probe_pod(
         # other capability (bounding set is NET_RAW alone) and cannot escalate.
         pod_security["runAsNonRoot"] = False
         pod_security["runAsUser"] = 0
-    if program_kind in ("listener", "retained_sender"):
+    if program_kind in ("listener", "retained_sender", "fresh_listener"):
         # A namespaced safe sysctl, so a twin can hold a target's low port, and a
         # retained sender can bind the original low source port, unprivileged.
         pod_security["sysctls"] = [{"name": "net.ipv4.ip_unprivileged_port_start", "value": "0"}]

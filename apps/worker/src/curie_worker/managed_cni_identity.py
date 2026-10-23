@@ -49,10 +49,11 @@ from .managed_cni_kubernetes import MeasuringIdentityAPI
 from .managed_cni_probe_kit import (
     PRODUCER_CONSTANTS,
     PRODUCER_KIND,
-    ObservationEntry,
+    Measurement,
     ProbeKitRefused,
     address_family,
     entries_document,
+    measurement_binding_matches,
     producer_constants_digest,
     refuse,
     require,
@@ -83,7 +84,7 @@ _MODE = re.compile(r'^\s*mode:\s*"?([A-Za-z]*)"?\s*$', re.MULTILINE)
 _TEMPLATE_HASH = "pod-template-hash"
 _BLOCKING = frozenset({"NoSchedule", "NoExecute"})
 FACT_KIND = "managed_cni_fact"
-FACT_VERSION = 1
+FACT_VERSION = 2
 IDENTITY_MEMBERS = (
     "cni_plugin_images",
     "policy_agent_images",
@@ -758,10 +759,13 @@ def identity_change(before: CniIdentity, after: CniIdentity) -> str | None:
 
 def cni_digest(identity_digest: str) -> str:
     """The ADR 0236 CNI channel digest (clause 1)."""
+    from .managed_cni_probe_programs import probe_kit_digest
+
     return sha256_canonical(
         {
             "producer_kind": PRODUCER_KIND,
             "producer_constants_digest": producer_constants_digest(),
+            "probe_kit_digest": probe_kit_digest(),
             "identity_digest": identity_digest,
         }
     )
@@ -773,13 +777,16 @@ def managed_cni_fact(
     runtime_generation: str,
     guard_config_digest: str,
     identity: CniIdentity,
-    entries: Iterable[ObservationEntry],
+    entries: Measurement,
 ) -> dict[str, Any]:
     """The clause 1 ``ManagedCniFact`` document: internal evidence, never a record."""
     require(type(runtime_id) is str and bool(runtime_id))
     require(type(runtime_generation) is str and bool(runtime_generation))
     require(re.fullmatch(r"[0-9a-f]{64}", guard_config_digest) is not None)
-    observations = entries_document(entries)
+    from .managed_cni_probe_programs import probe_kit_digest
+
+    require(isinstance(entries, Measurement) and measurement_binding_matches(entries))
+    observations = entries_document(entries.entries)
     keys = [
         tuple(item[k] for k in ("case", "sub_case", "family", "placement", "source_kind"))
         for item in observations
@@ -790,6 +797,7 @@ def managed_cni_fact(
         "fact_version": FACT_VERSION,
         "producer_kind": PRODUCER_KIND,
         "producer_constants_digest": producer_constants_digest(),
+        "probe_kit_digest": probe_kit_digest(),
         "runtime_id": runtime_id,
         "runtime_generation": runtime_generation,
         "guard_config_digest": guard_config_digest,

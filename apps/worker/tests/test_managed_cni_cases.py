@@ -26,6 +26,8 @@ from curie_worker.managed_cni_cases import (
 )
 from curie_worker.managed_cni_probe_kit import Measurement, ProbeKitRefused, accepts
 
+from apps.worker.tests.test_managed_cni_fresh_cases import FreshAPI
+
 ROLE = "curietech.ai/policy-role"
 PROBE_ROLE = "curietech.ai/managed-cni-probe-role"
 BROKER = Target(
@@ -79,6 +81,22 @@ class ModelCluster:
         self.enforcing = enforcing
         self.control_reachable = control_reachable
         self.now = 1_000_000.0
+        self._fresh = FreshAPI(allowed_labels=dict(BROKER.allowed_sender_labels))
+        self._fresh.ip_prefix = "10.1.0"
+        self._fresh.protected[0]["spec"] = {
+            "podSelector": {"matchLabels": dict(BROKER.role_labels)},
+            "policyTypes": ["Ingress"],
+            "ingress": [
+                {
+                    "from": [{"podSelector": {"matchLabels": dict(BROKER.allowed_sender_labels)}}],
+                    "ports": [
+                        {"protocol": p.upper(), "port": BROKER.port} for p in BROKER.protocols
+                    ],
+                }
+            ],
+        }
+        self.fresh_client_leaks = False
+        self.fresh_no_attempts = False
         self.pods: dict[tuple[str, str], dict[str, Any]] = {}
         self.logs: dict[tuple[str, str], list[dict[str, Any]]] = {}
         self.ip_owner: dict[str, tuple[str, str]] = {}
@@ -149,6 +167,7 @@ class ModelCluster:
 
     async def sleep(self, seconds: float) -> None:
         self.now += seconds
+        self._fresh.now = self.now
         await asyncio.sleep(0)  # let other probes interleave, as real waits do
 
     def _ms(self) -> int:
@@ -166,6 +185,15 @@ class ModelCluster:
         return "listener"
 
     async def create_pod(self, namespace: str, document: dict[str, Any]) -> dict[str, Any]:
+        template = document["metadata"]["labels"].get("curietech.ai/managed-cni-probe-template", "")
+        if template.startswith("fresh_"):
+            self._fresh.now = self.now
+            self._fresh.faults.update(no_reuse=not self.recycle, one_way=self.drop_liveness,
+                                     client_leak=self.fresh_client_leaks,
+                                     missing_attempts=self.fresh_no_attempts,
+                                     startup_delay=self.container_start_s)
+            self.created_templates.append((namespace, template))
+            return await self._fresh.create_pod(namespace, document)
         name = document["metadata"]["name"]
         assert (namespace, name) not in self.pods
         self.now += 1.0  # pod start latency
@@ -212,7 +240,7 @@ class ModelCluster:
         else:
             self._send(pod)
             pod["status"]["phase"] = "Succeeded"
-        return {"metadata": {"uid": uid}}
+        return pod
 
     def _spoof_send(self, sender: dict[str, Any]) -> None:
         packets = []
@@ -368,6 +396,9 @@ class ModelCluster:
         )
 
     async def read_pod(self, namespace: str, name: str) -> dict[str, Any] | None:
+        if (namespace, name) in self._fresh.arguments:
+            self._fresh.now = self.now
+            return await self._fresh.read_pod(namespace, name)
         key = (namespace, name)
         state = self.retained.get(key)
         if state is not None and not state["finalized"]:
@@ -380,6 +411,9 @@ class ModelCluster:
         return pod
 
     async def pod_log(self, namespace: str, name: str) -> str:
+        if (namespace, name) in self._fresh.arguments:
+            self._fresh.now = self.now
+            return await self._fresh.pod_log(namespace, name)
         pod = self.pods[(namespace, name)]
         if self.now < pod["starts_at"]:
             # HTTP 400: container "probe" is waiting to start: ContainerCreating.
@@ -394,6 +428,10 @@ class ModelCluster:
         return "\n".join(json.dumps(line) for line in lines)
 
     async def delete_pod(self, namespace: str, name: str, uid: str) -> None:
+        if (namespace, name) in self._fresh.arguments:
+            self._fresh.now = self.now
+            await self._fresh.delete_pod(namespace, name, uid)
+            return
         pod = self.pods.get((namespace, name))
         if pod is not None and pod["metadata"]["uid"] == uid:
             for item in pod["status"].get("podIPs", []):
@@ -421,7 +459,12 @@ class ModelCluster:
     async def create_network_policy(
         self, namespace: str, document: dict[str, Any]
     ) -> dict[str, Any]:
+        if "curietech.ai/managed-cni-campaign" in document["metadata"].get("labels", {}):
+            self._fresh.now = self.now
+            return await self._fresh.create_network_policy(namespace, document)
         name = document["metadata"]["name"]
+        document = {**document, "metadata": {**document["metadata"], "namespace": namespace,
+                                             "uid": f"np-{name}"}}
         self.policies[name] = document
         spec = document["spec"]
         role = spec.get("podSelector", {}).get("matchLabels", {}).get(PROBE_ROLE)
@@ -429,10 +472,18 @@ class ModelCluster:
         if role == "ret-listener" and not spec.get("ingress"):
             self.ret_deny_ms, self.ret_deny_name = self._ms(), name
         self._recompute_probe_roles()
-        return {"metadata": {"uid": f"np-{name}"}}
+        return document
 
-    async def delete_network_policy(self, namespace: str, name: str) -> None:
-        self.policies.pop(name, None)
+    async def delete_network_policy(self, namespace: str, name: str, uid: str) -> None:
+        if name in self._fresh.policies or name.startswith(
+            ("gate-", "control-", "allow-", "deny-")
+        ):
+            await self._fresh.delete_network_policy(namespace, name, uid)
+            return
+        document = self.policies.get(name)
+        if document is None or document["metadata"]["uid"] != uid:
+            return
+        self.policies.pop(name)
         if name == self.ret_deny_name:
             self.ret_deny_ms, self.ret_deny_name = None, None
         self._recompute_probe_roles()
@@ -518,6 +569,8 @@ class ModelCluster:
                     ],
                 },
             ]
+        if collection == "networkpolicies:probe-a":
+            return list(self.policies.values()) + await self._fresh.list_items(collection)
         assert collection == "networkpolicies:prot"
         self.policy_reads += 1
         if self.bump_policy_after_reads == self.policy_reads:
@@ -529,13 +582,16 @@ class ModelCluster:
                     "namespace": "prot",
                     "uid": "np-1",
                     "resourceVersion": self.policy_version,
-                }
+                },
+                "spec": self._fresh.protected[0]["spec"],
             }
         ]
 
 
 def measure(cluster: ModelCluster, layout: ProbeLayout = LAYOUT) -> Measurement:
-    kit = ProbeKit(cluster, layout, clock=cluster.clock, sleep=cluster.sleep)
+    kit = ProbeKit(
+        cluster, layout, clock=cluster.clock, sleep=cluster.sleep, monotonic=cluster.clock
+    )
     return asyncio.run(kit.measure())
 
 
@@ -547,18 +603,11 @@ def test_enforcing_two_node_cluster_passes_every_entry_it_can_measure() -> None:
     cluster = ModelCluster()
     measurement = measure(cluster)
     result = outcomes(measurement)
-    # Every entry passes except case 5 workload_replaced, which is unavailable by
-    # design: the original TCP sequence state cannot be reproduced from user space,
-    # so the campaign refuses on it (an enforcing CNI never leaks, so no fail).
-    assert measurement.refusal == "sequence_state_unavailable", result
-    assert result[(5, "workload_replaced", "ipv4", "same_node", "retained_peer")] == (
-        "unavailable",
-        "sequence_state_unavailable",
-    )
-    others = {k: v for k, v in result.items() if k[:2] != (5, "workload_replaced")}
-    assert all(outcome == "pass" for outcome, _ in others.values()), others
-    assert not accepts(measurement.entries, required_entries(LAYOUT))
-    assert cluster.pods == {}  # every probe pod was deleted by UID
+    # ADR 0243 replaces sequence-state replay with actual fresh connections.
+    assert measurement.refusal is None, result
+    assert all(outcome == "pass" for outcome, _ in result.values()), result
+    assert accepts(measurement.entries, required_entries(LAYOUT))
+    assert cluster.pods == {} and cluster._fresh.pods == {}  # UID-owned cleanup
 
 
 def test_non_enforcing_cluster_refuses_at_case_one_and_runs_nothing_else() -> None:
@@ -731,11 +780,10 @@ def test_an_enforcing_cluster_passes_every_timing_case() -> None:
         "denied",
     )
     assert result[(5, "policy_changed", "ipv4", "same_node", "retained_peer")] == ("pass", "denied")
-    # workload_replaced cannot be a pass from user space (no original sequence state):
-    # a non-leaking engine yields unavailable, never pass.
+    # Actual reuse followed by distinct post-trigger connections is now measurable.
     assert result[(5, "workload_replaced", "ipv4", "same_node", "retained_peer")] == (
-        "unavailable",
-        "sequence_state_unavailable",
+        "pass",
+        "denied",
     )
     assert result[(7, "node_origin", "ipv4", "same_node", "node")] == ("pass", "reaches")
     assert result[(7, "rbac_node_capability", "none", "none", "none")] == ("pass", "reviews_denied")
@@ -774,28 +822,31 @@ def test_unprovoked_reuse_is_unavailable_and_refuses_the_campaign() -> None:
     )
 
 
-def test_a_retained_flow_after_a_policy_change_fails_case_five() -> None:
+def test_a_new_forbidden_flow_after_a_policy_change_fails_case_five() -> None:
     cluster = ModelCluster()
-    cluster.retained_leaks = True
+    cluster.fresh_client_leaks = True
     measurement = measure(cluster)
-    assert measurement.refusal == "retained_flow"
+    assert measurement.refusal == "delivered"
     result = outcomes(measurement)
     assert result[(5, "policy_changed", "ipv4", "same_node", "retained_peer")] == (
-        "fail",
-        "retained_flow",
+        "fail", "delivered",
     )
 
 
-def test_conntrack_resume_after_workload_replace_fails_case_five() -> None:
-    # The four-tuple injection from the spoofing template reaches the hold twin when
-    # connection tracking retains the flow: a leak, not a pass.
+def test_a_new_forbidden_flow_after_workload_replace_fails_case_five() -> None:
+    cluster = ModelCluster()
+    cluster.fresh_client_leaks = True
+    result = outcomes(measure(cluster))
+    assert result[(5, "workload_replaced", "ipv4", "same_node", "retained_peer")] == (
+        "fail", "delivered",
+    )
+
+
+def test_old_connection_state_never_substitutes_for_a_fresh_case_five_tuple() -> None:
     cluster = ModelCluster()
     cluster.retained_leaks = True
     result = outcomes(measure(cluster))
-    assert result[(5, "workload_replaced", "ipv4", "same_node", "retained_peer")] == (
-        "fail",
-        "retained_flow",
-    )
+    assert all(outcome == "pass" for key, (outcome, _reason) in result.items() if key[0] == 5)
 
 
 def test_a_dead_listener_after_the_policy_change_is_unavailable_not_pass() -> None:
@@ -874,7 +925,7 @@ def test_nodes_proxy_allowed_fails_rbac_node_capability() -> None:
 def _run_for(cluster: ModelCluster):  # type: ignore[no-untyped-def]
     from curie_worker.managed_cni_cases import _Run
 
-    return _Run(cluster, LAYOUT, cluster.clock, cluster.sleep)
+    return _Run(cluster, LAYOUT, cluster.clock, cluster.sleep, monotonic=cluster.clock)
 
 
 def test_address_reuse_with_no_sender_record_is_unavailable_not_pass() -> None:
@@ -916,11 +967,11 @@ def test_running_node_capability_sees_a_privileged_init_container() -> None:
 
 
 def test_case_five_listeners_land_in_the_probe_namespace() -> None:
-    # Item 8: the retained listener uses the probe_listener template in probe-a, not
-    # the protected-namespace twin template.
+    # Policy-change listeners stay in the probe namespace; protected twins are
+    # used only for replacement, whose protected policies are never changed.
     cluster = ModelCluster()
     measure(cluster)
-    assert ("probe-a", "probe_listener") in cluster.created_templates
+    assert ("probe-a", "fresh_probe_listener") in cluster.created_templates
     assert ("probe-a", "twin") not in cluster.created_templates
 
 
@@ -937,10 +988,8 @@ def test_spoof_terminated_refuses_a_stale_address() -> None:
 
 
 def test_case_five_waits_for_a_sender_whose_container_is_still_starting() -> None:
-    # A real API server refuses the log of a pod whose container is still being
-    # created. Case 5 launches its retained sender without waiting for a phase, so
-    # that refusal means "not yet", not a timeout; the established flow must still
-    # be measured and an enforcing cluster must pass.
+    # Pending Pods have no address/status yet. Poll their actual readiness before
+    # triggering; no missing log may be treated as denial proof.
     cluster = ModelCluster()
     cluster.container_start_s = 3.0
     result = outcomes(measure(cluster))
@@ -950,45 +999,15 @@ def test_case_five_waits_for_a_sender_whose_container_is_still_starting() -> Non
             "denied",
         )
         assert result[(5, "workload_replaced", "ipv4", placement, "retained_peer")] == (
-            "unavailable",
-            "sequence_state_unavailable",
+            "pass",
+            "denied",
         )
 
 
-def test_a_retained_sender_deleted_before_it_starts_is_unavailable() -> None:
-    # The wait ends when the sender pod is gone, not only at the phase deadline.
-    from curie_worker.managed_cni_timing import _await_log
-
+def test_policy_changed_with_no_fresh_attempts_is_unavailable() -> None:
+    # Missing post-trigger attempts cannot establish the finite fresh predicate.
     cluster = ModelCluster()
-    cluster.container_start_s = 30.0
-    run = _run_for(cluster)
-
-    async def go() -> tuple[bool, float]:
-        created = await cluster.create_pod("probe-a", _retained_document())
-        uid = created["metadata"]["uid"]
-        await cluster.delete_pod("probe-a", "s", uid)
-        start = cluster.now
-        found = await _await_log(run, "probe-a", "s", uid, "established", start + 120)
-        return found, cluster.now - start
-
-    found, waited = asyncio.run(go())
-    assert found is False and waited < 2
-
-
-def _retained_document() -> dict[str, Any]:
-    from curie_worker.managed_cni_probe_programs import probe_pod
-
-    return probe_pod(
-        template="retained_sender", name="s", namespace="probe-a", node="n1", campaign="c1",
-        role_labels={}, argument={"addr": "10.0.0.1", "port": 1, "nonces": ["a" * 32],
-                                  "interval_ms": 100, "timeout_ms": 2000},
-    )
-
-
-def test_policy_changed_with_no_post_heartbeat_is_unavailable() -> None:
-    # Item 2: without a heartbeat sent past the bound, retention cannot be judged.
-    cluster = ModelCluster()
-    cluster.retained_no_post = True
+    cluster.fresh_no_attempts = True
     result = outcomes(measure(cluster))
     assert result[(5, "policy_changed", "ipv4", "same_node", "retained_peer")] == (
         "unavailable",
@@ -1008,21 +1027,19 @@ def test_node_origin_without_a_readiness_result_is_unavailable() -> None:
     )
 
 
-def test_an_injector_that_never_sent_makes_workload_replaced_unavailable() -> None:
-    # Item 1: the spoof injector's result is parsed; if it did not send, the entry is
-    # unavailable rather than a vacuous pass. Called directly so it does not gate case 3.
-    from curie_worker.managed_cni_cases import _twins
-    from curie_worker.managed_cni_timing import _workload_replaced
 
+
+def test_case_five_unconfirmed_cleanup_stops_later_campaign_work() -> None:
     cluster = ModelCluster()
-    cluster.spoof_send_fails = True
-    run = _run_for(cluster)
-
-    async def go() -> Any:
-        twins = await _twins(run)
-        return await _workload_replaced(
-            run, twin=twins["broker"], broker=BROKER, family="ipv4", placement="same_node"
-        )
-
-    entry = asyncio.run(go())
-    assert (entry.outcome, entry.reason) == ("unavailable", "transport_unavailable")
+    delete = cluster._fresh.delete_pod
+    async def stuck(namespace: str, name: str, uid: str) -> None:
+        return None
+    cluster._fresh.delete_pod = stuck  # external Kubernetes DELETE never retires these Pods
+    try:
+        measurement = measure(cluster)
+        assert measurement.refusal == "cleanup_unconfirmed"
+        assert not any(item.case in (6, 7) for item in measurement.entries)
+    finally:
+        for (namespace, name), pod in list(cluster._fresh.pods.items()):
+            asyncio.run(delete(namespace, name, pod["metadata"]["uid"]))
+    assert not cluster._fresh.pods

@@ -105,3 +105,39 @@ def test_lists_follow_continue_tokens_and_refuse_unknown_collections() -> None:
 def test_a_forbidden_list_reads_as_unavailable() -> None:
     client = api(lambda request: httpx.Response(403, json={"message": "forbidden"}))
     assert asyncio.run(client.list_items("clusterrolebindings")) is None
+
+
+def test_network_policy_delete_pins_uid_and_preserves_a_same_name_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Kubernetes v1.35 metav1.DeleteOptions.Preconditions binds deletion to UID:
+    # https://github.com/kubernetes/apimachinery/blob/v0.35.0/pkg/apis/meta/v1/types.go
+    current: dict[str, Any] = {"metadata": {"name": "owned-probe", "uid": "replacement"}}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal current
+        assert request.method == "DELETE"
+        assert request.url.path == (
+            "/apis/networking.k8s.io/v1/namespaces/probe-a/networkpolicies/owned-probe"
+        )
+        body = json.loads(request.content) if request.content else {}
+        if body.get("preconditions", {}).get("uid") != current["metadata"]["uid"]:
+            return httpx.Response(409, json={"kind": "Status", "reason": "Conflict"})
+        current = {}
+        return httpx.Response(200, json={"kind": "Status", "status": "Success"})
+
+    import certifi
+
+    # Substitute the external HTTP transport while retaining constructor wiring,
+    # including the production policy-namespace allowlist.
+    original_client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: original_client(
+        transport=httpx.MockTransport(handler), **kwargs))
+    client = MeasuringIdentityAPI(
+        MeasuringCredentials("https://k8s.example:6443", certifi.where(), "synthetic-token"),
+        namespaces=("probe-a", "prot"), policy_namespaces=("probe-a",),
+    )
+    asyncio.run(client.delete_network_policy("probe-a", "owned-probe", "original"))
+    assert current["metadata"]["uid"] == "replacement"
+    asyncio.run(client.delete_network_policy("probe-a", "owned-probe", "replacement"))
+    assert current == {}
