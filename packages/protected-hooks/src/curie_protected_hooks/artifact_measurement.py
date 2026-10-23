@@ -115,7 +115,7 @@ def _mapping(row: Any) -> None:
     _require(bool(repository) and separator == "@" and digest == row["oci_digest"])
 
 
-def _canonical(raw: bytes) -> bytes:
+def _canonical(raw: bytes, *, schema_version: int = 1) -> bytes:
     """Refuse stored bytes that differ from closed canonical encoding."""
     try:
         _require(type(raw) is bytes and 0 < len(raw) <= _MAX_BYTES)
@@ -126,25 +126,38 @@ def _canonical(raw: bytes) -> bytes:
             parse_constant=_reject_number,
         )
         _require(type(value) is dict and value.keys() == _TOP_FIELDS)
-        _scalar(value["schema_version"], "version")
+        _require(schema_version in (1, 2))
+        _require(type(value["schema_version"]) is int and value["schema_version"] == schema_version)
         _require(type(value["kind"]) is str and value["kind"] == "protected-artifact-qualification")
         for field in ("manifest_digest", "execution_config_digest"):
             _scalar(value[field], "sha256")
         _object(value["substrate"], _MANIFEST["substrate"])
         _object(value["guard_identity"], _GUARD)
-        _object(
-            value["launch_projection"],
-            {
-                "schema_version": "version",
-                "format": "opaque_ref",
-                "sha256": "sha256",
-            },
+        projection = value["launch_projection"]
+        _require(
+            type(projection) is dict
+            and projection.keys() == {"schema_version", "format", "sha256"}
         )
+        _require(
+            type(projection["schema_version"]) is int
+            and projection["schema_version"] == schema_version
+        )
+        _scalar(projection["format"], "opaque_ref")
+        _scalar(projection["sha256"], "sha256")
         _require(value["launch_projection"]["sha256"] == value["substrate"]["launch_config_sha256"])
         slots = value["delivery_slots"]
-        _require(type(slots) is dict and slots.keys() == _DELIVERY_SLOTS.keys())
-        _scalar(slots["schema_version"], "version")
-        for field, expected in _DELIVERY_SLOTS.items():
+        expected_slots = dict(_DELIVERY_SLOTS)
+        if schema_version == 2:
+            expected_slots.update(
+                schema_version=2,
+                lifecycle_context="guarded-lifecycle-context-v1",
+                sdk_lifecycle="owned-cold-sdk-capsule-v1",
+            )
+            _require(value["substrate"]["kind"] == "kubernetes")
+            _require(value["launch_projection"]["format"] == "kubernetes-custodied-pod-v1")
+        _require(type(slots) is dict and slots.keys() == expected_slots.keys())
+        _require(type(slots["schema_version"]) is int and slots["schema_version"] == schema_version)
+        for field, expected in expected_slots.items():
             if field != "schema_version":
                 _require(type(slots[field]) is str and slots[field] == expected)
         _scalar(value["enforcement_evidence_ref"], "oci_digest")
@@ -152,6 +165,9 @@ def _canonical(raw: bytes) -> bytes:
         _require(type(rows) is list and 1 <= len(rows) <= 32)
         for row in rows:
             _mapping(row)
+            if schema_version == 2:
+                _require(row["os"] == "linux")
+                _require(row["runtime_profile"] == "protected-sdk-custody-v1")
         identities = [_platform_identity(row) for row in rows]
         _require(len(set(identities)) == len(rows) and identities == sorted(identities))
         canonical = json.dumps(
@@ -226,6 +242,42 @@ class ArtifactMeasurement:
 def parse_artifact_measurement(raw: bytes) -> ArtifactMeasurement:
     """Parse structural canonical bytes only, @spec PROTECTED-HOOK-LANE-2."""
     return ArtifactMeasurement(raw)
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class ArtifactMeasurementV2:
+    """Closed ADR 0245 structural claim, unsupported by v1 launch consumers.
+
+    Parsing supplies neither runtime observations nor qualification. Full v2
+    projection, custody and producer composition must precede consumer use.
+    """
+
+    _canonical_bytes: bytes
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "_canonical_bytes", _canonical(self._canonical_bytes, schema_version=2)
+        )
+
+    def __repr__(self) -> str:
+        return "<ArtifactMeasurementV2>"
+
+    @property
+    def canonical_bytes(self) -> bytes:
+        return self._canonical_bytes
+
+    @property
+    def digest(self) -> str:
+        return hashlib.sha256(self._canonical_bytes).hexdigest()
+
+    def as_dict(self) -> dict[str, Any]:
+        value: dict[str, Any] = json.loads(self._canonical_bytes)
+        return value
+
+
+def parse_artifact_measurement_v2(raw: bytes) -> ArtifactMeasurementV2:
+    """Explicit schema2 parser; never upgrades or coerces a v1 record."""
+    return ArtifactMeasurementV2(raw)
 
 
 def _selection(manifest: Manifest, qualification: Qualification) -> str:

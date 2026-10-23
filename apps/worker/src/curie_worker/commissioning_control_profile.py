@@ -105,11 +105,13 @@ def _closed(value: Any, keys: set[str]) -> dict[str, Any]:
     return result
 
 
-def _validate(value: Any) -> None:
+def _validate(value: Any, *, schema_version: int = 1) -> None:
     v = _closed(value, _TOP)
-    _scalar(v["schema_version"], "version")
+    _require(schema_version in (1, 2))
+    _require(type(v["schema_version"]) is int and v["schema_version"] == schema_version)
     _require(type(v["record_type"]) is str and v["record_type"] == RECORD_TYPE)
-    _require(type(v["slot_policy"]) is str and v["slot_policy"] == SLOT_POLICY)
+    policy = SLOT_POLICY if schema_version == 1 else "host-custodied-cold-sdk-v1"
+    _require(type(v["slot_policy"]) is str and v["slot_policy"] == policy)
     _scalar(v["projection_digest"], "sha256")
     _scalar(v["authority_domain_id"], "uuid")
     minors = v["kubernetes_minors"]
@@ -125,7 +127,17 @@ def _validate(value: Any) -> None:
     _pattern(guard["image"], _IMAGE)
     _scalar(guard["server_ca_sha256"], "sha256")
     _require(type(guard["timeout_seconds"]) is int and 1 <= guard["timeout_seconds"] <= 10)
-    principals = _closed(v["principals"], _PRINCIPALS)
+    identities = (
+        ("mediator", "provisioner")
+        if schema_version == 1
+        else ("production_mediator", "commissioning_mediator", "provisioner", "guard_reader")
+    )
+    principal_keys = (
+        _PRINCIPALS
+        if schema_version == 1
+        else (_PRINCIPALS - {"mediator"}) | set(identities)
+    )
+    principals = _closed(v["principals"], principal_keys)
     system: set[str] = set()
     for name, pattern, low in (
         ("endpoint_controllers", _CONTROLLER, 1),
@@ -138,12 +150,17 @@ def _validate(value: Any) -> None:
             _pattern(user, pattern)
         _require(users == sorted(set(users)))
         system.update(users)
-    for name in ("mediator", "provisioner"):
+    for name in identities:
         user = principals[name]
         _pattern(user, _USERNAME)
         _require(user not in _RESERVED_USERS and not user.startswith("system:node:"))
         _require(user not in system)
-    _require(principals["mediator"] != principals["provisioner"])
+        if schema_version == 2 and user.startswith("system:"):
+            # Namespace ServiceAccounts are real workload principals, unlike
+            # built-in system users and kube-system controller identities.
+            match = re.fullmatch(r"system:serviceaccount:(" + _LABEL + r"):(" + _LABEL + r")", user)
+            _require(match is not None and match[1] != "kube-system")
+    _require(len({principals[name] for name in identities}) == len(identities))
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -186,6 +203,45 @@ class ControlProfile:
 def parse_control_profile(raw: bytes) -> ControlProfile:
     """Parse canonical bytes only; no provisioner selection or authority."""
     return ControlProfile(raw)
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class ControlProfileV2:
+    """Closed ADR 0245 identity claims; not effective RBAC or guard enforcement.
+
+    V1 binding/rendering consumers deliberately reject this distinct type. The
+    complete measured v2 projection and guarded runtime must precede its use.
+    """
+
+    _canonical_bytes: bytes = field(repr=False)
+
+    @safe_validation(ControlProfileInvalid)
+    def __post_init__(self) -> None:
+        value = _decode(self._canonical_bytes, _MAX_BYTES)
+        _validate(value, schema_version=2)
+        raw = canonical_json(value)
+        _require(raw == self._canonical_bytes)
+        object.__setattr__(self, "_canonical_bytes", raw)
+
+    def __repr__(self) -> str:
+        return "<ControlProfileV2>"
+
+    @property
+    def canonical_bytes(self) -> bytes:
+        return self._canonical_bytes
+
+    @property
+    def digest(self) -> str:
+        return hashlib.sha256(self._canonical_bytes).hexdigest()
+
+    def as_dict(self) -> dict[str, Any]:
+        value: dict[str, Any] = json.loads(self._canonical_bytes)
+        return value
+
+
+def parse_control_profile_v2(raw: bytes) -> ControlProfileV2:
+    """Explicit schema2 parsing only, with no fallback to the old grammar."""
+    return ControlProfileV2(raw)
 
 
 @safe_validation(ControlProfileInvalid)
