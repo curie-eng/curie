@@ -307,7 +307,7 @@ class SocketModeConnection(Connection):
                 attributes={
                     "service.name": "curie-dispatcher",
                     "slack_identity": self._identity_name,
-                    "type": kind if kind in _ENVELOPE_TYPES else "other",
+                    "type": kind if isinstance(kind, str) and kind in _ENVELOPE_TYPES else "other",
                 },
             )
             if kind == "hello":
