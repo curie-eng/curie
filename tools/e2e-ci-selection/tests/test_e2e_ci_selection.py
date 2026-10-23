@@ -898,6 +898,19 @@ def test_selector_and_workflow_paths_do_not_boot_kind(tmp_path: Path, path: str)
 
 
 @pytest.mark.parametrize(
+    ("path", "selected"),
+    [
+        (".github/workflows/release.yaml", ("local-release",)),
+        (".github/workflows/release-notes.yaml", ()),
+    ],
+)
+def test_release_workflow_selection_is_exact(
+    tmp_path: Path, path: str, selected: tuple[str, ...]
+) -> None:
+    _assert_selection(tmp_path, path, selected, pytest_needed=True)
+
+
+@pytest.mark.parametrize(
     "path",
     [
         "scripts/check-netpol-enforcement.sh",
@@ -5050,7 +5063,7 @@ def test_nightly_jobs_keep_their_selector_and_reject_a_missing_condition() -> No
 def test_aggregate_rejects_a_skip_on_a_nightly_dispatch(
     overrides: dict[str, str],
 ) -> None:
-    completed = _run_aggregate(**overrides)
+    completed = _run_aggregate(script_transform=None, **overrides)
     assert completed.returncode != 0, completed.stdout + completed.stderr
 
 
