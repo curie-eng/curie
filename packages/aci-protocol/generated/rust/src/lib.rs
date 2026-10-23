@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: &str = "0.5.24";
+pub const PROTOCOL_VERSION: &str = "0.5.25";
 
 pub const RUNS_STREAM_DEFAULT: &str = "curie:runs";
 
@@ -338,6 +338,12 @@ pub struct HookRunRef {
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct PrincipalRef {
+    pub principal_id: String,
+    pub authorization_version: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct QueuedTurn {
     pub event_id: String,
     pub conversation_id: String,
@@ -354,6 +360,8 @@ pub struct QueuedTurn {
     pub hook_run: Option<HookRunRef>,
     #[serde(default)]
     pub tool_access: Option<ToolAccess>,
+    #[serde(default)]
+    pub author_principal: Option<PrincipalRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -795,13 +803,13 @@ mod attachment_access_tests {
 
     #[test]
     fn accepts_compatible_patch() {
-        let raw = r#"{"type":"final","version":"0.5.25","text":"x","status":"done"}"#;
+        let raw = r#"{"type":"final","version":"0.5.26","text":"x","status":"done"}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_ok());
     }
 
     #[test]
     fn accepts_unknown_fields() {
-        let raw = r#"{"type":"final","version":"0.5.24","text":"x","status":"done","extra":1}"#;
+        let raw = r#"{"type":"final","version":"0.5.25","text":"x","status":"done","extra":1}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_ok());
     }
 }

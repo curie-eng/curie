@@ -41,7 +41,7 @@ from .service_config import (
     WORKER_GROUP_DEFAULT,
 )
 from .session import BootEnv, Budget, OtelConfig, SessionConfig
-from .turn import Attachment, HookRunRef, QueuedTurn, ReplyHandle, TurnSource
+from .turn import Attachment, HookRunRef, PrincipalRef, QueuedTurn, ReplyHandle, TurnSource
 from .version import PROTOCOL_VERSION, WIRE_VERSION_FIELD
 from .wire import ApprovalRequest, EvalJob, EvalReport, GateKind
 
@@ -639,6 +639,7 @@ def render_rust() -> str:
         _struct(ReplyHandle),
         _struct(Attachment),
         _struct(HookRunRef),
+        _struct(PrincipalRef),
         _struct(QueuedTurn),
         _struct(EvalJob),
         _struct(EvalReport),
