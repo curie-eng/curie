@@ -40,6 +40,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, Final
 
+from fastapi import status
 from plugin_format import connector_lock
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -59,6 +60,7 @@ from .models import (
     RemediationPolicyGeneration,
 )
 from .schemas.action_executions import DIGEST_PATTERN
+from .shared_connectors.declarations import DeclarationRefused, read_declarations
 from .storage import BundleStore, ObjectStore
 
 # @spec AUTOMATED-REMEDIATION-13: the seam's key namespace for remediations.
@@ -129,8 +131,17 @@ def _connector_digest(data: bytes, connector: str) -> str | None:
             max_compression_ratio=settings.bundle_max_compression_ratio,
             max_members=settings.bundle_max_members,
         )
+        declarations = read_declarations(Path(tmp))
+        if connector in {entry.name for entry in declarations.shared}:
+            # A shared connector's image is the application's, pinned at
+            # registration, not this version's (ADR 0239): no authority here.
+            raise DeclarationRefused(
+                status.HTTP_422_UNPROCESSABLE_CONTENT,
+                "shared_connector_digest_unsupported",
+                connector=connector,
+            )
         declared = connector_lock.apply_lock(
-            bundles.read_connectors(Path(tmp)),
+            declarations.dedicated,
             bundles.read_connector_lock(Path(tmp)),
             portable=True,
         )

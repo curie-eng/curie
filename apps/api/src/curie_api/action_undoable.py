@@ -58,6 +58,7 @@ from .models import (
     ExecutionKind,
     ExecutionState,
 )
+from .shared_connectors.declarations import read_declarations
 from .storage import ObjectStore
 
 logger = logging.getLogger(__name__)
@@ -80,7 +81,10 @@ def _sealed_connectors(data: bytes) -> frozenset[str]:
     """Connectors whose declaration gives them custody of the sealing key.
 
     Only a hosted connector: the key must reach "only the hosted connector",
-    and a ``SecretRef`` on a remote (``url:``) connector reaches no pod.
+    and a ``SecretRef`` on a remote (``url:``) connector reaches no pod. A
+    shared connector never has custody: it is the application's, not this
+    agent's (ADR 0239). A declaration that does not parse raises, so the caller
+    treats the bundle as unreadable and custody fails closed.
     """
 
     settings = get_settings()
@@ -92,10 +96,16 @@ def _sealed_connectors(data: bytes) -> frozenset[str]:
             max_compression_ratio=settings.bundle_max_compression_ratio,
             max_members=settings.bundle_max_members,
         )
-        declared = bundles.read_connectors(Path(tmp))
+        declarations = read_declarations(Path(tmp))
+    if declarations.shared:
+        logger.info(
+            "shared_connector_custody_unsupported: a shared connector never holds "
+            "sealing key custody",
+            extra={"connectors": [entry.name for entry in declarations.shared]},
+        )
     return frozenset(
         name
-        for name, spec in declared.connectors.items()
+        for name, spec in declarations.dedicated.connectors.items()
         if spec.is_hosted
         and any(
             isinstance(secret, SecretRef) and secret.name == SEALING_KEY_NAME

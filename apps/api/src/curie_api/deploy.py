@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import plugin_format
+from curie_internal.shared_declarations import Declarations, SharedEntry
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
@@ -22,6 +23,7 @@ from curie_api.schemas.versions import BundleOut
 from . import bundles
 from .config import Settings, get_settings
 from .models import AgentVersion
+from .shared_connectors import declarations
 from .storage import ObjectStore
 
 
@@ -185,28 +187,34 @@ def _bound_clause(bound: Iterable[str]) -> str:
 
 
 def validate_archive(
-    data: bytes, settings: Settings | None = None
-) -> tuple[str, str]:
-    """Validate an archive's bytes. Returns (extension, content_type).
+    data: bytes, settings: Settings | None = None, *, allow_shared: bool = False
+) -> tuple[str, str, tuple[SharedEntry, ...]]:
+    """Validate an archive's bytes. Returns (extension, content_type, shared).
 
     Raises ``bundles.UnsupportedArchive`` if the bytes are not a zip/tar(.gz),
     ``BundleInvalid`` if the plugin bundle fails validation, and (via
     ``safe_extract``) ``bundles.UnsupportedArchive`` again if the archive
     exceeds the configured uncompressed-size or compression-ratio cap.
+
+    ``shared`` is the bundle's shared connector entries, empty unless the
+    caller opts in with ``allow_shared``. A caller that opts in resolves them
+    with ``check_shared_declarations`` for the deploying agent before storing
+    the bundle; one that does not keeps the frozen refusal (ADR 0239).
     """
 
     settings = settings or get_settings()
     with tempfile.TemporaryDirectory() as tmp:
-        extension, content_type, result = bundles.extract_and_validate(
+        extension, content_type, result, shared = bundles.extract_and_validate(
             data,
             Path(tmp),
             max_uncompressed_bytes=settings.bundle_max_uncompressed_bytes,
             max_compression_ratio=settings.bundle_max_compression_ratio,
             max_members=settings.bundle_max_members,
+            allow_shared=allow_shared,
         )
     if not result.valid:
         raise BundleInvalid([e.model_dump() for e in result.errors])
-    return extension, content_type
+    return extension, content_type, shared
 
 
 async def revalidate_stored_bundle(
@@ -279,6 +287,72 @@ async def check_stored_sealing_key_custody(
         raise BundleTooLarge.for_stored_bundle(version.id, exc) from exc
     if reasons:
         raise SealingKeyCustody("; ".join(reasons))
+
+
+def _agent_declarations(
+    data: bytes, agent_name: str, settings: Settings
+) -> tuple[Declarations, list[str]]:
+    """Blocking half of ``check_shared_declarations``; run in a threadpool."""
+
+    with tempfile.TemporaryDirectory() as tmp:
+        dest = Path(tmp)
+        bundles.extract_stored_bundle(
+            data,
+            dest,
+            max_uncompressed_bytes=settings.bundle_max_uncompressed_bytes,
+            max_compression_ratio=settings.bundle_max_compression_ratio,
+            max_members=settings.bundle_max_members,
+        )
+        return declarations.for_agent(dest, agent_name)
+
+
+async def check_shared_declarations(
+    session: AsyncSession,
+    agent_id: uuid.UUID,
+    agent_name: str,
+    data: bytes,
+    settings: Settings | None = None,
+) -> None:
+    """Refuse an archive whose shared connectors this agent may not run (ADR 0239).
+
+    The bundle is parsed strictly, restricted to the agent's ``deploy.yaml``
+    target, and every shared entry left is resolved against the shared store:
+    the application exists in this installation, is enabled, and the agent is
+    a member under exactly that connector name. Raises
+    ``declarations.DeclarationRefused`` with the first refusal. For the
+    callers that hold the bytes, like ``check_routes_from_bytes``.
+    """
+
+    settings = settings or get_settings()
+    declared, applications = await run_in_threadpool(
+        _agent_declarations, data, agent_name, settings
+    )
+    await declarations.resolve(session, agent_id, declared.shared, declared=applications)
+
+
+async def check_stored_shared_declarations(
+    session: AsyncSession,
+    store: ObjectStore,
+    version: AgentVersion,
+    agent_id: uuid.UUID,
+    agent_name: str,
+    settings: Settings | None = None,
+) -> None:
+    """``check_shared_declarations`` on a version's stored bundle; a no-op without one.
+
+    Membership and the application can change after intake, so every path that
+    makes a stored version the one that boots resolves again. Stored bytes the
+    current caps refuse report ``BundleTooLarge`` (ADR-0059 decision 3).
+    """
+
+    if version.bundle_ref is None:
+        return
+    settings = settings or get_settings()
+    data = await store.get(version.bundle_ref)
+    try:
+        await check_shared_declarations(session, agent_id, agent_name, data, settings)
+    except plugin_format.UnsupportedArchive as exc:
+        raise BundleTooLarge.for_stored_bundle(version.id, exc) from exc
 
 
 def _declared_routes(data: bytes, settings: Settings) -> set[str] | None:

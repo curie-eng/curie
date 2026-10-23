@@ -438,6 +438,8 @@ _HTTP_OPERATIONS = [
     "/shared-connectors/bindings/{binding_id}/disable",
     "/v1/internal/shared-connectors/applications/{application_id}/recipients",
     "/v1/internal/shared-connectors/applications/{application_id}/database/status",
+    "/v1/internal/shared-connectors/applications/{application_id}/render",
+    "/v1/internal/shared-connectors/resolve",
     "/publications",
     "/publications/precheck",
     "/publications/{publication_id}",

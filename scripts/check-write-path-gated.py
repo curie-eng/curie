@@ -210,6 +210,15 @@ def check(bundle: pathlib.Path) -> list[str]:
     role_file = bundle / "manifests" / "write-role.yaml"
 
     for name, spec in connectors.items():
+        if isinstance(spec, dict) and "shared" in spec:
+            # ADR 0239: a shared connector runs the application's server under
+            # the application's tool policy, which this check cannot read.
+            problems.append(
+                f"{bundle.name} declares shared connector {name!r}: a shared "
+                f"connector's write tools are gated by its application policy; this "
+                f"check cannot verify them."
+            )
+            continue
         source = bundle / "connectors" / name / "server.py"
         for tool, read_only in sorted(tool_surface(source).items()):
             expected = f"mcp__{name}__{tool}"

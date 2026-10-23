@@ -3,9 +3,11 @@
 Two routers over one store. ``router`` is the operator surface and accepts only
 the platform key (``require_platform_key``, never a console session), as the
 identity routes do. ``internal_router`` accepts only the internal worker token:
-the worker registers the public half of each application key it generates and
-reports whether the resolver's database role is ready. Neither credential is
-accepted on the other's routes.
+the worker registers the public half of each application key it generates,
+reports whether the resolver's database role is ready, reads each application's
+frozen render with its Secret plan, and resolves the shared entries of the
+bundles its own readers parse. Neither credential is accepted on the other's
+routes.
 
 Every response from both routers carries ``Cache-Control: no-store``, and no
 422 echoes a submitted value: the bodies carry sealed credentials and key
@@ -18,6 +20,7 @@ import uuid
 from collections.abc import Callable, Coroutine, Iterator, Mapping
 from typing import Annotated, Any, ClassVar, get_args, get_origin
 
+from curie_internal.shared_declarations import SharedEntry
 from fastapi import APIRouter, Depends, HTTPException, Path, Request, Response, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
@@ -32,6 +35,7 @@ from ..schemas.shared_connectors import (
     SharedApplicationDisabled,
     SharedApplicationOut,
     SharedApplicationRegistration,
+    SharedApplicationRenderOut,
     SharedBindingCheck,
     SharedBindingCheckOut,
     SharedBindingDisabled,
@@ -49,8 +53,11 @@ from ..schemas.shared_connectors import (
     SharedRecipientRegistered,
     SharedRecipientRegistration,
     SharedRecipientRetired,
+    SharedResolveOut,
+    SharedResolveRequest,
 )
-from ..shared_connectors import database_roles, store
+from ..shared_connectors import database_roles, declarations, store
+from ..shared_connectors.application_render import application_render
 from ..shared_connectors.store import NO_STORE
 
 _REQUEST_MODELS: tuple[type[BaseModel], ...] = (
@@ -63,6 +70,7 @@ _REQUEST_MODELS: tuple[type[BaseModel], ...] = (
     SharedDatabaseStatusReport,
     SharedMembershipReplace,
     SharedRecipientRegistration,
+    SharedResolveRequest,
 )
 _LOC_ROOTS = frozenset({"body", "path", "query", "header", "cookie"})
 _REDACTED_LOC = "<redacted>"
@@ -347,3 +355,29 @@ async def report_shared_database_status(
     application_id: uuid.UUID, data: SharedDatabaseStatusReport, session: SessionDep
 ) -> SharedDatabaseStatusOut:
     return await database_roles.report_status(session, application_id, data)
+
+
+@internal_router.get(
+    "/applications/{application_id}/render", response_model=SharedApplicationRenderOut
+)
+async def render_shared_application(
+    application_id: uuid.UUID, namespace: str, release: str, session: SessionDep
+) -> SharedApplicationRenderOut:
+    """The frozen application render and its Secret plan, at the worker's root."""
+
+    return await application_render(session, application_id, namespace=namespace, release=release)
+
+
+@internal_router.post("/resolve", response_model=SharedResolveOut)
+async def resolve_shared_declarations(
+    data: SharedResolveRequest, session: SessionDep
+) -> SharedResolveOut:
+    """Resolve shared entries for one agent; the first refusal answers in its dict form."""
+
+    entries = [
+        SharedEntry(name=entry.name, application=str(entry.application)) for entry in data.entries
+    ]
+    resolved = await declarations.resolve(session, data.agent_id, entries)
+    return SharedResolveOut.model_validate(
+        {"agent_id": data.agent_id, "entries": declarations.entries_body(resolved)}
+    )

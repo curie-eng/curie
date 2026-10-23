@@ -109,6 +109,7 @@ from .routers import (
     workspaces,
 )
 from .schema_compat import assert_servable
+from .shared_connectors import caller_keys
 from .slack_approvers import build_approver_set_selector
 from .storage import BundleStore
 from .sweeper import run_expiry_sweeper
@@ -252,6 +253,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     app.state.lineage_reconciler_task = start_lineage_reconciler(
         app.state.sessionmaker, settings, http_client
+    )
+    # Every API process publishes the caller verify keys it carries for the
+    # shared proxies (ADR 0239), now and every minute, until shutdown. Below
+    # migration 0125 it waits for the tables instead of failing boot.
+    app.state.caller_keys_task = asyncio.create_task(
+        caller_keys.run_publisher(app.state.sessionmaker, settings)
     )
     # The expiry sweeper (#412) flips lapsed pending approvals and resumes their
     # stranded sessions. It shares this lifecycle's resources (sessionmaker,
@@ -401,6 +408,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 lineage_task.cancel()
                 try:
                     await lineage_task
+                except asyncio.CancelledError:
+                    pass
+            caller_keys_task = getattr(app.state, "caller_keys_task", None)
+            if caller_keys_task is not None:
+                caller_keys_task.cancel()
+                try:
+                    await caller_keys_task
                 except asyncio.CancelledError:
                     pass
             task = getattr(app.state, "resume_reconciler_task", None)

@@ -557,6 +557,8 @@
           "/shared-connectors/bindings/{binding_id}/disable",
           "/v1/internal/shared-connectors/applications/{application_id}/recipients",
           "/v1/internal/shared-connectors/applications/{application_id}/database/status",
+          "/v1/internal/shared-connectors/applications/{application_id}/render",
+          "/v1/internal/shared-connectors/resolve",
           "/publications",
           "/publications/precheck",
           "/publications/{publication_id}",
@@ -631,7 +633,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 1536,
+      "cardinality_bound": 1552,
       "description": "Active HTTP server requests.",
       "monotonic": false,
       "type": "up_down_counter",
@@ -776,6 +778,8 @@
           "/shared-connectors/bindings/{binding_id}/disable",
           "/v1/internal/shared-connectors/applications/{application_id}/recipients",
           "/v1/internal/shared-connectors/applications/{application_id}/database/status",
+          "/v1/internal/shared-connectors/applications/{application_id}/render",
+          "/v1/internal/shared-connectors/resolve",
           "/publications",
           "/publications/precheck",
           "/publications/{publication_id}",
@@ -857,7 +861,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 7680,
+      "cardinality_bound": 7760,
       "description": "HTTP server requests.",
       "monotonic": true,
       "type": "counter",
@@ -1002,6 +1006,8 @@
           "/shared-connectors/bindings/{binding_id}/disable",
           "/v1/internal/shared-connectors/applications/{application_id}/recipients",
           "/v1/internal/shared-connectors/applications/{application_id}/database/status",
+          "/v1/internal/shared-connectors/applications/{application_id}/render",
+          "/v1/internal/shared-connectors/resolve",
           "/publications",
           "/publications/precheck",
           "/publications/{publication_id}",
@@ -1083,7 +1089,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 7680,
+      "cardinality_bound": 7760,
       "description": "HTTP server request duration.",
       "monotonic": false,
       "type": "histogram",

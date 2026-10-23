@@ -4654,6 +4654,13 @@
             "title": "Owned Secret Name",
             "type": "string"
           },
+          "shared": {
+            "items": {
+              "$ref": "#/components/schemas/SharedConnectorReach"
+            },
+            "title": "Shared",
+            "type": "array"
+          },
           "triggers": {
             "items": {
               "additionalProperties": true,
@@ -12008,6 +12015,52 @@
         "title": "SharedApplicationRegistration",
         "type": "object"
       },
+      "SharedApplicationRenderOut": {
+        "description": "The frozen ``render_application`` output and the Secret plan beside it.",
+        "properties": {
+          "application_id": {
+            "format": "uuid",
+            "title": "Application Id",
+            "type": "string"
+          },
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "installation_label": {
+            "title": "Installation Label",
+            "type": "string"
+          },
+          "objects": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Objects",
+            "type": "array"
+          },
+          "recipients": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Recipients",
+            "type": "array"
+          },
+          "secrets": {
+            "$ref": "#/components/schemas/SharedSecretPlanOut"
+          }
+        },
+        "required": [
+          "application_id",
+          "enabled",
+          "installation_label",
+          "objects",
+          "secrets",
+          "recipients"
+        ],
+        "title": "SharedApplicationRenderOut",
+        "type": "object"
+      },
       "SharedBindingCheck": {
         "additionalProperties": false,
         "properties": {
@@ -12294,6 +12347,35 @@
         "title": "SharedBundledDatabaseOut",
         "type": "object"
       },
+      "SharedConnectorReach": {
+        "description": "One shared connector this agent runs: its alias, application and member reach.\n\n``reach`` is the frozen ``render_member_reach`` output for this agent,\nunmodified: the NetworkPolicies that let this agent's runner reach the\nshared application (ADR 0239). The application's own objects are the\nworker's to apply, from its own route.",
+        "properties": {
+          "application": {
+            "format": "uuid",
+            "title": "Application",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "reach": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Reach",
+            "type": "array"
+          }
+        },
+        "required": [
+          "name",
+          "application",
+          "reach"
+        ],
+        "title": "SharedConnectorReach",
+        "type": "object"
+      },
       "SharedCredentialEnvelope": {
         "additionalProperties": false,
         "description": "A credential the CLI sealed to one of the application's recipients.",
@@ -12388,6 +12470,70 @@
           "dsn_secret"
         ],
         "title": "SharedDatabaseOut",
+        "type": "object"
+      },
+      "SharedDatabasePlanOut": {
+        "description": "The application's database Secret, as the worker reconciles it.\n\nBundled: the worker-managed DSN Secret, and once provisioned the DSN sealed\nto the application's recipient with its revision, which the worker writes\nunopened. Managed: the operator's own Secret reference only.",
+        "properties": {
+          "dsn_revision": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dsn Revision"
+          },
+          "mode": {
+            "enum": [
+              "bundled",
+              "managed"
+            ],
+            "title": "Mode",
+            "type": "string"
+          },
+          "sealed_dsn": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sealed Dsn"
+          },
+          "secret": {
+            "$ref": "#/components/schemas/SharedSecretRefOut"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "enum": [
+                  "provisioned",
+                  "pending",
+                  "ready",
+                  "failed"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status"
+          }
+        },
+        "required": [
+          "mode",
+          "secret",
+          "sealed_dsn",
+          "dsn_revision",
+          "status"
+        ],
+        "title": "SharedDatabasePlanOut",
         "type": "object"
       },
       "SharedDatabaseProvision": {
@@ -12521,6 +12667,28 @@
           "dsn_revision"
         ],
         "title": "SharedDatabaseStatusReport",
+        "type": "object"
+      },
+      "SharedDeclarationEntryIn": {
+        "additionalProperties": false,
+        "description": "One shared entry of a bundle: its connector name and the application it references.",
+        "properties": {
+          "application": {
+            "format": "uuid",
+            "title": "Application",
+            "type": "string"
+          },
+          "name": {
+            "pattern": "^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$",
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "application"
+        ],
+        "title": "SharedDeclarationEntryIn",
         "type": "object"
       },
       "SharedManagedDatabaseOut": {
@@ -12908,6 +13076,109 @@
           "epoch"
         ],
         "title": "SharedRefreshOut",
+        "type": "object"
+      },
+      "SharedResolveOut": {
+        "properties": {
+          "agent_id": {
+            "format": "uuid",
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "entries": {
+            "items": {
+              "$ref": "#/components/schemas/SharedResolvedEntryOut"
+            },
+            "title": "Entries",
+            "type": "array"
+          }
+        },
+        "required": [
+          "agent_id",
+          "entries"
+        ],
+        "title": "SharedResolveOut",
+        "type": "object"
+      },
+      "SharedResolveRequest": {
+        "additionalProperties": false,
+        "description": "The worker's own readers resolve the shared entries an agent's target runs.",
+        "properties": {
+          "agent_id": {
+            "format": "uuid",
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "entries": {
+            "items": {
+              "$ref": "#/components/schemas/SharedDeclarationEntryIn"
+            },
+            "maxItems": 64,
+            "minItems": 1,
+            "title": "Entries",
+            "type": "array"
+          }
+        },
+        "required": [
+          "agent_id",
+          "entries"
+        ],
+        "title": "SharedResolveRequest",
+        "type": "object"
+      },
+      "SharedResolvedEntryOut": {
+        "properties": {
+          "application": {
+            "format": "uuid",
+            "title": "Application",
+            "type": "string"
+          },
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "application",
+          "enabled"
+        ],
+        "title": "SharedResolvedEntryOut",
+        "type": "object"
+      },
+      "SharedSecretPlanOut": {
+        "properties": {
+          "database": {
+            "$ref": "#/components/schemas/SharedDatabasePlanOut"
+          },
+          "encryption_key": {
+            "$ref": "#/components/schemas/SharedSecretRefOut"
+          },
+          "grant_store": {
+            "$ref": "#/components/schemas/SharedSecretRefOut"
+          },
+          "snapshot_seal": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SharedSecretRefOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "encryption_key",
+          "database",
+          "grant_store",
+          "snapshot_seal"
+        ],
+        "title": "SharedSecretPlanOut",
         "type": "object"
       },
       "SharedSecretRefOut": {
@@ -29901,6 +30172,144 @@
           }
         },
         "summary": "Register Shared Recipient",
+        "tags": [
+          "internal-shared-connectors"
+        ]
+      }
+    },
+    "/v1/internal/shared-connectors/applications/{application_id}/render": {
+      "get": {
+        "description": "The frozen application render and its Secret plan, at the worker's root.",
+        "operationId": "render_shared_application_v1_internal_shared_connectors_applications__application_id__render_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "application_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Application Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "namespace",
+            "required": true,
+            "schema": {
+              "title": "Namespace",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "release",
+            "required": true,
+            "schema": {
+              "title": "Release",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SharedApplicationRenderOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Render Shared Application",
+        "tags": [
+          "internal-shared-connectors"
+        ]
+      }
+    },
+    "/v1/internal/shared-connectors/resolve": {
+      "post": {
+        "description": "Resolve shared entries for one agent; the first refusal answers in its dict form.",
+        "operationId": "resolve_shared_declarations_v1_internal_shared_connectors_resolve_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SharedResolveRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SharedResolveOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Resolve Shared Declarations",
         "tags": [
           "internal-shared-connectors"
         ]

@@ -4,12 +4,13 @@ import functools
 import re
 import tempfile
 import uuid
-from collections.abc import AsyncIterator, Callable, Coroutine
+from collections.abc import AsyncIterator, Callable, Coroutine, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, NoReturn
 
 from aci_protocol.turn import route_identity
+from curie_internal.shared_declarations import SharedEntry
 from curie_protected_hooks.source_policy_sql import (
     SourceGate,
     SourceGateInvalid,
@@ -24,6 +25,7 @@ from fastapi.routing import APIRoute
 from plugin_format import connector_lock
 from plugin_format.connector_render import AmbiguousObjectName
 from plugin_format.deploy_targets import connectors_for_agent, restrict_connectors
+from plugin_format.shared_connector_render import SharedMember, render_member_reach
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.exc import DBAPIError, IntegrityError, SQLAlchemyError
@@ -45,8 +47,15 @@ from curie_api.schemas.channels import (
     ChannelRouteWrite,
     validate_allowed_callers,
 )
-from curie_api.schemas.deployments import ConnectorManifests
+from curie_api.schemas.deployments import ConnectorManifests, SharedConnectorReach
 from curie_api.schemas.versions import BundleFile, BundleFiles, VersionCreate, VersionOut
+from curie_api.shared_connectors.declarations import (
+    DeclarationRefused,
+    declared_applications,
+    read_declarations,
+    read_targets_strict,
+)
+from curie_api.shared_connectors.declarations import resolve as resolve_shared
 
 from .. import bundles, deploy, hook_signing
 from ..action_forward import RESTORE_TOOL
@@ -977,7 +986,7 @@ async def read_version_connectors(
     agent_name = agent.name
     capable = await _restore_capable_digests(session, agent_id)
 
-    def _render() -> ConnectorManifests:
+    def _render() -> tuple[ConnectorManifests, tuple[SharedEntry, ...], list[str]]:
         with tempfile.TemporaryDirectory() as tmp:
             bundles.extract_and_validate(
                 data,
@@ -986,6 +995,10 @@ async def read_version_connectors(
                 max_compression_ratio=settings.bundle_max_compression_ratio,
                 max_members=settings.bundle_max_members,
             )
+            # Strict (ADR 0239): a declaration that does not parse refuses with
+            # its code, never renders as an empty connector set. Shared entries
+            # are resolved below, after the agent's target has narrowed them.
+            declarations = read_declarations(Path(tmp))
             # Resolve every `build:` connector to the digest the bundle already
             # records before anything renders (ADR 0113). `apply_lock` reads a
             # recorded fact and never resolves or builds one, so the API stays a
@@ -1005,7 +1018,7 @@ async def read_version_connectors(
             # that feeds an applier, which is this one.
             try:
                 declared = connector_lock.apply_lock(
-                    bundles.read_connectors(Path(tmp)),
+                    declarations.dedicated,
                     bundles.read_connector_lock(Path(tmp)),
                     portable=True,
                 )
@@ -1018,11 +1031,20 @@ async def read_version_connectors(
                 # --plugin-dir <dir> --registry <ref>`, which the message names.
                 raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
             # @spec ADR-0168 d8: the agent's targets decide which connectors
-            # run, and every consumer of this route applies and prunes it.
-            declared = restrict_connectors(
-                declared,
-                connectors_for_agent(bundles.read_deploy_targets(Path(tmp)), agent_name),
-            )
+            # run, and every consumer of this route applies and prunes it. A
+            # bundle with shared entries reads its targets strictly: an invalid
+            # file must refuse, never read as "every connector runs".
+            applications = declared_applications(declarations)
+            if declarations.shared:
+                try:
+                    targets = read_targets_strict(Path(tmp))
+                except DeclarationRefused as refused:
+                    raise refused.naming(applications) from None
+            else:
+                targets = bundles.read_deploy_targets(Path(tmp))
+            allowlist = connectors_for_agent(targets, agent_name)
+            declared = restrict_connectors(declared, allowlist)
+            shared_entries = declarations.restricted(allowlist).shared
             # Per-agent too: a release-scoped Secret means deploying the prod
             # agent overwrites the dev agent's token in place (#1116).
             secret_name = f"{release}-{agent_name}-connector-secrets"
@@ -1057,7 +1079,7 @@ async def read_version_connectors(
                 )
             except ValueError as exc:
                 raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
-            return ConnectorManifests(
+            rendered = ConnectorManifests(
                 manifests=manifests,
                 mcp_entries=bundles.connector_mcp_entries(
                     declared, release=release, agent=agent_name, namespace=namespace
@@ -1070,6 +1092,7 @@ async def read_version_connectors(
                 version_id=version.id,
                 triggers=bundles.read_manifest_triggers(Path(tmp)),
             )
+            return rendered, shared_entries, applications
 
     # `object_name` fails closed on an agent name that forges its `-mcp-` join
     # (#1446), and that raise surfaces HERE: every derivation the renderer
@@ -1089,7 +1112,7 @@ async def read_version_connectors(
     # is no in-place rename to point them at. Saying "rename" would send them
     # looking for an API that does not exist.
     try:
-        return await run_in_threadpool(_render)
+        rendered, shared_entries, applications = await run_in_threadpool(_render)
     except AmbiguousObjectName as exc:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -1101,6 +1124,75 @@ async def read_version_connectors(
             "that neither contains '-mcp-' nor ends in '-mcp'; an agent's name "
             "cannot be changed in place.",
         ) from exc
+    rendered.shared = await _shared_reach(
+        session, agent_id, shared_entries, applications, release, namespace, app_name
+    )
+    return rendered
+
+
+async def _shared_reach(
+    session: AsyncSession,
+    agent_id: uuid.UUID,
+    entries: Sequence[SharedEntry],
+    applications: list[str],
+    release: str,
+    namespace: str,
+    app_name: str,
+) -> list[SharedConnectorReach]:
+    """Each shared entry's member reach, from the frozen ``render_member_reach`` (ADR 0239).
+
+    Every entry resolves against the store first: the application is this
+    installation's, enabled, and the agent is a member under that name. The
+    application must live at this route's root, and the member is the agent
+    UUID with the runner sandbox selector built from it. The reach is the frozen
+    function's output, unmodified. Any refusal answers its code and the
+    applications the bundle declares, never a 200 with an entry dropped.
+    """
+
+    reach: list[SharedConnectorReach] = []
+    for resolved in await resolve_shared(session, agent_id, entries, declared=applications):
+        spec = resolved.application
+
+        def refused(
+            status_code: int,
+            code: str,
+            name: str = resolved.name,
+            application: str = spec.application,
+        ) -> DeclarationRefused:
+            return DeclarationRefused(
+                status_code,
+                code,
+                application=application,
+                connector=name,
+                declared=applications,
+            )
+
+        if (spec.namespace, spec.release, spec.app_name) != (namespace, release, app_name):
+            raise refused(status.HTTP_409_CONFLICT, "shared_application_root_mismatch")
+        try:
+            member = SharedMember.model_validate(
+                {
+                    "agent": str(agent_id),
+                    "runner_labels": {
+                        "curietech.ai/agent-id": str(agent_id),
+                        "app.kubernetes.io/component": "runner-sandbox",
+                        "app.kubernetes.io/name": app_name,
+                        "app.kubernetes.io/instance": release,
+                    },
+                }
+            )
+        except ValueError:
+            raise refused(
+                status.HTTP_422_UNPROCESSABLE_CONTENT, "shared_member_selector_invalid"
+            ) from None
+        reach.append(
+            SharedConnectorReach(
+                name=resolved.name,
+                application=uuid.UUID(spec.application),
+                reach=render_member_reach(spec, member),
+            )
+        )
+    return reach
 
 
 @router.get("/{agent_id}/versions/{version_id}/files", response_model=BundleFiles)
