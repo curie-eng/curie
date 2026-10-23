@@ -35,7 +35,7 @@ from curie_internal.driver_declaration import (
     parse_drivers,
     refuse_published_defaults,
 )
-from curie_internal.keyspace import WORKER_KEY_PREFIX_DEFAULT
+from curie_internal.keyspace import SANDBOX_KEY_PREFIX_DEFAULT, WORKER_KEY_PREFIX_DEFAULT
 from curie_upgrade_pause import authoritative_key
 from plugin_format.connector_render import ConnectorProxy
 from pydantic import AliasChoices, Field, field_validator, model_validator
@@ -160,6 +160,12 @@ class Settings(BaseSettings):
         default=(),
         validation_alias=AliasChoices(TEST_INSTALLATION_DRIVERS_ENV, "test_installation_drivers"),
     )
+
+    # Opt-in lazy attachment facade; never infer activation from a URL.
+    attachment_access_enabled: bool = False
+    attachment_broker_url: str = ""
+    attachment_sandbox_key_prefix: str = SANDBOX_KEY_PREFIX_DEFAULT
+    attachment_transfer_timeout_seconds: int = Field(default=300, ge=1, le=3600)
 
     # Separate trust boundary for credential redemption. The operator/CLI API
     # key can administer deployments but cannot redeem the GitHub identity.

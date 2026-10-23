@@ -47,6 +47,7 @@ import base64
 import hashlib
 import json
 import os
+import socket
 import threading
 import time
 import urllib.error
@@ -54,6 +55,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from collections.abc import Callable, Container, Iterable, Iterator, Mapping, Sequence
+from contextvars import ContextVar, Token
 from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
@@ -724,6 +726,78 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+class AttachmentReadScope:
+    """Own only this transfer's sockets, so cancellation interrupts blocked reads.
+
+    The optional context is inherited by ``asyncio.to_thread``. Legacy eager
+    callers do not install it. A deadline and socket shutdown complement each
+    other: slow dripping bytes cannot refresh the absolute transfer lifetime.
+    """
+
+    def __init__(self, *, deadline_epoch: float) -> None:
+        self.deadline_epoch = deadline_epoch
+        self._lock = threading.Lock()
+        self._sockets: set[socket.socket] = set()
+        self._responses: set[Any] = set()
+        self._cancelled = False
+        self._token: Token[AttachmentReadScope | None] | None = None
+
+    def __enter__(self) -> AttachmentReadScope:
+        self._token = _READ_SCOPE.set(self)
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.cancel()
+        for response in tuple(self._responses):
+            response.close()
+        self._responses.clear()
+        if self._token is not None:
+            _READ_SCOPE.reset(self._token)
+
+    def remaining(self) -> float:
+        if self._cancelled or self.deadline_epoch <= time.time():
+            raise TimeoutError("attachment transfer ended")
+        return self.deadline_epoch - time.time()
+
+    def track(self, response: Any) -> socket.socket:
+        # urllib's HTTPResponse retains its socket through BufferedReader.raw.
+        # HTTP and HTTPS use this same ownership chain. Fail closed if a
+        # custom transport cannot expose a socket that this scope can stop.
+        sock = getattr(getattr(response.fp, "raw", None), "_sock", None)
+        if not isinstance(sock, socket.socket):
+            response.close()
+            raise OSError("attachment transport is not cancellable")
+        try:
+            with self._lock:
+                self.remaining()
+                self._sockets.add(sock)
+                self._responses.add(response)
+        except BaseException:
+            response.close()
+            raise
+        return sock
+
+    def untrack(self, sock: socket.socket, response: Any) -> None:
+        with self._lock:
+            self._sockets.discard(sock)
+            self._responses.discard(response)
+
+    def cancel(self) -> None:
+        with self._lock:
+            self._cancelled = True
+            owned = tuple(self._sockets)
+        for sock in owned:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+
+_READ_SCOPE: ContextVar[AttachmentReadScope | None] = ContextVar(
+    "attachment_transfer_read_scope", default=None
+)
+
+
 def _slack_transport(
     *,
     method: str,
@@ -738,22 +812,41 @@ def _slack_transport(
     Slack named rather than one this worker chose.
     """
 
+    scope = _READ_SCOPE.get()
+    timeout = min(30.0, scope.remaining()) if scope is not None else 30.0
     request = urllib.request.Request(url, headers=dict(headers), method=method)
     opener = urllib.request.build_opener(_NoRedirect())
     try:
-        response = opener.open(request, timeout=30)
+        response = opener.open(request, timeout=timeout)
     except urllib.error.HTTPError as exc:
-        body = exc.read()
+        # Error envelopes are control data, never attachment content.
+        with exc:
+            body = exc.read1(_MAX_INFO_BYTES + 1)
         return SlackFileResponse(
             status=int(exc.code),
             headers=dict(exc.headers.items()) if exc.headers is not None else {},
             chunks=iter([body]),
         )
 
+    owned = scope.track(response) if scope is not None else None
+
     def _chunks() -> Iterator[bytes]:
-        with response:
-            while chunk := response.read(chunk_bytes):
-                yield chunk
+        try:
+            with response:
+                while True:
+                    if scope is not None and owned is not None:
+                        owned.settimeout(min(30.0, scope.remaining()))
+                    chunk = response.read1(chunk_bytes)
+                    if scope is not None:
+                        scope.remaining()
+                    if not chunk:
+                        if response.length not in (None, 0):
+                            raise OSError("attachment response ended before Content-Length")
+                        break
+                    yield chunk
+        finally:
+            if scope is not None and owned is not None:
+                scope.untrack(owned, response)
 
     return SlackFileResponse(
         status=int(response.status),
