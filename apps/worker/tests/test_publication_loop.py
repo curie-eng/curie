@@ -4,19 +4,22 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import importlib.util
+import json
 import logging
 import os
 import subprocess
 import sys
 import threading
 import uuid
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import httpx
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
@@ -25,6 +28,7 @@ from channel_protocol.reply import ReplyAck, ReplyTarget
 from curie_test_support.postgres import pg_connect_or_skip
 from curie_worker.approval_cards import ApprovalCardRef
 from curie_worker.config import WorkerConfig
+from curie_worker.publication_clients import PublicationCodeHostClient, PublicationLineageClient
 from curie_worker.publication_loop import (
     PublicationIdentityUnavailable,
     PublicationLineageRefused,
@@ -199,6 +203,230 @@ async def publication_store() -> AsyncIterator[tuple[AsyncEngine, str, PostgresP
         async with engine.begin() as connection:
             await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
         await engine.dispose()
+
+
+@pytest.fixture
+async def timeout_recovery_case(
+    migrated_publication_database_url: str, request: pytest.FixtureRequest
+) -> AsyncIterator[tuple[Any, AsyncEngine, uuid.UUID, dict[str, str], str]]:
+    path = Path(__file__).parent / "fixtures" / "publication_timeout_repro.py"
+    spec = importlib.util.spec_from_file_location("publication_timeout_repro", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("publication timeout fixture could not be loaded")
+    repro = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = repro
+    spec.loader.exec_module(repro)
+    scenario = getattr(request, "param", "delayed-success-after-cap")
+    engine = create_async_engine(migrated_publication_database_url)
+    publication_id = uuid.uuid4()
+    try:
+        seeded = await repro._seed(engine, publication_id, 9)
+        yield repro, engine, publication_id, seeded, scenario
+    finally:
+        await engine.dispose()
+
+
+async def test_timeout_recovery_adopts_original_request_after_quiescence(
+    timeout_recovery_case: tuple[Any, AsyncEngine, uuid.UUID, dict[str, str], str],
+) -> None:
+    repro, engine, publication_id, seeded, scenario = timeout_recovery_case
+
+    report = await repro._run_seeded_scenario(scenario, engine, publication_id, seeded)
+
+    assert report["invariants"]["safe_adoption"]
+    assert report["invariants"]["no_duplicate"]
+    assert report["completed_by_original_request"]
+    assert report["remote_pr_count"] == 1
+    assert report["observed_store"]["status"] == "succeeded"
+    assert report["observed_store"]["reconcile_attempts"] == 9
+    assert report["observed_store"]["result_url"] == "https://code.example/acme/widget/pull/41"
+    assert report["observed_store"]["patch_cleared"]
+    assert not report["observed_store"]["dead_lettered"]
+    assert not report["claim_eligible_after"]
+    assert report["recovery_bodies"] == [
+        {"expected_head_sha": REVISION_HEAD, "adopt_only": False},
+        {"expected_head_sha": REVISION_HEAD, "adopt_only": True},
+    ]
+    assert [event["event"] for event in report["events"]] == [
+        "observation",
+        "redemption",
+        "POST",
+        "observation",
+        "release",
+        "POST",
+    ]
+    observations = [event["job_name"] for event in report["events"] if "job_name" in event]
+    assert len(observations) == 2
+    assert observations[0] == observations[1]
+    assert report["credential_redemptions"] == 1
+    assert report["job_count"] == report["push_count"] == 0
+    assert repro._exit_for(report) == 0
+
+
+@pytest.mark.parametrize("timeout_recovery_case", ["delayed-absent-after-cap"], indirect=True)
+async def test_timeout_recovery_without_original_success_preserves_tenth_attempt_cap(
+    timeout_recovery_case: tuple[Any, AsyncEngine, uuid.UUID, dict[str, str], str],
+) -> None:
+    repro, engine, publication_id, seeded, scenario = timeout_recovery_case
+
+    report = await repro._run_seeded_scenario(scenario, engine, publication_id, seeded)
+
+    assert report["observed_store"]["status"] == "failed"
+    assert report["observed_store"]["reconcile_attempts"] == 10
+    assert report["observed_store"]["patch_cleared"]
+    assert report["observed_store"]["dead_lettered"]
+    assert report["observed_store"]["terminal"]
+    assert report["observed_store"]["result_url"] is None
+    assert report["remote_pr_count"] == report["job_count"] == report["push_count"] == 0
+    assert not report["completed_by_original_request"]
+    assert not report["invariants"]["safe_adoption"]
+    assert report["invariants"]["cap_preserved"]
+    assert not report["claim_eligible_after"]
+    assert [body["adopt_only"] for body in report["recovery_bodies"]] == [False, True]
+    assert "release" not in [event["event"] for event in report["events"]]
+    assert report["credential_redemptions"] == 1
+    assert repro._exit_for(report) == 0
+
+
+async def test_timeout_recovery_stale_version_is_refused_by_real_api_crud_and_retry_cas(
+    publication: Any,
+    timeout_recovery_case: tuple[Any, AsyncEngine, uuid.UUID, dict[str, str], str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from curie_api.config import get_settings
+    from curie_api.crud.errors import PublicationLineageConflict
+    from curie_api.crud.lineages import advance_publication_lineage
+    from curie_api.routers.publications import internal_router
+    from curie_api.schemas.publications import PublicationLineageAdvance
+    from fastapi import FastAPI
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    repro, engine, publication_id, seeded, _ = timeout_recovery_case
+    settings = get_settings()
+    monkeypatch.setattr(settings, "internal_worker_token", "synthetic-worker-token")
+    monkeypatch.setattr(settings, "github_api_url", "https://code.example/api/v3")
+    app = FastAPI()
+    app.include_router(internal_router)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    app.state.sessionmaker = sessions
+    peer = repro.Peer(
+        scenario="delayed-success-after-cap",
+        head=REVISION_HEAD,
+        parent=PRIOR_HEAD,
+        branch=seeded["branch"],
+        released=False,
+    )
+    cluster = repro._Cluster(peer)
+    credentials = repro._Credentials("https://code.example", seeded["repo"], peer)
+    durable = PostgresPublicationStore(engine, schema="curie", lease_owner="timeout-stale-worker")
+    work = await durable.claim_next()
+    assert work is not None
+    lineage_requests: list[dict[str, Any]] = []
+    lineage_responses: list[httpx.Response] = []
+    competitor = create_async_engine(engine.url)
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="https://publication.example.com"
+        ) as api:
+
+            async def handler(request: httpx.Request) -> httpx.Response:
+                if request.url.path.endswith("/lineage"):
+                    lineage_requests.append(json.loads(request.content))
+                    response = await api.request(
+                        request.method,
+                        request.url.path,
+                        content=request.content,
+                        headers=dict(request.headers),
+                    )
+                    lineage_responses.append(response)
+                    return response
+                response = peer.handler(request)
+                if request.url.path.endswith("/pull-request") and response.status_code == 200:
+                    assert json.loads(request.content)["adopt_only"] is True
+                    async with competitor.begin() as connection:
+                        await connection.execute(
+                            text(
+                                "UPDATE curie.publications SET version = version + 1, "
+                                "lease_owner = 'newer-timeout-worker' WHERE id = :id"
+                            ),
+                            {"id": publication_id},
+                        )
+                return response
+
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+                app.state.http_client = http
+                loop = publication.PublicationReconciler(
+                    store=durable,
+                    credentials=credentials,
+                    cluster=cluster,
+                    code_host=PublicationCodeHostClient(
+                        api_base_url="https://publication.example.com",
+                        worker_token="synthetic-worker-token",
+                        client=http,
+                    ),
+                    lineage=PublicationLineageClient(
+                        api_base_url="https://publication.example.com",
+                        worker_token="synthetic-worker-token",
+                        client=http,
+                    ),
+                    replies=repro._Replies(),
+                    job_settings=repro._JOB_SETTINGS,
+                )
+                with pytest.raises(PublicationStoreError, match="retry CAS was lost"):
+                    await loop.reconcile(work)
+        assert [body["adopt_only"] for body in peer.recovery_bodies] == [False, True]
+        assert len(peer.prs) == 1
+        assert peer.completed_by_original_request
+        assert len(lineage_responses) == 1
+        assert lineage_responses[0].status_code == 409
+        assert lineage_responses[0].json()["detail"]["code"] == "publication.lease_lost"
+        assert lineage_requests[0]["expected_publication_version"] == work.version
+        assert lineage_requests[0]["lease_owner"] == work.lease_owner
+
+        async with sessions() as session:
+            with pytest.raises(PublicationLineageConflict) as conflict:
+                await advance_publication_lineage(
+                    session,
+                    publication_id,
+                    PublicationLineageAdvance.model_validate(lineage_requests[0]),
+                    github_html_base="https://code.example",
+                )
+            assert conflict.value.code == "publication.lease_lost"
+        stored = await repro._read_row(engine, publication_id)
+        assert stored["status"] == "launching"
+        assert stored["result_url"] is None
+        assert stored["reconcile_attempts"] == 9
+        assert not stored["patch_cleared"]
+        assert not stored["dead_lettered"]
+        assert not stored["terminal"]
+        async with engine.connect() as connection:
+            row = (
+                (
+                    await connection.execute(
+                        text(
+                            "SELECT p.version AS publication_version, p.lease_owner, "
+                            "l.version AS lineage_version, l.head_sha, l.pr_number, l.pr_url "
+                            "FROM curie.publications p JOIN curie.thread_publication_lineages l "
+                            "ON l.id = p.lineage_id WHERE p.id = :id"
+                        ),
+                        {"id": publication_id},
+                    )
+                )
+                .mappings()
+                .one()
+            )
+        assert dict(row) == {
+            "publication_version": work.version + 1,
+            "lease_owner": "newer-timeout-worker",
+            "lineage_version": 1,
+            "head_sha": None,
+            "pr_number": None,
+            "pr_url": None,
+        }
+        assert cluster.cleanups == cluster.jobs == cluster.pushes == 0
+        assert credentials.redeemed == 1
+    finally:
+        await competitor.dispose()
 
 
 async def test_charged_retry_blocks_claim_for_fifteen_seconds_then_reclaims(
@@ -722,7 +950,7 @@ class _CodeHost:
         self.calls: list[str] = []
         self.number_calls: list[tuple[uuid.UUID, int]] = []
         self.branch_calls: list[uuid.UUID] = []
-        self.recover_calls: list[tuple[uuid.UUID, str]] = []
+        self.recover_calls: list[tuple[uuid.UUID, str, bool]] = []
         self.verify_calls: list[tuple[uuid.UUID, str, uuid.UUID, str]] = []
         self.metadata_calls: list[uuid.UUID] = []
         self.state = "open"
@@ -792,10 +1020,10 @@ class _CodeHost:
         return self.branch_head
 
     def recover_pull_request(
-        self, publication_id: uuid.UUID, *, expected_head_sha: str
+        self, publication_id: uuid.UUID, *, expected_head_sha: str, adopt_only: bool
     ) -> Any | None:
         self.calls.append("recover_pull_request")
-        self.recover_calls.append((publication_id, expected_head_sha))
+        self.recover_calls.append((publication_id, expected_head_sha, adopt_only))
         if expected_head_sha != self.recovered_head_sha:
             raise PublicationReconcileError(
                 "recoverable pull request head does not match the expected commit"
@@ -1093,6 +1321,385 @@ def _loop(
 def _job_env(resources: Any) -> dict[str, str]:
     container = resources.job["spec"]["template"]["spec"]["containers"][0]
     return {item["name"]: item["value"] for item in container["env"]}
+
+
+class _TimeoutRecoveryPeer:
+    def __init__(self) -> None:
+        self.requests: list[str] = []
+        self.bodies: list[dict[str, Any]] = []
+        self.on_timeout: Callable[[], None] = lambda: None
+        self.adoption = "matching"
+        self.ordinary_failure: int | None = None
+        self.timeout_operation: str | None = None
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        self.requests.append(path.rsplit("/", 1)[-1])
+        if path.endswith(f"/{self.timeout_operation}"):
+            raise httpx.ReadTimeout("code host observation unavailable", request=request)
+        if path.endswith("/branch-head"):
+            return httpx.Response(200, json={"head_sha": REVISION_HEAD})
+        if path.endswith("/revision-commit"):
+            return httpx.Response(200, json={"commit_sha": REVISION_HEAD})
+        if not path.endswith("/pull-request") or request.method != "POST":
+            raise AssertionError(f"unexpected code host request: {request.method} {path}")
+        body = json.loads(request.content)
+        self.bodies.append(body)
+        if len(self.bodies) == 1:
+            if self.ordinary_failure is not None:
+                return httpx.Response(self.ordinary_failure, json={"detail": "recovery refused"})
+            self.on_timeout()
+            raise httpx.ReadTimeout("original recovery response lost", request=request)
+        if self.adoption == "timeout":
+            raise httpx.ReadTimeout("adoption response lost", request=request)
+        if self.adoption == "absent":
+            return httpx.Response(204)
+        if self.adoption == "unavailable":
+            return httpx.Response(503, json={"detail": "lookup unavailable"})
+        return httpx.Response(
+            200,
+            json={
+                "number": 123,
+                "url": PR_URL,
+                "state": "open",
+                "head_sha": "c" * 40 if self.adoption == "foreign" else REVISION_HEAD,
+                "head_ref": LINEAGE_BRANCH,
+            },
+        )
+
+
+@pytest.fixture
+async def timeout_recovery_peer() -> AsyncIterator[tuple[_TimeoutRecoveryPeer, Any]]:
+    peer = _TimeoutRecoveryPeer()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(peer.handler)) as client:
+        yield (
+            peer,
+            PublicationCodeHostClient(
+                api_base_url="https://publication.example.com",
+                worker_token="synthetic-worker-token",
+                client=client,
+            ),
+        )
+
+
+def _timeout_job(module: Any, phase: str, uid: str | None, *, marker: bool = False) -> Any:
+    return replace(_job(module, phase, commit_sha=REVISION_HEAD if marker else None), job_uid=uid)
+
+
+def _assert_timeout_recovery_waits(
+    store: _Store, cluster: _Cluster, replies: _Replies, lineage: _Lineage
+) -> None:
+    assert store.completed == {}
+    assert store.pending == {}
+    assert store.retries == []
+    assert store.failures == []
+    assert store.cleanup_pending == set()
+    assert cluster.applied == []
+    assert cluster.credentials_cleaned == []
+    assert cluster.terminals_cleaned == []
+    assert lineage.advances == []
+    assert replies.events == []
+
+
+@pytest.mark.parametrize("allow_launch", [False, True])
+@pytest.mark.parametrize("terminal_phase", ["succeeded", "failed"])
+@pytest.mark.parametrize("marker", [False, True])
+async def test_timeout_recovery_waits_for_newly_appeared_job_and_terminal_pods(
+    publication: Any,
+    timeout_recovery_peer: tuple[_TimeoutRecoveryPeer, Any],
+    allow_launch: bool,
+    terminal_phase: str,
+    marker: bool,
+) -> None:
+    peer, client = timeout_recovery_peer
+    lineage = _Lineage()
+    loop, store, credentials, cluster, _, replies = _loop(publication, lineage=lineage)
+    loop._code_host = client
+    peer.on_timeout = lambda: setattr(
+        cluster, "preexisting_observation", _timeout_job(publication, "running", "original-uid")
+    )
+    work = _work(publication)
+
+    await loop.reconcile(work)
+
+    _assert_timeout_recovery_waits(store, cluster, replies, lineage)
+    assert store.releases == [PUBLICATION_ID]
+    assert len(cluster.observed) == 2
+    assert credentials.calls == [PUBLICATION_ID]
+    assert peer.bodies == [{"expected_head_sha": REVISION_HEAD, "adopt_only": False}]
+    proof_requests = list(peer.requests)
+    cluster.preexisting_observation = _timeout_job(
+        publication, terminal_phase, "original-uid", marker=marker
+    )
+    for version in (2, 3):
+        await loop.reconcile(replace(work, version=version), allow_launch=allow_launch)
+        _assert_timeout_recovery_waits(store, cluster, replies, lineage)
+        assert peer.requests == proof_requests
+        assert credentials.calls == [PUBLICATION_ID]
+    assert store.releases == [PUBLICATION_ID] * 3
+    names = publication.publication_resource_names(PUBLICATION_ID)
+    assert cluster.quiescence_checks == [(names.job, "original-uid")] * 3
+
+    cluster.quiescent = True
+    await loop.reconcile(replace(work, version=7), allow_launch=allow_launch)
+
+    assert peer.bodies == [
+        {"expected_head_sha": REVISION_HEAD, "adopt_only": False},
+        {"expected_head_sha": REVISION_HEAD, "adopt_only": True},
+    ]
+    assert peer.requests == proof_requests + ["pull-request"]
+    assert credentials.calls == [PUBLICATION_ID]
+    assert cluster.applied == []
+    assert store.retries == []
+    assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
+    assert len(lineage.advances) == 1
+    assert lineage.advances[0]["expected_publication_version"] == 7
+    assert lineage.advances[0]["lease_owner"] == work.lease_owner
+    assert len(replies.events) == 1
+
+
+@pytest.mark.parametrize("timing", ["after-timeout", "later-pass"])
+@pytest.mark.parametrize(
+    "problem",
+    ["missing-uid", "empty-uid", "replacement", "absent", "error", "incomplete", "proof-error"],
+)
+async def test_timeout_recovery_known_uid_never_uses_missing_or_replaced_observation(
+    publication: Any,
+    timeout_recovery_peer: tuple[_TimeoutRecoveryPeer, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    problem: str,
+    timing: str,
+) -> None:
+    peer, client = timeout_recovery_peer
+    lineage = _Lineage()
+    loop, store, credentials, cluster, _, replies = _loop(publication, lineage=lineage)
+    loop._code_host = client
+    cluster.preexisting_observation = _timeout_job(publication, "succeeded", "original-uid")
+    original_observe = cluster.observe
+
+    def break_observation() -> None:
+        if problem in {"error", "incomplete"}:
+
+            def observe(_job_name: str) -> Any:
+                if problem == "error":
+                    raise RuntimeError("Job inventory unavailable")
+                return None
+
+            monkeypatch.setattr(cluster, "observe", observe)
+        elif problem == "absent":
+            cluster.preexisting_observation = publication.PublicationJobObservation(
+                phase="absent", logs="", exists=False
+            )
+        else:
+            uid = {"missing-uid": None, "empty-uid": "", "replacement": "replacement-uid"}.get(
+                problem, "original-uid"
+            )
+            cluster.preexisting_observation = _timeout_job(
+                publication, "succeeded", uid, marker=True
+            )
+        cluster.quiescent = True
+        if problem == "proof-error":
+            cluster.quiescence_error = RuntimeError("Pod inventory unavailable")
+
+    if timing == "after-timeout":
+        peer.on_timeout = break_observation
+    work = _work(publication)
+    await loop.reconcile(work)
+    _assert_timeout_recovery_waits(store, cluster, replies, lineage)
+    proof_requests = list(peer.requests)
+    if timing == "later-pass":
+        break_observation()
+    for version in (2, 3):
+        await loop.reconcile(replace(work, version=version), allow_launch=False)
+        _assert_timeout_recovery_waits(store, cluster, replies, lineage)
+        assert credentials.calls == [PUBLICATION_ID]
+        assert peer.requests == proof_requests
+    assert store.releases == [PUBLICATION_ID] * 3
+
+    monkeypatch.setattr(cluster, "observe", original_observe)
+    cluster.preexisting_observation = _timeout_job(publication, "succeeded", "original-uid")
+    cluster.quiescence_error = None
+    cluster.quiescent = True
+    await loop.reconcile(replace(work, version=4), allow_launch=False)
+
+    assert [body["adopt_only"] for body in peer.bodies] == [False, True]
+    assert credentials.calls == [PUBLICATION_ID]
+    assert store.retries == []
+    assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
+
+
+@pytest.mark.parametrize("problem", ["error", "incomplete"])
+async def test_timeout_recovery_absent_job_requires_a_fresh_complete_observation(
+    publication: Any,
+    timeout_recovery_peer: tuple[_TimeoutRecoveryPeer, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    problem: str,
+) -> None:
+    peer, client = timeout_recovery_peer
+    lineage = _Lineage()
+    loop, store, credentials, cluster, _, replies = _loop(publication, lineage=lineage)
+    loop._code_host = client
+    original_observe = cluster.observe
+
+    def incomplete_observe(_job_name: str) -> Any:
+        if problem == "error":
+            raise RuntimeError("Job inventory unavailable")
+        return None
+
+    peer.on_timeout = lambda: monkeypatch.setattr(cluster, "observe", incomplete_observe)
+    await loop.reconcile(_work(publication))
+
+    _assert_timeout_recovery_waits(store, cluster, replies, lineage)
+    assert store.releases == [PUBLICATION_ID]
+    assert [body["adopt_only"] for body in peer.bodies] == [False]
+    assert credentials.calls == [PUBLICATION_ID]
+    monkeypatch.setattr(cluster, "observe", original_observe)
+    await loop.reconcile(replace(_work(publication), version=2))
+
+    assert [body["adopt_only"] for body in peer.bodies] == [False, True]
+    assert cluster.quiescence_checks == []
+    assert store.retries == []
+    assert credentials.calls == [PUBLICATION_ID]
+    assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
+
+
+async def test_timeout_recovery_new_job_without_uid_waits_until_identity_and_pods_are_proven(
+    publication: Any, timeout_recovery_peer: tuple[_TimeoutRecoveryPeer, Any]
+) -> None:
+    peer, client = timeout_recovery_peer
+    lineage = _Lineage()
+    loop, store, credentials, cluster, _, replies = _loop(publication, lineage=lineage)
+    loop._code_host = client
+    peer.on_timeout = lambda: setattr(
+        cluster, "preexisting_observation", _timeout_job(publication, "succeeded", None)
+    )
+
+    await loop.reconcile(_work(publication))
+
+    _assert_timeout_recovery_waits(store, cluster, replies, lineage)
+    assert cluster.quiescence_checks == []
+    assert [body["adopt_only"] for body in peer.bodies] == [False]
+    cluster.preexisting_observation = _timeout_job(publication, "succeeded", "visible-uid")
+    cluster.quiescent = True
+    await loop.reconcile(replace(_work(publication), version=2))
+
+    assert [body["adopt_only"] for body in peer.bodies] == [False, True]
+    assert credentials.calls == [PUBLICATION_ID]
+    assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
+
+
+@pytest.mark.parametrize("site", ["post-push", "rejected-job"])
+async def test_timeout_recovery_covers_post_push_and_rejected_job_callers(
+    publication: Any,
+    timeout_recovery_peer: tuple[_TimeoutRecoveryPeer, Any],
+    site: str,
+) -> None:
+    peer, client = timeout_recovery_peer
+    lineage = _Lineage()
+    loop, store, credentials, cluster, _, replies = _loop(publication, lineage=lineage)
+    loop._code_host = client
+    if site == "post-push":
+        cluster.preexisting_observation = _timeout_job(
+            publication, "running", "original-uid", marker=True
+        )
+    else:
+        _reject_existing_job(publication, cluster, phase="succeeded")
+        cluster.quiescent = True
+        peer.on_timeout = lambda: setattr(cluster, "quiescent", False)
+
+    await loop.reconcile(_work(publication))
+
+    _assert_timeout_recovery_waits(store, cluster, replies, lineage)
+    assert credentials.calls == ([] if site == "post-push" else [PUBLICATION_ID])
+    assert [body["adopt_only"] for body in peer.bodies] == [False]
+    proof_requests = list(peer.requests)
+    cluster.quiescent = True
+    cluster.preexisting_observation = _timeout_job(
+        publication,
+        "succeeded",
+        "original-uid" if site == "post-push" else "old-job-uid",
+        marker=True,
+    )
+    await loop.reconcile(replace(_work(publication), version=2))
+
+    assert peer.requests == proof_requests + ["pull-request"]
+    assert [body["adopt_only"] for body in peer.bodies] == [False, True]
+    assert credentials.calls == ([] if site == "post-push" else [PUBLICATION_ID])
+    assert cluster.applied == []
+    assert store.retries == []
+    assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
+    assert len(lineage.advances) == 1
+
+
+@pytest.mark.parametrize("adoption", ["absent", "foreign", "timeout", "unavailable"])
+@pytest.mark.parametrize("terminal", [False, True])
+async def test_timeout_recovery_failed_adoption_charges_once_without_recursive_probe(
+    publication: Any,
+    timeout_recovery_peer: tuple[_TimeoutRecoveryPeer, Any],
+    adoption: str,
+    terminal: bool,
+) -> None:
+    peer, client = timeout_recovery_peer
+    peer.adoption = adoption
+    loop, store, credentials, cluster, _, replies = _loop(publication)
+    loop._code_host = client
+    store.retry_terminal_after = 1 if terminal else 99
+
+    await loop.reconcile(_work(publication))
+
+    assert [body["adopt_only"] for body in peer.bodies] == [False, True]
+    assert len(store.retries) == 1
+    assert store.completed == ({PUBLICATION_ID: ("failed", None)} if terminal else {})
+    assert loop._lineage.advances == []
+    assert credentials.calls == [PUBLICATION_ID]
+    assert cluster.applied == []
+    assert len(replies.events) == (1 if terminal else 0)
+    requests = list(peer.requests)
+    peer.adoption = "matching"
+    await loop.reconcile(replace(_work(publication), version=2))
+    if terminal:
+        assert peer.requests == requests
+    else:
+        assert [body["adopt_only"] for body in peer.bodies] == [False, True, False]
+        assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
+        assert credentials.calls == [PUBLICATION_ID] * 2
+    assert len(store.retries) == 1
+
+
+@pytest.mark.parametrize("status", [409, 503])
+async def test_timeout_recovery_does_not_probe_an_ordinary_refusal(
+    publication: Any, timeout_recovery_peer: tuple[_TimeoutRecoveryPeer, Any], status: int
+) -> None:
+    peer, client = timeout_recovery_peer
+    peer.ordinary_failure = status
+    loop, store, credentials, cluster, _, _ = _loop(publication)
+    loop._code_host = client
+
+    await loop.reconcile(_work(publication))
+
+    assert [body["adopt_only"] for body in peer.bodies] == [False]
+    assert len(store.retries) == 1
+    assert store.releases == []
+    assert credentials.calls == [PUBLICATION_ID]
+    assert cluster.applied == []
+
+
+@pytest.mark.parametrize("operation", ["branch-head", "revision-commit"])
+async def test_timeout_recovery_does_not_probe_timeouts_in_other_operations(
+    publication: Any, timeout_recovery_peer: tuple[_TimeoutRecoveryPeer, Any], operation: str
+) -> None:
+    peer, client = timeout_recovery_peer
+    peer.timeout_operation = operation
+    loop, store, credentials, cluster, _, _ = _loop(publication)
+    loop._code_host = client
+
+    await loop.reconcile(_work(publication))
+
+    assert peer.bodies == []
+    assert len(store.retries) == 1
+    assert store.releases == []
+    assert credentials.calls == [PUBLICATION_ID]
+    assert cluster.applied == []
 
 
 @pytest.mark.parametrize(
@@ -1541,7 +2148,7 @@ async def test_approved_publication_launches_job_and_reports_pr_url(
     ]
     assert github.number_calls == []
     assert github.verify_calls == [(PUBLICATION_ID, REVISION_HEAD, REVISION_ID, PRIOR_HEAD)]
-    assert github.recover_calls == [(PUBLICATION_ID, REVISION_HEAD)]
+    assert github.recover_calls == [(PUBLICATION_ID, REVISION_HEAD, False)]
     assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
     assert cluster.credentials_cleaned == [resources.names]
     assert cluster.terminals_cleaned == [resources.names]
@@ -1775,7 +2382,7 @@ async def test_ttl_deleted_first_revision_job_recovers_exact_marked_commit_and_p
         PUBLICATION_ID,
     ]
     assert github.verify_calls == [(PUBLICATION_ID, REVISION_HEAD, REVISION_ID, PRIOR_HEAD)]
-    assert github.recover_calls == [(PUBLICATION_ID, REVISION_HEAD)]
+    assert github.recover_calls == [(PUBLICATION_ID, REVISION_HEAD, False)]
     assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
     assert loop._lineage.advances[0]["pr_number"] == 123
     assert loop._lineage.advances[0]["head_sha"] == REVISION_HEAD
@@ -1794,7 +2401,7 @@ async def test_first_revision_recovery_refuses_pr_head_replaced_after_commit_pro
 
     assert credentials.calls == [PUBLICATION_ID]
     assert github.verify_calls == [(PUBLICATION_ID, REVISION_HEAD, REVISION_ID, PRIOR_HEAD)]
-    assert github.recover_calls == [(PUBLICATION_ID, REVISION_HEAD)]
+    assert github.recover_calls == [(PUBLICATION_ID, REVISION_HEAD, False)]
     assert cluster.applied == []
     assert store.completed == {}
     assert loop._lineage.advances == []
@@ -1820,7 +2427,7 @@ async def test_first_revision_recovery_persists_terminal_pull_without_repost(
     await loop.reconcile(_work(publication))
 
     assert credentials.calls == [PUBLICATION_ID]
-    assert github.recover_calls == [(PUBLICATION_ID, REVISION_HEAD)]
+    assert github.recover_calls == [(PUBLICATION_ID, REVISION_HEAD, False)]
     assert store.lineage_terminals == [
         {
             "lineage_id": LINEAGE_ID,
@@ -1962,7 +2569,7 @@ async def test_pull_merged_or_closed_after_first_push_persists_lineage_without_r
     assert len(cluster.validated_existing) == 1
     assert credentials.calls == []
     assert github.calls == ["verify_revision_commit", "recover_pull_request"]
-    assert github.recover_calls == [(PUBLICATION_ID, REVISION_HEAD)]
+    assert github.recover_calls == [(PUBLICATION_ID, REVISION_HEAD, False)]
     assert store.lineage_terminals == [
         {
             "lineage_id": LINEAGE_ID,
@@ -2764,7 +3371,7 @@ async def test_mismatched_existing_job_is_proven_through_github_without_charging
     assert credentials.calls == [PUBLICATION_ID]
     assert github.branch_calls == [PUBLICATION_ID]
     assert github.verify_calls == [(PUBLICATION_ID, REVISION_HEAD, REVISION_ID, PRIOR_HEAD)]
-    assert github.recover_calls == [(PUBLICATION_ID, REVISION_HEAD)]
+    assert github.recover_calls == [(PUBLICATION_ID, REVISION_HEAD, False)]
     assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
     assert store.retries == []
     assert store.failures == []
@@ -2778,7 +3385,7 @@ async def test_mismatched_existing_job_is_proven_through_github_without_charging
     assert PR_URL in replies.events[0][0].text
 
     await loop.reconcile(work)
-    assert github.recover_calls == [(PUBLICATION_ID, REVISION_HEAD)]
+    assert github.recover_calls == [(PUBLICATION_ID, REVISION_HEAD, False)]
     assert len(replies.events) == 1
     assert cluster.applied == []
     assert len(cluster.terminals_cleaned) == 1
@@ -2865,7 +3472,7 @@ async def test_rejected_job_checks_remote_branch_when_the_stored_pull_has_the_pr
     assert github.number_calls == [(PUBLICATION_ID, 123)]
     assert github.branch_calls == [PUBLICATION_ID]
     assert github.verify_calls == [(PUBLICATION_ID, REVISION_HEAD, REVISION_ID, PRIOR_HEAD)]
-    assert github.recover_calls == [(PUBLICATION_ID, REVISION_HEAD)]
+    assert github.recover_calls == [(PUBLICATION_ID, REVISION_HEAD, False)]
     assert store.completed == {PUBLICATION_ID: ("published", PR_URL)}
     assert store.retries == []
     assert store.failures == []
@@ -3037,7 +3644,7 @@ async def test_quiescent_rejected_job_refuses_foreign_remote_identity(
         assert github.verify_calls == [(PUBLICATION_ID, REVISION_HEAD, REVISION_ID, PRIOR_HEAD)]
         assert github.recover_calls == []
     elif foreign == "repository" and not stored_pull:
-        assert github.recover_calls == [(PUBLICATION_ID, REVISION_HEAD)]
+        assert github.recover_calls == [(PUBLICATION_ID, REVISION_HEAD, False)]
         assert store.retries == [(PUBLICATION_ID, refusal)]
 
     if foreign == "repository":
@@ -3101,7 +3708,7 @@ async def test_quiescent_rejected_job_recovers_api_approved_bitbucket_dc_identit
     assert github.branch_calls == [PUBLICATION_ID]
     assert github.verify_calls == [(PUBLICATION_ID, REVISION_HEAD, REVISION_ID, PRIOR_HEAD)]
     assert github.number_calls == ([(PUBLICATION_ID, 123)] if stored_pull else [])
-    assert github.recover_calls == ([] if stored_pull else [(PUBLICATION_ID, REVISION_HEAD)])
+    assert github.recover_calls == ([] if stored_pull else [(PUBLICATION_ID, REVISION_HEAD, False)])
     assert store.completed == {PUBLICATION_ID: ("published", pr_url)}
     assert store.failures == []
     assert store.retries == []
@@ -3132,7 +3739,7 @@ async def test_unclean_api_pull_request_url_is_bounded_instead_of_reported(
 
     await loop.reconcile(_work(publication))
 
-    assert github.recover_calls == [(PUBLICATION_ID, REVISION_HEAD)]
+    assert github.recover_calls == [(PUBLICATION_ID, REVISION_HEAD, False)]
     assert store.completed == {}
     assert loop._lineage.advances == []
     assert store.retries == [(PUBLICATION_ID, "the pull request URL is not a clean HTTPS URL")]
@@ -3626,8 +4233,9 @@ async def test_post_push_recover_opens_the_pull_when_none_is_stored(
     github.recovered_pr_url = None
     opened: list[str] = []
 
-    def recover(publication_id: uuid.UUID, *, expected_head_sha: str) -> Any:
+    def recover(publication_id: uuid.UUID, *, expected_head_sha: str, adopt_only: bool) -> Any:
         github.calls.append("recover_pull_request")
+        assert adopt_only is False
         assert github.branch_head == expected_head_sha, "recovery runs only after the push"
         opened.append(expected_head_sha)
         return publication.PublicationPullState(
@@ -3659,7 +4267,7 @@ async def test_post_push_absent_pull_request_is_bounded(publication: Any) -> Non
 
     await loop.reconcile(_work(publication))
 
-    assert github.recover_calls == [(PUBLICATION_ID, REVISION_HEAD)]
+    assert github.recover_calls == [(PUBLICATION_ID, REVISION_HEAD, False)]
     assert store.retries == [
         (PUBLICATION_ID, "the pushed publication branch is absent on the code host")
     ]

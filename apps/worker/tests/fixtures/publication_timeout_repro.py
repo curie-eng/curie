@@ -2,8 +2,8 @@
 
 Drives the production PublicationCodeHostClient, PublicationReconciler and
 PostgresPublicationStore. External HTTP, code-host and Kubernetes responses are
-simulated. This file is not a pytest module and does not pin the failing
-delayed-adoption case as a green product test.
+simulated. The scenario runner also serves the pytest regression using its
+existing migrated Postgres fixture.
 
 Exit 0: a control scenario met its invariants.
 Exit 1: the delayed scenario's safe-adoption invariant failed, or a control
@@ -116,13 +116,15 @@ class Peer:
     timeout_class: str | None = None
     timeout_cause: str | None = None
     requests: list[str] = field(default_factory=list)
+    recovery_bodies: list[dict[str, object]] = field(default_factory=list)
+    events: list[dict[str, object]] = field(default_factory=list)
     original_request_pending: bool = False
     completed_by_original_request: bool = False
 
-    def _pull(self) -> dict[str, object]:
+    def _pull(self, number: int = _PR_NUMBER) -> dict[str, object]:
         return {
-            "number": _PR_NUMBER,
-            "url": f"https://code.example/acme/widget/pull/{_PR_NUMBER}",
+            "number": number,
+            "url": f"https://code.example/acme/widget/pull/{number}",
             "state": "open",
             "head_sha": self.head,
             "head_ref": self.branch,
@@ -132,6 +134,7 @@ class Peer:
     def release(self) -> None:
         """Finish the request the caller already timed out, without a new POST."""
 
+        self.events.append({"event": "release"})
         self.released = True
         if self.original_request_pending and not self.prs:
             self.prs.append(self._pull())
@@ -155,12 +158,22 @@ class Peer:
             observed = body.get("commit_sha")
             return httpx.Response(200, json={"commit_sha": observed})
         if path.endswith("/pull-request") and request.method == "POST":
-            if self.scenario == "delayed-success-after-cap" and not self.released:
-                self.original_request_pending = True
+            body = json.loads(request.content)
+            self.recovery_bodies.append(body)
+            self.events.append({"event": "POST", **body})
+            if self.scenario == "delayed-absent-after-cap" or (
+                self.scenario == "delayed-success-after-cap" and not self.released
+            ):
+                self.original_request_pending = self.scenario == "delayed-success-after-cap"
                 exc = httpx.ReadTimeout("simulated read timeout", request=request)
                 self.timeout_class = type(exc).__name__
                 self.timeout_cause = str(exc)
                 raise exc
+            if body.get("adopt_only") is True:
+                return httpx.Response(200, json=self.prs[0]) if self.prs else httpx.Response(204)
+            if self.scenario == "delayed-success-after-cap" and self.released:
+                self.prs.append(self._pull(_PR_NUMBER + 1))
+                return httpx.Response(200, json=self.prs[-1])
             if not self.prs:
                 self.prs.append(self._pull())
             return httpx.Response(200, json=self.prs[0])
@@ -170,7 +183,8 @@ class Peer:
 
 
 class _Credentials:
-    def __init__(self, origin: str, repo: str) -> None:
+    def __init__(self, origin: str, repo: str, peer: Peer) -> None:
+        self._peer = peer
         self.redeemed = 0
         self._origin = origin
         self._repo = repo
@@ -178,6 +192,7 @@ class _Credentials:
     async def redeem(self, publication_id: uuid.UUID) -> PublicationCredential:
         del publication_id
         self.redeemed += 1
+        self._peer.events.append({"event": "redemption"})
         return PublicationCredential(
             clean_clone_url=f"{self._origin}/{self._repo}.git",
             authorization_header="Bearer synthetic",
@@ -187,13 +202,16 @@ class _Credentials:
 
 
 class _Cluster:
-    def __init__(self) -> None:
+    def __init__(self, peer: Peer) -> None:
+        self.peer = peer
         self.jobs = 0
         self.pushes = 0
         self.cleanups = 0
 
     async def observe(self, job_name: str) -> PublicationJobObservation:
-        del job_name
+        self.peer.events.append({"event": "observation", "job_name": job_name})
+        if self.peer.original_request_pending:
+            self.peer.release()
         return PublicationJobObservation(phase="absent", logs="", exists=False)
 
     async def apply(self, resources: object) -> None:
@@ -431,174 +449,189 @@ async def _read_row(engine: AsyncEngine, publication_id: uuid.UUID) -> dict[str,
 
 async def _run_scenario(scenario: str, async_url: str) -> dict[str, Any]:
     publication_id = uuid.uuid4()
-    attempts = _SEED_ATTEMPTS if scenario == "delayed-success-after-cap" else 0
-    head = _FOREIGN if scenario == "foreign-head" else _HEAD
+    attempts = _SEED_ATTEMPTS if scenario.startswith("delayed-") else 0
     engine = create_async_engine(async_url)
     try:
         seeded = await _seed(engine, publication_id, attempts)
-        peer = Peer(
-            scenario=scenario,
-            head=head,
-            parent=_PARENT,
-            branch=seeded["branch"],
-            released=scenario != "delayed-success-after-cap",
-        )
-        cluster = _Cluster()
-        credentials = _Credentials("https://code.example", seeded["repo"])
-        store = PostgresPublicationStore(engine, schema="curie", lease_owner="qualification-worker")
-        transport = httpx.MockTransport(peer.handler)
-        async with httpx.AsyncClient(
-            transport=transport,
-            base_url="http://publication-peer.example",
-            timeout=30.0,
-        ) as client:
-            code_host = PublicationCodeHostClient(
-                api_base_url="http://publication-peer.example",
-                worker_token="synthetic-worker-token",
-                client=client,
-            )
-            lineage = PublicationLineageClient(
-                api_base_url="http://publication-peer.example",
-                worker_token="synthetic-worker-token",
-                client=client,
-            )
-            reconciler = PublicationReconciler(
-                store=store,
-                credentials=credentials,
-                cluster=cluster,
-                code_host=code_host,
-                replies=_Replies(),
-                lineage=lineage,
-                job_settings=_JOB_SETTINGS,
-            )
-            work = await store.claim_next()
-            if work is None:
-                raise RuntimeError("seeded publication was not claimable")
-            await reconciler.reconcile(work)
-            after_reconcile = await _read_row(engine, publication_id)
-            remote_after_terminal: dict[str, object] | None = None
-            if scenario == "delayed-success-after-cap":
-                if after_reconcile["reconcile_attempts"] != _DEFAULT_CAP:
-                    raise RuntimeError("tenth attempt was not charged before delayed success")
-                if after_reconcile["status"] != "failed" or not after_reconcile["patch_cleared"]:
-                    raise RuntimeError("cap did not terminalize and clear the patch")
-                peer.release()
-                if not peer.completed_by_original_request or len(peer.prs) != 1:
-                    raise RuntimeError("delayed success was not the original timed-out request")
-                remote_after_terminal = {
-                    "pull": None,
-                    "exception_class": None,
-                    "exception_cause": None,
-                }
-                try:
-                    recovered = await code_host.recover_pull_request(
-                        publication_id, expected_head_sha=_HEAD
-                    )
-                except Exception as exc:  # noqa: BLE001 - report the real client failure
-                    remote_after_terminal = {
-                        "pull": None,
-                        "exception_class": type(exc).__name__,
-                        "exception_cause": type(exc.__cause__).__name__ if exc.__cause__ else None,
-                    }
-                else:
-                    remote_after_terminal = {
-                        "pull": None
-                        if recovered is None
-                        else {
-                            "number": recovered.number,
-                            "url": recovered.url,
-                            "head_sha": recovered.head_sha,
-                            "head_ref": recovered.head_ref,
-                        },
-                        "exception_class": None,
-                        "exception_cause": None,
-                    }
-            follower = PostgresPublicationStore(
-                engine, schema="curie", lease_owner="qualification-follower"
-            )
-            reclaimed = await follower.claim_next()
-            if reclaimed is not None:
-                await reconciler.reconcile(reclaimed)
-                reclaimed = await follower.claim_next()
-        stored = await _read_row(engine, publication_id)
-        adopted = (
-            stored["status"] == "succeeded"
-            and stored["result_url"] == f"https://code.example/acme/widget/pull/{_PR_NUMBER}"
-            and reclaimed is None
-        )
-        no_duplicate = len(peer.prs) <= 1 and cluster.jobs == 0 and cluster.pushes == 0
-        foreign_refused = (
-            scenario == "foreign-head"
-            and stored["status"] != "succeeded"
-            and stored["result_url"] is None
-            and len(peer.prs) == 0
-            and cluster.jobs == 0
-            and cluster.pushes == 0
-        )
-        return {
-            "scenario": scenario,
-            "seed_reconcile_attempts": attempts,
-            "default_cap": _DEFAULT_CAP,
-            "expected": {
-                "delayed-success-after-cap": "adopt the single delayed pull request",
-                "immediate-success": "adopt the same pull request with no second side effect",
-                "foreign-head": "refuse the foreign head and add no remote mutation",
-            }[scenario],
-            "observed_store": stored,
-            "after_reconcile": after_reconcile,
-            "claim_eligible_after": reclaimed is not None,
-            "remote_pr_count": len(peer.prs),
-            "completed_by_original_request": peer.completed_by_original_request,
-            "remote_after_terminal": remote_after_terminal,
-            "exception_class": "PublicationReconcileError" if stored["error"] else None,
-            "exception_cause": peer.timeout_class,
-            "timeout_class": peer.timeout_class,
-            "timeout_cause": peer.timeout_cause,
-            "job_count": cluster.jobs,
-            "push_count": cluster.pushes,
-            "cleanup_calls": cluster.cleanups,
-            "credential_redemptions": credentials.redeemed,
-            "verified_identity": {
-                "parent": _PARENT,
-                "head": _HEAD,
-                "observed_branch_head": head,
-                "branch": seeded["branch"],
-            },
-            "invariants": {
-                "safe_adoption": adopted,
-                "no_duplicate": no_duplicate,
-                "foreign_refused": foreign_refused,
-            },
-            "simulation_boundary": (
-                "HTTP code-host and lineage responses, credential redemption and "
-                "Kubernetes Job observation are simulated. The production client, "
-                "reconciler, store and claim_next run against migrated Postgres. "
-                "This does not qualify the API process, a live forge, or a deadline "
-                "crossing."
-            ),
-            "http_trace": peer.requests,
-        }
+        return await _run_seeded_scenario(scenario, engine, publication_id, seeded)
     finally:
         await engine.dispose()
+
+
+async def _run_seeded_scenario(
+    scenario: str, engine: AsyncEngine, publication_id: uuid.UUID, seeded: dict[str, str]
+) -> dict[str, Any]:
+    attempts = _SEED_ATTEMPTS if scenario.startswith("delayed-") else 0
+    head = _FOREIGN if scenario == "foreign-head" else _HEAD
+    peer = Peer(
+        scenario=scenario,
+        head=head,
+        parent=_PARENT,
+        branch=seeded["branch"],
+        released=not scenario.startswith("delayed-"),
+    )
+    cluster = _Cluster(peer)
+    credentials = _Credentials("https://code.example", seeded["repo"], peer)
+    store = PostgresPublicationStore(engine, schema="curie", lease_owner="qualification-worker")
+    transport = httpx.MockTransport(peer.handler)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://publication-peer.example",
+        timeout=30.0,
+    ) as client:
+        code_host = PublicationCodeHostClient(
+            api_base_url="http://publication-peer.example",
+            worker_token="synthetic-worker-token",
+            client=client,
+        )
+        lineage = PublicationLineageClient(
+            api_base_url="http://publication-peer.example",
+            worker_token="synthetic-worker-token",
+            client=client,
+        )
+        reconciler = PublicationReconciler(
+            store=store,
+            credentials=credentials,
+            cluster=cluster,
+            code_host=code_host,
+            replies=_Replies(),
+            lineage=lineage,
+            job_settings=_JOB_SETTINGS,
+        )
+        work = await store.claim_next()
+        if work is None:
+            raise RuntimeError("seeded publication was not claimable")
+        await reconciler.reconcile(work)
+        after_reconcile = await _read_row(engine, publication_id)
+        follower = PostgresPublicationStore(
+            engine, schema="curie", lease_owner="qualification-follower"
+        )
+        reclaimed = await follower.claim_next()
+    stored = await _read_row(engine, publication_id)
+    adopted = (
+        stored["status"] == "succeeded"
+        and stored["result_url"] == f"https://code.example/acme/widget/pull/{_PR_NUMBER}"
+        and reclaimed is None
+    )
+    no_duplicate = len(peer.prs) <= 1 and cluster.jobs == 0 and cluster.pushes == 0
+    foreign_refused = (
+        scenario == "foreign-head"
+        and stored["status"] != "succeeded"
+        and stored["result_url"] is None
+        and len(peer.prs) == 0
+        and cluster.jobs == 0
+        and cluster.pushes == 0
+    )
+    modes = [body.get("adopt_only") for body in peer.recovery_bodies]
+    events = [event["event"] for event in peer.events]
+    delayed_order = events == [
+        "observation",
+        "redemption",
+        "POST",
+        "observation",
+        "release",
+        "POST",
+    ]
+    cap_preserved = (
+        stored["status"] == "failed"
+        and stored["reconcile_attempts"] == _DEFAULT_CAP
+        and stored["patch_cleared"]
+        and stored["dead_lettered"]
+        and stored["terminal"]
+        and stored["result_url"] is None
+        and len(peer.prs) == 0
+        and not peer.completed_by_original_request
+        and modes == [False, True]
+        and reclaimed is None
+    )
+    return {
+        "scenario": scenario,
+        "seed_reconcile_attempts": attempts,
+        "default_cap": _DEFAULT_CAP,
+        "expected": {
+            "delayed-success-after-cap": "adopt the single delayed pull request",
+            "delayed-absent-after-cap": "fail at the existing retry cap without a pull request",
+            "immediate-success": "adopt the same pull request with no second side effect",
+            "foreign-head": "refuse the foreign head and add no remote mutation",
+        }[scenario],
+        "observed_store": stored,
+        "after_reconcile": after_reconcile,
+        "claim_eligible_after": reclaimed is not None,
+        "remote_pr_count": len(peer.prs),
+        "completed_by_original_request": peer.completed_by_original_request,
+        "exception_class": "PublicationReconcileError" if stored["error"] else None,
+        "exception_cause": peer.timeout_class,
+        "timeout_class": peer.timeout_class,
+        "timeout_cause": peer.timeout_cause,
+        "job_count": cluster.jobs,
+        "push_count": cluster.pushes,
+        "cleanup_calls": cluster.cleanups,
+        "credential_redemptions": credentials.redeemed,
+        "verified_identity": {
+            "parent": _PARENT,
+            "head": _HEAD,
+            "observed_branch_head": head,
+            "branch": seeded["branch"],
+        },
+        "invariants": {
+            "safe_adoption": adopted,
+            "no_duplicate": no_duplicate,
+            "foreign_refused": foreign_refused,
+            "delayed_order": delayed_order,
+            "cap_preserved": cap_preserved,
+        },
+        "simulation_boundary": (
+            "HTTP code-host and lineage responses, credential redemption and "
+            "Kubernetes Job observation are simulated. The production client, "
+            "reconciler, store and claim_next run against migrated Postgres. "
+            "This does not qualify the API process, a live forge, or a deadline "
+            "crossing."
+        ),
+        "http_trace": peer.requests,
+        "recovery_bodies": peer.recovery_bodies,
+        "events": peer.events,
+    }
 
 
 def _exit_for(report: dict[str, Any]) -> int:
     scenario = report["scenario"]
     invariants = report["invariants"]
+    modes = [body.get("adopt_only") for body in report["recovery_bodies"]]
+    stored = report["observed_store"]
     if scenario == "delayed-success-after-cap":
-        if not invariants["safe_adoption"]:
-            return 1
-        if not invariants["no_duplicate"]:
-            return 1
-        return 0
+        return (
+            0
+            if (
+                invariants["safe_adoption"]
+                and invariants["no_duplicate"]
+                and invariants["delayed_order"]
+                and report["completed_by_original_request"]
+                and report["remote_pr_count"] == 1
+                and modes == [False, True]
+                and stored["reconcile_attempts"] == _SEED_ATTEMPTS
+                and report["credential_redemptions"] == 1
+            )
+            else 1
+        )
+    if scenario == "delayed-absent-after-cap":
+        return 0 if invariants["cap_preserved"] and invariants["no_duplicate"] else 1
     if scenario == "immediate-success":
-        if invariants["safe_adoption"] and invariants["no_duplicate"]:
-            return 0
-        return 1
+        return (
+            0
+            if (
+                invariants["safe_adoption"]
+                and invariants["no_duplicate"]
+                and report["remote_pr_count"] == 1
+                and modes == [False]
+            )
+            else 1
+        )
     if scenario == "foreign-head":
-        if invariants["foreign_refused"] and invariants["no_duplicate"]:
-            return 0
-        return 1
+        return (
+            0
+            if (invariants["foreign_refused"] and invariants["no_duplicate"] and modes == [])
+            else 1
+        )
     return 2
 
 
@@ -632,6 +665,7 @@ def main() -> None:
         required=True,
         choices=(
             "delayed-success-after-cap",
+            "delayed-absent-after-cap",
             "immediate-success",
             "foreign-head",
             "prerequisite-failure",

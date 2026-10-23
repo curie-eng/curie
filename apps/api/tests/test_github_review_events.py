@@ -734,9 +734,10 @@ def publish_through_worker(
         branch = ""
 
         def recover_pull_request(
-            self, publication_id: uuid.UUID, *, expected_head_sha: str
+            self, publication_id: uuid.UUID, *, expected_head_sha: str, adopt_only: bool
         ) -> object:
             assert expected_head_sha == head_sha
+            assert adopt_only is False
             self.calls.append("recover_pull_request")
             return self.module.PublicationPullState(
                 number=pr_number,

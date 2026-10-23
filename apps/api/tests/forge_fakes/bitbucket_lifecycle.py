@@ -821,7 +821,7 @@ class BitbucketPair:
 
         return self.client.post(
             f"/v1/internal/publications/{publication.id}/pull-request",
-            json={"expected_head_sha": publication.head_sha},
+            json={"expected_head_sha": publication.head_sha, "adopt_only": False},
             headers=WORKER,
         )
 

@@ -743,7 +743,7 @@ def recover_pull_request(
     return install.call(
         "POST",
         f"/v1/internal/publications/{publication_id}/pull-request",
-        json={"expected_head_sha": head_sha},
+        json={"expected_head_sha": head_sha, "adopt_only": False},
     )
 
 

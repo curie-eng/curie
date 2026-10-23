@@ -153,6 +153,7 @@ async def _recover(
         repository,
         _contract(base=resolved, draft=draft),
         expected_head_sha=REVISION_HEAD,
+        adopt_only=False,
         before_open=_open_clear,
     )
 
