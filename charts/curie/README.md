@@ -1577,6 +1577,11 @@ unchanged. On, the Postgres and Valkey allow-ingress policies of the data tier
 rail each gain one peer: Pods labelled `app.kubernetes.io/part-of: <release>`,
 `app.kubernetes.io/component: shared-connector-application` and any
 `curietech.ai/shared-application`, same namespace, on that store's port only.
+`<fullname>-shared-app-deny-ingress` selects the same Pods with an Ingress
+policy and no rule, so their ingress isolation never depends on the
+per-application deny the worker garbage collects: worker replicas run with no
+leader election, and one can delete an application's policies after another
+recreated its Deployment. Only the members' reach policies admit a caller.
 Three egress policies select the same Pods:
 `<fullname>-shared-app-allow-dns` (the runner's DNS egress),
 `<fullname>-shared-app-allow-grant-store` (this release's Valkey on 6379, or

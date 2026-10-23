@@ -57,7 +57,11 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 from curie_telemetry import record_metric
-from plugin_format.connector_render import direct_service_name, object_name
+from plugin_format.connector_render import (
+    AmbiguousObjectName,
+    direct_service_name,
+    object_name,
+)
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -267,7 +271,8 @@ class _SharedGuard:
 
     Otherwise each shared entry whose application the reconciler has not
     observed ready marks the dedicated objects of the same alias retained
-    (``RenderedConnectors.retained``), by the frozen render's names.
+    (``RenderedConnectors.retained``), by the frozen render's names. An alias
+    those names refuse (``AmbiguousObjectName``) retains nothing.
     """
 
     def __init__(
@@ -284,16 +289,22 @@ class _SharedGuard:
         shared = self._shared
         if shared is None or not shared.ready:
             raise SharedRenderRefused(WORKER_TOKEN_MISSING)
-        retained = frozenset(
-            name
-            for entry in rendered.shared
-            if not shared.application_ready(entry.application)
-            for name in (
-                object_name(shared.release, self._agent, entry.name),
-                direct_service_name(shared.release, self._agent, entry.name),
-            )
-        )
-        return replace(rendered, retained=retained)
+        retained: set[str] = set()
+        for entry in rendered.shared:
+            if shared.application_ready(entry.application):
+                continue
+            try:
+                retained.update(
+                    (
+                        object_name(shared.release, self._agent, entry.name),
+                        direct_service_name(shared.release, self._agent, entry.name),
+                    )
+                )
+            except AmbiguousObjectName:
+                # An alias the frozen render refuses to name can never have
+                # been a dedicated connector, so there is nothing to retain.
+                continue
+        return replace(rendered, retained=frozenset(retained))
 
 
 class _ObservingClient:

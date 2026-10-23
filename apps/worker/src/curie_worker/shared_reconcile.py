@@ -661,7 +661,11 @@ class SharedReconciler:
         """``ready``, ``failed``/``deployment_unavailable``, or None while undecided.
 
         Read from the live Deployment's status at its current generation:
-        Available, or Progressing False (its progress deadline passed).
+        Available, or Progressing False (its progress deadline passed). A
+        Deployment carrying a ``deletionTimestamp`` is still undecided, never
+        ready or failed: it is the foreground deletion of an earlier
+        declaration, whose Pods are going away, not this application's
+        workload.
         """
 
         listed = self._client.list_labelled(
@@ -674,7 +678,7 @@ class SharedReconciler:
             },
         )
         live = next((item for item in listed if _name(item) == name), None)
-        if live is None:
+        if live is None or (live.get("metadata") or {}).get("deletionTimestamp"):
             return None
         status = live.get("status") or {}
         generation = (live.get("metadata") or {}).get("generation")

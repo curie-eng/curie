@@ -31,7 +31,8 @@ app.kubernetes.io/component=shared-connector-application and
 curietech.ai/shared-application=<uuid>, all from the frozen render. That
 render ships its own default-deny ingress and its database egress policy, so
 the Pod's egress is closed except what some policy allows. These policies,
-owned by this chart, allow the rest: DNS, the grant store, and per application
+owned by this chart, deny every shared application Pod's ingress at the root
+and allow the rest of its egress: DNS, the grant store, and per application
 provider egress. Nothing here selects a runner sandbox or a dedicated
 connector. Membership reach (which runners may call the application) is
 rendered per member by the worker, not here.
@@ -40,6 +41,28 @@ The metadata component is shared-connector-root, deliberately not the
 application component, so the worker's shared reach and application object
 selectors never match a chart-owned policy.
 */}}
+---
+# Ingress isolation of every shared application Pod, owned by the chart. The
+# render's own default-deny ingress is a per application object the worker
+# garbage collects, and worker replicas overlap with no leader election: one
+# can delete an application's policies after another recreated its
+# Deployment. This root deny never depends on that ordering. Ingress only,
+# with no rule, so only the members' reach policies admit a caller.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "curie.fullname" . }}-shared-app-deny-ingress
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: shared-connector-root
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: {{ .Release.Name }}
+      app.kubernetes.io/component: shared-connector-application
+    matchExpressions:
+      - { key: curietech.ai/shared-application, operator: Exists }
+  policyTypes: [Ingress]
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
