@@ -56,6 +56,30 @@ operator must retire it. A copied directory, different host/process owner or
 reconstructed head never authorizes continuation. The initial realization has
 no import, checkpoint restore, automatic retry or positive-work resume verb.
 
+The local custody directory is the fixed `commissioning-run` child of the
+owned installation ledger root; callers cannot choose an alternate run child
+for that installation. Creation requires an owner-only ledger with no created,
+uncertain or removed resource history. Predeclared `intended` ownership rows
+are allowed. Existing custody never becomes a fresh live handle. Copying only
+part of an installation's state is unsupported restoration, not a reset path.
+
+Local storage has exactly `lock`, `records`, `intent`, `head`, `location` and,
+after sealing, `plan`. The owner-only immutable files under `records` are named
+by their lowercase sha256, with no suffix; each is one canonical typed record.
+The pointer files contain exactly 64 lowercase ASCII hex bytes. `intent` and
+`plan` name their typed records; `head` names the last event, or 64 zeroes before
+any event. `location` is sha256 of canonical ASCII JSON with exactly
+`ledger_owner`, `parent_device`, `parent_inode`, `run_device`, `run_inode`,
+`records_device`, `records_inode`, `lock_device`, `lock_inode` and
+`root_path`, all strings derived from the opened ledger/run directories and
+normalized absolute run path; numeric filesystem identities use canonical
+unsigned decimal. This is host custody metadata, not portable evidence or a new
+record accepted by any broker reader. Moved/copied/replaced custody refuses.
+Regular files must be owner-only, single-link files, and directories owner-only.
+Unreferenced records, extra files, unfinished writes and broken pointers refuse.
+The live handle additionally pins its creating process and opened directory/lock
+identities; an inherited handle after fork has no positive authority.
+
 Run states are `prepared`, `running`, `closing`, then `closed` or `failed`.
 There is one irreversible transition to running. A fresh invocation finding an
 existing run may only observe/finish cleanup and mark failure, never issue a
