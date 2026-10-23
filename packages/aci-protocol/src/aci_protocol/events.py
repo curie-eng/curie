@@ -135,7 +135,7 @@ ATTACHMENT_ACCESS_STATUS_FIELD: TypingFinal = "attachment_access"
 
 
 class AttachmentAccessCapability(_AciModel):
-    """Platform attachment authority for one admitted logical turn (ADR 0243).
+    """Platform attachment authority for one admitted logical turn (ADR 0244).
 
     Only the kernel sends this on authenticated event/steer requests after the
     runner advertises enforcement. The URL is a trusted configured platform

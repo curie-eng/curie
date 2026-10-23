@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python, Pydantic, FastAPI/aiohttp, SQLAlchemy/Postgres, Valkey, Helm, generated Rust/TypeScript.
 
-**Spec:** [Approved design](../specs/2026-10-23-on-demand-attachments-design.md), [ADR 0243](../../adr/0243-attachments-are-fetched-on-demand-through-scoped-platform-tools.md).
+**Spec:** [Approved design](../specs/2026-10-23-on-demand-attachments-design.md), [ADR 0244](../../adr/0244-attachments-are-fetched-on-demand-through-scoped-platform-tools.md).
 
 ## Global Constraints
 

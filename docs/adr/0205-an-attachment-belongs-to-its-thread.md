@@ -4,7 +4,7 @@ Date: 2026-10-06
 
 Status: Accepted
 
-Partially amended by [ADR 0243](0243-attachments-are-fetched-on-demand-through-scoped-platform-tools.md)
+Partially amended by [ADR 0244](0244-attachments-are-fetched-on-demand-through-scoped-platform-tools.md)
 for opt-in on-demand registration, retrieval and removal of application byte
 ceilings; legacy eager delivery retains this ADR's original contract.
 

@@ -4,7 +4,7 @@ Date: 2026-09-16
 
 Status: Accepted
 
-Partially amended by [ADR 0243](0243-attachments-are-fetched-on-demand-through-scoped-platform-tools.md)
+Partially amended by [ADR 0244](0244-attachments-are-fetched-on-demand-through-scoped-platform-tools.md)
 for opt-in on-demand per-file delivery instead of eager complete-set handoff.
 
 **Partially amended by [ADR 0205](0205-an-attachment-belongs-to-its-thread.md)**

@@ -1,4 +1,4 @@
-# 243. Attachments are fetched on demand through scoped platform tools
+# 244. Attachments are fetched on demand through scoped platform tools
 
 Date: 2026-10-23
 
