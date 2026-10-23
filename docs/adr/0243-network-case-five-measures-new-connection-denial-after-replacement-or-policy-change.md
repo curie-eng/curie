@@ -2,14 +2,18 @@
 
 Date: 2026-10-23
 
-Status: Draft
+Status: Accepted
 
 Tracked under [#4557](https://github.com/curie-eng/curie/issues/4557).
-The [realizing amendment](../superpowers/specs/2026-10-23-network-case-five-new-connections.md)
-defines the measurement. This Draft authorizes no implementation or changed
-qualification. Current producers retain their current refusal behavior.
+The maintainer accepted this decision and authorized its PR merge on
+2026-10-23. This records architectural acceptance, not runtime qualification.
 
-Upon explicit maintainer acceptance, this decision partially supersedes only:
+The [realizing amendment](../superpowers/specs/2026-10-23-network-case-five-new-connections.md)
+defines the measurement. Source implementation follows publication of this
+Accepted decision. Current producers retain their current refusal behavior
+until the new measurement is implemented and verified.
+
+This decision partially supersedes only:
 
 - case 5, **Retained-connection refusal**, of
   [ADR 0238](0238-a-managed-cni-installation-qualifies-through-its-own-behavioral-network-producer.md);
@@ -98,8 +102,8 @@ Implementation is tracked in #4557. The realizing code paths are
 `apps/worker/src/curie_worker/managed_cni_probe_programs.py`,
 `apps/worker/src/curie_worker/managed_cni_identity.py` and
 `apps/worker/src/curie_worker/commissioning_local_network.py`.
-They must remain unavailable for the new claim until this decision is Accepted
-and the amendment's actual measurement and version checks are implemented.
+They must remain unavailable for the new claim until the amendment's actual
+measurement and version checks are implemented.
 
 ## Consequences
 

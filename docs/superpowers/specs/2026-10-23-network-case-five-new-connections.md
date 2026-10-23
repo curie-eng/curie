@@ -1,16 +1,16 @@
 # Case five: new connections after sender replacement or policy change
 
 Realizing amendment for
-[Draft ADR 0243](../../adr/0243-network-case-five-measures-new-connection-denial-after-replacement-or-policy-change.md),
+[Accepted ADR 0243](../../adr/0243-network-case-five-measures-new-connection-denial-after-replacement-or-policy-change.md),
 tracked in [#4557](https://github.com/curie-eng/curie/issues/4557).
-This document is a proposal. Neither its merge nor existing component tests
-change the current producer or establish qualification. Implementation requires
-explicit acceptance of that ADR first.
+This is the accepted measurement contract. Neither its merge nor existing
+component tests change the current producer or establish qualification. Source
+implementation follows publication of the Accepted ADR.
 
 ## Amendment boundary
 
 <!-- @spec CNI-FRESH-FLOW-1 -->
-On acceptance, this replaces only case 5 of
+This replaces only case 5 of
 [MANAGED-CNI-4](2026-10-20-managed-cni-behavioral-producer.md) and its
 retained-connection-specific constants. Common probe ownership, least privilege,
 policy equivalence, denied-before-allowed controls, cleanup, CNI invalidation and

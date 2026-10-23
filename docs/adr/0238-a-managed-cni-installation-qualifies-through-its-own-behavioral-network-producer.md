@@ -4,6 +4,11 @@ Date: 2026-10-19
 
 Status: Accepted
 
+Partially superseded by
+[ADR 0243](0243-network-case-five-measures-new-connection-denial-after-replacement-or-policy-change.md)
+only for case 5, retained-connection refusal.
+The remaining decision stays in force.
+
 Accepted on 2026-10-20 with explicit maintainer approval.
 
 This decides the managed cloud CNI producer and the production
