@@ -40,7 +40,17 @@ from ..workitem_dispatch import (
 if TYPE_CHECKING:
     from .core import Kernel
 
-from . import attachment_access, channel_read, clock, constants, failures, memory, routing
+from . import (
+    attachment_access,
+    channel_read,
+    claim,
+    clock,
+    constants,
+    delivery,
+    failures,
+    memory,
+    routing,
+)
 from .log import logger
 
 
@@ -208,107 +218,132 @@ async def _continue_unpublished(
         "early_stop" if early else "unpublished",
     )
     event = self._to_event(qevent).model_copy(update={"text": prompt})
+    turn = None
     try:
-        event, left = await self._bind_publication_context(
-            event,
-            queued_event_id=qevent.event_id,
-            workspace_deployment_id=workspace_deployment_id,
-            handle=handle,
-            run=run,
-            remaining_s=left,
-        )
-        if event.tool_access is not None:
-            # @spec WORKER-TOOL-ACCESS-2: the continuation opens a turn too.
-            await self._require_tool_access(handle, event.tool_access, left)
-        # ADR-0188: the continuation opens a turn too, with its own
-        # credential, minted from the budget its stream is bound from.
-        event = self._with_memory_token(event, qevent, memory_grant, left)
-        # ADR 0100: and its own channel read open, as this attempt's owner, on
-        # the same logical turn (the queued event id is unchanged).
-        if channel_read_grant is not None:
-            event = await self._with_channel_read(
-                event, handle, left, grant=channel_read_grant, qevent=qevent
-            )
-        if attachment_turn is None:
-            turn = await self._runner.start_turn(
-                handle.base_url, event, token=handle.token or None, remaining_s=left
-            )
-        else:
-            # A continuation is another runner open for this logical opener.
-            # Serialize admission with normal starts/steers, and preserve the
-            # attempt's owner so the earlier stream cannot revoke a successor.
-            async with self._lock.hold(self._config.lock_key(attachment_turn.thread_key)):
-                if await self._turn_active(handle, remaining_s=2.0):
-                    raise RunnerError("the attachment continuation no longer owns an idle runner")
-                event = await attachment_access.with_attachment_access(
-                    self, event, handle, left, turn=attachment_turn
+        try:
+            try:
+                event, left = await self._bind_publication_context(
+                    event,
+                    queued_event_id=qevent.event_id,
+                    workspace_deployment_id=workspace_deployment_id,
+                    handle=handle,
+                    run=run,
+                    remaining_s=left,
                 )
-                turn = await self._runner.start_turn(
-                    handle.base_url, event, token=handle.token or None, remaining_s=left
-                )
-        if memory_grant is not None:
-            self._record_turn_deadline(memory_grant, left)
-        memory._note_live_memory_turn(turn)
-    except PullRequestNotAdopted as exc:
-        logger.info("work-item continuation refused for %s: %s", qevent.event_id, exc)
-        return failures.TurnOutcome(
-            terminal_ok=False,
-            saw_side_effect=outcome.saw_side_effect,
-            classification="pull-request-not-adopted",
-            error_message=str(exc),
-            tools_called=outcome.tools_called,
-            assistant_text=outcome.assistant_text,
-            continued=True,
-        )
-    except failures.ToolAccessUnenforced as exc:
-        logger.warning("work-item continuation refused for %s: %s", qevent.event_id, exc)
-        return failures.TurnOutcome(
-            terminal_ok=False,
-            saw_side_effect=outcome.saw_side_effect,
-            classification=constants.TOOL_ACCESS_UNENFORCED_CLASSIFICATION,
-            error_message=exc.public_detail,
-            tools_called=outcome.tools_called,
-            assistant_text=outcome.assistant_text,
-            continued=True,
-        )
-    except failures.ChannelReadUnenforced as exc:
-        logger.warning("work-item continuation refused for %s: %s", qevent.event_id, exc)
-        return failures.TurnOutcome(
-            terminal_ok=False,
-            saw_side_effect=outcome.saw_side_effect,
-            classification=constants.CHANNEL_READ_UNENFORCED_CLASSIFICATION,
-            error_message=exc.public_detail,
-            tools_called=outcome.tools_called,
-            assistant_text=outcome.assistant_text,
-            continued=True,
-        )
-    except (RunnerError, aiohttp.ClientError, TimeoutError) as exc:
-        # The agent never saw the prompt, so the ending is the runner's: the
-        # normal failure policy (retry, or escalate after a side effect)
-        # decides, not early_stop. A cancel that landed after the status
-        # read above stops the continuation instead (#4191).
-        status = await self._request_not_running(run)
-        if status is not None:
-            logger.info(
-                "work-item continuation stopped for %s: request %s", qevent.event_id, status
+                if event.tool_access is not None:
+                    # @spec WORKER-TOOL-ACCESS-2: the continuation opens a turn too.
+                    await self._require_tool_access(handle, event.tool_access, left)
+                # ADR-0188: the continuation opens a turn too, with its own
+                # credential, minted from the budget its stream is bound from.
+                event = self._with_memory_token(event, qevent, memory_grant, left)
+                # ADR 0100: and its own channel read open, as this attempt's owner, on
+                # the same logical turn (the queued event id is unchanged).
+                if channel_read_grant is not None:
+                    event = await self._with_channel_read(
+                        event, handle, left, grant=channel_read_grant, qevent=qevent
+                    )
+                if attachment_turn is None:
+                    turn = await self._runner.start_turn(
+                        handle.base_url, event, token=handle.token or None, remaining_s=left
+                    )
+                else:
+                    # A continuation is another runner open for this logical opener.
+                    # Serialize admission with normal starts/steers, and preserve the
+                    # attempt's owner so the earlier stream cannot revoke a successor.
+                    async with self._lock.hold(self._config.lock_key(attachment_turn.thread_key)):
+                        if await self._turn_active(handle, remaining_s=2.0):
+                            raise RunnerError(
+                                "the attachment continuation no longer owns an idle runner"
+                            )
+                        event = await attachment_access.with_attachment_access(
+                            self, event, handle, left, turn=attachment_turn
+                        )
+                        turn = await self._runner.start_turn(
+                            handle.base_url, event, token=handle.token or None, remaining_s=left
+                        )
+                if memory_grant is not None:
+                    self._record_turn_deadline(memory_grant, left)
+                memory._note_live_memory_turn(turn)
+            except BaseException:
+                if turn is not None:
+                    # Acceptance permits execution before any frame is consumed.
+                    # Close before awaiting persistence and conservatively latch the
+                    # retry fence; this does not claim an observed tool action.
+                    turn.close()
+                    outcome.saw_side_effect = True
+                    outcome.execution_uncertain = True
+                    lease = constants._DELIVERY_LEASE.get()
+                    if claim._is_fenced(lease):
+                        assert lease is not None
+                        await self._mark_side_effect_with_retry(
+                            qevent.event_id,
+                            delivery._StreamAccumulator(saw_side_effect=True),
+                            lease,
+                        )
+                    else:
+                        await self._markers.mark_side_effect(qevent.event_id)
+                raise
+        except PullRequestNotAdopted as exc:
+            logger.info("work-item continuation refused for %s: %s", qevent.event_id, exc)
+            return failures.TurnOutcome(
+                terminal_ok=False,
+                saw_side_effect=outcome.saw_side_effect,
+                classification="pull-request-not-adopted",
+                error_message=str(exc),
+                tools_called=outcome.tools_called,
+                assistant_text=outcome.assistant_text,
+                continued=True,
             )
-            return outcome
-        logger.warning(
-            "work-item continuation failed to start for %s",
-            qevent.event_id,
-            exc_info=True,
-        )
-        return failures.TurnOutcome(
-            terminal_ok=False,
-            saw_side_effect=outcome.saw_side_effect,
-            classification=("runner-timeout" if isinstance(exc, TimeoutError) else "runner-error"),
-            error_message=str(exc) or None,
-            tools_called=outcome.tools_called,
-            assistant_text=outcome.assistant_text,
-            continued=True,
-        )
-    routing._lifecycle_event("runner.turn.started", "continuation")
-    try:
+        except failures.ToolAccessUnenforced as exc:
+            logger.warning("work-item continuation refused for %s: %s", qevent.event_id, exc)
+            return failures.TurnOutcome(
+                terminal_ok=False,
+                saw_side_effect=outcome.saw_side_effect,
+                classification=constants.TOOL_ACCESS_UNENFORCED_CLASSIFICATION,
+                error_message=exc.public_detail,
+                tools_called=outcome.tools_called,
+                assistant_text=outcome.assistant_text,
+                continued=True,
+            )
+        except failures.ChannelReadUnenforced as exc:
+            logger.warning("work-item continuation refused for %s: %s", qevent.event_id, exc)
+            return failures.TurnOutcome(
+                terminal_ok=False,
+                saw_side_effect=outcome.saw_side_effect,
+                classification=constants.CHANNEL_READ_UNENFORCED_CLASSIFICATION,
+                error_message=exc.public_detail,
+                tools_called=outcome.tools_called,
+                assistant_text=outcome.assistant_text,
+                continued=True,
+            )
+        except (RunnerError, aiohttp.ClientError, TimeoutError) as exc:
+            # Preaccept failures retain normal retry policy. An accepted stream
+            # whose lock exit failed has already latched the no-retry fence above.
+            # A requested cancel stops the continuation instead (#4191).
+            status = await self._request_not_running(run)
+            if status is not None:
+                logger.info(
+                    "work-item continuation stopped for %s: request %s", qevent.event_id, status
+                )
+                return outcome
+            logger.warning(
+                "work-item continuation failed to start for %s",
+                qevent.event_id,
+                exc_info=True,
+            )
+            return failures.TurnOutcome(
+                terminal_ok=False,
+                saw_side_effect=outcome.saw_side_effect,
+                execution_uncertain=outcome.execution_uncertain,
+                classification=(
+                    "runner-timeout" if isinstance(exc, TimeoutError) else "runner-error"
+                ),
+                error_message=str(exc) or None,
+                tools_called=outcome.tools_called,
+                assistant_text=outcome.assistant_text,
+                continued=True,
+            )
+        routing._lifecycle_event("runner.turn.started", "continuation")
         second = await self._consume(
             qevent,
             route,
@@ -318,11 +353,12 @@ async def _continue_unpublished(
             handle=handle,
             workspace_inferred_repo=inferred,
         )
+        second.tools_called = outcome.tools_called | second.tools_called
+        second.saw_side_effect = outcome.saw_side_effect or second.saw_side_effect
+        second.continued = True
+        if not second.assistant_text.strip():
+            second.assistant_text = outcome.assistant_text
+        return second
     finally:
-        turn.close()
-    second.tools_called = outcome.tools_called | second.tools_called
-    second.saw_side_effect = outcome.saw_side_effect or second.saw_side_effect
-    second.continued = True
-    if not second.assistant_text.strip():
-        second.assistant_text = outcome.assistant_text
-    return second
+        if turn is not None:
+            turn.close()

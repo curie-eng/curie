@@ -269,3 +269,154 @@ def test_lazy_factory_continuation_cancellation_revokes_original_owner(make_harn
                 await asyncio.gather(task, return_exceptions=True)
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("exit_failure", ["lease-lost", "cancelled"])
+def test_lazy_continuation_lock_exit_closes_accepted_stream_and_blocks_retry(
+    make_harness, caplog, exit_failure
+):
+    from contextlib import asynccontextmanager
+
+    from aci_protocol import SideEffectFlag
+    from curie_worker.threadlock import LockLeaseLost
+
+    async def run():
+        async with make_harness(
+            binding=FactoryBinding(),
+            workspace_factory=_Workspace,
+            publication_creator=_PublicationApi(),
+            attachment_enabled=True,
+            attachment_mode="lazy",
+            internal_worker_token="worker",
+            max_attempts=3,
+        ) as h:
+            control = Control()
+            h.kernel._attachment_access = control
+            h.kernel._work_items = _WorkItems()
+            h.runner.attachment_access_enforced = True
+            h.runner.turn_scripts = [
+                list(ZERO_WORK_TURN),
+                [SideEffectFlag(tool="synthetic_write"), TextDelta(text="working")],
+            ]
+            hold = asyncio.Event()
+            original_context = control.context
+            contexts = 0
+
+            async def context(**body):
+                nonlocal contexts
+                contexts += 1
+                if contexts == 2:
+                    h.runner.hold = hold
+                return await original_context(**body)
+
+            control.context = context
+            real_start = h.kernel._runner.start_turn
+            releases = []
+
+            async def start(*args, **kwargs):
+                turn = await real_start(*args, **kwargs)
+                released = {"n": 0}
+                releases.append(released)
+                real_release = turn._response.release
+
+                def release():
+                    released["n"] += 1
+                    return real_release()
+
+                turn._response.release = release
+                return turn
+
+            h.kernel._runner.start_turn = start
+            real_lock = h.kernel._lock
+            exit_started = asyncio.Event()
+            unblock = asyncio.Event()
+
+            class ExitFaultLock:
+                opens = 0
+
+                def __getattr__(self, name):
+                    return getattr(real_lock, name)
+
+                @asynccontextmanager
+                async def hold(self, key):
+                    async with real_lock.hold(key) as lease:
+                        self.opens += 1
+                        this_open = self.opens
+                        yield lease
+                        if this_open == 2:
+                            exit_started.set()
+                            if exit_failure == "lease-lost":
+                                raise LockLeaseLost("continuation lock expired")
+                            await unblock.wait()
+
+            h.kernel._lock = ExitFaultLock()
+            event = _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
+            task = asyncio.create_task(h.kernel.process_event(event))
+            try:
+                await asyncio.wait_for(exit_started.wait(), 3)
+                if exit_failure == "cancelled":
+                    task.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await task
+                else:
+                    await asyncio.wait_for(task, 3)
+                assert len(releases) == 2
+                assert releases[1]["n"] >= 1
+                assert await h.kernel._markers.saw_side_effect(event.event_id)
+                assert len(h.runner.event_bodies) == 2
+                assert h.kernel._work_items.calls.count("acquire") == 1
+                if exit_failure == "lease-lost":
+                    escalations = [
+                        record.getMessage()
+                        for record in caplog.records
+                        if "escalating event" in record.getMessage()
+                    ]
+                    assert any("could not be confirmed" in text for text in escalations)
+                    assert all("after starting an action" not in text for text in escalations)
+                # A reclaimed delivery must also stop before another model open.
+                await h.kernel.process_event(event)
+                assert len(h.runner.event_bodies) == 2
+            finally:
+                unblock.set()
+                hold.set()
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(run())
+
+
+def test_lazy_continuation_preaccept_failure_keeps_retry_policy(make_harness):
+    from curie_worker.runner_client import RunnerError
+
+    async def run():
+        async with make_harness(
+            binding=FactoryBinding(),
+            workspace_factory=_Workspace,
+            publication_creator=_PublicationApi(),
+            attachment_enabled=True,
+            attachment_mode="lazy",
+            internal_worker_token="worker",
+            max_attempts=2,
+        ) as h:
+            h.kernel._attachment_access = Control()
+            h.kernel._work_items = _WorkItems()
+            h.runner.attachment_access_enforced = True
+            h.runner.turn_scripts = [list(ZERO_WORK_TURN), [_done("cannot complete")]]
+            original_start = h.kernel._runner.start_turn
+            calls = 0
+
+            async def start(*args, **kwargs):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise RunnerError("continuation refused before acceptance")
+                return await original_start(*args, **kwargs)
+
+            h.kernel._runner.start_turn = start
+            event = _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
+            await h.kernel.process_event(event)
+            assert calls >= 3
+            assert len(h.runner.event_bodies) >= 2
+            assert not await h.kernel._markers.saw_side_effect(event.event_id)
+
+    asyncio.run(run())
