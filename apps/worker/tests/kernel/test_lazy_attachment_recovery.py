@@ -255,7 +255,7 @@ def test_lazy_factory_continuation_cancellation_revokes_original_owner(make_harn
                         await asyncio.sleep(0.01)
                 task.cancel()
                 with pytest.raises(asyncio.CancelledError):
-                    await task
+                    await asyncio.wait_for(asyncio.shield(task), 3)
                 contexts = [body for op, body in control.calls if op == "context"]
                 revokes = [body for op, body in control.calls if op == "revoke"]
                 assert contexts[0]["owner"] == contexts[1]["owner"]
@@ -271,7 +271,7 @@ def test_lazy_factory_continuation_cancellation_revokes_original_owner(make_harn
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("exit_failure", ["lease-lost", "cancelled"])
+@pytest.mark.parametrize("exit_failure", ["lease-lost", "cancelled", "cancelled-marker-timeout"])
 def test_lazy_continuation_lock_exit_closes_accepted_stream_and_blocks_retry(
     make_harness, caplog, exit_failure
 ):
@@ -354,9 +354,21 @@ def test_lazy_continuation_lock_exit_closes_accepted_stream_and_blocks_retry(
             task = asyncio.create_task(h.kernel.process_event(event))
             try:
                 await asyncio.wait_for(exit_started.wait(), 3)
-                if exit_failure == "cancelled":
-                    task.cancel()
-                    with pytest.raises(asyncio.CancelledError):
+                if exit_failure.startswith("cancelled"):
+                    if exit_failure == "cancelled-marker-timeout":
+                        real_mark = h.kernel._markers.mark_side_effect
+
+                        async def mark_then_timeout(event_id):
+                            # Real persistence with a lost acknowledgement: its
+                            # timeout must not replace the pending cancellation.
+                            await real_mark(event_id)
+                            raise TimeoutError("marker acknowledgement timed out")
+
+                        h.kernel._markers.mark_side_effect = mark_then_timeout
+                    task.cancel("continuation cancelled at lock exit")
+                    with pytest.raises(
+                        asyncio.CancelledError, match="continuation cancelled at lock exit"
+                    ):
                         await task
                 else:
                     await asyncio.wait_for(task, 3)

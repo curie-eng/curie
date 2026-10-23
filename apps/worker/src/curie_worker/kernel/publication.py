@@ -264,7 +264,7 @@ async def _continue_unpublished(
                 if memory_grant is not None:
                     self._record_turn_deadline(memory_grant, left)
                 memory._note_live_memory_turn(turn)
-            except BaseException:
+            except BaseException as startup_error:
                 if turn is not None:
                     # Acceptance permits execution before any frame is consumed.
                     # Close before awaiting persistence and conservatively latch the
@@ -272,16 +272,27 @@ async def _continue_unpublished(
                     turn.close()
                     outcome.saw_side_effect = True
                     outcome.execution_uncertain = True
-                    lease = constants._DELIVERY_LEASE.get()
-                    if claim._is_fenced(lease):
-                        assert lease is not None
-                        await self._mark_side_effect_with_retry(
-                            qevent.event_id,
-                            delivery._StreamAccumulator(saw_side_effect=True),
-                            lease,
-                        )
-                    else:
-                        await self._markers.mark_side_effect(qevent.event_id)
+                    try:
+                        lease = constants._DELIVERY_LEASE.get()
+                        if claim._is_fenced(lease):
+                            assert lease is not None
+                            await self._mark_side_effect_with_retry(
+                                qevent.event_id,
+                                delivery._StreamAccumulator(saw_side_effect=True),
+                                lease,
+                            )
+                        else:
+                            await self._markers.mark_side_effect(qevent.event_id)
+                    except Exception:
+                        if isinstance(startup_error, asyncio.CancelledError):
+                            logger.warning(
+                                "continuation retry fence persistence failed during cancellation "
+                                "for %s",
+                                qevent.event_id,
+                                exc_info=True,
+                            )
+                            raise startup_error from None
+                        raise
                 raise
         except PullRequestNotAdopted as exc:
             logger.info("work-item continuation refused for %s: %s", qevent.event_id, exc)

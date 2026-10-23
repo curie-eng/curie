@@ -543,7 +543,7 @@ async def _route_and_start(
                 boots = await asyncio.to_thread(self._substrate.lookup, thread_key) is None
         if (
             not attachment_fresh_only
-            and not (self._config.attachment_enabled and self._config.attachment_mode == "lazy")
+            and constants._ATTACHMENT_ACCESS_TURN.get() is None
             and boots
             and not (
                 boot_env
