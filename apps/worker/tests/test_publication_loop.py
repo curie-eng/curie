@@ -394,6 +394,7 @@ async def test_timeout_recovery_stale_version_is_refused_by_real_api_crud_and_re
                     publication_id,
                     PublicationLineageAdvance.model_validate(lineage_requests[0]),
                     github_html_base="https://code.example",
+                    first_parent_proof=None,
                 )
             assert conflict.value.code == "publication.lease_lost"
         stored = await repro._read_row(engine, publication_id)
