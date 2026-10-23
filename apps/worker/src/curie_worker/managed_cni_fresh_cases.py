@@ -57,6 +57,14 @@ def _need(value: bool, reason: str = "trigger_unconfirmed") -> None:
         raise _Unavailable(reason)
 
 
+def _policy_binding(document: dict[str, Any]) -> dict[str, Any]:
+    # A typed Kubernetes list item may omit TypeMeta. Validate it when present,
+    # then retain every actual object field, including UID and resourceVersion.
+    _need(document.get("apiVersion", "networking.k8s.io/v1") == "networking.k8s.io/v1")
+    _need(document.get("kind", "NetworkPolicy") == "NetworkPolicy")
+    return {key: value for key, value in document.items() if key not in {"apiVersion", "kind"}}
+
+
 def _fresh_nonce(run: _Run) -> str:
     for _ in range(8):
         value = _nonce()
@@ -139,7 +147,7 @@ class _Case:
             assert uid is not None
             _need(item.get("metadata", {}).get("namespace") == self.run.layout.probe_namespace)
             _need(isinstance(item.get("spec"), dict))
-            out[uid] = item
+            out[uid] = _policy_binding(item)
         return out
 
     async def protected_shape(self) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -159,7 +167,8 @@ class _Case:
         assert items is not None
         current: dict[str, dict[str, Any]] = {}
         allowances, empty = [], []
-        for item in items:
+        for raw in items:
+            item = _policy_binding(raw)
             uid = _resource_uid(item)
             _need(uid is not None and uid not in current)
             assert uid is not None
@@ -268,7 +277,7 @@ class _Case:
             created.get("spec") == document["spec"]
             and meta.get("labels") == document["metadata"]["labels"]
         )
-        self.inventory[uid] = created
+        self.inventory[uid] = _policy_binding(created)
         await self.check_policies()
         return uid
 

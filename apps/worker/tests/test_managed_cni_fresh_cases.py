@@ -464,3 +464,43 @@ def test_unconfirmed_cleanup_stops_new_work_and_reports_every_required_entry() -
 def test_listener_delivery_is_not_erased_by_a_later_malformed_row() -> None:
     entries, _ = measure(FreshAPI(listener_leak=True, malformed_listener=True))
     assert entries and all(item.outcome == "fail" for item in entries)
+
+
+@pytest.mark.parametrize(
+    "type_meta", [{}, {"apiVersion": "networking.k8s.io/v1", "kind": "NetworkPolicy"}]
+)
+def test_policy_reobservation_accepts_optional_item_type_metadata(
+    type_meta: dict[str, str],
+) -> None:
+    # TypeMeta is optional in Kubernetes API responses, including typed list items:
+    # https://github.com/kubernetes/apimachinery/blob/v0.35.0/pkg/apis/meta/v1/types.go
+    class TypedListAPI(FreshAPI):
+        async def list_items(self, collection: str) -> list[dict[str, Any]]:
+            items = await super().list_items(collection)
+            if collection == "networkpolicies:probe-a":
+                for item in items:
+                    item.pop("apiVersion", None)
+                    item.pop("kind", None)
+                    item.update(type_meta)
+            return items
+
+    entries, active = measure(TypedListAPI())
+    assert all(item.outcome == "pass" for item in entries), active.evidence
+
+
+@pytest.mark.parametrize(
+    "type_meta", [{"apiVersion": "unexpected/v9"}, {"kind": "UnexpectedPolicy"}]
+)
+def test_policy_reobservation_refuses_conflicting_item_type_metadata(
+    type_meta: dict[str, str],
+) -> None:
+    class WrongTypeAPI(FreshAPI):
+        async def list_items(self, collection: str) -> list[dict[str, Any]]:
+            items = await super().list_items(collection)
+            if collection == "networkpolicies:probe-a":
+                for item in items:
+                    item.update(type_meta)
+            return items
+
+    entries, _ = measure(WrongTypeAPI())
+    assert all(item.outcome == "unavailable" for item in entries)
