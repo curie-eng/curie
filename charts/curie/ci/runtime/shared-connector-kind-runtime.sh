@@ -93,7 +93,11 @@ DRIVER="$REPO_ROOT/charts/curie/ci/runtime/shared-connector-kind-driver.py"
 
 RAW_RUN_ID="${RUN_ID:-$(date +%s)}"
 RUN_ID="$(tr -cd 'a-z0-9' <<<"${RAW_RUN_ID,,}")"
-RUN_ID="${RUN_ID: -16}"
+# Keep at most the last 16 characters. ${RUN_ID: -16} alone empties any
+# shorter id, so trim only when it is longer.
+if (( ${#RUN_ID} > 16 )); then
+  RUN_ID="${RUN_ID: -16}"
+fi
 [[ -n "$RUN_ID" ]] || { echo "FAIL RUN_ID has no usable characters" >&2; exit 1; }
 
 KIND_VERSION="v0.24.0"

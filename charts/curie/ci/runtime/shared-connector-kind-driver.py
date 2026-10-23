@@ -248,8 +248,15 @@ class Kube:
             raise Failure(f"kubectl {' '.join(args[:3])} failed: {done.stderr.strip()[:400]}")
         return done
 
-    def get(self, kind: str, name: str) -> dict[str, Any] | None:
-        done = self.run("get", kind, name, "-o", "json", check=False)
+    def get(self, kind: str, name: str, *, managed_fields: bool = False) -> dict[str, Any] | None:
+        """The live object, or None on NotFound.
+
+        kubectl strips metadata.managedFields from its output unless asked, so
+        a check that reads the field manager must pass ``managed_fields``.
+        """
+
+        flags = ["--show-managed-fields"] if managed_fields else []
+        done = self.run("get", kind, name, "-o", "json", *flags, check=False)
         if done.returncode == 0:
             result: dict[str, Any] = json.loads(done.stdout)
             return result
@@ -415,7 +422,13 @@ def field_diff(want: Any, live: Any, path: str = "") -> list[str]:
 
     Fields the API server defaults are ignored; lists must match in length and
     order. Resource quantities compare by value, because the API server
-    canonicalizes them (1000m reads back as 1).
+    canonicalizes them (1000m reads back as 1). A desired ``False`` or ``[]``
+    whose key the live object lacks is equal: the server drops those zero
+    values for non-pointer omitempty fields. In the frozen render that is
+    VolumeMount.readOnly (the proxy's resolver mount) and NetworkPolicy
+    spec.ingress (the deny policy); every other ``False`` there is a pointer
+    field and reads back, and emptyDir ``{}`` reads back too, so nothing
+    broader is excused.
     """
 
     if isinstance(want, dict):
@@ -424,6 +437,8 @@ def field_diff(want: Any, live: Any, path: str = "") -> list[str]:
         out: list[str] = []
         for key, value in want.items():
             if key not in live:
+                if value is False or (isinstance(value, list) and not value):
+                    continue
                 out.append(f"{path}.{key}: missing")
             else:
                 out += field_diff(value, live[key], f"{path}.{key}")
@@ -451,7 +466,7 @@ def applied_by_reconciler(live: dict[str, Any]) -> bool:
 
 
 def expect_applied(kube: Kube, desired: dict[str, Any], label: str) -> dict[str, Any]:
-    live = kube.get(desired["kind"].lower(), desired["metadata"]["name"])
+    live = kube.get(desired["kind"].lower(), desired["metadata"]["name"], managed_fields=True)
     if live is None:
         raise Failure(f"{label}: {desired['kind']}/{desired['metadata']['name']} was not applied")
     diffs = field_diff({k: desired[k] for k in ("metadata", "spec")}, live)
