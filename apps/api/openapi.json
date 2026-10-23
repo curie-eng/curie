@@ -676,6 +676,20 @@
         "title": "ActionUndoOut",
         "type": "object"
       },
+      "Active": {
+        "additionalProperties": false,
+        "properties": {
+          "active": {
+            "title": "Active",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "active"
+        ],
+        "title": "Active",
+        "type": "object"
+      },
       "Activity": {
         "additionalProperties": false,
         "properties": {
@@ -3507,6 +3521,30 @@
         "title": "CanvasTable",
         "type": "object"
       },
+      "Capability": {
+        "additionalProperties": false,
+        "properties": {
+          "expires_at": {
+            "title": "Expires At",
+            "type": "integer"
+          },
+          "lease_seconds": {
+            "title": "Lease Seconds",
+            "type": "integer"
+          },
+          "token": {
+            "title": "Token",
+            "type": "string"
+          }
+        },
+        "required": [
+          "token",
+          "expires_at",
+          "lease_seconds"
+        ],
+        "title": "Capability",
+        "type": "object"
+      },
       "ChannelAddress": {
         "additionalProperties": false,
         "properties": {
@@ -4626,6 +4664,65 @@
         "title": "ClusterMessageReplyPage",
         "type": "object"
       },
+      "Completed": {
+        "additionalProperties": false,
+        "properties": {
+          "sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Sha256",
+            "type": "string"
+          },
+          "size_bytes": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Size Bytes",
+            "type": "integer"
+          },
+          "transfer_id": {
+            "maxLength": 128,
+            "minLength": 32,
+            "title": "Transfer Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "transfer_id",
+          "sha256",
+          "size_bytes"
+        ],
+        "title": "Completed",
+        "type": "object"
+      },
+      "Completion": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "sha256": {
+            "title": "Sha256",
+            "type": "string"
+          },
+          "size_bytes": {
+            "title": "Size Bytes",
+            "type": "integer"
+          },
+          "status": {
+            "const": "complete",
+            "default": "complete",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "sha256",
+          "size_bytes"
+        ],
+        "title": "Completion",
+        "type": "object"
+      },
       "ConnectorManifests": {
         "description": "Kubernetes objects derived from a version's ``connectors.yaml``.\n\nThe API renders; the caller applies. Rendering is a pure function of the\nbundle plus the deployment context the caller supplies, so producing this\nneeds no cluster access and the API's read-only RBAC is untouched\n(ADR-0086, #1063).",
         "properties": {
@@ -4754,6 +4851,75 @@
           "expires_at"
         ],
         "title": "ConsoleSessionOut",
+        "type": "object"
+      },
+      "Context": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": {
+            "format": "uuid",
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "deployment_id": {
+            "format": "uuid",
+            "title": "Deployment Id",
+            "type": "string"
+          },
+          "event_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Event Id",
+            "type": "string"
+          },
+          "owner": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Owner",
+            "type": "string"
+          },
+          "route_generation": {
+            "minimum": 0.0,
+            "title": "Route Generation",
+            "type": "integer"
+          },
+          "sandbox_name": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Sandbox Name",
+            "type": "string"
+          },
+          "session_id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Session Id",
+            "type": "string"
+          },
+          "thread_key": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Thread Key",
+            "type": "string"
+          },
+          "ttl_s": {
+            "default": 3600,
+            "maximum": 3600.0,
+            "minimum": 1.0,
+            "title": "Ttl S",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "agent_id",
+          "thread_key",
+          "event_id",
+          "owner",
+          "deployment_id",
+          "session_id",
+          "sandbox_name",
+          "route_generation"
+        ],
+        "title": "Context",
         "type": "object"
       },
       "CostReport": {
@@ -6679,6 +6845,66 @@
         "title": "FactoryWake",
         "type": "object"
       },
+      "FileDescriptor": {
+        "additionalProperties": false,
+        "properties": {
+          "current": {
+            "title": "Current",
+            "type": "boolean"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "mime_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mime Type"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "sha256": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sha256"
+          },
+          "size_bytes": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Size Bytes"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "mime_type",
+          "size_bytes",
+          "sha256",
+          "current"
+        ],
+        "title": "FileDescriptor",
+        "type": "object"
+      },
       "FinishBody": {
         "properties": {
           "cause": {
@@ -7660,6 +7886,32 @@
         "title": "ListedTargets",
         "type": "object"
       },
+      "Listing": {
+        "additionalProperties": false,
+        "properties": {
+          "cursor": {
+            "anyOf": [
+              {
+                "maxLength": 36,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cursor"
+          },
+          "limit": {
+            "default": 50,
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Limit",
+            "type": "integer"
+          }
+        },
+        "title": "Listing",
+        "type": "object"
+      },
       "LoadPackConfig": {
         "description": "Rotating \"working...\" load lines for one agent. Mirrors the worker's\ncurie_worker.behaviorpacks.LoadPack (packs ride on agent config, not the\nfrozen ACI contract, so the shape is duplicated across the layers the way\nBudgetConfig mirrors the ACI Budget).",
         "properties": {
@@ -8249,6 +8501,42 @@
         "title": "ObservationNode",
         "type": "object"
       },
+      "Owner": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": {
+            "format": "uuid",
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "event_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Event Id",
+            "type": "string"
+          },
+          "owner": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Owner",
+            "type": "string"
+          },
+          "thread_key": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Thread Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "agent_id",
+          "thread_key",
+          "event_id",
+          "owner"
+        ],
+        "title": "Owner",
+        "type": "object"
+      },
       "OwnerLostBody": {
         "properties": {
           "owner": {
@@ -8267,6 +8555,35 @@
           "runtime_epoch"
         ],
         "title": "OwnerLostBody",
+        "type": "object"
+      },
+      "Page": {
+        "additionalProperties": false,
+        "properties": {
+          "files": {
+            "items": {
+              "$ref": "#/components/schemas/FileDescriptor"
+            },
+            "title": "Files",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          }
+        },
+        "required": [
+          "files",
+          "next_cursor"
+        ],
+        "title": "Page",
         "type": "object"
       },
       "PhaseDeclaration": {
@@ -10022,6 +10339,139 @@
         "title": "ReadArguments",
         "type": "object"
       },
+      "Reference": {
+        "additionalProperties": false,
+        "properties": {
+          "file_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "File Id",
+            "type": "string"
+          },
+          "mime_type": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mime Type"
+          },
+          "name": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "ordinal": {
+            "maximum": 1000.0,
+            "minimum": 0.0,
+            "title": "Ordinal",
+            "type": "integer"
+          },
+          "route_adapter": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Route Adapter"
+          },
+          "route_identity": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Route Identity",
+            "type": "string"
+          },
+          "route_kind": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Route Kind",
+            "type": "string"
+          },
+          "size_bytes": {
+            "anyOf": [
+              {
+                "maximum": 9.223372036854776e+18,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Size Bytes"
+          }
+        },
+        "required": [
+          "file_id",
+          "ordinal",
+          "name",
+          "route_kind",
+          "route_identity"
+        ],
+        "title": "Reference",
+        "type": "object"
+      },
+      "Registered": {
+        "additionalProperties": false,
+        "properties": {
+          "appended": {
+            "title": "Appended",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "appended"
+        ],
+        "title": "Registered",
+        "type": "object"
+      },
+      "Registration": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": {
+            "format": "uuid",
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "event_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Event Id",
+            "type": "string"
+          },
+          "refs": {
+            "items": {
+              "$ref": "#/components/schemas/Reference"
+            },
+            "maxItems": 1000,
+            "title": "Refs",
+            "type": "array"
+          },
+          "thread_key": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Thread Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "agent_id",
+          "thread_key",
+          "event_id",
+          "refs"
+        ],
+        "title": "Registration",
+        "type": "object"
+      },
       "RemediationBreakerClose": {
         "additionalProperties": false,
         "description": "Why an operator closes a breaker; exactly ``{\"reason\"}``.\n\n@spec AUTOMATED-REMEDIATION-11.",
@@ -10776,6 +11226,55 @@
           "target"
         ],
         "title": "RemediationVerifierRunStart",
+        "type": "object"
+      },
+      "Renewal": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": {
+            "format": "uuid",
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "current_event_id": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current Event Id"
+          },
+          "event_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Event Id",
+            "type": "string"
+          },
+          "owner": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Owner",
+            "type": "string"
+          },
+          "thread_key": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Thread Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "agent_id",
+          "thread_key",
+          "event_id",
+          "owner"
+        ],
+        "title": "Renewal",
         "type": "object"
       },
       "ReplyHandle": {
@@ -11738,6 +12237,21 @@
         "title": "ScheduleListOut",
         "type": "object"
       },
+      "Selection": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "title": "Selection",
+        "type": "object"
+      },
       "SettingConfig": {
         "description": "One declared user-editable runtime knob (mirrors behaviorpacks.Setting).",
         "properties": {
@@ -12697,6 +13211,22 @@
         "title": "ThreadResetState",
         "type": "object"
       },
+      "Ticket": {
+        "additionalProperties": false,
+        "properties": {
+          "ticket": {
+            "maxLength": 128,
+            "minLength": 32,
+            "title": "Ticket",
+            "type": "string"
+          }
+        },
+        "required": [
+          "ticket"
+        ],
+        "title": "Ticket",
+        "type": "object"
+      },
       "TipsPackConfig": {
         "description": "Rotating capability tips for one agent (mirrors behaviorpacks.TipsPack).\nSeparate from LoadPackConfig: a load line is what the agent is doing now, a\ntip advertises what it can do.",
         "properties": {
@@ -12813,6 +13343,22 @@
           "issue_id"
         ],
         "title": "TrackerIssueIn",
+        "type": "object"
+      },
+      "Transfer": {
+        "additionalProperties": false,
+        "properties": {
+          "transfer_id": {
+            "maxLength": 128,
+            "minLength": 32,
+            "title": "Transfer Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "transfer_id"
+        ],
+        "title": "Transfer",
         "type": "object"
       },
       "TurnAccepted": {
@@ -21487,6 +22033,240 @@
         ]
       }
     },
+    "/attachment-access/authorize": {
+      "post": {
+        "operationId": "authorize_attachment_access_authorize_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Attachment-Access",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Attachment-Access"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Selection"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FileDescriptor"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Authorize",
+        "tags": [
+          "attachment-access"
+        ]
+      }
+    },
+    "/attachment-access/completion": {
+      "post": {
+        "operationId": "completion_attachment_access_completion_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Attachment-Access",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Attachment-Access"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Transfer"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Completion"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Completion",
+        "tags": [
+          "attachment-access"
+        ]
+      }
+    },
+    "/attachment-access/fetch": {
+      "post": {
+        "operationId": "fetch_attachment_access_fetch_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Attachment-Access",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Attachment-Access"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Selection"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Fetch",
+        "tags": [
+          "attachment-access"
+        ]
+      }
+    },
+    "/attachment-access/list": {
+      "post": {
+        "operationId": "list_files_attachment_access_list_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Attachment-Access",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Attachment-Access"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Listing"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Files",
+        "tags": [
+          "attachment-access"
+        ]
+      }
+    },
     "/channel-canvas": {
       "post": {
         "operationId": "channel_canvas_channel_canvas_post",
@@ -26521,6 +27301,362 @@
         "summary": "Factory Status Card",
         "tags": [
           "factory-status"
+        ]
+      }
+    },
+    "/v1/internal/attachment-access/complete": {
+      "post": {
+        "operationId": "complete_v1_internal_attachment_access_complete_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Completed"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Completion"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Complete",
+        "tags": [
+          "internal-attachment-access"
+        ]
+      }
+    },
+    "/v1/internal/attachment-access/context": {
+      "post": {
+        "operationId": "context_v1_internal_attachment_access_context_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Context"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Capability"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Context",
+        "tags": [
+          "internal-attachment-access"
+        ]
+      }
+    },
+    "/v1/internal/attachment-access/redeem": {
+      "post": {
+        "operationId": "redeem_v1_internal_attachment_access_redeem_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Ticket"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Redeem V1 Internal Attachment Access Redeem Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Redeem",
+        "tags": [
+          "internal-attachment-access"
+        ]
+      }
+    },
+    "/v1/internal/attachment-access/register": {
+      "post": {
+        "operationId": "register_v1_internal_attachment_access_register_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Registration"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Registered"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Register",
+        "tags": [
+          "internal-attachment-access"
+        ]
+      }
+    },
+    "/v1/internal/attachment-access/renew": {
+      "post": {
+        "operationId": "renew_v1_internal_attachment_access_renew_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Renewal"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Active"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Renew",
+        "tags": [
+          "internal-attachment-access"
+        ]
+      }
+    },
+    "/v1/internal/attachment-access/revoke": {
+      "post": {
+        "operationId": "revoke_v1_internal_attachment_access_revoke_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Owner"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Active"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Revoke",
+        "tags": [
+          "internal-attachment-access"
         ]
       }
     },

@@ -2143,7 +2143,16 @@ worker:
     # not refuse). Gates agentSandbox.runner.attachments too; that key is only a
     # sandbox-side sub-gate and cannot turn the lane on by itself.
     enabled: false
-    # Per-file ceiling, enforced while streaming in the worker (nothing is
+    # Explicit opt-in. Lazy mode requires compatible API/worker/runner images.
+    mode: eager
+    broker:
+      port: 8093
+      maxConcurrent: 8
+      transferTimeoutSeconds: 300
+
+    # Legacy eager-only per-file ceiling. Lazy catalog entries and selected
+    # transfers ignore this policy; finite cache/resource capacity still applies.
+    # Enforced while streaming in the eager worker (nothing is
     # buffered past the crossing chunk) and again in the init container. A zero
     # is refused rather than read as "unlimited".
     maxFileBytes: 33554432
@@ -2153,7 +2162,8 @@ worker:
     # How long the parked bytes are retained so a redelivery of the same turn can
     # still fetch them. Swept by the worker's existing reap_orphans tick.
     retentionTtlSeconds: 3600
-    # ADR 0205 decision 7: every boot of a thread rebuilds the thread's whole
+    # Legacy eager-only budgets (ADR 0205 decision 7). Lazy catalogs do not
+    # filter by these byte budgets. In eager mode every boot rebuilds the thread's whole
     # file set, so it is bounded per thread, separately from the per-message
     # cap. Over either bound the newest files are kept and the omitted ones are
     # named to the agent. threadMaxBytes must fit

@@ -63,6 +63,7 @@ from .routers import (
     agents,
     approval_recovery,
     approvals,
+    attachment_access,
     bundles,
     channel_identities,
     channel_read,
@@ -590,6 +591,8 @@ def create_app() -> FastAPI:
     app.include_router(publication_code_host.router)
     app.include_router(work_item_issue.router)
     app.include_router(work_item_issue.internal_router)
+    app.include_router(attachment_access.router)
+    app.include_router(attachment_access.internal_router)
     app.include_router(channel_read.router)
     app.include_router(channel_read.internal_router)
     app.include_router(work_items.router)

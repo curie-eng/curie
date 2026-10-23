@@ -10,6 +10,7 @@ from ..approvals import (
     ApprovalReader,
     PublicationCreator,
 )
+from ..attachment_access_client import AttachmentAccessClient
 from ..attachments import (
     AttachmentCoordinator,
 )
@@ -81,6 +82,7 @@ class Kernel:
         workspace: WorkspaceClaimCoordinator | None = None,
         attachments: AttachmentCoordinator | None = None,
         attachment_ledger: ThreadAttachmentLedgerClient | None = None,
+        attachment_access: AttachmentAccessClient | None = None,
         killswitch: KillSwitch | None = None,
         approvals: ApprovalCreator | None = None,
         publication_creator: PublicationCreator | None = None,
@@ -147,6 +149,7 @@ class Kernel:
         # boot for a thread rebuilds the thread's whole file set from it, and a
         # file turn appends its files once they are installed.
         self._attachment_ledger = attachment_ledger
+        self._attachment_access = attachment_access
         self._killswitch = killswitch
         # The approval-record backend (#244). When absent (unwired tests, a
         # deployment without the API), an awaiting-approval run degrades to an

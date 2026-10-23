@@ -493,6 +493,7 @@ class DockerSandboxClient:
         bundle_max_members: int = DEFAULT_MAX_MEMBERS,
         workspace_limits: WorkspaceLimits | None = None,
         attachment_limits: AttachmentLimits | None = None,
+        attachment_cache_size_bytes: int = 512 * 1024 * 1024,
     ) -> None:
         self._image = image
         self._bundles = bundle_store
@@ -523,6 +524,9 @@ class DockerSandboxClient:
         # Staging is released once the Docker volumes have been seeded.
         self._attachment_dirs: dict[str, str] = {}
         self._attachment_limits = attachment_limits or AttachmentLimits()
+        if attachment_cache_size_bytes <= 0:
+            raise ValueError("attachment cache capacity must be positive")
+        self._attachment_cache_size_bytes = attachment_cache_size_bytes
 
     # -- claim lifecycle ------------------------------------------------------
 
@@ -602,7 +606,16 @@ class DockerSandboxClient:
                     env.get(WORKSPACE_SHA256_ENV, ""),
                 )
                 inputs.append(("claim-workspace", root, WORKSPACE_MOUNT_PATH, True))
-            if env.get(ATTACHMENTS_REF_ENV):
+            if env.get(BootEnv.env_key("attachment_access_enabled")) == "1":
+                # An empty writable claim-owned cache. No provider/object store
+                # read occurs while booting lazy mode. Existing seed/ownership
+                # fencing and cleanup apply to this named volume unchanged.
+                tmp = tempfile.mkdtemp(prefix="curie-attachments-")
+                cache_root = Path(tmp) / "attachments"
+                cache_root.mkdir(mode=0o700)
+                self._attachment_dirs[attempt] = tmp
+                inputs.append(("claim-attachments", str(cache_root), ATTACHMENTS_MOUNT_PATH, True))
+            elif env.get(ATTACHMENTS_REF_ENV):
                 try:
                     root = self._prepare_attachments(attempt, env[ATTACHMENTS_REF_ENV])
                 except _NoAttachments:
@@ -672,7 +685,17 @@ class DockerSandboxClient:
         volumes: list[tuple[str, str, str]] = []
         try:
             for component, _root, destination, writable in inputs:
-                volume, helper = self._allocate_input_volume(name, component, attempt=attempt)
+                volume, helper = self._allocate_input_volume(
+                    name,
+                    component,
+                    attempt=attempt,
+                    cache_capacity=(
+                        self._attachment_cache_size_bytes
+                        if component == "claim-attachments"
+                        and env.get(BootEnv.env_key("attachment_access_enabled")) == "1"
+                        else None
+                    ),
+                )
                 volumes.append((component, volume, helper))
                 mode = "rw" if writable else "ro"
                 args += ["-v", f"{volume}:{destination}:{mode}"]
@@ -988,7 +1011,9 @@ class DockerSandboxClient:
             del expected[_ATTEMPT_LABEL]
         return all(labels.get(key) == value for key, value in expected.items())
 
-    def _allocate_input_volume(self, name: str, component: str, *, attempt: str) -> tuple[str, str]:
+    def _allocate_input_volume(
+        self, name: str, component: str, *, attempt: str, cache_capacity: int | None = None
+    ) -> tuple[str, str]:
         volume = f"curie-input-{uuid.uuid4().hex}"
         helper = f"{volume}-seed"
         labels = [
@@ -996,8 +1021,20 @@ class DockerSandboxClient:
             for key, value in self._resource_labels(name, component, attempt).items()
             for argument in ("--label", f"{key}={value}")
         ]
+        capacity_options = (
+            []
+            if cache_capacity is None
+            else [
+                "--opt",
+                "type=tmpfs",
+                "--opt",
+                "device=tmpfs",
+                "--opt",
+                f"o=size={cache_capacity},uid=1000,gid=1000,mode=0700",
+            ]
+        )
         self._docker(
-            ["volume", "create", *labels, volume],
+            ["volume", "create", *labels, *capacity_options, volume],
             request_timeout_seconds=_DOCKER_CONTROL_TIMEOUT_S,
         )
         helper_id = self._docker(

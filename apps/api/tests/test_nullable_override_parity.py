@@ -93,6 +93,7 @@ KNOWN_BODY_MODULES = frozenset(
         "curie_api.schemas.approvals",
         "curie_api.schemas.channel_identities",
         "curie_api.schemas.channels",
+        "curie_api.schemas.attachment_access",
         "curie_api.schemas.channel_read",
         "curie_api.schemas.common",
         "curie_api.schemas.console",

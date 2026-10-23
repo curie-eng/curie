@@ -19,7 +19,7 @@ from ..reply_sink import (
 from ..turn_progress import (
     TurnProgressPlan,
 )
-from . import channel_read, hooks, memory
+from . import attachment_access, channel_read, hooks, memory
 
 logger = logging.getLogger(__name__)
 
@@ -584,3 +584,10 @@ _CHANNEL_READ_TURNS: ContextVar[channel_read._AttemptChannelRead | None] = Conte
 
 # Strong references to in-flight channel read revocations, like the above.
 _PENDING_CHANNEL_READ_CLOSES: set[asyncio.Task[None]] = set()
+
+_ATTACHMENT_ACCESS_TURN: ContextVar[attachment_access.AttachmentAccessTurn | None] = ContextVar(
+    "curie_attachment_access_turn", default=None
+)
+_ATTACHMENT_ACCESS_ATTEMPT: ContextVar[attachment_access.AttemptAttachmentAccess | None] = (
+    ContextVar("curie_attachment_access_attempt", default=None)
+)

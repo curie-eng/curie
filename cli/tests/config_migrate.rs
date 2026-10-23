@@ -2492,6 +2492,15 @@ const RESERVED_WITHOUT_MIGRATION: &[&str] = &[
     "CURIE_ACTION_EXECUTOR_MAX_CONCURRENT_SANDBOXES",
     "CURIE_ATTACHMENT_THREAD_MAX_BYTES",
     "CURIE_ATTACHMENT_THREAD_MAX_FILES",
+    // #5005 / ADR 0244: new chart-owned lazy settings have no released extraEnv source.
+    // Broker origins are derived from the private Service, not migrated into a values map.
+    "ATTACHMENT_BROKER_URL",
+    "ATTACHMENT_TRANSFER_TIMEOUT_SECONDS",
+    "CURIE_ATTACHMENT_BROKER_HOST",
+    "CURIE_ATTACHMENT_BROKER_MAX_CONCURRENT",
+    "CURIE_ATTACHMENT_BROKER_PORT",
+    "CURIE_ATTACHMENT_MODE",
+    "CURIE_ATTACHMENT_TRANSFER_TIMEOUT_SECONDS",
     "CURIE_REMEDIATION_ENABLED",
     // The ADR 0231 remediation authority is a chart-managed credential from introduction.
     "CURIE_REMEDIATION_AUTHORITY_KEY",

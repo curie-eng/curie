@@ -480,8 +480,8 @@ async def _process_event(
             # A targetless turn owns no card: it never paused for approval.
             await self._finalize_settled_card(qevent, route)
 
-        # Crash-safety: a prior attempt executed a side effect but never
-        # reached done (worker died mid-run). Do not auto-retry the action.
+        # Crash-safety: prior observed or unconfirmed execution latched the
+        # retry fence but never reached done. Do not auto-retry the action.
         if await self._markers.saw_side_effect(event_id):
             # This path is NOT silent: it is the one message a human most
             # needs to see. It runs before binding resolution, so it emits
@@ -503,7 +503,7 @@ async def _process_event(
             await self._escalate(
                 qevent,
                 route,
-                "A prior attempt started an action before the worker restarted; "
+                "A prior attempt may already have executed an action; "
                 "not retrying automatically. Flagging for a human.",
                 failure_class="prior-side-effect",
             )
@@ -1426,8 +1426,13 @@ async def _process_event(
                     failures._escalation_text(
                         qevent,
                         lead=failures._with_guidance(
-                            f"The run hit an error ({token}) after starting an action; "
-                            "not retrying automatically.",
+                            (
+                                "The runner accepted a continuation whose execution could not be "
+                                "confirmed; not retrying automatically."
+                                if outcome.execution_uncertain
+                                else f"The run hit an error ({token}) after starting an action; "
+                                "not retrying automatically."
+                            ),
                             token,
                             delivered_max_turns=(boot_env or {}).get(MAX_TURNS_ENV),
                         ),

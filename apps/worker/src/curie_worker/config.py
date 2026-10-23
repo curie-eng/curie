@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import os
 import socket
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from aci_protocol.service_config import (
     API_KEY_ENV,
@@ -1170,6 +1170,25 @@ class WorkerConfig(BaseSettings):
     # charts/curie/values.yaml worker.attachments.enabled, which also gates the
     # sandbox half, and pinned by test_config.py.
     attachment_enabled: bool = Field(default=False, validation_alias="CURIE_ATTACHMENT_ENABLED")
+    attachment_mode: Literal["eager", "lazy"] = Field(
+        default="eager", validation_alias="CURIE_ATTACHMENT_MODE"
+    )
+    attachment_cache_size_bytes: int = Field(
+        default=512 * 1024 * 1024, gt=0, validation_alias="CURIE_ATTACHMENT_CACHE_SIZE_BYTES"
+    )
+    attachment_broker_host: str = Field(
+        default="127.0.0.1", validation_alias="CURIE_ATTACHMENT_BROKER_HOST"
+    )
+    attachment_broker_port: int = Field(
+        default=8093, gt=0, le=65535, validation_alias="CURIE_ATTACHMENT_BROKER_PORT"
+    )
+    attachment_broker_max_concurrent: int = Field(
+        default=8, gt=0, validation_alias="CURIE_ATTACHMENT_BROKER_MAX_CONCURRENT"
+    )
+    attachment_transfer_timeout_seconds: int = Field(
+        default=300, gt=0, validation_alias="CURIE_ATTACHMENT_TRANSFER_TIMEOUT_SECONDS"
+    )
+
     attachment_max_file_bytes: int = Field(
         default=32 * 1024 * 1024,
         gt=0,
@@ -1199,6 +1218,18 @@ class WorkerConfig(BaseSettings):
     attachment_thread_prepare_timeout_seconds: float = Field(
         default=15.0, gt=0, validation_alias="CURIE_ATTACHMENT_THREAD_PREPARE_TIMEOUT_SECONDS"
     )
+
+    @model_validator(mode="after")
+    def validate_lazy_attachment_activation(self) -> WorkerConfig:
+        if self.attachment_enabled and self.attachment_mode == "lazy":
+            if self.fake_model:
+                raise ValueError(
+                    "lazy attachments require a real runner; fake-model runs stay offline"
+                )
+            if not self.internal_worker_token:
+                raise ValueError("lazy attachments require CURIE_INTERNAL_WORKER_TOKEN")
+        return self
+
     # Approval-gated publication runs only on the Kubernetes substrate. These
     # values shape the worker-owned Job; none are bundle inputs.
     publication_enabled: bool = Field(default=True, validation_alias="CURIE_PUBLICATION_ENABLED")
@@ -1595,6 +1626,9 @@ class WorkerConfig(BaseSettings):
         # can open before this one's owner has drained, and this owner must
         # not close the steers that joined the next turn.
         return f"{self.key_prefix}:memory-steer-turns:{agent_id}:{live_turn}"
+
+    def attachment_access_turn_key(self, thread_key: str) -> str:
+        return f"{self.key_prefix}:attachment-access:turn:{thread_key}"
 
     def channel_read_turn_key(self, thread_key: str) -> str:
         # The live channel read logical turn on one thread (ADR 0100, #2877):

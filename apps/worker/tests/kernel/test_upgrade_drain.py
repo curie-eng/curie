@@ -7,7 +7,7 @@ The incident this file is written against, in full:
               rolled together
     11:16:31  the REPLACEMENT worker reclaimed the delivery, saw the durable
               side-effect marker, and emitted the designed escalation --
-              "A prior attempt started an action before the worker restarted;
+              "A prior attempt may already have executed an action;
               not retrying automatically. Flagging for a human."
     11:16:41  that reply was delivered
 
@@ -76,11 +76,11 @@ _wait_until = functools.partial(wait_until, timeout=20.0, interval=0.02)
 
 DONE = SessionStatus.DONE
 
-# The escalation the incident produced, verbatim from ``Kernel._process_one``.
+# The current escalation for the unsafe state, emitted by the kernel.
 # Byte-identical on purpose: these tests assert the FAILURE is reproduced in the
 # control and absent after the fix, and a paraphrase would pass both ways.
 ESCALATION = (
-    "A prior attempt started an action before the worker restarted; "
+    "A prior attempt may already have executed an action; "
     "not retrying automatically. Flagging for a human."
 )
 

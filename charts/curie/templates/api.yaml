@@ -224,6 +224,12 @@ spec:
                 secretKeyRef:
                   name: {{ include "curie.secretName" . }}
                   key: remediationAuthorityKey
+            - name: ATTACHMENT_TRANSFER_TIMEOUT_SECONDS
+              value: {{ dig "broker" "transferTimeoutSeconds" 300 .Values.worker.attachments | quote }}
+            - name: ATTACHMENT_ACCESS_ENABLED
+              value: {{ and .Values.worker.attachments.enabled (eq (.Values.worker.attachments.mode | default "eager") "lazy") | quote }}
+            - name: ATTACHMENT_BROKER_URL
+              value: {{ printf "http://%s-attachment-broker:%v" (include "curie.fullname" .) (dig "broker" "port" 8093 .Values.worker.attachments) | quote }}
             - name: CURIE_INTERNAL_WORKER_TOKEN
               valueFrom:
                 secretKeyRef:

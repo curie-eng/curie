@@ -617,7 +617,7 @@ spec:
           resources:
             {{- toYaml $runner.resources | nindent 12 }}
         {{- end }}
-        {{- if $af.enabled }}
+        {{- if and $af.enabled (ne (.Values.worker.attachments.mode | default "eager") "lazy") }}
         {{/*
         Inbound channel attachments (#2567). The worker holds the channel bot
         token, downloads each referenced file, parks it in the private object
@@ -886,6 +886,10 @@ spec:
                   optional: false
             {{- end }}
             {{- end }}
+            {{- end }}
+            {{- if and .Values.worker.attachments.enabled (eq (.Values.worker.attachments.mode | default "eager") "lazy") }}
+            - name: CURIE_ATTACHMENT_ACCESS_ENABLED
+              value: "1"
             {{- end }}
             {{- if and $runner.fakeModel (not .Values.inference.deploy) }}
             - name: CURIE_FAKE_MODEL

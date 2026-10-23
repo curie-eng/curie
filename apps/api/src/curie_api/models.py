@@ -2412,6 +2412,89 @@ class ThreadAttachmentRef(Base):
     )
 
 
+class AttachmentCatalog(Base):
+    """A transcript-lifetime incarnation, including catalogs with no files."""
+
+    __tablename__ = "attachment_catalogs"
+    __table_args__ = (
+        UniqueConstraint("agent_id", "thread_key", name="uq_attachment_catalog_thread"),
+        Index("ix_attachment_catalog_expiry", "agent_id", "expires_at"),
+    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE")
+    )
+    thread_key: Mapped[str] = mapped_column(Text)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class AttachmentReference(Base):
+    """An unfetched or verified reference in a thread catalog (ADR 0244).
+
+    Keyed exactly like ``ThreadTranscript`` and removed with it
+    (``curie_api.thread_attachments``). Only the worker writes it, through the
+    internal routes. It records the channel's file id and the route it came
+    from, never an endpoint, a URL or bytes. ``seq`` is the arrival order;
+    ``disk_name`` is the stable public display basename, unique in the thread.
+    The runner chooses its own local cache path after verified completion.
+    """
+
+    __tablename__ = "attachment_references"
+    __table_args__ = (
+        UniqueConstraint(
+            "agent_id",
+            "binding_scope",
+            "thread_key",
+            "event_id",
+            "file_id",
+            name="uq_attachment_references_event_file",
+            postgresql_nulls_not_distinct=True,
+        ),
+        UniqueConstraint(
+            "agent_id",
+            "binding_scope",
+            "thread_key",
+            "disk_name",
+            name="uq_attachment_references_disk_name",
+            postgresql_nulls_not_distinct=True,
+        ),
+        Index(
+            "ix_attachment_references_thread_seq",
+            "agent_id",
+            "binding_scope",
+            "thread_key",
+            "seq",
+        ),
+        Index("ix_attachment_references_expires_at", "expires_at"),
+        # The orphan sweep runs on every transcript write, scoped to one agent.
+        Index("ix_attachment_references_agent_expires_at", "agent_id", "expires_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    seq: Mapped[int] = mapped_column(BigInteger, Identity(always=True))
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE")
+    )
+    binding_scope: Mapped[str | None] = mapped_column(Text, default=None)
+    thread_key: Mapped[str] = mapped_column(Text)
+    event_id: Mapped[str] = mapped_column(Text)
+    file_id: Mapped[str] = mapped_column(Text)
+    ordinal: Mapped[int] = mapped_column(Integer)
+    name: Mapped[str] = mapped_column(Text)
+    disk_name: Mapped[str] = mapped_column(Text)
+    mime_type: Mapped[str | None] = mapped_column(Text, default=None)
+    size_bytes: Mapped[int | None] = mapped_column(BigInteger, default=None)
+    sha256: Mapped[str | None] = mapped_column(Text, default=None)
+    version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    route_kind: Mapped[str] = mapped_column(Text)
+    route_adapter: Mapped[str | None] = mapped_column(Text, default=None)
+    route_identity: Mapped[str] = mapped_column(Text)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
 class ConsoleSession(Base):
     """One console login: the code that establishes it and the session it becomes.
 

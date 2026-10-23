@@ -59,6 +59,9 @@ PLATFORM_IDEMPOTENT_TOOLS: frozenset[str] = (
             "mcp__curie__report_progress",
             "mcp__curie__progress",
             "mcp__curie__get_issue",
+            # Catalog listing reads metadata only. Fetch is deliberately absent:
+            # it binds catalog integrity and publishes a local cache file.
+            "mcp__curie__list_attachments",
         }
     )
     | CHANNEL_READ_TOOL_NAMES
