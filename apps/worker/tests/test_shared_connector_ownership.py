@@ -45,6 +45,7 @@ from test_shared_connector_apply import (  # noqa: E402
     World,
     _required_valkey,
     archive,
+    assert_reach_equal_render,
     b64,
     bundle_files,
     cleanup,
@@ -660,3 +661,104 @@ def test_cutover_after_restart_prunes_in_the_following_pass(world: World) -> Non
     world.run_pass()
     assert retained <= _dedicated_deleted(world), sorted(retained - _dedicated_deleted(world))
     assert not retained & set(world.cluster.objects)
+
+
+# =============================================================================
+# Review r2: a terminating Deployment is never ready (CR2-1)
+# =============================================================================
+
+
+def _conditions(world: World, deployment: str) -> dict[str, str]:
+    listed = world.cluster._listed(world.cluster.objects[("Deployment", deployment)])
+    return {str(c["type"]): str(c["status"]) for c in listed["status"]["conditions"]}
+
+
+def test_terminating_shared_deployment_never_reads_ready(world: World) -> None:
+    """Redeclared while its Deployment is foreground-terminating and still Available.
+
+    The dedicated holder the agent replaces must survive until a Deployment
+    that is not terminating reports Available, and the pass after.
+    """
+
+    application_id = world.application()
+    holder = world.member(application_id)
+    world.converge(application_id)
+    shared_deployment = world.deployment_name(application_id)
+    world.cluster.set_status(shared_deployment, "available")
+    world.run_pass()
+    agent = world.agent()
+    world.deploy(agent, shared={})
+    world.run_pass()
+    retained = _dedicated_objects(world, agent[1], DEDICATED)
+    assert {kind for kind, _ in retained} >= {"Deployment", "Service"}, retained
+
+    # The last declaration goes: GC starts a foreground delete of the Deployment.
+    world.cluster.terminating.add(shared_deployment)
+    world.deploy(holder, shared={})
+    world.run_pass()
+    assert world.cluster.objects[("Deployment", shared_deployment)]["metadata"].get(
+        "deletionTimestamp"
+    )
+
+    # Redeclared by the agent switching its dedicated alias to the shared reference.
+    world.join(application_id, agent[0], (DEDICATED,))
+    switched = _deploy_connectors(world, agent, {DEDICATED: _shared_ref(application_id)})
+    world.assert_declared(switched, application_id)
+    shared = world.loop._shared
+    for number in range(2):
+        world.run_pass()
+        live = world.cluster.objects[("Deployment", shared_deployment)]
+        assert live["metadata"].get("deletionTimestamp"), number
+        assert _conditions(world, shared_deployment).get("Available") == "True", number
+        assert not shared.application_ready(application_id), number
+        _assert_retained(world, retained, f"terminating pass {number}")
+
+    # Recovery: the old Deployment is gone, a fresh one is applied and Available.
+    world.cluster.finish_termination(shared_deployment)
+    world.run_pass()
+    fresh = world.cluster.objects[("Deployment", shared_deployment)]
+    assert not fresh["metadata"].get("deletionTimestamp")
+    assert shared.application_ready(application_id)
+    _assert_retained(world, retained, "fresh Deployment first observed ready")
+    world.run_pass()
+    assert retained <= _dedicated_deleted(world), sorted(retained - _dedicated_deleted(world))
+    assert not retained & set(world.cluster.objects)
+
+
+# =============================================================================
+# Review r2: an alias that can never name a dedicated connector (CR2-3)
+# =============================================================================
+
+# Valid as a shared alias, but ``object_name`` refuses it: it would forge a
+# second ``-mcp-`` join, so no dedicated connector can ever carry this name.
+FORGING_ALIAS = "mcp-grafana"
+
+
+def test_alias_naming_no_dedicated_connector_is_reconciled(world: World) -> None:
+    from plugin_format.connector_render import AmbiguousObjectName, object_name
+
+    with pytest.raises(AmbiguousObjectName):
+        object_name(RELEASE, "agent", FORGING_ALIAS)
+    application_id = world.application()
+    agent = world.agent()
+    world.deploy(agent, shared={})
+    world.run_pass()
+    retained = _dedicated_objects(world, agent[1], DEDICATED)
+    assert {kind for kind, _ in retained} >= {"Deployment", "Service"}, retained
+    world.join(application_id, agent[0], (DEDICATED, FORGING_ALIAS))
+    switched = _deploy_connectors(
+        world,
+        agent,
+        {DEDICATED: _shared_ref(application_id), FORGING_ALIAS: _shared_ref(application_id)},
+    )
+    world.assert_declared(switched, application_id)
+
+    summary = world.run_pass()
+
+    assert summary.shared_unresolved == 0, "the agent was left unresolved"
+    # Reconciled: its application was ensured and its reach applied.
+    assert world.last_of("create", "Secret") == [key_secret_name(application_id)]
+    assert len(world.current_recipients(application_id)) == 1
+    assert_reach_equal_render(world, application_id, agent[0])
+    # Control: the normal alias in the same render is still retained while unready.
+    _assert_retained(world, retained, "unready, beside an alias naming no dedicated connector")

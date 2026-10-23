@@ -486,6 +486,10 @@ apply += tier
 shared = docs("shared-connector-networkpolicy.yaml")
 if not shared:
     sys.exit("shared-connector-networkpolicy.yaml rendered nothing with sharedConnectors.enabled")
+# The root deny-ingress (review r2): every shared application Pod stays
+# ingress-isolated even when its own rendered deny policy is gone.
+if not [d for d in shared if d["metadata"]["name"] == f"{full}-shared-app-deny-ingress"]:
+    sys.exit("shared-connector-networkpolicy.yaml rendered no shared-app-deny-ingress root policy")
 apply += shared
 for doc in apply:
     if doc["kind"] not in ("ValidatingAdmissionPolicy", "ValidatingAdmissionPolicyBinding"):

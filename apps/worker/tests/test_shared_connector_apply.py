@@ -241,8 +241,10 @@ class RecordedCluster:
        its ReplicaSets and Pods are gone (Kubernetes docs, "Garbage
        Collection", foreground cascading deletion). A Deployment named in
        ``terminating`` behaves that way until ``finish_termination``; any
-       other is gone at once, as one whose Pods were already gone. A delete
-       ``fail_delete`` selects raises ``ApiException`` 500.
+       other is gone at once, as one whose Pods were already gone. A
+       server-side apply to a terminating Deployment updates it and leaves
+       it terminating. A delete ``fail_delete`` selects raises
+       ``ApiException`` 500.
 
     The fake never reads what it stored back through any production
     serializer; tests compare its records with independently computed
@@ -306,6 +308,10 @@ class RecordedCluster:
             metadata["resourceVersion"] = (
                 old_meta["resourceVersion"] if unchanged else str(next(self._versions))
             )
+            # An apply to a terminating object leaves it terminating (item 7).
+            for server_field in ("deletionTimestamp", "finalizers"):
+                if server_field in old_meta:
+                    metadata[server_field] = copy.deepcopy(old_meta[server_field])
         else:
             metadata["uid"] = str(uuid.uuid4())
             metadata["creationTimestamp"] = "2026-10-23T00:00:00Z"

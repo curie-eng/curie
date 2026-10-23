@@ -49,6 +49,14 @@ Phases, each assertion printed as one PASS line:
    provider's unconfigured port, while a namespace peer reaches each of those
    listeners (so each refusal is the shared Pod's own egress); the generic
    connector is refused at Postgres.
+5b. The GC race: the chart's root <fullname>-shared-app-deny-ingress policy
+   is applied and empty; the shared Pod listens on its server container port
+   (in-Pod control). The application's own deny policy is deleted with
+   kubectl: a namespace peer is refused at the Service, the Pod's proxy port
+   and its server port while member A still reaches the Service. Then every
+   member ingress policy is deleted too: the peer is still refused on all
+   three. Pass 3b restores the deny and the reach, and both members reach
+   the Service again.
 6. Adoption: applications 2 and 3 are registered; the cluster admin
    pre-creates a valid key Secret for 2 and a malformed one for 3; agents C
    and D become members and deploy (asserted declared through the render
@@ -676,8 +684,13 @@ def worker_kubeconfig(run: Run, kube: Kube) -> Path:
 
 
 def probe_pod(
-    run: Run, name: str, labels: dict[str, str], port: int | None = None
+    run: Run,
+    name: str,
+    labels: dict[str, str],
+    port: int | None = None,
+    server_port: int | None = None,
 ) -> dict[str, Any]:
+    listeners = [p for p in (port, server_port) if p]
     container: dict[str, Any] = {
         "name": "probe",
         "image": run.image,
@@ -685,13 +698,18 @@ def probe_pod(
         "command": [
             "sh",
             "-c",
-            (f"httpd -p {port} -h /tmp; " if port else "") + "exec sleep 36000",
+            "".join(f"httpd -p {p} -h /tmp; " for p in listeners) + "exec sleep 36000",
         ],
     }
     if port:
         # Named like the frozen proxy container port, which the Service targets.
         container["ports"] = [{"name": "proxy", "containerPort": port, "protocol": "TCP"}]
         container["readinessProbe"] = {"tcpSocket": {"port": port}, "periodSeconds": 2}
+    if server_port:
+        # Named like the frozen server container port, which no Service targets.
+        container.setdefault("ports", []).append(
+            {"name": "server", "containerPort": server_port, "protocol": "TCP"}
+        )
     return {
         "apiVersion": "v1",
         "kind": "Pod",
@@ -926,7 +944,9 @@ async def scenario(run: Run, kube: Kube, api: Api, loop: Any, log: PassLog, agen
     template_labels = deployment["spec"]["template"]["metadata"]["labels"]
     outsider = str(uuid.uuid4())
     pods = {
-        "sck-shared-app": probe_pod(run, "sck-shared-app", template_labels, PROXY_PORT),
+        "sck-shared-app": probe_pod(
+            run, "sck-shared-app", template_labels, PROXY_PORT, spec1.server_port
+        ),
         "sck-runner-a": probe_pod(run, "sck-runner-a", run.runner_labels(agents.ids["a"])),
         "sck-runner-b": probe_pod(run, "sck-runner-b", run.runner_labels(agents.ids["b"])),
         "sck-runner-outsider": probe_pod(run, "sck-runner-outsider", run.runner_labels(outsider)),
@@ -1036,6 +1056,93 @@ async def scenario(run: Run, kube: Kube, api: Api, loop: Any, log: PassLog, agen
         expect_refused(
             kube, f"the shared Pod is refused at {what}", "sck-shared-app", ips[target], port
         )
+
+    # -- phase 5b: the GC race, ingress isolation held by the chart's root policy ----------
+    # Another reconciler's GC can delete an application's own policies while its
+    # Pods still run. The chart's <fullname>-shared-app-deny-ingress keeps every
+    # shared application Pod ingress-isolated regardless, so a namespace peer is
+    # refused even with the application's deny and every member ingress gone.
+    server_port = spec1.server_port
+    root_deny = kube.get("networkpolicy", f"{run.fullname}-shared-app-deny-ingress")
+    check(
+        root_deny is not None
+        and root_deny["spec"].get("policyTypes") == ["Ingress"]
+        and not root_deny["spec"].get("ingress"),
+        "the chart's root deny-ingress policy for shared application Pods is applied",
+    )
+    check(
+        kube.exec_ok("sck-shared-app", "nc", "-z", "-w", "3", "127.0.0.1", str(server_port)),
+        "control: the shared Pod listens on its server container port",
+    )
+    app_deny = by_kind[("NetworkPolicy", "deny")]["metadata"]["name"]
+    kube.run("delete", "networkpolicy", app_deny, "--wait=true")
+    check(kube.get("networkpolicy", app_deny) is None, "the application's deny policy is deleted")
+    for target, port, what in (
+        (service_ip, PROXY_PORT, "the shared Service port"),
+        (ips["sck-shared-app"], PROXY_PORT, "the shared Pod's proxy port"),
+        (ips["sck-shared-app"], server_port, "the shared Pod's server container port"),
+    ):
+        expect_refused(
+            kube,
+            f"application deny deleted: a namespace peer is refused at {what}",
+            "sck-peer",
+            target,
+            port,
+        )
+    expect_reach(
+        kube,
+        "application deny deleted: member runner A still reaches the shared Service",
+        "sck-runner-a",
+        service_ip,
+        PROXY_PORT,
+    )
+    # The GC race proper: no member ingress either, only the chart's root policy.
+    member_ingress = [
+        item["metadata"]["name"]
+        for letter in ("a", "b")
+        for item in kube.list("networkpolicy", reach_selector(run, agents.ids[letter]))
+        if "Ingress" in (item["spec"].get("policyTypes") or [])
+    ]
+    check(len(member_ingress) == 2, "each member has one reach ingress policy", str(member_ingress))
+    for name in member_ingress:
+        kube.run("delete", "networkpolicy", name, "--wait=true")
+    for target, port, what in (
+        (service_ip, PROXY_PORT, "the shared Service port"),
+        (ips["sck-shared-app"], PROXY_PORT, "the shared Pod's proxy port"),
+        (ips["sck-shared-app"], server_port, "the shared Pod's server container port"),
+    ):
+        expect_refused(
+            kube,
+            f"no application or member ingress policy: a namespace peer is refused at {what}",
+            "sck-peer",
+            target,
+            port,
+            settle=True,
+        )
+    summary, _ = await run_pass(loop, log, "pass 3b (restores the deleted policies)")
+    check(summary.failed == 0, "pass 3b reports no failure")
+    expect_applied(
+        kube, by_kind[("NetworkPolicy", "deny")], "pass 3b restored the application deny"
+    )
+    for letter in ("a", "b"):
+        for desired in render_member_reach(spec1, run.member(agents.ids[letter])):
+            role = desired["metadata"]["name"].rsplit("-", 1)[0].removeprefix("shared-")
+            expect_applied(kube, desired, f"pass 3b restored {letter.upper()}'s {role} reach")
+    for letter in ("a", "b"):
+        expect_reach(
+            kube,
+            f"after pass 3b member runner {letter.upper()} reaches the shared Service again",
+            f"sck-runner-{letter}",
+            service_ip,
+            PROXY_PORT,
+        )
+    expect_refused(
+        kube,
+        "after pass 3b a namespace peer is still refused at the shared Pod's server port",
+        "sck-peer",
+        ips["sck-shared-app"],
+        server_port,
+    )
 
     # -- phase 6: adoption -----------------------------------------------------------
     api.register(run, app2)

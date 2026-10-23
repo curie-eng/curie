@@ -31,6 +31,13 @@
 #      pods on 6379, or the grantStoreEgress ipBlocks with valkey.deploy=false;
 #      application egress is exactly the configured entries. Nothing else
 #      renders from the template.
+#   3b. On: <fullname>-shared-app-deny-ingress renders (review r2), selecting
+#      exactly the shared selector, policyTypes [Ingress], no ingress rule and
+#      no egress, labelled component shared-connector-root so no worker
+#      selector matches it. Absent with shared off (assertion 1). Negative
+#      controls: an added ingress rule, an Egress policy type, a selector
+#      without the Exists expression, the application component label, and
+#      the policy missing are each caught.
 #   4. On with the data tier off: the shared root policies still render and no
 #      data-tier policy does.
 #   5. Refused at render, naming sharedConnectors: a non-UUID or uppercase
@@ -308,14 +315,32 @@ def check_root(docs, release, fullname, mode, apps):
         d["metadata"]["name"]: d for d in docs
         if d.get("_file") == "shared-connector-networkpolicy.yaml"
     }
-    want = {f"{fullname}-shared-app-allow-dns", f"{fullname}-shared-app-allow-grant-store"}
+    deny_name = f"{fullname}-shared-app-deny-ingress"
+    want = {
+        f"{fullname}-shared-app-allow-dns",
+        f"{fullname}-shared-app-allow-grant-store",
+        deny_name,
+    }
     want |= {f"{fullname}-shared-{app}-allow-egress" for app in apps}
     if set(rendered) != want:
         errors.append(f"shared root policies are {sorted(rendered)}, want {sorted(want)}")
         return errors
     for name, doc in rendered.items():
+        component = ((doc.get("metadata") or {}).get("labels") or {}).get(
+            "app.kubernetes.io/component"
+        )
+        if component != "shared-connector-root":
+            errors.append(f"{name}: component label {component!r}, want shared-connector-root")
         if doc.get("kind") != "NetworkPolicy":
             errors.append(f"{name} is a {doc.get('kind')}")
+        elif name == deny_name:
+            spec = doc["spec"]
+            if not select_shared(doc, release):
+                errors.append(f"{name}: selects {spec.get('podSelector')!r}")
+            if spec.get("policyTypes") != ["Ingress"]:
+                errors.append(f"{name}: policyTypes {spec.get('policyTypes')!r}, want ['Ingress']")
+            if spec.get("ingress") not in (None, []) or "egress" in spec:
+                errors.append(f"{name}: must allow no ingress and carry no egress")
         elif doc["spec"].get("policyTypes") != ["Egress"] or "ingress" in doc["spec"]:
             errors.append(f"{name}: must be Egress only, got {doc['spec'].get('policyTypes')!r}")
     runner_dns = [
@@ -472,6 +497,35 @@ def main():
                 post[0]["from"][0]["podSelector"].pop("matchExpressions", None)
             if not check_data_tier(mutated, off_docs, release, fullname):
                 errors.append(f"negative control not caught: {label}")
+    elif mode == "rootcontrols":
+        errors = []
+        deny_name = f"{fullname}-shared-app-deny-ingress"
+        if check_root(docs, release, fullname, "valkey", {}):
+            errors.append("root controls need a passing render first")
+        for label, change in (
+            ("an ingress rule on the root deny", "rule"),
+            ("an Egress policy type on the root deny", "egress"),
+            ("the root deny without the Exists expression", "exists"),
+            ("the root deny labelled with the application component", "component"),
+            ("the root deny missing", "missing"),
+        ):
+            if errors:
+                break
+            mutated = copy.deepcopy(docs)
+            (deny,) = [d for d in mutated if d["metadata"]["name"] == deny_name]
+            spec = deny["spec"]
+            if change == "rule":
+                spec["ingress"] = [{"from": [{"podSelector": {}}]}]
+            elif change == "egress":
+                spec["policyTypes"] = ["Ingress", "Egress"]
+            elif change == "exists":
+                spec["podSelector"].pop("matchExpressions", None)
+            elif change == "component":
+                deny["metadata"]["labels"]["app.kubernetes.io/component"] = COMPONENT
+            else:
+                mutated.remove(deny)
+            if not check_root(mutated, release, fullname, "valkey", {}):
+                errors.append(f"negative control not caught: {label}")
     else:
         raise SystemExit(f"unknown mode {mode!r}")
     for error in errors:
@@ -499,6 +553,8 @@ check on "$ON_OUT" "$OFF_OUT" "${APP_A},10.20.0.7/32,443" "${APP_B},10.30.0.0/24
   || fail "assertions 2 and 3 (valkey in chart)"
 check novalkey "$NOVALKEY_OUT" || fail "assertion 3 (valkey.deploy=false with grantStoreEgress)"
 check controls "$ON_OUT" "$OFF_OUT" || fail "assertion 2 negative controls"
+check rootcontrols "$NOTIER_OUT" || fail "assertion 3b negative controls"
+echo "  ok: the root deny-ingress selects every shared application Pod of this release and admits nothing; its negative controls are caught"
 echo "  ok: Postgres and Valkey admit only shared Pods of this release on their own port; DNS, grant-store and per-application egress select only shared Pods"
 
 echo "=== Assertion 4: the root policies do not depend on the data tier ==="
