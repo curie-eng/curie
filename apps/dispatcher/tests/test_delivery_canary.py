@@ -10,9 +10,13 @@ import json
 import logging
 from collections.abc import Callable, Iterator
 
+import httpx
 import pytest
 import redis
+from curie_dispatcher import identity as identity_module
+from curie_dispatcher.app import _stop_session_runner
 from curie_dispatcher.config import DispatcherConfig
+from curie_dispatcher.identity import IdentityResolveClient
 from curie_dispatcher.relevance import DROP_RATIONALES, DropReason
 from curie_telemetry import build_resource, configure_meter_provider
 from curie_telemetry import metrics as telemetry_metrics
@@ -30,6 +34,8 @@ from .test_inbound_relevance import (
     _mention,
     _stream_entries,
 )
+from .test_test_actions import DRIVER
+from .test_test_actions import _configured as _driver_configured
 
 _CANARY = "curie.slack.delivery_canary"
 _CANARY_CHANNEL = "C0EXAMPLE1"
@@ -128,6 +134,100 @@ def test_a_threaded_canary_mention_is_still_a_canary(
     harness.handler.handle(harness.sock, _events_api_request("env-t", "Ev-t", event))
     _drain(harness.app)
 
+    assert _drop_reasons_logged(harness.records) == [DropReason.DELIVERY_CANARY]
+    assert canaries() == {"default": 1}
+
+
+@pytest.mark.parametrize("canary", [True, False], ids=["canary", "ordinary-mention"])
+def test_a_canary_never_submits_a_principal_lookup(
+    redis_client: redis.Redis,
+    config: DispatcherConfig,
+    admission_api: FakeAdmissionApi,
+    canaries: Counts,
+    monkeypatch: pytest.MonkeyPatch,
+    canary: bool,
+) -> None:
+    """Global principal middleware must skip canaries while retaining ordinary lookups."""
+    config = _configured(config, monkeypatch, [_CANARY_CHANNEL])
+    requests: list[httpx.Request] = []
+
+    def api(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"status": "unresolved", "reason": "unknown_user"})
+
+    with httpx.Client(transport=httpx.MockTransport(api)) as http:
+        lookup = IdentityResolveClient("http://api.example.com", "example-key", client=http)
+        monkeypatch.setattr(
+            "curie_dispatcher.handlers.build_identity_client", lambda _config: lookup
+        )
+        harness = _build_harness(config, redis_client)
+        event = _mention(text="<@U0BOT> delivery canary")
+        event["channel"] = _CANARY_CHANNEL if canary else "C0EXAMPLE2"
+        try:
+            harness.handler.handle(
+                harness.sock, _events_api_request("env-lookup", "Ev-lookup", event)
+            )
+            _drain(harness.app)
+        finally:
+            # shutdown_identity_lookups cancels queued work without waiting.
+            # Drain the production pool first so an empty request list proves
+            # no lookup was submitted, rather than winning a scheduling race.
+            identity_module._shared_pool().shutdown(wait=True)
+            identity_module.shutdown_identity_lookups()
+            harness.handler.close()
+            _stop_session_runner(harness.handler.client)
+
+    assert harness.errors == []
+    assert harness.sock.acked_envelope_ids == ["env-lookup"]
+    if canary:
+        assert requests == []
+        assert admission_api.requests == []
+        assert _stream_entries(redis_client, config) == []
+        assert redis_client.exists(config.dedupe_key("Ev-lookup")) == 0
+        assert harness.web_client.chat_postMessage.call_count == 0  # type: ignore[attr-defined]
+        assert _drop_reasons_logged(harness.records) == [DropReason.DELIVERY_CANARY]
+        assert canaries() == {"default": 1}
+    else:
+        assert [(request.method, request.url.path) for request in requests] == [
+            ("POST", "/identity/resolve")
+        ]
+        assert len(_stream_entries(redis_client, config)) == 1
+        assert canaries() == {}
+
+
+def test_a_driver_approval_canary_bypasses_admission_even_during_an_outage(
+    redis_client: redis.Redis,
+    config: DispatcherConfig,
+    admission_api: FakeAdmissionApi,
+    canaries: Counts,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pre-ack ownership middleware must not intercept a canary approval reply."""
+    config = _driver_configured(_configured(config, monkeypatch, [_CANARY_CHANNEL]))
+    admission_api.down = True
+    harness = _build_harness(config, redis_client)
+    event = _mention(
+        text="<@U0BOT> [test action] approve 00000000-0000-4000-8000-000000000135",
+        bot_id=DRIVER.bot_id,
+        thread_ts="1600.0001",
+    )
+    event["channel"] = _CANARY_CHANNEL
+    try:
+        harness.handler.handle(
+            harness.sock, _events_api_request("env-driver-canary", "Ev-driver-canary", event)
+        )
+        _drain(harness.app)
+    finally:
+        harness.handler.close()
+        _stop_session_runner(harness.handler.client)
+
+    assert harness.errors == []
+    assert harness.sock.acked_envelope_ids == ["env-driver-canary"]
+    assert admission_api.requests == []
+    assert _stream_entries(redis_client, config) == []
+    assert redis_client.exists(config.dedupe_key("Ev-driver-canary")) == 0
+    assert harness.web_client.chat_postMessage.call_count == 0  # type: ignore[attr-defined]
+    assert harness.web_client.conversations_replies.call_count == 0  # type: ignore[attr-defined]
     assert _drop_reasons_logged(harness.records) == [DropReason.DELIVERY_CANARY]
     assert canaries() == {"default": 1}
 
