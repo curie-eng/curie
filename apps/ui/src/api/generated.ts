@@ -5654,6 +5654,8 @@ export interface components {
             owner: string;
             /** Reason */
             reason: string;
+            /** Start Failure Detail */
+            start_failure_detail?: string | null;
         };
         /** DeploymentCreate */
         DeploymentCreate: {
@@ -9541,6 +9543,8 @@ export interface components {
             execution_deadline: string | null;
             /** Last Deferral Reason */
             last_deferral_reason: string | null;
+            /** Last Start Failure Detail */
+            last_start_failure_detail: string | null;
             /** Sequence */
             sequence: number;
             /** Started At */

@@ -1668,6 +1668,7 @@ def _defer_start(request_id: uuid.UUID, times: int) -> None:
                         generation=generation,
                         reason="not_started:classified_failure",
                         capacity=False,
+                        start_failure_detail=None,
                     )
                     assert not isinstance(deferred, DispatchConflict), deferred
         finally:

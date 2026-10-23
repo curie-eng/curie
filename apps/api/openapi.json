@@ -4879,6 +4879,17 @@
             "minLength": 1,
             "title": "Reason",
             "type": "string"
+          },
+          "start_failure_detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Start Failure Detail"
           }
         },
         "required": [
@@ -13738,6 +13749,17 @@
             ],
             "title": "Last Deferral Reason"
           },
+          "last_start_failure_detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Start Failure Detail"
+          },
           "sequence": {
             "title": "Sequence",
             "type": "integer"
@@ -13816,7 +13838,8 @@
           "terminal_cause",
           "termination_observation",
           "capacity_deferrals",
-          "last_deferral_reason"
+          "last_deferral_reason",
+          "last_start_failure_detail"
         ],
         "title": "WorkItemRequestOut",
         "type": "object"

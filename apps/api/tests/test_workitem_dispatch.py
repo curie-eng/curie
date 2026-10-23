@@ -566,6 +566,7 @@ def test_defer_preserves_deadline_version_start_and_attempts(
             generation=1,
             reason="thread_busy",
             capacity=False,
+            start_failure_detail=None,
         )
         after_busy = await _request_row(session, facts.request_id)
         assert after_busy.wait_deadline == before.wait_deadline
@@ -595,6 +596,7 @@ def test_defer_preserves_deadline_version_start_and_attempts(
             generation=after_busy.dispatch_generation,
             reason="capacity",
             capacity=True,
+            start_failure_detail=None,
         )
         after_capacity = await _request_row(session, facts.request_id)
         assert after_capacity.wait_deadline == before.wait_deadline
@@ -1553,6 +1555,7 @@ async def _acquire_and_defer(
     *,
     reason: str,
     capacity: bool,
+    start_failure_detail: str | None = None,
 ) -> tuple[Any, datetime, datetime]:
     """Acquire the current generation, defer it, and bracket the defer's clock."""
 
@@ -1574,6 +1577,7 @@ async def _acquire_and_defer(
         generation=row.dispatch_generation,
         reason=reason,
         capacity=capacity,
+        start_failure_detail=start_failure_detail,
     )
     after = await _now(session)
     assert getattr(result, "code", None) is None, result
@@ -1647,6 +1651,7 @@ def test_fifth_start_deferral_fails_the_request_as_start_failed(
             generation=row.dispatch_generation,
             reason="not_started:classified_failure",
             capacity=False,
+            start_failure_detail=None,
         )
         assert _code(again) == "not_dispatchable"
         reacquired = await acquire(
@@ -1897,6 +1902,634 @@ def test_http_defer_reports_start_failed_on_the_fifth_start_deferral(
     )
     assert refused.status_code == 409, refused.text
     assert _http_code(refused) == "not_dispatchable"
+
+
+# --- #4930: the pre-start workspace diagnostic survives later waits --------
+
+ARCHIVE_DETAIL = "workspace archive-size failed: archive exceeds 1048576 bytes"
+NEWER_DETAIL = "workspace clone failed: remote ended the stream early"
+IGNORED_DETAIL = "workspace upload failed: this detail must never be stored"
+# Redactor facts this block relies on (packages/telemetry/src/curie_telemetry/
+# redact.py): the ``github_pat`` rule matches ``gh[pousr]_`` followed by at
+# least 20 ``[A-Za-z0-9]`` characters, and ``_placeholder`` renders its marker
+# as ``[REDACTED:github_pat]``.
+GITHUB_PAT = "ghp_" + "A" * 36
+PAT_MARKER = "[REDACTED:github_pat]"
+_OMIT = object()
+
+
+async def _start_failure_detail(session: AsyncSession, request_id: uuid.UUID) -> str | None:
+    value = await session.scalar(
+        text("SELECT last_start_failure_detail FROM curie.execution_requests WHERE id = :id"),
+        {"id": request_id},
+    )
+    assert value is None or isinstance(value, str)
+    return value
+
+
+async def _admitted(
+    session: AsyncSession, *, agent_id: uuid.UUID | None = None, issue_number: int = 4930
+) -> Admission:
+    if agent_id is None:
+        agent_id = await _agent_with_channel(session)
+    facts = _facts(agent_id, issue_number=issue_number)
+    await admit(session, facts)
+    return facts
+
+
+async def _acquired(
+    session: AsyncSession, request_id: uuid.UUID, *, owner: str = OWNER
+) -> AcquireGrant:
+    row = await _start_row(session, request_id)
+    granted = await acquire(
+        session,
+        request_id,
+        owner=owner,
+        generation=row.dispatch_generation,
+        wake=await factory_wake(session, request_id),
+        context=None,
+    )
+    assert isinstance(granted, AcquireGrant), granted
+    return granted
+
+
+def _http_admitted(client: TestClient, auth_headers: dict[str, str]) -> str:
+    created = client.post(
+        "/agents",
+        json={
+            "name": f"acme-bot-{uuid.uuid4().hex[:8]}",
+            "channel": {"kind": "slack", "address": ADDRESS},
+            "repo_full_name": REPO,
+        },
+        headers=auth_headers,
+    )
+    assert created.status_code == 201, created.text
+    facts = _facts(UUID(created.json()["id"]), issue_number=4930)
+    admitted = client.post(
+        f"{INTERNAL_PREFIX}/admissions", json=_facts_json(facts), headers=WORKER_HEADERS
+    )
+    assert admitted.status_code == 200, admitted.text
+    return str(admitted.json()["request"]["id"])
+
+
+def _http_view(client: TestClient, request_id: str) -> dict[str, Any]:
+    viewed = client.get(f"{INTERNAL_PREFIX}/requests/{request_id}", headers=WORKER_HEADERS)
+    assert viewed.status_code == 200, viewed.text
+    view = viewed.json()
+    assert isinstance(view, dict)
+    return view
+
+
+def _http_acquire_and_defer(
+    client: TestClient,
+    request_id: str,
+    *,
+    reason: str,
+    capacity: bool,
+    detail: object = _OMIT,
+) -> dict[str, Any]:
+    """Acquire the current generation over HTTP and defer it.
+
+    ``detail=_OMIT`` sends the body an older worker sends: no
+    ``start_failure_detail`` key at all.
+    """
+
+    generation = _http_view(client, request_id)["dispatch_generation"]
+    acquired = client.post(
+        f"{INTERNAL_PREFIX}/requests/{request_id}/acquire",
+        json=_acquire_body(generation),
+        headers=WORKER_HEADERS,
+    )
+    assert acquired.status_code == 200, acquired.text
+    payload: dict[str, Any] = {
+        "owner": OWNER,
+        "generation": generation,
+        "reason": reason,
+        "capacity": capacity,
+    }
+    if detail is not _OMIT:
+        payload["start_failure_detail"] = detail
+    deferred = client.post(
+        f"{INTERNAL_PREFIX}/requests/{request_id}/defer", json=payload, headers=WORKER_HEADERS
+    )
+    assert deferred.status_code == 200, deferred.text
+    body = deferred.json()
+    assert isinstance(body, dict)
+    return body
+
+
+def _stored_detail(request_id: str) -> str | None:
+    return with_session(lambda session: _start_failure_detail(session, UUID(request_id)))
+
+
+def test_http_defer_stores_a_redacted_clipped_start_failure_detail(
+    dispatch_client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    """Redaction runs BEFORE the 2000-char clip (#4930 R7).
+
+    The token straddles the bound. Clip-first would keep ``ghp_`` plus 15
+    ``A``s, under the 20-char minimum, so the redactor would no longer match
+    it and the stored value would carry a token prefix.
+    """
+
+    request_id = _http_admitted(dispatch_client, auth_headers)
+    raw = "a" * 1980 + " " + GITHUB_PAT + " " + "b" * 200
+    _http_acquire_and_defer(
+        dispatch_client,
+        request_id,
+        reason="not_started:classified_failure",
+        capacity=False,
+        detail=raw,
+    )
+    stored = _stored_detail(request_id)
+    assert isinstance(stored, str)
+    assert len(stored) <= 2000
+    assert stored.startswith("a" * 1980 + " [REDACTED:")
+    assert "ghp_" not in stored
+    assert "A" * 10 not in stored
+    # The tail past the bound is gone (the marker itself may be cut).
+    assert "b" * 10 not in stored
+    view = _http_view(dispatch_client, request_id)
+    assert view["last_start_failure_detail"] == stored
+    assert view["status"] == "waiting"
+    assert view["last_deferral_reason"] == "not_started:classified_failure"
+
+
+def test_http_defer_stores_the_full_redaction_marker_inside_the_bound(
+    dispatch_client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    request_id = _http_admitted(dispatch_client, auth_headers)
+    raw = f"  {ARCHIVE_DETAIL};\n\ttoken {GITHUB_PAT}   tail  \n"
+    _http_acquire_and_defer(
+        dispatch_client,
+        request_id,
+        reason="not_started:classified_failure",
+        capacity=False,
+        detail=raw,
+    )
+    expected = f"{ARCHIVE_DETAIL}; token {PAT_MARKER} tail"
+    assert _stored_detail(request_id) == expected
+    assert _http_view(dispatch_client, request_id)["last_start_failure_detail"] == expected
+
+
+@pytest.mark.parametrize(
+    "blank", [_OMIT, None, "", "   \n\t "], ids=["omitted", "null", "empty", "whitespace"]
+)
+def test_blank_start_failure_detail_is_not_stored(
+    dispatch_client: TestClient, auth_headers: dict[str, str], blank: object
+) -> None:
+    """A blank or absent detail stores nothing and keeps the previous one.
+
+    ``omitted`` is the body a worker from before #4930 sends.
+    """
+
+    fresh = _http_admitted(dispatch_client, auth_headers)
+    _http_acquire_and_defer(
+        dispatch_client,
+        fresh,
+        reason="not_started:classified_failure",
+        capacity=False,
+        detail=blank,
+    )
+    assert _stored_detail(fresh) is None
+    view = _http_view(dispatch_client, fresh)
+    assert view["last_start_failure_detail"] is None
+    assert view["last_deferral_reason"] == "not_started:classified_failure"
+
+    # Liveness: a real detail on the next start deferral IS stored, and a
+    # blank one after it leaves it in place.
+    _http_acquire_and_defer(
+        dispatch_client,
+        fresh,
+        reason="not_started:classified_failure",
+        capacity=False,
+        detail=ARCHIVE_DETAIL,
+    )
+    assert _stored_detail(fresh) == ARCHIVE_DETAIL
+    _http_acquire_and_defer(
+        dispatch_client,
+        fresh,
+        reason="not_started:classified_failure",
+        capacity=False,
+        detail=blank,
+    )
+    assert _stored_detail(fresh) == ARCHIVE_DETAIL
+    assert _http_view(dispatch_client, fresh)["status"] == "waiting"
+
+
+@pytest.mark.parametrize(
+    "reason, capacity",
+    [("capacity", True), ("thread_busy", False), ("runtime_unavailable", False)],
+)
+def test_start_failure_detail_ignored_on_capacity_and_waits(
+    dispatch_client: TestClient, auth_headers: dict[str, str], reason: str, capacity: bool
+) -> None:
+    """Only a non-capacity ``not_started:`` defer records a start failure.
+
+    A detail sent with any other wait is accepted (200) and ignored, both on a
+    request with no previous detail and on one that has one.
+    """
+
+    fresh = _http_admitted(dispatch_client, auth_headers)
+    body = _http_acquire_and_defer(
+        dispatch_client, fresh, reason=reason, capacity=capacity, detail=IGNORED_DETAIL
+    )
+    assert body["terminal_cause"] is None
+    assert _stored_detail(fresh) is None
+    assert _http_view(dispatch_client, fresh)["last_deferral_reason"] == reason
+
+    _http_acquire_and_defer(
+        dispatch_client,
+        fresh,
+        reason="not_started:classified_failure",
+        capacity=False,
+        detail=ARCHIVE_DETAIL,
+    )
+    assert _stored_detail(fresh) == ARCHIVE_DETAIL
+    _http_acquire_and_defer(
+        dispatch_client, fresh, reason=reason, capacity=capacity, detail=IGNORED_DETAIL
+    )
+    assert _stored_detail(fresh) == ARCHIVE_DETAIL
+    view = _http_view(dispatch_client, fresh)
+    assert view["last_deferral_reason"] == reason
+    assert view["last_start_failure_detail"] == ARCHIVE_DETAIL
+
+
+def test_fresh_request_has_no_start_failure_detail(
+    dispatch_client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    request_id = _http_admitted(dispatch_client, auth_headers)
+    view = _http_view(dispatch_client, request_id)
+    assert "last_start_failure_detail" in view
+    assert view["last_start_failure_detail"] is None
+    assert _stored_detail(request_id) is None
+
+
+def test_internal_request_read_exposes_last_start_failure_detail(
+    dispatch_client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    request_id = _http_admitted(dispatch_client, auth_headers)
+    assert _http_view(dispatch_client, request_id)["last_start_failure_detail"] is None
+    _http_acquire_and_defer(
+        dispatch_client,
+        request_id,
+        reason="not_started:classified_failure",
+        capacity=False,
+        detail=ARCHIVE_DETAIL,
+    )
+    view = _http_view(dispatch_client, request_id)
+    assert view["last_start_failure_detail"] == ARCHIVE_DETAIL
+    assert view["status"] == "waiting"
+    assert view["started_at"] is None
+
+
+def test_capacity_defers_preserve_the_previous_start_failure_detail(
+    clean_db: None, allowlisted: None
+) -> None:
+    async def body(session: AsyncSession) -> None:
+        facts = await _admitted(session)
+        admitted = await _request_row(session, facts.request_id)
+        await _acquire_and_defer(
+            session,
+            facts.request_id,
+            reason="not_started:classified_failure",
+            capacity=False,
+            start_failure_detail=ARCHIVE_DETAIL,
+        )
+        before = await _request_row(session, facts.request_id)
+        assert await _start_failure_detail(session, facts.request_id) == ARCHIVE_DETAIL
+        assert before.start_deferrals == 1
+        assert before.capacity_deferrals == 0
+        assert before.wait_deadline == admitted.wait_deadline
+
+        for count, seconds in enumerate([10, 20], start=1):
+            result, started, ended = await _acquire_and_defer(
+                session,
+                facts.request_id,
+                reason="capacity",
+                capacity=True,
+                start_failure_detail=None,
+            )
+            row = await _request_row(session, facts.request_id)
+            assert await _start_failure_detail(session, facts.request_id) == ARCHIVE_DETAIL
+            assert row.status == "waiting"
+            assert row.capacity_deferrals == count
+            assert row.start_deferrals == 1
+            assert row.last_deferral_reason == "capacity"
+            assert row.wait_deadline == admitted.wait_deadline
+            assert row.version == before.version
+            assert row.work_item_version == before.work_item_version
+            assert row.started_at is None
+            assert row.execution_attempts == 0
+            assert row.dispatch_generation == before.dispatch_generation + count
+            assert result.dispatch_generation == row.dispatch_generation
+            assert result.terminal_cause is None
+            _assert_delay(row.dispatch_not_before, started, ended, seconds)
+            assert result.not_before == row.dispatch_not_before
+
+    with_session(body)
+
+
+def test_acquire_lost_redispatch_preserves_the_start_failure_detail(
+    clean_db: None, allowlisted: None
+) -> None:
+    async def body(session: AsyncSession) -> None:
+        facts = await _admitted(session)
+        await _acquire_and_defer(
+            session,
+            facts.request_id,
+            reason="not_started:classified_failure",
+            capacity=False,
+            start_failure_detail=ARCHIVE_DETAIL,
+        )
+        await _acquired(session, facts.request_id)
+        await session.execute(
+            text(
+                "UPDATE curie.execution_requests SET "
+                "acquire_expires_at = clock_timestamp() - interval '1 second' "
+                "WHERE id = :id"
+            ),
+            {"id": facts.request_id},
+        )
+        await session.commit()
+        before = await _request_row(session, facts.request_id)
+        assert await redispatch_lapsed_acquisitions(session) == 1
+        after = await _request_row(session, facts.request_id)
+        assert after.last_deferral_reason == "acquire_lost"
+        assert after.dispatch_generation == before.dispatch_generation + 1
+        assert after.acquire_owner is None
+        assert after.start_deferrals == before.start_deferrals == 1
+        assert after.wait_deadline == before.wait_deadline
+        assert await _start_failure_detail(session, facts.request_id) == ARCHIVE_DETAIL
+
+    with_session(body)
+
+
+def test_stale_generation_expired_acquisition_and_replaced_owner_cannot_write_the_detail(
+    clean_db: None, allowlisted: None
+) -> None:
+    async def refused_defer(
+        session: AsyncSession, request_id: uuid.UUID, *, owner: str, generation: int
+    ) -> str:
+        result = await defer(
+            session,
+            request_id,
+            owner=owner,
+            generation=generation,
+            reason="not_started:classified_failure",
+            capacity=False,
+            start_failure_detail=NEWER_DETAIL,
+        )
+        return _code(result)
+
+    async def expire_acquisition(session: AsyncSession, request_id: uuid.UUID) -> None:
+        await session.execute(
+            text(
+                "UPDATE curie.execution_requests SET "
+                "acquire_expires_at = clock_timestamp() - interval '1 second' "
+                "WHERE id = :id"
+            ),
+            {"id": request_id},
+        )
+        await session.commit()
+
+    async def body(session: AsyncSession) -> None:
+        # No previous detail: every fenced-out writer leaves the column NULL.
+        empty = await _admitted(session, issue_number=4931)
+        agent_id = empty.agent_id
+        await _acquired(session, empty.request_id)
+        refused = await refused_defer(session, empty.request_id, owner=OTHER_OWNER, generation=1)
+        assert refused == "not_dispatchable"
+        refused = await refused_defer(session, empty.request_id, owner=OWNER, generation=2)
+        assert refused == "not_dispatchable"
+        await expire_acquisition(session, empty.request_id)
+        refused = await refused_defer(session, empty.request_id, owner=OWNER, generation=1)
+        assert refused == "not_dispatchable"
+        assert await _start_failure_detail(session, empty.request_id) is None
+        assert (await _start_row(session, empty.request_id)).start_deferrals == 0
+
+        # With a previous detail.
+        facts = await _admitted(session, agent_id=agent_id)
+        await _acquire_and_defer(
+            session,
+            facts.request_id,
+            reason="not_started:classified_failure",
+            capacity=False,
+            start_failure_detail=ARCHIVE_DETAIL,
+        )
+        current = await _acquired(session, facts.request_id)
+        assert current.generation == 2
+        before = await _request_row(session, facts.request_id)
+
+        # A stale generation (the worker that already deferred generation 1).
+        refused = await refused_defer(session, facts.request_id, owner=OWNER, generation=1)
+        assert refused == "not_published"
+        # A replaced owner: another worker holding no acquisition.
+        refused = await refused_defer(session, facts.request_id, owner=OTHER_OWNER, generation=2)
+        assert refused == "not_dispatchable"
+        # The owner whose acquisition expired.
+        await expire_acquisition(session, facts.request_id)
+        refused = await refused_defer(session, facts.request_id, owner=OWNER, generation=2)
+        assert refused == "not_dispatchable"
+
+        after = await _request_row(session, facts.request_id)
+        assert await _start_failure_detail(session, facts.request_id) == ARCHIVE_DETAIL
+        assert after.dispatch_generation == before.dispatch_generation
+        assert after.last_deferral_reason == "not_started:classified_failure"
+        assert (await _start_row(session, facts.request_id)).start_deferrals == 1
+
+        # Liveness: the current owner, re-acquired in-lease, writes the newer one.
+        reacquired = await _acquired(session, facts.request_id)
+        assert reacquired.generation == 2
+        accepted = await defer(
+            session,
+            facts.request_id,
+            owner=OWNER,
+            generation=2,
+            reason="not_started:classified_failure",
+            capacity=False,
+            start_failure_detail=NEWER_DETAIL,
+        )
+        assert getattr(accepted, "code", None) is None, accepted
+        assert await _start_failure_detail(session, facts.request_id) == NEWER_DETAIL
+        assert (await _start_row(session, facts.request_id)).start_deferrals == 2
+
+    with_session(body)
+
+
+def test_factory_refusal_defer_preserves_the_start_failure_detail(
+    clean_db: None, allowlisted: None
+) -> None:
+    async def body(session: AsyncSession) -> None:
+        facts = await _admitted(session)
+        await _acquire_and_defer(
+            session,
+            facts.request_id,
+            reason="not_started:classified_failure",
+            capacity=False,
+            start_failure_detail=ARCHIVE_DETAIL,
+        )
+        acquired = await _acquired(session, facts.request_id)
+        await _invalidate_factory_binding(session, facts.agent_id, "replaced")
+        refused = await start(
+            session,
+            facts.request_id,
+            owner=OWNER,
+            generation=acquired.generation,
+            claim_name=CLAIM_NAME,
+            sandbox_name=SANDBOX_NAME,
+            context=acquired.context,
+        )
+        assert _code(refused) == "factory_binding_changed"
+        row = await _request_row(session, facts.request_id)
+        assert row.status == "waiting"
+        assert row.last_deferral_reason == "not_started:factory_binding_changed"
+        assert row.start_deferrals == 2
+        assert row.started_at is None
+        assert await _start_failure_detail(session, facts.request_id) == ARCHIVE_DETAIL
+
+    with_session(body)
+
+
+def test_newer_start_failure_detail_replaces_the_previous_one(
+    clean_db: None, allowlisted: None
+) -> None:
+    async def body(session: AsyncSession) -> None:
+        facts = await _admitted(session)
+        await _acquire_and_defer(
+            session,
+            facts.request_id,
+            reason="not_started:classified_failure",
+            capacity=False,
+            start_failure_detail=ARCHIVE_DETAIL,
+        )
+        assert await _start_failure_detail(session, facts.request_id) == ARCHIVE_DETAIL
+        await _acquire_and_defer(
+            session,
+            facts.request_id,
+            reason="not_started:classified_failure",
+            capacity=False,
+            start_failure_detail=NEWER_DETAIL,
+        )
+        assert await _start_failure_detail(session, facts.request_id) == NEWER_DETAIL
+        row = await _start_row(session, facts.request_id)
+        assert (row.status, row.start_deferrals) == ("waiting", 2)
+
+    with_session(body)
+
+
+def test_start_failed_at_the_limit_keeps_the_start_failure_detail(
+    clean_db: None, allowlisted: None
+) -> None:
+    async def body(session: AsyncSession) -> None:
+        facts = await _admitted(session)
+        for index, reason in enumerate(START_REASONS[:4]):
+            await _acquire_and_defer(
+                session,
+                facts.request_id,
+                reason=reason,
+                capacity=False,
+                start_failure_detail=ARCHIVE_DETAIL if index == 0 else None,
+            )
+        assert await _start_failure_detail(session, facts.request_id) == ARCHIVE_DETAIL
+        result, _, _ = await _acquire_and_defer(
+            session,
+            facts.request_id,
+            reason=START_REASONS[4],
+            capacity=False,
+            start_failure_detail=NEWER_DETAIL,
+        )
+        assert result.terminal_cause == "start_failed"
+        row = await _start_row(session, facts.request_id)
+        assert (row.status, row.terminal_cause) == ("failed", "start_failed")
+        assert row.start_deferrals == 5
+        # Written by the same fenced UPDATE that ended the request.
+        assert await _start_failure_detail(session, facts.request_id) == NEWER_DETAIL
+
+    with_session(body)
+
+
+def test_successful_start_clears_the_start_failure_detail(
+    clean_db: None, allowlisted: None
+) -> None:
+    async def body(session: AsyncSession) -> None:
+        facts = await _admitted(session)
+        await _acquire_and_defer(
+            session,
+            facts.request_id,
+            reason="not_started:classified_failure",
+            capacity=False,
+            start_failure_detail=ARCHIVE_DETAIL,
+        )
+        acquired = await _acquired(session, facts.request_id)
+        started = await start(
+            session,
+            facts.request_id,
+            owner=OWNER,
+            generation=acquired.generation,
+            claim_name=CLAIM_NAME,
+            sandbox_name=SANDBOX_NAME,
+            context=acquired.context,
+        )
+        assert getattr(started, "code", None) is None, started
+        row = await _request_row(session, facts.request_id)
+        assert row.status == "running"
+        assert row.execution_attempts == 1
+        assert await _start_failure_detail(session, facts.request_id) is None
+
+    with_session(body)
+
+
+def test_refused_start_keeps_the_start_failure_detail(clean_db: None, allowlisted: None) -> None:
+    async def body(session: AsyncSession) -> None:
+        facts = await _admitted(session)
+        await _acquire_and_defer(
+            session,
+            facts.request_id,
+            reason="not_started:classified_failure",
+            capacity=False,
+            start_failure_detail=ARCHIVE_DETAIL,
+        )
+        acquired = await _acquired(session, facts.request_id)
+
+        async def try_start(owner: str) -> object:
+            return await start(
+                session,
+                facts.request_id,
+                owner=owner,
+                generation=acquired.generation,
+                claim_name=CLAIM_NAME,
+                sandbox_name=SANDBOX_NAME,
+                context=acquired.context,
+            )
+
+        # Another owner holds no acquisition of this generation.
+        assert _code(await try_start(OTHER_OWNER)) == "not_dispatchable"
+        assert await _start_failure_detail(session, facts.request_id) == ARCHIVE_DETAIL
+        # The owner's own acquisition has expired.
+        await session.execute(
+            text(
+                "UPDATE curie.execution_requests SET "
+                "acquire_expires_at = clock_timestamp() - interval '1 second' "
+                "WHERE id = :id"
+            ),
+            {"id": facts.request_id},
+        )
+        await session.commit()
+        assert _code(await try_start(OWNER)) == "not_dispatchable"
+        row = await _request_row(session, facts.request_id)
+        assert row.status == "waiting"
+        assert row.started_at is None
+        assert await _start_failure_detail(session, facts.request_id) == ARCHIVE_DETAIL
+
+        # Liveness: re-acquired in-lease, the same start is accepted and clears.
+        reacquired = await _acquired(session, facts.request_id)
+        assert reacquired.generation == acquired.generation
+        assert getattr(await try_start(OWNER), "code", None) is None
+        assert (await _request_row(session, facts.request_id)).status == "running"
+        assert await _start_failure_detail(session, facts.request_id) is None
+
+    with_session(body)
 
 
 async def _assert_factory_neighbor_starts(session: AsyncSession) -> None:
