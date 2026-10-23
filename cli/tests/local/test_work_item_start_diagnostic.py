@@ -115,25 +115,88 @@ def _chart_default_archive_bytes() -> int:
     return int(values["worker"]["workspace"]["maxArchiveBytes"])
 
 
+# The effective Docker endpoint and context name, resolved once per fixture
+# by ``resolve_docker_endpoint``. The scrubber names them in addition to the
+# raw DOCKER_HOST and DOCKER_CONTEXT values.
+_RESOLVED_DOCKER: dict[str, str] = {}
+
+
+def _docker_endpoints() -> list[str]:
+    """Every non-socket Docker endpoint string this process may talk to."""
+
+    values = (os.environ.get("DOCKER_HOST", ""), _RESOLVED_DOCKER.get("endpoint", ""))
+    return [value for value in dict.fromkeys(values) if value and not value.startswith("unix://")]
+
+
+def _endpoint_terms(endpoint: str) -> set[str]:
+    terms = {endpoint}
+    # Split by hand as well, so a malformed endpoint still yields its parts.
+    authority = endpoint.split("://", 1)[-1].split("/", 1)[0]
+    terms.add(authority)
+    user, _, host = authority.rpartition("@")
+    terms.update((user, host, host.rsplit(":", 1)[0]))
+    try:
+        parsed = urlsplit(endpoint)
+        terms.update(value for value in (parsed.netloc, parsed.username, parsed.hostname) if value)
+    except ValueError:
+        pass
+    return terms
+
+
+def resolve_docker_endpoint(env: dict[str, str]) -> str | None:
+    """The endpoint every docker call in ``env`` reaches, or None if unknown.
+
+    Docker's precedence: DOCKER_CONTEXT over DOCKER_HOST over the configured
+    current context (no ``--context`` flag is used here). ``docker context
+    inspect`` with no name reads the current context, honouring
+    DOCKER_CONTEXT. Nothing is switched or written. Never raises.
+    """
+
+    _RESOLVED_DOCKER.clear()
+
+    def probe(*argv: str) -> str | None:
+        try:
+            result = subprocess.run(
+                ["docker", "context", *argv],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return None
+        return result.stdout.strip() if result.returncode == 0 else None
+
+    name = probe("show")
+    if name:
+        _RESOLVED_DOCKER["context"] = name
+    if env.get("DOCKER_HOST") and not env.get("DOCKER_CONTEXT"):
+        endpoint: str | None = env["DOCKER_HOST"]
+    else:
+        raw = probe("inspect", "--format", "{{json .Endpoints.docker.Host}}")
+        try:
+            endpoint = json.loads(raw) if raw else None
+        except ValueError:
+            endpoint = None
+        if not isinstance(endpoint, str) or not endpoint:
+            endpoint = None
+    if endpoint is not None:
+        _RESOLVED_DOCKER["endpoint"] = endpoint
+    return endpoint
+
+
 def _private_terms() -> list[str]:
     """Names of this machine and its user that must never reach test output."""
 
     terms: set[str] = set()
-    docker_host = os.environ.get("DOCKER_HOST", "")
-    if docker_host and not docker_host.startswith("unix://"):
-        terms.add(docker_host)
-        # Split by hand as well, so a malformed endpoint still yields its parts.
-        authority = docker_host.split("://", 1)[-1].split("/", 1)[0]
-        terms.add(authority)
-        user, _, host = authority.rpartition("@")
-        terms.update((user, host, host.rsplit(":", 1)[0]))
-        try:
-            parsed = urlsplit(docker_host)
-            terms.update(
-                value for value in (parsed.netloc, parsed.username, parsed.hostname) if value
-            )
-        except ValueError:
-            pass
+    for endpoint in _docker_endpoints():
+        terms.update(_endpoint_terms(endpoint))
+    terms.update(
+        value
+        for value in (os.environ.get("DOCKER_CONTEXT"), _RESOLVED_DOCKER.get("context"))
+        if value and value != "default"
+    )
     terms.update(value for value in (os.environ.get("USER"), os.environ.get("LOGNAME")) if value)
     for lookup in (getpass.getuser, socket.gethostname):
         try:
@@ -166,9 +229,8 @@ def _safe(value: Any, secrets: list[str | None], limit: int = 4000) -> str:
 def _scrub(value: Any, secrets: list[str | None]) -> str:
     text = value if isinstance(value, str) else json.dumps(value, default=str, sort_keys=True)
     text = fe.redact_agent_text(text, secrets)[0] or ""
-    docker_host = os.environ.get("DOCKER_HOST", "")
-    if docker_host and not docker_host.startswith("unix://"):
-        text = text.replace(docker_host, "ssh://docker-host.invalid")
+    for endpoint in _docker_endpoints():
+        text = text.replace(endpoint, "ssh://docker-host.invalid")
     text = _URL.sub("https://example.com", text)
     home = str(Path.home())
     if home not in {"", "/"}:
@@ -302,9 +364,11 @@ class _Run(scripted_kind.ScriptedRun):
     """ScriptedRun's owned cluster plumbing with this test's disk floor."""
 
     disk_path = "/"
+    # Set from the resolved endpoint; unknown counts as remote.
+    local_engine = False
 
     def check_disk(self, stage: str) -> None:
-        if not scripted_kind.docker_engine_is_local(self.env.get("DOCKER_HOST")):
+        if not self.local_engine:
             return
         if shutil.disk_usage(self.disk_path).free < MIN_FREE_BYTES:
             raise RuntimeError(
@@ -330,6 +394,7 @@ class Harness:
         self.built: list[str] = []
         self.volumes: set[str] = set()
         self.docker_ready = False
+        self.docker_endpoint: str | None = None
         self.workdir: Path | None = None
         self.gate: GatedModel | None = None
         self.stub: Any = None
@@ -428,9 +493,13 @@ class Harness:
         for binary in REQUIRED_EXECUTABLES:
             if shutil.which(binary) is None:
                 raise RuntimeError(f"missing required executable: {binary}")
+        # Resolved once, before the first docker call, from exactly the env
+        # every docker call uses. An unknown endpoint counts as remote.
+        self.docker_endpoint = resolve_docker_endpoint(self.run.env)
+        local = self.docker_endpoint is not None and self.docker_endpoint.startswith("unix://")
+        self.run.local_engine = local
         self.run.command("docker", "info", timeout=60)
         self.docker_ready = True
-        local = scripted_kind.docker_engine_is_local(self.run.env.get("DOCKER_HOST"))
         if local:
             root = self.run.command(
                 "docker", "info", "--format", "{{.DockerRootDir}}", timeout=60
@@ -571,7 +640,11 @@ class Harness:
                 if item.get("Gateway") and ipaddress.ip_address(item["Gateway"]).version == 4
             )
         callback = scripted_kind.in_process_callback_host(
-            docker_host=run.env.get("DOCKER_HOST"),
+            # The resolved endpoint, not DOCKER_HOST alone: a caller's context
+            # can name a remote engine. Unknown is passed as remote.
+            docker_host=(
+                self.docker_endpoint if run.local_engine else "ssh://unresolved-or-remote.invalid"
+            ),
             stub_host=run.env.get("CURIE_LOCAL_STUB_HOST"),
             gateway=gateway,
         )
