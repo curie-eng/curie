@@ -10,7 +10,6 @@ The database egress rendered here is only one additive network-policy grant.
 from __future__ import annotations
 
 import base64
-import binascii
 import hashlib
 import ipaddress
 import json
@@ -483,11 +482,25 @@ def _container(
     }
 
 
+def _canonical_public_key(text: object) -> bool:
+    """Whether ``text`` is the canonical padded standard base64 of 32 bytes."""
+
+    if not isinstance(text, str):
+        return False
+    try:
+        raw = base64.b64decode(text, validate=True)
+    except ValueError:
+        return False
+    return (
+        len(raw) == _CALLER_PUBLIC_KEY_BYTES and base64.b64encode(raw).decode("ascii") == text
+    )
+
+
 def _caller_public_keys(keys: tuple[str, ...]) -> str:
     """The proxy's comma-joined caller public verify keys, or a named refusal.
 
-    Each key is the canonical padded standard base64 of 32 bytes, so one key
-    has one spelling. A refusal never echoes key text.
+    Each key has one spelling, so equal keys are equal text. A refusal never
+    echoes key text.
     """
 
     if not isinstance(keys, tuple):
@@ -499,25 +512,12 @@ def _caller_public_keys(keys: tuple[str, ...]) -> str:
             "caller_public_keys_too_many: at most the current caller public key "
             "and the one it replaced"
         )
-    decoded: list[bytes] = []
-    for text in keys:
-        raw: bytes | None = None
-        if isinstance(text, str):
-            try:
-                raw = base64.b64decode(text, validate=True)
-            except (binascii.Error, ValueError):
-                raw = None
-        if (
-            raw is None
-            or len(raw) != _CALLER_PUBLIC_KEY_BYTES
-            or base64.b64encode(raw).decode("ascii") != text
-        ):
-            raise ValueError(
-                "caller_public_key_malformed: a caller public key is not the canonical "
-                "standard base64 of 32 bytes"
-            )
-        decoded.append(raw)
-    if len(set(decoded)) != len(decoded):
+    if not all(map(_canonical_public_key, keys)):
+        raise ValueError(
+            "caller_public_key_malformed: a caller public key is not the canonical "
+            "standard base64 of 32 bytes"
+        )
+    if len(set(keys)) != len(keys):
         raise ValueError("caller_public_keys_duplicate: a caller public key is listed twice")
     return ",".join(keys)
 

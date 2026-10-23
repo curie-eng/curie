@@ -141,7 +141,7 @@ impl fmt::Display for CallerKeysRefusal {
 /// `tests/vectors/shared-render-caller-keys.json` and landed before any Rust
 /// shared render exists (ADR 0239 relationship 6). Each key must be the
 /// canonical padded standard base64 of 32 bytes, untrimmed, so one key has one
-/// spelling; duplicates compare decoded bytes. Curve point validity is not
+/// spelling and equal keys are equal text. Curve point validity is not
 /// checked, as the Python half does not check it.
 pub fn shared_caller_public_keys(keys: &[&str]) -> Result<String, CallerKeysRefusal> {
     if keys.is_empty() {
@@ -150,22 +150,24 @@ pub fn shared_caller_public_keys(keys: &[&str]) -> Result<String, CallerKeysRefu
     if keys.len() > MAX_SHARED_CALLER_PUBLIC_KEYS {
         return Err(CallerKeysRefusal::TooMany);
     }
-    let mut decoded: Vec<Vec<u8>> = Vec::with_capacity(keys.len());
-    for key in keys {
-        let Ok(raw) = b64().decode(key) else {
-            return Err(CallerKeysRefusal::Malformed);
-        };
-        if raw.len() != PUBLIC_KEY_BYTES || b64().encode(&raw) != *key {
-            return Err(CallerKeysRefusal::Malformed);
-        }
-        decoded.push(raw);
+    if !keys.iter().all(|key| canonical_public_key(key)) {
+        return Err(CallerKeysRefusal::Malformed);
     }
-    for (at, raw) in decoded.iter().enumerate() {
-        if decoded[..at].contains(raw) {
-            return Err(CallerKeysRefusal::Duplicate);
-        }
+    if keys
+        .iter()
+        .enumerate()
+        .any(|(at, key)| keys[..at].contains(key))
+    {
+        return Err(CallerKeysRefusal::Duplicate);
     }
     Ok(keys.join(","))
+}
+
+/// Whether `key` is the canonical padded standard base64 of 32 bytes.
+fn canonical_public_key(key: &str) -> bool {
+    b64()
+        .decode(key)
+        .is_ok_and(|raw| raw.len() == PUBLIC_KEY_BYTES && b64().encode(&raw) == key)
 }
 
 /// The first segment of every caller token this wire mints and admits.
