@@ -2,12 +2,15 @@
 
 Date: 2026-10-23
 
-Status: Draft
+Status: Accepted
+
+The maintainer explicitly approved this decision and its merge through
+[PR #5017](https://github.com/curie-eng/curie/pull/5017) on 2026-10-23.
 
 Tracked under [#4557](https://github.com/curie-eng/curie/issues/4557).
-The [proposed realizing specification](../superpowers/specs/2026-10-23-protected-sdk-lifecycle-custody.md)
-is part of this proposal. This Draft authorizes no implementation and supplies
-no runtime qualification or activation evidence.
+The [realizing specification](../superpowers/specs/2026-10-23-protected-sdk-lifecycle-custody.md)
+is part of this decision. Acceptance authorizes the realizing implementation sequence;
+it supplies no runtime qualification or activation evidence.
 
 ## Context
 
@@ -25,7 +28,7 @@ and exit. Independent original-container termination can corroborate that tail.
 This needs an explicit measured producer and custody boundary, rather than new
 all-true flags or receipt authority in the twelve-fact guard channel.
 
-## Proposed decision
+## Decision
 
 ### A fixed cold SDK lifetime has genuine owners
 
@@ -119,7 +122,7 @@ ADR 0242's special final host-verifier exemption is not used.
 
 ### New delivery semantics receive explicit new formats
 
-The proposal adds kubernetes-custodied-pod-v1 and ArtifactMeasurementV2, with
+This decision adds kubernetes-custodied-pod-v1 and ArtifactMeasurementV2, with
 closed versioned public context/SDK lifecycle delivery slots. Existing v1 formats
 remain closed and unchanged. A contract-only reviewed change precedes dependent
 consumers; no consumer may coerce old evidence or partially enable a new profile.

@@ -1,10 +1,12 @@
-# Protected SDK lifecycle custody proposal
+# Protected SDK lifecycle custody specification
 
-Realizing proposal for
-[Draft ADR 0245](../../adr/0245-protected-lifecycle-evidence-binds-host-owned-contexts-to-actual-sdk-closure.md),
+Realizing specification for
+[Accepted ADR 0245](../../adr/0245-protected-lifecycle-evidence-binds-host-owned-contexts-to-actual-sdk-closure.md),
 tracked in [#4557](https://github.com/curie-eng/curie/issues/4557).
-This Draft authorizes no implementation or runtime qualification. Existing
-producers continue to refuse unavailable genuine SDK/join evidence.
+Architecture accepted with explicit maintainer approval in
+[PR #5017](https://github.com/curie-eng/curie/pull/5017). This specification defines the
+realizing sequence; it supplies no runtime qualification. Existing producers continue to
+refuse unavailable genuine SDK/join evidence until the complete new profile is supported.
 
 ## Decision and trust roots
 
@@ -452,9 +454,9 @@ abandoned thread/cancellation, forced kill, five-second grace, container restart
 replacement/log truncation and genuine post-expiry closure. Stub-model/local-process tests
 prove plumbing only.
 
-This Draft authorizes no paid model, cloud, deployment action or runtime privilege.
-Maintainer architecture acceptance and reviewed closed contracts must precede
-implementation. Actual tests may still show that the pinned provider cannot meet its finite
+Architecture acceptance authorizes implementation, not paid model calls, cloud spend,
+deployment or runtime activation. Reviewed closed contracts must land before dependent
+consumers. Actual tests may still show that the pinned provider cannot meet its finite
 helper/join contract; that profile remains unavailable and returns to design review.
 
 Existing #4908 fail-closed treatment of never-started/uncertain Pods is unchanged. Moving
@@ -490,9 +492,9 @@ supported before actual use. A publisher cannot accept generic v1 hashes as v2 o
 Realizing order: separately reviewed closed artifact/projection/lifecycle record contract;
 guarded host-owned context and separated mediator assignments; actual pinned
 owned-transport/capsule logical close; genuine original-container evidence collector and
-complete registry composition; real SDK conformance and full fresh trial series. A Draft
-authorizes none of these. After architecture acceptance, the exact closed protocol/spec
-still receives security/correctness review before consumers are enabled. Pin's observed SDK
+complete registry composition; real SDK conformance and full fresh trial series. The exact
+closed protocol/spec still receives security/correctness review before consumers are enabled.
+Pin's observed SDK
 0.2.163 / CLI 2.1.286 identities are source audit inputs, not a qualification claim; actual
 image/library/binary hashes and helper inventory are mandatory and unavailable until
 measured.
