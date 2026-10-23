@@ -242,6 +242,10 @@ class AttachmentAccess:
         )
 
     def _verified(self, directory: int, cached: _Cached) -> bool:
+        # All callers run in an AnyIO worker under the original operation's
+        # authority and fail_after scope. Cooperative checks observe both even
+        # though run_sync shields its await while the worker releases the fd.
+        anyio.from_thread.check_cancelled()
         try:
             fd = os.open(
                 cached.filename, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory
@@ -254,11 +258,18 @@ class AttachmentAccess:
                     or info.st_size != cached.size
                 ):
                     return False
-                digest = hashlib.file_digest(stream, "sha256").hexdigest()
+                digest = hashlib.sha256()
+                while True:
+                    anyio.from_thread.check_cancelled()
+                    chunk = stream.read(CHUNK_BYTES)
+                    anyio.from_thread.check_cancelled()
+                    if not chunk:
+                        break
+                    digest.update(chunk)
                 after = os.fstat(stream.fileno())
                 entry = os.stat(cached.filename, dir_fd=directory, follow_symlinks=False)
                 return (
-                    digest == cached.digest
+                    digest.hexdigest() == cached.digest
                     and self._same_directory(directory)
                     and (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_size)
                     == (after.st_dev, after.st_ino, after.st_mtime_ns, after.st_size)

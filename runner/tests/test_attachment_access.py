@@ -729,3 +729,92 @@ anyio.run(main)
     with anyio.fail_after(5):
         result = await anyio.run_process([sys.executable, "-c", script, str(tmp_path), base])
     assert result.stdout.strip() == b"fifo-refused"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("operation", ["list", "fetch", "download"])
+@pytest.mark.parametrize("stop", ["deadline", "turn_end"])
+async def test_local_cache_hash_stops_with_original_operation_authority(
+    rig: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    stop: str,
+) -> None:
+    import threading
+    import time
+
+    import curie_runner.attachment_access as module
+
+    platform, access, turn, _ = rig
+    await access.fetch({"id": "ref-1"})
+    existing = set(access.root.iterdir())
+    if operation == "download":
+        # A new cache client exercises final verification after a real body
+        # transfer as well as the existing-cache read paths.
+        access = AttachmentAccess(turn, access.root)
+    real_fdopen = module.os.fdopen
+    started = threading.Event()
+    reads: list[int] = []
+
+    class SlowLocalReader:
+        """Delay bounded reads of the actual cached file, never substitute its bytes."""
+
+        def __init__(self, stream: Any) -> None:
+            self.stream = stream
+
+        def __enter__(self) -> SlowLocalReader:
+            self.stream.__enter__()
+            return self
+
+        def __exit__(self, *args: Any) -> Any:
+            return self.stream.__exit__(*args)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self.stream, name)
+
+        def read(self, size: int) -> bytes:
+            started.set()
+            reads.append(1)
+            time.sleep(0.004)
+            return self.stream.read(min(size, 64 * 1024))
+
+        def readinto(self, buffer: Any) -> int:
+            started.set()
+            reads.append(1)
+            time.sleep(0.004)
+            return self.stream.readinto(memoryview(buffer)[: 64 * 1024])
+
+    def controlled_reader(fd: int, mode: str) -> Any:
+        stream = real_fdopen(fd, mode)
+        return SlowLocalReader(stream) if mode == "rb" else stream
+
+    monkeypatch.setattr(module.os, "fdopen", controlled_reader)
+    if stop == "deadline":
+        monkeypatch.setattr(module, "TRANSFER_SECONDS", 0.3 if operation == "download" else 0.08)
+    failures: list[AttachmentAccessError] = []
+    started_at = time.monotonic()
+
+    async def use_cache() -> None:
+        try:
+            if operation != "list":
+                await access.fetch({"id": "ref-1"})
+            else:
+                await access.list({})
+        except AttachmentAccessError as exc:
+            failures.append(exc)
+
+    async with anyio.create_task_group() as tasks:
+        tasks.start_soon(use_cache)
+        if stop == "turn_end":
+            with anyio.fail_after(2):
+                while not started.is_set():
+                    await anyio.sleep(0.001)
+            turn.end()
+    assert failures, "A retired or expired operation must not return a cached path/catalog"
+    assert started.is_set(), "The cancellation must exercise actual disk verification"
+    assert time.monotonic() - started_at < 0.9
+    assert len(reads) < 128, "Cancellation must stop the disk hash before consuming the whole file"
+    assert set(access.root.iterdir()) == existing, "Cancelled publication must remove its new file"
+    assert platform.reads == (2 if operation == "download" else 1), (
+        "Verification cancellation must never trigger a provider retry"
+    )
