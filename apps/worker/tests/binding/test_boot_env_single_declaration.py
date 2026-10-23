@@ -435,6 +435,12 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # The snapshot seal file belongs only to the connector server.
         # ResolverConfig.from_env refuses it when present.
         "CURIE_SHARED_SNAPSHOT_SEAL_FILE",
+        # SharedProxyConfig.from_env reads these three in the connector proxy
+        # container: the shared listen port, the loopback upstream URL, and the
+        # file holding the shared grant store URL.
+        "CURIE_SHARED_PROXY_PORT",
+        "CURIE_SHARED_UPSTREAM_URL",
+        "CURIE_SHARED_GRANT_STORE_FILE",
         # runner-local harness selection (ADR-0060, #844); read by the runner from
         # its own env to pick the active harness, unset selects the built-in
         # Claude. Not a boot contract key.
