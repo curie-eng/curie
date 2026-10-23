@@ -6,6 +6,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import pytest
 from curie_worker import attachments
 
 
@@ -104,6 +105,68 @@ def test_cancel_scope_interrupts_owned_stalled_socket() -> None:
                 scope.cancel()
                 with pytest.raises((OSError, RuntimeError)):
                     future.result(timeout=1)
+            finally:
+                release.set()
+    finally:
+        release.set()
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+@pytest.mark.parametrize("stage", ["status", "headers", "tls"])
+@pytest.mark.parametrize("stop", ["cancel", "deadline"])
+def test_scope_interrupts_dripping_response_head(stage: str, stop: str) -> None:
+    import socketserver
+    import time
+
+    started, release = threading.Event(), threading.Event()
+
+    class Provider(socketserver.BaseRequestHandler):
+        def handle(self) -> None:
+            self.request.recv(8192)
+            if stage == "tls":
+                started.set()
+                release.wait(3)
+                return
+            prefix = b"HTTP/1.1 200" if stage == "status" else b"HTTP/1.1 200 OK\r\nX-Slow: "
+            try:
+                self.request.sendall(prefix)
+                started.set()
+                while not release.wait(0.02):
+                    self.request.sendall(b"x")
+            except OSError:
+                pass
+
+    server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Provider)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    scope = attachments.AttachmentReadScope(
+        deadline_epoch=time.time() + (0.35 if stop == "deadline" else 60)
+    )
+
+    def read() -> None:
+        with scope:
+            attachments._slack_transport(
+                method="GET",
+                url=f"{'https' if stage == 'tls' else 'http'}://127.0.0.1:{server.server_address[1]}",
+                headers={},
+                chunk_bytes=1024 * 1024,
+            )
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(read)
+            try:
+                assert started.wait(1)
+                if stop == "cancel":
+                    scope.cancel()
+                done = threading.Event()
+                future.add_done_callback(lambda _: done.set())
+                assert done.wait(1), (
+                    "owned header read remained blocked after cancellation/deadline"
+                )
+                assert future.exception() is not None
             finally:
                 release.set()
     finally:

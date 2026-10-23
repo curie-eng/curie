@@ -106,7 +106,12 @@ class AttachmentBroker:
             reference["route_identity"],
         )
         for route in routes:
-            if route.kind != kind:
+            if (
+                route.kind != kind
+                or str(route.binding_id) != reference["binding_id"]
+                or route.generation != reference["binding_generation"]
+                or route.address != reference["binding_address"]
+            ):
                 continue
             if kind == "slack" and (route.adapter or "default") == identity:
                 port = self.slack_files.get(identity)
@@ -153,11 +158,11 @@ class AttachmentBroker:
                     read_scope.deadline_epoch = time.time() + remaining
                     if remaining <= 0:
                         raise ValueError("attachment transfer expired")
-                    port = await self.file_port(reference)
                     # Cancellation retains this semaphore until the owned sync
                     # read returns (production socket timeout <=30s). Never
                     # launch another read while a canceled one is outstanding.
                     async with asyncio.timeout(remaining):
+                        port = await self.file_port(reference)
                         pending = asyncio.create_task(
                             asyncio.to_thread(capture_read, port.fetch, reference["file_id"])
                         )

@@ -57,7 +57,9 @@ for i=1,2 do redis.call('ZREMRANGEBYSCORE', KEYS[i], '-inf', ARGV[1]) end
 if redis.call('ZCARD', KEYS[1]) >= 16 or redis.call('ZCARD', KEYS[2]) >= 2 then return 0 end
 for i=1,2 do
  redis.call('ZADD', KEYS[i], ARGV[2], ARGV[3])
- redis.call('EXPIRE', KEYS[i], ARGV[4])
+ if redis.call('TTL', KEYS[i]) < tonumber(ARGV[4]) then
+  redis.call('EXPIRE', KEYS[i], ARGV[4])
+ end
 end
 return 1
 """
@@ -253,7 +255,16 @@ async def redeem(data: Ticket, request: Request, session: SessionDep) -> dict[st
     transfer = await transaction(request, transfer_id)
     claims = await authority.read_hash(transfer["token_hash"])
     row = await authorized_file(request, session, claims, uuid.UUID(transfer["id"]))
+    binding = await current_binding(session, Context.model_validate(claims["request"]))
+    if (
+        str(binding.id) != claims["binding_id"]
+        or binding.generation != claims["binding_generation"]
+    ):
+        raise catalog.refused("binding_revoked")
     return {
+        "binding_id": str(binding.id),
+        "binding_generation": binding.generation,
+        "binding_address": binding.address,
         "transfer_id": transfer_id,
         "agent_id": str(row.agent_id),
         "file_id": row.file_id,

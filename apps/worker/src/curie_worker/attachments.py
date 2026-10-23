@@ -45,9 +45,11 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import http.client
 import json
 import os
 import socket
+import ssl
 import threading
 import time
 import urllib.error
@@ -400,12 +402,18 @@ class AgentRoute:
 
     A re-fetch resolves its route from these and never from anything recorded
     with the file, so a rotated endpoint or a removed binding takes effect on
-    the next boot. Structural: any object with these three attributes serves.
+    the next boot. Eager materialization remains structural; the lazy broker
+    additionally requires the exact binding identity and generation.
     """
 
     kind: str
     adapter: str | None
     endpoint: str | None
+    # Exact binding fence used by the private lazy broker. Legacy eager ports
+    # may omit these, but the broker never admits an unidentified route.
+    binding_id: uuid.UUID | None = None
+    generation: int | None = None
+    address: str | None = None
 
 
 @dataclass(frozen=True)
@@ -732,6 +740,9 @@ class AttachmentReadScope:
     The optional context is inherited by ``asyncio.to_thread``. Legacy eager
     callers do not install it. A deadline and socket shutdown complement each
     other: slow dripping bytes cannot refresh the absolute transfer lifetime.
+    Synchronous OS DNS resolution cannot be forcibly interrupted; callers must
+    retain their concurrency slot until that owned call settles. TCP connect
+    also precedes socket ownership, with the original finite socket timeout.
     """
 
     def __init__(self, *, deadline_epoch: float) -> None:
@@ -741,16 +752,27 @@ class AttachmentReadScope:
         self._responses: set[Any] = set()
         self._cancelled = False
         self._token: Token[AttachmentReadScope | None] | None = None
+        self._deadline_timer: threading.Timer | None = None
 
     def __enter__(self) -> AttachmentReadScope:
         self._token = _READ_SCOPE.set(self)
+        self._deadline_timer = threading.Timer(
+            max(0, self.deadline_epoch - time.time()), self.cancel
+        )
+        self._deadline_timer.daemon = True
+        self._deadline_timer.start()
         return self
 
     def __exit__(self, *exc: object) -> None:
         self.cancel()
+        if self._deadline_timer is not None:
+            self._deadline_timer.cancel()
         for response in tuple(self._responses):
             response.close()
         self._responses.clear()
+        for sock in tuple(self._sockets):
+            sock.close()
+        self._sockets.clear()
         if self._token is not None:
             _READ_SCOPE.reset(self._token)
 
@@ -758,6 +780,15 @@ class AttachmentReadScope:
         if self._cancelled or self.deadline_epoch <= time.time():
             raise TimeoutError("attachment transfer ended")
         return self.deadline_epoch - time.time()
+
+    def track_socket(self, sock: socket.socket) -> None:
+        try:
+            with self._lock:
+                self.remaining()
+                self._sockets.add(sock)
+        except BaseException:
+            sock.close()
+            raise
 
     def track(self, response: Any) -> socket.socket:
         # urllib's HTTPResponse retains its socket through BufferedReader.raw.
@@ -798,6 +829,43 @@ _READ_SCOPE: ContextVar[AttachmentReadScope | None] = ContextVar(
 )
 
 
+class _ScopedHTTPConnection(http.client.HTTPConnection):
+    def connect(self) -> None:
+        super().connect()
+        scope = _READ_SCOPE.get()
+        assert scope is not None and self.sock is not None
+        scope.track_socket(self.sock)
+
+
+class _ScopedHTTPSConnection(http.client.HTTPSConnection):
+    _context: ssl.SSLContext
+
+    def connect(self) -> None:
+        # Own the TCP socket before TLS and response-head parsing. Preserve
+        # stdlib certificate/hostname verification through its default context.
+        http.client.HTTPConnection.connect(self)
+        scope = _READ_SCOPE.get()
+        assert scope is not None and self.sock is not None
+        scope.track_socket(self.sock)
+        self.sock = self._context.wrap_socket(
+            self.sock, server_hostname=self.host, do_handshake_on_connect=False
+        )
+        scope.track_socket(self.sock)
+        self.sock.do_handshake()
+
+
+class _ScopedHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, request: urllib.request.Request) -> Any:
+        return self.do_open(_ScopedHTTPConnection, request)
+
+
+class _ScopedHTTPSHandler(urllib.request.HTTPSHandler):
+    _context: ssl.SSLContext | None
+
+    def https_open(self, request: urllib.request.Request) -> Any:
+        return self.do_open(_ScopedHTTPSConnection, request, context=self._context)
+
+
 def _slack_transport(
     *,
     method: str,
@@ -815,7 +883,16 @@ def _slack_transport(
     scope = _READ_SCOPE.get()
     timeout = min(30.0, scope.remaining()) if scope is not None else 30.0
     request = urllib.request.Request(url, headers=dict(headers), method=method)
-    opener = urllib.request.build_opener(_NoRedirect())
+    opener = (
+        urllib.request.build_opener(
+            _NoRedirect(),
+            urllib.request.ProxyHandler({}),
+            _ScopedHTTPHandler(),
+            _ScopedHTTPSHandler(),
+        )
+        if scope is not None
+        else urllib.request.build_opener(_NoRedirect())
+    )
     try:
         response = opener.open(request, timeout=timeout)
     except urllib.error.HTTPError as exc:

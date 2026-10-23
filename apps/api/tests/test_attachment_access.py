@@ -78,6 +78,7 @@ async def access(clean_db: None, monkeypatch: pytest.MonkeyPatch) -> AsyncIterat
             "aid": aid,
             "did": did,
             "sessions": sessions,
+            "engine": engine,
             "valkey": valkey,
             "app": app,
         }
@@ -180,7 +181,9 @@ async def test_streamed_broker_commits_integrity_and_live_scope(
     )
     from curie_runner.platform_slack.capability import url_origin
     from curie_worker.attachment_broker import AttachmentBroker
-    from curie_worker.attachments import AgentRoute, ChannelPortFileClient
+    from curie_worker.attachments import ChannelPortFileClient
+    from curie_worker.binding import BindingResolver
+    from curie_worker.config import WorkerConfig
 
     body_reads: list[str] = []
     stopped = asyncio.Event()
@@ -188,6 +191,9 @@ async def test_streamed_broker_commits_integrity_and_live_scope(
 
     async def provider(req: web.Request) -> web.StreamResponse:
         assert req.headers["X-Curie-Adapter-Secret"] == "synthetic-adapter-key"
+        if req.match_info["lane"] == "a":
+            body_reads.append("wrong-endpoint")
+            return web.Response(body=b"wrong file")
         body_reads.append(req.match_info["id"])
         response = web.StreamResponse()
         await response.prepare(req)
@@ -202,7 +208,7 @@ async def test_streamed_broker_commits_integrity_and_live_scope(
         return response
 
     provider_app = web.Application()
-    provider_app.router.add_get("/attachments/{id}", provider)
+    provider_app.router.add_get("/{lane}/attachments/{id}", provider)
     provider_runner = web.AppRunner(provider_app)
     await provider_runner.setup()
     provider_site = web.TCPSite(provider_runner, "127.0.0.1", 0)
@@ -219,7 +225,16 @@ async def test_streamed_broker_commits_integrity_and_live_scope(
                 kind="email",
                 address="agent@example.test",
                 adapter="acme-adapter",
-                endpoint=provider_url,
+                endpoint=provider_url + "/b",
+            )
+        )
+        db.add(
+            AgentChannel(
+                agent_id=uuid.UUID(access["aid"]),
+                kind="email",
+                address="other@example.test",
+                adapter="acme-adapter",
+                endpoint=provider_url + "/a",
             )
         )
         await db.commit()
@@ -244,13 +259,11 @@ async def test_streamed_broker_commits_integrity_and_live_scope(
         while not server.started:
             await asyncio.sleep(0.01)
 
-    async def routes(aid: uuid.UUID) -> list[AgentRoute]:
-        assert str(aid) == access["aid"]
-        return [AgentRoute(kind="email", adapter="acme-adapter", endpoint=provider_url)]
+    resolver = BindingResolver(access["engine"], WorkerConfig(db_schema=get_settings().db_schema))
 
     broker = AttachmentBroker(
         internal_token=get_settings().internal_worker_token,
-        routes_for_agent=routes,
+        routes_for_agent=resolver.routes_for_agent,
         slack_files={},
         channel_files=ChannelPortFileClient(credentials={"acme-adapter": "synthetic-adapter-key"}),
         api_url=api_url,
@@ -714,3 +727,73 @@ async def test_verified_legacy_catalog_import_preserves_identity_and_old_schema(
             )
         )
         assert nullable == "NO"
+
+
+@pytest.mark.anyio
+async def test_short_transfer_cannot_expire_other_active_reservations(access: Any) -> None:
+    import time
+
+    from curie_api.attachment_access.authority import Authority
+    from curie_api.routers.attachment_access import RESERVE
+
+    client = access["valkey"]
+    prefix = Authority(client).prefix
+    global_key, session_key = prefix + "transfers", prefix + "test-session"
+    now = time.time()
+    assert await client.eval(RESERVE, 2, global_key, session_key, now, now + 100, "long", 101) == 1
+    assert await client.eval(RESERVE, 2, global_key, session_key, now, now + 1, "short", 2) == 1
+    # A short context must not erase either aggregate's still-running long entry.
+    assert await client.ttl(global_key) >= 99
+    assert await client.ttl(session_key) >= 99
+    assert (
+        await client.eval(RESERVE, 2, global_key, session_key, now + 2, now + 100, "next", 99) == 1
+    )
+    assert await client.zrange(global_key, 0, -1) == ["long", "next"]
+    assert (
+        await client.eval(RESERVE, 2, global_key, session_key, now + 2, now + 100, "over", 99) == 0
+    )
+
+
+@pytest.mark.anyio
+async def test_broker_rejects_changed_exact_binding_before_provider_access(access: Any) -> None:
+    from curie_worker.attachment_broker import AttachmentBroker
+    from curie_worker.binding import BindingResolver
+    from curie_worker.config import WorkerConfig
+    from sqlalchemy import update
+
+    class Provider:
+        def fetch(self, file_id: str) -> Any:
+            raise AssertionError("route rejection must precede provider access")
+
+    resolver = BindingResolver(access["engine"], WorkerConfig(db_schema=get_settings().db_schema))
+    route = (await resolver.routes_for_agent(uuid.UUID(access["aid"])))[0]
+    provider = Provider()
+    broker = AttachmentBroker(
+        internal_token="synthetic-worker-token",
+        routes_for_agent=resolver.routes_for_agent,
+        slack_files={"default": provider},
+        channel_files=None,
+        api_url="http://api.example.com",
+    )
+    ref = {
+        "agent_id": access["aid"],
+        "route_kind": "slack",
+        "route_adapter": "default",
+        "route_identity": "default",
+        "binding_id": str(route.binding_id),
+        "binding_generation": route.generation,
+        "binding_address": route.address,
+    }
+    assert await broker.file_port(ref) is provider
+    for change in ({"binding_id": str(uuid.uuid4())}, {"binding_address": "C0EXAMPLE2"}):
+        with pytest.raises(ValueError, match="binding unavailable"):
+            await broker.file_port(ref | change)
+    async with access["sessions"]() as db:
+        await db.execute(
+            update(AgentChannel)
+            .where(AgentChannel.id == route.binding_id)
+            .values(generation=AgentChannel.generation + 1)
+        )
+        await db.commit()
+    with pytest.raises(ValueError, match="binding unavailable"):
+        await broker.file_port(ref)
