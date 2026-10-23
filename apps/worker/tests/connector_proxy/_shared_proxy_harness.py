@@ -41,6 +41,7 @@ import concurrent.futures
 import dataclasses
 import datetime as dt
 import functools
+import gzip
 import http.client
 import itertools
 import json
@@ -48,6 +49,7 @@ import re
 import socket
 import time
 import uuid
+import zlib
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -103,6 +105,8 @@ LISTEN_PORT = "8480"
 HANDLE_SHAPE = re.compile(r"^crh1\.[A-Za-z0-9_-]{43}$")
 # Bounds every wait a request makes, so a hang fails instead of stalling.
 PROXY_WAIT_S = 90.0
+# How long a cleanup the proxy runs after answering may take to show.
+CLEANUP_WAIT_S = 10.0
 DEFAULT_EXPIRES_IN = 900
 
 
@@ -247,20 +251,38 @@ class ProxyReply:
 
 
 class EventStream:
-    """One held ``GET /mcp`` through the proxy."""
+    """One held exchange through the proxy: a ``GET /mcp``, or a POST answered as SSE."""
 
-    def __init__(self, port: int, headers: Sequence[tuple[str, str]]) -> None:
+    def __init__(
+        self,
+        port: int,
+        headers: Sequence[tuple[str, str]],
+        *,
+        method: str = "GET",
+        body: bytes | None = None,
+    ) -> None:
         self._connection = http.client.HTTPConnection("127.0.0.1", port, timeout=PROXY_WAIT_S)
-        self._connection.putrequest("GET", MCP_PATH, skip_accept_encoding=True)
+        self._connection.putrequest(method, MCP_PATH, skip_accept_encoding=True)
         for name, value in headers:
             self._connection.putheader(name, value)
-        self._connection.endheaders()
+        if body is not None:
+            self._connection.putheader("Content-Length", str(len(body)))
+        self._connection.endheaders(body)
         self.response = self._connection.getresponse()
         self.status = self.response.status
         self.headers = tuple(self.response.getheaders())
 
     def read_line(self) -> bytes:
         return self.response.readline()
+
+    def header(self, name: str) -> str | None:
+        wanted = name.lower()
+        return next((value for key, value in self.headers if key.lower() == wanted), None)
+
+    def read_rest(self) -> bytes:
+        """Everything left until the proxy ends the stream."""
+
+        return self.response.read()
 
     def reply(self) -> ProxyReply:
         """The whole answer of a refused stream."""
@@ -791,6 +813,31 @@ class SharedProxy:
     def open_stream(self, member: Member, session: str | None, **options: Any) -> EventStream:
         return EventStream(self.port, self.headers(member, session=session, **options))
 
+    def open_request_stream(self, member: Member, payload: object, **options: Any) -> EventStream:
+        """A POST whose answer is streamed back as it arrives (a streaming initialize)."""
+
+        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        return EventStream(self.port, self.headers(member, **options), method="POST", body=body)
+
+    def post_encoded(
+        self, member: Member | None, payload: object, encoding: str, **options: Any
+    ) -> ProxyReply:
+        """POST ``payload`` with ``Content-Encoding: <encoding>``, body encoded to match.
+
+        Each comma-separated coding is applied in order: ``gzip`` and
+        ``deflate`` really compress, ``identity`` leaves the bytes, and any
+        other token (``br``, ``x-made-up``) labels the JSON bytes unchanged.
+        """
+
+        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        for coding in (part.strip().lower() for part in encoding.split(",")):
+            if coding == "gzip":
+                body = gzip.compress(body)
+            elif coding == "deflate":
+                body = zlib.compress(body)
+        extra = [*options.pop("extra", ()), ("Content-Encoding", encoding)]
+        return self.send("POST", body=body, headers=self.headers(member, extra=extra, **options))
+
     def raw_post(self, body: bytes, headers: Sequence[tuple[str, str]]) -> socket.socket:
         """Send one POST on a raw socket and answer it unread; closing it hangs up."""
 
@@ -833,12 +880,17 @@ class SharedProxy:
 
         return self.registry.admit(handle)
 
-    def wait_for_invocations(self, count: int, timeout: float = PROXY_WAIT_S) -> None:
+    def wait_for_invocations(self, count: int, timeout: float = CLEANUP_WAIT_S) -> None:
+        """The proxy's ``finally`` may still be running when the client has its reply."""
+
         wait_until(
             lambda: self.registry.active_invocations == count,
             f"{count} active invocation(s)",
             timeout,
         )
+
+    def wait_for_sessions(self, count: int, timeout: float = CLEANUP_WAIT_S) -> None:
+        wait_until(lambda: self.registry.sessions == count, f"{count} open session(s)", timeout)
 
 
 def _pop(options: dict[str, Any], *names: str) -> dict[str, Any]:

@@ -396,6 +396,62 @@ def test_grant_an_unavailable_store_refuses(worlds: Worlds) -> None:
     assert _admitted(world.call(member, "whoami"))["binding"] == member.binding_id
 
 
+def test_grant_an_encoded_body_cannot_hide_a_gated_call(worlds: Worlds) -> None:
+    """CR1-1: an encoded gated call is refused, and refusing it spends no grant."""
+
+    world = worlds(gated_tools=("create_item",))
+    member = world.member()
+    arguments = {"title": "encoded"}
+    token, jti = world.grant(member, "create_item", arguments)
+    client = connect_or_skip()
+    key = GRANT_KEY_PREFIX + jti
+    try:
+        for grants in ([], [token]):
+            before = world.observe()
+            reply = world.post_encoded(
+                member, world.call_message("create_item", arguments), "gzip", grants=grants
+            )
+            world.assert_refused(reply, "body_encoding_unsupported", before)
+            assert client.exists(key) == 0
+        # Liveness: the same grant on the unencoded call is admitted once.
+        reply = world.call(member, "create_item", arguments, grants=[token])
+        assert _admitted(reply)["binding"] == member.binding_id
+        assert client.exists(key) == 1
+    finally:
+        client.delete(key)
+        client.close()
+
+
+def test_grant_a_call_refused_for_capacity_spends_no_grant(worlds: Worlds) -> None:
+    """CR1-2: invocations_full refuses before the single-use grant is spent."""
+
+    world = worlds(gated_tools=("create_item",), max_invocations=1)
+    holder, member = world.member(), world.member()
+    arguments = {"title": "capacity"}
+    token, jti = world.grant(member, "create_item", arguments)
+    client = connect_or_skip()
+    key = GRANT_KEY_PREFIX + jti
+    try:
+        hold, future = world.start_hold(holder, "capacity")
+        before = world.observe()
+        reply = world.call(member, "create_item", arguments, grants=[token])
+        world.assert_refused(reply, "invocations_full", before)
+        assert client.exists(key) == 0, "a call refused for capacity burned its grant"
+        outcome = _admitted(world.finish_hold(hold, future))
+        assert outcome["second"]["binding"] == holder.binding_id
+        world.wait_for_invocations(0)
+        # Capacity is back: the same grant is admitted once, then spent.
+        reply = world.call(member, "create_item", arguments, grants=[token])
+        assert _admitted(reply)["binding"] == member.binding_id
+        assert client.exists(key) == 1
+        before = world.observe()
+        replay = world.call(member, "create_item", arguments, grants=[token])
+        world.assert_refused(replay, "grant_required", before)
+    finally:
+        client.delete(key)
+        client.close()
+
+
 # =============================================================================
 # R1-2: a handle pins the admitted binding
 # =============================================================================

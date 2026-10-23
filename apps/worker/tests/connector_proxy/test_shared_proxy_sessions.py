@@ -20,8 +20,9 @@ in flight (R1-5), and a request id already reserved by a live exchange refuses
 
 from __future__ import annotations
 
+import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import pytest
@@ -29,10 +30,12 @@ from _fake_provider import FakeProvider
 from _fixture_mcp_server import PROTOCOL_VERSION
 from _resolver_harness import Fleet, Member
 from _shared_proxy_harness import (
+    CLEANUP_WAIT_S,
     PROXY_WAIT_S,
     ProxyReply,
     SharedProxy,
     Worlds,
+    expected_refusal_body,
     wait_until,
 )
 from curie_connector_proxy.resolver.handles import MAX_INVOCATIONS, MAX_SESSIONS
@@ -58,6 +61,25 @@ def _admitted(reply: ProxyReply) -> dict[str, Any]:
     result = reply.result
     assert "refused" not in result and "error" not in result, result
     return result
+
+
+def _admitted_once_released(world: SharedProxy, send: Callable[[], ProxyReply]) -> ProxyReply:
+    """``send`` until it is no longer refused ``request_id_in_use``, within the cleanup wait.
+
+    The previous exchange releases its request id in the proxy's ``finally``,
+    which may trail the reply the client already holds. Every interim answer
+    must be that exact refusal with nothing reaching the server.
+    """
+
+    deadline = time.monotonic() + CLEANUP_WAIT_S
+    while True:
+        before = world.observe()
+        reply = send()
+        in_use = reply.status == 403 and reply.json == expected_refusal_body("request_id_in_use")
+        if not in_use or time.monotonic() > deadline:
+            return reply
+        world.assert_refused(reply, "request_id_in_use", before)
+        time.sleep(0.05)
 
 
 def _initialize(world: SharedProxy, member: Member) -> ProxyReply:
@@ -112,7 +134,7 @@ def test_session_the_principals_own_membership_change_closes_it(worlds: Worlds) 
     before = world.observe()
     reply = world.call(member, "whoami", session=session)
     world.assert_refused(reply, "policy_generation_mismatch", before)
-    assert world.registry.sessions == open_sessions - 1
+    world.wait_for_sessions(open_sessions - 1)
     before = world.observe()
     world.assert_refused(world.call(member, "whoami", session=session), "session_unknown", before)
     # Liveness: a new session under the new membership works.
@@ -131,7 +153,7 @@ def test_session_a_removed_member_is_refused_and_readding_does_not_revive_it(
     world.remove(member)
     before = world.observe()
     world.assert_refused(world.call(member, "whoami", session=session), "not_member", before)
-    assert world.registry.sessions == open_sessions - 1
+    world.wait_for_sessions(open_sessions - 1)
     world.set_aliases(member, [{"alias": "primary", "tools": None}])
     before = world.observe()
     world.assert_refused(world.call(member, "whoami", session=session), "session_unknown", before)
@@ -251,7 +273,7 @@ def test_session_delete_ends_it_for_its_owner_only(worlds: Worlds) -> None:
     assert deleted.status == 200, deleted.text
     (seen,) = world.fixture.since(before.upstream)
     assert seen.method == "DELETE" and seen.session_id == session and seen.handles == []
-    assert world.registry.sessions == open_sessions - 1
+    world.wait_for_sessions(open_sessions - 1)
     before = world.observe()
     world.assert_refused(world.call(owner, "whoami", session=session), "session_unknown", before)
     assert _admitted(world.call(owner, "whoami", session=kept))["binding"] == owner.binding_id
@@ -267,7 +289,7 @@ def test_session_bound_refuses_a_session_past_the_maximum(worlds: Worlds) -> Non
     member = world.member()
     first = world.initialize(member)
     world.initialize(member)
-    assert world.registry.sessions == 2
+    world.wait_for_sessions(2)
     before = world.observe()
     world.assert_refused(_initialize(world, member), "sessions_full", before)
     assert world.registry.sessions == 2
@@ -275,7 +297,7 @@ def test_session_bound_refuses_a_session_past_the_maximum(worlds: Worlds) -> Non
     assert world.delete(member, first).status == 200
     third = world.initialize(member)
     assert _admitted(world.call(member, "whoami", session=third))["binding"] == member.binding_id
-    assert world.registry.sessions == 2
+    world.wait_for_sessions(2)
 
 
 def test_session_invocation_bound_refuses_a_second_call(worlds: Worlds) -> None:
@@ -392,7 +414,7 @@ def test_session_idle_sessions_are_pruned_but_active_ones_survive(worlds: Worlds
         world.clock.advance(120)
         # The idle session is reclaimed, freeing a slot under max_sessions.
         fourth = world.initialize(member)
-        assert world.registry.sessions == 3
+        world.wait_for_sessions(3)
         before = world.observe()
         world.assert_refused(world.call(member, "whoami", session=idle), "session_unknown", before)
         # The busy and streaming sessions were not: a fifth session has no slot.
@@ -430,7 +452,8 @@ def test_session_a_request_id_in_use_is_refused_until_its_exchange_ends(
     assert hold.wait_done()["second"] == {"refused": "handle_unknown", "status": 401}
     world.wait_for_invocations(0)
     # Once the first exchange ended, id 1 is usable again.
-    assert _admitted(world.call(member, "whoami", request_id=1))["binding"] == member.binding_id
+    reply = _admitted_once_released(world, lambda: world.call(member, "whoami", request_id=1))
+    assert _admitted(reply)["binding"] == member.binding_id
 
 
 def test_session_a_tools_call_without_an_id_is_handled_normally(worlds: Worlds) -> None:
@@ -447,3 +470,112 @@ def test_session_a_tools_call_without_an_id_is_handled_normally(worlds: Worlds) 
         ("/v1/whoami", world.digest(member))
     ]
     world.wait_for_invocations(0)
+
+
+# =============================================================================
+# CR1-3: a session opened by a streaming initialize
+# =============================================================================
+
+
+def test_session_a_streaming_initialize_counts_its_session_once(worlds: Worlds) -> None:
+    """The opening exchange's reservation becomes the session; it is not held twice."""
+
+    world = worlds(max_sessions=2)
+    member = world.member()
+    opening = world.fixture.stream_next_initialize()
+    stream = world.open_request_stream(member, world.message("initialize", INITIALIZE_PARAMS))
+    try:
+        assert stream.status == 200
+        session = stream.header("Mcp-Session-Id")
+        assert session is not None and session == opening.wait_opened()
+        assert stream.read_line().startswith(b"event: message")
+        assert not opening.closed.is_set(), "the opening stream ended early"
+        # The session is usable while its opening stream is still open.
+        assert _admitted(world.call(member, "whoami", session=session))["binding"] == (
+            member.binding_id
+        )
+        # One slot is left, so a second initialize is admitted...
+        second = world.initialize(member)
+        world.wait_for_sessions(2)
+        # ...and a third finds none.
+        before = world.observe()
+        world.assert_refused(_initialize(world, member), "sessions_full", before)
+        assert world.registry.sessions == 2
+        assert _admitted(world.call(member, "whoami", session=second))["binding"] == (
+            member.binding_id
+        )
+    finally:
+        opening.release()
+        stream.read_rest()
+        stream.close()
+    opening.wait_closed()
+
+
+def test_session_an_open_initialize_stream_keeps_its_session_from_pruning(
+    worlds: Worlds,
+) -> None:
+    """The opening exchange is in flight: idle pruning must not take its session."""
+
+    world = worlds(session_idle_seconds=30.0)
+    member = world.member()
+    opening = world.fixture.stream_next_initialize()
+    stream = world.open_request_stream(member, world.message("initialize", INITIALIZE_PARAMS))
+    try:
+        assert stream.status == 200
+        session = opening.wait_opened()
+        assert stream.header("Mcp-Session-Id") == session
+        finished = world.initialize(member)
+        world.clock.advance(120)
+        # A session-less request runs the pruning: the unused, finished session goes.
+        world.initialize(member)
+        before = world.observe()
+        world.assert_refused(
+            world.call(member, "whoami", session=finished), "session_unknown", before
+        )
+        opening.release()
+        stream.read_rest()
+    finally:
+        opening.release()
+        stream.close()
+    opening.wait_closed()
+    # The streamed session survived the threshold and still serves.
+    reply = world.call(member, "whoami", session=session)
+    assert _admitted(reply)["binding"] == member.binding_id
+
+
+# =============================================================================
+# A2: an SSE resumption binds its principal like any request
+# =============================================================================
+
+
+def test_session_a_resumption_is_bound_to_the_sessions_principal(worlds: Worlds) -> None:
+    world = worlds()
+    owner = world.member(aliases=BOTH_ALIASES)
+    other = world.member()
+    session = world.initialize(owner)
+    resume = [("Last-Event-ID", "event-41")]
+    for label, member, alias in [
+        ("another member", other, None),
+        ("the owner through another alias", owner, "secondary"),
+    ]:
+        before = world.observe()
+        refused = world.open_stream(member, session, alias=alias, extra=resume)
+        try:
+            world.assert_refused(refused.reply(), "session_principal_mismatch", before)
+        except AssertionError as error:
+            raise AssertionError(f"{label}: {error}") from None
+        finally:
+            refused.close()
+    # The owner's own resumption is forwarded, with no handle and no resolve.
+    before = world.observe()
+    stream = world.open_stream(owner, session, extra=resume)
+    try:
+        assert stream.status == 200
+        assert stream.read_line().startswith(b": open")
+        (seen,) = world.fixture.since(before.upstream)
+        assert seen.method == "GET" and seen.session_id == session
+        assert seen.values("Last-Event-ID") == ["event-41"]
+        assert seen.handles == []
+        assert world.resolver.admissions == before.admissions
+    finally:
+        stream.close()

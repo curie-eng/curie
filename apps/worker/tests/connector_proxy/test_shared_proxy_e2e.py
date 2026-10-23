@@ -63,7 +63,7 @@ def test_e2e_two_members_share_one_server_with_their_own_credentials(worlds: Wor
     calls = [r for r in world.fixture.since(before.upstream) if r.rpc == ("tools/call",)]
     assert len(calls) == 8
     assert len({request.handle for request in calls}) == 8
-    assert world.registry.active_invocations == 0
+    world.wait_for_invocations(0)
 
 
 def test_e2e_every_refusal_class_in_one_sequence_never_reaches_the_server(

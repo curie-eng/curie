@@ -8,6 +8,9 @@ a shared server needs:
 
 1. ``POST /mcp`` with ``initialize`` assigns a fresh ``Mcp-Session-Id`` on the
    response; a request naming a session the server does not hold is 404.
+   After ``stream_next_initialize()`` the next initialize is answered as an SSE
+   stream instead: ``Mcp-Session-Id`` in its headers, the result as the first
+   event, then held open until the test releases it.
 2. Notifications (``notifications/initialized``, ``notifications/cancelled``)
    and JSON-RPC responses are answered 202 with no body. Cancellation is
    recorded and otherwise ignored: a running tool is never stopped by it.
@@ -164,6 +167,27 @@ class Hold:
         return {"first": self.first, "second": self.second}
 
 
+@dataclass
+class OpeningStream:
+    """One initialize answered as a held SSE stream; released by the test."""
+
+    opened: threading.Event = field(default_factory=threading.Event)
+    released: threading.Event = field(default_factory=threading.Event)
+    closed: threading.Event = field(default_factory=threading.Event)
+    session_id: str | None = None
+
+    def wait_opened(self, timeout: float = HOLD_WAIT_S) -> str:
+        assert self.opened.wait(timeout), "the streaming initialize never opened"
+        assert self.session_id is not None
+        return self.session_id
+
+    def release(self) -> None:
+        self.released.set()
+
+    def wait_closed(self, timeout: float = HOLD_WAIT_S) -> None:
+        assert self.closed.wait(timeout), "the streaming initialize never ended"
+
+
 def _jsonrpc_result(message_id: object, result: Mapping[str, Any]) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": message_id, "result": dict(result)}
 
@@ -209,6 +233,7 @@ class FixtureMCPServer:
         self._requests: list[UpstreamRequest] = []
         self._sessions: set[str] = set()
         self._holds: dict[str, Hold] = {}
+        self._opening: list[OpeningStream] = []
         self._streams_open = 0
         self._stop_streams = threading.Event()
         self.stream_opened = threading.Event()
@@ -278,6 +303,14 @@ class FixtureMCPServer:
                 found = self._holds[key] = Hold(key)
             return found
 
+    def stream_next_initialize(self) -> OpeningStream:
+        """Answer the next ``initialize`` as a held SSE stream."""
+
+        opening = OpeningStream()
+        with self._lock:
+            self._opening.append(opening)
+        return opening
+
     # --- the transport ---------------------------------------------------------
 
     async def _handle(self, request: web.Request) -> web.StreamResponse:
@@ -305,7 +338,7 @@ class FixtureMCPServer:
             return web.json_response({"error": "method_not_allowed"}, status=405)
         if body and parsed is None:
             return web.json_response(_jsonrpc_error(None, -32700, "parse error"), status=400)
-        return await self._post(record, parsed)
+        return await self._post(request, record, parsed)
 
     def _known_session(self, record: UpstreamRequest) -> bool:
         session = record.session_id
@@ -314,10 +347,16 @@ class FixtureMCPServer:
         with self._lock:
             return session in self._sessions
 
-    async def _post(self, record: UpstreamRequest, parsed: object) -> web.StreamResponse:
+    async def _post(
+        self, request: web.Request, record: UpstreamRequest, parsed: object
+    ) -> web.StreamResponse:
         is_initialize = isinstance(parsed, dict) and parsed.get("method") == "initialize"
         if not is_initialize and not self._known_session(record):
             return web.json_response(_jsonrpc_error(None, -32001, "session not found"), status=404)
+        opening: OpeningStream | None = None
+        if is_initialize:
+            with self._lock:
+                opening = self._opening.pop(0) if self._opening else None
         if isinstance(parsed, list):
             replies: list[dict[str, Any]] = []
             for message in parsed:
@@ -330,8 +369,40 @@ class FixtureMCPServer:
         reply, session = await self._message(record, parsed)
         if reply is None:
             return web.Response(status=202)
+        if opening is not None and session is not None:
+            return await self._stream_initialize(request, reply, session, opening)
         headers = {SESSION_HEADER: session} if session is not None else {}
         return web.json_response(reply, headers=headers)
+
+    async def _stream_initialize(
+        self,
+        request: web.Request,
+        reply: Mapping[str, Any],
+        session: str,
+        opening: OpeningStream,
+    ) -> web.StreamResponse:
+        """The initialize result as the first SSE event of a stream held open."""
+
+        try:
+            response = web.StreamResponse(
+                headers={
+                    "Content-Type": "text/event-stream",
+                    "Cache-Control": "no-store",
+                    SESSION_HEADER: session,
+                }
+            )
+            await response.prepare(request)
+            event = b"event: message\ndata: " + json.dumps(dict(reply)).encode() + b"\n\n"
+            await response.write(event)
+            opening.session_id = session
+            opening.opened.set()
+            for _ in range(int(HOLD_WAIT_S / 0.05)):
+                if opening.released.is_set() or self._stop_streams.is_set():
+                    break
+                await asyncio.sleep(0.05)
+            return response
+        finally:
+            opening.closed.set()
 
     async def _message(
         self, record: UpstreamRequest, message: object
@@ -492,8 +563,11 @@ class FixtureMCPServer:
     def release_all(self) -> None:
         with self._lock:
             holds = list(self._holds.values())
+            openings = list(self._opening)
         for hold in holds:
             hold.release()
+        for opening in openings:
+            opening.release()
         self._stop_streams.set()
 
     def stop(self) -> None:

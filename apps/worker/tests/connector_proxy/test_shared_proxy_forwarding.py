@@ -173,7 +173,8 @@ def test_forward_every_call_gets_a_fresh_handle_that_dies_with_it(worlds: Worlds
         handle = _only(world, before.upstream).handle
         assert handle is not None and HANDLE_SHAPE.fullmatch(handle)
         handles.append(handle)
-        assert world.registry.active_invocations == baseline
+        # Cleanup runs in the proxy's finally, which may trail the reply.
+        world.wait_for_invocations(baseline)
         _handle_unknown(world, handle)
     assert len(set(handles)) == 3
 
@@ -234,8 +235,8 @@ def test_forward_the_handle_context_is_the_verified_token(worlds: Worlds) -> Non
     outcome = _admitted(reply)
     assert outcome["second"]["binding"] == member.binding_id
     # After completion the handle is gone.
+    world.wait_for_invocations(0)
     _handle_unknown(world, hold.handle)
-    assert world.registry.active_invocations == 0
 
 
 def test_forward_a_client_hang_up_revokes_the_handle(worlds: Worlds) -> None:
@@ -307,5 +308,5 @@ def test_forward_an_unreachable_server_answers_502_and_drops_the_handle(
     before = world.observe()
     reply = world.call(member, "whoami")
     assert reply.status == 502, reply.text
-    assert world.registry.active_invocations == 0
+    world.wait_for_invocations(0)
     assert world.observe() == before

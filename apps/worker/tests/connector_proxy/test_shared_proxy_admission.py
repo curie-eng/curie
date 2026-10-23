@@ -629,6 +629,48 @@ def test_authorize_a_batch_holds_at_most_one_tool_call(worlds: Worlds) -> None:
     assert world.resolver.admissions == before.admissions
 
 
+# CR1-1: the proxy authorizes only what it can read. Each coding is applied
+# for real where it compresses; an unknown token labels plain JSON bytes.
+ENCODINGS = ("gzip", "deflate", "br", "x-made-up", "gzip, gzip")
+
+
+def test_authorize_an_encoded_body_is_refused_before_it_is_forwarded(worlds: Worlds) -> None:
+    world = worlds(
+        tools=("whoami", "get_item", "run_task", "create_item", "hold"),
+        run_tools=("run_task",),
+        gated_tools=("create_item",),
+    )
+    member = world.member()
+    messages = [
+        ("a tool outside the policy", world.call_message("echo_headers")),
+        ("a run tool without a pair", world.call_message("run_task")),
+        ("a gated tool without a grant", world.call_message("create_item", {"title": "t"})),
+        ("an allowed tool", world.call_message("whoami")),
+        ("a batch hiding two tool calls", [world.call_message("whoami")] * 2),
+        ("a non-tool request", world.message("tools/list")),
+    ]
+    for encoding in ENCODINGS:
+        for label, message in messages:
+            before = world.observe()
+            reply = world.post_encoded(member, message, encoding)
+            try:
+                world.assert_refused(reply, "body_encoding_unsupported", before)
+            except AssertionError as error:
+                raise AssertionError(f"{encoding} / {label}: {error}") from None
+    # Liveness: the same calls unencoded, or explicitly identity, are inspected
+    # and decided on what they say.
+    _admitted_whoami(world.call(member, "whoami"), member.binding_id)
+    identity = world.post_encoded(member, world.call_message("whoami"), "identity")
+    _admitted_whoami(identity, member.binding_id)
+    for tool, arguments, code in [
+        ("echo_headers", {}, "tool_not_allowed"),
+        ("run_task", {}, "run_required"),
+        ("create_item", {"title": "t"}, "grant_required"),
+    ]:
+        before = world.observe()
+        world.assert_refused(world.call(member, tool, arguments), code, before)
+
+
 def test_authorize_a_dedicated_grant_never_authorizes_a_gated_shared_tool(
     worlds: Worlds,
 ) -> None:

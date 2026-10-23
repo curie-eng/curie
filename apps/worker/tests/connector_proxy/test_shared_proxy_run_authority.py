@@ -385,3 +385,18 @@ def test_run_the_handle_expires_with_the_token(worlds: Worlds) -> None:
     assert outcome["second"] == {"refused": "handle_expired", "status": 401}
     assert world.provider.calls("/v1/hold/second") == []
     world.wait_for_invocations(0)
+
+
+def test_run_an_encoded_body_cannot_hide_a_run_tool(worlds: Worlds) -> None:
+    """CR1-1: a gzip body the proxy cannot read is refused, never forwarded unchecked."""
+
+    world = worlds(run_tools=("run_task",))
+    member = world.member()
+    before = world.observe()
+    reply = world.post_encoded(member, world.call_message("run_task"), "gzip")
+    world.assert_refused(reply, "body_encoding_unsupported", before)
+    # Liveness: the paired call, unencoded, carries its pair to the server.
+    run, work_item = str(uuid.uuid4()), str(uuid.uuid4())
+    paired = world.call(member, "run_task", token_options={"run": run, "work_item": work_item})
+    result = _admitted(paired)
+    assert (result["run"], result["work_item"]) == (run, work_item)
