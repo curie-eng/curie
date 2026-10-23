@@ -111,12 +111,14 @@ jobs:
       GH_REPO: ${{ github.repository }}
       CI_REF: ${{ github.ref_name }}
     steps:
-      - name: Dispatch and wait for full CI on the tag
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Reuse complete kind proof or dispatch and wait for full CI
         run: |
-          dispatch=$(gh api --method POST "repos/$GH_REPO/actions/workflows/ci.yaml/dispatches" \
-            -f ref="$CI_REF" -F return_run_details=true)
-          run_id=$(jq -er '.workflow_run_id | select(type == "number" and . > 0 and . == floor)' <<< "$dispatch")
-          gh run watch "$run_id" --exit-status
+          python3 release/kind_ci.py run --repo "$GH_REPO" --ref "$CI_REF" \
+            --commit "$GITHUB_SHA" --timeout-seconds 20400
 
   build:
     permissions:
