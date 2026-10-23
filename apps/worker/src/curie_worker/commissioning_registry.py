@@ -44,6 +44,7 @@ from .protected_launch_registry import (
     _open_file,
     _open_root,
     _require,
+    _require_no_probe_storage,
     _safe,
     _scalar,
 )
@@ -255,6 +256,7 @@ class CommissioningLaunchRegistry:
         instance._mutex = threading.RLock()
         try:
             instance._root_fd = _open_root(root)
+            _require_no_probe_storage(instance._root_fd)
             instance._lock_fd = _open_file(instance._root_fd, "commissioning.lock")
             try:
                 fcntl.flock(instance._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -317,6 +319,7 @@ class CommissioningLaunchRegistry:
 
     def _check_root(self) -> None:
         _require(self._root_fd >= 0)
+        _require_no_probe_storage(self._root_fd)
         actual = os.stat(self._root, follow_symlinks=False)
         pinned = os.fstat(self._root_fd)
         _require(

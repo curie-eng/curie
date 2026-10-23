@@ -401,6 +401,58 @@ class Hanging(Api):
         return await super().read(namespace, kind, name)
 
 
+@pytest.mark.parametrize("through_fact", [False, True])
+def test_a_failed_absence_read_cancels_and_joins_its_siblings(tmp_path, through_fact):
+    class ReadFailure(Api):
+        """One external read fails only after its sibling reads have started."""
+
+        def __init__(self):
+            super().__init__()
+            self.armed = False
+            self.reading: set[str] = set()
+            self.ready = asyncio.Event()
+
+        async def read(self, namespace, kind, name):
+            if not self.armed:
+                return await super().read(namespace, kind, name)
+            if kind == "pods" and name == pod_name(PROBES[0]):
+                await self.ready.wait()
+                raise ConnectionError("synthetic unavailable API")
+            self.reading.add(name)
+            if len(self.reading) == (5 if through_fact else 2):
+                self.ready.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                self.reading.remove(name)
+
+    async def scenario():
+        api = ReadFailure()
+        probes = runtime(tmp_path, api)
+        try:
+            ids = PROBES if through_fact else PROBES[:1]
+            for i, probe_id in enumerate(ids):
+                await probes.launch(probe_id, ASSIGNMENT)
+                api.run(pod_name(probe_id), "containerd://" + ("c", "d")[i] * 64)
+                await probes.exercise(probe_id, Primitive())
+                assert await probes.retire(probe_id)
+            row = probes.registry.get(PROBES[0])
+            api.armed = True
+            if through_fact:
+                with pytest.raises(LaunchControlUnavailable):
+                    await PrimitiveCompletions(probes, ids).observe()
+            else:
+                with pytest.raises((ConnectionError, ExceptionGroup)):
+                    await probes.absent(row)
+            # The caller may tear down its client now. No sibling read may
+            # remain active after the failed observation returned.
+            assert api.reading == set()
+        finally:
+            probes.registry.close()
+
+    asyncio.run(scenario())
+
+
 def test_the_completions_fact_refuses_at_its_deadline(tmp_path, monkeypatch):
     from curie_worker.managed_cni_probe_kit import PRODUCER_CONSTANTS
 
