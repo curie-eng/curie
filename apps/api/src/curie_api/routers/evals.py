@@ -32,7 +32,7 @@ router = APIRouter(
 )
 
 
-def _stream_trace_window(stream_id: str) -> datetime:
+def _stream_trace_window(stream_id: str) -> datetime | None:
     """Read the enqueue milliseconds from a concrete Redis stream entry ID."""
     match = re.fullmatch(r"([0-9]{1,20})-([0-9]{1,20})", stream_id)
     if match is None:
@@ -45,17 +45,22 @@ def _stream_trace_window(stream_id: str) -> datetime:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_CONTENT, "stream_id is outside the Redis entry ID range"
         )
-    try:
-        # Allow a small clock skew between the queue and trace recorder. Keep
-        # integer milliseconds so the bound is exact, including UTC day edges.
-        return datetime(1970, 1, 1, tzinfo=UTC) + timedelta(
-            milliseconds=max(0, milliseconds - 5_000)
-        )
-    except OverflowError as exc:
+    # Pinned ClickHouse DateTime64 supports dates through 2299. Validate the
+    # enqueue timestamp itself, before allowing clock skew in the query bound.
+    # https://github.com/ClickHouse/ClickHouse/blob/v24.8.14.39-lts/docs/en/sql-reference/data-types/datetime64.md
+    if milliseconds > 10_413_791_999_999:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_CONTENT,
             "stream_id timestamp is outside the supported range",
-        ) from exc
+        )
+    lower_milliseconds = max(0, milliseconds - 5_000)
+    # Langfuse serializes this filter as numeric milliseconds. The pinned
+    # ClickHouse parser interprets smaller values as seconds (or rejects them).
+    # Omit this optimization for early IDs; exact stream metadata still filters.
+    # https://github.com/ClickHouse/ClickHouse/blob/v24.8.14.39-lts/src/IO/ReadHelpers.h
+    if lower_milliseconds < 10_413_792_000:
+        return None
+    return datetime(1970, 1, 1, tzinfo=UTC) + timedelta(milliseconds=lower_milliseconds)
 
 
 @router.post("/trigger", response_model=EvalTriggerResult)

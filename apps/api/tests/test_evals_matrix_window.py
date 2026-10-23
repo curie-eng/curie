@@ -1,7 +1,7 @@
 """The matrix scopes its real Langfuse HTTP reads before paging suite traces."""
 
 import asyncio
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -41,6 +41,7 @@ async def _matrix(
     *,
     page_size: int = 1,
     unstable_timestamp_ties: bool = False,
+    numeric_datetime_parameters: bool = False,
 ) -> tuple[httpx.Response, list[httpx.Request]]:
     requests: list[httpx.Request] = []
 
@@ -56,10 +57,21 @@ async def _matrix(
         # https://github.com/langfuse/langfuse/blob/v3.225.5/fern/apis/server/definition/trace.yml
         lower = request.url.params.get("fromTimestamp")
         if lower is not None:
+            bound = datetime.fromisoformat(lower)
+            if numeric_datetime_parameters:
+                delta = bound - datetime(1970, 1, 1, tzinfo=UTC)
+                millis = delta.days * 86_400_000 + delta.seconds * 1000 + delta.microseconds // 1000
+                # Langfuse 3.225.5 serializes the filter as integer Unix ms.
+                # Pinned ClickHouse interprets small integers as seconds (or
+                # refuses them), rather than as DateTime64(3) milliseconds.
+                if millis < 10_000:
+                    return httpx.Response(500, json={"error": "Cannot parse DateTime"})
+                if millis < 10_413_792_000:
+                    bound = datetime(1970, 1, 1, tzinfo=UTC) + timedelta(seconds=millis)
             selected = [
                 trace
                 for trace in selected
-                if datetime.fromisoformat(trace["timestamp"]) >= datetime.fromisoformat(lower)
+                if datetime.fromisoformat(trace["timestamp"]) >= bound
             ]
         # One trace per page exercises propagation on subsequent HTTP requests.
         page = int(request.url.params["page"])
@@ -202,6 +214,9 @@ def test_no_stream_preserves_suite_history(auth_headers: dict[str, str]) -> None
         "18446744073709551616-0",
         "1-18446744073709551616",
         "18446744073709551615-0",
+        "10413792000000-0",
+        "10413792004999-0",
+        "253402300799999-0",
     ],
 )
 def test_malformed_stream_id_is_rejected_before_langfuse(
@@ -217,13 +232,13 @@ def test_malformed_stream_id_is_rejected_before_langfuse(
     assert requests == []
 
 
-def test_early_stream_window_stays_at_epoch(auth_headers: dict[str, str]) -> None:
+def test_early_stream_window_omits_provider_cutoff(auth_headers: dict[str, str]) -> None:
     response, requests = asyncio.run(
         _matrix({"suite": "acme-suite", "stream_id": "1-18446744073709551615"}, auth_headers)
     )
 
     assert response.status_code == 200, response.text
-    assert requests[0].url.params["fromTimestamp"] == "1970-01-01T00:00:00.000+00:00"
+    assert "fromTimestamp" not in requests[0].url.params
 
 
 def test_equal_timestamp_pages_preserve_every_case(auth_headers: dict[str, str]) -> None:
@@ -263,3 +278,50 @@ def test_matrix_refuses_history_beyond_complete_read_bound(auth_headers: dict[st
     assert response.status_code == 503, response.text[:200]
     assert "stream_id" in response.json()["detail"]
     assert len(requests) == 1
+
+
+@pytest.mark.parametrize("milliseconds", [1, 1000, 10_413_796_999])
+def test_early_run_keeps_exact_results_without_ambiguous_provider_cutoff(
+    milliseconds: int, auth_headers: dict[str, str]
+) -> None:
+    # Observed against Langfuse 3.225.5 and ClickHouse 24.8.14.39-lts.
+    # The numeric date parser's scaled/subseconds switch is authoritative:
+    # https://github.com/ClickHouse/ClickHouse/blob/v24.8.14.39-lts/src/IO/ReadHelpers.h
+    stream_id = f"{milliseconds}-0"
+    stamp = (datetime(1970, 1, 1, tzinfo=UTC) + timedelta(milliseconds=milliseconds)).isoformat()
+    response, requests = asyncio.run(
+        _matrix(
+            {"suite": "acme-suite", "stream_id": stream_id},
+            auth_headers,
+            [_trace("requested", stamp, stream_id), _trace("other-run", stamp, "7000-0")],
+            numeric_datetime_parameters=True,
+        )
+    )
+    assert response.status_code == 200, response.text[:200]
+    assert response.json()["cases"] == ["requested"]
+    assert all("fromTimestamp" not in request.url.params for request in requests)
+
+
+@pytest.mark.parametrize("milliseconds", [10_413_797_000, 10_413_791_999_999])
+def test_supported_provider_window_edges_keep_exact_millisecond_cutoff(
+    milliseconds: int, auth_headers: dict[str, str]
+) -> None:
+    # The pinned DateTime64 supported range ends in 2299, unlike Python's:
+    # https://github.com/ClickHouse/ClickHouse/blob/v24.8.14.39-lts/docs/en/sql-reference/data-types/datetime64.md
+    stream_id = f"{milliseconds}-0"
+    epoch = datetime(1970, 1, 1, tzinfo=UTC)
+    stamp = (epoch + timedelta(milliseconds=milliseconds)).isoformat()
+    response, requests = asyncio.run(
+        _matrix(
+            {"suite": "acme-suite", "stream_id": stream_id},
+            auth_headers,
+            [_trace("requested", stamp, stream_id)],
+            numeric_datetime_parameters=True,
+        )
+    )
+    assert response.status_code == 200, response.text[:200]
+    assert response.json()["cases"] == ["requested"]
+    expected = (epoch + timedelta(milliseconds=milliseconds - 5000)).isoformat(
+        timespec="milliseconds"
+    )
+    assert all(request.url.params["fromTimestamp"] == expected for request in requests)
