@@ -11045,6 +11045,149 @@ export const commandManifest = {
           "name": "model-credit"
         },
         {
+          "about": "Evaluate conversational learning on a private local stack (#4780)",
+          "args": [
+            {
+              "default_values": [
+                "1"
+              ],
+              "global": false,
+              "help": "Number of fresh repetitions of the 24-scenario corpus",
+              "id": "repetitions",
+              "long": "repetitions",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "7.50"
+              ],
+              "global": false,
+              "help": "Campaign budget in USD for every paid call, at most 7.50",
+              "id": "budget_usd",
+              "long": "budget-usd",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "0.9"
+              ],
+              "global": false,
+              "help": "Minimum per-class precision with complete six-class coverage",
+              "id": "precision_threshold",
+              "long": "precision-threshold",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "0.8"
+              ],
+              "global": false,
+              "help": "Minimum per-class recall with complete six-class coverage",
+              "id": "recall_threshold",
+              "long": "recall-threshold",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "0.05"
+              ],
+              "global": false,
+              "help": "Maximum distractor false-write rate",
+              "id": "falsewrite_threshold",
+              "long": "falsewrite-threshold",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "0"
+              ],
+              "global": false,
+              "help": "Maximum correction duplicates",
+              "id": "duplicate_threshold",
+              "long": "duplicate-threshold",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "0"
+              ],
+              "global": false,
+              "help": "Learned-minus-removed held-out success difference must exceed this",
+              "id": "heldout_control_improvement_threshold",
+              "long": "heldout-control-improvement-threshold",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "1"
+              ],
+              "global": false,
+              "help": "Exact final deliveries required per due positive schedule",
+              "id": "scheduled_delivery_threshold",
+              "long": "scheduled-delivery-threshold",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Directory for report.json, report.md and turn context",
+              "id": "output_dir",
+              "long": "output-dir",
+              "positional": false,
+              "required": true
+            },
+            {
+              "global": false,
+              "help": "Validate inputs and print the plan without services or paid calls",
+              "id": "dry_run",
+              "long": "dry-run",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "long_about": "Evaluate conversational learning on a private local stack (#4780).\n\nOwns the whole lifecycle: a private compose project, the pinned actor and judge models, one campaign budget, report.json and report.md in the output directory, and teardown of everything it created.",
+          "name": "learning-eval"
+        },
+        {
+          "about": "Validate recorded learning-eval evidence without paid calls",
+          "args": [
+            {
+              "global": false,
+              "help": "Which validator to run",
+              "id": "validator",
+              "positional": true,
+              "possible_values": [
+                "report",
+                "calibration",
+                "negative",
+                "cleanup"
+              ],
+              "required": true
+            },
+            {
+              "global": false,
+              "help": "Path to the recorded report.json",
+              "id": "report",
+              "positional": true,
+              "required": true
+            }
+          ],
+          "hidden": false,
+          "name": "learning-eval-verify"
+        },
+        {
           "about": "Drive generic OIDC console login end to end against a real Dex IdP (#2908, #3800, `python3 tools/oidc-e2e/oidc_e2e.py`). Boots this checkout's API and console UI as an isolated compose project beside Dex, logs in through the console's /api proxy, and asserts PKCE and cookie flags, callback binding and replay, logout's Origin check, required claims, issuer binding, the rate limit, and that the login-code console login still resolves an approval with OIDC off. Removes everything on exit and writes JSON evidence. Needs Docker; no credentials",
           "args": [
             {

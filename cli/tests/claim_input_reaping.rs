@@ -127,6 +127,10 @@ elif args[:2] == ['volume', 'rm']:
     for name in (arg for arg in args[2:] if not arg.startswith('-')):
         if any(mount.get('Name') == name for _, body in resources('container') for mount in body.get('Mounts', [])):
             fail('volume is in use: ' + name)
+        if os.environ.get('CURIE_TEST_REAP_CASE') == 'removed-concurrently' and name == 'acme-workspace':
+            db.execute('DELETE FROM resources WHERE kind = ? AND name = ?', ('volume', name))
+            db.commit()
+            fail('Error response from daemon: get ' + name + ': no such volume')
         db.execute('DELETE FROM resources WHERE kind = ? AND name = ?', ('volume', name))
         print(name)
     db.commit()
@@ -256,4 +260,21 @@ fn local_down_preserves_inputs_without_valid_runner_ownership() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+}
+
+#[test]
+fn local_down_treats_an_input_removed_after_inspection_as_reaped() {
+    let dir = tempfile::tempdir().expect("temporary fixture");
+    let output = local_down(dir.path(), "removed-concurrently");
+    let diagnostic = format!(
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "{diagnostic}");
+    assert_eq!(
+        volume_names(dir.path()),
+        preserved_volumes(),
+        "{diagnostic}"
+    );
 }
