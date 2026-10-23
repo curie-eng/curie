@@ -26,7 +26,7 @@ import json
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from typing import cast
+from typing import Any, cast
 
 from nacl.exceptions import BadSignatureError
 from nacl.signing import VerifyKey
@@ -206,12 +206,6 @@ def _unique(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return parsed
 
 
-def _caller_payload(keys: Sequence[VerifyKey], token: str) -> dict[str, object] | None:
-    """The signed caller claims object, under the caller-only parse rules."""
-
-    return _strict_payload(keys, token, PREFIX)
-
-
 def _strict_payload(
     keys: Sequence[VerifyKey], token: str, prefix: str
 ) -> dict[str, object] | None:
@@ -264,6 +258,18 @@ def _uuid_ok(value: object) -> bool:
     return isinstance(value, str) and _UUID.fullmatch(value) is not None
 
 
+def alias_ok(value: object) -> bool:
+    """The membership alias spelling: 1 to 63 lowercase letters, digits or inner hyphens."""
+
+    return isinstance(value, str) and _ALIAS.fullmatch(value) is not None
+
+
+def sha256_hex_ok(value: object) -> bool:
+    """64 lowercase hex digits."""
+
+    return isinstance(value, str) and _SHA256_HEX.fullmatch(value) is not None
+
+
 def claims_fault(
     *,
     installation: object,
@@ -307,7 +313,8 @@ def claims(keys: Sequence[VerifyKey], token: str) -> Decision | None:
     here, and only ``decide_shared`` refuses it.
     """
 
-    parsed = _caller_payload(keys, token)
+    # The caller-only parse rules.
+    parsed = _strict_payload(keys, token, PREFIX)
     if parsed is None:
         return None
     if parsed.keys() != _CLAIMS and parsed.keys() != _PAIRED_CLAIMS:
@@ -438,11 +445,11 @@ def shared_grant_fault(
         return "application must be a lowercase hyphenated uuid"
     if not _uuid_ok(binding):
         return "binding must be a lowercase hyphenated uuid"
-    if not isinstance(alias, str) or _ALIAS.fullmatch(alias) is None:
+    if not alias_ok(alias):
         return "alias must be 1 to 63 lowercase letters, digits or inner hyphens"
     if not _tool_ok(tool):
         return "tool must be 1 to 128 characters with no control character"
-    if not isinstance(args_sha256, str) or _SHA256_HEX.fullmatch(args_sha256) is None:
+    if not sha256_hex_ok(args_sha256):
         return "args_sha256 must be 64 lowercase hex digits"
     if type(policy_generation) is not int or not 1 <= policy_generation <= _MAX_EXP:
         return "policy_generation must be an integer in 1..=2**63-1"
@@ -469,16 +476,7 @@ def verify_shared_grant(keys: Sequence[VerifyKey], token: str) -> SharedGrant | 
     if shared_grant_fault(**parsed) is not None:
         return None
     # ``shared_grant_fault`` has checked every type, which mypy cannot see.
-    return SharedGrant(
-        application=cast("str", parsed["application"]),
-        binding=cast("str", parsed["binding"]),
-        alias=cast("str", parsed["alias"]),
-        tool=cast("str", parsed["tool"]),
-        args_sha256=cast("str", parsed["args_sha256"]),
-        policy_generation=cast("int", parsed["policy_generation"]),
-        exp=cast("int", parsed["exp"]),
-        jti=cast("str", parsed["jti"]),
-    )
+    return SharedGrant(**cast("dict[str, Any]", parsed))
 
 
 def decide(

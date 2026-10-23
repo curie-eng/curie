@@ -49,7 +49,6 @@ fixed set. It never carries a token, handle, grant, credential or argument.
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import math
 import re
@@ -58,7 +57,7 @@ import uuid
 from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlparse
 
 from aiohttp import ClientError, ClientSession, web
@@ -68,7 +67,14 @@ from nacl.signing import VerifyKey
 from yarl import URL
 
 from . import caller, server
-from .resolver.admission import ACQUIRE_TIMEOUT_S, STORE_ERRORS, membership_stamp
+from .canonical import arguments_sha256
+from .resolver.admission import (
+    ACQUIRE_TIMEOUT_S,
+    MEMBERSHIP_SQL,
+    STORE_ERRORS,
+    jsonb,
+    membership_stamp,
+)
 from .resolver.handles import (
     REGISTRY_FOREIGN,
     HandleRegistry,
@@ -76,6 +82,7 @@ from .resolver.handles import (
     InvocationContext,
     Principal,
     RegistryRefusal,
+    uuid_ok,
 )
 from .resolver.http import ResolverRuntime
 from .resolver.wire import CodedError
@@ -170,8 +177,6 @@ GRANT_BINDING_MISMATCH = "binding_mismatch"
 GRANT_ALIAS_MISMATCH = "alias_mismatch"
 GRANT_GENERATION_MISMATCH = "generation_mismatch"
 
-_ALIAS = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
-_UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 _UPSTREAM_URL = re.compile(r"^http://127\.0\.0\.1:([1-9][0-9]{0,4})$")
 _STORE_SCHEMES = ("redis://", "rediss://")
 # Far above a Valkey URL; bounds what a mis-mounted file can cost.
@@ -200,16 +205,16 @@ class _GrantRefused(SharedRefusal):
 def refusal_body(code: str) -> dict[str, object]:
     """The dedicated JSON-RPC refusal for ``code``'s ``curie_caller``, plus ``curie_shared``."""
 
-    curie_caller = REFUSALS[code][1]
-    return {
-        "jsonrpc": "2.0",
-        "id": None,
-        "error": {
-            "code": server._REFUSAL_CODE,
-            "message": f"caller refused: {server._REFUSAL_MESSAGES[curie_caller]}",
-            "data": {"curie_caller": curie_caller, "curie_shared": code},
-        },
-    }
+    body = server.refusal_body(REFUSALS[code][1])
+    error = cast("dict[str, Any]", body["error"])
+    error["data"]["curie_shared"] = code
+    return body
+
+
+def refusal_response(code: str) -> web.Response:
+    """The refusal answer for ``code``: its status and ``refusal_body``."""
+
+    return web.json_response(refusal_body(code), status=REFUSALS[code][0])
 
 
 def run_context(
@@ -247,17 +252,6 @@ def _upstream_port(env: Mapping[str, str]) -> int:
             "with an explicit port and nothing else"
         )
     return int(matched.group(1))
-
-
-def _public_keys(env: Mapping[str, str]) -> tuple[VerifyKey, ...]:
-    texts = [text for text in env.get(server.PUBLIC_KEYS_ENV, "").split(",") if text.strip()]
-    if not texts:
-        raise ValueError(f"{server.PUBLIC_KEYS_ENV} names no public key")
-    try:
-        return tuple(caller.public_key(text) for text in texts)
-    except ValueError as exc:
-        # ``public_key`` names the fault and never the text.
-        raise ValueError(f"{server.PUBLIC_KEYS_ENV}: {exc}") from None
 
 
 def _grant_store_url(env: Mapping[str, str]) -> str:
@@ -314,14 +308,14 @@ class SharedProxyConfig:
                 "bytes with no control or white space character"
             )
         application = env.get(SHARED_APPLICATION_ENV, "")
-        if _UUID.fullmatch(application) is None:
+        if not uuid_ok(application):
             raise ValueError(f"{SHARED_APPLICATION_ENV} must be a canonical lowercase UUID")
         return cls(
             installation=installation,
             application=application,
             listen_port=_port(env, PROXY_PORT_ENV),
             upstream_port=_upstream_port(env),
-            public_keys=_public_keys(env),
+            public_keys=server._public_keys(env),
             grant_store_url=_grant_store_url(env),
         )
 
@@ -332,12 +326,6 @@ _APPLICATION_SQL = """
 SELECT a.installation_id, a.enabled, a.policy_generation, a.policy
 FROM curie.shared_connector_applications a
 WHERE a.id = $1
-"""
-
-_MEMBERSHIP_SQL = """
-SELECT m.tools, m.created_at, m.updated_at
-FROM curie.shared_connector_memberships m
-WHERE m.application_id = $1 AND m.agent_id = $2 AND m.alias = $3
 """
 
 _BINDING_SQL = """
@@ -366,12 +354,6 @@ class _Policy:
         return tool in self.tools and (self.alias_tools is None or tool in self.alias_tools)
 
 
-def _json(value: Any) -> Any:
-    """A JSONB value; asyncpg answers JSONB as text."""
-
-    return json.loads(value) if isinstance(value, str) else value
-
-
 def _names(value: object) -> frozenset[str]:
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
         raise ValueError("not a JSON list of strings")
@@ -396,10 +378,10 @@ def _evaluate(
     if not binding["enabled"]:
         raise SharedRefusal(BINDING_DISABLED)
     try:
-        policy = _json(application["policy"])
+        policy = jsonb(application["policy"])
         if not isinstance(policy, dict):
             raise ValueError("the policy is not a JSON object")
-        alias_tools = _json(member["tools"])
+        alias_tools = jsonb(member["tools"])
         generation = application["policy_generation"]
         if type(generation) is not int or generation < 1:
             raise ValueError("the policy generation is not a positive integer")
@@ -433,7 +415,7 @@ async def _read_policy(
         async with pool.acquire(timeout=ACQUIRE_TIMEOUT_S) as connection:
             async with connection.transaction(isolation="repeatable_read", readonly=True):
                 application = await connection.fetchrow(_APPLICATION_SQL, application_id)
-                member = await connection.fetchrow(_MEMBERSHIP_SQL, application_id, agent, alias)
+                member = await connection.fetchrow(MEMBERSHIP_SQL, application_id, agent, alias)
                 binding = await connection.fetchrow(_BINDING_SQL, application_id, agent)
     except STORE_ERRORS:
         raise SharedRefusal(STORE_UNAVAILABLE) from None
@@ -473,7 +455,7 @@ def _verified(decision: caller.Decision) -> _Caller:
 
 def _alias(headers: CIMultiDictProxy[str]) -> str:
     presented = headers.getall(ALIAS_HEADER, [])
-    if len(presented) != 1 or _ALIAS.fullmatch(presented[0]) is None:
+    if len(presented) != 1 or not caller.alias_ok(presented[0]):
         raise SharedRefusal(ALIAS_REQUIRED)
     return presented[0]
 
@@ -498,9 +480,8 @@ async def _read_body(request: web.Request) -> bytes | None:
     try:
         body = await request.read()
     except web.HTTPRequestEntityTooLarge:
+        # ``make_shared_app`` sets ``client_max_size`` to the limit, so ``read`` enforces it.
         raise SharedRefusal(BODY_TOO_LARGE) from None
-    if len(body) > server._MAX_BODY_BYTES:
-        raise SharedRefusal(BODY_TOO_LARGE)
     return body
 
 
@@ -630,6 +611,11 @@ class _SharedProxy:
         self.reserved_invocations = 0
         self.pending: dict[_Key, _Pending] = {}
         self.upstream: ClientSession | None = None
+        self.grants = server._ValkeyGrantStore(
+            config.grant_store_url,
+            prefix=GRANT_KEY_PREFIX,
+            failure="shared connector grant spend failed",
+        )
 
     # --- sessions -----------------------------------------------------------------
 
@@ -675,6 +661,11 @@ class _SharedProxy:
         if exchange.reserved_invocation:
             exchange.reserved_invocation = False
             self.reserved_invocations -= 1
+
+    def _release_slot(self, exchange: _Exchange) -> None:
+        if exchange.reserved_slot:
+            exchange.reserved_slot = False
+            self.reserved_sessions -= 1
 
     def _owned_session(
         self, request: web.Request, verified: _Caller, alias: str
@@ -725,9 +716,7 @@ class _SharedProxy:
         # The reservation becomes the session in the same step, so it counts
         # once; and the opening exchange, which may still be streaming, is in
         # flight on it, so idle pruning never takes it while open.
-        if exchange.reserved_slot:
-            exchange.reserved_slot = False
-            self.reserved_sessions -= 1
+        self._release_slot(exchange)
         row.in_flight += 1
         exchange.row = row
 
@@ -778,10 +767,7 @@ class _SharedProxy:
         if grant.tool != call.name:
             raise _GrantRefused(server.GRANT_TOOL_MISMATCH)
         canonical = server._canonical_arguments(call.arguments)
-        if (
-            canonical is None
-            or hashlib.sha256(canonical.encode("utf-8")).hexdigest() != grant.args_sha256
-        ):
+        if canonical is None or arguments_sha256(canonical) != grant.args_sha256:
             raise _GrantRefused(server.GRANT_ARGUMENTS_MISMATCH)
         if grant.policy_generation != policy.generation:
             raise _GrantRefused(GRANT_GENERATION_MISMATCH)
@@ -790,17 +776,8 @@ class _SharedProxy:
     async def _spend(self, grant: caller.SharedGrant, now: int) -> None:
         """Spend ``grant`` once in Valkey; any failure refuses. Runs last of every check."""
 
-        try:
-            spent = await asyncio.to_thread(
-                server._set_nx_ex,
-                self.config.grant_store_url,
-                GRANT_KEY_PREFIX + grant.jti,
-                max(grant.exp - now, 1),
-            )
-        except Exception:  # noqa: BLE001 - a failed spend refuses, whatever raised it
-            logger.warning("shared connector grant spend failed")
-            spent = False
-        if not spent:
+        # The store answers False, after its own warning, for whatever failed.
+        if not await asyncio.to_thread(self.grants.spend, grant.jti, grant.exp - now):
             raise _GrantRefused(server.GRANT_NOT_SPENT)
 
     # --- one request -------------------------------------------------------------------
@@ -892,7 +869,7 @@ class _SharedProxy:
             self._reserve_session()
             exchange.reserved_slot = True
         if calls:
-            request_id = _request_id(calls[0]["id"]) if "id" in calls[0] else None
+            request_id = _request_id(calls[0].get("id"))
             if request_id is not None:
                 key: _Key = (verified.agent_id, alias, session_id, request_id)
                 if key in self.pending:
@@ -938,9 +915,7 @@ class _SharedProxy:
         if exchange.key is not None and self.pending.get(exchange.key) is exchange.pending:
             del self.pending[exchange.key]
         self._release_invocation(exchange)
-        if exchange.reserved_slot:
-            exchange.reserved_slot = False
-            self.reserved_sessions -= 1
+        self._release_slot(exchange)
         if exchange.row is not None:
             exchange.row.in_flight -= 1
             exchange.row.last_used = self.clock()
@@ -973,7 +948,7 @@ class _SharedProxy:
         except SharedRefusal as refusal:
             reason = refusal.reason if isinstance(refusal, _GrantRefused) else None
             self._log(request, agent, refusal.code, reason)
-            return web.json_response(refusal_body(refusal.code), status=REFUSALS[refusal.code][0])
+            return refusal_response(refusal.code)
         try:
             self._log(request, agent, "admitted")
             return await self._forward(request, exchange)
@@ -1013,9 +988,7 @@ class _SharedProxy:
                     self._open_session(assigned[0], exchange)
                 except SharedRefusal as refusal:
                     self._log(request, exchange.caller.agent, refusal.code)
-                    return web.json_response(
-                        refusal_body(refusal.code), status=REFUSALS[refusal.code][0]
-                    )
+                    return refusal_response(refusal.code)
             if exchange.ends_session and exchange.session_id is not None:
                 # The server has answered the DELETE: end the session before the
                 # caller hears so, and again in ``finish`` on any other path.

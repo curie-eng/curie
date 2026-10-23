@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+from collections.abc import Awaitable
 
 from aiohttp import web
 
@@ -17,6 +18,16 @@ from .resolver.config import ResolverConfig
 from .resolver.http import ResolverStartRefused, start_resolver
 from .server import ProxyConfig, make_app, shared_mode
 from .shared import SharedProxyConfig, make_shared_app
+
+
+def _run(app: web.Application | Awaitable[web.Application], port: int) -> None:
+    web.run_app(
+        app,
+        host="0.0.0.0",  # noqa: S104 - the Service and the rendered policies select this port
+        port=port,
+        handler_cancellation=True,
+        print=None,
+    )
 
 
 def _serve_shared() -> int:
@@ -45,13 +56,7 @@ def _serve_shared() -> int:
         return app
 
     try:
-        web.run_app(
-            application(),
-            host="0.0.0.0",  # noqa: S104 - the Service and the rendered policies select this port
-            port=config.listen_port,
-            handler_cancellation=True,
-            print=None,
-        )
+        _run(application(), config.listen_port)
     except ResolverStartRefused as refused:
         # The code names the failed check, never a value.
         print(f"curie_connector_proxy: the resolver refused to start: {refused}", file=sys.stderr)
@@ -70,13 +75,7 @@ def main() -> int:
         # proxy port, so no caller reaches the server either.
         print(f"curie_connector_proxy: {exc}", file=sys.stderr)
         return 2
-    web.run_app(
-        make_app(config),
-        host="0.0.0.0",  # noqa: S104 - the Service and the rendered policies select this port
-        port=config.listen_port,
-        handler_cancellation=True,
-        print=None,
-    )
+    _run(make_app(config), config.listen_port)
     return 0
 
 

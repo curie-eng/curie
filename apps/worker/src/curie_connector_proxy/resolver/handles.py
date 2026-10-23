@@ -36,6 +36,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from .. import caller
 from ..caller import nonblank_installation_ok
 from .wire import CodedError
 
@@ -57,8 +58,6 @@ _HANDLE_BYTES = 32
 _MAX_HANDLE_CHARS = 128
 _MAX_SESSION_ID_CHARS = 256
 _UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
-_ALIAS = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
-_STAMP = re.compile(r"^[0-9a-f]{64}$")
 
 
 class RegistryRefusal(CodedError):
@@ -265,13 +264,13 @@ class HandleRegistry:
     def _valid(self, context: InvocationContext) -> bool:
         if not isinstance(context, InvocationContext) or not _principal_ok(context.principal):
             return False
-        if not isinstance(context.alias, str) or _ALIAS.fullmatch(context.alias) is None:
+        if not caller.alias_ok(context.alias):
             return False
         if not _is_int(context.expires_at):
             return False
         if not uuid_ok(context.binding):
             return False
-        if not isinstance(context.membership, str) or _STAMP.fullmatch(context.membership) is None:
+        if not caller.sha256_hex_ok(context.membership):
             return False
         if (context.run is None) != (context.work_item is None):
             return False

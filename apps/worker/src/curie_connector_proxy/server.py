@@ -191,16 +191,24 @@ def _set_nx_ex(url: str, key: str, ttl: int) -> bool:
 
 
 class _ValkeyGrantStore:
-    """SET ``connector-grant:<jti>`` NX EX without importing the redis client."""
+    """SET ``<prefix><jti>`` NX EX without importing the redis client."""
 
-    def __init__(self, url: str) -> None:
+    def __init__(
+        self,
+        url: str,
+        prefix: str = "connector-grant:",
+        failure: str = "connector grant spend failed",
+    ) -> None:
         self._url = url
+        self._prefix = prefix
+        # The warning's text, so a mode keeps its own wording.
+        self._failure = failure
 
     def spend(self, jti: str, ttl: int) -> bool:
         try:
-            return _set_nx_ex(self._url, f"connector-grant:{jti}", max(ttl, 1))
+            return _set_nx_ex(self._url, f"{self._prefix}{jti}", max(ttl, 1))
         except Exception:  # noqa: BLE001 - existing broad catch retained
-            logger.warning("connector grant spend failed")
+            logger.warning(self._failure)
             return False
 
 
@@ -215,6 +223,17 @@ def _gated_tools(env: Mapping[str, str]) -> tuple[str, ...]:
     if not isinstance(parsed, list) or not all(isinstance(name, str) for name in parsed):
         raise ValueError(f"{GATED_TOOLS_ENV} must be a JSON list of strings")
     return tuple(parsed)
+
+
+def _public_keys(env: Mapping[str, str]) -> tuple[VerifyKey, ...]:
+    texts = [text for text in env.get(PUBLIC_KEYS_ENV, "").split(",") if text.strip()]
+    if not texts:
+        raise ValueError(f"{PUBLIC_KEYS_ENV} names no public key")
+    try:
+        return tuple(caller.public_key(text) for text in texts)
+    except ValueError as exc:
+        # ``public_key`` names the fault and never the text.
+        raise ValueError(f"{PUBLIC_KEYS_ENV}: {exc}") from None
 
 
 @dataclass(frozen=True)
@@ -244,13 +263,7 @@ class ProxyConfig:
                 raise ValueError(f"{name} must be a TCP port, got {raw!r}")
             return int(raw)
 
-        texts = [text for text in env.get(PUBLIC_KEYS_ENV, "").split(",") if text.strip()]
-        if not texts:
-            raise ValueError(f"{PUBLIC_KEYS_ENV} names no public key")
-        try:
-            keys = tuple(caller.public_key(text) for text in texts)
-        except ValueError as exc:
-            raise ValueError(f"{PUBLIC_KEYS_ENV}: {exc}") from None
+        keys = _public_keys(env)
         try:
             admits = json.loads(env.get(ADMITS_ENV, ""))
         except ValueError:

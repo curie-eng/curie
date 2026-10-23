@@ -16,6 +16,7 @@ Python's default ``json.dumps`` would write the non-JSON tokens ``NaN`` and
 
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Any
 
@@ -36,3 +37,13 @@ def canonical_arguments(arguments: Any) -> str:
         ensure_ascii=False,
         allow_nan=False,
     )
+
+
+def arguments_sha256(text: str) -> str:
+    """SHA-256 hex of ``text``'s UTF-8 bytes. @spec ACTION-EXECUTOR-7.
+
+    Over the bytes as given, never re-canonicalized: a re-spelling of the same
+    object is a different digest, which is what makes it ``arguments_mismatch``.
+    """
+
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()

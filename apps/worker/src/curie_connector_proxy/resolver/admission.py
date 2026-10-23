@@ -84,7 +84,8 @@ WHERE a.id = $1
 FOR SHARE
 """
 
-_MEMBERSHIP_SQL = """
+# The one read of an agent's alias row, shared with the caller proxy's per-call read.
+MEMBERSHIP_SQL = """
 SELECT m.tools, m.created_at, m.updated_at
 FROM curie.shared_connector_memberships m
 WHERE m.application_id = $1 AND m.agent_id = $2 AND m.alias = $3
@@ -137,10 +138,16 @@ class Admitted:
     refresh: RefreshIntent | None
 
 
+def jsonb(value: Any) -> Any:
+    """A JSONB value; asyncpg answers JSONB as text."""
+
+    return json.loads(value) if isinstance(value, str) else value
+
+
 def _json_strings(value: Any) -> tuple[str, ...]:
     """A JSONB list of strings (asyncpg answers JSONB as text); anything else refuses."""
 
-    parsed = json.loads(value) if isinstance(value, str) else value
+    parsed = jsonb(value)
     if not isinstance(parsed, list) or not all(isinstance(item, str) for item in parsed):
         raise ResolveRefusal("source_unavailable")
     return tuple(parsed)
@@ -169,9 +176,7 @@ def membership_stamp(
 def _row_stamp(alias: str, row: Any) -> str:
     """The stamp of a membership row as asyncpg answers it (JSONB as text)."""
 
-    tools = row["tools"]
-    parsed = json.loads(tools) if isinstance(tools, str) else tools
-    return membership_stamp(alias, parsed, row["created_at"], row["updated_at"])
+    return membership_stamp(alias, jsonb(row["tools"]), row["created_at"], row["updated_at"])
 
 
 def slot_accepted(slot: str, slots: tuple[str, ...]) -> bool:
@@ -206,7 +211,7 @@ async def admit(connection: Any, context: InvocationContext, slot: str) -> Admit
         raise ResolveRefusal("application_disabled")
 
     # Unlocked, and still before the binding lock, so cp1's lock order holds.
-    member = await connection.fetchrow(_MEMBERSHIP_SQL, application_id, agent_id, context.alias)
+    member = await connection.fetchrow(MEMBERSHIP_SQL, application_id, agent_id, context.alias)
     if int(application["policy_generation"]) != principal.policy_generation and (
         member is None or _row_stamp(context.alias, member) != context.membership
     ):
