@@ -1671,7 +1671,12 @@ async fn remove_claim_input_volume(
     {
         return Ok(());
     }
-    docker(&["volume".into(), "rm".into(), volume.into()]).await?;
+    let (status, _, stderr) =
+        docker_capture(&["volume".into(), "rm".into(), volume.into()]).await?;
+    // The worker can remove its own input between the inspect above and this rm.
+    if !status.success() && !stderr.to_ascii_lowercase().contains("no such volume") {
+        bail!("could not remove claim input volume '{volume}': {stderr}");
+    }
     Ok(())
 }
 
