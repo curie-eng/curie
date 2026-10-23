@@ -51,6 +51,7 @@ import re
 import shutil
 import signal
 import socket
+import socketserver
 import subprocess
 import sys
 import tempfile
@@ -120,8 +121,19 @@ def _private_terms() -> list[str]:
     terms: set[str] = set()
     docker_host = os.environ.get("DOCKER_HOST", "")
     if docker_host and not docker_host.startswith("unix://"):
-        parsed = urlsplit(docker_host)
-        terms.update(value for value in (parsed.netloc, parsed.username, parsed.hostname) if value)
+        terms.add(docker_host)
+        # Split by hand as well, so a malformed endpoint still yields its parts.
+        authority = docker_host.split("://", 1)[-1].split("/", 1)[0]
+        terms.add(authority)
+        user, _, host = authority.rpartition("@")
+        terms.update((user, host, host.rsplit(":", 1)[0]))
+        try:
+            parsed = urlsplit(docker_host)
+            terms.update(
+                value for value in (parsed.netloc, parsed.username, parsed.hostname) if value
+            )
+        except ValueError:
+            pass
     terms.update(value for value in (os.environ.get("USER"), os.environ.get("LOGNAME")) if value)
     for lookup in (getpass.getuser, socket.gethostname):
         try:
@@ -136,15 +148,22 @@ def _private_terms() -> list[str]:
 
 
 def _safe(value: Any, secrets: list[str | None], limit: int = 4000) -> str:
-    """Anonymous text for failure messages.
+    """Anonymous text for failure messages. Never raises.
 
     Removes known secrets (the API key, worker token and generated keys) and
     credential shapes, the Docker endpoint and its user and host, every URL
     (ssh endpoints and the kube API server included), the home directory and
     paths under it, user@host pairs, this machine's user and host names, and
-    IPv4 addresses.
+    IPv4 addresses. If scrubbing itself fails, nothing of the input survives.
     """
 
+    try:
+        return _scrub(value, secrets)[:limit]
+    except Exception:  # noqa: BLE001 - an unscrubbable value is withheld, never shown
+        return "[output withheld: it could not be scrubbed]"
+
+
+def _scrub(value: Any, secrets: list[str | None]) -> str:
     text = value if isinstance(value, str) else json.dumps(value, default=str, sort_keys=True)
     text = fe.redact_agent_text(text, secrets)[0] or ""
     docker_host = os.environ.get("DOCKER_HOST", "")
@@ -158,7 +177,27 @@ def _safe(value: Any, secrets: list[str | None], limit: int = 4000) -> str:
     for term in _private_terms():
         text = re.sub(rf"(?<![\w.-]){re.escape(term)}(?![\w-])", "<private>", text)
     text = _IPV4.sub("192.0.2.1", text)
-    return text[:limit]
+    return text
+
+
+def _close_bounded(close: Callable[[], Any], timeout: float = 30) -> None:
+    """Run a server close in a daemon thread; a hang becomes a TimeoutError."""
+
+    outcome: list[BaseException] = []
+
+    def target() -> None:
+        try:
+            close()
+        except BaseException as exc:  # noqa: BLE001 - handed back to the caller
+            outcome.append(exc)
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        raise TimeoutError(f"server close did not finish within {timeout:.0f} s")
+    if outcome:
+        raise outcome[0]
 
 
 class GatedModel:
@@ -302,6 +341,48 @@ class Harness:
         self.previous_sigterm: Any = None
         # Request ids whose worker log lines diagnostics always keep.
         self.watched: list[str] = []
+        # Scrubbed one-line summaries of errors raised on fixture server and
+        # daemon threads, which would otherwise print raw tracebacks.
+        self.background_errors: list[str] = []
+        self._background_lock = threading.Lock()
+        self._previous_handle_error: Any = None
+        self._previous_excepthook: Any = None
+
+    def note_background_error(self, source: str, exc: BaseException | None) -> None:
+        name = type(exc).__name__ if exc is not None else "error"
+        summary = f"{source}: {name}: {self.safe(str(exc)) if exc is not None else ''}"
+        with self._background_lock:
+            if len(self.background_errors) < 50:
+                self.background_errors.append(summary)
+
+    def install_quiet_errors(self) -> None:
+        """Record server and thread errors scrubbed, for the fixture's lifetime.
+
+        socketserver's default handle_error prints the client address and a
+        traceback with absolute paths; threading's default hook prints the
+        traceback of a failed daemon thread. Both are replaced until teardown.
+        """
+
+        harness = self
+
+        def handle_error(_server: Any, _request: Any, _client_address: Any) -> None:
+            harness.note_background_error("fixture server request", sys.exc_info()[1])
+
+        def excepthook(args: Any) -> None:
+            harness.note_background_error("background thread", args.exc_value)
+
+        self._previous_handle_error = socketserver.BaseServer.handle_error
+        socketserver.BaseServer.handle_error = handle_error  # type: ignore[method-assign]
+        self._previous_excepthook = threading.excepthook
+        threading.excepthook = excepthook
+
+    def restore_quiet_errors(self) -> None:
+        if self._previous_handle_error is not None:
+            socketserver.BaseServer.handle_error = self._previous_handle_error  # type: ignore[method-assign]
+            self._previous_handle_error = None
+        if self._previous_excepthook is not None:
+            threading.excepthook = self._previous_excepthook
+            self._previous_excepthook = None
 
     # Output and failure text -------------------------------------------------
 
@@ -658,10 +739,13 @@ class Harness:
                 self.snapshot("failure")
             unknown = list(self.stub.unknown_requests) if self.stub is not None else []
             unexpected = list(self.gate.unexpected) if self.gate is not None else []
+            with self._background_lock:
+                background = list(self.background_errors)
             print(
                 self.safe(
                     f"fx4930 diagnostics: unsupported stub requests {unknown[:8]}; "
-                    f"unexpected model requests {unexpected[:8]}"
+                    f"unexpected model requests {unexpected[:8]}; "
+                    f"background errors {background[:20]}"
                 ),
                 file=sys.stderr,
                 flush=True,
@@ -861,7 +945,7 @@ class Harness:
                     self.record_volumes(run.registry)
             step("stopping the API port-forward", self._stop_forward)
             if self.gate is not None:
-                step("closing the model endpoint", self.gate.close)
+                step("closing the model endpoint", lambda: _close_bounded(self.gate.close))
             if self.stub is not None:
                 step("closing the forge stub", self._close_stub)
             if self.docker_ready:
@@ -884,6 +968,7 @@ class Harness:
             step("removing the work directory", self._remove_workdir)
             step("taking the teardown inventory", lambda: errors.extend(self.inventory()))
         finally:
+            self.restore_quiet_errors()
             signal.signal(signal.SIGTERM, self.previous_sigterm or signal.SIG_DFL)
         if errors:
             raise RuntimeError(
@@ -914,13 +999,23 @@ class Harness:
                 forward.stdout.close()
 
     def _close_stub(self) -> None:
+        stub = self.stub
+        server = getattr(stub, "_server", None)
+        thread = getattr(stub, "_thread", None)
+        if server is not None and (thread is None or not thread.is_alive()):
+            # Startup stopped before serve_forever ran, and shutdown() would
+            # wait for it forever. Closing the socket is all there is to undo.
+            stub._closed = True
+            stub._server = None
+            server.server_close()
+            return
         try:
-            self.stub.close()
+            _close_bounded(stub.close)
         except RuntimeError:
             # close() shuts the server down first, then re-raises its audit of
             # unsupported requests; diagnostics report those. The inventory
             # still proves the endpoint stopped listening.
-            if not self.stub.unknown_requests:
+            if not stub.unknown_requests:
                 raise
 
     def _delete_cluster(self) -> None:
@@ -1227,6 +1322,7 @@ def diagnostic_cluster(request: pytest.FixtureRequest) -> Harness:
     harness = Harness()
     # Registered before any resource exists, so every exit path tears down.
     request.addfinalizer(harness.teardown)
+    harness.install_quiet_errors()
 
     def interrupted(signum: int, _frame: Any) -> None:
         raise KeyboardInterrupt(f"interrupted by signal {signum}")
@@ -1476,19 +1572,24 @@ def _scenario(h: Harness) -> None:
 
     # 8. Release the holder; the target starts and its start clears the detail.
     h.set_label(HOLDER_ISSUE, False)
+    # Every state awaited below is stable once reached (a terminal holder, its
+    # pod gone, a running target parked on the held model), so the time this
+    # snapshot takes cannot make an observation miss its deadline. The global
+    # quota is not awaited at zero: the new worker may take the freed slot for
+    # the target at once.
     h.snapshot("holder released")
 
     def holder_released() -> tuple[bool, Any]:
         row = h.internal(holder_id)
-        return row["status"] != "running", row
+        return row["status"] != "running" and row.get("terminal_at") is not None, row
 
-    h.poll("the holder cancellation", holder_released, timeout=600, interval=5)
-    h.poll(
-        "sandbox quota used.pods == 0 after the holder release",
-        lambda: ((used := h.used_pods()) in {None, "0"}, f"used.pods {used!r}"),
-        timeout=600,
-        interval=5,
-    )
+    h.poll("the holder request terminal", holder_released, timeout=600, interval=5)
+
+    def holder_pod_gone() -> tuple[bool, Any]:
+        pods = h.sandbox_pods()
+        return all(pod["uid"] != holder_pod["uid"] for pod in pods), pods
+
+    h.poll("the holder's sandbox pod deleted", holder_pod_gone, timeout=600, interval=5)
 
     def target_running() -> tuple[bool, Any]:
         row = h.internal(target_id)
