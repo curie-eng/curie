@@ -18,8 +18,9 @@ names it; (4) the issuer-written permit is this campaign's and its binding
 holds at live broker time; (5) the campaign's ``ChannelCampaignGuard``,
 premeasured for this B, M and permit, passes.
 Step 3 has no worker-side capability (see ``commissioning_worker``). The
-consumer then verifies every claim afresh and parks it. The production
-``open_runtime`` is unchanged.
+consumer verifies every claim afresh. An internal executor may be composed to
+forward a verified claim once under its delivery lease; otherwise claims remain
+pending. The production ``open_runtime`` is unchanged.
 """
 
 from __future__ import annotations
@@ -68,7 +69,8 @@ from curie_worker.config import WorkerConfig
 from curie_worker.protected_worker_bootstrap import _read
 from pydantic import AliasChoices
 
-from .consumer import RECHECK_INTERVAL_S, CommissioningConsumer, Verdict
+from .claim_execution import CONSUMER_NAME, ExecuteClaim
+from .consumer import RECHECK_INTERVAL_S, CommissioningConsumer, ExecutionOutcome, Verdict
 
 __all__ = [
     "COMPOSITION",
@@ -206,12 +208,17 @@ class CommissioningWorker:
         """The latest claim verdict per entry."""
         return self._consumer.verdicts
 
+    @property
+    def execution_outcomes(self) -> dict[str, ExecutionOutcome]:
+        """Confirmed completion and fail-closed dispatch observations."""
+        return self._consumer.execution_outcomes
+
     async def run(self) -> None:
         """Consume the campaign lane until stopped."""
         await self._consumer.run()
 
     def request_stop(self) -> None:
-        """Stop reading new entries; parked claims stay pending."""
+        """Stop new reads and drain handlers; parked claims stay pending."""
         self._consumer.request_stop()
 
     async def close(self) -> None:
@@ -223,13 +230,17 @@ async def open_commissioning_worker(
     directory: str,
     *,
     guard: ChannelCampaignGuard | None = None,
-    consumer_name: str = "commissioning-consumer-1",
+    consumer_name: str = CONSUMER_NAME,
     recheck_interval_s: float = RECHECK_INTERVAL_S,
+    execute_claim: ExecuteClaim | None = None,
 ) -> CommissioningWorker:
     """Open the worker over ``directory`` in refusal order, @spec PROTECTED-COMMISSIONING-4."""
     client: AuthenticatedWorkerClient | None = None
     step = 1
     try:
+        _require(
+            execute_claim is None or (callable(execute_claim) and consumer_name == CONSUMER_NAME)
+        )
         d = await asyncio.to_thread(_load, directory)
         b = d.bootstrap.as_dict()
         _require(COMPOSITION in ENTRY_POINT_COMPOSITIONS[COMMISSIONING_ENTRY_POINT])
@@ -272,7 +283,8 @@ async def open_commissioning_worker(
         await bound.require_current()
         config = _campaign_config(permit, consumer_name)
         consumer = CommissioningConsumer(
-            client=client, gate=gate, config=config, recheck_interval_s=recheck_interval_s
+            client=client, gate=gate, config=config, recheck_interval_s=recheck_interval_s,
+            execute_claim=execute_claim,
         )
         return CommissioningWorker(client, consumer, config)
     except Exception:  # noqa: BLE001  The refusal names only the deciding step.
