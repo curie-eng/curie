@@ -187,6 +187,10 @@ satisfying the egress Protocol, or out of process over the HTTP wire.
   services count `curie.turn.refused`. The list is set with
   `PUT /agents/{agent_id}/channels/callers`, which leaves the binding generation,
   and so the adapter's token, alone.
+  The [common API admission extraction contract](../../superpowers/specs/2026-10-23-common-admission-extraction.md)
+  specifies behavior-preserving delegation of the existing list and invocation-team
+  composition by both API entry points; it preserves their different evidence,
+  refusal, cache and enqueue boundaries.
 - **Binding** — a channel resolves to a deployment by exact `(kind, address)` equality in
   `BindingResolver.resolve` (`apps/worker/src/curie_worker/binding.py::BindingResolver.resolve`).
   Both halves are required, with no address-only fallback, and uniqueness is on the same
