@@ -13,6 +13,7 @@ from pathlib import Path
 
 from .authority_records import _pairs, _reject_number
 from .commissioning_local_ownership import OwnershipLedger, _entry, valid_owner
+from .commissioning_operator_records import OperatorEvent, OperatorRecipe
 from .commissioning_run_records import RunEvent, RunIntent, RunPlan
 from .runtime_directory import RuntimeDirectoryInvalid
 from .runtime_directory_writer import _flush, _open_root
@@ -95,7 +96,15 @@ def _new_at(directory: int, name: str, raw: bytes) -> None:
 class _CustodyStore:
     """An internal owned FD set. A file pointer never supplies a live handle."""
 
-    def __init__(self, ledger: OwnershipLedger, *, create: bool, intent: RunIntent | None = None):
+    def __init__(
+        self,
+        ledger: OwnershipLedger,
+        *,
+        create: bool,
+        intent: RunIntent | None = None,
+        format_version: int = 1,
+        operator_recipe: OperatorRecipe | None = None,
+    ):
         self.parent_path = Path(ledger.root)
         self.root = self.parent_path / "commissioning-run"
         self.owner = ledger.owner
@@ -103,7 +112,14 @@ class _CustodyStore:
         self._closed = False
         self._fds: dict[str, int] = {}
         self._ids: dict[str, tuple[int, int]] = {}
+        self._format_version = format_version
         try:
+            _require(type(format_version) is int and format_version in {1, 2})
+            _require(
+                operator_recipe is None
+                if format_version == 1 or not create
+                else type(operator_recipe) is OperatorRecipe
+            )
             _require(type(ledger) is OwnershipLedger and valid_owner(self.owner))
             parent = self._remember("parent", _open_root(str(self.parent_path)), directory=True)
             entries = self._ledger_entries(parent)
@@ -122,6 +138,12 @@ class _CustodyStore:
                 os.chmod("records", 0o700, dir_fd=root, follow_symlinks=False)
                 _new_at(root, "lock", b"")
             self._remember("records", os.open("records", _DIR, dir_fd=root), directory=True)
+            if format_version == 2:
+                if create:
+                    os.mkdir("operators", 0o700, dir_fd=root)
+                    os.chmod("operators", 0o700, dir_fd=root, follow_symlinks=False)
+                    _new_at(root, "format", b"2")
+                self._remember("operators", os.open("operators", _DIR, dir_fd=root), directory=True)
             lock = self._remember(
                 "lock",
                 os.open(
@@ -136,6 +158,11 @@ class _CustodyStore:
                 _new_at(root, "location", self._location().encode("ascii"))
                 _new_at(root, "intent", intent.digest.encode("ascii"))
                 _new_at(root, "head", _ZERO.encode("ascii"))
+                if format_version == 2:
+                    assert operator_recipe is not None
+                    self.operator_put(operator_recipe)
+                    _new_at(root, "operator-recipe", operator_recipe.digest.encode("ascii"))
+                    _new_at(root, "operator-head", _ZERO.encode("ascii"))
                 os.fsync(root)
                 os.fsync(parent)
             self.check()
@@ -168,19 +195,29 @@ class _CustodyStore:
     def _location(self) -> str:
         parent, root = self._ids["parent"], self._ids["root"]
         records, lock = self._ids["records"], self._ids["lock"]
+        value = {
+            "ledger_owner": self.owner,
+            "parent_device": str(parent[0]),
+            "parent_inode": str(parent[1]),
+            "run_device": str(root[0]),
+            "run_inode": str(root[1]),
+            "root_path": str(self.root),
+            "records_device": str(records[0]),
+            "records_inode": str(records[1]),
+            "lock_device": str(lock[0]),
+            "lock_inode": str(lock[1]),
+        }
+        if self._format_version == 2:
+            operators = self._ids["operators"]
+            value.update(
+                {
+                    "format": "2",
+                    "operators_device": str(operators[0]),
+                    "operators_inode": str(operators[1]),
+                }
+            )
         raw = json.dumps(
-            {
-                "ledger_owner": self.owner,
-                "parent_device": str(parent[0]),
-                "parent_inode": str(parent[1]),
-                "run_device": str(root[0]),
-                "run_inode": str(root[1]),
-                "root_path": str(self.root),
-                "records_device": str(records[0]),
-                "records_inode": str(records[1]),
-                "lock_device": str(lock[0]),
-                "lock_inode": str(lock[1]),
-            },
+            value,
             sort_keys=True,
             separators=(",", ":"),
             ensure_ascii=True,
@@ -204,13 +241,19 @@ class _CustodyStore:
         ):
             info = os.stat(name, dir_fd=self._fds[parent], follow_symlinks=False)
             _require(_identity(info) == self._ids[target])
+        extra: set[str] = set()
+        if self._format_version == 2:
+            _require(_read_at(self._fds["root"], "format", 1) == b"2")
+            info = os.stat("operators", dir_fd=self._fds["root"], follow_symlinks=False)
+            _require(_identity(info) == self._ids["operators"])
+            extra = {"format", "operators", "operator-recipe", "operator-head"}
         _require(self.pointer("location") == self._location())
         names = set(os.listdir(self._fds["root"]))
         _require(
             names
             in (
-                {"lock", "records", "intent", "head", "location"},
-                {"lock", "records", "intent", "head", "location", "plan"},
+                {"lock", "records", "intent", "head", "location"} | extra,
+                {"lock", "records", "intent", "head", "location", "plan"} | extra,
             )
         )
 
@@ -236,10 +279,50 @@ class _CustodyStore:
     def put(self, record: RunIntent | RunPlan | RunEvent) -> None:
         _require(type(record) in {RunIntent, RunPlan, RunEvent})
         names = self.record_names()
-        _require(record.digest not in names and len(names) < 4096)
-        size = sum(len(self.record(name)) for name in names)
-        _require(size + len(record.canonical_bytes) + 512 <= 67108864)
+        _require(record.digest not in names)
+        self._space(record.canonical_bytes)
         _new_at(self._fds["records"], record.digest, record.canonical_bytes)
+
+    def _space(self, raw: bytes) -> None:
+        names = self.record_names()
+        size = sum(len(self.record(name)) for name in names)
+        count = len(names)
+        if self._format_version == 2:
+            operators = self.operator_names()
+            count += len(operators)
+            size += sum(len(self.operator_record(name)) for name in operators)
+        _require(count < 4096 and size + len(raw) + 512 <= 67108864)
+
+    def operator_names(self) -> set[str]:
+        _require(self._format_version == 2)
+        names = set(os.listdir(self._fds["operators"]))
+        _require(len(names) <= 4096 and all(_HEX.fullmatch(name) is not None for name in names))
+        return names
+
+    def operator_record(self, digest: str) -> bytes:
+        _require(
+            self._format_version == 2 and type(digest) is str and _HEX.fullmatch(digest) is not None
+        )
+        raw = _read_at(self._fds["operators"], digest)
+        _require(hashlib.sha256(raw).hexdigest() == digest)
+        return raw
+
+    def operator_put(self, record: OperatorRecipe | OperatorEvent) -> None:
+        _require(self._format_version == 2 and type(record) in {OperatorRecipe, OperatorEvent})
+        _require(record.digest not in self.operator_names())
+        self._space(record.canonical_bytes)
+        _new_at(self._fds["operators"], record.digest, record.canonical_bytes)
+
+    def operator_append(self, event: OperatorEvent, expected_head: str) -> None:
+        self.check()
+        _require(self.pointer("operator-head") == expected_head)
+        self.operator_put(event)
+        temporary = ".operator-head-" + secrets.token_hex(16)
+        _new_at(self._fds["root"], temporary, event.digest.encode("ascii"))
+        os.replace(
+            temporary, "operator-head", src_dir_fd=self._fds["root"], dst_dir_fd=self._fds["root"]
+        )
+        os.fsync(self._fds["root"])
 
     def set_plan(self, plan: RunPlan) -> None:
         self.put(plan)
