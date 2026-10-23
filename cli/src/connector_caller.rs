@@ -90,6 +90,86 @@ pub fn generate_keypair() -> Result<CallerKeypair> {
     })
 }
 
+/// The most caller public keys a shared proxy lists: the current key, then the
+/// one it replaced during a rotation.
+pub const MAX_SHARED_CALLER_PUBLIC_KEYS: usize = 2;
+/// The bytes of one Ed25519 public key.
+const PUBLIC_KEY_BYTES: usize = 32;
+
+/// Why a shared render refuses its caller public key list, named as the Python
+/// render names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallerKeysRefusal {
+    Empty,
+    TooMany,
+    Malformed,
+    Duplicate,
+}
+
+impl CallerKeysRefusal {
+    /// Every refusal, in the order the checks run.
+    pub const ALL: [CallerKeysRefusal; 4] = [
+        CallerKeysRefusal::Empty,
+        CallerKeysRefusal::TooMany,
+        CallerKeysRefusal::Malformed,
+        CallerKeysRefusal::Duplicate,
+    ];
+
+    /// The refusal code the shared render reports.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CallerKeysRefusal::Empty => "caller_public_keys_empty",
+            CallerKeysRefusal::TooMany => "caller_public_keys_too_many",
+            CallerKeysRefusal::Malformed => "caller_public_key_malformed",
+            CallerKeysRefusal::Duplicate => "caller_public_keys_duplicate",
+        }
+    }
+}
+
+impl fmt::Display for CallerKeysRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The shared proxy's `CURIE_CALLER_PROXY_PUBLIC_KEYS` value for `keys`, or the
+/// first refusal in [`CallerKeysRefusal::ALL`] order.
+///
+/// The Rust half of the shared render's key list rule
+/// (`plugin_format.shared_connector_render.render_application`), frozen in
+/// `tests/vectors/shared-render-caller-keys.json` and landed before any Rust
+/// shared render exists (ADR 0239 relationship 6). Each key must be the
+/// canonical padded standard base64 of 32 bytes, untrimmed, so one key has one
+/// spelling and equal keys are equal text. Curve point validity is not
+/// checked, as the Python half does not check it.
+pub fn shared_caller_public_keys(keys: &[&str]) -> Result<String, CallerKeysRefusal> {
+    if keys.is_empty() {
+        return Err(CallerKeysRefusal::Empty);
+    }
+    if keys.len() > MAX_SHARED_CALLER_PUBLIC_KEYS {
+        return Err(CallerKeysRefusal::TooMany);
+    }
+    if !keys.iter().all(|key| canonical_public_key(key)) {
+        return Err(CallerKeysRefusal::Malformed);
+    }
+    if keys
+        .iter()
+        .enumerate()
+        .any(|(at, key)| keys[..at].contains(key))
+    {
+        return Err(CallerKeysRefusal::Duplicate);
+    }
+    Ok(keys.join(","))
+}
+
+/// Whether `key` is the canonical padded standard base64 of 32 bytes.
+fn canonical_public_key(key: &str) -> bool {
+    b64()
+        .decode(key)
+        .is_ok_and(|raw| raw.len() == PUBLIC_KEY_BYTES && b64().encode(&raw) == key)
+}
+
 /// The first segment of every caller token this wire mints and admits.
 pub const CALLER_TOKEN_PREFIX: &str = "cct2";
 /// Far above any minted token; bounds the work one header can ask for.

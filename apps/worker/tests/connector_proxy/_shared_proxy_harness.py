@@ -365,7 +365,12 @@ class SharedProxy:
         max_sessions: int | None = None,
         session_idle_seconds: float | None = None,
         grant_store_url: str | None = None,
+        proxy_env: Callable[[SharedProxy, dict[str, str]], Mapping[str, str]] | None = None,
     ) -> None:
+        """``proxy_env``, when given, receives this world and the harness's env
+        (resolver, fixture and grant store already in place) and answers the
+        env the proxy starts on instead."""
+
         self.fleet = fleet
         self.provider = provider
         self.store = fleet.store
@@ -404,6 +409,8 @@ class SharedProxy:
                 GRANT_STORE_FILE_ENV: str(store_file),
                 PUBLIC_KEYS_ENV: self.public_key,
             }
+            if proxy_env is not None:
+                self.env = dict(proxy_env(self, dict(self.env)))
             from curie_connector_proxy import shared
 
             config = shared.SharedProxyConfig.from_env(self.env)

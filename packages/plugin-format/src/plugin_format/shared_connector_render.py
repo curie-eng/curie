@@ -9,6 +9,7 @@ The database egress rendered here is only one additive network-policy grant.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import ipaddress
 import json
@@ -56,6 +57,10 @@ _SERVER_DEFAULTS = {
     "requests": {"cpu": "10m", "memory": "64Mi"},
     "limits": {"cpu": "500m", "memory": "256Mi"},
 }
+_CALLER_PUBLIC_KEYS_ENV = "CURIE_CALLER_PROXY_PUBLIC_KEYS"
+# The current key, then the one it replaced during a rotation.
+_MAX_CALLER_PUBLIC_KEYS = 2
+_CALLER_PUBLIC_KEY_BYTES = 32
 
 
 def _dns_label(value: str) -> str:
@@ -477,10 +482,59 @@ def _container(
     }
 
 
-def render_application(application: SharedApplication) -> list[dict[str, Any]]:
-    """Render the member-independent workload, Service and isolation policies."""
+def _canonical_public_key(text: object) -> bool:
+    """Whether ``text`` is the canonical padded standard base64 of 32 bytes."""
+
+    if not isinstance(text, str):
+        return False
+    try:
+        raw = base64.b64decode(text, validate=True)
+    except ValueError:
+        return False
+    return (
+        len(raw) == _CALLER_PUBLIC_KEY_BYTES and base64.b64encode(raw).decode("ascii") == text
+    )
+
+
+def _caller_public_keys(keys: tuple[str, ...]) -> str:
+    """The proxy's comma-joined caller public verify keys, or a named refusal.
+
+    Each key has one spelling, so equal keys are equal text. A refusal never
+    echoes key text.
+    """
+
+    if not isinstance(keys, tuple):
+        raise TypeError("caller public keys must be a tuple of strings")
+    if not keys:
+        raise ValueError("caller_public_keys_empty: the shared proxy needs a caller public key")
+    if len(keys) > _MAX_CALLER_PUBLIC_KEYS:
+        raise ValueError(
+            "caller_public_keys_too_many: at most the current caller public key "
+            "and the one it replaced"
+        )
+    if not all(map(_canonical_public_key, keys)):
+        raise ValueError(
+            "caller_public_key_malformed: a caller public key is not the canonical "
+            "standard base64 of 32 bytes"
+        )
+    if len(set(keys)) != len(keys):
+        raise ValueError("caller_public_keys_duplicate: a caller public key is listed twice")
+    return ",".join(keys)
+
+
+def render_application(
+    application: SharedApplication,
+    *,
+    caller_public_keys: tuple[str, ...],
+) -> list[dict[str, Any]]:
+    """Render the member-independent workload, Service and isolation policies.
+
+    The caller public verify keys are a render-time input, not a stored
+    application field, so rotating them re-renders the Deployment.
+    """
 
     application = SharedApplication.model_validate(deepcopy(application.model_dump(mode="python")))
+    caller_keys = _caller_public_keys(caller_public_keys)
     labels = _application_labels(application)
     socket_dir = str(PurePosixPath(application.resolver_socket).parent)
     server_env = {
@@ -491,6 +545,7 @@ def render_application(application: SharedApplication) -> list[dict[str, Any]]:
     proxy_mounts = [_mount("resolver", socket_dir, read_only=False)]
     volumes: list[dict[str, Any]] = [{"name": "resolver", "emptyDir": {}}]
     proxy_env = {
+        _CALLER_PUBLIC_KEYS_ENV: caller_keys,
         "CURIE_SHARED_INSTALLATION": application.installation,
         "CURIE_SHARED_APPLICATION": application.application,
         "CURIE_SHARED_PROXY_PORT": str(application.proxy_port),

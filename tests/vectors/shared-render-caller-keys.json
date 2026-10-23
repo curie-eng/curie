@@ -1,0 +1,153 @@
+{
+  "comment": "The caller public verify keys the shared application render takes as a render-time input and writes, comma-joined, into the proxy container's CURIE_CALLER_PROXY_PUBLIC_KEYS (ADR 0239 identity contract 2, ADR 0194 parity). A key is the canonical standard base64, padded, of a 32-byte Ed25519 public key: one spelling per key, so stray trailing bits refuse. At most max_keys: the current key, then the one it replaced during a rotation. Checks run in precedence order and the first that fails names the refusal. The two well-formed keys are the public keys frozen in connector-caller-token.json.",
+  "env": "CURIE_CALLER_PROXY_PUBLIC_KEYS",
+  "max_keys": 2,
+  "precedence": [
+    "caller_public_keys_empty",
+    "caller_public_keys_too_many",
+    "caller_public_key_malformed",
+    "caller_public_keys_duplicate"
+  ],
+  "vectors": [
+    {
+      "name": "the current key alone",
+      "public_keys": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "env": "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+    },
+    {
+      "name": "the current key then the previous one during a rotation",
+      "public_keys": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
+        "Kay64UG8yvCyLhqU000LxzYeUm0L/hLIl5S8kyKWbdc="
+      ],
+      "env": "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=,Kay64UG8yvCyLhqU000LxzYeUm0L/hLIl5S8kyKWbdc="
+    },
+    {
+      "name": "the order given is the order rendered",
+      "public_keys": [
+        "Kay64UG8yvCyLhqU000LxzYeUm0L/hLIl5S8kyKWbdc=",
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "env": "Kay64UG8yvCyLhqU000LxzYeUm0L/hLIl5S8kyKWbdc=,A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+    },
+    {
+      "name": "no key",
+      "public_keys": [],
+      "refusal": "caller_public_keys_empty"
+    },
+    {
+      "name": "three keys",
+      "public_keys": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
+        "Kay64UG8yvCyLhqU000LxzYeUm0L/hLIl5S8kyKWbdc=",
+        "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc="
+      ],
+      "refusal": "caller_public_keys_too_many"
+    },
+    {
+      "name": "the count is checked before any key",
+      "public_keys": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
+        "not base64!"
+      ],
+      "refusal": "caller_public_keys_too_many"
+    },
+    {
+      "name": "the same key twice",
+      "public_keys": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "refusal": "caller_public_keys_duplicate"
+    },
+    {
+      "name": "not base64",
+      "public_keys": [
+        "not base64!"
+      ],
+      "refusal": "caller_public_key_malformed"
+    },
+    {
+      "name": "an empty key",
+      "public_keys": [
+        ""
+      ],
+      "refusal": "caller_public_key_malformed"
+    },
+    {
+      "name": "31 bytes",
+      "public_keys": [
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="
+      ],
+      "refusal": "caller_public_key_malformed"
+    },
+    {
+      "name": "33 bytes",
+      "public_keys": [
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+      ],
+      "refusal": "caller_public_key_malformed"
+    },
+    {
+      "name": "unpadded",
+      "public_keys": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg"
+      ],
+      "refusal": "caller_public_key_malformed"
+    },
+    {
+      "name": "surrounding white space",
+      "public_keys": [
+        " A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "refusal": "caller_public_key_malformed"
+    },
+    {
+      "name": "a trailing newline",
+      "public_keys": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=\n"
+      ],
+      "refusal": "caller_public_key_malformed"
+    },
+    {
+      "name": "the URL-safe alphabet",
+      "public_keys": [
+        "A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "refusal": "caller_public_key_malformed"
+    },
+    {
+      "name": "stray trailing bits spell the same bytes twice",
+      "public_keys": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbh="
+      ],
+      "refusal": "caller_public_key_malformed"
+    },
+    {
+      "name": "two keys joined into one entry",
+      "public_keys": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=,Kay64UG8yvCyLhqU000LxzYeUm0L/hLIl5S8kyKWbdc="
+      ],
+      "refusal": "caller_public_key_malformed"
+    },
+    {
+      "name": "a malformed previous key beside a good current one",
+      "public_keys": [
+        "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
+        "not base64!"
+      ],
+      "refusal": "caller_public_key_malformed"
+    },
+    {
+      "name": "malformed is checked before duplicate",
+      "public_keys": [
+        "A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
+        "A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="
+      ],
+      "refusal": "caller_public_key_malformed"
+    }
+  ]
+}
