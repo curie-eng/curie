@@ -254,6 +254,7 @@ chart_scenarios:
 rules:
   exact:
     compose.dev.yaml: [local]
+    .github/workflows/release.yaml: [local-release]
     pyproject.toml: [skill, local, local-release, cluster]
     uv.lock: [skill, local, local-release, cluster]
     # These scripts run in cluster-gated jobs despite their ignored parent trees.
