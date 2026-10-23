@@ -424,7 +424,7 @@ class Candidate:
                 if process.stdin is None:
                     self.fail("Docker build stdin unavailable")
                 with tarfile.open(
-                    fileobj=process.stdin, mode="w|", format=tarfile.USTAR_FORMAT
+                    fileobj=process.stdin, mode="w|", format=tarfile.PAX_FORMAT
                 ) as archive:
                     for path in self.source_files():
                         archive.add(
