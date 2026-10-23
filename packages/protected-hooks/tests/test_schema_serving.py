@@ -57,7 +57,9 @@ def graph_payload() -> dict[str, Any]:
         ("0102", False),
         ("0103", False),
         ("0108", False),
-        ("0122", True),
+        # #4930: the candidate reads the 0123 start failure detail column.
+        ("0122", False),
+        ("0123", True),
         ("0000", True),
         ("future-expand", True),
     ],
