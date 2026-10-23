@@ -1298,7 +1298,7 @@ def test_label_readmission_of_headless_all_null_base_uses_moved_repository_defau
         assert verified.json() == {"commit_sha": FIRST_REVISION_SHA, "parent_sha": MOVED_PARENT_SHA}
         opened = client.post(
             f"{root}/pull-request",
-            json={"expected_head_sha": FIRST_REVISION_SHA},
+            json={"expected_head_sha": FIRST_REVISION_SHA, "adopt_only": False},
             headers=WORKER_HEADERS,
         )
         assert opened.status_code == 200, opened.text
@@ -1392,7 +1392,7 @@ def test_manual_admission_without_base_can_open_first_publication(
     assert verified.json() == {"commit_sha": FIRST_REVISION_SHA, "parent_sha": parent}
     opened = client.post(
         f"{root}/pull-request",
-        json={"expected_head_sha": FIRST_REVISION_SHA},
+        json={"expected_head_sha": FIRST_REVISION_SHA, "adopt_only": False},
         headers=WORKER_HEADERS,
     )
     assert opened.status_code == 200, opened.text
@@ -1562,7 +1562,7 @@ def test_manual_admission_without_base_still_requires_ancestry_and_revision_iden
         ),
         client.post(
             f"{root}/pull-request",
-            json={"expected_head_sha": FIRST_REVISION_SHA},
+            json={"expected_head_sha": FIRST_REVISION_SHA, "adopt_only": False},
             headers=WORKER_HEADERS,
         ),
         _settle_moved(client, publication, lease),
