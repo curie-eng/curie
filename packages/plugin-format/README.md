@@ -54,11 +54,12 @@ declaration with `shared_connector_requires_application`. Direct dedicated
 render, MCP entry and activation helpers also refuse shared references. Metadata
 inspection, including sealing-key custody inspection, grants no activation.
 
-`shared_connector_render.render_application(application)` and
-`render_member_reach(application, member)` are pure render functions with
-explicit validated inputs. Application inputs describe the installation,
-immutable application identity, images, ports, Secret key references, resources
-and database destination. Membership is separate from application pod settings;
+`shared_connector_render.render_application(application, caller_public_keys=...)`
+and `render_member_reach(application, member)` are pure render functions with
+explicit validated inputs. The caller public verify keys are a render-time
+input, not part of the application record. Application inputs describe the
+installation, immutable application identity, images, ports, Secret key
+references, resources and database destination. Membership is separate from application pod settings;
 changing membership must not change the Deployment template. Tool narrowing
 uses the manifest's existing `toolPolicy`, with no new per-reference policy
 field and no claim of runtime policy enforcement.
