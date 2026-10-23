@@ -24,9 +24,9 @@
 # and an amd64 CI runner both work -- a hardcoded tarball URL would not).
 # Floating tags would still pick up upstream OS security patches without a
 # commit; Dependabot's docker ecosystem raises those base moves as PRs instead.
-FROM node:22.23.4-bookworm-slim@sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d AS node
+FROM node:26.11.1-bookworm-slim@sha256:86f07bc9c5dce4578cf37e5a418b7bfc7f817cda25cde66e2b66e95ed86c4567 AS node
 
-FROM python:3.13.15-slim-bookworm@sha256:ed86c82274b3c69b52fb5820f358f0bd7df0b603332063cb5c6e32bd220c3e6e
+FROM python:3.14.7-slim-bookworm@sha256:82bc3c539b8813ada9d68c63b40158fa002f7f33de9bf3312a3dfdc0620dff56
 
 # Only the Node bits, never all of /usr/local: the python base keeps its own
 # interpreter there, so a blanket copy would clobber it.
