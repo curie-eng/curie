@@ -70,8 +70,8 @@ def test_repeated_failed_connects_leave_no_thread_running(
 class _RecordingHandler:
     """Stands in for Bolt's SocketModeHandler: records connect and close."""
 
-    def __init__(self, app: App, app_token: str) -> None:
-        del app, app_token
+    def __init__(self, app: App, app_token: str, logger: Any = None) -> None:
+        del app, app_token, logger
         self.events: list[str] = []
         self.client = type(
             "Client",
