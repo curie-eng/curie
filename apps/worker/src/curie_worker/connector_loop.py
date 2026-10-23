@@ -32,6 +32,18 @@ its reason changes, one INFO when it leaves, and the
 The cluster-shaped work is synchronous -- the Kubernetes client is, and so is
 the render fetch -- so a pass runs in a worker thread rather than blocking the
 event loop the kernel is using.
+
+**Shared applications (ADR 0239) follow the agents.** Each agent's render
+lists its shared entries with their member reach, or refuses with a code. The
+pass records every agent's answer in a ``SharedObservation`` (authoritative,
+unresolved, or gone), then ensures every declared application, applies and
+prunes reach, and collects application garbage (``shared_reconcile``). A
+refused render applies no dedicated change for that agent and prunes all of
+its shared reach; a render the pass could not get leaves its reach alone and
+blocks application garbage collection. The agents run first and read the
+readiness earlier passes recorded, so a dedicated connector replaced by a
+shared reference keeps its objects until the pass after its application is
+first observed ready (ADR 0239 Restore 6).
 """
 
 from __future__ import annotations
@@ -40,11 +52,17 @@ import asyncio
 import logging
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 import httpx
+from curie_internal.shared_declarations import APPLICATION_LABEL
 from curie_telemetry import record_metric
+from plugin_format.connector_render import (
+    AmbiguousObjectName,
+    direct_service_name,
+    object_name,
+)
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -52,10 +70,21 @@ from .connector_agent import (
     AgentOutcome,
     ManifestSource,
     RenderedConnectors,
+    SharedReach,
     prune_agent,
     reconcile_agent,
 )
 from .connector_apply import ConnectorClient
+from .shared_declarations_client import WORKER_TOKEN_MISSING, shared_refusal
+from .shared_reconcile import (
+    AGENT_LABEL,
+    COMPONENT,
+    COMPONENT_LABEL,
+    PART_OF_LABEL,
+    SharedObservation,
+    SharedOutcome,
+    SharedReconciler,
+)
 
 if TYPE_CHECKING:
     from .connector_probe import ProbeTrigger
@@ -64,6 +93,26 @@ logger = logging.getLogger(__name__)
 _monotonic = time.monotonic
 
 _PLATFORM_5XX_GRACE_PASSES = 3
+
+RENDER_MALFORMED = "shared_render_malformed"
+REACH_FOREIGN = "shared_reach_foreign"
+
+
+class SharedRenderRefused(Exception):
+    """The render refused this agent's shared declarations, or answered them malformed.
+
+    ``declared`` is every application the bundle declares when the refusal
+    names them, else None: the declarations are unknown, which blocks
+    application garbage collection for the pass. ``str(exc)`` is the code.
+    """
+
+    def __init__(self, code: str, declared: tuple[str, ...] | None = None) -> None:
+        super().__init__(code)
+        self.code = code
+        self.declared = declared
+
+    def __str__(self) -> str:
+        return self.code
 
 
 # Every agent with an in-force deployment, and the version that deployment
@@ -136,23 +185,126 @@ class HttpManifestSource:
         namespace: str,
         app_name: str,
         timeout: float = 30.0,
+        client: httpx.Client | None = None,
     ) -> None:
         self._base = api_base_url.rstrip("/")
         self._headers = {"X-API-Key": api_key} if api_key else {}
         self._params = {"release": release, "namespace": namespace, "app_name": app_name}
+        self._release = release
+        self._namespace = namespace
         self._timeout = timeout
+        # The transport seam; None builds a client per call.
+        self._client = client
 
     def rendered(self, *, agent_id: str, version_id: str) -> RenderedConnectors:
         url = f"{self._base}/agents/{agent_id}/versions/{version_id}/connectors"
-        with httpx.Client(timeout=self._timeout) as client:
-            response = client.get(url, params=self._params, headers=self._headers)
+        if self._client is not None:
+            response = self._client.get(url, params=self._params, headers=self._headers)
+        else:
+            with httpx.Client(timeout=self._timeout) as client:
+                response = client.get(url, params=self._params, headers=self._headers)
+        refused = shared_refusal(response)
+        if refused is not None:
+            raise SharedRenderRefused(*refused)
         response.raise_for_status()
         body: dict[str, Any] = response.json()
         return RenderedConnectors(
             manifests=list(body.get("manifests") or []),
             owned_secret_name=str(body.get("owned_secret_name") or ""),
             owned_secret_keys=list(body.get("owned_secret_keys") or []),
+            shared=self._shared(body.get("shared", []), agent_id),
         )
+
+    def _shared(self, value: object, agent_id: str) -> tuple[SharedReach, ...]:
+        """The render's shared entries, each reach object held to this agent and release.
+
+        Anything else is the whole render refused (``shared_render_malformed``,
+        or ``shared_reach_foreign`` for a reach object that is not this
+        agent's), so nothing of it is applied and its declarations count as
+        unknown. A render with no ``shared`` field declares none.
+        """
+
+        if not isinstance(value, list):
+            raise SharedRenderRefused(RENDER_MALFORMED)
+        entries: list[SharedReach] = []
+        for item in value:
+            if not isinstance(item, dict):
+                raise SharedRenderRefused(RENDER_MALFORMED)
+            name, application, reach = item.get("name"), item.get("application"), item.get("reach")
+            if (
+                not isinstance(name, str)
+                or not isinstance(application, str)
+                or not isinstance(reach, list)
+                or not all(isinstance(obj, dict) for obj in reach)
+            ):
+                raise SharedRenderRefused(RENDER_MALFORMED)
+            for obj in reach:
+                self._own_reach(obj, agent_id, application)
+            entries.append(SharedReach(name=name, application=application, reach=tuple(reach)))
+        return tuple(entries)
+
+    def _own_reach(self, obj: dict[str, Any], agent_id: str, application: str) -> None:
+        metadata = obj.get("metadata")
+        labels = metadata.get("labels") if isinstance(metadata, dict) else None
+        if (
+            obj.get("kind") != "NetworkPolicy"
+            or not isinstance(labels, dict)
+            or not isinstance(metadata, dict)
+            or not isinstance(metadata.get("name"), str)
+            or metadata.get("namespace", self._namespace) != self._namespace
+            or labels.get(AGENT_LABEL) != agent_id
+            or labels.get(COMPONENT_LABEL) != COMPONENT
+            or labels.get(PART_OF_LABEL) != self._release
+            or labels.get(APPLICATION_LABEL) != application
+        ):
+            raise SharedRenderRefused(REACH_FOREIGN)
+
+
+class _SharedGuard:
+    """The render source, refusing shared entries the loop cannot reconcile.
+
+    Without a shared reconciler that can reach the worker routes (no internal
+    worker token), a render that carries shared entries is refused before any
+    of it is applied, as undecidable: the agent's shared reach is pruned and
+    application garbage collection waits, while dedicated-only agents are
+    unaffected.
+
+    Otherwise each shared entry whose application the reconciler has not
+    observed ready marks the dedicated objects of the same alias retained
+    (``RenderedConnectors.retained``), by the frozen render's names. An alias
+    those names refuse (``AmbiguousObjectName``) retains nothing.
+    """
+
+    def __init__(
+        self, inner: ManifestSource, *, shared: SharedReconciler | None, agent: str
+    ) -> None:
+        self._inner = inner
+        self._shared = shared
+        self._agent = agent
+
+    def rendered(self, *, agent_id: str, version_id: str) -> RenderedConnectors:
+        rendered = self._inner.rendered(agent_id=agent_id, version_id=version_id)
+        if not rendered.shared:
+            return rendered
+        shared = self._shared
+        if shared is None or not shared.ready:
+            raise SharedRenderRefused(WORKER_TOKEN_MISSING)
+        retained: set[str] = set()
+        for entry in rendered.shared:
+            if shared.application_ready(entry.application):
+                continue
+            try:
+                retained.update(
+                    (
+                        object_name(shared.release, self._agent, entry.name),
+                        direct_service_name(shared.release, self._agent, entry.name),
+                    )
+                )
+            except AmbiguousObjectName:
+                # An alias the frozen render refuses to name can never have
+                # been a dedicated connector, so there is nothing to retain.
+                continue
+        return replace(rendered, retained=frozenset(retained))
 
 
 class _ObservingClient:
@@ -198,6 +350,9 @@ class PassSummary:
     deleted: int = 0
     skipped: int = 0
     failed: int = 0
+    # Agents whose render this pass could not get: their shared reach is
+    # kept, and shared application garbage collection waits.
+    shared_unresolved: int = 0
 
     @property
     def did_work(self) -> bool:
@@ -219,8 +374,13 @@ class ConnectorReconcileLoop:
         db_schema: str,
         interval_seconds: float = 60.0,
         probe_trigger: ProbeTrigger | None = None,
+        shared: SharedReconciler | None = None,
     ) -> None:
         self._engine = engine
+        # ADR 0239. None, or one without the internal worker token, cannot
+        # reconcile a shared application: an agent whose render carries shared
+        # entries is then refused as undecidable.
+        self._shared = shared
         # ACTION-EXECUTOR-13: asks for a capability probe from what a pass
         # observed. None is the loop without it.
         self._probe_trigger = probe_trigger
@@ -267,7 +427,7 @@ class ConnectorReconcileLoop:
                 namespace=self._namespace,
             )
         return reconcile_agent(
-            self._source,
+            _SharedGuard(self._source, shared=self._shared, agent=target.agent_name),
             client,
             agent=target.agent_name,
             agent_id=str(target.agent_id),
@@ -281,6 +441,7 @@ class ConnectorReconcileLoop:
         summary = PassSummary()
         targets = await self.targets()
         deployed = {target.agent_id for target in targets}
+        observation = SharedObservation(deployed={str(agent_id) for agent_id in deployed})
         for agent_id in [known for known in self._skip_reasons if known not in deployed]:
             # No longer deployed, so no longer skipped. Dropped without a line:
             # the undeploy is the event, and this loop did not cause it.
@@ -293,7 +454,23 @@ class ConnectorReconcileLoop:
                     outcome = await asyncio.to_thread(self._reconcile_one, target)
                 else:
                     outcome = await asyncio.to_thread(self._reconcile_with, target, observing)
+            except SharedRenderRefused as refused:
+                # An answer, not an outage: no dedicated change for this agent
+                # this pass, and all of its shared reach is pruned.
+                self._platform_5xx_streaks.pop(target.agent_id, None)
+                declared = refused.declared
+                if declared and not (self._shared is not None and self._shared.ready):
+                    refused, declared = SharedRenderRefused(WORKER_TOKEN_MISSING), None
+                observation.refused(str(target.agent_id), declared)
+                summary.failed += 1
+                logger.warning(
+                    "connector reconcile render refused for agent=%s code=%s",
+                    target.agent_name,
+                    refused.code,
+                )
+                continue
             except Exception as exc:
+                observation.unresolvable(str(target.agent_id))
                 if (
                     isinstance(exc, httpx.HTTPStatusError)
                     and 500 <= exc.response.status_code <= 599
@@ -326,6 +503,8 @@ class ConnectorReconcileLoop:
                 continue
 
             self._platform_5xx_streaks.pop(target.agent_id, None)
+            rendered = outcome.rendered
+            observation.rendered(str(target.agent_id), rendered.shared if rendered else ())
             if observing is not None:
                 await self._request_probes(target, outcome, observing)
             self._note_skip(target, outcome.skipped)
@@ -341,19 +520,67 @@ class ConnectorReconcileLoop:
                 if not outcome.report.ok:
                     summary.failed += 1
 
+        summary.shared_unresolved = len(observation.unresolved)
+        if self._shared is not None:
+            await self._reconcile_shared(self._shared, observation, summary)
+
         log = logger.info if summary.did_work else logger.debug
         log(
-            "connector reconcile pass: %d agent(s), %d applied, %d deleted, %d skipped, %d failed",
+            "connector reconcile pass: %d agent(s), %d applied, %d deleted, %d skipped, "
+            "%d failed, %d shared unresolved",
             summary.reconciled,
             summary.applied,
             summary.deleted,
             summary.skipped,
             summary.failed,
+            summary.shared_unresolved,
         )
         self._record_pass_metrics(
             outcome="failure" if summary.failed else "success",
         )
         return summary
+
+    async def _reconcile_shared(
+        self, shared: SharedReconciler, observation: SharedObservation, summary: PassSummary
+    ) -> None:
+        """Applications, then reach, then garbage; each failure ends with its own step.
+
+        Every declared application is ensured, so a disabled application, or
+        one whose members' renders refuse while still declaring it, keeps its
+        objects. Reach runs only after, and garbage last, from the same
+        observation.
+        """
+
+        def fold(outcome: SharedOutcome) -> None:
+            summary.applied += outcome.applied
+            summary.deleted += outcome.deleted
+            if outcome.failures:
+                summary.failed += 1
+
+        if shared.ready:
+            for application_id in sorted(observation.declared_applications()):
+                try:
+                    fold(await asyncio.to_thread(shared.ensure_application, application_id))
+                except Exception:
+                    summary.failed += 1
+                    logger.exception(
+                        "shared application reconcile raised for application=%s; "
+                        "continuing with the rest",
+                        application_id,
+                    )
+        for step, name in (
+            (shared.reconcile_reach, "reach"),
+            (shared.collect_garbage, "garbage collection"),
+        ):
+            try:
+                outcome = await asyncio.to_thread(step, observation)
+            except Exception:
+                summary.failed += 1
+                logger.exception("shared connector %s raised; retrying next pass", name)
+                continue
+            for failure in outcome.failures:
+                logger.warning("shared connector %s failed: %s", name, failure)
+            fold(outcome)
 
     async def _request_probes(
         self, target: AgentTarget, outcome: AgentOutcome, observing: _ObservingClient

@@ -7,7 +7,8 @@ names what failed without echoing what was sent.
 
 Credentials cross this API only as sealed boxes; no response model has a
 ciphertext field, and the sealed DSN appears only in the provisioning and
-rotation answers, never in an application record.
+rotation answers and the worker's application render, never in an application
+record.
 """
 
 from __future__ import annotations
@@ -30,6 +31,8 @@ CLIENT_FINGERPRINT_PATTERN = r"^sha256:[0-9a-f]{64}$"
 SOURCE_FINGERPRINT_PATTERN = r"^hmac-sha256:[0-9a-f]{64}$"
 MANAGED_ROLE_PATTERN = r"^[a-z_][a-z0-9_]{0,62}$"
 STATUS_REASON_PATTERN = r"^[a-z][a-z0-9_]{0,63}$"
+# A bundle connector name: the frozen dedicated rule, at most 40 characters.
+CONNECTOR_NAME_PATTERN = r"^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$"
 
 Custody = Literal["platform", "connector"]
 DatabaseMode = Literal["bundled", "managed"]
@@ -281,6 +284,29 @@ class SharedDatabaseStatusReport(BaseModel):
     dsn_revision: int = Field(ge=1)
 
 
+class SharedDeclarationEntryIn(BaseModel):
+    """One shared entry of a bundle: its connector name and the application it references."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(pattern=CONNECTOR_NAME_PATTERN)
+    application: uuid.UUID
+
+
+class SharedResolveRequest(BaseModel):
+    """The worker's own readers resolve the shared entries an agent's target runs."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    agent_id: uuid.UUID
+    entries: list[SharedDeclarationEntryIn] = Field(min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def _distinct_names(self) -> Self:
+        _unique([entry.name for entry in self.entries], "entry names")
+        return self
+
+
 # --- responses ----------------------------------------------------------------
 
 
@@ -420,3 +446,47 @@ class SharedRecipientRetired(BaseModel):
     application_id: uuid.UUID
     recipient_id: str
     retired_at: datetime
+
+
+class SharedResolvedEntryOut(BaseModel):
+    name: str
+    application: uuid.UUID
+    enabled: bool
+
+
+class SharedResolveOut(BaseModel):
+    agent_id: uuid.UUID
+    entries: list[SharedResolvedEntryOut]
+
+
+class SharedDatabasePlanOut(BaseModel):
+    """The application's database Secret, as the worker reconciles it.
+
+    Bundled: the worker-managed DSN Secret, and once provisioned the DSN sealed
+    to the application's recipient with its revision, which the worker writes
+    unopened. Managed: the operator's own Secret reference only.
+    """
+
+    mode: DatabaseMode
+    secret: SharedSecretRefOut
+    sealed_dsn: str | None
+    dsn_revision: int | None
+    status: DatabaseStatus | None
+
+
+class SharedSecretPlanOut(BaseModel):
+    encryption_key: SharedSecretRefOut
+    database: SharedDatabasePlanOut
+    grant_store: SharedSecretRefOut
+    snapshot_seal: SharedSecretRefOut | None
+
+
+class SharedApplicationRenderOut(BaseModel):
+    """The frozen ``render_application`` output and the Secret plan beside it."""
+
+    application_id: uuid.UUID
+    enabled: bool
+    installation_label: str
+    objects: list[dict[str, Any]]
+    secrets: SharedSecretPlanOut
+    recipients: list[str]

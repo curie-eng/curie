@@ -16,10 +16,19 @@ from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any
 
+import yaml
 from curie_internal.sealing_key import (
     custody_reason,
     is_sealing_key_name,
     sealing_key_references,
+)
+from curie_internal.shared_declarations import (
+    Declarations,
+    SharedEntry,
+    dedicated_subset,
+    has_shared,
+    parse_declarations,
+    valid_connector_name,
 )
 from plugin_format import (
     DEFAULT_MAX_COMPRESSION_RATIO,
@@ -30,24 +39,29 @@ from plugin_format import (
     TOOL_POLICY_ENFORCEMENT,
     ApprovalPolicy,
     PluginManifest,
+    ToolPolicy,
     UnsupportedArchive,
     ValidationIssue,
     ValidationResult,
     bundle_root,
     connector_render,
+    connector_tool_prefix,
+    literal_server_segment,
+    policy_patterns,
     resolve_manifest,
     safe_extract,
     validate_bundle,
 )
+from plugin_format.approval_policy import declared_mcp_server_names
 from plugin_format.connector_lock import (
     CONNECTOR_LOCK_FILE,
     ConnectorLockFile,
     validate_connector_lock,
 )
-from plugin_format.connectors import CONNECTORS_FILE, ConnectorsFile, validate_connectors
+from plugin_format.connectors import CONNECTORS_FILE, ConnectorsFile
 from plugin_format.deploy_targets import DeployTargetsFile, validate_deploy_targets
 from plugin_format.validate import DEPLOY_FILE
-from plugin_format.yaml_loader import safe_load_unique
+from plugin_format.yaml_loader import DuplicateKeyError, safe_load_unique
 
 from curie_api.e2e_connector import (
     CONNECTOR_NAME,
@@ -69,6 +83,10 @@ __all__ = [
     "extract_stored_bundle",
     "read_bundle_text_files",
 ]
+
+# The ``deploy.yaml`` codes after which no model exists to cross-check, as the
+# frozen validator's own target check reads them.
+_DEPLOY_SHAPE_ERRORS = frozenset({"deploy.not_object", "deploy.invalid"})
 
 # Detected format -> (stored key extension, content type). Detection sniffs the
 # bytes rather than trusting the upload filename.
@@ -102,8 +120,9 @@ def extract_and_validate(
     max_uncompressed_bytes: int = DEFAULT_MAX_UNCOMPRESSED_BYTES,
     max_compression_ratio: float = DEFAULT_MAX_COMPRESSION_RATIO,
     max_members: int = DEFAULT_MAX_MEMBERS,
-) -> tuple[str, str, ValidationResult]:
-    """Detect, extract, and validate. Returns (extension, content_type, result).
+    allow_shared: bool = False,
+) -> tuple[str, str, ValidationResult, tuple[SharedEntry, ...]]:
+    """Detect, extract, and validate. Returns (extension, content_type, result, shared).
 
     Extraction (with the traversal/symlink/special-file, size/ratio, and
     member-count guards) and the single-wrapper-dir unwrap live in
@@ -111,6 +130,12 @@ def extract_and_validate(
     upload path needs. The caps default to ``plugin_format``'s generous
     fallbacks; ``deploy.py`` passes the operator-configured ``Settings`` values
     instead.
+
+    ``shared`` is the valid bundle's shared connector entries, for a caller that
+    opted in with ``allow_shared`` and resolves them against the shared store
+    for the agent that deploys it (ADR 0239). Without it a shared entry keeps
+    the frozen ``connectors.shared_connector_requires_application`` refusal, so
+    a caller that never resolves fails closed.
     """
 
     extension, content_type = detect_format(data)
@@ -132,13 +157,253 @@ def extract_and_validate(
     # so it refuses to BOOT a policy-bearing bundle. The failure mode of an old
     # runner meeting a new bundle is "will not start", never "starts unfenced".
     root = bundle_root(dest)
+    if not allow_shared:
+        return extension, content_type, _validate_dedicated(root), ()
+    result, declarations = validate_with_shared(root)
+    shared = declarations.shared if result.valid and declarations is not None else ()
+    return extension, content_type, result, shared
+
+
+def _validate_dedicated(root: Path) -> ValidationResult:
+    """The frozen ``validate_bundle`` plus sealing key custody: intake before ADR 0239."""
+
     result = validate_bundle(root, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT)
     custody = sealing_key_custody_issues(root)
     if custody:
         result = ValidationResult(
             valid=False, errors=[*result.errors, *custody], warnings=result.warnings
         )
-    return extension, content_type, result
+    return result
+
+
+def _issue(code: str, message: str, location: str) -> ValidationIssue:
+    return ValidationIssue(code=code, message=message, location=location)
+
+
+def _load_declared(path: Path) -> Any:
+    """``connectors.yaml`` content; None when absent or unreadable (the frozen run reports it)."""
+
+    if not path.is_file():
+        return None
+    try:
+        return safe_load_unique(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, yaml.YAMLError):
+        return None
+
+
+def _original_targets(
+    root: Path, declarations: Declarations
+) -> tuple[Any, bool, list[ValidationIssue]]:
+    """The ORIGINAL ``deploy.yaml``: its content, whether it is valid, and its refusals.
+
+    The frozen target checks, in the frozen order, against the full declared
+    set (dedicated plus shared), so every target refusal keeps its own code and
+    message even though the frozen validator later sees only the dedicated
+    subset. Content is None when the file is absent or unreadable.
+    """
+
+    path = root / DEPLOY_FILE
+    if not path.is_file():
+        return None, True, []
+    try:
+        data = safe_load_unique(path.read_text(encoding="utf-8"))
+    except DuplicateKeyError as exc:
+        message = f"{DEPLOY_FILE}: duplicate target key {exc.key!r}"
+        return None, False, [_issue("deploy.duplicate_target", message, DEPLOY_FILE)]
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
+        return None, False, [_issue("deploy.unreadable", f"{DEPLOY_FILE}: {exc}", DEPLOY_FILE)]
+    parsed, errors = validate_deploy_targets(data)
+    issues = [_issue(code, message, DEPLOY_FILE) for code, message in errors]
+    if parsed is None and not {code for code, _ in errors} & _DEPLOY_SHAPE_ERRORS:
+        parsed = DeployTargetsFile.model_validate(data)
+    if parsed is not None:
+        declared = declarations.names()
+        for name, target in parsed.targets.items():
+            for connector in dict.fromkeys(target.connectors or ()):
+                if connector not in declared and valid_connector_name(connector):
+                    issues.append(
+                        _issue(
+                            "deploy.unknown_connector",
+                            f"targets.{name}: connectors lists `{connector}`, which "
+                            f"{CONNECTORS_FILE} does not declare",
+                            DEPLOY_FILE,
+                        )
+                    )
+    return data, not issues, issues
+
+
+def _without_shared_targets(data: Any, shared: frozenset[str]) -> Any:
+    """Valid ``deploy.yaml`` content with the shared names taken out of every target list."""
+
+    targets = data.get("targets") if isinstance(data, dict) else None
+    if not isinstance(targets, dict):
+        return data
+    stripped: dict[Any, Any] = {}
+    for name, target in targets.items():
+        if isinstance(target, dict) and isinstance(target.get("connectors"), list):
+            target = {
+                **target,
+                "connectors": [c for c in target["connectors"] if c not in shared],
+            }
+        stripped[name] = target
+    return {**data, "targets": stripped}
+
+
+_UNKNOWN_SERVER = "tool_policy.unknown_server"
+_GATE_NOT_NAMESPACED = "approval_policy.gate_not_namespaced"
+
+
+def _policy_entries(root: Path) -> dict[str, tuple[str, str]]:
+    """Each tool policy pattern and approval gate by the location the frozen validator reports.
+
+    ``{location: (code, value)}``: a pattern for ``tool_policy.unknown_server``
+    and a stripped gate for ``approval_policy.gate_not_namespaced``. Read with
+    the frozen models; a policy that does not parse yields nothing, so no
+    error is ever dropped on a guess.
+    """
+
+    entries: dict[str, tuple[str, str]] = {}
+    path = resolve_manifest(root)
+    if path is None:
+        return entries
+    try:
+        manifest = PluginManifest.model_validate(json.loads(path.read_text(encoding="utf-8")))
+    except (ValueError, TypeError, OSError):
+        return entries
+    if isinstance(manifest.toolPolicy, dict):
+        try:
+            tool_policy = ToolPolicy.model_validate(manifest.toolPolicy)
+        except ValueError:
+            pass
+        else:
+            for collection, i, pattern in policy_patterns(tool_policy):
+                entries[f"plugin.json (toolPolicy.{collection}[{i}])"] = (_UNKNOWN_SERVER, pattern)
+    if isinstance(manifest.approvalPolicy, dict):
+        try:
+            approval = ApprovalPolicy.model_validate(manifest.approvalPolicy)
+        except ValueError:
+            pass
+        else:
+            for i, gate in enumerate(approval.gates):
+                if isinstance(gate.gate, str):
+                    entries[f"plugin.json (approvalPolicy.gates[{i}])"] = (
+                        _GATE_NOT_NAMESPACED,
+                        gate.gate.strip(),
+                    )
+    return entries
+
+
+def _satisfied_by_shared(
+    issue: ValidationIssue, entries: Mapping[str, tuple[str, str]], aliases: frozenset[str]
+) -> bool:
+    """Whether a frozen policy error is raised only because the run did not see a shared alias.
+
+    The frozen run validates the dedicated subset, so its declared-server
+    cross-checks miss the shared aliases. An error is dropped only when its
+    code is one of those two checks, its location names one policy entry, and
+    that entry recomputed with the frozen helpers names a shared alias: a
+    pattern whose literal server segment is an alias, or a gate carrying an
+    alias's tool prefix and a nonempty tool name after it.
+    """
+
+    code, value = entries.get(issue.location, ("", ""))
+    if code != issue.code:
+        return False
+    if code == _UNKNOWN_SERVER:
+        return literal_server_segment(value) in aliases
+    return any(
+        value.startswith(prefix) and len(value) > len(prefix)
+        for prefix in map(connector_tool_prefix, aliases)
+    )
+
+
+def validate_with_shared(root: Path) -> tuple[ValidationResult, Declarations | None]:
+    """Intake for a bundle that may declare shared connectors (ADR 0239).
+
+    Without a shared entry this is exactly ``_validate_dedicated``. With one:
+
+    1. A declaration that does not parse is refused with the shared parser's
+       codes in place of the frozen ``shared_connector_requires_application``.
+    2. Otherwise the ORIGINAL ``deploy.yaml`` is checked first
+       (``_original_targets``), so no target guard is lost.
+    3. The frozen ``validate_bundle`` and custody then run on this same tree
+       with ``connectors.yaml`` rewritten to the dedicated subset, and with the
+       shared names taken out of valid target lists, or ``deploy.yaml`` set
+       aside when it is invalid so its refusals are not reported twice. Both
+       files are restored byte for byte whatever happens.
+    4. The frozen policy cross-checks ran without the shared aliases, so an
+       error they raise only for want of one is dropped
+       (``_satisfied_by_shared``). Every other error stays.
+
+    The declarations are returned only when they parsed; the caller resolves
+    the shared entries for the agent that deploys the bundle.
+    """
+
+    connectors_path = root / CONNECTORS_FILE
+    content = _load_declared(connectors_path)
+    if not has_shared(content):
+        if connectors_path.is_file() and content is None:
+            return _validate_dedicated(root), None
+        declarations, _ = parse_declarations(content)
+        return _validate_dedicated(root), declarations
+
+    declarations, errors = parse_declarations(content)
+    if declarations is None:
+        # The frozen run refuses the whole file on its first problem (the shared
+        # entry); the shared parser's codes replace that refusal.
+        frozen = _validate_dedicated(root)
+        issues = [issue for issue in frozen.errors if issue.location != CONNECTORS_FILE]
+        issues += [_issue(code, message, CONNECTORS_FILE) for code, message in errors]
+        return ValidationResult(valid=False, errors=issues, warnings=frozen.warnings), None
+
+    targets, targets_valid, target_issues = _original_targets(root, declarations)
+    # The frozen MCP config cross-check, for the names the frozen run will not see.
+    mcp_servers = declared_mcp_server_names(root) or set()
+    for name in sorted({entry.name for entry in declarations.shared} & mcp_servers):
+        target_issues.append(
+            _issue(
+                "connectors.duplicate_server",
+                f"connectors.{name}: `{name}` is declared in both {CONNECTORS_FILE} and the "
+                "bundle's MCP config. Curie derives this server's URL from the Service it "
+                f"creates, so remove the `{name}` entry from the MCP config and let "
+                f"{CONNECTORS_FILE} own it.",
+                CONNECTORS_FILE,
+            )
+        )
+
+    deploy_path = root / DEPLOY_FILE
+    original_connectors = connectors_path.read_bytes()
+    original_deploy = deploy_path.read_bytes() if deploy_path.is_file() else None
+    try:
+        connectors_path.write_text(
+            yaml.safe_dump(dedicated_subset(content), sort_keys=False), encoding="utf-8"
+        )
+        if original_deploy is not None:
+            if targets_valid:
+                shared_names = frozenset(entry.name for entry in declarations.shared)
+                deploy_path.write_text(
+                    yaml.safe_dump(_without_shared_targets(targets, shared_names), sort_keys=False),
+                    encoding="utf-8",
+                )
+            else:
+                deploy_path.unlink()
+        frozen = _validate_dedicated(root)
+    finally:
+        connectors_path.write_bytes(original_connectors)
+        if original_deploy is not None:
+            deploy_path.write_bytes(original_deploy)
+
+    aliases = frozenset(entry.name for entry in declarations.shared)
+    issues = [*frozen.errors]
+    if any(issue.code in (_UNKNOWN_SERVER, _GATE_NOT_NAMESPACED) for issue in issues):
+        entries = _policy_entries(root)
+        issues = [issue for issue in issues if not _satisfied_by_shared(issue, entries, aliases)]
+    seen = {(issue.code, issue.message) for issue in issues}
+    for issue in target_issues:
+        if (issue.code, issue.message) not in seen:
+            seen.add((issue.code, issue.message))
+            issues.append(issue)
+    return ValidationResult(valid=not issues, errors=issues, warnings=frozen.warnings), declarations
 
 
 SEALING_KEY_CODE = "secrets.sealing_key_custody"
@@ -335,23 +600,6 @@ def declared_approval_routes(root: Path) -> set[str] | None:
     return set(routes.values())
 
 
-def read_connectors(root: Path) -> ConnectorsFile:
-    """Parse a validated bundle's ``connectors.yaml``, or an empty set.
-
-    Safe to call only after ``validate_bundle`` has passed: every malformed
-    shape is already rejected there, so this cannot be the place a bad
-    declaration first surfaces.
-    """
-
-    path = bundle_root(root) / CONNECTORS_FILE
-    if not path.is_file():
-        return ConnectorsFile()
-    parsed, errors = validate_connectors(safe_load_unique(path.read_text(encoding="utf-8")))
-    if errors or parsed is None:  # pragma: no cover -- validate_bundle gates this
-        return ConnectorsFile()
-    return parsed
-
-
 def read_manifest_triggers(root: Path) -> list[Any]:
     """Return ``plugin.json`` ``triggers`` as stored, or an empty list.
 
@@ -379,7 +627,7 @@ def read_connector_lock(root: Path) -> ConnectorLockFile | None:
 
     None is not an error and is the common case: an ordinary ``image:`` bundle
     carries no lock and never will. Safe to call only after ``validate_bundle``
-    has passed, exactly like ``read_connectors`` -- a malformed lock, a lockless
+    has passed, exactly like the connector declarations -- a malformed lock, a lockless
     ``build:`` bundle, and a stale digest are all already rejected there, so this
     cannot be the place a bad lock first surfaces.
     """

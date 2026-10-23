@@ -188,8 +188,9 @@ spec:
   policyName: {{ $fullname }}-runner-claim-cleanup
   validationActions: ["Deny"]
 ---
-{{- /* #3842: the worker's Secret create exists only for the per-claim token
-       Secret. Admit exactly that shape: the claim label, a -tokens name, and
+{{- /* #3842: the worker's Secret create exists for the per-claim token
+       Secret and, since ADR 0239, the two shared connector application Secret
+       shapes below. Admit the token shape exactly: the claim label, a -tokens name, and
        Opaque, which refuses minting a kubernetes.io/service-account-token
        Secret for another ServiceAccount. Scoped to the release namespace by
        namespaceSelector: the same worker identity also creates publication
@@ -215,13 +216,55 @@ spec:
   matchConditions:
     - name: worker-service-account
       expression: {{ printf "request.userInfo.username == 'system:serviceaccount:%s:%s'" .Release.Namespace $workerSA | quote }}
-  validations:
-    - expression: >-
+  {{- /* ADR 0239 (cp5): the worker also creates, once per shared connector
+         application, a key Secret shared-key-<uuid> (one data key,
+         private-keys) and a sealed DSN Secret shared-dsn-<uuid> (one data key,
+         sealed-dsn). Each shape is one variable carrying its whole predicate;
+         the validation is their OR. A -tokens Secret may not carry either
+         shared label, and a shared Secret may not carry the claim label, so no
+         Secret can satisfy two shapes at once. The shapes are typed and
+         stringData is refused, so nothing but the exact worker-written Secret
+         is admitted. */}}
+  variables:
+    - name: tokens
+      expression: >-
         has(object.metadata.labels) &&
         'curietech.ai/sandbox-claim' in object.metadata.labels &&
+        !('curietech.ai/shared-application' in object.metadata.labels) &&
+        !('curietech.ai/shared-secret' in object.metadata.labels) &&
         object.metadata.name.endsWith('-tokens') &&
         (!has(object.type) || object.type == 'Opaque')
-      message: the worker may create only Opaque per-claim -tokens Secrets labelled curietech.ai/sandbox-claim
+    - name: sharedKey
+      expression: >-
+        has(object.metadata.labels) &&
+        !('curietech.ai/sandbox-claim' in object.metadata.labels) &&
+        'curietech.ai/shared-application' in object.metadata.labels &&
+        object.metadata.labels['curietech.ai/shared-application'].matches('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$') &&
+        'curietech.ai/shared-secret' in object.metadata.labels &&
+        object.metadata.labels['curietech.ai/shared-secret'] == 'encryption-key' &&
+        'app.kubernetes.io/component' in object.metadata.labels &&
+        object.metadata.labels['app.kubernetes.io/component'] == 'shared-connector-application' &&
+        object.metadata.name == 'shared-key-' + object.metadata.labels['curietech.ai/shared-application'] &&
+        has(object.type) && object.type == 'Opaque' &&
+        has(object.data) && object.data.size() == 1 && 'private-keys' in object.data &&
+        !has(object.stringData)
+    - name: sharedDsn
+      expression: >-
+        has(object.metadata.labels) &&
+        !('curietech.ai/sandbox-claim' in object.metadata.labels) &&
+        'curietech.ai/shared-application' in object.metadata.labels &&
+        object.metadata.labels['curietech.ai/shared-application'].matches('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$') &&
+        'curietech.ai/shared-secret' in object.metadata.labels &&
+        object.metadata.labels['curietech.ai/shared-secret'] == 'database-dsn' &&
+        'app.kubernetes.io/component' in object.metadata.labels &&
+        object.metadata.labels['app.kubernetes.io/component'] == 'shared-connector-application' &&
+        object.metadata.name == 'shared-dsn-' + object.metadata.labels['curietech.ai/shared-application'] &&
+        has(object.type) && object.type == 'Opaque' &&
+        has(object.data) && object.data.size() == 1 && 'sealed-dsn' in object.data &&
+        !has(object.stringData)
+  validations:
+    - expression: variables.tokens || variables.sharedKey || variables.sharedDsn
+      message: the worker may create only Opaque per-claim -tokens Secrets labelled curietech.ai/sandbox-claim, or, for one shared connector application, the Opaque shared-key-<uuid> Secret holding only private-keys and the Opaque shared-dsn-<uuid> Secret holding only sealed-dsn, each labelled with that application and its shared-secret role
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding

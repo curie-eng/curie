@@ -135,7 +135,7 @@ def test_health_is_served_while_bundle_validation_is_in_progress(
     release_validation = threading.Event()
     real_validate = deploy.validate_archive
 
-    def _gated_validate(*args: Any, **kwargs: Any) -> tuple[str, str]:
+    def _gated_validate(*args: Any, **kwargs: Any) -> tuple[str, str, tuple[Any, ...]]:
         entered_validation.set()
         assert release_validation.wait(timeout=15), "health did not release validation"
         return real_validate(*args, **kwargs)

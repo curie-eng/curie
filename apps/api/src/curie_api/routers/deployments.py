@@ -51,6 +51,12 @@ async def create_deployment(
         await deploy.check_stored_sealing_key_custody(store, version)
     except (deploy.BundleTooLarge, deploy.SealingKeyCustody) as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+    # Shared connectors (ADR 0239): membership and the application can change
+    # after intake, so the version that is about to boot resolves again.
+    try:
+        await deploy.check_stored_shared_declarations(session, store, version, agent.id, agent.name)
+    except deploy.BundleTooLarge as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
     # The declared/bound approval-route join (#2436): this is the first moment
     # both halves are known for a specific agent, and the moment the version
     # becomes the thing that boots. AFTER the bounds check above, so an over-cap

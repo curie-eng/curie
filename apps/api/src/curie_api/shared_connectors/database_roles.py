@@ -458,6 +458,33 @@ async def rotate_database(
     return _bundled_out(application_id, role, recipient.recipient_id, int(revision), sealed)
 
 
+async def sealed_dsn_for_worker(
+    session: AsyncSession, application_id: uuid.UUID
+) -> tuple[bytes, int, str] | None:
+    """The bundled sealed DSN, its revision and recipient, for the worker's Secret.
+
+    The one read of ``sealed_dsn`` the API makes; every other load defers it
+    with ``raiseload``. Only the worker-authenticated application render calls
+    this, and the worker writes the box unopened into the DSN Secret.
+    """
+
+    row = (
+        await session.execute(
+            select(
+                SharedConnectorDatabaseRole.sealed_dsn,
+                SharedConnectorDatabaseRole.dsn_revision,
+                SharedConnectorDatabaseRole.dsn_recipient_id,
+            ).where(
+                SharedConnectorDatabaseRole.application_id == application_id,
+                SharedConnectorDatabaseRole.mode == "bundled",
+            )
+        )
+    ).one_or_none()
+    if row is None or row.sealed_dsn is None or row.dsn_recipient_id is None:
+        return None
+    return bytes(row.sealed_dsn), int(row.dsn_revision), str(row.dsn_recipient_id)
+
+
 async def report_status(
     session: AsyncSession, application_id: uuid.UUID, body: SharedDatabaseStatusReport
 ) -> SharedDatabaseStatusOut:

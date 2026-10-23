@@ -114,8 +114,10 @@ by the API through `render_connector_manifests`
 (`apps/api/src/curie_api/bundles.py::render_connector_manifests`) and served at
 the version subresource `read_version_connectors`
 (`apps/api/src/curie_api/routers/agents.py::read_version_connectors`), with
-`read_connectors` (`apps/api/src/curie_api/bundles.py::read_connectors`) parsing
-the file and `connector_mcp_entries`
+`read_declarations`
+(`apps/api/src/curie_api/shared_connectors/declarations.py::read_declarations`)
+parsing the file strictly (a shared entry is resolved against the shared store,
+never rendered as a dedicated connector) and `connector_mcp_entries`
 (`apps/api/src/curie_api/bundles.py::connector_mcp_entries`) deriving the
 `.mcp.json` the sandbox dials.
 

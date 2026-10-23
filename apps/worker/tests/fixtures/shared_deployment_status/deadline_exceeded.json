@@ -1,0 +1,30 @@
+{
+  "_source": "Field names and nesting: Kubernetes API reference apps/v1 DeploymentStatus and DeploymentCondition (v1.31). Condition reasons and messages: the deployment controller (kubernetes/kubernetes pkg/controller/deployment/util/deployment_util.go, v1.31: MinimumReplicasAvailable, MinimumReplicasUnavailable, NewReplicaSetAvailable, ReplicaSetUpdated, ProgressDeadlineExceeded). Only metadata.generation and status are kept, the two parts the reconciler reads. Replace with `kubectl get deployment <name> -o json` from a kind v1.31 API server (shared-connector-kind-driver.py --record-status-fixtures) when that capture is taken.",
+  "metadata": {
+    "generation": 1
+  },
+  "status": {
+    "observedGeneration": 1,
+    "replicas": 1,
+    "updatedReplicas": 1,
+    "unavailableReplicas": 1,
+    "conditions": [
+      {
+        "type": "Available",
+        "status": "False",
+        "lastUpdateTime": "2026-10-23T00:00:00Z",
+        "lastTransitionTime": "2026-10-23T00:00:00Z",
+        "reason": "MinimumReplicasUnavailable",
+        "message": "Deployment does not have minimum availability."
+      },
+      {
+        "type": "Progressing",
+        "status": "False",
+        "lastUpdateTime": "2026-10-23T00:00:00Z",
+        "lastTransitionTime": "2026-10-23T00:00:00Z",
+        "reason": "ProgressDeadlineExceeded",
+        "message": "ReplicaSet \"shared-app-0123456789abcdef0123456789abcdef-5d8f7c9b6d\" has timed out progressing."
+      }
+    ]
+  }
+}

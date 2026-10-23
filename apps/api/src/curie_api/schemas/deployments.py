@@ -97,6 +97,20 @@ class RoutingCheck(BaseModel):
     unresolvable: list[RoutingCheckProblem] = Field(default_factory=list)
 
 
+class SharedConnectorReach(BaseModel):
+    """One shared connector this agent runs: its alias, application and member reach.
+
+    ``reach`` is the frozen ``render_member_reach`` output for this agent,
+    unmodified: the NetworkPolicies that let this agent's runner reach the
+    shared application (ADR 0239). The application's own objects are the
+    worker's to apply, from its own route.
+    """
+
+    name: str
+    application: uuid.UUID
+    reach: list[dict[str, Any]]
+
+
 class ConnectorManifests(BaseModel):
     """Kubernetes objects derived from a version's ``connectors.yaml``.
 
@@ -124,6 +138,9 @@ class ConnectorManifests(BaseModel):
     # plugin.json triggers as stored. Missing, null, and non-list values are
     # an empty list. Entries are not validated or rewritten.
     triggers: list[dict[str, Any]] = Field(default_factory=list)
+    # Every shared connector the agent's target runs, each resolved against
+    # the shared store. Empty for a bundle that declares none.
+    shared: list[SharedConnectorReach] = Field(default_factory=list)
 
 
 class DeploymentCreate(BaseModel):

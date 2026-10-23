@@ -26,6 +26,7 @@ from typing import Any, Protocol
 from urllib.parse import urlsplit
 
 from aci_protocol import EvalJob
+from curie_internal.shared_declarations import SharedEntry
 from plugin_format.deploy_targets import DeployTargetsFile
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
@@ -41,6 +42,7 @@ from .evalqueue import EvalQueue, now_iso
 from .github_app import credentials_for
 from .models import GIT_FLOW_CREATED_BY, Agent, AgentVersion, Environment
 from .repo_full_name import InvalidRepoFullName, repo_url_path
+from .shared_connectors.declarations import DeclarationRefused
 from .storage import ObjectStore
 
 logger = logging.getLogger(__name__)
@@ -407,7 +409,12 @@ def log_push_outcome(result: WebhookResult, payload: dict[str, object], *, sourc
 
 
 def _rejected(
-    exc: deploy.ApprovalRoutesUnbound | deploy.BundleTooLarge | deploy.SealingKeyCustody,
+    exc: (
+        deploy.ApprovalRoutesUnbound
+        | deploy.BundleTooLarge
+        | deploy.SealingKeyCustody
+        | DeclarationRefused
+    ),
     agent_id: uuid.UUID | None = None,
 ) -> WebhookResult:
     """The rejection envelope for the two refusals `process_push` shares with the API.
@@ -491,6 +498,9 @@ async def process_push(
     # came from the store (see the `assert` in the bundle_built block below).
     extension: str | None = None
     content_type: str | None = None
+    # Shared connector entries of a freshly cloned archive (ADR 0239), resolved
+    # for the target agent before its bundle is stored.
+    shared: tuple[SharedEntry, ...] = ()
 
     try:
         # Unconditionally, before any database or object-store work: a forged
@@ -598,8 +608,8 @@ async def process_push(
                 repo_full_name=trusted_repo_full_name,
                 ref=ref,
             )
-            extension, content_type = await run_in_threadpool(
-                deploy.validate_archive, archive, settings
+            extension, content_type, shared = await run_in_threadpool(
+                deploy.validate_archive, archive, settings, allow_shared=True
             )
             targets = await run_in_threadpool(_read_targets, archive, settings)
     except InvalidRepoFullName as exc:
@@ -724,10 +734,15 @@ async def process_push(
                 # @spec ACTION-EXECUTOR-16: the sibling object is stored
                 # bytes too, so it gets the custody re-check intake would give.
                 await deploy.check_stored_sealing_key_custody(store, sibling, settings)
+                # ADR 0239: and its shared connectors resolve for THIS agent.
+                await deploy.check_stored_shared_declarations(
+                    session, store, sibling, agent.id, agent.name, settings
+                )
             except (
                 deploy.BundleTooLarge,
                 deploy.ApprovalRoutesUnbound,
                 deploy.SealingKeyCustody,
+                DeclarationRefused,
             ) as exc:
                 # `bundle.too_large` is live here, not theoretical: the sibling
                 # object is a DIFFERENT object from the archive
@@ -753,7 +768,13 @@ async def process_push(
                 await deploy.check_routes_from_bytes(
                     archive, agent.approval_routes, version.id, settings
                 )
-            except deploy.ApprovalRoutesUnbound as exc:
+                # ADR 0239: an agent the bundle's deploy.yaml mints, or one that
+                # is not a member, is refused here, before the bundle is stored.
+                if shared:
+                    await deploy.check_shared_declarations(
+                        session, agent.id, agent.name, archive, settings
+                    )
+            except (deploy.ApprovalRoutesUnbound, DeclarationRefused) as exc:
                 return _rejected(exc, agent.id)
             await deploy.store_bundle(
                 store, session, agent.id, version, archive, extension, content_type
@@ -785,7 +806,12 @@ async def process_push(
             # refused a non-SecretRef sealing key declaration is refused here,
             # as `POST /deployments` refuses it.
             await deploy.check_stored_sealing_key_custody(store, version, settings)
-        except (deploy.BundleTooLarge, deploy.SealingKeyCustody) as exc:
+            # ADR 0239: membership can change after intake, so a reused bundle's
+            # shared connectors resolve again for the resolved agent.
+            await deploy.check_stored_shared_declarations(
+                session, store, version, agent.id, agent.name, settings
+            )
+        except (deploy.BundleTooLarge, deploy.SealingKeyCustody, DeclarationRefused) as exc:
             return _rejected(exc, agent.id)
 
     # The declared/bound approval-route join at the moment the version becomes

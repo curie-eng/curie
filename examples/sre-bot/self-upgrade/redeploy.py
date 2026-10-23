@@ -355,6 +355,10 @@ def pin_build_connectors(
 
     parsed = yaml.safe_load(declaration)
     for name, spec in (parsed.get("connectors") or {}).items():
+        if "shared" in spec:
+            # A shared reference must stay the sole property (ADR 0239): it has
+            # no image or env of its own to pin or carry.
+            continue
         if "build" in spec:
             spec.pop("build")
             spec["image"] = f"ghcr.io/curie-eng/curie-sre-bot-{name}@{resolve_digest(name, commit)}"

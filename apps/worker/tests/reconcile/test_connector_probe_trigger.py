@@ -587,14 +587,39 @@ async def test_the_http_requester_treats_an_adopted_probe_as_success() -> None:
 # --------------------------------------------------------------------------- #
 # Composition: off unless the executor is on and the worker token is present
 # --------------------------------------------------------------------------- #
+class EmptySharedCluster:
+    """The ``KubernetesSharedClient`` surface over a namespace with no shared objects.
+
+    The production loop also builds the shared reconciler (ADR 0239), and its
+    sweep lists shared objects every pass. These renders declare no shared
+    connector, so every list is empty, as the API server answers a label
+    selector that matches nothing; any write would be a bug here and fails.
+    """
+
+    def __init__(self) -> None:
+        self.lists: list[tuple[str, str]] = []
+
+    def list_labelled(self, namespace: str, kind: str, selector: Any) -> list[dict[str, Any]]:
+        self.lists.append((kind, str(selector)))
+        return []
+
+    def __getattr__(self, name: str) -> Any:
+        if name.startswith("_"):
+            raise AttributeError(name)
+        raise AssertionError(f"shared Kubernetes call {name} with no shared connector declared")
+
+
 def _compose(monkeypatch: pytest.MonkeyPatch, **config: Any) -> tuple[Any, list[httpx.Request]]:
-    from curie_worker import connector_k8s
+    from curie_worker import connector_k8s, shared_k8s
     from curie_worker.config import WorkerConfig
     from curie_worker.connector_loop import HttpManifestSource
     from curie_worker.run import _build_connector_loop
 
     live = served(rendered())
     monkeypatch.setattr(connector_k8s, "KubernetesConnectorClient", lambda **_: FakeClient(live))
+    # Never a real cluster: the shared reconciler's client is built by the same
+    # builder (as test_shared_connector_apply.World.build_loop replaces it).
+    monkeypatch.setattr(shared_k8s, "KubernetesSharedClient", lambda **_: EmptySharedCluster())
 
     async def targets(self: Any) -> list[AgentTarget]:
         return [TARGET]

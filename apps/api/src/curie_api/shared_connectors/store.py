@@ -26,6 +26,14 @@ import uuid
 from collections.abc import Sequence
 from typing import Any, Literal
 
+from curie_internal.shared_declarations import (
+    DSN_SECRET_KEY,
+    DSN_SECRET_PREFIX,
+    KEY_SECRET_KEY,
+    KEY_SECRET_PREFIX,
+    dsn_secret_name,
+    key_secret_name,
+)
 from fastapi import HTTPException, status
 from plugin_format.shared_connector_render import SharedApplication
 from sqlalchemy import Select, delete, func, null, or_, select, update
@@ -71,7 +79,10 @@ _UNIQUE_VIOLATION = "23505"
 Lock = Literal["update", "no_key_update", "share", "key_share"]
 
 # The API writes ciphertext and sealed DSNs but never reads them back: these
-# loader options leave the columns unloaded and raise on any access.
+# loader options leave the columns unloaded and raise on any access. The one
+# exception is ``database_roles.sealed_dsn_for_worker``, an explicit column read
+# for the worker-authenticated application render, which hands the box unopened
+# to the worker for its DSN Secret.
 SEALED_BINDING = defer(SharedConnectorBinding.ciphertext, raiseload=True)
 SEALED_DSN = defer(SharedConnectorDatabaseRole.sealed_dsn, raiseload=True)
 
@@ -83,7 +94,7 @@ class SharedRefusal(HTTPException):
         super().__init__(status_code, detail=code, headers=dict(NO_STORE))
 
 
-def _locked[S: Select[Any]](statement: S, lock: Lock | None) -> S:
+def with_lock[S: Select[Any]](statement: S, lock: Lock | None) -> S:
     # populate_existing so a row read after waiting on its lock replaces any
     # copy this session already holds.
     statement = statement.execution_options(populate_existing=True)
@@ -136,7 +147,9 @@ async def lock_application(
     statement = select(SharedConnectorApplication).where(
         SharedConnectorApplication.id == application_id
     )
-    application: SharedConnectorApplication | None = await session.scalar(_locked(statement, lock))
+    application: SharedConnectorApplication | None = await session.scalar(
+        with_lock(statement, lock)
+    )
     if application is None:
         raise SharedRefusal(status.HTTP_404_NOT_FOUND, "shared_application_not_found")
     return application
@@ -146,7 +159,7 @@ async def _lock_agent(session: AsyncSession, agent_id: uuid.UUID) -> bool:
     """FOR KEY SHARE on the agent row: an agent delete waits for this write."""
 
     statement = select(Agent.id).where(Agent.id == agent_id)
-    return await session.scalar(_locked(statement, "key_share")) is not None
+    return await session.scalar(with_lock(statement, "key_share")) is not None
 
 
 async def current_recipient(
@@ -167,7 +180,7 @@ async def current_recipient(
         .order_by(SharedConnectorRecipient.ordinal.desc())
         .limit(1)
     )
-    recipient: SharedConnectorRecipient | None = await session.scalar(_locked(statement, lock))
+    recipient: SharedConnectorRecipient | None = await session.scalar(with_lock(statement, lock))
     return recipient
 
 
@@ -178,7 +191,7 @@ async def _lock_recipient(
         SharedConnectorRecipient.application_id == application_id,
         SharedConnectorRecipient.recipient_id == recipient_id,
     )
-    row: SharedConnectorRecipient | None = await session.scalar(_locked(statement, lock))
+    row: SharedConnectorRecipient | None = await session.scalar(with_lock(statement, lock))
     return row
 
 
@@ -199,7 +212,7 @@ async def _lock_binding(
         .where(SharedConnectorBinding.id == binding_id)
         .options(SEALED_BINDING)
     )
-    binding: SharedConnectorBinding | None = await session.scalar(_locked(statement, lock))
+    binding: SharedConnectorBinding | None = await session.scalar(with_lock(statement, lock))
     if binding is None:
         raise SharedRefusal(status.HTTP_404_NOT_FOUND, "shared_binding_not_found")
     return binding
@@ -213,7 +226,7 @@ async def database_role(
         .where(SharedConnectorDatabaseRole.application_id == application_id)
         .options(SEALED_DSN)
     )
-    row: SharedConnectorDatabaseRole | None = await session.scalar(_locked(statement, lock))
+    row: SharedConnectorDatabaseRole | None = await session.scalar(with_lock(statement, lock))
     return row
 
 
@@ -223,7 +236,7 @@ async def _lock_intent(
     statement = select(SharedConnectorRefreshIntent).where(
         SharedConnectorRefreshIntent.binding_id == binding_id
     )
-    intent: SharedConnectorRefreshIntent | None = await session.scalar(_locked(statement, lock))
+    intent: SharedConnectorRefreshIntent | None = await session.scalar(with_lock(statement, lock))
     return intent
 
 
@@ -239,7 +252,7 @@ async def _policy_generation(session: AsyncSession, application_id: uuid.UUID) -
 # --- applications ----------------------------------------------------------------
 
 
-def _usable_installation() -> str:
+def usable_installation() -> str:
     """The configured installation ID, when shared registration may use it.
 
     Blank, invalid under the frozen ``SharedApplication`` rule, and not yet
@@ -257,6 +270,40 @@ def _usable_installation() -> str:
     if not settings.installation_id_observed:
         raise SharedRefusal(status.HTTP_409_CONFLICT, "shared_installation_unobserved")
     return configured
+
+
+def require_worker_secret_refs(spec: SharedApplication, *, status_code: int) -> None:
+    """Pin the worker-managed Secret names, so the two kinds of Secret never cross.
+
+    The worker creates the key Secret, and for a bundled database the DSN
+    Secret, once and never patches them; the admission policy admits only
+    these names. So the spec must name exactly those, and an operator Secret
+    (a managed DSN, the grant store, the snapshot seal) must never carry a
+    worker-managed prefix, or the worker would create or adopt it.
+
+    Checked at registration (422, the client's input) and again on every
+    stored-spec read the worker depends on (409, stored state): a row stored
+    before this check, or one that drifted, is refused rather than rendered.
+    """
+
+    application = spec.application
+    worker_prefixes = (KEY_SECRET_PREFIX, DSN_SECRET_PREFIX)
+    operator_refs = [spec.grant_store, spec.snapshot_seal]
+    if spec.dsn_encoding == "bundled-sealed":
+        dsn_pinned = (spec.database_dsn.name, spec.database_dsn.key) == (
+            dsn_secret_name(application),
+            DSN_SECRET_KEY,
+        )
+    else:
+        dsn_pinned = True
+        operator_refs.append(spec.database_dsn)
+    if (
+        (spec.encryption_key.name, spec.encryption_key.key)
+        != (key_secret_name(application), KEY_SECRET_KEY)
+        or not dsn_pinned
+        or any(ref is not None and ref.name.startswith(worker_prefixes) for ref in operator_refs)
+    ):
+        raise SharedRefusal(status_code, "shared_application_secret_ref_invalid")
 
 
 def _pin_digest(spec: dict[str, Any], policy: dict[str, Any]) -> str:
@@ -278,7 +325,7 @@ async def register_application(
     other pins is refused, never updated.
     """
 
-    installation = _usable_installation()
+    installation = usable_installation()
     try:
         # JSON mode: the frozen model is strict and declares tuple fields.
         spec = SharedApplication.model_validate_json(json.dumps(body.application))
@@ -291,6 +338,7 @@ async def register_application(
         raise SharedRefusal(status.HTTP_422_UNPROCESSABLE_CONTENT, "shared_application_invalid")
     if spec.installation != installation:
         raise SharedRefusal(status.HTTP_409_CONFLICT, "shared_installation_mismatch")
+    require_worker_secret_refs(spec, status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
 
     spec_json = spec.model_dump(mode="json")
     # The tool subsets are stored only when nonempty, so a policy without them
@@ -346,7 +394,7 @@ async def application_record(
     application = await lock_application(session, application_id)
     recipients = (
         await session.scalars(
-            _locked(
+            with_lock(
                 select(SharedConnectorRecipient)
                 .where(SharedConnectorRecipient.application_id == application_id)
                 .order_by(SharedConnectorRecipient.ordinal),

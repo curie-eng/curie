@@ -40,7 +40,7 @@ from _shared_proxy_harness import (
     agent_name,
     refusal_table,
 )
-from curie_api.config import Settings
+from curie_api.config import Settings, get_settings
 from curie_connector_proxy import server, shared
 from curie_connector_proxy.resolver.config import ResolverConfig
 from curie_worker.caller_token import mint
@@ -235,6 +235,10 @@ def test_the_proxy_starts_on_the_rendered_env_with_only_host_local_names_swapped
 def test_current_and_previous_signers_are_admitted_and_an_unlisted_one_is_refused(
     world: SharedProxy, signers: Signers
 ) -> None:
+    _assert_current_and_previous_admitted(world, signers)
+
+
+def _assert_current_and_previous_admitted(world: SharedProxy, signers: Signers) -> None:
     member = world.member()
 
     def token(signing: SigningKey) -> str:
@@ -302,3 +306,94 @@ def test_the_proxy_reads_every_accepted_render_value_as_its_keys(vector: dict[st
     assert [bytes(key) for key in keys] == [
         base64.b64decode(text, validate=True) for text in vector["public_keys"]
     ]
+
+
+# =============================================================================
+# Rework 1: the keys come from the API's own render route, never from a table
+# =============================================================================
+
+
+def _canonical(value: Any) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+
+
+class RoutedEnv(RenderedEnv):
+    """``proxy_env`` from the worker render route the reconciler applies, unmodified.
+
+    The objects must be byte-identical to the frozen render of the stored spec
+    with the trusted keys, so the proxy admits only what the API rendered.
+    """
+
+    def __call__(self, world: SharedProxy, harness_env: dict[str, str]) -> dict[str, str]:
+        response = world.store.application_render(world.app.application_id)
+        assert response.status_code == 200, response.text
+        self.objects = response.json()["objects"]
+        spec = _stored_spec(world.app.application_id)
+        assert _canonical(self.objects) == _canonical(
+            render_application(spec, caller_public_keys=self.keys)
+        )
+        self.rendered = _env_of(_container(self.objects, "proxy"))
+        self.harness = dict(harness_env)
+        env = dict(self.rendered)
+        for name in HOST_LOCAL_ENV:
+            env[name] = harness_env[name]
+        return env
+
+
+@pytest.fixture
+def routed(trusted_keys: tuple[str, ...]) -> Iterator[RoutedEnv]:
+    # The routes read settings per request: the trusted keys are what they render with.
+    get_settings.cache_clear()
+    try:
+        yield RoutedEnv(trusted_keys)
+    finally:
+        get_settings.cache_clear()
+
+
+def test_the_api_rendered_env_admits_current_and_previous_and_refuses_unlisted(
+    worlds: Worlds, routed: RoutedEnv, signers: Signers, trusted_keys: tuple[str, ...]
+) -> None:
+    world = worlds(proxy_env=routed)
+    assert routed.rendered[PUBLIC_KEYS_ENV] == ",".join(trusted_keys)
+    assert world.env[PUBLIC_KEYS_ENV] == ",".join(trusted_keys)
+    server_env = _env_of(_container(routed.objects, "server"))
+    assert not [name for name in server_env if name.startswith("CURIE_CALLER_")]
+    _assert_current_and_previous_admitted(world, signers)
+
+
+# Assembled so this file does not name what it looks for.
+_RESIDUE = (
+    "shared_connector_" + "caller_key",
+    "read_" + "caller_keys",
+    "build_" + "shared_app",
+    "publish_" + "caller_keys",
+    "caller_keys" + ".publish",
+    "caller_keys_" + "unavailable",
+)
+_SOURCE_SUFFIXES = {".py", ".json", ".sql", ".toml", ".yaml", ".yml", ".sh", ".rs", ".md"}
+# Code, the chart and the interface docs; ADRs and atlas snapshots are history.
+_SCANNED = ("apps", "packages", "charts", "docs/interfaces")
+
+
+def test_no_caller_key_table_or_reader_remains() -> None:
+    """The rejected key table leaves no migration, model, reader, publisher or test."""
+
+    versions = REPO / "apps" / "api" / "alembic" / "versions"
+    assert not sorted(versions.glob("0125_*")), "there is no 0125"
+    assert not (REPO / "apps/api/src/curie_api/shared_connectors/caller_keys.py").exists()
+    me = Path(__file__).resolve()
+    found: list[str] = []
+    for root in (REPO / name for name in _SCANNED):
+        for path in root.rglob("*"):
+            if (
+                not path.is_file()
+                or path.suffix not in _SOURCE_SUFFIXES
+                or path.resolve() == me
+                or any(part in {"__pycache__", "node_modules", ".venv"} for part in path.parts)
+            ):
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+            found += [f"{path.relative_to(REPO)}: {token}" for token in _RESIDUE if token in text]
+    assert found == [], found
+    # The shared proxy takes its keys from the rendered env, never as dedicated-only.
+    assert PUBLIC_KEYS_ENV not in shared.DEDICATED_ONLY_ENV
