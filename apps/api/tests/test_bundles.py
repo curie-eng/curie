@@ -51,16 +51,17 @@ def _zip(files: dict[str, str]) -> bytes:
 
 
 def test_valid_tar_gz_passes_validation(tmp_path: Path) -> None:
-    ext, content_type, result = bundles.extract_and_validate(
+    ext, content_type, result, shared = bundles.extract_and_validate(
         _tar_gz(_valid_files()), tmp_path
     )
     assert ext == ".tar.gz"
     assert content_type == "application/gzip"
     assert result.valid, result.errors
+    assert shared == ()
 
 
 def test_valid_zip_passes_validation(tmp_path: Path) -> None:
-    ext, _, result = bundles.extract_and_validate(_zip(_valid_files()), tmp_path)
+    ext, _, result, _ = bundles.extract_and_validate(_zip(_valid_files()), tmp_path)
     assert ext == ".zip"
     assert result.valid, result.errors
 
@@ -68,7 +69,7 @@ def test_valid_zip_passes_validation(tmp_path: Path) -> None:
 def test_missing_skill_frontmatter_is_rejected(tmp_path: Path) -> None:
     files = _valid_files()
     files["skills/beta/SKILL.md"] = "# beta with no frontmatter\n"
-    _, _, result = bundles.extract_and_validate(_tar_gz(files), tmp_path)
+    _, _, result, _ = bundles.extract_and_validate(_tar_gz(files), tmp_path)
     assert not result.valid
     codes = {e.code for e in result.errors}
     assert "skill.frontmatter_missing" in codes
@@ -77,7 +78,7 @@ def test_missing_skill_frontmatter_is_rejected(tmp_path: Path) -> None:
 def test_bad_manifest_is_rejected(tmp_path: Path) -> None:
     files = _valid_files()
     files[".claude-plugin/plugin.json"] = '{"version": "0.1.0"}'  # no name
-    _, _, result = bundles.extract_and_validate(_tar_gz(files), tmp_path)
+    _, _, result, _ = bundles.extract_and_validate(_tar_gz(files), tmp_path)
     assert not result.valid
     assert any(e.code.startswith("manifest.") for e in result.errors)
 

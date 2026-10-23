@@ -46,11 +46,11 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
     # and the feature train schema. The released v0.13.0 window stays at that
     # join while the candidate advances to team sync state (0120), agent access
     # policies (0121) and directory identity (0122). The shared connector store
-    # (0123, ADR 0239) and its source_stale flag (0124, ADR 0239) are
-    # expand-only, so they move the candidate head past the
-    # released 0.14.0 window and leave the minimum.
+    # (0123, ADR 0239), its source_stale flag (0124, ADR 0239) and the caller
+    # verify keys (0125, ADR 0239) are expand-only, so they move the candidate
+    # head past the released 0.14.0 window and leave the minimum.
     released_0130 = {"schema_min": "0108", "schema_head": "0108"}
-    candidate = {"schema_min": "0122", "schema_head": "0124"}
+    candidate = {"schema_min": "0122", "schema_head": "0125"}
     assert catalog["windows"]["0.12.0"] == released
     assert catalog["windows"]["0.12.0-rc.1"] == released
     assert catalog["windows"]["0.12.1"] == stable
@@ -60,9 +60,9 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
     assert catalog["windows"]["0.13.0"] == released_0130
     assert catalog["windows"]["0.13.1"] == released_0130
     assert catalog["candidate"]["schema_head"] == catalog["revisions"][-1]
-    assert catalog["revisions"][-17:] == [
+    assert catalog["revisions"][-18:] == [
         "0095", "0096", "0097", "0098", "0099", "0100", "0101", "0102", "0103",
-        "0105", "0107", "0108", "0120", "0121", "0122", "0123", "0124",
+        "0105", "0107", "0108", "0120", "0121", "0122", "0123", "0124", "0125",
     ]
     assert "0074" not in catalog["revisions"]
     prior_windows = json.loads(

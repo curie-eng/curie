@@ -78,7 +78,9 @@ class FakeBinding:
         self.boot_thread_keys: list[str] = []
 
     async def resolve_agent(self, agent_id: uuid.UUID) -> ResolvedDeployment | None:
-        assert agent_id == AGENT_ID
+        # The agent the binding was built for (a real API agent in the shared
+        # declaration suite), else this file's fixed one.
+        assert agent_id == (self.resolved.agent_id if self.resolved else AGENT_ID)
         return self.resolved
 
     def boot_env(
@@ -142,6 +144,9 @@ def _bindings(
             bundle if bundle is not None else _bundle({"connectors.yaml": CONNECTORS_YAML})
         ),
         manifests=source,  # type: ignore[arg-type]
+        # cp5: no shared resolve client. These bundles declare no shared entry,
+        # so none is needed (test_shared_connector_declarations.py covers it).
+        shared=None,
         release=RELEASE,
         namespace=NAMESPACE,
         max_uncompressed_bytes=10_000_000,
@@ -223,13 +228,13 @@ async def test_the_boot_env_is_resolved_for_the_execution_thread_key() -> None:
     "bundle",
     [
         _bundle({"README.md": "no connectors here\n"}),
-        _bundle({"connectors.yaml": "connectors: [\n"}),
-        _bundle({"connectors.yaml": "connectors:\n  example-scale: {}\n"}),
         _bundle({"connectors.yaml": CONNECTORS_YAML.replace(CONNECTOR, "renamed")}),
     ],
-    ids=["no_connectors_file", "unparseable", "invalid", "connector_absent"],
+    ids=["no_connectors_file", "connector_absent"],
 )
-async def test_a_bundle_without_a_valid_target_entry_expands_no_secret(bundle: bytes) -> None:
+async def test_a_bundle_without_the_target_entry_expands_no_secret(bundle: bytes) -> None:
+    """The genuinely absent cases stay empty: no file, or no such connector."""
+
     bindings, _ = _bindings(bundle=bundle)
 
     boot = await bindings.executor_boot(
@@ -237,6 +242,34 @@ async def test_a_bundle_without_a_valid_target_entry_expands_no_secret(bundle: b
     )
 
     assert boot.header_secret_names == frozenset()
+
+
+@pytest.mark.parametrize(
+    ("bundle", "code"),
+    [
+        (_bundle({"connectors.yaml": "connectors: [\n"}), "connectors.unreadable"),
+        (
+            _bundle({"connectors.yaml": "connectors:\n  example-scale: {}\n"}),
+            "connectors.underspecified",
+        ),
+    ],
+    ids=["unparseable", "invalid"],
+)
+async def test_an_unreadable_or_invalid_declaration_refuses_with_its_code(
+    bundle: bytes, code: str
+) -> None:
+    """cp5 (r1-7): the reader boundary never turns a broken file into no secrets."""
+
+    from curie_worker.shared_declarations_client import ConnectorDeclarationRefused
+
+    bindings, _ = _bindings(bundle=bundle)
+
+    with pytest.raises(ConnectorDeclarationRefused) as refused:
+        await bindings.executor_boot(
+            str(AGENT_ID), CONNECTOR, thread_key=f"action-exec:{EXECUTION_ID}"
+        )
+
+    assert refused.value.code == code
 
 
 async def test_an_agent_without_an_in_force_deployment_has_no_executor_boot() -> None:

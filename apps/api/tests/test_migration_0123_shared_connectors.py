@@ -29,6 +29,8 @@ from _migration_support import (
     sql_dicts,
 )
 from _shared_connector_support import (
+    APPLICATION_TABLES,
+    CALLER_KEY_TABLES,
     OTHER_SERVER_IMAGE,
     SERVER_IMAGE,
     SHARED_FUNCTIONS,
@@ -58,7 +60,8 @@ from curie_api.config import get_settings
 from sqlalchemy.engine import make_url
 
 REVISION_KINDS = Path(__file__).resolve().parents[1] / "src/curie_api/revision_kinds.json"
-POLICIES = {
+# The policies 0123 itself creates, on its six tables.
+POLICIES_0123 = {
     "shared_connector_applications": {"SELECT", "UPDATE"},
     "shared_connector_bindings": {"SELECT", "UPDATE"},
     "shared_connector_recipients": {"SELECT"},
@@ -66,6 +69,8 @@ POLICIES = {
     "shared_connector_memberships": {"SELECT"},
     "shared_connector_refresh_intents": {"SELECT"},
 }
+# At head 0125 adds a SELECT-only policy on each caller verify key table.
+POLICIES = {**POLICIES_0123, **{table: {"SELECT"} for table in CALLER_KEY_TABLES}}
 NAMED_CONSTRAINTS = {
     "shared_connector_applications_pkey",
     "shared_connector_applications_custody_key",
@@ -93,10 +98,21 @@ def _store_absent() -> None:
     assert shared_function_names() == set()
 
 
-def _store_present() -> None:
-    for table in SHARED_TABLES:
+def _store_present(tables: tuple[str, ...] = SHARED_TABLES) -> None:
+    for table in tables:
         assert regclass(table) is not None, table
     assert set(SHARED_FUNCTIONS) <= shared_function_names()
+
+
+def _policies(tables: tuple[str, ...]) -> dict[str, set[str]]:
+    policies: dict[str, set[str]] = {}
+    for row in sql_dicts(
+        "SELECT tablename, cmd FROM pg_policies "
+        "WHERE schemaname = 'curie' AND tablename = ANY(:tables)",
+        {"tables": list(tables)},
+    ):
+        policies.setdefault(row["tablename"], set()).add(row["cmd"])
+    return policies
 
 
 def test_0123_is_an_expand_revision_on_0122() -> None:
@@ -112,25 +128,21 @@ def test_upgrade_creates_the_store_with_row_level_security_policies_and_named_ke
     isolated_migration_db.at("0122")
     _store_absent()
     command.upgrade(alembic_config(), "0123")
-    _store_present()
+    _store_present(APPLICATION_TABLES)
+    # The caller verify key tables are 0125's, not this revision's.
+    for table in CALLER_KEY_TABLES:
+        assert regclass(table) is None, table
 
     rows = sql_dicts(
         "SELECT c.relname, c.relrowsecurity, c.relforcerowsecurity FROM pg_class c "
         "JOIN pg_namespace n ON n.oid = c.relnamespace "
         "WHERE n.nspname = 'curie' AND c.relname = ANY(:tables)",
-        {"tables": list(SHARED_TABLES)},
+        {"tables": list(APPLICATION_TABLES)},
     )
     assert {
         row["relname"]: (row["relrowsecurity"], row["relforcerowsecurity"]) for row in rows
-    } == {table: (True, False) for table in SHARED_TABLES}
-    policies: dict[str, set[str]] = {}
-    for row in sql_dicts(
-        "SELECT tablename, cmd FROM pg_policies "
-        "WHERE schemaname = 'curie' AND tablename = ANY(:tables)",
-        {"tables": list(SHARED_TABLES)},
-    ):
-        policies.setdefault(row["tablename"], set()).add(row["cmd"])
-    assert policies == POLICIES
+    } == {table: (True, False) for table in APPLICATION_TABLES}
+    assert _policies(SHARED_TABLES) == POLICIES_0123
 
     constraints = {
         row["conname"]
@@ -147,6 +159,10 @@ def test_upgrade_creates_the_store_with_row_level_security_policies_and_named_ke
     assert "UNIQUE" in index["indexdef"]
     assert "application_id" in index["indexdef"] and "agent_id" in index["indexdef"]
     assert "WHERE enabled" in index["indexdef"]
+
+
+def test_head_has_a_select_only_policy_on_every_shared_table(migrated: None) -> None:
+    assert _policies(SHARED_TABLES) == POLICIES
 
 
 def test_store_functions_are_security_definer_with_a_pinned_search_path_and_no_public_execute(

@@ -21,15 +21,19 @@ import base64
 import concurrent.futures
 import contextlib
 import hashlib
+import io
 import json
 import logging
 import secrets
 import string
+import tarfile
+import tempfile
 import threading
 import time
 import uuid
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 from urllib.parse import SplitResult, unquote, urlsplit
 
@@ -56,7 +60,8 @@ DSN_SECRET = {"name": "acme-database", "key": "dsn"}
 SLOT = "access_token"
 TOOLS = ("issues.read", "issues.write", "issues.close")
 
-SHARED_TABLES = (
+# The six 0123 tables, each scoped to one application.
+APPLICATION_TABLES = (
     "shared_connector_applications",
     "shared_connector_recipients",
     "shared_connector_database_roles",
@@ -64,6 +69,18 @@ SHARED_TABLES = (
     "shared_connector_bindings",
     "shared_connector_refresh_intents",
 )
+# The two 0125 tables the shared proxy reads its caller verify keys from, each
+# scoped to the installation of the reading role's application.
+CALLER_KEY_TABLES = (
+    "shared_connector_caller_keys",
+    "shared_connector_caller_key_heartbeats",
+)
+SHARED_TABLES = (*APPLICATION_TABLES, *CALLER_KEY_TABLES)
+# The worker-managed Secret names and data keys registration pins (cp5).
+KEY_SECRET_PREFIX = "shared-key-"
+KEY_SECRET_KEY = "private-keys"
+DSN_SECRET_PREFIX = "shared-dsn-"
+DSN_SECRET_KEY = "sealed-dsn"
 REFRESH_FUNCTIONS = (
     "shared_connector_refresh_begin",
     "shared_connector_refresh_commit",
@@ -136,7 +153,11 @@ def application_spec(
     dsn_encoding: str = "bundled-sealed",
     server_image: str = SERVER_IMAGE,
 ) -> dict[str, Any]:
-    """A valid frozen ``SharedApplication`` in its JSON form."""
+    """A valid frozen ``SharedApplication`` in its JSON form.
+
+    The encryption key and a bundled DSN use the worker-managed Secret names
+    registration requires; a managed DSN keeps the operator's own Secret.
+    """
 
     return {
         "installation": installation,
@@ -147,8 +168,10 @@ def application_spec(
         "server_image": server_image,
         "proxy_image": PROXY_IMAGE,
         "server_args": ["--transport", "streamable-http"],
-        "encryption_key": {"name": "acme-encryption", "key": "private"},
-        "database_dsn": dict(DSN_SECRET),
+        "encryption_key": key_secret_ref(application_id),
+        "database_dsn": (
+            dsn_secret_ref(application_id) if dsn_encoding == "bundled-sealed" else dict(DSN_SECRET)
+        ),
         "dsn_encoding": dsn_encoding,
         "grant_store": {"name": "acme-grants", "key": "url"},
         "provider_origins": ["https://api.example.com"],
@@ -159,6 +182,14 @@ def application_spec(
             "port": 5432,
         },
     }
+
+
+def key_secret_ref(application_id: str) -> dict[str, str]:
+    return {"name": KEY_SECRET_PREFIX + application_id, "key": KEY_SECRET_KEY}
+
+
+def dsn_secret_ref(application_id: str) -> dict[str, str]:
+    return {"name": DSN_SECRET_PREFIX + application_id, "key": DSN_SECRET_KEY}
 
 
 def shared_policy(tools: Sequence[str] = TOOLS, custody: str = "platform") -> dict[str, Any]:
@@ -225,10 +256,19 @@ class Recipient:
 
 
 def detail_code(response: httpx.Response) -> str | None:
+    """The refusal code, from ``{"detail": code}`` or ``{"detail": {"code": code}}``.
+
+    Declaration and resolution refusals carry the dict form, which also names
+    the application, the connector and the declared applications (cp5).
+    """
+
     try:
         detail = response.json().get("detail")
     except (ValueError, AttributeError):
         return None
+    if isinstance(detail, dict):
+        code = detail.get("code")
+        return code if isinstance(code, str) else None
     return detail if isinstance(detail, str) else None
 
 
@@ -312,7 +352,7 @@ def shared_function_names() -> set[str]:
 
 
 def shared_table_text() -> str:
-    """Every row of the six tables, rendered whole as the owner sees it."""
+    """Every row of the eight tables, rendered whole as the owner sees it."""
 
     parts: list[str] = []
     for table in SHARED_TABLES:
@@ -567,6 +607,16 @@ class SharedCleanup:
                         "WHERE installation_id = $1",
                         installation,
                     )
+                # Every API process with this installation publishes its verify
+                # keys and a heartbeat (0125); they are keyed by installation.
+                for table in CALLER_KEY_TABLES:
+                    if await connection.fetchval(
+                        "SELECT to_regclass($1) IS NOT NULL", f"curie.{table}"
+                    ):
+                        await connection.execute(
+                            f"DELETE FROM curie.{table} WHERE installation_id = $1",
+                            installation,
+                        )
             finally:
                 await connection.close()
         admin = await self._connect("postgres")
@@ -623,6 +673,18 @@ def shared_app(
             yield client
     finally:
         get_settings.cache_clear()
+
+
+def restore_installation(monkeypatch: pytest.MonkeyPatch, installation: str) -> None:
+    """Point settings back at ``installation`` after a nested ``shared_app``.
+
+    The routes read the installation from settings per request, so an outer
+    app answers for whatever a nested ``shared_app`` configured last.
+    """
+
+    monkeypatch.setenv(INSTALLATION_ENV, installation)
+    monkeypatch.setenv(OBSERVED_ENV, "true")
+    get_settings.cache_clear()
 
 
 def _shared_route(path: str) -> bool:
@@ -860,6 +922,86 @@ class SharedStore:
             {"status": status, "reason": reason, "dsn_revision": dsn_revision},
         )
 
+    # bundles, versions and deployments (cp5)
+
+    def agent_name(self, agent_id: str) -> str:
+        response = self.call("GET", f"/agents/{agent_id}", headers=operator_headers())
+        assert response.status_code == 200, response.text
+        return str(response.json()["name"])
+
+    def create_version(self, agent_id: str) -> str:
+        response = self.call(
+            "POST",
+            f"/agents/{agent_id}/versions",
+            json={"version_label": f"v-{uuid.uuid4().hex[:8]}", "created_by": "test"},
+            headers=operator_headers(),
+        )
+        assert response.status_code == 201, response.text
+        return str(response.json()["id"])
+
+    def upload(self, agent_id: str, version_id: str, archive: bytes) -> httpx.Response:
+        response = self.client.put(
+            f"/agents/{agent_id}/versions/{version_id}/bundle",
+            files={"file": ("bundle.tar.gz", archive)},
+            headers=operator_headers(),
+        )
+        self.responses.append(response)
+        return response
+
+    def uploaded(self, agent_id: str, archive: bytes) -> str:
+        """A new version of ``agent_id`` carrying ``archive``; the upload must pass."""
+
+        version_id = self.create_version(agent_id)
+        response = self.upload(agent_id, version_id, archive)
+        assert response.status_code == 201, response.text
+        return version_id
+
+    def deploy(self, agent_id: str, version_id: str, environment: str = "dev") -> httpx.Response:
+        return self.call(
+            "POST",
+            "/deployments",
+            json={"agent_id": agent_id, "version_id": version_id, "environment": environment},
+            headers=operator_headers(),
+        )
+
+    def render(self, agent_id: str, version_id: str, **root: str) -> httpx.Response:
+        """``GET .../connectors`` at the application spec's own root unless overridden."""
+
+        response = self.client.get(
+            f"/agents/{agent_id}/versions/{version_id}/connectors",
+            params={**RENDER_ROOT, **root},
+            headers=operator_headers(),
+        )
+        self.responses.append(response)
+        return response
+
+    def application_render(
+        self, application_id: str, *, namespace: str = "acme", release: str = "acme"
+    ) -> httpx.Response:
+        response = self.client.get(
+            f"{WORKER_PREFIX}/applications/{application_id}/render",
+            params={"namespace": namespace, "release": release},
+            headers=worker_headers(),
+        )
+        self.responses.append(response)
+        if response.is_success:
+            assert_no_store(response)
+        return response
+
+    def resolve(self, agent_id: str, entries: Sequence[Mapping[str, str]]) -> httpx.Response:
+        return self.worker(
+            "POST", "/resolve", {"agent_id": agent_id, "entries": [dict(e) for e in entries]}
+        )
+
+    def member(self, application_id: str, agent_id: str, *aliases: str) -> None:
+        response = self.put_members(
+            application_id, agent_id, [{"alias": alias, "tools": None} for alias in aliases]
+        )
+        assert response.status_code == 200, response.text
+
+    def remove_member(self, application_id: str, agent_id: str) -> httpx.Response:
+        return self.operator("DELETE", f"/applications/{application_id}/members/{agent_id}")
+
 
 @dataclass
 class World:
@@ -967,3 +1109,147 @@ def captured_log_text(records: Sequence[logging.LogRecord]) -> str:
         if record.exc_info:
             parts.append(formatter.formatException(record.exc_info))
     return "\n".join(parts)
+
+
+# --- bundles that declare shared connectors (cp5) ------------------------------
+
+# The root ``application_spec`` registers; a member render passes the same three.
+RENDER_ROOT = {"release": "acme", "namespace": "acme", "app_name": "curie"}
+PLUGIN_NAME = "shared-bot"
+# A hosted dedicated connector: it renders objects, so a render that dropped or
+# changed it is visible in ``manifests``.
+HOSTED_DEDICATED = (
+    "  grafana:\n"
+    "    image: grafana/mcp-grafana:0.17.2\n"
+    "    args: [-t, streamable-http]\n"
+    "    env: {GRAFANA_URL: 'https://g.example.com'}\n"
+    "    secrets: [GRAFANA_TOKEN]\n"
+)
+# A remote dedicated connector: no objects, one MCP entry.
+REMOTE_DEDICATED = "  internal:\n    url: https://mcp.internal.example/mcp\n"
+
+
+def shared_entry(name: str, application_id: str) -> str:
+    """One ``connectors.yaml`` entry referencing ``application_id`` by contract 1."""
+
+    return f"  {name}:\n    shared:\n      application: {application_id}\n      contract: 1\n"
+
+
+def connectors_yaml(*entries: str) -> str:
+    return "connectors:\n" + "".join(entries)
+
+
+def bundle_files(
+    connectors: str | None,
+    *,
+    deploy: str | None = None,
+    plugin: Mapping[str, Any] | None = None,
+) -> dict[str, str]:
+    """The files of a minimal valid plugin bundle, relative to its root."""
+
+    manifest = dict(plugin or {"name": PLUGIN_NAME, "version": "0.1.0", "description": "t"})
+    files = {
+        ".claude-plugin/plugin.json": json.dumps(manifest),
+        f"skills/{manifest['name']}/SKILL.md": (
+            f"---\nname: {manifest['name']}\ndescription: t\n---\nhi\n"
+        ),
+    }
+    if connectors is not None:
+        files["connectors.yaml"] = connectors
+    if deploy is not None:
+        files["deploy.yaml"] = deploy
+    return files
+
+
+def write_tree(root: Path, files: Mapping[str, str | bytes]) -> Path:
+    for relative, content in files.items():
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(content, bytes):
+            path.write_bytes(content)
+        else:
+            path.write_text(content, encoding="utf-8")
+    return root
+
+
+def bundle_archive(
+    connectors: str | None,
+    *,
+    deploy: str | None = None,
+    files: Mapping[str, str | bytes] | None = None,
+) -> bytes:
+    """A ``.tar.gz`` of one plugin bundle under a single wrapper directory."""
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = write_tree(Path(tmp) / PLUGIN_NAME, bundle_files(connectors, deploy=deploy))
+        if files:
+            write_tree(root, files)
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+            archive.add(root, arcname=PLUGIN_NAME)
+        return buffer.getvalue()
+
+
+def tree_digest(root: Path) -> dict[str, str]:
+    """Every regular file under ``root`` and the sha256 of its bytes."""
+
+    return {
+        str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
+def canonical(value: Any) -> bytes:
+    """Canonical JSON bytes: how the byte-identity proofs compare renders."""
+
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+
+
+def bundle_ref(version_id: str) -> str | None:
+    (row,) = sql_dicts(
+        "SELECT bundle_ref FROM curie.agent_versions WHERE id = :id", {"id": uuid.UUID(version_id)}
+    )
+    return row["bundle_ref"]
+
+
+def deployment_count(agent_id: str) -> int:
+    (row,) = sql_dicts(
+        "SELECT count(*) AS n FROM curie.deployments WHERE agent_id = :id",
+        {"id": uuid.UUID(agent_id)},
+    )
+    return int(row["n"])
+
+
+_UNSET: Any = object()
+
+
+def assert_declaration_refused(
+    response: httpx.Response,
+    status: int,
+    code: str,
+    *,
+    application: Any = _UNSET,
+    connector: Any = _UNSET,
+    declared: Any = _UNSET,
+) -> dict[str, Any]:
+    """A declaration or resolution refusal in its dict form, never cached.
+
+    ``{"detail": {"code", "application", "connector", "declared"}}``: the
+    worker reads ``declared`` to tell a refusal that names its applications
+    from one whose declarations are unknown (``declared`` null).
+    """
+
+    assert response.status_code == status, response.text
+    detail = response.json().get("detail")
+    assert isinstance(detail, dict), response.text
+    assert set(detail) == {"code", "application", "connector", "declared"}, detail
+    assert detail["code"] == code, response.text
+    if application is not _UNSET:
+        assert detail["application"] == application, detail
+    if connector is not _UNSET:
+        assert detail["connector"] == connector, detail
+    if declared is not _UNSET:
+        assert detail["declared"] == declared, detail
+    assert_no_store(response)
+    return detail

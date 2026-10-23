@@ -32,8 +32,6 @@ from __future__ import annotations
 import base64
 import http.client
 import json
-import os
-import socket
 import subprocess
 import sys
 import time
@@ -68,7 +66,10 @@ from _shared_proxy_harness import (
     agent_name,
     closed_port,
     expected_refusal_body,
+    process_env,
     refusal_table,
+    refuses_connection,
+    signing_pair,
     valkey_url,
     wait_until,
 )
@@ -101,14 +102,14 @@ def _pure_env(tmp_path: Path) -> dict[str, str]:
 
     store_file = tmp_path / "grant-store"
     store_file.write_text(valkey_url() + "\n")
-    signing = SigningKey.generate()
+    # cp5: no verify key here. A shared proxy reads its keys from the database
+    # (test_shared_proxy_caller_keys.py); the dedicated variable refuses start.
     return {
         INSTALLATION_ENV: random_installation(),
         APPLICATION_ENV: str(uuid.uuid4()),
         PROXY_PORT_ENV: LISTEN_PORT,
         UPSTREAM_URL_ENV: "http://127.0.0.1:18080",
         GRANT_STORE_FILE_ENV: str(store_file),
-        PUBLIC_KEYS_ENV: base64.b64encode(bytes(signing.verify_key)).decode("ascii"),
     }
 
 
@@ -149,8 +150,8 @@ _START_REFUSALS: list[tuple[str, str, Callable[[Path], str] | None]] = [
         GRANT_STORE_FILE_ENV,
         lambda p: _write(p, "http", "http://user:hunter2-not-a-store@store.invalid/0\n"),
     ),
-    ("public-keys-absent", PUBLIC_KEYS_ENV, None),
-    ("public-keys-not-a-key", PUBLIC_KEYS_ENV, lambda _: "bm90LWEta2V5"),
+    # cp5: a well-formed verify key list is dedicated-only and refuses start.
+    ("public-keys-present-refuses", PUBLIC_KEYS_ENV, lambda _: signing_pair()[1]),
     *[
         (f"dedicated-{name.lower()}", name, lambda _: '["acme-dev"]')
         for name in DEDICATED_ONLY_ENV
@@ -174,9 +175,11 @@ def test_authorize_wire_names_are_the_frozen_render_names() -> None:
     assert caller.HEADER == CALLER_HEADER
     assert server.GRANT_HEADER == GRANT_HEADER
     assert shared.DEFAULT_SESSION_IDLE_SECONDS == 3600.0
-    # Every dedicated-only name is the dedicated proxy's own.
+    # Every dedicated-only name is the dedicated proxy's own, the verify-key
+    # list included (cp5).
     assert set(shared.DEDICATED_ONLY_ENV) == set(DEDICATED_ONLY_ENV)
     assert set(DEDICATED_ONLY_ENV) == {
+        server.PUBLIC_KEYS_ENV,
         server.ADMITS_ENV,
         server.GATED_TOOLS_ENV,
         server.CONNECTOR_ENV,
@@ -202,7 +205,7 @@ def test_authorize_mode_is_selected_only_by_the_application_variable(tmp_path: P
     dedicated = {
         server.LISTEN_PORT_ENV: "8480",
         server.UPSTREAM_PORT_ENV: "18080",
-        server.PUBLIC_KEYS_ENV: env[PUBLIC_KEYS_ENV],
+        server.PUBLIC_KEYS_ENV: signing_pair()[1],
         server.ADMITS_ENV: '["acme-dev"]',
         INSTALLATION_ENV: env[INSTALLATION_ENV],
     }
@@ -219,8 +222,9 @@ def test_authorize_config_reads_the_frozen_render(tmp_path: Path) -> None:
     assert config.application == env[APPLICATION_ENV]
     assert config.listen_port == int(LISTEN_PORT)
     assert config.upstream_port == 18080
-    assert len(config.public_keys) == 1
-    assert bytes(config.public_keys[0]) == base64.b64decode(env[PUBLIC_KEYS_ENV])
+    # cp5: the config carries no verify key; they are read from the database
+    # (asserted in test_shared_proxy_caller_keys.py).
+    assert not hasattr(config, "public_keys")
     assert config.grant_store_url == valkey_url()
     assert config.session_idle_seconds == shared.DEFAULT_SESSION_IDLE_SECONDS
     # The store URL carries the Valkey password: never in repr.
@@ -285,23 +289,6 @@ def test_authorize_make_shared_app_refuses_without_its_own_resolver(
     _admitted_whoami(world.call(member, "whoami"), member.binding_id)
 
 
-def _process_env(env: dict[str, str]) -> dict[str, str]:
-    inherited = {
-        name: value
-        for name, value in os.environ.items()
-        if not name.startswith(("CURIE_SHARED_", "CURIE_CALLER_PROXY_", "CURIE_CONNECTOR_CALLER_"))
-    }
-    return {**inherited, **env}
-
-
-def _refuses_connection(port: int) -> bool:
-    try:
-        with socket.create_connection(("127.0.0.1", port), timeout=2):
-            return False
-    except OSError:
-        return True
-
-
 def test_authorize_entrypoint_refuses_a_blank_installation_and_never_listens(
     tmp_path: Path,
 ) -> None:
@@ -311,7 +298,7 @@ def test_authorize_entrypoint_refuses_a_blank_installation_and_never_listens(
     env[PROXY_PORT_ENV] = str(port)
     finished = subprocess.run(
         [sys.executable, "-m", "curie_connector_proxy"],
-        env=_process_env(env),
+        env=process_env(env),
         cwd=REPO,
         capture_output=True,
         text=True,
@@ -321,13 +308,17 @@ def test_authorize_entrypoint_refuses_a_blank_installation_and_never_listens(
     assert finished.returncode == 2, (finished.returncode, finished.stderr[-800:])
     assert INSTALLATION_ENV in finished.stderr
     assert "Traceback" not in finished.stderr
-    assert _refuses_connection(port)
+    assert refuses_connection(port)
 
 
 def test_authorize_entrypoint_serves_shared_mode_from_the_render(
     worlds: Worlds, fleet: Fleet
 ) -> None:
-    """Liveness for the refusal above: the same entry point starts and forwards."""
+    """Liveness for the refusal above: the same entry point starts and forwards.
+
+    The world published its verify key through the API publisher before this
+    process starts (cp5); the environment carries none.
+    """
 
     world = worlds()
     member = world.member()
@@ -341,7 +332,7 @@ def test_authorize_entrypoint_serves_shared_mode_from_the_render(
     }
     process = subprocess.Popen(
         [sys.executable, "-m", "curie_connector_proxy"],
-        env=_process_env(env),
+        env=process_env(env),
         cwd=REPO,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -349,7 +340,7 @@ def test_authorize_entrypoint_serves_shared_mode_from_the_render(
     )
     try:
         wait_until(
-            lambda: process.poll() is not None or not _refuses_connection(port),
+            lambda: process.poll() is not None or not refuses_connection(port),
             "the shared proxy process to listen",
         )
         assert process.poll() is None, "the shared proxy process exited instead of listening"

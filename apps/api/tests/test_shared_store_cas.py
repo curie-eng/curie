@@ -32,6 +32,7 @@ import nacl.exceptions
 import pytest
 from _migration_support import render_url, sql_dicts
 from _shared_connector_support import (
+    APPLICATION_TABLES,
     BEGIN_SQL,
     COMMIT_SQL,
     MARK_RECOVERY_SQL,
@@ -202,7 +203,9 @@ def test_an_application_role_sees_only_its_own_rows_in_every_shared_table(
     role = sessions.open(mine.dsn)
     assert role.fetchval("SELECT current_user") == mine.role_name
     both = [uuid.UUID(mine.application_id), uuid.UUID(theirs.application_id)]
-    for table in SHARED_TABLES:
+    # The caller verify key tables are scoped to the installation, not the
+    # application (0125); test_shared_connector_caller_keys.py covers them.
+    for table in APPLICATION_TABLES:
         column = "id" if table == "shared_connector_applications" else "application_id"
         stored = {
             str(row[column])
@@ -314,7 +317,7 @@ def test_an_application_role_has_no_write_authority_and_cannot_borrow_another_id
         f"SELECT set_config('curie.shared_role', '{theirs.role_name}', false)",
     ):
         role.execute(statement)
-        for table in SHARED_TABLES:
+        for table in APPLICATION_TABLES:
             assert _own_ids(role, table) == {mine.application_id}, (statement, table)
     assert _outcome(role, BEGIN_SQL, theirs.grant_id, "intruder", 30) == "not_found"
     expect_sqlstate(role, "42501", f"SET ROLE {quote_ident(theirs.role_name)}")

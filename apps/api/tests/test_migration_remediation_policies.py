@@ -42,8 +42,9 @@ BELOW = "0086"
 # follow that, the train join revision (0108) follows them, team sync state
 # (0120), agent access policies (0121) and directory identity (0122) follow
 # that, the shared connector store (0123, ADR 0239) follows, and its
-# source_stale flag (0124, ADR 0239) is last.
-HEAD = "0124"
+# source_stale flag (0124, ADR 0239) and the caller verify keys (0125, ADR
+# 0239) follow it.
+HEAD = "0125"
 
 POLICY_COLUMNS = {"agent_id", "hook", "generation", "operation_id", "armed", "active", "updated_at"}
 GENERATION_COLUMNS = {

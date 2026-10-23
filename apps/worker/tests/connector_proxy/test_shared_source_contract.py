@@ -1077,8 +1077,21 @@ WIDENINGS = {
         "REVOKE {plain} FROM {role}",
         "role_inherits_membership",
     ),
-    # Any privilege outside the six shared tables and four functions is foreign
-    # authority, whether a table grant or schema CREATE (security review S3).
+    # cp5: the caller verify-key tables are read by the proxy through this
+    # role, so SELECT on each is required like the other six tables.
+    "caller-keys-select-revoked": (
+        "REVOKE SELECT ON curie.shared_connector_caller_keys FROM {role}",
+        "GRANT SELECT ON curie.shared_connector_caller_keys TO {role}",
+        "role_missing_select",
+    ),
+    "caller-key-heartbeats-select-revoked": (
+        "REVOKE SELECT ON curie.shared_connector_caller_key_heartbeats FROM {role}",
+        "GRANT SELECT ON curie.shared_connector_caller_key_heartbeats TO {role}",
+        "role_missing_select",
+    ),
+    # Any privilege outside the eight shared tables and four functions is
+    # foreign authority, whether a table grant or schema CREATE (security
+    # review S3).
     "select-on-agents": (
         "GRANT SELECT ON curie.agents TO {role}",
         "REVOKE SELECT ON curie.agents FROM {role}",
