@@ -40,6 +40,8 @@ _DNS_LABEL = re.compile(DNS_LABEL_PATTERN)
 
 _Tool = Annotated[str, Field(pattern=TOOL_PATTERN)]
 _Tools = Annotated[list[_Tool], Field(min_length=1, max_length=256)]
+# A policy tool subset; may be empty.
+_ToolSubset = Annotated[list[_Tool], Field(max_length=256)]
 
 
 def _has_control(value: str) -> bool:
@@ -88,6 +90,25 @@ class SharedPolicy(BaseModel):
     # declare at least one slot. "connector": identity-only admission for a
     # connector holding its own binding-indexed store, which declares none.
     custody: Custody = "platform"
+    # Tools the shared proxy admits only for a caller token carrying a run pair,
+    # and tools it admits only with a shared approval grant (``csg``). Each is
+    # a subset of ``tools``. Stored only when nonempty, so a policy without
+    # them keeps the JSON and pin digest it had before they existed.
+    run_tools: Annotated[
+        _ToolSubset, AfterValidator(lambda value: _unique(value, "run tools"))
+    ] = Field(default_factory=list)
+    gated_tools: Annotated[
+        _ToolSubset, AfterValidator(lambda value: _unique(value, "gated tools"))
+    ] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _subsets_of_tools(self) -> Self:
+        allowed = set(self.tools)
+        if not set(self.run_tools) <= allowed:
+            raise ValueError("run tools must be policy tools")
+        if not set(self.gated_tools) <= allowed:
+            raise ValueError("gated tools must be policy tools")
+        return self
 
 
 class SharedApplicationRegistration(BaseModel):
@@ -266,6 +287,8 @@ class SharedDatabaseStatusReport(BaseModel):
 class SharedPolicyOut(BaseModel):
     tools: list[str]
     custody: Custody
+    run_tools: list[str]
+    gated_tools: list[str]
 
 
 class SharedSecretRefOut(BaseModel):

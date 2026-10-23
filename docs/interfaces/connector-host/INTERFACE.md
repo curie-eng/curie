@@ -239,6 +239,170 @@ an install its key this covers every runner from before it and any runner a
 worker pod the roll has not replaced yet boots; `charts/curie/README.md` says
 how long that window lasts.
 
+### Shared application mode
+
+An explicit shared connector application
+([ADR-0239](../../adr/0239-explicit-shared-connector-applications-resolve-credentials-for-each-authenticated-caller.md))
+runs one server for several agents, so the server holds no agent's credential
+and learns who a call is for only through an invocation handle. The same
+`python -m curie_connector_proxy` serves it in a second mode, which lives in
+`apps/worker/src/curie_connector_proxy/shared.py`. Everything above this heading
+is dedicated mode and is unchanged; in shared mode the `admits` list, `decide`
+and the `ccg` grant are never consulted.
+
+Selection is explicit. `shared_mode`
+(`apps/worker/src/curie_connector_proxy/server.py::shared_mode`) picks shared
+mode when the proxy's environment holds `CURIE_SHARED_APPLICATION`, the name the
+frozen shared render
+(`packages/plugin-format/src/plugin_format/shared_connector_render.py::render_application`)
+gives the proxy container. `SharedProxyConfig.from_env`
+(`apps/worker/src/curie_connector_proxy/shared.py::SharedProxyConfig.from_env`)
+then reads exactly these names:
+
+1. `CURIE_SHARED_INSTALLATION`, a nonblank installation ID (shared mode is
+   cluster only).
+2. `CURIE_SHARED_APPLICATION`, a canonical lowercase UUID.
+3. `CURIE_SHARED_PROXY_PORT`, the listen port.
+4. `CURIE_SHARED_UPSTREAM_URL`, exactly `http://127.0.0.1:<port>`.
+5. `CURIE_SHARED_GRANT_STORE_FILE`, a file holding one `redis://` or `rediss://`
+   Valkey URL, read once at start.
+6. `CURIE_CALLER_PROXY_PUBLIC_KEYS`, parsed as in dedicated mode.
+
+The resolver runs in the same process and reads its own names through
+`ResolverConfig.from_env`
+(`apps/worker/src/curie_connector_proxy/resolver/config.py::ResolverConfig.from_env`).
+A bad or missing value, or any dedicated-only name
+(`apps/worker/src/curie_connector_proxy/shared.py::DEDICATED_ONLY_ENV`) beside
+them, prints a message naming the variable, never its value, and exits 2. The
+entry point (`apps/worker/src/curie_connector_proxy/__main__.py`) then starts the
+resolver with `start_resolver`
+(`apps/worker/src/curie_connector_proxy/resolver/http.py::start_resolver`) before
+the proxy port listens, so a resolver that refuses to start exits nonzero with
+nothing listening, and closes it on shutdown. `make_shared_app`
+(`apps/worker/src/curie_connector_proxy/shared.py::make_shared_app`) refuses
+without a resolver, or with one for another installation or application.
+
+The frozen shared render does not emit `CURIE_CALLER_PROXY_PUBLIC_KEYS`. The
+worker reconciliation that applies shared applications must add it to the proxy
+container; until it does, a rendered shared proxy refuses to start.
+
+A caller presents these request headers:
+
+1. `X-Curie-Caller`: exactly one `cct2` token, checked by `decide_shared`
+   (`apps/worker/src/curie_connector_proxy/caller.py::decide_shared`) against the
+   configured installation. A blank or name-only installation claim is refused.
+2. `X-Curie-Connector-Alias`: exactly one alias of DNS label shape. It only
+   selects among the verified agent's own memberships.
+3. `Mcp-Session-Id`: the session the server assigned on `initialize`, echoed on
+   later requests, as MCP Streamable HTTP does.
+4. `X-Curie-Connector-Grant`: exactly one `csg` shared grant, only on a
+   `tools/call` of a gated tool.
+
+Every request, any method or path, is checked in this order and refused before
+anything reaches the server:
+
+1. The caller token.
+2. The alias header.
+3. A presented session must be one this proxy recorded for the same
+   installation, application, agent and alias. Ownership is proved here, before
+   any refusal below may close the session.
+4. The body, at most 1 MiB.
+5. One read-only REPEATABLE READ transaction through the application's own role
+   (the resolver's pool) reads the application, the agent's alias row and its
+   binding, on every call and never cached. Membership and tool names are never
+   in the Pod's environment.
+6. At most one `tools/call`, whose tool is in the application policy's `tools`
+   and, when the alias row narrows them, in the alias's list.
+7. A tool in the policy's `run_tools` needs the token's own `run` and
+   `work_item` (`apps/worker/src/curie_connector_proxy/shared.py::run_context`).
+   Headers, arguments and the session never supply a pair.
+8. A tool in the policy's `gated_tools` needs a matching `csg` grant, described
+   in [mcp-service-auth](../mcp-service-auth/INTERFACE.md).
+9. A request without a session reserves a session slot, a `tools/call` with an
+   `id` reserves its cancellation key, a gated call spends its grant, and only
+   then is the handle registered, immediately before the upstream request.
+
+The forward strips every hop-by-hop header, every header whose name starts with
+`x-curie-` (the caller token, the grant, the alias, any `X-Curie-Agent`,
+`X-Curie-Run`, `X-Curie-Work-Item` or inbound `X-Curie-Invocation`, and any
+invented identity header), and `Authorization`, `Proxy-Authorization` and
+`Cookie`. It then adds exactly one `X-Curie-Invocation` header, a fresh
+256-bit handle spelled `crh1.` and 43 base64url characters, on a forwarded
+`tools/call` POST, and on nothing else: `initialize`, `tools/list`, notifications, JSON-RPC responses,
+`GET` streams and `DELETE` carry none. No agent, run or alias header reaches a
+shared server. The server presents the handle to the resolver, whose 200 body
+carries `run` and `work_item` only when the caller token carried the pair.
+Response headers come back with the same hop-by-hop and `x-curie-` stripping.
+The handle is removed when its exchange ends, whether it completed, the server
+failed or the caller hung up. An unreachable server answers 502 with the handle
+already removed.
+
+A refusal is a JSON-RPC error with no challenge:
+`{"jsonrpc":"2.0","id":null,"error":{"code":-32000,"message":"caller refused: ...","data":{"curie_caller":...,"curie_shared":<code>}}}`
+(`apps/worker/src/curie_connector_proxy/shared.py::refusal_body`). The message
+and `curie_caller` are the dedicated ones, so a runner that reads only
+`curie_caller` still classifies it; `curie_shared` names the shared check. The
+table is frozen in `tests/vectors/connector-shared-caller.json`
+(`apps/worker/src/curie_connector_proxy/shared.py::REFUSALS`):
+
+| `curie_shared` | Status | `curie_caller` |
+| --- | --- | --- |
+| `missing` | 403 | `missing` |
+| `invalid` | 403 | `invalid` |
+| `expired` | 403 | `expired` |
+| `not_admitted` (another installation) | 403 | `not_admitted` |
+| `alias_required` | 403 | `not_admitted` |
+| `application_unknown` | 403 | `not_admitted` |
+| `installation_mismatch` | 403 | `not_admitted` |
+| `application_disabled` | 403 | `not_admitted` |
+| `not_member` | 403 | `not_admitted` |
+| `binding_missing` | 403 | `not_admitted` |
+| `binding_disabled` | 403 | `not_admitted` |
+| `tool_not_allowed` | 403 | `not_admitted` |
+| `multiple_tool_calls` | 403 | `not_admitted` |
+| `run_required` | 403 | `not_admitted` |
+| `session_unknown` | 403 | `not_admitted` |
+| `session_principal_mismatch` | 403 | `not_admitted` |
+| `policy_generation_mismatch` | 403 | `not_admitted` |
+| `sessions_full` | 403 | `not_admitted` |
+| `invocations_full` | 403 | `not_admitted` |
+| `request_id_in_use` | 403 | `not_admitted` |
+| `body_too_large` | 403 | `not_admitted` |
+| `grant_required` | 403 | `grant_required` |
+| `store_unavailable` | 503 | `not_admitted` |
+
+`store_unavailable` is any database error or pool timeout, failing closed.
+Unlike dedicated mode, a body over 1 MiB gets this JSON refusal.
+
+Sessions and cancellation:
+
+1. A request without `Mcp-Session-Id` whose response carries one opens that
+   session for the caller's principal and alias. Another agent, or the same
+   agent through another alias, presenting it is `session_principal_mismatch`
+   and leaves it intact; an ID the proxy never recorded is `session_unknown`.
+2. A session keeps the membership stamp of its owner's alias row
+   (`apps/worker/src/curie_connector_proxy/resolver/admission.py::membership_stamp`).
+   It survives a policy generation change made by another member, and the
+   owner's own membership change closes it with `policy_generation_mismatch`.
+   The owner's removal closes it with `not_member`, and re-adding the agent
+   does not revive it.
+3. `DELETE` with the session forwards, then closes it. An idle session, unused
+   for an hour (`session_idle_seconds`) with no exchange in flight, is reclaimed
+   before the session bound is checked. An open `GET` stream or a running call
+   keeps a session from being reclaimed, and no tool timeout is imposed.
+4. An authenticated `notifications/cancelled` whose `params.requestId` names a
+   live `tools/call` of the same agent, alias and session revokes that call's
+   handle before the notification is forwarded. One from another agent, alias or
+   session revokes nothing. A second `tools/call` with an `id` still held by a
+   live exchange of the same agent, alias and session is `request_id_in_use`.
+
+Bounds are per application: 1024 active invocations and 4096 sessions, the
+resolver registry's defaults
+(`apps/worker/src/curie_connector_proxy/resolver/handles.py::HandleRegistry`),
+and overflow refuses before any upstream request. The log line is the dedicated
+shape, with `mode=shared`, the outcome code and, for a refused grant, a fixed
+sub-reason; it never carries a token, handle, grant or argument.
+
 ## Implementations today
 
 One production host plus a fake:

@@ -293,7 +293,17 @@ async def register_application(
         raise SharedRefusal(status.HTTP_409_CONFLICT, "shared_installation_mismatch")
 
     spec_json = spec.model_dump(mode="json")
-    policy_json = body.policy.model_dump(mode="json")
+    # The tool subsets are stored only when nonempty, so a policy without them
+    # keeps the JSON and pin digest it had before they existed.
+    empty_subsets = {
+        name
+        for name, values in (
+            ("run_tools", body.policy.run_tools),
+            ("gated_tools", body.policy.gated_tools),
+        )
+        if not values
+    }
+    policy_json = body.policy.model_dump(mode="json", exclude=empty_subsets)
     pin_digest = _pin_digest(spec_json, policy_json)
     application_id = uuid.UUID(spec.application)
     inserted = await session.scalar(
@@ -356,7 +366,13 @@ async def application_record(
             "credential_slots": list(application.credential_slots),
             "provider_origins": list(application.provider_origins),
             "snapshot_seal": application.snapshot_seal,
-            "policy": application.policy,
+            "policy": {
+                "tools": application.policy["tools"],
+                "custody": application.policy["custody"],
+                # Stored only when nonempty (``register_application``).
+                "run_tools": application.policy.get("run_tools", []),
+                "gated_tools": application.policy.get("gated_tools", []),
+            },
             "custody": application.custody,
             "policy_generation": application.policy_generation,
             "enabled": application.enabled,

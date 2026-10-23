@@ -361,6 +361,12 @@ class ResolverRuntime:
         self._socket_path = socket_path
         self._closed = False
 
+    @property
+    def pool(self) -> Any:
+        """The application-role asyncpg pool, shared with the proxy's per-call policy read."""
+
+        return self._pool
+
     async def close(self) -> None:
         """Stop serving, remove the socket, then close the pool. Idempotent."""
 

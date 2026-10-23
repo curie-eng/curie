@@ -10,6 +10,12 @@ Paths are not special-cased. The bundled Claude CLI sends the header on its
 OAuth discovery and registration requests as well as on ``/mcp``, so those are
 checked and forwarded like any other; an admitted caller reaches whatever the
 server serves, and a refused one reaches nothing.
+
+That is dedicated mode. Shared application mode (ADR 0239) is a second,
+explicitly selected mode that lives in ``shared.py``: ``shared_mode`` selects
+it when the frozen shared render's ``CURIE_SHARED_APPLICATION`` is present, and
+in it nothing here decides a request. The admits list, ``caller.decide`` and the
+``ccg`` grant check below are never consulted for a shared call.
 """
 
 from __future__ import annotations
@@ -571,18 +577,36 @@ async def _handle(request: web.Request, handler: Handler) -> web.StreamResponse:
         answer.release()
 
 
+def shared_mode(env: Mapping[str, str]) -> bool:
+    """True when ``env`` selects shared application mode (``shared.py``).
+
+    Presence alone selects it, so a blank value refuses to start in shared
+    mode rather than falling back to dedicated mode.
+    """
+
+    from .shared import SHARED_APPLICATION_ENV
+
+    return SHARED_APPLICATION_ENV in env
+
+
+def _upstream_client() -> ClientSession:
+    """The client both modes forward with."""
+
+    # No total timeout: an MCP GET stream stays open for the session.
+    return ClientSession(
+        connector=TCPConnector(limit=0),
+        timeout=ClientTimeout(total=None, sock_connect=5),
+        auto_decompress=False,
+        # The forwarding client must add nothing a caller did not send: a
+        # caller that sent no Accept-Encoding must not get a compressed
+        # body back because the proxy's own client asked for one.
+        skip_auto_headers=("Accept", "Accept-Encoding", "User-Agent"),
+    )
+
+
 def make_app(config: ProxyConfig, *, clock: Callable[[], float] = time.time) -> web.Application:
     async def upstream(app: web.Application) -> AsyncIterator[None]:
-        # No total timeout: an MCP GET stream stays open for the session.
-        session = ClientSession(
-            connector=TCPConnector(limit=0),
-            timeout=ClientTimeout(total=None, sock_connect=5),
-            auto_decompress=False,
-            # The forwarding client must add nothing a caller did not send: a
-            # caller that sent no Accept-Encoding must not get a compressed
-            # body back because the proxy's own client asked for one.
-            skip_auto_headers=("Accept", "Accept-Encoding", "User-Agent"),
-        )
+        session = _upstream_client()
         app[_UPSTREAM] = session
         yield
         await session.close()

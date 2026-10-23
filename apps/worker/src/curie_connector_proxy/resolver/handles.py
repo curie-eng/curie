@@ -3,10 +3,15 @@
 "Bundle, identity and request contract" 3 and 6. The proxy verifies the caller
 token, then forwards a fresh 256-bit random handle instead of anything the
 caller sent. The handle names one invocation context (installation,
-application, agent, alias, policy generation, optional run and work item) for
+application, agent, alias, policy generation, the binding the proxy admitted,
+the stamp of the agent's own membership row, optional run and work item) for
 as long as that invocation lives and the signed caller expiry allows, and it is
-removed on completion or cancellation. A session ID is never identity: lookups
-are by handle only, so a session ID presented as a handle is unknown.
+removed on completion or cancellation. The binding pins the account: admission
+refuses ``binding_mismatch`` when the agent's current binding is another one, so
+an account replacement cannot redirect an in-flight call. The membership stamp
+lets the handle survive a policy generation change another member caused
+(``admission``). A session ID is never identity: lookups are by handle only,
+so a session ID presented as a handle is unknown.
 
 The registry stores ``sha256(handle)`` rather than the handle, so a heap dump
 of the registry alone does not hand out live handles, and neither ``repr`` nor
@@ -53,6 +58,7 @@ _MAX_HANDLE_CHARS = 128
 _MAX_SESSION_ID_CHARS = 256
 _UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 _ALIAS = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
+_STAMP = re.compile(r"^[0-9a-f]{64}$")
 
 
 class RegistryRefusal(CodedError):
@@ -78,6 +84,11 @@ class InvocationContext:
     alias: str
     # The signed caller exp in epoch seconds; invalid once clock() >= expires_at.
     expires_at: int
+    # The binding ID the proxy's per-call read admitted (canonical UUID).
+    binding: str
+    # ``admission.membership_stamp`` of the agent's alias row as the proxy read
+    # it (64 lowercase hex).
+    membership: str
     run: str | None = None
     work_item: str | None = None
     session_id: str | None = None
@@ -191,6 +202,14 @@ class HandleRegistry:
         return self._application
 
     @property
+    def max_invocations(self) -> int:
+        return self._max_invocations
+
+    @property
+    def max_sessions(self) -> int:
+        return self._max_sessions
+
+    @property
     def active_invocations(self) -> int:
         with self._lock:
             self._prune()
@@ -249,6 +268,10 @@ class HandleRegistry:
         if not isinstance(context.alias, str) or _ALIAS.fullmatch(context.alias) is None:
             return False
         if not _is_int(context.expires_at):
+            return False
+        if not uuid_ok(context.binding):
+            return False
+        if not isinstance(context.membership, str) or _STAMP.fullmatch(context.membership) is None:
             return False
         if (context.run is None) != (context.work_item is None):
             return False

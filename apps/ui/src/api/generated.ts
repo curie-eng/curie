@@ -9372,6 +9372,10 @@ export interface components {
              * @enum {string}
              */
             custody?: "platform" | "connector";
+            /** Gated Tools */
+            gated_tools?: string[];
+            /** Run Tools */
+            run_tools?: string[];
             /** Tools */
             tools: string[];
         };
@@ -9382,6 +9386,10 @@ export interface components {
              * @enum {string}
              */
             custody: "platform" | "connector";
+            /** Gated Tools */
+            gated_tools: string[];
+            /** Run Tools */
+            run_tools: string[];
             /** Tools */
             tools: string[];
         };

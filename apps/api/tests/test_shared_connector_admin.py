@@ -308,7 +308,8 @@ def test_identical_registration_replays_and_different_pins_conflict(store: Share
     assert record["credential_slots"] == [SLOT]
     assert record["provider_origins"] == body["application"]["provider_origins"]
     assert record["snapshot_seal"] is None
-    assert record["policy"] == shared_policy()
+    # The record carries both authority lists, empty when the registration had none.
+    assert record["policy"] == {**shared_policy(), "run_tools": [], "gated_tools": []}
     assert record["custody"] == "platform"
     assert record["enabled"] is True
     assert record["recipients"] == []
