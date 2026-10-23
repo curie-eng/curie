@@ -77,13 +77,19 @@ with no fallback between the two modes.
    placeholder, which the capability probe reports as a missing credential.
    Unrelated secrets stay in the env so ADR-0009 stdio and remote `${VAR}`
    expansion still works.
-4. **The caller token, `cct`.** When `CURIE_CONNECTOR_CALLER_SIGNING_KEY` is set,
+4. **The caller token, `cct2`.** When `CURIE_CONNECTOR_CALLER_SIGNING_KEY` is set,
    `BindingResolver.boot_env`
    (`apps/worker/src/curie_worker/binding.py::BindingResolver.boot_env`) mints one
    per boot with `mint` (`apps/worker/src/curie_worker/caller_token.py::mint`):
-   an Ed25519 signature over compact JSON `{agent, exp}`, plus `run` and
-   `work_item` together or not at all (ADR-0178), each a lowercase hyphenated
-   UUID. Expiry is 24 hours, capped by the run's execution deadline when the
+   an Ed25519 signature over compact JSON `{installation, agent_id, agent, exp}`
+   ([ADR-0239](../../adr/0239-explicit-shared-connector-applications-resolve-credentials-for-each-authenticated-caller.md), "Bundle, identity and request contract" item 2), plus
+   `run` and `work_item` together or not at all (ADR-0178). `installation` is
+   the worker's installation id, opaque text (blank for a dedicated standalone
+   worker, otherwise at most 128 UTF-8 bytes with no surrogate and no control or
+   white space code point: general category Cc plus Unicode White_Space, written
+   out in the corpus as `installation_forbidden`, so no reader derives it from a
+   Unicode table); `agent_id`, `run` and `work_item` are lowercase
+   hyphenated UUIDs; `agent` is the display name. Expiry is 24 hours, capped by the run's execution deadline when the
    kernel passes one. The wire is frozen in
    `tests/vectors/connector-caller-token.json`. The signing key is listed in
    `HOST_APPLICATION_CREDENTIAL_ENV_NAMES`
@@ -107,7 +113,7 @@ with no fallback between the two modes.
    valid `admits` list (`apps/worker/src/curie_connector_proxy/server.py::ProxyConfig.from_env`).
 7. **Admission.** `decide` (`apps/worker/src/curie_connector_proxy/caller.py::decide`)
    verifies the signature over the received text before parsing, accepts exactly
-   `{agent, exp}` or that set plus the pair (`apps/worker/src/curie_connector_proxy/caller.py::claims`),
+   `{installation, agent_id, agent, exp}` or that set plus the pair (`apps/worker/src/curie_connector_proxy/caller.py::claims`),
    requires `exp` later than now, and matches `agent` exactly against the
    rendered `admits` list. Either configured key may verify, which is how a
    rotation overlaps. The verified identity reaches the server as headers only
@@ -118,7 +124,7 @@ with no fallback between the two modes.
    (`apps/worker/src/curie_worker/kernel/claim.py::_connector_tool_grant`) mints one
    with `mint` (`apps/worker/src/curie_worker/connector_grant.py::mint`): claims
    exactly `agent`, `connector`, `tool`, `args` (canonical JSON), `exp` and a
-   random `jti`. It uses the same signing key as `cct` and is told apart by
+   random `jti`. It uses the same signing key as `cct2` and is told apart by
    prefix and claim set. The runner adds `X-Curie-Connector-Grant`
    (`runner/src/curie_runner/connectors.py::GRANT_HEADER`) to hosted entries only
    when a grant is present. Only a permission-gate approval carries the arguments a grant
@@ -192,10 +198,8 @@ and no grant check (`cli/src/docker.rs`, `cli/src/connector_build.rs`).
 6. **Docs and comments still describe the keyless install.** The chart values
    comment and the connector-host file say an install with no key renders no
    proxy and leaves the NetworkPolicy as the only check; `render` now refuses that
-   case. Comments in `apps/worker/src/curie_connector_proxy/caller.py` and
-   `apps/worker/src/curie_worker/connector_grant.py` say `cct` stays `{agent, exp}`,
-   which predates ADR-0178's optional pair.
-7. **One key signs two token kinds.** `cct` and `ccg` share the signing key and
+   case.
+7. **One key signs two token kinds.** `cct2` and `ccg` share the signing key and
    the verifying keys, separated only by prefix and an exact claim set, so a
    rotation or compromise of one is a rotation or compromise of both.
 

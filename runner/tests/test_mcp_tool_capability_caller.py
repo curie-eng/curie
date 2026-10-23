@@ -70,6 +70,7 @@ def test_the_refusal_vector_names_the_header_the_runner_sends() -> None:
         "status",
         "content_type",
         "unpaired",
+        "duplicate_header",
         "vectors",
     }
     assert set(_REFUSAL["unpaired"]) == {"why", "token", "refusal"}

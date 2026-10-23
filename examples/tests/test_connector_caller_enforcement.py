@@ -52,8 +52,13 @@ if "get" in args and "deployment" in args:
     print("8000", end="")
     raise SystemExit(0)
 if "exec" in args:
+    # A header sent as `-H @-` arrives on stdin, which kubectl forwards only
+    # with `-i`. Record what this call was given, beside its argv.
+    stdin = sys.stdin.read() if "-i" in args else None
+    with open(os.environ["FAKE_KUBECTL_STDIN_LOG"], "a", encoding="utf-8") as stream:
+        stream.write(json.dumps({"args": args, "stdin": stdin}) + "\\n")
     command = args[args.index("--") + 1 :]
-    pod = args[args.index("exec") + 1]
+    pod = [a for a in args[args.index("exec") + 1 :] if not a.startswith("-")][0]
     if "other-agent" in pod:
         raise SystemExit(0 if env("FAKE_OTHER_AGENT_REACHES", "0") == "1" else 1)
     if command[0] == "python":
@@ -62,7 +67,10 @@ if "exec" in args:
     if url.startswith("http://192.0.2.20:"):
         raise SystemExit(0 if env("FAKE_DIRECT_REACHABLE") == "1" else 28)
     if "-H" in command:
-        token = command[command.index("-H") + 1].split(": ", 1)[1]
+        header = command[command.index("-H") + 1]
+        if header == "@-":
+            header = (stdin or "").splitlines()[0] if (stdin or "").strip() else ""
+        token = header.split(": ", 1)[1].strip() if ": " in header else ""
         if token == "cct.minted-for.weather":
             print(env("FAKE_ADMITTED_CODE", "400"), end="")
         else:
@@ -110,6 +118,7 @@ def _run(
         **os.environ,
         "PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}",
         "FAKE_KUBECTL_LOG": str(log),
+        "FAKE_KUBECTL_STDIN_LOG": str(tmp_path / "kubectl-stdin.jsonl"),
         "FAKE_DOCKER_LOG": str(tmp_path / "docker.jsonl"),
         "FAKE_CONNECTORS": SERVICE,
         **fake,
@@ -178,8 +187,20 @@ def test_a_sandbox_reaching_the_server_port_directly_fails(tmp_path: Path) -> No
     assert "past the caller proxy" in result.stderr
 
 
-def _token_dials(calls: list[list[str]]) -> list[str]:
-    return [c[c.index("-H") + 1] for c in calls if "exec" in c and "-H" in c]
+def _token_dials(tmp_path: Path) -> list[str]:
+    """The caller header of each exec whose curl reads it from stdin (`-H @-`)."""
+
+    log = tmp_path / "kubectl-stdin.jsonl"
+    if not log.exists():
+        return []
+    dialled: list[str] = []
+    for line in log.read_text(encoding="utf-8").splitlines():
+        record = json.loads(line)
+        args: list[str] = record["args"]
+        if "-H" in args and args[args.index("-H") + 1] == "@-":
+            stdin = record["stdin"] or ""
+            dialled.append(stdin.splitlines()[0] if stdin.strip() else "")
+    return dialled
 
 
 # @spec ADR-0168 d7
@@ -196,9 +217,15 @@ def test_an_admitted_caller_reaches_the_server_and_an_outsider_does_not(tmp_path
     assert result.returncode == 0, result.stderr
     assert "admits a caller token for weather" in result.stdout
     assert "refuses an agent it does not admit" in result.stdout
-    dialled = _token_dials(calls)
+    dialled = _token_dials(tmp_path)
+    assert len(dialled) == 2
     assert dialled[0] == "X-Curie-Caller: cct.minted-for.weather"
-    assert len(dialled) == 2 and "weather" not in dialled[1]
+    assert dialled[1].startswith("X-Curie-Caller: cct.minted-for.")
+    assert "weather" not in dialled[1]
+    # The token travels on stdin: no argv kubectl was given carries it, so it
+    # never shows in a process listing.
+    assert "cct.minted-for." not in json.dumps(calls)
+    assert "X-Curie-Caller" not in json.dumps(calls)
     # The seed rides the mint container's env by name, never an argv.
     assert _SEED not in (tmp_path / "docker.jsonl").read_text(encoding="utf-8")
     assert _SEED not in json.dumps(calls)
@@ -231,7 +258,7 @@ def test_no_signing_key_is_fatal_before_any_admitted_leg(tmp_path: Path) -> None
     result, calls = _run(tmp_path, seed=None)
     assert result.returncode != 0
     assert "CURIE_CALLER_SIGNING_KEY" in result.stderr
-    assert _token_dials(calls) == []
+    assert _token_dials(tmp_path) == []
 
 
 # @spec ADR-0168 d7
@@ -239,4 +266,4 @@ def test_a_connector_admitting_nobody_is_not_an_admitted_leg(tmp_path: Path) -> 
     result, calls = _run(tmp_path, FAKE_ADMITS="[]")
     assert result.returncode != 0
     assert "no connector admits an agent" in result.stderr
-    assert _token_dials(calls) == []
+    assert _token_dials(tmp_path) == []

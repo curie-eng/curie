@@ -136,10 +136,14 @@ def _boots_differently(
 
 
 def _caller_token_exp(token: str) -> int | None:
-    """The ``exp`` claim of a caller token, or None when the token is unreadable."""
+    """The ``exp`` claim of a caller token, or None when the token is unreadable.
+
+    Only the current wire (``caller_token.PREFIX``) is read; a legacy or other
+    prefix is unreadable, so it is never re-minted.
+    """
 
     parts = token.split(".")
-    if len(parts) != 3:
+    if len(parts) != 3 or parts[0] != caller_token.PREFIX:
         return None
     try:
         padded = parts[1] + "=" * (-len(parts[1]) % 4)
@@ -1105,6 +1109,8 @@ async def _cap_caller_token_to_deadline(
         return handle
     boot_env[CONNECTOR_CALLER_TOKEN_ENV] = caller_token.mint(
         self._config.connector_caller_signing_key,
+        installation=self._config.installation_id,
+        agent_id=str(run.agent_id),
         agent=agent_name,
         exp=min(int(clock.time.time()) + SANDBOX_TOKEN_TTL_SECONDS, deadline_unix),
         run=str(run.request_id),

@@ -1,11 +1,33 @@
 {
-  "comment": "What a hosted connector's caller proxy answers when it refuses a caller (ADR-0168 decision 7), and what the runner reads back to name the refusal. The proxy (apps/worker/src/curie_connector_proxy/server.py) answers every refusal with `status` and a JSON-RPC error body, never contacts the connector, and sends no WWW-Authenticate: a 401 sends the bundled Claude CLI into OAuth discovery and client registration against the connector, and a 403 does not. The MCP client surfaces a JSON-RPC error body at a non-2xx status as the request's error, so the runner (runner/src/curie_runner/mcp_tool_capability.py) finds `error.data.curie_caller` and reports the refusal by name. `header` is the request header the token travels in. Read by apps/worker/tests/test_connector_proxy.py and runner/tests/test_mcp_tool_capability_caller.py, which reject an unknown key so a key added for one reader cannot pass vacuously.",
+  "comment": "What a hosted connector's caller proxy answers when it refuses a caller (ADR-0168 decision 7), and what the runner reads back to name the refusal. The proxy (apps/worker/src/curie_connector_proxy/server.py) answers every refusal with `status` and a JSON-RPC error body, never contacts the connector, and sends no WWW-Authenticate: a 401 sends the bundled Claude CLI into OAuth discovery and client registration against the connector, and a 403 does not. The MCP client surfaces a JSON-RPC error body at a non-2xx status as the request's error, so the runner (runner/src/curie_runner/mcp_tool_capability.py) finds `error.data.curie_caller` and reports the refusal by name. `header` is the request header the token travels in. `unpaired` and `duplicate_header` are driven through the real proxy; their tokens are cct2 (tests/vectors/connector-caller-token.json) signed by that corpus's first seed. Read by apps/worker/tests/test_connector_proxy.py and runner/tests/test_mcp_tool_capability_caller.py, which reject an unknown key so a key added for one reader cannot pass vacuously. Every token (`unpaired.token` and each `duplicate_header.tokens` entry) is stored as its \".\"-separated segments, exactly token.split(\".\"), so no single high-entropy token string appears in the corpus, and readers join them with \".\".",
   "header": "X-Curie-Caller",
   "status": 403,
   "content_type": "application/json",
   "unpaired": {
-    "why": "A signed token that carries run without work_item is malformed and refused as invalid.",
-    "token": "cct.eyJhZ2VudCI6ImFjbWUtZGV2IiwiZXhwIjoxNzkwMDAwMDAwLCJydW4iOiIxMTExMTExMS0xMTExLTQxMTEtODExMS0xMTExMTExMTExMTEifQ.GENbUYfT0PWv5h5J_-m9v0LBE0A5TA7a7WdImBeLv_3y0uTueF0QWnWvA41C3FHEbXMKvwfpm0P_wHXHAKRVBQ",
+    "why": "A validly signed cct2 token that carries run without work_item is malformed and refused as invalid.",
+    "token": [
+      "cct2",
+      "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIiwicnVuIjoiMTExMTExMTEtMTExMS00MTExLTgxMTEtMTExMTExMTExMTExIn0",
+      "KOrKbKU1KYDZvFMpPhuVUGKUeVZBZQwbTKaVzb2Bsp_HZOmolIs6Pn1YHpp1SXXMXrWxee4etnqRLZEawrE5BQ"
+    ],
+    "refusal": "invalid"
+  },
+  "duplicate_header": {
+    "why": "Two X-Curie-Caller headers are refused as invalid even when each token alone would be admitted under `admits` at `now`, so the proxy never has to choose one.",
+    "tokens": [
+      [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIn0",
+        "74l_wg1og5TWkfkxmZCSOse4EwwqxfG0xRcJ1fiihUpOm9F6wNG1BQ3X26PRXQWaDF-QyFu5I9VPnYM1PrthAQ"
+      ],
+      [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIiwicnVuIjoiMTExMTExMTEtMTExMS00MTExLTgxMTEtMTExMTExMTExMTExIiwid29ya19pdGVtIjoiMjIyMjIyMjItMjIyMi00MjIyLTgyMjItMjIyMjIyMjIyMjIyIn0",
+        "tkHQmP81hM-mbVpL9IwVFwxb4qBLitskewg15huAvp0BYm0hOIb_anlVz2PClCfPciCyIYmgRqemSKqGQK09Aw"
+      ]
+    ],
+    "admits": ["acme-dev"],
+    "now": 1789999990,
     "refusal": "invalid"
   },
   "vectors": [

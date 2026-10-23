@@ -144,8 +144,10 @@ object kinds, so a worker that is not reconciling does not hold that grant.
 Who may call a hosted connector is decision 7 of
 [ADR-0168](../../adr/0168-one-installation-hosts-several-bot-identities.md).
 When `CURIE_CONNECTOR_CALLER_SIGNING_KEY` is set, the worker's `boot_env`
-(`apps/worker/src/curie_worker/binding.py::BindingResolver.boot_env`) signs the
-resolved agent's name with `mint`
+(`apps/worker/src/curie_worker/binding.py::BindingResolver.boot_env`) signs a
+`cct2` token naming its installation (blank, or at most 128 UTF-8 bytes with no
+surrogate, control or white space code point) and the resolved agent's UUID and name
+([ADR-0239](../../adr/0239-explicit-shared-connector-applications-resolve-credentials-for-each-authenticated-caller.md), "Bundle, identity and request contract" item 2) with `mint`
 (`apps/worker/src/curie_worker/caller_token.py::mint`), and `render_worker`
 (`packages/aci-protocol/src/aci_protocol/session.py::BootEnv.render_worker`)
 emits it as `CURIE_CONNECTOR_CALLER_TOKEN` with the connector scope. The runner's

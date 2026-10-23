@@ -63,6 +63,7 @@ mod connector_build;
 mod connector_build_decl_vectors;
 mod connector_caller_dev_pair;
 mod connector_caller_keys;
+mod connector_caller_token;
 mod connector_compose;
 mod connector_hosted_caller_key;
 mod connector_lock;
