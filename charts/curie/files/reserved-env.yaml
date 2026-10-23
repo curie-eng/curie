@@ -9,6 +9,11 @@ worker:
   CURIE_ADAPTER_CREDENTIALS: worker.adapterCredentialsExistingSecret
   CURIE_AGENT_CONNECTOR_SECRET_POOLS: agentSandbox.connectorSecrets
   CURIE_AGENT_SANDBOX_POOLS: agentSandbox.connectorSecrets or agentSandbox.registryEgress
+  CURIE_ATTACHMENT_BROKER_HOST: worker.attachments.broker
+  CURIE_ATTACHMENT_BROKER_PORT: worker.attachments.broker.port
+  CURIE_ATTACHMENT_BROKER_MAX_CONCURRENT: worker.attachments.broker.maxConcurrent
+  CURIE_ATTACHMENT_TRANSFER_TIMEOUT_SECONDS: worker.attachments.broker.transferTimeoutSeconds
+  CURIE_ATTACHMENT_MODE: worker.attachments.mode
   CURIE_ATTACHMENT_ENABLED: worker.attachments.enabled
   CURIE_ATTACHMENT_MAX_FILE_BYTES: worker.attachments.maxFileBytes
   CURIE_ATTACHMENT_REFERENCE_TTL_SECONDS: worker.attachments.referenceTtlSeconds
@@ -114,6 +119,9 @@ worker:
   VALKEY_PORT: valkey.port
   VALKEY_TLS: valkey.tls
 api:
+  ATTACHMENT_TRANSFER_TIMEOUT_SECONDS: worker.attachments.broker.transferTimeoutSeconds
+  ATTACHMENT_ACCESS_ENABLED: worker.attachments.enabled and worker.attachments.mode
+  ATTACHMENT_BROKER_URL: worker.attachments.broker
   API_KEY: api.apiKey
   APPROVAL_SWEEP_INTERVAL_S: api.approvalSweepIntervalSeconds
   BUNDLE_BUCKET: agentSandbox.runner.bundleFetch.bucket
@@ -216,6 +224,7 @@ dispatcher:
   VALKEY_PORT: valkey.port
   VALKEY_TLS: valkey.tls
 agentSandbox.runner:
+  CURIE_ATTACHMENT_ACCESS_ENABLED: worker.attachments.enabled and worker.attachments.mode
   ANTHROPIC_BASE_URL: inference.service.port
   CURIE_ATTACHMENTS_MANIFEST: the claim's attachment manifest, filled per boot (remove this override)
   CURIE_BUDGET: agentSandbox.runner.budget.maxOutputTokensPerRun

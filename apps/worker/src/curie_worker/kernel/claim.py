@@ -543,6 +543,7 @@ async def _route_and_start(
                 boots = await asyncio.to_thread(self._substrate.lookup, thread_key) is None
         if (
             not attachment_fresh_only
+            and not (self._config.attachment_enabled and self._config.attachment_mode == "lazy")
             and boots
             and not (
                 boot_env
@@ -856,6 +857,16 @@ async def _route_and_start(
             steer_event,
             renew=retained_live_route and active_before_steer and channel_read_supported,
             thread_key=thread_key,
+            remaining_s=remaining_s,
+        )
+        from .attachment_access import steer_attachment_access
+
+        steer_event = await steer_attachment_access(
+            self,
+            steer_event,
+            handle,
+            thread_key,
+            active=retained_live_route and active_before_steer,
             remaining_s=remaining_s,
         )
         steered = await self._runner.steer(

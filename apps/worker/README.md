@@ -1309,3 +1309,38 @@ Receipt and CLI progress metadata use the same reference-boundary vector as
 approval displays. Closing code quotes end a sentence reference just as closing
 parentheses, brackets and ordinary quotes do; requested filenames and paths stay
 literal. This wording changes neither answers nor stored actions.
+
+### On-demand attachment rollout
+
+The attachment lane remains off by default. With `CURIE_ATTACHMENT_ENABLED=true`,
+`CURIE_ATTACHMENT_MODE=eager` preserves the existing complete-set handoff and its
+positive byte budgets. Explicit `CURIE_ATTACHMENT_MODE=lazy` registers inbound
+metadata before routing, including references above the legacy byte budgets, and
+starts without downloading provider file bodies. Text-only follow-ups register
+no files and do not rebuild attachment history. The real runner exposes
+`list_attachments` and `fetch_attachment` through its existing platform tool
+server; only a selected file is streamed into its private writable cache.
+
+Lazy activation requires matching API, worker, broker and runner support. The
+worker refuses a runner that does not advertise literal `attachment_access:
+true`; the API refuses a missing or incompatible private broker. There is no
+eager fallback. Fake-model runs cannot enable this mode. Every logical opener
+owns a scoped finite lease for the actual sandbox session and route generation.
+A steer renews that opener; completion, cancellation and failed start revoke
+only the ending owner's authority. A crash or unavailable revoke is bounded by
+the independently renewed 90-second lease.
+
+The broker listens on a private worker port (`CURIE_ATTACHMENT_BROKER_PORT`,
+default `8093`) and accepts only internal worker authentication. Channel
+credentials stay in the worker. The API alone exposes the runner-facing facade;
+capabilities are carried on authenticated ACI events, never in boot environment
+variables. Broker concurrency defaults to eight transfers and each transfer has
+a 300-second deadline. Cache storage remains finite; an incomplete transfer or
+capacity failure returns no usable final path. Removing policy byte ceilings
+does not expand the sandbox's storage or memory resources.
+
+The Docker substrate uses a claim-owned named tmpfs volume, bounded by
+`CURIE_ATTACHMENT_CACHE_SIZE_BYTES` (default 512 MiB). These cached bytes consume
+effective memory resources in addition to the model process; a file under the
+volume capacity is not guaranteed to fit the runner's remaining memory. This is
+a resource capacity limit, not a catalog selection or per-file policy ceiling.

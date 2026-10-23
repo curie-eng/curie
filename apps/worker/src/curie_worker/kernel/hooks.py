@@ -201,6 +201,9 @@ async def _start_turn_under_hook_control(
     # reason, and only after the runner advertises enforcement does it ride
     # the event. Every open, the attachment handoff included, comes through.
     event = await self._with_channel_read(event, handle, remaining_s)
+    from .attachment_access import with_attachment_access
+
+    event = await with_attachment_access(self, event, handle, remaining_s)
     carry = constants._HOOK_RUN_CARRY.get()
     if carry is not None and carry.recorder is not None and carry.ref is not None:
         async with carry.recorder.start_guard(carry.ref) as allowed:

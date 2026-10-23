@@ -715,6 +715,7 @@ class FakeRunner:
         # None omits the key, as a runner that predates it does; anything else
         # is sent as is, so a test can advertise ``False`` or ``"true"``.
         self.channel_read_enforced: object = None
+        self.attachment_access_enforced: object = None
         # When set, /status answers 200 with no ``turn_active`` field.
         self.status_malformed = False
         self.status_delay_seconds = 0.0
@@ -770,6 +771,8 @@ class FakeRunner:
         }
         if self.tool_access_enforced is not None:
             body["tool_access"] = list(self.tool_access_enforced)
+        if self.attachment_access_enforced is not None:
+            body["attachment_access"] = self.attachment_access_enforced
         if self.channel_read_enforced is not None:
             body["channel_read"] = self.channel_read_enforced
         if request.path == "/v1/status":

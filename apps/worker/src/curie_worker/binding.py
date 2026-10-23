@@ -1404,6 +1404,11 @@ class BindingResolver:
             or None,
             deployment_environment=resolved.deployment_environment or None,
             fake_model=self._config.fake_model,
+            attachment_access_enabled=(
+                True
+                if self._config.attachment_enabled and self._config.attachment_mode == "lazy"
+                else None
+            ),
             credentials_ref=self._config.credentials,
             base_url=self._config.model_base_url,
             # The endpoint's declared wire protocol and credential key(s) (#514).
