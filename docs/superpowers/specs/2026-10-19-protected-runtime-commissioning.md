@@ -18,6 +18,12 @@ provisioning or activation evidence. The design choices that the Accepted ADRs
 leave to a realizing specification are fixed under
 [Design decisions](#design-decisions), each with the clauses it rests on.
 
+The evidence-composition clauses were amended on 2026-10-22 by
+[ADR 0241](../../adr/0241-a-commissioning-run-separates-destructive-trials-from-final-acceptance.md) and its
+[trial-series specification](2026-10-22-commissioning-trial-series.md).
+That amendment governs historical destructive trials, aggregate run custody
+and final-only acceptance. All other clauses remain in force.
+
 ## Scope
 
 In scope are the stages ADR 0236 plans: one disposable local Kubernetes
@@ -293,8 +299,12 @@ production and commissioning references refuse.
 <!-- @spec PROTECTED-COMMISSIONING-5 -->
 The operator command of ADR 0236 owns a unique installation, its labels and
 IDs, cleanup registered before startup, the exact image and configuration tuple,
-and one bounded campaign. Each case below needs a passing observation from this
-installation's own producers or from signed channel replies bound to it.
+and one precommitted bounded run containing separate destructive trials and a
+final accepting campaign. The exact inventory, permitted historical evidence,
+aggregate bounds and fresh final checks are defined by the
+[trial-series specification](2026-10-22-commissioning-trial-series.md). Each case
+below still needs a passing observation from this installation's own producers;
+the fixed signed guard channel does not attest arbitrary case results.
 
 Positive: a supplied synthetic alert arrives through signed ingress, a read-only
 turn reads the owned fixture, and a grounded reply reaches the operator's own
@@ -327,6 +337,11 @@ authorization state for the already measured production entry point. This
 clause demonstrates that transition against the existing production readers.
 If an implementation cannot hold every invariant below, this specification
 returns to ADR review; it does not redefine "unchanged tuple".
+
+For this clause, "the campaign" is the final accepting campaign of the
+[trial series](2026-10-22-commissioning-trial-series.md). Historical trial
+transitions finish before its premeasurement; no historical tuple is relabeled
+as the final tuple.
 
 Before the campaign the provisioner installs, and the campaign measures:
 
@@ -481,20 +496,26 @@ observed image IDs per platform, the launch projection digest, and pinned SDK
 primitive observations for that runner image and runtime profile. The verifier
 re-validates the binding on reuse.
 
-Installation observations are never reused: guard, RBAC, CNI and network
+Except for the explicitly precommitted historical destructive trials in the
+[trial-series specification](2026-10-22-commissioning-trial-series.md),
+installation observations are never reused: guard, RBAC, CNI and network
 enforcement, broker ACL and identity, credential separation, revocation,
 cleanup and the ingress to reply path. Installation A cannot qualify
 installation B. A broker `run_id` change, a new manifest, execution
 configuration, guard or bootstrap invalidates the bound campaign evidence and
-requires a new campaign against the new tuple.
+requires a new campaign against the new tuple. The trial-series exception
+retains the old observations only as authenticated transition history within
+one fresh run; it never treats them as fresh checks of the final epoch. The
+final campaign freshly observes the controls and delivery path required by that
+specification.
 
 ## Verification boundary
 
 Closed codec and pure binding tests prove grammar and refusal only. Real
 isolated Valkey tests prove the authenticated journal, reservation and restart
 behavior. Actual Kubernetes controls and pinned SDK tests prove preventive
-controls. Only the complete campaign of clause 5 on a fresh installation proves
-installation delivery. No slice claims production activation or release
+controls. Only the complete trial series and final campaign of clause 5 on a
+fresh installation proves installation delivery. No slice claims production activation or release
 eligibility.
 
 ## Design decisions
@@ -613,8 +634,8 @@ accept because the records they already require now exist.
 ### 5. Evidence bar
 
 An upstream automated remediation issue closes on evidence from a freshly
-commissioned disposable installation: the complete clause 5 campaign, accepted
-by the ADR 0236 verifier, on an installation created for that run. Code, fake
+commissioned disposable installation: the complete clause 5 trial series and
+final campaign, accepted by the independent verifier under ADRs 0236/0241, on an installation created for that run. Code, fake
 model plumbing, direct provider replies or a reused installation do not close
 it. Closing an upstream issue is not production activation: each production
 installation still runs its own campaign against its own final tuple and is
