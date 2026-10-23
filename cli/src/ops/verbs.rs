@@ -1098,22 +1098,6 @@ fn unresolved_context_error(
     )
 }
 
-pub fn cluster_message_context_error(
-    error: anyhow::Error,
-    context_resolved: bool,
-    available: &[String],
-) -> anyhow::Error {
-    if !context_resolved && is_connectivity_failure(&format!("{error:#}")) {
-        if let Some(diagnosis) = unresolved_context_error(context_resolved, false, false, available)
-        {
-            let message = diagnosis.message.clone();
-            let remedy = diagnosis.fix.clone();
-            return crate::exit::operator_context(diagnosis.into(), message, remedy);
-        }
-    }
-    error
-}
-
 /// Port-forward readiness budget for the credential health read; matches
 /// `message::start_port_forward`'s own readiness deadline.
 const HEALTH_PORT_FORWARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
@@ -5761,57 +5745,6 @@ mod tests {
     use super::*;
 
     use crate::ops::testsupport::*;
-
-    #[test]
-    fn unresolved_context_message_error_reuses_status_diagnosis_and_fix() {
-        for available in [vec![], vec!["pin-ctx".into(), "other-ctx".into()]] {
-            let expected = unresolved_context_error(false, false, false, &available).unwrap();
-            let error = anyhow::anyhow!("dial tcp [::1]:8080: connect: connection refused")
-                .context("could not inspect Helm state");
-            let actual = cluster_message_context_error(error, false, &available);
-            let diagnosis = actual
-                .chain()
-                .find_map(|cause| cause.downcast_ref::<crate::exit::CliError>())
-                .expect("shared structured diagnosis");
-            assert_eq!(diagnosis.message, expected.message);
-            assert_eq!(diagnosis.fix, expected.fix);
-            assert_eq!(diagnosis.class, expected.class);
-            assert_eq!(
-                crate::exit::classify(&actual),
-                (expected.class, expected.fix.clone())
-            );
-            assert_eq!(
-                crate::exit::present_error(&actual),
-                (expected.message, expected.fix)
-            );
-        }
-    }
-
-    #[test]
-    fn unresolved_context_message_error_preserves_resolved_and_nonconnectivity_failures() {
-        for (resolved, message) in [
-            (true, "dial tcp [::1]:8080: connect: connection refused"),
-            (false, "Error from server (Forbidden): deployments.apps is forbidden"),
-            (false, "Error: Kubernetes cluster unreachable: Unauthorized"),
-            (false, "Error: Kubernetes cluster unreachable: getting credentials: exec: executable missing"),
-            (false, "kubectl not found on PATH"),
-            (false, "malformed Helm release list JSON"),
-            (false, "release has not converged"),
-        ] {
-            let error = anyhow::anyhow!(message).context("message bootstrap");
-            let original = format!("{error:#}");
-            let actual = cluster_message_context_error(error, resolved, &[]);
-            assert_eq!(format!("{actual:#}"), original);
-            assert!(!actual.to_string().contains("no Kubernetes context"));
-        }
-        for (resolved, helm_ok, pods_listed) in [
-            (true, false, false),
-            (false, true, false),
-            (false, false, true),
-        ] {
-            assert!(unresolved_context_error(resolved, helm_ok, pods_listed, &[]).is_none());
-        }
-    }
 
     fn complete_teardown(
         helm: HelmOutcome,

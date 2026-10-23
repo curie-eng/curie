@@ -176,7 +176,6 @@ fn every_dry_run_verb_emits_json_object() {
         // branch; pre-fix that path emits exit 0 + empty stdout (the RED we want).
         let root = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
         let output = Command::new(bin())
-            .env("KUBECONFIG", "/dev/null")
             .current_dir(root)
             .args(&argv)
             .output()
@@ -234,7 +233,6 @@ fn observability_emits_json_object() {
     // `{"surfaces":[{"name","url"}]}` contract (empty-stdout was already fixed
     // by #456/PR#503, before this branch).
     let output = Command::new(bin())
-        .env("KUBECONFIG", "/dev/null")
         .args(["local", "observability", "--json"])
         .output()
         .expect("run curie local observability --json");
@@ -273,7 +271,6 @@ fn dry_run_json_masks_credentials() {
     // CARGO_MANIFEST_DIR). `--dry-run` never fetches or stats it.
     let chart = concat!(env!("CARGO_MANIFEST_DIR"), "/../charts/curie");
     let output = Command::new(bin())
-        .env("KUBECONFIG", "/dev/null")
         .args(["cluster", "up", "--chart", chart, "--dry-run", "--json"])
         .env("CURIE_MODEL_CREDENTIALS", "sk-ant-SECRETSENTINEL9999")
         .output()
@@ -315,7 +312,6 @@ fn dry_run_json_masks_credentials() {
 /// `--dry-run` touches no network.
 fn assert_eval_dry_run_plan(tier: &str) {
     let output = Command::new(bin())
-        .env("KUBECONFIG", "/dev/null")
         .args([tier, "eval", "--dry-run", "--json"])
         .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/weather"))
         .output()
@@ -445,7 +441,6 @@ fn assert_comms_dry_run_plan(tier: &str, extra: &[&str]) -> serde_json::Value {
     args.extend_from_slice(extra);
     args.extend_from_slice(&["--dry-run", "--json"]);
     let output = Command::new(bin())
-        .env("KUBECONFIG", "/dev/null")
         .args(&args)
         // The token flags default from these; remove them so an ambient shell
         // value can never influence the plan under test.
@@ -1394,7 +1389,6 @@ fn init_from_spec_emits_json_object() {
     let out_dir = tmp.path().join("bundle");
 
     let output = Command::new(bin())
-        .env("KUBECONFIG", tmp.path().join("kubeconfig"))
         .args([
             "init",
             "--from-spec",
@@ -1933,7 +1927,6 @@ fn run_cluster_deploy(fixture: ClusterDeployFixture) -> (Output, Vec<support::Re
     }
     command
         .env("PATH", stub_path(tools.path()))
-        .env("KUBECONFIG", tools.path().join("kubeconfig"))
         .env("CURIE_CONFIG_DIR", empty_config_dir.path())
         .env("NO_COLOR", "1")
         .env_remove("CURIE_API_URL")

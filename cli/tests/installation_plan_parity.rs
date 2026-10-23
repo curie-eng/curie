@@ -667,7 +667,6 @@ exit 0
             .args(globals)
             .args(args)
             .env("PATH", path)
-            .env("KUBECONFIG", self.temp.path().join("kubeconfig"))
             .env("CURIE_TEST_CALL_LOG", &self.log)
             .env("CURIE_TEST_MIGRATION_STATE", &self.migration_state)
             .env("CURIE_TEST_LAST_EXEC_SCRIPT", &self.last_exec_script)

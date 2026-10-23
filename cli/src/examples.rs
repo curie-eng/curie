@@ -396,18 +396,10 @@ impl InstallCommand {
     }
 
     fn display(&self, chart: &Path) -> String {
-        let mut parts = vec![self.program.to_string()];
-        let flag = match self.program {
-            "helm" => Some("--kube-context"),
-            "kubectl" => Some("--context"),
-            _ => None,
-        };
-        if let (Some(flag), Some(context)) = (flag, crate::kube_context::pinned_context_name()) {
-            parts.push(flag.to_string());
-            parts.push(crate::ops::shell_quote(context));
-        }
-        parts.extend(self.args.iter().map(|arg| arg.display(chart)));
-        parts.join(" ")
+        std::iter::once(self.program.to_string())
+            .chain(self.args.iter().map(|arg| arg.display(chart)))
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 }
 

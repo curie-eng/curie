@@ -9,12 +9,9 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 
 use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
-
-static PINNED_CONTEXT: OnceLock<String> = OnceLock::new();
 
 /// The resolved context and the cluster it points at.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -255,11 +252,6 @@ pub fn current_context_name() -> Option<String> {
         .map(|target| target.context)
 }
 
-/// The context successfully pinned for this process, if any.
-pub fn pinned_context_name() -> Option<&'static str> {
-    PINNED_CONTEXT.get().map(String::as_str)
-}
-
 /// Resolve and pin the Kubernetes context for this `curie cluster` process.
 ///
 /// With an explicit name, any failure to read the kubeconfig or an unknown name is an
@@ -294,7 +286,6 @@ pub fn pin_for_cluster_command(explicit: Option<&str>) -> Result<Option<KubeTarg
         // that reads the environment.
         std::env::set_var(key, value);
     }
-    let _ = PINNED_CONTEXT.set(target.context.clone());
     Ok(Some(target))
 }
 

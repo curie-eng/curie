@@ -85,7 +85,6 @@ fn local_eval_rejects_empty_whitespace_and_mixed_models_before_bundle_or_api_acc
             &api.base_url,
         ])
         .current_dir(empty_root.path())
-        .env("KUBECONFIG", empty_root.path().join("kubeconfig"))
         .env("CURIE_CONFIG_DIR", empty_root.path().join("config"))
         .env_remove("CURIE_API_URL")
         .env_remove("CURIE_API_KEY")
@@ -111,7 +110,6 @@ fn local_eval_rejects_empty_whitespace_and_mixed_models_before_bundle_or_api_acc
             &api.base_url,
         ])
         .current_dir(bundle.path())
-        .env("KUBECONFIG", bundle.path().join("kubeconfig"))
         .env("CURIE_CONFIG_DIR", bundle.path().join("config"))
         .env_remove("CURIE_API_URL")
         .env_remove("CURIE_API_KEY")
@@ -138,7 +136,6 @@ fn local_eval_rejects_empty_whitespace_and_mixed_models_before_bundle_or_api_acc
                 &api.base_url,
             ])
             .current_dir(bundle.path())
-            .env("KUBECONFIG", bundle.path().join("kubeconfig"))
             .env("CURIE_CONFIG_DIR", bundle.path().join("config"))
             .env_remove("CURIE_API_URL")
             .env_remove("CURIE_API_KEY")
@@ -183,7 +180,6 @@ fn cluster_eval_rejects_blank_models_before_bundle_or_cluster_tooling() {
                 "C0EXAMPLE1",
             ])
             .current_dir(cwd)
-            .env("KUBECONFIG", cwd.join("kubeconfig"))
             .env("CURIE_CONFIG_DIR", cwd.join("config"))
             .env("PATH", empty_path.path())
             .env_remove("CURIE_API_KEY")

@@ -534,19 +534,12 @@ impl RollbackFixture {
     }
 
     fn run(&self, extra: &[&str]) -> Output {
-        let home = self.dir.path().join("home");
-        let kubeconfig = home.join(".kube").join("config");
-        fs::create_dir_all(home.join(".kube")).expect("create private kubeconfig directory");
-        fs::write(&kubeconfig, "").expect("write empty kubeconfig");
         let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_curie"));
         cmd.args(["cluster", "rollback"])
             .args(["--namespace", "agent-ns", "--release", "prod-release"])
             .args(["--yes", "--json"])
             .args(extra)
             .env("PATH", fake_tool_path(self.dir.path()))
-            .env("HOME", &home)
-            .env("KUBECONFIG", &kubeconfig)
-            .env("TMPDIR", self.dir.path())
             .env("NO_COLOR", "1");
         cmd.output().expect("run curie cluster rollback")
     }
@@ -554,19 +547,12 @@ impl RollbackFixture {
     /// Same command as `run` but without `--json`, so the human error
     /// presenter (stderr `Error: <message>`) is what the caller observes.
     fn run_human(&self, extra: &[&str]) -> Output {
-        let home = self.dir.path().join("home");
-        let kubeconfig = home.join(".kube").join("config");
-        fs::create_dir_all(home.join(".kube")).expect("create private kubeconfig directory");
-        fs::write(&kubeconfig, "").expect("write empty kubeconfig");
         let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_curie"));
         cmd.args(["cluster", "rollback"])
             .args(["--namespace", "agent-ns", "--release", "prod-release"])
             .args(["--yes"])
             .args(extra)
             .env("PATH", fake_tool_path(self.dir.path()))
-            .env("HOME", &home)
-            .env("KUBECONFIG", &kubeconfig)
-            .env("TMPDIR", self.dir.path())
             .env("NO_COLOR", "1");
         cmd.output().expect("run curie cluster rollback")
     }
@@ -968,18 +954,11 @@ fn unambiguous_v090_does_not_read_retained_manifest() {
 }
 
 fn run_rollback_json(dir: &Path) -> std::process::Output {
-    let home = dir.join("home");
-    let kubeconfig = home.join(".kube").join("config");
-    fs::create_dir_all(home.join(".kube")).expect("create private kubeconfig directory");
-    fs::write(&kubeconfig, "").expect("write empty kubeconfig");
     std::process::Command::new(env!("CARGO_BIN_EXE_curie"))
         .args(["cluster", "rollback"])
         .args(["--namespace", "agent-ns", "--release", "prod-release"])
         .args(["--yes", "--json"])
         .env("PATH", fake_tool_path(dir))
-        .env("HOME", &home)
-        .env("KUBECONFIG", &kubeconfig)
-        .env("TMPDIR", dir)
         .env("NO_COLOR", "1")
         .output()
         .expect("run curie cluster rollback --json")

@@ -327,7 +327,6 @@ impl Fixture {
         command
             .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/.."))
             .env("PATH", std::env::join_paths(paths).unwrap())
-            .env("KUBECONFIG", self._temp.path().join("kubeconfig"))
             .env("CURIE_TEST_CLUSTER_STATE", &self.state)
             .env("CURIE_TEST_CLUSTER_LOG", &self.log)
             .env("CURIE_CONFIG_DIR", self._temp.path().join("config"))
@@ -431,7 +430,6 @@ impl Fixture {
             .args(["-c", command])
             .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/.."))
             .env("PATH", std::env::join_paths(paths).unwrap())
-            .env("KUBECONFIG", self._temp.path().join("kubeconfig"))
             .env("CURIE_TEST_CLUSTER_STATE", &self.state)
             .env("CURIE_TEST_CLUSTER_LOG", &self.log)
             .output()

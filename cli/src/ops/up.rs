@@ -5453,17 +5453,6 @@ pub enum ClusterUpOutput {
     Up { namespace: String, release: String },
 }
 
-fn status_hint(namespace: &str, release: &str, context: Option<&str>) -> String {
-    let context = context
-        .map(|context| format!(" --context {}", crate::ops::shell_quote(context)))
-        .unwrap_or_default();
-    format!(
-        "Run `curie cluster status{context} --namespace {} --release {}` for pod health and URLs.",
-        crate::ops::shell_quote(namespace),
-        crate::ops::shell_quote(release),
-    )
-}
-
 impl crate::ui::CliOutput for ClusterUpOutput {
     fn to_json(&self) -> serde_json::Value {
         match self {
@@ -5479,13 +5468,9 @@ impl crate::ui::CliOutput for ClusterUpOutput {
     fn render(&self, ui: &crate::ui::Ui) {
         match self {
             ClusterUpOutput::DryRun(plan) => plan.render(ui),
-            ClusterUpOutput::Up { namespace, release } => {
+            ClusterUpOutput::Up { .. } => {
                 ui.payload("curie is up");
-                ui.note(&status_hint(
-                    namespace,
-                    release,
-                    crate::kube_context::pinned_context_name(),
-                ));
+                ui.note("Run `curie cluster status` for pod health and URLs.");
             }
         }
     }
@@ -6443,22 +6428,6 @@ mod tests {
     use super::*;
 
     use crate::ops::testsupport::*;
-
-    #[test]
-    fn cluster_up_status_hint_context() {
-        assert_eq!(
-            status_hint("target-ns", "target-release", Some("pin-ctx")),
-            "Run `curie cluster status --context pin-ctx --namespace target-ns --release target-release` for pod health and URLs.",
-        );
-        assert_eq!(
-            status_hint("target-ns", "target-release", None),
-            "Run `curie cluster status --namespace target-ns --release target-release` for pod health and URLs.",
-        );
-        assert_eq!(
-            status_hint("ns space;$", "rel'quote", Some("ctx '$;\\name")),
-            r"Run `curie cluster status --context 'ctx '\''$;\name' --namespace 'ns space;$' --release 'rel'\''quote'` for pod health and URLs.",
-        );
-    }
 
     mod failed_first_revision_data_pvc_tests {
         use super::*;

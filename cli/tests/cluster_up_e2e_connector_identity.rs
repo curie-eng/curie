@@ -18,7 +18,6 @@ fn dry_run(extra: &[&str]) -> String {
         ])
         .args(extra)
         .env("HOME", home.path())
-        .env("KUBECONFIG", home.path().join(".kube/config"))
         .env("XDG_CONFIG_HOME", home.path())
         .env_remove("CURIE_CREDENTIALS")
         .env_remove("CURIE_MODEL_CREDENTIALS")

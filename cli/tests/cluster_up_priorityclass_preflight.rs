@@ -379,7 +379,6 @@ exit 0
         command
             .args(args)
             .env("PATH", path)
-            .env("KUBECONFIG", self._temp.path().join("kubeconfig"))
             .env("CI", "1")
             .env("TERM", "dumb")
             .env("NO_COLOR", "1")

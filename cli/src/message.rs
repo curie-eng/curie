@@ -404,7 +404,6 @@ pub struct MessageOpts {
     /// `--agent`: send as this agent's binding (ADR-0168 decision 8).
     pub agent: Option<String>,
     pub thread: Option<String>,
-    pub context: Option<String>,
     pub namespace: String,
     pub release: String,
     pub chart: String,
@@ -446,7 +445,6 @@ impl Default for MessageOpts {
             channel: None,
             agent: None,
             thread: None,
-            context: None,
             namespace: "curie".to_string(),
             release: "curie".to_string(),
             chart: "charts/curie".to_string(),
@@ -512,19 +510,12 @@ fn persist_and_hint(opts: &MessageOpts, verb: TurnVerb, channel: &str, thread_ts
     let ui = crate::ui::ui();
     let verb_str = match verb {
         TurnVerb::Local => format!("{} message", tier_str(verb)),
-        TurnVerb::Cluster => {
-            let context = opts
-                .context
-                .as_deref()
-                .map(|context| format!(" --context {}", crate::ops::shell_quote(context)))
-                .unwrap_or_default();
-            format!(
-                "{} message{context} --namespace {} --release {}",
-                tier_str(verb),
-                crate::ops::shell_quote(&opts.namespace),
-                crate::ops::shell_quote(&opts.release),
-            )
-        }
+        TurnVerb::Cluster => format!(
+            "{} message --namespace {} --release {}",
+            tier_str(verb),
+            crate::ops::shell_quote(&opts.namespace),
+            crate::ops::shell_quote(&opts.release),
+        ),
     };
     match save_turn_context(opts, verb, channel, thread_ts) {
         Ok(()) => ui.note(&continue_hint_line(&verb_str)),
@@ -3481,16 +3472,7 @@ pub async fn message(mut opts: MessageOpts) -> Result<()> {
     // against its ts with no per-turn endpoint, so the approval card and any
     // resumed reply ride the connected transport. A kubectl failure remains
     // fail-closed; only positively observed absence selects the built-in relay.
-    if dispatcher_connected_strict(&opts.namespace, &fullname)
-        .await
-        .map_err(|error| {
-            crate::ops::cluster_message_context_error(
-                error,
-                opts.context.is_some(),
-                &crate::kube_context::available_contexts(),
-            )
-        })?
-    {
+    if dispatcher_connected_strict(&opts.namespace, &fullname).await? {
         return message_connected(opts, &fullname).await;
     }
 
@@ -5207,28 +5189,19 @@ mod tests {
     const PERSIST_HINT_DRIVER: &str = "CURIE_TEST_PERSIST_HINT_DRIVER";
 
     fn capture_persist_hint(mode: &str) -> std::process::Output {
-        capture_persist_hint_state(mode).0
-    }
-
-    fn capture_persist_hint_state(mode: &str) -> (std::process::Output, Option<serde_json::Value>) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let output =
-            std::process::Command::new(std::env::current_exe().expect("current test binary"))
-                .args([
-                    "--exact",
-                    "message::tests::persist_and_hint_subprocess_driver",
-                    "--nocapture",
-                ])
-                .env(PERSIST_HINT_DRIVER, mode)
-                .env("NO_COLOR", "1")
-                .env("CI", "1")
-                .current_dir(dir.path())
-                .output()
-                .expect("run hint driver");
-        let state = std::fs::read_to_string(dir.path().join(".curie/last-turn.json"))
-            .ok()
-            .map(|raw| serde_json::from_str(&raw).expect("saved turn JSON"));
-        (output, state)
+        std::process::Command::new(std::env::current_exe().expect("current test binary"))
+            .args([
+                "--exact",
+                "message::tests::persist_and_hint_subprocess_driver",
+                "--nocapture",
+            ])
+            .env(PERSIST_HINT_DRIVER, mode)
+            .env("NO_COLOR", "1")
+            .env("CI", "1")
+            .current_dir(dir.path())
+            .output()
+            .expect("run hint driver")
     }
 
     fn captured_stderr(output: &std::process::Output) -> String {
@@ -5243,13 +5216,11 @@ mod tests {
         let mut opts = MessageOpts::default();
         match mode.as_str() {
             "cluster-short" => {
-                opts.context = Some("pin-ctx".into());
                 opts.namespace = "acme-platform".into();
                 opts.release = "acme-prod".into();
                 persist_and_hint(&opts, TurnVerb::Cluster, "C0EXAMPLE1", "1700000000.000100");
             }
             "cluster-fallback" => {
-                opts.context = Some("pin-ctx".into());
                 opts.namespace = "acme-platform".into();
                 opts.release = "acme-prod".into();
                 std::fs::write(".curie", "blocks the state directory")
@@ -5269,17 +5240,7 @@ mod tests {
                     .expect("create state obstruction");
                 persist_and_hint(&opts, TurnVerb::Cluster, "C0EXAMPLE1", "1700000000.000100");
             }
-            "cluster-context-special" | "cluster-context-special-fallback" => {
-                opts.context = Some("ctx '$;\\name".into());
-                opts.namespace = "ns space;$".into();
-                opts.release = "rel'quote".into();
-                if mode.ends_with("fallback") {
-                    std::fs::write(".curie", "obstruction").unwrap();
-                }
-                persist_and_hint(&opts, TurnVerb::Cluster, "C0EXAMPLE1", "1700000000.000100");
-            }
             "local" => {
-                opts.context = Some("must-not-appear".into());
                 opts.namespace = "must-not-appear".into();
                 opts.release = "must-not-appear".into();
                 persist_and_hint(&opts, TurnVerb::Local, "C0EXAMPLE1", "1700000000.000100");
@@ -5370,59 +5331,6 @@ mod tests {
                     case.name
                 );
             }
-        }
-    }
-
-    #[test]
-    fn continue_hint_context_short_and_fallback() {
-        for mode in ["cluster-short", "cluster-fallback"] {
-            let (output, state) = capture_persist_hint_state(mode);
-            let text = captured_stderr(&output);
-            assert!(output.status.success(), "{mode}: {text}");
-            assert!(text.contains(
-                "curie cluster message --context pin-ctx --namespace acme-platform --release acme-prod"
-            ), "{mode}: {text}");
-            if mode == "cluster-short" {
-                assert!(text.contains("--continue"), "{text}");
-                assert_eq!(state.unwrap()["context"], "pin-ctx");
-            } else {
-                assert!(text.contains("could not save turn context"), "{text}");
-                assert!(
-                    text.contains("--channel 'C0EXAMPLE1' --thread 1700000000.000100"),
-                    "{text}"
-                );
-                assert!(!text.contains("--continue"), "{text}");
-                assert!(state.is_none());
-            }
-        }
-    }
-
-    #[test]
-    fn continue_hint_without_context_and_local() {
-        for mode in ["cluster-default", "cluster-default-fallback", "local"] {
-            let output = capture_persist_hint(mode);
-            let text = captured_stderr(&output);
-            assert!(output.status.success(), "{mode}: {text}");
-            assert!(!text.contains("--context"), "{mode}: {text}");
-            if mode == "local" {
-                assert!(text.contains("curie local message --continue"), "{text}");
-                assert!(!text.contains("must-not-appear"), "{text}");
-            }
-        }
-    }
-
-    #[test]
-    fn continue_hint_context_quotes_special_characters_in_both_branches() {
-        for mode in [
-            "cluster-context-special",
-            "cluster-context-special-fallback",
-        ] {
-            let output = capture_persist_hint(mode);
-            let text = captured_stderr(&output);
-            assert!(output.status.success(), "{mode}: {text}");
-            assert!(text.contains(
-                r"curie cluster message --context 'ctx '\''$;\name' --namespace 'ns space;$' --release 'rel'\''quote'"
-            ), "{mode}: {text}");
         }
     }
 
@@ -6778,7 +6686,6 @@ mod tests {
         MessageOpts {
             text: "hi".into(),
             channel: channel.map(str::to_string),
-            context: None,
             agent: None,
             thread: None,
             namespace: "curie".into(),

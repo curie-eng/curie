@@ -652,7 +652,6 @@ impl FakeCluster {
         command
             .args(&args)
             .env("PATH", self.child_path())
-            .env("KUBECONFIG", self.dir.path().join("kubeconfig"))
             .env("FAKE_CLUSTER_STATE", self.state())
             .env("FAKE_CLUSTER_SCENARIO", scenario)
             .env("FAKE_SENSITIVE_SENTINEL", sensitive_stderr_sentinel())

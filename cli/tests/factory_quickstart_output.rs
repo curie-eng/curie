@@ -2381,10 +2381,7 @@ fn debug_reveals_chained_detail_and_default_failure_reports_one_pathless_error()
     let fixture = Fixture::new();
     let (code, shown) = fixture.run(false, &["--debug", "--color", "never"]);
     assert_eq!(code, 0, "{shown}");
-    assert!(
-        shown.contains("helm --kube-context kind-curie-factory upgrade --install"),
-        "{shown}"
-    );
+    assert!(shown.contains("helm upgrade"), "{shown}");
     assert!(shown.contains("Release accepted"), "{shown}");
     // A fresh fixture is not yet at the target release, so this failure still
     // enters cluster up. The debug run above already is, and would skip it.

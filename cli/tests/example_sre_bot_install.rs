@@ -46,7 +46,6 @@ fn repo_root() -> PathBuf {
 #[test]
 fn observability_only_plan_never_touches_the_curie_release_or_bot() {
     let output = Command::new(bin())
-        .env("KUBECONFIG", "/dev/null")
         .args([
             "--json",
             "example",
@@ -83,7 +82,6 @@ fn observability_only_plan_never_touches_the_curie_release_or_bot() {
         );
     }
     let conflicting = Command::new(bin())
-        .env("KUBECONFIG", "/dev/null")
         .args([
             "example",
             "sre-bot",
@@ -143,7 +141,6 @@ fn render_writes_a_deployable_runtime_bundle_without_cluster_mutation() {
     let fixture = Fixture::new(nodes(vec![]), pods(vec![]));
     let out = fixture._temp.path().join("nested/rendered-bot");
     let output = Command::new(bin())
-        .env("KUBECONFIG", fixture._temp.path().join("kubeconfig"))
         .args([
             "--json",
             "example",
@@ -184,7 +181,6 @@ fn render_writes_a_deployable_runtime_bundle_without_cluster_mutation() {
     assert!(fixture.helm_calls().is_empty() && fixture.kubectl_calls().is_empty());
     let previous_connectors = fs::read(out.join("connectors.yaml")).unwrap();
     let second = Command::new(bin())
-        .env("KUBECONFIG", fixture._temp.path().join("kubeconfig"))
         .args([
             "example",
             "sre-bot",
@@ -213,7 +209,6 @@ fn render_platform_upgrade_keeps_only_the_gated_upgrade_path_and_custom_namespac
     let fixture = Fixture::new(nodes(vec![]), pods(vec![]));
     let out = fixture._temp.path().join("rendered-upgrade-bot");
     let output = Command::new(bin())
-        .env("KUBECONFIG", fixture._temp.path().join("kubeconfig"))
         .args([
             "example",
             "sre-bot",
@@ -921,7 +916,6 @@ exit 64
             .current_dir(current_dir)
             .args(args)
             .env("PATH", path)
-            .env("KUBECONFIG", self._temp.path().join("kubeconfig"))
             .env("CI", "1")
             .env("TERM", "dumb")
             .env("NO_COLOR", "1")
@@ -1496,7 +1490,6 @@ fn assert_refused_before_helm(fixture: &Fixture, output: &Output) -> String {
 #[test]
 fn clap_routes_install_and_exposes_no_operator_configuration_or_credential_flags() {
     let output = Command::new(bin())
-        .env("KUBECONFIG", "/dev/null")
         .args(["example", "sre-bot", "install", "--help"])
         .output()
         .expect("run example installer help");
