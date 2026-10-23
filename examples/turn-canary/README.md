@@ -90,7 +90,10 @@ kind, address, conversation ID, reply reference and completion event ID. Malform
 unrelated or duplicate observed completions fail closed. Status and progress
 alone do not count as a text answer. Exact nonce success still controls the last
 success timestamps, cycle success and one-shot exit code. The new gauge shares
-the selected route label layout and metric prefix.
+the selected route label layout and metric prefix. Exact nonce success retains
+its original last-update and event-type rules: a later progress update or a
+`reply.post` cannot turn a previously failing sequence into success. An approval
+pause is unsuccessful even though its relay page remains nonterminal.
 
 The exporter retains delivery observations across skipped or held cycles and
 removes them when a successful inventory read drops their route. Delivery is not

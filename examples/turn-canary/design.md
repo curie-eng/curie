@@ -57,7 +57,11 @@ adapter is connected.
   Delivery is lifecycle evidence, not proof of model execution, useful task
   completion, policy compliance or final-text provenance. Exact nonce success,
   last-success timestamps, cycle success and exit status keep their existing
-  meaning.
+  meaning: exact success uses the last `reply.update` literally, including a
+  progress edit, and accepts only `reply.update`, `turn.status` and
+  `turn.completed` event types. A valid `reply.post` therefore cannot broaden
+  exact success. An `awaiting-approval` completion uses the relay's nonterminal
+  page shape and fails the probe as `not_delivered`.
 
 - **TURN-CANARY-4: owned cleanup.** After every enqueued probe, including
   timeout and error paths, the checker computes the worker thread key with
