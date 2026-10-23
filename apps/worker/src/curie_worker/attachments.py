@@ -911,6 +911,12 @@ def _slack_transport(
         try:
             with response:
                 while True:
+                    # read1 closes the socket after the final Content-Length
+                    # byte. Honor cancellation, then finish without touching it.
+                    if response.length == 0:
+                        if scope is not None:
+                            scope.remaining()
+                        break
                     if scope is not None and owned is not None:
                         owned.settimeout(min(30.0, scope.remaining()))
                     chunk = response.read1(chunk_bytes)
