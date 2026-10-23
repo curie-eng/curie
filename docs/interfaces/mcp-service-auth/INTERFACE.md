@@ -180,7 +180,9 @@ with no fallback between the two modes.
    the caller token's strict parse. The proxy checks, in order, that it is
    unexpired and names this application, the binding it read this call, the
    request's alias, the tool, the call's argument digest and the current policy
-   generation, and only then, after every other check, spends the `jti` as
+   generation, and only then, after every other check and after the call holds
+   an invocation slot (so a call refused `invocations_full` never burns its
+   grant), spends the `jti` as
    `SET connector-shared-grant:<jti> 1 NX EX max(exp - now, 1)` in Valkey through
    the URL in `CURIE_SHARED_GRANT_STORE_FILE`. A mismatched grant is never
    spent, the key is global so one grant spends once whichever alias presents

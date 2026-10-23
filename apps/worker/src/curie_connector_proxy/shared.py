@@ -18,7 +18,7 @@ answers before anything reaches the server:
 3. A presented ``Mcp-Session-Id`` must be one this proxy recorded, for the same
    installation, application, agent and alias. Ownership is proved here,
    before any refusal below may close the session.
-4. The body, at most 1 MiB.
+4. The body, at most 1 MiB and not content-encoded, since it is relayed undecoded.
 5. One read-only REPEATABLE READ transaction through the application's own
    role (the resolver's pool) reads the application, the agent's alias row and
    its binding. Nothing is cached; any database failure is ``store_unavailable``.
@@ -28,8 +28,9 @@ answers before anything reaches the server:
    both allow, with the token's own run pair when the tool is a run tool, and a
    matching ``csg`` grant when it is gated.
 7. A session-less request reserves a session slot, a ``tools/call`` reserves its
-   cancellation key, a gated call spends its grant in Valkey, and only then is
-   the handle registered, immediately before the upstream request. Closing the
+   cancellation key and an invocation slot, a gated call spends its grant in
+   Valkey (so no capacity refusal can follow a spend), and only then is the
+   handle registered, immediately before the upstream request. Closing the
    invocation in ``finally`` removes the handle on completion, on an upstream
    error and on cancellation alike.
 
@@ -126,6 +127,7 @@ SESSIONS_FULL = "sessions_full"
 INVOCATIONS_FULL = "invocations_full"
 REQUEST_ID_IN_USE = "request_id_in_use"
 BODY_TOO_LARGE = "body_too_large"
+BODY_ENCODING_UNSUPPORTED = "body_encoding_unsupported"
 GRANT_REQUIRED = caller.GRANT_REQUIRED
 STORE_UNAVAILABLE = "store_unavailable"
 
@@ -155,6 +157,7 @@ REFUSALS: Mapping[str, tuple[int, str]] = MappingProxyType(
         INVOCATIONS_FULL: (403, NOT_ADMITTED),
         REQUEST_ID_IN_USE: (403, NOT_ADMITTED),
         BODY_TOO_LARGE: (403, NOT_ADMITTED),
+        BODY_ENCODING_UNSUPPORTED: (403, NOT_ADMITTED),
         GRANT_REQUIRED: (403, GRANT_REQUIRED),
         STORE_UNAVAILABLE: (503, NOT_ADMITTED),
     }
@@ -475,6 +478,20 @@ def _alias(headers: CIMultiDictProxy[str]) -> str:
     return presented[0]
 
 
+def _identity_encoded(headers: CIMultiDictProxy[str]) -> None:
+    """Refuse a ``Content-Encoding`` other than ``identity``.
+
+    The proxy relays a body as sent and never decodes it, so an encoded body
+    is one it cannot read: a ``tools/call`` inside it would reach a decoding
+    server with no policy, run or grant check. Any coding but a lone
+    ``identity`` refuses, a list such as ``gzip, gzip`` included.
+    """
+
+    for value in headers.getall("Content-Encoding", []):
+        if value.strip().lower() != "identity":
+            raise SharedRefusal(BODY_ENCODING_UNSUPPORTED)
+
+
 async def _read_body(request: web.Request) -> bytes | None:
     if not request.body_exists:
         return None
@@ -582,6 +599,7 @@ class _Exchange:
     principal: Principal | None = None
     stamp: str = ""
     reserved_slot: bool = False
+    reserved_invocation: bool = False
     key: _Key | None = None
     pending: _Pending | None = None
     invocation: Invocation | None = None
@@ -607,6 +625,9 @@ class _SharedProxy:
         self.clock = clock
         self.sessions: dict[str, _Session] = {}
         self.reserved_sessions = 0
+        # Invocation slots held by calls between their capacity check and their
+        # registration, which a grant spend awaits in.
+        self.reserved_invocations = 0
         self.pending: dict[_Key, _Pending] = {}
         self.upstream: ClientSession | None = None
 
@@ -635,6 +656,25 @@ class _SharedProxy:
         if self.registry.sessions + self.reserved_sessions >= self.registry.max_sessions:
             raise SharedRefusal(SESSIONS_FULL)
         self.reserved_sessions += 1
+
+    def _reserve_invocation(self, exchange: _Exchange) -> None:
+        """Hold one invocation slot, so no later refusal is for capacity.
+
+        Checked with the registry's live count and taken with no ``await``
+        between, so a grant spent after this is never burned by
+        ``invocations_full``.
+        """
+
+        registry = self.registry
+        if registry.active_invocations + self.reserved_invocations >= registry.max_invocations:
+            raise SharedRefusal(INVOCATIONS_FULL)
+        self.reserved_invocations += 1
+        exchange.reserved_invocation = True
+
+    def _release_invocation(self, exchange: _Exchange) -> None:
+        if exchange.reserved_invocation:
+            exchange.reserved_invocation = False
+            self.reserved_invocations -= 1
 
     def _owned_session(
         self, request: web.Request, verified: _Caller, alias: str
@@ -674,13 +714,22 @@ class _SharedProxy:
             self.registry.open_session(session_id, principal)
         except RegistryRefusal as refusal:
             raise SharedRefusal(_registry_code(refusal.code)) from None
-        if existing is None:
-            self.sessions[session_id] = _Session(
+        row = existing
+        if row is None:
+            row = self.sessions[session_id] = _Session(
                 principal=principal,
                 alias=exchange.alias,
                 stamp=exchange.stamp,
                 last_used=self.clock(),
             )
+        # The reservation becomes the session in the same step, so it counts
+        # once; and the opening exchange, which may still be streaming, is in
+        # flight on it, so idle pruning never takes it while open.
+        if exchange.reserved_slot:
+            exchange.reserved_slot = False
+            self.reserved_sessions -= 1
+        row.in_flight += 1
+        exchange.row = row
 
     # --- cancellation and grants ----------------------------------------------------
 
@@ -791,6 +840,7 @@ class _SharedProxy:
             exchange.session_id,
             exchange.row,
         )
+        _identity_encoded(request.headers)
         exchange.body = await _read_body(request)
         messages = _messages(exchange.body) if request.method == "POST" else ()
         try:
@@ -849,6 +899,8 @@ class _SharedProxy:
                     raise SharedRefusal(REQUEST_ID_IN_USE)
                 exchange.key, exchange.pending = key, _Pending()
                 self.pending[key] = exchange.pending
+        if call is not None:
+            self._reserve_invocation(exchange)
         if grant is not None:
             await self._spend(grant, now)
         for message in messages:
@@ -865,6 +917,8 @@ class _SharedProxy:
                 work_item=work_item,
                 session_id=session_id,
             )
+            # The held slot becomes the registered invocation in one step.
+            self._release_invocation(exchange)
             try:
                 exchange.invocation = self.registry.register(context)
             except RegistryRefusal as refusal:
@@ -883,6 +937,7 @@ class _SharedProxy:
             exchange.invocation.close()
         if exchange.key is not None and self.pending.get(exchange.key) is exchange.pending:
             del self.pending[exchange.key]
+        self._release_invocation(exchange)
         if exchange.reserved_slot:
             exchange.reserved_slot = False
             self.reserved_sessions -= 1

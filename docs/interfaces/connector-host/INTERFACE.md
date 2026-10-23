@@ -306,7 +306,10 @@ anything reaches the server:
 3. A presented session must be one this proxy recorded for the same
    installation, application, agent and alias. Ownership is proved here, before
    any refusal below may close the session.
-4. The body, at most 1 MiB.
+4. The body, at most 1 MiB, with no `Content-Encoding` other than `identity`.
+   The proxy relays a body as sent and never decodes it, so it refuses a body
+   it cannot read as JSON (any other coding, or a list such as `gzip, gzip`)
+   with `body_encoding_unsupported`, whatever the method.
 5. One read-only REPEATABLE READ transaction through the application's own role
    (the resolver's pool) reads the application, the agent's alias row and its
    binding, on every call and never cached. Membership and tool names are never
@@ -319,8 +322,10 @@ anything reaches the server:
 8. A tool in the policy's `gated_tools` needs a matching `csg` grant, described
    in [mcp-service-auth](../mcp-service-auth/INTERFACE.md).
 9. A request without a session reserves a session slot, a `tools/call` with an
-   `id` reserves its cancellation key, a gated call spends its grant, and only
-   then is the handle registered, immediately before the upstream request.
+   `id` reserves its cancellation key, a `tools/call` reserves an invocation
+   slot, a gated call spends its grant, and only then is the handle registered,
+   immediately before the upstream request. A call refused for capacity is
+   refused before its grant is spent, so it never burns one.
 
 The forward strips every hop-by-hop header, every header whose name starts with
 `x-curie-` (the caller token, the grant, the alias, any `X-Curie-Agent`,
@@ -368,6 +373,7 @@ table is frozen in `tests/vectors/connector-shared-caller.json`
 | `invocations_full` | 403 | `not_admitted` |
 | `request_id_in_use` | 403 | `not_admitted` |
 | `body_too_large` | 403 | `not_admitted` |
+| `body_encoding_unsupported` | 403 | `not_admitted` |
 | `grant_required` | 403 | `grant_required` |
 | `store_unavailable` | 503 | `not_admitted` |
 
@@ -377,7 +383,10 @@ Unlike dedicated mode, a body over 1 MiB gets this JSON refusal.
 Sessions and cancellation:
 
 1. A request without `Mcp-Session-Id` whose response carries one opens that
-   session for the caller's principal and alias. Another agent, or the same
+   session for the caller's principal and alias. Its session slot reservation
+   becomes the session, so it counts once toward the bound, and the opening
+   exchange counts as in flight on it until its response finishes streaming.
+   The session accepts other requests while that stream is still open. Another agent, or the same
    agent through another alias, presenting it is `session_principal_mismatch`
    and leaves it intact; an ID the proxy never recorded is `session_unknown`.
 2. A session keeps the membership stamp of its owner's alias row
@@ -389,7 +398,8 @@ Sessions and cancellation:
 3. `DELETE` with the session forwards, then closes it. An idle session, unused
    for an hour (`session_idle_seconds`) with no exchange in flight, is reclaimed
    before the session bound is checked. An open `GET` stream or a running call
-   keeps a session from being reclaimed, and no tool timeout is imposed.
+   (the opening one included) keeps a session from being reclaimed, and no tool
+   timeout is imposed.
 4. An authenticated `notifications/cancelled` whose `params.requestId` names a
    live `tools/call` of the same agent, alias and session revokes that call's
    handle before the notification is forwarded. One from another agent, alias or
