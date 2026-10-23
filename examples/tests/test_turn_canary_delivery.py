@@ -8,7 +8,7 @@ import copy
 import json
 
 import pytest
-from channel_protocol import ReplyUpdate, TurnStatus
+from channel_protocol import OutboundMessage, ReplyPost, ReplyUpdate, TurnStatus
 from channel_protocol.progress import ProgressCard
 
 from examples.tests.test_turn_canary import (
@@ -188,8 +188,7 @@ def test_delivered_mismatch_exports_delivery_without_success_or_content():
     }
     assert (
         'target_delivery_success{agent="sample-agent",kind="slack",'
-        'address="C-EXAMPLE-1",adapter="blue"} 1'
-        in canary.prometheus_text(result, labels="split")
+        'address="C-EXAMPLE-1",adapter="blue"} 1' in canary.prometheus_text(result, labels="split")
     )
 
 
@@ -348,3 +347,68 @@ def test_latest_blank_text_overrides_earlier_nonce():
     result = canary.assess_relay(events, nonce="nonce-1", turn=turn)
     assert not result.exact_nonce and not result.delivery_success
     assert result.reason == "blank_reply"
+
+
+@pytest.mark.parametrize("extra_event", ["progress_update", "reply_post"])
+def test_delivery_evidence_does_not_broaden_legacy_nonce_success(extra_event):
+    """Retain the original last-update and allowed-event rules. @spec TURN-CANARY-3"""
+    canary = _canary()
+
+    class ExtraEvent(DeliveryPlatform):
+        async def replies(self, reply_ref, after):
+            nonce = self.turn.text.split("no other text: ")[1].split(". Do not")[0]
+            events = reply_events(self.turn, nonce)
+            if extra_event == "progress_update":
+                extra = ReplyUpdate(
+                    version="1.1",
+                    event="reply.update",
+                    target=target_for(self.turn),
+                    delivery_id="00000000-0000-4000-8000-000000000002",
+                    progress=ProgressCard(
+                        kind="card", state="complete", summary="Done", revision=1, terminal=True
+                    ),
+                )
+            else:
+                extra = ReplyPost(
+                    version="1.0",
+                    event="reply.post",
+                    target=target_for(self.turn),
+                    message=OutboundMessage(version="1.0", text="Synthetic platform notice"),
+                    requested_by="turn-canary",
+                )
+            events.insert(1, extra.model_dump(mode="json"))
+            self.events = events
+            self.nonce = nonce
+            return {"events": events, "next_cursor": 3, "terminal": True}
+
+    platform = ExtraEvent()
+    result = cycle(canary, platform)
+    observed = canary.assess_relay(platform.events, nonce=platform.nonce, turn=platform.turn)
+    assert observed.delivery_success is True
+    assert observed.exact_nonce is False
+    assert canary.relay_outcome(platform.events, nonce=platform.nonce, turn=platform.turn) is False
+    assert result.target_delivery_success == {ROUTE: True}
+    assert result.target_success == {ROUTE: False}
+    assert not result.success and result.last_success is None and result.target_last_success == {}
+
+
+def test_awaiting_approval_uses_nonterminal_production_page_shape():
+    """The relay keeps approval pauses nonterminal. @spec TURN-CANARY-3"""
+    canary = _canary()
+
+    class AwaitingApproval(DeliveryPlatform):
+        async def replies(self, reply_ref, after):
+            # apps/api/src/curie_api/routers/cluster_message_replies.py::_is_terminal
+            # deliberately excludes awaiting-approval because resumed events reuse the bucket.
+            return {
+                "events": reply_events(self.turn, outcome="awaiting-approval"),
+                "next_cursor": 2,
+                "terminal": False,
+            }
+
+    platform = AwaitingApproval()
+    result = cycle(canary, platform)
+    assert result.target_delivery_success == {ROUTE: False}
+    assert result.target_success == {ROUTE: False}
+    assert {"phase": "relay", "outcome": "not_delivered"} in result.logs
+    assert not result.success and not result.cleanup_degraded and platform.active == 0

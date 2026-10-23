@@ -687,15 +687,22 @@ def assess_relay(
         return RelayAssessment(reason="wrong_event_id")
     if completed[0].outcome != "delivered":
         return RelayAssessment(reason="not_delivered")
-    updates = [
-        event for event in parsed if isinstance(event, ReplyUpdate) and event.progress is None
-    ]
-    text = updates[-1].text if updates else None
+    updates = [event for event in parsed if isinstance(event, ReplyUpdate)]
+    # Delivery observations must not broaden the original exact nonce verdict:
+    # its last update includes progress edits, and reply.post was never allowed.
+    exact = (
+        bool(updates)
+        and updates[-1].text == nonce
+        and all(
+            event.event in {"reply.update", "turn.completed", "turn.status"} for event in parsed
+        )
+    )
+    answers = [event for event in updates if event.progress is None]
+    text = answers[-1].text if answers else None
     if text is None:
-        return RelayAssessment(reason="missing_reply")
+        return RelayAssessment(exact_nonce=exact, reason="missing_reply")
     if not text.strip():
-        return RelayAssessment(reason="blank_reply")
-    exact = text == nonce
+        return RelayAssessment(exact_nonce=exact, reason="blank_reply")
     return RelayAssessment(exact, True, "exact_nonce" if exact else "nonce_mismatch")
 
 
@@ -755,7 +762,14 @@ async def _await_relay(
                 }:
                     return observed
                 completed = observed.reason != "missing_completion"
-                if page["terminal"] != completed:
+                # The production relay keeps awaiting-approval nonterminal so a
+                # resumed turn can reuse the bucket. It still fails this probe.
+                terminal = any(
+                    item.get("event") == "turn.completed"
+                    and item.get("outcome") != "awaiting-approval"
+                    for item in events
+                )
+                if page["terminal"] != terminal:
                     return RelayAssessment(reason="terminal_mismatch")
                 if completed:
                     return observed
