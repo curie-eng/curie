@@ -1367,7 +1367,9 @@ ServiceAccount enforce the shape (Kubernetes 1.30 or newer, rendered with
 - `<fullname>-runner-claim-cleanup` lets the worker delete only SandboxTemplates
   labelled `curietech.ai/sandbox-claim`, never the chart's.
 - `<fullname>-worker-secrets` lets the worker create only Opaque `*-tokens`
-  Secrets labelled `curietech.ai/sandbox-claim` in the release namespace.
+  Secrets labelled `curietech.ai/sandbox-claim` in the release namespace, plus
+  the two shared connector application Secret shapes described under
+  "Shared connector applications" below.
 
 The chart also refuses a runner `eks.amazonaws.com/role-arn` that equals the api,
 worker, or langfuse ServiceAccount's. It cannot see the role's IAM policy or an
@@ -1567,6 +1569,44 @@ Valkey port rule; the release app peer, Valkey default-deny policy, and all
 other NetworkPolicies remain. The value must be a boolean. It does not replace
 caller-proxy preflight or the chart's NetworkPolicy verification. See
 [issue #4318](https://github.com/curie-eng/curie/issues/4318).
+
+**Shared connector applications (ADR 0239).** `sharedConnectors.enabled`
+(default `false`) is one switch for every root network policy a shared
+connector application Pod needs. Off, nothing renders and the data tier is
+unchanged. On, the Postgres and Valkey allow-ingress policies of the data tier
+rail each gain one peer: Pods labelled `app.kubernetes.io/part-of: <release>`,
+`app.kubernetes.io/component: shared-connector-application` and any
+`curietech.ai/shared-application`, same namespace, on that store's port only.
+Three egress policies select the same Pods:
+`<fullname>-shared-app-allow-dns` (the runner's DNS egress),
+`<fullname>-shared-app-allow-grant-store` (this release's Valkey on 6379, or
+`sharedConnectors.grantStoreEgress` when `valkey.deploy` is `false`, where it
+is required), and one `<fullname>-shared-<uuid>-allow-egress` per
+`sharedConnectors.applicationEgress` key, which must be a canonical lowercase
+application UUID. Egress entries take the `agentSandbox.connectorEgress` floor:
+no default route, nothing shorter than /8 (IPv4) or /32 (IPv6), never the cloud
+metadata address, and a concrete port on every entry. Database egress is not
+here; the application's own rendered policy allows only its registered
+database target.
+
+The worker creates two Secrets per shared application in the release
+namespace, once, and never patches them: `shared-key-<uuid>` holding only
+`private-keys`, and, for a bundled database, `shared-dsn-<uuid>` holding only
+`sealed-dsn`. Both are Opaque and labelled `curietech.ai/shared-application:
+<uuid>`, `curietech.ai/shared-secret: encryption-key` or `database-dsn`, and
+`app.kubernetes.io/component: shared-connector-application`. The
+`<fullname>-worker-secrets` policy admits exactly those shapes and refuses a
+`*-tokens` Secret that carries either shared label. The API holds no Secret
+access, and the worker's Role is unchanged.
+
+The API publishes its connector caller verify keys into
+`shared_connector_caller_keys` and `shared_connector_caller_key_heartbeats`,
+which every shared application's resolver reads before admitting a caller.
+Bundled roles the API provisions are granted `SELECT` on both tables
+(migration 0125 grants it to roles that already exist). An
+operator-managed database role must be granted `SELECT` on both tables as well,
+alongside the other shared connector tables, or the resolver's pre-activation
+privilege check refuses to start the application.
 
 **gVisor needs runsc on the node**, and `security.gvisor.mode` is a tri-state
 (default `auto`):

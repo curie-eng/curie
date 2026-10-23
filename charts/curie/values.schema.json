@@ -555,6 +555,19 @@
         }
       }
     },
+    "sharedConnectors": {
+      "type": "object",
+      "description": "Root network policies for shared connector applications (ADR 0239). A new key, read in the templates through default dict so a --reuse-values upgrade from a release without it still renders; enabled is a boolean, so a quoted \"true\" cannot turn it on. The egress entries are validated in the template against the egress floor.",
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "applicationEgress": {
+          "type": "object",
+          "propertyNames": {"pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},
+          "additionalProperties": {"type": "array", "items": {"type": "object"}}
+        },
+        "grantStoreEgress": {"type": "array", "items": {"type": "object"}}
+      }
+    },
     "remediation": {
       "type": "object",
       "description": "The automated remediation switch (AUTOMATED-REMEDIATION-1), rendered into both the API and the worker. Requires actionExecutor.enabled. A boolean, so a quoted \"true\" cannot turn it on.",

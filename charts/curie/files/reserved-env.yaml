@@ -149,6 +149,7 @@ api:
   CURIE_E2E_WORKER_CLUSTER_ROLE: e2eConnector.workerClusterRole
   CURIE_FORGES: factory.codeHosts / factory.trackers / factory.bindings
   CURIE_INSTALLATION_ID: the release-managed installation identity (remove this override)
+  CURIE_INSTALLATION_ID_OBSERVED: the release-managed installation identity (remove this override)
   CURIE_INTERNAL_WORKER_TOKEN: worker.internalWorkerToken
   CURIE_PUBLICATION_PATCH_MAX_BYTES: worker.publication.patchMaxBytes
   CURIE_PUBLICATION_RETENTION_SECONDS: worker.publication.retentionSeconds

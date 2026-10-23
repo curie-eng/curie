@@ -237,6 +237,13 @@ spec:
                   name: {{ include "curie.secretName" . }}
                   key: installationId
                   optional: false
+            # Whether this render observed the installation identity (ADR 0239).
+            # The same helper hands the upgrade drain hook its
+            # --installation-id-observed, so the API and the hook never disagree.
+            # Shared connector routes and the caller key publisher refuse an
+            # unobserved installation.
+            - name: CURIE_INSTALLATION_ID_OBSERVED
+              value: {{ include "curie.installationIdObserved" . | quote }}
             # The action executor switch (ACTION-EXECUTOR-1). The worker
             # renders the same value from the same helper; the two must never
             # differ.

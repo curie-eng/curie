@@ -214,6 +214,12 @@ jobs:
       - name: helm render assertions (MCP connector Valkey ingress opt-out)
         run: bash charts/curie/ci/mcp-valkey-ingress-optout-assertions.sh
 
+      - name: helm render assertions (shared connector admission)
+        run: bash charts/curie/ci/shared-connector-admission-assertions.sh
+
+      - name: helm render assertions (shared connector network)
+        run: bash charts/curie/ci/shared-connector-network-assertions.sh
+
       # Prove the api reads runner pods for the Logs tab from the release
       # namespace, the same namespace the worker claims sandboxes in.
       - name: helm render assertions (api runner namespace)
