@@ -1005,6 +1005,10 @@ fn fake_helm_dir(history_json: &str) -> tempfile::TempDir {
 /// `curie cluster rollback` against that fake helm, with PATH scoped to the
 /// child process.
 fn run_rollback(dir: &Path, args: &[&str]) -> std::process::Output {
+    let home = dir.join("home");
+    let kubeconfig = home.join(".kube").join("config");
+    fs::create_dir_all(home.join(".kube")).expect("create private kubeconfig directory");
+    fs::write(&kubeconfig, "").expect("write empty kubeconfig");
     let existing = std::env::var_os("PATH").unwrap_or_default();
     let mut paths = vec![dir.to_path_buf()];
     paths.extend(std::env::split_paths(&existing));
@@ -1013,6 +1017,9 @@ fn run_rollback(dir: &Path, args: &[&str]) -> std::process::Output {
         .args(["--namespace", "agent-ns", "--release", "prod-release"])
         .args(args)
         .env("PATH", std::env::join_paths(paths).expect("join PATH"))
+        .env("HOME", &home)
+        .env("KUBECONFIG", &kubeconfig)
+        .env("TMPDIR", dir)
         // Plain text, and never an unanswered prompt in a test binary.
         .env("NO_COLOR", "1")
         .output()
