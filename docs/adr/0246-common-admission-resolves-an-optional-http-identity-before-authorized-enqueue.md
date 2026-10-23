@@ -2,11 +2,17 @@
 
 Date: 2026-10-23
 
-Status: Draft
+Status: Accepted
 
+Accepted 2026-10-23 with explicit maintainer approval from Junwon Jung,
+including agent-owned role filters and retained channel/approval-route narrowing.
 Tracked in [#4890](https://github.com/curie-eng/curie/issues/4890).
-This proposal does not authorize implementation. Acceptance must settle the
-review questions below and publish the corresponding versioned contracts.
+
+Acceptance authorizes this architecture and the behavior-preserving shared
+admission extraction. Code that depends on new tenant-mode, HTTP, filter or
+migration interfaces waits for their published versioned contracts. The
+existing policy and transport behavior remains until its explicit migration;
+an extracted composition alone does not complete the gateway.
 
 ## Context
 
@@ -31,7 +37,7 @@ the platform. A request-time service also introduces failure and freshness
 behavior that the projection model deliberately avoids. This decision makes
 that behavior opt-in and preserves existing policy semantics until migration.
 
-## Proposed decision
+## Decision
 
 ### 1. The API owns admission and authorized enqueue
 
@@ -75,7 +81,7 @@ stable issuer-scoped group identifiers and observation metadata. Distinct
 outcomes cover unresolved, inactive and unavailable subjects. The service
 receives no message text and returns no allow/deny policy verdict.
 
-Proposed initial transport bounds are a two-second total lookup deadline,
+Initial transport bounds are a two-second total lookup deadline,
 no automatic retry inside the request, a 64 KiB response limit and no
 redirects. Unsupported versions, contradictory results, scope mismatches,
 unavailable endpoints and invalid responses refuse the operation. They never
@@ -103,16 +109,26 @@ Entries identify exact surface accounts, issuer-scoped subjects or
 issuer-scoped groups. A populated filter matches any listed entry; null is
 unrestricted and an explicit empty filter matches nobody. Invocation and
 approval roles do not grant each other permission. Scope and global denials
-are applied before matching. The role's configuration target and precedence
-against an existing agent-wide policy must be published in its migration
-contract; implementations cannot mix these models implicitly.
+are applied before matching.
 
-The proposed any-match rule makes an exact surface-account entry an
+Each new caller or approver filter belongs to the agent's versioned access
+policy and applies across its supported channels. Any-match is confined to
+entries within that role's filter. Existing binding caller lists, explicit
+approval-route restrictions and agent-team restrictions continue to narrow
+access until an explicit, versioned migration changes the applicable
+restriction. Enabling HTTP resolution or adding a filter never clears them
+implicitly. Ambiguous coexistence is rejected. Missing new configuration
+retains existing behavior; new null does not clear a legacy restriction.
+Migration uses expected policy versions and preserves the other role.
+Old-client writes cannot reset or reinterpret a migrated role silently.
+
+The any-match rule makes an exact surface-account entry an
 independent grant after a definitive identity result. Removing or suspending
 an IdP account therefore does not revoke that raw entry. Operators must remove
 the raw entry too. This tradeoff is exposed in validation and readback and
-requires explicit acceptance. Provider unavailability is not a definitive
-identity result and never falls through to the raw entry. Inactive tenants or
+is retained only for an explicitly migrated role. A retained legacy team or
+route constraint can still refuse that caller. Provider unavailability is not a
+definitive identity result and never falls through to the raw entry. Inactive tenants or
 agents, invalid scope and forbidden principal kinds remain global denials.
 
 HTTP mode does not add a new account-linking workflow. Existing projection
@@ -151,7 +167,7 @@ hook/schedule authorization remain separate contracts.
 ## Realization and acceptance evidence
 
 [#4890](https://github.com/curie-eng/curie/issues/4890) tracks these realizing
-paths, none of which this Draft claims implemented:
+paths, none of which this architecture record claims implemented:
 
 1. A shared API admission service, delegated to by the existing channel entry
    points, and an optional HTTP resolver with versioned configuration.
@@ -175,20 +191,57 @@ Membership removal, account suspension, pending approvals, upgrades and every
 claimed channel are separate cases. Synthetic conformance is not real
 directory mapping or freshness qualification.
 
-## Review questions required for acceptance
+## Staged contracts and partial supersession
 
-1. Accept request-time HTTP resolution as a new opt-in mode alongside the
-   existing projection mode, including the proposed bounds and failure rule?
-2. Include Slack's API-owned admission/enqueue convergence in the first complete
-   capability, permitting only a separately reported extraction slice first?
-3. Accept mixed any-match policy, null/open and empty/deny-all for the new
-   schema, and raw grants surviving definitive IdP inactivity? Which
-   configuration object owns each role, and how does it migrate existing
-   agent-wide narrowing without widening access implicitly?
+The HTTP request/response, tenant mode/configuration lifecycle, freshness and
+role migration schemas are published before implementation depends on them.
+The migration contract resolves or rejects incompatible authority-mode and
+legacy-team combinations; a mode change never converts or drops a team.
+Provenance production/rechecks additionally depend on #4868 and their supported
+core contract, including explicit treatment of old queued work.
 
-Acceptance must enumerate the precise clauses superseded from ADRs 0175,
-0198 and 0220. Their Accepted bodies remain immutable. This Draft adds no
-supersession backlink to them.
+After Slack migrates to API-owned enqueue, every enqueue needs current API
+authority. A cached or stale allow is only a hint and never authorizes an
+offline enqueue. Configured HTTP resolution cannot be skipped by cached/open
+route answers. Existing caches and dispatcher enqueue remain unchanged during
+the behavior-preserving extraction and on unmigrated paths.
+
+This ADR supersedes only the following historical clauses in the stated scope:
+
+- **ADR 0175 decision 2, Slack and Caching, and decision 7's first paragraph:**
+  migrated Slack uses one authenticated sender and API-owned authorized enqueue;
+  neither the earlier allow nor the five-minute stale-allow path authorizes it.
+  Existing multi-ID callers/cache behavior remains during extraction.
+- **ADR 0175 decision 6:** the complete capability changes Slack's enqueue
+  composition; new filters do not reinterpret legacy list entries as links.
+  Decision 1's existing null/open and invalid-empty writes remain unchanged.
+- **ADR 0198 decision 7, step 7 only:** HTTP mode uses scoped canonical provider
+  facts instead of requiring a local link as its identity source. The migrated
+  raw-entry exception is explicit. Steps 1 to 6, reviewed sender derivation,
+  namespace/installation lifecycle and local link trust rules remain binding.
+- **ADR 0220's opening Decision and decision 1's projection-only choice:** a
+  tenant can explicitly select HTTP facts instead. Read-only projection,
+  complete-snapshot and non-expiring membership semantics remain for local mode;
+  HTTP adds no administrator-created identity mappings.
+- **ADR 0220 decision 3 step 1, decision 9 step 1 and decision 4's local-link
+  storage requirement:** HTTP uses its defined outcomes without a new connect
+  flow or fallback. Existing projection connection flows remain. An HTTP email
+  realization must separately qualify mailbox facts and sender authenticity.
+- **ADR 0220 decision 7's final inactive-person bullet, decision 9 step 1's
+  inactive-person refusal and decision 10's first active-team requirement:**
+  only an expressly migrated role gains the disclosed definitive-result raw
+  grant exception. Tenant, agent, scope, kind and outage denials remain.
+- **ADR 0220 decision 8's team-only role fields, decision 9 step 2 and decision
+  10's team-only mechanism:** an explicit per-role migration can replace its
+  former team with the versioned agent-owned filter. Decision 9 step 3's AND
+  narrowing and explicit approval-route narrowing are not superseded.
+- **ADR 0220 decision 11's retained TTL/API-outage behavior and local cache
+  tuple:** HTTP has no positive core identity cache; migrated enqueue requires
+  current API authority and the published config/policy version contract.
+  Legacy local versions/fences and extraction-stage caches remain unchanged.
+
+These ADRs remain Accepted in all other respects. Their bodies stay immutable;
+only the corresponding partial-supersession backlinks are added.
 
 ## Consequences
 

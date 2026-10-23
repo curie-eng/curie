@@ -265,5 +265,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0243 | [Network case five measures new connection denial after replacement or policy change](0243-network-case-five-measures-new-connection-denial-after-replacement-or-policy-change.md) | Accepted |
 | 0244 | [Attachments are fetched on demand through scoped platform tools](0244-attachments-are-fetched-on-demand-through-scoped-platform-tools.md) | Accepted |
 | 0245 | [Protected lifecycle evidence binds host-owned contexts to actual SDK closure](0245-protected-lifecycle-evidence-binds-host-owned-contexts-to-actual-sdk-closure.md) | Accepted |
-| 0246 | [Common admission resolves an optional HTTP identity before authorized enqueue](0246-common-admission-resolves-an-optional-http-identity-before-authorized-enqueue.md) | Draft |
+| 0246 | [Common admission resolves an optional HTTP identity before authorized enqueue](0246-common-admission-resolves-an-optional-http-identity-before-authorized-enqueue.md) | Accepted |
 <!-- END GENERATED: adr-index -->

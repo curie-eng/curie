@@ -4,6 +4,11 @@ Date: 2026-10-03
 
 Status: Accepted
 
+Partially superseded by [ADR 0246](0246-common-admission-resolves-an-optional-http-identity-before-authorized-enqueue.md):
+decision 7 step 7's local-link identity source in explicitly selected HTTP mode
+and its active-principal requirement for the expressly migrated raw-entry
+exception. Other clauses and unmigrated local behavior remain unchanged.
+
 **Superseded in part by [ADR 0201](0201-provider-field-mappings-live-with-their-realization.md)**
 (back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
 in decision 6, the Slack list's field list ("the event's `user_team`, or an
