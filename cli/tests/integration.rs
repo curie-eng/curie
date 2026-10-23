@@ -22,6 +22,7 @@ mod approvals_list_truncation;
 mod approvals_manifest_unreadable;
 mod artifacts_fetch;
 mod boot_env_contract;
+mod budget_factory_allowance;
 mod callers_verb;
 mod channel_token_verb;
 mod chart_check;

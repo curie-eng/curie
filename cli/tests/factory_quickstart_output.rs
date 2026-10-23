@@ -2955,3 +2955,124 @@ fn a_saved_key_is_checked_when_the_release_records_no_model() {
         "{bearers:?}"
     );
 }
+
+// #4939: the factory agent's per-run output allowance. A dry run prints every
+// argv the quickstart would execute, so the budget line is the exact
+// `curie cluster budget` call the ready path makes.
+
+/// The one `curie cluster budget` line of a `--dry-run --json` plan.
+fn dry_run_budget_line(fixture: &Fixture, extra: &[&str]) -> String {
+    let mut args = vec!["--dry-run", "--json"];
+    args.extend_from_slice(extra);
+    let output = fixture
+        .command(true, &args)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let shown = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "{shown}");
+    let body: Value = serde_json::from_slice(&output.stdout).expect("one plan JSON object");
+    let budget: Vec<&str> = body["plan"]
+        .as_array()
+        .expect("plan lines")
+        .iter()
+        .filter_map(Value::as_str)
+        .filter(|line| line.starts_with("curie cluster budget "))
+        .collect();
+    assert_eq!(budget.len(), 1, "{body}");
+    assert!(
+        helm_upgrade_calls(fixture).is_empty(),
+        "a dry run must not upgrade: {shown}"
+    );
+    budget[0].to_string()
+}
+
+#[test]
+fn default_plan_sets_factory_output_allowance() {
+    // Pins the default to the product constant the plan prints.
+    assert_eq!(
+        curie::factory_quickstart::DEFAULT_OUTPUT_TOKENS_PER_RUN,
+        250_000,
+        "the factory quickstart default per-run output allowance is 250000 tokens (#4939)"
+    );
+    let fixture = Fixture::new();
+    let line = dry_run_budget_line(&fixture, &[]);
+    assert!(
+        line.ends_with(" --limit 5 --output-tokens 250000"),
+        "the default factory budget step must set both the dollar limit and the 250000 token output allowance: {line}"
+    );
+}
+
+#[test]
+fn operator_output_tokens_reaches_budget_step() {
+    let fixture = Fixture::new();
+    let line = dry_run_budget_line(&fixture, &["--output-tokens", "400000"]);
+    assert!(
+        line.ends_with(" --limit 5 --output-tokens 400000"),
+        "{line}"
+    );
+    assert!(!line.contains("250000"), "{line}");
+}
+
+#[test]
+fn output_tokens_one_is_accepted() {
+    // Liveness for the zero refusal below: the smallest positive allowance
+    // parses and reaches the budget step.
+    let fixture = Fixture::new();
+    let line = dry_run_budget_line(&fixture, &["--output-tokens", "1"]);
+    assert!(line.ends_with(" --limit 5 --output-tokens 1"), "{line}");
+}
+
+#[test]
+fn output_tokens_zero_is_refused() {
+    let fixture = Fixture::new();
+    let output = fixture
+        .command(true, &["--output-tokens", "0"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("--output-tokens"), "{stderr}");
+    assert!(
+        stderr.contains("invalid value '0'"),
+        "0 must be refused as a value of a known flag: {stderr}"
+    );
+    assert!(fixture.registry.recorded().is_empty());
+    assert!(fixture.github.recorded().is_empty());
+    assert!(fixture.platform.recorded().is_empty());
+    assert!(fixture.openrouter.recorded().is_empty());
+    assert!(!fixture.dir.path().join("calls").exists());
+}
+
+#[test]
+fn the_ready_path_puts_the_factory_output_allowance_and_reports_it() {
+    let fixture = Fixture::new();
+    let output = fixture.command(true, &["--json"]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body: Value = serde_json::from_slice(&output.stdout).expect("one JSON object");
+    assert_eq!(body["phase"], "ready", "{body}");
+    assert_eq!(body["budget_usd"], json!(5.0), "{body}");
+    assert_eq!(body["output_tokens_per_run"], json!(250000), "{body}");
+    let puts: Vec<Value> = fixture
+        .platform
+        .recorded()
+        .iter()
+        .filter(|req| req.method == "PUT" && req.path == "/agents/agent-fixture/budget")
+        .map(|req| serde_json::from_slice(&req.body).unwrap())
+        .collect();
+    assert_eq!(puts.len(), 1, "{puts:?}");
+    assert_eq!(
+        puts[0],
+        json!({"max_output_tokens_per_run": 250000, "max_usd_per_day": 5.0})
+    );
+}

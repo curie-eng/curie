@@ -1443,6 +1443,10 @@ pub(crate) enum FactoryAction {
         /// Daily USD budget for the deployed agent.
         #[arg(long, default_value_t = curie::factory_quickstart::DEFAULT_BUDGET_USD)]
         budget: f64,
+        /// Output token allowance for each run of the deployed agent
+        /// (max_output_tokens_per_run). Must be > 0.
+        #[arg(long, value_name = "N", default_value_t = curie::factory_quickstart::DEFAULT_OUTPUT_TOKENS_PER_RUN, value_parser = clap::value_parser!(u64).range(1..))]
+        output_tokens: u64,
         /// Agent to deploy. On a release that already records factory intake
         /// and with no App flags, the agent is added to that install: no
         /// cluster up, App registration, or intake.
