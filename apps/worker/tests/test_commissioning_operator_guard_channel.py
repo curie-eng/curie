@@ -215,3 +215,83 @@ def test_an_unsigned_reply_refuses():
     with pytest.raises(guard_m.OperatorGuardRefused):
         asyncio.run(guard.require_current())
     assert requester.calls == 0
+
+
+# These deadline regressions use genuine observer ACL replies from the owned
+# TLS broker. Fact digests remain the existing channel plumbing placeholders.
+from .test_commissioning_worker_entry import _name, pworker_service  # noqa: E402
+
+_acl_broker = importlib.import_module(_name + ".test_commissioning_acl_observer_identity")
+installed = _acl_broker.installed
+__all__ = ["installed", "pworker_service"]
+
+
+@pytest.mark.parametrize("slow_acl", [False, True, "suppresses"])
+def test_acl_stage_budget_is_distinct_from_aggregate_guard_budget(
+    pworker_service, installed, monkeypatch, slow_acl
+):
+    from curie_protected_hooks.commissioning_producers import AclPrincipalStateProducer
+    from curie_worker import commissioning_control_process as process
+
+    guard_m, producers = product()
+    acl, client = _acl_broker._producer(pworker_service, installed, "observer")
+    facts = DIGESTS | {"bootstrap": acl.baseline.bootstrap_digest}
+    reader = _acl_broker.BrokerReader(client)
+
+    class ScheduledReader:
+        async def getuser(self, username):
+            try:
+                await asyncio.sleep(0.2 if slow_acl else 0.02)
+            except asyncio.CancelledError:
+                if slow_acl != "suppresses":
+                    raise
+            return await reader.getuser(username)
+
+        async def key_read_denied(self, key):
+            await asyncio.sleep(0.02)
+            return await reader.key_read_denied(key)
+
+    class ScheduledFact(Fact):
+        async def observe(self):
+            await asyncio.sleep(0.06)
+            return await super().observe()
+
+    store = Store()
+    requester, responder, _, _ = pair(store, observed=None, timeout_s=1)
+    responder._facts = facts
+    remote = producers.ReobservationSet(tuple(Fact(name, facts) for name in facts))
+    responder._reobserve = remote.reobserve
+    monkeypatch.setitem(process.PRODUCER_CONSTANTS, "per_call_deadline_ms", 100)
+    guard = guard_m.ChannelCampaignGuard(
+        premeasured=facts,
+        control=producers.ReobservationSet(
+            tuple(process.BoundedProducer(ScheduledFact(name, facts)) for name in facts)
+        ),
+        acl=AclPrincipalStateProducer(
+            reader=ScheduledReader(),
+            baseline=acl.baseline,
+            observer_username=installed["observer"].username,
+            provisioner_username=installed["provisioner"].username,
+        ),
+        phase=lambda: producers.PhaseExpectation("campaign", {}),
+        transport=requester,
+        deadline_s=1,
+        acl_deadline_s=0.1,
+    )
+
+    async def body():
+        if slow_acl:
+            with pytest.raises(guard_m.OperatorGuardRefused):
+                await guard.require_current()
+            with pytest.raises(guard_m.OperatorGuardRefused):
+                await guard.require_current()
+            assert requester.calls == 0
+        else:
+            await guard.require_current()
+            assert guard.latencies_ms[0] > 100
+            assert requester.calls == 1
+
+    try:
+        asyncio.run(serving(responder, body))
+    finally:
+        client.close()

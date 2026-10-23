@@ -81,6 +81,7 @@ _SELECTION = frozenset(
 _KUBECTL_COMMANDS = frozenset(
     {
         "get",
+        "version",
         "apply",
         "create",
         "delete",
@@ -105,6 +106,7 @@ _KUBECTL_FLAGS = frozenset(
         "--selector",
         "--field-selector",
         "--timeout",
+        "--request-timeout",
         "--for",
         "--ignore-not-found",
         "--grace-period",
