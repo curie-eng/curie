@@ -205,6 +205,7 @@ def _full_boot_env() -> BootEnv:
         thinking="disabled",
         deployment_environment="prod",
         channel_bound=True,
+        attachment_access_enabled=True,
         channel_kind="slack",
         repo_origin="https://gitlab.example.com",
         repo_path="platform/team/infra",
@@ -579,6 +580,7 @@ def test_render_worker_emits_exactly_the_worker_owned_key_subset() -> None:
         channel_memory_ref=_CHANNEL_MEMORY_REF,
         memory_writes=True,
         channel_bound=True,
+        attachment_access_enabled=True,
         channel_kind="slack",
         repo_origin="https://gitlab.example.com",
         repo_path="platform/team/infra",
@@ -861,6 +863,7 @@ def test_env_keys_declares_the_whole_flattened_boot_surface() -> None:
         "CURIE_ISSUE_READ_URL",
         "CURIE_ISSUE_READ_TOKEN",
         "CURIE_ATTACHMENTS_MANIFEST",
+        "CURIE_ATTACHMENT_ACCESS_ENABLED",
         "CURIE_APPROVAL_REQUIRED_TOOLS",
         "CURIE_APPROVAL_GRANT_TOOL",
         "CURIE_APPROVAL_GRANT_ARGUMENTS",
@@ -981,6 +984,7 @@ def test_the_substrate_writes_identity_otel_and_the_warm_pool_defaults() -> None
         # Kernel-authoritative with an empty substrate declaration (ADR 0205):
         # the runner template declares it so the per-claim value can land.
         "CURIE_ATTACHMENTS_MANIFEST",
+        "CURIE_ATTACHMENT_ACCESS_ENABLED",
     }
 
 
