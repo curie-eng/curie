@@ -161,6 +161,7 @@ pub(super) async fn run(action: LocalAction) -> Result<()> {
                 CliTurnArgs {
                     channel,
                     thread,
+                    context: None,
                     namespace: None,
                     release: None,
                     chart: None,
@@ -182,6 +183,7 @@ pub(super) async fn run(action: LocalAction) -> Result<()> {
                 channel: resolved.channel,
                 agent: resolved.agent,
                 thread: resolved.thread,
+                context: None,
                 namespace: "curie".into(),
                 release: "curie".into(),
                 chart: "charts/curie".into(),
