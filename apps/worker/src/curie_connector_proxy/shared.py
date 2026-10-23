@@ -176,6 +176,8 @@ GRANT_APPLICATION_MISMATCH = "application_mismatch"
 GRANT_BINDING_MISMATCH = "binding_mismatch"
 GRANT_ALIAS_MISMATCH = "alias_mismatch"
 GRANT_GENERATION_MISMATCH = "generation_mismatch"
+# The one warning a failed shared spend logs; it never carries a value.
+SPEND_FAILURE = "shared connector grant spend failed"
 
 _UPSTREAM_URL = re.compile(r"^http://127\.0\.0\.1:([1-9][0-9]{0,4})$")
 _STORE_SCHEMES = ("redis://", "rediss://")
@@ -614,7 +616,7 @@ class _SharedProxy:
         self.grants = server._ValkeyGrantStore(
             config.grant_store_url,
             prefix=GRANT_KEY_PREFIX,
-            failure="shared connector grant spend failed",
+            failure=SPEND_FAILURE,
         )
 
     # --- sessions -----------------------------------------------------------------
@@ -776,8 +778,15 @@ class _SharedProxy:
     async def _spend(self, grant: caller.SharedGrant, now: int) -> None:
         """Spend ``grant`` once in Valkey; any failure refuses. Runs last of every check."""
 
-        # The store answers False, after its own warning, for whatever failed.
-        if not await asyncio.to_thread(self.grants.spend, grant.jti, grant.exp - now):
+        # The store answers False, after its own warning, for whatever failed
+        # inside it; the catch covers what fails around it, such as handing
+        # the call to a worker thread.
+        try:
+            spent = await asyncio.to_thread(self.grants.spend, grant.jti, grant.exp - now)
+        except Exception:  # noqa: BLE001 - a failed spend refuses, whatever raised it
+            logger.warning(SPEND_FAILURE)
+            spent = False
+        if not spent:
             raise _GrantRefused(server.GRANT_NOT_SPENT)
 
     # --- one request -------------------------------------------------------------------
