@@ -19,6 +19,7 @@ from typing import Any
 from urllib.parse import quote
 
 import httpx
+import jwt
 import pytest
 from channel_protocol.reply import ReplyAck
 from curie_worker.publication_clients import (
@@ -64,6 +65,13 @@ OWNER_NAME = "publication-owner"
 SERVICE_ACCOUNT = "publication-runner"
 AUTHORIZATION = "Bearer fixture-token"
 REST_AUTHORIZATION = "Basic " + base64.b64encode(b"x-access-token:fixture-token").decode()
+APP_ID = "51"
+INSTALLATION_ID = 41
+APP_TOKEN = "fixture-publication-app-token"
+APP_AUTHORIZATION = f"Bearer {APP_TOKEN}"
+APP_REST_AUTHORIZATION = (
+    "Basic " + base64.b64encode(f"x-access-token:{APP_TOKEN}".encode()).decode()
+)
 ADOPT_ID = uuid.UUID("20000001-2222-4222-8222-000000000001")
 MISMATCH_ID = uuid.UUID("20000002-2222-4222-8222-000000000002")
 FAILURE_ID = uuid.UUID("20000003-2222-4222-8222-000000000003")
@@ -161,13 +169,17 @@ def _ssl_context() -> ssl.SSLContext:
     return ssl.create_default_context(cafile=_required("CURIE_PUBLICATION_FIXTURE_CA"))
 
 
-async def _forward_fixture_request(request: httpx.Request) -> None:
+def _forward_fixture_url(request: httpx.Request) -> None:
     """Reach the fixture port forward while retaining its configured forge identity."""
     if str(request.url).startswith(_required("CURIE_PUBLICATION_FIXTURE_CLUSTER_API") + "/"):
         forwarded = httpx.URL(_required("CURIE_PUBLICATION_FIXTURE_API"))
         request.url = request.url.copy_with(
             scheme=forwarded.scheme, host=forwarded.host, port=forwarded.port
         )
+
+
+async def _forward_fixture_request(request: httpx.Request) -> None:
+    _forward_fixture_url(request)
 
 
 async def _fixture_get(path: str) -> httpx.Response:
@@ -226,7 +238,11 @@ async def test_fixture_rest_and_control_routes_require_their_exact_auth_contract
     base_sha = await _base_sha()
     branch = await _fixture_get(f"/repos/{REPO_FULL_NAME}/git/ref/heads/main")
     assert branch.status_code == 200, branch.text
-    assert branch.json() == {"ref": "refs/heads/main", "object": {"sha": base_sha}}
+    # https://docs.github.com/en/rest/git/refs#get-a-reference
+    assert branch.json() == {
+        "ref": "refs/heads/main",
+        "object": {"type": "commit", "sha": base_sha},
+    }
 
     origin = _required("CURIE_PUBLICATION_FIXTURE_API")
     async with httpx.AsyncClient(verify=_ssl_context(), timeout=10) as client:
@@ -249,6 +265,119 @@ async def test_fixture_rest_and_control_routes_require_their_exact_auth_contract
                 headers={"Authorization": authorization} if authorization is not None else {},
             )
             assert response.status_code == 401, response.text
+
+
+@requires_cluster
+async def test_fixture_app_routes_require_signed_jwt_and_minted_installation_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    private_key = await _configure_github_app(monkeypatch)
+    now = int(time.time())
+    claims = {"iss": APP_ID, "iat": now - 60, "exp": now + 480}
+    signed = jwt.encode(claims, private_key, algorithm="RS256")
+    jwt_authorization = f"Bearer {signed}"
+    repo_path = f"/repos/{REPO_FULL_NAME}"
+    token_path = f"/app/installations/{INSTALLATION_ID}/access_tokens"
+    # https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-json-web-token-jwt-for-a-github-app
+    invalid_jwts = [
+        jwt.encode(
+            {key: value for key, value in claims.items() if key != required},
+            private_key,
+            algorithm="RS256",
+        )
+        for required in claims
+    ] + [
+        jwt.encode({**claims, "iss": "52"}, private_key, algorithm="RS256"),
+        jwt.encode(
+            {**claims, "iat": now - 800, "exp": now - 200}, private_key, algorithm="RS256"
+        ),
+        jwt.encode({**claims, "iat": now + 120}, private_key, algorithm="RS256"),
+        jwt.encode({**claims, "exp": now + 1200}, private_key, algorithm="RS256"),
+        jwt.encode(
+            claims,
+            rsa.generate_private_key(public_exponent=65537, key_size=2048),
+            algorithm="RS256",
+        ),
+        jwt.encode(claims, "fixture-wrong-app-secret-00000000", algorithm="HS256"),
+        jwt.encode(claims, "", algorithm="none"),
+    ]
+    origin = _required("CURIE_PUBLICATION_FIXTURE_API")
+    async with httpx.AsyncClient(verify=_ssl_context(), timeout=10) as client:
+        for method, path in (("GET", f"{repo_path}/installation"), ("POST", token_path)):
+            for authorization in (
+                None,
+                AUTHORIZATION,
+                REST_AUTHORIZATION,
+                APP_AUTHORIZATION,
+                "Bearer malformed",
+                *(f"Bearer {token}" for token in invalid_jwts),
+            ):
+                response = await client.request(
+                    method,
+                    f"{origin}{path}",
+                    json={"repositories": ["acme-bot"]},
+                    headers={"Authorization": authorization} if authorization is not None else {},
+                )
+                assert response.status_code == 401, response.text
+        for authorization in (APP_AUTHORIZATION, APP_REST_AUTHORIZATION):
+            unissued = await client.get(
+                f"{origin}{repo_path}", headers={"Authorization": authorization}
+            )
+            assert unissued.status_code == 401, unissued.text
+        installation = await client.get(
+            f"{origin}{repo_path}/installation", headers={"Authorization": jwt_authorization}
+        )
+        assert installation.status_code == 200, installation.text
+        assert installation.json() == {"id": INSTALLATION_ID}
+        for repositories in ([], ["other-repo"]):
+            refused = await client.post(
+                f"{origin}{token_path}",
+                json={"repositories": repositories},
+                headers={"Authorization": jwt_authorization},
+            )
+            assert refused.status_code == 422, refused.text
+        minted = await client.post(
+            f"{origin}{token_path}",
+            json={"repositories": ["acme-bot"]},
+            headers={"Authorization": jwt_authorization},
+        )
+        assert minted.status_code == 201, minted.text
+        assert minted.json()["token"] == APP_TOKEN
+        for path, authorization, expected in (
+            (repo_path, APP_AUTHORIZATION, 200),
+            (repo_path, APP_REST_AUTHORIZATION, 200),
+            (f"{repo_path}/git/ref/heads/main", APP_REST_AUTHORIZATION, 200),
+            (f"{repo_path}/git/ref/heads/main", APP_AUTHORIZATION, 401),
+            (repo_path, jwt_authorization, 401),
+            ("/__fixture/state", APP_AUTHORIZATION, 401),
+            ("/__fixture/state", APP_REST_AUTHORIZATION, 401),
+            ("/__fixture/state", jwt_authorization, 401),
+        ):
+            response = await client.get(
+                f"{origin}{path}", headers={"Authorization": authorization}
+            )
+            assert response.status_code == expected, response.text
+        for authorization in (
+            None,
+            REST_AUTHORIZATION,
+            APP_AUTHORIZATION,
+            APP_REST_AUTHORIZATION,
+            jwt_authorization,
+        ):
+            response = await client.post(
+                f"{origin}/__fixture/app",
+                json={"public_key": "invalid"},
+                headers={"Authorization": authorization} if authorization is not None else {},
+            )
+            assert response.status_code == 401, response.text
+        invalid_key = await client.post(
+            f"{origin}/__fixture/app",
+            json={"public_key": "invalid"},
+            headers={"Authorization": AUTHORIZATION},
+        )
+        assert invalid_key.status_code == 400, invalid_key.text
 
 
 @requires_cluster
@@ -498,6 +627,41 @@ async def _seed_publication(
     return lineage_id
 
 
+async def _seed_publication_authority(engine: AsyncEngine, publication_id: uuid.UUID) -> None:
+    agent_id = uuid.uuid5(publication_id, "agent")
+    binding_id = uuid.uuid5(publication_id, "binding")
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(
+                "INSERT INTO curie.thread_workspaces "
+                "(id, agent_id, selected_by_deployment_id, conversation_id, repo_full_name, "
+                "selected_by) VALUES (:id, :agent, :deployment, "
+                "'slack:C0EXAMPLE1:1700000000.000100', :repo, 'fixture')"
+            ),
+            {
+                "id": uuid.uuid4(),
+                "agent": agent_id,
+                "deployment": uuid.uuid5(publication_id, "deployment"),
+                "repo": REPO_FULL_NAME,
+            },
+        )
+        await connection.execute(
+            text(
+                "INSERT INTO curie.agent_channels (id, agent_id, kind, address, adapter, "
+                "generation) VALUES (:id, :agent, 'slack', 'C0EXAMPLE1', 'default', 1)"
+            ),
+            {"id": binding_id, "agent": agent_id},
+        )
+        await connection.execute(
+            text(
+                "UPDATE curie.thread_publication_lineages SET binding_id = :binding, "
+                "binding_generation = 1, reply_conversation_id = '1700000000.000100' "
+                "WHERE id = :id"
+            ),
+            {"id": uuid.uuid5(publication_id, "lineage"), "binding": binding_id},
+        )
+
+
 class _NoBranchCodeHost:
     """The API's code host routes for a publication whose branch was never pushed."""
 
@@ -714,6 +878,55 @@ async def _fixture_post(path: str, payload: dict[str, Any]) -> dict[str, Any]:
     return dict(response.json())
 
 
+async def _configure_github_app(monkeypatch: pytest.MonkeyPatch) -> str:
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from curie_api.config import get_settings
+    from curie_api.github_app import _RESOLVERS
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    configured = await _fixture_post(
+        "/__fixture/app",
+        {
+            "public_key": (
+                key.public_key()
+                .public_bytes(
+                    serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+                )
+                .decode()
+            )
+        },
+    )
+    assert configured == {"app_id": APP_ID, "installation_id": INSTALLATION_ID}
+    private_key = key.private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
+    ).decode()
+    for name, value in {
+        "GITHUB_APP_ID": APP_ID,
+        "GITHUB_APP_PRIVATE_KEY": private_key,
+        "GITHUB_TOKEN": "",
+        "GITHUB_API_URL": _origin(),
+        "GITHUB_REPO_ALLOWLIST": '["acme-corp/*"]',
+        "GITHUB_REVIEW_INGRESS_ENABLED": "false",
+        "CURIE_CODE_HOST_CA_BUNDLE": "",
+        "CURIE_FORGES": "{}",
+        "SSL_CERT_FILE": _required("CURIE_PUBLICATION_FIXTURE_CA"),
+    }.items():
+        monkeypatch.setenv(name, value)
+    real_client = httpx.Client
+
+    def forwarded_client(*args: Any, **kwargs: Any) -> httpx.Client:
+        hooks = dict(kwargs.pop("event_hooks", {}))
+        hooks["request"] = [*hooks.get("request", []), _forward_fixture_url]
+        return real_client(*args, **kwargs, event_hooks=hooks)
+
+    # The resolver owns its sync client; both clients use the real HTTPS fixture.
+    monkeypatch.setattr("curie_api.github_app.httpx.Client", forwarded_client)
+    _RESOLVERS.clear()
+    get_settings.cache_clear()
+    return private_key
+
+
 def _image_bound_contract_hash(
     payload: PublicationPayload, settings: PublicationJobSettings
 ) -> str:
@@ -806,60 +1019,17 @@ async def _moved_cluster_scenario(
         for name, value in {
             "DATABASE_URL": _required("TEST_DATABASE_URL"),
             "INTERNAL_WORKER_TOKEN": "publication-cluster-worker",
-            "GITHUB_TOKEN": "fixture-token",
-            "GITHUB_APP_ID": "",
-            "GITHUB_APP_PRIVATE_KEY": "",
-            "GITHUB_API_URL": _origin(),
             "GITHUB_CLONE_BASE": _origin(),
-            "GITHUB_REPO_ALLOWLIST": '["acme-corp/*"]',
-            "GITHUB_REVIEW_INGRESS_ENABLED": "false",
-            "CURIE_CODE_HOST_CA_BUNDLE": "",
-            "CURIE_FORGES": "{}",
         }.items():
             monkeypatch.setenv(name, value)
-        get_settings.cache_clear()
-        _RESOLVERS.clear()
+        await _configure_github_app(monkeypatch)
         lineage_id = await _seed_publication(
             engine,
             scenario["original_base_sha"],
             publication_id=publication_id,
             patch=scenario["patch"].encode(),
         )
-        agent_id = uuid.uuid5(publication_id, "agent")
-        deployment_id = uuid.uuid5(publication_id, "deployment")
-        binding_id = uuid.uuid5(publication_id, "binding")
-        async with engine.begin() as connection:
-            await connection.execute(
-                text(
-                    "INSERT INTO curie.thread_workspaces "
-                    "(id, agent_id, selected_by_deployment_id, conversation_id, repo_full_name, "
-                    "selected_by) "
-                    "VALUES (:id, :agent, :deployment, 'slack:C0EXAMPLE1:1700000000.000100', "
-                    ":repo, 'fixture')"
-                ),
-                {
-                    "id": uuid.uuid4(),
-                    "agent": agent_id,
-                    "deployment": deployment_id,
-                    "repo": REPO_FULL_NAME,
-                },
-            )
-            await connection.execute(
-                text(
-                    "INSERT INTO curie.agent_channels (id, agent_id, kind, address, adapter, "
-                    "generation) "
-                    "VALUES (:id, :agent, 'slack', 'C0EXAMPLE1', 'default', 1)"
-                ),
-                {"id": binding_id, "agent": agent_id},
-            )
-            await connection.execute(
-                text(
-                    "UPDATE curie.thread_publication_lineages SET binding_id = :binding, "
-                    "binding_generation = 1, reply_conversation_id = '1700000000.000100' WHERE id "
-                    "= :id"
-                ),
-                {"id": lineage_id, "binding": binding_id},
-            )
+        await _seed_publication_authority(engine, publication_id)
 
         async with httpx.AsyncClient(
             verify=_ssl_context(),
@@ -1143,16 +1313,13 @@ async def test_job_from_another_runner_image_is_adopted_through_github(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from curie_api.config import get_settings
+    from curie_api.github_app import _RESOLVERS
     from curie_api.main import create_app
 
     worker_token = "publication-cluster-worker"
     monkeypatch.setenv("DATABASE_URL", _required("TEST_DATABASE_URL"))
     monkeypatch.setenv("CURIE_INTERNAL_WORKER_TOKEN", worker_token)
-    monkeypatch.setenv("GITHUB_API_URL", _origin())
-    monkeypatch.setenv("GITHUB_TOKEN", "fixture-token")
-    monkeypatch.setenv("GITHUB_APP_ID", "")
-    monkeypatch.setenv("GITHUB_APP_PRIVATE_KEY", "")
-    get_settings.cache_clear()
+    await _configure_github_app(monkeypatch)
     engine = create_async_engine(_required("TEST_DATABASE_URL"))
     payload: PublicationPayload | None = None
     barriers_armed = False
@@ -1167,6 +1334,7 @@ async def test_job_from_another_runner_image_is_adopted_through_github(
             b"+published across a worker upgrade\n"
         )
         await _seed_publication(engine, base_sha, publication_id=UPGRADE_ID, patch=patch)
+        await _seed_publication_authority(engine, UPGRADE_ID)
         store = PostgresPublicationStore(
             engine, schema="curie", lease_owner="publication-upgrade-proof", lease_seconds=30
         )
@@ -1405,6 +1573,7 @@ async def test_job_from_another_runner_image_is_adopted_through_github(
                 await _receive_barrier(payload.branch, "after")
         finally:
             await engine.dispose()
+            _RESOLVERS.clear()
             get_settings.cache_clear()
 
 

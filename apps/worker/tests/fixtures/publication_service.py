@@ -9,12 +9,18 @@ import json
 import ssl
 import subprocess
 import threading
+import time
 import uuid
+from datetime import UTC, datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
+
+import jwt
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
 
 REPO_FULL_NAME = "acme-corp/acme-bot"
 DEFAULT_BRANCH = "main"
@@ -22,6 +28,13 @@ AUTHORIZATION = "Bearer fixture-token"
 # Observed GitHubCodeHost._token contract: REST uses this Git Basic header.
 # https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/authenticating-as-a-github-app-installation
 REST_AUTHORIZATION = "Basic " + base64.b64encode(b"x-access-token:fixture-token").decode("ascii")
+APP_ID = "51"
+INSTALLATION_ID = 41
+APP_TOKEN = "fixture-publication-app-token"
+APP_AUTHORIZATION = f"Bearer {APP_TOKEN}"
+APP_REST_AUTHORIZATION = (
+    "Basic " + base64.b64encode(f"x-access-token:{APP_TOKEN}".encode()).decode("ascii")
+)
 PULL_NUMBER = 1
 
 
@@ -46,6 +59,8 @@ class FixtureState:
         self.pull: dict[str, Any] | None = None
         self.pull_creations = 0
         self.scenario: dict[str, Any] | None = None
+        self.app_public_key: rsa.RSAPublicKey | None = None
+        self.app_token_issued = False
         self.base_sha = self._initialize_repository()
         self.barriers = self.root / "barriers"
         self.barriers.mkdir()
@@ -84,6 +99,29 @@ class FixtureState:
             "before": (root / "pre-receive" / "entered").exists(),
             "after": (root / "post-receive" / "entered").exists(),
         }
+
+    def app_authorized(self, authorization: str) -> bool:
+        if self.app_public_key is None or not authorization.startswith("Bearer "):
+            return False
+        # https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-json-web-token-jwt-for-a-github-app
+        try:
+            claims = jwt.decode(
+                authorization.removeprefix("Bearer "),
+                self.app_public_key,
+                algorithms=["RS256"],
+                issuer=APP_ID,
+                options={"require": ["iss", "iat", "exp"]},
+            )
+        except jwt.PyJWTError:
+            return False
+        issued_at, expires_at = claims["iat"], claims["exp"]
+        return (
+            isinstance(issued_at, int)
+            and not isinstance(issued_at, bool)
+            and isinstance(expires_at, int)
+            and not isinstance(expires_at, bool)
+            and issued_at < expires_at <= int(time.time()) + 600
+        )
 
     def _initialize_repository(self) -> str:
         work = self.root / "seed"
@@ -152,12 +190,12 @@ class FixtureState:
                 "head": {
                     "ref": branch,
                     "sha": head_sha,
-                    "repo": {"full_name": REPO_FULL_NAME},
+                    "repo": {"id": 9001, "full_name": REPO_FULL_NAME},
                 },
                 "base": {
                     "ref": DEFAULT_BRANCH,
                     "sha": self.ref(DEFAULT_BRANCH),
-                    "repo": {"full_name": REPO_FULL_NAME},
+                    "repo": {"id": 9001, "full_name": REPO_FULL_NAME},
                 },
             }
 
@@ -347,8 +385,27 @@ class FixtureHandler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _authorized(self, path: str) -> bool:
-        authorization = REST_AUTHORIZATION if path.startswith("/repos/") else AUTHORIZATION
-        if self.headers.get("Authorization") == authorization:
+        authorization = self.headers.get("Authorization", "")
+        repo_path = f"/repos/{REPO_FULL_NAME}"
+        if (self.command, path) in {
+            ("GET", f"{repo_path}/installation"),
+            ("POST", f"/app/installations/{INSTALLATION_ID}/access_tokens"),
+        }:
+            authorized = self.server.state.app_authorized(authorization)
+        elif path.startswith("/repos/"):
+            allowed = {REST_AUTHORIZATION}
+            if self.server.state.app_token_issued:
+                allowed.add(APP_REST_AUTHORIZATION)
+                # Identity verification uses Bearer on these two GETs only.
+                if self.command == "GET" and path in {
+                    repo_path,
+                    f"{self._pulls_path()}/{PULL_NUMBER}",
+                }:
+                    allowed.add(APP_AUTHORIZATION)
+            authorized = authorization in allowed
+        else:
+            authorized = authorization == AUTHORIZATION
+        if authorized:
             return True
         self._json(HTTPStatus.UNAUTHORIZED, {"message": "fixture authorization required"})
         return False
@@ -364,6 +421,10 @@ class FixtureHandler(BaseHTTPRequestHandler):
         if not self._authorized(parsed.path):
             return
         repo_path = f"/repos/{REPO_FULL_NAME}"
+        if parsed.path == f"{repo_path}/installation":
+            # https://docs.github.com/en/rest/apps/apps#get-a-repository-installation-for-the-authenticated-app
+            self._json(HTTPStatus.OK, {"id": INSTALLATION_ID})
+            return
         if parsed.path == repo_path:
             self._json(
                 HTTPStatus.OK,
@@ -385,13 +446,16 @@ class FixtureHandler(BaseHTTPRequestHandler):
         ref_prefix = f"{repo_path}/git/ref/heads/"
         if parsed.path.startswith(ref_prefix):
             branch = unquote(parsed.path[len(ref_prefix) :])
-            sha = self.server.state.ref(branch)
-            if sha is None:
+            head_sha = self.server.state.ref(branch)
+            if head_sha is None:
                 self._json(HTTPStatus.NOT_FOUND, {"message": "ref not found"})
             else:
                 self._json(
                     HTTPStatus.OK,
-                    {"ref": f"refs/heads/{branch}", "object": {"type": "commit", "sha": sha}},
+                    {
+                        "ref": f"refs/heads/{branch}",
+                        "object": {"type": "commit", "sha": head_sha},
+                    },
                 )
             return
         if parsed.path == self._pulls_path():
@@ -424,6 +488,45 @@ class FixtureHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         parsed = urlsplit(self.path)
         if not self._authorized(parsed.path):
+            return
+        if parsed.path == "/__fixture/app":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 0 < length <= 4096:
+                    raise ValueError("invalid App public key payload")
+                body = json.loads(self.rfile.read(length))
+                key = serialization.load_pem_public_key(body["public_key"].encode())
+                if not isinstance(key, rsa.RSAPublicKey) or key.key_size < 2048:
+                    raise ValueError("App public key must be RSA")
+            except (KeyError, TypeError, ValueError, AttributeError):
+                self._json(HTTPStatus.BAD_REQUEST, {"message": "invalid App public key"})
+            else:
+                with self.server.state.lock:
+                    self.server.state.app_public_key = key
+                    self.server.state.app_token_issued = False
+                self._json(HTTPStatus.OK, {"app_id": APP_ID, "installation_id": INSTALLATION_ID})
+            return
+        if parsed.path == f"/app/installations/{INSTALLATION_ID}/access_tokens":
+            # https://docs.github.com/en/rest/apps/apps#create-an-installation-access-token-for-an-app
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 0 < length <= 4096:
+                    raise ValueError("invalid installation token payload")
+                body = json.loads(self.rfile.read(length))
+                if body != {"repositories": [REPO_FULL_NAME.split("/", 1)[1]]}:
+                    raise ValueError("installation token must name the fixture repository")
+            except ValueError:
+                self._json(HTTPStatus.UNPROCESSABLE_ENTITY, {"message": "invalid token scope"})
+            else:
+                with self.server.state.lock:
+                    self.server.state.app_token_issued = True
+                self._json(
+                    HTTPStatus.CREATED,
+                    {
+                        "token": APP_TOKEN,
+                        "expires_at": datetime.fromtimestamp(time.time() + 3600, UTC).isoformat(),
+                    },
+                )
             return
         if parsed.path == "/__fixture/barrier":
             try:
