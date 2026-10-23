@@ -1120,7 +1120,7 @@ EOF
     current=$'helm --kube-context kind-curie-upgrade-matrix rollback t2590 3 -n acme-2590'
     takeover=$(printf '%s\n' \
         "$current --wait --timeout 15m" \
-        'helm --kube-context kind-curie-upgrade-matrix upgrade rel chart -n acme-2590')
+        'helm upgrade t2590 /example/charts/curie-0.10.1.tgz -n acme-2590 --wait --timeout 21900s -f <retained-values>')
     if check_explicit_helm_plan fixture-takeover "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1].splitlines()))' "$takeover")" \
         t2590 3 acme-2590 \
         && check_explicit_helm_plan fixture-rollback-target "$(python3 -c 'import json,sys; print(json.dumps([sys.argv[1]]))' "$current")" \
@@ -1129,12 +1129,12 @@ EOF
             t2590 3 acme-2590 \
         && ! check_explicit_helm_plan fixture-rollback-target "$(python3 -c 'import json,sys; print(json.dumps([sys.argv[1]]))' "$current")" \
             t2590 9 acme-2590 \
-        && ! check_explicit_helm_plan fixture-takeover "$(python3 -c 'import json,sys; print(json.dumps(["helm --kube-context kind-curie-upgrade-matrix upgrade rel chart","helm --kube-context kind-curie-upgrade-matrix rollback t2590 3 -n acme-2590 --wait --timeout 15m"]))')" \
+        && ! check_explicit_helm_plan fixture-takeover "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1].splitlines()[::-1]))' "$takeover")" \
             t2590 3 acme-2590
     then
-        log "explicit-context helm plan parser accepts the current rollback shape and rejects the old argv"
+        log "helm plan parser accepts context-prefixed rollback before unprefixed upgrade"
     else
-        log "self-test: helm plan parser must require helm --kube-context <context> <verb> and keep rollback target, namespace, wait, timeout, and order"
+        log "self-test: helm plans must keep rollback context, target, namespace, wait, timeout, and order before unprefixed upgrade"
         failed=1
     fi
     (( failed == 0 )) || die "self-test failed"
@@ -2575,8 +2575,6 @@ run_previous_serves() {
     log "fail-forward retry after previous-serves kill succeeded"
 }
 
-# Helm plan lines are `helm --kube-context <context> <verb> ...` (cli display_with_context).
-# A line that still puts the verb in argv[1] is a harness bug, not a second accepted shape.
 check_explicit_helm_plan() {
     python3 - "$@" <<'PY'
 import json, shlex, sys
@@ -2598,7 +2596,13 @@ def helm_rows(plan):
     rows = []
     for line in plan:
         if isinstance(line, str) and line.startswith("helm "):
-            rows.append(explicit(shlex.split(line)))
+            argv = shlex.split(line)
+            if argv[1:2] == ["upgrade"]:
+                rows.append(("upgrade", argv[2:]))
+            else:
+                verb, rest = explicit(argv)
+                if verb == "rollback":
+                    rows.append((verb, rest))
     return rows
 
 mode = sys.argv[1]
@@ -2623,7 +2627,7 @@ if mode == "takeover":
     if rollback is None:
         raise SystemExit("dry run did not plan an explicit-context helm rollback")
     if upgrade is None:
-        raise SystemExit("dry run did not plan an explicit-context helm upgrade")
+        raise SystemExit("dry run did not plan an unprefixed helm upgrade")
     if rollback >= upgrade:
         raise SystemExit("dry run did not plan rollback before upgrade")
 elif mode == "rollback-target":
