@@ -275,6 +275,42 @@
         "kind": "regex",
         "expected": "^\\s*unknown\\s*$"
       }
+    },
+    {
+      "id": "canary-delivered-mismatch",
+      "input": "Fresh same-route readings for an example turn canary: target_delivery_success=1, target_success=0, the owned probe result is a legitimate role refusal instead of the requested nonce. No user-turn or Slack transport evidence is available. Classify only the supplied evidence. Reply in one sentence using the fields Delivery, response, and user impact, separated by semicolons. Do not add a repair action.",
+      "grader": {
+        "kind": "regex",
+        "expected": "(?i)^Delivery:\\ observed;\\ response:\\ mismatch;\\ user\\ impact:\\ unverified\\.$",
+        "case_sensitive": false
+      }
+    },
+    {
+      "id": "canary-legacy-failure",
+      "input": "The installed legacy turn canary requires an exact nonce response. Fresh target_success=0; no delivery metric or diagnostics are exported. No user-turn evidence is available. Classify only the supplied evidence. Reply in one sentence using the fields Delivery, response, and user impact, separated by semicolons. Do not add a repair action.",
+      "grader": {
+        "kind": "regex",
+        "expected": "(?i)^Delivery:\\ unverified;\\ response:\\ unverified;\\ user\\ impact:\\ unverified\\.$",
+        "case_sensitive": false
+      }
+    },
+    {
+      "id": "canary-delivery-timeout",
+      "input": "Fresh same-route turn-canary readings: target_delivery_success=0, diagnostic timeout. Binding health passes; channel capability preflight is unverified. No transport error or user-turn evidence is available. Classify only the supplied evidence. Reply in one sentence using the fields Delivery, cause, and user impact, separated by semicolons. Do not add a repair action.",
+      "grader": {
+        "kind": "regex",
+        "expected": "(?i)^Delivery:\\ failed;\\ cause:\\ unverified;\\ user\\ impact:\\ unverified\\.$",
+        "case_sensitive": false
+      }
+    },
+    {
+      "id": "canary-legacy-event-shape",
+      "input": "Fresh same-route turn-canary readings show target_delivery_success=1 and target_success=0. The installed checker preserves a legacy verdict that can also fail on progress edits or event shape; the owned probe result is unavailable. Classify only the supplied evidence. Reply in one sentence using the fields Delivery, response, and user impact, separated by semicolons. Do not add a repair action.",
+      "grader": {
+        "kind": "regex",
+        "expected": "(?i)^Delivery:\\ observed;\\ response:\\ unverified;\\ user\\ impact:\\ unverified\\.$",
+        "case_sensitive": false
+      }
     }
   ]
 }
