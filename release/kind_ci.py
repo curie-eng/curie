@@ -228,6 +228,15 @@ class _GitHub:
                 if run_id in seen:
                     continue
                 seen.add(run_id)
+                head_commit = run.get("head_commit")
+                if (
+                    not isinstance(head_commit, dict)
+                    or head_commit.get("id") != run["head_sha"]
+                    or not _sha(head_commit.get("tree_id"))
+                ):
+                    continue
+                if head_commit["tree_id"] != target_tree:
+                    continue
                 _, candidate_tree = self.commit(cast(str, run["head_sha"]))
                 if candidate_tree != target_tree:
                     continue
