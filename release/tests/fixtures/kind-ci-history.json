@@ -1,0 +1,431 @@
+{
+  "source": "GET repos/curie-eng/curie/actions/runs/39653199666 and attempts/1/jobs, recorded 2026-10-23; unused identifying fields omitted",
+  "run": {
+    "id": 39653199666,
+    "head_sha": "0a494307081188dbfc88574030c87efddfb02c5e",
+    "head_branch": "main",
+    "event": "workflow_dispatch",
+    "status": "completed",
+    "conclusion": "success",
+    "run_attempt": 1,
+    "path": ".github/workflows/ci.yaml",
+    "html_url": "https://github.com/curie-eng/curie/actions/runs/39653199666",
+    "workflow_id": 307513450,
+    "repository": {
+      "full_name": "curie-eng/curie"
+    },
+    "head_repository": {
+      "full_name": "curie-eng/curie"
+    }
+  },
+  "jobs": [
+    {
+      "name": "Rust (fmt + clippy)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "Contracts (generated TypeScript compiles)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "Preserve next on release merge",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "UI (lint + vitest + build + Playwright)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "Select end to end tiers",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "Compose (release stack validates)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "Action SHA pins",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "Turn canary contract",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "SRE bot adapter credential reconciliation",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "Commit messages (no AI attribution)",
+      "status": "completed",
+      "conclusion": "skipped"
+    },
+    {
+      "name": "Select Rust tests",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "CLI builds for macOS (the fourth release target)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "Python static gates",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "Python dry run fixture (pytest)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "Python container fixtures (pytest)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "CLI runs on old glibc (and publishes per-commit binaries)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "Build the curie release binary",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "Build sre-bot-tempo image (no push)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "Python pytest (shard 4/6)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "CI policy (workflow meta-tests)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "Python pytest (shard 2/6)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "Build sre-bot-self-upgrade image (no push)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "Python pytest (shard 5/6)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "Build github-activity-github image (no push)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "Python pytest (shard 1/6)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "Build CI images (no push)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "Python pytest (shard 6/6)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "Admitted agent runtime regressions (kind, shard 5/5)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "Admitted agent runtime regressions (kind, shard 2/5)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "E2E cluster upgrade matrix shards",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "Build sre-bot-scaler image (no push)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "Admitted agent runtime regressions (kind, shard 4/5)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "Runtime assertion registration",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "Admitted agent runtime regressions (kind, shard 1/5)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "Admitted agent runtime regressions (kind, shard 3/5)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "Python pytest (shard 3/6)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "Forge instance regression (kind, ${{ matrix.suite }})",
+      "status": "completed",
+      "conclusion": "skipped"
+    },
+    {
+      "name": "Rust test build",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "Rust convergence regressions (kind)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "Rust test (partition 2/3)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "Rust test (partition 1/3)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "Rust test (partition 3/3)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "Image proofs (smoke, Docker daemon, toolchain)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "E2E parity ladder (cluster rung on kind, fake model)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "E2E parity ladder (local-release, fake model)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "E2E scripted factory (kind, scripted model, fresh-install)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "E2E scripted factory (kind, scripted model, static-token-rotation)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "E2E approval resume after worker and store restarts (kind)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "Eval falsifiability gate (fake model, offline)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "E2E released chart upgrade negative control (nil unsafe helpers)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "E2E scripted factory (kind, scripted model, initial-binding)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "E2E OIDC console login (real Dex)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "E2E chart runtime regressions (kind, Calico, chart)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "E2E scripted factory (kind, scripted model, scenario)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "E2E parity ladder (skill + local, fake model)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "E2E chart runtime regressions (kind, Calico, workload)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "E2E cluster upgrade matrix (s05)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "E2E cluster upgrade matrix (s08)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "E2E cluster upgrade matrix (s01)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "E2E cluster upgrade matrix (s17)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "E2E cluster upgrade matrix (s03)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "E2E cluster upgrade matrix (s18)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "E2E cluster upgrade matrix (s14)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "E2E cluster upgrade matrix (s06)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "E2E cluster upgrade matrix (s02)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "E2E cluster upgrade matrix (s09)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "E2E cluster upgrade matrix (s13)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "E2E cluster upgrade matrix (s07)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "E2E cluster upgrade matrix (s15)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "E2E cluster upgrade matrix (s04)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "E2E cluster upgrade matrix (s16)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "E2E cluster upgrade matrix (s19)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "E2E cluster upgrade matrix (s21)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "E2E cluster upgrade matrix (s11)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "E2E cluster upgrade matrix (s20)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "E2E rollout-free invocation and dead-consumer recovery (kind)",
+      "status": "completed",
+      "conclusion": "skipped"
+    },
+    {
+      "name": "E2E released chart upgrade (released install to candidate)",
+      "status": "completed",
+      "conclusion": "skipped"
+    },
+    {
+      "name": "Python (ruff + mypy + pytest)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "Rust (fmt + clippy + test)",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "name": "E2E required",
+      "status": "completed",
+      "conclusion": "success"
+    }
+  ],
+  "commit": {
+    "sha": "0a494307081188dbfc88574030c87efddfb02c5e",
+    "commit": {
+      "tree": {
+        "sha": "b9f4f11802de9ebacba9a7b46e1e11921ab3ee5f"
+      }
+    }
+  }
+}
