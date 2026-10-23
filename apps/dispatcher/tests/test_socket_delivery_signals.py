@@ -148,6 +148,32 @@ def test_every_frame_is_counted_by_identity_and_type_before_any_listener(
     }
 
 
+@pytest.mark.parametrize(
+    "kind", [[], {}, None, 123, True], ids=["list", "object", "null", "number", "bool"]
+)
+def test_non_string_frame_types_are_counted_and_delivered_as_other(
+    offline_socket_mode: None,
+    envelopes: Counts,
+    kind: object,
+) -> None:
+    """Telemetry must not prevent malformed frames from reaching the SDK (#4960)."""
+    conn = SocketModeConnection(
+        _app(),
+        app_token="xapp-test",
+        logger=logging.getLogger("test-socket-envelopes-malformed"),
+        identity_name="ops",
+    )
+    thread = _run_in_background(conn)
+    try:
+        _wait_connected(conn)
+        deliver_frames(conn._handler.client, {"type": kind})
+    finally:
+        conn.close()
+        thread.join(timeout=5)
+
+    assert envelopes() == {("ops", "other"): 1}
+
+
 def test_a_disconnect_frame_is_counted_although_no_listener_sees_it(
     offline_socket_mode: None,
     envelopes: Counts,
