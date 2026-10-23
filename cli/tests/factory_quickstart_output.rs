@@ -2990,6 +2990,12 @@ fn dry_run_budget_line(fixture: &Fixture, extra: &[&str]) -> String {
 
 #[test]
 fn default_plan_sets_factory_output_allowance() {
+    // Pins the default to the product constant the plan prints.
+    assert_eq!(
+        curie::factory_quickstart::DEFAULT_OUTPUT_TOKENS_PER_RUN,
+        250_000,
+        "the factory quickstart default per-run output allowance is 250000 tokens (#4939)"
+    );
     let fixture = Fixture::new();
     let line = dry_run_budget_line(&fixture, &[]);
     assert!(
