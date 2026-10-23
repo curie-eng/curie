@@ -100,7 +100,12 @@
     {
       "struct": "WorkItemRequest",
       "schema": "WorkItemRequestOut",
-      "omissions": []
+      "omissions": [
+        {
+          "field": "last_start_failure_detail",
+          "why": "The CLI renders the previous start failure through the item's actionable_cause; no CLI path reads the raw request field."
+        }
+      ]
     },
     {
       "struct": "Agent",

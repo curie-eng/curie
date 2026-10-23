@@ -961,6 +961,15 @@ class WorkItem(Base):
 
 
 # The typed reply target's shape. Migration 0078 carries a frozen copy.
+# #4930: a stored start failure detail is nonblank (a POSIX class, so a value of
+# only tabs or newlines is refused too, which btrim alone would let through)
+# and within the API's clip bound.
+LAST_START_FAILURE_DETAIL_CHECK = (
+    "last_start_failure_detail IS NULL OR "
+    "(last_start_failure_detail ~ '[^[:space:]]' "
+    "AND length(last_start_failure_detail) <= 2000)"
+)
+
 REPLY_TARGET_CHECK = (
     "((reply_target_kind = 'issue' AND reply_target_pr_number IS NULL "
     "AND reply_target_comment_id IS NULL AND reply_target_url IS NULL) "
@@ -1105,6 +1114,10 @@ class ExecutionRequest(Base):
             name="execution_requests_snapshot_ck",
         ),
         CheckConstraint(REPLY_TARGET_CHECK, name="execution_requests_reply_target_ck"),
+        CheckConstraint(
+            LAST_START_FAILURE_DETAIL_CHECK,
+            name="execution_requests_last_start_failure_detail_ck",
+        ),
         UniqueConstraint(
             "work_item_id",
             "sequence",
@@ -1185,6 +1198,7 @@ class ExecutionRequest(Base):
     capacity_deferrals: Mapped[int] = mapped_column(default=0, server_default="0")
     start_deferrals: Mapped[int] = mapped_column(default=0, server_default="0")
     last_deferral_reason: Mapped[str | None] = mapped_column(Text, default=None)
+    last_start_failure_detail: Mapped[str | None] = mapped_column(Text, default=None)
     execution_attempts: Mapped[int] = mapped_column(default=0, server_default="0")
     runtime_owner: Mapped[str | None] = mapped_column(Text, default=None)
     runtime_epoch: Mapped[int] = mapped_column(

@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from aci_protocol.turn import route_identity
+from curie_telemetry.redact import redact_text
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import and_, exists, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -62,6 +63,19 @@ logger = logging.getLogger(__name__)
 # example the kernel's ``thread_busy`` while another turn holds the thread: it
 # keeps the flat base backoff, is not counted, and never ends the request.
 START_DEFERRAL_REASON_PREFIX = "not_started:"
+
+# #4930: the stored bound on a pre-start workspace diagnostic. Redaction runs
+# before the clip, so a clip can never cut a credential into a shape the
+# redaction rules no longer match.
+START_FAILURE_DETAIL_MAX = 2000
+
+
+def _start_failure_detail(detail: str | None) -> str | None:
+    if detail is None:
+        return None
+    safe = " ".join(redact_text(detail).split())[:START_FAILURE_DETAIL_MAX].rstrip()
+    return safe or None
+
 
 RefusalCode = Literal[
     "not_found",
@@ -760,6 +774,7 @@ async def _defer_factory_refusal(
         generation=generation,
         reason=f"not_started:{refusal}",
         capacity=False,
+        start_failure_detail=None,
         now=await database_now(session),
     )
     if isinstance(result, DispatchConflict):
@@ -904,6 +919,7 @@ async def defer(
     generation: int,
     reason: str,
     capacity: bool,
+    start_failure_detail: str | None,
 ) -> DeferResult | DispatchConflict:
     counts_as_start = not capacity and reason.startswith(START_DEFERRAL_REASON_PREFIX)
     if not counts_as_start:
@@ -949,6 +965,7 @@ async def defer(
         generation=generation,
         reason=reason,
         capacity=capacity,
+        start_failure_detail=start_failure_detail,
         now=now,
     )
 
@@ -962,10 +979,14 @@ async def _apply_deferral(
     generation: int,
     reason: str,
     capacity: bool,
+    start_failure_detail: str | None,
     now: datetime,
 ) -> DeferResult | DispatchConflict:
     counts_as_start = not capacity and reason.startswith(START_DEFERRAL_REASON_PREFIX)
     settings = get_settings()
+    # Only a failed sandbox start records its cause; capacity and other waits
+    # leave the previous one in place (#4930).
+    detail = _start_failure_detail(start_failure_detail) if counts_as_start else None
     values: dict[str, Any] = {}
     if capacity:
         delay = _backoff_seconds(settings, request.capacity_deferrals)
@@ -975,6 +996,8 @@ async def _apply_deferral(
     else:
         delay = _backoff_seconds(settings, request.start_deferrals)
         values["start_deferrals"] = ExecutionRequest.start_deferrals + 1
+    if detail is not None:
+        values["last_start_failure_detail"] = detail
     fails_start = (
         counts_as_start and request.start_deferrals + 1 >= settings.work_item_start_deferral_limit
     )
@@ -1868,6 +1891,7 @@ def request_view(row: ExecutionRequest) -> dict[str, Any]:
         "dispatch_not_before": row.dispatch_not_before,
         "capacity_deferrals": row.capacity_deferrals,
         "last_deferral_reason": row.last_deferral_reason,
+        "last_start_failure_detail": row.last_start_failure_detail,
         "execution_attempts": row.execution_attempts,
         "runtime_owner": row.runtime_owner,
         "runtime_epoch": row.runtime_epoch,

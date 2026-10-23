@@ -673,7 +673,11 @@ async def _process_event(
                                 ci_fix_round=None,
                             )
                         else:
-                            await factory_run.defer(f"not_started:{refusal}", capacity=False)
+                            await factory_run.defer(
+                                f"not_started:{refusal}",
+                                capacity=False,
+                                start_failure_detail=None,
+                            )
                     except WorkItemConflict as exc:
                         logger.info(
                             "factory refusal settlement for %s refused: %s", event_id, exc.code
@@ -1194,7 +1198,7 @@ async def _process_event(
                 )
                 if run is not None and not run.started:
                     try:
-                        await run.defer("thread_busy", capacity=False)
+                        await run.defer("thread_busy", capacity=False, start_failure_detail=None)
                     except WorkItemConflict as exc:
                         logger.info(
                             "work-item thread_busy defer refused for %s: %s",

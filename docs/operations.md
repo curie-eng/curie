@@ -2283,17 +2283,23 @@ request, a `state` and an `actionable_cause`. The states:
 
 - `waiting`: admitted and waiting for sandbox capacity. The cause names
   capacity deferrals and says when the waiting deadline has elapsed but the
-  reconciler has not yet expired the request.
+  reconciler has not yet expired the request. When an earlier start failed
+  while preparing the workspace, the cause also names that previous start
+  failure (its stage and a redacted reason, at most 2000 characters), and the
+  request's `last_start_failure_detail` holds the same text. Later capacity
+  deferrals and a worker replacement keep it; a successful start clears it.
 - `running`: started, bounded by the agent's execution deadline (default 1800 s).
 - `cancellation_requested`: termination requested (`issue_cancelled`,
   `execution_deadline` or `owner_lost`) and awaiting a runtime observation.
 - `cancelled`: the issue label was removed or the issue was closed. A pull
   request already opened is kept.
-- `expired`: `capacity_wait_expired` or `execution_deadline`.
+- `expired`: `capacity_wait_expired` or `execution_deadline`. A capacity
+  wait that expires after a failed start still names the previous start
+  failure.
 - `failed`: the cause names the terminal cause verbatim. For
   `deadline_halted`, raise `worker.deliveryBudgetSeconds`. For `start_failed`,
-  the sandbox never started; the cause names the attempt count and the last
-  deferral reason.
+  the sandbox never started; the cause names the attempt count, the last
+  deferral reason and the previous start failure when one was recorded.
 - `awaiting_approval`: a publication approval or a tool approval on the same
   conversation is pending.
 - `publishing`: the publication is approved and in flight.
