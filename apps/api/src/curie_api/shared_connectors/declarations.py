@@ -4,8 +4,9 @@
 ``connectors.yaml`` that does not parse raises ``DeclarationRefused`` with its
 code and is never read as an empty connector set. ``resolve`` checks each
 shared entry against the shared store in one read transaction: the
-installation is usable, the application exists in it and is enabled, and the
-deploying agent is a member under exactly the bundle's connector name.
+installation is usable, the application exists in it and is enabled, the
+deploying agent is a member under exactly the bundle's connector name, and the
+stored spec names only the canonical worker Secrets.
 
 A declaration or resolution refusal answers ``{"detail": {"code",
 "application", "connector", "declared"}}`` and is never cached. ``declared``
@@ -41,7 +42,13 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..models import SharedConnectorApplication, SharedConnectorMembership
-from .store import NO_STORE, SharedRefusal, usable_installation, with_lock
+from .store import (
+    NO_STORE,
+    SharedRefusal,
+    require_worker_secret_refs,
+    usable_installation,
+    with_lock,
+)
 
 
 class DeclarationRefused(SharedRefusal):
@@ -227,6 +234,12 @@ async def resolve(
             raise refusal(
                 status.HTTP_500_INTERNAL_SERVER_ERROR, "shared_application_invalid"
             ) from None
+        # The stored spec, checked as the worker will read it: never resolved
+        # into a render whose application the worker would refuse.
+        try:
+            require_worker_secret_refs(spec, status_code=conflict)
+        except SharedRefusal as refused:
+            raise refusal(refused.status_code, str(refused.detail)) from None
         resolved.append(ResolvedShared(name=entry.name, application=spec, enabled=True))
     return tuple(resolved)
 

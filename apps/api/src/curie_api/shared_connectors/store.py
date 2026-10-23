@@ -272,7 +272,7 @@ def usable_installation() -> str:
     return configured
 
 
-def _require_worker_secret_refs(spec: SharedApplication) -> None:
+def require_worker_secret_refs(spec: SharedApplication, *, status_code: int) -> None:
     """Pin the worker-managed Secret names, so the two kinds of Secret never cross.
 
     The worker creates the key Secret, and for a bundled database the DSN
@@ -280,6 +280,10 @@ def _require_worker_secret_refs(spec: SharedApplication) -> None:
     these names. So the spec must name exactly those, and an operator Secret
     (a managed DSN, the grant store, the snapshot seal) must never carry a
     worker-managed prefix, or the worker would create or adopt it.
+
+    Checked at registration (422, the client's input) and again on every
+    stored-spec read the worker depends on (409, stored state): a row stored
+    before this check, or one that drifted, is refused rather than rendered.
     """
 
     application = spec.application
@@ -299,9 +303,7 @@ def _require_worker_secret_refs(spec: SharedApplication) -> None:
         or not dsn_pinned
         or any(ref is not None and ref.name.startswith(worker_prefixes) for ref in operator_refs)
     ):
-        raise SharedRefusal(
-            status.HTTP_422_UNPROCESSABLE_CONTENT, "shared_application_secret_ref_invalid"
-        )
+        raise SharedRefusal(status_code, "shared_application_secret_ref_invalid")
 
 
 def _pin_digest(spec: dict[str, Any], policy: dict[str, Any]) -> str:
@@ -336,7 +338,7 @@ async def register_application(
         raise SharedRefusal(status.HTTP_422_UNPROCESSABLE_CONTENT, "shared_application_invalid")
     if spec.installation != installation:
         raise SharedRefusal(status.HTTP_409_CONFLICT, "shared_installation_mismatch")
-    _require_worker_secret_refs(spec)
+    require_worker_secret_refs(spec, status_code=status.HTTP_422_UNPROCESSABLE_CONTENT)
 
     spec_json = spec.model_dump(mode="json")
     # The tool subsets are stored only when nonempty, so a policy without them

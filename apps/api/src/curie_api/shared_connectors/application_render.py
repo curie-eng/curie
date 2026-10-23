@@ -28,6 +28,7 @@ from .store import (
     SharedRefusal,
     database_role,
     lock_application,
+    require_worker_secret_refs,
     usable_installation,
     with_lock,
 )
@@ -43,8 +44,10 @@ async def application_render(
     """Render one application of this installation at the worker's own root.
 
     An application of another installation, namespace or release is refused as
-    a root mismatch. A disabled application still renders, marked disabled:
-    the worker keeps its objects and applies nothing new.
+    a root mismatch, and a stored spec naming a non-canonical Secret as
+    ``shared_application_secret_ref_invalid``. A disabled application still
+    renders, marked disabled: the worker keeps its objects and applies nothing
+    new.
     """
 
     installation = usable_installation()
@@ -61,6 +64,9 @@ async def application_render(
         release,
     ):
         raise SharedRefusal(status.HTTP_409_CONFLICT, "shared_application_root_mismatch")
+    # Stored state: a spec naming a Secret the worker never creates is refused,
+    # so the worker creates no Secret and registers no recipient for it.
+    require_worker_secret_refs(spec, status_code=status.HTTP_409_CONFLICT)
 
     database: dict[str, Any] = {
         "mode": "bundled" if spec.dsn_encoding == "bundled-sealed" else "managed",

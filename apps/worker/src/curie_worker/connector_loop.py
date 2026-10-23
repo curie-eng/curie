@@ -40,7 +40,10 @@ unresolved, or gone), then ensures every declared application, applies and
 prunes reach, and collects application garbage (``shared_reconcile``). A
 refused render applies no dedicated change for that agent and prunes all of
 its shared reach; a render the pass could not get leaves its reach alone and
-blocks application garbage collection.
+blocks application garbage collection. The agents run first and read the
+readiness earlier passes recorded, so a dedicated connector replaced by a
+shared reference keeps its objects until the pass after its application is
+first observed ready (ADR 0239 Restore 6).
 """
 
 from __future__ import annotations
@@ -49,11 +52,12 @@ import asyncio
 import logging
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 import httpx
 from curie_telemetry import record_metric
+from plugin_format.connector_render import direct_service_name, object_name
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -260,17 +264,36 @@ class _SharedGuard:
     of it is applied, as undecidable: the agent's shared reach is pruned and
     application garbage collection waits, while dedicated-only agents are
     unaffected.
+
+    Otherwise each shared entry whose application the reconciler has not
+    observed ready marks the dedicated objects of the same alias retained
+    (``RenderedConnectors.retained``), by the frozen render's names.
     """
 
-    def __init__(self, inner: ManifestSource, *, ready: bool) -> None:
+    def __init__(
+        self, inner: ManifestSource, *, shared: SharedReconciler | None, agent: str
+    ) -> None:
         self._inner = inner
-        self._ready = ready
+        self._shared = shared
+        self._agent = agent
 
     def rendered(self, *, agent_id: str, version_id: str) -> RenderedConnectors:
         rendered = self._inner.rendered(agent_id=agent_id, version_id=version_id)
-        if rendered.shared and not self._ready:
+        if not rendered.shared:
+            return rendered
+        shared = self._shared
+        if shared is None or not shared.ready:
             raise SharedRenderRefused(WORKER_TOKEN_MISSING)
-        return rendered
+        retained = frozenset(
+            name
+            for entry in rendered.shared
+            if not shared.application_ready(entry.application)
+            for name in (
+                object_name(shared.release, self._agent, entry.name),
+                direct_service_name(shared.release, self._agent, entry.name),
+            )
+        )
+        return replace(rendered, retained=retained)
 
 
 class _ObservingClient:
@@ -393,7 +416,7 @@ class ConnectorReconcileLoop:
                 namespace=self._namespace,
             )
         return reconcile_agent(
-            _SharedGuard(self._source, ready=self._shared is not None and self._shared.ready),
+            _SharedGuard(self._source, shared=self._shared, agent=target.agent_name),
             client,
             agent=target.agent_name,
             agent_id=str(target.agent_id),

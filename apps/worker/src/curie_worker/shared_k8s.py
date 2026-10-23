@@ -7,7 +7,11 @@ the verbs are narrower than the dedicated client's.
 1. Deployments, Services and NetworkPolicies are server-side applied with the
    field manager ``curie-shared-connector-reconciler`` (``force=True``, the
    same drift correction ``connector_k8s`` documents), listed by label and
-   deleted by name.
+   deleted by name. A Deployment is deleted with ``Foreground`` propagation,
+   so the API server keeps it listed, with a ``deletionTimestamp``, until its
+   ReplicaSets and Pods are gone: the reconciler deletes an application's
+   Service and NetworkPolicies only once its Deployment is no longer listed,
+   with no Pod verb in the worker's Role.
 2. Secrets are never applied, patched or deleted. The worker's own key and
    DSN Secrets are created once (``POST``; ``409 AlreadyExists`` answers
    ``"exists"`` and changes nothing) and read back by an exact ``list``
@@ -107,8 +111,14 @@ class KubernetesSharedClient:
 
     def delete(self, namespace: str, kind: str, name: str) -> None:
         api, suffix = self._kind(kind)
+        # Foreground for a Deployment (point 1); the server's default otherwise.
+        options: dict[str, Any] = (
+            {"propagation_policy": "Foreground"} if kind == "Deployment" else {}
+        )
         try:
-            getattr(api, f"delete_namespaced_{suffix}")(name, namespace, _preload_content=False)
+            getattr(api, f"delete_namespaced_{suffix}")(
+                name, namespace, _preload_content=False, **options
+            )
         except k8s_client.ApiException as exc:
             # Already gone is the state we wanted. Anything else is real.
             if exc.status != 404:

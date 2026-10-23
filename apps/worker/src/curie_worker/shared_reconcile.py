@@ -24,6 +24,19 @@ So reach is pruned only on an authoritative answer, and application objects
 are deleted only in a pass with GC unblocked and no authoritative agent
 declaring the application. Secrets are never deleted.
 
+An application's Pods never run without its ingress isolation. Its
+NetworkPolicies are applied first, then its Service, and its Deployment only
+once every policy applied. GC deletes the Deployment first, in the foreground,
+and its Service and NetworkPolicies only in a pass that lists no Deployment of
+that application: a failed delete, or a Deployment still terminating, keeps
+them for a later pass.
+
+``application_ready`` answers whether this process last observed an
+application's Deployment ready. The agent reconcile reads it before this
+pass's ``ensure_application`` runs, so a dedicated connector replaced by a
+shared reference is retained until a pass after the first ready observation
+(ADR 0239 Restore 6).
+
 ``ensure_application`` per application:
 
 1. Reads the worker route's render and Secret plan. A disabled application
@@ -41,8 +54,9 @@ declaring the application. Secrets are never deleted.
    reported ``failed``/``dsn_secret_stale`` and never patched. A managed
    database's operator Secret, and the grant store and snapshot seal, are
    checked by metadata only.
-5. The render's objects are server-side applied, and the database status is
-   reported from the Deployment's observed readiness, only when it changes.
+5. The render's objects are server-side applied in that isolation order, and
+   the database status is reported from the Deployment's observed readiness,
+   only when it changes.
 """
 
 from __future__ import annotations
@@ -96,6 +110,9 @@ APPLICATION_DISABLED = "shared_application_disabled"
 DSN_SECRET_STALE = "dsn_secret_stale"
 DSN_SECRET_MISSING = "dsn_secret_missing"
 DEPLOYMENT_UNAVAILABLE = "deployment_unavailable"
+
+# The order an application's objects are applied in: no Pod before its policies.
+_APPLY_ORDER = {"NetworkPolicy": 0, "Service": 1, "Deployment": 2}
 
 # What the API answers a refusal with: a fixed code, never a value.
 _CODE = re.compile(r"^[a-z][a-z0-9_.]{0,63}$")
@@ -320,12 +337,29 @@ class SharedReconciler:
         # sent only when it changes. In process only: a restarted worker
         # reports the current status once.
         self._reported: dict[str, tuple[str, str | None, int]] = {}
+        # Applications whose Deployment the last ``ensure_application`` saw
+        # ready. In process only: a restarted worker starts with none, so a
+        # retained dedicated holder lasts one extra pass.
+        self._ready_applications: set[str] = set()
 
     @property
     def ready(self) -> bool:
         """Whether applications can be reconciled: the worker routes need the token."""
 
         return self._api is not None
+
+    @property
+    def release(self) -> str:
+        return self._release
+
+    def application_ready(self, application_id: str) -> bool:
+        """Whether the last ``ensure_application`` here observed the Deployment ready.
+
+        False until then, and again after any later non-ready observation,
+        refusal, disabled or unprovisioned render, transport failure, or GC.
+        """
+
+        return application_id in self._ready_applications
 
     # --- reach --------------------------------------------------------------------
 
@@ -365,7 +399,11 @@ class SharedReconciler:
         """Delete the objects of applications no authoritative agent declares.
 
         Only in a pass whose GC is unblocked: no agent unresolved and none
-        undecidable. Secrets are never listed or deleted.
+        undecidable. Secrets are never listed or deleted. The Deployments go
+        first (foreground, so a terminating one stays listed); an
+        application's Service and NetworkPolicies go only once a list after
+        those deletes shows none of its Deployments, so its Pods never outlive
+        their isolation.
         """
 
         outcome = SharedOutcome()
@@ -376,14 +414,38 @@ class SharedReconciler:
             f"{COMPONENT_LABEL}={COMPONENT},{PART_OF_LABEL}={self._release},"
             f"{APPLICATION_LABEL},!{AGENT_LABEL}"
         )
+
+        def undeclared(kind: str) -> list[tuple[str, dict[str, Any]]]:
+            listed = self._client.list_labelled(self._namespace, kind, selector)
+            return [
+                (application, item)
+                for item in listed
+                if (application := _labels(item).get(APPLICATION_LABEL, "")) not in declared
+            ]
+
+        deployments = undeclared("Deployment")
+        for application, item in deployments:
+            self._forget(application)
+            # Already terminating: the foreground delete is in progress.
+            if not (item.get("metadata") or {}).get("deletionTimestamp"):
+                self._delete("Deployment", _name(item), outcome)
+        # Listed again: one whose Pods were gone is gone at once, while one
+        # still terminating, or whose delete failed, holds its isolation.
+        held = (
+            {application for application, _ in undeclared("Deployment")} if deployments else set()
+        )
         for kind in SHARED_KINDS:
-            for item in self._client.list_labelled(self._namespace, kind, selector):
-                application = _labels(item).get(APPLICATION_LABEL, "")
-                if application in declared:
-                    continue
-                self._delete(kind, _name(item), outcome)
-                self._reported.pop(application, None)
+            if kind == "Deployment":
+                continue
+            for application, item in undeclared(kind):
+                self._forget(application)
+                if application not in held:
+                    self._delete(kind, _name(item), outcome)
         return outcome
+
+    def _forget(self, application_id: str) -> None:
+        self._reported.pop(application_id, None)
+        self._ready_applications.discard(application_id)
 
     # --- one application -----------------------------------------------------------
 
@@ -391,6 +453,8 @@ class SharedReconciler:
         """Converge one declared application. Raises only for transport failures."""
 
         outcome = SharedOutcome()
+        # Ready only if this pass observes it so again.
+        self._ready_applications.discard(application_id)
         try:
             self._ensure(application_id, outcome)
         except SharedReconcileRefused as refused:
@@ -444,8 +508,17 @@ class SharedReconciler:
             ):
                 raise SharedReconcileRefused(OPERATOR_SECRET_MISSING)
 
-        # Every object is attempted; one failure does not hold back the rest.
-        applied = all([self._apply(obj, outcome) for obj in objects])
+        # Policies, then the Service, then the Deployment, which waits for every
+        # policy: no Pod of the application runs without its isolation. Any
+        # other failure does not hold back the rest.
+        applied = isolated = True
+        for obj in sorted(objects, key=lambda obj: _APPLY_ORDER.get(str(obj.get("kind")), 1)):
+            if obj.get("kind") == "Deployment" and not isolated:
+                applied = False
+                continue
+            if not self._apply(obj, outcome):
+                applied = False
+                isolated = isolated and obj.get("kind") != "NetworkPolicy"
         if stale:
             self._report(application_id, "failed", DSN_SECRET_STALE, revision, outcome)
             return
@@ -454,6 +527,8 @@ class SharedReconciler:
             return
         observed = self._readiness(application_id, deployments[0])
         if observed is not None:
+            if observed[0] == "ready":
+                self._ready_applications.add(application_id)
             self._report(application_id, observed[0], observed[1], revision, outcome)
 
     # --- Secrets ------------------------------------------------------------------
