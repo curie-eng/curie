@@ -956,7 +956,7 @@ def run_label_to_merge_request_ci_review_and_cancel(
     assert push.json()["clone_url"] == f"{install.origin}/{backend.project_path}.git"
     assert push.json()["authorization_header"] == basic_oauth2(backend.token)
     branch = publication["branch"]
-    head = backend.push(branch, "Fix the widget parser")
+    head = backend.push(branch, f"Fix the widget parser\n\nCurie-Revision: {publication['id']}")
     recovered = recover_pull_request(install, publication["id"], head)
     assert recovered.status_code == 200, recovered.text
     pull = recovered.json()
@@ -1035,7 +1035,11 @@ def run_label_to_merge_request_ci_review_and_cancel(
     assert revised.status_code == 201, revised.text
     revision_publication = revised.json()
     approve(revision_publication["id"])
-    fix_head = backend.push(branch, "Fix the widget parser off-by-one", fix=True)
+    fix_head = backend.push(
+        branch,
+        f"Fix the widget parser off-by-one\n\nCurie-Revision: {revision_publication['id']}",
+        fix=True,
+    )
     fixed = advance_lineage(
         install,
         revision_publication,

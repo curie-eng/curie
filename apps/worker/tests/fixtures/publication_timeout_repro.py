@@ -145,7 +145,7 @@ class Peer:
         path = request.url.path
         self.requests.append(f"{request.method} {path}")
         if path.endswith("/branch-head"):
-            return httpx.Response(200, json={"head_sha": self.head})
+            return httpx.Response(200, json={"head_sha": self.head, "base_branch": "main"})
         if path.endswith("/revision-commit"):
             body = json.loads(request.content.decode())
             if body.get("expected_parent") != self.parent:
@@ -156,7 +156,7 @@ class Peer:
                     json={"detail": {"message": "commit is not this revision"}},
                 )
             observed = body.get("commit_sha")
-            return httpx.Response(200, json={"commit_sha": observed})
+            return httpx.Response(200, json={"commit_sha": observed, "parent_sha": self.parent})
         if path.endswith("/pull-request") and request.method == "POST":
             body = json.loads(request.content)
             self.recovery_bodies.append(body)

@@ -812,7 +812,10 @@ class BitbucketPair:
             "UPDATE curie.publications SET status = 'approved' WHERE id = :id",
             {"id": uuid.UUID(publication["id"])},
         )
-        head = self.backend.push(publication["branch"], "Keep the last field of a line")
+        head = self.backend.push(
+            publication["branch"],
+            f"{publication['title']}\n\nCurie-Revision: {publication['id']}\n",
+        )
         return Publication(publication["id"], publication["branch"], publication["body"], head)
 
     def open_publication(self, publication: Publication) -> httpx.Response:

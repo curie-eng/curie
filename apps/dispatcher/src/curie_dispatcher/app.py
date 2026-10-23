@@ -16,6 +16,7 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 import redis
+from curie_telemetry import record_metric
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slack_sdk.web import WebClient
@@ -27,6 +28,10 @@ from .identities import SlackIdentityCredentials, default_identity_credentials
 from .identity import IdentityResolver
 from .socket_presence import SocketPresence
 from .supervisor import Connection
+
+# The Socket Mode frame types ``curie.slack.socket.envelopes`` names; any
+# other type, and a frame that is not a JSON object, counts as ``other``.
+_ENVELOPE_TYPES = frozenset({"hello", "disconnect", "events_api", "interactive", "slash_commands"})
 
 # In Socket Mode the signing secret is never used to verify requests (they arrive
 # over the authenticated websocket, not HTTP), but Bolt's App still wants one at
@@ -198,6 +203,13 @@ class SocketModeConnection(Connection):
     With a ``presence``, the connection reports its socket to the
     ``curie.slack.socket.identities`` gauge, and ``run``'s otherwise idle wait
     takes that gauge's samples.
+
+    ``identity_name`` names the identity on its delivery signals (#4960) even
+    when ``slack_identity`` is left off its log lines; it falls back to
+    ``slack_identity``, then ``default``. Each frame Slack hands the client is
+    counted on ``curie.slack.socket.envelopes`` as the SDK enqueues it, and the
+    client logs to ``<logger>.slack_socket.<identity_name>``, so slack_sdk's
+    INFO session lifecycle reaches the service logger's handlers.
     """
 
     def __init__(
@@ -207,12 +219,20 @@ class SocketModeConnection(Connection):
         *,
         logger: logging.Logger | None = None,
         slack_identity: str | None = None,
+        identity_name: str | None = None,
         presence: SocketPresence | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        self._handler = SocketModeHandler(app, app_token=app_token)
         self._logger = logger or logging.getLogger(__name__)
         self._slack_identity = slack_identity
+        self._identity_name = identity_name or slack_identity or "default"
+        # Bolt otherwise hands the client its own ``slack_bolt.App`` logger,
+        # which only the root WARNING backstop handles.
+        self._handler = SocketModeHandler(
+            app,
+            app_token=app_token,
+            logger=self._logger.getChild(f"slack_socket.{self._identity_name}"),
+        )
         self._presence = presence
         self._clock = clock
         self._closed = threading.Event()
@@ -281,7 +301,16 @@ class SocketModeConnection(Connection):
                 )
             except ValueError:
                 message = None
-            if isinstance(message, dict) and message.get("type") == "hello":
+            kind = message.get("type") if isinstance(message, dict) else None
+            record_metric(
+                "curie.slack.socket.envelopes",
+                attributes={
+                    "service.name": "curie-dispatcher",
+                    "slack_identity": self._identity_name,
+                    "type": kind if isinstance(kind, str) and kind in _ENVELOPE_TYPES else "other",
+                },
+            )
+            if kind == "hello":
                 with self._hello_own_sockets_lock:
                     self._hello_own_sockets[id(raw_message)] = self._own_sockets
             try:
