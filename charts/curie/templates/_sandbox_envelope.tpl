@@ -253,3 +253,35 @@ template's in any field (#4889 A6). Used by NOTES.
 {{- end -}}
 {{- toJson $out -}}
 {{- end -}}
+
+{{/*
+curie.api.resources: root -> YAML of api.resources with limits.memory resolved
+(#4939). Shared by the API Deployment and the schema-migrate Job.
+  1. an explicit non-empty api.resources.limits.memory wins for every install;
+  2. else agentSandbox.resourceProfiles.<profile>.apiMemoryLimit, where the
+     profile is `factory` when factory.enabled is true, else `standard`.
+Every other key an operator set is kept. A release made by an older chart and
+reused with --reuse-values carries an explicit limit from its own values.yaml,
+so it resolves at step 1 even without a profile catalog. A limit that resolves
+to nothing fails the render (ADR-0059: finite bounds).
+*/}}
+{{- define "curie.api.resources" -}}
+{{- $root := . -}}
+{{- $res := deepCopy ($root.Values.api.resources | default dict) -}}
+{{- $limits := get $res "limits" | default dict -}}
+{{- $mem := get $limits "memory" -}}
+{{- if kindIs "invalid" $mem }}{{ $mem = "" }}{{ end -}}
+{{- if eq (toString $mem) "" -}}
+{{- $name := "standard" -}}
+{{- if get ($root.Values.factory | default dict) "enabled" }}{{ $name = "factory" }}{{ end -}}
+{{- $catalog := get ($root.Values.agentSandbox | default dict) "resourceProfiles" | default dict -}}
+{{- $mem = get (get $catalog $name | default dict) "apiMemoryLimit" -}}
+{{- if kindIs "invalid" $mem }}{{ $mem = "" }}{{ end -}}
+{{- if eq (toString $mem) "" -}}
+{{- fail (printf "API memory limit resolves to no value: set api.resources.limits.memory, or agentSandbox.resourceProfiles.%s.apiMemoryLimit (profile %s is selected because factory.enabled is %v)" $name $name (eq $name "factory")) -}}
+{{- end -}}
+{{- $_ := set $limits "memory" $mem -}}
+{{- $_ := set $res "limits" $limits -}}
+{{- end -}}
+{{- toYaml $res -}}
+{{- end -}}
