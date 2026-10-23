@@ -206,6 +206,16 @@ async def test_streamed_broker_commits_integrity_and_live_scope(
         try:
             for _ in range(257 if req.match_info["id"] == "FEXAMPLE1" else 200):
                 await response.write(chunk)
+                if req.match_info["id"] == "FEXAMPLE2" and body_reads.count("FEXAMPLE2") == 2:
+                    # Hold the revoked transfer inside a provider read, so the
+                    # authority monitor must close an outstanding upstream read.
+                    transport = req.transport
+                    assert transport is not None
+                    async with asyncio.timeout(3):
+                        while not transport.is_closing():
+                            await asyncio.sleep(0.01)
+                    stopped.set()
+                    return response
                 if req.match_info["id"] != "FEXAMPLE1":
                     await asyncio.sleep(0.05)
             await response.write_eof()
