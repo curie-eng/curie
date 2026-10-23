@@ -452,6 +452,49 @@ def test_grant_a_call_refused_for_capacity_spends_no_grant(worlds: Worlds) -> No
         client.close()
 
 
+def test_grant_a_spend_that_cannot_reach_its_worker_thread_refuses_closed(
+    worlds: Worlds,
+) -> None:
+    """The spend's executor hand-off failing is a failed spend: 403, never a 500."""
+
+    from curie_connector_proxy import shared
+
+    world = worlds(gated_tools=("create_item",))
+    member = world.member()
+    arguments = {"title": "no thread"}
+    token, jti = world.grant(member, "create_item", arguments)
+    client = connect_or_skip()
+    key = GRANT_KEY_PREFIX + jti
+
+    def no_thread(*args: object, **kwargs: object) -> Any:
+        raise RuntimeError("can't start new thread")
+
+    try:
+        # Patched on the module object shared.py calls through, for this request
+        # only; the proxy's event loop thread sees it, which is the point.
+        # Restored by hand: the store fixture's monkeypatch must not be undone.
+        original = shared.asyncio.to_thread
+        shared.asyncio.to_thread = no_thread  # type: ignore[assignment]
+        try:
+            before = world.observe()
+            reply = world.call(member, "create_item", arguments, grants=[token])
+        finally:
+            shared.asyncio.to_thread = original
+        world.assert_refused(reply, "grant_required", before)
+        assert reply.json["error"]["data"] == {
+            "curie_caller": "grant_required",
+            "curie_shared": "grant_required",
+        }
+        assert client.exists(key) == 0
+        # Liveness: restored, the same grant is admitted once.
+        reply = world.call(member, "create_item", arguments, grants=[token])
+        assert _admitted(reply)["binding"] == member.binding_id
+        assert client.exists(key) == 1
+    finally:
+        client.delete(key)
+        client.close()
+
+
 # =============================================================================
 # R1-2: a handle pins the admitted binding
 # =============================================================================
