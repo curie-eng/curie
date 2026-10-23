@@ -663,7 +663,7 @@ def test_unstartable_failure_does_not_chain_the_raw_error(harness: Harness) -> N
     assert error.__context__ is None or error.__suppress_context__, repr(error.__context__)
 
 
-# Basename is 109 bytes, past the USTAR 100-byte name field. This is the path
+# Basename is 102 bytes, past the USTAR 100-byte name field. This is the path
 # that stopped the Forge instance image build while streaming the working tree.
 LONG_CONTEXT_PATH = (
     "docs/adr/0240-a-hosted-connector-declares-the-routes-its-bundles-"
