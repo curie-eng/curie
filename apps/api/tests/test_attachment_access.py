@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import uuid
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -163,14 +164,21 @@ async def test_no_public_authority_from_worker_or_platform_credential(access: An
 
 @pytest.mark.anyio
 async def test_streamed_broker_commits_integrity_and_live_scope(
-    access: Any, monkeypatch: pytest.MonkeyPatch
+    access: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     import asyncio
     import hashlib
     import socket
 
     import uvicorn
+    from aci_protocol import Event
     from aiohttp import web
+    from curie_runner.attachment_access import (
+        AttachmentAccess,
+        AttachmentAccessError,
+        AttachmentAccessTurn,
+    )
+    from curie_runner.platform_slack.capability import url_origin
     from curie_worker.attachment_broker import AttachmentBroker
     from curie_worker.attachments import AgentRoute, ChannelPortFileClient
 
@@ -320,6 +328,29 @@ async def test_streamed_broker_commits_integrity_and_live_scope(
                 "status": "complete",
             }, final.text
             assert body_reads == ["FEXAMPLE1"]
+            # Exercise the real runner consumer against the actual API/broker/
+            # adapter chain, including its durable completion and local cache.
+            turn = AttachmentAccessTurn(trusted_origin=url_origin(api_url))
+            turn.begin(
+                Event(
+                    type="message",
+                    text="Read the selected file",
+                    user="U",
+                    ts="1",
+                    attachment_access={"url": api_url + "/attachment-access", "token": token},
+                )
+            )
+            runner_access = AttachmentAccess(turn, tmp_path)
+            listing = await runner_access.list({})
+            assert len(listing["files"]) == 3 and body_reads == ["FEXAMPLE1"]
+            assert [item["current"] for item in listing["files"]] == [False, False, True]
+            downloaded = await runner_access.fetch({"id": file["id"]})
+            assert Path(downloaded["path"]).stat().st_size == total
+            assert downloaded["size_bytes"] == total
+            with Path(downloaded["path"]).open("rb") as cached:
+                assert hashlib.file_digest(cached, "sha256").hexdigest() == hashed.hexdigest()
+            assert await runner_access.fetch({"id": file["id"]}) == downloaded
+            assert body_reads == ["FEXAMPLE1", "FEXAMPLE1"]
             second_id = page.json()["files"][1]["id"]
             async with client.stream(
                 "POST", "/attachment-access/fetch", headers=headers, json={"id": second_id}
@@ -357,9 +388,12 @@ async def test_streamed_broker_commits_integrity_and_live_scope(
                 "/attachment-access/authorize", headers=headers, json={"id": file["id"]}
             )
             assert denied.status_code == 409
+            with pytest.raises(AttachmentAccessError):
+                await runner_access.fetch({"id": file["id"]})
+            turn.end()
             late = await client.post(INTERNAL + "/context", headers=worker(), json=mint)
             assert late.status_code == 409
-            assert body_reads == ["FEXAMPLE1", "FEXAMPLE2", "FEXAMPLE2"]
+            assert body_reads == ["FEXAMPLE1", "FEXAMPLE1", "FEXAMPLE2", "FEXAMPLE2"]
     finally:
         await broker_runner.cleanup()
         server.should_exit = True
