@@ -1178,10 +1178,12 @@ class ActionExecutorLoop:
             )
         except Exception as exc:  # noqa: BLE001 -- quota, timeout or route race alike
             logger.info(
-                "action execution %s sandbox unavailable connector=%s error=%s",
+                "action execution %s sandbox unavailable connector=%s error=%s code=%s",
                 execution.id,
                 execution.connector,
                 type(exc).__name__,
+                # A reader refusal's fixed code (ADR 0239); never a value.
+                getattr(exc, "code", None),
             )
             raise _Refuse("sandbox_unavailable", "sandbox") from None
         run.handle = handle

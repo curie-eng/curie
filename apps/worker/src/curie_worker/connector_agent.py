@@ -65,6 +65,21 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
+class SharedReach:
+    """One shared entry of the render (ADR 0239): its alias, application and member reach.
+
+    ``reach`` is the frozen ``render_member_reach`` output for this agent,
+    applied by the shared reconciler and never by this module: shared objects
+    carry no ``curie.dev/connector-owner`` label, so no dedicated plan ever
+    sees them.
+    """
+
+    name: str
+    application: str
+    reach: tuple[dict[str, Any], ...] = ()
+
+
+@dataclass(frozen=True)
 class RenderedConnectors:
     """What the API returns for one version's `connectors.yaml`."""
 
@@ -73,6 +88,7 @@ class RenderedConnectors:
     # must supply. Non-empty means the CLI owns that Secret's lifecycle.
     owned_secret_name: str = ""
     owned_secret_keys: list[str] = field(default_factory=list)
+    shared: tuple[SharedReach, ...] = ()
 
     @property
     def needs_operator_credentials(self) -> bool:
@@ -100,6 +116,9 @@ class AgentOutcome:
     skipped: str | None = None
     plan: ReconcilePlan | None = None
     report: ApplyReport | None = None
+    # The render this outcome reconciled; None on the prune-only path, which
+    # has none. The loop reads its shared entries.
+    rendered: RenderedConnectors | None = None
 
     @property
     def ok(self) -> bool:
@@ -129,6 +148,7 @@ def _execute_and_report(
     agent: str,
     namespace: str,
     skipped: str | None = None,
+    rendered: RenderedConnectors | None = None,
 ) -> AgentOutcome:
     """Run a decided plan and turn it into an outcome.
 
@@ -148,7 +168,9 @@ def _execute_and_report(
             len(report.failures),
             "; ".join(f"{kind}/{name}: {err}" for kind, name, err in report.failures),
         )
-    return AgentOutcome(agent=agent, skipped=skipped, plan=carried, report=report)
+    return AgentOutcome(
+        agent=agent, skipped=skipped, plan=carried, report=report, rendered=rendered
+    )
 
 
 def reconcile_agent(
@@ -230,12 +252,12 @@ def reconcile_agent(
         # describe a pass that did not happen.
         carried = ReconcilePlan(delete=computed.delete)
     elif computed.is_noop:
-        return AgentOutcome(agent=agent, plan=computed, report=ApplyReport())
+        return AgentOutcome(agent=agent, plan=computed, report=ApplyReport(), rendered=rendered)
     else:
         carried = computed
 
     return _execute_and_report(
-        client, carried, agent=agent, namespace=namespace, skipped=skipped
+        client, carried, agent=agent, namespace=namespace, skipped=skipped, rendered=rendered
     )
 
 

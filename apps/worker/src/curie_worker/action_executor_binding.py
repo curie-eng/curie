@@ -8,11 +8,17 @@ ordinary turn would resolve it (``BindingResolver.resolve_agent``):
   the connector's Deployment at, through the same API render the connector
   reconcile loop applies (``HttpManifestSource``). A tag, an unknown agent, a
   connector the version does not run, or any failure is None, which refuses
-  ``connector_digest_unavailable``.
+  ``connector_digest_unavailable``. A connector the render lists as shared
+  raises ``SharedConnectorUnsupported`` instead (ADR 0239).
 * ``executor_boot``: the binding's boot env (stripped by the loop) and the
   connector secrets the target connector's derived MCP entry headers expand,
   read from the version's stored bundle with ``plugin_format``'s own
-  ``mcp_entry``, so the header set is the runner's derivation.
+  ``mcp_entry``, so the header set is the runner's derivation. The bundle's
+  declarations are read strictly (``read_bundle_declarations``): an unreadable
+  or invalid file raises ``ConnectorDeclarationRefused`` with its code, and
+  only no bundle or no ``connectors.yaml`` expands nothing. Shared entries the
+  acting agent's target runs are resolved through the API first, and a shared
+  target connector raises ``SharedConnectorUnsupported``.
 
 Neither reads conversation text, model output or history.
 """
@@ -25,17 +31,22 @@ import re
 import tempfile
 import uuid
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
-import yaml
 from aci_protocol import BootEnv
 from plugin_format.connector_render import mcp_entry, object_name
-from plugin_format.connectors import CONNECTORS_FILE, validate_connectors
-from plugin_format.yaml_loader import safe_load_unique
 
 from .action_digest import observe
 from .action_executor_loop import ExecutorBoot
 from .bundle_store import extract_bundle
+from .shared_declarations_client import (
+    ACTION_UNSUPPORTED,
+    WORKER_TOKEN_MISSING,
+    SharedConnectorUnsupported,
+    SharedDeclarationRefused,
+    SharedResolveClient,
+    read_bundle_declarations,
+)
 
 if TYPE_CHECKING:
     from .binding import BindingResolver, ResolvedDeployment
@@ -59,6 +70,7 @@ class ExecutorBindings:
         binding: BindingResolver,
         bundles: BundleReader,
         manifests: HttpManifestSource | None,
+        shared: SharedResolveClient | None,
         release: str,
         namespace: str,
         max_uncompressed_bytes: int,
@@ -69,6 +81,9 @@ class ExecutorBindings:
         self._bundles = bundles
         # None on the local tier, which renders no connector Deployment.
         self._manifests = manifests
+        # None without an internal worker token: a bundle whose acting target
+        # runs a shared entry then refuses ``shared_worker_token_missing``.
+        self._shared = shared
         self._release = release
         self._namespace = namespace
         self._max_uncompressed_bytes = max_uncompressed_bytes
@@ -90,6 +105,8 @@ class ExecutorBindings:
         rendered = await asyncio.to_thread(
             manifests.rendered, agent_id=str(resolved.agent_id), version_id=str(resolved.version_id)
         )
+        if connector in {entry.name for entry in rendered.shared}:
+            raise SharedConnectorUnsupported(ACTION_UNSUPPORTED)
         name = object_name(self._release, resolved.agent_name, connector)
         for manifest in rendered.manifests:
             if not isinstance(manifest, dict) or manifest.get("kind") != "Deployment":
@@ -112,12 +129,16 @@ class ExecutorBindings:
             raise LookupError("the agent has no in-force deployment")
         env = self._binding.boot_env(resolved, thread_key)
         names = await asyncio.to_thread(
-            self._header_secret_names, resolved.bundle_ref, resolved.agent_name, connector
+            self._header_secret_names,
+            resolved.bundle_ref,
+            str(resolved.agent_id),
+            resolved.agent_name,
+            connector,
         )
         return ExecutorBoot(boot_env=env, header_secret_names=names, agent_name=resolved.agent_name)
 
     def _header_secret_names(
-        self, bundle_ref: str | None, agent_name: str, connector: str
+        self, bundle_ref: str | None, agent_id: str, agent_name: str, connector: str
     ) -> frozenset[str]:
         """Names the connector's derived MCP entry headers expand (``${NAME}``)."""
 
@@ -132,20 +153,19 @@ class ExecutorBindings:
                 max_compression_ratio=self._max_compression_ratio,
                 max_members=self._max_members,
             )
-            path = root / CONNECTORS_FILE
-            if not path.is_file():
-                return frozenset()
-            try:
-                parsed_yaml: Any = safe_load_unique(path.read_text(encoding="utf-8"))
-            except (OSError, UnicodeDecodeError, yaml.YAMLError):
-                logger.warning(
-                    "connectors.yaml unreadable; no header secrets connector=%s", connector
-                )
-                return frozenset()
-        declared, errors = validate_connectors(parsed_yaml)
-        if errors or declared is None:
-            return frozenset()
-        spec = declared.connectors.get(connector)
+            # Narrowed to this agent's target: an excluded connector, shared
+            # or dedicated, is absent below and expands nothing.
+            declared = read_bundle_declarations(root, agent_name=agent_name)
+        if declared.shared:
+            # Resolved before the target connector is looked at: a shared
+            # entry this agent may not run refuses the boot, whichever
+            # connector it is for.
+            if self._shared is None:
+                raise SharedDeclarationRefused(WORKER_TOKEN_MISSING)
+            self._shared.resolve(agent_id, declared.shared)
+        if connector in {entry.name for entry in declared.shared}:
+            raise SharedConnectorUnsupported(ACTION_UNSUPPORTED)
+        spec = declared.dedicated.connectors.get(connector)
         if spec is None:
             return frozenset()
         entry = mcp_entry(self._release, agent_name, self._namespace, connector, spec)

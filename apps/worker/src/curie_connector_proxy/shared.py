@@ -12,7 +12,12 @@ Every request, any method or path, is checked in this order, and a refusal
 answers before anything reaches the server:
 
 1. Exactly one ``X-Curie-Caller`` that ``caller.decide_shared`` admits for the
-   configured installation.
+   configured installation, against the caller verify keys read for this
+   request (``read_caller_keys``): the keys live API processes published
+   within ``CALLER_KEY_WINDOW_S`` of the installation's newest heartbeat. A
+   request with no token is ``missing`` without a read; none published, or a
+   failed read, is ``store_unavailable``. A ``csg`` grant verifies against the
+   same set.
 2. Exactly one ``X-Curie-Connector-Alias`` of alias shape. It only selects among
    the verified agent's own memberships.
 3. A presented ``Mcp-Session-Id`` must be one this proxy recorded, for the same
@@ -84,7 +89,7 @@ from .resolver.handles import (
     RegistryRefusal,
     uuid_ok,
 )
-from .resolver.http import ResolverRuntime
+from .resolver.http import ResolverRuntime, ResolverStartRefused
 from .resolver.wire import CodedError
 
 ALIAS_HEADER = "X-Curie-Connector-Alias"
@@ -101,8 +106,10 @@ UPSTREAM_URL_ENV = "CURIE_SHARED_UPSTREAM_URL"
 GRANT_STORE_FILE_ENV = "CURIE_SHARED_GRANT_STORE_FILE"
 # Present only in a mis-rendered Pod: the admits list and the dedicated gated
 # tools can never authorize a shared call, because shared mode never starts
-# beside them.
+# beside them. The verify key list is dedicated-only too: a shared proxy reads
+# its keys from the database (``read_caller_keys``).
 DEDICATED_ONLY_ENV: tuple[str, ...] = (
+    server.PUBLIC_KEYS_ENV,
     server.ADMITS_ENV,
     server.GATED_TOOLS_ENV,
     server.CONNECTOR_ENV,
@@ -112,6 +119,10 @@ DEDICATED_ONLY_ENV: tuple[str, ...] = (
     server.UPSTREAM_HOST_ENV,
 )
 DEFAULT_SESSION_IDLE_SECONDS = 3600.0
+# Five of the API publisher's intervals (``caller_keys.CALLER_KEYS_PUBLISH_INTERVAL_S``):
+# a key no live API process republished within this of the newest heartbeat is
+# no longer accepted.
+CALLER_KEY_WINDOW_S = 300
 
 MISSING = caller.MISSING
 INVALID = caller.INVALID
@@ -288,7 +299,6 @@ class SharedProxyConfig:
     application: str
     listen_port: int
     upstream_port: int
-    public_keys: tuple[VerifyKey, ...]
     # Carries the store's password.
     grant_store_url: str = field(repr=False)
     session_idle_seconds: float = DEFAULT_SESSION_IDLE_SECONDS
@@ -317,7 +327,6 @@ class SharedProxyConfig:
             application=application,
             listen_port=_port(env, PROXY_PORT_ENV),
             upstream_port=_upstream_port(env),
-            public_keys=server._public_keys(env),
             grant_store_url=_grant_store_url(env),
         )
 
@@ -422,6 +431,44 @@ async def _read_policy(
     except STORE_ERRORS:
         raise SharedRefusal(STORE_UNAVAILABLE) from None
     return _evaluate(config, alias, application, member, binding)
+
+
+# --- the per-call caller verify keys ---------------------------------------------
+
+_CALLER_KEYS_SQL = """
+SELECT k.public_key
+FROM curie.shared_connector_caller_keys k
+JOIN curie.shared_connector_caller_key_heartbeats h ON h.installation_id = k.installation_id
+WHERE k.installation_id = $1 AND k.seen_at >= h.seen_at - make_interval(secs => $2)
+ORDER BY k.public_key
+"""
+
+
+async def read_caller_keys(pool: Any, installation: str) -> tuple[VerifyKey, ...]:
+    """The verify keys accepted now: published within the window of the newest heartbeat.
+
+    Read through the application's own role in one read-only transaction, so
+    the rows are the ones its installation may see. Nothing is cached. A failed
+    read, no heartbeat, no key in the window, or a row that is not a key is
+    ``store_unavailable``.
+    """
+
+    try:
+        async with pool.acquire(timeout=ACQUIRE_TIMEOUT_S) as connection:
+            async with connection.transaction(readonly=True):
+                rows = await connection.fetch(
+                    _CALLER_KEYS_SQL, installation, float(CALLER_KEY_WINDOW_S)
+                )
+    except STORE_ERRORS:
+        raise SharedRefusal(STORE_UNAVAILABLE) from None
+    try:
+        keys = tuple(caller.public_key(str(row["public_key"])) for row in rows)
+    except ValueError:
+        # A row the API never writes is a store fault: closed, never admitted.
+        raise SharedRefusal(STORE_UNAVAILABLE) from None
+    if not keys:
+        raise SharedRefusal(STORE_UNAVAILABLE)
+    return keys
 
 
 # --- request pieces ----------------------------------------------------------------
@@ -578,6 +625,9 @@ class _Exchange:
     alias: str
     session_id: str | None
     row: _Session | None
+    # The verify keys this request's token was admitted on; its grant
+    # verifies against the same set.
+    keys: tuple[VerifyKey, ...] = ()
     body: bytes | None = None
     principal: Principal | None = None
     stamp: str = ""
@@ -744,7 +794,7 @@ class _SharedProxy:
         self,
         request: web.Request,
         call: server._ToolCall,
-        alias: str,
+        exchange: _Exchange,
         policy: _Policy,
         now: int,
     ) -> caller.SharedGrant:
@@ -755,7 +805,8 @@ class _SharedProxy:
             raise _GrantRefused(server.GRANT_HEADER_MISSING)
         if len(presented) != 1:
             raise _GrantRefused(server.GRANT_HEADER_REPEATED)
-        grant = caller.verify_shared_grant(self.config.public_keys, presented[0])
+        alias = exchange.alias
+        grant = caller.verify_shared_grant(exchange.keys, presented[0])
         if grant is None:
             raise _GrantRefused(server.GRANT_INVALID)
         if grant.exp <= now:
@@ -791,23 +842,37 @@ class _SharedProxy:
 
     # --- one request -------------------------------------------------------------------
 
-    def _decide(self, request: web.Request) -> caller.Decision:
+    async def _decide(self, request: web.Request) -> tuple[caller.Decision, tuple[VerifyKey, ...]]:
+        """The token's decision and the keys it was made on.
+
+        No token is ``missing`` and a repeated one ``invalid``, both without a
+        database read; a single token is decided on this request's key read.
+        """
+
         tokens = request.headers.getall(caller.HEADER, [])
         if len(tokens) > 1:
-            return caller.Decision(agent=None, refusal=INVALID)
-        return caller.decide_shared(
-            self.config.public_keys,
+            return caller.Decision(agent=None, refusal=INVALID), ()
+        keys: tuple[VerifyKey, ...] = ()
+        if tokens:
+            keys = await read_caller_keys(self.pool, self.config.installation)
+        decision = caller.decide_shared(
+            keys,
             tokens[0] if tokens else None,
             installation=self.config.installation,
             now=int(self.clock()),
         )
+        return decision, keys
 
-    async def _admit(self, request: web.Request, verified: _Caller) -> _Exchange:
+    async def _admit(
+        self, request: web.Request, verified: _Caller, keys: tuple[VerifyKey, ...]
+    ) -> _Exchange:
         """Every check, then every reservation; the exchange holds what it reserved."""
 
         alias = _alias(request.headers)
         session_id, row = self._owned_session(request, verified, alias)
-        exchange = _Exchange(caller=verified, alias=alias, session_id=session_id, row=row)
+        exchange = _Exchange(
+            caller=verified, alias=alias, session_id=session_id, row=row, keys=keys
+        )
         if row is not None:
             # Counted from here, so idle pruning never closes it under this request.
             row.in_flight += 1
@@ -854,7 +919,7 @@ class _SharedProxy:
         )
         now = int(self.clock())
         grant = (
-            self._grant(request, call, alias, policy, now)
+            self._grant(request, call, exchange, policy, now)
             if call is not None and call.name in policy.gated_tools
             else None
         )
@@ -949,11 +1014,11 @@ class _SharedProxy:
     async def handle(self, request: web.Request) -> web.StreamResponse:
         agent = "-"
         try:
-            decision = self._decide(request)
+            decision, keys = await self._decide(request)
             agent = decision.agent or "-"
             if decision.refusal is not None:
                 raise SharedRefusal(decision.refusal)
-            exchange = await self._admit(request, _verified(decision))
+            exchange = await self._admit(request, _verified(decision), keys)
         except SharedRefusal as refusal:
             reason = refusal.reason if isinstance(refusal, _GrantRefused) else None
             self._log(request, agent, refusal.code, reason)
@@ -1072,4 +1137,26 @@ def make_shared_app(
     )
     app[_PROXY] = proxy
     app.cleanup_ctx.append(upstream)
+    return app
+
+
+async def build_shared_app(
+    config: SharedProxyConfig,
+    runtime: ResolverRuntime | None,
+    *,
+    clock: Callable[[], float] = time.time,
+) -> web.Application:
+    """``make_shared_app``, once the caller verify keys are readable (the entry point's wiring).
+
+    The keys are read once through the resolver's pool before anything
+    listens: none published, or a failed read, refuses to start with
+    ``caller_keys_unavailable``. Every request reads them again.
+    """
+
+    app = make_shared_app(config, runtime, clock=clock)
+    assert runtime is not None  # make_shared_app refuses without one
+    try:
+        await read_caller_keys(runtime.pool, config.installation)
+    except SharedRefusal:
+        raise ResolverStartRefused("caller_keys_unavailable") from None
     return app
