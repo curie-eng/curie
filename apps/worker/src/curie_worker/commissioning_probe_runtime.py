@@ -367,15 +367,16 @@ class PrimitiveProbeRuntime:
 
     async def absent(self, row: ProbeSnapshot) -> bool:
         """Whether a read now finds none of this probe's objects at their recorded names."""
-        found = await asyncio.gather(
-            *(
-                self._kube.read(
-                    self._namespace, kind + "s", present(getattr(row.objects, kind + "_name"))
+        async with asyncio.TaskGroup() as group:
+            reads = [
+                group.create_task(
+                    self._kube.read(
+                        self._namespace, kind + "s", present(getattr(row.objects, kind + "_name"))
+                    )
                 )
                 for kind in _CREATE_ORDER
-            )
-        )
-        return all(doc is None for doc in found)
+            ]
+        return all(read.result() is None for read in reads)
 
     async def retire_all(self) -> bool:
         """Retire every probe; ``True`` only when every row is retired.
@@ -423,7 +424,9 @@ class PrimitiveCompletions:
         runtime = self._runtime
         rows = runtime.registry.probes()
         require(tuple(row.probe_id for row in rows) == self._probe_ids)
-        absent = await asyncio.gather(*(runtime.absent(row) for row in rows))
+        async with asyncio.TaskGroup() as group:
+            reads = [group.create_task(runtime.absent(row)) for row in rows]
+        absent = [read.result() for read in reads]
         entries = []
         for row, gone in zip(rows, absent, strict=True):
             # A completion needs a recorded runner, so its proof is a termination.
