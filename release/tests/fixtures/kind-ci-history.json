@@ -1,8 +1,12 @@
 {
-  "source": "GET repos/curie-eng/curie/actions/runs/39653199666 and attempts/1/jobs, recorded 2026-10-23; unused identifying fields omitted",
+  "source": "GET repos/curie-eng/curie/actions/runs/39653199666 and attempts/1/jobs; head_commit.id/tree_id from GET repos/curie-eng/curie/actions/workflows/ci.yaml/runs?head_sha=0a494307081188dbfc88574030c87efddfb02c5e for run 39653199666, recorded 2026-10-23; unused identifying fields omitted",
   "run": {
     "id": 39653199666,
     "head_sha": "0a494307081188dbfc88574030c87efddfb02c5e",
+    "head_commit": {
+      "id": "0a494307081188dbfc88574030c87efddfb02c5e",
+      "tree_id": "b9f4f11802de9ebacba9a7b46e1e11921ab3ee5f"
+    },
     "head_branch": "main",
     "event": "workflow_dispatch",
     "status": "completed",

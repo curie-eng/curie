@@ -1,7 +1,7 @@
 """Replay recorded GitHub evidence through the release kind gate for #4863.
 
 Capture provenance: fixtures/kind-ci-history.json, source field, recorded
-2026-10-23 from run 39653199666 and its attempt-1 jobs endpoint.
+2026-10-23 from run 39653199666, its attempt-1 jobs, and the workflow runs GET.
 """
 
 import importlib.util
@@ -266,7 +266,7 @@ def test_each_required_job_must_supply_complete_success(
     {"status": "in_progress"}, {"status": None}, {"conclusion": "failure"},
     {"conclusion": "cancelled"}, {"conclusion": "skipped"}, {"conclusion": None},
     {"path": ".github/workflows/nightly-kind.yaml"}, {"id": None}, {"id": True},
-    {"head_sha": None},
+    {"head_sha": None, "head_commit": {"id": None, "tree_id": TREE}},
 ])
 def test_run_itself_must_be_successful_ci_with_identity(
     kind_ci: ModuleType, change: dict[str, Any]
@@ -295,10 +295,12 @@ def test_select_uses_tree_equality_and_never_posts(
     github: GitHub, same_sha: bool, same_tree: bool
 ) -> None:
     run = {**HISTORY["run"], "head_sha": COMMIT if same_sha else "a" * 40}
+    tree = TREE if same_tree else "b" * 40
+    run["head_commit"] = {"id": run["head_sha"], "tree_id": tree}
     github.history([run])
     github.reply(
         f"{PREFIX}/commits/{run['head_sha']}",
-        {"sha": run["head_sha"], "commit": {"tree": {"sha": TREE if same_tree else "b" * 40}}},
+        {"sha": run["head_sha"], "commit": {"tree": {"sha": tree}}},
     )
     result = github.cli("select")
     assert result.returncode == (0 if same_tree else 3), result.stderr
@@ -306,6 +308,55 @@ def test_select_uses_tree_equality_and_never_posts(
         "selected_run_id": run["id"] if same_tree else None,
         "selected_run_url": run["html_url"] if same_tree else None,
     }
+    assert not github.calls("POST")
+
+
+@pytest.mark.parametrize("verified_tree", [TREE, "b" * 40])
+def test_select_skips_unrelated_run_trees_and_verifies_matching_commit(
+    github: GitHub, verified_tree: str
+) -> None:
+    unrelated = [
+        {**HISTORY["run"], "id": n, "head_sha": f"{n:040x}",
+         "head_commit": {"id": f"{n:040x}", "tree_id": "c" * 40}}
+        for n in range(1, 4)
+    ]
+    sha = "a" * 40
+    candidate = {**HISTORY["run"], "head_sha": sha,
+                 "head_commit": {"id": sha, "tree_id": TREE}}
+    github.history([*unrelated, candidate])
+    for run in unrelated:
+        github.reply(f"{PREFIX}/commits/{run['head_sha']}", {
+            "sha": run["head_sha"], "commit": {"tree": {"sha": run["head_commit"]["tree_id"]}},
+        })
+    github.reply(f"{PREFIX}/commits/{sha}", {
+        "sha": sha, "commit": {"tree": {"sha": verified_tree}},
+    })
+    result = github.cli("select")
+    assert result.returncode == (0 if verified_tree == TREE else 3), result.stderr
+    assert json.loads(result.stdout)["selected_run_id"] == (
+        candidate["id"] if verified_tree == TREE else None
+    )
+    assert [path for path, _ in github.calls("GET") if "/commits/" in path] == [
+        f"{PREFIX}/commits/{TAG}", f"{PREFIX}/commits/{sha}",
+    ]
+    assert not github.calls("POST")
+
+
+@pytest.mark.parametrize("metadata", [
+    "missing", None, [], {}, {"id": COMMIT}, {"tree_id": TREE},
+    {"id": "a" * 40, "tree_id": TREE}, {"id": None, "tree_id": TREE},
+    {"id": COMMIT, "tree_id": None}, {"id": COMMIT, "tree_id": "invalid"},
+])
+def test_invalid_run_commit_metadata_cannot_supply_proof(github: GitHub, metadata: Any) -> None:
+    run = deepcopy(HISTORY["run"])
+    run.pop("head_commit")
+    if metadata != "missing":
+        run["head_commit"] = metadata
+    github.history([run])
+    result = github.cli("select")
+    assert result.returncode in (1, 3), result.stderr
+    if result.returncode == 3:
+        assert json.loads(result.stdout)["selected_run_id"] is None
     assert not github.calls("POST")
 
 
