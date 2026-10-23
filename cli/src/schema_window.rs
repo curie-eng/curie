@@ -757,7 +757,7 @@ print(json.dumps(graph))
         // @spec DEPLOY-NOTICE-RELEASE-1.
         let candidate = source_candidate_window();
         assert_eq!(candidate.schema_min, "0122");
-        assert_eq!(candidate.schema_head, "0125");
+        assert_eq!(candidate.schema_head, "0124");
         assert_eq!(
             candidate.schema_head.as_str(),
             catalog().revisions.last().unwrap()
@@ -779,7 +779,6 @@ print(json.dumps(graph))
         assert!(live_in_window("0122", &current));
         assert!(live_in_window("0123", &current));
         assert!(live_in_window("0124", &current));
-        assert!(live_in_window("0125", &current));
         assert!(!live_in_window("0075", &current));
         assert!(!live_in_window("0076", &current));
         let retained = window_for("0.12.0").expect("published foundation remains catalogued");
@@ -826,7 +825,6 @@ print(json.dumps(graph))
         assert!(live_in_window("0122", &feature_release));
         assert!(!live_in_window("0123", &feature_release));
         assert!(!live_in_window("0124", &feature_release));
-        assert!(!live_in_window("0125", &feature_release));
         assert!(!live_in_window("0100", &candidate_release));
         assert!(!live_in_window("0075", &candidate_release));
         let published =

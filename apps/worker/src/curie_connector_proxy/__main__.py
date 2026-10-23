@@ -17,7 +17,7 @@ from aiohttp import web
 from .resolver.config import ResolverConfig
 from .resolver.http import ResolverStartRefused, start_resolver
 from .server import ProxyConfig, make_app, shared_mode
-from .shared import SharedProxyConfig, build_shared_app
+from .shared import SharedProxyConfig, make_shared_app
 
 
 def _run(app: web.Application | Awaitable[web.Application], port: int) -> None:
@@ -41,12 +41,10 @@ def _serve_shared() -> int:
 
     async def application() -> web.Application:
         # Awaited by ``run_app`` before any site is started, so a resolver that
-        # refuses to start, or no published caller verify key
-        # (``caller_keys_unavailable``), aborts startup before the proxy port
-        # listens.
+        # refuses to start aborts startup before the proxy port listens.
         runtime = await start_resolver(resolver_config)
         try:
-            app = await build_shared_app(config, runtime)
+            app = make_shared_app(config, runtime)
         except BaseException:
             await runtime.close()
             raise

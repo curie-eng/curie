@@ -64,7 +64,7 @@ column names are a second, ORM-independent coupling a conforming DB must honor.
 - **Migrations**: the target DB must apply the **whole Alembic chain in `apps/api/alembic/versions/`**, in revision order, ending at `alembic heads`. The chain grows with the product, so it is deliberately not enumerated here: `ls apps/api/alembic/versions/` is the list, and `alembic heads` is the tip a conforming DB must reach. A single head is the invariant — a fork means two branches each added a migration (rebase and merge the heads before swapping anything). Two recent expand revisions make authenticated review feedback part of this schema contract: `0042_review_lineage_authority.py` adds immutable App-observed authority to publication lineages and the `publication_review_reservations` concurrency table; `0043_github_review_feedback.py` adds the `github_review_deliveries` audit table and the `github_review_feedback` durable feedback/outbox table. The latter stores normalized feedback and a credential-free queued turn, never a raw webhook body or GitHub credential.
 
 The current application schema window is `schema_min: "0122"` and
-`schema_head: "0125"`, as recorded in
+`schema_head: "0124"`, as recorded in
 `apps/api/src/curie_api/schema_compat.json`. Revision `0108` merges the `0107`
 and `0106` histories (`apps/api/alembic/versions/0108_merge_stable_reply_identity.py`);
 revisions `0120` through `0122` add team directory sync state, agent access
@@ -72,12 +72,7 @@ policies and directory identity, and the floor is `0122`; revision `0123` adds
 the shared connector store
 (`apps/api/alembic/versions/0123_shared_connector_store.py`) and revision
 `0124` adds its persisted source staleness flag
-(`apps/api/alembic/versions/0124_shared_connector_source_stale.py`) and revision
-`0125` adds the shared proxy's caller verify key tables
-(`apps/api/alembic/versions/0125_shared_connector_caller_keys.py`). These are
-expand only and leave the floor at `0122`, so an API at `0125` still serves a
-database at `0122` through `0124`; until `0125` is applied the API's caller key
-publisher waits for the tables and shared proxies refuse closed.
+(`apps/api/alembic/versions/0124_shared_connector_source_stale.py`).
 These values describe this candidate, not a historical release window.
 
 The `channel_canvas_edits` table (`apps/api/src/curie_api/models.py::ChannelCanvasEdit`,
@@ -298,24 +293,6 @@ holding the binding commit, and later resolves see it. The lock order stays
 application, binding, intent, recipient last, and `CREATE OR REPLACE` keeps
 each function's owner and grants. The downgrade restores the 0123 function
 definitions, then drops the constraint, then the column.
-
-Migration `0125_shared_connector_caller_keys.py` (ADR 0239) adds
-`shared_connector_caller_keys` (installation, standard base64 Ed25519 public
-key, `seen_at`; primary key installation and key) and
-`shared_connector_caller_key_heartbeats` (installation, `seen_at`). Every API
-process upserts the caller verify keys it is configured with and its
-installation's heartbeat at startup and every 60 s, in one transaction on
-database time (`apps/api/src/curie_api/shared_connectors/caller_keys.py::publish`);
-the API is the only writer and never deletes a key that could still be
-accepted. A shared proxy accepts the keys seen within 300 s of its
-installation's newest heartbeat. Both tables enable row level security with one
-SELECT policy each, scoped to the installation of the reading role's
-application, and no write policy. The revision grants SELECT on both to every
-bundled application role that exists; the API grants it to roles it provisions
-later and verifies it with the six 0123 table grants, so a role without it
-refuses rotation. An operator-managed role must also hold SELECT on both tables,
-or the resolver's pre-activation privilege test refuses it. The downgrade drops
-both tables, and their grants with them.
 
 The candidate application serving window and ordered revision ancestry live in
 `packages/protected-hooks/src/curie_protected_hooks/schema_serving.json`,

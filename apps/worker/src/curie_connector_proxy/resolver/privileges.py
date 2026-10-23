@@ -1,10 +1,9 @@
 """The resolver tests its own database role before it activates (ADR 0239).
 
 "Custody and least privilege" 3 and 4: every application has a distinct
-non-superuser role with role-derived row access, SELECT on the eight shared
-tables (the caller verify keys and their heartbeats among them), UPDATE of the
-non-authority ``lock_guard`` column alone on application and binding rows, and
-EXECUTE on the four refresh and reseal functions. A
+non-superuser role with role-derived row access, SELECT on the six shared
+tables, UPDATE of the non-authority ``lock_guard`` column alone on application
+and binding rows, and EXECUTE on the four refresh and reseal functions. A
 managed role is created by an operator, and a bundled one can be altered after
 the API verified it, so the resolver reads its actual privileges back from the
 catalog before it binds its socket and refuses to start on anything wider or
@@ -48,8 +47,6 @@ SHARED_TABLES = (
     "shared_connector_memberships",
     "shared_connector_bindings",
     "shared_connector_refresh_intents",
-    "shared_connector_caller_keys",
-    "shared_connector_caller_key_heartbeats",
 )
 LOCK_GUARD_TABLES = ("shared_connector_applications", "shared_connector_bindings")
 SHARED_FUNCTIONS = (
@@ -111,7 +108,7 @@ FROM unnest($1::text[]) AS f
 """
 
 # Every authority outside the shared objects, in one catalog pass. $1 is the
-# schema of the eight shared tables, $2 their names, $3 the four permitted
+# schema of the six shared tables, $2 their names, $3 the four permitted
 # functions' qualified signatures.
 _FOREIGN_SQL = r"""
 WITH me AS (

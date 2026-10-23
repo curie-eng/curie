@@ -39,11 +39,15 @@ from plugin_format import (
     TOOL_POLICY_ENFORCEMENT,
     ApprovalPolicy,
     PluginManifest,
+    ToolPolicy,
     UnsupportedArchive,
     ValidationIssue,
     ValidationResult,
     bundle_root,
     connector_render,
+    connector_tool_prefix,
+    literal_server_segment,
+    policy_patterns,
     resolve_manifest,
     safe_extract,
     validate_bundle,
@@ -245,6 +249,74 @@ def _without_shared_targets(data: Any, shared: frozenset[str]) -> Any:
     return {**data, "targets": stripped}
 
 
+_UNKNOWN_SERVER = "tool_policy.unknown_server"
+_GATE_NOT_NAMESPACED = "approval_policy.gate_not_namespaced"
+
+
+def _policy_entries(root: Path) -> dict[str, tuple[str, str]]:
+    """Each tool policy pattern and approval gate by the location the frozen validator reports.
+
+    ``{location: (code, value)}``: a pattern for ``tool_policy.unknown_server``
+    and a stripped gate for ``approval_policy.gate_not_namespaced``. Read with
+    the frozen models; a policy that does not parse yields nothing, so no
+    error is ever dropped on a guess.
+    """
+
+    entries: dict[str, tuple[str, str]] = {}
+    path = resolve_manifest(root)
+    if path is None:
+        return entries
+    try:
+        manifest = PluginManifest.model_validate(json.loads(path.read_text(encoding="utf-8")))
+    except (ValueError, TypeError, OSError):
+        return entries
+    if isinstance(manifest.toolPolicy, dict):
+        try:
+            tool_policy = ToolPolicy.model_validate(manifest.toolPolicy)
+        except ValueError:
+            pass
+        else:
+            for collection, i, pattern in policy_patterns(tool_policy):
+                entries[f"plugin.json (toolPolicy.{collection}[{i}])"] = (_UNKNOWN_SERVER, pattern)
+    if isinstance(manifest.approvalPolicy, dict):
+        try:
+            approval = ApprovalPolicy.model_validate(manifest.approvalPolicy)
+        except ValueError:
+            pass
+        else:
+            for i, gate in enumerate(approval.gates):
+                if isinstance(gate.gate, str):
+                    entries[f"plugin.json (approvalPolicy.gates[{i}])"] = (
+                        _GATE_NOT_NAMESPACED,
+                        gate.gate.strip(),
+                    )
+    return entries
+
+
+def _satisfied_by_shared(
+    issue: ValidationIssue, entries: Mapping[str, tuple[str, str]], aliases: frozenset[str]
+) -> bool:
+    """Whether a frozen policy error is raised only because the run did not see a shared alias.
+
+    The frozen run validates the dedicated subset, so its declared-server
+    cross-checks miss the shared aliases. An error is dropped only when its
+    code is one of those two checks, its location names one policy entry, and
+    that entry recomputed with the frozen helpers names a shared alias: a
+    pattern whose literal server segment is an alias, or a gate carrying an
+    alias's tool prefix and a nonempty tool name after it.
+    """
+
+    code, value = entries.get(issue.location, ("", ""))
+    if code != issue.code:
+        return False
+    if code == _UNKNOWN_SERVER:
+        return literal_server_segment(value) in aliases
+    return any(
+        value.startswith(prefix) and len(value) > len(prefix)
+        for prefix in map(connector_tool_prefix, aliases)
+    )
+
+
 def validate_with_shared(root: Path) -> tuple[ValidationResult, Declarations | None]:
     """Intake for a bundle that may declare shared connectors (ADR 0239).
 
@@ -259,6 +331,9 @@ def validate_with_shared(root: Path) -> tuple[ValidationResult, Declarations | N
        shared names taken out of valid target lists, or ``deploy.yaml`` set
        aside when it is invalid so its refusals are not reported twice. Both
        files are restored byte for byte whatever happens.
+    4. The frozen policy cross-checks ran without the shared aliases, so an
+       error they raise only for want of one is dropped
+       (``_satisfied_by_shared``). Every other error stays.
 
     The declarations are returned only when they parsed; the caller resolves
     the shared entries for the agent that deploys the bundle.
@@ -318,8 +393,12 @@ def validate_with_shared(root: Path) -> tuple[ValidationResult, Declarations | N
         if original_deploy is not None:
             deploy_path.write_bytes(original_deploy)
 
-    seen = {(issue.code, issue.message) for issue in frozen.errors}
+    aliases = frozenset(entry.name for entry in declarations.shared)
     issues = [*frozen.errors]
+    if any(issue.code in (_UNKNOWN_SERVER, _GATE_NOT_NAMESPACED) for issue in issues):
+        entries = _policy_entries(root)
+        issues = [issue for issue in issues if not _satisfied_by_shared(issue, entries, aliases)]
+    seen = {(issue.code, issue.message) for issue in issues}
     for issue in target_issues:
         if (issue.code, issue.message) not in seen:
             seen.add((issue.code, issue.message))

@@ -1,10 +1,9 @@
 """Each shared application's restricted Postgres role (ADR 0239 "Custody" 3 and 4).
 
 Bundled mode: the API creates one non-superuser LOGIN role per application
-through its own installation connection, grants it SELECT on the eight shared
-tables (0123's six and 0125's two caller verify key tables), UPDATE of
-``lock_guard`` alone on application and binding rows, and EXECUTE on the
-refresh and reseal functions, verifies all of that from the
+through its own installation connection, grants it SELECT on the six shared
+tables, UPDATE of ``lock_guard`` alone on application and binding rows, and
+EXECUTE on the refresh and reseal functions, verifies all of that from the
 catalog in the same transaction, then seals the role's DSN to the
 application's current recipient before storing or returning it. Managed mode
 records an operator-owned role and the spec's own DSN Secret reference; the API
@@ -61,11 +60,7 @@ SHARED_TABLES = (
     "shared_connector_memberships",
     "shared_connector_bindings",
     "shared_connector_refresh_intents",
-    "shared_connector_caller_keys",
-    "shared_connector_caller_key_heartbeats",
 )
-# The 0125 tables: the serving window still admits a database below 0125.
-CALLER_KEY_TABLES = SHARED_TABLES[-2:]
 # The only column an application role may update: a non-authority column that
 # lets FOR SHARE and FOR KEY SHARE lock the role's own rows.
 LOCK_GUARD_TABLES = ("shared_connector_applications", "shared_connector_bindings")
@@ -285,21 +280,6 @@ async def _role_is_restricted(session: AsyncSession, role: str) -> bool:
     return bool(executable)
 
 
-async def _require_caller_key_tables(session: AsyncSession) -> None:
-    """Refuse before any DDL when the database predates the 0125 tables.
-
-    Provisioning grants, and verification requires, SELECT on them, so below
-    0125 both would otherwise fail on a missing relation.
-    """
-
-    present = await session.scalar(
-        text("SELECT bool_and(to_regclass(t) IS NOT NULL) FROM unnest(CAST(:tables AS text[])) t"),
-        {"tables": [f"{SCHEMA}.{table}" for table in CALLER_KEY_TABLES]},
-    )
-    if not present:
-        raise SharedRefusal(status.HTTP_503_SERVICE_UNAVAILABLE, "shared_store_unavailable")
-
-
 async def _verify_role(session: AsyncSession, role: str) -> None:
     if not await _role_is_restricted(session, role):
         raise SharedRefusal(
@@ -350,7 +330,6 @@ async def _provision_bundled(
     session: AsyncSession, application_id: uuid.UUID
 ) -> SharedBundledDatabaseOut:
     await _require_role_admin(session)
-    await _require_caller_key_tables(session)
     application = await _provisionable(session, application_id, "bundled-sealed")
     recipient = await current_recipient(session, application_id, "share")
     if recipient is None:
@@ -434,7 +413,6 @@ async def rotate_database(
     """
 
     await _require_role_admin(session)
-    await _require_caller_key_tables(session)
     row = await database_role(session, application_id, "update")
     if row is None:
         raise SharedRefusal(status.HTTP_404_NOT_FOUND, "shared_database_not_provisioned")

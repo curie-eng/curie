@@ -1604,15 +1604,6 @@ namespace, once, and never patches them: `shared-key-<uuid>` holding only
 `*-tokens` Secret that carries either shared label. The API holds no Secret
 access, and the worker's Role is unchanged.
 
-The API publishes its connector caller verify keys into
-`shared_connector_caller_keys` and `shared_connector_caller_key_heartbeats`,
-which every shared application's resolver reads before admitting a caller.
-Bundled roles the API provisions are granted `SELECT` on both tables
-(migration 0125 grants it to roles that already exist). An
-operator-managed database role must be granted `SELECT` on both tables as well,
-alongside the other shared connector tables, or the resolver's pre-activation
-privilege check refuses to start the application.
-
 **gVisor needs runsc on the node**, and `security.gvisor.mode` is a tri-state
 (default `auto`):
 
