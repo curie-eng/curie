@@ -1098,6 +1098,7 @@ class _FakeRuntime:
         self.eval_redis = _FakeTransport()
         self.engine = _FakeTransport()
         self.orphan_sweeper = None
+        self.attachment_broker = None
 
 
 def _register_legacy_fake_transports(runtime: _FakeRuntime, resources: Any) -> None:
