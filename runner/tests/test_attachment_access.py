@@ -250,8 +250,9 @@ def test_boot_mounts_policy_governed_tools_and_fake_is_offline(
     from curie_runner.__main__ import build_runner
     from curie_runner.approval import is_platform_owned_tool
     from runner_boot_session import initialized_session_sync
-    from test_channel_read import _config, _patch_sdk
     from test_connectors import _published_live_tool_names
+
+    from runner.tests.test_channel_read import _config, _patch_sdk
 
     _patch_sdk(monkeypatch)
     config = replace(
@@ -285,7 +286,8 @@ def test_lazy_activation_requires_writable_cache_and_trusted_origin(
     from dataclasses import replace
 
     from curie_runner.__main__ import build_runner
-    from test_channel_read import _config, _patch_sdk
+
+    from runner.tests.test_channel_read import _config, _patch_sdk
 
     _patch_sdk(monkeypatch)
     config = replace(_config(monkeypatch, tmp_path, grant=False), attachment_access_enabled=True)
@@ -303,7 +305,8 @@ async def test_session_lifecycle_and_status_use_actual_boot_tools(
     from aiohttp.test_utils import TestClient
     from curie_runner import create_app
     from curie_runner.__main__ import build_runner
-    from test_channel_read import _call_server, _config, _patch_sdk, _until
+
+    from runner.tests.test_channel_read import _call_server, _config, _patch_sdk, _until
 
     platform = Platform(17)
     app = web.Application()
@@ -579,8 +582,9 @@ def test_policy_and_operator_gates_intercept_attachment_tools(
 
     from curie_runner.__main__ import build_runner
     from runner_boot_session import initialized_session_sync
-    from test_channel_read import _config, _patch_sdk
     from test_tool_policy_enforcement import _interception_reason
+
+    from runner.tests.test_channel_read import _config, _patch_sdk
 
     _patch_sdk(monkeypatch)
     config = replace(
@@ -614,7 +618,8 @@ def test_readonly_turn_can_list_but_cannot_fetch(
     )
     from curie_runner.__main__ import build_runner
     from runner_boot_session import initialized_session_sync
-    from test_channel_read import _config, _patch_sdk
+
+    from runner.tests.test_channel_read import _config, _patch_sdk
 
     _patch_sdk(monkeypatch)
     config = replace(
