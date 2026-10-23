@@ -12623,6 +12623,24 @@
             "title": "Custody",
             "type": "string"
           },
+          "gated_tools": {
+            "items": {
+              "pattern": "^[A-Za-z0-9_.:-]{1,128}$",
+              "type": "string"
+            },
+            "maxItems": 256,
+            "title": "Gated Tools",
+            "type": "array"
+          },
+          "run_tools": {
+            "items": {
+              "pattern": "^[A-Za-z0-9_.:-]{1,128}$",
+              "type": "string"
+            },
+            "maxItems": 256,
+            "title": "Run Tools",
+            "type": "array"
+          },
           "tools": {
             "items": {
               "pattern": "^[A-Za-z0-9_.:-]{1,128}$",
@@ -12650,6 +12668,20 @@
             "title": "Custody",
             "type": "string"
           },
+          "gated_tools": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Gated Tools",
+            "type": "array"
+          },
+          "run_tools": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Run Tools",
+            "type": "array"
+          },
           "tools": {
             "items": {
               "type": "string"
@@ -12660,7 +12692,9 @@
         },
         "required": [
           "tools",
-          "custody"
+          "custody",
+          "run_tools",
+          "gated_tools"
         ],
         "title": "SharedPolicyOut",
         "type": "object"

@@ -64,6 +64,14 @@ A connector-custody application releases identity only: request the empty
 slot `""` and use the binding and account to select the credential your
 connector manages.
 
+`Resolution.run` and `Resolution.work_item` carry the run context of the
+verified caller token the proxy admitted for this invocation. They are both
+set, as lowercase hyphenated UUIDs, when the caller carried a run, and both
+`None` otherwise. The resolver answer includes `run` and `work_item` only in
+the first case; an answer with one of them alone, or with a value that is not
+a canonical UUID, raises `ResolverProtocolError`. Take run context from here,
+never from tool arguments, request headers or the session.
+
 ## Running the corpus against your copy
 
 The runner needs a live world: a resolver for a platform-custody application

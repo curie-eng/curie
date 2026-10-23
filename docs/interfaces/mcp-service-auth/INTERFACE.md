@@ -145,6 +145,58 @@ with no fallback between the two modes.
    is logged. Approval resolution itself stays in the
    [approval](../approval/INTERFACE.md) seam; the grant only carries its result to
    the connector boundary.
+10. **Shared application mode admits by membership, not by list.** For an explicit
+   shared connector application
+   ([ADR-0239](../../adr/0239-explicit-shared-connector-applications-resolve-credentials-for-each-authenticated-caller.md)),
+   `shared_mode` (`apps/worker/src/curie_connector_proxy/server.py::shared_mode`)
+   selects the second proxy mode when `CURIE_SHARED_APPLICATION` is present, and
+   `make_shared_app`
+   (`apps/worker/src/curie_connector_proxy/shared.py::make_shared_app`) serves it.
+   There is no `admits` list: a shared proxy refuses to start beside any
+   dedicated-only name. Each request needs exactly one `X-Curie-Caller` `cct2`
+   token that `decide_shared`
+   (`apps/worker/src/curie_connector_proxy/caller.py::decide_shared`) admits for
+   the configured installation (a blank installation claim, so any name-only or
+   dedicated standalone token, is refused), and exactly one
+   `X-Curie-Connector-Alias`. The agent's alias row, the application's policy and
+   the agent's binding are then read from Postgres through the application's own
+   role on every call. The keys are `CURIE_CALLER_PROXY_PUBLIC_KEYS`, which the
+   frozen shared render does not emit: the worker reconciliation that applies
+   shared applications must supply it, and a shared proxy without it refuses to
+   start. Run authority comes only from the token: a tool in the policy's
+   `run_tools` needs the token's `run` and `work_item`
+   (`apps/worker/src/curie_connector_proxy/shared.py::run_context`). The verified
+   identity reaches a shared server only as the invocation handle the resolver
+   admits, never as headers; [connector-host](../connector-host/INTERFACE.md) has
+   the request headers, what is stripped, the refusal table and the session
+   rules.
+11. **The shared grant, `csg`, is a third token.** A `tools/call` of a tool in the
+   policy's `gated_tools` needs exactly one `X-Curie-Connector-Grant` that
+   `verify_shared_grant`
+   (`apps/worker/src/curie_connector_proxy/caller.py::verify_shared_grant`)
+   accepts. Its claims are exactly `application`, `binding`, `alias`, `tool`,
+   `args_sha256` (SHA-256 hex of the canonical arguments), `policy_generation`,
+   `exp` and `jti`, signed over `csg.<payload>` by the same key as `cct2`, under
+   the caller token's strict parse. The proxy checks, in order, that it is
+   unexpired and names this application, the binding it read this call, the
+   request's alias, the tool, the call's argument digest and the current policy
+   generation, and only then, after every other check and after the call holds
+   an invocation slot (so a call refused `invocations_full` never burns its
+   grant), spends the `jti` as
+   `SET connector-shared-grant:<jti> 1 NX EX max(exp - now, 1)` in Valkey through
+   the URL in `CURIE_SHARED_GRANT_STORE_FILE`. A mismatched grant is never
+   spent, the key is global so one grant spends once whichever alias presents
+   it, and a replay, an unreachable store or a failed spend refuses. A `ccg`
+   grant never authorizes a shared call. Every failure is the one
+   `grant_required` refusal; the log line names the check (`header_missing`,
+   `grant_invalid`, `alias_mismatch`, `binding_mismatch`, `generation_mismatch`,
+   `not_spent` and the rest in `shared.py`). The handle also pins the binding,
+   so an account replacement committed during an approved call refuses its
+   next resolve.
+12. **Nothing mints `csg` yet.** `mint_shared`
+   (`apps/worker/src/curie_worker/connector_grant.py::mint_shared`) writes the
+   wire, and no worker path calls it, so a gated shared tool refuses every call
+   until the approval path that issues shared grants lands.
 
 ## Implementations today
 
@@ -154,7 +206,8 @@ the signed caller token, enforced by the proxy on Kubernetes.
 1. **Signer:** the worker, `apps/worker/src/curie_worker/caller_token.py` and
    `apps/worker/src/curie_worker/connector_grant.py`.
 2. **Verifier:** the caller proxy, `apps/worker/src/curie_connector_proxy/caller.py`
-   and `apps/worker/src/curie_connector_proxy/server.py`, run from the worker image.
+   and `apps/worker/src/curie_connector_proxy/server.py`, run from the worker image,
+   with shared application mode in `apps/worker/src/curie_connector_proxy/shared.py`.
 3. **Key custody:** `curie cluster up` generates the pair and carries it across
    upgrades (`cli/src/connector_caller.rs`); the chart holds it as
    `connectorCaller` values or a BYO `existingSecret` (`charts/curie/values.yaml`,
@@ -199,9 +252,9 @@ and no grant check (`cli/src/docker.rs`, `cli/src/connector_build.rs`).
    comment and the connector-host file say an install with no key renders no
    proxy and leaves the NetworkPolicy as the only check; `render` now refuses that
    case.
-7. **One key signs two token kinds.** `cct2` and `ccg` share the signing key and
-   the verifying keys, separated only by prefix and an exact claim set, so a
-   rotation or compromise of one is a rotation or compromise of both.
+7. **One key signs three token kinds.** `cct2`, `ccg` and `csg` share the signing
+   key and the verifying keys, separated only by prefix and an exact claim set, so
+   a rotation or compromise of one is a rotation or compromise of all three.
 
 ## Cross-links
 

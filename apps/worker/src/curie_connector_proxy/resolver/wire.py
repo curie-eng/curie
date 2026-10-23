@@ -45,6 +45,7 @@ REFUSAL_STATUS = {
     "application_disabled": 403,
     "binding_disabled": 403,
     "binding_missing": 403,
+    "binding_mismatch": 403,
     "custody_mismatch": 403,
     "slot_unbound": 403,
     "source_stale": 409,

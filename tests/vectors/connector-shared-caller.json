@@ -1,0 +1,343 @@
+{
+  "comment": "Run authority and refusal codes of the caller proxy in shared application mode (ADR 0239 'Bundle, identity and request contract' items 2 and 3; the run and work_item pair and the deadline bound stand from ADR 0178). In shared mode the proxy (apps/worker/src/curie_connector_proxy/shared.py) verifies the X-Curie-Caller cct2 token with caller.decide_shared against its configured installation, then takes the invocation's run and work_item only from the verified token (shared.run_context): a tool in the application policy's run_tools refuses run_required when the token carries no pair, and inbound X-Curie-Run / X-Curie-Work-Item headers, tool arguments and the session never supply a pair. The handle's expires_at is the token's exp, which the worker already capped to the run deadline at mint. `cases` drive the pure decision (decide_shared then run_context at `now` for `installation`) and the real proxy, fixture MCP server and resolver socket, where expect.context is what the shared server's resolution reports. `deadline`, when not null, is the run deadline the token was minted under: expires_at never exceeds it and always equals claims.exp. `refusals` is the frozen shared refusal table: code, HTTP status and the curie_caller value (one of the five in tests/vectors/connector-caller-refusal.json, which is not extended); the body is the dedicated JSON-RPC refusal with error.data.curie_shared set to the code. body_encoding_unsupported refuses any request body carrying a Content-Encoding other than identity, which the proxy cannot inspect as JSON. Every token is stored as its \".\"-separated segments, exactly token.split(\".\"), signed by the seed of the first vector of tests/vectors/connector-caller-token.json (`signed_by` names it), so no whole token string appears here; readers join the segments with \".\". Read by apps/worker/tests/connector_proxy/test_shared_proxy_run_authority.py, which rejects an unknown key so a key added for one reader cannot pass vacuously, and by the shared proxy's refusal assertions in apps/worker/tests/connector_proxy/_shared_proxy_harness.py.",
+  "signed_by": "a_plain_agent_name",
+  "header": "X-Curie-Caller",
+  "alias_header": "X-Curie-Connector-Alias",
+  "jsonrpc_error_code": -32000,
+  "cases": [
+    {
+      "name": "a_paired_token_on_a_run_tool",
+      "why": "A run tool admits a token carrying the run and work_item pair, and the context is exactly that pair with the token's exp.",
+      "claims": {
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "agent": "acme-dev",
+        "exp": 1790000000,
+        "run": "11111111-1111-4111-8111-111111111111",
+        "work_item": "22222222-2222-4222-8222-222222222222"
+      },
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIiwicnVuIjoiMTExMTExMTEtMTExMS00MTExLTgxMTEtMTExMTExMTExMTExIiwid29ya19pdGVtIjoiMjIyMjIyMjItMjIyMi00MjIyLTgyMjItMjIyMjIyMjIyMjIyIn0",
+        "tkHQmP81hM-mbVpL9IwVFwxb4qBLitskewg15huAvp0BYm0hOIb_anlVz2PClCfPciCyIYmgRqemSKqGQK09Aw"
+      ],
+      "now": 1789999100,
+      "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA",
+      "tool": "run_task",
+      "run_tools": ["run_task"],
+      "spoof": {"headers": {}, "arguments": {}},
+      "deadline": null,
+      "expect": {
+        "outcome": "admitted",
+        "context": {
+          "run": "11111111-1111-4111-8111-111111111111",
+          "work_item": "22222222-2222-4222-8222-222222222222",
+          "expires_at": 1790000000
+        }
+      }
+    },
+    {
+      "name": "an_unpaired_token_on_a_run_tool",
+      "why": "A run tool refuses a token that carries no pair: action execution requires run and work_item.",
+      "claims": {
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "agent": "acme-dev",
+        "exp": 1790000000
+      },
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIn0",
+        "74l_wg1og5TWkfkxmZCSOse4EwwqxfG0xRcJ1fiihUpOm9F6wNG1BQ3X26PRXQWaDF-QyFu5I9VPnYM1PrthAQ"
+      ],
+      "now": 1789999100,
+      "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA",
+      "tool": "run_task",
+      "run_tools": ["run_task"],
+      "spoof": {"headers": {}, "arguments": {}},
+      "deadline": null,
+      "expect": {
+        "outcome": "refused",
+        "status": 403,
+        "curie_caller": "not_admitted",
+        "curie_shared": "run_required"
+      }
+    },
+    {
+      "name": "an_unpaired_token_on_an_ordinary_tool",
+      "why": "A tool outside run_tools admits an unpaired token, and its context carries no pair.",
+      "claims": {
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "agent": "acme-dev",
+        "exp": 1790000000
+      },
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIn0",
+        "74l_wg1og5TWkfkxmZCSOse4EwwqxfG0xRcJ1fiihUpOm9F6wNG1BQ3X26PRXQWaDF-QyFu5I9VPnYM1PrthAQ"
+      ],
+      "now": 1789999100,
+      "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA",
+      "tool": "whoami",
+      "run_tools": ["run_task"],
+      "spoof": {"headers": {}, "arguments": {}},
+      "deadline": null,
+      "expect": {
+        "outcome": "admitted",
+        "context": {"run": null, "work_item": null, "expires_at": 1790000000}
+      }
+    },
+    {
+      "name": "a_paired_token_ignores_a_spoofed_run_header_and_argument",
+      "why": "Headers and arguments naming another pair change nothing: the context is still the token's pair.",
+      "claims": {
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "agent": "acme-dev",
+        "exp": 1790000000,
+        "run": "11111111-1111-4111-8111-111111111111",
+        "work_item": "22222222-2222-4222-8222-222222222222"
+      },
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIiwicnVuIjoiMTExMTExMTEtMTExMS00MTExLTgxMTEtMTExMTExMTExMTExIiwid29ya19pdGVtIjoiMjIyMjIyMjItMjIyMi00MjIyLTgyMjItMjIyMjIyMjIyMjIyIn0",
+        "tkHQmP81hM-mbVpL9IwVFwxb4qBLitskewg15huAvp0BYm0hOIb_anlVz2PClCfPciCyIYmgRqemSKqGQK09Aw"
+      ],
+      "now": 1789999100,
+      "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA",
+      "tool": "run_task",
+      "run_tools": ["run_task"],
+      "spoof": {
+        "headers": {
+          "X-Curie-Run": "33333333-3333-4333-8333-333333333333",
+          "X-Curie-Work-Item": "55555555-5555-4555-8555-555555555555"
+        },
+        "arguments": {
+          "run": "33333333-3333-4333-8333-333333333333",
+          "work_item": "55555555-5555-4555-8555-555555555555"
+        }
+      },
+      "deadline": null,
+      "expect": {
+        "outcome": "admitted",
+        "context": {
+          "run": "11111111-1111-4111-8111-111111111111",
+          "work_item": "22222222-2222-4222-8222-222222222222",
+          "expires_at": 1790000000
+        }
+      }
+    },
+    {
+      "name": "an_unpaired_token_cannot_borrow_a_spoofed_pair",
+      "why": "An unpaired token presenting another pair in headers and arguments still refuses on a run tool.",
+      "claims": {
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "agent": "acme-dev",
+        "exp": 1790000000
+      },
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIn0",
+        "74l_wg1og5TWkfkxmZCSOse4EwwqxfG0xRcJ1fiihUpOm9F6wNG1BQ3X26PRXQWaDF-QyFu5I9VPnYM1PrthAQ"
+      ],
+      "now": 1789999100,
+      "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA",
+      "tool": "run_task",
+      "run_tools": ["run_task"],
+      "spoof": {
+        "headers": {
+          "X-Curie-Run": "33333333-3333-4333-8333-333333333333",
+          "X-Curie-Work-Item": "55555555-5555-4555-8555-555555555555"
+        },
+        "arguments": {
+          "run": "33333333-3333-4333-8333-333333333333",
+          "work_item": "55555555-5555-4555-8555-555555555555"
+        }
+      },
+      "deadline": null,
+      "expect": {
+        "outcome": "refused",
+        "status": 403,
+        "curie_caller": "not_admitted",
+        "curie_shared": "run_required"
+      }
+    },
+    {
+      "name": "a_deadline_capped_token_keeps_its_capped_exp",
+      "why": "The worker capped exp to the run deadline at mint; the handle expires at that earlier exp, never later.",
+      "claims": {
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "agent": "acme-dev",
+        "exp": 1789999400,
+        "run": "11111111-1111-4111-8111-111111111111",
+        "work_item": "22222222-2222-4222-8222-222222222222"
+      },
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3ODk5OTk0MDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIiwicnVuIjoiMTExMTExMTEtMTExMS00MTExLTgxMTEtMTExMTExMTExMTExIiwid29ya19pdGVtIjoiMjIyMjIyMjItMjIyMi00MjIyLTgyMjItMjIyMjIyMjIyMjIyIn0",
+        "maAdAS-mfOhHxjG59HiMxQu-6d3JiHMHpG04kFtI4xMNLfVe3-q4_fuTxTE7S469Pahf-2DFJiXHFvtakafhAQ"
+      ],
+      "now": 1789999100,
+      "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA",
+      "tool": "run_task",
+      "run_tools": ["run_task"],
+      "spoof": {"headers": {}, "arguments": {}},
+      "deadline": 1789999400,
+      "expect": {
+        "outcome": "admitted",
+        "context": {
+          "run": "11111111-1111-4111-8111-111111111111",
+          "work_item": "22222222-2222-4222-8222-222222222222",
+          "expires_at": 1789999400
+        }
+      }
+    },
+    {
+      "name": "a_later_deadline_never_extends_exp",
+      "why": "A deadline after exp leaves exp alone: the handle expires at the token's exp.",
+      "claims": {
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "agent": "acme-dev",
+        "exp": 1790000000,
+        "run": "11111111-1111-4111-8111-111111111111",
+        "work_item": "22222222-2222-4222-8222-222222222222"
+      },
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIiwicnVuIjoiMTExMTExMTEtMTExMS00MTExLTgxMTEtMTExMTExMTExMTExIiwid29ya19pdGVtIjoiMjIyMjIyMjItMjIyMi00MjIyLTgyMjItMjIyMjIyMjIyMjIyIn0",
+        "tkHQmP81hM-mbVpL9IwVFwxb4qBLitskewg15huAvp0BYm0hOIb_anlVz2PClCfPciCyIYmgRqemSKqGQK09Aw"
+      ],
+      "now": 1789999100,
+      "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA",
+      "tool": "run_task",
+      "run_tools": ["run_task"],
+      "spoof": {"headers": {}, "arguments": {}},
+      "deadline": 1790003600,
+      "expect": {
+        "outcome": "admitted",
+        "context": {
+          "run": "11111111-1111-4111-8111-111111111111",
+          "work_item": "22222222-2222-4222-8222-222222222222",
+          "expires_at": 1790000000
+        }
+      }
+    },
+    {
+      "name": "an_expired_token",
+      "why": "Only exp strictly greater than now is valid; at exp the token is expired before any run check.",
+      "claims": {
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "agent": "acme-dev",
+        "exp": 1790000000,
+        "run": "11111111-1111-4111-8111-111111111111",
+        "work_item": "22222222-2222-4222-8222-222222222222"
+      },
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIiwicnVuIjoiMTExMTExMTEtMTExMS00MTExLTgxMTEtMTExMTExMTExMTExIiwid29ya19pdGVtIjoiMjIyMjIyMjItMjIyMi00MjIyLTgyMjItMjIyMjIyMjIyMjIyIn0",
+        "tkHQmP81hM-mbVpL9IwVFwxb4qBLitskewg15huAvp0BYm0hOIb_anlVz2PClCfPciCyIYmgRqemSKqGQK09Aw"
+      ],
+      "now": 1790000000,
+      "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA",
+      "tool": "run_task",
+      "run_tools": ["run_task"],
+      "spoof": {"headers": {}, "arguments": {}},
+      "deadline": null,
+      "expect": {
+        "outcome": "refused",
+        "status": 403,
+        "curie_caller": "expired",
+        "curie_shared": "expired"
+      }
+    },
+    {
+      "name": "a_blank_installation_token",
+      "why": "A name-only token (a dedicated standalone worker's blank installation) never authorizes shared execution.",
+      "claims": {
+        "installation": "",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "agent": "acme-dev",
+        "exp": 1790000000,
+        "run": "11111111-1111-4111-8111-111111111111",
+        "work_item": "22222222-2222-4222-8222-222222222222"
+      },
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IiIsInJ1biI6IjExMTExMTExLTExMTEtNDExMS04MTExLTExMTExMTExMTExMSIsIndvcmtfaXRlbSI6IjIyMjIyMjIyLTIyMjItNDIyMi04MjIyLTIyMjIyMjIyMjIyMiJ9",
+        "_XyIqBA3RAJFIWWz3pZvwkuAgytUc1kZCLV0kqTnHW-fY5gtk-ynW3BqsyGWiNhEDzqs-kMrDyJmgRUBZUV-Cg"
+      ],
+      "now": 1789999100,
+      "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA",
+      "tool": "run_task",
+      "run_tools": ["run_task"],
+      "spoof": {"headers": {}, "arguments": {}},
+      "deadline": null,
+      "expect": {
+        "outcome": "refused",
+        "status": 403,
+        "curie_caller": "invalid",
+        "curie_shared": "invalid"
+      }
+    },
+    {
+      "name": "a_foreign_installation_token",
+      "why": "The claim's installation must equal the configured one byte for byte.",
+      "claims": {
+        "installation": "Zq8mX2vN7kP4tR9wL3sB6yH1cF5gJ0dA",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "agent": "acme-dev",
+        "exp": 1790000000,
+        "run": "11111111-1111-4111-8111-111111111111",
+        "work_item": "22222222-2222-4222-8222-222222222222"
+      },
+      "token": [
+        "cct2",
+        "eyJhZ2VudCI6ImFjbWUtZGV2IiwiYWdlbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJleHAiOjE3OTAwMDAwMDAsImluc3RhbGxhdGlvbiI6IlpxOG1YMnZON2tQNHRSOXdMM3NCNnlIMWNGNWdKMGRBIiwicnVuIjoiMTExMTExMTEtMTExMS00MTExLTgxMTEtMTExMTExMTExMTExIiwid29ya19pdGVtIjoiMjIyMjIyMjItMjIyMi00MjIyLTgyMjItMjIyMjIyMjIyMjIyIn0",
+        "tkHQmP81hM-mbVpL9IwVFwxb4qBLitskewg15huAvp0BYm0hOIb_anlVz2PClCfPciCyIYmgRqemSKqGQK09Aw"
+      ],
+      "now": 1789999100,
+      "installation": "Hk4pW7rT2nB9xM6qL1vC8zD3fJ5sG0yA",
+      "tool": "run_task",
+      "run_tools": ["run_task"],
+      "spoof": {"headers": {}, "arguments": {}},
+      "deadline": null,
+      "expect": {
+        "outcome": "refused",
+        "status": 403,
+        "curie_caller": "not_admitted",
+        "curie_shared": "not_admitted"
+      }
+    }
+  ],
+  "refusals": [
+    {"code": "missing", "status": 403, "curie_caller": "missing"},
+    {"code": "invalid", "status": 403, "curie_caller": "invalid"},
+    {"code": "expired", "status": 403, "curie_caller": "expired"},
+    {"code": "not_admitted", "status": 403, "curie_caller": "not_admitted"},
+    {"code": "alias_required", "status": 403, "curie_caller": "not_admitted"},
+    {"code": "application_unknown", "status": 403, "curie_caller": "not_admitted"},
+    {"code": "installation_mismatch", "status": 403, "curie_caller": "not_admitted"},
+    {"code": "application_disabled", "status": 403, "curie_caller": "not_admitted"},
+    {"code": "not_member", "status": 403, "curie_caller": "not_admitted"},
+    {"code": "binding_missing", "status": 403, "curie_caller": "not_admitted"},
+    {"code": "binding_disabled", "status": 403, "curie_caller": "not_admitted"},
+    {"code": "tool_not_allowed", "status": 403, "curie_caller": "not_admitted"},
+    {"code": "multiple_tool_calls", "status": 403, "curie_caller": "not_admitted"},
+    {"code": "run_required", "status": 403, "curie_caller": "not_admitted"},
+    {"code": "session_unknown", "status": 403, "curie_caller": "not_admitted"},
+    {"code": "session_principal_mismatch", "status": 403, "curie_caller": "not_admitted"},
+    {"code": "policy_generation_mismatch", "status": 403, "curie_caller": "not_admitted"},
+    {"code": "sessions_full", "status": 403, "curie_caller": "not_admitted"},
+    {"code": "invocations_full", "status": 403, "curie_caller": "not_admitted"},
+    {"code": "request_id_in_use", "status": 403, "curie_caller": "not_admitted"},
+    {"code": "body_too_large", "status": 403, "curie_caller": "not_admitted"},
+    {"code": "body_encoding_unsupported", "status": 403, "curie_caller": "not_admitted"},
+    {"code": "grant_required", "status": 403, "curie_caller": "grant_required"},
+    {"code": "store_unavailable", "status": 503, "curie_caller": "not_admitted"}
+  ]
+}

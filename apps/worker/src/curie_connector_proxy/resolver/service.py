@@ -250,6 +250,11 @@ class Resolver:
             "expires_at": context.expires_at,
             "slot": slot,
         }
+        # The verified token's pair, registered by the proxy; absent without one,
+        # so a body for a context without a pair is unchanged.
+        if context.run is not None and context.work_item is not None:
+            body["run"] = context.run
+            body["work_item"] = context.work_item
         if fields is not None:
             body["credential"] = {
                 "fields": {name: _field_json(value) for name, value in fields.items()}

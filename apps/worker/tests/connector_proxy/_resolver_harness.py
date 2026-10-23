@@ -77,6 +77,8 @@ from curie_connector_proxy.resolver.wire import RESOLVE_PATH
 from sqlalchemy.engine import make_url
 
 IDENTITY_SLOT = ""
+# A membership stamp no row has, so a context is strictly bound to its generation.
+UNOBSERVED_MEMBERSHIP = "0" * 64
 RESOLVER_APPLICATION_NAME = "curie-shared-resolver"
 STATIC_FIELD = "token"
 DEFAULT_ORIGINS = ("https://api.example.com",)
@@ -456,12 +458,16 @@ class ResolverHarness:
         run: str | None = None,
         work_item: str | None = None,
         session_id: str | None = None,
+        binding: str | None = None,
+        membership: str = UNOBSERVED_MEMBERSHIP,
         **principal: Any,
     ) -> InvocationContext:
         return InvocationContext(
             principal=self.principal(member, **principal),
             alias=member.alias if alias is None else alias,
             expires_at=int(time.time() + expires_in) if expires_at is None else expires_at,
+            binding=member.binding_id if binding is None else binding,
+            membership=membership,
             run=run,
             work_item=work_item,
             session_id=session_id,

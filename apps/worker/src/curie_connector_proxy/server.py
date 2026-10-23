@@ -10,6 +10,12 @@ Paths are not special-cased. The bundled Claude CLI sends the header on its
 OAuth discovery and registration requests as well as on ``/mcp``, so those are
 checked and forwarded like any other; an admitted caller reaches whatever the
 server serves, and a refused one reaches nothing.
+
+That is dedicated mode. Shared application mode (ADR 0239) is a second,
+explicitly selected mode that lives in ``shared.py``: ``shared_mode`` selects
+it when the frozen shared render's ``CURIE_SHARED_APPLICATION`` is present, and
+in it nothing here decides a request. The admits list, ``caller.decide`` and the
+``ccg`` grant check below are never consulted for a shared call.
 """
 
 from __future__ import annotations
@@ -185,16 +191,24 @@ def _set_nx_ex(url: str, key: str, ttl: int) -> bool:
 
 
 class _ValkeyGrantStore:
-    """SET ``connector-grant:<jti>`` NX EX without importing the redis client."""
+    """SET ``<prefix><jti>`` NX EX without importing the redis client."""
 
-    def __init__(self, url: str) -> None:
+    def __init__(
+        self,
+        url: str,
+        prefix: str = "connector-grant:",
+        failure: str = "connector grant spend failed",
+    ) -> None:
         self._url = url
+        self._prefix = prefix
+        # The warning's text, so a mode keeps its own wording.
+        self._failure = failure
 
     def spend(self, jti: str, ttl: int) -> bool:
         try:
-            return _set_nx_ex(self._url, f"connector-grant:{jti}", max(ttl, 1))
+            return _set_nx_ex(self._url, f"{self._prefix}{jti}", max(ttl, 1))
         except Exception:  # noqa: BLE001 - existing broad catch retained
-            logger.warning("connector grant spend failed")
+            logger.warning(self._failure)
             return False
 
 
@@ -209,6 +223,17 @@ def _gated_tools(env: Mapping[str, str]) -> tuple[str, ...]:
     if not isinstance(parsed, list) or not all(isinstance(name, str) for name in parsed):
         raise ValueError(f"{GATED_TOOLS_ENV} must be a JSON list of strings")
     return tuple(parsed)
+
+
+def _public_keys(env: Mapping[str, str]) -> tuple[VerifyKey, ...]:
+    texts = [text for text in env.get(PUBLIC_KEYS_ENV, "").split(",") if text.strip()]
+    if not texts:
+        raise ValueError(f"{PUBLIC_KEYS_ENV} names no public key")
+    try:
+        return tuple(caller.public_key(text) for text in texts)
+    except ValueError as exc:
+        # ``public_key`` names the fault and never the text.
+        raise ValueError(f"{PUBLIC_KEYS_ENV}: {exc}") from None
 
 
 @dataclass(frozen=True)
@@ -238,13 +263,7 @@ class ProxyConfig:
                 raise ValueError(f"{name} must be a TCP port, got {raw!r}")
             return int(raw)
 
-        texts = [text for text in env.get(PUBLIC_KEYS_ENV, "").split(",") if text.strip()]
-        if not texts:
-            raise ValueError(f"{PUBLIC_KEYS_ENV} names no public key")
-        try:
-            keys = tuple(caller.public_key(text) for text in texts)
-        except ValueError as exc:
-            raise ValueError(f"{PUBLIC_KEYS_ENV}: {exc}") from None
+        keys = _public_keys(env)
         try:
             admits = json.loads(env.get(ADMITS_ENV, ""))
         except ValueError:
@@ -571,18 +590,36 @@ async def _handle(request: web.Request, handler: Handler) -> web.StreamResponse:
         answer.release()
 
 
+def shared_mode(env: Mapping[str, str]) -> bool:
+    """True when ``env`` selects shared application mode (``shared.py``).
+
+    Presence alone selects it, so a blank value refuses to start in shared
+    mode rather than falling back to dedicated mode.
+    """
+
+    from .shared import SHARED_APPLICATION_ENV
+
+    return SHARED_APPLICATION_ENV in env
+
+
+def _upstream_client() -> ClientSession:
+    """The client both modes forward with."""
+
+    # No total timeout: an MCP GET stream stays open for the session.
+    return ClientSession(
+        connector=TCPConnector(limit=0),
+        timeout=ClientTimeout(total=None, sock_connect=5),
+        auto_decompress=False,
+        # The forwarding client must add nothing a caller did not send: a
+        # caller that sent no Accept-Encoding must not get a compressed
+        # body back because the proxy's own client asked for one.
+        skip_auto_headers=("Accept", "Accept-Encoding", "User-Agent"),
+    )
+
+
 def make_app(config: ProxyConfig, *, clock: Callable[[], float] = time.time) -> web.Application:
     async def upstream(app: web.Application) -> AsyncIterator[None]:
-        # No total timeout: an MCP GET stream stays open for the session.
-        session = ClientSession(
-            connector=TCPConnector(limit=0),
-            timeout=ClientTimeout(total=None, sock_connect=5),
-            auto_decompress=False,
-            # The forwarding client must add nothing a caller did not send: a
-            # caller that sent no Accept-Encoding must not get a compressed
-            # body back because the proxy's own client asked for one.
-            skip_auto_headers=("Accept", "Accept-Encoding", "User-Agent"),
-        )
+        session = _upstream_client()
         app[_UPSTREAM] = session
         yield
         await session.close()

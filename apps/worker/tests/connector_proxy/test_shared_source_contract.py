@@ -76,6 +76,7 @@ from _resolver_harness import (
     PURPOSE,
     RESOLVER_APPLICATION_NAME,
     STATIC_FIELD,
+    UNOBSERVED_MEMBERSHIP,
     Fleet,
     Member,
     ResolverHarness,
@@ -175,6 +176,8 @@ def _pure_registry(clock: Any = None) -> tuple[HandleRegistry, Principal]:
 def _context(principal: Principal, **options: Any) -> InvocationContext:
     options.setdefault("alias", "primary")
     options.setdefault("expires_at", int(time.time()) + 600)
+    options.setdefault("binding", str(uuid.uuid4()))
+    options.setdefault("membership", UNOBSERVED_MEMBERSHIP)
     return InvocationContext(principal=principal, **options)
 
 

@@ -9,6 +9,13 @@ here re-serializes the claims.
 ``decide`` is the dedicated proxy's check against its admits list.
 ``decide_shared`` is shared execution's: the token's installation must equal
 the configured one, and membership is decided elsewhere.
+
+Two approval grant wires are read here too. ``verify`` reads the dedicated
+``ccg`` grant (issue #3552). ``verify_shared_grant`` reads the shared ``csg``
+grant (ADR 0239 "Bundle" 7), which binds application, binding, alias,
+canonical tool, argument digest and policy generation, and is parsed under the
+same strict rules as the caller token. Neither wire is ever read as the other,
+so a dedicated grant never authorizes a shared call.
 """
 
 from __future__ import annotations
@@ -19,7 +26,7 @@ import json
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from typing import cast
+from typing import Any, cast
 
 from nacl.exceptions import BadSignatureError
 from nacl.signing import VerifyKey
@@ -37,6 +44,9 @@ REFUSALS = (MISSING, INVALID, EXPIRED, NOT_ADMITTED, GRANT_REQUIRED)
 # A connector tool grant, not a caller token. Its parse is the one ``cct``
 # had (``_opened``); the caller-only rules below never apply to it.
 GRANT_PREFIX = "ccg"
+# The shared application approval grant (ADR 0239 "Bundle" 7). Its own wire,
+# parsed under the caller-strict rules; ``ccg`` never stands in for it.
+SHARED_GRANT_PREFIX = "csg"
 
 _KEY_BYTES = 32
 _SIGNATURE_BYTES = 64
@@ -67,6 +77,14 @@ _INSTALLATION_FORBIDDEN: tuple[tuple[int, int], ...] = (
 # The signed 64-bit range, so a Rust i64 reader holds every exp losslessly.
 _MAX_EXP = 2**63 - 1
 _GRANT_CLAIMS = frozenset({"agent", "connector", "tool", "args", "exp", "jti"})
+_SHARED_GRANT_CLAIMS = frozenset(
+    {"application", "binding", "alias", "tool", "args_sha256", "policy_generation", "exp", "jti"}
+)
+# The membership alias spelling cp1 stores.
+_ALIAS = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+_MAX_TOOL_CHARS = 128
+_MAX_JTI_CHARS = 128
 
 AGENT_HEADER = "X-Curie-Agent"
 RUN_HEADER = "X-Curie-Run"
@@ -188,15 +206,17 @@ def _unique(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return parsed
 
 
-def _caller_payload(keys: Sequence[VerifyKey], token: str) -> dict[str, object] | None:
-    """The signed caller claims object, under the caller-only parse rules.
+def _strict_payload(
+    keys: Sequence[VerifyKey], token: str, prefix: str
+) -> dict[str, object] | None:
+    """The signed JSON object under ``prefix``, parsed strictly, or None.
 
-    The payload must be ASCII, as the minter writes it, so no BOM or UTF-16/32
+    The payload must be ASCII, as the minters write it, so no BOM or UTF-16/32
     detection applies. Duplicate keys, NaN/Infinity and negative integer
     literals are refused, where serde_json and Python would disagree.
     """
 
-    payload = _signed_payload(keys, token, PREFIX)
+    payload = _signed_payload(keys, token, prefix)
     if payload is None or not payload.isascii():
         return None
     try:
@@ -236,6 +256,18 @@ def nonblank_installation_ok(value: object) -> bool:
 
 def _uuid_ok(value: object) -> bool:
     return isinstance(value, str) and _UUID.fullmatch(value) is not None
+
+
+def alias_ok(value: object) -> bool:
+    """The membership alias spelling: 1 to 63 lowercase letters, digits or inner hyphens."""
+
+    return isinstance(value, str) and _ALIAS.fullmatch(value) is not None
+
+
+def sha256_hex_ok(value: object) -> bool:
+    """64 lowercase hex digits."""
+
+    return isinstance(value, str) and _SHA256_HEX.fullmatch(value) is not None
 
 
 def claims_fault(
@@ -281,7 +313,8 @@ def claims(keys: Sequence[VerifyKey], token: str) -> Decision | None:
     here, and only ``decide_shared`` refuses it.
     """
 
-    parsed = _caller_payload(keys, token)
+    # The caller-only parse rules.
+    parsed = _strict_payload(keys, token, PREFIX)
     if parsed is None:
         return None
     if parsed.keys() != _CLAIMS and parsed.keys() != _PAIRED_CLAIMS:
@@ -355,6 +388,95 @@ def verify(keys: Sequence[VerifyKey], token: str) -> Grant | None:
     ):
         return None
     return Grant(agent=agent, connector=connector, tool=tool, args=args, exp=exp, jti=jti)
+
+
+@dataclass(frozen=True)
+class SharedGrant:
+    """One signed shared connector tool call (``csg``). Every field is checked."""
+
+    application: str
+    binding: str
+    alias: str
+    tool: str
+    args_sha256: str
+    policy_generation: int
+    exp: int
+    jti: str
+
+
+def _tool_ok(value: object) -> bool:
+    # 1..128 characters, no C0/C1 control character and no lone surrogate.
+    return (
+        isinstance(value, str)
+        and 0 < len(value) <= _MAX_TOOL_CHARS
+        and _surrogate_free(value)
+        and not any(ord(char) < 0x20 or 0x7F <= ord(char) <= 0x9F for char in value)
+    )
+
+
+def _jti_ok(value: object) -> bool:
+    # 1..128 printable ASCII characters.
+    return (
+        isinstance(value, str)
+        and 0 < len(value) <= _MAX_JTI_CHARS
+        and all(0x20 <= ord(char) <= 0x7E for char in value)
+    )
+
+
+def shared_grant_fault(
+    *,
+    application: object,
+    binding: object,
+    alias: object,
+    tool: object,
+    args_sha256: object,
+    policy_generation: object,
+    exp: object,
+    jti: object,
+) -> str | None:
+    """The first ``csg`` claim rule these values break, or None when they satisfy all.
+
+    The one statement of the shared grant claim rules, shared by
+    ``verify_shared_grant`` and the worker's ``connector_grant.mint_shared``.
+    The reason names the rule and never echoes a value.
+    """
+
+    if not _uuid_ok(application):
+        return "application must be a lowercase hyphenated uuid"
+    if not _uuid_ok(binding):
+        return "binding must be a lowercase hyphenated uuid"
+    if not alias_ok(alias):
+        return "alias must be 1 to 63 lowercase letters, digits or inner hyphens"
+    if not _tool_ok(tool):
+        return "tool must be 1 to 128 characters with no control character"
+    if not sha256_hex_ok(args_sha256):
+        return "args_sha256 must be 64 lowercase hex digits"
+    if type(policy_generation) is not int or not 1 <= policy_generation <= _MAX_EXP:
+        return "policy_generation must be an integer in 1..=2**63-1"
+    if type(exp) is not int or not 0 <= exp <= _MAX_EXP:
+        return "exp must be an integer in 0..=2**63-1"
+    if not _jti_ok(jti):
+        return "jti must be 1 to 128 printable ASCII characters"
+    return None
+
+
+def verify_shared_grant(keys: Sequence[VerifyKey], token: str) -> SharedGrant | None:
+    """The ``csg`` grant one of ``keys`` signed, or None. Never raises.
+
+    The signature over the received ``csg.<payload>`` is checked first, then
+    the caller-strict parse and the exact claim set. A ``ccg`` grant or a
+    ``cct2`` caller token fails the prefix check.
+    """
+
+    if not isinstance(token, str):
+        return None
+    parsed = _strict_payload(keys, token, SHARED_GRANT_PREFIX)
+    if parsed is None or parsed.keys() != _SHARED_GRANT_CLAIMS:
+        return None
+    if shared_grant_fault(**parsed) is not None:
+        return None
+    # ``shared_grant_fault`` has checked every type, which mypy cannot see.
+    return SharedGrant(**cast("dict[str, Any]", parsed))
 
 
 def decide(

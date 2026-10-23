@@ -84,6 +84,8 @@ _HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
 _HEADER_VALUE = re.compile(r"[\t\x20-\x7e\xa0-\xff]*")
 # A sendable request target: printable ASCII without spaces.
 _REQUEST_TARGET = re.compile(r"[\x21-\x7e]+")
+# The canonical spelling of the run and work item UUIDs the resolver answers.
+_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 _HOST_HEADER = "host"
 
 
@@ -185,7 +187,9 @@ class Field(_Immutable):
 class Resolution(_Immutable):
     """One admitted resolve. Use it for one provider call, then drop it.
 
-    ``fields`` is a read-only mapping and is excluded from ``repr``.
+    ``fields`` is a read-only mapping and is excluded from ``repr``. ``run``
+    and ``work_item`` are the run context of the verified caller token the
+    proxy admitted: both set, or both None when the caller carried no run.
     """
 
     __slots__ = (
@@ -197,6 +201,8 @@ class Resolution(_Immutable):
         "expires_at",
         "slot",
         "fields",
+        "run",
+        "work_item",
     )
     admission: str
     binding: str
@@ -206,6 +212,8 @@ class Resolution(_Immutable):
     expires_at: int
     slot: str
     fields: Mapping[str, Field]
+    run: str | None
+    work_item: str | None
 
     def __init__(
         self,
@@ -217,7 +225,11 @@ class Resolution(_Immutable):
         expires_at: int,
         slot: str,
         fields: Mapping[str, Field],
+        run: str | None = None,
+        work_item: str | None = None,
     ) -> None:
+        if (run is None) != (work_item is None):
+            raise ValueError("a Resolution carries run and work_item together or neither")
         self._set(
             admission=admission,
             binding=binding,
@@ -227,6 +239,8 @@ class Resolution(_Immutable):
             expires_at=expires_at,
             slot=slot,
             fields=MappingProxyType(dict(fields)),
+            run=run,
+            work_item=work_item,
         )
 
     @property
@@ -244,13 +258,16 @@ class Resolution(_Immutable):
             self.origins,
             self.expires_at,
             self.slot,
+            self.run,
+            self.work_item,
         )
 
     def __repr__(self) -> str:
         return (
             f"Resolution(admission={self.admission!r}, binding={self.binding!r}, "
             f"account={self.account!r}, revision={self.revision!r}, origins={self.origins!r}, "
-            f"expires_at={self.expires_at!r}, slot={self.slot!r})"
+            f"expires_at={self.expires_at!r}, slot={self.slot!r}, run={self.run!r}, "
+            f"work_item={self.work_item!r})"
         )
 
     def __eq__(self, other: object) -> bool:
@@ -338,6 +355,23 @@ def _fields(credential: Any) -> Mapping[str, Field]:
     return MappingProxyType(fields)
 
 
+def _run_context(document: Mapping[str, Any]) -> tuple[str | None, str | None]:
+    """The answer's ``run`` and ``work_item``: both absent, or both canonical UUIDs."""
+
+    if "run" not in document and "work_item" not in document:
+        return None, None
+    run = document.get("run")
+    work_item = document.get("work_item")
+    if (
+        not isinstance(run, str)
+        or not isinstance(work_item, str)
+        or _UUID.fullmatch(run) is None
+        or _UUID.fullmatch(work_item) is None
+    ):
+        raise ResolverProtocolError("the resolver answer's run context is not a uuid pair")
+    return run, work_item
+
+
 def _resolution(document: Any, slot: str) -> Resolution:
     if not isinstance(document, dict):
         raise ResolverProtocolError("the resolver answer is not a JSON object")
@@ -356,6 +390,7 @@ def _resolution(document: Any, slot: str) -> Resolution:
         fields = MappingProxyType({})
     else:
         raise ResolverProtocolError("the resolver answer names an unknown admission")
+    run, work_item = _run_context(document)
     return Resolution(
         admission=admission,
         binding=_string(document, "binding"),
@@ -365,6 +400,8 @@ def _resolution(document: Any, slot: str) -> Resolution:
         expires_at=_integer(document, "expires_at"),
         slot=answered_slot,
         fields=fields,
+        run=run,
+        work_item=work_item,
     )
 
 
