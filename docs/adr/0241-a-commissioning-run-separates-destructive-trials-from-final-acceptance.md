@@ -4,6 +4,11 @@ Date: 2026-10-22
 
 Status: Accepted
 
+Partially superseded by
+[ADR 0242](0242-commissioning-session-scope-makes-the-last-observer-finite.md)
+only for session-cleanup ownership scope and the final verifier transport's
+teardown witness. The remaining decision stays in force.
+
 The maintainer explicitly approved this evidence-composition decision on
 2026-10-22. Publication still requires ADR PR review; this document records no
 runtime qualification or implementation evidence.

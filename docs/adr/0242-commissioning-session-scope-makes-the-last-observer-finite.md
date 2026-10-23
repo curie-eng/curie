@@ -2,13 +2,14 @@
 
 Date: 2026-10-22
 
-Status: Draft
+Status: Accepted
 
-This is a proposal for explicit maintainer review. It does not authorize
-implementation or alter the currently Accepted commissioning contract.
+The maintainer explicitly accepted this decision and authorized its PR merge on
+2026-10-23. This records architectural acceptance, not runtime qualification;
+implementation remains gated on the realizing specification below.
 
 Tracked under [#4557](https://github.com/curie-eng/curie/issues/4557).
-If accepted, it partially supersedes
+This partially supersedes
 [ADR 0241](0241-a-commissioning-run-separates-destructive-trials-from-final-acceptance.md)
 and its [trial-series specification](../superpowers/specs/2026-10-22-commissioning-trial-series.md)
 only in the ownership scope of session cleanup and the final verifier transport's
@@ -198,8 +199,8 @@ change; this proposal makes no broker-enforced acceptance-only privilege claim.
 The realizing specification must explicitly adopt these scopes, versioned
 custody records, phase checks, complete registry and teardown predicates before
 any complete cleanup/acceptance implementation is enabled. The Accepted ADR
-body remains historical; after acceptance only its allowed partial-supersession
-back-link is added. This Draft changes no existing implementation or record.
+body remains historical with only its allowed partial-supersession back-link.
+This decision alone changes no existing implementation or record.
 
 Proof must include a successful finite final witness and refusal for a hidden
 trial connection labelled as a verifier, a setup/admin transport surviving into
