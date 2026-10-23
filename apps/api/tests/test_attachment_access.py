@@ -28,67 +28,72 @@ def anyio_backend() -> str:
 
 @pytest.fixture
 async def access(clean_db: None, monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[Any]:
-    monkeypatch.setenv("KEY_PREFIX", f"curie:worker:attachment-test-{uuid.uuid4().hex}")
+    prefix = f"curie:worker:attachment-test-{uuid.uuid4().hex}"
+    monkeypatch.setenv("KEY_PREFIX", prefix)
+    monkeypatch.setenv("ATTACHMENT_SANDBOX_KEY_PREFIX", prefix + ":sandbox")
     monkeypatch.setenv("ATTACHMENT_ACCESS_ENABLED", "true")
     monkeypatch.setenv("ATTACHMENT_BROKER_URL", "http://127.0.0.1:8093")
     get_settings.cache_clear()
     settings = get_settings()
     engine = create_async_engine(settings.database_url)
     sessions = async_sessionmaker(engine, expire_on_commit=False)
-    valkey = redis.Redis(
-        host=settings.valkey_host, port=settings.valkey_port, decode_responses=True
-    )
-    app = create_app()
-    app.state.sessionmaker = sessions
-    app.state.valkey = valkey
-    async with sessions() as db:
-        agent = Agent(name=f"attachment-{uuid.uuid4().hex}")
-        db.add(agent)
-        await db.flush()
-        version = AgentVersion(agent_id=agent.id, version_label="test", created_by="test")
-        db.add(version)
-        db.add(
-            AgentChannel(agent_id=agent.id, kind="slack", address="C0EXAMPLE1", adapter="default")
+    valkey = redis.from_url(settings.valkey_dsn(), decode_responses=True)
+    try:
+        app = create_app()
+        app.state.sessionmaker = sessions
+        app.state.valkey = valkey
+        async with sessions() as db:
+            agent = Agent(name=f"attachment-{uuid.uuid4().hex}")
+            db.add(agent)
+            await db.flush()
+            version = AgentVersion(agent_id=agent.id, version_label="test", created_by="test")
+            db.add(version)
+            db.add(
+                AgentChannel(
+                    agent_id=agent.id, kind="slack", address="C0EXAMPLE1", adapter="default"
+                )
+            )
+            await db.flush()
+            deployment = Deployment(
+                agent_id=agent.id, version_id=version.id, environment=Environment.dev
+            )
+            db.add(deployment)
+            await db.commit()
+            aid, did = str(agent.id), str(deployment.id)
+        route_key = f"{get_settings().attachment_sandbox_key_prefix}:route:{THREAD}"
+        await valkey.set(
+            route_key,
+            json.dumps(
+                {
+                    "state": "live",
+                    "session_id": "session-one",
+                    "sandbox_name": "acme-sandbox",
+                    "generation": 1,
+                    "thread_key": THREAD,
+                }
+            ),
         )
-        await db.flush()
-        deployment = Deployment(
-            agent_id=agent.id, version_id=version.id, environment=Environment.dev
-        )
-        db.add(deployment)
-        await db.commit()
-        aid, did = str(agent.id), str(deployment.id)
-    route_key = f"curie:sandbox:route:{THREAD}"
-    await valkey.set(
-        route_key,
-        json.dumps(
-            {
-                "state": "live",
-                "session_id": "session-one",
-                "sandbox_name": "acme-sandbox",
-                "generation": 1,
-                "thread_key": THREAD,
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            yield {
+                "client": client,
+                "aid": aid,
+                "did": did,
+                "sessions": sessions,
+                "engine": engine,
+                "valkey": valkey,
+                "app": app,
             }
-        ),
-    )
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://test"
-    ) as client:
-        yield {
-            "client": client,
-            "aid": aid,
-            "did": did,
-            "sessions": sessions,
-            "engine": engine,
-            "valkey": valkey,
-            "app": app,
-        }
-    await valkey.delete(route_key)
-    owned = [key async for key in valkey.scan_iter(settings.worker_key_prefix + ":*")]
-    if owned:
-        await valkey.delete(*owned)
-    await valkey.aclose()
-    await engine.dispose()
-    get_settings.cache_clear()
+    finally:
+        try:
+            owned = [key async for key in valkey.scan_iter(settings.worker_key_prefix + ":*")]
+            if owned:
+                await valkey.delete(*owned)
+        finally:
+            await valkey.aclose()
+            await engine.dispose()
+            get_settings.cache_clear()
 
 
 def worker() -> dict[str, str]:
@@ -240,7 +245,7 @@ async def test_streamed_broker_commits_integrity_and_live_scope(
         )
         await db.commit()
     await access["valkey"].set(
-        f"curie:sandbox:route:{email_thread}",
+        f"{get_settings().attachment_sandbox_key_prefix}:route:{email_thread}",
         json.dumps(
             {
                 "state": "live",
@@ -415,7 +420,9 @@ async def test_streamed_broker_commits_integrity_and_live_scope(
         await server_task
         sock.close()
         await provider_runner.cleanup()
-        await access["valkey"].delete(f"curie:sandbox:route:{email_thread}")
+        await access["valkey"].delete(
+            f"{get_settings().attachment_sandbox_key_prefix}:route:{email_thread}"
+        )
 
 
 @pytest.mark.anyio
@@ -562,7 +569,7 @@ async def test_expired_lease_and_replaced_route_refuse_cached_authorize(access: 
     page = (await client.post("/attachment-access/list", headers=headers, json={})).json()
     ref = page["files"][0]["id"]
     await access["valkey"].set(
-        f"curie:sandbox:route:{THREAD}",
+        f"{get_settings().attachment_sandbox_key_prefix}:route:{THREAD}",
         json.dumps(
             {
                 "state": "live",
@@ -799,3 +806,89 @@ async def test_broker_rejects_changed_exact_binding_before_provider_access(acces
         await db.commit()
     with pytest.raises(ValueError, match="binding unavailable"):
         await broker.file_port(ref)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/attachment-access/" + operation
+        for operation in ("list", "authorize", "fetch", "completion")
+    ]
+    + [
+        INTERNAL + "/" + operation
+        for operation in ("register", "context", "renew", "revoke", "redeem", "complete")
+    ],
+)
+async def test_disabled_routes_authenticate_before_reporting_activation(
+    access: Any, monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    import time
+
+    from curie_api.channel_token import CHANNEL_ENQUEUE_SCOPE, mint
+
+    channel_token = mint(
+        get_settings().api_key,
+        channel_id=str(uuid.uuid4()),
+        generation=1,
+        scope=CHANNEL_ENQUEUE_SCOPE,
+        exp=int(time.time()) + 60,
+    )
+    client = access["client"]
+    await client.post(INTERNAL + "/register", headers=worker(), json=registration(access["aid"]))
+    capability, _ = await direct_context(access)
+    monkeypatch.setenv("ATTACHMENT_ACCESS_ENABLED", "false")
+    get_settings.cache_clear()
+    for headers in (
+        {},
+        {"X-API-Key": channel_token},
+        {"X-Curie-Worker-Token": "invalid"},
+        {"X-Curie-Attachment-Access": "ata.invalid"},
+        {"X-Curie-Attachment-Access": "ata." + "0" * 64},
+    ):
+        response = await client.post(path, headers=headers, json={})
+        assert response.status_code == 401, response.text
+    authorized = worker() if path.startswith(INTERNAL) else capability
+    response = await client.post(path, headers=authorized, json={})
+    assert response.status_code == 503, response.text
+    assert response.json()["detail"]["code"] == "attachment_access.disabled"
+
+
+@pytest.mark.anyio
+async def test_disabled_facade_fails_closed_when_authority_store_is_unavailable(
+    access: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import socket
+
+    from redis.backoff import NoBackoff
+    from redis.retry import Retry
+
+    client = access["client"]
+    await client.post(INTERNAL + "/register", headers=worker(), json=registration(access["aid"]))
+    capability, _ = await direct_context(access)
+    monkeypatch.setenv("ATTACHMENT_ACCESS_ENABLED", "false")
+    get_settings.cache_clear()
+    with socket.socket() as unreachable:
+        unreachable.bind(("127.0.0.1", 0))
+        unavailable = redis.Redis(
+            host="127.0.0.1",
+            port=unreachable.getsockname()[1],
+            socket_connect_timeout=0.1,
+            socket_timeout=0.1,
+            retry=Retry(NoBackoff(), 0),
+        )
+        access["app"].state.valkey = unavailable
+        try:
+            refused = await client.post(
+                "/attachment-access/list", headers={"X-API-Key": "chn.invalid"}, json={}
+            )
+            assert refused.status_code == 401
+            response = await client.post("/attachment-access/list", headers=capability, json={})
+            assert response.status_code == 503
+            assert response.json()["detail"]["code"] == "attachment_access.authority_unavailable"
+            internal = await client.post(INTERNAL + "/context", headers=worker(), json={})
+            assert internal.status_code == 503
+            assert internal.json()["detail"]["code"] == "attachment_access.disabled"
+        finally:
+            access["app"].state.valkey = access["valkey"]
+            await unavailable.aclose()

@@ -72,8 +72,6 @@ class ControlRoute(APIRoute):
         handler = super().get_route_handler()
 
         async def guarded(request: Request) -> Response:
-            if not get_settings().attachment_access_enabled:
-                raise catalog.refused("disabled", 503)
             chunks, size = [], 0
             async for chunk in request.stream():
                 size += len(chunk)
@@ -97,6 +95,17 @@ class ControlRoute(APIRoute):
         return guarded
 
 
+def require_enabled() -> None:
+    if not get_settings().attachment_access_enabled:
+        raise catalog.refused("disabled", 503)
+
+
+async def require_internal_access(
+    _authenticated: Annotated[None, Depends(require_internal_worker_token)],
+) -> None:
+    require_enabled()
+
+
 router = APIRouter(
     prefix="/attachment-access", tags=["attachment-access"], route_class=ControlRoute
 )
@@ -104,7 +113,7 @@ internal_router = APIRouter(
     prefix="/v1/internal/attachment-access",
     tags=["internal-attachment-access"],
     route_class=ControlRoute,
-    dependencies=[Depends(require_internal_worker_token)],
+    dependencies=[Depends(require_internal_access)],
 )
 
 
@@ -131,7 +140,9 @@ async def require_access(
     request: Request,
     credential: Annotated[str | None, Header(alias="X-Curie-Attachment-Access")] = None,
 ) -> dict[str, Any]:
-    return await ledger(request).read(credential)
+    claims = await ledger(request).read(credential)
+    require_enabled()
+    return claims
 
 
 Claims = Annotated[dict[str, Any], Depends(require_access)]
