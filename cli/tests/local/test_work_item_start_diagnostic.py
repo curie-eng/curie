@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import getpass
 import ipaddress
 import json
 import os
@@ -60,6 +61,7 @@ from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import pytest
 import yaml
@@ -104,6 +106,7 @@ DIAGNOSTIC_LIMIT = 24000
 
 _URL = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s\"'<>]+")
 _IPV4 = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+_USER_AT_HOST = re.compile(r"\b[A-Za-z0-9._-]+@[A-Za-z0-9.-]+[A-Za-z0-9]\b")
 
 
 def _chart_default_archive_bytes() -> int:
@@ -111,16 +114,50 @@ def _chart_default_archive_bytes() -> int:
     return int(values["worker"]["workspace"]["maxArchiveBytes"])
 
 
+def _private_terms() -> list[str]:
+    """Names of this machine and its user that must never reach test output."""
+
+    terms: set[str] = set()
+    docker_host = os.environ.get("DOCKER_HOST", "")
+    if docker_host and not docker_host.startswith("unix://"):
+        parsed = urlsplit(docker_host)
+        terms.update(value for value in (parsed.netloc, parsed.username, parsed.hostname) if value)
+    terms.update(value for value in (os.environ.get("USER"), os.environ.get("LOGNAME")) if value)
+    for lookup in (getpass.getuser, socket.gethostname):
+        try:
+            terms.add(lookup())
+        except (OSError, KeyError):
+            pass
+    return sorted(
+        (term for term in terms if len(term) >= 3 and term not in {"localhost", "root"}),
+        key=len,
+        reverse=True,
+    )
+
+
 def _safe(value: Any, secrets: list[str | None], limit: int = 4000) -> str:
-    """Anonymous text for failure messages: no secrets, addresses or home paths."""
+    """Anonymous text for failure messages.
+
+    Removes known secrets (the API key, worker token and generated keys) and
+    credential shapes, the Docker endpoint and its user and host, every URL
+    (ssh endpoints and the kube API server included), the home directory and
+    paths under it, user@host pairs, this machine's user and host names, and
+    IPv4 addresses.
+    """
 
     text = value if isinstance(value, str) else json.dumps(value, default=str, sort_keys=True)
     text = fe.redact_agent_text(text, secrets)[0] or ""
+    docker_host = os.environ.get("DOCKER_HOST", "")
+    if docker_host and not docker_host.startswith("unix://"):
+        text = text.replace(docker_host, "ssh://docker-host.invalid")
     text = _URL.sub("https://example.com", text)
-    text = _IPV4.sub("192.0.2.1", text)
     home = str(Path.home())
     if home not in {"", "/"}:
         text = text.replace(home, "~")
+    text = _USER_AT_HOST.sub("user@host.invalid", text)
+    for term in _private_terms():
+        text = re.sub(rf"(?<![\w.-]){re.escape(term)}(?![\w-])", "<private>", text)
+    text = _IPV4.sub("192.0.2.1", text)
     return text[:limit]
 
 
@@ -274,6 +311,7 @@ class Harness:
     def check(self, condition: bool, message: str) -> None:
         # A plain raise, not ``assert``: pytest's introspection would render
         # whole rows, which carry fixture addresses.
+        __tracebackhide__ = True
         if not condition:
             raise AssertionError(self.safe(message))
 
@@ -285,6 +323,7 @@ class Harness:
         timeout: float,
         interval: float = 3.0,
     ) -> Any:
+        __tracebackhide__ = True
         deadline = time.monotonic() + timeout
         last: Any = None
         while True:
@@ -351,12 +390,21 @@ class Harness:
         return str(binary)
 
     def record_volumes(self, container: str) -> None:
-        result = self.docker("inspect", container)
-        if result.returncode:
+        """Remember a container's named and anonymous volumes. Never raises.
+
+        Called as each container is created, and again (best effort) when
+        teardown begins.
+        """
+
+        try:
+            result = self.docker("inspect", container)
+            if result.returncode:
+                return
+            for mount in json.loads(result.stdout)[0].get("Mounts") or []:
+                if mount.get("Type") == "volume" and mount.get("Name"):
+                    self.volumes.add(mount["Name"])
+        except (OSError, subprocess.SubprocessError, ValueError, LookupError, AttributeError):
             return
-        for mount in json.loads(result.stdout)[0].get("Mounts") or []:
-            if mount.get("Type") == "volume" and mount.get("Name"):
-                self.volumes.add(mount["Name"])
 
     def docker(self, *argv: str) -> subprocess.CompletedProcess[str]:
         """A Docker probe that reports instead of raising."""
@@ -607,7 +655,6 @@ class Harness:
     def diagnose(self) -> None:
         try:
             if self.run.cluster_attempted:
-                self.run.capture_failure_diagnostics()
                 self.snapshot("failure")
             unknown = list(self.stub.unknown_requests) if self.stub is not None else []
             unexpected = list(self.gate.unexpected) if self.gate is not None else []
@@ -725,6 +772,10 @@ class Harness:
         )
         guarded("sandbox template archive caps", self.template_caps)
         emit("resourcequota -A -o yaml", read("get", "resourcequota", "-A", "-o", "yaml"))
+        api_logs = read(
+            "-n", NAMESPACE, "logs", "deployment/curie-api", "-c", "api", "--tail=200", timeout=60
+        )
+        emit("api logs (last 200 lines)", api_logs)
         events = read("get", "events", "-A", "--sort-by=.lastTimestamp").splitlines()
         emit("events -A (latest 150)", "\n".join(events[-150:]))
 
@@ -755,7 +806,8 @@ class Harness:
         clone the repaired base template.
         """
 
-        assert self.workdir is not None
+        if self.workdir is None:
+            raise RuntimeError("the run has no work directory")
         repaired: list[str] = []
         for template in self.sandbox_templates():
             metadata = template["metadata"]
@@ -780,42 +832,141 @@ class Harness:
         return repaired
 
     def teardown(self) -> None:
+        """Release everything this run owned, then prove it is gone.
+
+        Each step is guarded on its own, so a failed or timed-out step never
+        skips the ones after it. Order: the port-forward and fixture servers,
+        the kind cluster, owned containers, recorded volumes, image tags, the
+        work directory, then the inventory. One scrubbed error names every
+        failed step and every remaining resource.
+        """
+
+        __tracebackhide__ = True
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        run = self.run
         errors: list[str] = []
+
+        def step(name: str, action: Callable[[], Any]) -> None:
+            try:
+                action()
+            except Exception as exc:  # noqa: BLE001 - later steps must still run
+                errors.append(f"{name} failed: {type(exc).__name__}: {exc}")
+
         try:
-            run = self.run
+            run.deadline = None
             if self.docker_ready:
                 if run.cluster_attempted:
                     self.record_volumes(f"{run.cluster}-control-plane")
                 if run.registry_attempted:
                     self.record_volumes(run.registry)
-            try:
-                errors.extend(run.cleanup())
-            except Exception as exc:  # noqa: BLE001 - every owned resource still gets removed
-                errors.append(f"cleanup raised {type(exc).__name__}: {exc}")
+            step("stopping the API port-forward", self._stop_forward)
+            if self.gate is not None:
+                step("closing the model endpoint", self.gate.close)
+            if self.stub is not None:
+                step("closing the forge stub", self._close_stub)
             if self.docker_ready:
-                for image in self.built:
-                    if self.docker("image", "inspect", image).returncode == 0:
-                        removed = self.docker("image", "rm", image)
-                        if removed.returncode:
-                            errors.append(f"could not remove image {image}")
+                if run.cluster_attempted:
+                    step("deleting the kind cluster", self._delete_cluster)
+                for container in self._owned_containers(errors):
+                    step(
+                        "removing an owned container",
+                        lambda container=container: self._remove("container", container),
+                    )
                 for volume in sorted(self.volumes):
-                    if self.docker("volume", "inspect", volume).returncode == 0:
-                        removed = self.docker("volume", "rm", volume)
-                        if removed.returncode:
-                            errors.append(f"could not remove an owned volume of {run.cluster}")
-                errors.extend(self.inventory())
-            elif self.workdir is not None and self.workdir.exists():
-                shutil.rmtree(self.workdir, ignore_errors=True)
-                if self.workdir.exists():
-                    errors.append("owned work directory remains")
+                    step(
+                        "removing an owned volume",
+                        lambda volume=volume: self._remove("volume", volume),
+                    )
+                for image in [*self.built, *self._registry_tags(errors)]:
+                    step(
+                        f"removing image {image}", lambda image=image: self._remove("image", image)
+                    )
+            step("removing the work directory", self._remove_workdir)
+            step("taking the teardown inventory", lambda: errors.extend(self.inventory()))
         finally:
             signal.signal(signal.SIGTERM, self.previous_sigterm or signal.SIG_DFL)
         if errors:
             raise RuntimeError(
                 "teardown did not remove everything this run owned: "
                 + "; ".join(self.safe(error) for error in errors)
-            )
+            ) from None
+
+    def _try_docker(self, *argv: str) -> subprocess.CompletedProcess[str] | None:
+        try:
+            return self.docker(*argv)
+        except (OSError, subprocess.SubprocessError):
+            return None
+
+    def _stop_forward(self) -> None:
+        forward = self.run.forward
+        if forward is None:
+            return
+        try:
+            if forward.poll() is None:
+                forward.terminate()
+                try:
+                    forward.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    forward.kill()
+                    forward.wait(timeout=10)
+        finally:
+            if forward.stdout is not None:
+                forward.stdout.close()
+
+    def _close_stub(self) -> None:
+        try:
+            self.stub.close()
+        except RuntimeError:
+            # close() shuts the server down first, then re-raises its audit of
+            # unsupported requests; diagnostics report those. The inventory
+            # still proves the endpoint stopped listening.
+            if not self.stub.unknown_requests:
+                raise
+
+    def _delete_cluster(self) -> None:
+        self.run.command("kind", "delete", "cluster", "--name", self.run.cluster, timeout=300)
+
+    def _owned_containers(self, errors: list[str]) -> list[str]:
+        run = self.run
+        found: list[str] = []
+        for selector in (
+            f"label=io.x-k8s.kind.cluster={run.cluster}",
+            f"name={run.cluster}",
+            f"label=curie.factory-scripted={run.run_id}",
+        ):
+            listed = self._try_docker("ps", "-aq", "--filter", selector)
+            if listed is None or listed.returncode:
+                errors.append(f"listing owned containers ({selector.split('=')[0]}) failed")
+                continue
+            found.extend(item for item in listed.stdout.split() if item not in found)
+        return found
+
+    def _registry_tags(self, errors: list[str]) -> list[str]:
+        if self.registry_ref is None:
+            return []
+        listed = self._try_docker(
+            "images",
+            "--format",
+            "{{.Repository}}:{{.Tag}}",
+            "--filter",
+            f"reference={self.registry_ref}/*",
+        )
+        if listed is None or listed.returncode:
+            errors.append("listing the run registry's image tags failed")
+            return []
+        return listed.stdout.split()
+
+    def _remove(self, kind: str, name: str) -> None:
+        if self.docker(kind, "inspect", name).returncode:
+            return
+        flags = ("-f", "-v") if kind == "container" else ()
+        removed = self.docker(kind, "rm", *flags, name)
+        if removed.returncode:
+            raise RuntimeError(f"docker {kind} rm exited {removed.returncode}")
+
+    def _remove_workdir(self) -> None:
+        if self.workdir is not None and self.workdir.exists():
+            shutil.rmtree(self.workdir)
 
     def inventory(self) -> list[str]:
         """Everything this run could have created, listed again after removal."""
@@ -823,45 +974,58 @@ class Harness:
         run = self.run
         remaining: list[str] = []
 
-        def listed(*argv: str) -> list[str]:
-            result = self.docker(*argv)
-            if result.returncode:
+        def present(*argv: str) -> bool:
+            result = self._try_docker(*argv)
+            if result is None or result.returncode:
                 remaining.append(f"inventory command failed: docker {argv[0]} {argv[1]}")
-                return []
-            return result.stdout.split()
+                return False
+            return bool(result.stdout.split())
 
-        if run.cluster_attempted:
-            clusters = subprocess.run(
-                ["kind", "get", "clusters"],
-                env=run.env,
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=60,
-            )
-            if clusters.returncode or run.cluster in clusters.stdout.split():
-                remaining.append("owned kind cluster remains or could not be listed")
-        for argv in (
-            ("ps", "-aq", "--filter", f"label=io.x-k8s.kind.cluster={run.cluster}"),
-            ("ps", "-aq", "--filter", f"name={run.cluster}"),
-            ("ps", "-aq", "--filter", f"label=curie.factory-scripted={run.run_id}"),
-        ):
-            if listed(*argv):
-                remaining.append(f"owned containers remain ({argv[-1].split('=')[0]})")
-        if listed("network", "ls", "-q", "--filter", f"name={run.cluster}"):
-            remaining.append("owned network remains")
-        if listed("volume", "ls", "-q", "--filter", f"label=io.x-k8s.kind.cluster={run.cluster}"):
-            remaining.append("owned kind volume remains")
-        for volume in sorted(self.volumes):
-            if self.docker("volume", "inspect", volume).returncode == 0:
-                remaining.append("owned volume remains")
-        for image in self.built:
-            if self.docker("image", "inspect", image).returncode == 0:
-                remaining.append(f"owned image tag remains: {image}")
-        if self.registry_ref is not None and listed(
-            "images", "-q", "--filter", f"reference={self.registry_ref}/*"
-        ):
-            remaining.append("owned registry image tags remain")
+        def exists(kind: str, name: str) -> bool:
+            result = self._try_docker(kind, "inspect", name)
+            if result is None:
+                remaining.append(f"inventory command failed: docker {kind} inspect")
+                return False
+            return result.returncode == 0
+
+        if self.docker_ready:
+            if run.cluster_attempted:
+                try:
+                    clusters = subprocess.run(
+                        ["kind", "get", "clusters"],
+                        env=run.env,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                        timeout=60,
+                    )
+                    if clusters.returncode or run.cluster in clusters.stdout.split():
+                        remaining.append("owned kind cluster remains or could not be listed")
+                except (OSError, subprocess.SubprocessError):
+                    remaining.append("owned kind clusters could not be listed")
+            for selector in (
+                f"label=io.x-k8s.kind.cluster={run.cluster}",
+                f"name={run.cluster}",
+                f"label=curie.factory-scripted={run.run_id}",
+            ):
+                if present("ps", "-aq", "--filter", selector):
+                    remaining.append(f"owned containers remain ({selector.split('=')[0]})")
+            if present("network", "ls", "-q", "--filter", f"name={run.cluster}"):
+                remaining.append("owned network remains")
+            if present(
+                "volume", "ls", "-q", "--filter", f"label=io.x-k8s.kind.cluster={run.cluster}"
+            ):
+                remaining.append("owned kind volume remains")
+            for volume in sorted(self.volumes):
+                if exists("volume", volume):
+                    remaining.append("owned volume remains")
+            for image in self.built:
+                if exists("image", image):
+                    remaining.append(f"owned image tag remains: {image}")
+            if self.registry_ref is not None and present(
+                "images", "-q", "--filter", f"reference={self.registry_ref}/*"
+            ):
+                remaining.append("owned registry image tags remain")
         if self.workdir is not None and self.workdir.exists():
             remaining.append("owned work directory remains")
         if run.forward is not None and run.forward.poll() is None:
@@ -869,10 +1033,13 @@ class Harness:
         for service in (self.gate, self.stub):
             if service is None:
                 continue
-            with socket.socket() as sock:
-                sock.settimeout(1)
-                if sock.connect_ex((service.host, service.port)) == 0:
-                    remaining.append("an owned fixture endpoint still listens")
+            try:
+                with socket.socket() as sock:
+                    sock.settimeout(1)
+                    if sock.connect_ex((service.host, service.port)) == 0:
+                        remaining.append("an owned fixture endpoint still listens")
+            except OSError:
+                remaining.append("an owned fixture endpoint could not be probed")
         return remaining
 
     # Reads -------------------------------------------------------------------
@@ -1012,7 +1179,8 @@ class Harness:
     def push_incompressible_commit(self) -> str:
         """Add anonymous random bytes to the stub repository's main branch."""
 
-        assert self.workdir is not None
+        if self.workdir is None:
+            raise RuntimeError("the run has no work directory")
         before = self.stub._ref("main")
         clone = self.workdir / "push-clone"
         env = {
@@ -1064,23 +1232,41 @@ def diagnostic_cluster(request: pytest.FixtureRequest) -> Harness:
         raise KeyboardInterrupt(f"interrupted by signal {signum}")
 
     harness.previous_sigterm = signal.signal(signal.SIGTERM, interrupted)
-    harness.prerequisites()
+    # Every error leaving the fixture is rebuilt from scrubbed text, unchained,
+    # so neither the original message nor its traceback reaches the report.
+    # A missing prerequisite stays a fixture ERROR, never a skip.
+    failure: str | None = None
+    try:
+        harness.prerequisites()
+    except Exception as exc:  # noqa: BLE001 - rebuilt below as a scrubbed fixture error
+        failure = harness.safe(f"prerequisite unavailable: {type(exc).__name__}: {exc}")
+    if failure is not None:
+        raise RuntimeError(failure) from None
     try:
         harness.start()
-    except Exception:
+    except Exception as exc:  # noqa: BLE001 - rebuilt below as a scrubbed fixture error
         harness.diagnose()
-        raise
+        failure = harness.safe(f"fixture setup failed: {type(exc).__name__}: {exc}")
+    if failure is not None:
+        raise RuntimeError(failure) from None
     return harness
 
 
 def test_archive_failure_survives_capacity_and_worker_replacement(
     diagnostic_cluster: Harness,
 ) -> None:
+    h = diagnostic_cluster
+    failure: BaseException | None = None
     try:
-        _scenario(diagnostic_cluster)
-    except Exception:
-        diagnostic_cluster.diagnose()
-        raise
+        _scenario(h)
+    except AssertionError as exc:
+        h.diagnose()
+        failure = AssertionError(h.safe(str(exc)))
+    except Exception as exc:  # noqa: BLE001 - rebuilt below as a scrubbed failure
+        h.diagnose()
+        failure = RuntimeError(h.safe(f"{type(exc).__name__}: {exc}"))
+    if failure is not None:
+        raise failure from None
 
 
 def _single_request(h: Harness, number: int) -> Callable[[], tuple[bool, Any]]:
