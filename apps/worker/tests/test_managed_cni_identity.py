@@ -322,10 +322,13 @@ def test_the_reads_stay_inside_the_provider_entry() -> None:
 
 def test_the_cni_channel_digest_binds_kind_constants_and_identity() -> None:
     identity = observe(installation())
+    from curie_worker.managed_cni_probe_programs import probe_kit_digest
+
     assert cni_digest(identity.digest) == sha256_canonical(
         {
             "producer_kind": PRODUCER_KIND,
             "producer_constants_digest": producer_constants_digest(),
+            "probe_kit_digest": probe_kit_digest(),
             "identity_digest": identity.digest,
         }
     )
@@ -895,6 +898,15 @@ def entry(case: int, sub_case: str, outcome: str = "pass") -> ObservationEntry:
     )  # type: ignore[arg-type]
 
 
+def bound_entries(values: list[Any]) -> Any:
+    from curie_worker.managed_cni_probe_kit import Measurement
+    from curie_worker.managed_cni_probe_programs import probe_kit_digest
+
+    return Measurement(
+        tuple(values), None, PRODUCER_KIND, producer_constants_digest(), probe_kit_digest()
+    )
+
+
 def test_the_fact_document_has_exactly_the_clause_1_members() -> None:
     identity = observe(installation())
     fact = managed_cni_fact(
@@ -902,7 +914,7 @@ def test_the_fact_document_has_exactly_the_clause_1_members() -> None:
         runtime_generation="3",
         guard_config_digest=GUARD,
         identity=identity,
-        entries=[entry(8, "rbac_policy"), entry(2, "rbac_refusal")],
+        entries=bound_entries([entry(8, "rbac_policy"), entry(2, "rbac_refusal")]),
     )
     assert sorted(fact) == sorted(
         [
@@ -910,6 +922,7 @@ def test_the_fact_document_has_exactly_the_clause_1_members() -> None:
             "fact_version",
             "producer_kind",
             "producer_constants_digest",
+            "probe_kit_digest",
             "runtime_id",
             "runtime_generation",
             "guard_config_digest",
@@ -918,7 +931,7 @@ def test_the_fact_document_has_exactly_the_clause_1_members() -> None:
             "observations",
         ]
     )
-    assert fact["fact_kind"] == "managed_cni_fact" and fact["fact_version"] == 1
+    assert fact["fact_kind"] == "managed_cni_fact" and fact["fact_version"] == 2
     assert fact["producer_kind"] == PRODUCER_KIND
     assert fact["identity_digest"] == identity.digest == sha256_canonical(fact["identity"])
     assert {item["sub_case"] for item in fact["observations"]} == {"rbac_policy", "rbac_refusal"}
@@ -929,7 +942,7 @@ def test_the_fact_document_has_exactly_the_clause_1_members() -> None:
 @pytest.mark.parametrize(
     "changes",
     [
-        {"entries": [entry(8, "rbac_policy"), entry(8, "rbac_policy", "fail")]},
+        {"entries": bound_entries([entry(8, "rbac_policy"), entry(8, "rbac_policy", "fail")])},
         {"guard_config_digest": "G"},
         {"runtime_id": ""},
         {"runtime_generation": 3},
@@ -941,7 +954,7 @@ def test_an_invalid_fact_refuses(changes: dict[str, Any]) -> None:
         "runtime_generation": "3",
         "guard_config_digest": GUARD,
         "identity": observe(installation()),
-        "entries": [entry(8, "rbac_policy")],
+        "entries": bound_entries([entry(8, "rbac_policy")]),
     }
     with pytest.raises(ProbeKitRefused):
         managed_cni_fact(**(values | changes))
@@ -1027,3 +1040,27 @@ def test_the_client_reads_bootstrap_roles_whose_names_carry_colons() -> None:
     for name in ("../secrets", "a/b", "a?b", ""):
         with pytest.raises(ProbeKitRefused):
             asyncio.run(client.read_role("ClusterRole", "", name))
+
+
+def test_actual_program_bytes_invalidate_the_managed_cni_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import curie_worker.managed_cni_probe_programs as programs
+
+    identity = observe(installation())
+    first = cni_digest(identity.digest)
+    monkeypatch.setitem(
+        programs._PROGRAMS, "fresh_sender", programs._PROGRAMS["fresh_sender"] + "\n"
+    )
+    assert cni_digest(identity.digest) != first
+
+
+def test_bare_observations_cannot_be_relabelled_as_a_v2_fact() -> None:
+    with pytest.raises(ProbeKitRefused):
+        managed_cni_fact(
+            runtime_id="rt-1",
+            runtime_generation="3",
+            guard_config_digest=GUARD,
+            identity=observe(installation()),
+            entries=[entry(8, "rbac_policy")],
+        )

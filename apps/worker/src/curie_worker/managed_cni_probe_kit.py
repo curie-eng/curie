@@ -28,7 +28,7 @@ Outcome = Literal["pass", "fail", "unavailable"]
 Verdict = tuple[Outcome, str]
 EntryKey = tuple[int, str, str, str, str]
 
-PRODUCER_KIND = "managed-behavioral-v1"
+PRODUCER_KIND = "managed-behavioral-v2"
 
 # Clause 2, "Producer constants". Changing one is a new producer kind.
 PRODUCER_CONSTANTS: dict[str, int] = {
@@ -43,8 +43,9 @@ PRODUCER_CONSTANTS: dict[str, int] = {
     "first_packet_repetitions": 10,
     "address_reuse_max_pods": 40,
     "address_reuse_max_ms": 900000,
-    "retained_heartbeat_ms": 100,
-    "retained_bound_ms": 10000,
+    "fresh_total_deadline_ms": 120000,
+    "fresh_gate_port": 42001,
+    "fresh_max_targets": 8,
     "per_call_deadline_ms": 4000,
 }
 
@@ -145,6 +146,7 @@ REASONS = frozenset(
         "address_reassigned",
         "retained_flow",
         "trigger_unconfirmed",
+        "cleanup_unconfirmed",
         "reaches",
         "blocked",
         "node_probe_unavailable",
@@ -256,11 +258,21 @@ def entries_document(entries: Iterable[ObservationEntry]) -> list[dict[str, Any]
     return sorted((item.document() for item in entries), key=lambda doc: canonical_json(doc))
 
 
-def channel_digest(entries: Iterable[ObservationEntry], channel: str) -> str:
+def channel_digest(measurement: Measurement, channel: str) -> str:
     """sha256 of the canonical sorted array of the entries one ADR 0236 digest covers."""
+    require(isinstance(measurement, Measurement) and measurement_binding_matches(measurement))
     require(channel in CHANNEL_CASES)
+    entries = measurement.entries
     cases = CHANNEL_CASES[channel]
-    return sha256_canonical(entries_document(item for item in entries if item.case in cases))
+    # Import lazily: the fixed executable programs use these closed codecs.
+    from .managed_cni_probe_programs import probe_kit_digest
+
+    return sha256_canonical({
+        "producer_kind": PRODUCER_KIND,
+        "producer_constants_digest": producer_constants_digest(),
+        "probe_kit_digest": probe_kit_digest(),
+        "observations": entries_document(item for item in entries if item.case in cases),
+    })
 
 
 def accepts(entries: Sequence[ObservationEntry], required: Set[EntryKey]) -> bool:
@@ -281,6 +293,19 @@ class Measurement:
 
     entries: tuple[ObservationEntry, ...]
     refusal: str | None
+    # Internal execution binding, not a signed guard-channel record. Missing
+    # fields remain missing: a legacy result cannot acquire current semantics.
+    producer_kind: str | None = None
+    producer_constants_digest: str | None = None
+    probe_kit_digest: str | None = None
+
+
+def measurement_binding_matches(measurement: Measurement) -> bool:
+    from .managed_cni_probe_programs import probe_kit_digest
+
+    return (measurement.producer_kind == PRODUCER_KIND
+            and measurement.producer_constants_digest == producer_constants_digest()
+            and measurement.probe_kit_digest == probe_kit_digest())
 
 
 class BehavioralNetworkProducer(Protocol):

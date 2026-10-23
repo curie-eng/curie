@@ -23,6 +23,7 @@ from curie_worker.commissioning_local_network import (
     LOCAL_PRODUCER_KIND,
     NOT_APPLICABLE_SUB_CASES,
     LocalCiliumNetworkProducer,
+    local_channel_digest,
     local_required_entries,
 )
 from curie_worker.managed_cni_cases import (
@@ -37,7 +38,6 @@ from curie_worker.managed_cni_probe_kit import (
     Measurement,
     ObservationEntry,
     ProbeKitRefused,
-    channel_digest,
 )
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -136,7 +136,11 @@ class FakeKit:
         self.calls += 1
         if self.during is not None:
             self.during()
-        measurement = Measurement(tuple(self.entries), self.refusal)
+        from curie_worker.managed_cni_probe_kit import PRODUCER_KIND, producer_constants_digest
+        from curie_worker.managed_cni_probe_programs import probe_kit_digest
+
+        measurement = Measurement(tuple(self.entries), self.refusal, PRODUCER_KIND,
+                                  producer_constants_digest(), probe_kit_digest())
         self.last = KitResult(measurement, ({"kit": "evidence"},), self.leftovers)
         return measurement
 
@@ -162,6 +166,15 @@ class FakeCluster(FakeReader):
         return None if value is None else [dict(item) for item in value]
 
 
+def bound(entries: Any) -> Measurement:
+    from curie_worker.managed_cni_probe_kit import PRODUCER_KIND, producer_constants_digest
+    from curie_worker.managed_cni_probe_programs import probe_kit_digest
+
+    return Measurement(
+        tuple(entries), None, PRODUCER_KIND, producer_constants_digest(), probe_kit_digest()
+    )
+
+
 def producer(
     cluster: FakeCluster | None = None, kit: FakeKit | None = None, **changes: Any
 ) -> tuple[LocalCiliumNetworkProducer, FakeCluster, FakeKit]:
@@ -180,7 +193,7 @@ def measured(**changes: Any) -> tuple[LocalCiliumNetworkProducer, FakeCluster, F
 
 def test_the_local_producer_has_its_own_kind() -> None:
     made, _, _ = producer()
-    assert made.producer_kind == LOCAL_PRODUCER_KIND == "local-cilium-v1"
+    assert made.producer_kind == LOCAL_PRODUCER_KIND == "local-cilium-v2"
 
 
 def test_the_local_required_set_is_an_allowlist_of_the_three_peer_facts() -> None:
@@ -323,7 +336,7 @@ def network(made: LocalCiliumNetworkProducer) -> str:
 def test_the_network_fact_is_the_channel_digest_of_the_network_cases() -> None:
     made, _, _ = measured()
     assert made.last is not None
-    expected = channel_digest(made.last.measurement.entries, "network")
+    expected = local_channel_digest(bound(made.last.measurement.entries), "network")
     assert network(made) == network(made) == expected
 
 
@@ -331,7 +344,8 @@ def test_the_network_fact_covers_only_network_cases() -> None:
     made, _, _ = measured()
     assert made.last is not None
     entries = made.last.measurement.entries
-    assert channel_digest([i for i in entries if i.case != 2], "network") == network(made)
+    assert (local_channel_digest(bound([i for i in entries if i.case != 2]), "network")
+            == network(made))
 
 
 def test_other_kit_cases_change_neither_the_fact_digest_nor_the_verdict() -> None:
@@ -469,10 +483,10 @@ def test_each_peer_fact_is_the_channel_digest_of_its_own_cases() -> None:
     made, _, _ = measured()
     assert made.last is not None
     entries = made.last.measurement.entries
-    assert observe(made, "hostile_peer") == channel_digest(entries, "hostile")
-    assert observe(made, "retained_peer") == channel_digest(entries, "retained_peer")
+    assert observe(made, "hostile_peer") == local_channel_digest(bound(entries), "hostile")
+    assert observe(made, "retained_peer") == local_channel_digest(bound(entries), "retained_peer")
     hostile = [item for item in entries if item.case in (2, 3, 4)]
-    assert channel_digest(hostile, "hostile") == observe(made, "hostile_peer")
+    assert local_channel_digest(bound(hostile), "hostile") == observe(made, "hostile_peer")
     assert len({network(made), observe(made, "hostile_peer"), observe(made, "retained_peer")}) == 3
 
 
@@ -609,3 +623,38 @@ def test_an_extra_unrequired_peer_entry_refuses(
     assert asyncio.run(made.measure()).refusal == "incomplete"
     with pytest.raises(ProbeKitRefused):
         observe(made, fact)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {},
+        {"producer_kind": "managed-behavioral-v1"},
+        {"producer_constants_digest": "0" * 64},
+        {"probe_kit_digest": "0" * 64},
+    ],
+)
+def test_missing_or_mixed_behavioral_version_cannot_qualify_local_facts(
+    change: dict[str, Any],
+) -> None:
+    from dataclasses import replace
+
+    class WrongKit(FakeKit):
+        async def measure(self) -> Measurement:
+            measurement = await super().measure()
+            if not change:
+                return Measurement(measurement.entries, measurement.refusal)
+            return replace(measurement, **change)
+
+    made, _, _ = producer(kit=WrongKit(kit_entries(layout())))
+    assert asyncio.run(made.measure()).refusal == "producer_binding_unavailable"
+    with pytest.raises(ProbeKitRefused):
+        observe(made, "retained_peer")
+
+
+def test_an_earlier_cleanup_refusal_blocks_every_local_fact_even_after_later_absence() -> None:
+    made, _, _ = producer(kit=FakeKit(kit_entries(layout()), refusal="cleanup_unconfirmed"))
+    assert asyncio.run(made.measure()).refusal == "cleanup_unconfirmed"
+    for name in FACTS:
+        with pytest.raises(ProbeKitRefused):
+            observe(made, name)

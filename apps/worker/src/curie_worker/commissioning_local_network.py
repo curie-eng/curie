@@ -17,10 +17,9 @@ signed guard reply. Re-running the behavioral cases takes minutes, so each fact
 call reobserves what binds the measurement instead: the engine identity and the
 policy set. Any difference refuses every fact. Each fact then judges only its
 own channel's entries, so evidence shows which fact refused: an unavailable
-spoof or address-reuse entry refuses the hostile-peer fact, and case 5
-``workload_replaced``, which cannot pass from user space, refuses the
-retained-peer fact. The producer's own verdict still refuses while any local
-entry is not ``pass``. This module implements the commissioning
+spoof or address-reuse entry refuses the hostile-peer fact, and an unavailable
+fresh-connection entry refuses the retained-peer fact. The producer's own verdict
+still refuses while any local entry is not ``pass``. This module implements the commissioning
 ``FactProducer`` protocol structurally; production composition never imports
 it.
 """
@@ -30,7 +29,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Protocol
 
 from .commissioning_local_cilium import (
@@ -59,11 +58,14 @@ from .managed_cni_probe_kit import (
     ProbeKitRefused,
     accepts,
     channel_digest,
+    measurement_binding_matches,
+    producer_constants_digest,
     refuse,
     require,
+    sha256_canonical,
 )
 
-LOCAL_PRODUCER_KIND = "local-cilium-v1"
+LOCAL_PRODUCER_KIND = "local-cilium-v2"
 # Sub-cases this producer does not measure even within its own cases: a local
 # Docker-driver install has no instance metadata service.
 NOT_APPLICABLE_SUB_CASES = frozenset({"instance_metadata"})
@@ -104,7 +106,7 @@ def _keep_entry(item: ObservationEntry) -> bool:
 
 
 # Kit refusals that stop before the remaining cases; the local filter keeps them.
-_EARLY = ("enforcement_absent", "non_vacuity_unavailable")
+_EARLY = ("enforcement_absent", "non_vacuity_unavailable", "cleanup_unconfirmed")
 
 
 class LocalCluster(ProbeCluster, CiliumReader, Protocol):
@@ -199,7 +201,11 @@ class LocalCiliumNetworkProducer:
             after = None
         bracket = self._bracket(kit, report, before, after, await self._policies() == policies)
         refusal = bracket or self._entry_refusal(entries, local_required_entries(self._layout))
-        return LocalResult(Measurement(entries, refusal), before, policies, report, bracket)
+        from .managed_cni_probe_programs import probe_kit_digest
+
+        return LocalResult(Measurement(entries, refusal, LOCAL_PRODUCER_KIND,
+                                       producer_constants_digest(), probe_kit_digest()),
+                           before, policies, report, bracket)
 
     @staticmethod
     def _bracket(
@@ -209,8 +215,12 @@ class LocalCiliumNetworkProducer:
         after: CiliumIdentity | None,
         policies_unchanged: bool,
     ) -> str | None:
+        if not measurement_binding_matches(kit):
+            return "producer_binding_unavailable"
         if report is None or report.leftovers:
             return "cleanup_unconfirmed"
+        if report.measurement != kit or not measurement_binding_matches(report.measurement):
+            return "producer_binding_unavailable"
         if after is None:
             return "cni_unavailable"
         if after.digest != before.digest:
@@ -250,7 +260,21 @@ class LocalCiliumNetworkProducer:
         current = await self._identity()
         require(current.digest == result.identity.digest)
         require(await self._policies() == result.policies)
-        return channel_digest(entries, channel)
+        require(result.kit is not None and measurement_binding_matches(result.kit.measurement))
+        assert result.kit is not None
+        return local_channel_digest(
+            replace(result.kit.measurement, entries=tuple(entries), refusal=None), channel
+        )
+
+
+def local_channel_digest(measurement: Measurement, channel: str) -> str:
+    """Fixed local identity around the shared v2 behavioral execution binding."""
+    return sha256_canonical(
+        {
+            "producer_kind": LOCAL_PRODUCER_KIND,
+            "behavioral_digest": channel_digest(measurement, channel),
+        }
+    )
 
 
 class LocalNetworkFact:

@@ -202,9 +202,13 @@ class MeasuringIdentityAPI:
         assert created is not None
         return created
 
-    async def delete_network_policy(self, namespace: str, name: str) -> None:
-        status, _body = await self._send("DELETE", self._policies(namespace, name))
-        require(200 <= status < 300 or status == 404)
+    async def delete_network_policy(self, namespace: str, name: str, uid: str) -> None:
+        require(isinstance(uid, str) and bool(uid))
+        status, _body = await self._send(
+            "DELETE", self._policies(namespace, name),
+            {"apiVersion": "v1", "kind": "DeleteOptions", "preconditions": {"uid": uid}},
+        )
+        require(200 <= status < 300 or status in (404, 409))
 
     async def list_items(self, collection: str) -> list[dict[str, Any]] | None:
         if collection.startswith("networkpolicies:"):

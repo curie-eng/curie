@@ -120,12 +120,13 @@ def parse_fresh_sender_log(log: str, *, allow_partial: bool = False) -> FreshSen
     require(ready["ev"] == "ready" and ready["mode"] in ("deny", "control", "setup"))
     source = _address(ready["source"])
     targets = ready["targets"]
-    require(type(targets) is list and 1 <= len(targets) <= 2)
+    require(type(targets) is list and 1 <= len(targets) <= 8)
     names: set[str] = set()
     endpoints: set[tuple[str, int]] = set()
     for target in targets:
         _members(target, "target address port echo")
-        require(target["target"] in ("real", "twin") and target["target"] not in names)
+        require(target["target"] in ("real", "twin")
+                and (target["target"] == "real" or "twin" not in names))
         names.add(target["target"])
         endpoint = _address(target["address"]), _integer(target["port"], 1, 65535)
         require(endpoint not in endpoints and endpoint[1] != 42001)
@@ -387,12 +388,12 @@ if mode == "control" and cfg["setup"]:
     raise ValueError("setup")
 af = family(cfg["family"])
 targets = cfg["targets"]
-if type(targets) is not list or not 1 <= len(targets) <= 2:
+if type(targets) is not list or not 1 <= len(targets) <= 8:
     raise ValueError("targets")
 names, destinations = set(), set()
 for target in targets:
     keys(target, "target address port echo")
-    if target["target"] not in ("real", "twin") or target["target"] in names:
+    if target["target"] not in ("real", "twin") or (target["target"] == "twin" and "twin" in names):
         raise ValueError("target")
     names.add(target["target"])
     target["address"] = address(target["address"], af)
@@ -736,12 +737,13 @@ def validate_fresh_argument(template: str, argument: dict[str, Any]) -> None:
     if argument["setup"]:
         challenge(argument["setup_nonce"])
     targets = argument["targets"]
-    require(type(targets) is list and 1 <= len(targets) <= 2)
+    require(type(targets) is list and 1 <= len(targets) <= 8)
     seen: set[str] = set()
     endpoints: set[tuple[str, int]] = set()
     for target in targets:
         _members(target, "target address port echo")
-        require(target["target"] in ("real", "twin") and target["target"] not in seen)
+        require(target["target"] in ("real", "twin")
+                and (target["target"] == "real" or "twin" not in seen))
         seen.add(target["target"])
         require(type(target["echo"]) is bool and target["echo"] == (target["target"] == "twin"))
         endpoint = address(target["address"]), _integer(target["port"], 1, 65535)

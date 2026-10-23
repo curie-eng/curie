@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import Any, Protocol
 
+from .managed_cni_fresh_programs import parse_fresh_listener_log, parse_fresh_sender_log
 from .managed_cni_probe_kit import (
     FAMILIES,
     PLACEMENTS,
@@ -41,6 +42,7 @@ from .managed_cni_probe_kit import (
     judge_guard_dry_run,
     judge_policy_sets,
     judge_reviews,
+    producer_constants_digest,
     refuse,
     require,
     sha256_canonical,
@@ -153,7 +155,7 @@ class ProbeCluster(Protocol):
         self, namespace: str, document: dict[str, Any]
     ) -> dict[str, Any]: ...
 
-    async def delete_network_policy(self, namespace: str, name: str) -> None: ...
+    async def delete_network_policy(self, namespace: str, name: str, uid: str) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -249,6 +251,9 @@ class _Pod:
     uid: str
     node: str
     addresses: tuple[str, ...]
+    container_id: str | None = None
+    image_id: str | None = None
+    binding_digest: str | None = None
 
     def address(self, family: str) -> str | None:
         return next((a for a in self.addresses if address_family(a) == family), None)
@@ -262,7 +267,9 @@ class _Run:
     sleep: Callable[[float], Awaitable[None]]
     created: list[tuple[str, str, str]] = field(default_factory=list)
     # Probe NetworkPolicies this run created in the probe namespace (case 5).
-    created_policies: list[tuple[str, str]] = field(default_factory=list)
+    created_policies: list[tuple[str, str, str]] = field(default_factory=list)
+    pending_pods: set[tuple[str, str]] = field(default_factory=set)
+    pending_policies: set[tuple[str, str]] = field(default_factory=set)
     evidence: list[dict[str, Any]] = field(default_factory=list)
     counter: int = 0
     # Set by case 7 when node-local traffic reaches but a capability entry is not pass.
@@ -272,6 +279,8 @@ class _Run:
     # One sender per node from creation until its listener window closes, so no
     # other probe pod of this run can take over its address inside the window.
     node_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
+    monotonic: Callable[[], float] = time.monotonic
+    cleanup_unconfirmed: bool = False
 
     def node_lock(self, node: str) -> asyncio.Lock:
         return self.node_locks.setdefault(node, asyncio.Lock())
@@ -311,6 +320,99 @@ def _entry(
     )
 
 
+def _fresh_observed(document: Mapping[str, Any], expected: Mapping[str, Any]) -> _Pod | None:
+    """Bind one admitted fixed workload, without confusing image and index digests."""
+    def contains(actual: Any, wanted: Any) -> bool:
+        if isinstance(wanted, dict):
+            return isinstance(actual, dict) and all(
+                key in actual and contains(actual[key], value) for key, value in wanted.items())
+        if isinstance(wanted, list):
+            return isinstance(actual, list) and len(actual) == len(wanted) and all(
+                contains(a, w) for a, w in zip(actual, wanted, strict=True))
+        return type(actual) is type(wanted) and actual == wanted
+
+    meta, spec, status = (document.get(key, {}) for key in ("metadata", "spec", "status"))
+    require(isinstance(meta, dict) and isinstance(spec, dict) and isinstance(status, dict))
+    expected_spec = expected["spec"]
+    # Kubernetes v1.35 omits false value-type host flags; pointer-valued false
+    # security settings must remain explicit. Defaulting never grants new work.
+    normalized_spec = {"hostNetwork": False, "hostPID": False, "hostIPC": False, **spec}
+    require(contains(meta, expected["metadata"]) and contains(normalized_spec, expected_spec))
+    pod_defaults = {
+        "dnsPolicy": "ClusterFirst",
+        "schedulerName": "default-scheduler",
+        "serviceAccountName": "default",
+        "serviceAccount": "default",
+        "priority": 0,
+        "preemptionPolicy": "PreemptLowerPriority",
+    }
+    require(set(spec) <= set(expected_spec) | set(pod_defaults) | {"tolerations"})
+    require(
+        all(key not in spec or contains(spec[key], value) for key, value in pod_defaults.items())
+    )
+    tolerations = spec.get("tolerations", [])
+    require(isinstance(tolerations, list) and len(tolerations) <= 2)
+    defaults = [
+        {"key": key, "operator": "Exists", "effect": "NoExecute", "tolerationSeconds": 300}
+        for key in ("node.kubernetes.io/not-ready", "node.kubernetes.io/unreachable")
+    ]
+    require(all(item in defaults for item in tolerations))
+    require(spec.get("securityContext") == expected_spec["securityContext"])
+    container_spec = spec["containers"][0]
+    expected_container = expected_spec["containers"][0]
+    container_defaults = {
+        "terminationMessagePath": "/dev/termination-log",
+        "terminationMessagePolicy": "File",
+    }
+    require(set(container_spec) <= set(expected_container) | set(container_defaults))
+    require(
+        all(
+            key not in container_spec or contains(container_spec[key], value)
+            for key, value in container_defaults.items()
+        )
+    )
+    require(container_spec.get("securityContext") == expected_container["securityContext"])
+    require(container_spec.get("resources") == expected_container["resources"])
+    require(
+        not any(
+            spec.get(key)
+            for key in (
+                "hostNetwork",
+                "hostPID",
+                "hostIPC",
+                "shareProcessNamespace",
+                "initContainers",
+                "ephemeralContainers",
+                "volumes",
+            )
+        )
+    )
+    identities = status.get("containerStatuses", [])
+    if not identities:
+        return None
+    require(isinstance(identities, list) and len(identities) == 1)
+    container = identities[0]
+    require(
+        isinstance(container, dict)
+        and container.get("restartCount") == 0
+        and type(container.get("restartCount")) is int
+    )
+    require(container.get("name") == spec["containers"][0]["name"])
+    cid, iid = container.get("containerID"), container.get("imageID")
+    if not cid or not iid:
+        return None
+    require(isinstance(cid, str) and isinstance(iid, str))
+    uid = _resource_uid(document)
+    require(uid is not None)
+    assert uid is not None
+    addresses = tuple(item["ip"] for item in status.get("podIPs", []))
+    require(bool(addresses) and len(set(addresses)) == len(addresses))
+    for address in addresses:
+        address_family(address)
+    return _Pod(meta["namespace"], meta["name"], uid, spec["nodeName"], addresses,
+                cid, iid, sha256_canonical({"spec": spec, "labels": meta["labels"]}))
+
+
 async def _start(
     run: _Run,
     *,
@@ -320,8 +422,14 @@ async def _start(
     labels: Mapping[str, str],
     argument: Mapping[str, Any],
     finished: bool,
+    deadline: float | None = None,
 ) -> _Pod | None:
     """Create one probe pod and wait for Running (listener) or a terminal phase (sender)."""
+    clock = run.monotonic if template.startswith("fresh_") else run.clock
+    phase_deadline = clock() + PRODUCER_CONSTANTS["pod_phase_timeout_ms"] / 1000
+    deadline = phase_deadline if deadline is None else min(deadline, phase_deadline)
+    if clock() >= deadline:
+        return None
     run.counter += 1
     name = f"cni-{run.layout.campaign}-{run.counter}-{secrets.token_hex(3)}"[:63].rstrip("-")
     document = probe_pod(
@@ -333,24 +441,50 @@ async def _start(
         role_labels=labels,
         argument=argument,
     )
+    run.pending_pods.add((namespace, name))
     created = await run.cluster.create_pod(namespace, document)
-    uid = created["metadata"]["uid"]
+    meta = created.get("metadata", {})
+    uid = meta.get("uid")
+    require(isinstance(uid, str) and bool(uid))
+    require(meta.get("name") == name and meta.get("namespace") == namespace)
     run.created.append((namespace, name, uid))
-    deadline = run.clock() + PRODUCER_CONSTANTS["pod_phase_timeout_ms"] / 1000
-    while run.clock() < deadline:
+    run.pending_pods.remove((namespace, name))
+    while clock() < deadline:
         pod = await run.cluster.read_pod(namespace, name)
+        if clock() >= deadline:
+            return None
         if pod is None or pod["metadata"]["uid"] != uid:
             refuse()
         status = pod.get("status", {})
         phase = status.get("phase")
         addresses = tuple(item["ip"] for item in status.get("podIPs", []) if item.get("ip"))
         observed = _Pod(namespace, name, uid, pod["spec"].get("nodeName", ""), addresses)
+        if template.startswith("fresh_") and phase in ("Running", "Succeeded", "Failed"):
+            bound = _fresh_observed(pod, document)
+            if bound is None:
+                await run.sleep(min(_POLL_S, max(0, deadline - clock())))
+                continue
+            observed = bound
         if finished and phase in ("Succeeded", "Failed"):
-            return observed
+            return observed if clock() < deadline else None
         if not finished and phase == "Running" and addresses:
-            if parse_listener_log(await run.cluster.pod_log(namespace, name)).ready:
-                return observed
-        await run.sleep(_POLL_S)
+            log = await run.cluster.pod_log(namespace, name)
+            ready = False
+            if template in ("fresh_twin", "fresh_probe_listener"):
+                if log:
+                    record = parse_fresh_listener_log(log)
+                    ready = record.port == argument["port"] and bool(record.ticks)
+            elif template in ("fresh_setup", "fresh_sender"):
+                if log:
+                    sender = parse_fresh_sender_log(log, allow_partial=True)
+                    ready = (sender.mode == argument["mode"] and sender.source in addresses
+                             and sender.refusal is None and sender.challenge is None
+                             and (sender.setup is not None) == argument["setup"])
+            else:
+                ready = parse_listener_log(log).ready
+            if ready:
+                return observed if clock() < deadline else None
+        await run.sleep(min(_POLL_S, max(0, deadline - clock())))
     return None
 
 
@@ -389,7 +523,11 @@ async def _sender_record(run: _Run, pod: _Pod | None) -> SenderRecord | None:
 def _pod_evidence(pod: _Pod | None) -> dict[str, Any] | None:
     if pod is None:
         return None
-    return {"uid": pod.uid, "node": pod.node, "addresses": list(pod.addresses)}
+    evidence: dict[str, Any] = {"uid": pod.uid, "node": pod.node, "addresses": list(pod.addresses)}
+    if pod.binding_digest is not None:
+        evidence.update(container_id=pod.container_id, image_id=pod.image_id,
+                        binding_digest=pod.binding_digest)
+    return evidence
 
 
 def _sender_evidence(record: SenderRecord | None) -> list[list[Any]] | None:
@@ -1068,33 +1206,62 @@ async def case_eight_reviews(run: _Run, identities: Sequence[Subject] | None) ->
     return _entry(run, (8, "rbac_policy", *NONE), verdict=verdict, evidence={"reviews": record})
 
 
+def _resource_uid(value: Any) -> str | None:
+    meta = value.get("metadata") if isinstance(value, dict) else None
+    uid = meta.get("uid") if isinstance(meta, dict) else None
+    return uid if isinstance(uid, str) and uid else None
+
+
 async def _cleanup(run: _Run) -> list[str]:
     """Delete every pod and probe policy this run created, by UID, and confirm absence."""
-    leftovers = []
-    for namespace, name in run.created_policies:
+    # Start before DELETEs; wall-clock movement and slow transports cannot grant
+    # another object's request a fresh budget. A DELETE response is not absence.
+    deadline = run.monotonic() + 120
+    unbound = [
+        f"{namespace}/{name}/unbound-{kind}"
+        for kind, pending in (("pod", run.pending_pods), ("policy", run.pending_policies))
+        for namespace, name in sorted(pending)
+    ]
+    pods, policies = set(run.created), set(run.created_policies)
+
+    async def perform(operation: Callable[[], Awaitable[Any]]) -> tuple[bool, Any]:
+        remaining = deadline - run.monotonic()
+        if remaining <= 0:
+            return False, None
         try:
-            await run.cluster.delete_network_policy(namespace, name)
-        except ProbeKitRefused:
-            pass
-    for namespace, name, uid in run.created:
-        try:
-            await run.cluster.delete_pod(namespace, name, uid)
-        except ProbeKitRefused:
-            pass
-    deadline = run.clock() + 120
-    for namespace, name, uid in run.created:
-        while True:
-            try:
-                pod = await run.cluster.read_pod(namespace, name)
-            except ProbeKitRefused:
-                pod = {"metadata": {"uid": uid}}
-            if pod is None or pod["metadata"]["uid"] != uid:
-                break
-            if run.clock() > deadline:
-                leftovers.append(f"{namespace}/{name}/{uid}")
-                break
-            await run.sleep(_POLL_S)
-    return leftovers
+            async with asyncio.timeout(remaining):
+                result = await operation()
+        except (ProbeKitRefused, TimeoutError):
+            return False, None
+        return run.monotonic() < deadline, result
+
+    for namespace, name, uid in sorted(policies):
+        await perform(partial(run.cluster.delete_network_policy, namespace, name, uid))
+    for namespace, name, uid in sorted(pods):
+        await perform(partial(run.cluster.delete_pod, namespace, name, uid))
+    while (pods or policies) and run.monotonic() < deadline:
+        for namespace in sorted({namespace for namespace, _name, _uid in policies}):
+            ok, items = await perform(
+                partial(run.cluster.list_items, "networkpolicies:" + namespace)
+            )
+            if ok and isinstance(items, list):
+                identities = [_resource_uid(item) for item in items]
+                if all(value is not None for value in identities):
+                    policies = {
+                        owned
+                        for owned in policies
+                        if owned[0] != namespace or owned[2] in identities
+                    }
+        for namespace, name, uid in sorted(pods):
+            ok, pod = await perform(partial(run.cluster.read_pod, namespace, name))
+            observed_uid = _resource_uid(pod)
+            if ok and (pod is None or (observed_uid is not None and observed_uid != uid)):
+                pods.remove((namespace, name, uid))
+        if pods or policies:
+            await perform(partial(run.sleep, min(_POLL_S, max(0, deadline - run.monotonic()))))
+    return unbound + [
+        f"{namespace}/{name}/{uid}" for namespace, name, uid in sorted(pods | policies)
+    ]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1116,12 +1283,14 @@ class ProbeKit:
         *,
         clock: Callable[[], float] = time.time,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._cluster, self._layout, self._clock, self._sleep = cluster, layout, clock, sleep
+        self._monotonic = monotonic
         self.last: KitResult | None = None
 
     async def measure(self) -> Measurement:
-        run = _Run(self._cluster, self._layout, self._clock, self._sleep)
+        run = _Run(self._cluster, self._layout, self._clock, self._sleep, monotonic=self._monotonic)
         try:
             measurement = await self._measure(run)
         finally:
@@ -1131,6 +1300,8 @@ class ProbeKit:
             measurement = Measurement(
                 measurement.entries, measurement.refusal or "cleanup_unconfirmed"
             )
+        measurement = Measurement(measurement.entries, measurement.refusal, PRODUCER_KIND,
+                                  producer_constants_digest(), probe_kit_digest())
         run.evidence.append({"probe_kit_digest": probe_kit_digest(), "leftovers": leftovers})
         self.last = KitResult(measurement, tuple(run.evidence), tuple(leftovers))
         return measurement
@@ -1159,6 +1330,8 @@ class ProbeKit:
         entries += await case_three(run, twins)
         entries += await case_four(run, twins)
         entries += await case_five(run, twins)
+        if run.cleanup_unconfirmed:
+            return Measurement(tuple(entries), "cleanup_unconfirmed")
         entries += await case_seven(run, identities)
         snapshots.append(await policy_snapshot(run))
         entries += await case_six(run)

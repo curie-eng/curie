@@ -379,9 +379,10 @@ _NODE = re.compile(r"[a-z0-9][a-z0-9.-]{0,252}")
 
 
 def probe_kit_digest() -> str:
-    """sha256 over the probe image and every program, recorded with the evidence."""
+    """sha256 over the image, programs and fixed template dispatch, recorded with evidence."""
     return hashlib.sha256(
-        canonical_json({"image": PROBE_IMAGE, "programs": dict(sorted(_PROGRAMS.items()))})
+        canonical_json({"image": PROBE_IMAGE, "programs": dict(sorted(_PROGRAMS.items())),
+                        "templates": dict(sorted(TEMPLATES.items()))})
     ).hexdigest()
 
 

@@ -463,3 +463,59 @@ def test_actual_control_does_not_claim_a_round_trip_from_one_way_or_wrong_reply(
         receiver.close()
         thread.join(timeout=5)
         assert not thread.is_alive() and not failures
+
+
+def test_all_distinct_real_endpoints_are_retained_in_one_bounded_sender() -> None:
+    argument = template_argument("fresh_sender")
+    argument["targets"] = [
+        {"target": "real", "address": f"127.0.0.{i}", "port": 18080, "echo": False}
+        for i in range(2, 5)
+    ] + [{"target": "twin", "address": "127.0.0.1", "port": 18080, "echo": True}]
+    pod = probe_pod(
+        template="fresh_sender",
+        name="fresh-many",
+        namespace="probe-a",
+        node="node-a",
+        campaign="trial-a",
+        role_labels={},
+        argument=argument,
+    )
+    assert json.loads(pod["spec"]["containers"][0]["command"][4])["targets"] == argument["targets"]
+    rows = sender_rows()
+    rows[0]["targets"] = argument["targets"]
+    attempts = []
+    for index, target in enumerate(argument["targets"]):
+        for ordinal in range(5):
+            attempts.append(
+                {
+                    **rows[2],
+                    "target": target["target"],
+                    "destination": target["address"],
+                    "port": target["port"],
+                    "source_port": 42010 + len(attempts),
+                    "nonce": CHALLENGE + f"{index:02x}{ordinal:02x}",
+                }
+            )
+    record = fresh().parse_fresh_sender_log(lines([rows[0], rows[1], *attempts, rows[-1]]))
+    assert record.complete and len(record.attempts) == 20
+    for bad in ([argument["targets"][-1]] * 2, argument["targets"] * 3):
+        with pytest.raises(ProbeKitRefused):
+            probe_pod(
+                template="fresh_sender",
+                name="fresh-many",
+                namespace="probe-a",
+                node="node-a",
+                campaign="trial-a",
+                role_labels={},
+                argument={**argument, "targets": bad},
+            )
+
+
+def test_template_dispatch_is_part_of_the_actual_probe_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import curie_worker.managed_cni_probe_programs as programs
+
+    before = programs.probe_kit_digest()
+    monkeypatch.setitem(programs.TEMPLATES, "fresh_sender", ("fresh_listener", "probe"))
+    assert programs.probe_kit_digest() != before

@@ -54,6 +54,15 @@ def entry(**changes: object) -> ObservationEntry:
     return ObservationEntry(**base)  # type: ignore[arg-type]
 
 
+def bound(entries: tuple[ObservationEntry, ...]) -> object:
+    from curie_worker.managed_cni_probe_kit import Measurement
+    from curie_worker.managed_cni_probe_programs import probe_kit_digest
+
+    return Measurement(
+        entries, None, PRODUCER_KIND, producer_constants_digest(), probe_kit_digest()
+    )
+
+
 def clean_denial(**changes: object) -> DenialEvidence:
     base = DenialEvidence(
         sender_ready=True,
@@ -72,7 +81,7 @@ def clean_denial(**changes: object) -> DenialEvidence:
 
 
 def test_constants_table_is_exactly_clause_two() -> None:
-    assert PRODUCER_KIND == "managed-behavioral-v1"
+    assert PRODUCER_KIND == "managed-behavioral-v2"
     assert PRODUCER_CONSTANTS["denial_tcp_attempts"] == 5
     assert PRODUCER_CONSTANTS["denial_udp_attempts"] == 5
     assert PRODUCER_CONSTANTS["attempt_interval_ms"] == 200
@@ -162,13 +171,13 @@ def test_acceptance_refuses_missing_duplicate_and_non_pass_entries() -> None:
 def test_channel_digest_groups_cases_as_the_spec_table() -> None:
     one = entry()
     two = entry(case=2, sub_case="broker", source_kind="release_namespace")
-    network = channel_digest((one, two), "network")
-    hostile = channel_digest((one, two), "hostile")
-    assert network == channel_digest((one,), "network")
-    assert hostile == channel_digest((two,), "hostile")
-    assert channel_digest((two, one), "network") == network  # order independent
+    network = channel_digest(bound((one, two)), "network")
+    hostile = channel_digest(bound((one, two)), "hostile")
+    assert network == channel_digest(bound((one,)), "network")
+    assert hostile == channel_digest(bound((two,)), "hostile")
+    assert channel_digest(bound((two, one)), "network") == network  # order independent
     with pytest.raises(ProbeKitRefused):
-        channel_digest((one,), "cni")
+        channel_digest(bound((one,)), "cni")
 
 
 def test_denial_passes_only_on_clean_evidence() -> None:
@@ -435,3 +444,25 @@ def test_running_node_capability() -> None:
     assert judge_running_nodes(0) == ("pass", "reviews_denied")
     assert judge_running_nodes(2) == ("fail", "node_capable_pod")
     assert judge_running_nodes(None) == ("unavailable", "review_unavailable")
+
+
+def test_v2_channel_digest_binds_fixed_kind_constants_and_actual_programs() -> None:
+    from curie_worker.managed_cni_probe_kit import entries_document, sha256_canonical
+    from curie_worker.managed_cni_probe_programs import probe_kit_digest
+
+    one = entry()
+    assert PRODUCER_KIND == "managed-behavioral-v2"
+    assert PRODUCER_CONSTANTS["fresh_total_deadline_ms"] == 120000
+    assert PRODUCER_CONSTANTS["fresh_gate_port"] == 42001
+    assert "retained_bound_ms" not in PRODUCER_CONSTANTS
+    assert channel_digest(bound((one,)), "network") == sha256_canonical({
+        "producer_kind": PRODUCER_KIND,
+        "producer_constants_digest": producer_constants_digest(),
+        "probe_kit_digest": probe_kit_digest(),
+        "observations": entries_document([one]),
+    })
+
+
+def test_bare_legacy_entries_cannot_be_relabelled_by_current_hashing() -> None:
+    with pytest.raises(ProbeKitRefused):
+        channel_digest((entry(),), "network")
