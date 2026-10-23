@@ -183,6 +183,18 @@ forbidden_modules = [
     "curie_protected_hooks.qualification_publication",
 ]
 
+# ADR 0236's internal operator composition is the only worker-side reader of
+# these records. The provisioner-only adapter owns the local installation reads.
+ignore_imports = [
+    "curie_worker.commissioning_control_process -> curie_protected_hooks.commissioning_bootstrap",
+    "curie_worker.commissioning_control_process -> curie_protected_hooks.commissioning_operator_guard",
+    "curie_worker.commissioning_control_process -> curie_protected_hooks.commissioning_producers",
+    "curie_worker.commissioning_control_process -> curie_protected_hooks.commissioning_provisioner",
+    "curie_worker.commissioning_control_process -> curie_protected_hooks.commissioning_records",
+    "curie_worker.commissioning_control_reader -> curie_protected_hooks.commissioning_local_installation",
+    "curie_worker.commissioning_control_reader -> curie_protected_hooks.commissioning_local_ownership",
+]
+
 # @spec PROTECTED-COMMISSIONING-8: the commissioning launch authorizer is the
 # second closed authorizer of the shared launch mechanics. It and its registry
 # live in `curie_worker` beside the mechanics, import no commissioning record,
@@ -272,6 +284,7 @@ name = "Production composition never imports the commissioning guard"
 type = "forbidden"
 source_modules = [
     "curie_api",
+    "curie_worker.__main__",
     "curie_worker.protected_binding",
     "curie_worker.protected_completion",
     "curie_worker.protected_configuration",
@@ -304,6 +317,8 @@ forbidden_modules = [
     "curie_worker.commissioning_control_admission",
     "curie_worker.commissioning_control_installation",
     "curie_worker.commissioning_control_observer",
+    "curie_worker.commissioning_control_process",
+    "curie_worker.commissioning_control_reader",
     "curie_worker.commissioning_control_profile",
     "curie_worker.commissioning_control_slots",
 ]
@@ -326,6 +341,23 @@ forbidden_modules = [
     "curie_worker.protected_launch_client",
     "curie_worker.protected_launch_kubernetes",
     "curie_worker.protected_launch_registry",
+]
+
+# The in-cluster control process cannot acquire the provisioner's local cluster
+# configuration or signing key, acceptance writer, or publication credentials.
+[[tool.importlinter.contracts]]
+name = "The control process never owns provisioner or publication authority"
+type = "forbidden"
+source_modules = ["curie_worker.commissioning_control_process"]
+forbidden_modules = [
+    "curie_worker.commissioning_control_reader",
+    "curie_worker.commissioning_control_installation",
+    "curie_protected_hooks.commissioning_local_installation",
+    "curie_protected_hooks.commissioning_local_ownership",
+    "curie_protected_hooks.commissioning_local_bootstrap",
+    "curie_protected_hooks.commissioning_acceptance_writer",
+    "curie_protected_hooks.commissioning_activation",
+    "curie_protected_hooks.qualification_publication",
 ]
 
 # @spec PROTECTED-COMMISSIONING-2/4: the commissioning ingress and worker are
