@@ -401,6 +401,8 @@ services:
     # `--network curie_runner` always resolves. The data tier
     # (postgres/valkey/rustfs/clickhouse) is deliberately NOT on this network.
     networks: [default, curie_runner]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       postgres:
         condition: service_healthy
@@ -432,6 +434,9 @@ services:
       # policy need it in X-Curie-Remediation-Authority. It is independent from
       # API_KEY, which every worker holds, so only the API receives it.
       CURIE_REMEDIATION_AUTHORITY_KEY: ${CURIE_REMEDIATION_AUTHORITY_KEY:-curie-dev-remediation-authority}
+      ATTACHMENT_TRANSFER_TIMEOUT_SECONDS: ${CURIE_ATTACHMENT_TRANSFER_TIMEOUT_SECONDS:-300}
+      ATTACHMENT_ACCESS_ENABLED: ${CURIE_ATTACHMENT_ACCESS_ENABLED:-false}
+      ATTACHMENT_BROKER_URL: ${CURIE_ATTACHMENT_BROKER_URL:-http://host.docker.internal:${CURIE_ATTACHMENT_BROKER_PORT:-28093}}
       CURIE_INTERNAL_WORKER_TOKEN: curie-dev-worker-token
       # The action executor switch (ACTION-EXECUTOR-1). curie-worker reads the
       # same interpolation, so one CURIE_ACTION_EXECUTOR_ENABLED in the
@@ -615,6 +620,13 @@ services:
       # with this key, so it must match curie-api's API_KEY. The Helm chart sets
       # the same variable on the worker.
       - CURIE_API_KEY=${CURIE_LOCAL_API_KEY:-curie-dev-key}
+      - CURIE_ATTACHMENT_ENABLED=${CURIE_ATTACHMENT_ENABLED:-false}
+      - CURIE_ATTACHMENT_CACHE_SIZE_BYTES=${CURIE_ATTACHMENT_CACHE_SIZE_BYTES:-536870912}
+      - CURIE_ATTACHMENT_MODE=${CURIE_ATTACHMENT_MODE:-eager}
+      - CURIE_ATTACHMENT_BROKER_HOST=${CURIE_ATTACHMENT_BROKER_HOST:-127.0.0.1}
+      - CURIE_ATTACHMENT_BROKER_PORT=${CURIE_ATTACHMENT_BROKER_PORT:-28093}
+      - CURIE_ATTACHMENT_BROKER_MAX_CONCURRENT=${CURIE_ATTACHMENT_BROKER_MAX_CONCURRENT:-8}
+      - CURIE_ATTACHMENT_TRANSFER_TIMEOUT_SECONDS=${CURIE_ATTACHMENT_TRANSFER_TIMEOUT_SECONDS:-300}
       - CURIE_INTERNAL_WORKER_TOKEN=curie-dev-worker-token
       # The worker runs host-net, so it self-dials the API at the published
       # localhost port above. But the runner containers it spawns join the

@@ -263,4 +263,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0241 | [A commissioning run separates destructive trials from final acceptance](0241-a-commissioning-run-separates-destructive-trials-from-final-acceptance.md) | Accepted |
 | 0242 | [Commissioning session scope makes the last observer finite](0242-commissioning-session-scope-makes-the-last-observer-finite.md) | Accepted |
 | 0243 | [Network case five measures new connection denial after replacement or policy change](0243-network-case-five-measures-new-connection-denial-after-replacement-or-policy-change.md) | Accepted |
+| 0244 | [Attachments are fetched on demand through scoped platform tools](0244-attachments-are-fetched-on-demand-through-scoped-platform-tools.md) | Accepted |
 <!-- END GENERATED: adr-index -->

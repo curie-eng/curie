@@ -130,6 +130,7 @@ def build_approval_server(
     turn_progress_tool: SdkMcpTool[Any] | None = None,
     memory_tools: Sequence[SdkMcpTool[Any]] = (),
     issue_tool: SdkMcpTool[Any] | None = None,
+    attachment_tools: Sequence[SdkMcpTool[Any]] = (),
 ) -> McpSdkServerConfig:
     """Build the in-process MCP server carrying applicable approval tools.
 
@@ -194,6 +195,7 @@ def build_approval_server(
     elif turn_progress_tool is not None:
         tools.append(turn_progress_tool)
     tools.extend(memory_tools)
+    tools.extend(attachment_tools)
     if issue_tool is not None:
         tools.append(issue_tool)
 

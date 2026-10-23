@@ -1575,6 +1575,74 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/attachment-access/authorize": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Authorize */
+        post: operations["authorize_attachment_access_authorize_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/attachment-access/completion": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Completion */
+        post: operations["completion_attachment_access_completion_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/attachment-access/fetch": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Fetch */
+        post: operations["fetch_attachment_access_fetch_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/attachment-access/list": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** List Files */
+        post: operations["list_files_attachment_access_list_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/channel-canvas": {
         parameters: {
             query?: never;
@@ -2926,6 +2994,108 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/internal/attachment-access/complete": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Complete */
+        post: operations["complete_v1_internal_attachment_access_complete_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/attachment-access/context": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Context */
+        post: operations["context_v1_internal_attachment_access_context_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/attachment-access/redeem": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Redeem */
+        post: operations["redeem_v1_internal_attachment_access_redeem_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/attachment-access/register": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Register */
+        post: operations["register_v1_internal_attachment_access_register_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/attachment-access/renew": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Renew */
+        post: operations["renew_v1_internal_attachment_access_renew_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/attachment-access/revoke": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Revoke */
+        post: operations["revoke_v1_internal_attachment_access_revoke_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/internal/channel-read/context": {
         parameters: {
             query?: never;
@@ -3978,6 +4148,11 @@ export interface components {
             execution_id: string;
             /** State */
             state: string;
+        };
+        /** Active */
+        Active: {
+            /** Active */
+            active: boolean;
         };
         /** Activity */
         Activity: {
@@ -5097,6 +5272,15 @@ export interface components {
             /** Rows */
             rows: components["schemas"]["CanvasCell"][][];
         };
+        /** Capability */
+        Capability: {
+            /** Expires At */
+            expires_at: number;
+            /** Lease Seconds */
+            lease_seconds: number;
+            /** Token */
+            token: string;
+        };
         /** ChannelAddress */
         ChannelAddress: {
             /** Address */
@@ -5522,6 +5706,30 @@ export interface components {
             /** Terminal */
             terminal: boolean;
         };
+        /** Completed */
+        Completed: {
+            /** Sha256 */
+            sha256: string;
+            /** Size Bytes */
+            size_bytes: number;
+            /** Transfer Id */
+            transfer_id: string;
+        };
+        /** Completion */
+        Completion: {
+            /** Id */
+            id: string;
+            /** Sha256 */
+            sha256: string;
+            /** Size Bytes */
+            size_bytes: number;
+            /**
+             * Status
+             * @default complete
+             * @constant
+             */
+            status?: "complete";
+        };
         /**
          * ConnectorManifests
          * @description Kubernetes objects derived from a version's ``connectors.yaml``.
@@ -5607,6 +5815,36 @@ export interface components {
             expires_at: string;
             /** Subject */
             subject: string | null;
+        };
+        /** Context */
+        Context: {
+            /**
+             * Agent Id
+             * Format: uuid
+             */
+            agent_id: string;
+            /**
+             * Deployment Id
+             * Format: uuid
+             */
+            deployment_id: string;
+            /** Event Id */
+            event_id: string;
+            /** Owner */
+            owner: string;
+            /** Route Generation */
+            route_generation: number;
+            /** Sandbox Name */
+            sandbox_name: string;
+            /** Session Id */
+            session_id: string;
+            /** Thread Key */
+            thread_key: string;
+            /**
+             * Ttl S
+             * @default 3600
+             */
+            ttl_s?: number;
         };
         /**
          * CostReport
@@ -6472,6 +6710,21 @@ export interface components {
             /** Kind */
             kind: string;
         };
+        /** FileDescriptor */
+        FileDescriptor: {
+            /** Current */
+            current: boolean;
+            /** Id */
+            id: string;
+            /** Mime Type */
+            mime_type: string | null;
+            /** Name */
+            name: string;
+            /** Sha256 */
+            sha256: string | null;
+            /** Size Bytes */
+            size_bytes: number | null;
+        };
         /** FinishBody */
         FinishBody: {
             /** Cause */
@@ -6942,6 +7195,16 @@ export interface components {
              */
             targets?: components["schemas"]["NamedTarget"][];
         };
+        /** Listing */
+        Listing: {
+            /** Cursor */
+            cursor?: string | null;
+            /**
+             * Limit
+             * @default 50
+             */
+            limit?: number;
+        };
         /**
          * LoadPackConfig
          * @description Rotating "working..." load lines for one agent. Mirrors the worker's
@@ -7241,12 +7504,33 @@ export interface components {
                 [key: string]: unknown;
             } | null;
         };
+        /** Owner */
+        Owner: {
+            /**
+             * Agent Id
+             * Format: uuid
+             */
+            agent_id: string;
+            /** Event Id */
+            event_id: string;
+            /** Owner */
+            owner: string;
+            /** Thread Key */
+            thread_key: string;
+        };
         /** OwnerLostBody */
         OwnerLostBody: {
             /** Owner */
             owner: string;
             /** Runtime Epoch */
             runtime_epoch: number;
+        };
+        /** Page */
+        Page: {
+            /** Files */
+            files: components["schemas"]["FileDescriptor"][];
+            /** Next Cursor */
+            next_cursor: string | null;
         };
         /** PhaseDeclaration */
         PhaseDeclaration: {
@@ -7941,6 +8225,44 @@ export interface components {
             /** Tool */
             tool: string;
         };
+        /** Reference */
+        Reference: {
+            /** File Id */
+            file_id: string;
+            /** Mime Type */
+            mime_type?: string | null;
+            /** Name */
+            name: string;
+            /** Ordinal */
+            ordinal: number;
+            /** Route Adapter */
+            route_adapter?: string | null;
+            /** Route Identity */
+            route_identity: string;
+            /** Route Kind */
+            route_kind: string;
+            /** Size Bytes */
+            size_bytes?: number | null;
+        };
+        /** Registered */
+        Registered: {
+            /** Appended */
+            appended: number;
+        };
+        /** Registration */
+        Registration: {
+            /**
+             * Agent Id
+             * Format: uuid
+             */
+            agent_id: string;
+            /** Event Id */
+            event_id: string;
+            /** Refs */
+            refs: components["schemas"]["Reference"][];
+            /** Thread Key */
+            thread_key: string;
+        };
         /**
          * RemediationBreakerClose
          * @description Why an operator closes a breaker; exactly ``{"reason"}``.
@@ -8295,6 +8617,22 @@ export interface components {
              * @description A literal member of the action's target.allowed list.
              */
             target: string | number | boolean;
+        };
+        /** Renewal */
+        Renewal: {
+            /**
+             * Agent Id
+             * Format: uuid
+             */
+            agent_id: string;
+            /** Current Event Id */
+            current_event_id?: string | null;
+            /** Event Id */
+            event_id: string;
+            /** Owner */
+            owner: string;
+            /** Thread Key */
+            thread_key: string;
         };
         /**
          * ReplyHandle
@@ -8738,6 +9076,14 @@ export interface components {
             /** Schedules */
             schedules: components["schemas"]["AgentSchedulesOut"][];
         };
+        /** Selection */
+        Selection: {
+            /**
+             * Id
+             * Format: uuid
+             */
+            id: string;
+        };
         /**
          * SettingConfig
          * @description One declared user-editable runtime knob (mirrors behaviorpacks.Setting).
@@ -9132,6 +9478,11 @@ export interface components {
             /** Route Existed */
             route_existed?: boolean | null;
         };
+        /** Ticket */
+        Ticket: {
+            /** Ticket */
+            ticket: string;
+        };
         /**
          * TipsPackConfig
          * @description Rotating capability tips for one agent (mirrors behaviorpacks.TipsPack).
@@ -9199,6 +9550,11 @@ export interface components {
             kind: string;
             /** Scope Id */
             scope_id: string;
+        };
+        /** Transfer */
+        Transfer: {
+            /** Transfer Id */
+            transfer_id: string;
         };
         /**
          * TurnAccepted
@@ -13281,6 +13637,146 @@ export interface operations {
             };
         };
     };
+    authorize_attachment_access_authorize_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Attachment-Access"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Selection"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FileDescriptor"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    completion_attachment_access_completion_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Attachment-Access"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Transfer"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Completion"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    fetch_attachment_access_fetch_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Attachment-Access"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Selection"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_files_attachment_access_list_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Attachment-Access"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Listing"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Page"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     channel_canvas_channel_canvas_post: {
         parameters: {
             query?: never;
@@ -15925,6 +16421,218 @@ export interface operations {
                 };
                 content: {
                     "image/svg+xml": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    complete_v1_internal_attachment_access_complete_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Completed"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Completion"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    context_v1_internal_attachment_access_context_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Context"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Capability"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    redeem_v1_internal_attachment_access_redeem_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Ticket"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    register_v1_internal_attachment_access_register_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Registration"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Registered"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    renew_v1_internal_attachment_access_renew_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Renewal"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Active"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    revoke_v1_internal_attachment_access_revoke_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Owner"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Active"];
                 };
             };
             /** @description Validation Error */

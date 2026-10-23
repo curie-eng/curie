@@ -45,6 +45,14 @@ from .approval import (
     policy_disallowed_tools,
     resolve_approval_policy,
 )
+from .attachment_access import (
+    LAZY_ATTACHMENT_NOTICE,
+    AttachmentAccess,
+    AttachmentAccessTurn,
+)
+from .attachment_access import (
+    TOOL_NAMES as ATTACHMENT_TOOL_NAMES,
+)
 from .attachments import (
     MANIFEST_ENV,
     AttachmentView,
@@ -76,6 +84,7 @@ from .harness.claude.approval import (
     build_can_use_tool,
     build_memory_tools,
 )
+from .harness.claude.attachment_access import build_attachment_tools
 from .harness.claude.platform_slack import build_channel_read_server
 from .harness.claude.preflight_blocked import PreflightBlockedSession
 from .harness.contribution import HarnessContribution
@@ -912,7 +921,10 @@ def build_runner(
             ),
             tool_manifest_preamble=tool_manifest_preamble,
             remote_docker_preamble=remote_docker_preamble,
-            attachment_preamble=format_attachment_preamble(attachment_view),
+            attachment_preamble=(
+                LAZY_ATTACHMENT_NOTICE if config.attachment_access_enabled
+                else format_attachment_preamble(attachment_view)
+            ),
             progress_preamble=PROGRESS_PREAMBLE if turn_progress is not None else None,
             facts_preamble=memory_facts_preamble,
             guidance_preamble=(
@@ -949,6 +961,29 @@ def build_runner(
         frozenset() if fake_model else load_bundle_platform_slack_grants(config.session.plugin_dir)
     )
     channel_read_mounted = bool(platform_slack_grants)
+    attachment_access = None
+    attachment_turn = None
+    if config.attachment_access_enabled and not fake_model:
+        origin = url_origin(os.environ.get(BootEnv.env_key("state_url")))
+        if attachments_path is None or origin is None:
+            raise ValueError(
+                "on-demand attachments require a writable attachments mount and trusted state URL"
+            )
+        # Open exclusively through the actual mount now; activation fails closed.
+        directory = os.open(attachments_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        probe = f".attachment-probe-{os.getpid()}"
+        try:
+            fd = os.open(
+                probe, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW,
+                0o600, dir_fd=directory,
+            )
+            os.close(fd)
+            os.unlink(probe, dir_fd=directory)
+        finally:
+            os.close(directory)
+        attachment_turn = AttachmentAccessTurn(trusted_origin=origin)
+        attachment_access = AttachmentAccess(attachment_turn, attachments_path)
+
     try:
         resolution = resolve_approval_policy(config.session.plugin_dir)
         approval_gate = build_approval_gate(
@@ -968,7 +1003,12 @@ def build_runner(
             bundle_name=resolution.bundle_name,
             mcp_servers=resolution.mcp_servers,
             connector_servers=_with_channel_read_server(
-                resolution.connector_servers, channel_read_mounted
+                (
+                    set(resolution.connector_servers) | {APPROVAL_SERVER_NAME}
+                    if attachment_turn is not None and resolution.connector_servers is not None
+                    else resolution.connector_servers
+                ),
+                channel_read_mounted,
             ),
             managed_workspace=mounted_workspace is not None,
             tool_policy=resolution.tool_policy,
@@ -1121,7 +1161,12 @@ def build_runner(
     def session_tool_access(observed: frozenset[str]) -> TurnToolAccess:
         # @spec RUNNER-TOOL-ACCESS-1: the classifier's set, built once per boot.
         return TurnToolAccess(
-            _readonly_tools(harness, observed, approval_gate),
+            _readonly_tools(
+                harness,
+                observed | (frozenset({"mcp__curie__list_attachments"})
+                            if attachment_turn is not None else frozenset()),
+                approval_gate,
+            ),
             requires_approval=(
                 approval_gate.requires_approval if approval_gate is not None else None
             ),
@@ -1192,6 +1237,7 @@ def build_runner(
                 # The probe never sees an in-process server, so the mounted
                 # curie-slack tools join the projection by their published names.
                 capability.observed_tools
+                | (ATTACHMENT_TOOL_NAMES if attachment_turn is not None else frozenset())
                 | (
                     platform_slack_tool_names(platform_slack_grants)
                     if channel_read_turn is not None
@@ -1250,6 +1296,10 @@ def build_runner(
                     else ()
                 ),
                 issue_tool=(build_issue_tool(*issue_read) if issue_read is not None else None),
+                attachment_tools=(
+                    build_attachment_tools(attachment_access)
+                    if attachment_access is not None else ()
+                ),
             ),
             **(
                 {STATE_SERVER_NAME: build_state_server(state_client)}
@@ -1470,8 +1520,12 @@ def build_runner(
             history_capacity_exceeded=history_capacity_exceeded,
             memory_turn=memory_turn,
             channel_read=channel_read_turn,
+            attachment_access=attachment_turn,
             tool_access=tool_access,
-            attachment_notice=format_attachment_notice(attachment_view),
+            attachment_notice=(
+                None if config.attachment_access_enabled
+                else format_attachment_notice(attachment_view)
+            ),
             channel_kind=config.channel_kind,
             initializer=initialize,
         ),

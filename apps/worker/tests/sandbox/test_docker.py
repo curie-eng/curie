@@ -2044,3 +2044,31 @@ def test_docker_client_refuses_every_daemon_call(
         with result:
             pass
     assert client.calls == []
+
+
+def test_lazy_attachments_boot_with_empty_writable_claim_cache() -> None:
+    client = _RecordingDocker(
+        image="curie-runner", network="lazy-stack", bundle_store=_FakeBundleStore(b"")
+    )
+    client.create_claim(
+        "claim-lazy",
+        pool="pool",
+        env={"CURIE_ATTACHMENT_ACCESS_ENABLED": "1"},
+        deadline=time.monotonic() + 300,
+    )
+    mounts = _volume_mounts(client.runner_argv)
+    volume, mode = mounts["/attachments"]
+    assert mode == "rw"
+    assert client.volume_files[volume] == {}
+    allocation = next(
+        argv for argv in client.calls if argv[:2] == ["volume", "create"] and argv[-1] == volume
+    )
+    assert _flag_values(allocation, "--opt") == [
+        "type=tmpfs",
+        "device=tmpfs",
+        "o=size=536870912,uid=1000,gid=1000,mode=0700",
+    ]
+    labels = client.volumes[volume]
+    assert labels["curietech.ai/claim"] == "claim-lazy"
+    client.delete_claim("claim-lazy", request_timeout_seconds=10)
+    assert volume not in client.volumes

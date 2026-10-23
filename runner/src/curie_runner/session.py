@@ -53,6 +53,7 @@ from .adapter import (
     model_message_to_conversation,
 )
 from .approval import ApprovalGate, is_mcp_tool, platform_tool_names
+from .attachment_access import LAZY_ATTACHMENT_NOTICE, AttachmentAccessTurn
 from .budget import BUDGET_CLASSIFICATION, BudgetTracker
 from .final_answer import (
     FINAL_ANSWER_CLASSIFICATION,
@@ -326,6 +327,7 @@ class SessionRunner:
         turn_progress: TurnProgress | None = None,
         memory_turn: MemoryTurn | None = None,
         channel_read: ChannelReadTurn | None = None,
+        attachment_access: AttachmentAccessTurn | None = None,
         tool_access: TurnToolAccess | None = None,
         attachment_notice: str | None = None,
         channel_kind: str | None = None,
@@ -373,6 +375,7 @@ class SessionRunner:
         # at turn start, renewed or cleared at each steer, cleared on every
         # terminal path before any await.
         self._channel_read = channel_read
+        self._attachment_access = attachment_access
         # Session-wide activity counters for report_progress (#3077); None when
         # no progress tool is mounted.
         self._progress_activity = progress_activity
@@ -553,6 +556,11 @@ class SessionRunner:
         """Whether every completed logical turn is present in durable replay."""
 
         return self._history_durable
+
+    @property
+    def enforces_attachment_access(self) -> bool:
+        """The tools and active-turn enforcement were mounted together at boot."""
+        return self._attachment_access is not None
 
     @property
     def enforces_channel_read(self) -> bool:
@@ -841,6 +849,8 @@ class SessionRunner:
         await asyncio.shield(self.begin_start())
 
     async def close(self) -> None:
+        if self._attachment_access is not None:
+            self._attachment_access.end()
         task = self._start_task
         if task is not None and not task.done():
             # Shutdown during a held preflight: cancelling kills the check's
@@ -872,6 +882,8 @@ class SessionRunner:
         lock is free the moment this runs.
         """
 
+        if self._attachment_access is not None:
+            self._attachment_access.end()
         if self._channel_read is not None:
             self._channel_read.end()
         async with self._turn_lock:
@@ -963,6 +975,8 @@ class SessionRunner:
         self._unrestricted_prompt_sent = True
         if event is not None and self._memory_turn is not None:
             self._memory_turn.begin(event)
+        if self._attachment_access is not None:
+            self._attachment_access.steer(event)
         if self._channel_read is not None:
             # Replace or clear before the steered text reaches the model, so it
             # never reads under an earlier generation (ADR 0100).
@@ -988,6 +1002,8 @@ class SessionRunner:
         if self._persistence_owned:
             return
         self._interrupt_requested = True
+        if self._attachment_access is not None:
+            self._attachment_access.end()
         if self._channel_read is not None:
             self._channel_read.end()
         if self._turn_open and not self._turn_ready:
@@ -1018,6 +1034,8 @@ class SessionRunner:
             return False
         # Only after the epoch guard: a stale timeout never touches the
         # current turn's channel read credential.
+        if self._attachment_access is not None:
+            self._attachment_access.end()
         if self._channel_read is not None:
             self._channel_read.end()
         timeout_interrupt_settled = anyio.Event()
@@ -1095,6 +1113,11 @@ class SessionRunner:
             )
         ) as stream:
             async for line in stream:
+                # The terminal can remain suspended at yield while its client
+                # drains. Retire access before exposing that final, while this
+                # generator still owns the logical turn lock.
+                if self._attachment_access is not None and not self._turn_open:
+                    self._attachment_access.end()
                 for scrubbed in redactor.push(line):
                     yield scrubbed
             pending = redactor.finish()
@@ -1141,6 +1164,10 @@ class SessionRunner:
                 ),
             )
             self._active_state = state
+            attachment_opener = (
+                self._attachment_access.begin(event)
+                if self._attachment_access is not None else None
+            )
             if self._memory_turn is not None:
                 self._memory_turn.begin(event)
             if self._channel_read is not None:
@@ -1464,6 +1491,8 @@ class SessionRunner:
                             self._turn_epoch = None
                             # An abandoned turn loses its channel read credential
                             # before the interrupt below can await.
+                            if self._attachment_access is not None:
+                                self._attachment_access.end(attachment_opener)
                             if self._turn_open and self._channel_read is not None:
                                 self._channel_read.end()
                             # If the turn never reached a terminal final (_turn_open
@@ -1507,6 +1536,8 @@ class SessionRunner:
                         int((time.monotonic() - start) * 1000),
                     )
                 self._active_state = None
+                if self._attachment_access is not None:
+                    self._attachment_access.end(attachment_opener)
                 if self._memory_turn is not None:
                     # However the turn ended, its write credential ends with it.
                     self._memory_turn.end()
@@ -1639,6 +1670,8 @@ class SessionRunner:
             self._read_only_prompt_sent = True
         self._result_pending = True
         prompt = frame_user_turn(event.type, event.user, event.text, self._channel_kind)
+        if self._attachment_access is not None:
+            prompt = f"{prompt}\n\n{LAZY_ATTACHMENT_NOTICE}"
         if self._attachment_notice is not None:
             prompt = f"{prompt}\n\n{self._attachment_notice}"
             self._attachment_notice = None

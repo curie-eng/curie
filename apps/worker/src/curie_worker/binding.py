@@ -833,11 +833,13 @@ class BindingResolver:
         A re-fetch of an earlier attachment resolves its route from these and
         never from anything recorded with the file, so a removed binding makes
         the file unavailable and a moved adapter endpoint is followed. Read
-        only; the address is not returned because no re-fetch needs it.
+        only. The private lazy broker also matches the exact binding identity,
+        generation and address authorized by the API.
         """
 
         sql = text(
-            f"SELECT kind, adapter, endpoint FROM {self._config.db_schema}.agent_channels "
+            f"SELECT id, generation, address, kind, adapter, endpoint "
+            f"FROM {self._config.db_schema}.agent_channels "
             "WHERE agent_id = :id AND tenant_id = :tenant_id "
             "ORDER BY kind, adapter NULLS FIRST, endpoint NULLS FIRST"
         )
@@ -845,7 +847,10 @@ class BindingResolver:
             result = await conn.execute(sql, {"id": agent_id, "tenant_id": self._tenant_id})
             rows = result.all()
         return [
-            AgentRoute(kind=str(row.kind), adapter=row.adapter, endpoint=row.endpoint)
+            AgentRoute(
+                kind=str(row.kind), adapter=row.adapter, endpoint=row.endpoint,
+                binding_id=row.id, generation=row.generation, address=row.address,
+            )
             for row in rows
         ]
 
@@ -1404,6 +1409,11 @@ class BindingResolver:
             or None,
             deployment_environment=resolved.deployment_environment or None,
             fake_model=self._config.fake_model,
+            attachment_access_enabled=(
+                True
+                if self._config.attachment_enabled and self._config.attachment_mode == "lazy"
+                else None
+            ),
             credentials_ref=self._config.credentials,
             base_url=self._config.model_base_url,
             # The endpoint's declared wire protocol and credential key(s) (#514).

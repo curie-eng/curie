@@ -431,6 +431,12 @@ class BootEnv(_AciModel):
     attachments_manifest: str | None = Field(
         default=None, json_schema_extra=_env("CURIE_ATTACHMENTS_MANIFEST", "kernel", "substrate")
     )
+    # Tool availability only, not read authority. Scoped authority arrives on
+    # Event.attachment_access and must never be copied into this environment.
+    attachment_access_enabled: bool | None = Field(
+        default=None,
+        json_schema_extra=_env("CURIE_ATTACHMENT_ACCESS_ENABLED", "worker", "substrate"),
+    )
     # Per-agent permission gates (#245, ADR-0010).
     approval_required_tools: list[str] | None = Field(
         default=None, json_schema_extra=_env("CURIE_APPROVAL_REQUIRED_TOOLS", "worker")
@@ -686,6 +692,7 @@ class BootEnv(_AciModel):
         model: str | None = None,
         reviewer_model: str | None = None,
         fake_model: bool | None = None,
+        attachment_access_enabled: bool | None = None,
         credentials_ref: str | None = None,
         base_url: str | None = None,
         api_backend: str | None = None,
@@ -748,6 +755,10 @@ class BootEnv(_AciModel):
             env[cls.env_key("approval_required_tools")] = ",".join(approval_required_tools)
         if fake_model:
             env[cls.env_key("fake_model")] = "1"
+        if attachment_access_enabled is not None:
+            env[cls.env_key("attachment_access_enabled")] = (
+                "1" if attachment_access_enabled else "0"
+            )
         if credentials_ref:
             env[cls.env_key("credentials_ref")] = credentials_ref
         if base_url:
@@ -854,6 +865,10 @@ class BootEnv(_AciModel):
             env[self.env_key("issue_read_token")] = self.issue_read_token
         if self.attachments_manifest is not None:
             env[self.env_key("attachments_manifest")] = self.attachments_manifest
+        if self.attachment_access_enabled is not None:
+            env[self.env_key("attachment_access_enabled")] = (
+                "1" if self.attachment_access_enabled else "0"
+            )
         if self.approval_required_tools:
             env[self.env_key("approval_required_tools")] = ",".join(self.approval_required_tools)
         if self.approval_grant_tool is not None:
@@ -942,6 +957,7 @@ class BootEnv(_AciModel):
             issue_read_url=_str_or_none(env.get("CURIE_ISSUE_READ_URL")),
             issue_read_token=_str_or_none(env.get("CURIE_ISSUE_READ_TOKEN")),
             attachments_manifest=_stripped_or_none(env.get("CURIE_ATTACHMENTS_MANIFEST")),
+            attachment_access_enabled=_switch_or_none(env.get("CURIE_ATTACHMENT_ACCESS_ENABLED")),
             approval_required_tools=_list_or_none(env.get("CURIE_APPROVAL_REQUIRED_TOOLS")),
             approval_grant_tool=_stripped_or_none(env.get("CURIE_APPROVAL_GRANT_TOOL")),
             approval_grant_arguments=(

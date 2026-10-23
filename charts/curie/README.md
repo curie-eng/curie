@@ -2403,3 +2403,42 @@ The existing OTEL overrides and worker `CURIE_API_URL` / `CURIE_API_KEY`
 overrides remain supported: their helpers omit the chart entry, so each name
 appears once. Repeating any name within `extraEnv` itself is refused. Workloads
 without an `extraEnv` surface cannot append entries to their chart-owned env.
+
+### Opting into on-demand attachments
+
+The default `worker.attachments.enabled: false` keeps the lane off. Operators
+may opt in with `worker.attachments.enabled: true` and
+`worker.attachments.mode: lazy` after installing compatible API, worker and
+runner images. Activation is an explicit operator choice. Lazy mode requires
+a real runner (`agentSandbox.runner.fakeModel: false`) and the existing
+attachments cache mount. The chart creates an internal broker Service on
+`worker.attachments.broker.port` (default `8093`) and permits ingress only from
+the API pods. It supplies the API facade settings and worker transfer budgets
+from the same values. There is no new external ingress.
+
+The runner retains a writable attachments `emptyDir` with the finite
+`agentSandbox.runner.attachments.sizeLimit` (default `512Mi`) and existing
+sandbox resource limits. Lazy mode renders no eager `attachments-init`
+container. Listing references does not materialize their bytes. A requested file
+must fit the available cache; storage exhaustion is an explicit fetch failure.
+Legacy `maxFileBytes` and `threadMaxBytes` apply only in `mode: eager`.
+
+For an isolated source-built local stack, export
+`CURIE_ATTACHMENT_ENABLED=true`, `CURIE_ATTACHMENT_MODE=lazy` and
+`CURIE_ATTACHMENT_ACCESS_ENABLED=true` before `curie local up --build`, together
+with the existing real-model settings. Choose a unique
+`CURIE_ATTACHMENT_BROKER_PORT` for each simultaneous local stack (default
+`28093`). The broker binds loopback by default. The API reaches the host-network worker
+through `host.docker.internal` where Docker Desktop forwards that loopback
+listener. Native Linux or other topologies may require
+`CURIE_ATTACHMENT_BROKER_HOST` set to a verified private Docker bridge/gateway
+interface and `CURIE_ATTACHMENT_BROKER_URL` set to the matching API-reachable
+origin. A refused/unreachable broker blocks lazy activation. Do not broaden the
+bind to a LAN-facing interface to hide a networking error. Internal authentication
+is required on every broker request. Keep the
+existing Compose project, override files and endpoints consistent for startup
+and teardown. The local runner receives a claim-owned writable named tmpfs cache volume;
+`CURIE_ATTACHMENT_CACHE_SIZE_BYTES` controls its finite capacity (default
+`536870912`, or `512Mi`). Its contents consume effective memory resources, so
+a file below the volume capacity can still fail when the runner's memory limit
+is exhausted. Claim deletion removes only that claim's volume.

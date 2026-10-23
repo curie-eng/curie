@@ -13,10 +13,12 @@ class and regenerates the committed schema and types.
 
 from .conformance import ConformanceReport, Producer, run_conformance
 from .events import (
+    ATTACHMENT_ACCESS_STATUS_FIELD,
     CHANNEL_READ_STATUS_FIELD,
     OUTBOUND_EVENT_TYPES,
     READER_CONTEXT,
     TOOL_ACCESS_STATUS_FIELD,
+    AttachmentAccessCapability,
     ChannelReadCapability,
     ErrorEvent,
     Event,
@@ -98,6 +100,8 @@ __all__ = [
     "Event",
     "PublicationContext",
     "ChannelReadCapability",
+    "AttachmentAccessCapability",
+    "ATTACHMENT_ACCESS_STATUS_FIELD",
     "CHANNEL_READ_STATUS_FIELD",
     # per-turn tool access (TOOL-ACCESS)
     "ToolAccess",
