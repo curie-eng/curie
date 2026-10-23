@@ -262,4 +262,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0240 | [A hosted connector declares the routes its bundle's stdio servers call through the caller proxy](0240-a-hosted-connector-declares-the-routes-its-bundles-stdio-servers-call-through-the-caller-proxy.md) | Accepted |
 | 0241 | [A commissioning run separates destructive trials from final acceptance](0241-a-commissioning-run-separates-destructive-trials-from-final-acceptance.md) | Accepted |
 | 0242 | [Commissioning session scope makes the last observer finite](0242-commissioning-session-scope-makes-the-last-observer-finite.md) | Accepted |
+| 0243 | [Attachments are fetched on demand through scoped platform tools](0243-attachments-are-fetched-on-demand-through-scoped-platform-tools.md) | Draft |
 <!-- END GENERATED: adr-index -->
