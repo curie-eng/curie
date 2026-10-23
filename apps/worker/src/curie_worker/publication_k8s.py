@@ -121,6 +121,24 @@ def valid_repository_path(path: str) -> bool:
     )
 
 
+def valid_base_branch(branch: str) -> bool:
+    """Whether a required short branch name can name an exact heads ref."""
+
+    return (
+        isinstance(branch, str)
+        and 0 < len(branch) <= 1024
+        and branch not in {"@", "HEAD"}
+        and not branch.startswith(("-", "/", "refs/heads/"))
+        and not branch.endswith(("/", "."))
+        and re.fullmatch(r"[0-9a-fA-F]{40,64}", branch) is None
+        and re.search(r"[\x00-\x20\x7f~^:?*\[\\]", branch) is None
+        and not any(part in branch for part in ("..", "@{", "//"))
+        and all(
+            not part.startswith(".") and not part.endswith(".lock") for part in branch.split("/")
+        )
+    )
+
+
 @dataclass(frozen=True)
 class PublicationJobSettings:
     namespace: str
@@ -155,6 +173,7 @@ class PublicationPayload:
     revision_number: int
     repo_full_name: str
     clean_clone_url: str
+    base_branch: str
     base_sha: str
     expected_prior_head: str
     expected_remote_head: str | None
@@ -316,6 +335,55 @@ if git_with_timeout diff --cached --quiet; then
 fi
 git_with_timeout -c user.name="$GIT_USER_NAME" -c user.email="$GIT_USER_EMAIL" commit \
   -m "$COMMIT_TITLE" -m "Curie-Revision: $REVISION_ID"
+if [[ -z "$EXPECTED_REMOTE_HEAD" ]]; then
+  if [[ -z "$BASE_BRANCH" || "$BASE_BRANCH" == refs/heads/* || "$BASE_BRANCH" == -* ]] || \
+      ! git_with_timeout check-ref-format "refs/heads/$BASE_BRANCH"; then
+    echo "publication base branch is invalid" >&2
+    exit 1
+  fi
+  approved_commit=$(git_with_timeout rev-parse HEAD)
+  git_with_timeout fetch --no-tags origin "refs/heads/$BASE_BRANCH" 2> >(redact >&2)
+  base_tip=$(git_with_timeout rev-parse --verify 'FETCH_HEAD^{commit}')
+  if [[ "$base_tip" != "$BASE_SHA" ]]; then
+    replay_reason=publication_base_moved_replay_failed
+    if git_with_timeout merge-base --is-ancestor "$BASE_SHA" "$base_tip"; then
+      if git_with_timeout checkout --detach "$base_tip" 2> >(redact >&2); then
+        if git_with_timeout -c user.name="$GIT_USER_NAME" -c user.email="$GIT_USER_EMAIL" \
+            cherry-pick "$approved_commit" 2> >(redact >&2); then
+          replay_reason=
+        else
+          replay_status=$?
+          if [[ "$replay_status" -eq 1 ]]; then
+            if conflicts=$(git_with_timeout diff --name-only --diff-filter=U); then
+              if [[ -n "$conflicts" ]]; then
+                replay_reason=publication_base_moved_conflict
+              elif git_with_timeout rev-parse --verify CHERRY_PICK_HEAD >/dev/null 2>&1 && \
+                  git_with_timeout diff --cached --quiet; then
+                replay_reason=publication_base_moved_empty
+              fi
+            fi
+          fi
+        fi
+      fi
+    else
+      ancestry_status=$?
+      if [[ "$ancestry_status" -eq 1 ]]; then
+        replay_reason=publication_base_moved_unrelated
+      fi
+    fi
+    if [[ -n "$replay_reason" ]]; then
+      case "$replay_reason" in
+        publication_base_moved_conflict) detail='approved patch does not apply to the new tip' ;;
+        publication_base_moved_empty) detail='approved patch replay produced no changes' ;;
+        publication_base_moved_unrelated)
+          detail='new tip does not descend from the approved base' ;;
+        *) detail='approved patch replay failed' ;;
+      esac
+      echo "$replay_reason: base branch $BASE_BRANCH moved from $BASE_SHA to $base_tip; $detail" >&2
+      exit 1
+    fi
+  fi
+fi
 commit_sha=$(git_with_timeout rev-parse HEAD)
 # The lease is the branch guard: the push lands only if the remote branch still
 # holds the head this revision was approved against.
@@ -450,6 +518,8 @@ def build_publication_resources(
         raise PublicationResourceError("the publication Job only pushes a non-empty patch")
     if not _valid_publication_branch(payload):
         raise PublicationResourceError("publication branch is not a valid stored lineage branch")
+    if not valid_base_branch(payload.base_branch):
+        raise PublicationResourceError("publication base branch is not a valid short branch name")
     if re.fullmatch(r"[0-9a-f]{40,64}", payload.base_sha) is None:
         raise PublicationResourceError(
             "publication base SHA must be 40-64 lowercase hexadecimal characters"
@@ -503,6 +573,7 @@ def build_publication_resources(
         # upgrade still adopts the Jobs it left running.
         "ca_bundle_config_map": names.config_map if ca_pem is not None else None,
         "ca_bundle_key": _CA_CONFIG_MAP_KEY if ca_pem is not None else None,
+        "base_branch": payload.base_branch,
         "base_sha": payload.base_sha,
         "expected_prior_head": payload.expected_prior_head,
         "expected_remote_head": payload.expected_remote_head,
@@ -552,6 +623,7 @@ def build_publication_resources(
         {"name": "CLEAN_CLONE_URL", "value": payload.clean_clone_url},
         {"name": _ORIGIN_ENV, "value": payload.transport.origin},
         {"name": _HEADER_FORM_ENV, "value": payload.transport.header_form},
+        {"name": "BASE_BRANCH", "value": payload.base_branch},
         {"name": "BASE_SHA", "value": payload.base_sha},
         {"name": "BRANCH", "value": payload.branch},
         {"name": "REVISION_ID", "value": str(payload.revision_id)},

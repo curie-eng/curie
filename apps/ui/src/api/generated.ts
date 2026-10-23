@@ -3219,7 +3219,7 @@ export interface paths {
         put?: never;
         /**
          * Verify Publication Revision
-         * @description Prove a remote commit is this revision's marked commit on its expected parent.
+         * @description Prove the marked revision and its authoritative publication parent.
          */
         post: operations["verify_publication_revision_v1_internal_publications__publication_id__revision_commit_post"];
         delete?: never;
@@ -7449,6 +7449,8 @@ export interface components {
          * @description The head of a publication's branch; ``None`` when the branch does not exist.
          */
         PublicationBranchHeadOut: {
+            /** Base Branch */
+            base_branch: string;
             /** Head Sha */
             head_sha: string | null;
         };
@@ -7837,6 +7839,8 @@ export interface components {
         PublicationRevisionOut: {
             /** Commit Sha */
             commit_sha: string;
+            /** Parent Sha */
+            parent_sha: string;
         };
         /**
          * PublicationRevisionVerify

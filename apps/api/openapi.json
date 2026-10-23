@@ -8829,6 +8829,12 @@
       "PublicationBranchHeadOut": {
         "description": "The head of a publication's branch; ``None`` when the branch does not exist.",
         "properties": {
+          "base_branch": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Base Branch",
+            "type": "string"
+          },
           "head_sha": {
             "anyOf": [
               {
@@ -8842,7 +8848,8 @@
           }
         },
         "required": [
-          "head_sha"
+          "head_sha",
+          "base_branch"
         ],
         "title": "PublicationBranchHeadOut",
         "type": "object"
@@ -9253,6 +9260,7 @@
         "type": "object"
       },
       "PublicationLineageAdvance": {
+        "additionalProperties": false,
         "description": "Exact compare-and-set facts for one publication revision outcome.",
         "properties": {
           "expected_head_sha": {
@@ -9877,12 +9885,19 @@
       "PublicationRevisionOut": {
         "properties": {
           "commit_sha": {
+            "pattern": "^[0-9a-f]{40,64}$",
             "title": "Commit Sha",
+            "type": "string"
+          },
+          "parent_sha": {
+            "pattern": "^[0-9a-f]{40,64}$",
+            "title": "Parent Sha",
             "type": "string"
           }
         },
         "required": [
-          "commit_sha"
+          "commit_sha",
+          "parent_sha"
         ],
         "title": "PublicationRevisionOut",
         "type": "object"
@@ -27565,7 +27580,7 @@
     },
     "/v1/internal/publications/{publication_id}/revision-commit": {
       "post": {
-        "description": "Prove a remote commit is this revision's marked commit on its expected parent.",
+        "description": "Prove the marked revision and its authoritative publication parent.",
         "operationId": "verify_publication_revision_v1_internal_publications__publication_id__revision_commit_post",
         "parameters": [
           {

@@ -45,6 +45,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 DELIVERY = str(uuid.UUID(int=1))
 REPO = "acme-corp/acme-bot"
 HEAD = "a" * 40
+BASE_HEAD = "c" * 40
 
 
 def feedback_payload(event: str = "issue_comment") -> dict:
@@ -314,7 +315,11 @@ class GitHubTruth:
         self.calls: list[str] = []
         self.installation = {"id": 11}
         self.installation_status = 200
-        self.repo = {"id": 21, "full_name": REPO}
+        self.repo = {"id": 21, "full_name": REPO, "default_branch": "main"}
+        self.branches: dict[str, str] = {"main": BASE_HEAD}
+        self.commits: dict[str, dict[str, Any]] = {
+            BASE_HEAD: {"sha": BASE_HEAD, "parents": [], "message": "Fixture base commit"},
+        }
         self.pr = copy.deepcopy(feedback_payload("pull_request_review")["pull_request"])
         self.pr["merged"] = False
         self.pr["node_id"] = "PR_example_17"
@@ -349,9 +354,31 @@ class GitHubTruth:
                     "expires_at": "2999-01-01T00:00:00Z",
                 },
             )
-        assert request.headers["Authorization"] == "Bearer fixture-app-token-private-sentinel"
+        authorizations = {"Bearer fixture-app-token-private-sentinel"}
+        if path == f"/repos/{REPO}" or path.startswith(
+            (f"/repos/{REPO}/git/ref/heads/", f"/repos/{REPO}/git/commits/")
+        ):
+            authorizations.add(
+                "Basic "
+                + base64.b64encode(
+                    b"x-access-token:fixture-app-token-private-sentinel"
+                ).decode("ascii")
+            )
+        assert request.headers["Authorization"] in authorizations
         if path == f"/repos/{REPO}":
             return httpx.Response(200, json=self.repo)
+        # https://docs.github.com/en/rest/git/refs#get-a-reference
+        if path.startswith(f"/repos/{REPO}/git/ref/heads/"):
+            branch = path.removeprefix(f"/repos/{REPO}/git/ref/heads/")
+            if branch not in self.branches:
+                return httpx.Response(404, json={"message": "Not Found"})
+            return httpx.Response(200, json={"object": {"sha": self.branches[branch]}})
+        # https://docs.github.com/en/rest/git/commits#get-a-commit-object
+        if path.startswith(f"/repos/{REPO}/git/commits/"):
+            sha = path.removeprefix(f"/repos/{REPO}/git/commits/")
+            if sha not in self.commits:
+                return httpx.Response(404, json={"message": "Not Found"})
+            return httpx.Response(200, json=self.commits[sha])
         if path == f"/repos/{REPO}/pulls/17":
             return httpx.Response(200, json=self.pr)
         if path == f"/repos/{REPO}/issues/17/comments":
@@ -709,36 +736,36 @@ def publish_through_worker(
     """Drive the production worker success path for the one approved publication.
 
     The real Postgres store, reconciler and API lineage client execute; only the
-    Kubernetes Job, write credential, GitHub branch lookup and reply transport
-    are the worker suite's fixtures. The Job reports its pushed commit and the
-    code host reports this exact PR.
+    Kubernetes Job, write credential, PR recovery and reply transport are
+    fixtures. Branch and revision proofs execute through the production API
+    client. The Job reports its pushed commit and recovery reports this exact PR.
     """
-    from curie_worker.publication_clients import PublicationLineageClient
-    from curie_worker.publication_k8s import PublicationJobSettings
-    from curie_worker.publication_loop import PublicationReconciler
+    from curie_worker.publication_clients import (
+        PublicationCodeHostClient,
+        PublicationLineageClient,
+    )
+    from curie_worker.publication_k8s import PublicationJobSettings, PublicationTransport
+    from curie_worker.publication_loop import PublicationPullState, PublicationReconciler
     from curie_worker.publication_store import PostgresPublicationStore
 
     from apps.worker.tests.test_publication_loop import (
         _Cluster,
-        _CodeHost,
         _Credentials,
-        _job,
         _Replies,
     )
 
     pr_url = f"https://github.com/{pr_repo}/pull/{pr_number}"
 
-    class _ReportedPull(_CodeHost):
+    class _ReportedPull(PublicationCodeHostClient):
         """The code host reports the PR the Job's pushed commit opened."""
 
         branch = ""
 
-        def recover_pull_request(
+        async def recover_pull_request(
             self, publication_id: uuid.UUID, *, expected_head_sha: str
-        ) -> object:
+        ) -> PublicationPullState:
             assert expected_head_sha == head_sha
-            self.calls.append("recover_pull_request")
-            return self.module.PublicationPullState(
+            return PublicationPullState(
                 number=pr_number,
                 url=pr_url,
                 state="open",
@@ -762,11 +789,21 @@ def publish_through_worker(
             assert work is not None
             cluster = _Cluster(module)
             # The Job already ran and printed its pushed commit marker.
-            cluster.observation = _job(module, "succeeded", commit_sha=head_sha)
+            cluster.observation = module.PublicationJobObservation(
+                phase="succeeded",
+                logs=f"CURIE_COMMIT_SHA={head_sha}\n",
+                commit_sha=head_sha,
+                transport=PublicationTransport(
+                    origin="https://github.com", header_form="authorization_basic"
+                ),
+            )
             cluster.active_jobs.add(module.publication_resource_names(work.publication_id).job)
-            code_host = _ReportedPull(module)
+            code_host = _ReportedPull(
+                api_base_url="http://api",
+                worker_token="fixture-review-worker-token",
+                client=api,
+            )
             code_host.branch = work.branch
-            code_host.allow_exact_revision(head_sha, work.revision_id, work.expected_prior_head)
             reconciler = PublicationReconciler(
                 store=store,
                 credentials=_Credentials(module),
@@ -1052,7 +1089,7 @@ def _review_stack(
                 "reply_kind": "slack",
                 "reply_channel": reply_channel,
                 "dedupe_key": f"fixture-{uuid.uuid4()}",
-                "base_sha": HEAD,
+                "base_sha": BASE_HEAD,
                 "patch_b64": base64.b64encode(b"diff --git a/a b/a\n").decode(),
                 "changed_paths": ["a"],
                 "expires_in_seconds": 600,
@@ -1062,6 +1099,15 @@ def _review_stack(
         assert publication.status_code == 201, publication.text
         branch = publication.json()["branch"]
         truth.pr["head"]["ref"] = branch
+        truth.branches[branch] = HEAD
+        truth.commits[HEAD] = {
+            "sha": HEAD,
+            "parents": [{"sha": BASE_HEAD}],
+            "message": (
+                f"{publication.json()['title']}\n\n"
+                f"Curie-Revision: {publication.json()['id']}\n"
+            ),
+        }
         principal = approval_principal.mint(
             get_settings().approval_chat_attester_secret,
             subject="U0REQUEST1",
