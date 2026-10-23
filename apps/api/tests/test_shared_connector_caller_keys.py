@@ -382,6 +382,10 @@ def test_malformed_config_refuses_boot_and_leaves_rows(
     with pytest.raises(ValidationError, match="caller proxy is misconfigured"):
         with shared_app(monkeypatch, installation, **malformed):
             pass
+    # shared_app leaves the malformed key in the environment, and every owner
+    # read builds Settings, so put the valid key back before reading the rows.
+    monkeypatch.setenv(CURRENT_ENV, k1)
+    get_settings.cache_clear()
     assert _state(installation) == before
 
     # Liveness: the same boot with the valid key starts and publishes again.

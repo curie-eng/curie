@@ -64,6 +64,9 @@ def graph_payload() -> dict[str, Any]:
         # The shared connector source_stale flag (0124, ADR 0239) is expand-only
         # above the minimum, so the candidate head is served.
         ("0124", True),
+        # The shared proxy's caller verify keys (0125, ADR 0239) are expand-only
+        # above the minimum, so the candidate head is served.
+        ("0125", True),
         ("0000", True),
         ("future-expand", True),
     ],

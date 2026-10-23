@@ -266,6 +266,27 @@ CHART_SCENARIOS: dict[str, _ChartScenario] = {
         "inputs": ["charts/curie/ci/runtime/runner-template-admission-runtime.sh"],
         "leg": "chart",
     },
+    "shared-connector-kind": {
+        "step": (
+            "Shared connector applications admit, reach and own only what they should "
+            "(own kind cluster)"
+        ),
+        "inputs": [
+            "charts/curie/ci/runtime/shared-connector-kind-runtime.sh",
+            "charts/curie/ci/runtime/shared-connector-kind-driver.py",
+            "charts/curie/templates/runner-resources-admission.yaml",
+            "charts/curie/templates/security-datatier-networkpolicy.yaml",
+            "charts/curie/templates/shared-connector-networkpolicy.yaml",
+            "apps/worker/src/curie_worker/shared_k8s.py",
+            "apps/worker/src/curie_worker/shared_reconcile.py",
+            "apps/worker/src/curie_worker/connector_loop.py",
+            "apps/api/src/curie_api/shared_connectors",
+            "packages/plugin-format/src/plugin_format/shared_connector_render.py",
+            "pyproject.toml",
+            "uv.lock",
+        ],
+        "leg": "chart",
+    },
     "runner-byo-egress": {
         "step": "Runner BYO egress enforces (not just rendered)",
         "inputs": ["scripts/check-runner-byo-egress.sh"],

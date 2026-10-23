@@ -519,6 +519,9 @@ class FakeConnectorClient(_Facade):
 # =============================================================================
 
 
+_FRAMING_HEADERS = ("host", "content-length", "transfer-encoding")
+
+
 class ApiTransport(httpx.BaseTransport):
     """Hands each worker request to the real API app and records it.
 
@@ -541,13 +544,31 @@ class ApiTransport(httpx.BaseTransport):
                 raise outcome
             if isinstance(outcome, httpx.Response):
                 return outcome
-        answered = self.client.send(request)
+        # Starlette's TestClient is built on a separate httpx distribution
+        # (``httpx2``), so the worker's request object cannot cross as is: the
+        # same method, URL, headers and body are sent again through it. The
+        # framing headers are left for each client to compute from the body.
+        answered = self.client.request(
+            request.method,
+            str(request.url),
+            content=request.content,
+            headers=[
+                (name, value)
+                for name, value in request.headers.multi_items()
+                if name.lower() not in _FRAMING_HEADERS
+            ],
+            follow_redirects=False,
+        )
+        # The TestClient hands back the decoded body, so a content-encoding
+        # header would make the worker's client decode it twice.
         headers = [
             (name, value)
             for name, value in answered.headers.multi_items()
-            if name.lower() not in ("content-encoding", "content-length", "transfer-encoding")
+            if name.lower() not in (*_FRAMING_HEADERS, "content-encoding")
         ]
-        return httpx.Response(answered.status_code, headers=headers, content=answered.content)
+        return httpx.Response(
+            answered.status_code, headers=headers, content=answered.content, request=request
+        )
 
     def count(self, method: str, path: str) -> int:
         return sum(1 for seen in self.requests if seen == (method, path))

@@ -39,7 +39,7 @@ from typing import Any
 
 import pytest
 from _fake_provider import FakeProvider, authorization_digest
-from _fixture_mcp_server import MCP_PATH, PROTOCOL_VERSION, FixtureMCPServer
+from _fixture_mcp_server import MCP_PATH, PROTOCOL_VERSION, TOOLS, FixtureMCPServer
 from _migration_support import sql_rows
 from _resolver_harness import Fleet, Member, SharedApp, terminate_role_backends
 from _shared_connector_support import SLOT, SessionPool, SharedStore, quote_ident
@@ -242,7 +242,9 @@ def _render_application(fleet: Fleet, provider: FakeProvider) -> RenderedApplica
     fixture = FixtureMCPServer(str(socket_path), provider, slot=SLOT)
     try:
         application_id = str(uuid.uuid4())
-        body = store.registration_body(application_id, slots=(SLOT,))
+        # The fixture server's tools, as _shared_proxy_harness.register_application
+        # registers them, so the application policy allows the calls made here.
+        body = store.registration_body(application_id, slots=(SLOT,), tools=TOOLS)
         body["application"]["provider_origins"] = [provider.origin]
         # The render's upstream URL and proxy port are spec fields; they are
         # registered as the ports this host test can serve on, so the env stays
