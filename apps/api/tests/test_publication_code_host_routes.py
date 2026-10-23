@@ -12,11 +12,16 @@ import asyncio
 import hashlib
 import time
 import uuid
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
 
 import pytest
-from curie_api.forges.errors import NotFound, Unavailable
+from curie_api.config import get_settings
+from curie_api.factory_rediscovery import issue_marker
+from curie_api.forges.config import ForgesConfig
+from curie_api.forges.errors import Ambiguous, NotFound, Unavailable
+from curie_api.forges.registry import build_registry
 from curie_api.forges.types import (
     Commit,
     FactoryPublication,
@@ -25,9 +30,11 @@ from curie_api.forges.types import (
     PullRequestState,
     RepositoryRef,
 )
+from curie_api.models import ExecutionRequest, Publication, WorkItem
 from curie_api.routers import publication_code_host
 from fastapi.testclient import TestClient
-from sqlalchemy import text
+from forge_fakes.github import forges_document
+from sqlalchemy import select, text
 
 from apps.api.tests.test_workitem_outcomes import (  # noqa: F401 - the stack fixture
     BASE_SHA,
@@ -54,7 +61,7 @@ ROUTES = (
         "revision-commit",
         {"commit_sha": "b" * 40, "revision_id": str(uuid.uuid4()), "expected_parent": "a" * 40},
     ),
-    ("POST", "pull-request", {"expected_head_sha": "b" * 40}),
+    ("POST", "pull-request", {"expected_head_sha": "b" * 40, "adopt_only": False}),
     ("POST", "pull-request/metadata", None),
 )
 UPDATED_AT = datetime(2026, 10, 5, 12, 0, tzinfo=UTC)
@@ -67,6 +74,8 @@ class _CodeHost:
         self.head: str | None = HEAD_SHA
         self.existing: PullRequest | None = None
         self.opened: list[dict[str, Any]] = []
+        self.calls: list[str] = []
+        self.publications: tuple[FactoryPublication, ...] = ()
         self.commit = Commit(sha=HEAD_SHA, parents=("0" * 40,), message="unmarked")
         self.commits: dict[str, Commit] = {}
         self.base_head: str | None = BASE_SHA
@@ -113,6 +122,7 @@ class _CodeHost:
         )
 
     async def branch_head(self, repository: RepositoryRef, branch: str) -> str | None:
+        self.calls.append("branch_head")
         self._maybe_fail()
         self.branch_reads.append(branch)
         return self.head if branch == self.branch else self.base_head
@@ -138,16 +148,20 @@ class _CodeHost:
     async def find_pull_request(
         self, repository: RepositoryRef, *, head_ref: str
     ) -> PullRequest | None:
+        self.calls.append("find_pull_request")
         self._maybe_fail()
+        assert head_ref == self.branch
         return self.existing
 
     async def list_factory_publications(
         self, repository: RepositoryRef
     ) -> tuple[FactoryPublication, ...]:
+        self.calls.append("list_factory_publications")
         self._maybe_fail()
-        return ()
+        return self.publications
 
     async def open_pull_request(self, repository: RepositoryRef, **fields: Any) -> PullRequest:
+        self.calls.append("open_pull_request")
         self.opened.append(fields)
         return self._pull(
             repository,
@@ -222,7 +236,19 @@ def factory_approved(
     auth_headers: dict[str, str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> Seeded:
+    config = ForgesConfig.model_validate(forges_document(api_url=get_settings().github_api_url))
+    stack.app.state.forges = build_registry(config)
     return _seed(stack, auth_headers, monkeypatch, open_pr=False, trigger_label="curie:implement")
+
+
+def _matching_pull(publication: dict[str, Any], code_host: _CodeHost) -> PullRequest:
+    repository = RepositoryRef("github", "github.com", "101", REPO)
+    return code_host._pull(
+        repository,
+        title=publication["title"],
+        body=publication["body"],
+        draft=publication["open_as_draft"],
+    )
 
 
 def _url(publication_id: object, suffix: str) -> str:
@@ -234,7 +260,7 @@ def test_every_route_requires_the_internal_worker_token(
     stack: TestClient,  # noqa: F811
     method: str,
     suffix: str,
-    body: dict[str, str] | None,
+    body: dict[str, Any] | None,
 ) -> None:
     for headers in ({}, {"X-Curie-Worker-Token": "wrong-token"}):
         response = stack.request(method, _url(uuid.uuid4(), suffix), json=body, headers=headers)
@@ -246,7 +272,7 @@ def test_an_unknown_publication_is_not_found(
     stack: TestClient,  # noqa: F811
     method: str,
     suffix: str,
-    body: dict[str, str] | None,
+    body: dict[str, Any] | None,
 ) -> None:
     response = stack.request(method, _url(uuid.uuid4(), suffix), json=body, headers=WORKER_HEADERS)
 
@@ -336,7 +362,7 @@ def test_recovery_opens_the_stored_contract_once_and_adopts_it(
 
     response = client.post(
         _url(publication["id"], "pull-request"),
-        json={"expected_head_sha": HEAD_SHA},
+        json={"expected_head_sha": HEAD_SHA, "adopt_only": False},
         headers=WORKER_HEADERS,
     )
 
@@ -355,7 +381,7 @@ def test_recovery_of_a_moved_branch_is_refused(
 
     response = client.post(
         _url(publication["id"], "pull-request"),
-        json={"expected_head_sha": HEAD_SHA},
+        json={"expected_head_sha": HEAD_SHA, "adopt_only": False},
         headers=WORKER_HEADERS,
     )
 
@@ -372,11 +398,348 @@ def test_recovery_of_an_absent_branch_is_no_content(
 
     response = client.post(
         _url(publication["id"], "pull-request"),
-        json={"expected_head_sha": HEAD_SHA},
+        json={"expected_head_sha": HEAD_SHA, "adopt_only": False},
         headers=WORKER_HEADERS,
     )
 
     assert response.status_code == 204
+    assert code_host.opened == []
+
+
+@pytest.mark.parametrize(
+    ("fields", "error_type"),
+    [({}, "missing"), ({"adopt_only": None}, "bool_type")],
+    ids=["omitted", "null"],
+)
+def test_adopt_only_is_a_required_non_null_boolean(
+    factory_approved: Seeded, fields: dict[str, Any], error_type: str
+) -> None:
+    client, publication, code_host = factory_approved
+
+    response = client.post(
+        _url(publication["id"], "pull-request"),
+        json={"expected_head_sha": HEAD_SHA, **fields},
+        headers=WORKER_HEADERS,
+    )
+
+    assert response.status_code == 422, response.text
+    [error] = response.json()["detail"]
+    assert error["loc"] == ["body", "adopt_only"]
+    assert error["type"] == error_type
+    assert code_host.calls == []
+    assert code_host.opened == []
+
+
+@pytest.mark.parametrize("publication_status", ["approved", "launching", "running"])
+def test_adopt_only_adopts_a_matching_existing_pull_request(
+    factory_approved: Seeded, publication_status: str
+) -> None:
+    client, publication, code_host = factory_approved
+    _execute(
+        "UPDATE curie.publications SET status = :status WHERE id = :id",
+        {"id": uuid.UUID(publication["id"]), "status": publication_status},
+    )
+    code_host.existing = _matching_pull(publication, code_host)
+
+    response = client.post(
+        _url(publication["id"], "pull-request"),
+        json={"expected_head_sha": HEAD_SHA, "adopt_only": True},
+        headers=WORKER_HEADERS,
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "number": PR_NUMBER,
+        "url": PR_URL,
+        "state": "open",
+        "head_sha": HEAD_SHA,
+        "head_ref": code_host.branch,
+        "updated_at": None,
+    }
+    assert response.headers["Cache-Control"] == "no-store"
+    assert code_host.calls == ["branch_head", "branch_head", "find_pull_request"]
+    assert code_host.opened == []
+
+
+@pytest.mark.parametrize("branch_head", [HEAD_SHA, None], ids=["expected-head", "absent"])
+def test_adopt_only_without_a_pull_request_returns_204_without_open_or_before_open(
+    factory_approved: Seeded, branch_head: str | None
+) -> None:
+    client, publication, code_host = factory_approved
+    code_host.head = branch_head
+
+    response = client.post(
+        _url(publication["id"], "pull-request"),
+        json={"expected_head_sha": HEAD_SHA, "adopt_only": True},
+        headers=WORKER_HEADERS,
+    )
+
+    assert response.status_code == 204, response.text
+    assert response.content == b""
+    assert response.headers["Cache-Control"] == "no-store"
+    assert code_host.calls == (
+        ["branch_head", "branch_head", "find_pull_request", "branch_head"]
+        if branch_head is not None
+        else ["branch_head"]
+    )
+    assert code_host.opened == []
+
+
+def test_adopt_only_false_opens_the_stored_contract_after_before_open(
+    factory_approved: Seeded,
+) -> None:
+    client, publication, code_host = factory_approved
+
+    response = client.post(
+        _url(publication["id"], "pull-request"),
+        json={"expected_head_sha": HEAD_SHA, "adopt_only": False},
+        headers=WORKER_HEADERS,
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["number"] == PR_NUMBER
+    assert code_host.calls == [
+        "branch_head",
+        "branch_head",
+        "find_pull_request",
+        "branch_head",
+        "list_factory_publications",
+        "open_pull_request",
+    ]
+    assert code_host.opened == [
+        {
+            "head_ref": code_host.branch,
+            "base_ref": "main",
+            "title": publication["title"],
+            "body": publication["body"],
+            "draft": publication["open_as_draft"],
+        }
+    ]
+
+
+def test_adopt_only_false_keeps_the_rediscovery_refusal_and_can_later_open(
+    factory_approved: Seeded,
+) -> None:
+    client, publication, code_host = factory_approved
+    matching = _matching_pull(publication, code_host)
+    work_item = with_session(
+        lambda session: session.scalar(
+            select(WorkItem)
+            .join(ExecutionRequest, ExecutionRequest.work_item_id == WorkItem.id)
+            .join(Publication, Publication.execution_request_id == ExecutionRequest.id)
+            .where(Publication.id == uuid.UUID(publication["id"]))
+        )
+    )
+    assert work_item is not None
+    code_host.publications = (
+        FactoryPublication(
+            ref=PullRequestRef(matching.ref.repository, str(PR_NUMBER + 1)),
+            url=f"https://github.com/{REPO}/pull/{PR_NUMBER + 1}",
+            head_ref="curie/publication-" + "d" * 32,
+            state=PullRequestState.OPEN,
+            body=f"{matching.body}\n\n{issue_marker(work_item.tracker_issue)}",
+            closed_at=None,
+            owner_verified=True,
+        ),
+    )
+
+    refused = client.post(
+        _url(publication["id"], "pull-request"),
+        json={"expected_head_sha": HEAD_SHA, "adopt_only": False},
+        headers=WORKER_HEADERS,
+    )
+
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["code"] == "publication.publication_exists"
+    assert code_host.calls == [
+        "branch_head",
+        "branch_head",
+        "find_pull_request",
+        "branch_head",
+        "list_factory_publications",
+    ]
+    assert code_host.opened == []
+
+    code_host.publications = ()
+    opened = client.post(
+        _url(publication["id"], "pull-request"),
+        json={"expected_head_sha": HEAD_SHA, "adopt_only": False},
+        headers=WORKER_HEADERS,
+    )
+
+    assert opened.status_code == 200, opened.text
+    assert opened.json()["number"] == PR_NUMBER
+    assert len(code_host.opened) == 1
+
+
+def test_adopt_only_refuses_a_moved_branch_and_can_later_adopt(
+    factory_approved: Seeded,
+) -> None:
+    client, publication, code_host = factory_approved
+    code_host.head = "c" * 40
+
+    refused = client.post(
+        _url(publication["id"], "pull-request"),
+        json={"expected_head_sha": HEAD_SHA, "adopt_only": True},
+        headers=WORKER_HEADERS,
+    )
+
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["code"] == "publication.branch_moved"
+    assert code_host.calls == ["branch_head"]
+    assert code_host.opened == []
+
+    code_host.head = HEAD_SHA
+    code_host.existing = _matching_pull(publication, code_host)
+    adopted = client.post(
+        _url(publication["id"], "pull-request"),
+        json={"expected_head_sha": HEAD_SHA, "adopt_only": True},
+        headers=WORKER_HEADERS,
+    )
+
+    assert adopted.status_code == 200, adopted.text
+    assert adopted.json()["number"] == PR_NUMBER
+    assert code_host.opened == []
+
+
+@pytest.mark.parametrize(
+    ("field", "foreign_value"),
+    [
+        ("title", "Unapproved title"),
+        ("body", "Unapproved body"),
+        ("head_ref", "another-branch"),
+        ("base_ref", "another-base"),
+        ("head_sha", "c" * 40),
+        ("draft", False),
+    ],
+)
+def test_adopt_only_refuses_a_foreign_contract_and_can_later_adopt(
+    factory_approved: Seeded, field: str, foreign_value: str | bool
+) -> None:
+    client, publication, code_host = factory_approved
+    _execute(
+        "UPDATE curie.publications SET open_as_draft = true WHERE id = :id",
+        {"id": uuid.UUID(publication["id"])},
+    )
+    matching = replace(_matching_pull(publication, code_host), draft=True)
+    code_host.existing = replace(matching, **{field: foreign_value})
+
+    refused = client.post(
+        _url(publication["id"], "pull-request"),
+        json={"expected_head_sha": HEAD_SHA, "adopt_only": True},
+        headers=WORKER_HEADERS,
+    )
+
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["code"] == "publication.pull_request_mismatch"
+    assert code_host.calls == ["branch_head", "branch_head", "find_pull_request"]
+    assert code_host.opened == []
+
+    code_host.existing = matching
+    adopted = client.post(
+        _url(publication["id"], "pull-request"),
+        json={"expected_head_sha": HEAD_SHA, "adopt_only": True},
+        headers=WORKER_HEADERS,
+    )
+
+    assert adopted.status_code == 200, adopted.text
+    assert adopted.json()["number"] == PR_NUMBER
+    assert code_host.calls == ["branch_head", "branch_head", "find_pull_request"] * 2
+    assert code_host.opened == []
+
+
+def test_adopt_only_refuses_ambiguous_pull_requests_and_can_later_adopt(
+    factory_approved: Seeded, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, publication, code_host = factory_approved
+    find_pull_request = code_host.find_pull_request
+
+    async def ambiguous(repository: RepositoryRef, *, head_ref: str) -> PullRequest | None:
+        code_host.calls.append("find_pull_request")
+        raise Ambiguous("multiple_pull_requests")
+
+    monkeypatch.setattr(code_host, "find_pull_request", ambiguous)
+
+    refused = client.post(
+        _url(publication["id"], "pull-request"),
+        json={"expected_head_sha": HEAD_SHA, "adopt_only": True},
+        headers=WORKER_HEADERS,
+    )
+
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["code"] == "publication.multiple_pull_requests"
+    assert code_host.calls == ["branch_head", "branch_head", "find_pull_request"]
+    assert code_host.opened == []
+
+    monkeypatch.setattr(code_host, "find_pull_request", find_pull_request)
+    code_host.existing = _matching_pull(publication, code_host)
+    adopted = client.post(
+        _url(publication["id"], "pull-request"),
+        json={"expected_head_sha": HEAD_SHA, "adopt_only": True},
+        headers=WORKER_HEADERS,
+    )
+
+    assert adopted.status_code == 200, adopted.text
+    assert adopted.json()["number"] == PR_NUMBER
+    assert code_host.opened == []
+
+
+@pytest.mark.parametrize(
+    ("publication_status", "lineage_status", "refusal_code"),
+    [
+        ("pending", "open", "not_approved"),
+        ("failed", "open", "not_approved"),
+        ("succeeded", "open", "not_approved"),
+        ("approved", "merged", "lineage_terminal"),
+        ("approved", "closed", "lineage_terminal"),
+    ],
+)
+def test_adopt_only_preserves_publication_and_lineage_authority(
+    factory_approved: Seeded, publication_status: str, lineage_status: str, refusal_code: str
+) -> None:
+    client, publication, code_host = factory_approved
+    code_host.existing = _matching_pull(publication, code_host)
+    params = {
+        "publication_id": uuid.UUID(publication["id"]),
+        "publication_status": publication_status,
+        "lineage_id": uuid.UUID(publication["lineage_id"]),
+        "lineage_status": lineage_status,
+    }
+    _execute(
+        "UPDATE curie.publications SET status = :publication_status WHERE id = :publication_id",
+        params,
+    )
+    _execute(
+        "UPDATE curie.thread_publication_lineages SET status = :lineage_status "
+        "WHERE id = :lineage_id",
+        params,
+    )
+
+    refused = client.post(
+        _url(publication["id"], "pull-request"),
+        json={"expected_head_sha": HEAD_SHA, "adopt_only": True},
+        headers=WORKER_HEADERS,
+    )
+
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["code"] == f"publication.{refusal_code}"
+    assert code_host.calls == []
+    assert code_host.opened == []
+
+    _execute("UPDATE curie.publications SET status = 'approved' WHERE id = :publication_id", params)
+    _execute(
+        "UPDATE curie.thread_publication_lineages SET status = 'open' WHERE id = :lineage_id",
+        params,
+    )
+    adopted = client.post(
+        _url(publication["id"], "pull-request"),
+        json={"expected_head_sha": HEAD_SHA, "adopt_only": True},
+        headers=WORKER_HEADERS,
+    )
+
+    assert adopted.status_code == 200, adopted.text
+    assert adopted.json()["number"] == PR_NUMBER
+    assert code_host.calls == ["branch_head", "branch_head", "find_pull_request"]
     assert code_host.opened == []
 
 
@@ -490,7 +853,7 @@ def test_recovery_opens_against_the_work_items_recorded_base(
 
     response = client.post(
         _url(publication["id"], "pull-request"),
-        json={"expected_head_sha": HEAD_SHA},
+        json={"expected_head_sha": HEAD_SHA, "adopt_only": False},
         headers=WORKER_HEADERS,
     )
 
@@ -754,6 +1117,7 @@ def test_missing_execution_relation_cannot_use_repository_default(
                 {"id": uuid.UUID(publication["id"]), "request": original},
             )
         else:
+
             async def restore_relation(session: Any) -> None:
                 await session.execute(text("SET LOCAL session_replication_role = replica"))
                 await session.execute(
@@ -840,7 +1204,7 @@ def test_first_publication_rejects_a_parent_outside_the_authoritative_base(
             if suffix == "revision-commit"
             else client.post(
                 _url(publication["id"], suffix),
-                json={"expected_head_sha": HEAD_SHA},
+                json={"expected_head_sha": HEAD_SHA, "adopt_only": False},
                 headers=WORKER_HEADERS,
             )
         )
@@ -879,7 +1243,7 @@ def test_first_publication_still_requires_exact_marker_sha_and_single_parent(
     assert code_host.opened == []
     recovery = client.post(
         _url(publication["id"], "pull-request"),
-        json={"expected_head_sha": HEAD_SHA},
+        json={"expected_head_sha": HEAD_SHA, "adopt_only": False},
         headers=WORKER_HEADERS,
     )
     assert recovery.status_code == 409, recovery.text
@@ -917,7 +1281,7 @@ def test_unreadable_or_malformed_ancestry_fails_closed_and_healthy_retry_progres
     assert code_host.opened == []
     recovery = client.post(
         _url(publication["id"], "pull-request"),
-        json={"expected_head_sha": HEAD_SHA},
+        json={"expected_head_sha": HEAD_SHA, "adopt_only": False},
         headers=WORKER_HEADERS,
     )
     assert recovery.status_code == 503, recovery.text
@@ -993,7 +1357,7 @@ def test_paced_ancestry_obeys_wallclock_limit_below_read_cap_and_same_graph_retr
     body = (
         {"commit_sha": HEAD_SHA, "revision_id": publication["id"], "expected_parent": BASE_SHA}
         if operation == "revision-commit"
-        else {"expected_head_sha": HEAD_SHA}
+        else {"expected_head_sha": HEAD_SHA, "adopt_only": False}
     )
     started = time.monotonic()
 
@@ -1091,7 +1455,7 @@ def test_base_can_advance_after_push_before_opening_without_changing_actual_pare
 
     opened = client.post(
         _url(publication["id"], "pull-request"),
-        json={"expected_head_sha": HEAD_SHA},
+        json={"expected_head_sha": HEAD_SHA, "adopt_only": False},
         headers=WORKER_HEADERS,
     )
 

@@ -251,7 +251,9 @@ def _no_other_publication(
 @router.post(
     "/{publication_id}/pull-request",
     response_model=PublicationPullRequestOut,
-    responses={204: {"description": "The publication branch does not exist"}},
+    responses={
+        204: {"description": "Publication branch absent, or no pull request in adoption-only mode"},
+    },
 )
 async def recover_publication_pull_request(
     publication_id: uuid.UUID,
@@ -260,11 +262,13 @@ async def recover_publication_pull_request(
     session: SessionDep,
     response: Response,
 ) -> PublicationPullRequestOut | Response:
-    """Adopt the branch's pull request, or open it when the branch exists.
+    """Adopt the branch's pull request, or open one unless ``adopt_only`` is true.
 
     The contract is the stored publication's title, body and draft flag, the
     lineage branch, and the admitted WorkItem's base or else the repository's
     default branch (`curie_api.publication_pulls.adopt_or_open`).
+
+    An absent branch, or no pull request in adoption-only mode, returns 204.
     """
 
     response.headers["Cache-Control"] = "no-store"
@@ -303,6 +307,7 @@ async def recover_publication_pull_request(
             repository,
             contract,
             expected_head_sha=data.expected_head_sha,
+            adopt_only=data.adopt_only,
             before_open=_no_other_publication(request, session, publication, lineage, code_host),
         )
     except PullRequestRefused as refused:
