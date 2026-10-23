@@ -139,7 +139,11 @@ These are new internal **provisioner custody records**, not new broker grants
 or production records. Each uses PC-1 canonical ASCII JSON, recursive duplicate
 member refusal, immutable values, no floats and the existing UUID, generation,
 millisecond and sha256 scalar spellings. Unknown members refuse. Counts and
-durations are generation strings. Each record is at most 16384 bytes; large
+maximum durations are generation strings. `elapsed_ms` uses the existing
+millisecond scalar, which permits zero. An event ordinal is either the literal
+string `0` for a run-level event or a positive trial generation; it does not
+reinterpret the existing positive-only generation scalar. Each record is at
+most 16384 bytes; large
 evidence is split by typed observation into separate bounded records, never
 URLs or arbitrary paths. There is no raw chunk, concatenation or arbitrary
 payload format. Each record is at most 16384 bytes, the run contains at most
