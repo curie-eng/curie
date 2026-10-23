@@ -5063,7 +5063,7 @@ def test_nightly_jobs_keep_their_selector_and_reject_a_missing_condition() -> No
 def test_aggregate_rejects_a_skip_on_a_nightly_dispatch(
     overrides: dict[str, str],
 ) -> None:
-    completed = _run_aggregate(**overrides)
+    completed = _run_aggregate(script_transform=None, **overrides)
     assert completed.returncode != 0, completed.stdout + completed.stderr
 
 
