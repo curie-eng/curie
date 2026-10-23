@@ -819,17 +819,29 @@ pub async fn install_sre_bot(opts: SreBotInstallOpts) -> Result<SreBotInstallRes
     Ok(SreBotInstallResult::Installed(Box::new(deployed)))
 }
 
-/// Install only the factory-owned authoring skill; execution assets and image
-/// resolution are deliberately outside this local preparation path.
-pub fn install_factory_preparation(
+/// Install all human-facing Curie workflows without factory execution assets.
+/// Bundle-owned paths select the payloads; the generic installer owns file safety.
+pub fn install_curie_skills(
     options: crate::agent_skills::InstallOptions,
 ) -> Result<Box<dyn CliOutput>> {
-    const PREFIX: &str = "preparation/skills/prepare-factory-ticket/";
-    let files: Vec<(&str, &[u8])> = DARK_FACTORY_BUNDLE_FILES
-        .iter()
-        .filter_map(|(name, bytes)| name.strip_prefix(PREFIX).map(|relative| (relative, *bytes)))
-        .collect();
-    crate::agent_skills::install("prepare-factory-ticket", &files, options)
+    let skills: Vec<crate::agent_skills::SkillFiles<'_>> = [
+        ("preparation", "prepare-factory-ticket"),
+        ("review", "review-pr"),
+    ]
+    .into_iter()
+    .map(|(resource, name)| {
+        let prefix = format!("{resource}/skills/{name}/");
+        let files = DARK_FACTORY_BUNDLE_FILES
+            .iter()
+            .filter_map(|(path, bytes)| {
+                path.strip_prefix(&prefix)
+                    .map(|relative| (relative, *bytes))
+            })
+            .collect();
+        (name, files)
+    })
+    .collect();
+    crate::agent_skills::install_set(&skills, options)
 }
 
 /// Every tracked file of `examples/dark-factory`, embedded so a released
@@ -918,6 +930,26 @@ pub const DARK_FACTORY_BUNDLE_FILES: &[(&str, &[u8])] = &[
     (
         "preparation/skills/prepare-factory-ticket/references/specification.md",
         include_bytes!("../../examples/dark-factory/preparation/skills/prepare-factory-ticket/references/specification.md"),
+    ),
+    (
+        "review/evals/README.md",
+        include_bytes!("../../examples/dark-factory/review/evals/README.md"),
+    ),
+    (
+        "review/evals/cases.json",
+        include_bytes!("../../examples/dark-factory/review/evals/cases.json"),
+    ),
+    (
+        "review/skills/review-pr/SKILL.md",
+        include_bytes!("../../examples/dark-factory/review/skills/review-pr/SKILL.md"),
+    ),
+    (
+        "review/skills/review-pr/references/review.md",
+        include_bytes!("../../examples/dark-factory/review/skills/review-pr/references/review.md"),
+    ),
+    (
+        "review/skills/review-pr/references/feedback.md",
+        include_bytes!("../../examples/dark-factory/review/skills/review-pr/references/feedback.md"),
     ),
     (
         "verification/contract.md",

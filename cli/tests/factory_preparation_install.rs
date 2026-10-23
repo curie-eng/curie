@@ -60,7 +60,7 @@ impl Fixture {
             .env("HTTP_PROXY", "http://127.0.0.1:9")
             .env("HTTPS_PROXY", "http://127.0.0.1:9")
             .current_dir(cwd)
-            .args(["--json", "factory", "prepare", "install"])
+            .args(["--json", "skills", "install"])
             .args(args)
             .output()
             .expect("run candidate curie")
@@ -79,7 +79,7 @@ fn success(output: &Output) -> Value {
     let schema_name = if value["dry_run"] == true {
         "dry-run.schema.json"
     } else {
-        "agent-skill-install.schema.json"
+        "agent-skills-install.schema.json"
     };
     let schema_path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("schema")
@@ -90,7 +90,17 @@ fn success(output: &Output) -> Value {
     if let Err(error) = validator.validate(&value) {
         panic!("{schema_name}: {error}; result: {value}");
     }
-    value
+    if value["dry_run"] == true {
+        value
+    } else {
+        let skills = value["skills"].as_array().expect("skill set receipt");
+        assert_eq!(skills.len(), 2);
+        skills
+            .iter()
+            .find(|receipt| receipt["skill"] == SKILL)
+            .expect("requested skill receipt")
+            .clone()
+    }
 }
 
 fn refused(output: &Output) {

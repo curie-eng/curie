@@ -1,12 +1,15 @@
 ---
 name: prepare-factory-ticket
-description: Prepare, review and publish Software Factory specifications from existing tickets or new intent, then optionally select approved issues for the configured factory. Does not implement features.
+description: Review existing issues, specifications, plans or discussions for Software Factory execution, resolve readiness gaps, and publish or hand off approved work. Also supports new intent. Does not implement features.
 ---
 
 # Prepare a factory ticket
 
-Turn the developer's intent and repository context into a reviewed specification,
-then offer to publish it and optionally start the configured factory.
+Review existing material for factory execution, resolve the gaps that matter,
+then offer the approved publication or handoff. Start from issues, specifications,
+plans or discussions produced by the developer's existing local workflow, including
+open source or internal skills. New intent is also supported. Do not require those
+skills to be installed here or run them again to establish provenance.
 
 This is a text-only preparation skill. Use the host agent's existing capabilities;
 no specific model, provider, Python, parser package, container runtime or Curie
@@ -28,9 +31,21 @@ requires reviewing the complete changed specification.
 
 ## Establish the source
 
+For existing material, first inventory its requirements, decisions, open questions
+and verification evidence. Read the supplied files or discussion and relevant
+repository context before asking the developer to repeat anything. Resolve
+conflicting or stale decisions explicitly; an earlier answer remains settled
+unless the new request or repository evidence contradicts it. Do not treat the
+name or popularity of its authoring skill as evidence of factory readiness.
+
+
 - For an existing ticket, inspect its current body and relevant linked work when
   accessible. Preserve its real identity, original requirements and human edits.
   Ask for missing source content if access is unavailable; never invent it.
+- For a specification, plan or discussion without an issue identity, retain its
+  actual source and requirements. Find an existing issue only with evidence of the
+  match; otherwise prepare a proposed new issue. Never claim that local material
+  is already published or accessible to the factory.
 - For new intent, record the developer's requested outcome with a descriptive
   local identity. Do not manufacture tracker issue numbers.
 - Confirm the intended checkout, base and local output location. Inspect the
@@ -47,7 +62,10 @@ keep the drafts and explain what access is missing.
 ## Inspect and resolve
 
 Read repository guidance and inspect relevant implementation, callers and tests
-before asking about behavior. Resolve facts from that evidence, including existing
+before asking about behavior. Review existing material against the same scope,
+decision, prerequisite and verification criteria as a new draft. Present a concise
+gap assessment identifying what is already settled, what is missing and why each
+gap matters; a sufficient source may need no questions or content changes. Resolve facts from that evidence, including existing
 conventions and verification routes. Ask the developer about missing intent or
 conflicting choices that the repository cannot settle. Keep an internal checklist
 of scope, prerequisites, failure behavior, edge cases and verification; do not turn
@@ -101,7 +119,7 @@ when repository setup and documented factory tooling establish a feasible route.
 
 Separate unavailable live-service checks, credentials, hardware or human judgment
 from the proposed implementation acceptance. Flag these external qualification
-steps visibly in the issue's Out of scope section, with their impact, proposed
+steps visibly in the issue's Out of scope or existing equivalent section, with their impact, proposed
 owner and what remains unproved. Preserve the original request in a coverage map
 and explicitly present this boundary for developer approval in the full-spec
 review; approval can cover the whole boundary without another question round.
@@ -131,15 +149,20 @@ for parallel execution or selection.
 
 ## Save and review
 
-For this resolved contract, read [references/specification.md](references/specification.md).
-Write the seven-section canonical specification, or one per proposed child, and
-a separate local report using the reference. Do not add mandatory issue headings
+Read [references/specification.md](references/specification.md) for source-format
+preservation, the new-draft template and handoff rules. Preserve an existing issue
+or specification's structure, wording, criterion identifiers and human decisions
+when it already conveys the required substance. Propose targeted additions for
+actual gaps; do not rewrite sufficient material merely to fit the seven-section
+template. Use that template for new drafts without an established source format,
+including newly proposed child issues. Save the exact final body and a separate
+local report using the reference. Do not add mandatory issue headings
 for provenance, traceability or preparation status. Every criterion needs a
 traceability row tying observable behavior to code, decisions, verification,
 execution location, required capabilities, prerequisites and evidence status.
 
 Resolve the questions with the developer, revise the complete specification and
-present every final canonical body for review, including title, destination
+present every complete final body for review, including title, destination
 repository and existing issue identity or proposed new issue. For a split, present
 all children, coverage and ordering together. Do not substitute `report.md`, a
 summary or selected acceptance criteria for review of the entire specification;
@@ -149,7 +172,12 @@ approval. Record a concise decision summary only after actual review. An
 unanswered behavioral choice stays unresolved; do not offer to publish it as final.
 
 After intent approval, ask whether to **publish only**, **publish and start the
-factory**, or **keep local drafts**. Name the repository, create/update actions
+factory**, or **keep local drafts**. For a sufficient unchanged existing issue,
+explain that publication is already complete and offer to **verify and start the
+existing issue**, or retain the local assessment. Do not perform a title/body
+update when the approved content is unchanged. Existing explicit authorization
+for that exact handoff remains valid; do not ask again just because this skill
+reached another stage. Name the repository, create/update actions
 and exact issues to select, and explain that adding the configured factory label
 can start implementation. Offer publish-and-start when the agreed implementation
 has feasible automated tests, including tests to add;

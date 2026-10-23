@@ -123,3 +123,41 @@ verify core semantics likewise prevented selection while approved publication
 completed. Exact final bodies, open state, readbacks, one update per issue and
 label operations were checked. No product implementation, real external service,
 deployed factory execution or outcome improvement was demonstrated.
+
+## Existing-material readiness cases
+
+The `readiness-*` cases include raw tracker snapshots, local skill outputs and
+later approval turns. Materialize `readiness_repository_files` as an isolated Git
+repository; replace the synthetic base SHA consistently with its actual fixture
+commit before replay. Keep the source issue's structure intact. Deliver user turns
+only at their stated stage. Withhold `expected` from the executing context and
+check the actual artifacts and tracker operation log afterwards.
+
+Exercise a sufficient externally prepared issue, one material ambiguity, a local
+internal plan with corrected discussion decisions, approved deferred qualification,
+a missing core runner and an active selected source-edit request. Count repeated
+questions and body writes, not just final issue headings. The sufficient unchanged
+case should produce no body update; the selected active case should produce no
+source mutation without observed safe coordination. A supplied CI result or image
+configuration is not a live sandbox observation. These fixtures are replay inputs,
+not proof that a model or deployed factory executed them.
+
+### Readiness-first observations
+
+Fresh synthetic replays exercised all six readiness cases. A sufficient external
+issue retained its exact title/body and settled decisions, received no update and
+one approved intake label with readback. An ambiguous existing issue received one
+behavioral clarification and stayed local. An internal plan retained its corrected
+discussion decision, created one approved issue and remained publish-only.
+
+Further reviewer-followed replays observed approved deferred qualification being
+published and selected, a missing core runner with unresolved intent being
+published explicitly as a draft without selection, and an active selected issue
+receiving no source update or label toggle without observed safe coordination.
+The last case exposed an instruction gap; the reference was tightened and the
+observed RUNNING state rechecked against that explicit rule. Complete artifacts
+and before/after fake-tracker operation logs were inspected. Host fixture tests
+passed, but neither those runs nor supplied image/configuration evidence establish
+a live sandbox, real tracker permissions or deployed factory admission. The
+boundary replays were reviewer-followed and knew their expected effects; they are
+not blinded model evaluations or evidence of improved factory completion.

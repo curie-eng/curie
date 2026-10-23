@@ -1,7 +1,8 @@
 # Factory specification format
 
-The [preparation skill](factory-preparation.md) uses this format to help a coding
-agent and developer review one deliverable. It follows the intent of
+The [preparation skill](factory-preparation.md) uses this default new-draft format
+to help a coding agent and developer review one deliverable. Existing sufficiently
+specified issues keep their own structure and settled decisions. It follows the intent of
 [ADR 0199](../adr/0199-the-factory-admits-only-tickets-it-can-start-and-finish.md).
 [ADR 0222](../adr/0222-coworker-bundles-own-workflow-policy-and-curie-enforces-execution.md)
 assigns factory workflow policy to the factory bundle.
@@ -11,9 +12,25 @@ runtime admission check. Format review cannot establish that decisions are
 resolved, prerequisites have merged, verification commands work, or a deployment
 can finish the work. Connected evaluation remains tracked in #4487 and #4488.
 
+## Existing issues and specifications
+
+The factory readiness review checks substance, not whether another authoring
+workflow used our headings. Preserve an existing issue's wording, structure and
+criterion IDs when requirements, scope, decisions, prerequisites, base and feasible
+verification are sufficiently clear. Keep the exact title and body unchanged when
+no content gap needs correction. Save the assessment separately, show the complete
+issue for approval and verify its current content before an approved handoff.
+
+For gaps, propose targeted edits in the existing structure. Verification commands,
+tests to add and approved deferred qualification must remain visible to the factory
+in the issue or accessible repository material. Prior local skill execution is not
+evidence that a deployment can run the task. Literal canonical headings and
+`Verified by:`/`Runs in:` fields are not required for a retained source format.
+
 ## Canonical ticket
 
-Use these seven headings once each, as Markdown h2 or h3:
+For new drafts without an established source format, use these seven headings
+once each, as Markdown h2 or h3:
 
 | Heading | Content |
 |---|---|

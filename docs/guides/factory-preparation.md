@@ -1,10 +1,21 @@
 # Prepare, publish and select a factory specification
 
-Use the factory's `prepare-factory-ticket` skill in your existing coding agent to
-turn an existing ticket or new intent into a reviewed specification. For larger
-requests it can propose complete child specifications, coverage and dependency
-ordering. The skill writes local artifacts, presents the full specification for
-review, then offers to publish it and select eligible issues for the factory.
+Use `prepare-factory-ticket` in your local coding agent to review existing work
+for factory execution. Start with an issue, specification, plan or discussion
+produced by your existing workflow, including open source or internally developed
+skills. The skill inspects repository context, resolves consequential gaps and
+assesses whether the agreed implementation has a feasible verification route.
+It preserves an existing sufficient specification and proposes targeted additions
+for actual gaps, then presents the complete final issue for approval and handoff.
+An unchanged published issue can be verified and selected without rewriting it.
+
+Think of it as the readiness review and handoff step after local preparation.
+It can also help you start from rough intent. For larger requests it can propose
+child specifications, coverage and dependency ordering. The factory can accept
+an issue prepared without this skill; using it is an optional guided workflow.
+See [existing local workflows](../software-factory.md#bring-your-existing-local-workflow)
+for examples from Matt Pocock, Superpowers and Addy Osmani, and how the same handoff
+applies to your organization's internal skills.
 
 Specifications remain **deployment-unvalidated**, even after publication and
 selection. Developer review and local repository evidence do not prove that Curie
@@ -18,8 +29,28 @@ For guided preparation, open the repository the factory will change and install
 the skill for your coding agent. With a CLI build containing this command:
 
 ```bash
-curie factory prepare install --agent codex
+curie skills install --agent codex
 ```
+
+Bring the existing issue link or make the specification, plan or discussion
+available in the local session. For example:
+
+```text
+Use prepare-factory-ticket to review this specification for factory execution.
+Keep the decisions we have already made and identify any remaining gaps.
+```
+
+Existing settled decisions do not need another interview. New drafts use the
+seven-section template when there is no established source format; existing
+issues do not need those headings to pass the substantive review.
+
+The review considers scope, unresolved behavior, repository prerequisites and
+per-criterion verification. Missing coverage becomes tests to add during
+implementation. Unavailable external qualification is made visible for explicit
+scope approval. This review is advisory: it is not a connected deployment check
+or a guarantee of successful execution.
+
+This also installs the companion `review-pr` skill; no second install is needed.
 
 In Codex, start a new session if the skill is not visible, then use this minimal
 prompt with the actual issue URL:
@@ -55,12 +86,12 @@ Use a Curie CLI built from this change, or a release that contains it. From the
 repository you want to prepare work for, choose your coding agent:
 
 ```bash
-curie factory prepare install --agent codex
+curie skills install --agent codex
 # Or select claude-code, copilot, gemini, or cursor instead.
 ```
 
-Installation copies the bundled Markdown skill and its reference directly into
-the selected client's directory. It is offline and requires no source checkout,
+The single command installs both `prepare-factory-ticket` and `review-pr`,
+including their Markdown references, into the selected client's directory. It is offline and requires no source checkout,
 Python, parser package, Docker or running Curie service. The default destination
 is the nearest ancestor repository root, including Git worktrees; outside a
 repository it is the current directory. Use `--dir /path/to/project` to select
@@ -68,8 +99,8 @@ exactly an existing directory, or `--global` to install for your user across
 repositories. `--dir` and `--global` cannot be combined.
 
 ```bash
-curie factory prepare install --agent claude-code --global
-curie factory prepare install --agent cursor --dir /path/to/project --dry-run
+curie skills install --agent claude-code --global
+curie skills install --agent cursor --dir /path/to/project --dry-run
 ```
 
 Repeating an installation keeps an identical copy. An edited or incomplete copy
@@ -119,7 +150,8 @@ execution hooks or plugin manifest.
 
 If your agent cannot discover skills, open the copied `SKILL.md` and ask it to
 follow that file and its linked reference. Keep the folder intact. The fallback
-uses the same instructions and canonical format rather than a different parser.
+uses the same readiness review, source-preservation and new-draft rules without
+requiring a parser.
 Do not overwrite an existing local skill or draft without reviewing the change.
 
 ## Install from a source checkout
@@ -127,7 +159,7 @@ Do not overwrite an existing local skill or draft without reviewing the change.
 Check whether your CLI contains the installer:
 
 ```bash
-curie factory prepare install --help
+curie skills install --help
 ```
 
 An older released CLI will report an unknown command. Until a release contains
@@ -137,7 +169,7 @@ two absolute paths with your Curie checkout and the repository you want to work 
 
 ```bash
 cargo run --locked --manifest-path /path/to/curie/cli/Cargo.toml -- \
-  factory prepare install --agent codex --dir /path/to/your/repository
+  skills install --agent codex --dir /path/to/your/repository
 ```
 
 The target directory must already exist. Use the client names from the table
@@ -182,8 +214,9 @@ answers become decisions or acceptance criteria.
 The local report counts questions and batches separately from review/publication
 choices, with preparation duration marked unknown unless observed or supplied.
 
-Choose a local output location when needed. The canonical body has the seven
-[factory contract](factory-specification.md) sections. A separate preparation
+Choose a local output location when needed. Sufficient existing issues retain
+their structure; new drafts without an established format use the seven
+[template](factory-specification.md) sections. A separate preparation
 report records original identity, inspected/base revisions, unresolved questions,
 criterion traceability, observed evidence and developer review status. Raw
 conversations and credentials do not belong in the report.
@@ -236,8 +269,12 @@ Spec approval alone does not authorize publication. Publish-only never selects
 work. The usual label is `curie-factory`, but the skill confirms your deployment's
 actual label and intended repository instead of assuming the default.
 
-With an existing authenticated tracker connection, the agent updates the original
-issue or creates the agreed new issues, then reads back their full content. It
+With an existing authenticated tracker connection, the agent updates changed
+issues or creates agreed new issues, then reads back their full content. For a
+sufficient unchanged published issue, it skips the body write and offers to verify
+and start that existing issue. Existing selection or active work is inspected
+before any change; a source update waits for supported coordination and an
+observed safe state, rather than treating a label removal as completed cancellation. It
 keeps `report.md` local and returns real tracker links. If you publish manually,
 give it the links so it can verify and reuse those issues. Missing tracker access
 leaves an actionable gap rather than a claim that local files were published.
@@ -283,7 +320,7 @@ fit the new workflow; installation does not merge or discard them.
 For example, after backing up and moving the existing skill folder:
 
 ```bash
-curie factory prepare install --agent codex
+curie skills install --agent codex
 ```
 
 Use the same `--global` or `--dir` scope as the installation being replaced. Keep

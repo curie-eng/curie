@@ -675,23 +675,23 @@ pub(crate) async fn run(command: Option<Command>) -> Result<()> {
         Some(Command::Dev { action }) => dev_action::run(action).await,
         Some(Command::Skill { action }) => skill_action::run(action).await,
         Some(Command::Local { action }) => local_action::run(action).await,
-        Some(Command::Factory { action }) => match action {
-            FactoryAction::Prepare {
-                action:
-                    FactoryPrepareAction::Install {
-                        agent,
-                        global,
-                        dir,
-                        dry_run,
-                    },
-            } => emit_boxed(curie::examples::install_factory_preparation(
-                curie::agent_skills::InstallOptions {
+        Some(Command::Skills {
+            action:
+                AgentSkillsAction::Install {
                     agent,
                     global,
                     dir,
                     dry_run,
                 },
-            )?),
+        }) => emit_boxed(curie::examples::install_curie_skills(
+            curie::agent_skills::InstallOptions {
+                agent,
+                global,
+                dir,
+                dry_run,
+            },
+        )?),
+        Some(Command::Factory { action }) => match action {
             FactoryAction::Quickstart(options) => {
                 let FactoryQuickstartArgs {
                     repos,

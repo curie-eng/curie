@@ -34,8 +34,8 @@ impl AgentClient {
 
     fn guidance(self, name: &str) -> String {
         match self {
-            Self::Codex => format!("Use ${name} followed by your intent or ticket. If absent, restart the Codex session."),
-            Self::ClaudeCode => format!("Use /{name} followed by your intent or ticket. If absent, start a new Claude Code session."),
+            Self::Codex => format!("Use ${name} followed by your request or link. If absent, restart the Codex session."),
+            Self::ClaudeCode => format!("Use /{name} followed by your request or link. If absent, start a new Claude Code session."),
             Self::Copilot => format!("Ask a skill-capable Copilot agent to use {name}. In Copilot CLI, run /skills reload; in an IDE, refresh the agent session if absent."),
             Self::Gemini => format!("Run /skills reload in Gemini CLI, then ask it to use {name}. Gemini CLI requests activation consent."),
             Self::Cursor => format!("Ask Cursor Agent to use {name}. If absent, refresh the agent session and check its skill settings."),
@@ -70,6 +70,56 @@ impl CliOutput for AgentSkillInstallOutput {
         ui.payload_plain(&format!("{}: {}", self.status, self.directory.display()));
         ui.payload_plain(&self.guidance);
     }
+}
+
+pub type SkillFiles<'a> = (&'a str, Vec<(&'a str, &'a [u8])>);
+
+struct AgentSkillsInstallOutput {
+    skills: Vec<Box<dyn CliOutput>>,
+}
+
+impl CliOutput for AgentSkillsInstallOutput {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({"skills": self.skills.iter().map(|skill| skill.to_json()).collect::<Vec<_>>()})
+    }
+
+    fn render(&self, ui: &Ui) {
+        for skill in &self.skills {
+            skill.render(ui);
+        }
+    }
+}
+
+/// Check every destination before installing any skill. Existing customized
+/// skills are never overwritten; unrelated skills remain outside this operation.
+/// Each new folder is published atomically. I/O failures can leave earlier
+/// folders installed, so rerunning accepts those identical copies.
+pub fn install_set(
+    skills: &[SkillFiles<'_>],
+    options: InstallOptions,
+) -> Result<Box<dyn CliOutput>> {
+    let mut preview = options.clone();
+    preview.dry_run = true;
+    let mut lines = Vec::new();
+    for (name, files) in skills {
+        let plan = install(name, files, preview.clone())?;
+        let value = plan.to_json();
+        lines.extend(
+            value["plan"]
+                .as_array()
+                .expect("dry run steps")
+                .iter()
+                .map(|line| line.as_str().expect("dry run line").to_owned()),
+        );
+    }
+    if options.dry_run {
+        return Ok(Box::new(DryRunPlan { lines }));
+    }
+    let installed = skills
+        .iter()
+        .map(|(name, files)| install(name, files, options.clone()))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Box::new(AgentSkillsInstallOutput { skills: installed }))
 }
 
 fn refusal(path: &Path) -> anyhow::Error {

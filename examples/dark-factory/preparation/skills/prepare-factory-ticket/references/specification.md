@@ -1,11 +1,41 @@
 # Factory specification preparation reference
 
-This packaged reference is sufficient for offline drafting. Contract v1 uses
-the same canonical format for an agent-written specification and an issue form.
-It describes structure and preparation evidence; it does not supply a parser or
-establish deployment readiness.
+This packaged reference supports readiness review and offline drafting. Review
+existing material for substance, not template conformance. The seven-section
+format is the default for new drafts without an established source format.
+Neither format review nor a prior authoring skill establishes deployment readiness.
+This reference supplies no parser or connected deployment validator.
 
-## Canonical body
+## Existing material
+
+Preserve the source structure, wording and criterion identifiers when requirements,
+scope, decisions, base, prerequisites and verification are sufficiently clear.
+These facts may be conveyed by existing sections, links to accessible repository
+material and repository evidence recorded in the local report. Literal canonical
+headings, consecutive numbering and `Verified by:` or `Runs in:` fields are not
+required in an existing issue. A missing heading is not a missing requirement.
+
+Assess every criterion with the feasibility procedure below. Use existing
+criterion identifiers or stable local report IDs without renumbering the issue.
+Put material proposed tests, verification requirements, prerequisites and approved
+external qualification in appropriate existing sections so the factory can read
+them. Necessary local decisions or context must be incorporated in the issue or
+accessible repository material; the factory does not inherit the local session.
+
+Show a gap assessment and propose only changes needed for actual missing substance
+or conflicts. Preserve settled decisions; ask about them only when new evidence
+or an explicit change exposes a consequential conflict. If a source is sufficient,
+keep its exact title and body unchanged, save its snapshot and assessment, present
+it for complete review and offer the applicable handoff. Source preservation is
+not permission to select work with unresolved core verification gaps.
+
+For local plans or discussions, preserve their established organization where
+usable, but distinguish them from a published tracker issue. Draft a new issue or
+update a confirmed existing identity only with approval. If there is no usable
+source format, use the new-draft template below. For proposed splits, explain and
+review new child boundaries before producing child drafts.
+
+## New-draft template
 
 Use these seven headings exactly once, at Markdown level 2 or 3:
 
@@ -101,8 +131,9 @@ owner, and obtain the developer's approval of that explicit implementation bound
 Do not claim the fixture proves live integration or silently discard the original
 live outcome.
 
-Show the complete revised body, test plan and flagged qualifications together.
-Keep external qualification visible in the published Out of scope section, not
+Show the complete final body, test plan and flagged qualifications together.
+Keep external qualification visible in the published Out of scope section or an
+existing equivalent deferred-qualification section, not
 only in the private report: original requested outcome, what the automated tests
 prove, what they do not prove, missing capability, and owner or owner unknown.
 Retain traceability from the original requirements to automated acceptance or the
@@ -123,13 +154,14 @@ of the deployed sandbox. Every result retains deployment readiness `unvalidated`
 
 ## Local report
 
-Keep this report beside the canonical body, rather than requiring more issue
+Keep this report beside the final issue body, rather than requiring more issue
 headings. Use the developer's preferred filenames and preserve existing output.
 
 - **Source and identity:** existing-ticket identity and retained source intent,
   or new-intent local identity; inspected revision, selected base SHA and relevant
   working-tree differences. If a revision or source is unavailable, say so.
-- **Preparation workflow:** instruction source and canonical format v1; include
+- **Preparation workflow:** instruction source and whether an existing format was retained or the new-draft
+  template was used; include
   the CLI release or source revision when known. Keep unknown versions explicitly
   unknown. Preserve the source snapshot before changing instructions for a draft.
   These identify local instructions, not deployment compatibility.
@@ -203,7 +235,7 @@ links and verify them before selection. Never claim a missing write succeeded.
 
 ### Review and authorization
 
-Present the full final title and canonical body for each issue, the target
+Present the full final title and body for each issue, the target
 repository, existing issue identities, and proposed dependency mapping. Keep local
 preparation evidence and `report.md` out of the published issue unless specifically
 requested. Preserve original requirements and human edits in the reviewed body.
@@ -238,19 +270,31 @@ approval carries forward while its exact content and action remain unchanged.
 
 ### Publish and verify
 
-Publish the complete reviewed canonical Markdown body through the existing
-tracker intake. No deployment prefix, body digest, compatibility API or repository
+Publish the complete reviewed Markdown body through the existing tracker
+intake. Retained source formats and new-draft templates use the same intake. No deployment prefix, body digest, compatibility API or repository
 pin is required for publication or factory selection. Resolve any conflict with
 the repository's stated requirements before final review. Do not claim that local
 format review proves deployment readiness.
 
-1. Re-read each existing issue immediately before updating it. Compare its title
+1. Re-read each existing issue immediately before updating or selecting it. Compare its title
    and body with the source snapshot used for review. If it changed, preserve the
    remote edits, reconcile the draft and return for review of the changed spec.
    Read labels/state too: do not edit an already selected issue as part of a new
    run, reopen a closed issue or remove/re-add its label without explicit direction
    after inspecting existing work. These actions can replace or cancel a run.
-2. Update the original issue rather than creating a duplicate. For new work, create
+   For a requested title/body change on selected work, establish a supported way
+   to coordinate the existing execution and observe the safe state before writing:
+   an acknowledged stop, or an authoritative revision route binding the new source
+   to the intended work. An approval to change the spec does not establish this
+   coordination. Removing a label or sending a cancellation request is not proof
+   that execution has stopped. If an active run or publication can race the update
+   and coordination cannot be verified, keep the reviewed changes local and report
+   the specific operator action needed. An unchanged issue can still be assessed
+   and reported already selected without editing or toggling its label.
+2. For an unchanged approved existing issue, skip the title/body write. Verify
+   its full current content and reuse the existing identity for handoff. This is
+   verified existing publication, not a newly performed update.
+   For changed content, update the original issue rather than creating a duplicate. For new work, create
    only the reviewed issues, initially without the factory label. Persist actual
    returned issue IDs and URLs in the local report as each succeeds. For splits,
    obtain approval of mechanical substitutions of local child IDs with returned

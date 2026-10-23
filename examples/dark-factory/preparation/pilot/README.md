@@ -25,9 +25,13 @@ the CSV:
    agreed behavior works, required checks pass, and the reviewer accepts the
    change. An opened PR alone is not acceptance. If practical, hide the trial arm
    from the acceptance reviewer.
-3. The two arms: `usual` follows the team's ordinary intake process; `prepared`
+3. The default two arms: `usual` follows the team's ordinary intake process; `prepared`
    uses the preparation skill with repository investigation, questions according
    to ambiguity, full specification review and explicit publication consent.
+   An optional third `external` arm can use a named existing local skill workflow.
+   Record its exact revision and whether it includes the Curie readiness review;
+   keep that choice fixed rather than silently mixing preparation treatments.
+   The authoring skill's popularity is not an outcome measure.
 4. The assignment method. Enroll before preparation and assign before outcomes.
    Randomize within comparable task types or sizes when feasible. Otherwise use
    a documented matching rule and describe the comparison as observational.

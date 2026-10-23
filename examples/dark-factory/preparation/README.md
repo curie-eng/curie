@@ -2,14 +2,18 @@
 
 The `skills/prepare-factory-ticket` folder contains the text-only preparation
 workflow for a developer's existing coding agent. Install it directly with
-`curie factory prepare install --agent codex` (or `claude-code`, `copilot`,
+`curie skills install --agent codex` (or `claude-code`, `copilot`,
 `gemini`, `cursor`). Add `--global` for personal installation across projects.
-The installer copies only that skill folder and its references, offline.
+The command installs the complete human-facing Curie skill set: this preparation
+workflow and `review-pr`, with their references, offline.
 It requires no Python interpreter,
 parser installation, container runtime or reachable Curie deployment.
 
-Preparation uses the host coding agent to review the specification format,
-coverage and dependencies. This release contains no Python parser, deterministic
+Preparation uses the host coding agent to review existing issues, specifications,
+plans or discussions for scope, verification feasibility, coverage and dependencies.
+It preserves sufficient existing formats and decisions, proposes targeted gap
+repairs and skips body writes for unchanged published issues. New drafts use the
+seven-section template when no established source format is available. This release contains no Python parser, deterministic
 specification validator or ticket-set envelope. The canonical format is documented
 in the packaged skill reference and the [specification guide](../../../docs/guides/factory-specification.md).
 

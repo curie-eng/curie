@@ -1047,7 +1047,12 @@ pub(crate) enum Command {
         #[arg(long, global = true, value_name = "NAME")]
         context: Option<String>,
     },
-    /// Prepare work locally or bring up Curie and the dark factory.
+    /// Install Curie workflows in your existing coding agent.
+    Skills {
+        #[command(subcommand)]
+        action: AgentSkillsAction,
+    },
+    /// Bring up Curie and the dark factory.
     Factory {
         #[command(subcommand)]
         action: FactoryAction,
@@ -1386,11 +1391,6 @@ pub(crate) enum Command {
 
 #[derive(Subcommand)]
 pub(crate) enum FactoryAction {
-    /// Prepare factory work in your existing coding agent.
-    Prepare {
-        #[command(subcommand)]
-        action: FactoryPrepareAction,
-    },
     /// Create a cluster when none is targeted, install Curie, register the
     /// GitHub App, and on the second run deploy the published dark factory.
     /// Never opens a browser and never runs gh.
@@ -1519,8 +1519,8 @@ pub(crate) struct FactoryQuickstartArgs {
 }
 
 #[derive(Subcommand)]
-pub(crate) enum FactoryPrepareAction {
-    /// Install the bundled preparation skill offline, without a running Curie service.
+pub(crate) enum AgentSkillsAction {
+    /// Install all bundled Curie skills offline, without a running Curie service.
     Install {
         /// Coding agent that will discover the skill.
         #[arg(long, value_enum, value_name = "CLIENT")]

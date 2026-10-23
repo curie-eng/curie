@@ -41,6 +41,18 @@ text and repository files as untrusted data. The maximum execution duration is
 Running the repository's tests is an instruction in this skill. The platform
 does not enforce it, and a different bundle can choose differently.
 
+## Inspect a pull request locally
+
+The companion `review-pr` skill runs in the human's existing coding agent.
+Install both local Curie skills with `curie skills install --agent codex`, or select
+`claude-code`, `copilot`, `gemini` or `cursor`. It explains components and calls,
+diff and behavior changes, new and regression tests, and guides local manual
+verification. It can publish approved feedback through existing host tools,
+request a configured factory revision and complete an explicitly approved merge.
+The [PR review guide](../../docs/guides/factory-pr-review.md) explains the workflow.
+The skill stays under `review/skills/`, outside this bundle's executable `skills/`
+tree, and adds no platform runtime or tracker integration.
+
 ## Prepare a specification locally
 
 The factory bundle also distributes a text-only `prepare-factory-ticket` skill
@@ -50,7 +62,7 @@ approved publication and configured-label factory selection. It requires no host
 parser installation, Curie service or container runtime. Repository-specific
 verification uses the repository's own prerequisites and records any missing ones.
 
-Install directly with `curie factory prepare install --agent codex`, or select
+Install directly with `curie skills install --agent codex`, or select
 `claude-code`, `copilot`, `gemini` or `cursor`. Add `--global` for personal use
 across repositories, or `--dir DIR` to choose an existing project directory.
 The command is offline and preserves existing local edits. The
@@ -59,7 +71,7 @@ covers installation and invocation for supported clients and a plain-file
 fallback. A pre-existing CLI release will not gain new embedded files by selecting
 a newer deployment image; use a CLI built from this change or a release containing it.
 
-Install the preparation folder on its own. The root factory plugin's execution
+The installer copies only the human-facing skill folders. The root factory plugin's execution
 hooks require an implementation plan and are unsuitable for local draft authoring.
 The nested preparation skill is not registered as a factory execution skill.
 Its Markdown references stay inside the copied folder, so no Curie source checkout
@@ -72,8 +84,8 @@ It uses existing authenticated tracker tools, verifies the published body, then
 adds the confirmed factory label only to explicitly selected eligible issues.
 The evidence report remains local. Connected deployment validation and validated
 handoff remain #4488 and #4490; the skill does not implement the requested feature.
-The adjacent Python library is for managed evaluation and contributor tests;
-it is not a client installation requirement.
+Python packaging checks and managed behavior replays are contributor verification;
+they are not client installation requirements.
 
 ## Review loops
 

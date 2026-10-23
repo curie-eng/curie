@@ -1,4 +1,4 @@
-"""Execute packaging contracts; preparation behavior is covered by artifact evals."""
+"""Execute portable factory skill packaging contracts; behavior uses host replays."""
 
 import json
 import re
@@ -12,7 +12,15 @@ from plugin_format import PROFILE_AGENT_SKILLS_STRICT, TOOL_POLICY_ENFORCEMENT, 
 
 ROOT = Path(__file__).resolve().parents[2]
 BUNDLE = ROOT / "examples/dark-factory"
-SKILL = BUNDLE / "preparation/skills/prepare-factory-ticket"
+SKILLS = [
+    BUNDLE / "preparation/skills/prepare-factory-ticket",
+    BUNDLE / "review/skills/review-pr",
+]
+
+
+@pytest.fixture(params=SKILLS, ids=lambda path: path.name)
+def skill(request: pytest.FixtureRequest) -> Path:
+    return Path(request.param)
 
 
 def assert_self_contained(skill: Path) -> None:
@@ -36,31 +44,34 @@ def assert_self_contained(skill: Path) -> None:
                 assert reference.is_file(), (path, destination)
 
 
-def test_frontmatter_passes_portable_production_validation(tmp_path: Path) -> None:
-    assert (SKILL / "SKILL.md").is_file()
-    document = (SKILL / "SKILL.md").read_text(encoding="utf-8")
+def test_frontmatter_passes_portable_production_validation(tmp_path: Path, skill: Path) -> None:
+    assert (skill / "SKILL.md").is_file()
+    document = (skill / "SKILL.md").read_text(encoding="utf-8")
     frontmatter = re.match(r"\A---\n(.*?)\n---(?:\n|$)", document, re.DOTALL)
     assert frontmatter is not None
     metadata = yaml.safe_load(frontmatter.group(1))
-    assert metadata["name"] == SKILL.name
+    assert metadata["name"] == skill.name
     assert isinstance(metadata["description"], str) and metadata["description"].strip()
     manifest = tmp_path / ".claude-plugin/plugin.json"
     manifest.parent.mkdir()
     manifest.write_text(json.dumps({"name": "portable-skill-check"}), encoding="utf-8")
-    shutil.copytree(SKILL, tmp_path / "skills" / SKILL.name)
+    shutil.copytree(skill, tmp_path / "skills" / skill.name)
     result = validate_bundle(tmp_path, profile=PROFILE_AGENT_SKILLS_STRICT)
     assert result.valid, result.errors
 
 
 @pytest.mark.parametrize(
-    "provider_directory", [".agents/skills", ".claude/skills", ".github/skills"]
+    "provider_directory",
+    [".agents/skills", ".claude/skills", ".github/skills", ".gemini/skills", ".cursor/skills"],
 )
-def test_folder_only_install_is_self_contained(tmp_path: Path, provider_directory: str) -> None:
-    assert_self_contained(SKILL)
-    destination = tmp_path / "client project café" / provider_directory / SKILL.name
-    shutil.copytree(SKILL, destination)
+def test_folder_only_install_is_self_contained(
+    tmp_path: Path, provider_directory: str, skill: Path
+) -> None:
+    assert_self_contained(skill)
+    destination = tmp_path / "client project café" / provider_directory / skill.name
+    shutil.copytree(skill, destination)
     assert_self_contained(destination)
-    original = {path.relative_to(SKILL): path.read_bytes() for path in SKILL.rglob("*.md")}
+    original = {path.relative_to(skill): path.read_bytes() for path in skill.rglob("*.md")}
     installed = {
         path.relative_to(destination): path.read_bytes() for path in destination.rglob("*.md")
     }
@@ -70,8 +81,8 @@ def test_folder_only_install_is_self_contained(tmp_path: Path, provider_director
     assert not (destination / ".claude-plugin").exists()
 
 
-def test_execution_validation_does_not_discover_preparation_skill(tmp_path: Path) -> None:
-    assert (SKILL / "SKILL.md").is_file()
+def test_execution_validation_does_not_discover_local_skill(tmp_path: Path, skill: Path) -> None:
+    assert (skill / "SKILL.md").is_file()
     copy = tmp_path / "factory"
     shutil.copytree(BUNDLE, copy, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     execution = list((copy / "skills").rglob("SKILL.md"))
@@ -79,7 +90,7 @@ def test_execution_validation_does_not_discover_preparation_skill(tmp_path: Path
     before = validate_bundle(
         copy, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT
     )
-    nested = copy / SKILL.relative_to(BUNDLE) / "SKILL.md"
+    nested = copy / skill.relative_to(BUNDLE) / "SKILL.md"
     nested.write_text("---\nname: []\n---\n", encoding="utf-8")
     after = validate_bundle(
         copy, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT

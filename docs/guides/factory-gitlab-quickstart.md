@@ -145,7 +145,7 @@ Do not supply GitHub App flags: GitLab quickstart refuses them.
 
 You can use the [preparation skill](factory-preparation.md) in your coding agent
 to investigate and review the complete issue before submission. Install it with
-`curie factory prepare install --agent codex` using a CLI build that contains the
+`curie skills install --agent codex` using a CLI build that contains the
 command; the guide covers other clients and source builds. Publication and
 selection use your agent's tracker connection when available, with the same
 start authority requirements described below.
