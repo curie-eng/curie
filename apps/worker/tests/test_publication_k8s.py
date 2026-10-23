@@ -238,6 +238,104 @@ def test_publication_resource_names_and_stored_lineage_branch_are_deterministic(
     assert _job_env(first)["BRANCH"] == LINEAGE_BRANCH
 
 
+@pytest.mark.parametrize(
+    ("old_image", "new_image"),
+    [
+        ("registry.example.com/curie-runner:A", "registry.example.com/curie-runner:B"),
+        (
+            "registry.example.com/curie-runner:A",
+            "registry.example.com/curie-runner@sha256:" + "b" * 64,
+        ),
+        (
+            "registry.example.com:5000/curie-runner@sha256:" + "a" * 64,
+            "registry.example.com:5000/curie-runner:B",
+        ),
+        ("registry.example.com/curie-runner", "registry.example.com/curie-runner:B"),
+    ],
+)
+def test_same_repository_runner_tags_and_digests_are_adoptable(
+    publication_k8s: Any, old_image: str, new_image: str
+) -> None:
+    old = _build(
+        publication_k8s,
+        _payload(publication_k8s),
+        replace(_settings(publication_k8s), runner_image=old_image),
+    )
+    new = _build(
+        publication_k8s,
+        _payload(publication_k8s),
+        replace(_settings(publication_k8s), runner_image=new_image),
+    )
+
+    assert _container(old)["image"] == old_image
+    assert _container(new)["image"] == new_image
+    for kind, expected, observed in (
+        ("Job", new.job, old.job),
+        ("ConfigMap", new.config_map, old.config_map),
+        ("Secret", new.secret, old.secret),
+    ):
+        publication_k8s.validate_adopted_resource(
+            kind, expected, observed, compare_secret_value=False
+        )
+
+
+@pytest.mark.parametrize(
+    "image",
+    [
+        "registry.example.com/other-runner:B",
+        "other.example.com/curie-runner:B",
+        "registry.example.com/curie-runner-extra:B",
+        "registry.example.com:5000/curie-runner:B",
+    ],
+)
+def test_a_different_runner_repository_cannot_be_adopted(publication_k8s: Any, image: str) -> None:
+    resources = _build(
+        publication_k8s,
+        _payload(publication_k8s),
+        replace(_settings(publication_k8s), runner_image="registry.example.com/curie-runner:B"),
+    )
+    observed = deepcopy(resources.job)
+    observed["spec"]["template"]["spec"]["containers"][0]["image"] = image
+
+    with pytest.raises(publication_k8s.PublicationResourceError):
+        publication_k8s.validate_adopted_resource("Job", resources.job, observed)
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        (("spec", "activeDeadlineSeconds"), 301),
+        (("spec", "template", "spec", "serviceAccountName"), "another-account"),
+        (("spec", "template", "spec", "restartPolicy"), "OnFailure"),
+        (("spec", "template", "spec", "containers", 0, "command"), ["/bin/true"]),
+        (("spec", "template", "spec", "containers", 0, "env", 0, "value"), "foreign-value"),
+        (("spec", "template", "spec", "containers", 0, "resources", "limits", "cpu"), "2"),
+        (("spec", "template", "spec", "containers", 0, "imagePullPolicy"), "Always"),
+    ],
+)
+def test_runner_version_tolerance_preserves_every_other_job_field(
+    publication_k8s: Any, path: tuple[str | int, ...], value: Any
+) -> None:
+    old = _build(
+        publication_k8s,
+        _payload(publication_k8s),
+        replace(_settings(publication_k8s), runner_image="registry.example.com/curie-runner:A"),
+    )
+    expected = _build(
+        publication_k8s,
+        _payload(publication_k8s),
+        replace(_settings(publication_k8s), runner_image="registry.example.com/curie-runner:B"),
+    )
+    observed = deepcopy(old.job)
+    parent = observed
+    for key in path[:-1]:
+        parent = parent[key]
+    parent[path[-1]] = value
+
+    with pytest.raises(publication_k8s.PublicationResourceError, match="spec mismatch"):
+        publication_k8s.validate_adopted_resource("Job", expected.job, observed)
+
+
 def test_built_job_is_bounded_secret_free_and_outside_sandbox_selectors(
     publication_k8s: Any,
 ) -> None:
@@ -2034,6 +2132,7 @@ def test_observe_reads_logs_only_from_a_pod_owned_by_the_exact_job(
     assert observed.phase == "succeeded"
     assert observed.commit_sha == REVISION_HEAD
     assert observed.error is None
+    assert observed.job_uid == job_uid
 
 
 def test_observe_reads_terminal_status_from_dict_shaped_kubernetes_objects(
@@ -2058,6 +2157,7 @@ def test_observe_reads_terminal_status_from_dict_shaped_kubernetes_objects(
     assert observed.phase == "failed"
     assert observed.error == "DeadlineExceeded; pod logs were unavailable"
     assert observed.transport is None
+    assert observed.job_uid == "job-uid-123"
 
 
 def test_observe_reports_the_transport_the_existing_job_was_built_with(
@@ -2088,6 +2188,7 @@ def test_observe_reports_the_transport_the_existing_job_was_built_with(
     assert observed.phase == "running"
     assert observed.commit_sha is None
     assert observed.transport == payload.transport
+    assert observed.job_uid == "job-uid-live"
 
 
 def test_observe_of_a_missing_job_reports_not_existing(publication_k8s: Any) -> None:
@@ -2104,6 +2205,7 @@ def test_observe_of_a_missing_job_reports_not_existing(publication_k8s: Any) -> 
     assert observed.exists is False
     assert observed.phase == "pending"
     assert observed.transport is None
+    assert observed.job_uid is None
 
 
 def _real_client_pod_log(raw: bytes) -> Any:
@@ -2576,7 +2678,6 @@ def test_a_job_without_the_base_branch_contract_is_refused_after_upgrade(
         "branch": LINEAGE_BRANCH,
         "title": "Update repository",
         "branch_prefix": None,
-        "runner_image": "ghcr.io/curie-eng/curie-runner:v0.7.0",
         "service_account_name": "curie-publication",
         "active_deadline_seconds": 300,
         "git_timeout_seconds": 60,
@@ -2587,7 +2688,10 @@ def test_a_job_without_the_base_branch_contract_is_refused_after_upgrade(
             json.dumps(contract, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
     )
-    old_hash = "583ff66a400a55b143deff2f55935e6548680630568ace51c65280c11c00e22f"
+    del contract["base_branch"]
+    old_hash = hashlib.sha256(
+        json.dumps(contract, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
     assert resources.job["metadata"]["annotations"][annotation] != old_hash
     previous_job = deepcopy(resources.job)
     previous_job["metadata"]["annotations"][annotation] = old_hash
@@ -2598,3 +2702,273 @@ def test_a_job_without_the_base_branch_contract_is_refused_after_upgrade(
     publication_k8s.validate_adopted_resource(
         "Job", resources.job, _omitempty(deepcopy(resources.job))
     )
+
+
+def test_a_job_with_the_pre_upgrade_image_bound_hash_requires_remote_proof(
+    publication_k8s: Any,
+) -> None:
+    resources = _resources(publication_k8s)
+    observed = deepcopy(resources.job)
+    observed["metadata"]["annotations"]["curietech.ai/publication-contract-sha256"] = (
+        "583ff66a400a55b143deff2f55935e6548680630568ace51c65280c11c00e22f"
+    )
+
+    with pytest.raises(publication_k8s.PublicationResourceError, match="metadata contract"):
+        publication_k8s.validate_adopted_resource("Job", resources.job, observed)
+
+
+def _quiescence_pod(
+    *,
+    job_name: str = "publication-job",
+    job_uid: str = "rejected-job-uid",
+    phase: str = "Succeeded",
+) -> dict[str, Any]:
+    # SDK 36.0.3 V1OwnerReference and V1ContainerStatus require these wire fields:
+    # https://github.com/kubernetes-client/python/tree/v36.0.3/kubernetes/client/models
+    state = {"running": {}} if phase == "Running" else {"terminated": {"exitCode": 0}}
+    return {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": f"{job_name}-pod",
+            "ownerReferences": [
+                {
+                    "apiVersion": "batch/v1",
+                    "kind": "Job",
+                    "name": job_name,
+                    "uid": job_uid,
+                    "controller": True,
+                }
+            ],
+        },
+        "spec": {"containers": [{"name": "publish", "image": "registry.example.com/runner:A"}]},
+        "status": {
+            "phase": phase,
+            "containerStatuses": [
+                {
+                    "name": "publish",
+                    "image": "registry.example.com/runner:A",
+                    "imageID": f"registry.example.com/runner@sha256:{'a' * 64}",
+                    "ready": False,
+                    "restartCount": 0,
+                    "state": state,
+                }
+            ],
+        },
+    }
+
+
+def _quiescence_cluster(
+    module: Any, *, job: dict[str, Any] | None = None, pods: list[Any] | None = None
+) -> Any:
+    cluster = object.__new__(module.KubernetesPublicationCluster)
+    cluster.namespace = "curie-publications"
+    live_job = (
+        job
+        if job is not None
+        else {
+            "metadata": {"name": "publication-job", "uid": "rejected-job-uid"},
+            "status": {
+                "succeeded": 1,
+                "conditions": [{"type": "Complete", "status": "True"}],
+            },
+        }
+    )
+    cluster._batch = SimpleNamespace(read_namespaced_job=lambda *_args: live_job)
+    cluster._core = SimpleNamespace(
+        list_namespaced_pod=lambda *_args, **_kwargs: {
+            "items": [_quiescence_pod()] if pods is None else pods
+        }
+    )
+    return cluster
+
+
+@pytest.mark.parametrize("condition", ["Complete", "Failed"])
+@pytest.mark.parametrize("as_model", [False, True])
+def test_rejected_job_quiescence_uses_exact_uid_terminal_condition_and_stopped_pods(
+    publication_k8s: Any, condition: str, as_model: bool
+) -> None:
+    job = {
+        "metadata": {"uid": "rejected-job-uid"},
+        "status": {"conditions": [{"type": condition, "status": "True"}]},
+    }
+    stopped = _quiescence_pod(phase="Failed" if condition == "Failed" else "Succeeded")
+    foreign = _quiescence_pod(job_name="foreign-job", job_uid="foreign-job-uid", phase="Running")
+    cluster = _quiescence_cluster(publication_k8s, job=job, pods=[stopped, foreign])
+    if as_model:
+        api = ApiClient()
+        job_model = api.deserialize(SimpleNamespace(data=json.dumps(job)), "V1Job")
+        pod_models = api.deserialize(
+            SimpleNamespace(data=json.dumps({"items": [stopped, foreign]})), "V1PodList"
+        )
+        cluster._batch = SimpleNamespace(read_namespaced_job=lambda *_args: job_model)
+        cluster._core = SimpleNamespace(list_namespaced_pod=lambda *_args, **_kwargs: pod_models)
+
+    assert cluster.rejected_job_quiescent("publication-job", "rejected-job-uid") is True
+
+
+@pytest.mark.parametrize("phase", ["Running", "Succeeded"])
+@pytest.mark.parametrize("as_model", [False, True])
+def test_rejected_job_quiescence_refuses_same_name_foreign_uid_pod(
+    publication_k8s: Any, phase: str, as_model: bool
+) -> None:
+    stopped = _quiescence_pod()
+    replacement = _quiescence_pod(job_uid="replacement-job-uid", phase=phase)
+    replacement["metadata"]["name"] = "replacement-publisher-pod"
+    pods = [stopped, replacement]
+    cluster = _quiescence_cluster(publication_k8s, pods=pods)
+    if as_model:
+        pod_models = ApiClient().deserialize(
+            SimpleNamespace(data=json.dumps({"items": pods})), "V1PodList"
+        )
+        cluster._core = SimpleNamespace(list_namespaced_pod=lambda *_args, **_kwargs: pod_models)
+
+    assert cluster.rejected_job_quiescent("publication-job", "rejected-job-uid") is False
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "replaced-uid",
+        "missing-uid",
+        "missing-status",
+        "active-job",
+        "success-counter-only",
+        "failure-counter-only",
+        "complete-false",
+        "failure-target-only",
+        "running-pod",
+        "pending-pod",
+        "unknown-pod",
+        "running-container",
+        "waiting-container",
+        "missing-container-status",
+        "running-init-container",
+        "terminating-running-pod",
+        "second-owned-pod-running",
+    ],
+)
+def test_rejected_job_quiescence_fails_closed_without_complete_control_plane_proof(
+    publication_k8s: Any, case: str
+) -> None:
+    job: dict[str, Any] = {
+        "metadata": {"uid": "rejected-job-uid"},
+        "status": {"conditions": [{"type": "Complete", "status": "True"}]},
+    }
+    pod = _quiescence_pod()
+    pods = [pod]
+    if case == "replaced-uid":
+        job["metadata"]["uid"] = "replacement-job-uid"
+    elif case == "missing-uid":
+        job["metadata"].pop("uid")
+    elif case == "missing-status":
+        job.pop("status")
+    elif case == "active-job":
+        job["status"] = {"active": 1}
+    elif case == "success-counter-only":
+        job["status"] = {"succeeded": 1}
+    elif case == "failure-counter-only":
+        job["status"] = {"failed": 1}
+    elif case == "complete-false":
+        job["status"]["conditions"][0]["status"] = "False"
+    elif case == "failure-target-only":
+        job["status"]["conditions"][0]["type"] = "FailureTarget"
+    elif case in {"running-pod", "pending-pod", "unknown-pod"}:
+        pod["status"]["phase"] = case.removesuffix("-pod").capitalize()
+    elif case in {"running-container", "waiting-container"}:
+        pod["status"]["containerStatuses"][0]["state"] = {case.removesuffix("-container"): {}}
+    elif case == "missing-container-status":
+        pod["status"].pop("containerStatuses")
+    elif case == "running-init-container":
+        pod["spec"]["initContainers"] = [{"name": "publisher-init", "image": "runner:A"}]
+        pod["status"]["initContainerStatuses"] = [
+            {"name": "publisher-init", "state": {"running": {}}}
+        ]
+    elif case == "terminating-running-pod":
+        pod["metadata"]["deletionTimestamp"] = "2026-10-22T00:00:00Z"
+        pod["status"]["phase"] = "Running"
+    else:
+        pods.append(_quiescence_pod(phase="Running"))
+    cluster = _quiescence_cluster(publication_k8s, job=job, pods=pods)
+
+    assert cluster.rejected_job_quiescent("publication-job", "rejected-job-uid") is False
+
+
+@pytest.mark.parametrize("read", ["job", "pods"])
+@pytest.mark.parametrize("status", [404, 403, 503])
+def test_rejected_job_quiescence_observation_errors_cannot_prove_absence(
+    publication_k8s: Any, read: str, status: int
+) -> None:
+    cluster = _quiescence_cluster(publication_k8s)
+
+    def unavailable(*_args: Any, **_kwargs: Any) -> Any:
+        raise ApiException(status=status)
+
+    if read == "job":
+        cluster._batch.read_namespaced_job = unavailable
+    else:
+        cluster._core.list_namespaced_pod = unavailable
+
+    assert cluster.rejected_job_quiescent("publication-job", "rejected-job-uid") is False
+
+
+def test_rejected_job_quiescence_inventories_the_namespace_without_mutable_labels(
+    publication_k8s: Any,
+) -> None:
+    pod = _quiescence_pod(phase="Running")
+    pod["metadata"]["labels"] = {"job-name": "unrelated-job"}
+    cluster = _quiescence_cluster(publication_k8s)
+    requests: list[tuple[str, dict[str, Any]]] = []
+
+    def inventory(namespace: str, **kwargs: Any) -> dict[str, Any]:
+        requests.append((namespace, kwargs))
+        return {"items": [] if kwargs.get("label_selector") else [pod]}
+
+    cluster._core.list_namespaced_pod = inventory
+
+    assert cluster.rejected_job_quiescent("publication-job", "rejected-job-uid") is False
+    assert requests
+    assert all(namespace == cluster.namespace for namespace, _ in requests)
+    assert all(not kwargs.get("label_selector") for _, kwargs in requests)
+
+
+def test_rejected_job_quiescence_rejects_an_incomplete_pod_inventory(
+    publication_k8s: Any,
+) -> None:
+    cluster = _quiescence_cluster(publication_k8s)
+    pages = iter(
+        [
+            {"metadata": {"continue": "more-pods"}, "items": [_quiescence_pod()]},
+            ApiException(status=503),
+        ]
+    )
+
+    def incomplete(*_args: Any, **_kwargs: Any) -> Any:
+        page = next(pages)
+        if isinstance(page, Exception):
+            raise page
+        return page
+
+    cluster._core.list_namespaced_pod = incomplete
+
+    assert cluster.rejected_job_quiescent("publication-job", "rejected-job-uid") is False
+
+
+def test_rejected_job_quiescence_rereads_the_uid_after_the_pod_inventory(
+    publication_k8s: Any,
+) -> None:
+    cluster = _quiescence_cluster(publication_k8s)
+    reads: list[str] = []
+
+    def read_job(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        uid = "rejected-job-uid" if not reads else "replacement-job-uid"
+        reads.append(uid)
+        return {
+            "metadata": {"uid": uid},
+            "status": {"conditions": [{"type": "Complete", "status": "True"}]},
+        }
+
+    cluster._batch.read_namespaced_job = read_job
+
+    assert cluster.rejected_job_quiescent("publication-job", "rejected-job-uid") is False
+    assert reads == ["rejected-job-uid", "replacement-job-uid"]

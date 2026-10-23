@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import ssl
 import subprocess
@@ -20,7 +21,7 @@ DEFAULT_BRANCH = "main"
 AUTHORIZATION = "Bearer fixture-token"
 # Observed GitHubCodeHost._token contract: REST uses this Git Basic header.
 # https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/authenticating-as-a-github-app-installation
-BASIC_AUTHORIZATION = "Basic " + base64.b64encode(b"x-access-token:fixture-token").decode("ascii")
+REST_AUTHORIZATION = "Basic " + base64.b64encode(b"x-access-token:fixture-token").decode("ascii")
 PULL_NUMBER = 1
 
 
@@ -46,6 +47,43 @@ class FixtureState:
         self.pull_creations = 0
         self.scenario: dict[str, Any] | None = None
         self.base_sha = self._initialize_repository()
+        self.barriers = self.root / "barriers"
+        self.barriers.mkdir()
+        for stage in ("pre-receive", "post-receive"):
+            hook = self.bare_repo / "hooks" / stage
+            hook.write_text(
+                "#!/usr/bin/env python3\n"
+                "import hashlib, pathlib, sys, time\n"
+                f"root = pathlib.Path({str(self.barriers)!r})\n"
+                f"stage = {stage!r}\n"
+                "for update in sys.stdin:\n"
+                "    ref = update.split()[2]\n"
+                "    gate = root / hashlib.sha256(ref.encode()).hexdigest() / stage\n"
+                "    if not gate.exists():\n"
+                "        continue\n"
+                "    (gate / 'entered').touch()\n"
+                "    deadline = time.monotonic() + 60\n"
+                "    while not (gate / 'released').exists():\n"
+                "        if time.monotonic() >= deadline:\n"
+                "            sys.exit('fixture receive barrier timed out')\n"
+                "        time.sleep(0.05)\n"
+            )
+            hook.chmod(0o755)
+
+    def barrier(self, branch: str, action: str) -> dict[str, bool]:
+        if not branch.startswith("curie/") or action not in {"arm", "before", "after", "state"}:
+            raise ValueError("invalid receive barrier")
+        root = self.barriers / hashlib.sha256(f"refs/heads/{branch}".encode()).hexdigest()
+        for stage in ("pre-receive", "post-receive"):
+            gate = root / stage
+            if action == "arm":
+                gate.mkdir(parents=True)
+            elif action == {"pre-receive": "before", "post-receive": "after"}[stage]:
+                (gate / "released").touch()
+        return {
+            "before": (root / "pre-receive" / "entered").exists(),
+            "after": (root / "post-receive" / "entered").exists(),
+        }
 
     def _initialize_repository(self) -> str:
         work = self.root / "seed"
@@ -308,14 +346,9 @@ class FixtureHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _authorized(self) -> bool:
-        authorization = self.headers.get("Authorization")
-        repo_path = f"/repos/{REPO_FULL_NAME}"
-        path = urlsplit(self.path).path
-        if authorization == AUTHORIZATION or (
-            authorization == BASIC_AUTHORIZATION
-            and (path == repo_path or path.startswith(f"{repo_path}/"))
-        ):
+    def _authorized(self, path: str) -> bool:
+        authorization = REST_AUTHORIZATION if path.startswith("/repos/") else AUTHORIZATION
+        if self.headers.get("Authorization") == authorization:
             return True
         self._json(HTTPStatus.UNAUTHORIZED, {"message": "fixture authorization required"})
         return False
@@ -328,7 +361,7 @@ class FixtureHandler(BaseHTTPRequestHandler):
         if parsed.path == "/health":
             self._json(HTTPStatus.OK, {"status": "ok"})
             return
-        if not self._authorized():
+        if not self._authorized(parsed.path):
             return
         repo_path = f"/repos/{REPO_FULL_NAME}"
         if parsed.path == repo_path:
@@ -336,6 +369,18 @@ class FixtureHandler(BaseHTTPRequestHandler):
                 HTTPStatus.OK,
                 {"id": 9001, "full_name": REPO_FULL_NAME, "default_branch": DEFAULT_BRANCH},
             )
+            return
+        commit_prefix = f"{repo_path}/git/commits/"
+        if parsed.path.startswith(commit_prefix):
+            # https://docs.github.com/en/rest/git/commits#get-a-commit-object
+            sha = parsed.path[len(commit_prefix) :]
+            if len(sha) != 40 or any(char not in "0123456789abcdef" for char in sha):
+                self._json(HTTPStatus.BAD_REQUEST, {"message": "invalid commit"})
+                return
+            try:
+                self._json(HTTPStatus.OK, self.server.state.commit(sha))
+            except subprocess.CalledProcessError:
+                self._json(HTTPStatus.NOT_FOUND, {"message": "commit not found"})
             return
         ref_prefix = f"{repo_path}/git/ref/heads/"
         if parsed.path.startswith(ref_prefix):
@@ -349,23 +394,11 @@ class FixtureHandler(BaseHTTPRequestHandler):
                     {"ref": f"refs/heads/{branch}", "object": {"type": "commit", "sha": sha}},
                 )
             return
-        commit_prefix = f"{repo_path}/git/commits/"
-        if parsed.path.startswith(commit_prefix):
-            # https://docs.github.com/en/rest/git/commits#get-a-commit-object
-            try:
-                commit = self.server.state.commit(parsed.path[len(commit_prefix) :])
-            except (ValueError, subprocess.CalledProcessError):
-                self._json(HTTPStatus.NOT_FOUND, {"message": "commit not found"})
-            else:
-                self._json(HTTPStatus.OK, commit)
-            return
         if parsed.path == self._pulls_path():
             query = parse_qs(parsed.query)
             requested_head = (query.get("head") or [""])[0]
             pull = self.server.state.pull_payload()
-            expected_head = (
-                f"acme-corp:{pull['head']['ref']}" if pull is not None else None
-            )
+            expected_head = f"acme-corp:{pull['head']['ref']}" if pull is not None else None
             rows = [pull] if pull is not None and requested_head == expected_head else []
             self._json(HTTPStatus.OK, rows)
             return
@@ -390,7 +423,19 @@ class FixtureHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlsplit(self.path)
-        if not self._authorized():
+        if not self._authorized(parsed.path):
+            return
+        if parsed.path == "/__fixture/barrier":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 0 < length <= 4096:
+                    raise ValueError("invalid barrier payload")
+                payload = json.loads(self.rfile.read(length))
+                state = self.server.state.barrier(payload["branch"], payload["action"])
+            except (KeyError, TypeError, ValueError):
+                self._json(HTTPStatus.BAD_REQUEST, {"message": "invalid barrier payload"})
+            else:
+                self._json(HTTPStatus.OK, state)
             return
         fixture_operations = {
             "/__fixture/scenario",

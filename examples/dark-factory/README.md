@@ -376,27 +376,12 @@ Cargo cache used 585 MiB, and UI modules used 223 MiB. After
 These are measured values for this checkout; other repositories and build
 profiles can need different amounts. The chart's default 1 GiB workspace,
 512 MiB home scratch, and 4 GiB runner ephemeral storage limit cannot hold this
-workload. Give the factory agent its own workspace ceiling with
-`agentSandbox.workspaceSizeLimits`, which applies to that agent's sandboxes
-only. Merge these values into the same Helm values file as the registry routes:
-
-```yaml
-agentSandbox:
-  workspaceSizeLimits:
-    dark-factory: 24Gi
-  runner:
-    hardening:
-      writablePathSizeLimit: 2Gi
-```
-
-The kubelet counts the workspace against the pod's `ephemeral-storage` limit
-too, so raise the factory agent's runner resources to match. This override
-applies to the `dark-factory` agent only:
-
-```bash
-curie cluster overrides dark-factory --runner-resources \
-  '{"requests":{"cpu":"500m","memory":"2Gi","ephemeral-storage":"16Gi"},"limits":{"cpu":"2","memory":"6Gi","ephemeral-storage":"28Gi"}}'
-```
+workload. The chart's `factory` resource profile is sized for it, and the
+`values.yaml` in this directory selects it for the `dark-factory` agent with
+`agentSandbox.agentResourceProfiles`. No per-key sizing recipe is needed. The
+profile gives that agent's sandboxes 8Gi of memory (request and limit), 2 CPU,
+10Gi to 20Gi of ephemeral storage, a 15Gi workspace, a 15Gi home volume and a
+4Gi tmp volume. Other agents keep the `standard` profile.
 
 With these settings, a sandbox running this layer built every `cli/` test
 target (`cargo test --locked --manifest-path cli/Cargo.toml --no-run`) in about
@@ -404,11 +389,31 @@ three minutes. The workspace peaked at 8.8 GiB and the build used the full 6 GiB
 of memory. With a 2 GiB memory limit, the same build was OOMKilled while
 linking.
 
-`writablePathSizeLimit` still applies to every sandbox runner in this Helm
-release. The larger home scratch holds the default uv, Cargo and pnpm caches;
-a run can instead put them under `/workspace`. Repeat the frozen installs and
-Rust build in a pod with these values, measure peak disk and memory use, and
-raise the limits if the completed build needs more room.
+The volume ceilings are independent upper bounds, and the 20Gi
+ephemeral-storage limit also caps their combined use, so a pod is evicted if any
+one volume passes its ceiling or the total passes 20Gi. The home volume holds
+the default uv, Cargo and pnpm caches; a run can instead put them under
+`/workspace`. Each factory sandbox requests 8Gi of memory, so the default
+`resourceQuota.hard.requestsMemory` of `8Gi` admits one at a time; raise
+`resourceQuota.hard.*` for concurrency. Sandboxes created before an upgrade keep
+the limits they started with.
+
+To change one field, override it on the profile in your Helm values. For
+example, to give the workspace 24Gi while keeping the rest of the profile:
+
+```yaml
+agentSandbox:
+  resourceProfiles:
+    factory:
+      workspaceSizeLimit: 24Gi
+```
+
+A per-agent `agentSandbox.workspaceSizeLimits.dark-factory` value takes
+precedence over the profile for the workspace only, and
+`curie cluster overrides dark-factory --runner-resources` still applies on top
+at claim time. Repeat the frozen installs and Rust build in a pod, measure peak
+disk and memory use, and raise the limits if the completed build needs more
+room.
 
 The $100 cap is an example for this three hour recipe. Tune it to the model
 and expected workload. The SDK applies it to each session; it does not meter

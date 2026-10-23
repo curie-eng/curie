@@ -179,13 +179,12 @@ roleRef:
 {{- fail (printf "agentSandbox.runner.extraEnv contains %q, a reserved snapshot sealing key: it must reach only the hosted connector, so declare it as a SecretRef (from_secret) on that connector in the bundle, never in the runner environment" .name) }}
 {{- end }}
 {{- end }}
+{{- /* #4889: the effective envelope (resources on every container, the
+       workspace and each writable path sizeLimit) for this template's
+       resource profile; see _sandbox_envelope.tpl for the precedence. */}}
+{{- $env := include "curie.sandboxEnvelope" (dict "root" . "agent" $agent) | fromJson }}
 {{- $bf := $runner.bundleFetch }}
-{{- $wf := $runner.workspace }}
-{{- if $agent }}
-{{- with index (.Values.agentSandbox.workspaceSizeLimits | default dict) $agent }}
-{{- $wf = set (deepCopy $wf) "sizeLimit" . }}
-{{- end }}
-{{- end }}
+{{- $wf := set (deepCopy ($runner.workspace | default dict)) "sizeLimit" $env.workspaceSizeLimit }}
 {{- $af := $runner.attachments | default dict }}
 {{/*
 The inbound-attachment lane is ONE switch. `worker.attachments.enabled` gates
@@ -333,10 +332,11 @@ spec:
         {{- if $runner.hardening.enabled }}
         {{- range $i, $p := $runner.hardening.writablePaths }}
         # sizeLimit is ADR-0059 decision 2 (see hardening.writablePathSizeLimit
-        # in values.yaml for the periodic-measurement caveat).
+        # in values.yaml for the periodic-measurement caveat); the envelope
+        # resolves it per path from the resource profile (#4889).
         - name: writable-{{ $i }}
           emptyDir:
-            sizeLimit: {{ $runner.hardening.writablePathSizeLimit | quote }}
+            sizeLimit: {{ index $env.writable $i | quote }}
         {{- end }}
         {{- end }}
       {{- end }}
@@ -415,7 +415,7 @@ spec:
             - name: aws-config
               mountPath: /aws-config
           resources:
-            {{- toYaml $runner.resources | nindent 12 }}
+            {{- toYaml $env.resources | nindent 12 }}
         - name: bundle-extract
           image: {{ $bf.extractImage }}
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
@@ -477,7 +477,7 @@ spec:
             - name: bundles
               mountPath: {{ $bf.mountPath }}
           resources:
-            {{- toYaml $runner.resources | nindent 12 }}
+            {{- toYaml $env.resources | nindent 12 }}
         {{- end }}
         {{- if $wf.enabled }}
         - name: workspace-init
@@ -615,7 +615,7 @@ spec:
             - name: workspace
               mountPath: {{ $wf.mountPath }}
           resources:
-            {{- toYaml $runner.resources | nindent 12 }}
+            {{- toYaml $env.resources | nindent 12 }}
         {{- end }}
         {{- if $af.enabled }}
         {{/*
@@ -855,7 +855,7 @@ spec:
             - name: attachments
               mountPath: {{ $af.mountPath }}
           resources:
-            {{- toYaml $runner.resources | nindent 12 }}
+            {{- toYaml $env.resources | nindent 12 }}
         {{- end }}
       {{- end }}
       containers:
@@ -977,7 +977,7 @@ spec:
               port: {{ $runner.port }}
             {{- toYaml $runner.readinessProbe | nindent 12 }}
           resources:
-            {{- toYaml $runner.resources | nindent 12 }}
+            {{- toYaml $env.resources | nindent 12 }}
           {{- if or $bf.enabled $wf.enabled $af.enabled $runner.hardening.enabled (include "curie.codeHostTrust.name" .) }}
           volumeMounts:
             {{- include "curie.codeHostTrust.volumeMount" . | nindent 12 }}
@@ -1050,6 +1050,7 @@ spec:
 {{- fail (printf "agentSandbox.runnerImages.%s must be a digest reference <repository>@sha256:<64 hex> produced by curie build, got %q" $agent (toString $ref)) }}
 {{- end }}
 {{- end }}
+{{- include "curie.sandboxEnvelope.validate" . }}
 {{- range $agent, $limit := .Values.agentSandbox.workspaceSizeLimits | default dict }}
 {{- if or (gt (len $agent) 40) (not (regexMatch "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$" $agent)) }}
 {{- fail (printf "agentSandbox.workspaceSizeLimits.%s has an invalid agent name" $agent) }}

@@ -464,7 +464,7 @@ services:
       # credentials name key files the API reads; it carries no secret itself.
       FACTORY_ENABLED: ${FACTORY_ENABLED:-false}
       FACTORY_INTAKE: ${FACTORY_INTAKE:-poll}
-      FACTORY_CI_WAIT_S: ${FACTORY_CI_WAIT_S:-1200}
+      FACTORY_CI_WAIT_S: ${FACTORY_CI_WAIT_S:-3600}
       CURIE_FORGES: ${CURIE_FORGES:-}
       GITHUB_APP_ID: ${GITHUB_APP_ID:-}
       GITHUB_APP_PRIVATE_KEY: ${GITHUB_APP_PRIVATE_KEY:-}

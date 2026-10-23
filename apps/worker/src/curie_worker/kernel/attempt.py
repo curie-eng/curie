@@ -1042,6 +1042,9 @@ async def _consume(
                 if termination is not None:
                     classification = "sandbox-terminated"
                     acc.error_message = failures._sandbox_termination_detail(termination)
+                    termination_carry = constants._SANDBOX_TERMINATION_CARRY.get()
+                    if termination_carry is not None:
+                        termination_carry.termination = termination
         return failures.TurnOutcome(
             terminal_ok=False,
             saw_side_effect=acc.saw_side_effect,
