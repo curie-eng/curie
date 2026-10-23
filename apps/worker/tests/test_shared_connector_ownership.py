@@ -34,13 +34,19 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import yaml  # noqa: E402
 from test_shared_connector_apply import (  # noqa: E402
     ALIAS,
     DEDICATED,
+    DEDICATED_SPEC,
+    OWNER_LABEL,
     RELEASE,
     Deployed,
     World,
     _required_valkey,
+    archive,
+    b64,
+    bundle_files,
     cleanup,
     dsn_secret_name,
     fail_render,
@@ -422,3 +428,235 @@ def test_undeployed_agent_reach_swept(world: World) -> None:
     assert world.cluster.reach(first.agent_id) == {}
     assert world.cluster.reach(second.agent_id) == kept
     assert _survivors(world, application_id) == survivors
+
+
+# =============================================================================
+# Review r1: isolation outlives the workload (CR1-2)
+# =============================================================================
+
+
+def _isolation(world: World, application_id: str) -> set[tuple[str, str]]:
+    """The application's Service and NetworkPolicies, which must outlive its Pods."""
+
+    return {
+        (obj["kind"], obj["metadata"]["name"])
+        for obj in world.expected_application(application_id)
+        if obj["kind"] in ("Service", "NetworkPolicy")
+    }
+
+
+def test_failed_deployment_delete_keeps_isolation(
+    world: World, worker_logs: pytest.LogCaptureFixture
+) -> None:
+    application_id = world.application()
+    member = world.member(application_id)
+    world.converge(application_id)
+    deployment = world.deployment_name(application_id)
+    isolation = _isolation(world, application_id)
+    world.deploy(member, shared={})
+    world.cluster.fail_delete = lambda kind, name: kind == "Deployment" and name == deployment
+
+    summary = world.run_pass()
+
+    assert ("delete", "Deployment", deployment) in world.last, "the delete was attempted"
+    assert ("Deployment", deployment) in world.cluster.objects
+    for key in sorted(isolation):
+        assert key in world.cluster.objects, key
+        assert key not in _deleted(world), key
+    assert summary.failed >= 1
+    assert logged(worker_logs, "shared_delete_failed")
+
+    # Liveness: the fault cleared, the next pass deletes everything.
+    world.cluster.fail_delete = lambda _kind, _name: False
+    world.run_pass()
+    _assert_gone(world, application_id)
+
+
+def test_terminating_deployment_keeps_isolation(world: World) -> None:
+    application_id = world.application()
+    member = world.member(application_id)
+    world.converge(application_id)
+    deployment = world.deployment_name(application_id)
+    isolation = _isolation(world, application_id)
+    survivors = _survivors_secrets(world, application_id)
+    world.cluster.terminating.add(deployment)
+    world.deploy(member, shared={})
+
+    for number in range(2):
+        world.run_pass()
+        live = world.cluster.objects.get(("Deployment", deployment))
+        assert live is not None and live["metadata"].get("deletionTimestamp"), number
+        for key in sorted(isolation):
+            assert key in world.cluster.objects, (number, key)
+            assert key not in _deleted(world), (number, key)
+    assert ("delete", "Deployment", deployment) in world.cluster.calls
+
+    # Liveness: once the Deployment is gone, the next pass removes the rest.
+    world.cluster.finish_termination(deployment)
+    world.run_pass()
+    assert world.cluster.application_objects(application_id) == {}
+    assert isolation <= set(_deleted(world)), _deleted(world)
+    assert _survivors_secrets(world, application_id) == survivors
+
+
+# =============================================================================
+# Review r1: a dedicated holder outlives its shared replacement's start (CR1-1)
+# =============================================================================
+
+REMOVED = "loki"
+OWNED_KEY = "GRAFANA_TOKEN"
+
+
+def _deploy_connectors(
+    world: World, agent: tuple[str, str] | Deployed, connectors: dict[str, Any]
+) -> Deployed:
+    """A new active version of ``agent`` declaring exactly ``connectors``."""
+
+    agent_id, name = (agent.agent_id, agent.name) if isinstance(agent, Deployed) else agent
+    version_id = world._version(agent_id)
+    data = archive(bundle_files(yaml.safe_dump({"connectors": connectors}, sort_keys=True)))
+    uploaded = world.upload(agent_id, version_id, data)
+    assert uploaded.status_code == 201, uploaded.text
+    world._deploy_version(agent_id, version_id)
+    return Deployed(agent_id, name, version_id)
+
+
+def _shared_ref(application_id: str) -> dict[str, Any]:
+    return {"shared": {"application": application_id, "contract": 1}}
+
+
+def _dedicated_objects(world: World, agent_name: str, connector: str) -> set[tuple[str, str]]:
+    """Live objects the agent owns for ``connector``, by the frozen name label."""
+
+    from plugin_format.connector_render import direct_service_name, object_name
+
+    selected = object_name(RELEASE, agent_name, connector)
+    direct = direct_service_name(RELEASE, agent_name, connector)
+    return {
+        (kind, name)
+        for (kind, name), obj in world.cluster.objects.items()
+        if (obj["metadata"].get("labels") or {}).get(OWNER_LABEL) == agent_name
+        and (
+            (obj["metadata"].get("labels") or {}).get("app.kubernetes.io/name") == selected
+            or name == direct
+        )
+    }
+
+
+def _dedicated_deleted(world: World) -> set[tuple[str, str]]:
+    return {(kind, name) for verb, kind, name in world.last if verb == "dedicated-delete"}
+
+
+def _assert_retained(world: World, retained: set[tuple[str, str]], label: str) -> None:
+    for key in sorted(retained):
+        assert key in world.cluster.objects, (label, key)
+        assert key not in _dedicated_deleted(world), (label, key)
+
+
+def test_cutover_to_shared_retains_dedicated_until_ready(world: World) -> None:
+    """ADR 0239 Restore 6: the old holder is pruned only after the application is ready.
+
+    A version replaces dedicated ``grafana`` (whose owned Secret it mounts)
+    with a shared reference under the same name, and drops ``loki`` outright.
+    """
+
+    application_id = world.application()
+    agent = world.agent()
+    first = _deploy_connectors(
+        world,
+        agent,
+        {DEDICATED: {**DEDICATED_SPEC, "secrets": [OWNED_KEY]}, REMOVED: dict(DEDICATED_SPEC)},
+    )
+    response = world.render(first)
+    assert response.status_code == 200, response.text
+    owned_secret = str(response.json()["owned_secret_name"])
+    assert owned_secret
+    world.cluster.seed_secret(
+        owned_secret,
+        labels={OWNER_LABEL: agent[1]},
+        data={OWNED_KEY: b64("operator-supplied")},
+    )
+    world.run_pass()
+    replaced = _dedicated_objects(world, agent[1], DEDICATED)
+    removed = _dedicated_objects(world, agent[1], REMOVED)
+    assert {kind for kind, _ in replaced} >= {"Deployment", "Service"}, replaced
+    assert ("Deployment", next(n for k, n in removed if k == "Deployment")) in removed
+    retained = replaced | {("Secret", owned_secret)}
+
+    world.join(application_id, agent[0], (DEDICATED,))
+    second = _deploy_connectors(world, agent, {DEDICATED: _shared_ref(application_id)})
+    world.assert_declared(second, application_id)
+
+    # Unprovisioned (no sealed DSN, so no shared Deployment), for two passes.
+    for number in range(2):
+        world.run_pass()
+        _assert_retained(world, retained, f"unprovisioned pass {number}")
+        assert world.cluster.application_objects(application_id) == {}
+        if number == 0:
+            # The alias removed outright is pruned in the very first pass.
+            assert removed <= _dedicated_deleted(world), sorted(removed)
+            assert not removed & set(world.cluster.objects), sorted(removed)
+
+    # Provisioned and applied, but the shared Deployment is not ready yet.
+    world.provision(application_id)
+    world.run_pass()
+    shared_deployment = world.deployment_name(application_id)
+    assert ("Deployment", shared_deployment) in world.cluster.objects
+    _assert_retained(world, retained, "applied, not ready")
+    world.cluster.set_status(shared_deployment, "progressing")
+    world.run_pass()
+    _assert_retained(world, retained, "progressing")
+
+    # First ready observation: the dedicated half ran before it, so still retained.
+    world.cluster.set_status(shared_deployment, "available")
+    world.run_pass()
+    _assert_retained(world, retained, "first ready observation")
+
+    # Recovery: the next pass prunes the old holder, owned Secret included.
+    world.run_pass()
+    assert retained <= _dedicated_deleted(world), sorted(retained - _dedicated_deleted(world))
+    assert not retained & set(world.cluster.objects), retained & set(world.cluster.objects)
+
+
+def test_cutover_removed_alias_pruned_in_first_pass(world: World) -> None:
+    """Negative control on its own: no shared reference, no retention."""
+
+    agent = world.agent()
+    world.deploy(agent, shared={})
+    world.run_pass()
+    dedicated = _dedicated_objects(world, agent[1], DEDICATED)
+    assert {kind for kind, _ in dedicated} >= {"Deployment", "Service"}, dedicated
+
+    world.deploy(agent, shared={}, dedicated=None)
+    world.run_pass()
+
+    assert dedicated <= _dedicated_deleted(world)
+    assert not dedicated & set(world.cluster.objects)
+
+
+def test_cutover_after_restart_prunes_in_the_following_pass(world: World) -> None:
+    """A restarted worker has observed no readiness: retention lasts one extra pass."""
+
+    application_id = world.application()
+    world.member(application_id)
+    world.converge(application_id)
+    world.cluster.set_status(world.deployment_name(application_id), "available")
+    world.run_pass()
+    assert world.record(application_id)["database"]["status"] == "ready"
+
+    agent = world.agent()
+    world.deploy(agent, shared={})
+    world.run_pass()
+    retained = _dedicated_objects(world, agent[1], DEDICATED)
+    assert {kind for kind, _ in retained} >= {"Deployment", "Service"}, retained
+    world.join(application_id, agent[0], (DEDICATED,))
+    switched = _deploy_connectors(world, agent, {DEDICATED: _shared_ref(application_id)})
+    world.assert_declared(switched, application_id)
+
+    world._loop = world.build_loop()  # the worker restarted
+    world.run_pass()
+    _assert_retained(world, retained, "first pass after restart")
+
+    world.run_pass()
+    assert retained <= _dedicated_deleted(world), sorted(retained - _dedicated_deleted(world))
+    assert not retained & set(world.cluster.objects)

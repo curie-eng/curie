@@ -233,6 +233,16 @@ class RecordedCluster:
     6. The metadata-only read (``Accept:
        application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1``)
        returns no ``data``: here it answers presence only.
+    7. ``KubernetesSharedClient.delete`` deletes a Deployment with
+       ``propagationPolicy: Foreground`` (pinned against the generated API
+       call by ``test_kubernetes_shared_client_deletes_deployments_in_foreground``).
+       The server then sets ``metadata.deletionTimestamp`` and the
+       ``foregroundDeletion`` finalizer and keeps the Deployment listed until
+       its ReplicaSets and Pods are gone (Kubernetes docs, "Garbage
+       Collection", foreground cascading deletion). A Deployment named in
+       ``terminating`` behaves that way until ``finish_termination``; any
+       other is gone at once, as one whose Pods were already gone. A delete
+       ``fail_delete`` selects raises ``ApiException`` 500.
 
     The fake never reads what it stored back through any production
     serializer; tests compare its records with independently computed
@@ -253,6 +263,11 @@ class RecordedCluster:
         self.operator_secrets: set[str] = set()
         self.statuses: dict[str, dict[str, Any]] = {}
         self.fail_apply: Callable[[Mapping[str, Any]], bool] = lambda _obj: False
+        self.fail_delete: Callable[[str, str], bool] = lambda _kind, _name: False
+        # Deployments whose Pods are still terminating (item 7), and the
+        # options every shared delete was sent with.
+        self.terminating: set[str] = set()
+        self.delete_options: list[tuple[str, str, dict[str, Any]]] = []
         # Names whose next exact list misses them: a create race another
         # writer won between this worker's list and its create.
         self.hidden_secrets: set[str] = set()
@@ -351,6 +366,15 @@ class RecordedCluster:
     def set_status(self, deployment_name: str, shape: str) -> None:
         self.statuses[deployment_name] = recorded_status(shape)
 
+    def finish_termination(self, deployment_name: str) -> None:
+        """The terminating Deployment's Pods are gone: the garbage collector removes it."""
+
+        self.terminating.discard(deployment_name)
+        stored = self.objects.get(("Deployment", deployment_name))
+        assert stored is not None, deployment_name
+        assert stored["metadata"].get("deletionTimestamp"), "never deleted"
+        del self.objects[("Deployment", deployment_name)]
+
     # --- observations -------------------------------------------------------
 
     def secret(self, name: str) -> dict[str, Any] | None:
@@ -430,14 +454,30 @@ class FakeSharedClient(_Facade):
             raise ApiException(status=422, reason="Unprocessable Entity")
         cluster._store(obj)
 
-    def delete(self, namespace: str, kind: str, name: str) -> None:
+    def delete(self, namespace: str, kind: str, name: str, **options: Any) -> None:
         cluster = self.cluster
         cluster._namespace(namespace)
         cluster.calls.append(("delete", kind, name))
+        cluster.delete_options.append((kind, name, dict(options)))
         if kind == "Secret":
             raise cluster.refuse(f"delete of Secret {name}")
-        if cluster.objects.pop((kind, name), None) is None:
+        propagation = options.get("propagation_policy")
+        if kind == "Deployment" and propagation not in (None, "Foreground"):
+            raise cluster.refuse(f"Deployment {name} deleted with {propagation} propagation")
+        if cluster.fail_delete(kind, name):
+            raise ApiException(status=500, reason="Internal Server Error")
+        stored = cluster.objects.get((kind, name))
+        if stored is None:
             raise ApiException(status=404, reason="Not Found")
+        if kind == "Deployment" and name in cluster.terminating:
+            # Foreground deletion (item 7): still listed until its Pods are gone.
+            metadata = stored["metadata"]
+            metadata.setdefault("deletionTimestamp", "2026-10-23T00:05:00Z")
+            finalizers = metadata.setdefault("finalizers", [])
+            if "foregroundDeletion" not in finalizers:
+                finalizers.append("foregroundDeletion")
+            return
+        del cluster.objects[(kind, name)]
 
     def create_secret(self, namespace: str, body: dict[str, Any]) -> str:
         cluster = self.cluster
@@ -1461,3 +1501,195 @@ def test_two_aliases_of_one_application_apply_one_reach_set(world: World) -> Non
     applied = [name for name in world.last_of("apply", "NetworkPolicy") if name in expected]
     assert sorted(applied) == sorted(expected), "each reach object applied once per pass"
     assert_reach_equal_render(world, application_id, member.agent_id)
+
+
+# =============================================================================
+# Review r1: ingress isolation before the workload, stored Secret references
+# =============================================================================
+
+
+def _application_policy_names(world: World, application_id: str) -> set[str]:
+    return {
+        obj["metadata"]["name"]
+        for obj in world.expected_application(application_id)
+        if obj["kind"] == "NetworkPolicy"
+    }
+
+
+def _deny_name(world: World, application_id: str) -> str:
+    (deny,) = [
+        obj["metadata"]["name"]
+        for obj in world.expected_application(application_id)
+        if obj["kind"] == "NetworkPolicy" and obj["spec"].get("ingress") == []
+    ]
+    return str(deny)
+
+
+def test_policies_applied_before_deployment(world: World) -> None:
+    """CR1-2: a fresh apply sends every application policy and the Service first."""
+
+    application_id = world.application()
+    world.member(application_id)
+    world.run_pass()
+    world.provision(application_id)
+
+    world.run_pass()
+
+    deployment = world.deployment_name(application_id)
+    policies = _application_policy_names(world, application_id)
+    service = next(
+        obj["metadata"]["name"]
+        for obj in world.expected_application(application_id)
+        if obj["kind"] == "Service"
+    )
+    applies = [(kind, name) for verb, kind, name in world.last if verb == "apply"]
+    assert ("Deployment", deployment) in applies, "liveness: the Deployment was applied"
+    at = applies.index(("Deployment", deployment))
+    before = {name for kind, name in applies[:at] if kind == "NetworkPolicy"}
+    assert policies <= before, ("a policy applied after the Deployment", applies)
+    assert ("Service", service) in applies[:at], applies
+
+
+def test_policy_apply_failure_holds_back_deployment(
+    world: World, worker_logs: pytest.LogCaptureFixture
+) -> None:
+    """CR1-2: no Deployment is applied in a pass whose deny policy did not apply."""
+
+    application_id = world.application()
+    world.member(application_id)
+    world.run_pass()
+    world.provision(application_id)
+    deny = _deny_name(world, application_id)
+    deployment = world.deployment_name(application_id)
+    world.cluster.fail_apply = lambda obj: (
+        obj["kind"] == "NetworkPolicy" and obj["metadata"]["name"] == deny
+    )
+
+    summary = world.run_pass()
+
+    assert ("apply", "NetworkPolicy", deny) in world.last, "the policy apply was attempted"
+    assert ("apply", "Deployment", deployment) not in world.last, world.last
+    assert ("Deployment", deployment) not in world.cluster.objects
+    assert summary.failed >= 1
+    assert logged(worker_logs, "shared_apply_failed")
+
+    # Liveness: the fault cleared, the next pass applies the policy, then the workload.
+    world.cluster.fail_apply = lambda _obj: False
+    world.run_pass()
+    assert ("NetworkPolicy", deny) in world.cluster.objects
+    assert ("Deployment", deployment) in world.cluster.objects
+    assert_application_objects_equal_render(world, application_id)
+
+
+@pytest.mark.parametrize(
+    "drift",
+    [
+        pytest.param(
+            {"encryption_key": {"name": "acme-encryption", "key": "private"}}, id="key-ref"
+        ),
+        pytest.param({"database_dsn": {"name": "acme-database", "key": "dsn"}}, id="bundled-dsn"),
+        pytest.param(
+            {"grant_store": {"name": KEY_SECRET_PREFIX + "0" * 8, "key": "url"}},
+            id="operator-ref-worker-prefix",
+        ),
+    ],
+)
+def test_stored_secret_ref_invalid_refuses_application(
+    world: World, worker_logs: pytest.LogCaptureFixture, drift: dict[str, Any]
+) -> None:
+    """CR1-3: a stored spec naming a Secret the worker never creates is refused.
+
+    The bad spec is written straight into the stored row (registration
+    refuses it), after the member's bundle was accepted.
+    """
+
+    from _shared_connector_support import recipient_rows, rewrite_stored_spec
+
+    drifted, healthy = world.application(), world.application()
+    member = world.member(drifted)
+    world.member(healthy)
+    rewrite_stored_spec(drifted, drift)
+    recipients_before = recipient_rows(drifted)
+
+    summary = world.run_pass()
+
+    touched = [
+        (verb, name)
+        for verb, _, name in world.last
+        if drifted in name and verb in ("create", "apply")
+    ]
+    assert touched == [], touched
+    assert world.cluster.secret(key_secret_name(drifted)) is None
+    assert world.cluster.secret(dsn_secret_name(drifted)) is None
+    assert recipient_rows(drifted) == recipients_before == []
+    assert world.cluster.application_objects(drifted) == {}
+    assert world.cluster.reach(member.agent_id) == {}
+    assert summary.failed >= 1
+    assert logged(worker_logs, "shared_application_secret_ref_invalid")
+    # Liveness: the canonical application in the same pass got its key and recipient.
+    assert world.cluster.secret(key_secret_name(healthy)) is not None
+    assert len(world.current_recipients(healthy)) == 1
+
+
+def _delete_propagation(kwargs: Mapping[str, Any]) -> str | None:
+    """The propagation policy a generated ``delete_namespaced_*`` call carries, if any."""
+
+    if kwargs.get("propagation_policy") is not None:
+        return str(kwargs["propagation_policy"])
+    body = kwargs.get("body")
+    if body is None:
+        return None
+    if isinstance(body, Mapping):
+        value = body.get("propagationPolicy", body.get("propagation_policy"))
+        return None if value is None else str(value)
+    value = getattr(body, "propagation_policy", None)
+    return None if value is None else str(value)
+
+
+def test_kubernetes_shared_client_deletes_deployments_in_foreground() -> None:
+    """CR1-2: the real client asks the API server for foreground deletion of a Deployment.
+
+    Only the generated API classes are replaced; ``delete`` is the production
+    method. Other kinds keep the server's default propagation.
+    """
+
+    from curie_worker.shared_k8s import KubernetesSharedClient
+    from kubernetes import client as k8s_client
+
+    calls: list[tuple[str, str, str, dict[str, Any]]] = []
+
+    class RecordingApi:
+        def __getattr__(self, method: str) -> Any:
+            if not method.startswith("delete_namespaced_"):
+                raise AttributeError(method)
+
+            def call(name: str, namespace: str, *args: Any, **kwargs: Any) -> None:
+                if args:
+                    kwargs = {"body": args[0], **kwargs}
+                calls.append((method, name, namespace, kwargs))
+
+            return call
+
+    client = KubernetesSharedClient.__new__(KubernetesSharedClient)
+    client._kubeconfig = None
+    client._loaded = True
+    client._apis = {
+        k8s_client.AppsV1Api: RecordingApi(),
+        k8s_client.CoreV1Api: RecordingApi(),
+        k8s_client.NetworkingV1Api: RecordingApi(),
+    }
+
+    client.delete(NAMESPACE, "Deployment", "shared-app-x")
+    client.delete(NAMESPACE, "Service", "shared-service-x")
+    client.delete(NAMESPACE, "NetworkPolicy", "shared-deny-x")
+
+    by_method = {method: kwargs for method, _, _, kwargs in calls}
+    assert [(method, name) for method, name, _, _ in calls] == [
+        ("delete_namespaced_deployment", "shared-app-x"),
+        ("delete_namespaced_service", "shared-service-x"),
+        ("delete_namespaced_network_policy", "shared-deny-x"),
+    ]
+    assert all(namespace == NAMESPACE for _, _, namespace, _ in calls)
+    assert _delete_propagation(by_method["delete_namespaced_deployment"]) == "Foreground"
+    assert _delete_propagation(by_method["delete_namespaced_service"]) is None
+    assert _delete_propagation(by_method["delete_namespaced_network_policy"]) is None

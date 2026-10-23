@@ -41,7 +41,9 @@ from _shared_connector_support import (
     canonical,
     connectors_yaml,
     random_installation,
+    recipient_rows,
     restore_installation,
+    rewrite_stored_spec,
     shared_app,
     shared_entry,
 )
@@ -393,3 +395,50 @@ def test_remote_dedicated_sibling_renders_beside_shared(store: SharedStore) -> N
     assert body["manifests"] == []
     assert sorted(body["mcp_entries"]) == ["internal"]
     assert [entry["name"] for entry in body["shared"]] == [ALIAS]
+
+
+@pytest.mark.parametrize(
+    "drift",
+    [
+        pytest.param(
+            {"encryption_key": {"name": "acme-encryption", "key": "private"}}, id="key-ref"
+        ),
+        pytest.param({"database_dsn": {"name": "acme-database", "key": "dsn"}}, id="bundled-dsn"),
+        pytest.param(
+            {"snapshot_seal": {"name": "shared-dsn-" + "0" * 8, "key": "seal"}},
+            id="operator-ref-worker-prefix",
+        ),
+    ],
+)
+def test_render_refuses_stored_spec_with_invalid_secret_ref(
+    store: SharedStore, drift: dict[str, Any]
+) -> None:
+    """Review r1 CR1-3: the agent render resolves the stored spec and refuses it, never omits."""
+
+    application_id = store.register_application()["application_id"]
+    agent_id = store.create_agent()
+    version_id = _member_version(store, application_id, agent_id)
+    store.register_recipient(application_id)
+    # Liveness before the drift: the member renders.
+    assert _ok(store.render(agent_id, version_id))["shared"]
+    rewrite_stored_spec(application_id, drift)
+    before = recipient_rows(application_id)
+
+    assert_declaration_refused(
+        store.render(agent_id, version_id),
+        409,
+        "shared_application_secret_ref_invalid",
+        application=application_id,
+        connector=ALIAS,
+        declared=[application_id],
+    )
+    assert recipient_rows(application_id) == before
+
+    # Liveness: another member of a canonical stored spec still renders.
+    other_application = store.register_application()["application_id"]
+    other_agent = store.create_agent()
+    other_version = _member_version(store, other_application, other_agent)
+    body = _ok(store.render(other_agent, other_version))
+    assert canonical(body["shared"][0]["reach"]) == canonical(
+        render_member_reach(_stored_spec(other_application), _member(other_agent))
+    )

@@ -325,6 +325,53 @@ def application_row(application_id: str) -> dict[str, Any]:
     return row
 
 
+def rewrite_stored_spec(application_id: str, changes: Mapping[str, Any]) -> dict[str, Any]:
+    """Overwrite fields of a stored application's spec, as a drifted or pre-check row.
+
+    Registration refuses a non-canonical Secret reference and the pinned
+    column trigger refuses any spec update, so the row is rewritten with
+    triggers off for this one transaction (``session_replication_role``),
+    the pattern the work item tests use for guarded columns. Answers the
+    stored spec as written.
+    """
+
+    spec = dict(application_row(application_id)["spec"])
+    spec.update(json.loads(json.dumps(dict(changes))))
+
+    async def run() -> None:
+        from sqlalchemy import text
+        from sqlalchemy.ext.asyncio import create_async_engine
+
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(text("SET LOCAL session_replication_role = replica"))
+                await conn.execute(
+                    text(
+                        "UPDATE curie.shared_connector_applications "
+                        "SET spec = CAST(:spec AS jsonb) WHERE id = :id"
+                    ),
+                    {"spec": json.dumps(spec), "id": uuid.UUID(application_id)},
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(run())
+    stored: dict[str, Any] = application_row(application_id)["spec"]
+    assert stored == spec, "the stored spec was not rewritten"
+    return stored
+
+
+def recipient_rows(application_id: str) -> list[dict[str, Any]]:
+    """Every recipient row of an application, in ordinal order, as stored."""
+
+    return sql_dicts(
+        "SELECT recipient_id, ordinal, retired_at FROM curie.shared_connector_recipients "
+        "WHERE application_id = :id ORDER BY ordinal",
+        {"id": uuid.UUID(application_id)},
+    )
+
+
 def database_role_rows(application_id: str) -> list[dict[str, Any]]:
     return sql_dicts(
         "SELECT * FROM curie.shared_connector_database_roles WHERE application_id = :id",

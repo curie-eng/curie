@@ -61,7 +61,9 @@ Phases, each assertion printed as one PASS line:
    generation and template), the Service, both policies and both Secrets
    remain. B then deploys a version without the alias: same survivors. A
    then deploys a version without the alias: the application objects are
-   deleted in that pass and the key and DSN Secrets remain unchanged.
+   deleted, over as many passes as the foreground Deployment deletion takes;
+   the deny ingress policy exists whenever the Deployment is still listed,
+   both are gone at the end, and the key and DSN Secrets remain unchanged.
 
 ``SCK_RECORD_STATUS_FIXTURES=<dir>`` also records the Deployment status
 shapes AC3's suite replays (available, progressing, deadline exceeded).
@@ -1173,10 +1175,48 @@ async def scenario(run: Run, kube: Kube, api: Api, loop: Any, log: PassLog, agen
         kube.list("networkpolicy", reach_selector(run, agents.ids["a"])) == [],
         "A's reach is deleted once A no longer declares the application",
     )
+    # The Deployment is deleted with foreground propagation, so it stays listed
+    # (with a deletionTimestamp) until its ReplicaSets and Pods are gone, and
+    # the application's ingress deny policy must outlive it. Later passes
+    # finish the cleanup; every observation while the Deployment is listed
+    # must still find the deny policy.
+    deployment_name = deployment["metadata"]["name"]
+    deny_name = by_kind[("NetworkPolicy", "deny")]["metadata"]["name"]
+    listed_with_deny: list[bool] = []
+    for number in range(30):
+        still = kube.get("deployment", deployment_name)
+        if still is not None:
+            listed_with_deny.append(kube.get("networkpolicy", deny_name) is not None)
+            terminating = still["metadata"].get("deletionTimestamp") is not None
+            check(
+                not terminating
+                or "foregroundDeletion" in (still["metadata"].get("finalizers") or []),
+                "a terminating application Deployment was deleted with foreground propagation",
+                str(still["metadata"].get("finalizers")),
+            )
+        remaining = [
+            name
+            for name, obj in survivors.items()
+            if kube.get(obj["kind"].lower(), name) is not None
+        ]
+        if not remaining:
+            break
+        time.sleep(2)
+        await run_pass(loop, log, f"pass 7.{number + 1} (application cleanup)")
+    check(
+        all(listed_with_deny),
+        "the application's deny ingress policy exists whenever its Deployment is still listed",
+        f"{len(listed_with_deny)} observation(s): {listed_with_deny}",
+    )
     gone = [
         name for name, obj in survivors.items() if kube.get(obj["kind"].lower(), name) is not None
     ]
     check(gone == [], "the last declaration removed deletes the application objects", str(gone))
+    check(
+        kube.get("deployment", deployment_name) is None
+        and kube.get("networkpolicy", deny_name) is None,
+        "the application Deployment and its deny ingress policy are both gone at the end",
+    )
     check(
         all(rv(kube.must("secret", name)) == version for name, version in secrets_before.items()),
         "the key and DSN Secrets outlive the application objects, unchanged",

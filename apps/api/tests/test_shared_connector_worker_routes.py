@@ -55,6 +55,8 @@ from _shared_connector_support import (
     key_secret_ref,
     operator_headers,
     random_installation,
+    recipient_rows,
+    rewrite_stored_spec,
     shared_app,
     worker_headers,
 )
@@ -493,3 +495,57 @@ def test_resolve_route_codes(
             409,
             "shared_installation_unavailable",
         )
+
+
+# --- 8. stored specs are checked on every worker read (review r1, CR1-3) -------
+
+
+def _stored_ref_drifts(application_id: str) -> dict[str, dict[str, Any]]:
+    """Stored spec changes registration refuses: references the worker never creates."""
+
+    other = str(uuid.uuid4())
+    return {
+        "key-ref-non-canonical": {"encryption_key": {"name": "acme-encryption", "key": "private"}},
+        "bundled-dsn-non-canonical": {"database_dsn": dict(DSN_SECRET)},
+        "operator-ref-worker-prefix": {
+            "grant_store": {"name": KEY_SECRET_PREFIX + other, "key": "url"}
+        },
+        "managed-dsn-worker-prefix": {
+            "dsn_encoding": "managed-raw",
+            "database_dsn": {"name": DSN_SECRET_PREFIX + application_id, "key": "dsn"},
+        },
+    }
+
+
+@pytest.mark.parametrize("drift", list(_stored_ref_drifts(str(uuid.uuid4()))))
+def test_stored_spec_secret_ref_invalid_refuses_worker_reads(
+    store: SharedStore, drift: str
+) -> None:
+    application_id = store.register_application()["application_id"]
+    canonical_id = store.register_application()["application_id"]
+    agent_id = store.create_agent()
+    store.member(application_id, agent_id, "tracker")
+    store.member(canonical_id, agent_id, "wiki")
+    store.register_recipient(application_id)
+    rewrite_stored_spec(application_id, _stored_ref_drifts(application_id)[drift])
+    before = recipient_rows(application_id)
+    assert len(before) == 1
+
+    assert_refused(
+        store.application_render(application_id), 409, "shared_application_secret_ref_invalid"
+    )
+    assert_declaration_refused(
+        store.resolve(agent_id, [{"name": "tracker", "application": application_id}]),
+        409,
+        "shared_application_secret_ref_invalid",
+        application=application_id,
+        connector="tracker",
+    )
+    assert recipient_rows(application_id) == before, drift
+
+    # Liveness: the canonical stored spec still renders and resolves.
+    assert canonical(_rendered(store, canonical_id)["objects"]) == canonical(
+        render_application(_stored_spec(canonical_id))
+    )
+    resolved = store.resolve(agent_id, [{"name": "wiki", "application": canonical_id}])
+    assert resolved.status_code == 200, resolved.text
