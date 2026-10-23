@@ -416,8 +416,14 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # header only when it is set. It is not a BootEnv field: the caller
         # token contract stays unchanged.
         "CURIE_CONNECTOR_TOOL_GRANT",
+        # ADR 0240 decision 2: the route tokens, written beside BootEnv the
+        # same way, and the descriptor the runner hands a declared caller.
+        # Neither is a BootEnv field, so the ACI contract stays unchanged.
+        "CURIE_CONNECTOR_ROUTE_TOKENS",
+        "CURIE_CONNECTOR_ROUTES_FD",
         # The connector proxy process, not the sandbox. The API render writes
         # these onto the proxy container.
+        "CURIE_CALLER_PROXY_ROUTES",
         "CURIE_CALLER_PROXY_GATED_TOOLS",
         "CURIE_CALLER_PROXY_CONNECTOR",
         "CURIE_CALLER_PROXY_GRANT_STORE",

@@ -64,6 +64,7 @@ runner/tests/test_factory_preflight.py
 runner/tests/test_hooks.py
 runner/tests/test_preflight_blocked.py
 runner/tests/test_repository_verification.py
+runner/tests/test_route_callers.py
 runner/tests/test_tool_policy_enforcement.py
 runner/tests/test_workspace_preamble.py
 tests/test_repository_facts.py

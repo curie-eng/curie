@@ -19,6 +19,8 @@ import re
 from nacl.signing import SigningKey
 
 PREFIX = "cct"
+# A route token (ADR 0240 decision 2): the caller's claims plus one connector.
+ROUTE_PREFIX = "ccr"
 
 _SEED_BYTES = 32
 # ADR 0178 decision 1: lowercase hyphenated UUID text, one spelling.
@@ -62,17 +64,50 @@ def mint(
     signatures are, and the caller supplies ``exp``.
     """
 
+    _check_run_pair(run, work_item)
+    body: dict[str, object] = {"agent": agent, "exp": exp}
+    if run is not None:
+        body["run"] = run
+        body["work_item"] = work_item
+    return _signed(signing_key_text, PREFIX, body)
+
+
+def mint_route(
+    signing_key_text: str,
+    *,
+    agent: str,
+    connector: str,
+    exp: int,
+    run: str | None = None,
+    work_item: str | None = None,
+) -> str:
+    """A ``ccr`` route token: ``mint``'s claims plus the one ``connector``.
+
+    ADR 0240 decision 2. The proxy admits it only on that connector's declared
+    routes, and a ``cct`` never there.
+    """
+
+    if not connector:
+        raise ValueError("a route token names its connector")
+    _check_run_pair(run, work_item)
+    body: dict[str, object] = {"agent": agent, "connector": connector, "exp": exp}
+    if run is not None:
+        body["run"] = run
+        body["work_item"] = work_item
+    return _signed(signing_key_text, ROUTE_PREFIX, body)
+
+
+def _check_run_pair(run: str | None, work_item: str | None) -> None:
     if (run is None) != (work_item is None):
         raise ValueError("run and work_item are present together or not at all")
     if run is not None and (
         _UUID.fullmatch(run) is None or _UUID.fullmatch(work_item or "") is None
     ):
         raise ValueError("run and work_item must be lowercase hyphenated uuids")
-    body: dict[str, object] = {"agent": agent, "exp": exp}
-    if run is not None:
-        body["run"] = run
-        body["work_item"] = work_item
+
+
+def _signed(signing_key_text: str, prefix: str, body: dict[str, object]) -> str:
     payload = json.dumps(body, separators=(",", ":"), sort_keys=True).encode("ascii")
-    signing_input = f"{PREFIX}.{_b64url(payload)}"
+    signing_input = f"{prefix}.{_b64url(payload)}"
     signature = signing_key(signing_key_text).sign(signing_input.encode("ascii")).signature
     return f"{signing_input}.{_b64url(signature)}"

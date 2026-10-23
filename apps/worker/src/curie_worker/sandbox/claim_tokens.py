@@ -45,17 +45,24 @@ CLAIM_LABEL = "curietech.ai/sandbox-claim"
 #   history/memory/state/progress_token  ``sbx.`` scoped state-store tokens
 #   issue_read_token        ``wir.`` work-item issue read token
 #   connector_caller_token  ``cct.`` hosted-connector caller identity
-CLAIM_TOKEN_ENVS: tuple[str, ...] = tuple(
-    BootEnv.env_key(field)
-    for field in (
-        "runner_token",
-        "history_token",
-        "memory_token",
-        "state_token",
-        "progress_token",
-        "issue_read_token",
-        "connector_caller_token",
-    )
+# and the tokens the worker writes beside the render, which are not BootEnv
+# fields (WORKER_TOKEN_ENVS).
+#   CURIE_CONNECTOR_ROUTE_TOKENS  ``ccr.`` route tokens (ADR 0240 decision 2)
+WORKER_TOKEN_ENVS: tuple[str, ...] = ("CURIE_CONNECTOR_ROUTE_TOKENS",)
+CLAIM_TOKEN_ENVS: tuple[str, ...] = (
+    *(
+        BootEnv.env_key(field)
+        for field in (
+            "runner_token",
+            "history_token",
+            "memory_token",
+            "state_token",
+            "progress_token",
+            "issue_read_token",
+            "connector_caller_token",
+        )
+    ),
+    *WORKER_TOKEN_ENVS,
 )
 
 _RUNNER_CONTAINER = "runner"

@@ -527,3 +527,47 @@ def test_boot_env_omits_channel_kind_when_no_kind_is_passed() -> None:
     env = _boot_env(WorkerConfig(), _resolved())
     assert "CURIE_CHANNEL_KIND" not in env
     assert "CURIE_CHANNEL_BOUND" not in env
+
+
+def _route_boot(config: WorkerConfig, routes: frozenset[str], **kwargs: object) -> dict[str, str]:
+    resolver = BindingResolver.__new__(BindingResolver)
+    resolver._config = config  # type: ignore[attr-defined]
+    return resolver.boot_env(_resolved(), _THREAD, route_connectors=routes, **kwargs)  # type: ignore[arg-type]
+
+
+# @spec ADR-0240 d2
+def test_a_boot_carries_one_route_token_per_route_connector() -> None:
+    seed = _caller_seed()
+    run = "11111111-1111-4111-8111-111111111111"
+    work_item = "22222222-2222-4222-8222-222222222222"
+    env = _route_boot(
+        WorkerConfig(connector_caller_signing_key=seed, **_SCOPED),
+        frozenset({"reviewer", "uploads"}),
+        caller_run=run,
+        caller_work_item=work_item,
+    )
+    tokens = json.loads(env["CURIE_CONNECTOR_ROUTE_TOKENS"])
+    assert sorted(tokens) == ["reviewer", "uploads"]
+    caller = _claims(env["CURIE_CONNECTOR_CALLER_TOKEN"])
+    verify_key = SigningKey(base64.b64decode(seed)).verify_key
+    for connector, token in tokens.items():
+        prefix, payload, signature = token.split(".")
+        assert prefix == "ccr"
+        verify_key.verify(f"{prefix}.{payload}".encode("ascii"), _b64url_decode(signature))
+        # The caller token's claims and expiry, plus its one connector.
+        assert _claims(token) == {**caller, "connector": connector}
+    assert tokens["reviewer"] != tokens["uploads"]
+
+
+# @spec ADR-0240 d2
+def test_no_route_connector_no_key_or_no_scope_mints_no_route_token() -> None:
+    seed = _caller_seed()
+    assert "CURIE_CONNECTOR_ROUTE_TOKENS" not in _route_boot(
+        WorkerConfig(connector_caller_signing_key=seed, **_SCOPED), frozenset()
+    )
+    assert "CURIE_CONNECTOR_ROUTE_TOKENS" not in _route_boot(
+        WorkerConfig(**_SCOPED), frozenset({"reviewer"})
+    )
+    assert "CURIE_CONNECTOR_ROUTE_TOKENS" not in _route_boot(
+        WorkerConfig(connector_caller_signing_key=seed), frozenset({"reviewer"})
+    )

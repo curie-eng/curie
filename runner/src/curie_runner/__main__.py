@@ -134,6 +134,13 @@ from .progress import (
 )
 from .publication_precheck import PublicationPrecheck
 from .redact import collect_held_secrets, install_stdout_redaction
+from .route_callers import (
+    connector_urls,
+    mount_route_callers,
+    route_caller_lock_library,
+    route_callers,
+    take_route_tokens,
+)
 from .sdk_auth import (
     CREDENTIALS_ENV,
     DEFAULT_CREDENTIAL_ENV_KEYS,
@@ -1074,8 +1081,38 @@ def build_runner(
     # env. Bash and hooks must not inherit it (#3550).
     if spawn_env is os.environ:
         materialize_connector_caller_headers(derived_mcp_servers, os.environ)
+        route_tokens = take_route_tokens(os.environ)
     else:
         materialize_connector_caller_headers(derived_mcp_servers, spawn_env, os.environ)
+        route_tokens = take_route_tokens(spawn_env, os.environ)
+    # ADR 0240 decision 4: a stdio server a connector route names as a caller
+    # runs under the runner, not the CLI, and gets its route tokens on a pipe.
+    declared_callers = route_callers(config.session.plugin_dir, agent=config.connector_agent)
+    # Fake-model boots never execute bundle servers, including startup code
+    # that could call an external service before the first tool invocation.
+    if declared_callers and not fake_model:
+        route_relays = mount_route_callers(
+            bundle_servers,
+            callers=declared_callers,
+            tokens=route_tokens,
+            connector_urls=connector_urls(
+                config.session.plugin_dir,
+                release=config.connector_release,
+                agent=config.connector_agent,
+                namespace=config.connector_namespace,
+            ),
+            source_env=os.environ,
+            lock_library=route_caller_lock_library(os.environ),
+            # The bundle root, as the capability probe uses, never a
+            # directory Bash writes.
+            cwd=str(config.session.plugin_dir),
+        )
+        # Started now, at boot, before the runner serves any turn, so no turn's
+        # Bash exists yet when a caller starts and reads its routes.
+        for key in sorted(route_relays):
+            bundle_servers[key]["instance"].start()
+    # The route tokens are held values too: redact them like the caller token.
+    held_secrets = held_secrets | frozenset(route_tokens.values())
 
     real_options: ClaudeAgentOptions | None = None
     build_real_options: Callable[[str | None], ClaudeAgentOptions] | None = None
@@ -1803,6 +1840,8 @@ def _serve_executor(config: RunnerConfig, serving_token: str | None) -> None:
     )
     materialize_hosted_bearer_headers(connectors, os.environ)
     materialize_connector_caller_headers(connectors, os.environ)
+    # An executor runs one connector tool and mounts no bundle stdio server.
+    take_route_tokens(os.environ)
     app = create_executor_app(
         connectors,
         token=serving_token,

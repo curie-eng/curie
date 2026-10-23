@@ -110,6 +110,11 @@ pub struct ConnectorSpecDecl {
     /// written; the quantity and request-within-limit rules are Python's.
     #[serde(default)]
     pub resources: Option<ConnectorResourcesDecl>,
+    /// Non-MCP routes the caller proxy admits a connector-scoped route token
+    /// on (ADR 0240). Carried as written; `plugin_format.validate_connectors`
+    /// and `validate_bundle` own the path, method, size and caller rules.
+    #[serde(default)]
+    pub routes: Vec<ConnectorRouteDecl>,
 
     // -- remote form --
     pub url: Option<String>,
@@ -138,6 +143,21 @@ pub struct ConnectorSpecDecl {
     /// sandbox. See [`declared_secret_names`] and [`bearer_secret_name`].
     #[serde(default)]
     pub config: Vec<String>,
+}
+
+/// One entry of `routes:` on a hosted connector (ADR 0240).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectorRouteDecl {
+    pub path: String,
+    #[serde(default = "default_route_methods")]
+    pub methods: Vec<String>,
+    pub max_body_bytes: u64,
+    pub callers: Vec<String>,
+}
+
+fn default_route_methods() -> Vec<String> {
+    vec!["POST".to_string()]
 }
 
 /// `resources:` on a hosted connector: either side may be omitted.
@@ -211,6 +231,7 @@ impl Default for ConnectorSpecDecl {
             proxy_upstream_host: None,
             readiness_path: None,
             resources: None,
+            routes: Vec::new(),
             url: None,
             headers: BTreeMap::new(),
             secrets: Vec::new(),

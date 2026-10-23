@@ -598,10 +598,19 @@ async def _process_event(
             # No kind/address: there is no binding to scope the state
             # namespace to. No approval grant, resumed kind or decision
             # either: a targetless turn is never a resume.
+            # ADR 0240 decision 2: passed only when the bundle declares
+            # routes, so a binding that predates the keyword still boots.
+            route_connectors = await self._route_connectors(
+                getattr(resolved, "bundle_ref", None), str(agent_name or "")
+            )
+            targetless_kwargs: dict[str, Any] = (
+                {"route_connectors": route_connectors} if route_connectors else {}
+            )
             boot_env = binding.boot_env(
                 resolved,
                 thread_key,
                 token_ttl_s=self._runner.turn_deadline_s(claim._remaining_budget(lease)),
+                **targetless_kwargs,
             )
             workspace_deployment_id = resolved.deployment_id
             if resolved.deployment_id is not None:
@@ -839,6 +848,12 @@ async def _process_event(
                 boot_env_kwargs["caller_run"] = str(caller_for_boot.request_id)
                 boot_env_kwargs["caller_work_item"] = str(caller_for_boot.work_item_id)
                 boot_env_kwargs["caller_exp_ceiling"] = caller_ceiling
+            # ADR 0240 decision 2, passed only when the bundle declares routes.
+            route_connectors = await self._route_connectors(
+                getattr(resolved, "bundle_ref", None), str(getattr(resolved, "agent_name", ""))
+            )
+            if route_connectors:
+                boot_env_kwargs["route_connectors"] = route_connectors
             boot_env = self._binding.boot_env(
                 resolved,
                 thread_key,

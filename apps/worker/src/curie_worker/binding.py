@@ -115,6 +115,9 @@ PLUGIN_DIR_ENV = BootEnv.env_key("plugin_dir")
 BUDGET_ENV = BootEnv.env_key("budget")
 MAX_TURNS_ENV = BootEnv.env_key("max_turns")
 CONNECTOR_CALLER_TOKEN_ENV = BootEnv.env_key("connector_caller_token")
+# ADR 0240 decision 2. Not a BootEnv field: the worker writes it beside the
+# render, like CURIE_CONNECTOR_TOOL_GRANT. A JSON object, connector -> ccr.
+CONNECTOR_ROUTE_TOKENS_ENV = "CURIE_CONNECTOR_ROUTE_TOKENS"
 SESSION_ID_ENV = BootEnv.env_key("session_id")
 FAKE_MODEL_ENV = BootEnv.env_key("fake_model")
 CREDENTIALS_ENV = BootEnv.env_key("credentials_ref")
@@ -1207,6 +1210,7 @@ class BindingResolver:
         caller_work_item: str | None = None,
         caller_exp_ceiling: int | None = None,
         token_ttl_s: float | None = None,
+        route_connectors: frozenset[str] = frozenset(),
     ) -> dict[str, str]:
         """The env injected into the sandbox claim for a bound run.
 
@@ -1341,6 +1345,9 @@ class BindingResolver:
         # which is the stock install. render_worker emits it only with the
         # connector scope.
         connector_caller_token: str | None = None
+        # ADR 0240 decision 2: one ccr per hosted connector that declares
+        # routes, with the caller token's own claims and expiry.
+        route_tokens: dict[str, str] = {}
         if self._config.connector_caller_signing_key.strip():
             caller_exp = int(time.time()) + SANDBOX_TOKEN_TTL_SECONDS
             if caller_exp_ceiling is not None:
@@ -1352,6 +1359,15 @@ class BindingResolver:
                 run=caller_run,
                 work_item=caller_work_item,
             )
+            for connector in sorted(route_connectors):
+                route_tokens[connector] = caller_token.mint_route(
+                    self._config.connector_caller_signing_key,
+                    agent=resolved.agent_name,
+                    connector=connector,
+                    exp=caller_exp,
+                    run=caller_run,
+                    work_item=caller_work_item,
+                )
         env = BootEnv.render_worker(
             plugin_dir=self._config.bundle_plugin_dir,
             session_id=f"agent-{resolved.agent_id}-thread-{thread_key}",
@@ -1432,6 +1448,13 @@ class BindingResolver:
         # keys, and stays the marker's sole writer -- see the
         # inject_connector_secrets docstring for the #457/#429 rationale.
         inject_connector_secrets(env, resolved.secrets, agent_label=resolved.agent_id)
+        # ADR 0240 decision 2. Only beside a rendered caller token, which
+        # render_worker emits with the connector scope or not at all, so a
+        # route token never reaches a sandbox that has no Service to call.
+        if route_tokens and CONNECTOR_CALLER_TOKEN_ENV in env:
+            env[CONNECTOR_ROUTE_TOKENS_ENV] = json.dumps(
+                route_tokens, sort_keys=True, separators=(",", ":")
+            )
         # #1909: default local/cluster eval is a static bundle-plus-cases gate.
         # Ambient durable memory is per-agent, so a fresh thread still loaded
         # it and could change a committed case. The CLI marks those turns with
