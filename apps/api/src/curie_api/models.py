@@ -960,7 +960,6 @@ class WorkItem(Base):
         )
 
 
-# The typed reply target's shape. Migration 0078 carries a frozen copy.
 # #4930: a stored start failure detail is nonblank (a POSIX class, so a value of
 # only tabs or newlines is refused too, which btrim alone would let through)
 # and within the API's clip bound.
@@ -970,6 +969,7 @@ LAST_START_FAILURE_DETAIL_CHECK = (
     "AND length(last_start_failure_detail) <= 2000)"
 )
 
+# The typed reply target's shape. Migration 0078 carries a frozen copy.
 REPLY_TARGET_CHECK = (
     "((reply_target_kind = 'issue' AND reply_target_pr_number IS NULL "
     "AND reply_target_comment_id IS NULL AND reply_target_url IS NULL) "
