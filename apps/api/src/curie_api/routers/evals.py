@@ -22,6 +22,7 @@ from ..deps import EvalQueueDep, GitHubReporterDep, LangfuseDep, SessionDep
 from ..evalqueue import now_iso
 from ..evals import build_matrix
 from ..github_checks import GitHubReportError
+from ..langfuse import LangfuseReadLimitExceeded
 from ..models import Environment
 from ..repo_full_name import InvalidRepoFullName
 from ..wirebody import EvalReportBody
@@ -146,9 +147,20 @@ async def eval_matrix(
     from_timestamp = _stream_trace_window(stream_id) if stream_id is not None else None
     # Matrix outcomes and recorded costs live in metadata (io); it needs no
     # observation, score or metric aggregations, including for historical reads.
-    traces = await lf.list_traces_by_tags(
-        ["eval", f"suite:{suite}"], from_timestamp=from_timestamp, fields="core,io"
-    )
+    try:
+        traces = await lf.list_traces_by_tags(
+            ["eval", f"suite:{suite}"],
+            from_timestamp=from_timestamp,
+            fields="core,io",
+            # A unique order prevents omissions when timestamp ties cross pages.
+            order_by="id.asc",
+            require_complete=True,
+        )
+    except LangfuseReadLimitExceeded as exc:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "matrix history exceeds the complete read bound; select a narrower stream_id",
+        ) from exc
     if stream_id is not None:
         traces = [
             trace

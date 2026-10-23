@@ -169,6 +169,10 @@ def build_tree(observations: list[dict[str, Any]]) -> list[ObservationNode]:
     return [node_for(root) for root in roots]
 
 
+class LangfuseReadLimitExceeded(RuntimeError):
+    """A complete trace read exceeds the configured pagination bound."""
+
+
 class LangfuseClient:
     """Thin async client over Langfuse's public read API."""
 
@@ -191,6 +195,7 @@ class LangfuseClient:
         params: dict[str, Any],
         max_items: int | None = None,
         max_pages: int = 50,
+        require_complete: bool = False,
     ) -> list[dict[str, Any]]:
         """Fetch pages of a paginated list endpoint (data[] + meta.totalPages).
 
@@ -203,6 +208,9 @@ class LangfuseClient:
             body = await self._get(
                 path, {**params, "page": page, "limit": _MAX_PAGE_SIZE}
             )
+            meta = body.get("meta") or {}
+            if require_complete and int(meta.get("totalPages", page)) > max_pages:
+                raise LangfuseReadLimitExceeded("complete trace read exceeds page bound")
             items.extend(body.get("data", []))
             if max_items is not None and len(items) >= max_items:
                 return items[:max_items]
@@ -239,6 +247,8 @@ class LangfuseClient:
         *,
         from_timestamp: datetime | None = None,
         fields: str | None = None,
+        order_by: str | None = None,
+        require_complete: bool = False,
     ) -> list[dict[str, Any]]:
         """Every trace carrying all of the given tags (e.g. suite:<name>)."""
 
@@ -247,7 +257,11 @@ class LangfuseClient:
             params["fromTimestamp"] = from_timestamp.isoformat(timespec="milliseconds")
         if fields is not None:
             params["fields"] = fields
-        return await self._get_all("/api/public/traces", params)
+        if order_by is not None:
+            params["orderBy"] = order_by
+        return await self._get_all(
+            "/api/public/traces", params, require_complete=require_complete
+        )
 
     async def query_metrics(self, query: dict[str, Any]) -> list[dict[str, Any]]:
         """Run a Langfuse Metrics API query and return its data rows.

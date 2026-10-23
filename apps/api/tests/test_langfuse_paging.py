@@ -87,6 +87,7 @@ def test_tag_listing_without_projection_preserves_provider_default() -> None:
     assert len(traces) == 250
     assert len(backend.requests) == 3
     assert all("fields" not in params for params in backend.requests)
+    assert all("orderBy" not in params for params in backend.requests)
     assert all(
         params.get_list("tags") == ["eval", "suite:acme-suite"] for params in backend.requests
     )

@@ -38,6 +38,9 @@ async def _matrix(
     params: dict[str, str],
     headers: dict[str, str],
     traces: list[dict[str, Any]] | None = None,
+    *,
+    page_size: int = 1,
+    unstable_timestamp_ties: bool = False,
 ) -> tuple[httpx.Response, list[httpx.Request]]:
     requests: list[httpx.Request] = []
 
@@ -60,11 +63,17 @@ async def _matrix(
             ]
         # One trace per page exercises propagation on subsequent HTTP requests.
         page = int(request.url.params["page"])
+        if request.url.params.get("orderBy") == "id.asc":
+            selected = sorted(selected, key=lambda trace: trace["id"])
+        elif unstable_timestamp_ties and page % 2 == 0:
+            # Timestamp-only ordering has no tie-breaker: different page queries
+            # may enumerate equal-time records in a different physical order.
+            selected = list(reversed(selected))
         fields = set(
             request.url.params.get("fields", "core,io,scores,observations,metrics").split(",")
         )
         data = []
-        for trace in selected[page - 1 : page]:
+        for trace in selected[(page - 1) * page_size : page * page_size]:
             projected = {key: trace[key] for key in ("id", "timestamp", "tags")}
             projected.update(observations=[], scores=[], totalCost=-1, latency=-1)
             if "io" in fields:
@@ -76,7 +85,13 @@ async def _matrix(
             if "metrics" in fields:
                 projected["totalCost"] = trace["totalCost"]
             data.append(projected)
-        return httpx.Response(200, json={"data": data, "meta": {"totalPages": len(selected)}})
+        return httpx.Response(
+            200,
+            json={
+                "data": data,
+                "meta": {"totalPages": (len(selected) + page_size - 1) // page_size},
+            },
+        )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as outbound:
         app = FastAPI()
@@ -209,3 +224,42 @@ def test_early_stream_window_stays_at_epoch(auth_headers: dict[str, str]) -> Non
 
     assert response.status_code == 200, response.text
     assert requests[0].url.params["fromTimestamp"] == "1970-01-01T00:00:00.000+00:00"
+
+
+def test_equal_timestamp_pages_preserve_every_case(auth_headers: dict[str, str]) -> None:
+    # The pinned API supports a unique id order, unlike timestamp-only ordering:
+    # https://github.com/langfuse/langfuse/blob/v3.225.5/fern/apis/server/definition/trace.yml
+    # Case outcomes must survive a page boundary even when timestamps tie.
+    stream_id = "1735689600123-7"
+    traces = [
+        _trace(f"case-{index:03d}", "2025-01-01T00:00:01Z", stream_id) for index in range(101)
+    ]
+    response, requests = asyncio.run(
+        _matrix(
+            {"suite": "acme-suite", "stream_id": stream_id},
+            auth_headers,
+            traces,
+            page_size=100,
+            unstable_timestamp_ties=True,
+        )
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["cases"] == [trace["id"] for trace in traces]
+    assert response.json()["model_summaries"][0]["total"] == 101
+    assert response.json()["model_summaries"][0]["cost_usd"] == 126.25
+    assert len(requests) == 2
+
+
+def test_matrix_refuses_history_beyond_complete_read_bound(auth_headers: dict[str, str]) -> None:
+    # A stable ID order must never turn the 50-page safety cap into an arbitrary
+    # partial history that can hide the newest version.
+    traces = [
+        _trace(f"case-{index:05d}", "2025-01-01T00:00:01Z", "1735689600123-7")
+        for index in range(5001)
+    ]
+    response, requests = asyncio.run(
+        _matrix({"suite": "acme-suite"}, auth_headers, traces, page_size=100)
+    )
+    assert response.status_code == 503, response.text[:200]
+    assert "stream_id" in response.json()["detail"]
+    assert len(requests) == 1
