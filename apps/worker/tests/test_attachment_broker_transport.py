@@ -174,3 +174,51 @@ def test_scope_interrupts_dripping_response_head(stage: str, stop: str) -> None:
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+@pytest.mark.parametrize("size", [0, 1, 1024 * 1024, 1024 * 1024 + 17])
+@pytest.mark.parametrize("outcome", ["complete", "truncated", "cancelled"])
+def test_scoped_content_length_download_finishes_only_when_complete(
+    size: int, outcome: str
+) -> None:
+    import time
+
+    payload = b"x" * size
+
+    class Provider(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 -- stdlib contract
+            self.send_response(200)
+            self.send_header("Content-Length", str(size + int(outcome == "truncated")))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Provider)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    client = attachments.ChannelPortFileClient(credentials={"acme-adapter": "synthetic-key"})
+    port = client.bind_route("acme-adapter", f"http://127.0.0.1:{server.server_port}")
+    try:
+        with attachments.AttachmentReadScope(deadline_epoch=time.time() + 5) as scope:
+            if outcome == "cancelled":
+                chunks = port.fetch("FEXAMPLE1")
+                received = 0
+                while received < size:
+                    received += len(next(chunks))
+                scope.cancel()
+                with pytest.raises(TimeoutError):
+                    list(chunks)
+            elif outcome == "truncated":
+                with pytest.raises(OSError, match="ended before Content-Length"):
+                    b"".join(port.fetch("FEXAMPLE1"))
+            else:
+                # CPython HTTPResponse.read1 closes its socket as soon as the
+                # declared length is consumed, before the iterator's next read.
+                # This real HTTP boundary covers that observed stdlib behavior.
+                assert b"".join(port.fetch("FEXAMPLE1")) == payload
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()

@@ -398,8 +398,12 @@ async def fetch(
                         finally:
                             if not read.done():
                                 read.cancel()
-                                with contextlib.suppress(asyncio.CancelledError):
-                                    await read
+                            # Closing upstream on revocation can finish this
+                            # read before the monitor raises. Retrieve every
+                            # outcome without replacing the primary exception;
+                            # ordinary read failures still raise in the try above.
+                            with contextlib.suppress(asyncio.CancelledError):
+                                await asyncio.gather(read, return_exceptions=True)
                         if chunk is None:
                             break
                         yield chunk
