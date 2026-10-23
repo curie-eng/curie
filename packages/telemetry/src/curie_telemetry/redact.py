@@ -18,6 +18,22 @@ def _placeholder(name: str) -> str:
     return f"[REDACTED:{name}]"
 
 
+def _dotted_token_rule(name: str, prefix: str) -> RedactionRule:
+    """Redact ``<prefix>.<segment>.<segment>`` and nothing after it.
+
+    The leading lookbehind keeps a hyphenated identifier that merely ends in the
+    prefix from matching. The trailing lookahead only stops a segment from being
+    cut short, so a token followed by dotted text (``.next``) is still replaced;
+    that text is left as it is and never holds payload or signature characters.
+    """
+
+    return RedactionRule(
+        name,
+        re.compile(rf"(?<![A-Za-z0-9_-]){prefix}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?![A-Za-z0-9_-])"),
+        _placeholder(name),
+    )
+
+
 REDACTION_RULES: tuple[RedactionRule, ...] = (
     RedactionRule(
         "oidc_callback_query",
@@ -139,33 +155,22 @@ REDACTION_RULES: tuple[RedactionRule, ...] = (
         re.compile(r"\bchn\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"),
         _placeholder("channel_token"),
     ),
-    RedactionRule(
+    _dotted_token_rule(
         "sandbox_token",
         # The sandbox state token minter uses two unpadded base64url segments.
-        re.compile(
-            r"(?<![A-Za-z0-9_-])sbx\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"
-            r"(?![A-Za-z0-9_-]|\.[A-Za-z0-9_-])"
-        ),
-        _placeholder("sandbox_token"),
+        "sbx",
     ),
-    RedactionRule(
+    _dotted_token_rule(
         "channel_read_token",
         # The API issued channel read capability (ADR 0100), the same two
         # base64url segments behind the ``chr`` prefix.
-        re.compile(
-            r"(?<![A-Za-z0-9_-])chr\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"
-            r"(?![A-Za-z0-9_-]|\.[A-Za-z0-9_-])"
-        ),
-        _placeholder("channel_read_token"),
+        "chr",
     ),
-    RedactionRule(
+    _dotted_token_rule(
         "connector_caller_token",
         # The connector caller minter uses the same base64url segment alphabet.
-        re.compile(
-            r"(?<![A-Za-z0-9_-])cct\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"
-            r"(?![A-Za-z0-9_-]|\.[A-Za-z0-9_-])"
-        ),
-        _placeholder("connector_caller_token"),
+        # cct2 is the wire (ADR 0239); legacy cct text is still redacted.
+        "cct2?",
     ),
     RedactionRule(
         "secret_json_field",

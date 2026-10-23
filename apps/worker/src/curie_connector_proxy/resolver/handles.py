@@ -31,6 +31,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from ..caller import nonblank_installation_ok
 from .wire import CodedError
 
 MAX_INVOCATIONS = 1024
@@ -50,7 +51,6 @@ _HANDLE_BYTES = 32
 # Far above a real handle (48 characters); bounds the work one lookup does.
 _MAX_HANDLE_CHARS = 128
 _MAX_SESSION_ID_CHARS = 256
-_MAX_INSTALLATION_BYTES = 128
 _UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 _ALIAS = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 
@@ -88,11 +88,9 @@ def _is_int(value: object) -> bool:
 
 
 def installation_ok(value: object) -> bool:
-    if not isinstance(value, str) or not value:
-        return False
-    if len(value.encode("utf-8")) > _MAX_INSTALLATION_BYTES:
-        return False
-    return not any(char.isspace() or not char.isprintable() for char in value)
+    """A resolver installation is always nonblank: ADR 0239's rule, defined in ``caller``."""
+
+    return nonblank_installation_ok(value)
 
 
 def uuid_ok(value: object) -> bool:

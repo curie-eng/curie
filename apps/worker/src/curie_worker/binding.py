@@ -1334,8 +1334,10 @@ class BindingResolver:
                 exp=state_exp,
                 claims={"cred": credential_id},
             )
-        # The caller token (ADR-0168 decision 7, ADR 0178): this sandbox's
-        # agent, signed for its hosted connectors. Its expiry stays the 24 hour
+        # The caller token (ADR-0168 decision 7, ADR 0178, ADR 0239): this
+        # sandbox's installation and agent, signed for its hosted connectors.
+        # A blank installation is a dedicated standalone worker's; one the
+        # wire refuses fails the boot closed. Its expiry stays the 24 hour
         # cap, or the run's execution deadline when the kernel passed one. It
         # does not follow the boot state token (#3823). No key mints none,
         # which is the stock install. render_worker emits it only with the
@@ -1347,6 +1349,8 @@ class BindingResolver:
                 caller_exp = min(caller_exp, int(caller_exp_ceiling))
             connector_caller_token = caller_token.mint(
                 self._config.connector_caller_signing_key,
+                installation=self._config.installation_id,
+                agent_id=str(resolved.agent_id),
                 agent=resolved.agent_name,
                 exp=caller_exp,
                 run=caller_run,

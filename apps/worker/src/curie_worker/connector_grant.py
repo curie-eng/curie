@@ -1,6 +1,7 @@
 """A one-shot grant for one hosted connector tool call (issue #3552).
 
-Separate from the caller token on purpose: ``cct`` stays ``{agent, exp}``.
+Separate from the caller token on purpose: the caller token (``cct2``, ADR 0239)
+carries a different, exact claim set, and this grant stays its own wire.
 This wire is ``ccg`` with claims exactly ``agent``, ``connector``, ``tool``,
 ``args``, ``exp``, and ``jti``. ``args`` is the canonical JSON string the
 caller already computed. The proxy spends ``jti`` once.

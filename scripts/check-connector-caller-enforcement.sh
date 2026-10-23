@@ -53,12 +53,20 @@ echo "== connector caller proxy enforcement (namespace=$NS release=$RELEASE app=
 [ -n "${CURIE_CALLER_SIGNING_KEY:-}" ] \
   || fail "CURIE_CALLER_SIGNING_KEY is not set, so no admitted caller can be proved to get through"
 
-# A token naming $1, valid for ten minutes.
+# A token naming $1, valid for ten minutes. The dedicated proxy compares
+# neither the installation (CURIE_CALLER_INSTALLATION, blank when unset) nor
+# the agent_id, so a fresh UUID stands in for the latter.
 mint() {
-  docker run --rm -e CURIE_CALLER_SIGNING_KEY "$MINT_IMAGE" python -c '
-import os, sys, time
+  docker run --rm -e CURIE_CALLER_SIGNING_KEY -e CURIE_CALLER_INSTALLATION "$MINT_IMAGE" python -c '
+import os, sys, time, uuid
 from curie_worker.caller_token import mint
-print(mint(os.environ["CURIE_CALLER_SIGNING_KEY"], agent=sys.argv[1], exp=int(time.time()) + 600))
+print(mint(
+    os.environ["CURIE_CALLER_SIGNING_KEY"],
+    installation=os.environ.get("CURIE_CALLER_INSTALLATION", ""),
+    agent_id=str(uuid.uuid4()),
+    agent=sys.argv[1],
+    exp=int(time.time()) + 600,
+))
 ' "$1"
 }
 
@@ -212,18 +220,18 @@ print(names[0] if names else "-", outsider)
   fi
 
   TOKEN="$(mint "$ADMITTED")" || fail "could not mint a caller token in $MINT_IMAGE"
-  CODE="$(kubectl -n "$NS" exec "$PROBE_POD" -- \
-    curl -s -m 10 -o /dev/null -w '%{http_code}' -H "X-Curie-Caller: $TOKEN" \
-    "http://${svc}:${PORT}/mcp" 2>/dev/null || true)"
+  CODE="$(kubectl -n "$NS" exec -i "$PROBE_POD" -- \
+    curl -s -m 10 -o /dev/null -w '%{http_code}' -H @- \
+    "http://${svc}:${PORT}/mcp" <<<"X-Curie-Caller: $TOKEN" 2>/dev/null || true)"
   case "$CODE" in
     403|502|000|"") fail "an admitted caller token for $ADMITTED did not reach the server behind $svc: '$CODE'" ;;
   esac
   echo "  ok  $svc admits a caller token for $ADMITTED, and the server answered $CODE"
 
   TOKEN="$(mint "$OUTSIDER")" || fail "could not mint a caller token in $MINT_IMAGE"
-  ANSWER="$(kubectl -n "$NS" exec "$PROBE_POD" -- \
-    curl -s -m 10 -w '\n%{http_code}' -H "X-Curie-Caller: $TOKEN" \
-    "http://${svc}:${PORT}/mcp" 2>/dev/null || true)"
+  ANSWER="$(kubectl -n "$NS" exec -i "$PROBE_POD" -- \
+    curl -s -m 10 -w '\n%{http_code}' -H @- \
+    "http://${svc}:${PORT}/mcp" <<<"X-Curie-Caller: $TOKEN" 2>/dev/null || true)"
   CODE="${ANSWER##*$'\n'}"
   BODY="${ANSWER%$'\n'*}"
   if [ "$CODE" != "403" ] || ! grep -Eq '"curie_caller": ?"not_admitted"' <<<"$BODY"; then
