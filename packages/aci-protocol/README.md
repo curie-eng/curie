@@ -36,6 +36,26 @@ Generated TypeScript and Rust types express the optional field but cannot
 enforce this cross field rule. The current worker rejects targetless turns
 before processing. Targetless cron execution is deferred to a separate change.
 
+**Initiating principal contract** (`INITIATING-PRINCIPAL-1`, issue #4868)
+
+`PrincipalRef` has exactly two required fields: `principal_id: str`, the
+principal UUID as a string, and `authorization_version: int`, the value read by
+the admitting decision. Producer construction rejects missing and unknown
+fields; wire decoding follows the package's tolerant reader policy.
+
+`QueuedTurn.author_principal: PrincipalRef | None` follows `tool_access` and
+defaults to `None`. It is the initiating subject that admission resolved `author`
+to. `author` keeps its existing provider ID or address meaning. The executing
+actor, the agent, is never this principal. This field is provenance, not
+authority: neither its presence nor its absence grants anything. Legacy payloads
+that omit it decode to `None`; populated and null values round trip.
+
+This contract change adds no producer or consumer. The additive optional field
+earns one ACI protocol patch above the base branch, independently of the Curie
+release version. Schema, wire lock, queue fixture, TypeScript and Rust are
+regenerated together. CLI struct literals and the queue key list only name the
+new field as null. The basis is Accepted ADR 0166 decision 6 and ADR 0220.
+
 **Session setup** (`SessionConfig`, with `to_env()` / `from_env()`):
 
 | Field | Env var | Notes |
