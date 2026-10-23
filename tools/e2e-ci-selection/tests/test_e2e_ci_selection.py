@@ -898,6 +898,19 @@ def test_selector_and_workflow_paths_do_not_boot_kind(tmp_path: Path, path: str)
 
 
 @pytest.mark.parametrize(
+    ("path", "selected"),
+    [
+        (".github/workflows/release.yaml", ("local-release",)),
+        (".github/workflows/release-notes.yaml", ()),
+    ],
+)
+def test_release_workflow_selection_is_exact(
+    tmp_path: Path, path: str, selected: tuple[str, ...]
+) -> None:
+    _assert_selection(tmp_path, path, selected, pytest_needed=True)
+
+
+@pytest.mark.parametrize(
     "path",
     [
         "scripts/check-netpol-enforcement.sh",
