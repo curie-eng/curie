@@ -171,6 +171,126 @@ complete trial-session inventory, final observer teardown and successful
 receipts/acceptance remain separate obligations; these reads do not establish
 them. Existing v1 issuer/control compositions do not issue B2 campaigns.
 
+## Versioned operator transport custody
+
+<!-- @spec COMMISSIONING-SERIES-8 -->
+[Accepted ADR 0242](../../adr/0242-commissioning-session-scope-makes-the-last-observer-finite.md)
+partially supersedes the all-installation-session cleanup scope below. All SDK,
+runner and positive-work-capable transports remain trial-owned under original C.
+Only the predeclared measured operator roles in that decision may be run-owned;
+scope never changes after intent. Existing v1 records are historical, closed and
+unchanged. Their readers must reject a v2 custody directory rather than ignore
+its operator history. Neither a parsed journal nor a role label proves actual
+rights, complete membership, joins, cleanup or qualification.
+
+The explicit v2 custody extension retains the same fixed child, fd/inode/process
+pinning, exclusive lock, suspend-inclusive elapsed deadline and cleanup-only
+recovery. It adds exactly `format` (the single ASCII byte `2`), `operators`
+(a private directory of content-addressed records), `operator-recipe` and
+`operator-head` (canonical 64-byte digest pointers). Existing `records`, `intent`,
+optional `plan`, `head`, `location` and `lock` retain their existing meanings.
+The location pin additionally binds the operator-directory device/inode and
+format. There is no second lock or portable/resumable positive handle. Both
+record directories share the existing 4096-record / 67108864-byte bounds;
+each record remains at most 16384 bytes. All records must be referenced by their
+typed chains, including failed or unbound attempts; unknown extra files refuse.
+
+New records use strict integer `schema_version: 2`, canonical ASCII JSON and
+the existing closed scalar grammars. Exact additional members are:
+
+| Record type | Additional members |
+| --- | --- |
+| `commissioning_operator_recipe` | `provisioning_recipe_digest`, `roles` |
+| `commissioning_operator_event` | `run_id`, `revision`, `previous_digest`, `elapsed_ms`, `kind`, `intent_id`, `role`, `phase`, `ordinal`, `binding_digest`, `identity` |
+
+The original run intent's `recipe_digest` binds the complete operator recipe,
+which in turn binds the immutable provisioning recipe. `roles` contains exactly
+one row for each of `administrator`, `evidence-observer`, `acl-observer`,
+`acceptance-publisher`, `qualification-publisher`, `activation-publisher`, sorted
+lexically by role. Each row has exactly `role`, `credential` (CredentialReference)
+and `max_connections` (generation, at most 256); credentials are distinct and
+the sum of ceilings is at most 1000. A ceiling counts every intended attempt,
+including failed, unbound and closed attempts, without refund or automatic retry.
+This recipe supplies no grant to open a connection. Fresh B2/G2, administrator
+baseline, measured ownership and phase predicates still authorize each actual
+adapter. An unrealized role or phase fails closed.
+
+Operator events have consecutive revisions from `1`, a zero first predecessor,
+nondecreasing elapsed milliseconds and one immutable run/intent/role/phase/ordinal
+binding per attempt. `kind` is `intended`, `bound`, `closed` or `uncertain`.
+`intended` is durable before opening; its identity and binding digest are null.
+`bound` carries the actual identity and a null binding digest. `closed` carries
+the preceding bound-event digest and a null identity; it is written only by the
+actual adapter after transport closure and tracked I/O joins. `uncertain` has a
+null identity and either the original binding digest or null if unbound; it
+retains failure, never establishes closure. Each attempt permits only intended,
+optionally bound, then one terminal event. A missing terminal record is uncertain.
+An unbound attempt cannot be repaired or reused by another connection.
+
+For broker operator transports, identity has exactly `client_id` (generation),
+`broker_identity` (BrokerIdentity), `credential` (CredentialReference) and
+`host_process`. The Linux host-process binding has exactly `pid`, `start_ticks`,
+`pid_namespace_inode` (generations), and `boot_id` (UUID), freshly observed from
+the trusted supervisor's own procfs. PID alone cannot identify a process.
+Unsupported host identity observation refuses; no invented container ID or PID
+fallback is permitted. TLS/authentication plus the minimum HELLO/INFO identity
+exchange may precede binding; retained reads may not.
+
+The preliminary paired-verifier factory checks its sealed plan's B2/G2 and
+execution-configuration bindings plus both exact recipe credentials before
+opening. Any existing live, unbound or uncertain operator attempt refuses a new
+factory. It binds the evidence connection first, then durably intends and binds
+the independent ACL connection before its first GETUSER. The ACL role needs only
+its existing HELLO handshake and GETUSER permissions: its actual client ID/user
+is corroborated through the independently authenticated evidence connection and
+fresh broker epoch. No WHOAMI/INFO privilege is added to that ACL role.
+
+Before each retained read, fresh GETUSER replies for both verifier users must
+match their exact product permission recipes, selector/key/channel permissions,
+single expected password hash and enabled state. The original credentials and
+actual process/connection identities stay distinct. Missing, widened or changed
+rights refuse and end both connections. Each observation runs as an owned I/O
+task; the outer trusted owner joins those tasks and the original TLS writers
+before storing terminal connection events. A failed observation revokes positive
+custody; another factory cannot repair it. These observations do not establish
+the complete installation inventory or administrator baseline, nor produce
+trial cleanup, a checkpoint, acceptance or a final operator verdict.
+
+Close starts irreversible transport shutdown before scheduling its owned teardown
+task. Caller cancellation, including repeated cancellation, cannot cancel or
+detach that bounded task: the caller waits for its actual outcome before
+cancellation is re-raised. Failed teardown remains a refusal on later close calls.
+Registered observations and joined-close witnesses additionally pin their process
+PID and CPython parent-fork generation. An observed `os.fork` after transport
+creation irreversibly refuses useful observations and successful closure, even
+after the child exits. Parent-owned descriptors are still closed and joined;
+unresolved history and revoked positive custody report uncertainty, never child
+cleanup. This opt-in fence does not change v1 parent-custody behavior or default
+unregistered observations. It is not complete native child-process accounting;
+the measured composition and complete process inventory remain required before
+any campaign cleanup or final operator verdict can be accepted.
+
+`phase` is `setup`, `trial`, `transition`, `decision`, `publication` or `teardown`.
+`ordinal` is `0` for setup/teardown and a trial ordinal `1` through `10` otherwise;
+decision/publication require `10`. Administrators are restricted to quiescent
+setup/transition/teardown; publishers to post-decision publication. Read-only
+verification roles may operate only after their actual rights and separation
+are freshly corroborated. The first implementation may persist setup/trial
+operator history but must refuse unimplemented transitions, decisions and
+publication. No event or caller-supplied phase advances the trial series.
+
+The future pre-decision checkpoint must bind complete trial results/rosters and
+the complete operator registry including live verifiers. A distinct typed,
+append-only post-decision tail must bind that checkpoint and prior head for
+fresh PC-6 observations/publication/activation and terminal operator closure.
+No v1 dossier, digest-only extension or this preliminary journal may substitute
+for either record or claim full acceptance. The final verifier's actual local
+transport close plus task/process join is witnessed by the measured supervisor;
+trial broker sessions still require independent fresh epoch/client absence.
+Before activation, uncertain teardown withholds activation; after an activation
+write, report its actual state plus failure/uncertainty. A successful operator
+result additionally requires the durable final tail and lock release.
+
 ## Closed plan and evidence records
 
 <!-- @spec COMMISSIONING-SERIES-4 -->

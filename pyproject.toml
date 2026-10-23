@@ -145,6 +145,9 @@ source_modules = [
     "curie_protected_hooks.runtime_directory",
 ]
 forbidden_modules = ["curie_protected_hooks.runtime_directory_writer"]
+ignore_imports = [
+    "curie_worker.commissioning_registered_observer -> curie_protected_hooks.commissioning_operator_custody",
+]
 
 # @spec PROTECTED-COMMISSIONING-1/2: production composition reads no commissioning
 # record. The whole API and worker are sources, so a new production module is
@@ -156,6 +159,12 @@ type = "forbidden"
 source_modules = ["curie_api", "curie_worker"]
 forbidden_modules = [
     "curie_protected_hooks.commissioning_series_guard",
+    "curie_protected_hooks.commissioning_operator_custody",
+    "curie_protected_hooks.commissioning_operator_records",
+    "curie_protected_hooks.commissioning_run_authority",
+    "curie_protected_hooks.commissioning_run_storage",
+    "curie_protected_hooks.commissioning_run_records",
+    "curie_protected_hooks.commissioning_evidence_acl",
     "curie_protected_hooks.commissioning_series_bootstrap",
     "curie_protected_hooks.commissioning_retained",
     "curie_protected_hooks.commissioning_evidence_records",
@@ -190,6 +199,12 @@ forbidden_modules = [
 # ADR 0236's internal operator and ADR 0241's provisioner-only evidence reader
 # have only these named exceptions. Local installation reads stay provisioner-only.
 ignore_imports = [
+    "curie_worker.commissioning_registered_observer -> curie_protected_hooks.commissioning_operator_custody",
+    "curie_worker.commissioning_registered_observer -> curie_protected_hooks.commissioning_journal",
+    "curie_worker.commissioning_registered_observer -> curie_protected_hooks.commissioning_records",
+    "curie_worker.commissioning_registered_observer -> curie_protected_hooks.commissioning_producers",
+    "curie_worker.commissioning_registered_observer -> curie_protected_hooks.commissioning_evidence_records",
+    "curie_worker.commissioning_registered_observer -> curie_protected_hooks.commissioning_evidence_acl",
     "curie_worker.commissioning_evidence_observer -> curie_protected_hooks.commissioning_series_guard",
     "curie_worker.commissioning_evidence_observer -> curie_protected_hooks.commissioning_series_bootstrap",
     "curie_worker.commissioning_evidence_observer -> curie_protected_hooks.commissioning_records",
@@ -324,6 +339,7 @@ source_modules = [
 ]
 forbidden_modules = [
     "curie_worker.commissioning_evidence_observer",
+    "curie_worker.commissioning_registered_observer",
     "curie_worker.commissioning_control_admission",
     "curie_worker.commissioning_control_installation",
     "curie_worker.commissioning_control_observer",
@@ -361,6 +377,7 @@ type = "forbidden"
 source_modules = ["curie_worker.commissioning_control_process"]
 forbidden_modules = [
     "curie_worker.commissioning_evidence_observer",
+    "curie_worker.commissioning_registered_observer",
     "curie_worker.commissioning_control_reader",
     "curie_worker.commissioning_control_installation",
     "curie_protected_hooks.commissioning_local_installation",

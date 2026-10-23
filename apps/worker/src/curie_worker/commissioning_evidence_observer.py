@@ -1,4 +1,4 @@
-"""Provisioner-only retained observations, @spec COMMISSIONING-SERIES-3/6.
+"""Provisioner-only retained observations, @spec COMMISSIONING-SERIES-3/6/8.
 
 Reads are neither causal witnesses nor cleanup, acceptance or dispatch authority.
 Original campaign epochs survive historical reads; actual live epochs are pinned
@@ -14,7 +14,7 @@ import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any, Self
+from typing import TYPE_CHECKING, Any, Self
 
 from curie_protected_hooks.authority_records import Manifest
 from curie_protected_hooks.commissioning_evidence_records import (
@@ -30,6 +30,9 @@ from curie_protected_hooks.commissioning_series_guard import verify_series_tuple
 from curie_protected_hooks.worker_transport import WorkerCredential
 
 from .managed_cni_probe_kit import PRODUCER_CONSTANTS
+
+if TYPE_CHECKING:
+    from .commissioning_registered_observer import _OperatorRegistration
 
 _DEADLINE = PRODUCER_CONSTANTS["per_call_deadline_ms"] / 1000
 _MAX_INT = 9223372036854775807
@@ -175,6 +178,7 @@ class RetainedEvidenceObserver:
         "__last_time",
         "__lock",
         "__closed",
+        "__registration",
     )
     __binding: SeriesEvidenceBinding
     __session: CommissioningSession
@@ -183,6 +187,7 @@ class RetainedEvidenceObserver:
     __last_time: int
     __lock: asyncio.Lock
     __closed: bool
+    __registration: _OperatorRegistration | None
 
     def __new__(cls) -> Self:
         raise EvidenceObservationRefused()
@@ -196,12 +201,22 @@ class RetainedEvidenceObserver:
 
     @classmethod
     async def connect(
-        cls, binding: SeriesEvidenceBinding, credential: WorkerCredential, ca_pem: str
+        cls,
+        binding: SeriesEvidenceBinding,
+        credential: WorkerCredential,
+        ca_pem: str,
+        *,
+        _registration: _OperatorRegistration | None = None,
     ) -> Self:
         session = None
         expiry = None
         deadline = asyncio.get_running_loop().time() + _DEADLINE
         try:
+            if _registration is not None:
+                from .commissioning_registered_observer import _OperatorRegistration
+
+                _require(type(_registration) is _OperatorRegistration)
+                deadline = min(deadline, asyncio.get_running_loop().time() + _registration.budget())
             async with asyncio.timeout_at(deadline):
                 _require(type(binding) is SeriesEvidenceBinding)
                 binding.__post_init__()
@@ -213,7 +228,11 @@ class RetainedEvidenceObserver:
                     terminal=True,
                     deadline=deadline,
                 )
-                expiry = asyncio.get_running_loop().call_at(deadline, session.abort)
+                if _registration is not None:
+                    _registration.session = session
+                expiry = asyncio.get_running_loop().call_at(
+                    deadline, _registration.abort if _registration is not None else session.abort
+                )
                 observer = object.__new__(cls)
                 observer.__binding = binding
                 observer.__session = session
@@ -222,6 +241,11 @@ class RetainedEvidenceObserver:
                 observer.__last_time = -1
                 observer.__lock = asyncio.Lock()
                 observer.__closed = False
+                observer.__registration = _registration
+                if _registration is not None:
+                    await _registration.bind_and_measure(
+                        session, observer.__epoch, observer.__client
+                    )
                 await observer.__presence()
                 return observer
         except BaseException as error:  # noqa: BLE001  Suppress credential/transport detail.
@@ -237,10 +261,21 @@ class RetainedEvidenceObserver:
     @asynccontextmanager
     async def __bounded(self) -> AsyncIterator[None]:
         deadline = asyncio.get_running_loop().time() + _DEADLINE
-        expiry = asyncio.get_running_loop().call_at(deadline, self.__session.abort)
+        if self.__registration is not None:
+            deadline = min(
+                deadline, asyncio.get_running_loop().time() + self.__registration.budget()
+            )
+        expiry = asyncio.get_running_loop().call_at(
+            deadline,
+            self.__registration.abort if self.__registration is not None else self.__session.abort,
+        )
         try:
+            if self.__registration is not None:
+                self.__registration.check_active()
             async with asyncio.timeout_at(deadline):
                 yield
+                if self.__registration is not None:
+                    self.__registration.check_active()
         finally:
             expiry.cancel()
 
@@ -291,6 +326,8 @@ class RetainedEvidenceObserver:
         try:
             async with self.__bounded(), self.__lock:
                 _require(not self.__closed)
+                if self.__registration is not None:
+                    await self.__registration.measure()
                 return await self.__presence()
         except BaseException as error:  # noqa: BLE001  Poison all failed/cancelled observations.
             await self.close()
@@ -305,6 +342,8 @@ class RetainedEvidenceObserver:
         try:
             async with self.__bounded(), self.__lock:
                 _require(not self.__closed)
+                if self.__registration is not None:
+                    await self.__registration.measure()
                 _permit(self.__binding, permit)
                 keys = retained_keys(permit, inventory)
                 first = await self.__values(keys)
@@ -324,4 +363,9 @@ class RetainedEvidenceObserver:
     async def close(self) -> None:
         """Idempotently end this session without a reconnect path."""
         self.__closed = True
+        if self.__registration is not None:
+            self.__registration.abort()
+            async with self.__lock:
+                await self.__registration.close_transports(self.__session)
+            return
         await self.__session.close(nowait=True)

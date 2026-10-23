@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import math
+import os
 from dataclasses import dataclass, field
 from threading import get_ident
 from typing import Any, Self
@@ -180,10 +181,45 @@ class _TerminalConnection(_AsyncConnection):
             raise ConnectionError(_ERROR)
 
 
+_TRANSPORT_FORK_GENERATION = 0
+
+
+def _parent_transport_forked() -> None:
+    global _TRANSPORT_FORK_GENERATION
+    _TRANSPORT_FORK_GENERATION += 1
+
+
+os.register_at_fork(after_in_parent=_parent_transport_forked)
+
+
 class _DeadlineLifetime(_Lifetime):
     """Every failure hard-closes before any inherited cleanup detaches its writer."""
 
+    def __init__(self) -> None:
+        super().__init__()
+        self.writers: set[asyncio.StreamWriter] = set()
+        self.sockets: dict[asyncio.StreamWriter, Any] = {}
+        self._owner_pid = os.getpid()
+        self._fork_generation = _TRANSPORT_FORK_GENERATION
+
+    def require_unforked(self) -> None:
+        # Opt-in registered observations/join witnesses use this check. Default
+        # sessions retain their existing behavior. A joined child cannot undo
+        # the fact that original socket ownership became ambiguous on fork.
+        if self._owner_pid != os.getpid() or self._fork_generation != _TRANSPORT_FORK_GENERATION:
+            raise CommissioningJournalRefused()
+
     def fail(self) -> None:
+        for connection in self.async_connections:
+            writer = connection._writer
+            if writer is not None and writer not in self.writers:
+                self.writers.add(writer)
+                # SSLProtocolTransport detaches its protocol at connection_lost;
+                # retain the original socket before requesting close.
+                try:
+                    self.sockets[writer] = writer.get_extra_info("socket")
+                except AttributeError:
+                    self.sockets[writer] = None
         super().fail()
         for connection in self.async_connections:
             if connection._writer is not None:
@@ -192,6 +228,23 @@ class _DeadlineLifetime(_Lifetime):
                     abort()
                 elif not self.loop.is_closed():
                     self.loop.call_soon_threadsafe(abort)
+
+    async def join_closed(self) -> None:
+        """Join retained TLS writers after failure, @spec COMMISSIONING-SERIES-8."""
+        self.fail()
+        results = await asyncio.gather(
+            *(writer.wait_closed() for writer in self.writers), return_exceptions=True
+        )
+        for result in results:
+            if isinstance(result, BaseException) and not isinstance(
+                result, (OSError, ConnectionError)
+            ):
+                raise CommissioningJournalRefused()
+        for writer in self.writers:
+            socket = self.sockets[writer]
+            if not writer.is_closing() or socket is None or socket.fileno() != -1:
+                raise CommissioningJournalRefused()
+        self.require_unforked()
 
 
 class CommissioningSession:
@@ -380,6 +433,24 @@ class CommissioningSession:
             )
         else:
             await self.__pool.disconnect()
+
+    async def close_joined(self) -> None:
+        """Actual writer closure for the finite host witness, @spec COMMISSIONING-SERIES-8.
+
+        The owning adapter must first join its command tasks. This method alone
+        supplies no registry completeness, SDK join or independent broker absence.
+        """
+        if type(self.__lifetime) is not _DeadlineLifetime:
+            raise CommissioningJournalRefused()
+        self.__lifetime.fail()
+        await self.close(nowait=True)
+        await self.__lifetime.join_closed()
+
+    def check_process_custody(self) -> None:
+        """Registered process/fork fence, no broker verdict, @spec COMMISSIONING-SERIES-8."""
+        if type(self.__lifetime) is not _DeadlineLifetime:
+            raise CommissioningJournalRefused()
+        self.__lifetime.require_unforked()
 
 
 def _binding(
