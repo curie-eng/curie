@@ -164,6 +164,8 @@ forbidden_modules = [
     "curie_protected_hooks.commissioning_run_authority",
     "curie_protected_hooks.commissioning_run_storage",
     "curie_protected_hooks.commissioning_run_records",
+    "curie_protected_hooks.commissioning_trial_records",
+    "curie_protected_hooks.commissioning_trial_evidence_records",
     "curie_protected_hooks.commissioning_evidence_acl",
     "curie_protected_hooks.commissioning_series_bootstrap",
     "curie_protected_hooks.commissioning_retained",

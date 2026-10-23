@@ -416,7 +416,9 @@ must be literal `pass`. A
 subject is a sha256 of its original ownership entry including its identity; it
 never names a replacement resource or arbitrary API target.
 
-Image roles are exactly the measured profile's complete image inventory, with
+Image rows sort by role then platform, with no repeated role/platform pair;
+one role may retain its distinct observed platforms. Image roles are exactly
+the measured profile's complete image inventory, with
 OCI sha256 digests, OCI platform strings and actual observed image IDs under
 the existing artifact/platform validation. Ownership snapshots use
 `packages/protected-hooks/src/curie_protected_hooks/commissioning_local_ownership.py::OwnershipLedger`
