@@ -18,8 +18,8 @@ resolves membership.
 
 Phases, each assertion printed as one PASS line:
 
-1. The API boots, and its lifespan publisher writes the configured caller
-   verify key and the installation heartbeat.
+1. The API boots with a configured caller verify key; the render route is
+   the only way that key reaches the shared proxy (no key table).
 2. Application 1 is registered; agents A and B become members, upload a
    bundle declaring the shared alias plus a remote ``url:`` connector, and
    deploy. The worker identity is checked (it may list and create Secrets,
@@ -101,7 +101,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-import asyncpg
 import httpx
 import nacl.exceptions
 import nacl.public
@@ -183,6 +182,9 @@ class Run:
     grant_secret: str = field(default_factory=lambda: env("SCK_GRANT_SECRET"))
     db_target_label: str = field(default_factory=lambda: env("SCK_DB_TARGET_LABEL"))
     secrets_policy: str = field(default_factory=lambda: env("SCK_SECRETS_POLICY"))
+    # The API's trusted caller verify keys, current first: the only way they
+    # reach the shared proxy is the render (rework 1).
+    caller_keys: tuple[str, ...] = ()
     installation: str = field(
         default_factory=lambda: "".join(
             secrets.choice(string.ascii_letters + string.digits) for _ in range(32)
@@ -498,7 +500,7 @@ def reach_selector(run: Run, agent: str) -> str:
 
 
 def app_objects(run: Run, app: str) -> list[dict[str, Any]]:
-    return render_application(run.model(app))
+    return render_application(run.model(app), caller_public_keys=run.caller_keys)
 
 
 def secret_labels(run: Run, app: str, role: str) -> dict[str, str]:
@@ -627,30 +629,6 @@ class PassLog(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         self.lines.append(record.getMessage())
-
-
-async def caller_keys_published(run: Run, public_key: str) -> bool:
-    url = run.database_url().replace("postgresql+asyncpg://", "postgresql://")
-    deadline = time.monotonic() + 60
-    while time.monotonic() < deadline:
-        connection = await asyncpg.connect(url)
-        try:
-            keys = await connection.fetch(
-                "SELECT public_key FROM curie.shared_connector_caller_keys "
-                "WHERE installation_id = $1",
-                run.installation,
-            )
-            beat = await connection.fetchval(
-                "SELECT count(*) FROM curie.shared_connector_caller_key_heartbeats "
-                "WHERE installation_id = $1",
-                run.installation,
-            )
-        finally:
-            await connection.close()
-        if public_key in {row["public_key"] for row in keys} and beat == 1:
-            return True
-        await asyncio.sleep(2)
-    return False
 
 
 def worker_kubeconfig(run: Run, kube: Kube) -> Path:
@@ -784,7 +762,7 @@ async def run_pass(loop: Any, log: PassLog, label: str) -> tuple[Any, list[str]]
 async def scenario(run: Run, kube: Kube, api: Api, loop: Any, log: PassLog, agents: Agents) -> None:
     app1, app2, app3 = run.apps
     spec1 = run.model(app1)
-    objects1 = render_application(spec1)
+    objects1 = render_application(spec1, caller_public_keys=run.caller_keys)
     by_kind = {(o["kind"], o["metadata"]["name"].split("-")[1]): o for o in objects1}
     deployment = by_kind[("Deployment", "app")]
     service = by_kind[("Service", "service")]
@@ -893,6 +871,15 @@ async def scenario(run: Run, kube: Kube, api: Api, loop: Any, log: PassLog, agen
     check(
         canonical(plan.get("objects")) == canonical(objects1),
         "the worker render route's objects equal render_application byte for byte",
+    )
+    containers = {
+        c["name"]: {e["name"]: e.get("value") for e in c.get("env") or []}
+        for c in deployment["spec"]["template"]["spec"]["containers"]
+    }
+    check(
+        containers["proxy"].get("CURIE_CALLER_PROXY_PUBLIC_KEYS") == ",".join(run.caller_keys)
+        and not [name for name in containers["server"] if name.startswith("CURIE_CALLER_")],
+        "the render carries the API's caller verify key to the proxy container only",
     )
     sealed = (plan.get("secrets") or {}).get("database", {}).get("sealed_dsn")
     dsn_live, dsn_content = expect_secret(
@@ -1430,6 +1417,7 @@ async def main() -> None:
     worker_token = secrets.token_hex(24)
     caller = nacl.signing.SigningKey.generate()
     caller_public = b64(bytes(caller.verify_key))
+    run.caller_keys = (caller_public,)
     stores = {
         "DATABASE_URL": run.database_url(),
         "VALKEY_HOST": "127.0.0.1",
@@ -1469,10 +1457,6 @@ async def main() -> None:
     worker_kubeconfig(run, kube)
     with api_process(run, api_env) as base:
         ok("the API (uvicorn curie_api.main:create_app) answers /health")
-        check(
-            await caller_keys_published(run, caller_public),
-            "the API lifespan publisher wrote the caller verify key and the installation heartbeat",
-        )
         api = Api(base, api_key, worker_token)
 
         os.environ.update(

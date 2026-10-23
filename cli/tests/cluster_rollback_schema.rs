@@ -189,8 +189,8 @@ fn stable_v0100_sorts_after_its_release_candidate_for_fail_forward() {
 /// tracker identity contract 0103, trigger label expansion 0105, and identity
 /// links expansion 0107 and train join 0108, then team sync state 0120, agent
 /// access policies 0121, directory identity 0122, shared connector store
-/// expansion 0123, its source staleness flag 0124 and caller verify keys 0125,
-/// so the upgrade is forward-only.
+/// expansion 0123 and its source staleness flag 0124, so the upgrade is
+/// forward-only.
 #[test]
 fn v091_source_upgrades_through_the_packaged_chart_graph() {
     let source = window_for("0.9.1").expect("0.9.1 is catalogued");
@@ -200,7 +200,7 @@ fn v091_source_upgrades_through_the_packaged_chart_graph() {
 
     assert_eq!(source.schema_head, "0044");
     assert_eq!(target.schema_min, "0122");
-    assert_eq!(target.schema_head, "0125");
+    assert_eq!(target.schema_head, "0124");
 
     let pending =
         pending_revisions(Some("0044"), &target).expect("0044 reaches the packaged chart head");
@@ -222,7 +222,7 @@ fn v091_source_upgrades_through_the_packaged_chart_graph() {
             "0081", "0082", "0083", "0084", "0085", "0086", "0087", "0088", "0089", "0090",
             "0091a", "0092a", "0093a", "0094", "0095", "0096", "0097", "0098", "0091", "0092",
             "0093", "0099", "0100", "0101", "0102", "0103", "0105", "0107", "0106", "0108", "0120",
-            "0121", "0122", "0123", "0124", "0125"
+            "0121", "0122", "0123", "0124"
         ]
     );
     let contracts: Vec<&str> = pending
@@ -266,7 +266,7 @@ fn released_v0101_upgrades_through_the_new_feature_train_revision() {
             .expect("packaged chart schema compatibility metadata parses");
 
     assert_eq!(source.schema_head, "0058");
-    assert_eq!(target.schema_head, "0125");
+    assert_eq!(target.schema_head, "0124");
     let pending = pending_revisions(Some(&source.schema_head), &target)
         .expect("released 0.10.1 reaches the new head");
     assert_eq!(
@@ -285,8 +285,7 @@ fn released_v0101_upgrades_through_the_new_feature_train_revision() {
             "0070", "0071", "0072", "0073", "0075", "0076", "0079", "0080", "0081", "0082", "0083",
             "0084", "0085", "0086", "0087", "0088", "0089", "0090", "0091a", "0092a", "0093a",
             "0094", "0095", "0096", "0097", "0098", "0091", "0092", "0093", "0099", "0100", "0101",
-            "0102", "0103", "0105", "0107", "0106", "0108", "0120", "0121", "0122", "0123", "0124",
-            "0125"
+            "0102", "0103", "0105", "0107", "0106", "0108", "0120", "0121", "0122", "0123", "0124"
         ]
     );
 
@@ -322,7 +321,7 @@ fn released_v0101_upgrades_through_the_new_feature_train_revision() {
 /// identity contract 0103, trigger label expansion 0105 and identity links
 /// expansion 0107 and train join 0108, then team sync state 0120, agent
 /// access policies 0121, directory identity 0122, shared connector store
-/// expansion 0123, its source staleness flag 0124 and caller verify keys 0125.
+/// expansion 0123 and its source staleness flag 0124.
 #[test]
 fn released_v0102_upgrades_through_the_feature_train_revisions() {
     // @spec DEPLOY-NOTICE-RELEASE-1.
@@ -332,7 +331,7 @@ fn released_v0102_upgrades_through_the_feature_train_revisions() {
             .expect("packaged chart schema compatibility metadata parses");
 
     assert_eq!(source.schema_head, "0062");
-    assert_eq!(target.schema_head, "0125");
+    assert_eq!(target.schema_head, "0124");
     let pending = pending_revisions(Some(&source.schema_head), &target)
         .expect("released 0.10.2 reaches the new head");
     assert_eq!(
@@ -351,7 +350,7 @@ fn released_v0102_upgrades_through_the_feature_train_revisions() {
             "0075", "0076", "0079", "0080", "0081", "0082", "0083", "0084", "0085", "0086", "0087",
             "0088", "0089", "0090", "0091a", "0092a", "0093a", "0094", "0095", "0096", "0097",
             "0098", "0091", "0092", "0093", "0099", "0100", "0101", "0102", "0103", "0105", "0107",
-            "0106", "0108", "0120", "0121", "0122", "0123", "0124", "0125"
+            "0106", "0108", "0120", "0121", "0122", "0123", "0124"
         ]
     );
     let contracts: Vec<&str> = pending
@@ -388,8 +387,7 @@ fn released_v0102_upgrades_through_the_feature_train_revisions() {
 /// tracker identity contract 0103, the trigger label expansion 0105, and the
 /// identity links expansion 0107 and train join 0108, then team sync state
 /// expansion 0120, agent access policies 0121, directory identity 0122, the
-/// shared connector store expansion 0123, its source staleness flag 0124 and
-/// caller verify keys 0125.
+/// shared connector store expansion 0123 and its source staleness flag 0124.
 #[test]
 fn released_v0103_upgrades_through_the_renumbered_feature_train() {
     // @spec DEPLOY-NOTICE-RELEASE-1.
@@ -399,7 +397,7 @@ fn released_v0103_upgrades_through_the_renumbered_feature_train() {
             .expect("packaged chart schema compatibility metadata parses");
 
     assert_eq!(source.schema_head, "0063");
-    assert_eq!(target.schema_head, "0125");
+    assert_eq!(target.schema_head, "0124");
     let pending = pending_revisions(Some(&source.schema_head), &target)
         .expect("released 0.10.3 reaches the new head");
     assert_eq!(
@@ -418,7 +416,7 @@ fn released_v0103_upgrades_through_the_renumbered_feature_train() {
             "0076", "0079", "0080", "0081", "0082", "0083", "0084", "0085", "0086", "0087", "0088",
             "0089", "0090", "0091a", "0092a", "0093a", "0094", "0095", "0096", "0097", "0098",
             "0091", "0092", "0093", "0099", "0100", "0101", "0102", "0103", "0105", "0107", "0106",
-            "0108", "0120", "0121", "0122", "0123", "0124", "0125"
+            "0108", "0120", "0121", "0122", "0123", "0124"
         ]
     );
     let contracts: Vec<&str> = pending

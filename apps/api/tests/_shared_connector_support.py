@@ -60,8 +60,7 @@ DSN_SECRET = {"name": "acme-database", "key": "dsn"}
 SLOT = "access_token"
 TOOLS = ("issues.read", "issues.write", "issues.close")
 
-# The six 0123 tables, each scoped to one application.
-APPLICATION_TABLES = (
+SHARED_TABLES = (
     "shared_connector_applications",
     "shared_connector_recipients",
     "shared_connector_database_roles",
@@ -69,13 +68,6 @@ APPLICATION_TABLES = (
     "shared_connector_bindings",
     "shared_connector_refresh_intents",
 )
-# The two 0125 tables the shared proxy reads its caller verify keys from, each
-# scoped to the installation of the reading role's application.
-CALLER_KEY_TABLES = (
-    "shared_connector_caller_keys",
-    "shared_connector_caller_key_heartbeats",
-)
-SHARED_TABLES = (*APPLICATION_TABLES, *CALLER_KEY_TABLES)
 # The worker-managed Secret names and data keys registration pins (cp5).
 KEY_SECRET_PREFIX = "shared-key-"
 KEY_SECRET_KEY = "private-keys"
@@ -317,6 +309,37 @@ def intent_row(binding_id: str) -> dict[str, Any]:
     return row
 
 
+def caller_verify_key() -> str:
+    """A fresh caller verify key: canonical padded standard base64 of 32 bytes."""
+
+    import nacl.signing
+
+    return base64.b64encode(bytes(nacl.signing.SigningKey.generate().verify_key)).decode()
+
+
+def configured_caller_keys() -> tuple[str, ...]:
+    """The keys a shared application render must carry, from the API's settings now.
+
+    Computed here, independently of the API (rework 1): the current then the
+    previous key, each stripped, strictly decoded to 32 bytes and re-encoded
+    as padded standard base64, blanks and repeats dropped.
+    """
+
+    settings = get_settings()
+    keys: list[str] = []
+    for text in (
+        settings.connector_caller_public_key,
+        settings.connector_caller_previous_public_key,
+    ):
+        if text.strip():
+            raw = base64.b64decode(text.strip(), validate=True)
+            assert len(raw) == 32, "a configured caller key is 32 bytes"
+            key = base64.b64encode(raw).decode()
+            if key not in keys:
+                keys.append(key)
+    return tuple(keys)
+
+
 def application_row(application_id: str) -> dict[str, Any]:
     (row,) = sql_dicts(
         "SELECT * FROM curie.shared_connector_applications WHERE id = :id",
@@ -399,7 +422,7 @@ def shared_function_names() -> set[str]:
 
 
 def shared_table_text() -> str:
-    """Every row of the eight tables, rendered whole as the owner sees it."""
+    """Every row of the six tables, rendered whole as the owner sees it."""
 
     parts: list[str] = []
     for table in SHARED_TABLES:
@@ -654,16 +677,6 @@ class SharedCleanup:
                         "WHERE installation_id = $1",
                         installation,
                     )
-                # Every API process with this installation publishes its verify
-                # keys and a heartbeat (0125); they are keyed by installation.
-                for table in CALLER_KEY_TABLES:
-                    if await connection.fetchval(
-                        "SELECT to_regclass($1) IS NOT NULL", f"curie.{table}"
-                    ):
-                        await connection.execute(
-                            f"DELETE FROM curie.{table} WHERE installation_id = $1",
-                            installation,
-                        )
             finally:
                 await connection.close()
         admin = await self._connect("postgres")

@@ -39,6 +39,7 @@ from _shared_connector_support import (
     assert_declaration_refused,
     bundle_archive,
     canonical,
+    configured_caller_keys,
     connectors_yaml,
     random_installation,
     recipient_rows,
@@ -276,7 +277,11 @@ def test_render_restricted_by_the_agents_target(store: SharedStore) -> None:
 def test_application_render_is_frozen_output(store: SharedStore) -> None:
     application_id = store.register_application()["application_id"]
     objects = _app_objects(store, application_id)
-    assert canonical(objects) == canonical(render_application(_stored_spec(application_id)))
+    assert canonical(objects) == canonical(
+        render_application(
+            _stored_spec(application_id), caller_public_keys=configured_caller_keys()
+        )
+    )
     for item in objects:
         labels = item["metadata"]["labels"]
         assert labels[APPLICATION_LABEL] == application_id

@@ -4,14 +4,10 @@
 real API with ``run_tools`` and ``gated_tools`` in its policy, its real
 resolver launched by ``Fleet.launch`` (optionally on a ``HandleRegistry`` with
 custom bounds), the fixture MCP server (``_fixture_mcp_server``) as its
-upstream, and ``build_shared_app`` (the entry point's own wiring) served on the
-resolver harness's own event loop with ``web.AppRunner(app,
-handler_cancellation=True)`` on ``127.0.0.1``. The proxy's configuration comes
-from ``SharedProxyConfig.from_env`` over the frozen render's names, with the
-grant store file holding a real Valkey URL. The caller verify key is never in
-that environment (cp5): it is published into the database by the API's own
-``caller_keys.publish`` (``publish_caller_keys``) before the proxy is built,
-and the proxy reads it through the application role.
+upstream, and ``make_shared_app`` served on the resolver harness's own event
+loop with ``web.AppRunner(app, handler_cancellation=True)`` on ``127.0.0.1``.
+The proxy's configuration comes from ``SharedProxyConfig.from_env`` over the
+frozen render's names, with the grant store file holding a real Valkey URL.
 
 Members are real: an agent created through the API, its alias rows written by
 the membership API, and a platform-custody static binding imported through the
@@ -40,7 +36,6 @@ Readings this module settles so every suite uses one value:
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import concurrent.futures
 import dataclasses
@@ -50,7 +45,6 @@ import gzip
 import http.client
 import itertools
 import json
-import os
 import re
 import socket
 import time
@@ -66,9 +60,8 @@ from _fake_provider import FakeProvider, authorization_digest
 from _fixture_mcp_server import MCP_PATH, PROTOCOL_VERSION, TOOLS, FixtureMCPServer, Hold
 from _migration_support import sql_dicts
 from _resolver_harness import STATIC_FIELD, Fleet, Member, ResolverHarness, SharedApp, envelope
-from _shared_connector_support import PROXY_IMAGE, SLOT, in_background, source_metadata
+from _shared_connector_support import SLOT, in_background, source_metadata
 from aiohttp import web
-from curie_api.config import get_settings
 from curie_connector_proxy import server
 from curie_connector_proxy.resolver.handles import (
     MAX_INVOCATIONS,
@@ -78,8 +71,6 @@ from curie_connector_proxy.resolver.handles import (
 )
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
 from nacl.signing import SigningKey
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-from sqlalchemy.pool import NullPool
 
 REPO = Path(__file__).resolve().parents[4]
 SHARED_VECTOR_FILE = REPO / "tests" / "vectors" / "connector-shared-caller.json"
@@ -100,10 +91,7 @@ PROXY_PORT_ENV = "CURIE_SHARED_PROXY_PORT"
 UPSTREAM_URL_ENV = "CURIE_SHARED_UPSTREAM_URL"
 GRANT_STORE_FILE_ENV = "CURIE_SHARED_GRANT_STORE_FILE"
 PUBLIC_KEYS_ENV = "CURIE_CALLER_PROXY_PUBLIC_KEYS"
-# cp5: the dedicated verify-key variable is dedicated-only too; a shared proxy
-# reads its keys from the database.
 DEDICATED_ONLY_ENV = (
-    PUBLIC_KEYS_ENV,
     "CURIE_CALLER_PROXY_ADMITS",
     "CURIE_CALLER_PROXY_GATED_TOOLS",
     "CURIE_CALLER_PROXY_CONNECTOR",
@@ -168,57 +156,6 @@ def valkey_url() -> str:
     return f"redis://{auth}{VALKEY_HOST}:{VALKEY_PORT}/0"
 
 
-def signing_pair() -> tuple[str, str]:
-    """A fresh caller signing seed and its verify key, both standard base64."""
-
-    signing = SigningKey.generate()
-    return (
-        base64.b64encode(bytes(signing)).decode("ascii"),
-        base64.b64encode(bytes(signing.verify_key)).decode("ascii"),
-    )
-
-
-def publish_caller_keys(installation: str, current: str = "", previous: str = "") -> str:
-    """One tick of the API's live publisher for ``installation`` (cp5, D1).
-
-    Runs the production ``caller_keys.publish`` against the test database
-    with the API's settings narrowed to this installation and verify keys,
-    exactly as an API process configured with ``CURIE_CONNECTOR_CALLER_PUBLIC_KEY``
-    (and the previous key) publishes on each tick. A blank ``current`` is a
-    process with no verify key configured: it heartbeats and publishes no key.
-
-    A second API app is deliberately not started for this: its own 60 s
-    publisher would keep ticking for the rest of the test, and the
-    ``monkeypatch`` it needs would change the env the fixture's app reads.
-    """
-
-    from curie_api.shared_connectors import caller_keys
-
-    settings = get_settings().model_copy(
-        update={
-            "installation_id": installation,
-            "installation_id_observed": True,
-            "connector_caller_public_key": current,
-            "connector_caller_previous_public_key": previous,
-            "connector_proxy_image": PROXY_IMAGE,
-        }
-    )
-
-    async def run() -> str:
-        engine = create_async_engine(get_settings().database_url, poolclass=NullPool)
-        try:
-            async with async_sessionmaker(engine, expire_on_commit=False)() as session:
-                outcome = await caller_keys.publish(session, settings)
-                await session.commit()
-                return str(outcome)
-        finally:
-            await engine.dispose()
-
-    outcome = asyncio.run(run())
-    assert outcome == "published", outcome
-    return outcome
-
-
 def closed_port() -> int:
     """A loopback port nothing listens on."""
 
@@ -226,25 +163,6 @@ def closed_port() -> int:
         probe.bind(("127.0.0.1", 0))
         port: int = probe.getsockname()[1]
     return port
-
-
-def process_env(env: Mapping[str, str]) -> dict[str, str]:
-    """``env`` over this process's own, minus every inherited proxy variable."""
-
-    inherited = {
-        name: value
-        for name, value in os.environ.items()
-        if not name.startswith(("CURIE_SHARED_", "CURIE_CALLER_PROXY_", "CURIE_CONNECTOR_CALLER_"))
-    }
-    return {**inherited, **env}
-
-
-def refuses_connection(port: int) -> bool:
-    try:
-        with socket.create_connection(("127.0.0.1", port), timeout=2):
-            return False
-    except OSError:
-        return True
 
 
 def agent_name(agent_id: str) -> str:
@@ -472,7 +390,9 @@ class SharedProxy:
         self.resolver: ResolverHarness = fleet.launch(self.app, handles=handles)
         self.registry: HandleRegistry = self.resolver.handles
         self.clock = MutableClock()
-        self.seed, self.public_key = signing_pair()
+        signing = SigningKey.generate()
+        self.seed = base64.b64encode(bytes(signing)).decode("ascii")
+        self.public_key = base64.b64encode(bytes(signing.verify_key)).decode("ascii")
         self.grant_store_url = valkey_url() if grant_store_url is None else grant_store_url
         self._ids = itertools.count(1000)
         self._runner: web.AppRunner | None = None
@@ -487,15 +407,13 @@ class SharedProxy:
                 PROXY_PORT_ENV: LISTEN_PORT,
                 UPSTREAM_URL_ENV: self.fixture.url,
                 GRANT_STORE_FILE_ENV: str(store_file),
+                PUBLIC_KEYS_ENV: self.public_key,
             }
             if proxy_env is not None:
                 self.env = dict(proxy_env(self, dict(self.env)))
             from curie_connector_proxy import shared
 
             config = shared.SharedProxyConfig.from_env(self.env)
-            # The verify key reaches the proxy only through the database, as
-            # one API process configured with it publishes it.
-            publish_caller_keys(self.app.installation, self.public_key)
             if session_idle_seconds is not None:
                 config = dataclasses.replace(config, session_idle_seconds=session_idle_seconds)
             self.config = config
@@ -507,7 +425,7 @@ class SharedProxy:
     async def _serve(self) -> int:
         from curie_connector_proxy import shared
 
-        app = await shared.build_shared_app(self.config, self.resolver.runtime, clock=self.clock)
+        app = shared.make_shared_app(self.config, self.resolver.runtime, clock=self.clock)
         runner = web.AppRunner(app, handler_cancellation=True, shutdown_timeout=5.0)
         await runner.setup()
         site = web.TCPSite(runner, "127.0.0.1", 0)

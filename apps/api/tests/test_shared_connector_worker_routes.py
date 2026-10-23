@@ -49,7 +49,9 @@ from _shared_connector_support import (
     assert_no_store,
     assert_refused,
     b64,
+    caller_verify_key,
     canonical,
+    configured_caller_keys,
     detail_code,
     dsn_secret_ref,
     key_secret_ref,
@@ -77,7 +79,13 @@ def cleanup(migrated: None) -> Iterator[SharedCleanup]:
 @pytest.fixture
 def store(cleanup: SharedCleanup, monkeypatch: pytest.MonkeyPatch) -> Iterator[SharedStore]:
     installation = cleanup.installation(random_installation())
-    with shared_app(monkeypatch, installation) as client:
+    # The application render needs the trusted caller verify key (rework 1).
+    with shared_app(
+        monkeypatch,
+        installation,
+        CURIE_CONNECTOR_CALLER_PUBLIC_KEY=caller_verify_key(),
+        CURIE_CONNECTOR_PROXY_IMAGE="example.com/acme/proxy@sha256:" + "b" * 64,
+    ) as client:
         yield SharedStore(client, installation, cleanup)
     monkeypatch.undo()
     get_settings.cache_clear()
@@ -206,7 +214,9 @@ def test_application_render_objects_are_the_frozen_function_output(store: Shared
     application_id = store.register_application()["application_id"]
     body = _rendered(store, application_id)
     spec = _stored_spec(application_id)
-    assert canonical(body["objects"]) == canonical(render_application(spec))
+    assert canonical(body["objects"]) == canonical(
+        render_application(spec, caller_public_keys=configured_caller_keys())
+    )
     assert (
         body["installation_label"] == hashlib.sha256(store.installation.encode()).hexdigest()[:40]
     )
@@ -545,7 +555,7 @@ def test_stored_spec_secret_ref_invalid_refuses_worker_reads(
 
     # Liveness: the canonical stored spec still renders and resolves.
     assert canonical(_rendered(store, canonical_id)["objects"]) == canonical(
-        render_application(_stored_spec(canonical_id))
+        render_application(_stored_spec(canonical_id), caller_public_keys=configured_caller_keys())
     )
     resolved = store.resolve(agent_id, [{"name": "wiki", "application": canonical_id}])
     assert resolved.status_code == 200, resolved.text

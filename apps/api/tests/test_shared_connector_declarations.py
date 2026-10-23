@@ -896,3 +896,143 @@ def test_read_declarations_never_returns_empty_on_error(
         lambda session: in_force_connector_digest(session, objects, agent, "k8s")
     )
     assert digest is None
+
+
+# --- 12. policy cross-checks see shared aliases (rework 1, finding 3) ---------
+
+POLICY_ENFORCEMENT = bundles.TOOL_POLICY_ENFORCEMENT
+GATE_ROUTE = "ops-approvals"
+UNKNOWN_SERVER = "tool_policy.unknown_server"
+NOT_NAMESPACED = "approval_policy.gate_not_namespaced"
+
+
+def _manifest(*, allow: list[str] | None = None, gates: list[str] | None = None) -> dict[str, str]:
+    """``plugin.json`` declaring a tool policy and approval gates, as one file override."""
+
+    document: dict[str, Any] = {"name": PLUGIN_NAME, "version": "0.1.0", "description": "t"}
+    if allow is not None:
+        document["toolPolicy"] = {"enforcement": POLICY_ENFORCEMENT, "allow": allow}
+    if gates is not None:
+        document["approvalPolicy"] = {
+            "gates": [{"gate": gate, "route": GATE_ROUTE} for gate in gates]
+        }
+    return {".claude-plugin/plugin.json": json.dumps(document)}
+
+
+def _policy_tree(root: Path, connectors: str, **policy: list[str] | None) -> Path:
+    files: dict[str, str | bytes] = dict(bundle_files(connectors))
+    files.update(_manifest(**policy))
+    return write_tree(root, files)
+
+
+# (allow, gates, the error codes with their locations; empty is valid)
+POLICY_CASES: dict[str, tuple[list[str] | None, list[str] | None, set[tuple[str, str]]]] = {
+    "allow-shared-alias": (["tracker/read"], None, set()),
+    "gate-shared-alias": (None, [f"mcp__{ALIAS}__write"], set()),
+    "allow-and-gate-shared-and-dedicated": (
+        ["tracker/read", "grafana/query"],
+        [f"mcp__{ALIAS}__write", "mcp__grafana__query"],
+        set(),
+    ),
+    "allow-unknown-alias": (
+        ["nosuch/read"],
+        None,
+        {(UNKNOWN_SERVER, "plugin.json (toolPolicy.allow[0])")},
+    ),
+    "allow-one-unknown-beside-the-alias": (
+        ["tracker/read", "nosuch/read"],
+        None,
+        {(UNKNOWN_SERVER, "plugin.json (toolPolicy.allow[1])")},
+    ),
+    "gate-unknown-alias": (None, ["mcp__nosuch__write"], {(NOT_NAMESPACED, "")}),
+    "gate-empty-suffix": (None, [f"mcp__{ALIAS}__"], {(NOT_NAMESPACED, "")}),
+}
+
+
+def _codes(result: Any) -> set[tuple[str, str]]:
+    """Each error's code, with its location for the tool policy (gates keep any location)."""
+
+    return {
+        (error.code, error.location if error.code == UNKNOWN_SERVER else "")
+        for error in result.errors
+    }
+
+
+@pytest.mark.parametrize("case", list(POLICY_CASES))
+def test_validate_with_shared_policy_sees_shared_aliases(tmp_path: Path, case: str) -> None:
+    allow, gates, expected = POLICY_CASES[case]
+    application_id = str(uuid.uuid4())
+    root = _policy_tree(tmp_path / "b", _mixed(application_id), allow=allow, gates=gates)
+    before = tree_digest(root)
+
+    result, declarations = bundles.validate_with_shared(root)
+
+    assert tree_digest(root) == before
+    assert declarations is not None
+    assert _codes(result) == expected, [e.model_dump() for e in result.errors]
+    assert result.valid is (not expected)
+
+
+@pytest.mark.parametrize("case", list(POLICY_CASES))
+def test_archive_validator_policy_sees_shared_aliases(case: str) -> None:
+    allow, gates, expected = POLICY_CASES[case]
+    application_id = str(uuid.uuid4())
+    archive = bundle_archive(_mixed(application_id), files=_manifest(allow=allow, gates=gates))
+    if not expected:
+        _, _, shared = deploy.validate_archive(archive, allow_shared=True)
+        assert shared == (SharedEntry(ALIAS, application_id),)
+        return
+    with pytest.raises(deploy.BundleInvalid) as refused:
+        deploy.validate_archive(archive, allow_shared=True)
+    codes = {
+        (error["code"], error["location"] if error["code"] == UNKNOWN_SERVER else "")
+        for error in refused.value.errors
+    }
+    assert codes == expected, refused.value.errors
+
+
+@pytest.mark.parametrize(
+    "case", ["allow-shared-alias", "gate-shared-alias", "allow-unknown-alias", "gate-empty-suffix"]
+)
+def test_upload_policy_sees_shared_aliases(store: SharedStore, case: str) -> None:
+    allow, gates, expected = POLICY_CASES[case]
+    application_id = store.register_application()["application_id"]
+    agent_id = store.create_agent()
+    store.member(application_id, agent_id, ALIAS)
+    version_id = store.create_version(agent_id)
+    archive = bundle_archive(_mixed(application_id), files=_manifest(allow=allow, gates=gates))
+
+    response = store.upload(agent_id, version_id, archive)
+
+    if not expected:
+        assert response.status_code == 201, response.text
+        assert bundle_ref(version_id) == response.json()["bundle_ref"]
+        return
+    assert {code for code, _ in _invalid(response)} == {code for code, _ in expected}
+    assert bundle_ref(version_id) is None
+
+
+@pytest.mark.parametrize(
+    ("allow", "gates"),
+    [
+        (["grafana/query", "nosuch/read"], None),
+        (["tracker/read"], None),
+        (None, [f"mcp__{ALIAS}__write"]),
+        (None, ["mcp__grafana__", "mcp__nosuch__write"]),
+        (["grafana/query"], ["mcp__grafana__query"]),
+    ],
+)
+def test_dedicated_only_policy_results_are_unchanged(
+    tmp_path: Path, allow: list[str] | None, gates: list[str] | None
+) -> None:
+    """No shared entry: exactly the frozen validator's answer, alias-looking names included."""
+
+    from plugin_format import validate_bundle
+
+    root = _policy_tree(tmp_path / "b", connectors_yaml(HOSTED_DEDICATED), allow=allow, gates=gates)
+    frozen = validate_bundle(root, enforces_tool_policy=POLICY_ENFORCEMENT)
+
+    result, _ = bundles.validate_with_shared(root)
+
+    assert [e.model_dump() for e in result.errors] == [e.model_dump() for e in frozen.errors]
+    assert result.valid is frozen.valid

@@ -52,6 +52,7 @@ from typing import Any
 
 import httpx
 import nacl.public
+import nacl.signing
 import pytest
 import yaml
 
@@ -81,7 +82,6 @@ from _shared_connector_support import (  # noqa: E402
     role_name_for,
     shared_app,
 )
-from _shared_proxy_harness import signing_pair  # noqa: E402
 from curie_api.config import get_settings  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 from kubernetes.client.exceptions import ApiException  # noqa: E402
@@ -160,6 +160,41 @@ def recorded_status(name: str) -> dict[str, Any]:
 
 def template_hash(deployment: Mapping[str, Any]) -> str:
     return hashlib.sha256(canonical(deployment["spec"]["template"])).hexdigest()
+
+
+def verify_key() -> str:
+    """A fresh caller verify key, canonical standard base64 of 32 bytes."""
+
+    return b64(bytes(nacl.signing.SigningKey.generate().verify_key))
+
+
+def canonical_caller_keys(*configured: str) -> tuple[str, ...]:
+    """The keys a render must carry for these configured values (rework 1, B).
+
+    Independent of the API: each stripped and strictly decoded to its 32
+    bytes, re-encoded as padded standard base64, blanks and repeats dropped,
+    order kept (current first).
+    """
+
+    keys: list[str] = []
+    for text in configured:
+        if not text.strip():
+            continue
+        raw = base64.b64decode(text.strip(), validate=True)
+        assert len(raw) == 32, "a configured caller key is 32 bytes"
+        key = b64(raw)
+        if key not in keys:
+            keys.append(key)
+    return tuple(keys)
+
+
+def configured_caller_keys() -> tuple[str, ...]:
+    """The canonical keys the API's settings configure right now."""
+
+    settings = get_settings()
+    return canonical_caller_keys(
+        settings.connector_caller_public_key, settings.connector_caller_previous_public_key
+    )
 
 
 def logged(caplog: pytest.LogCaptureFixture, code: str) -> bool:
@@ -740,7 +775,9 @@ class World:
         return SharedApplication.model_validate_json(json.dumps(self.specs[application_id]))
 
     def expected_application(self, application_id: str) -> list[dict[str, Any]]:
-        return render_application(self.spec(application_id))
+        return render_application(
+            self.spec(application_id), caller_public_keys=configured_caller_keys()
+        )
 
     def expected_reach(self, application_id: str, agent_id: str) -> list[dict[str, Any]]:
         member = SharedMember.model_validate_json(
@@ -1004,7 +1041,7 @@ def world(
     # the database, and the loop reconciles every active deployment.
     sql_rows("UPDATE curie.deployments SET status = 'inactive' WHERE status = 'active'")
     installation = cleanup.installation(random_installation())
-    _, caller_public = signing_pair()
+    caller_public = verify_key()
     # A hosted dedicated connector renders only with a caller verify key.
     with shared_app(
         monkeypatch,
@@ -1699,3 +1736,82 @@ def test_kubernetes_shared_client_deletes_deployments_in_foreground() -> None:
     assert _delete_propagation(by_method["delete_namespaced_deployment"]) == "Foreground"
     assert _delete_propagation(by_method["delete_namespaced_service"]) is None
     assert _delete_propagation(by_method["delete_namespaced_network_policy"]) is None
+
+
+# =============================================================================
+# Rework 1 (B): the caller verify keys reach the proxy only through the render
+# =============================================================================
+
+PUBLIC_KEYS_ENV = "CURIE_CALLER_PROXY_PUBLIC_KEYS"
+CURRENT_KEY_ENV = "CURIE_CONNECTOR_CALLER_PUBLIC_KEY"
+PREVIOUS_KEY_ENV = "CURIE_CONNECTOR_CALLER_PREVIOUS_PUBLIC_KEY"
+
+
+def _container_env(deployment: Mapping[str, Any], name: str) -> dict[str, str]:
+    (container,) = [
+        c for c in deployment["spec"]["template"]["spec"]["containers"] if c["name"] == name
+    ]
+    return {entry["name"]: entry["value"] for entry in container.get("env") or []}
+
+
+def _routed_deployment(world: World, application_id: str) -> dict[str, Any]:
+    (deployment,) = [
+        obj
+        for obj in world.application_render(application_id)["objects"]
+        if obj["kind"] == "Deployment"
+    ]
+    return deployment
+
+
+def test_worker_applies_the_api_render_with_its_caller_keys(world: World) -> None:
+    application_id = world.application()
+    world.member(application_id)
+    world.converge(application_id)
+    name = world.deployment_name(application_id)
+
+    keys = configured_caller_keys()
+    assert len(keys) == 1
+    (sent,) = world.cluster.sent_named("Deployment", name)[-1:]
+    routed = _routed_deployment(world, application_id)
+    assert canonical(sent) == canonical(routed), "the worker applies the API's render unmodified"
+    assert _container_env(sent, "proxy")[PUBLIC_KEYS_ENV] == keys[0]
+    server = _container_env(sent, "server")
+    assert not [env for env in server if env.startswith("CURIE_CALLER_")], server
+    assert not any(keys[0] in value for value in server.values())
+    assert_application_objects_equal_render(world, application_id)
+
+
+def test_caller_key_rotation_reapplies_the_deployment_with_both_keys(world: World) -> None:
+    application_id = world.application()
+    world.member(application_id)
+    world.converge(application_id)
+    name = world.deployment_name(application_id)
+    (old,) = configured_caller_keys()
+    others_before = {
+        (obj["kind"], obj["metadata"]["name"]): canonical(obj)
+        for obj in world.expected_application(application_id)
+        if obj["kind"] != "Deployment"
+    }
+    generation = world.cluster.objects[("Deployment", name)]["metadata"]["generation"]
+
+    new = verify_key()
+    world.monkeypatch.setenv(CURRENT_KEY_ENV, new)
+    world.monkeypatch.setenv(PREVIOUS_KEY_ENV, old)
+    get_settings.cache_clear()
+    assert configured_caller_keys() == (new, old)
+
+    world.run_pass()
+
+    assert ("apply", "Deployment", name) in world.last
+    (sent,) = world.cluster.sent_named("Deployment", name)[-1:]
+    assert _container_env(sent, "proxy")[PUBLIC_KEYS_ENV] == f"{new},{old}"
+    assert canonical(sent) == canonical(_routed_deployment(world, application_id))
+    assert world.cluster.objects[("Deployment", name)]["metadata"]["generation"] == generation + 1
+    # Only the proxy env changed: every other application object renders as before.
+    others_after = {
+        (obj["kind"], obj["metadata"]["name"]): canonical(obj)
+        for obj in world.expected_application(application_id)
+        if obj["kind"] != "Deployment"
+    }
+    assert others_after == others_before
+    assert_application_objects_equal_render(world, application_id)
