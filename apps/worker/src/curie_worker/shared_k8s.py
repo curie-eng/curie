@@ -44,7 +44,6 @@ _KINDS: dict[str, tuple[type[Any], str]] = {
     "Service": (k8s_client.CoreV1Api, "service"),
     "NetworkPolicy": (k8s_client.NetworkingV1Api, "network_policy"),
 }
-SHARED_KINDS = tuple(_KINDS)
 _METADATA_ONLY = "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1"
 
 

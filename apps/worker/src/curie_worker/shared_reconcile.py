@@ -62,7 +62,6 @@ shared reference is retained until a pass after the first ready observation
 from __future__ import annotations
 
 import base64
-import binascii
 import hashlib
 import logging
 import re
@@ -85,7 +84,6 @@ from kubernetes.client.exceptions import ApiException
 
 from .connector_agent import SharedReach
 from .shared_declarations_client import WORKER_TOKEN_HEADER, WORKER_TOKEN_MISSING
-from .shared_k8s import SHARED_KINDS
 
 logger = logging.getLogger(__name__)
 
@@ -293,7 +291,6 @@ class SharedOutcome:
     applied: int = 0
     deleted: int = 0
     failures: list[str] = field(default_factory=list)
-    status_reported: bool = False
 
 
 # =============================================================================
@@ -311,6 +308,20 @@ def _name(obj: Mapping[str, Any]) -> str:
 
 def _b64(raw: bytes) -> str:
     return base64.b64encode(raw).decode("ascii")
+
+
+def _secret_text(secret: Mapping[str, Any] | None, name: str, key: str) -> str | None:
+    """The one data value of a worker Secret of the expected shape, decoded; else None."""
+
+    if secret is None or _name(secret) != name or secret.get("type") != "Opaque":
+        return None
+    data = secret.get("data")
+    if "stringData" in secret or not isinstance(data, Mapping) or set(data) != {key}:
+        return None
+    try:
+        return strict_b64decode(str(data[key])).decode("ascii")
+    except (ValueError, UnicodeDecodeError):
+        return None
 
 
 class SharedReconciler:
@@ -434,9 +445,7 @@ class SharedReconciler:
         held = (
             {application for application, _ in undeclared("Deployment")} if deployments else set()
         )
-        for kind in SHARED_KINDS:
-            if kind == "Deployment":
-                continue
+        for kind in ("Service", "NetworkPolicy"):
             for application, item in undeclared(kind):
                 self._forget(application)
                 if application not in held:
@@ -500,7 +509,7 @@ class SharedReconciler:
         elif database["status"] is None:
             return
         elif not self._client.secret_exists_metadata_only(self._namespace, dsn_ref["name"]):
-            self._report(application_id, "failed", DSN_SECRET_MISSING, revision, outcome)
+            self._report(application_id, "failed", DSN_SECRET_MISSING, revision)
             return
         for ref in operator_refs:
             if ref is not None and not self._client.secret_exists_metadata_only(
@@ -520,7 +529,7 @@ class SharedReconciler:
                 applied = False
                 isolated = isolated and obj.get("kind") != "NetworkPolicy"
         if stale:
-            self._report(application_id, "failed", DSN_SECRET_STALE, revision, outcome)
+            self._report(application_id, "failed", DSN_SECRET_STALE, revision)
             return
         deployments = [_name(obj) for obj in objects if obj.get("kind") == "Deployment"]
         if not applied or len(deployments) != 1:
@@ -529,7 +538,7 @@ class SharedReconciler:
         if observed is not None:
             if observed[0] == "ready":
                 self._ready_applications.add(application_id)
-            self._report(application_id, observed[0], observed[1], revision, outcome)
+            self._report(application_id, observed[0], observed[1], revision)
 
     # --- Secrets ------------------------------------------------------------------
 
@@ -563,19 +572,6 @@ class SharedReconciler:
         self._client.create_secret(self._namespace, body)
         return self._client.list_secret(self._namespace, name, labels)
 
-    def _secret_text(self, secret: Mapping[str, Any] | None, name: str, key: str) -> str | None:
-        """The one data value of a worker Secret of the expected shape, decoded; else None."""
-
-        if secret is None or _name(secret) != name or secret.get("type") != "Opaque":
-            return None
-        data = secret.get("data")
-        if "stringData" in secret or not isinstance(data, Mapping) or set(data) != {key}:
-            return None
-        try:
-            return strict_b64decode(str(data[key])).decode("ascii")
-        except (ValueError, UnicodeDecodeError):
-            return None
-
     def _ensure_key_secret(self, application_id: str) -> bytes:
         """The current raw public key the key Secret's private key derives."""
 
@@ -588,7 +584,7 @@ class SharedReconciler:
             # One key line, current first: the resolver's key file format.
             lambda: _b64(bytes(nacl.public.PrivateKey.generate())) + "\n",
         )
-        text = self._secret_text(secret, name, KEY_SECRET_KEY)
+        text = _secret_text(secret, name, KEY_SECRET_KEY)
         if text is None:
             raise SharedReconcileRefused(KEY_SECRET_INVALID)
         try:
@@ -626,13 +622,13 @@ class SharedReconciler:
         labels = self._secret_labels(application_id, ROLE_DATABASE_DSN)
         # The API's base64 sealed DSN, verbatim; the resolver opens it unchanged.
         secret = self._create_once(name, labels, DSN_SECRET_KEY, lambda: sealed)
-        text = self._secret_text(secret, name, DSN_SECRET_KEY)
+        text = _secret_text(secret, name, DSN_SECRET_KEY)
         if text is None:
             raise SharedReconcileRefused(DSN_SECRET_INVALID)
         held = "".join(text.split())
         try:
             strict_b64decode(held)
-        except (ValueError, binascii.Error):
+        except ValueError:
             raise SharedReconcileRefused(DSN_SECRET_INVALID) from None
         return "current" if held == "".join(sealed.split()) else "stale"
 
@@ -704,7 +700,6 @@ class SharedReconciler:
         status: str,
         reason: str | None,
         revision: object,
-        outcome: SharedOutcome,
     ) -> None:
         if not isinstance(revision, int):
             return
@@ -718,4 +713,3 @@ class SharedReconciler:
             body["reason"] = reason
         api.report_status(application_id, body)
         self._reported[application_id] = report
-        outcome.status_reported = True

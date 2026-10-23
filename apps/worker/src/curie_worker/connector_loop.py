@@ -56,6 +56,7 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 import httpx
+from curie_internal.shared_declarations import APPLICATION_LABEL
 from curie_telemetry import record_metric
 from plugin_format.connector_render import (
     AmbiguousObjectName,
@@ -95,7 +96,6 @@ _PLATFORM_5XX_GRACE_PASSES = 3
 
 RENDER_MALFORMED = "shared_render_malformed"
 REACH_FOREIGN = "shared_reach_foreign"
-_APPLICATION_LABEL = "curietech.ai/shared-application"
 
 
 class SharedRenderRefused(Exception):
@@ -255,7 +255,7 @@ class HttpManifestSource:
             or labels.get(AGENT_LABEL) != agent_id
             or labels.get(COMPONENT_LABEL) != COMPONENT
             or labels.get(PART_OF_LABEL) != self._release
-            or labels.get(_APPLICATION_LABEL) != application
+            or labels.get(APPLICATION_LABEL) != application
         ):
             raise SharedRenderRefused(REACH_FOREIGN)
 
