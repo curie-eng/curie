@@ -12,9 +12,22 @@ REPO = Path(__file__).resolve().parents[2]
 @pytest.mark.parametrize(
     "case_id,expected",
     [
-        ("canary-delivered-mismatch", "Delivery: observed; response: mismatch; user impact: unverified."),
-        ("canary-legacy-failure", "Delivery: unverified; response: mismatch; user impact: unverified."),
-        ("canary-delivery-timeout", "Delivery: failed; cause: unverified; user impact: unverified."),
+        (
+            "canary-delivered-mismatch",
+            "Delivery: observed; response: mismatch; user impact: unverified.",
+        ),
+        (
+            "canary-legacy-failure",
+            "Delivery: unverified; response: unverified; user impact: unverified.",
+        ),
+        (
+            "canary-delivery-timeout",
+            "Delivery: failed; cause: unverified; user impact: unverified.",
+        ),
+        (
+            "canary-legacy-event-shape",
+            "Delivery: observed; response: unverified; user impact: unverified.",
+        ),
     ],
 )
 def test_canary_classification_controls(case_id: str, expected: str) -> None:
