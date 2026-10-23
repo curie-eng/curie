@@ -161,8 +161,8 @@ with no fallback between the two modes.
    `X-Curie-Connector-Alias`. The agent's alias row, the application's policy and
    the agent's binding are then read from Postgres through the application's own
    role on every call. The keys are `CURIE_CALLER_PROXY_PUBLIC_KEYS`, which the
-   frozen shared render does not emit: the worker reconciliation that applies
-   shared applications must supply it, and a shared proxy without it refuses to
+   frozen shared render writes into the proxy container from its explicit
+   `caller_public_keys` render input; a shared proxy without it still refuses to
    start. Run authority comes only from the token: a tool in the policy's
    `run_tools` needs the token's `run` and `work_item`
    (`apps/worker/src/curie_connector_proxy/shared.py::run_context`). The verified

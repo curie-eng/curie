@@ -284,9 +284,17 @@ nothing listening, and closes it on shutdown. `make_shared_app`
 (`apps/worker/src/curie_connector_proxy/shared.py::make_shared_app`) refuses
 without a resolver, or with one for another installation or application.
 
-The frozen shared render does not emit `CURIE_CALLER_PROXY_PUBLIC_KEYS`. The
-worker reconciliation that applies shared applications must add it to the proxy
-container; until it does, a rendered shared proxy refuses to start.
+The frozen shared render takes the installation's caller public verify keys as
+an explicit render-time input, `caller_public_keys`
+(`packages/plugin-format/src/plugin_format/shared_connector_render.py::render_application`).
+They are the same keys the dedicated render receives through
+`ConnectorProxy.public_keys`, from the API's configured current and previous
+caller public key. The render writes them comma-joined into the proxy
+container's `CURIE_CALLER_PROXY_PUBLIC_KEYS` only, never the server container,
+and refuses an empty, malformed, duplicate or more-than-two list (the rule is
+frozen in `tests/vectors/shared-render-caller-keys.json`). The keys are not a
+stored application field, so a rotation re-renders the Deployment and rolls its
+Pod.
 
 A caller presents these request headers:
 
