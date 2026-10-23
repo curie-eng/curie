@@ -24,7 +24,13 @@ def _trace(
             "case_id": trace_id,
             "stream_id": stream_id,
             "outcome": "pass",
+            "model": "acme-model",
+            "scorer": "grader",
+            "cost_usd": 1.25,
         },
+        "observations": ["acme-observation"],
+        "scores": ["acme-score"],
+        "totalCost": 999,
     }
 
 
@@ -41,7 +47,9 @@ async def _matrix(
         tags = request.url.params.get_list("tags")
         selected = [trace for trace in traces or [] if set(tags) <= set(trace["tags"])]
         # Langfuse's official v3 API defines fromTimestamp as an inclusive
-        # ISO-8601 datetime and tags as requiring every supplied tag:
+        # ISO-8601 datetime and tags as requiring every supplied tag. Its fields
+        # selector retains metadata in io and timestamp/tags in core, while
+        # omitting observations, scores and aggregated metrics when unrequested:
         # https://github.com/langfuse/langfuse/blob/v3.225.5/fern/apis/server/definition/trace.yml
         lower = request.url.params.get("fromTimestamp")
         if lower is not None:
@@ -52,9 +60,23 @@ async def _matrix(
             ]
         # One trace per page exercises propagation on subsequent HTTP requests.
         page = int(request.url.params["page"])
-        return httpx.Response(
-            200, json={"data": selected[page - 1 : page], "meta": {"totalPages": len(selected)}}
+        fields = set(
+            request.url.params.get("fields", "core,io,scores,observations,metrics").split(",")
         )
+        data = []
+        for trace in selected[page - 1 : page]:
+            projected = {key: trace[key] for key in ("id", "timestamp", "tags")}
+            projected.update(observations=[], scores=[], totalCost=-1, latency=-1)
+            if "io" in fields:
+                projected["metadata"] = trace["metadata"]
+            if "observations" in fields:
+                projected["observations"] = trace["observations"]
+            if "scores" in fields:
+                projected["scores"] = trace["scores"]
+            if "metrics" in fields:
+                projected["totalCost"] = trace["totalCost"]
+            data.append(projected)
+        return httpx.Response(200, json={"data": data, "meta": {"totalPages": len(selected)}})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as outbound:
         app = FastAPI()
@@ -88,10 +110,26 @@ def test_stream_window_reaches_http_and_keeps_exact_run_and_suite(
 
     assert response.status_code == 200, response.text
     assert response.json()["cases"] == ["edge", "requested"]
+    assert response.json()["model_summaries"] == [
+        {
+            "model": "acme-model",
+            "passed": 2,
+            "total": 2,
+            "cost_usd": 2.5,
+            "plumbing": 0,
+            "completed": 2,
+        }
+    ]
+    for row in response.json()["rows"]:
+        assert row["cells"][0]["status"] == "pass"
+        assert row["cells"][0]["stream_id"] == stream_id
+        assert row["cells"][0]["model"] == "acme-model"
+        assert row["cells"][0]["scorer"] == "grader"
     assert len(requests) == 3
     for request in requests:
         assert request.url.params.get_list("tags") == ["eval", "suite:acme-suite"]
         assert request.url.params["fromTimestamp"] == "2024-12-31T23:59:55.123+00:00"
+        assert request.url.params.get("fields") == "core,io"
 
 
 def test_no_stream_preserves_suite_history(auth_headers: dict[str, str]) -> None:
@@ -111,8 +149,22 @@ def test_no_stream_preserves_suite_history(auth_headers: dict[str, str]) -> None
 
     assert response.status_code == 200, response.text
     assert response.json()["cases"] == ["historic", "recent"]
+    assert response.json()["model_summaries"] == [
+        {
+            "model": "acme-model",
+            "passed": 2,
+            "total": 2,
+            "cost_usd": 2.5,
+            "plumbing": 0,
+            "completed": 2,
+        }
+    ]
+    cells = [row["cells"][0] for row in response.json()["rows"]]
+    assert [cell["stream_id"] for cell in cells] == ["1704067200000-0", "1735689600123-0"]
+    assert all(cell["status"] == "pass" and cell["scorer"] == "grader" for cell in cells)
     assert len(requests) == 2
     assert all("fromTimestamp" not in request.url.params for request in requests)
+    assert all(request.url.params.get("fields") == "core,io" for request in requests)
 
 
 @pytest.mark.parametrize(

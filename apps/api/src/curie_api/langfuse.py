@@ -234,13 +234,19 @@ class LangfuseClient:
         return observations
 
     async def list_traces_by_tags(
-        self, tags: list[str], *, from_timestamp: datetime | None = None
+        self,
+        tags: list[str],
+        *,
+        from_timestamp: datetime | None = None,
+        fields: str | None = None,
     ) -> list[dict[str, Any]]:
         """Every trace carrying all of the given tags (e.g. suite:<name>)."""
 
         params: dict[str, Any] = {"tags": tags}
         if from_timestamp is not None:
             params["fromTimestamp"] = from_timestamp.isoformat(timespec="milliseconds")
+        if fields is not None:
+            params["fields"] = fields
         return await self._get_all("/api/public/traces", params)
 
     async def query_metrics(self, query: dict[str, Any]) -> list[dict[str, Any]]:

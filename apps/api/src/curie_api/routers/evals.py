@@ -144,8 +144,10 @@ async def eval_matrix(
     # deliberately no agent filter: eval traces are tagged by suite + version,
     # not agent, so an agent param would be dead. Do not re-add one.
     from_timestamp = _stream_trace_window(stream_id) if stream_id is not None else None
+    # Matrix outcomes and recorded costs live in metadata (io); it needs no
+    # observation, score or metric aggregations, including for historical reads.
     traces = await lf.list_traces_by_tags(
-        ["eval", f"suite:{suite}"], from_timestamp=from_timestamp
+        ["eval", f"suite:{suite}"], from_timestamp=from_timestamp, fields="core,io"
     )
     if stream_id is not None:
         traces = [
