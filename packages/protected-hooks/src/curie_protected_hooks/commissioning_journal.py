@@ -22,7 +22,9 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import math
 from dataclasses import dataclass, field
+from threading import get_ident
 from typing import Any, Self
 
 from redis import asyncio as aioredis
@@ -178,6 +180,20 @@ class _TerminalConnection(_AsyncConnection):
             raise ConnectionError(_ERROR)
 
 
+class _DeadlineLifetime(_Lifetime):
+    """Every failure hard-closes before any inherited cleanup detaches its writer."""
+
+    def fail(self) -> None:
+        super().fail()
+        for connection in self.async_connections:
+            if connection._writer is not None:
+                abort = connection._writer.transport.abort
+                if get_ident() == self.loop_thread:
+                    abort()
+                elif not self.loop.is_closed():
+                    self.loop.call_soon_threadsafe(abort)
+
+
 class CommissioningSession:
     """One authenticated, non-reconnecting session as one named principal.
 
@@ -220,14 +236,24 @@ class CommissioningSession:
         *,
         principal: dict[str, Any],
         terminal: bool = False,
+        deadline: float | None = None,
     ) -> Self:
         """Pin TLS and epoch, then prove ``ACL WHOAMI`` names the principal.
 
         @spec PROTECTED-COMMISSIONING-1/3.
         """
-        lifetime = _Lifetime()
+        lifetime = _Lifetime() if deadline is None else _DeadlineLifetime()
         pool: _AsyncPool | None = None
+        expiry: asyncio.TimerHandle | None = None
         try:
+            if deadline is not None:
+                if (
+                    type(deadline) is not float
+                    or not math.isfinite(deadline)
+                    or terminal is not True
+                ):
+                    raise CommissioningJournalRefused()
+                expiry = asyncio.get_running_loop().call_at(deadline, lifetime.fail)
             if (
                 type(manifest) is not Manifest
                 or type(credential) is not WorkerCredential
@@ -269,12 +295,24 @@ class CommissioningSession:
         except BaseException as error:  # noqa: BLE001  Close the socket before suppressing transport details.
             lifetime.fail()
             if pool is not None:
-                await pool.disconnect()
+                if deadline is None:
+                    await pool.disconnect()
+                else:
+                    lifetime.fail()
+                    await asyncio.gather(
+                        *(
+                            connection.disconnect(nowait=True)
+                            for connection in lifetime.async_connections
+                        )
+                    )
             if not isinstance(error, Exception):
                 raise
             if isinstance(error, CommissioningJournalRefused):
                 raise CommissioningJournalRefused(error.reason) from None
             raise CommissioningJournalRefused() from None
+        finally:
+            if expiry is not None:
+                expiry.cancel()
 
     @property
     def principal(self) -> dict[str, Any]:
@@ -325,10 +363,23 @@ class CommissioningSession:
             type(manifest) is Manifest and manifest.as_dict()["broker_identity"] == self.__identity
         )
 
-    async def close(self) -> None:
+    def abort(self) -> None:
+        """Immediately poison sockets before cancelled parser draining can delay closure."""
+        self.__lifetime.fail()
+
+    async def close(self, *, nowait: bool = False) -> None:
         """End the session without a reconnect path, @spec PROTECTED-COMMISSIONING-3."""
         self.__lifetime.fail()
-        await self.__pool.disconnect()
+        if nowait:
+            self.abort()
+            await asyncio.gather(
+                *(
+                    connection.disconnect(nowait=True)
+                    for connection in self.__lifetime.async_connections
+                )
+            )
+        else:
+            await self.__pool.disconnect()
 
 
 def _binding(

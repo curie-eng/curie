@@ -155,6 +155,10 @@ name = "Production composition never imports commissioning records"
 type = "forbidden"
 source_modules = ["curie_api", "curie_worker"]
 forbidden_modules = [
+    "curie_protected_hooks.commissioning_series_guard",
+    "curie_protected_hooks.commissioning_series_bootstrap",
+    "curie_protected_hooks.commissioning_retained",
+    "curie_protected_hooks.commissioning_evidence_records",
     "curie_protected_hooks.commissioning_acceptance_writer",
     "curie_protected_hooks.commissioning_acl",
     "curie_protected_hooks.commissioning_activation",
@@ -183,9 +187,14 @@ forbidden_modules = [
     "curie_protected_hooks.qualification_publication",
 ]
 
-# ADR 0236's internal operator composition is the only worker-side reader of
-# these records. The provisioner-only adapter owns the local installation reads.
+# ADR 0236's internal operator and ADR 0241's provisioner-only evidence reader
+# have only these named exceptions. Local installation reads stay provisioner-only.
 ignore_imports = [
+    "curie_worker.commissioning_evidence_observer -> curie_protected_hooks.commissioning_series_guard",
+    "curie_worker.commissioning_evidence_observer -> curie_protected_hooks.commissioning_series_bootstrap",
+    "curie_worker.commissioning_evidence_observer -> curie_protected_hooks.commissioning_records",
+    "curie_worker.commissioning_evidence_observer -> curie_protected_hooks.commissioning_journal",
+    "curie_worker.commissioning_evidence_observer -> curie_protected_hooks.commissioning_evidence_records",
     "curie_worker.commissioning_control_process -> curie_protected_hooks.commissioning_bootstrap",
     "curie_worker.commissioning_control_process -> curie_protected_hooks.commissioning_operator_guard",
     "curie_worker.commissioning_control_process -> curie_protected_hooks.commissioning_producers",
@@ -314,6 +323,7 @@ source_modules = [
     "curie_worker.protected_worker_bootstrap",
 ]
 forbidden_modules = [
+    "curie_worker.commissioning_evidence_observer",
     "curie_worker.commissioning_control_admission",
     "curie_worker.commissioning_control_installation",
     "curie_worker.commissioning_control_observer",
@@ -350,6 +360,7 @@ name = "The control process never owns provisioner or publication authority"
 type = "forbidden"
 source_modules = ["curie_worker.commissioning_control_process"]
 forbidden_modules = [
+    "curie_worker.commissioning_evidence_observer",
     "curie_worker.commissioning_control_reader",
     "curie_worker.commissioning_control_installation",
     "curie_protected_hooks.commissioning_local_installation",

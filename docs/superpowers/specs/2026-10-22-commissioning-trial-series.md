@@ -156,6 +156,21 @@ workload/session/receiver observations; stored control-written state alone is
 not proof of causality, dispatch or cleanup. Missing or inconsistent observations
 refuse. Existing principals and the twelve-fact guard channel gain no rights.
 
+The bounded read component is
+`apps/worker/src/curie_worker/commissioning_evidence_observer.py`. It uses exact
+B2/G2 inputs and the dedicated role, derives only known keys, reads their bytes
+twice around fresh client/time/epoch observations, and joins the original C's
+journal, reservation, ownership and admission records. It preserves the original
+epoch separately from the actual live epoch during historical reads. Pure stored
+record decoders and joins live in
+`packages/protected-hooks/src/curie_protected_hooks/commissioning_retained.py`
+and
+`packages/protected-hooks/src/curie_protected_hooks/commissioning_evidence_records.py`.
+These components emit observations only. Full measured series composition,
+complete trial-session inventory, final observer teardown and successful
+receipts/acceptance remain separate obligations; these reads do not establish
+them. Existing v1 issuer/control compositions do not issue B2 campaigns.
+
 ## Closed plan and evidence records
 
 <!-- @spec COMMISSIONING-SERIES-4 -->
