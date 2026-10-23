@@ -23,6 +23,7 @@ import pytest
 from aci_protocol import (
     PROTOCOL_VERSION,
     HookRunRef,
+    PrincipalRef,
     QueuedTurn,
     ReplyHandle,
     TurnSource,
@@ -39,6 +40,102 @@ from aci_protocol.turn import (
     slack_speaking_identity,
 )
 from pydantic import ValidationError
+
+
+def test_principal_ref_has_exact_required_fields_and_no_extra_value_constraints() -> None:
+    # @spec INITIATING-PRINCIPAL-1
+    assert list(PrincipalRef.model_fields) == ["principal_id", "authorization_version"]
+    assert all(field.is_required() for field in PrincipalRef.model_fields.values())
+
+    principal = PrincipalRef(principal_id="not-required-to-be-a-uuid", authorization_version=-1)
+    assert principal.principal_id == "not-required-to-be-a-uuid"
+    assert principal.authorization_version == -1
+
+
+@pytest.mark.parametrize("missing", ["principal_id", "authorization_version"])
+def test_principal_ref_rejects_each_missing_required_field(missing: str) -> None:
+    # @spec INITIATING-PRINCIPAL-1
+    values: dict[str, object] = {
+        "principal_id": "00000000-0000-4000-8000-000000000001",
+        "authorization_version": 0,
+    }
+    values.pop(missing)
+
+    with pytest.raises(ValidationError):
+        PrincipalRef.model_validate(values)
+
+
+def test_principal_ref_producer_rejects_unknown_fields() -> None:
+    # @spec INITIATING-PRINCIPAL-1
+    with pytest.raises(ValidationError):
+        PrincipalRef.model_validate(
+            {
+                "principal_id": "00000000-0000-4000-8000-000000000001",
+                "authorization_version": 0,
+                "future_field": "ignored only by consumers",
+            }
+        )
+
+
+def _queued_turn_payload() -> dict[str, object]:
+    return {
+        "event_id": "e1",
+        "conversation_id": "c1",
+        "author": "provider-user-1",
+        "text": "hello",
+        "received_at": "2026-01-01T00:00:00Z",
+        "reply_handle": {"kind": "slack", "channel": "C1", "placeholder": None},
+        "tool_access": None,
+    }
+
+
+def test_author_principal_follows_tool_access_and_round_trips_when_populated() -> None:
+    # @spec INITIATING-PRINCIPAL-1
+    assert list(QueuedTurn.model_fields).index("author_principal") == (
+        list(QueuedTurn.model_fields).index("tool_access") + 1
+    )
+    principal = PrincipalRef(
+        principal_id="00000000-0000-4000-8000-000000000001",
+        authorization_version=7,
+    )
+    payload = _queued_turn_payload()
+    payload["author_principal"] = principal.model_dump()
+
+    turn = QueuedTurn.model_validate(payload)
+    assert turn.author_principal == principal
+    decoded = parse_queued_turn(turn.model_dump_json())
+    assert decoded.author_principal == principal
+
+
+def test_author_principal_none_round_trips_and_legacy_omission_defaults_to_none() -> None:
+    # @spec INITIATING-PRINCIPAL-1
+    payload = _queued_turn_payload()
+    turn = QueuedTurn.model_validate(payload)
+    assert turn.author_principal is None
+    assert json.loads(turn.model_dump_json())["author_principal"] is None
+    assert parse_queued_turn(turn.model_dump_json()).author_principal is None
+
+    legacy = QueuedTurn.model_validate(payload | {"author_principal": None})
+    legacy_payload = json.loads(legacy.model_dump_json())
+    del legacy_payload["author_principal"]
+    assert parse_queued_turn(json.dumps(legacy_payload)).author_principal is None
+
+
+def test_nested_principal_unknown_field_is_tolerated_only_by_queued_turn_reader() -> None:
+    # @spec INITIATING-PRINCIPAL-1
+    payload = _queued_turn_payload()
+    payload["author_principal"] = {
+        "principal_id": "00000000-0000-4000-8000-000000000001",
+        "authorization_version": 7,
+        "future_field": "consumer may ignore",
+    }
+
+    assert parse_queued_turn(json.dumps(payload)).author_principal == PrincipalRef(
+        principal_id="00000000-0000-4000-8000-000000000001",
+        authorization_version=7,
+    )
+    with pytest.raises(ValidationError):
+        QueuedTurn.model_validate(payload)
 
 # The committed cross-language golden the Rust CLI re-serializes byte-identically
 # (`cli/src/queue.rs::queued_turn_matches_cross_language_golden`, T-A3). Read from
@@ -335,7 +432,7 @@ def test_a_patch_difference_is_compatible_in_both_directions() -> None:
 
 
 def test_targetless_turns_start_a_new_incompatible_protocol_line() -> None:
-    assert PROTOCOL_VERSION == "0.5.24"
+    assert PROTOCOL_VERSION == "0.5.25"
     assert is_compatible("0.5.10", PROTOCOL_VERSION) is True
     assert is_compatible("0.4.5", PROTOCOL_VERSION) is False
     assert is_compatible(PROTOCOL_VERSION, "0.4.5") is False
