@@ -169,6 +169,7 @@ async def test_streamed_broker_commits_integrity_and_live_scope(
 ) -> None:
     import asyncio
     import hashlib
+    import shutil
     import socket
 
     import uvicorn
@@ -408,6 +409,7 @@ async def test_streamed_broker_commits_integrity_and_live_scope(
             assert late.status_code == 409
             assert body_reads == ["FEXAMPLE1", "FEXAMPLE1", "FEXAMPLE2", "FEXAMPLE2"]
     finally:
+        shutil.rmtree(tmp_path)
         await broker_runner.cleanup()
         server.should_exit = True
         await server_task
