@@ -22,4 +22,4 @@ curie cluster surfaces dark-factory --context kind-curie-factory --namespace cur
 without --label, skip the gitlab=factory-fixture/nested/widgets surfaces step when the agent already holds that surface, and keep its stored trigger label
 curie cluster overrides dark-factory --context kind-curie-factory --namespace curie --release curie --execution-deadline 10800
 curie cluster publication-policy dark-factory --context kind-curie-factory --namespace curie --release curie --policy auto
-curie cluster budget dark-factory --context kind-curie-factory --namespace curie --release curie --limit 5
+curie cluster budget dark-factory --context kind-curie-factory --namespace curie --release curie --limit 5 --output-tokens 250000

@@ -3973,4 +3973,40 @@ mod tests {
         let legacy = serde_json::json!({ "api": api });
         assert_eq!(recorded_intake(&legacy), None);
     }
+
+    /// #4939: the factory budget step carries the per-run output allowance
+    /// beside the daily dollar limit, so `cluster budget` sets both. The
+    /// default allowance is 250000 tokens; an operator value replaces it.
+    #[test]
+    fn agent_settings_budget_step_sets_dollar_limit_and_output_allowance() {
+        assert_eq!(DEFAULT_OUTPUT_TOKENS_PER_RUN, 250_000);
+        for (output_tokens, shown) in [
+            (DEFAULT_OUTPUT_TOKENS_PER_RUN, "250000"),
+            (400_000, "400000"),
+        ] {
+            let settings = agent_settings(
+                "dark-factory",
+                "kind-curie-factory",
+                "curie",
+                "curie",
+                DEFAULT_DEADLINE_SECONDS,
+                DEFAULT_BUDGET_USD,
+                output_tokens,
+            );
+            let budget: Vec<&(Vec<String>, &str)> = settings
+                .iter()
+                .filter(|(_, step)| *step == "Setting factory budget")
+                .collect();
+            assert_eq!(budget.len(), 1, "{settings:?}");
+            let argv = &budget[0].0;
+            assert_eq!(argv[..3], ["cluster", "budget", "dark-factory"], "{argv:?}");
+            let tail = &argv[argv.len() - 4..];
+            assert_eq!(tail, ["--limit", "5", "--output-tokens", shown], "{argv:?}");
+            assert_eq!(
+                argv.iter().filter(|arg| *arg == "--output-tokens").count(),
+                1,
+                "{argv:?}"
+            );
+        }
+    }
 }
