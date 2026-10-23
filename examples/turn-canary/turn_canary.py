@@ -15,12 +15,19 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Protocol, TextIO
+from typing import Any, Literal, Protocol, TextIO
 from urllib.parse import urlsplit
 
 from aci_protocol import READER_CONTEXT, QueuedTurn, ReplyHandle, TurnSource
 from aci_protocol.events import ToolAccess
-from channel_protocol import scoped_conversation_id
+from channel_protocol import (
+    ReplyEvent,
+    ReplyTarget,
+    ReplyUpdate,
+    TurnCompleted,
+    scoped_conversation_id,
+)
+from pydantic import TypeAdapter, ValidationError
 
 
 class Platform(Protocol):
@@ -145,6 +152,7 @@ class CycleResult:
     cleanup_degraded: bool = False
     capacity_skips: int = 0
     target_success: dict[str, bool] = field(default_factory=dict)
+    target_delivery_success: dict[str, bool] = field(default_factory=dict)
     target_capacity_skipped: dict[str, bool] = field(default_factory=dict)
     target_cleanup_degraded: dict[str, bool] = field(default_factory=dict)
     target_last_run: dict[str, float] = field(default_factory=dict)
@@ -624,22 +632,85 @@ def build_turn(
     return QueuedTurn.model_validate_json(turn.model_dump_json(), context=READER_CONTEXT)
 
 
-def relay_outcome(events: list[dict[str, Any]], *, nonce: str) -> bool:
-    """Require an exact answer and delivered terminal event. @spec TURN-CANARY-3"""
-    if not isinstance(events, list) or any(
-        not isinstance(item, dict)
-        or item.get("event") not in {"reply.update", "turn.completed", "turn.status"}
-        for item in events
-    ):
-        return False
-    updates = [item for item in events if item.get("event") == "reply.update"]
-    terminal = [item for item in events if item.get("event") == "turn.completed"]
-    return (
+RelayReason = Literal[
+    "exact_nonce", "nonce_mismatch", "missing_reply", "blank_reply",
+    "missing_completion", "duplicate_completion", "not_delivered",
+    "malformed_event", "wrong_target", "wrong_event_id",
+    "malformed_page", "terminal_mismatch", "timeout",
+]
+_REPLY_EVENT = TypeAdapter(ReplyEvent)
+
+
+@dataclass(frozen=True)
+class RelayAssessment:
+    """Bounded lifecycle evidence, independent of nonce compliance. @spec TURN-CANARY-3"""
+
+    exact_nonce: bool = False
+    delivery_success: bool = False
+    reason: RelayReason = "missing_completion"
+
+
+def assess_relay(
+    events: list[dict[str, Any]], *, nonce: str, turn: QueuedTurn | None = None
+) -> RelayAssessment:
+    """Validate every observed event; the runtime always supplies its turn.
+
+    Without a turn, the Boolean compatibility helper can check only internal
+    target consistency, not correlation to an enqueued request.
+    @spec TURN-CANARY-3
+    """
+    if not isinstance(events, list):
+        return RelayAssessment(reason="malformed_event")
+    try:
+        parsed = [_REPLY_EVENT.validate_python(item) for item in events]
+    except ValidationError:
+        return RelayAssessment(reason="malformed_event")
+    expected = None
+    if turn is not None:
+        handle = turn.reply_handle
+        if handle is None:
+            return RelayAssessment(reason="wrong_target")
+        expected = ReplyTarget(
+            kind=handle.kind, address=handle.channel,
+            conversation_id=turn.conversation_id, reply_ref=handle.placeholder,
+        )
+    elif parsed:
+        expected = parsed[0].target
+    if any(event.target != expected for event in parsed):
+        return RelayAssessment(reason="wrong_target")
+    completed = [event for event in parsed if isinstance(event, TurnCompleted)]
+    if not completed:
+        return RelayAssessment(reason="missing_completion")
+    if len(completed) != 1:
+        return RelayAssessment(reason="duplicate_completion")
+    if turn is not None and completed[0].event_id != turn.event_id:
+        return RelayAssessment(reason="wrong_event_id")
+    if completed[0].outcome != "delivered":
+        return RelayAssessment(reason="not_delivered")
+    updates = [event for event in parsed if isinstance(event, ReplyUpdate)]
+    # Delivery observations must not broaden the original exact nonce verdict:
+    # its last update includes progress edits, and reply.post was never allowed.
+    exact = (
         bool(updates)
-        and updates[-1].get("text") == nonce
-        and len(terminal) == 1
-        and terminal[0].get("outcome") == "delivered"
+        and updates[-1].text == nonce
+        and all(
+            event.event in {"reply.update", "turn.completed", "turn.status"} for event in parsed
+        )
     )
+    answers = [event for event in updates if event.progress is None]
+    text = answers[-1].text if answers else None
+    if text is None:
+        return RelayAssessment(exact_nonce=exact, reason="missing_reply")
+    if not text.strip():
+        return RelayAssessment(exact_nonce=exact, reason="blank_reply")
+    return RelayAssessment(exact, True, "exact_nonce" if exact else "nonce_mismatch")
+
+
+def relay_outcome(
+    events: list[dict[str, Any]], *, nonce: str, turn: QueuedTurn | None = None
+) -> bool:
+    """Boolean compatibility for exact nonce success. @spec TURN-CANARY-3"""
+    return assess_relay(events, nonce=nonce, turn=turn).exact_nonce
 
 
 def scoped_reset_key(binding: dict[str, str], conversation_id: str) -> str:
@@ -661,26 +732,52 @@ def cleanup_confirmed(state: dict[str, Any]) -> bool:
 
 
 async def _await_relay(
-    platform: Platform, reply_ref: str, nonce: str, deadline: float, poll: float
-) -> bool:
+    platform: Platform, turn: QueuedTurn, nonce: str, deadline: float, poll: float
+) -> RelayAssessment:
+    """Consume the relay's count cursor under the turn deadline. @spec TURN-CANARY-3"""
+    assert turn.reply_handle is not None
+    reply_ref = turn.reply_handle.placeholder
     cursor = 0
     events: list[dict[str, Any]] = []
     end = time.monotonic() + deadline
-    while time.monotonic() < end:
-        page = await platform.replies(reply_ref, cursor)
-        if not isinstance(page, dict) or not isinstance(page.get("events"), list):
-            raise ValueError("malformed relay page")
-        next_cursor = page.get("next_cursor")
-        if not isinstance(next_cursor, int) or next_cursor < cursor:
-            raise ValueError("nonmonotonic relay cursor")
-        events.extend(page["events"])
-        cursor = next_cursor
-        if page.get("terminal") or any(
-            item.get("event") == "turn.completed" for item in events if isinstance(item, dict)
-        ):
-            return relay_outcome(events, nonce=nonce)
-        await asyncio.sleep(min(poll, max(0, end - time.monotonic())))
-    return False
+    try:
+        async with asyncio.timeout(deadline):
+            while time.monotonic() < end:
+                page = await platform.replies(reply_ref, cursor)
+                if (
+                    not isinstance(page, dict)
+                    or not isinstance(page.get("events"), list)
+                    or type(page.get("next_cursor")) is not int
+                    or type(page.get("terminal")) is not bool
+                ):
+                    return RelayAssessment(reason="malformed_page")
+                batch = page["events"]
+                next_cursor = page["next_cursor"]
+                if next_cursor != cursor + len(batch):
+                    return RelayAssessment(reason="malformed_page")
+                events.extend(batch)
+                observed = assess_relay(events, nonce=nonce, turn=turn)
+                if observed.reason in {
+                    "malformed_event", "wrong_target", "wrong_event_id", "duplicate_completion"
+                }:
+                    return observed
+                completed = observed.reason != "missing_completion"
+                # The production relay keeps awaiting-approval nonterminal so a
+                # resumed turn can reuse the bucket. It still fails this probe.
+                terminal = any(
+                    item.get("event") == "turn.completed"
+                    and item.get("outcome") != "awaiting-approval"
+                    for item in events
+                )
+                if page["terminal"] != terminal:
+                    return RelayAssessment(reason="terminal_mismatch")
+                if completed:
+                    return observed
+                cursor = next_cursor
+                await asyncio.sleep(min(poll, max(0, end - time.monotonic())))
+    except TimeoutError:
+        pass
+    return RelayAssessment(reason="timeout")
 
 
 async def _await_reset(
@@ -963,17 +1060,22 @@ async def _turn_targets(
         except Exception as exc:  # noqa: BLE001 - uncertain XADD still requires cleanup
             result.record("enqueue", "failed", exc)
             result.target_success[target_label] = False
+            result.target_delivery_success[target_label] = False
             all_ok = False
         if enqueued:
             try:
-                result.target_success[target_label] = await _await_relay(
-                    platform, reply_ref, nonce, turn_deadline, poll_period
+                assessment = await _await_relay(
+                    platform, turn, nonce, turn_deadline, poll_period
                 )
+                result.target_success[target_label] = assessment.exact_nonce
+                result.target_delivery_success[target_label] = assessment.delivery_success
+                result.record("relay", assessment.reason)
                 result.record(
                     "turn", "delivered" if result.target_success[target_label] else "failed"
                 )
             except Exception as exc:  # noqa: BLE001 - reset is still owed
                 result.target_success[target_label] = False
+                result.target_delivery_success[target_label] = False
                 result.record("relay", "failed", exc)
             all_ok = all_ok and result.target_success[target_label]
             if result.target_success[target_label]:
@@ -1257,6 +1359,8 @@ def prometheus_text(
                     label,
                 )
             )
+    for route, delivered in sorted(result.target_delivery_success.items()):
+        output.append(line("target_delivery_success", int(delivered), route_labels(route)))
     for route, skipped in sorted(result.target_capacity_skipped.items()):
         label = route_labels(route)
         output.append(line("target_capacity_skipped", int(skipped), label))
@@ -1347,6 +1451,7 @@ class Monitor:
             view.route_agents = dict(result.route_agents)
         per_route = (
             "target_success",
+            "target_delivery_success",
             "target_last_run",
             "target_last_success",
             "target_capacity_skipped",
