@@ -8,6 +8,7 @@ prototypes/observability/read_tree.py).
 """
 
 import json
+from datetime import datetime
 from typing import Any
 
 import httpx
@@ -232,10 +233,15 @@ class LangfuseClient:
         observations: list[dict[str, Any]] = body.get("data", [])
         return observations
 
-    async def list_traces_by_tags(self, tags: list[str]) -> list[dict[str, Any]]:
+    async def list_traces_by_tags(
+        self, tags: list[str], *, from_timestamp: datetime | None = None
+    ) -> list[dict[str, Any]]:
         """Every trace carrying all of the given tags (e.g. suite:<name>)."""
 
-        return await self._get_all("/api/public/traces", {"tags": tags})
+        params: dict[str, Any] = {"tags": tags}
+        if from_timestamp is not None:
+            params["fromTimestamp"] = from_timestamp.isoformat(timespec="milliseconds")
+        return await self._get_all("/api/public/traces", params)
 
     async def query_metrics(self, query: dict[str, Any]) -> list[dict[str, Any]]:
         """Run a Langfuse Metrics API query and return its data rows.

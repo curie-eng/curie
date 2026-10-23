@@ -1,5 +1,8 @@
 """Eval endpoints (K1): the matrix grid and the PR-check report callback."""
 
+import re
+from datetime import UTC, datetime, timedelta
+
 from aci_protocol import EvalJob
 from fastapi import APIRouter, Depends, HTTPException, status
 
@@ -26,6 +29,32 @@ from ..wirebody import EvalReportBody
 router = APIRouter(
     prefix="/evals", tags=["evals"], dependencies=[Depends(require_api_key)]
 )
+
+
+def _stream_trace_window(stream_id: str) -> datetime:
+    """Read the enqueue milliseconds from a concrete Redis stream entry ID."""
+    match = re.fullmatch(r"([0-9]{1,20})-([0-9]{1,20})", stream_id)
+    if match is None:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "stream_id must be a Redis stream entry ID (<milliseconds>-<sequence>)",
+        )
+    milliseconds, sequence = map(int, match.groups())
+    if max(milliseconds, sequence) > 2**64 - 1 or (milliseconds, sequence) == (0, 0):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT, "stream_id is outside the Redis entry ID range"
+        )
+    try:
+        # Allow a small clock skew between the queue and trace recorder. Keep
+        # integer milliseconds so the bound is exact, including UTC day edges.
+        return datetime(1970, 1, 1, tzinfo=UTC) + timedelta(
+            milliseconds=max(0, milliseconds - 5_000)
+        )
+    except OverflowError as exc:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "stream_id timestamp is outside the supported range",
+        ) from exc
 
 
 @router.post("/trigger", response_model=EvalTriggerResult)
@@ -114,7 +143,10 @@ async def eval_matrix(
     # Filtered by SUITE, the real dimension on eval traces. There is
     # deliberately no agent filter: eval traces are tagged by suite + version,
     # not agent, so an agent param would be dead. Do not re-add one.
-    traces = await lf.list_traces_by_tags(["eval", f"suite:{suite}"])
+    from_timestamp = _stream_trace_window(stream_id) if stream_id is not None else None
+    traces = await lf.list_traces_by_tags(
+        ["eval", f"suite:{suite}"], from_timestamp=from_timestamp
+    )
     if stream_id is not None:
         traces = [
             trace
