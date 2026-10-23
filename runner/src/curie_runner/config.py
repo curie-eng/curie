@@ -158,6 +158,8 @@ class RunnerConfig:
     # host and an owner/name path. None for both is a GitHub boot.
     repo_origin: str | None = None
     repo_path: str | None = None
+    # Optional ACI feature negotiation; authority is supplied only per event.
+    attachment_access_enabled: bool = False
     # The runner-local CURIE_RUNNER_ALLOW_TOKENLESS dev flag as parsed (#3821).
     # Only require_serving_token consumes it; a set token always wins.
     allow_tokenless: bool = False
@@ -245,6 +247,7 @@ class RunnerConfig:
         allow_tokenless = env.get(ALLOW_TOKENLESS_ENV, "").strip().lower() in ("1", "true")
         return cls(
             session=boot.session,
+            attachment_access_enabled=boot.attachment_access_enabled is True,
             model=boot.model,
             reviewer_model=boot.reviewer_model,
             thinking=parse_thinking(boot.thinking),

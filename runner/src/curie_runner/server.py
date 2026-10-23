@@ -37,6 +37,7 @@ from types import MappingProxyType
 from typing import TypedDict, cast
 
 from aci_protocol import (
+    ATTACHMENT_ACCESS_STATUS_FIELD,
     CHANNEL_READ_STATUS_FIELD,
     TOOL_ACCESS_STATUS_FIELD,
     Event,
@@ -310,6 +311,8 @@ async def _status(request: web.Request) -> web.Response:
         # @spec RUNNER-TOOL-ACCESS-5: credential-free, so on both status routes.
         TOOL_ACCESS_STATUS_FIELD: list(runner.enforced_tool_access),
     }
+    if runner.enforces_attachment_access:
+        body[ATTACHMENT_ACCESS_STATUS_FIELD] = True
     if runner.enforces_channel_read:
         # Literal true only when curie-slack is mounted and the holder is live
         # (ADR 0100); credential free, so on both status routes. An absent key

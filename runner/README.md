@@ -533,3 +533,35 @@ followed by a sentence-ending period (including whitespace or closing punctuatio
 uses its plain action label. Filenames, extensions, paths, URLs and identifiers
 embedded within another word remain literal data, including Unicode text. The
 stored summary, exact grant target, arguments and nested content remain unchanged.
+
+## On-demand attachment access
+
+With `CURIE_ATTACHMENT_ACCESS_ENABLED=1`, a real-model runner requires a writable
+`/attachments` mount and the trusted platform origin from `CURIE_STATE_URL`.
+It mounts `list_attachments` and `fetch_attachment` on the existing `curie`
+platform server and advertises literal `attachment_access: true` in status.
+Fake-model mode mounts neither tool and performs no attachment network access.
+Without the flag, the legacy disk-present manifest and notices remain in use.
+
+The per-event attachment context stays in memory. New logical turns replace
+it; a steer renews the same opener, while a missing context revokes reads.
+Terminal output, interruption, timeout, reset and shutdown retire access.
+Notices describe remote references until a fetch returns a verified absolute
+path. A fetch accepts only a catalog ID and returns the complete selected file,
+without per-file or thread-total application byte ceilings. Actual sandbox
+storage, a 300-second total operation deadline, and at most two concurrent
+transfers remain finite. A failed or cancelled transfer removes its partial file.
+
+Listing reads metadata only. Fetching streams chunks of at most 1 MiB, checks
+the platform's durable integrity completion, and publishes the cache entry
+atomically without overwriting an existing path. Reuse reauthorizes the ID and
+hashes the local file; a revoked route cannot use a cache hit. The cache belongs
+to the sandbox and downloads no unrequested file. Fetch remains conservatively
+side-effecting because it binds catalog integrity and publishes a local file.
+
+These two tools receive no platform-name approval or tool-policy exemption.
+Existing wildcard patterns such as `*/list_attachments`, `*/fetch_attachment`
+and `*/*` govern them, including deny-by-default behavior and operator approval
+gates. Literal `curie/...` policy patterns remain reserved by bundle validation;
+use those wildcard patterns for this data-tool surface. Fetching does not grant
+permission to execute another tool against the returned file.
