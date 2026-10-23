@@ -140,6 +140,7 @@ def _runtime(executor: _Executor | None) -> Any:
         cron_loop=None,
         publication_loop=None,
         action_executor=executor,
+        attachment_broker=None,
     )
 
 
