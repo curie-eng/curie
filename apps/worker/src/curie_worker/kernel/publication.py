@@ -40,7 +40,7 @@ from ..workitem_dispatch import (
 if TYPE_CHECKING:
     from .core import Kernel
 
-from . import channel_read, clock, constants, failures, memory, routing
+from . import attachment_access, channel_read, clock, constants, failures, memory, routing
 from .log import logger
 
 
@@ -168,6 +168,7 @@ async def _continue_unpublished(
     remaining_s: float | None,
     memory_grant: memory.TurnMemoryGrant | None = None,
     channel_read_grant: channel_read.TurnChannelReadGrant | None = None,
+    attachment_turn: attachment_access.AttachmentAccessTurn | None = None,
 ) -> failures.TurnOutcome:
     """Re-prompt a factory execute turn that ended without publishing, ONCE.
 
@@ -228,9 +229,23 @@ async def _continue_unpublished(
             event = await self._with_channel_read(
                 event, handle, left, grant=channel_read_grant, qevent=qevent
             )
-        turn = await self._runner.start_turn(
-            handle.base_url, event, token=handle.token or None, remaining_s=left
-        )
+        if attachment_turn is None:
+            turn = await self._runner.start_turn(
+                handle.base_url, event, token=handle.token or None, remaining_s=left
+            )
+        else:
+            # A continuation is another runner open for this logical opener.
+            # Serialize admission with normal starts/steers, and preserve the
+            # attempt's owner so the earlier stream cannot revoke a successor.
+            async with self._lock.hold(self._config.lock_key(attachment_turn.thread_key)):
+                if await self._turn_active(handle, remaining_s=2.0):
+                    raise RunnerError("the attachment continuation no longer owns an idle runner")
+                event = await attachment_access.with_attachment_access(
+                    self, event, handle, left, turn=attachment_turn
+                )
+                turn = await self._runner.start_turn(
+                    handle.base_url, event, token=handle.token or None, remaining_s=left
+                )
         if memory_grant is not None:
             self._record_turn_deadline(memory_grant, left)
         memory._note_live_memory_turn(turn)

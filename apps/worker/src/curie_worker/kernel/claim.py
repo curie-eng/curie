@@ -859,19 +859,26 @@ async def _route_and_start(
             thread_key=thread_key,
             remaining_s=remaining_s,
         )
-        from .attachment_access import steer_attachment_access
+        from .attachment_access import AttachmentTurnEnded, steer_attachment_access
 
-        steer_event = await steer_attachment_access(
-            self,
-            steer_event,
-            handle,
-            thread_key,
-            active=retained_live_route and active_before_steer,
-            remaining_s=remaining_s,
-        )
-        steered = await self._runner.steer(
-            handle.base_url, steer_event, token=handle.token or None, remaining_s=remaining_s
-        )
+        try:
+            steer_event = await steer_attachment_access(
+                self,
+                steer_event,
+                handle,
+                thread_key,
+                active=retained_live_route and active_before_steer,
+                remaining_s=remaining_s,
+            )
+        except AttachmentTurnEnded:
+            # The authority ended after the pre-steer snapshot, and a locked
+            # liveness recheck proved the runner idle. Use the same fresh-turn
+            # fallback as a 409; never send a null-authority steer to a live turn.
+            steered = False
+        else:
+            steered = await self._runner.steer(
+                handle.base_url, steer_event, token=handle.token or None, remaining_s=remaining_s
+            )
         if steered:
             memory_turns = constants._MEMORY_TURNS.get()
             if memory_turns is not None:

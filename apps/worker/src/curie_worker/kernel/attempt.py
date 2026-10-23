@@ -238,13 +238,14 @@ async def _attempt_turn(
     )
 
     lazy = self._config.attachment_enabled and self._config.attachment_mode == "lazy"
-    aa_turn = constants._ATTACHMENT_ACCESS_TURN.set(
+    attachment_turn = (
         attachment_access.AttachmentAccessTurn(
             str(agent_id), str(workspace_deployment_id), thread_key, qevent.event_id
         )
         if lazy and agent_id is not None and workspace_deployment_id is not None
         else None
     )
+    aa_turn = constants._ATTACHMENT_ACCESS_TURN.set(attachment_turn)
     attachment_intent = not lazy and self._attachments is not None and bool(qevent.attachments)
 
     # Critical section: decide steer-vs-new-turn and, if new, open the turn so
@@ -788,6 +789,7 @@ async def _attempt_turn(
                 ),
                 memory_grant=memory_grant,
                 channel_read_grant=channel_read_grant,
+                attachment_turn=attachment_turn,
             )
         outcome.workspace_inferred_repo = inferred
         if verified_review is not None:

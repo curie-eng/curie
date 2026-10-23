@@ -11,7 +11,7 @@ import asyncio
 import math
 import uuid
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NoReturn
 
 from aci_protocol import ATTACHMENT_ACCESS_STATUS_FIELD, AttachmentAccessCapability, Event
 
@@ -24,6 +24,22 @@ _LEASE_RENEW_S = 30.0
 
 if TYPE_CHECKING:
     from .core import Kernel
+
+
+class AttachmentTurnEnded(Exception):
+    """The locked liveness recheck proved the missing opener already ended."""
+
+
+async def _refuse_or_finished(
+    self: Kernel, handle: SandboxHandle, remaining_s: float | None, message: str
+) -> NoReturn:
+    # Called only under the route lock. A missing/expired authority is not
+    # evidence of runner liveness: the opener can finish between the original
+    # status snapshot and this lookup. Unknown or still active stays refused.
+    budget = 2.0 if remaining_s is None else min(2.0, remaining_s)
+    if not await self._turn_active(handle, remaining_s=budget):
+        raise AttachmentTurnEnded()
+    raise AttachmentAccessUnavailable(message)
 
 
 @dataclass(frozen=True)
@@ -75,9 +91,14 @@ async def _require_runner(self: Kernel, handle: SandboxHandle, remaining_s: floa
 
 
 async def with_attachment_access(
-    self: Kernel, event: Event, handle: SandboxHandle, remaining_s: float | None
+    self: Kernel,
+    event: Event,
+    handle: SandboxHandle,
+    remaining_s: float | None,
+    *,
+    turn: AttachmentAccessTurn | None = None,
 ) -> Event:
-    carry = constants._ATTACHMENT_ACCESS_TURN.get()
+    carry = turn if turn is not None else constants._ATTACHMENT_ACCESS_TURN.get()
     if carry is None:
         return event
     if self._attachment_access is None:
@@ -137,14 +158,24 @@ async def steer_attachment_access(
         or body.get("sandbox_name") != handle.sandbox_name
         or body.get("route_generation") != handle.generation
     ):
-        raise AttachmentAccessUnavailable(
-            "The live turn has no matching attachment access authority."
+        await _refuse_or_finished(
+            self, handle, remaining_s, "The live turn has no matching attachment access authority."
         )
-    if not await client.renew(**_identity(body), current_event_id=carry.event_id):
-        raise AttachmentAccessUnavailable("The live attachment access lease has expired.")
+    assert body is not None
+    try:
+        renewed = await client.renew(**_identity(body), current_event_id=carry.event_id)
+    except AttachmentAccessUnavailable as exc:
+        await _refuse_or_finished(self, handle, remaining_s, str(exc))
+    if not renewed:
+        await _refuse_or_finished(
+            self, handle, remaining_s, "The live attachment access lease has expired."
+        )
     # Idempotent context returns the SAME opener's token with its original fixed
     # expiry. A steer owns no mint and therefore settles no opener authority.
-    minted = await client.context(**body)
+    try:
+        minted = await client.context(**body)
+    except AttachmentAccessUnavailable as exc:
+        await _refuse_or_finished(self, handle, remaining_s, str(exc))
     return event.model_copy(
         update={
             "attachment_access": AttachmentAccessCapability(
