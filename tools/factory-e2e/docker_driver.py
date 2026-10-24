@@ -374,27 +374,16 @@ class DockerScenario(dl.Lifecycle):
 
     def build_platform_next(self) -> None:
         """A second platform runner for both platforms, distinct by label, for the upgrade."""
-        fx, f = self.fx, self.f
-        tag = f"{f.registry}/fd-{self.nonce}/platform-next:candidate"
-        fx.require(tag not in fx.run(fx.TAGS).stdout.split(), "build_tag_occupied")
-        request = uuid.uuid4().hex
-        f.asset("tag_intent", tag, request)
-        metadata = f.work / "platform-next-build.json"
-        fx.require(self.builder, "builder_missing")
-        argv = ["docker", "buildx", "build", "--builder", self.builder, "--platform"]
-        argv += [PLATFORMS]
-        argv += ["--label", f"{fx.REQUEST}={request}", "--label", f"{fx.NONCE}={self.nonce}"]
-        argv += ["--label", "curie.fixture.platform=next"]
-        argv += ["--provenance=false", "--push", "--metadata-file", str(metadata), "-t", tag]
-        argv += ["-f", str(f.snapshot / "runner/Dockerfile"), str(f.snapshot)]
-        fx.run(argv, timeout=7200)
-        top = str(fx.loads(metadata.read_text())["containerimage.digest"])
-        fx.require(re.fullmatch(dl.SHA256, top), "invalid_image_digest")
-        ref = tag.rsplit(":", 1)[0] + "@" + top
-        f.note("platform-next_image", ref)
-        image = dict(f.resolve("platform-next", ref))
+        self.fx.require(self.builder, "builder_missing")
+        image = self.build_image(
+            "platform-next",
+            builder=self.builder,
+            platform=PLATFORMS,
+            dockerfile=self.f.snapshot / "runner/Dockerfile",
+            labels=("curie.fixture.platform=next",),
+        )
         distinct = image["digest"] != self.images["platform"]["digest"]
-        fx.require(distinct, "platform_next_not_distinct")
+        self.fx.require(distinct, "platform_next_not_distinct")
         self.images["platform-next"] = image
 
     def build_runner_cli(self) -> None:
