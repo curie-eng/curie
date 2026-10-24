@@ -1065,7 +1065,15 @@ class Lifecycle:
         names |= {"arch": self.f.arch}
         return lifecycle_values(self.base_values, self.images, docker=docker, **names)
 
-    def build_image(self, name: str) -> dict[str, str]:
+    def build_image(
+        self,
+        name: str,
+        *,
+        builder: str = "default",
+        platform: str | None = None,
+        dockerfile: Path | None = None,
+        labels: tuple[str, ...] = (),
+    ) -> dict[str, str]:
         """API and worker images, built exactly as Fixture.images() builds its own."""
         fx, f = self.fx, self.f
         tag = f"{f.registry}/fd-{self.nonce}/{name}:candidate"
@@ -1073,11 +1081,14 @@ class Lifecycle:
         request = uuid.uuid4().hex
         f.asset("tag_intent", tag, request)
         metadata = f.work / (name + "-build.json")
-        argv = ["docker", "buildx", "build", "--builder", "default", "--platform"]
-        argv += ["linux/" + f.arch]
+        argv = ["docker", "buildx", "build", "--builder", builder, "--platform"]
+        argv += [platform or "linux/" + f.arch]
         argv += ["--label", f"{fx.REQUEST}={request}", "--label", f"{fx.NONCE}={self.nonce}"]
+        for label in labels:
+            argv += ["--label", label]
         argv += ["--provenance=false", "--push", "--metadata-file", str(metadata), "-t", tag]
-        argv += ["-f", str(f.snapshot / "apps" / name / "Dockerfile"), str(f.snapshot)]
+        dockerfile = dockerfile or f.snapshot / "apps" / name / "Dockerfile"
+        argv += ["-f", str(dockerfile), str(f.snapshot)]
         fx.run(argv, timeout=7200)
         top = str(fx.loads(metadata.read_text())["containerimage.digest"])
         fx.require(re.fullmatch(SHA256, top), "invalid_image_digest")
