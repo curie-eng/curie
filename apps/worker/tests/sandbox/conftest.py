@@ -24,6 +24,7 @@ from curie_test_support.valkey import (
     VALKEY_HOST,
     VALKEY_PORT,
     VALKEY_PW,
+    connect_or_skip,
 )
 from curie_worker.sandbox import (
     AffinityStore,
@@ -38,7 +39,6 @@ from redis.asyncio import Redis as AsyncRedis
 from redis.asyncio.retry import Retry as AsyncRetry
 from redis.backoff import NoBackoff
 from redis.maint_notifications import MaintNotificationsConfig
-from redis.retry import Retry
 
 
 def pytest_ignore_collect(collection_path: Path, config: pytest.Config) -> bool:
@@ -321,20 +321,14 @@ def _seed_source(client: _RecordingDocker, target: str) -> Path:
 
 @pytest.fixture
 def redis_client(request: pytest.FixtureRequest) -> redis.Redis:
-    client = redis.Redis(
-        host=VALKEY_HOST,
-        port=VALKEY_PORT,
-        password=VALKEY_PW or None,
-        decode_responses=False,
-        socket_timeout=2,
-        socket_connect_timeout=2,
-        retry=Retry(NoBackoff(), 0),
-    )
-    request.addfinalizer(client.close)
-    try:
-        client.ping()
-    except redis.RedisError:
-        raise RuntimeError("sandbox tests require reachable Valkey") from None
+    client: redis.Redis | None = None
+
+    def cleanup() -> None:
+        if client is not None:
+            client.close()
+
+    request.addfinalizer(cleanup)
+    client = connect_or_skip(decode_responses=False)
     return client
 
 

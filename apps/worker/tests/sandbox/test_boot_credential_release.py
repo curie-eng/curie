@@ -111,6 +111,9 @@ def credential_api(request: pytest.FixtureRequest) -> _CredentialAPI:
     for name, value in {
         "DATABASE_URL": url,
         "S3_ENDPOINT_URL": caller_settings.s3_endpoint_url,
+        "S3_ACCESS_KEY": caller_settings.s3_access_key or "rustfs",
+        "S3_SECRET_KEY": caller_settings.s3_secret_key or "rustfssecret",
+        "CI_REQUIRE_VALKEY_TESTS": "1",
         "DB_SCHEMA": "curie",
         "API_KEY": "credential-lifecycle-test-api-key",
         "CURIE_INTERNAL_WORKER_TOKEN": "credential-lifecycle-test-worker-token",
