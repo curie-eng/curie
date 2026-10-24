@@ -77,8 +77,15 @@ from curie_api.crud import channels as crud_channels
 from curie_api.graveyardwatcher import text
 from curie_api.schemas.channels import ChannelBinding
 
-from .. import adapter_principal, channel_token, identity_audit, identity_fence, team_authorization
-from ..admission import AdmissionDecision, admit
+from .. import (
+    adapter_principal,
+    admission,
+    channel_token,
+    identity_audit,
+    identity_fence,
+    team_authorization,
+)
+from ..admission import AdmissionDecision
 from ..approval_auth import platform_key_or_adapter
 from ..auth import require_api_key, verify_platform_key
 from ..channel_token import CHANNEL_ENQUEUE_SCOPE
@@ -599,6 +606,9 @@ def _duplicate(event_id: str, current: str, response: Response) -> TurnAccepted:
     return TurnAccepted(event_id=event_id, stream_id=stream_id, duplicate=True)
 
 
+# @spec COMMON-ADMISSION-EXTRACTION-1
+# @spec COMMON-ADMISSION-EXTRACTION-3
+# @spec COMMON-ADMISSION-EXTRACTION-4
 @router.post("/turns", response_model=TurnAccepted)
 async def ingest_turn(
     request: Request,
@@ -664,22 +674,23 @@ async def ingest_turn(
     # trusted to send the sender it authenticated, as it always was; `author`
     # is that sender. The platform key is not exempt: the list is about who
     # wrote the message, not who carried it.
-    decision = admit(row, [body.author])
-    if not decision.allowed:
+    def on_list_refusal(decision: AdmissionDecision) -> None:
+        """@spec COMMON-ADMISSION-EXTRACTION-3"""
         _record_refusal(row, decision, surface="channel-port")
         record_metric(
             "curie.turn.refused",
             attributes={"service.name": "curie-api", "reason": decision.reason.value},
         )
-        raise HTTPException(status.HTTP_403_FORBIDDEN, CALLER_NOT_ALLOWED_DETAIL)
 
-    human = await team_authorization.check_binding(
+    decision = await admission.evaluate_invocation(
         session,
         row,
-        role="invocation",
+        [body.author],
+        surface="channel-port",
         email=body.author if row.kind == "email" else None,
+        on_list_refusal=on_list_refusal,
     )
-    if not human.allowed:
+    if not decision.allowed:
         raise HTTPException(status.HTTP_403_FORBIDDEN, CALLER_NOT_ALLOWED_DETAIL)
 
     # One hash of the `delivery_id`, shared by the two names derived from it.
@@ -841,6 +852,9 @@ async def ingest_turn(
 # --- POST /channels/admission ---------------------------------------------------
 
 
+# @spec COMMON-ADMISSION-EXTRACTION-1
+# @spec COMMON-ADMISSION-EXTRACTION-3
+# @spec COMMON-ADMISSION-EXTRACTION-4
 @router.post(
     "/admission",
     response_model=AdmissionOut,
@@ -870,25 +884,27 @@ async def check_admission(
     response.headers["Cache-Control"] = "private, no-store"
     await identity_fence.lock_identity_reader(session)
     row = await crud_channels.binding_for_route(session, data.kind, data.adapter, data.address)
-    decision = admit(row, data.callers)
-    if not decision.allowed and row is not None:
+
+    def on_list_refusal(decision: AdmissionDecision) -> None:
+        """@spec COMMON-ADMISSION-EXTRACTION-3"""
         # The dispatcher counts its own refusal (`curie.turn.refused` with
         # service curie-dispatcher); counting it here too would double every
         # Slack refusal, so this side only logs the binding and reason.
-        _record_refusal(row, decision, surface="admission", level=logging.DEBUG)
+        if row is not None:
+            _record_refusal(row, decision, surface="admission", level=logging.DEBUG)
+
+    decision = await admission.evaluate_invocation(
+        session,
+        row,
+        data.callers,
+        surface="admission",
+        slack=data.slack,
+        on_list_refusal=on_list_refusal,
+    )
     connect_url = None
     allowed, restricted = decision.allowed, decision.restricted
-    if row is not None:
-        human = await team_authorization.check_binding(
-            session,
-            row,
-            role="invocation",
-            slack=data.slack,
-        )
-        allowed = allowed and human.allowed
-        restricted = restricted or human.restricted
-        if human.restricted and data.slack is not None:
-            allowed = allowed and data.slack.user_id in data.callers
+    human = decision.team_decision
+    if row is not None and human is not None:
         if not allowed and human.restricted:
             identity_audit.record(
                 session,
@@ -902,7 +918,7 @@ async def check_admission(
             origin = urlsplit(get_settings().oidc_redirect_uri)
             if (
                 human.unlinked
-                and decision.allowed
+                and decision.list_decision.allowed
                 and data.slack is not None
                 and data.slack.user_id in data.callers
                 and get_settings().oidc_enabled
