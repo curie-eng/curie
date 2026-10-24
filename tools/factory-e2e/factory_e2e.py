@@ -149,6 +149,21 @@ head, a two-service Compose project built and reached on the run's daemon, and
 the skill rung of the e2e ladder against a runner image built there. It needs
 no credentials or cluster contact.
 
+`curie dev factory-e2e run --scenario docker --context <context>` (docker_driver.py)
+collects that envelope live on the cluster the explicit context names (or
+CURIE_FACTORY_KUBE_CONTEXT); there is no default. CURIE_LOCAL_STUB_HOST is the
+routable IPv4 the GitHub stub and the scripted model bind; any model credential or
+model route in the environment, `--model-base-url`, `--candidate-images build` and a
+`--candidate` other than the worktree HEAD are refused. It owns fd-docker-<nonce>
+(namespace and release), fd-docker-d-<nonce> and fd-docker-c-<nonce>, labelled
+owner=factory-tools, and builds every image from the HEAD snapshot into a run-owned
+registry container. Phases: install as daemon_lifecycle.py does, two concurrent
+Docker runs whose turns run the probe, compose and skill-rung collectors, the
+lifecycle scenarios, an upgrade through `curie cluster upgrade` and a turn on a custom
+repository, CI from the stub, then teardown proved object by object. It exits 0 only
+when docker_scenario.py's judge finds nothing and teardown is verified. Live use is
+the w2 waypoint and acceptance.
+
 The App, fixture repository, mention author and model credentials come only
 from operator files or environment variables; nothing here names a real one.
 Standard library only, so it runs from a bare source checkout.
@@ -415,9 +430,10 @@ SCENARIOS: dict[str, ScenarioDriver | None] = {
     "github-loop": None,
     "tls-code-host": None,  # bound at the bottom from tls_code_host.py
     "repo-runner": None,  # bound at the bottom from repo_runner.py
+    "docker": None,  # bound at the bottom from docker_driver.py
 }
 SCENARIO_NAMES = tuple(SCENARIOS)
-WHOLE_FLOW_SCENARIOS = frozenset({"tls-code-host", "repo-runner"})
+WHOLE_FLOW_SCENARIOS = frozenset({"tls-code-host", "repo-runner", "docker"})
 
 
 def resolve_scenario(name: str) -> ScenarioDriver:
@@ -6578,7 +6594,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             "repo-runner: needs an explicit --context (a throwaway cluster such as "
             "k8-scratch), release factory-tools, local scripted model. Set "
             "CURIE_FACTORY_REPO_RUNNER_PLAN (three chart bindings and seven turns) and "
-            "CURIE_LOCAL_STUB_HOST."
+            "CURIE_LOCAL_STUB_HOST. docker: run --scenario docker --context <context> with "
+            "CURIE_LOCAL_STUB_HOST and no model credential; builds the worktree HEAD into a "
+            "run-owned registry and exits 0 only when the docker judge passes and teardown "
+            "is verified."
         ),
     )
     scenario.add_argument("--scenario", required=True, choices=tuple(SCENARIOS))
@@ -6685,6 +6704,20 @@ def _repo_root() -> Path:
 
 def _images_published(commit: str) -> bool:
     return not unpublished_images(f"sha-{commit}")
+
+
+def _head_candidate(repo_root: Path, requested: str | None) -> str:
+    """The worktree HEAD commit; the docker scenario builds from it and nothing else."""
+
+    head = run(["git", "-C", str(repo_root), "rev-parse", "--verify", "HEAD^{commit}"]).strip()
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head):
+        raise ConfigError(f"cannot read the worktree HEAD commit: {head!r}")
+    if requested not in (None, "HEAD", head):
+        raise ConfigError(
+            "docker builds its candidate from the worktree HEAD; check out "
+            f"{requested!r} and pass --candidate HEAD (or omit it)"
+        )
+    return head
 
 
 def _resolve_candidate(
@@ -7221,11 +7254,21 @@ def main(argv: list[str] | None = None) -> int:
         if whole_flow:
             if args.scenario == "repo-runner" and args.model_base_url:
                 raise ConfigError("repo-runner refuses an external model endpoint")
-            loaders = {
-                "tls-code-host": load_tls_code_host().load_tls_config,
-                "repo-runner": load_repo_runner().load_repo_runner_config,
-            }
-            config = loaders[args.scenario](os.environ, context=args.context)
+            if args.scenario == "docker":
+                if args.model_base_url:
+                    raise ConfigError("docker refuses an external model endpoint")
+                if args.candidate_images == "build":
+                    raise ConfigError(
+                        "docker builds its own images into a run-owned registry; "
+                        "drop --candidate-images build"
+                    )
+                config = load_docker_driver().load_docker_config(os.environ, context=args.context)
+            else:
+                loaders = {
+                    "tls-code-host": load_tls_code_host().load_tls_config,
+                    "repo-runner": load_repo_runner().load_repo_runner_config,
+                }
+                config = loaders[args.scenario](os.environ, context=args.context)
         else:
             config = load_config(os.environ, context=args.context)
         if args.model_base_url:
@@ -7250,11 +7293,12 @@ def main(argv: list[str] | None = None) -> int:
             curie_bin, curie_version = resolve_curie_binary(os.environ.get("CURIE_BIN") or "curie")
         config = dataclasses.replace(config, curie_bin=curie_bin)
         repo_root = _repo_root()
-        candidate = (
-            _resolve_candidate(repo_root, args.candidate, published=lambda _commit: True)
-            if args.candidate_images == "build"
-            else _resolve_candidate(repo_root, args.candidate)
-        )
+        if args.mode == "run" and args.scenario == "docker":
+            candidate = _head_candidate(repo_root, args.candidate)
+        elif args.candidate_images == "build":
+            candidate = _resolve_candidate(repo_root, args.candidate, published=lambda _c: True)
+        else:
+            candidate = _resolve_candidate(repo_root, args.candidate)
         namespace = (
             validate_namespace(args.namespace) if args.namespace else default_namespace(candidate)
         )
@@ -7384,6 +7428,21 @@ def load_docker_scenario() -> Any:
     """Load the docker scenario offline judge once."""
 
     return _load_by_path("docker_scenario", Path(__file__).with_name("docker_scenario.py"))
+
+
+def load_docker_driver() -> Any:
+    """Load the docker scenario's live driver once."""
+
+    return _load_by_path("docker_driver", Path(__file__).with_name("docker_driver.py"))
+
+
+def _drive_docker(p: Preflight) -> dict[str, Any]:
+    # Loaded at call time: docker_driver subclasses daemon_lifecycle.Lifecycle, and
+    # daemon_lifecycle imports this module, so an eager load here could see it half built.
+    return cast(dict[str, Any], load_docker_driver().drive(p))
+
+
+SCENARIOS["docker"] = _drive_docker
 
 
 if __name__ == "__main__":
