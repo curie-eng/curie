@@ -21,4 +21,4 @@ curie cluster deploy --context kind-curie-factory --namespace curie --release cu
 curie cluster surfaces jira-factory --context kind-curie-factory --namespace curie --release curie --add jira=jira
 curie cluster overrides jira-factory --context kind-curie-factory --namespace curie --release curie --execution-deadline 10800
 curie cluster publication-policy jira-factory --context kind-curie-factory --namespace curie --release curie --policy auto
-curie cluster budget jira-factory --context kind-curie-factory --namespace curie --release curie --limit 5
+curie cluster budget jira-factory --context kind-curie-factory --namespace curie --release curie --limit 5 --output-tokens 250000

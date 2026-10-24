@@ -39,6 +39,10 @@
 # agentResourceProfiles opt-out and every explicit envelope override, so real
 # `helm template` of it renders the full factory envelope for the factory agent
 # and the standard one elsewhere; a release without the factory stays standard.
+# It also carries the API memory limit (#4939): with no retained
+# api.resources.limits.memory the factory release renders the factory
+# profile's 2Gi and the control renders 512Mi; a retained explicit 512Mi stays
+# in the captured overlay and wins over the factory profile.
 #
 # `helm`/`kubectl` are the recording stubs `cli/tests/data/upgrade-driver.py`
 # already provides for `cluster_upgrade_live.rs`, so the run is offline and
@@ -324,6 +328,12 @@ doc["agentSandbox"] = {
 print(json.dumps(doc, indent=2))
 PY
 )"
+FACTORY_EXPLICIT_RETAINED="$(printf '%s\n' "$FACTORY_RETAINED" | python3 -c '
+import json, sys
+doc = json.load(sys.stdin)
+doc["api"] = {"resources": {"limits": {"memory": "512Mi"}}}
+print(json.dumps(doc, indent=2))
+')"
 CONTROL_RETAINED="$(python3 -c 'import json; print(json.dumps({"connectorCaller": {"existingSecret": "acme-" + "caller-pair"}, "security": {"gvisor": {"mode": "off"}}}, indent=2))')"
 
 PROFILE_CHECK="$TMP/profile-check.py"
@@ -406,9 +416,51 @@ if failures:
     raise SystemExit(1)
 PY
 
+API_CHECK="$TMP/api-check.py"
+cat > "$API_CHECK" <<'PY'
+"""api-check.py <label> <capture> <rendered> <want-limit> [retained-limit]
+
+The rendered API Deployment's api container has memory limit <want-limit>,
+request 256Mi and cpu 100m/"1". The captured overlay carries
+api.resources.limits.memory exactly when the release retained one."""
+import sys
+
+import yaml
+
+label, capture, rendered, want = sys.argv[1:5]
+retained = sys.argv[5] if len(sys.argv) > 5 else None
+failures = []
+deployments = [d for d in yaml.safe_load_all(open(rendered))
+               if d and d.get("kind") == "Deployment" and d["metadata"]["name"].endswith("-api")]
+if len(deployments) != 1:
+    failures.append(f"want one API Deployment, got {len(deployments)}")
+else:
+    api = next((c for c in deployments[0]["spec"]["template"]["spec"]["containers"]
+                if c["name"] == "api"), None)
+    res = (api or {}).get("resources") or {}
+    got = {side: {k: str(v) for k, v in (res.get(side) or {}).items()}
+           for side in ("requests", "limits")}
+    expected = {"requests": {"cpu": "100m", "memory": "256Mi"},
+                "limits": {"cpu": "1", "memory": want}}
+    if got != expected:
+        failures.append(f"API container resources {got}, want {expected}")
+doc = yaml.safe_load(open(capture)) or {}
+node = doc
+for key in ("api", "resources", "limits"):
+    node = node.get(key) if isinstance(node, dict) else None
+held = node.get("memory") if isinstance(node, dict) else None
+if held != retained:
+    failures.append(f"captured api.resources.limits.memory is {held!r}, want {retained!r}")
+if failures:
+    print(f"FAIL: {label}: {capture}", file=sys.stderr)
+    for failure in failures:
+        print("  " + failure, file=sys.stderr)
+    raise SystemExit(1)
+PY
+
 assert_profile_captures() {
-  # assert_profile_captures <label> <root> <factory|control>
-  local label="$1" root="$2" mode="$3"
+  # assert_profile_captures <label> <root> <factory|control> <api-memory> [retained-api-memory]
+  local label="$1" root="$2" mode="$3" api_memory="$4" retained_api="${5:-}"
   shopt -s nullglob
   local captures=("$root"/values-*.yaml)
   shopt -u nullglob
@@ -420,15 +472,22 @@ assert_profile_captures() {
       exit 1
     fi
     python3 "$PROFILE_CHECK" "$label" "$capture" "$capture.profile" "$mode"
+    python3 "$API_CHECK" "$label" "$capture" "$capture.profile" "$api_memory" \
+      ${retained_api:+"$retained_api"}
   done
   echo "OK: $label kept the sandbox resource envelope across the retained-values round trip"
+  echo "OK: $label rendered API memory limit $api_memory"
 }
 
 RETAINED_DOC="$FACTORY_RETAINED" run_capture "factory profile upgrade" "$TMP/factory"
-assert_profile_captures "factory profile upgrade" "$TMP/factory" factory
+assert_profile_captures "factory profile upgrade" "$TMP/factory" factory 2Gi
+
+RETAINED_DOC="$FACTORY_EXPLICIT_RETAINED" run_capture "factory explicit API memory upgrade" "$TMP/factory-api"
+assert_profile_captures "factory explicit API memory upgrade" "$TMP/factory-api" factory 512Mi 512Mi
 
 RETAINED_DOC="$CONTROL_RETAINED" run_capture "non-factory control upgrade" "$TMP/control"
-assert_profile_captures "non-factory control upgrade" "$TMP/control" control
+assert_profile_captures "non-factory control upgrade" "$TMP/control" control 512Mi
 
 printf '%s\n' 'Retained-values scalar preservation assertions passed for both overlay paths.'
 printf '%s\n' 'Retained-values factory resource profile assertions passed (factory envelope, overrides, non-factory control).'
+printf '%s\n' 'Retained-values API memory assertions passed (factory 2Gi, explicit 512Mi retained, non-factory 512Mi).'

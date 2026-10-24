@@ -153,6 +153,7 @@ async def _recover(
         repository,
         _contract(base=resolved, draft=draft),
         expected_head_sha=REVISION_HEAD,
+        adopt_only=False,
         before_open=_open_clear,
     )
 
@@ -1196,9 +1197,7 @@ def test_required_checks_rules_not_found_keeps_protection_only() -> None:
     async def body(host: GitHubCodeHost) -> frozenset[str]:
         return await host.required_checks(_repository(), "main")
 
-    found = _with_host(
-        _required_handler(404, {"message": "Not Found"}, branch_body=branch), body
-    )
+    found = _with_host(_required_handler(404, {"message": "Not Found"}, branch_body=branch), body)
     assert found == frozenset({"lint"})
 
 

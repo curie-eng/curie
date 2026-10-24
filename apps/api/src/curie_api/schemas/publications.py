@@ -344,7 +344,11 @@ class PublicationRevisionOut(BaseModel):
 
 
 class PublicationPullRecover(BaseModel):
-    """Adopt the publication branch's pull request, or open it when the branch
-    holds exactly ``expected_head_sha``."""
+    """Adopt the publication branch's pull request.
+
+    When ``adopt_only`` is false, open one if the branch holds exactly
+    ``expected_head_sha``.
+    """
 
     expected_head_sha: str = Field(pattern=_COMMIT_SHA_PATTERN)
+    adopt_only: bool

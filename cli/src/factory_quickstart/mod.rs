@@ -65,6 +65,9 @@ pub const DEFAULT_MODEL: &str = "z-ai/glm-5.3-flash";
 pub const ANTHROPIC_DEFAULT_MODEL: &str = "claude-sonnet-5-5";
 pub const DEFAULT_DEADLINE_SECONDS: u32 = 10800;
 pub const DEFAULT_BUDGET_USD: f64 = 5.0;
+/// Per-run output token allowance for factory agents (#4939). The generic
+/// platform default stays 100000; the factory deploys with this larger one.
+pub const DEFAULT_OUTPUT_TOKENS_PER_RUN: u64 = 250_000;
 pub const DEFAULT_AGENT: &str = "dark-factory";
 pub const GVISOR_OFF_SET: &str = "security.gvisor.mode=off";
 pub const POLL_INTAKE: &str = "poll";
@@ -87,6 +90,7 @@ pub struct QuickstartOpts {
     pub model: Option<String>,
     pub execution_deadline_seconds: u32,
     pub budget_usd: f64,
+    pub output_tokens: u64,
     /// The agent to deploy (`--agent`, default [`DEFAULT_AGENT`]).
     pub agent: String,
     /// The trigger label for this agent's GitHub bindings (`--label`).
@@ -469,6 +473,7 @@ pub struct PlanInput {
     pub org: Option<String>,
     pub execution_deadline_seconds: u32,
     pub budget_usd: f64,
+    pub output_tokens: u64,
     pub chart: String,
     pub credential_in_env: bool,
     pub release_has_real_model: bool,
@@ -590,6 +595,7 @@ pub enum Action {
         repos: Vec<String>,
         deadline_seconds: u32,
         budget_usd: f64,
+        output_tokens: u64,
         agent: String,
         label: Option<String>,
         /// The operator bundle; `None` renders the published dark factory.
@@ -654,6 +660,7 @@ pub enum QuickstartOutput {
         effective_label: String,
         deadline_seconds: u32,
         budget_usd: f64,
+        output_tokens: u64,
         /// OpenRouter credit left to the model credential, when it was read.
         credit_remaining_usd: Option<f64>,
     },
@@ -670,6 +677,7 @@ pub enum QuickstartOutput {
         runner_image: Option<String>,
         deadline_seconds: u32,
         budget_usd: f64,
+        output_tokens: u64,
         credit_remaining_usd: Option<f64>,
     },
 }
@@ -707,6 +715,7 @@ impl crate::ui::CliOutput for QuickstartOutput {
                 effective_label,
                 deadline_seconds,
                 budget_usd,
+                output_tokens,
                 credit_remaining_usd,
             } => serde_json::json!({
                 "phase": "ready",
@@ -728,6 +737,7 @@ impl crate::ui::CliOutput for QuickstartOutput {
                 "effective_label": effective_label,
                 "execution_deadline_seconds": deadline_seconds,
                 "budget_usd": budget_usd,
+                "output_tokens_per_run": output_tokens,
                 "reviewer_model": REVIEWER_MODEL,
                 "run_credit_usd": RUN_CREDIT_USD,
                 "credit_remaining_usd": credit_remaining_usd,
@@ -742,6 +752,7 @@ impl crate::ui::CliOutput for QuickstartOutput {
                 runner_image,
                 deadline_seconds,
                 budget_usd,
+                output_tokens,
                 credit_remaining_usd,
             } => serde_json::json!({
                 "phase": "agent_added",
@@ -754,6 +765,7 @@ impl crate::ui::CliOutput for QuickstartOutput {
                 "runner_image": runner_image,
                 "execution_deadline_seconds": deadline_seconds,
                 "budget_usd": budget_usd,
+                "output_tokens_per_run": output_tokens,
                 "credit_remaining_usd": credit_remaining_usd,
             }),
         }
@@ -784,6 +796,7 @@ impl crate::ui::CliOutput for QuickstartOutput {
                 effective_label,
                 deadline_seconds,
                 budget_usd,
+                output_tokens,
                 credit_remaining_usd,
                 ..
             } => {
@@ -805,7 +818,7 @@ impl crate::ui::CliOutput for QuickstartOutput {
                     repos.join(", ")
                 ));
                 ui.payload(&format!(
-                    "Deployed {agent} from {}. Label {effective_label} starts its work. Execution deadline {deadline_seconds}s. Publication auto. Budget {budget_usd} USD.",
+                    "Deployed {agent} from {}. Label {effective_label} starts its work. Execution deadline {deadline_seconds}s. Publication auto. Budget {budget_usd} USD. Output allowance {output_tokens} tokens per run.",
                     runner_source(runner_image.as_deref())
                 ));
                 // Worded apart from the pre-deploy low-credit warning.
@@ -826,6 +839,7 @@ impl crate::ui::CliOutput for QuickstartOutput {
                 runner_image,
                 deadline_seconds,
                 budget_usd,
+                output_tokens,
                 credit_remaining_usd,
                 ..
             } => {
@@ -834,7 +848,7 @@ impl crate::ui::CliOutput for QuickstartOutput {
                     repos.join(", ")
                 ));
                 ui.payload(&format!(
-                    "Label {effective_label} starts its work. Bundle {bundle} on {}. Execution deadline {deadline_seconds}s. Publication auto. Budget {budget_usd} USD.",
+                    "Label {effective_label} starts its work. Bundle {bundle} on {}. Execution deadline {deadline_seconds}s. Publication auto. Budget {budget_usd} USD. Output allowance {output_tokens} tokens per run.",
                     runner_source(runner_image.as_deref())
                 ));
                 if let Some(left) = credit_remaining_usd {
@@ -1460,6 +1474,7 @@ pub fn quickstart_plan(input: &PlanInput) -> Result<Planned> {
         repos: input.repos.clone(),
         deadline_seconds: input.execution_deadline_seconds,
         budget_usd: input.budget_usd,
+        output_tokens: input.output_tokens,
         agent: input.agent.clone(),
         label: input.label.clone(),
         runner_image: bundle.as_ref().and(input.runner_image.clone()),
@@ -1669,6 +1684,7 @@ pub fn describe(planned: &Planned) -> Vec<String> {
                 repos,
                 deadline_seconds,
                 budget_usd,
+                output_tokens,
                 agent,
                 label,
                 bundle,
@@ -1711,6 +1727,7 @@ pub fn describe(planned: &Planned) -> Vec<String> {
                         release,
                         *deadline_seconds,
                         *budget_usd,
+                        *output_tokens,
                     )
                     .into_iter()
                     .map(|(args, _)| format!("curie {}", args.join(" "))),
@@ -1829,21 +1846,27 @@ fn agent_settings(
     release: &str,
     deadline_seconds: u32,
     budget_usd: f64,
+    output_tokens: u64,
 ) -> Vec<(Vec<String>, &'static str)> {
-    let settings: [(&str, [String; 2], &str); 3] = [
+    let settings: [(&str, Vec<String>, &str); 3] = [
         (
             "overrides",
-            ["--execution-deadline".into(), deadline_seconds.to_string()],
+            vec!["--execution-deadline".into(), deadline_seconds.to_string()],
             "Setting execution deadline",
         ),
         (
             "publication-policy",
-            ["--policy".into(), "auto".into()],
+            vec!["--policy".into(), "auto".into()],
             "Setting publication policy",
         ),
         (
             "budget",
-            ["--limit".into(), budget_display(budget_usd)],
+            vec![
+                "--limit".into(),
+                budget_display(budget_usd),
+                "--output-tokens".into(),
+                output_tokens.to_string(),
+            ],
             "Setting factory budget",
         ),
     ];
@@ -2670,6 +2693,7 @@ mod tests {
             org: None,
             execution_deadline_seconds: DEFAULT_DEADLINE_SECONDS,
             budget_usd: DEFAULT_BUDGET_USD,
+            output_tokens: DEFAULT_OUTPUT_TOKENS_PER_RUN,
             chart: "charts/curie".into(),
             credential_in_env: false,
             release_has_real_model: false,
@@ -3105,7 +3129,7 @@ mod tests {
             "curie cluster surfaces dark-factory --context kind-curie-factory --namespace curie --release curie --add github=acme/widgets".to_string(),
             "curie cluster overrides dark-factory --context kind-curie-factory --namespace curie --release curie --execution-deadline 10800".to_string(),
             "curie cluster publication-policy dark-factory --context kind-curie-factory --namespace curie --release curie --policy auto".to_string(),
-            "curie cluster budget dark-factory --context kind-curie-factory --namespace curie --release curie --limit 5".to_string(),
+            "curie cluster budget dark-factory --context kind-curie-factory --namespace curie --release curie --limit 5 --output-tokens 250000".to_string(),
         ];
         assert_eq!(lines, expected);
         let ready = QuickstartOutput::Ready {
@@ -3125,6 +3149,7 @@ mod tests {
             effective_label: "factory".into(),
             deadline_seconds: DEFAULT_DEADLINE_SECONDS,
             budget_usd: DEFAULT_BUDGET_USD,
+            output_tokens: DEFAULT_OUTPUT_TOKENS_PER_RUN,
             credit_remaining_usd: None,
         };
         let json = crate::ui::CliOutput::to_json(&ready);
@@ -3972,5 +3997,41 @@ mod tests {
         }
         let legacy = serde_json::json!({ "api": api });
         assert_eq!(recorded_intake(&legacy), None);
+    }
+
+    /// #4939: the factory budget step carries the per-run output allowance
+    /// beside the daily dollar limit, so `cluster budget` sets both. The
+    /// default allowance is 250000 tokens; an operator value replaces it.
+    #[test]
+    fn agent_settings_budget_step_sets_dollar_limit_and_output_allowance() {
+        assert_eq!(DEFAULT_OUTPUT_TOKENS_PER_RUN, 250_000);
+        for (output_tokens, shown) in [
+            (DEFAULT_OUTPUT_TOKENS_PER_RUN, "250000"),
+            (400_000, "400000"),
+        ] {
+            let settings = agent_settings(
+                "dark-factory",
+                "kind-curie-factory",
+                "curie",
+                "curie",
+                DEFAULT_DEADLINE_SECONDS,
+                DEFAULT_BUDGET_USD,
+                output_tokens,
+            );
+            let budget: Vec<&(Vec<String>, &str)> = settings
+                .iter()
+                .filter(|(_, step)| *step == "Setting factory budget")
+                .collect();
+            assert_eq!(budget.len(), 1, "{settings:?}");
+            let argv = &budget[0].0;
+            assert_eq!(argv[..3], ["cluster", "budget", "dark-factory"], "{argv:?}");
+            let tail = &argv[argv.len() - 4..];
+            assert_eq!(tail, ["--limit", "5", "--output-tokens", shown], "{argv:?}");
+            assert_eq!(
+                argv.iter().filter(|arg| *arg == "--output-tokens").count(),
+                1,
+                "{argv:?}"
+            );
+        }
     }
 }

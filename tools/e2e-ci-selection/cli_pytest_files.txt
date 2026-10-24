@@ -42,6 +42,7 @@ examples/tests/test_alert_path_heartbeat.py
 examples/tests/test_dark_factory_bundle.py
 examples/tests/test_dark_factory_review_gate.py
 examples/tests/test_shipped_connector_tests_are_collected.py
+examples/tests/test_sre_bot_canary_evidence.py
 examples/tests/test_sre_bot_metric_alignment.py
 examples/tests/test_sre_bot_observability_runtime.py
 examples/tests/test_sre_bot_reply_format.py
@@ -56,6 +57,7 @@ packages/test-support/tests/test_pytest_collection.py
 release/tests/test_atlas.py
 release/tests/test_authorize.py
 release/tests/test_get_curie.py
+release/tests/test_kind_ci.py
 release/tests/test_sdk_approval_gate_workflow.py
 runner/tests/test_dark_factory_runner_toolchain.py
 runner/tests/test_dockerfile_registry_layer.py

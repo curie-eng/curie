@@ -35,6 +35,7 @@ use curie::factory_quickstart::{
     quickstart_plan, Action, CodeHostKind, EgressEntry, EgressPort, ForgeFlags, JiraPlan,
     Observation, PlanInput, RecordedIntake, ReleaseRead, SecretUse, TrackerKind, DEFAULT_AGENT,
     DEFAULT_BUDGET_USD, DEFAULT_DEADLINE_SECONDS, DEFAULT_KIND_NAME, DEFAULT_MODEL,
+    DEFAULT_OUTPUT_TOKENS_PER_RUN,
 };
 use curie::factory_toolchain::{preflight, preflight_with_pem, AppPreflight};
 use serde_json::{json, Value};
@@ -722,6 +723,7 @@ fn input() -> PlanInput {
         org: None,
         execution_deadline_seconds: DEFAULT_DEADLINE_SECONDS,
         budget_usd: DEFAULT_BUDGET_USD,
+        output_tokens: DEFAULT_OUTPUT_TOKENS_PER_RUN,
         chart: "charts/curie".into(),
         credential_in_env: true,
         release_has_real_model: false,

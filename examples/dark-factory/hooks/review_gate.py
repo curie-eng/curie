@@ -59,7 +59,8 @@ One script handles every hook event the bundle registers:
     the bundle's verification contract to the prompt, the same bytes for both
     reviewers, followed by the bundle's ``verification/checks.json`` when the
     bundle declares one, fenced as declared data. When either cannot be read
-    the call is denied and the run stops.
+    the call is denied and the run stops. A missing prompt fingerprint denies
+    plan review before spending a round; it cannot be captured later in the run.
 
 ``PostToolUse`` / ``PostToolUseFailure`` on ``Agent``/``Task``
     Reads the reviewer's ``REVIEWER:`` and ``VERDICT:`` lines. A reply without
@@ -95,10 +96,12 @@ One script handles every hook event the bundle registers:
 
 ``UserPromptSubmit``
     A new message starts a new run: the reset state is saved, then the checkout
-    fingerprint is taken under a deadline that also bounds hashing untracked
-    files. A prompt whose first line is exactly ``<task-notification>`` (the
-    text before the first newline, compared with no stripping) continues the
-    current run: saved state is loaded and left as it is, the fingerprint is
+    fingerprint is taken with at most two attempts sharing a seven-second
+    deadline that also bounds hashing untracked files. If neither succeeds,
+    the run stops with the prerequisite failure. A prompt whose first line is
+    exactly ``<task-notification>`` (the text before the first newline,
+    compared with no stripping) continues the current run: saved state is
+    loaded and left as it is, the fingerprint is
     not retaken, and the hook returns no additional context. Every other
     prompt, including one that contains that line anywhere else, still starts
     a new run. A CI fix round starts at ``implement``. A fresh run and a CI fix
@@ -158,6 +161,11 @@ TEST_FILES = ("test_*", "*_test.*", "*.test.*", "*.spec.*", "*_spec.*", "conftes
 # The hook itself has 10 seconds; the git calls share most of it.
 GIT_BUDGET_SECONDS = 7.0
 GIT_CALL_SECONDS = 3.0
+FINGERPRINT_MISSING = (
+    "The initial checkout fingerprint could not be captured (checkout_unverifiable). "
+    "Ensure the checkout is readable by Git within the seven-second budget, "
+    "then submit a new prompt before plan review."
+)
 # The one verification contract for the implementer and both reviewers (#3874).
 CONTRACT_PATH = Path(__file__).resolve().parents[1] / "verification" / "contract.md"
 CONTRACT_HEADER = (
@@ -428,7 +436,7 @@ def _github_changed_path(workspace: str) -> str | None:
     return None
 
 
-def fingerprint(workspace: str) -> str | None:
+def fingerprint(workspace: str, deadline: float) -> str | None:
     """A sha256 over the checkout's HEAD, status, diff and untracked files.
 
     ``None`` when any part cannot be read in time: the caller treats that as an
@@ -436,7 +444,6 @@ def fingerprint(workspace: str) -> str | None:
     """
     if not workspace:
         return None
-    deadline = time.monotonic() + GIT_BUDGET_SECONDS
     digest = hashlib.sha256()
     try:
         top, head = _git(workspace, deadline, "rev-parse", "--show-toplevel", "HEAD").split()
@@ -462,7 +469,7 @@ def fingerprint(workspace: str) -> str | None:
                             return None
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
-    return digest.hexdigest()
+    return digest.hexdigest() if time.monotonic() < deadline else None
 
 
 def is_test_path(path: str, workspace: str) -> bool:
@@ -851,6 +858,10 @@ def pre_agent(state: dict[str, Any], tool_input: dict[str, Any]) -> dict[str, An
             "The plan is already approved. A diff review rejection returns to "
             "implement, not to plan: fix the diff and call the diff reviewer."
         )
+    if kind == PLAN and state["fingerprint"] is None:
+        state["stopped"] = FINGERPRINT_MISSING
+        emit_gate(state, "fingerprint_unavailable", stage="plan_review")
+        return _deny(_stop_text(state["stopped"]))
     if kind == DIFF and diff["verdict"] == "APPROVE":
         return _deny("The diff reviewer already approved; go to publish.")
     contract = contract_text()
@@ -965,7 +976,11 @@ def post_skill(state: dict[str, Any], tool_input: dict[str, Any]) -> None:
 
 def refuse_approval(state: dict[str, Any]) -> str | None:
     """The stop cause when the checkout moved before plan approval, else ``None``."""
-    now = fingerprint(state["workspace"])
+    now = (
+        fingerprint(state["workspace"], time.monotonic() + GIT_BUDGET_SECONDS)
+        if state["fingerprint"] is not None
+        else None
+    )
     if state["fingerprint"] is None or now is None:
         cause = "checkout_unverifiable"
     elif now != state["fingerprint"]:
@@ -1053,7 +1068,16 @@ def handle(data: dict[str, Any]) -> dict[str, Any] | None:
             # Saved first: a hook killed mid-fingerprint must not leave the last
             # run's approvals in place.
             save(path, state)
-            state["fingerprint"] = fingerprint(state["workspace"])
+            deadline = time.monotonic() + GIT_BUDGET_SECONDS
+            for _ in range(2):
+                if time.monotonic() >= deadline:
+                    break
+                state["fingerprint"] = fingerprint(state["workspace"], deadline)
+                if state["fingerprint"] is not None:
+                    break
+            if state["fingerprint"] is None:
+                state["stopped"] = FINGERPRINT_MISSING
+                emit_gate(state, "fingerprint_unavailable", stage="prompt")
         else:
             emit_phase(
                 state, "wait_ci", ci_round, f"checks failed; fix round {ci_round} of {MAX_ROUNDS}"
@@ -1063,7 +1087,7 @@ def handle(data: dict[str, Any]) -> dict[str, Any] | None:
             state["stopped"] = CONTRACT_MISSING
             emit_gate(state, "contract_unavailable", stage="prompt")
         save(path, state)
-        if contract is None:
+        if contract is None or state["stopped"]:
             return _context("UserPromptSubmit", _stop_text(state["stopped"]))
         if ci_round:
             return _context(

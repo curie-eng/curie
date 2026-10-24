@@ -106,7 +106,9 @@ curie cluster status --context <your-production-context>
    resource profile). A factory agent uses the `factory` profile instead:
    **8Gi memory request and limit**, so it needs a node with 8Gi of unrequested
    allocatable memory, and the default quota admits one factory sandbox at a
-   time. See the chart README's
+   time. With `factory.enabled`, the API container's memory limit is **2Gi**
+   instead of 512Mi (its request stays 256Mi); set
+   `api.resources.limits.memory` to choose another value. See the chart README's
    [resource profiles](../charts/curie/README.md#resource-profiles). Each distinct
    layered runner digest adds a prewarm container requesting another
    10m CPU and 16Mi memory per node.
@@ -1807,6 +1809,13 @@ refuses for stock layers unless `--allow-stock-layer-clear` is set, while
 owner-built layers are cleared; setting the chart value `agentSandbox.runner.digest` pins
 the runner so no lookup is needed.
 
+With `factory.enabled`, the API container's memory limit is 2Gi, from
+`agentSandbox.resourceProfiles.factory.apiMemoryLimit`; a non-factory install
+keeps 512Mi from the `standard` profile. An explicit
+`api.resources.limits.memory` wins on any install. The 2Gi is headroom, not a
+measured need: after #4895 the factory publication listing over 231 pages
+peaked near 170 MB under both a 512Mi and a 2Gi limit.
+
 For a run that can last three hours, set an illustrative $100 USD cap after
 deploying the agent:
 
@@ -2283,17 +2292,23 @@ request, a `state` and an `actionable_cause`. The states:
 
 - `waiting`: admitted and waiting for sandbox capacity. The cause names
   capacity deferrals and says when the waiting deadline has elapsed but the
-  reconciler has not yet expired the request.
+  reconciler has not yet expired the request. When an earlier start failed
+  while preparing the workspace, the cause also names that previous start
+  failure (its stage and a redacted reason, at most 2000 characters), and the
+  request's `last_start_failure_detail` holds the same text. Later capacity
+  deferrals and a worker replacement keep it; a successful start clears it.
 - `running`: started, bounded by the agent's execution deadline (default 1800 s).
 - `cancellation_requested`: termination requested (`issue_cancelled`,
   `execution_deadline` or `owner_lost`) and awaiting a runtime observation.
 - `cancelled`: the issue label was removed or the issue was closed. A pull
   request already opened is kept.
-- `expired`: `capacity_wait_expired` or `execution_deadline`.
+- `expired`: `capacity_wait_expired` or `execution_deadline`. A capacity
+  wait that expires after a failed start still names the previous start
+  failure.
 - `failed`: the cause names the terminal cause verbatim. For
   `deadline_halted`, raise `worker.deliveryBudgetSeconds`. For `start_failed`,
-  the sandbox never started; the cause names the attempt count and the last
-  deferral reason.
+  the sandbox never started; the cause names the attempt count, the last
+  deferral reason and the previous start failure when one was recorded.
 - `awaiting_approval`: a publication approval or a tool approval on the same
   conversation is pending.
 - `publishing`: the publication is approved and in flight.

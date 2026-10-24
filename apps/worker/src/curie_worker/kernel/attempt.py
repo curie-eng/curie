@@ -407,7 +407,7 @@ async def _attempt_turn(
             if run is not None and not run.started:
                 release_order()
                 try:
-                    await run.defer("capacity", capacity=True)
+                    await run.defer("capacity", capacity=True, start_failure_detail=None)
                 except WorkItemConflict as exc:
                     logger.info(
                         "work-item capacity defer refused for %s: %s",
@@ -649,7 +649,7 @@ async def _attempt_turn(
                     exc,
                 )
                 try:
-                    await run.defer("capacity", capacity=True)
+                    await run.defer("capacity", capacity=True, start_failure_detail=None)
                 except WorkItemConflict as conflict:
                     logger.info(
                         "work-item capacity defer refused for %s: %s",

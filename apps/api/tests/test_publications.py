@@ -6766,9 +6766,12 @@ class _PushedPullCodeHost:
         self.calls.append("verify_revision_commit")
         return PublicationRevisionCommit(commit_sha=commit_sha, parent_sha=expected_parent)
 
-    def recover_pull_request(self, _publication_id: uuid.UUID, *, expected_head_sha: str) -> Any:
+    def recover_pull_request(
+        self, _publication_id: uuid.UUID, *, expected_head_sha: str, adopt_only: bool
+    ) -> Any:
         from curie_worker.publication_loop import PublicationPullState
 
+        assert adopt_only is False
         self.calls.append("recover_pull_request")
         return PublicationPullState(
             number=PR_NUMBER,
