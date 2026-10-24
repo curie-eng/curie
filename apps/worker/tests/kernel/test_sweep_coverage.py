@@ -494,7 +494,7 @@ def test_read_sends_the_platform_key_and_quotes_the_binding_address(make_hook_ru
                 [
                     f"/agents/{run.agent_id}/state/memory",
                     f"/agents/{run.agent_id}/state/bindings/webhook/"
-                    "http%3A%2F%2Fsink.example%2Fhooks%2Fa%20b%3Fx%3D1/memory",
+                    "http%3A%252F%252Fsink.example%252Fhooks%252Fa%20b%3Fx%3D1/memory",
                 ]
             )
             for request in api.requests:
