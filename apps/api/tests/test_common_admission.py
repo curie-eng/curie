@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 from curie_api import admission, team_authorization
 from curie_api.config import get_settings
+from curie_api.identity.slack import SlackEvidence
 from curie_api.models import (
     Agent,
     AgentAccessPolicy,
@@ -155,7 +156,9 @@ def test_both_http_routes_delegate_once_with_their_existing_evidence(
     assert calls[0].get("email") == (author if surface == "port-email" else None)
     slack = calls[0].get("slack")
     assert (slack.model_dump() if slack else None) == (
-        payload["slack"] if surface == "query-slack" else None
+        SlackEvidence.model_validate(payload["slack"]).model_dump()
+        if surface == "query-slack"
+        else None
     )
 
 
