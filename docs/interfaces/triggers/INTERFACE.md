@@ -140,8 +140,12 @@ another handler that mints a `QueuedTurn` with the right `source`. The ten hardc
   [TOOL-ACCESS contract](../aci-producer/INTERFACE.md). Omission retains ordinary
   hooks and approvals; untrusted body text never selects the policy. The receipt's
   `tool_access` proves only the queued value. Completed retries must match the
-  original value, and return 409 if it differs or the original queued turn is
-  unavailable. A pending restricted retry also returns 409; an ordinary pending
+  original value. They read a bounded retained receipt beside the delivery claim
+  (`apps/api/src/curie_api/hook_receipts.py::read_receipt`), falling back to the
+  original queued turn only when that receipt is absent for a legacy claim.
+  Policy mismatch, missing evidence or malformed evidence returns 409; a malformed
+  retained receipt never falls back to the queue. A pending restricted retry also
+  returns 409; an ordinary pending
   202 receipt proves no accepted turn. Before opting in, the operator must verify
   homogeneous worker artifacts implementing TOOL-ACCESS-6 and compatible runners;
   this API cannot discover or exclude old workers. Implementing workers verify the
@@ -392,9 +396,12 @@ stays where its source arrives.
 
 A second, narrower leak the CLI path exposes: **the dedupe id is minted by whoever enqueues**,
 under a different rule per producer, with nothing enforcing that the rules stay disjoint.
-`apps/dispatcher/src/curie_dispatcher/handlers.py::process_event` passes Slack's own `event_id`
-through verbatim; `apps/dispatcher/src/curie_dispatcher/handlers.py::process_action` synthesizes
-`action-<interaction id>`; `apps/api/src/curie_api/resumequeue.py::resume_event_id` returns a
+`apps/dispatcher/src/curie_dispatcher/handlers.py::process_event` uses Slack's own `event_id`,
+and `apps/dispatcher/src/curie_dispatcher/handlers.py::process_action` synthesizes
+`action-<interaction id>`. Both pass their id through
+`apps/dispatcher/src/curie_dispatcher/identities.py::delivery_key`, which keeps it
+unchanged for the default identity and appends `:identity` for every other identity.
+`apps/api/src/curie_api/resumequeue.py::resume_event_id` returns a
 deterministic `approval-<id>-resolved`; GitHub review feedback first claims the delivery UUID
 through `apps/api/src/curie_api/github_review_audit.py::claim_review_delivery`, then mints a
 stable `github-feedback-<uuid5>` event id from repository id, event kind, and provider feedback

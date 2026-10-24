@@ -201,6 +201,9 @@ streaming/presign/delete/list implementation.
 
 ## Cross-links
 
-- **Epic(s):** #83 — vision epic for the blob-storage seam (extract a port only when a non-S3 backend lands).
+**Epic(s):** #83 is the vision epic for the blob-storage seam. The port was
+already extracted by #282 under ADR-0026; a non-S3 adapter remains deferred
+until a real non-S3 backend is needed.
+
 - **Vision doc:** [architecture-vision.md](../../architecture-vision.md) — Job 4 (Blob storage), grade B+
 - **ADR(s):** [ADR-0007](../../adr/0007-adopt-not-build-boundaries.md): Adopt-not-build boundaries (RustFS adopted under Apache 2.0, "offer BYO-S3"); [ADR-0026](../../adr/0026-extract-storage-port-defer-second-adapter.md): extract the storage port and defer the second adapter
