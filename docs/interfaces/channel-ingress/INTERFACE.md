@@ -166,8 +166,9 @@ satisfying the egress Protocol, or out of process over the HTTP wire.
   (`apps/worker/src/curie_worker/reply_sink.py::_ClusterMessageReplyAdapter`), selected by
   `ReplySinkRouter` for the reserved `curie-cluster-message` adapter name.
 - **Admission**: each binding may carry `allowed_callers`, an optional list of the
-  exact caller ids that may start a turn through it (ADR 0175); none means everyone.
-  One function decides, `admit`
+  exact caller ids that may start a turn through it (ADR 0175); none means everyone
+  only when the agent has no IdP invocation team (below).
+  One function decides the list, `admit`
   (`apps/api/src/curie_api/admission.py::admit`), before any turn, placeholder or
   reply. The wire ingress runs it inside `POST /channels/turns` after verifying the
   token and before claiming the delivery, and answers a refused `author` with 403
@@ -182,7 +183,19 @@ satisfying the egress Protocol, or out of process over the HTTP wire.
   minutes while the API cannot answer, and refuses a cold miss during an outage
   unless its last answer, within those 5 minutes, said no binding on the install
   carries a list. An API that predates the admission route (FastAPI's route-miss
-  404) has no lists, so the dispatcher admits. A refused caller gets no placeholder and no reply;
+  404) has no lists, so the dispatcher admits.
+  After `admit`, both `POST /channels/turns` and `POST /channels/admission` call
+  `check_binding` (`apps/api/src/curie_api/team_authorization.py::check_binding`)
+  with the `invocation` role (ADR 0220): when the agent has an invocation team, a
+  caller who does not resolve to an active IdP person in that team is refused as
+  `caller_not_allowed`, even with no `allowed_callers` list. A refused caller gets
+  no placeholder and no public reply. The one exception is a Slack sender with no
+  linked account who passes `admit`: when OIDC is enabled with an HTTPS redirect
+  origin, `POST /channels/admission` may return a
+  `connect_url`, and the dispatcher's `_refused_caller`
+  (`apps/dispatcher/src/curie_dispatcher/handlers.py`) posts it as a private
+  ephemeral "Connect your account, then ask again." offer while still refusing the
+  turn;
   the dispatcher logs `caller_not_allowed` or `admission_unavailable`, and both
   services count `curie.turn.refused`. The list is set with
   `PUT /agents/{agent_id}/channels/callers`, which leaves the binding generation,
@@ -265,6 +278,7 @@ tests assert the two sets equal in both directions.
 | `NO_ACTION_IN_PAYLOAD` | A block-action payload carrying no actions names no command and addresses nothing, so there is no turn to mint from it. |
 | `EMPTY_ACTION_COMMAND` | A clicked button carrying neither a value nor a usable action id names no command, so the turn text would be empty. |
 | `UNADDRESSABLE_ACTION` | An App Home or modal click carries no channel and no message, so there is no thread in which a reply could be delivered. |
+| `DELIVERY_CANARY` | The mention arrived in a channel listed as a delivery canary, whose only job is to prove Slack still delivers to this identity; it is counted on curie.slack.delivery_canary and never asks the API, posts a placeholder or mints a turn (#4960). |
 
 The last three sit on the Block Kit click lane, which is a real ingest lane:
 `apps/dispatcher/src/curie_dispatcher/handlers.py::process_action` mints a `QueuedTurn`

@@ -1,7 +1,7 @@
 ---
 seam: Approval / authorizer
 kind: CLEAN
-impls: 5 approver sets behind one authorizer (Slack channel, Slack user group, explicit user list, email list, no verifiable approvers)
+impls: 6 approver sets behind one authorizer (Slack channel, Slack user group, explicit user list, email list, no verifiable approvers, IdP approver team)
 grade: not separately graded
 epics:
   - "#22"
@@ -22,7 +22,7 @@ credential cleanup, so adapter retries cannot repeat a GitHub mutation.
 > Part of the Curie swappable-seam catalog — see the [seam index](../../interfaces.md).
 
 <!-- BEGIN GENERATED: header (curie dev docs-lint) -->
-> **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** 5 approver sets behind one authorizer (Slack channel, Slack user group, explicit user list, email list, no verifiable approvers) &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
+> **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** 6 approver sets behind one authorizer (Slack channel, Slack user group, explicit user list, email list, no verifiable approvers, IdP approver team) &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
 <!-- END GENERATED: header -->
 
 **Kind legend:** CLEAN = a real `Protocol`/typed port class · SOFT = swap via env/URL/prefix/wire, no code interface · NONE = not built yet.
@@ -423,7 +423,7 @@ names as unrecognized on purpose, so arming one still trips the existing
 ## Implementations today
 
 **One authorizer** (`apps/api/src/curie_api/authorizer.py`, pure policy with no Slack in
-it) over **five approver sets** behind the `ApproverSet` port (ADR-0034), after an
+it) over **six approver sets** behind the `ApproverSet` port (ADR-0034), after an
 independent authentication boundary resolves one of ADR-0106's `chat`, `console`, or
 `operator` principals, ADR-0156's `adapter` principal, or ADR-0202's `test_driver`
 principal. A set answers only "is this actor in the set"; every rule that is
@@ -451,7 +451,7 @@ user and channel match the principal, and a channel matching the recorded
 `ExplicitUsers` admits this principal, and its subject must be listed. Channel
 membership and user-group membership never authorize a test driver (ADR-0202).
 
-Two of the five sets are Slack's, and that is the honest framing: a channel and a user
+Two of the six sets are Slack's, and that is the honest framing: a channel and a user
 group are two ways Slack says "who is in the authorized set", not a neutral baseline plus a
 Slack feature.
 
@@ -498,11 +498,28 @@ Slack feature.
   raised, so this set meets only an approval pending from before that rule or one whose
   route was rewritten while it pended.
 
+- **`IdpTeamApprovers`** ([ADR-0220](../../adr/0220-one-identity-provider-decides-who-may-invoke-and-approve-on-every-channel.md),
+  `apps/api/src/curie_api/approvers.py::IdpTeamApprovers`), the set for an approval whose
+  agent has an IdP approver team. `resolve_approval` asks
+  `apps/api/src/curie_api/approval_teams.py::approval_team_decision`, which calls
+  `apps/api/src/curie_api/team_authorization.py::check_binding` with the `approver` role;
+  when that decision is restricted, this set replaces the one the route selector chose,
+  including the channel-membership default. The agent's approver team decides. A route
+  that declares `approvers` (or names a route whose binding is missing or malformed, per
+  `apps/api/src/curie_api/approval_teams.py::team_restriction`) only narrows it: the
+  route's set is consulted after team membership passes, and an undeclared route adds no
+  channel-membership check. `operator` and `test_driver` principals are refused with
+  reason `idp_sign_in_required`, and an adapter or chat principal answering on the wrong
+  surface is refused with `wrong_resolution_surface`.
+
 Platform-RBAC, the set the epic once planned as its fourth, is not built.
 
 **The audit vocabulary is frozen.** Each set's `audit_name` pins its pre-ADR-0034 class
 name, so `approval_audit.authorizer` still records `ChannelMembershipAuthorizer`,
-`ExplicitUserListAuthorizer`, and `UserGroupAuthorizer`. Those classes no longer exist. The
+`ExplicitUserListAuthorizer`, and `UserGroupAuthorizer`. Those classes no longer exist.
+`IdpTeamApprovers` records the route restriction's name only when the team admits the
+principal and a route restriction applies; any other team decision records a null `authorizer` and
+carries the decision in the `team_id`, `team_epoch` and `team_digest` columns instead. The
 column is append-only history and rows already on main carry those values, so renaming the
 vocabulary would make old rows lie about what decided.
 
@@ -569,7 +586,8 @@ approval_routes: {
 ```
 
 **Precedence: `users` > `group` > channel membership.** When `users` is set, `group` is
-ignored and no Slack call is made. When neither is declared, channel membership decides.
+ignored and no Slack call is made. When neither is declared, channel membership decides
+for an agent without an IdP approver team; with one, the team decides (`IdpTeamApprovers`).
 
 **Fail closed, precisely scoped.** When a binding DOES declare an `approvers` spec, every
 lookup and config error denies: no bot token configured, HTTP error, network error,
@@ -592,7 +610,8 @@ that route's binding, so with the binding gone the selector returns `UnboundRout
 admits nobody and reports `undetermined`; the resolve attempt is a 403 and the audit row
 records `UnboundRouteBinding` with the missing route in its evidence. ADR-0123 supersedes
 exactly this one consequence of ADR-0034; ADR-0034's AC4 zero-setup default stands, so a
-binding that is PRESENT and declares no `approvers` still means card-channel membership.
+binding that is PRESENT and declares no `approvers` still means card-channel membership for
+an agent without an IdP approver team.
 An approval with a NULL `agent_id` that nonetheless names a route falls under the same
 rule and is refused too — `get_approval_route_binding` returns a bare None for every miss,
 and the split is on whether the approval named a route, not on why the binding is missing.
@@ -754,3 +773,4 @@ one authenticated member confirmed their own request, not that a second person r
 5. **Additional ADR:** [ADR-0177](../../adr/0177-an-approval-is-answered-where-it-was-asked-including-by-email.md): An approval is answered where it was asked, including by email (Accepted); adds the `requesting_surface` route mode and the requester-only set for non-Slack cards, and refuses adapter principals on every Slack approver set.
 6. **Additional ADR:** [ADR-0177 amendment](../../adr/0177-an-approval-is-answered-where-it-was-asked-including-by-email.md#amendment-email-approver-lists): email approver lists (2026-10-01); replaces ADR-0177's requester-only set with the route's approver `emails`, checked after the binding's `allowed_callers`.
 7. **Additional ADR:** [ADR-0202](../../adr/0202-a-test-installation-admits-a-listed-bots-actions-and-approval-replies.md): adds the test-installation driver principal and its explicit-user-only admission.
+8. **Additional ADR:** [ADR-0220](../../adr/0220-one-identity-provider-decides-who-may-invoke-and-approve-on-every-channel.md): One identity provider decides who may invoke and approve, on every channel (Accepted); adds the `IdpTeamApprovers` set, under which the agent's IdP approver team replaces the channel-membership default and a route's `approvers` only narrow it.

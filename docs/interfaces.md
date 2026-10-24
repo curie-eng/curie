@@ -24,7 +24,7 @@ is documentation of where the code already draws the line, not a new abstraction
 | Relational DB (Postgres) | SOFT | 1 | A- | #84 | [Relational DB (Postgres)](interfaces/relational-db/INTERFACE.md) |
 | Queue / stream (Valkey) | CLEAN | 1 (redis-py) behind the broker port | not separately graded | #85, #7 | [Queue / stream (Valkey)](interfaces/queue-stream/INTERFACE.md) |
 | Bundle format | CLEAN, frozen | 1 | not separately graded | #30 | [Bundle format](interfaces/bundle-format/INTERFACE.md) |
-| Approval / authorizer | CLEAN | 5 approver sets behind one authorizer (Slack channel, Slack user group, explicit user list, email list, no verifiable approvers) | not separately graded | #22 | [Approval / authorizer](interfaces/approval/INTERFACE.md) |
+| Approval / authorizer | CLEAN | 6 approver sets behind one authorizer (Slack channel, Slack user group, explicit user list, email list, no verifiable approvers, IdP approver team) | not separately graded | #22 | [Approval / authorizer](interfaces/approval/INTERFACE.md) |
 | Workflow state store | SOFT | 1 (API state router) | not separately graded | #23, #248 | [Workflow state store](interfaces/workflow-state/INTERFACE.md) |
 | Memory | CLEAN | 1 loader (StateApiMemoryStore) + facts store (MemoryFactsStore) | not separately graded | #28 | [Memory](interfaces/memory/INTERFACE.md) |
 | Conversation history | CLEAN | 1 loader (StateApiTranscriptStore) | not separately graded | #20 | [Conversation history](interfaces/conversation-history/INTERFACE.md) |

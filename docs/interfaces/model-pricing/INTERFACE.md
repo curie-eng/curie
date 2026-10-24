@@ -105,6 +105,13 @@ model-family table and input/output rates, without cache-read or cache-write
 rates. An unpriced model returns `None`. Changing the factory price source does
 not change eval cost attribution.
 
+Budget enforcement also remains outside `PriceBook`. The runner passes
+`max_usd_per_day` to the agent SDK as `max_budget_usd`
+(`runner/src/curie_runner/__main__.py`), so the SDK's own price table decides
+the USD stop. That table can price a model above the recorded `PriceBook`
+estimate; `apps/api/src/curie_api/factory_notices.py::result_section` reports
+the gap when a run stops on the USD cap below its recorded estimate.
+
 ## Cross-links
 
 1. **Related work:** #3223 implements factory usage and estimated cost; #3923
