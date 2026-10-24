@@ -144,8 +144,10 @@ judge with no credentials or cluster contact.
 `curie dev factory-e2e judge-docker --envelope <file>` runs docker_scenario.py's
 offline judge on a docker-scenario/v1 envelope (ADR 0216, ADR 0217): per-run
 daemon identity and events, refused escapes, blocked egress, cleanup, the
-non-opted control, the runner upgrade and required checks green on the first
-head. It needs no credentials or cluster contact.
+non-opted control, the runner upgrade, required checks green on the first
+head, a two-service Compose project built and reached on the run's daemon, and
+the skill rung of the e2e ladder against a runner image built there. It needs
+no credentials or cluster contact.
 
 The App, fixture repository, mention author and model credentials come only
 from operator files or environment variables; nothing here names a real one.
