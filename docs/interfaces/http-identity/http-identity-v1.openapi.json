@@ -15,6 +15,8 @@
             "type": "string"
           },
           "issuer": {
+            "minLength": 1,
+            "pattern": "^(?![\\s\\S]*\\s$)[hH][tT][tT][pP][sS]://(?:\\[[^/?#@\\]]+\\]|[^:/?#@\\[\\]]+)(?::[^/?#@]*)?(?:/[^?#]*)?(?:\\?)?(?:#)?$(?![\\s\\S])",
             "title": "Issuer",
             "type": "string"
           },
@@ -52,6 +54,8 @@
             "type": "string"
           },
           "issuer": {
+            "minLength": 1,
+            "pattern": "^(?![\\s\\S]*\\s$)[hH][tT][tT][pP][sS]://(?:\\[[^/?#@\\]]+\\]|[^:/?#@\\[\\]]+)(?::[^/?#@]*)?(?:/[^?#]*)?(?:\\?)?(?:#)?$(?![\\s\\S])",
             "title": "Issuer",
             "type": "string"
           }
@@ -476,6 +480,9 @@
         "description": "@spec HTTP-IDENTITY-V1-2, HTTP-IDENTITY-V1-4.",
         "properties": {
           "as_of": {
+            "description": "Enable date-time format assertions to validate calendar dates.",
+            "format": "date-time",
+            "pattern": "^(?!0000)[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](?:\\.[0-9]+)?(?:Z|\\+00:00)$(?![\\s\\S])",
             "title": "As Of",
             "type": "string"
           },
@@ -497,6 +504,8 @@
         "description": "@spec HTTP-IDENTITY-V1-1.",
         "properties": {
           "expected_issuer": {
+            "minLength": 1,
+            "pattern": "^(?![\\s\\S]*\\s$)[hH][tT][tT][pP][sS]://(?:\\[[^/?#@\\]]+\\]|[^:/?#@\\[\\]]+)(?::[^/?#@]*)?(?:/[^?#]*)?(?:\\?)?(?:#)?$(?![\\s\\S])",
             "title": "Expected Issuer",
             "type": "string"
           },
@@ -555,7 +564,7 @@
     }
   },
   "info": {
-    "description": "Provider-hosted reference operation; deployment maps its lookup URL to this operation. This document registers no Curie API route. Facts grant no permission. Transport obligations are published but not implemented by the pure facts contract. Cross-object issuer equality, exact request echo and independent freshness require semantic validation.",
+    "description": "Provider-hosted reference operation; deployment maps its lookup URL to this operation. This document registers no Curie API route. Facts grant no permission. Transport obligations are published but not implemented by the pure facts contract. Cross-object issuer equality, exact request echo and independent freshness require semantic validation. Enable date-time format assertions for calendar validation of observation timestamps; patterns retain UTC syntax and fractional precision.",
     "title": "HTTP identity facts provider",
     "version": "1"
   },
