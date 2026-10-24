@@ -480,7 +480,10 @@ def _schema_windows_at(commit: str, *, cwd: Path | None) -> object:
     """The parsed schema-window catalog at `commit`, or None if unreadable.
 
     A missing file or malformed JSON is not an error here: it only means the
-    delta cannot be a registration, so the walk refuses on its own terms.
+    delta cannot be a registration, so the walk refuses on its own terms. A
+    document with a duplicate object key at any level is treated the same way:
+    json.loads would silently keep the last member, but the Rust consumer
+    rejects such documents.
     """
     try:
         result = subprocess.run(
@@ -497,9 +500,23 @@ def _schema_windows_at(commit: str, *, cwd: Path | None) -> object:
     if result.returncode != 0:
         return None
     try:
-        return json.loads(result.stdout)
-    except json.JSONDecodeError:
+        return json.loads(result.stdout, object_pairs_hook=_reject_duplicate_keys)
+    except (json.JSONDecodeError, ValueError):
         return None
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate key {key!r}")
+        result[key] = value
+    return result
+
+
+def _canonical(value: object) -> str:
+    """Type-sensitive form of parsed JSON: True and 1 and 1.0 stay distinct."""
+    return json.dumps(value, sort_keys=True)
 
 
 def is_schema_window_registration(
@@ -522,13 +539,17 @@ def is_schema_window_registration(
         return False
     if version in old_windows or version not in new_windows:
         return False
-    if "candidate" not in old or new_windows[version] != old["candidate"]:
+    if "candidate" not in old or _canonical(new_windows[version]) != _canonical(
+        old["candidate"]
+    ):
         return False
-    if {k: v for k, v in new_windows.items() if k != version} != old_windows:
+    if _canonical({k: v for k, v in new_windows.items() if k != version}) != (
+        _canonical(old_windows)
+    ):
         return False
-    return {k: v for k, v in new.items() if k != "windows"} == {
-        k: v for k, v in old.items() if k != "windows"
-    }
+    return _canonical({k: v for k, v in new.items() if k != "windows"}) == (
+        _canonical({k: v for k, v in old.items() if k != "windows"})
+    )
 
 
 def find_version_only_proof(
