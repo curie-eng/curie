@@ -263,6 +263,14 @@ CHART_YAML = (
     "dependencies:\n  - name: valkey\n    version: 1.2.3\n"
 )
 BASE_VERSION = "9.8.7-fdbase"
+# The fake snapshot's cli/src/config_migrate.rs, shaped like the real file's declaration.
+SNAPSHOT_SCHEMA_VERSION = "7.6.5"
+CONFIG_MIGRATE_RS = (
+    "use serde_json::Value;\n\n"
+    f'pub const TARGET_SCHEMA_VERSION: &str = "{SNAPSHOT_SCHEMA_VERSION}";\n\n'
+    "pub fn infer_schema_version() {}\n"
+)
+SCHEMA_VERSION = "0.9.0"  # an explicit value for the pure docker_values calls
 
 
 class FakeFixture:
@@ -279,6 +287,8 @@ class FakeFixture:
         (chart / "values-dev.yaml").write_text("ui:\n  deploy: false\n")
         (chart / "templates").mkdir()
         (chart / "templates/configmap.yaml").write_text("kind: ConfigMap\n")
+        (self.snapshot / "cli/src").mkdir(parents=True)
+        (self.snapshot / "cli/src/config_migrate.rs").write_text(CONFIG_MIGRATE_RS)
         (self.snapshot / "runner").mkdir()
         (self.snapshot / "runner/Dockerfile").write_text("FROM scratch\n")
         self.registry, self.port, self.arch = "localhost:5000", "5000", "amd64"
@@ -650,7 +660,7 @@ def test_install_docker_values_mark_acme_bot_custom_and_add_the_catalog_reposito
     source = _lifecycle_values(docker=docker)
     snapshot = copy.deepcopy(source)
     images = _images()
-    values = docker_driver.docker_values(source, images)
+    values = docker_driver.docker_values(source, images, SCHEMA_VERSION)
     assert source == snapshot, "docker_values mutated its input"
     repos = _repos(values)
     assert list(repos) == [CUSTOM_REPO, CATALOG_REPO]
@@ -676,7 +686,7 @@ def test_install_docker_values_mark_acme_bot_custom_and_add_the_catalog_reposito
 
 
 def test_install_docker_values_raise_the_daemon_limits_for_a_skill_rung() -> None:
-    values = docker_driver.docker_values(_lifecycle_values(docker=True), _images())
+    values = docker_driver.docker_values(_lifecycle_values(docker=True), _images(), SCHEMA_VERSION)
     daemon = values["factory"]["docker"]
     assert daemon["maxClaimLifetimeSeconds"] == 3600
     assert daemon["storageSizeLimit"] == "24Gi"
@@ -694,8 +704,66 @@ def test_install_values_method_is_docker_values_over_the_lifecycle_values(
     obj = _scenario(tmp_path, monkeypatch, Commands())
     obj.base_values = _base_values()
     for docker in (True, False):
-        expected = docker_driver.docker_values(_lifecycle_values(docker=docker), _images())
-        assert obj.values(docker=docker) == expected
+        lifecycle = _lifecycle_values(docker=docker)
+        expected = docker_driver.docker_values(lifecycle, _images(), SNAPSHOT_SCHEMA_VERSION)
+        values = obj.values(docker=docker)
+        assert values == expected
+        # The snapshot's constant, not this repository's: a release installed by the CLI
+        # carries it, and the upgrade's config migration accepts only it as a source.
+        assert values["config"]["schemaVersion"] == SNAPSHOT_SCHEMA_VERSION
+
+
+def test_install_docker_values_stamp_the_config_schema_version() -> None:
+    source = _lifecycle_values(docker=True)
+    source["config"] = {"logLevel": "debug", "schemaVersion": ""}
+    snapshot = copy.deepcopy(source)
+    values = docker_driver.docker_values(source, _images(), SCHEMA_VERSION)
+    assert source == snapshot, "docker_values mutated its input"
+    assert values["config"] == {"logLevel": "debug", "schemaVersion": SCHEMA_VERSION}
+    bare = _lifecycle_values(docker=True)
+    bare.pop("config", None)
+    assert docker_driver.docker_values(bare, _images(), SCHEMA_VERSION)["config"] == {
+        "schemaVersion": SCHEMA_VERSION
+    }
+
+
+def _rust_constant(path: Path) -> str:
+    """TARGET_SCHEMA_VERSION read independently of the driver's parser."""
+
+    prefix = "pub const TARGET_SCHEMA_VERSION: &str = "
+    [line] = [line for line in path.read_text().splitlines() if line.startswith(prefix)]
+    return line.removeprefix(prefix).removesuffix(";").strip('"')
+
+
+def test_install_target_schema_version_reads_the_repository_constant() -> None:
+    expected = _rust_constant(REPO_ROOT / "cli/src/config_migrate.rs")
+    assert re.fullmatch(r"\d+\.\d+\.\d+", expected), expected
+    assert docker_driver.target_schema_version(REPO_ROOT) == expected
+
+
+def test_install_target_schema_version_reads_the_snapshot_file(tmp_path: Path) -> None:
+    source = tmp_path / "cli/src/config_migrate.rs"
+    source.parent.mkdir(parents=True)
+    source.write_text(CONFIG_MIGRATE_RS)
+    assert docker_driver.target_schema_version(tmp_path) == SNAPSHOT_SCHEMA_VERSION
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param("", id="empty"),
+        pytest.param('const OTHER: &str = "1.0.0";\n', id="other-constant"),
+        pytest.param("// pub const TARGET_SCHEMA_VERSION_OLD: u32 = 1;\n", id="lookalike"),
+    ],
+)
+def test_install_target_schema_version_refuses_a_file_without_the_constant(
+    tmp_path: Path, text: str
+) -> None:
+    source = tmp_path / "cli/src/config_migrate.rs"
+    source.parent.mkdir(parents=True)
+    source.write_text(text)
+    with pytest.raises(RuntimeError, match="target_schema_version_missing"):
+        docker_driver.target_schema_version(tmp_path)
 
 
 # The fixture's images() writes the catalog Dockerfile acme-bot's runner was built from.
