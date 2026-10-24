@@ -257,6 +257,14 @@ class Commands:
         return [(a, k) for a, k in self.calls if Path(a[0]).name == program]
 
 
+# A nested dependency version shows that only the top-level version line is rewritten.
+CHART_YAML = (
+    'apiVersion: v2\nname: curie\nversion: 9.8.7\nappVersion: "9.8.7"\n'
+    "dependencies:\n  - name: valkey\n    version: 1.2.3\n"
+)
+BASE_VERSION = "9.8.7-fdbase"
+
+
 class FakeFixture:
     """The attributes of docker-daemon-fixture.py's Fixture the driver reads."""
 
@@ -267,9 +275,10 @@ class FakeFixture:
         self.snapshot = self.work / "snapshot"
         chart = self.snapshot / "charts/curie"
         chart.mkdir(parents=True)
-        (chart / "Chart.yaml").write_text(
-            'apiVersion: v2\nname: curie\nversion: 9.8.7\nappVersion: "9.8.7"\n'
-        )
+        (chart / "Chart.yaml").write_text(CHART_YAML)
+        (chart / "values-dev.yaml").write_text("ui:\n  deploy: false\n")
+        (chart / "templates").mkdir()
+        (chart / "templates/configmap.yaml").write_text("kind: ConfigMap\n")
         (self.snapshot / "runner").mkdir()
         (self.snapshot / "runner/Dockerfile").write_text("FROM scratch\n")
         self.registry, self.port, self.arch = "localhost:5000", "5000", "amd64"
@@ -689,10 +698,18 @@ def test_install_values_method_is_docker_values_over_the_lifecycle_values(
         assert obj.values(docker=docker) == expected
 
 
-def test_install_start_servers_load_the_docker_scenario_transcript(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+# The fixture's images() writes the catalog Dockerfile acme-bot's runner was built from.
+CATALOG_DOCKERFILE = "FROM localhost:5000/fd-e8ce1a8c/platform@sha256:" + "2" * 64 + "\n"
+
+
+def _servers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, catalog: bool = True
+) -> tuple[Any, dict[str, Any]]:
+    """A DockerScenario whose stub, model and proxy classes only record their inputs."""
+
     obj = _scenario(tmp_path, monkeypatch, Commands())
+    if catalog:
+        (obj.f.work / "Catalog.Dockerfile").write_text(CATALOG_DOCKERFILE)
     seen: dict[str, Any] = {}
 
     class Stub:
@@ -729,13 +746,131 @@ def test_install_start_servers_load_the_docker_scenario_transcript(
     monkeypatch.setattr(dl, "ModelProxy", Proxy)
     if hasattr(docker_driver, "ModelProxy"):
         monkeypatch.setattr(docker_driver, "ModelProxy", Proxy)
+    seen["model_base_url"] = Model.base_url
+    return obj, seen
+
+
+def test_install_start_servers_load_the_docker_scenario_transcript(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    obj, seen = _servers(tmp_path, monkeypatch)
     obj.start_servers()
     transcript, host = seen["model"]
     assert transcript.resolve() == (DOCKER_FIXTURES / "transcript.json").resolve()
     assert transcript.resolve() != dl.TRANSCRIPT.resolve()
     assert host == STUB_HOST
     assert seen["model_started"] and seen["stub_started"]
-    assert seen["proxy"] == (STUB_HOST, Model.base_url)
+    assert seen["proxy"] == (STUB_HOST, seen["model_base_url"])
+
+
+def _files(root: Path) -> dict[str, bytes]:
+    return {str(p.relative_to(root)): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+
+
+def test_install_start_servers_seed_acme_bot_with_its_declared_dockerfile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    obj, seen = _servers(tmp_path, monkeypatch)
+    source = _files(dl.SEED_TREE)
+    obj.start_servers()
+    _root, _version, seeds = seen["stub"]
+    seed_tree = obj.f.work / "seed-tree"
+    assert Path(seeds["seed_tree"]).resolve() == seed_tree.resolve()
+    copied = _files(seed_tree)
+    assert copied.pop("Dockerfile").decode() == CATALOG_DOCKERFILE
+    assert copied == source, "the seed tree must be the unitconv fixture plus the Dockerfile"
+    assert _files(dl.SEED_TREE) == source, "the shared fixture must not change"
+    assert "Dockerfile" not in source
+
+
+def test_install_start_servers_refuse_without_the_catalog_dockerfile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    obj, seen = _servers(tmp_path, monkeypatch, catalog=False)
+    with pytest.raises(RuntimeError, match="custom_dockerfile_missing"):
+        obj.start_servers()
+    assert "stub" not in seen
+
+
+def test_install_chart_of_daemon_lifecycle_is_the_snapshot_chart(tmp_path: Path) -> None:
+    fixture = SimpleNamespace(snapshot=tmp_path / "snapshot")
+    lifecycle = SimpleNamespace(f=fixture)
+    chart = dl.Lifecycle.install_chart(lifecycle)
+    assert Path(chart) == tmp_path / "snapshot" / "charts/curie"
+
+
+def test_install_chart_of_the_docker_scenario_is_a_prerelease_base_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    obj = _scenario(tmp_path, monkeypatch, Commands())
+    snapshot_chart = obj.f.snapshot / "charts/curie"
+    chart = Path(obj.install_chart())
+    assert chart.resolve() == (obj.f.work / "chart-base").resolve()
+    text = (chart / "Chart.yaml").read_text()
+    assert f"\nversion: {BASE_VERSION}\n" in text
+    assert '\nappVersion: "9.8.7"\n' in text
+    assert "\n    version: 1.2.3\n" in text, "only the top-level version line changes"
+    assert (snapshot_chart / "Chart.yaml").read_text() == CHART_YAML
+    expected = _files(snapshot_chart)
+    expected["Chart.yaml"] = text.encode()
+    assert _files(chart) == expected
+    assert Path(obj.install_chart()).resolve() == chart.resolve(), "copied once"
+
+
+def test_install_chart_refuses_a_chart_without_a_version_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    obj = _scenario(tmp_path, monkeypatch, Commands())
+    (obj.f.snapshot / "charts/curie/Chart.yaml").write_text("apiVersion: v2\nname: curie\n")
+    with pytest.raises(RuntimeError, match="chart_version_missing"):
+        obj.install_chart()
+
+
+class _Stop(Exception):
+    """Raised by the first rollouts: the chart choice is already recorded by then."""
+
+
+def test_install_and_control_use_the_base_chart_while_the_upgrade_uses_the_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    obj, fake, commands = _upgrade(tmp_path, monkeypatch)
+
+    def label(argv: list[str], _kwargs: dict[str, Any]) -> Result | None:
+        kubectl = Path(argv[0]).name == "kubectl"
+        return (0, "", "") if kubectl and _strip_kubectl(argv)[:1] == ["label"] else None
+
+    commands.handlers.append(label)
+    helm: list[tuple[str, tuple[str, ...]]] = []
+    rollouts: list[tuple[str, ...]] = []
+
+    def rollout(*components: str) -> None:
+        rollouts.append(components)
+        if len(rollouts) <= 2:
+            raise _Stop
+
+    monkeypatch.setattr(obj, "helm", lambda verb, *argv: helm.append((verb, argv)))
+    monkeypatch.setattr(obj, "rollout", rollout)
+    monkeypatch.setattr(obj, "start_servers", lambda: None)
+    monkeypatch.setattr(obj, "values", lambda *, docker: {"factory": {"bindings": []}})
+    monkeypatch.setattr(obj, "secret_inputs", lambda: {})
+    obj.stub = SimpleNamespace(base_url=f"https://{STUB_HOST}:4443", unknown_requests=[])
+    obj.proxy = SimpleNamespace(base_url=f"http://{STUB_HOST}:4445")
+    base = str(obj.f.work / "chart-base")
+    with pytest.raises(_Stop):
+        obj.install()
+    with pytest.raises(_Stop):
+        obj.scenario_control()
+    [(install_verb, install), (upgrade_verb, control)] = helm
+    assert (install_verb, upgrade_verb) == ("install", "upgrade")
+    assert install[0] == base
+    assert _adjacent(list(install), "-f", base + "/values-dev.yaml")
+    assert control[0] == base
+    obj.scenario_upgrade()
+    [(argv, _values, _mode)] = fake.upgrade
+    snapshot = str(obj.f.snapshot / "charts/curie")
+    assert _adjacent(argv, "--chart", snapshot)
+    assert _adjacent(argv, "--to", "9.8.7")
+    assert snapshot != base
 
 
 def test_install_transcript_runs_the_two_docker_lanes_then_the_lifecycle_verbatim() -> None:
@@ -1362,7 +1497,8 @@ UPGRADE_OUTPUT = {
     "status": "succeeded",
     "phase": "commit",
     "target_version": "9.8.7",
-    "from_version": "9.8.6",
+    # Installed from the run-owned chart-base copy, so the upgrade is a real transition.
+    "from_version": BASE_VERSION,
     "known_good_version": "9.8.7",
     "resumed": False,
     "previous_serving": False,
@@ -1550,6 +1686,8 @@ def test_upgrade_scenario_runs_the_cli_and_builds_the_section(
     assert json.loads((work / "values-before.json").read_text()) == VALUES_BEFORE
     assert json.loads((work / "values-after.json").read_text()) == VALUES_AFTER
     assert obj.evidence["upgrade_exit_code"] == 0
+    assert obj.evidence["from_version"] == BASE_VERSION
+    assert obj.evidence["target_version"] == "9.8.7"
     expected = docker_scenario.upgrade_section(
         docker_driver.plan_text(UPGRADE_OUTPUT),
         VALUES_BEFORE, VALUES_AFTER, CATALOG_REPO, CUSTOM_REPO, STALE_REPLY,
@@ -1561,7 +1699,7 @@ def test_upgrade_scenario_runs_the_cli_and_builds_the_section(
 FAILED_UPGRADE = UPGRADE_OUTPUT | {
     "status": "failed",
     "phase": "apply",
-    "known_good_version": "9.8.6",
+    "known_good_version": BASE_VERSION,
 }
 
 
@@ -1949,7 +2087,7 @@ def test_teardown_verify_fails_when_the_registry_container_remains(
     assert errors
 
 
-def test_teardown_scrub_removes_the_upgrade_values_and_runner_cli(
+def test_teardown_scrub_removes_the_run_owned_work_files(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     obj, _commands = _teardown(tmp_path, monkeypatch, _Leftovers())
@@ -1957,11 +2095,15 @@ def test_teardown_scrub_removes_the_upgrade_values_and_runner_cli(
     (work / "upgrade.values.json").write_text("{}")
     (work / "runner-cli").mkdir()
     (work / "runner-cli/curie").write_text("#!/bin/sh\n")
+    for directory in ("chart-base", "seed-tree"):
+        (work / directory).mkdir()
+        (work / directory / "Chart.yaml").write_text("version: 9.8.7-fdbase\n")
     errors: list[str] = []
     obj.scrub_work(errors)
     assert errors == []
-    assert not (work / "upgrade.values.json").exists()
-    assert not (work / "runner-cli").exists()
+    for name in ("upgrade.values.json", "runner-cli", "chart-base", "seed-tree"):
+        assert not (work / name).exists(), name
+    assert (work / "snapshot/charts/curie/Chart.yaml").read_text() == CHART_YAML
 
 
 # --------------------------------------------------------------------------
