@@ -1422,7 +1422,7 @@ def test_the_fix_pin_job_is_required_and_carries_the_whole_gate() -> None:
         "fix pin Cargo cache",
     )
     cache = steps[cache_index]
-    cache_action = "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6"
+    cache_action = "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0"
     assert cache.get("name") == "Cargo cache"
     assert cache.get("uses") == cache_action
     assert _string(cache, "if") == CARGO_NEEDED_GUARD
