@@ -656,8 +656,10 @@ def _lifecycle_values(*, docker: bool) -> dict[str, Any]:
 
 
 def _repos(values: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    repos = values["factory"]["bindings"][0]["repos"]
-    return {repo["path"]: repo for repo in repos}
+    """Every factory.bindings[*].repos[*] entry by path, in binding order."""
+
+    bindings = values["factory"]["bindings"]
+    return {repo["path"]: repo for binding in bindings for repo in binding["repos"]}
 
 
 @pytest.mark.parametrize("docker", [True, False], ids=["opted-in", "control"])
@@ -669,8 +671,26 @@ def test_install_docker_values_mark_acme_bot_custom_and_add_the_catalog_reposito
     images = _images()
     values = docker_driver.docker_values(source, images, SCHEMA_VERSION)
     assert source == snapshot, "docker_values mutated its input"
+    # A native GitHub binding holds exactly its own repository
+    # (apps/api/src/curie_api/forges/config.py _check_native), so the catalog
+    # repository gets a second binding and binding 0 keeps only acme-bot.
+    first, second = values["factory"]["bindings"]
+    assert first == snapshot["factory"]["bindings"][0] | {"repos": first["repos"]}
+    assert [repo["path"] for repo in first["repos"]] == [CUSTOM_REPO]
+    assert {k: second[k] for k in ("name", "tracker", "trackerScopeId")} == {
+        "name": "acme-catalog",
+        "tracker": first["tracker"],
+        "trackerScopeId": "4402",
+    }
+    assert [repo["path"] for repo in second["repos"]] == [CATALOG_REPO]
+    assert second["repos"][0]["projectId"] == second["trackerScopeId"]
+    assert second["name"] != first["name"]
+    assert second["trackerScopeId"] != first["trackerScopeId"]
     repos = _repos(values)
     assert list(repos) == [CUSTOM_REPO, CATALOG_REPO]
+    # upgrade_section reads runner images across every binding.
+    assert docker_scenario.runner_image(values, CATALOG_REPO) == images["runner"]["ref"]
+    assert docker_scenario.runner_image(values, CUSTOM_REPO) == images["runner"]["ref"]
     custom, catalog = repos[CUSTOM_REPO], repos[CATALOG_REPO]
     # acme-bot keeps its receipt and its docker opt-in; only the Dockerfile key is added.
     original = _repos(snapshot)[CUSTOM_REPO]
@@ -690,6 +710,78 @@ def test_install_docker_values_mark_acme_bot_custom_and_add_the_catalog_reposito
     assert runner["base"] == images["platform"]["digest"]
     assert runner["platformDigests"] == original["runner"]["platformDigests"]
     assert runner["tools"] == ["docker-cli"]
+
+
+def _chart_snake(value: Any) -> Any:
+    """charts/curie/templates/_helpers.tpl curie.factory.snake: keys to snake_case
+    (interval_seconds -> interval_s), an ``*Id`` value as a string, and the
+    ``components`` and ``reviewFeedbackAllowlist`` maps kept as they are."""
+
+    if isinstance(value, list):
+        return [_chart_snake(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    out: dict[str, Any] = {}
+    for key, child in value.items():
+        name = re.sub(r"(?<!^)(?=[A-Z])", "_", key).lower()
+        name = name.replace("interval_seconds", "interval_s")
+        if key in ("components", "reviewFeedbackAllowlist"):
+            out[name] = child
+        elif key.endswith("Id"):
+            out[name] = str(child)
+        else:
+            out[name] = _chart_snake(child)
+    return out
+
+
+def _chart_forges(factory: dict[str, Any], private_key: str) -> dict[str, Any]:
+    """The CURIE_FORGES document curie.factory.forgesJson renders from ``factory``, after
+    the API loader has read each credential file (apps/api/src/curie_api/forges/loader.py);
+    the key file's content is given directly instead of read from a mounted Secret."""
+
+    secrets = ("existingSecret", "existingSecretKey", "privateKey", "clientSecret", "token")
+    document: dict[str, Any] = {"code_hosts": [], "trackers": [], "card_base_url": ""}
+    document["bindings"] = _chart_snake(factory.get("bindings") or [])
+    for key, section in (("codeHosts", "code_hosts"), ("trackers", "trackers")):
+        for entry in factory.get(key) or []:
+            kept = {k: v for k, v in entry.items() if k not in ("egress", "credential")}
+            out = _chart_snake(kept)
+            raw = entry["credential"]
+            credential = _chart_snake({k: v for k, v in raw.items() if k not in secrets})
+            credential["type"] = raw.get("type") or "github_app"
+            credential["private_key"] = private_key
+            document[section].append(out | {"credential": credential})
+    return document
+
+
+def test_install_docker_values_bindings_load_in_the_api_forge_config() -> None:
+    from curie_api.forges.config import ForgesConfig
+
+    values = docker_driver.docker_values(_lifecycle_values(docker=True), _images(), SCHEMA_VERSION)
+    document = _chart_forges(values["factory"], "fixture-private-key")
+    config = ForgesConfig.model_validate(document)
+    assert [binding.name for binding in config.bindings] == ["acme-bot", "acme-catalog"]
+    by_name = {binding.name: binding for binding in config.bindings}
+    custom, catalog = by_name["acme-bot"].repos, by_name["acme-catalog"].repos
+    assert [repo.path for repo in custom] == [CUSTOM_REPO]
+    assert [repo.path for repo in catalog] == [CATALOG_REPO]
+    assert custom[0].runner is not None and custom[0].runner.dockerfile == "Dockerfile"
+    assert catalog[0].runner is not None and catalog[0].runner.dockerfile is None
+    assert catalog[0].project_id == by_name["acme-catalog"].tracker_scope_id == "4402"
+
+
+def test_install_api_forge_config_refuses_two_repositories_in_one_github_binding() -> None:
+    """Liveness of the check above: the shape before the fix is refused by the same model."""
+
+    from curie_api.forges.config import ForgesConfig
+
+    values = docker_driver.docker_values(_lifecycle_values(docker=True), _images(), SCHEMA_VERSION)
+    first, second = values["factory"]["bindings"]
+    merged = copy.deepcopy(values["factory"])
+    merged["bindings"] = [first | {"repos": [*first["repos"], *second["repos"]]}]
+    document = _chart_forges(merged, "fixture-private-key")
+    with pytest.raises(ValueError, match="exactly its own repository"):
+        ForgesConfig.model_validate(document)
 
 
 def test_install_docker_values_raise_the_daemon_limits_for_a_skill_rung() -> None:
@@ -1667,9 +1759,14 @@ def _helm_values(catalog: str, custom: str, platform: dict[str, str]) -> dict[st
             "path": CATALOG_REPO, "runner": runner | {"image": catalog},
         },
     ]  # fmt: skip
-    binding = {"name": "acme-bot", "tracker": "github", "trackerScopeId": "4401", "repos": repos}
+    # One native GitHub binding per repository, as docker_values writes them.
+    bindings = [
+        {"name": repo["alias"], "tracker": "github", "trackerScopeId": repo["projectId"]}
+        | {"repos": [repo]}
+        for repo in repos
+    ]
     sandbox = {"image": platform["ref"].split("@")[0], "digest": platform["digest"]}
-    return {"agentSandbox": {"runner": sandbox}, "factory": {"bindings": [binding]}}
+    return {"agentSandbox": {"runner": sandbox}, "factory": {"bindings": bindings}}
 
 
 IMAGES = _images()
