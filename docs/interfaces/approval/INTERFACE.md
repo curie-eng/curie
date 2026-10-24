@@ -508,9 +508,12 @@ Slack feature.
   that declares `approvers` (or names a route whose binding is missing or malformed, per
   `apps/api/src/curie_api/approval_teams.py::team_restriction`) only narrows it: the
   route's set is consulted after team membership passes, and an undeclared route adds no
-  channel-membership check. `operator` and `test_driver` principals are refused with
-  reason `idp_sign_in_required`, and an adapter or chat principal answering on the wrong
-  surface is refused with `wrong_resolution_surface`.
+  channel-membership check. `operator` and `test_driver` principals are never eligible
+  under it (the team decision's internal reason is `idp_sign_in_required`), and an adapter
+  or chat principal answering on the wrong surface is not admitted (internal reason
+  `wrong_resolution_surface`). Those reasons are recorded as the team decision, not
+  returned: the resolve endpoint refuses with the set's own reason text, "this approval
+  requires an active member of its IdP approver team".
 
 Platform-RBAC, the set the epic once planned as its fourth, is not built.
 
@@ -594,7 +597,7 @@ lookup and config error denies: no bot token configured, HTTP error, network err
 `ok: false`, malformed body, malformed approvers JSON. All deny with a could-not-verify
 reason and an audit row; none falls back to channel membership. Failures are not cached.
 This does NOT mean the absence of a declaration fails closed: no `approvers` declared means
-channel membership, by design. A group that legitimately resolves to zero members is a
+channel membership, by design, for an agent without an IdP approver team. A group that legitimately resolves to zero members is a
 successful lookup, not a failure: the actor is simply not a member and is denied as a
 non-approver.
 
@@ -616,7 +619,7 @@ An approval with a NULL `agent_id` that nonetheless names a route falls under th
 rule and is refused too — `get_approval_route_binding` returns a bare None for every miss,
 and the split is on whether the approval named a route, not on why the binding is missing.
 An approval that names NO route never had a narrower set to lose and keeps channel
-membership. The ordinary recovery from a stuck approval is to restore the binding, after
+membership when its agent has no IdP approver team. The ordinary recovery from a stuck approval is to restore the binding, after
 which it resolves normally; nothing is lost. When the binding cannot be restored, an
 operator on an installation with `approval_recovery_enabled` can reject the approval
 through break-glass recovery (Current contract), which is audited and only ever rejects.

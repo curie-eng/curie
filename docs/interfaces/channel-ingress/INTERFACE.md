@@ -275,10 +275,10 @@ tests assert the two sets equal in both directions.
 | `DUPLICATE_DELIVERY` | Slack redelivered a delivery whose idempotency key was already claimed, so processing it again would post a second placeholder and mint a second turn for one message. |
 | `CALLER_NOT_ALLOWED` | The binding this delivery arrived on carries a list of who may talk to the bot, and the platform API said the caller is not on it (ADR 0175), so no placeholder is posted and no turn is minted: a polite refusal would tell a stranger the bot exists. |
 | `ADMISSION_UNAVAILABLE` | The platform API could not answer whether the caller may talk to the bot and no usable answer was cached, so the delivery is refused rather than admitted unchecked (ADR 0175 fails closed). This is an outage signal, not a list typo: the route may carry no list at all. |
+| `DELIVERY_CANARY` | The mention arrived in a channel listed as a delivery canary, whose only job is to prove Slack still delivers to this identity; it is counted on curie.slack.delivery_canary and never asks the API, posts a placeholder or mints a turn (#4960). |
 | `NO_ACTION_IN_PAYLOAD` | A block-action payload carrying no actions names no command and addresses nothing, so there is no turn to mint from it. |
 | `EMPTY_ACTION_COMMAND` | A clicked button carrying neither a value nor a usable action id names no command, so the turn text would be empty. |
 | `UNADDRESSABLE_ACTION` | An App Home or modal click carries no channel and no message, so there is no thread in which a reply could be delivered. |
-| `DELIVERY_CANARY` | The mention arrived in a channel listed as a delivery canary, whose only job is to prove Slack still delivers to this identity; it is counted on curie.slack.delivery_canary and never asks the API, posts a placeholder or mints a turn (#4960). |
 
 The last three sit on the Block Kit click lane, which is a real ingest lane:
 `apps/dispatcher/src/curie_dispatcher/handlers.py::process_action` mints a `QueuedTurn`

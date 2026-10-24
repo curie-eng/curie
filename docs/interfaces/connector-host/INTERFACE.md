@@ -290,8 +290,9 @@ Deployment shape for capability probes to become eligible.
   call `read_namespaced_deployment` by name on the raw `AppsV1Api` from
   `apps/worker/src/curie_worker/connector_k8s.py::connector_deployments_api`, not
   through `ConnectorClient`. `apps/worker/src/curie_worker/run.py` composes both
-  whenever `WorkerConfig.executor_reads_connectors` is on, with or without the
-  connector reconciler. A second host therefore needs a Deployment get API too:
+  whenever `WorkerConfig.executor_reads_connectors` is on and an internal worker
+  token is configured (without one, neither the executor nor the recorder wrapper
+  starts), with or without the connector reconciler. A second host therefore needs a Deployment get API too:
   without a readable Deployment the executor refuses with
   `connector_digest_unavailable` before any sandbox claim, and the recorder
   records a null digest.

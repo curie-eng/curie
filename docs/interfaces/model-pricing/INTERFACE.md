@@ -110,7 +110,8 @@ Budget enforcement also remains outside `PriceBook`. The runner passes
 (`runner/src/curie_runner/__main__.py`), so the SDK's own price table decides
 the USD stop. That table can price a model above the recorded `PriceBook`
 estimate; `apps/api/src/curie_api/factory_notices.py::result_section` reports
-the gap when a run stops on the USD cap below its recorded estimate.
+the gap when a run stops on the USD cap while Curie's recorded estimate is still
+below that cap.
 
 ## Cross-links
 
