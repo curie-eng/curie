@@ -196,8 +196,12 @@ satisfying the egress Protocol, or out of process over the HTTP wire.
   (`apps/dispatcher/src/curie_dispatcher/handlers.py`) posts it as a private
   ephemeral "Connect your account, then ask again." offer while still refusing the
   turn;
-  the dispatcher logs `caller_not_allowed` or `admission_unavailable`, and both
-  services count `curie.turn.refused`. The list is set with
+  the dispatcher logs `caller_not_allowed` or `admission_unavailable` and counts
+  `curie.turn.refused` for every refusal it receives. On `POST /channels/turns` the
+  API counts `curie.turn.refused` only for an `allowed_callers` refusal; its
+  invocation-team refusal returns the same 403 with no metric and no refusal log,
+  while `POST /channels/admission` records a restricted team refusal as an
+  `invocation.refused` identity audit event. The list is set with
   `PUT /agents/{agent_id}/channels/callers`, which leaves the binding generation,
   and so the adapter's token, alone.
 - **Delivery canary**: a Slack mention in a channel listed in
