@@ -36,7 +36,7 @@
 # release itself rejects fails here instead of quietly testing nothing.
 #
 # On the newest source it also proves the sandbox resource profiles (#4889):
-# released values keep the released generic envelope for every template,
+# released values keep each released template envelope,
 # candidate values give a factory agent the full factory profile, and explicit
 # overrides win on both.
 #
@@ -275,8 +275,8 @@ echo "OK: v$LATEST_VERSION layered binding upgrades when the stale key is remove
 # explicit. Proves, on the newest release's values:
 #   * released values (helm upgrade --reuse-values from that release): the
 #     generic template renders byte for byte what the released chart renders,
-#     and the factory agent resolves the released generic envelope instead of
-#     failing; explicit per-agent workspace and cpu overrides still win.
+#     and the factory agent retains its released envelope; explicit per-agent
+#     workspace and cpu overrides still win.
 #   * candidate values (helm upgrade --reset-then-reuse-values, curie cluster
 #     upgrade, and a later --reuse-values once the release runs the candidate):
 #     the factory agent gets the full factory profile, explicit overrides win,
@@ -392,17 +392,15 @@ profile_render "--reuse-values from v$LATEST_VERSION with the factory fixture" \
   upgrade "$profile_reuse" "$TMP/profile-reuse.yaml" "$PROFILE_FIXTURE"
 shape_is "released values: the generic template changed under --reuse-values" \
   "$TMP/profile-reuse.yaml" generic same "$TMP/profile-released.yaml" generic
-shape_is "released values: the factory agent did not resolve the released generic envelope" \
-  "$TMP/profile-reuse.yaml" acme-factory same "$TMP/profile-released.yaml" generic
-shape_is "released values: the factory agent envelope is not the standard one" \
-  "$TMP/profile-reuse.yaml" acme-factory "$(std_env)"
+shape_is "released values: the factory agent envelope changed under --reuse-values" \
+  "$TMP/profile-reuse.yaml" acme-factory same "$TMP/profile-released.yaml" acme-factory
 profile_render "--reuse-values from v$LATEST_VERSION with explicit overrides" \
   upgrade "$profile_reuse" "$TMP/profile-reuse-ovr.yaml" "$TMP/profile-overrides.json"
 shape_is "released values: explicit workspace and cpu overrides lost" \
-  "$TMP/profile-reuse-ovr.yaml" acme-factory "$(std_env 3 18Gi)"
+  "$TMP/profile-reuse-ovr.yaml" acme-factory same "$TMP/profile-released-ovr.yaml" acme-factory
 shape_is "released values: generic template changed under explicit overrides" \
   "$TMP/profile-reuse-ovr.yaml" generic same "$TMP/profile-released-ovr.yaml" generic
-echo "OK: v$LATEST_VERSION --reuse-values keeps the released generic envelope for every template and honors explicit overrides"
+echo "OK: v$LATEST_VERSION --reuse-values keeps each released template envelope and honors explicit overrides"
 
 # Candidate values (--reset-then-reuse-values, curie cluster upgrade).
 profile_render "candidate upgrade with the factory fixture" upgrade "$CHART" "$TMP/profile-cand.yaml" "$PROFILE_FIXTURE"
