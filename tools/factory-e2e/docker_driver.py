@@ -30,7 +30,9 @@ run created it.
 
 The release is installed from a run-owned chart copy whose version is <v>-fdbase and
 upgraded to the snapshot chart's <v>: an upgrade to the serving version would skip
-Apply, so the base install must sit at another version.
+Apply, so the base install must sit at another version. Its values carry the snapshot's
+config.schemaVersion, as a CLI install does, because the upgrade's config migration
+would otherwise infer the schema from <v>-fdbase and refuse it.
 
 Flow:
 
@@ -130,6 +132,7 @@ RUN_KEYS = ("claim", "daemon_pod", "probe", "daemon")
 SECTIONS = ("upgrade", "ci", "compose", "skill_rung")
 # Key material the install put in the values; never retained in a values snapshot.
 SECRET_VALUES = ("connectorCaller", "sealing")
+SCHEMA_CONSTANT = re.compile(r'^pub const TARGET_SCHEMA_VERSION: &str = "([^"]+)";$', re.M)
 UPGRADE_TEXT = "Run the Docker scenario upgrade check."
 
 
@@ -183,10 +186,26 @@ def scenario_args(context: str, callback_host: str, nonce: str | None = None) ->
     return args
 
 
-def docker_values(values: Obj, images: dict[str, dict[str, str]]) -> Obj:
+def target_schema_version(source_root: Path) -> str:
+    """TARGET_SCHEMA_VERSION of ``source_root``'s cli/src/config_migrate.rs."""
+
+    try:
+        text = (source_root / "cli/src/config_migrate.rs").read_text()
+    except OSError:
+        raise RuntimeError("target_schema_version_missing") from None
+    found = SCHEMA_CONSTANT.search(text)
+    if found is None:
+        raise RuntimeError("target_schema_version_missing")
+    return found[1]
+
+
+def docker_values(values: Obj, images: dict[str, dict[str, str]], schema_version: str) -> Obj:
     """``values`` with acme-bot custom, a catalog repository and daemon limits a skill rung fits."""
 
     out = copy.deepcopy(values)
+    # Stamped as a CLI install stamps it: the upgrade's config migration infers an unstamped
+    # release's schema from its chart version and refuses the <v>-fdbase base install.
+    out["config"] = dict(out.get("config") or {}) | {"schemaVersion": schema_version}
     repos = out["factory"]["bindings"][0]["repos"]
     custom = next(repo for repo in repos if repo["path"] == CUSTOM_REPO)
     # Only the CLI upgrade planner reads the key; the chart and worker ignore it.
@@ -413,7 +432,8 @@ class DockerScenario(dl.Lifecycle):
         self.proxy = dl.ModelProxy(host, self.model.base_url)
 
     def values(self, *, docker: bool) -> Obj:
-        return docker_values(super().values(docker=docker), self.images)
+        schema = target_schema_version(self.f.snapshot)
+        return docker_values(super().values(docker=docker), self.images, schema)
 
     # scenarios
 
