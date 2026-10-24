@@ -13,7 +13,7 @@ import asyncio
 import json
 import os
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -24,7 +24,6 @@ from curie_test_support.valkey import (
     VALKEY_HOST,
     VALKEY_PORT,
     VALKEY_PW,
-    connect_or_skip,
 )
 from curie_worker.sandbox import (
     AffinityStore,
@@ -39,6 +38,7 @@ from redis.asyncio import Redis as AsyncRedis
 from redis.asyncio.retry import Retry as AsyncRetry
 from redis.backoff import NoBackoff
 from redis.maint_notifications import MaintNotificationsConfig
+from redis.retry import Retry
 
 
 def pytest_ignore_collect(collection_path: Path, config: pytest.Config) -> bool:
@@ -320,21 +320,38 @@ def _seed_source(client: _RecordingDocker, target: str) -> Path:
 
 
 @pytest.fixture
-def redis_client() -> Iterator[redis.Redis]:
-    client = connect_or_skip(decode_responses=False)
-    yield client
-    client.close()
+def redis_client(request: pytest.FixtureRequest) -> redis.Redis:
+    client = redis.Redis(
+        host=VALKEY_HOST,
+        port=VALKEY_PORT,
+        password=VALKEY_PW or None,
+        decode_responses=False,
+        socket_timeout=2,
+        socket_connect_timeout=2,
+        retry=Retry(NoBackoff(), 0),
+    )
+    request.addfinalizer(client.close)
+    try:
+        client.ping()
+    except redis.RedisError:
+        raise RuntimeError("sandbox tests require reachable Valkey") from None
+    return client
 
 
 @pytest.fixture
-def key_prefix(redis_client: redis.Redis) -> Iterator[str]:
+def key_prefix(redis_client: redis.Redis, request: pytest.FixtureRequest) -> str:
     """Per-test-unique key prefix on the shared Valkey, cleaned up after."""
 
     prefix = f"test:curie:sandbox:{uuid.uuid4().hex}"
-    yield prefix
-    keys = list(redis_client.scan_iter(match=f"{prefix}:*"))
-    if keys:
-        redis_client.delete(*keys)
+
+    def cleanup() -> None:
+        keys = list(redis_client.scan_iter(match=f"{prefix}:*"))
+        if keys:
+            redis_client.delete(*keys)
+        assert not list(redis_client.scan_iter(match=f"{prefix}:*"))
+
+    request.addfinalizer(cleanup)
+    return prefix
 
 
 @pytest.fixture
@@ -360,14 +377,15 @@ def affinity(
     redis_client: redis.Redis,
     pressure_redis_factory: Callable[[], AsyncRedis],
     key_prefix: str,
-) -> Iterator[AffinityStore]:
+    request: pytest.FixtureRequest,
+) -> AffinityStore:
     pressure_client = pressure_redis_factory()
-    yield AffinityStore(
+    request.addfinalizer(lambda: asyncio.run(pressure_client.aclose()))
+    return AffinityStore(
         redis_client,
         pressure_client=pressure_client,
         key_prefix=key_prefix,
     )
-    asyncio.run(pressure_client.aclose())
 
 
 @pytest.fixture
