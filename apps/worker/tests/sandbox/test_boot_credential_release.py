@@ -79,10 +79,8 @@ def credential_api(request: pytest.FixtureRequest) -> _CredentialAPI:
     patch = pytest.MonkeyPatch()
     resources.callback(get_settings.cache_clear)
     resources.callback(patch.undo)
-    for variable in ("TEST_DATABASE_URL", "S3_ENDPOINT_URL", "S3_ACCESS_KEY", "S3_SECRET_KEY"):
-        if not os.environ.get(variable):
-            raise RuntimeError(f"credential lifecycle tests require {variable}")
-    base = make_url(os.environ["TEST_DATABASE_URL"])
+    caller_settings = get_settings()
+    base = make_url(caller_settings.database_url)
     database = f"curie_credential_{uuid.uuid4().hex}"
     url = base.set(database=database).render_as_string(hide_password=False)
     admin = create_async_engine(
@@ -112,6 +110,7 @@ def credential_api(request: pytest.FixtureRequest) -> _CredentialAPI:
             patch.delenv(name)
     for name, value in {
         "DATABASE_URL": url,
+        "S3_ENDPOINT_URL": caller_settings.s3_endpoint_url,
         "DB_SCHEMA": "curie",
         "API_KEY": "credential-lifecycle-test-api-key",
         "CURIE_INTERNAL_WORKER_TOKEN": "credential-lifecycle-test-worker-token",
