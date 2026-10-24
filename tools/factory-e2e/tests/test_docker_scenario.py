@@ -10,6 +10,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Callable, Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -3193,3 +3194,77 @@ def test_cli_skill_rung_exits_1_after_writing_when_cleanup_is_not_verified(
     code = docker_scenario.main([*_skill_rung_args(source, out), "--curie-bin", str(curie_bin)])
     assert code == 1
     assert json.loads(out.read_text())["cleanup"]["verified"] is False
+
+
+# review round 2: ladder env and process-group timeouts
+
+
+def test_skill_rung_ladder_env_carries_only_its_own_curie_e2e_keys(
+    tmp_path: Path, fake_commands: FakeCommands, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inherited = {
+        "CURIE_E2E_IMAGE": "ghcr.io/example/other-runner:dev",
+        "CURIE_E2E_PORT": "18080",
+        "CURIE_E2E_NETWORK": "other-net",
+        "CURIE_E2E_BUNDLE": "examples/other",
+        "CURIE_E2E_CONNECTOR_BUNDLE": "examples/connector",
+        "CURIE_E2E_HOOK_APPROVAL": "1",
+        "CURIE_E2E_TIERS": "skill,local",
+        "CURIE_E2E_LIVE": "1",
+    }
+    for name, value in inherited.items():
+        monkeypatch.setenv(name, value)
+    source, curie_bin = _skill_source(tmp_path)
+    _run_skill_rung(source, curie_bin)
+    env = fake_commands.call("ladder")[2]
+    assert env is not None
+    assert {k: v for k, v in env.items() if k.startswith("CURIE_E2E_")} == {
+        "CURIE_E2E_TIERS": "skill",
+        "CURIE_E2E_LIVE": "0",
+        "CURIE_E2E_IMAGE": "curie-runner",
+    }
+
+
+def _gone(pid: int) -> bool:
+    """True once pid no longer exists or is a zombie awaiting its reaper."""
+
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    try:
+        state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+    except (OSError, IndexError):
+        return True
+    return state == "Z"
+
+
+def test_skill_rung_command_timeout_kills_the_process_group(tmp_path: Path) -> None:
+    pid_file = tmp_path / "pid"
+    started = time.monotonic()
+    code, _, err = docker_scenario._command(
+        ["bash", "-c", f"sleep 30 >/dev/null 2>&1 & echo $! > {pid_file}; wait"], timeout=1
+    )
+    assert code == 124, err
+    pid = int(pid_file.read_text().strip())
+    deadline = time.monotonic() + 2
+    while not _gone(pid) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    try:
+        assert _gone(pid), f"background sleep {pid} outlived the timed-out command"
+    finally:
+        if not _gone(pid):
+            os.kill(pid, 9)
+    assert time.monotonic() - started < 5
+
+
+def test_skill_rung_command_within_timeout_keeps_code_and_output() -> None:
+    code, out, err = docker_scenario._command(
+        ["bash", "-c", "echo out; echo err >&2; exit 3"], timeout=10
+    )
+    assert (code, out, err) == (3, "out\n", "err\n")
+
+
+def test_skill_rung_command_missing_binary_is_127() -> None:
+    code, out, _ = docker_scenario._command(["curie-no-such-binary-for-tests"], timeout=5)
+    assert (code, out) == (127, "")
