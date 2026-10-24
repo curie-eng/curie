@@ -7582,6 +7582,16 @@ export interface components {
              */
             tenant_id: string;
         };
+        /**
+         * PrincipalRef
+         * @description Initiating principal provenance. @spec INITIATING-PRINCIPAL-1
+         */
+        PrincipalRef: {
+            /** Authorization Version */
+            authorization_version: number;
+            /** Principal Id */
+            principal_id: string;
+        };
         /** PrincipalResolutionOut */
         PrincipalResolutionOut: {
             /** Channel Identity Id */
@@ -8183,6 +8193,11 @@ export interface components {
          *     and one that does not drops it. It defaults to ``None``, today's
          *     unrestricted turn, so a pre-upgrade producer keeps decoding unchanged. No
          *     first-party ingress sets it.
+         *
+         *     ``author_principal`` is the initiating subject admission resolved ``author``
+         *     to (INITIATING-PRINCIPAL-1). ``author`` keeps its existing meaning. The
+         *     executing actor, the agent, is never this principal. This is provenance,
+         *     not authority: neither its presence nor its absence grants anything.
          */
         QueuedTurn: {
             /**
@@ -8192,6 +8207,7 @@ export interface components {
             attachments?: components["schemas"]["Attachment"][];
             /** Author */
             author: string;
+            author_principal?: components["schemas"]["PrincipalRef"] | null;
             /** Conversation Id */
             conversation_id: string;
             /** Event Id */
