@@ -22,6 +22,12 @@ network:
    lists every step without constructing a driver.
 7. The review comment mentions the Jira factory account, the tracker's
    `mention`, so the factory's review poll admits it.
+8. The Jira tracker judgement reads the Jira key from the pull request
+   description on each code host, not from GitHub.
+
+The pull request payloads in fixtures/bitbucket follow the Bitbucket Cloud REST
+2.0 and Data Center REST API reference for the pull request resource; no live
+recording was taken.
 
 The HTTP seam is the HTTPS handler under each driver's opener: the stub
 replaces `urllib.request.HTTPSHandler`, so every request still passes through
@@ -1404,3 +1410,54 @@ def test_the_default_ticket_and_review_become_the_readme_only_ones(name: str) ->
     assert fe.readme_only_ticket("own", "ticket") == ("own", "ticket")
     assert fe.readme_only_review(fe.DEFAULT_LOOP_REVIEW_TEXT) == fe.README_ONLY_LOOP_REVIEW_TEXT
     assert fe.readme_only_review("own review") == "own review"
+
+
+# --- the Jira tracker judgement reads the pull request description ----------------------
+
+FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "bitbucket"
+PR_FIXTURES = {"bitbucket_cloud": "cloud_pullrequest.json", "bitbucket_dc": "dc_pull_request.json"}
+KEYED_DESCRIPTION = "Fixes KAN-1 (https://example.atlassian.net/browse/KAN-1)."
+
+
+@pytest.mark.parametrize("forge", FORGES)
+def test_tracker_judgement_reads_the_key_from_the_pull_request_description(
+    forge: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorded = json.loads((FIXTURES / PR_FIXTURES[forge]).read_text())
+    pr_url = (
+        f"{CLOUD_API}/pullrequests/7"
+        if forge == "bitbucket_cloud"
+        else f"{DC_REST}/pull-requests/7"
+    )
+    served: dict[str, Any] = {}
+
+    driver, _provider, http = _driver_on(forge, tmp_path, monkeypatch)
+
+    def answer(method: str, url: str) -> tuple[Any, ...]:
+        if method == "GET" and url.split("?")[0] == pr_url:
+            return 200, served["pr"]
+        return 200, {"values": [], "isLastPage": True}
+
+    http.answer = answer
+    jira = _entry_module("jira_cloud").JiraCloudDriver(driver.p, github=None)
+    jira.key = "KAN-1"
+    monkeypatch.setattr(jira, "_status_comments", lambda _key: 1)
+    monkeypatch.setattr(jira, "_remote_links", lambda _key, _change: 1)
+    monkeypatch.setattr(jira, "_bot_label_admitted", lambda: False)
+    driver._jira = jira
+
+    served["pr"] = recorded
+    evidence = driver.tracker_evidence(CHANGE, "wi-1")
+    assert evidence["pr_body_has_key"] is False
+    assert driver.judge_tracker(evidence) == [
+        "the pull request body does not name the Jira key and its browse URL"
+    ]
+
+    served["pr"] = {**recorded, "description": KEYED_DESCRIPTION}
+    evidence = driver.tracker_evidence(CHANGE, "wi-1")
+    assert evidence["pr_body_has_key"] is True
+    assert driver.judge_tracker(evidence) == []
+
+    urls = [call.url.split("?")[0] for call in http.calls]
+    assert pr_url in urls
+    assert not [url for url in urls if "api.github.com" in url]
