@@ -45,7 +45,9 @@ def render_openapi() -> bytes:
                 "this operation. This document registers no Curie API route. Facts grant "
                 "no permission. Transport obligations are published but not implemented "
                 "by the pure facts contract. Cross-object issuer equality, exact request "
-                "echo and independent freshness require semantic validation. Enable "
+                "echo, Unicode NFKC URL netloc checks and independent freshness require "
+                "semantic validation with the pure facts validator. Structural issuer "
+                "patterns alone do not prove full URL validity. Enable "
                 "date-time format assertions for calendar validation of observation "
                 "timestamps; patterns retain UTC syntax and fractional precision."
             ),
