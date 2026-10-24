@@ -67,8 +67,13 @@ HEAD_SHA = "0123456789abcdef0123456789abcdef01234567"
 NAMESPACE = f"fd-docker-{NONCE}"
 DAEMON_NAMESPACE = f"fd-docker-d-{NONCE}"
 CONTROLLER_NAMESPACE = f"fd-docker-c-{NONCE}"
-CATALOG_REPO = "acme-corp/acme-bot"
-CUSTOM_REPO = "acme-corp/acme-custom"
+# The custom repository (its own Dockerfile) is the stub-served, cloneable acme-bot; the
+# catalog repository is only rebuilt by the CLI, never cloned.
+CUSTOM_REPO = "acme-corp/acme-bot"
+CATALOG_REPO = "acme-corp/acme-catalog"
+BUILDER = f"fd-builder-{NONCE}"
+BUILDKIT_CONTAINER = f"buildx_buildkit_{BUILDER}0"
+BUILDKIT_VOLUME = f"buildx_buildkit_{BUILDER}0_state"
 SRC = "/tmp/fd-docker/src"
 COLLECTOR = f"{SRC}/tools/factory-e2e/docker_scenario.py"
 API_IP = "10.0.0.5"
@@ -538,7 +543,8 @@ def test_main_run_help_lists_docker_and_the_docs_name_the_invocation(
 def test_install_constants_name_the_scenario() -> None:
     assert docker_driver.SLICE == "docker"
     assert docker_driver.RUN_ISSUES == {"a": 4106, "b": 4107}
-    assert docker_driver.CUSTOM_REPO == CUSTOM_REPO
+    assert docker_driver.CUSTOM_REPO == CUSTOM_REPO == dl.REPO
+    assert docker_driver.CATALOG_REPO == CATALOG_REPO
     assert tuple(docker_driver.REQUIRED_CHECKS) == ("E2E required",)
     assert (
         Path(docker_driver.TRANSCRIPT).resolve() == (DOCKER_FIXTURES / "transcript.json").resolve()
@@ -629,29 +635,35 @@ def _repos(values: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 
 @pytest.mark.parametrize("docker", [True, False], ids=["opted-in", "control"])
-def test_install_docker_values_add_the_custom_repository(docker: bool) -> None:
+def test_install_docker_values_mark_acme_bot_custom_and_add_the_catalog_repository(
+    docker: bool,
+) -> None:
     source = _lifecycle_values(docker=docker)
     snapshot = copy.deepcopy(source)
     images = _images()
     values = docker_driver.docker_values(source, images)
     assert source == snapshot, "docker_values mutated its input"
     repos = _repos(values)
-    assert list(repos) == [CATALOG_REPO, CUSTOM_REPO]
-    catalog, custom = repos[CATALOG_REPO], repos[CUSTOM_REPO]
-    assert catalog == _repos(snapshot)[CATALOG_REPO]
-    assert ("docker" in catalog) is docker
-    assert {k: custom[k] for k in ("alias", "codeHost", "projectId")} == {
-        "alias": "acme-custom",
+    assert list(repos) == [CUSTOM_REPO, CATALOG_REPO]
+    custom, catalog = repos[CUSTOM_REPO], repos[CATALOG_REPO]
+    # acme-bot keeps its receipt and its docker opt-in; only the Dockerfile key is added.
+    original = _repos(snapshot)[CUSTOM_REPO]
+    expected_custom = copy.deepcopy(original)
+    expected_custom["runner"]["dockerfile"] = "Dockerfile"
+    assert custom == expected_custom
+    assert ("docker" in custom) is docker
+    assert {k: catalog[k] for k in ("alias", "codeHost", "projectId")} == {
+        "alias": "acme-catalog",
         "codeHost": "github",
         "projectId": "4402",
     }
-    assert "docker" not in custom
-    runner = custom["runner"]
+    assert "docker" not in catalog
+    runner = catalog["runner"]
+    assert "dockerfile" not in runner
     assert runner["image"] == images["runner"]["ref"]
     assert runner["base"] == images["platform"]["digest"]
-    assert runner["platformDigests"] == catalog["runner"]["platformDigests"]
+    assert runner["platformDigests"] == original["runner"]["platformDigests"]
     assert runner["tools"] == ["docker-cli"]
-    assert runner["dockerfile"] == "Dockerfile"
 
 
 def test_install_docker_values_raise_the_daemon_limits_for_a_skill_rung() -> None:
@@ -775,13 +787,16 @@ def test_install_build_platform_next_pushes_a_labelled_second_platform(
 ) -> None:
     commands = Commands()
     obj = _scenario(tmp_path, monkeypatch, commands)
+    obj.builder = BUILDER  # what prepare() records after creating the run-owned builder
     del obj.images["platform-next"]
     commands.handlers.append(_buildx(NEXT_DIGEST))
     obj.build_platform_next()
     [(argv, _kwargs)] = [c for c in commands.calls if c[0][:3] == ["docker", "buildx", "build"]]
     tag = f"localhost:5000/fd-{NONCE}/platform-next:candidate"
-    assert _adjacent(argv, "--builder", "default")
-    assert _adjacent(argv, "--platform", "linux/amd64")
+    # The production catalog rebuild builds both platforms and refuses the default
+    # docker driver for a multi-platform push (cli/src/repo_runner_build.rs).
+    assert _adjacent(argv, "--builder", BUILDER)
+    assert _adjacent(argv, "--platform", "linux/amd64,linux/arm64")
     assert "--push" in argv
     assert _adjacent(argv, "--label", "curie.fixture.platform=next")
     assert _adjacent(argv, "-t", tag)
@@ -800,13 +815,91 @@ def test_install_build_platform_next_refuses_the_platform_digest(
 ) -> None:
     commands = Commands()
     obj = _scenario(tmp_path, monkeypatch, commands)
+    obj.builder = BUILDER
     del obj.images["platform-next"]
     commands.handlers.append(_buildx(obj.images["platform"]["digest"]))
     with pytest.raises(RuntimeError, match="platform_next_not_distinct"):
         obj.build_platform_next()
 
 
-def test_install_build_runner_cli_copies_the_binary_out_without_a_bind_mount(
+class _Builders:
+    """`docker buildx inspect|create|rm` for the run-owned builder on the default engine."""
+
+    def __init__(self, existing: bool = False) -> None:
+        self.existing, self.created = existing, False
+        self.calls: list[tuple[str, list[str]]] = []
+
+    def handle(self, argv: list[str], _kwargs: dict[str, Any]) -> Result | None:
+        verb = argv[2] if argv[:2] == ["docker", "buildx"] and len(argv) > 2 else ""
+        if verb == "inspect":
+            self.calls.append(("inspect", argv))
+            if self.existing or self.created:
+                return 0, f"Name:          {BUILDER}\nDriver:        docker-container\n", ""
+            # docker buildx's stderr for an unknown builder name.
+            return 1, "", f'ERROR: no builder "{BUILDER}" found\n'
+        if verb == "create":
+            self.calls.append(("create", argv))
+            self.created = True
+            return 0, BUILDER + "\n", ""
+        if verb == "rm":
+            self.calls.append(("rm", argv))
+            return 0, "", ""
+        return None
+
+
+def _prepare(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, builders: _Builders
+) -> tuple[Any, list[str]]:
+    """A DockerScenario whose inherited prepare and image builds only record their order."""
+
+    commands = Commands()
+    order: list[str] = []
+
+    def record(argv: list[str], kwargs: dict[str, Any]) -> Result | None:
+        found = builders.handle(argv, kwargs)
+        if found is not None:
+            order.append("buildx " + argv[2])
+        return found
+
+    commands.handlers.append(record)
+    obj = _scenario(tmp_path, monkeypatch, commands)
+    monkeypatch.setattr(dl.Lifecycle, "prepare", lambda _self: order.append("super"))
+    monkeypatch.setattr(obj, "build_platform_next", lambda: order.append("platform_next"))
+    monkeypatch.setattr(obj, "build_runner_cli", lambda: order.append("runner_cli"))
+    return obj, order
+
+
+def test_install_prepare_creates_a_run_owned_buildx_builder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    builders = _Builders()
+    obj, order = _prepare(tmp_path, monkeypatch, builders)
+    obj.prepare()
+    [create] = [argv for verb, argv in builders.calls if verb == "create"]
+    assert _adjacent(create, "--name", BUILDER)
+    assert _adjacent(create, "--driver", "docker-container")
+    assert _adjacent(create, "--driver-opt", "network=host")
+    assert not {"-v", "--volume", "--mount"} & set(create)
+    inspected = [argv for verb, argv in builders.calls if verb == "inspect"]
+    assert inspected and BUILDER in inspected[0]
+    assert order.index("buildx inspect") < order.index("buildx create")
+    assert order.index("buildx create") < order.index("platform_next")
+    assert "super" in order and "runner_cli" in order
+    assert obj.builder == BUILDER
+
+
+def test_install_prepare_refuses_an_existing_builder_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    builders = _Builders(existing=True)
+    obj, order = _prepare(tmp_path, monkeypatch, builders)
+    with pytest.raises(RuntimeError, match="builder_name_occupied"):
+        obj.prepare()
+    assert [verb for verb, _argv in builders.calls if verb == "create"] == []
+    assert "platform_next" not in order
+
+
+def test_install_build_runner_cli_records_intents_and_copies_out_without_a_bind_mount(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     commands = Commands()
@@ -824,8 +917,11 @@ def test_install_build_runner_cli_copies_the_binary_out_without_a_bind_mount(
             assert dockerfile is not None
             dockerfiles.append(dockerfile)
             dockerfiles.append(Path(dockerfile).read_text())
+            assert any(a[0] == "tag_intent" for a in obj.f.assets), "build before tag_intent"
             return 0, "sha256:" + "d" * 64 + "\n", ""
         if argv[1] == "create" or argv[1:3] == ["container", "create"]:
+            intent = any(a[0] == "container_intent" for a in obj.f.assets)
+            assert intent, "container created before its container_intent"
             return 0, container + "\n", ""
         if argv[1] == "cp":
             dest = Path(argv[-1])
@@ -844,10 +940,17 @@ def test_install_build_runner_cli_copies_the_binary_out_without_a_bind_mount(
         " ".join(argv[1:3]) if argv[1] in ("image", "container") else argv[1] for argv in calls
     ]
     tag = f"fd-{NONCE}-runner-cli:candidate"
+    name = f"fd-{NONCE}-runner-cli"
     build = calls[verbs.index("build")]
     assert _adjacent(build, "--label", "owner=factory-tools")
     assert _adjacent(build, "--label", f"factory-tools/nonce={NONCE}")
     assert _adjacent(build, "-t", tag)
+    # Both intents are recorded before the object exists, so the fixture's
+    # release_docker_assets reclaims them on any failure.
+    [(_kind, _tag, tag_request)] = [a for a in obj.f.assets if a[:2] == ("tag_intent", tag)]
+    assert _adjacent(build, "--label", f"factory-tools/request={tag_request}")
+    intents = [a for a in obj.f.assets if a[:2] == ("container_intent", name)]
+    [(_kind, _name, container_request)] = intents
     assert build[-1] == str(obj.f.snapshot)
     dockerfile_path, dockerfile = Path(dockerfiles[0]), dockerfiles[1]
     assert dockerfile_path.resolve().is_relative_to(obj.f.work.resolve())
@@ -863,11 +966,18 @@ def test_install_build_runner_cli_copies_the_binary_out_without_a_bind_mount(
     untag = [v for v in verbs if v in ("rmi", "image rm")][0]
     order = [verbs.index(v) for v in ("build", create, "cp", remove, untag)]
     assert order == sorted(order)
-    assert tag in calls[verbs.index(create)]
+    create_argv = calls[verbs.index(create)]
+    assert tag in create_argv
+    assert _adjacent(create_argv, "--name", name)
+    assert _adjacent(create_argv, "--label", "owner=factory-tools")
+    assert _adjacent(create_argv, "--label", f"factory-tools/nonce={NONCE}")
+    assert _adjacent(create_argv, "--label", f"factory-tools/request={container_request}")
+    assert container_request != tag_request
     copy_argv = calls[verbs.index("cp")]
-    assert f"{container}:/src/cli/target/release/curie" in copy_argv
+    sources = {f"{who}:/src/cli/target/release/curie" for who in (container, name)}
+    assert sources & set(copy_argv)
     assert Path(copy_argv[-1]).resolve().is_relative_to((obj.f.work / "runner-cli").resolve())
-    assert container in calls[verbs.index(remove)]
+    assert {container, name} & set(calls[verbs.index(remove)])
     assert tag in calls[verbs.index(untag)]
     for argv in calls:
         assert not {"-v", "--volume", "--mount"} & set(argv), argv
@@ -1213,12 +1323,13 @@ def _helm_values(catalog: str, custom: str, platform: dict[str, str]) -> dict[st
     runner = {"base": platform["digest"], "tools": ["docker-cli"]}
     repos = [
         {
-            "alias": "acme-bot", "codeHost": "github", "projectId": "4401", "path": CATALOG_REPO,
-            "runner": runner | {"image": catalog}, "docker": {"enabled": True},
+            "alias": "acme-bot", "codeHost": "github", "projectId": "4401", "path": CUSTOM_REPO,
+            "runner": runner | {"image": custom, "dockerfile": "Dockerfile"},
+            "docker": {"enabled": True},
         },
         {
-            "alias": "acme-custom", "codeHost": "github", "projectId": "4402", "path": CUSTOM_REPO,
-            "runner": runner | {"image": custom, "dockerfile": "Dockerfile"},
+            "alias": "acme-catalog", "codeHost": "github", "projectId": "4402",
+            "path": CATALOG_REPO, "runner": runner | {"image": catalog},
         },
     ]  # fmt: skip
     binding = {"name": "acme-bot", "tracker": "github", "trackerScopeId": "4401", "repos": repos}
@@ -1229,7 +1340,7 @@ def _helm_values(catalog: str, custom: str, platform: dict[str, str]) -> dict[st
 IMAGES = _images()
 REGISTRY_PATH = f"localhost:5000/fd-{NONCE}"
 VALUES_BEFORE = _helm_values(IMAGES["runner"]["ref"], IMAGES["runner"]["ref"], IMAGES["platform"])
-CATALOG_AFTER = f"{REGISTRY_PATH}/runner-acme-bot@sha256:" + "2b" * 32
+CATALOG_AFTER = f"{REGISTRY_PATH}/runner-acme-catalog@sha256:" + "2b" * 32
 VALUES_AFTER = _helm_values(CATALOG_AFTER, IMAGES["runner"]["ref"], IMAGES["platform-next"])
 # cli/src/ops/upgrade.rs plan_repository_runners: the catalog rebuild line and the
 # custom-repository preserved line, with custom_repository_rebuild_command's command.
@@ -1245,12 +1356,13 @@ PRESERVED_LINE = (
     f"=repo-runner.yaml --registry {REGISTRY_PATH} --namespace {NAMESPACE} --release {NAMESPACE}"
     " --chart /work/snapshot/charts/curie"
 )
-# cli/src/ops/upgrade.rs ClusterUpgradeOutput::Completed to_json, the `--json` document.
+# cli/src/ops/upgrade.rs ClusterUpgradeOutput::Completed to_json, the `--json` document;
+# completed_output sets status "succeeded" and phase "commit" on success.
 UPGRADE_OUTPUT = {
-    "status": "completed",
-    "phase": "complete",
+    "status": "succeeded",
+    "phase": "commit",
     "target_version": "9.8.7",
-    "from_version": "9.8.7",
+    "from_version": "9.8.6",
     "known_good_version": "9.8.7",
     "resumed": False,
     "previous_serving": False,
@@ -1343,13 +1455,16 @@ def test_upgrade_message_reply_is_the_last_json_reply(stdout: str, reply: str) -
 class _Upgrade:
     """helm, the host CLI's upgrade and message, and the release Secret."""
 
-    def __init__(self, curie: str, exit_code: int = 0) -> None:
+    def __init__(
+        self, curie: str, exit_code: int = 0, output: dict[str, Any] | None = None
+    ) -> None:
         self.curie, self.exit_code = curie, exit_code
         self.values_calls: list[list[str]] = []
         self.upgrade: list[tuple[list[str], str, int]] = []
+        self.upgrade_env: list[dict[str, str]] = []
         self.message: list[tuple[list[str], dict[str, str]]] = []
         self.order: list[str] = []
-        self.stdout = json.dumps(UPGRADE_OUTPUT, indent=2) + "\n"
+        self.stdout = json.dumps(UPGRADE_OUTPUT if output is None else output, indent=2) + "\n"
         # One JSON object per line, the reply field as repo_runner.py reads it.
         self.message_stdout = json.dumps({"reply": STALE_REPLY, "failure_class": None}) + "\n"
 
@@ -1364,6 +1479,7 @@ class _Upgrade:
             values_file = Path(argv[argv.index("-f") + 1])
             mode = values_file.stat().st_mode & 0o777
             self.upgrade.append((argv, values_file.read_text(), mode))
+            self.upgrade_env.append(dict(kwargs.get("env") or {}))
             self.order.append("upgrade")
             return self.exit_code, self.stdout, ""
         if argv[0] == self.curie and "message" in argv:
@@ -1383,11 +1499,15 @@ class _Upgrade:
 
 
 def _upgrade(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exit_code: int = 0
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    exit_code: int = 0,
+    output: dict[str, Any] | None = None,
 ) -> tuple[Any, _Upgrade, Commands]:
     commands = Commands()
     obj = _scenario(tmp_path, monkeypatch, commands)
-    fake = _Upgrade(obj.curie, exit_code)
+    obj.builder = BUILDER  # created by prepare() in a live run
+    fake = _Upgrade(obj.curie, exit_code, output)
     commands.handlers.append(fake.handle)
     secret = f"/api/v1/namespaces/{NAMESPACE}/secrets/fd-{NONCE}-secrets"
     encoded = base64.b64encode(API_KEY.encode()).decode()
@@ -1414,6 +1534,9 @@ def test_upgrade_scenario_runs_the_cli_and_builds_the_section(
     )
     assert json.loads(values_text) == docker_driver.upgrade_values(IMAGES["platform-next"])
     assert mode == 0o600
+    # The catalog rebuild is multi-platform, so the CLI must use the run-owned builder.
+    [upgrade_env] = fake.upgrade_env
+    assert upgrade_env["BUILDX_BUILDER"] == BUILDER
     [(message, env)] = fake.message
     assert message == docker_driver.message_argv(
         obj.curie, CONTEXT, nonce=NONCE, namespace=NAMESPACE, release=NAMESPACE,
@@ -1435,15 +1558,59 @@ def test_upgrade_scenario_runs_the_cli_and_builds_the_section(
     assert docker_scenario._judge_upgrade(obj.sections["upgrade"]) == []
 
 
-def test_upgrade_cli_failure_keeps_its_output_and_still_builds_the_section(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+FAILED_UPGRADE = UPGRADE_OUTPUT | {
+    "status": "failed",
+    "phase": "apply",
+    "known_good_version": "9.8.6",
+}
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "output", "detail"),
+    [
+        pytest.param(1, FAILED_UPGRADE, "failed", id="exit-1-status-failed"),
+        pytest.param(1, UPGRADE_OUTPUT, "", id="exit-1-status-succeeded"),
+        pytest.param(0, FAILED_UPGRADE, "failed", id="exit-0-status-failed"),
+        pytest.param(0, UPGRADE_OUTPUT | {"status": "in_progress"}, "in_progress", id="pending"),
+    ],
+)
+def test_upgrade_failure_fails_after_recording_its_output_and_section(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    exit_code: int,
+    output: dict[str, Any],
+    detail: str,
 ) -> None:
-    obj, fake, _commands = _upgrade(tmp_path, monkeypatch, exit_code=1)
-    obj.scenario_upgrade()
+    obj, fake, _commands = _upgrade(tmp_path, monkeypatch, exit_code, output)
+    with pytest.raises(RuntimeError) as failure:
+        obj.scenario_upgrade()
+    assert str(failure.value).startswith("upgrade_failed:")
+    assert detail in str(failure.value)
     assert (obj.f.work / "upgrade-output.json").read_text() == fake.stdout
-    assert obj.evidence["upgrade_exit_code"] == 1
+    assert obj.evidence["upgrade_exit_code"] == exit_code
+    assert fake.order[-1] == "message", "the custom turn still runs for the evidence"
     assert obj.sections["upgrade"]["catalog"]["repo"] == CATALOG_REPO
     assert obj.sections["upgrade"]["custom"]["repo"] == CUSTOM_REPO
+
+
+def test_upgrade_succeeded_with_exit_zero_does_not_fail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    obj, _fake, _commands = _upgrade(tmp_path, monkeypatch, 0, UPGRADE_OUTPUT)
+    obj.scenario_upgrade()  # raises nothing
+    assert obj.evidence["upgrade_exit_code"] == 0
+    assert docker_scenario._judge_upgrade(obj.sections["upgrade"]) == []
+
+
+def test_upgrade_failure_fails_the_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def failing_upgrade(obj: Any) -> None:
+        _fill_passing(obj)
+        raise RuntimeError("upgrade_failed:failed")
+
+    obj, _calls, _leftovers = _run(tmp_path, monkeypatch, failing_upgrade)
+    result = obj.run()
+    assert result["result"] == "failed"
+    assert any(f.startswith("upgrade_failed:") for f in result["failures"])
 
 
 # --------------------------------------------------------------------------
@@ -1509,7 +1676,7 @@ def test_ci_collect_advances_the_stub_and_reads_its_main_head(
     assert argv[0] == sys.executable
     assert Path(argv[1]).resolve() == (ROOT / "docker_scenario.py").resolve()
     assert argv[2:] == [
-        "ci", "--api-url", Stub.base_url + "/api/v3", "--repo", CATALOG_REPO,
+        "ci", "--api-url", Stub.base_url + "/api/v3", "--repo", dl.REPO,
         "--base", "main", "--sha", sha, "--required", "E2E required",
         "--out", str(obj.f.work / "ci.json"),
     ]  # fmt: skip
@@ -1548,7 +1715,7 @@ def test_ci_stub_check_runs_carry_the_requested_head(
         monkeypatch.setenv("SSL_CERT_FILE", str(stub.ca_file))
         monkeypatch.setenv("GITHUB_TOKEN", token)
         section = docker_scenario.collect_ci(
-            stub.base_url + "/api/v3", CATALOG_REPO, "main", sha, ["E2E required"]
+            stub.base_url + "/api/v3", dl.REPO, "main", sha, ["E2E required"]
         )
         assert section["first_head"] == sha
         assert section["required"] == ["E2E required"]
@@ -1586,11 +1753,34 @@ class _Leftovers:
         labelled: dict[str, str] | None = None,
         registry_left: bool = False,
         unreachable: bool = False,
+        builder_left: tuple[str, ...] = (),
     ) -> None:
         self.present, self.labelled = set(present), labelled or {}
         self.registry_left, self.unreachable = registry_left, unreachable
+        self.builder_left = set(builder_left)  # of "builder", "container", "volume"
         self.namespaces: list[tuple[str | None, str]] = []
         self.docker: list[tuple[str, str]] = []
+
+    def buildkit(self, argv: list[str], joined: str) -> Result | None:
+        """The run-owned builder and its buildkit container and state volume, by exact name."""
+
+        if argv[1:3] == ["buildx", "inspect"] and BUILDER in argv:
+            self.docker.append(("builder", joined))
+            if "builder" in self.builder_left:
+                return 0, f"Name:          {BUILDER}\nDriver:        docker-container\n", ""
+            return 1, "", f'ERROR: no builder "{BUILDER}" found\n'
+        # The state volume's name extends the container's, so match it first.
+        for role, object_name in (("volume", BUILDKIT_VOLUME), ("container", BUILDKIT_CONTAINER)):
+            if object_name not in joined:
+                continue
+            self.docker.append((f"buildkit_{role}", joined))
+            left = role in self.builder_left
+            if "inspect" in argv:
+                if left:
+                    return 0, json.dumps([{"Name": object_name}]), ""
+                return 1, "", f"Error: No such {role}: {object_name}\n"
+            return 0, (object_name + "\n" if left else ""), ""
+        return None
 
     def handle(self, argv: list[str], _kwargs: dict[str, Any]) -> Result | None:
         name = Path(argv[0]).name
@@ -1616,6 +1806,9 @@ class _Leftovers:
             return 1, "", f'Error from server (NotFound): namespaces "{names[0]}" not found\n'
         if name == "docker":
             joined = " ".join(argv)
+            found = self.buildkit(argv, joined)
+            if found is not None:
+                return found
             if f"name=^fd-registry-{NONCE}$" in joined:
                 self.docker.append(("registry", joined))
                 return 0, ("f00dfeed1234\n" if self.registry_left else ""), ""
@@ -1649,6 +1842,72 @@ def test_teardown_verify_passes_when_every_namespace_is_not_found_and_nothing_is
     assert {context for context, _n in leftovers.namespaces} == {CONTEXT}
     kinds = {kind for kind, _joined in leftovers.docker}
     assert kinds >= {"containers", "images", "volumes", "networks", "registry"}
+
+
+def test_teardown_verify_passes_when_the_builder_and_its_buildkit_objects_are_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    leftovers = _Leftovers()
+    obj, _commands = _teardown(tmp_path, monkeypatch, leftovers)
+    errors: list[str] = []
+    obj.verify_teardown(errors)
+    assert errors == []
+    kinds = {kind for kind, _joined in leftovers.docker}
+    assert kinds >= {"builder", "buildkit_container", "buildkit_volume"}
+
+
+@pytest.mark.parametrize("left", ["builder", "container", "volume"])
+def test_teardown_verify_fails_when_the_builder_or_its_buildkit_objects_remain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, left: str
+) -> None:
+    obj, _commands = _teardown(tmp_path, monkeypatch, _Leftovers(builder_left=(left,)))
+    errors: list[str] = []
+    obj.verify_teardown(errors)
+    assert errors
+
+
+def _release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, builders: _Builders
+) -> tuple[Any, list[str]]:
+    """release_everything over a recording inherited teardown and the builder engine."""
+
+    obj, order = _prepare(tmp_path, monkeypatch, builders)
+
+    def inherited(_self: Any, _errors: list[str]) -> dict[str, bool]:
+        order.append("super_release")
+        return dict.fromkeys(dl.CLEANUP_KEYS, True)
+
+    monkeypatch.setattr(dl.Lifecycle, "release_everything", inherited)
+    return obj, order
+
+
+def test_teardown_removes_the_builder_this_run_created(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    builders = _Builders()
+    obj, order = _release(tmp_path, monkeypatch, builders)
+    obj.prepare()
+    errors: list[str] = []
+    cleanup = obj.release_everything(errors)
+    assert errors == []
+    assert all(cleanup[key] is True for key in dl.CLEANUP_KEYS)
+    [remove] = [argv for verb, argv in builders.calls if verb == "rm"]
+    assert BUILDER in remove
+    assert order.index("super_release") < order.index("buildx rm")
+
+
+@pytest.mark.parametrize("occupied", [True, False], ids=["refused-existing", "never-prepared"])
+def test_teardown_keeps_a_builder_this_run_did_not_create(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, occupied: bool
+) -> None:
+    builders = _Builders(existing=occupied)
+    obj, order = _release(tmp_path, monkeypatch, builders)
+    if occupied:
+        with pytest.raises(RuntimeError, match="builder_name_occupied"):
+            obj.prepare()
+    obj.release_everything([])
+    assert "super_release" in order
+    assert [verb for verb, _argv in builders.calls if verb == "rm"] == []
 
 
 @pytest.mark.parametrize("present", OWNED)
