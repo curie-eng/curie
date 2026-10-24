@@ -42,6 +42,7 @@ is documentation of where the code already draws the line, not a new abstraction
 | Protected hook source authority | CLEAN | 1 production resolver (ProvisionedSourceAuthority) + 2 test resolvers | not separately graded | #3603 | [Protected hook source authority](interfaces/protected-hook-source-authority/INTERFACE.md) |
 | Channel read | CLEAN | 1 Slack reader pair (history and canvas) plus HTTP test fakes | not separately graded | ADR-0100, ADR-0200, #2877, #3819 | [Channel read](interfaces/channel-read/INTERFACE.md) |
 | Mail provider | CLEAN | 1 in-tree (AgentMail) + out-of-tree providers loaded from the `curie.mail_provider` entry-point group | not separately graded | ADR-0228 | [Mail provider](interfaces/mail-provider/INTERFACE.md) |
+| HTTP identity facts | NONE | 0 active providers; facts-only v1 contract and synthetic vectors | not separately graded | #4890 | [HTTP identity facts](interfaces/http-identity/INTERFACE.md) |
 <!-- END GENERATED: seam-table -->
 
 ## Kind legend
