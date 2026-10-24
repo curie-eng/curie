@@ -3,6 +3,7 @@
 import asyncio
 import inspect
 import logging
+import uuid
 from collections.abc import Iterator
 from typing import Any
 
@@ -199,6 +200,75 @@ def test_admission_preserves_list_team_and_and_the_evidence_sender_check(
     assert response.status_code == 200, response.text
     assert response.json() == {"allowed": allowed, "restricted": True, "install_restricted": True}
     assert response.headers["cache-control"] == "private, no-store"
+
+
+def test_linked_invocation_member_must_remain_a_human_principal(
+    channels_client: TestClient,  # noqa: F811
+    auth_headers: dict[str, str],
+    team_route: dict[str, Any],
+) -> None:
+    """@spec COMMON-ADMISSION-EXTRACTION-2"""
+    route = team_route
+    payload = _query(route)
+    human = channels_client.post("/channels/admission", json=payload, headers=auth_headers)
+    assert human.status_code == 200, human.text
+    assert human.json() == {"allowed": True, "restricted": True, "install_restricted": True}
+
+    # Keep the active link, issuer, team and membership unchanged.
+    _sql("UPDATE curie.principals SET type = 'service' WHERE id = :id", {"id": route["person"].id})
+    service = channels_client.post("/channels/admission", json=payload, headers=auth_headers)
+    assert service.status_code == 200, service.text
+    assert service.json() == {"allowed": False, "restricted": True, "install_restricted": True}
+    audit = _sql(
+        "SELECT * FROM curie.identity_audit_events WHERE tenant_id = :id",
+        {"id": route["person"].tenant_id},
+    )
+    assert len(audit) == 1
+    assert audit[0]["principal_id"] == route["person"].id
+    assert audit[0]["details"]["reason"] == "principal_inactive"
+
+
+def test_invocation_refuses_a_binding_outside_its_agents_tenant(
+    channels_client: TestClient,  # noqa: F811
+    auth_headers: dict[str, str],
+    team_route: dict[str, Any],
+) -> None:
+    """@spec COMMON-ADMISSION-EXTRACTION-2"""
+    route = team_route
+    payload = _query(route)
+    scoped = channels_client.post("/channels/admission", json=payload, headers=auth_headers)
+    assert scoped.status_code == 200, scoped.text
+    assert scoped.json() == {"allowed": True, "restricted": True, "install_restricted": True}
+
+    other_tenant = uuid.uuid4()
+    _sql(
+        "INSERT INTO curie.tenants (id, deployment_id, status) VALUES (:id, :name, 'active')",
+        {"id": other_tenant, "name": f"admission-scope-{other_tenant}"},
+    )
+    try:
+        _sql(
+            "UPDATE curie.agent_channels SET tenant_id = :tenant WHERE id = :id",
+            {"tenant": other_tenant, "id": route["binding"].id},
+        )
+        outside = channels_client.post("/channels/admission", json=payload, headers=auth_headers)
+        assert outside.status_code == 200, outside.text
+        assert outside.json() == {
+            "allowed": False,
+            "restricted": True,
+            "install_restricted": True,
+        }
+        audit = _sql(
+            "SELECT * FROM curie.identity_audit_events WHERE tenant_id = :id", {"id": other_tenant}
+        )
+        assert len(audit) == 1
+        assert audit[0]["details"]["reason"] == "agent_unavailable"
+    finally:
+        _sql(
+            "UPDATE curie.agent_channels SET tenant_id = :tenant WHERE id = :id",
+            {"tenant": route["person"].tenant_id, "id": route["binding"].id},
+        )
+        _sql("DELETE FROM curie.identity_audit_events WHERE tenant_id = :id", {"id": other_tenant})
+        _sql("DELETE FROM curie.tenants WHERE id = :id", {"id": other_tenant})
 
 
 def test_query_slack_identity_is_not_invented_for_a_channel_port_author(
