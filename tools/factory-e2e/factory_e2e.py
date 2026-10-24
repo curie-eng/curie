@@ -157,12 +157,16 @@ model route in the environment, `--model-base-url`, `--candidate-images build` a
 `--candidate` other than the worktree HEAD are refused. It owns fd-docker-<nonce>
 (namespace and release), fd-docker-d-<nonce> and fd-docker-c-<nonce>, labelled
 owner=factory-tools, and builds every image from the HEAD snapshot into a run-owned
-registry container. Phases: install as daemon_lifecycle.py does, two concurrent
-Docker runs whose turns run the probe, compose and skill-rung collectors, the
-lifecycle scenarios, an upgrade through `curie cluster upgrade` and a turn on a custom
-repository, CI from the stub, then teardown proved object by object. It exits 0 only
-when docker_scenario.py's judge finds nothing and teardown is verified. Live use is
-the w2 waypoint and acceptance.
+registry container. The production catalog rebuild always builds linux/amd64 and
+linux/arm64, so the run creates its own docker-container buildx builder
+fd-builder-<nonce> on the default engine and removes it at teardown; that engine's
+host needs linux/arm64 emulation (binfmt). Phases: install as daemon_lifecycle.py
+does, two concurrent Docker runs whose turns run the probe, compose and skill-rung
+collectors, the lifecycle scenarios, an upgrade through `curie cluster upgrade` that
+rebuilds a catalog repository's runner and a turn on the custom repository, CI from
+the stub, then teardown proved object by object. It exits 0 only when
+docker_scenario.py's judge finds nothing and teardown is verified. Live use is the
+w2 waypoint and acceptance.
 
 The App, fixture repository, mention author and model credentials come only
 from operator files or environment variables; nothing here names a real one.
@@ -6596,8 +6600,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             "CURIE_FACTORY_REPO_RUNNER_PLAN (three chart bindings and seven turns) and "
             "CURIE_LOCAL_STUB_HOST. docker: run --scenario docker --context <context> with "
             "CURIE_LOCAL_STUB_HOST and no model credential; builds the worktree HEAD into a "
-            "run-owned registry and exits 0 only when the docker judge passes and teardown "
-            "is verified."
+            "run-owned registry, needs linux/arm64 emulation on the Docker engine host (the "
+            "catalog rebuild builds both platforms), and exits 0 only when the docker judge "
+            "passes and teardown is verified."
         ),
     )
     scenario.add_argument("--scenario", required=True, choices=tuple(SCENARIOS))

@@ -14,8 +14,18 @@ owner=factory-tools and factory-tools/nonce=<n>, and builds the daemon, platform
 catalog and runner images from the HEAD snapshot into a run-owned registry container
 on the default Docker engine; api and worker build the same way. This driver adds a
 second platform runner (platform-next) for the upgrade, the candidate CLI built for
-the runner's glibc, and a custom repository with its own Dockerfile. No host path is
-ever bind-mounted.
+the runner's glibc, and a second repository binding. The stub-served acme-corp/acme-bot
+is the custom repository (its receipt declares Dockerfile "Dockerfile"), and
+acme-corp/acme-catalog is a catalog repository whose runner the upgrade rebuilds; it
+is never cloned and takes no turn. No host path is ever bind-mounted.
+
+The production catalog rebuild always builds linux/amd64 and linux/arm64 and refuses
+the default docker driver for a multi-platform push, so the run creates its own
+docker-container buildx builder fd-builder-<n> (host network, to reach the run-owned
+registry on the engine host's loopback), builds platform-next for both platforms on it
+and runs the upgrade with BUILDX_BUILDER naming it. The default engine's host therefore
+needs linux/arm64 emulation (binfmt). The builder is removed at teardown only when this
+run created it.
 
 Flow:
 
@@ -27,11 +37,13 @@ Flow:
 2. lifecycle: the daemon_lifecycle scenarios, success through control.
 3. upgrade: `curie cluster upgrade` pins platform-next; the plan lines and the chart
    values around it are kept, then a turn on the custom repository must be refused
-   with stale_base.
+   with stale_base. An upgrade that exits nonzero or does not report "succeeded" fails
+   the run once that evidence is recorded.
 4. ci: required checks on the stub's main head, read by docker_scenario.py ci.
 
 Teardown always runs, then every owned namespace is proved absent by name, no Docker
-object carries the run's nonce label and the registry container is gone. ``run``
+object carries the run's nonce label, and the registry container, the builder and its
+buildkit container and state volume are gone by exact name. ``run``
 passes only when no phase failed, the judge returns nothing and teardown is verified;
 ``drive`` raises PreflightFailed otherwise, so the command exits non-zero. Evidence is
 <work-dir>/docker-evidence.json (0600). Live use is the w2 waypoint and acceptance.
@@ -68,7 +80,8 @@ ds = fe.load_docker_scenario()
 SCENARIO = SLICE = "docker"
 TRANSCRIPT = HERE / "fixtures" / "docker-scenario" / "transcript.json"
 RUN_ISSUES = {"a": 4106, "b": 4107}
-CUSTOM_REPO = "acme-corp/acme-custom"
+CUSTOM_REPO = dl.REPO  # stub-served and cloneable; declares its own Dockerfile
+CATALOG_REPO = "acme-corp/acme-catalog"  # rebuilt by the upgrade, never cloned
 REQUIRED_CHECKS = ("E2E required",)
 CI_CLOCK_SECONDS = 1800  # the recording's last check completes 1633 s after its epoch
 MODEL_ENV = (
@@ -87,6 +100,7 @@ COMPOSE_IMAGE = (
     "@sha256:ed86c82274b3c69b52fb5820f358f0bd7df0b603332063cb5c6e32bd220c3e6e"
 )
 # Bookworm like the runner, so the CLI links against the runner's glibc.
+PLATFORMS = "linux/amd64,linux/arm64"  # what the production catalog rebuild builds
 CLI_BUILD_IMAGE = (
     "rust:1.95.0-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1"
 )
@@ -165,16 +179,18 @@ def scenario_args(context: str, callback_host: str, nonce: str | None = None) ->
 
 
 def docker_values(values: Obj, images: dict[str, dict[str, str]]) -> Obj:
-    """``values`` plus the custom repository and daemon limits a skill rung fits in."""
+    """``values`` with acme-bot custom, a catalog repository and daemon limits a skill rung fits."""
 
     out = copy.deepcopy(values)
     repos = out["factory"]["bindings"][0]["repos"]
-    catalog = next(repo for repo in repos if repo["path"] == dl.REPO)
+    custom = next(repo for repo in repos if repo["path"] == CUSTOM_REPO)
+    # Only the CLI upgrade planner reads the key; the chart and worker ignore it.
+    custom["runner"]["dockerfile"] = "Dockerfile"
     runner: Obj = {"image": images["runner"]["ref"], "base": images["platform"]["digest"]}
-    runner |= {"platformDigests": dict(catalog["runner"]["platformDigests"])}
-    runner |= {"tools": ["docker-cli"], "dockerfile": "Dockerfile"}
-    custom: Obj = {"alias": "acme-custom", "codeHost": "github", "projectId": "4402"}
-    repos.append(custom | {"path": CUSTOM_REPO, "runner": runner})
+    runner |= {"platformDigests": dict(custom["runner"]["platformDigests"])}
+    runner |= {"tools": ["docker-cli"]}
+    catalog: Obj = {"alias": "acme-catalog", "codeHost": "github", "projectId": "4402"}
+    repos.append(catalog | {"path": CATALOG_REPO, "runner": runner})
     daemon = out["factory"]["docker"]
     daemon |= {"maxClaimLifetimeSeconds": 3600, "storageSizeLimit": "24Gi"}
     resources = daemon.setdefault("resources", {})
@@ -276,6 +292,7 @@ class DockerScenario(dl.Lifecycle):
         self.runs: dict[str, Obj] = {}
         self.sections: dict[str, Obj] = {}
         self.cleanup_evidence: Obj = {}
+        self.builder = ""  # set only once this run has proved the name free and created it
         self.lock = threading.Lock()
 
     # prepare and install
@@ -284,19 +301,31 @@ class DockerScenario(dl.Lifecycle):
         super().prepare()
         moved = self.candidate and self.f.candidate != self.candidate
         self.fx.require(not moved, "candidate_moved")
+        self.create_builder()
         self.build_platform_next()
         self.build_runner_cli()
 
+    def create_builder(self) -> None:
+        """A run-owned docker-container builder for multi-platform pushes."""
+        name = f"fd-builder-{self.nonce}"
+        found = self.fx.run(["docker", "buildx", "inspect", name], check=False, timeout=60)
+        self.fx.require(found.returncode, "builder_name_occupied")
+        self.fx.require("no builder" in found.stderr.lower(), "builder_inventory_unavailable")
+        self.builder = name  # proved free above, so whatever create leaves is this run's
+        argv = ["docker", "buildx", "create", "--name", name, "--driver", "docker-container"]
+        self.fx.run([*argv, "--driver-opt", "network=host"], timeout=300)
+
     def build_platform_next(self) -> None:
-        """A second platform runner, distinct by label, for the upgrade to pin."""
+        """A second platform runner for both platforms, distinct by label, for the upgrade."""
         fx, f = self.fx, self.f
         tag = f"{f.registry}/fd-{self.nonce}/platform-next:candidate"
         fx.require(tag not in fx.run(fx.TAGS).stdout.split(), "build_tag_occupied")
         request = uuid.uuid4().hex
         f.asset("tag_intent", tag, request)
         metadata = f.work / "platform-next-build.json"
-        argv = ["docker", "buildx", "build", "--builder", "default", "--platform"]
-        argv += ["linux/" + f.arch]
+        fx.require(self.builder, "builder_missing")
+        argv = ["docker", "buildx", "build", "--builder", self.builder, "--platform"]
+        argv += [PLATFORMS]
         argv += ["--label", f"{fx.REQUEST}={request}", "--label", f"{fx.NONCE}={self.nonce}"]
         argv += ["--label", "curie.fixture.platform=next"]
         argv += ["--provenance=false", "--push", "--metadata-file", str(metadata), "-t", tag]
@@ -318,18 +347,24 @@ class DockerScenario(dl.Lifecycle):
         fx.require(tag not in fx.run(fx.TAGS).stdout.split(), "build_tag_occupied")
         dockerfile = f.work / "runner-cli.Dockerfile"
         dockerfile.write_text(RUNNER_CLI_DOCKERFILE)
-        labels = ["--label", "owner=factory-tools", "--label", f"{fx.NONCE}={self.nonce}"]
+        owned = ["--label", "owner=factory-tools", "--label", f"{fx.NONCE}={self.nonce}"]
         target = f.work / "runner-cli"
         target.mkdir(mode=0o700, exist_ok=True)
+        # Intents first, so the fixture's release_docker_assets reclaims both on any failure.
+        request = uuid.uuid4().hex
+        f.asset("tag_intent", tag, request)
         try:
-            build = ["docker", "build", *labels, "-t", tag, "-f", str(dockerfile), str(f.snapshot)]
-            fx.run(build, timeout=7200)
-            container = fx.run(["docker", "create", *labels, tag]).stdout.strip()
+            build = ["docker", "build", *owned, "--label", f"{fx.REQUEST}={request}"]
+            fx.run([*build, "-t", tag, "-f", str(dockerfile), str(f.snapshot)], timeout=7200)
+            name, request = f"fd-{self.nonce}-runner-cli", uuid.uuid4().hex
+            f.asset("container_intent", name, request)
+            create = ["docker", "create", "--name", name, *owned]
+            fx.run([*create, "--label", f"{fx.REQUEST}={request}", tag])
             try:
-                source = f"{container}:/src/cli/target/release/curie"
+                source = f"{name}:/src/cli/target/release/curie"
                 fx.run(["docker", "cp", source, str(target / "curie")], timeout=300)
             finally:
-                fx.run(["docker", "rm", "-f", container])
+                fx.run(["docker", "rm", "-f", name])
         finally:
             fx.run(["docker", "image", "rm", tag], check=False)
         (target / "curie").chmod(0o755)
@@ -511,7 +546,10 @@ class DockerScenario(dl.Lifecycle):
             self.curie, self.args.context, chart_version(chart), str(chart), self.ns,
             self.release, str(values_file),
         )  # fmt: skip
-        upgraded = self.fx.run(argv, env=self.env, check=False, timeout=3600)
+        self.fx.require(self.builder, "builder_missing")
+        # The catalog rebuild is a multi-platform push, so it needs the run-owned builder.
+        build_env = dict(self.env, BUILDX_BUILDER=self.builder)
+        upgraded = self.fx.run(argv, env=build_env, check=False, timeout=3600)
         (work / "upgrade-output.json").write_text(upgraded.stdout)
         self.evidence |= {"upgrade_exit_code": upgraded.returncode}
         self.evidence["upgrade_output"] = upgraded.stdout
@@ -519,7 +557,9 @@ class DockerScenario(dl.Lifecycle):
             output = json.loads(upgraded.stdout)
         except ValueError:
             output = None
-        if upgraded.returncode == 0:
+        status = output.get("status") if isinstance(output, dict) else None
+        succeeded = upgraded.returncode == 0 and status == "succeeded"
+        if succeeded:
             self.rollout("api", "worker")
         after = self.helm_values()
         for name, values in (("values-before.json", before), ("values-after.json", after)):
@@ -536,8 +576,11 @@ class DockerScenario(dl.Lifecycle):
         self.evidence["upgrade_message_exit_code"] = turn.returncode
         reply = message_reply(turn.stdout)
         self.sections["upgrade"] = ds.upgrade_section(
-            plan_text(output), before, after, dl.REPO, CUSTOM_REPO, reply
+            plan_text(output), before, after, CATALOG_REPO, CUSTOM_REPO, reply
         )
+        if not succeeded:  # raised last, so the output, turn and section stay as evidence
+            detail = status if status not in (None, "succeeded") else None
+            raise RuntimeError(f"upgrade_failed:{detail or f'exit_{upgraded.returncode}'}")
 
     def collect_ci(self) -> None:
         """Required checks on the stub's main head, read like a real GitHub."""
@@ -566,6 +609,20 @@ class DockerScenario(dl.Lifecycle):
 
     # teardown
 
+    def release_everything(self, errors: list[str]) -> dict[str, bool]:
+        cleanup: dict[str, bool] = super().release_everything(errors)
+        if self.builder:  # never a builder this run did not create
+            argv = ["docker", "buildx", "rm", self.builder]
+            try:
+                removed = self.fx.run(argv, check=False, timeout=300).returncode == 0
+            except (OSError, subprocess.SubprocessError) as exc:
+                removed = False
+                errors.append(f"builder_remove:{type(exc).__name__}")
+            if not removed:
+                errors.append("builder_remove_failed")
+                cleanup["docker_assets_absent"] = False
+        return cleanup
+
     def scrub_work(self, errors: list[str]) -> None:
         super().scrub_work(errors)
         if self.f is None:
@@ -580,7 +637,7 @@ class DockerScenario(dl.Lifecycle):
             errors.append(f"work_dir_scrub:{type(exc).__name__}")
 
     def verify_teardown(self, errors: list[str]) -> None:
-        """Each owned namespace NotFound by name, no nonce-labelled Docker object, no registry."""
+        """Owned namespaces NotFound, no nonce-labelled Docker object, no named run object."""
         names: dict[str, str] = {}
         owned = (self.ns, self.dns, self.args.controller_namespace)
         kubectl = ["kubectl", "--context", self.args.context, "--request-timeout=15s"]
@@ -604,6 +661,19 @@ class DockerScenario(dl.Lifecycle):
         for kind, argv in (*listings.items(), ("registry", registry)):
             result = self.fx.run(argv, check=False, timeout=60)
             docker[kind] = result.stdout.split() if result.returncode == 0 else "unproved"
+        builder = f"fd-builder-{self.nonce}"
+        buildkit = f"buildx_buildkit_{builder}0"
+        named = {
+            "builder": (["docker", "buildx", "inspect", builder], "no builder"),
+            "buildkit_container": (["docker", "container", "inspect", buildkit], "no such"),
+            "buildkit_volume": (["docker", "volume", "inspect", f"{buildkit}_state"], "no such"),
+        }
+        for kind, (argv, missing) in named.items():
+            result = self.fx.run(argv, check=False, timeout=60)
+            if result.returncode == 0:
+                docker[kind] = [argv[-1]]
+            else:
+                docker[kind] = [] if missing in result.stderr.lower() else "unproved"
         self.cleanup_evidence = {"namespaces": names, "docker": docker}
         if any(state != "absent" for state in names.values()):
             errors.append("teardown_unverified: owned namespace not proved absent")
