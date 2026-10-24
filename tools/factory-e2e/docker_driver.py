@@ -15,7 +15,8 @@ catalog and runner images from the HEAD snapshot into a run-owned registry conta
 on the default Docker engine; api and worker build the same way. This driver adds a
 second platform runner (platform-next) for the upgrade, the candidate CLI built for
 the runner's glibc, and a second repository binding. The stub-served acme-corp/acme-bot
-is the custom repository (its receipt declares Dockerfile "Dockerfile"), and
+is the custom repository (its receipt declares Dockerfile "Dockerfile", and the stub
+serves it a tree carrying that Dockerfile, the one its runner was built from), and
 acme-corp/acme-catalog is a catalog repository whose runner the upgrade rebuilds; it
 is never cloned and takes no turn. No host path is ever bind-mounted.
 
@@ -26,6 +27,10 @@ registry on the engine host's loopback), builds platform-next for both platforms
 and runs the upgrade with BUILDX_BUILDER naming it. The default engine's host therefore
 needs linux/arm64 emulation (binfmt). The builder is removed at teardown only when this
 run created it.
+
+The release is installed from a run-owned chart copy whose version is <v>-fdbase and
+upgraded to the snapshot chart's <v>: an upgrade to the serving version would skip
+Apply, so the base install must sit at another version.
 
 Flow:
 
@@ -67,7 +72,7 @@ import time
 import uuid
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import daemon_lifecycle as dl
 import factory_e2e as fe
@@ -369,11 +374,36 @@ class DockerScenario(dl.Lifecycle):
             fx.run(["docker", "image", "rm", tag], check=False)
         (target / "curie").chmod(0o755)
 
+    def install_chart(self) -> Path:
+        """A run-owned copy of the snapshot chart at <v>-fdbase, so the upgrade to <v> applies."""
+        base = self.f.work / "chart-base"
+        if not base.exists():
+            text = (self.f.snapshot / "charts/curie/Chart.yaml").read_text()
+            line = re.compile(r"^version:[ \t]*[\"']?([^\"'\s]+)[\"']?[ \t]*$", re.M)
+            found = line.search(text)
+            if found is None:
+                raise RuntimeError("chart_version_missing")
+            rewritten = text[: found.start()] + f"version: {found[1]}-fdbase" + text[found.end() :]
+            shutil.copytree(self.f.snapshot / "charts/curie", base)
+            (base / "Chart.yaml").write_text(rewritten)
+        return cast(Path, base)
+
+    def seed_tree(self) -> Path:
+        """acme-bot's repository: the unitconv fixture plus the Dockerfile its receipt declares."""
+        dockerfile = self.f.work / "Catalog.Dockerfile"  # what the fixture built the runner from
+        if not dockerfile.is_file():
+            raise RuntimeError("custom_dockerfile_missing")
+        tree = self.f.work / "seed-tree"
+        shutil.rmtree(tree, ignore_errors=True)
+        shutil.copytree(dl.SEED_TREE, tree)
+        (tree / "Dockerfile").write_text(dockerfile.read_text())
+        return cast(Path, tree)
+
     def start_servers(self) -> None:
-        """daemon_lifecycle's servers with this scenario's transcript."""
+        """daemon_lifecycle's servers with this scenario's transcript and seed tree."""
         host = self.args.callback_host
         recording = json.loads(dl.RECORDING.read_text())
-        seeds = {"host": host, "seed_tree": dl.SEED_TREE, "issue_file": dl.ISSUE_FILE}
+        seeds = {"host": host, "seed_tree": self.seed_tree(), "issue_file": dl.ISSUE_FILE}
         self.stub = self.github.GithubStub(self.f.work / "github", recording, **seeds)
         self.stub.start()
         # The stub seeds issue 3815 labelled; this run uses its own issues only.
@@ -558,6 +588,8 @@ class DockerScenario(dl.Lifecycle):
         except ValueError:
             output = None
         status = output.get("status") if isinstance(output, dict) else None
+        for key in ("from_version", "target_version"):
+            self.evidence[key] = output.get(key) if isinstance(output, dict) else None
         succeeded = upgraded.returncode == 0 and status == "succeeded"
         if succeeded:
             self.rollout("api", "worker")
@@ -630,8 +662,11 @@ class DockerScenario(dl.Lifecycle):
         work = self.f.work
         try:
             (work / "upgrade.values.json").unlink(missing_ok=True)
-            shutil.rmtree(work / "runner-cli", ignore_errors=True)
-            if (work / "upgrade.values.json").exists() or (work / "runner-cli").exists():
+            directories = ("runner-cli", "chart-base", "seed-tree")
+            for directory in directories:
+                shutil.rmtree(work / directory, ignore_errors=True)
+            left = [d for d in directories if (work / d).exists()]
+            if (work / "upgrade.values.json").exists() or left:
                 errors.append("work_dir_key_material_remains")
         except OSError as exc:
             errors.append(f"work_dir_scrub:{type(exc).__name__}")

@@ -1025,7 +1025,7 @@ class Lifecycle:
         control = self.values(docker=False)
         values = self.f.work / "control.values.json"
         private_file(values, json.dumps({"factory": {"bindings": control["factory"]["bindings"]}}))
-        chart = str(self.f.snapshot / "charts/curie")
+        chart = str(self.install_chart())
         upgrade = (chart, "-n", self.ns, "--reuse-values", "-f", str(values), "--timeout", "15m")
         self.helm("upgrade", *upgrade)
         self.rollout("api", "worker")
@@ -1053,6 +1053,10 @@ class Lifecycle:
         result["settle_cause"] = row.get("cause", "")
         result["turn_delivered"] = (row.get("status"), row.get("cause")) == DELIVERY
         self.envelope["control"] = result
+
+    def install_chart(self) -> Path:
+        """The chart the release is installed and control-upgraded from."""
+        return cast(Path, self.f.snapshot / "charts/curie")
 
     def values(self, *, docker: bool) -> Obj:
         names = {"nonce": self.nonce, "daemon_namespace": self.dns, "release": self.release}
@@ -1160,7 +1164,7 @@ class Lifecycle:
         self.k("label", "namespace", self.ns, "--overwrite", psa)
         self.f.note("app_namespace_psa", "baseline")
         self.install_attempted = True
-        chart = str(self.f.snapshot / "charts/curie")
+        chart = str(self.install_chart())
         files = ("-f", chart + "/values-dev.yaml", "-f", str(values_file), "--timeout", "15m")
         self.helm("install", chart, "-n", self.ns, "--skip-crds", *files)
         self.rollout("api", "worker")
@@ -1216,7 +1220,7 @@ class Lifecycle:
         self.fx.run(build, env=env, timeout=1800)
         deploy = [self.curie, "cluster", "--context", self.args.context, "deploy"]
         deploy += ["--plugin-dir", str(bundle), "--agent", AGENT, "--env", "prod"]
-        deploy += ["--chart", str(self.f.snapshot / "charts/curie")]
+        deploy += ["--chart", str(self.install_chart())]
         deploy += ["--secret", "GITHUB_PERSONAL_ACCESS_TOKEN", "--namespace", self.ns]
         deploy += ["--release", self.release, "--api-url", api_url]
         self.fx.run(deploy, env=env, timeout=600)
