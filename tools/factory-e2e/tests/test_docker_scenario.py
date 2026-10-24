@@ -1677,7 +1677,21 @@ DOCKER_HOST = "tcp://10.240.1.2:2375"
 SOURCE_REVISION = "4f1c2b9a7d3e5f60718293a4b5c6d7e8f9012345"
 RUNNER_ID = "sha256:3b9f0c1d2e4a5b6c7d8e9f00112233445566778899aabbccddeeff0011223344"
 LISTING = "9f8e7d6c5b4a\n"
-MANAGED = "label=curietech.ai/managed-by=curie-cli"
+SNAPSHOT_PS = ["docker", "ps", "-aq", "--no-trunc"]
+SNAPSHOT_NETWORKS = ["docker", "network", "ls", "-q", "--no-trunc"]
+SNAPSHOT_VOLUMES = ["docker", "volume", "ls", "-q"]
+# The daemon's default bridge, host and none networks, present in every network listing.
+DEFAULT_NETWORKS = [
+    "5f1b0c2a9d8e7f60" + "1" * 48,
+    "7a2c1d3b0e9f8a71" + "2" * 48,
+    "9b3d2e4c1f0a9b82" + "3" * 48,
+]
+PREEXISTING_CONTAINER = "c0ffee00" + "4" * 56
+PREEXISTING_VOLUME = "curie-preexisting-cache"
+NEW_CONTAINER = "d00dfeed" + "5" * 56
+NEW_NETWORK = "e1e1e1e1" + "6" * 56
+NEW_VOLUME = "curie-ladder-workspace"
+DAEMON_KINDS_BY_KEY = {"ps": "containers", "network ls": "networks", "volume ls": "volumes"}
 CREDENTIALS = (
     "ANTHROPIC_API_KEY",
     "CLAUDE_CODE_OAUTH_TOKEN",
@@ -1743,6 +1757,17 @@ class FakeCommands:
         self.http: list[tuple[int | None, str]] = []
         self.urls: list[str] = []
         self.sleeps: list[float] = []
+        # Daemon objects the unfiltered skill_rung listings report; removals drop ids
+        # unless they are sticky (a removal that leaves the object behind).
+        self.daemon: dict[str, list[str]] = {
+            "containers": [],
+            "networks": list(DEFAULT_NETWORKS),
+            "volumes": [],
+        }
+        self.sticky: set[str] = set()
+
+    def add(self, kind: str, ident: str) -> None:
+        self.daemon[kind].append(ident)
 
     @staticmethod
     def key(argv: list[str]) -> str:
@@ -1750,7 +1775,7 @@ class FakeCommands:
             rest = argv[argv.index("-f") + 2 :]
             return f"compose {rest[0]}" if rest else "compose"
         if argv[:1] == ["docker"]:
-            if argv[1:2] in (["info"], ["build"], ["ps"]):
+            if argv[1:2] in (["info"], ["build"], ["ps"], ["rm"]):
                 return argv[1]
             if argv[1:2] in (["network"], ["volume"], ["image"]):
                 return " ".join(argv[1:3])
@@ -1761,6 +1786,16 @@ class FakeCommands:
         return "unknown"
 
     def default(self, key: str, argv: list[str]) -> tuple[int, str, str]:
+        if key in DAEMON_KINDS_BY_KEY and "--filter" not in argv:
+            ids = self.daemon[DAEMON_KINDS_BY_KEY[key]]
+            return 0, "".join(f"{i}\n" for i in ids), ""
+        removals = {"rm": "containers", "network rm": "networks", "volume rm": "volumes"}
+        if key in removals:
+            kind = removals[key]
+            for ident in argv[3:]:
+                if not ident.startswith("-") and ident not in self.sticky:
+                    self.daemon[kind] = [i for i in self.daemon[kind] if i != ident]
+            return 0, "", ""
         if key == "compose ps":
             project = argv[argv.index("-p") + 1]
             lines = [json.dumps(_ps_object(project, s)) for s in ("server", "client")]
@@ -2232,8 +2267,11 @@ def test_skill_rung_provisions_runs_the_ladder_and_cleans_up(
     assert fake.argvs("image rm") == [["docker", "image", "rm", "-f", "curie-runner"]]
     image_ls = ["docker", "image", "ls", "-q", "curie-runner"]
     assert fake.argvs("image ls").count(image_ls) == 2
-    assert fake.argvs("ps") == [["docker", "ps", "-aq", "--filter", MANAGED]]
-    assert fake.argvs("volume ls") == [["docker", "volume", "ls", "-q", "--filter", MANAGED]]
+    assert fake.argvs("ps") == [SNAPSHOT_PS] * 3
+    assert fake.argvs("network ls") == [SNAPSHOT_NETWORKS] * 3
+    assert fake.argvs("volume ls") == [SNAPSHOT_VOLUMES] * 3
+    for removal in ("rm", "network rm", "volume rm"):
+        assert removal not in fake.keys(), removal
     keys = fake.keys()
     first_ls = keys.index("image ls")
     last_ls = len(keys) - 1 - keys[::-1].index("image ls")
@@ -2246,8 +2284,9 @@ def test_skill_rung_provisions_runs_the_ladder_and_cleans_up(
         last_ls,
     ]
     assert order == sorted(order), keys
-    assert keys.index("image rm") < keys.index("ps")
-    assert keys.index("image rm") < keys.index("volume ls")
+    for listing in DAEMON_KINDS_BY_KEY:
+        assert keys.index(listing) < keys.index("build"), listing
+        assert keys.index("image rm") < len(keys) - 1 - keys[::-1].index(listing), listing
     assert "unknown" not in keys, fake.calls
 
     assert section["docker_host"] == DOCKER_HOST
@@ -2280,6 +2319,7 @@ def test_skill_rung_provisions_runs_the_ladder_and_cleans_up(
     assert section["cleanup"] == {
         "image_removed": True,
         "containers": [],
+        "networks": [],
         "volumes": [],
         "verified": True,
     }
@@ -2331,8 +2371,8 @@ def _assert_skill_cleanup_ran(fake: FakeCommands) -> None:
     assert keys.index("ladder") < rm
     after = fake.calls[rm + 1 :]
     assert ["docker", "image", "ls", "-q", "curie-runner"] in [a for a, _, _ in after]
-    assert ["docker", "ps", "-aq", "--filter", MANAGED] in [a for a, _, _ in after]
-    assert ["docker", "volume", "ls", "-q", "--filter", MANAGED] in [a for a, _, _ in after]
+    for listing in (SNAPSHOT_PS, SNAPSHOT_NETWORKS, SNAPSHOT_VOLUMES):
+        assert listing in [a for a, _, _ in after], listing
 
 
 def test_skill_rung_cleans_up_when_the_ladder_fails(
@@ -2380,17 +2420,177 @@ def test_skill_rung_refuses_when_curie_runner_cannot_be_proven_absent(
     assert "ladder" not in keys
 
 
-@pytest.mark.parametrize(("where", "key"), [("containers", "ps"), ("volumes", "volume ls")])
-def test_skill_rung_unverified_cleanup_is_recorded(
-    tmp_path: Path, fake_commands: FakeCommands, where: str, key: str
+def _leave_behind(fake: FakeCommands) -> None:
+    """The ladder leaves a new container, network and volume on the daemon."""
+
+    def ladder(argv: list[str], env: dict[str, str] | None) -> None:
+        fake.add("containers", NEW_CONTAINER)
+        fake.add("networks", NEW_NETWORK)
+        fake.add("volumes", NEW_VOLUME)
+
+    fake.hooks["ladder"] = ladder
+
+
+def _with_preexisting(fake: FakeCommands) -> None:
+    fake.add("containers", PREEXISTING_CONTAINER)
+    fake.add("volumes", PREEXISTING_VOLUME)
+
+
+def test_skill_rung_removes_what_the_failed_ladder_left(
+    tmp_path: Path, fake_commands: FakeCommands
+) -> None:
+    fake = fake_commands
+    source, curie_bin = _skill_source(tmp_path)
+    _with_preexisting(fake)
+    _leave_behind(fake)
+    fake.answers["ladder"] = (1, "", "LADDER FAIL (tiers: skill)\n")
+    section = _run_skill_rung(source, curie_bin)
+
+    assert fake.argvs("rm") == [["docker", "rm", "-f", "-v", NEW_CONTAINER]]
+    assert fake.argvs("network rm") == [["docker", "network", "rm", NEW_NETWORK]]
+    assert fake.argvs("volume rm") == [["docker", "volume", "rm", "-f", NEW_VOLUME]]
+    preexisting = {PREEXISTING_CONTAINER, PREEXISTING_VOLUME, *DEFAULT_NETWORKS}
+    for key in ("rm", "network rm", "volume rm"):
+        for argv in fake.argvs(key):
+            assert not preexisting & set(argv), argv
+    assert fake.daemon["containers"] == [PREEXISTING_CONTAINER]
+    assert fake.daemon["networks"] == DEFAULT_NETWORKS
+    assert fake.daemon["volumes"] == [PREEXISTING_VOLUME]
+
+    keys = fake.keys()
+    for listing in DAEMON_KINDS_BY_KEY:
+        assert keys.index(listing) < keys.index("build"), listing
+    last_rm = max(keys.index(k) for k in ("rm", "network rm", "volume rm"))
+    assert keys.index("ladder") < min(keys.index(k) for k in ("rm", "network rm", "volume rm"))
+    assert last_rm < keys.index("image rm")
+    for listing in DAEMON_KINDS_BY_KEY:
+        assert keys.index("image rm") < len(keys) - 1 - keys[::-1].index(listing), listing
+        assert keys.count(listing) == 3, (listing, keys)
+    assert section["cleanup"] == {
+        "image_removed": True,
+        "containers": [],
+        "networks": [],
+        "volumes": [],
+        "verified": True,
+    }
+    reasons = docker_scenario.judge_skill_rung(section)
+    assert _reasons_with(reasons, "skill_rung_ladder_failed"), reasons
+    assert not _reasons_with(reasons, "incomplete_cleanup"), reasons
+
+
+@pytest.mark.parametrize(
+    ("kind", "ident"),
+    [("containers", NEW_CONTAINER), ("networks", NEW_NETWORK), ("volumes", NEW_VOLUME)],
+)
+def test_skill_rung_removal_that_leaves_one_behind_is_not_verified(
+    tmp_path: Path, fake_commands: FakeCommands, kind: str, ident: str
 ) -> None:
     source, curie_bin = _skill_source(tmp_path)
-    fake_commands.answers[key] = (0, LISTING, "")
+    _with_preexisting(fake_commands)
+    _leave_behind(fake_commands)
+    fake_commands.sticky.add(ident)
+    section = _run_skill_rung(source, curie_bin)
+    cleanup = section["cleanup"]
+    assert cleanup[kind] == [ident]
+    assert [cleanup[k] for k in ("containers", "networks", "volumes") if k != kind] == [[], []]
+    assert cleanup["verified"] is False
+    for preexisting in (PREEXISTING_CONTAINER, PREEXISTING_VOLUME, *DEFAULT_NETWORKS):
+        assert preexisting not in cleanup[kind]
+    reasons = _reasons_with(docker_scenario.judge_skill_rung(section), "incomplete_cleanup")
+    assert any(kind in r and ident in r for r in reasons), reasons
+
+
+def test_skill_rung_never_removes_snapshot_objects(
+    tmp_path: Path, fake_commands: FakeCommands
+) -> None:
+    source, curie_bin = _skill_source(tmp_path)
+    _with_preexisting(fake_commands)
+    section = _run_skill_rung(source, curie_bin)
+    keys = fake_commands.keys()
+    for removal in ("rm", "network rm", "volume rm"):
+        assert removal not in keys, removal
+    assert section["cleanup"]["verified"] is True
+    assert docker_scenario.judge_skill_rung(section) == []
+
+
+@pytest.mark.parametrize("key", list(DAEMON_KINDS_BY_KEY))
+def test_skill_rung_failed_snapshot_listing_builds_nothing(
+    tmp_path: Path, fake_commands: FakeCommands, key: str
+) -> None:
+    source, curie_bin = _skill_source(tmp_path)
+    fake_commands.answers[key] = (1, "", "Cannot connect to the Docker daemon\n")
+    with pytest.raises(docker_scenario.CommandError):
+        _run_skill_rung(source, curie_bin)
+    keys = fake_commands.keys()
+    assert "build" not in keys
+    assert "ladder" not in keys
+    assert "image rm" not in keys
+
+
+@pytest.mark.parametrize("key", list(DAEMON_KINDS_BY_KEY))
+def test_skill_rung_failed_final_listing_is_not_verified(
+    tmp_path: Path, fake_commands: FakeCommands, key: str
+) -> None:
+    source, curie_bin = _skill_source(tmp_path)
+
+    def fail_later(argv: list[str], env: dict[str, str] | None) -> None:
+        fake_commands.answers[key] = (1, "", "Cannot connect to the Docker daemon\n")
+
+    fake_commands.hooks["ladder"] = fail_later
     section = _run_skill_rung(source, curie_bin)
     assert section["cleanup"]["verified"] is False
-    assert LISTING.strip() in section["cleanup"][where]
-    reasons = docker_scenario.judge_skill_rung(section)
-    assert any(r.startswith("incomplete_cleanup: ") for r in reasons), reasons
+
+
+def test_skill_rung_reason_names_leftover_networks(skill_section: dict[str, Any]) -> None:
+    skill_section["cleanup"]["networks"] = [NEW_NETWORK]
+    reasons = _reasons_with(docker_scenario.judge_skill_rung(skill_section), "incomplete_cleanup")
+    assert any(r.startswith("incomplete_cleanup: skill rung left networks") for r in reasons), (
+        reasons
+    )
+
+
+# docker env: DOCKER_CONTEXT and BUILDX_BUILDER never reach the collectors' commands
+
+
+def test_compose_and_skill_rung_docker_env_drops_context_and_builder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DOCKER_CONTEXT", "elsewhere")
+    monkeypatch.setenv("BUILDX_BUILDER", "remote-builder")
+    monkeypatch.setenv("DOCKER_HOST", DOCKER_HOST)
+    env = docker_scenario._docker_env()
+    assert "DOCKER_CONTEXT" not in env and "BUILDX_BUILDER" not in env
+    assert env["DOCKER_HOST"] == DOCKER_HOST
+    assert env == {
+        k: v for k, v in os.environ.items() if k not in ("DOCKER_CONTEXT", "BUILDX_BUILDER")
+    }
+    env["DOCKER_HOST"] = "tcp://changed:2375"
+    assert os.environ["DOCKER_HOST"] == DOCKER_HOST
+    assert os.environ["DOCKER_CONTEXT"] == "elsewhere"
+
+
+@pytest.mark.parametrize("collector", ["compose", "skill_rung"])
+def test_compose_and_skill_rung_commands_never_see_context_or_builder(
+    tmp_path: Path, fake_commands: FakeCommands, monkeypatch: pytest.MonkeyPatch, collector: str
+) -> None:
+    monkeypatch.setenv("DOCKER_CONTEXT", "elsewhere")
+    monkeypatch.setenv("BUILDX_BUILDER", "remote-builder")
+    if collector == "compose":
+        _run_compose()
+    else:
+        source, curie_bin = _skill_source(tmp_path)
+        _leave_behind(fake_commands)
+        _run_skill_rung(source, curie_bin)
+    assert fake_commands.calls
+    for argv, _, env in fake_commands.calls:
+        assert env is not None, argv
+        assert "DOCKER_CONTEXT" not in env and "BUILDX_BUILDER" not in env, argv
+        assert env.get("DOCKER_HOST") == DOCKER_HOST, argv
+    if collector == "skill_rung":
+        ladder_env = fake_commands.call("ladder")[2]
+        assert ladder_env is not None
+        assert ladder_env["CURIE_E2E_TIERS"] == "skill"
+        assert ladder_env["CURIE_E2E_LIVE"] == "0"
 
 
 def test_skill_rung_image_still_present_after_removal_is_not_verified(
@@ -2566,6 +2766,7 @@ def test_recorded_skill_rung_passing_shapes(skill_section: dict[str, Any]) -> No
     assert inputs["curie_bin"]["version"]
     assert re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", inputs["source_revision"])
     assert section["cleanup"]["image_removed"] is True
+    assert section["cleanup"]["networks"] == []
     assert section["cleanup"]["verified"] is True
 
 
@@ -2736,6 +2937,10 @@ SKILL_RUNG_MUTATIONS: list[Mutation] = [
     ("image-not-removed", "incomplete_cleanup", _set(("cleanup", "image_removed"), False)),
     ("left-containers", "incomplete_cleanup", _set(("cleanup", "containers"), ["4c1d9e2f7a3b"])),
     ("left-volumes", "incomplete_cleanup", _set(("cleanup", "volumes"), ["curie-volume"])),
+    ("left-networks", "incomplete_cleanup", _set(("cleanup", "networks"), [NEW_NETWORK])),
+    ("cleanup-networks-absent", "missing_observation", _delete(("cleanup", "networks"))),
+    ("cleanup-networks-text", "missing_observation", _set(("cleanup", "networks"), "none")),
+    ("cleanup-networks-null", "missing_observation", _set(("cleanup", "networks"), None)),
     ("cleanup-unverified", "incomplete_cleanup", _set(("cleanup", "verified"), False)),
 ]
 
@@ -2982,7 +3187,8 @@ def test_cli_skill_rung_exits_1_after_writing_when_cleanup_is_not_verified(
     tmp_path: Path, fake_commands: FakeCommands
 ) -> None:
     source, curie_bin = _skill_source(tmp_path)
-    fake_commands.answers["ps"] = (0, LISTING, "")
+    _leave_behind(fake_commands)
+    fake_commands.sticky.add(NEW_CONTAINER)
     out = tmp_path / "skill-rung.json"
     code = docker_scenario.main([*_skill_rung_args(source, out), "--curie-bin", str(curie_bin)])
     assert code == 1
