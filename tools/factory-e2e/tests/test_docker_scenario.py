@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Callable, Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -17,6 +19,7 @@ from typing import Any
 import docker_scenario
 import factory_e2e as fe
 import pytest
+import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 REPO = ROOT.parents[1]
@@ -37,7 +40,7 @@ LATER_HEAD = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d"
 CATALOG = "acme-corp/acme-bot"
 CUSTOM = "acme-corp/acme-tools"
 CUSTOM_REPLY = FIXTURES / "custom-reply.txt"
-SECTIONS = ("runs", "cleanup", "control", "upgrade", "ci")
+SECTIONS = ("runs", "cleanup", "control", "upgrade", "ci", "compose", "skill_rung")
 EXPECTED_RULES = {
     "userns-host": "host-namespace",
     "privileged": "privileged",
@@ -723,7 +726,13 @@ def test_assemble_rebuilds_the_envelope(
     envelope: dict[str, Any], lifecycle: dict[str, Any]
 ) -> None:
     assembled = docker_scenario.assemble(
-        NONCE, envelope["runs"], lifecycle, envelope["upgrade"], envelope["ci"]
+        NONCE,
+        envelope["runs"],
+        lifecycle,
+        envelope["upgrade"],
+        envelope["ci"],
+        envelope["compose"],
+        envelope["skill_rung"],
     )
     assert assembled == envelope
 
@@ -879,7 +888,13 @@ def test_judge_assembled_failing_lifecycle_is_incomplete_cleanup(
     envelope: dict[str, Any], lifecycle: dict[str, Any]
 ) -> None:
     assembled = docker_scenario.assemble(
-        NONCE, envelope["runs"], _failing_lifecycle(lifecycle), envelope["upgrade"], envelope["ci"]
+        NONCE,
+        envelope["runs"],
+        _failing_lifecycle(lifecycle),
+        envelope["upgrade"],
+        envelope["ci"],
+        envelope["compose"],
+        envelope["skill_rung"],
     )
     reasons = _assert_prefix(assembled, "incomplete_cleanup")
     assert any(r.startswith("incomplete_cleanup: ") and "lifecycle" in r for r in reasons)
@@ -1638,3 +1653,1618 @@ def test_ci_follows_link_headers_for_check_runs_and_statuses(
     assert names == expected + ["legacy/one", "legacy/two"]
     assert len(requested) == 4, requested
     assert sum("page=2" in path for path in requested) == 2, requested
+
+
+# compose and skill_rung collectors against a fake _command
+
+# The fake outputs replay shapes observed through the hardened daemon (built from
+# apps/docker-daemon with curie-authz loaded) on the recording run:
+# `docker compose port server 8080` printed `0.0.0.0:32768`;
+# `docker compose ps --all --format json` printed one JSON object per line with keys
+# including "Service" and "State"; `docker info --format '{{.ID}} {{.Name}}'` printed
+# `275deac0-10bc-4cf6-857e-3f51f70c36de ded1c42cd936`; `docker compose down` and the
+# label-filtered `docker ps -aq`, `network ls -q`, `volume ls -q` and `image ls -q`
+# listings printed nothing on success.
+
+COMPOSE_FILES = ("compose.yaml", "server/Dockerfile", "server/index.html", "client/Dockerfile")
+LADDER_FILES = ("cli/scripts/e2e-ladder.sh", "cli/scripts/e2e.sh", "cli/scripts/gnu-process.py")
+LADDER_BUNDLE = "examples/weather"
+LADDER_PASS = "LADDER PASS (tiers: skill)"
+COMPOSE_INFO = "275deac0-10bc-4cf6-857e-3f51f70c36de ded1c42cd936\n"
+COMPOSE_DAEMON = {"id": "275deac0-10bc-4cf6-857e-3f51f70c36de", "name": "ded1c42cd936"}
+COMPOSE_IMAGE = "python:3.12-alpine"
+PUBLISHED_HOST = "10.240.1.2"
+DOCKER_HOST = "tcp://10.240.1.2:2375"
+SOURCE_REVISION = "4f1c2b9a7d3e5f60718293a4b5c6d7e8f9012345"
+RUNNER_ID = "sha256:3b9f0c1d2e4a5b6c7d8e9f00112233445566778899aabbccddeeff0011223344"
+LISTING = "9f8e7d6c5b4a\n"
+SNAPSHOT_PS = ["docker", "ps", "-aq", "--no-trunc"]
+SNAPSHOT_NETWORKS = ["docker", "network", "ls", "-q", "--no-trunc"]
+SNAPSHOT_VOLUMES = ["docker", "volume", "ls", "-q"]
+# The daemon's default bridge, host and none networks, present in every network listing.
+DEFAULT_NETWORKS = [
+    "5f1b0c2a9d8e7f60" + "1" * 48,
+    "7a2c1d3b0e9f8a71" + "2" * 48,
+    "9b3d2e4c1f0a9b82" + "3" * 48,
+]
+PREEXISTING_CONTAINER = "c0ffee00" + "4" * 56
+PREEXISTING_VOLUME = "curie-preexisting-cache"
+NEW_CONTAINER = "d00dfeed" + "5" * 56
+NEW_NETWORK = "e1e1e1e1" + "6" * 56
+NEW_VOLUME = "curie-ladder-workspace"
+DAEMON_KINDS_BY_KEY = {"ps": "containers", "network ls": "networks", "volume ls": "volumes"}
+CREDENTIALS = (
+    "ANTHROPIC_API_KEY",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CURIE_CREDENTIALS",
+    "CURIE_MODEL_CREDENTIALS",
+    "CURIE_MODEL_BASE_URL",
+    "ANTHROPIC_BASE_URL",
+    "CURIE_MODEL",
+)
+COMPOSE_KINDS = (
+    ("containers", "ps"),
+    ("networks", "network ls"),
+    ("volumes", "volume ls"),
+    ("images", "image ls"),
+)
+HEX64 = re.compile(r"[0-9a-f]{64}")
+
+
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _tree_digest(root: Path) -> str:
+    """The plan's tree digest, computed independently of docker_scenario."""
+
+    digest = hashlib.sha256()
+    files = sorted(p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file())
+    for rel in files:
+        digest.update(f"{rel}\0{_sha256((root / rel).read_bytes())}\n".encode())
+    return digest.hexdigest()
+
+
+def _marker() -> str:
+    return f"curie-compose {NONCE}"
+
+
+def _ps_object(project: str, service: str, state: str = "running") -> dict[str, Any]:
+    return {
+        "Command": "python3 -m http.server 8080 -d /srv"
+        if service == "server"
+        else "sleep infinity",
+        "CreatedAt": "2026-10-24 10:15:02 +0000 UTC",
+        "ExitCode": 0,
+        "Health": "",
+        "ID": "4c1d9e2f7a3b" if service == "server" else "8e2a6b0c5d1f",
+        "Image": f"{project}-{service}",
+        "Name": f"{project}-{service}-1",
+        "Project": project,
+        "Service": service,
+        "State": state,
+        "Status": "Up 3 seconds",
+    }
+
+
+class FakeCommands:
+    """Stands in for docker_scenario._command; answers by argv shape and records calls."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[list[str], int, dict[str, str] | None]] = []
+        self.answers: dict[str, tuple[int, str, str]] = {}
+        self.raises: dict[str, BaseException] = {}
+        self.hooks: dict[str, Callable[[list[str], dict[str, str] | None], None]] = {}
+        self.http: list[tuple[int | None, str]] = []
+        self.urls: list[str] = []
+        self.sleeps: list[float] = []
+        # Daemon objects the unfiltered skill_rung listings report; removals drop ids
+        # unless they are sticky (a removal that leaves the object behind).
+        self.daemon: dict[str, list[str]] = {
+            "containers": [],
+            "networks": list(DEFAULT_NETWORKS),
+            "volumes": [],
+        }
+        self.sticky: set[str] = set()
+
+    def add(self, kind: str, ident: str) -> None:
+        self.daemon[kind].append(ident)
+
+    @staticmethod
+    def key(argv: list[str]) -> str:
+        if argv[:2] == ["docker", "compose"] and "-f" in argv:
+            rest = argv[argv.index("-f") + 2 :]
+            return f"compose {rest[0]}" if rest else "compose"
+        if argv[:1] == ["docker"]:
+            if argv[1:2] in (["info"], ["build"], ["ps"], ["rm"]):
+                return argv[1]
+            if argv[1:2] in (["network"], ["volume"], ["image"]):
+                return " ".join(argv[1:3])
+        if argv[:1] == ["bash"]:
+            return "ladder"
+        if argv[0].endswith("/curie") and argv[1:] == ["--version"]:
+            return "version"
+        return "unknown"
+
+    def default(self, key: str, argv: list[str]) -> tuple[int, str, str]:
+        if key in DAEMON_KINDS_BY_KEY and "--filter" not in argv:
+            ids = self.daemon[DAEMON_KINDS_BY_KEY[key]]
+            return 0, "".join(f"{i}\n" for i in ids), ""
+        removals = {"rm": "containers", "network rm": "networks", "volume rm": "volumes"}
+        if key in removals:
+            kind = removals[key]
+            for ident in argv[3:]:
+                if not ident.startswith("-") and ident not in self.sticky:
+                    self.daemon[kind] = [i for i in self.daemon[kind] if i != ident]
+            return 0, "", ""
+        if key == "compose ps":
+            project = argv[argv.index("-p") + 1]
+            lines = [json.dumps(_ps_object(project, s)) for s in ("server", "client")]
+            return 0, "\n".join(lines) + "\n", ""
+        answers = {
+            "info": (0, COMPOSE_INFO, ""),
+            "compose build": (0, "", "#9 naming to docker.io/library/server done\n"),
+            "compose up": (0, "", " Container server-1  Started\n"),
+            "compose exec": (0, _marker() + "\n", ""),
+            "compose port": (0, "0.0.0.0:32768\n", ""),
+            "compose down": (0, "", ""),
+            "ps": (0, "", ""),
+            "network ls": (0, "", ""),
+            "volume ls": (0, "", ""),
+            "image ls": (0, "", ""),
+            "build": (0, "", "#12 naming to docker.io/library/curie-runner:latest done\n"),
+            "image inspect": (0, f"{RUNNER_ID} {NONCE}\n", ""),
+            "ladder": (
+                0,
+                "skill tier: weather bundle ok\n" + LADDER_PASS + "\n",
+                "",
+            ),
+            "image rm": (0, f"Untagged: curie-runner:latest\nDeleted: {RUNNER_ID}\n", ""),
+            "version": (0, "curie 0.14.1\n", ""),
+        }
+        return answers.get(key, (99, "", "fake: unexpected argv " + " ".join(argv)))
+
+    def __call__(
+        self, argv: list[str], timeout: int = 120, env: dict[str, str] | None = None
+    ) -> tuple[int, str, str]:
+        argv = [str(a) for a in argv]
+        self.calls.append((argv, timeout, None if env is None else dict(env)))
+        key = self.key(argv)
+        if key in self.hooks:
+            self.hooks[key](argv, env)
+        if key in self.raises:
+            raise self.raises[key]
+        if key in self.answers:
+            return self.answers[key]
+        return self.default(key, argv)
+
+    def http_get(self, url: str, timeout: int = 5) -> tuple[int | None, str]:
+        self.urls.append(url)
+        return self.http.pop(0) if self.http else (200, _marker() + "\n")
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+
+    def keys(self) -> list[str]:
+        return [self.key(argv) for argv, _, _ in self.calls]
+
+    def argvs(self, key: str) -> list[list[str]]:
+        return [argv for argv, _, _ in self.calls if self.key(argv) == key]
+
+    def call(self, key: str) -> tuple[list[str], int, dict[str, str] | None]:
+        found = [c for c in self.calls if self.key(c[0]) == key]
+        assert len(found) == 1, (key, self.keys())
+        return found[0]
+
+
+@pytest.fixture
+def fake_commands(monkeypatch: pytest.MonkeyPatch) -> FakeCommands:
+    fake = FakeCommands()
+    monkeypatch.setattr(docker_scenario, "_command", fake)
+    monkeypatch.setattr(docker_scenario, "_http_get", fake.http_get)
+    monkeypatch.setattr(docker_scenario.time, "sleep", fake.sleep)
+    monkeypatch.setenv("DOCKER_HOST", DOCKER_HOST)
+    return fake
+
+
+def _compose_base(fake: FakeCommands) -> list[str]:
+    argv = next(a for a, _, _ in fake.calls if a[:2] == ["docker", "compose"])
+    return argv[: argv.index("-f") + 2]
+
+
+def _run_compose(host: str = PUBLISHED_HOST) -> dict[str, Any]:
+    return docker_scenario.compose(NONCE, COMPOSE_IMAGE, host)
+
+
+# compose: pure helpers
+
+
+def test_compose_constants_match_the_plan() -> None:
+    assert docker_scenario.COMPOSE_PORT == 8080
+    assert docker_scenario.COMPOSE_SERVICES == ("server", "client")
+    assert docker_scenario.COMPOSE_FILES == COMPOSE_FILES
+    assert docker_scenario.COMPOSE_LABEL == "com.docker.compose.project"
+    assert docker_scenario.compose_marker(NONCE) == _marker()
+
+
+def test_compose_files_build_from_the_image_without_volumes() -> None:
+    files = docker_scenario.compose_files(NONCE, COMPOSE_IMAGE)
+    assert set(files) == set(COMPOSE_FILES)
+    assert files["server/index.html"] == _marker() + "\n"
+    server = files["server/Dockerfile"]
+    assert server.splitlines()[0] == f"FROM {COMPOSE_IMAGE}"
+    assert "COPY index.html /srv/index.html" in server
+    assert '["python3", "-m", "http.server", "8080", "-d", "/srv"]' in server
+    client = files["client/Dockerfile"]
+    assert client.splitlines()[0] == f"FROM {COMPOSE_IMAGE}"
+    assert '["sleep", "infinity"]' in client
+    spec = yaml.safe_load(files["compose.yaml"])
+    services = spec["services"]
+    assert set(services) == {"server", "client"}
+    assert services["server"]["build"] == "./server"
+    assert [str(p) for p in services["server"]["ports"]] == ["8080"]
+    assert services["client"]["build"] == "./client"
+    assert "volumes" not in spec
+    for name, service in services.items():
+        assert "volumes" not in service, name
+    for rel, text in files.items():
+        assert "volumes" not in text and "bind" not in text, rel
+
+
+@pytest.mark.parametrize(
+    ("text", "port"),
+    [
+        ("0.0.0.0:32768\n", 32768),
+        ("[::]:32768\n", 32768),
+        ("0.0.0.0:32768\n[::]:32768\n", 32768),
+        ("0.0.0.0:1", 1),
+        ("0.0.0.0:65535", 65535),
+        ("", None),
+        ("\n", None),
+        ("0.0.0.0:0", None),
+        ("0.0.0.0:65536", None),
+        ("0.0.0.0:x", None),
+        ("no such service: server", None),
+    ],
+)
+def test_compose_parse_port(text: str, port: int | None) -> None:
+    assert docker_scenario.parse_port(text) == port
+
+
+# compose: collector
+
+
+def test_compose_runs_build_up_exec_port_and_publishes(fake_commands: FakeCommands) -> None:
+    fake = fake_commands
+    written: dict[str, str] = {}
+
+    def capture(argv: list[str], env: dict[str, str] | None) -> None:
+        project_dir = Path(argv[argv.index("-f") + 1]).parent
+        for path in project_dir.rglob("*"):
+            if path.is_file():
+                written[path.relative_to(project_dir).as_posix()] = path.read_text()
+
+    fake.hooks["compose build"] = capture
+    section = _run_compose()
+
+    assert written == docker_scenario.compose_files(NONCE, COMPOSE_IMAGE)
+    for rel, text in written.items():
+        assert "volumes:" not in text and "bind" not in text, rel
+    base = _compose_base(fake)
+    project = base[base.index("-p") + 1]
+    assert re.fullmatch(rf"curie-compose-{NONCE}-[0-9a-f]{{6}}", project), project
+    assert base == ["docker", "compose", "-p", project, "-f", base[-1]]
+    assert Path(base[-1]).name == "compose.yaml"
+    assert not Path(base[-1]).exists()
+    for argv, _, _ in fake.calls:
+        if argv[:2] == ["docker", "compose"]:
+            assert argv[: len(base)] == base, argv
+
+    keys = fake.keys()
+    assert keys.index("compose build") < keys.index("compose up")
+    assert ["docker", "info", "--format", docker_scenario.INFO_FORMAT] in fake.argvs("info")
+    build, build_timeout, _ = fake.call("compose build")
+    assert build == [*base, "build"]
+    assert build_timeout == docker_scenario.BUILD_TIMEOUT
+    assert fake.argvs("compose up") == [[*base, "up", "-d"]]
+    assert fake.argvs("compose ps") == [[*base, "ps", "--all", "--format", "json"]]
+    exec_argv = fake.call("compose exec")[0]
+    assert exec_argv[: len(base) + 5] == [*base, "exec", "-T", "client", "python3", "-c"]
+    assert "http://server:8080/index.html" in exec_argv[-1]
+    assert fake.argvs("compose port") == [[*base, "port", "server", "8080"]]
+    assert fake.urls == [f"http://{PUBLISHED_HOST}:32768/index.html"]
+    label = f"label=com.docker.compose.project={project}"
+    assert fake.argvs("compose down") == [
+        [*base, "down", "--volumes", "--rmi", "local", "--remove-orphans"]
+    ]
+    assert fake.argvs("ps") == [["docker", "ps", "-aq", "--filter", label]]
+    assert fake.argvs("network ls") == [["docker", "network", "ls", "-q", "--filter", label]]
+    assert fake.argvs("volume ls") == [["docker", "volume", "ls", "-q", "--filter", label]]
+    assert fake.argvs("image ls") == [["docker", "image", "ls", "-q", "--filter", label]]
+    assert max(keys.index(k) for k in ("compose exec", "compose port")) < keys.index("compose down")
+    assert keys.index("compose down") < min(keys.index(k) for _, k in COMPOSE_KINDS)
+
+    assert section["project"] == project
+    assert section["docker_host"] == DOCKER_HOST
+    assert section["published_host"] == PUBLISHED_HOST
+    assert section["info"] == COMPOSE_DAEMON
+    assert section["image"] == COMPOSE_IMAGE
+    assert section["expected"] == _marker()
+    assert section["files"] == {
+        rel: _sha256(text.encode())
+        for rel, text in docker_scenario.compose_files(NONCE, COMPOSE_IMAGE).items()
+    }
+    assert section["build"]["exit_code"] == 0
+    assert section["up"]["exit_code"] == 0
+    assert section["down"]["exit_code"] == 0
+    assert section["services"] == [
+        {"service": "server", "state": "running"},
+        {"service": "client", "state": "running"},
+    ]
+    assert section["reach"] == {
+        "from": "client",
+        "to": "server:8080",
+        "exit_code": 0,
+        "body": _marker() + "\n",
+    }
+    assert section["published"] == {
+        "port": 32768,
+        "url": f"http://{PUBLISHED_HOST}:32768/index.html",
+        "status": 200,
+        "body": _marker() + "\n",
+    }
+    assert section["cleanup"] == {
+        "containers": [],
+        "networks": [],
+        "volumes": [],
+        "images": [],
+        "verified": True,
+    }
+    t0, t1 = section["window"]
+    assert isinstance(t0, float) and isinstance(t1, float) and t0 <= t1
+
+
+def test_compose_happy_path_judges_clean(fake_commands: FakeCommands) -> None:
+    assert docker_scenario.judge_compose(_run_compose()) == []
+
+
+def test_compose_published_check_retries_until_200(fake_commands: FakeCommands) -> None:
+    fake_commands.http = [(None, "Connection refused"), (502, "Bad Gateway")]
+    section = _run_compose()
+    assert len(fake_commands.urls) == 3
+    assert fake_commands.sleeps and all(s == 1 for s in fake_commands.sleeps)
+    assert section["published"]["status"] == 200
+    assert section["published"]["body"] == _marker() + "\n"
+    assert docker_scenario.judge_compose(section) == []
+
+
+def test_compose_published_check_gives_up_after_the_attempts(
+    fake_commands: FakeCommands,
+) -> None:
+    fake_commands.http = [(None, "Connection refused")] * (docker_scenario.HTTP_ATTEMPTS + 5)
+    section = _run_compose()
+    assert len(fake_commands.urls) == docker_scenario.HTTP_ATTEMPTS
+    assert section["published"]["status"] is None
+    reasons = docker_scenario.judge_compose(section)
+    assert any(r.startswith("compose_published_port_unreachable: ") for r in reasons), reasons
+
+
+def test_compose_brackets_an_ipv6_published_host(fake_commands: FakeCommands) -> None:
+    section = _run_compose("fd00::5")
+    assert fake_commands.urls == ["http://[fd00::5]:32768/index.html"]
+    assert section["published"]["url"] == "http://[fd00::5]:32768/index.html"
+
+
+def test_compose_without_a_port_skips_the_published_check(fake_commands: FakeCommands) -> None:
+    fake_commands.answers["compose port"] = (1, "", "no port 8080/tcp published\n")
+    section = _run_compose()
+    assert fake_commands.urls == []
+    assert section["published"]["port"] is None
+    assert section["published"]["status"] is None
+    assert section["published"]["url"] == ""
+    reasons = docker_scenario.judge_compose(section)
+    assert any(r.startswith("compose_published_port_unreachable: ") for r in reasons), reasons
+
+
+def test_compose_ps_accepts_a_json_array(fake_commands: FakeCommands) -> None:
+    def array(argv: list[str], env: dict[str, str] | None) -> None:
+        project = argv[argv.index("-p") + 1]
+        objects = [_ps_object(project, "server"), _ps_object(project, "client", "exited")]
+        fake_commands.answers["compose ps"] = (0, json.dumps(objects) + "\n", "")
+
+    fake_commands.hooks["compose ps"] = array
+    section = _run_compose()
+    assert section["services"] == [
+        {"service": "server", "state": "running"},
+        {"service": "client", "state": "exited"},
+    ]
+    reasons = docker_scenario.judge_compose(section)
+    assert any(r.startswith("compose_service_not_running: client") for r in reasons), reasons
+
+
+def _assert_compose_cleanup_ran(fake: FakeCommands) -> None:
+    base = _compose_base(fake)
+    project = base[base.index("-p") + 1]
+    label = f"label=com.docker.compose.project={project}"
+    assert [*base, "down", "--volumes", "--rmi", "local", "--remove-orphans"] in fake.argvs(
+        "compose down"
+    )
+    for _, key in COMPOSE_KINDS:
+        assert any(label in argv for argv in fake.argvs(key)), (key, fake.keys())
+
+
+def test_compose_cleans_up_when_up_fails(fake_commands: FakeCommands) -> None:
+    fake_commands.answers["compose up"] = (1, "", "Error response from daemon: up failed\n")
+    try:
+        section: dict[str, Any] | None = _run_compose()
+    except docker_scenario.CommandError:
+        section = None
+    _assert_compose_cleanup_ran(fake_commands)
+    if section is not None:
+        assert section["up"]["exit_code"] == 1
+        reasons = docker_scenario.judge_compose(section)
+        assert any(r.startswith("compose_up_failed: ") for r in reasons), reasons
+
+
+class _Boom(Exception):
+    pass
+
+
+@pytest.mark.parametrize("step", ["compose up", "compose exec", "compose port"])
+def test_compose_cleans_up_when_a_step_raises(fake_commands: FakeCommands, step: str) -> None:
+    fake_commands.raises[step] = _Boom(step)
+    with pytest.raises(_Boom):
+        _run_compose()
+    _assert_compose_cleanup_ran(fake_commands)
+
+
+@pytest.mark.parametrize(("kind", "key"), COMPOSE_KINDS)
+@pytest.mark.parametrize("answer", [(0, LISTING, ""), (1, "", "Error response from daemon\n")])
+def test_compose_unverified_cleanup_is_recorded(
+    fake_commands: FakeCommands, kind: str, key: str, answer: tuple[int, str, str]
+) -> None:
+    fake_commands.answers[key] = answer
+    section = _run_compose()
+    cleanup = section["cleanup"]
+    assert cleanup["verified"] is False
+    if answer[1]:
+        assert LISTING.strip() in cleanup[kind]
+    reasons = docker_scenario.judge_compose(section)
+    assert any(r.startswith("incomplete_cleanup: ") for r in reasons), reasons
+
+
+def test_compose_requires_a_published_host(fake_commands: FakeCommands) -> None:
+    with pytest.raises(docker_scenario.CommandError):
+        _run_compose("")
+    assert fake_commands.calls == []
+
+
+# skill_rung: fake source tree and collector
+
+
+SOURCE_FILES = {
+    "cli/scripts/e2e-ladder.sh": "#!/usr/bin/env bash\nset -euo pipefail\necho ladder\n",
+    "cli/scripts/e2e.sh": "#!/usr/bin/env bash\nset -euo pipefail\necho e2e\n",
+    "cli/scripts/gnu-process.py": "import sys\nsys.exit(0)\n",
+    "examples/weather/curie.yaml": "name: weather\n",
+    "examples/weather/skills/forecast/SKILL.md": "# Forecast\nRead the forecast.\n",
+    "runner/Dockerfile": "FROM python:3.12-slim\nRUN true\n",
+    "README.md": "not provisioned\n",
+}
+
+
+def _skill_source(tmp_path: Path) -> tuple[Path, Path]:
+    source = tmp_path / "source"
+    for rel, text in SOURCE_FILES.items():
+        path = source / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+    curie_bin = tmp_path / "built" / "curie"
+    curie_bin.parent.mkdir()
+    curie_bin.write_text("#!/bin/sh\necho 'curie 0.14.1'\n")
+    curie_bin.chmod(0o755)
+    return source, curie_bin
+
+
+def _run_skill_rung(source: Path, curie_bin: Path, host: str = PUBLISHED_HOST) -> dict[str, Any]:
+    return docker_scenario.skill_rung(NONCE, source, curie_bin, host, SOURCE_REVISION)
+
+
+def test_skill_rung_constants_match_the_plan() -> None:
+    assert docker_scenario.LADDER_FILES == LADDER_FILES
+    assert docker_scenario.LADDER_BUNDLE == LADDER_BUNDLE
+    assert docker_scenario.RUNNER_TAG == "curie-runner"
+    assert docker_scenario.RUNNER_DOCKERFILE == "runner/Dockerfile"
+    assert docker_scenario.LADDER_PASS == LADDER_PASS
+    assert docker_scenario.MANAGED_LABEL == "curietech.ai/managed-by=curie-cli"
+
+
+def test_skill_rung_tree_digest_and_sha256_file(tmp_path: Path) -> None:
+    source, curie_bin = _skill_source(tmp_path)
+    bundle = source / "examples/weather"
+    assert docker_scenario.tree_digest(bundle) == _tree_digest(bundle)
+    assert docker_scenario.sha256_file(curie_bin) == _sha256(curie_bin.read_bytes())
+    before = docker_scenario.tree_digest(bundle)
+    (bundle / "curie.yaml").write_text("name: other\n")
+    assert docker_scenario.tree_digest(bundle) != before
+
+
+def test_skill_rung_tree_digest_refuses_symlinks(tmp_path: Path) -> None:
+    source, _ = _skill_source(tmp_path)
+    bundle = source / "examples/weather"
+    (bundle / "link.md").symlink_to(bundle / "curie.yaml")
+    with pytest.raises(ValueError):
+        docker_scenario.tree_digest(bundle)
+
+
+def test_skill_rung_provisions_runs_the_ladder_and_cleans_up(
+    tmp_path: Path, fake_commands: FakeCommands, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = fake_commands
+    source, curie_bin = _skill_source(tmp_path)
+    for name in CREDENTIALS:
+        monkeypatch.setenv(name, "not-a-real-credential")
+    monkeypatch.setenv("CURIE_BIN", str(tmp_path / "elsewhere" / "curie"))
+    seen: dict[str, Any] = {}
+
+    def capture(argv: list[str], env: dict[str, str] | None) -> None:
+        script = Path(argv[1])
+        repo, work = script.parents[2], script.parents[3]
+        bundle = repo / LADDER_BUNDLE
+        curie = work / "bin" / "curie"
+        seen.update(
+            work=work,
+            files={rel: (repo / rel).read_text() for rel in LADDER_FILES},
+            bundle={
+                p.relative_to(bundle).as_posix(): p.read_text()
+                for p in bundle.rglob("*")
+                if p.is_file()
+            },
+            readme=(repo / "README.md").exists(),
+            curie=curie.read_bytes(),
+            executable=os.access(curie, os.X_OK),
+            mode=curie.stat().st_mode & 0o777,
+        )
+
+    fake.hooks["ladder"] = capture
+    section = _run_skill_rung(source, curie_bin)
+
+    work = seen["work"]
+    ladder_argv, ladder_timeout, env = fake.call("ladder")
+    assert ladder_argv == ["bash", str(work / "repo" / "cli" / "scripts" / "e2e-ladder.sh")]
+    assert ladder_timeout == docker_scenario.LADDER_TIMEOUT
+    assert seen["files"] == {rel: SOURCE_FILES[rel] for rel in LADDER_FILES}
+    assert seen["bundle"] == {
+        "curie.yaml": SOURCE_FILES["examples/weather/curie.yaml"],
+        "skills/forecast/SKILL.md": SOURCE_FILES["examples/weather/skills/forecast/SKILL.md"],
+    }
+    assert seen["readme"] is False
+    assert seen["curie"] == curie_bin.read_bytes()
+    assert seen["executable"] is True and seen["mode"] == 0o755
+    assert not work.exists()
+
+    assert env is not None
+    assert env["CURIE_E2E_TIERS"] == "skill"
+    assert env["CURIE_E2E_LIVE"] == "0"
+    assert env["CURIE_BIN"] == str(work / "bin" / "curie")
+    assert env["DOCKER_PUBLISHED_HOST"] == PUBLISHED_HOST
+    assert env["DOCKER_HOST"] == DOCKER_HOST
+    assert env.get("PATH") == os.environ["PATH"]
+    for name in CREDENTIALS:
+        assert name not in env, name
+
+    build, build_timeout, _ = fake.call("build")
+    assert build == [
+        "docker", "build", "-f", str(source / "runner" / "Dockerfile"), "-t", "curie-runner",
+        "--label", f"curie.fixture.nonce={NONCE}", str(source),
+    ]  # fmt: skip
+    assert build_timeout == docker_scenario.BUILD_TIMEOUT
+    assert fake.argvs("image inspect") == [
+        [
+            "docker", "image", "inspect", "--format",
+            '{{.Id}} {{index .Config.Labels "curie.fixture.nonce"}}', "curie-runner",
+        ]
+    ]  # fmt: skip
+    assert fake.argvs("image rm") == [["docker", "image", "rm", "-f", "curie-runner"]]
+    image_ls = ["docker", "image", "ls", "-q", "curie-runner"]
+    assert fake.argvs("image ls").count(image_ls) == 2
+    assert fake.argvs("ps") == [SNAPSHOT_PS] * 3
+    assert fake.argvs("network ls") == [SNAPSHOT_NETWORKS] * 3
+    assert fake.argvs("volume ls") == [SNAPSHOT_VOLUMES] * 3
+    for removal in ("rm", "network rm", "volume rm"):
+        assert removal not in fake.keys(), removal
+    keys = fake.keys()
+    first_ls = keys.index("image ls")
+    last_ls = len(keys) - 1 - keys[::-1].index("image ls")
+    order = [
+        first_ls,
+        keys.index("build"),
+        keys.index("image inspect"),
+        keys.index("ladder"),
+        keys.index("image rm"),
+        last_ls,
+    ]
+    assert order == sorted(order), keys
+    for listing in DAEMON_KINDS_BY_KEY:
+        assert keys.index(listing) < keys.index("build"), listing
+        assert keys.index("image rm") < len(keys) - 1 - keys[::-1].index(listing), listing
+    assert "unknown" not in keys, fake.calls
+
+    assert section["docker_host"] == DOCKER_HOST
+    assert section["published_host"] == PUBLISHED_HOST
+    assert section["nonce"] == NONCE
+    assert section["info"] == COMPOSE_DAEMON
+    inputs = section["inputs"]
+    assert inputs["curie_bin"] == {
+        "sha256": _sha256(curie_bin.read_bytes()),
+        "version": "curie 0.14.1",
+    }
+    assert inputs["files"] == {rel: _sha256(SOURCE_FILES[rel].encode()) for rel in LADDER_FILES}
+    assert inputs["bundle"] == {
+        "path": "examples/weather",
+        "digest": _tree_digest(source / "examples/weather"),
+    }
+    assert inputs["source_revision"] == SOURCE_REVISION
+    image = section["image"]
+    assert image["tag"] == "curie-runner"
+    assert image["id"] == RUNNER_ID
+    assert image["label_nonce"] == NONCE
+    assert image["dockerfile"] == "runner/Dockerfile"
+    assert image["dockerfile_sha256"] == _sha256(SOURCE_FILES["runner/Dockerfile"].encode())
+    assert image["daemon_id"] == COMPOSE_DAEMON["id"]
+    assert image["exit_code"] == 0
+    ladder = section["ladder"]
+    assert ladder["tiers"] == "skill" and ladder["live"] == "0"
+    assert ladder["exit_code"] == 0 and ladder["passed"] is True
+    assert docker_scenario.LADDER_PASS in ladder["output_tail"].splitlines()
+    assert section["cleanup"] == {
+        "image_removed": True,
+        "containers": [],
+        "networks": [],
+        "volumes": [],
+        "verified": True,
+    }
+    t0, t1 = section["window"]
+    assert isinstance(t0, float) and isinstance(t1, float) and t0 <= t1
+
+
+def test_skill_rung_happy_path_judges_clean(tmp_path: Path, fake_commands: FakeCommands) -> None:
+    source, curie_bin = _skill_source(tmp_path)
+    assert docker_scenario.judge_skill_rung(_run_skill_rung(source, curie_bin)) == []
+
+
+def test_skill_rung_ladder_output_tail_keeps_the_last_4000_characters(
+    tmp_path: Path, fake_commands: FakeCommands
+) -> None:
+    source, curie_bin = _skill_source(tmp_path)
+    out = "z" * 5000 + "\n" + LADDER_PASS + "\n"
+    fake_commands.answers["ladder"] = (0, out, "")
+    ladder = _run_skill_rung(source, curie_bin)["ladder"]
+    assert ladder["output_tail"] == out[-4000:]
+    assert ladder["passed"] is True
+
+
+@pytest.mark.parametrize(
+    ("code", "out", "passed"),
+    [
+        (0, "skill tier ok\nLADDER PASS (tiers: skill)\n", True),
+        (1, "skill tier ok\nLADDER PASS (tiers: skill)\n", False),
+        (0, "skill tier ok\n", False),
+        (0, "LADDER PASS (tiers: skill, live)\n", False),
+        (0, "not yet LADDER PASS (tiers: skill)\n", False),
+        (0, "LADDER FAIL (tiers: skill)\n", False),
+    ],
+    ids=["pass", "nonzero", "no-line", "other-tiers", "embedded", "fail-line"],
+)
+def test_skill_rung_passed_needs_exit_0_and_the_exact_line(
+    tmp_path: Path, fake_commands: FakeCommands, code: int, out: str, passed: bool
+) -> None:
+    source, curie_bin = _skill_source(tmp_path)
+    fake_commands.answers["ladder"] = (code, out, "")
+    ladder = _run_skill_rung(source, curie_bin)["ladder"]
+    assert ladder["passed"] is passed
+    assert ladder["exit_code"] == code
+
+
+def _assert_skill_cleanup_ran(fake: FakeCommands) -> None:
+    keys = fake.keys()
+    rm = keys.index("image rm")
+    assert keys.index("ladder") < rm
+    after = fake.calls[rm + 1 :]
+    assert ["docker", "image", "ls", "-q", "curie-runner"] in [a for a, _, _ in after]
+    for listing in (SNAPSHOT_PS, SNAPSHOT_NETWORKS, SNAPSHOT_VOLUMES):
+        assert listing in [a for a, _, _ in after], listing
+
+
+def test_skill_rung_cleans_up_when_the_ladder_fails(
+    tmp_path: Path, fake_commands: FakeCommands
+) -> None:
+    source, curie_bin = _skill_source(tmp_path)
+    fake_commands.answers["ladder"] = (1, "", "LADDER FAIL (tiers: skill)\n")
+    try:
+        section: dict[str, Any] | None = _run_skill_rung(source, curie_bin)
+    except docker_scenario.CommandError:
+        section = None
+    _assert_skill_cleanup_ran(fake_commands)
+    if section is not None:
+        assert section["ladder"]["passed"] is False
+        reasons = docker_scenario.judge_skill_rung(section)
+        assert any(r.startswith("skill_rung_ladder_failed: ") for r in reasons), reasons
+
+
+def test_skill_rung_cleans_up_when_the_ladder_raises(
+    tmp_path: Path, fake_commands: FakeCommands
+) -> None:
+    source, curie_bin = _skill_source(tmp_path)
+    seen: list[Path] = []
+    fake_commands.hooks["ladder"] = lambda argv, env: seen.append(Path(argv[1]).parents[3])
+    fake_commands.raises["ladder"] = _Boom("ladder")
+    with pytest.raises(_Boom):
+        _run_skill_rung(source, curie_bin)
+    _assert_skill_cleanup_ran(fake_commands)
+    assert seen and not seen[0].exists()
+
+
+@pytest.mark.parametrize(
+    "answer", [(0, LISTING, ""), (1, "", "Cannot connect to the Docker daemon\n")]
+)
+def test_skill_rung_refuses_when_curie_runner_cannot_be_proven_absent(
+    tmp_path: Path, fake_commands: FakeCommands, answer: tuple[int, str, str]
+) -> None:
+    source, curie_bin = _skill_source(tmp_path)
+    fake_commands.answers["image ls"] = answer
+    with pytest.raises(docker_scenario.CommandError):
+        _run_skill_rung(source, curie_bin)
+    keys = fake_commands.keys()
+    assert "build" not in keys
+    assert "image rm" not in keys
+    assert "ladder" not in keys
+
+
+def _leave_behind(fake: FakeCommands) -> None:
+    """The ladder leaves a new container, network and volume on the daemon."""
+
+    def ladder(argv: list[str], env: dict[str, str] | None) -> None:
+        fake.add("containers", NEW_CONTAINER)
+        fake.add("networks", NEW_NETWORK)
+        fake.add("volumes", NEW_VOLUME)
+
+    fake.hooks["ladder"] = ladder
+
+
+def _with_preexisting(fake: FakeCommands) -> None:
+    fake.add("containers", PREEXISTING_CONTAINER)
+    fake.add("volumes", PREEXISTING_VOLUME)
+
+
+def test_skill_rung_removes_what_the_failed_ladder_left(
+    tmp_path: Path, fake_commands: FakeCommands
+) -> None:
+    fake = fake_commands
+    source, curie_bin = _skill_source(tmp_path)
+    _with_preexisting(fake)
+    _leave_behind(fake)
+    fake.answers["ladder"] = (1, "", "LADDER FAIL (tiers: skill)\n")
+    section = _run_skill_rung(source, curie_bin)
+
+    assert fake.argvs("rm") == [["docker", "rm", "-f", "-v", NEW_CONTAINER]]
+    assert fake.argvs("network rm") == [["docker", "network", "rm", NEW_NETWORK]]
+    assert fake.argvs("volume rm") == [["docker", "volume", "rm", "-f", NEW_VOLUME]]
+    preexisting = {PREEXISTING_CONTAINER, PREEXISTING_VOLUME, *DEFAULT_NETWORKS}
+    for key in ("rm", "network rm", "volume rm"):
+        for argv in fake.argvs(key):
+            assert not preexisting & set(argv), argv
+    assert fake.daemon["containers"] == [PREEXISTING_CONTAINER]
+    assert fake.daemon["networks"] == DEFAULT_NETWORKS
+    assert fake.daemon["volumes"] == [PREEXISTING_VOLUME]
+
+    keys = fake.keys()
+    for listing in DAEMON_KINDS_BY_KEY:
+        assert keys.index(listing) < keys.index("build"), listing
+    last_rm = max(keys.index(k) for k in ("rm", "network rm", "volume rm"))
+    assert keys.index("ladder") < min(keys.index(k) for k in ("rm", "network rm", "volume rm"))
+    assert last_rm < keys.index("image rm")
+    for listing in DAEMON_KINDS_BY_KEY:
+        assert keys.index("image rm") < len(keys) - 1 - keys[::-1].index(listing), listing
+        assert keys.count(listing) == 3, (listing, keys)
+    assert section["cleanup"] == {
+        "image_removed": True,
+        "containers": [],
+        "networks": [],
+        "volumes": [],
+        "verified": True,
+    }
+    reasons = docker_scenario.judge_skill_rung(section)
+    assert _reasons_with(reasons, "skill_rung_ladder_failed"), reasons
+    assert not _reasons_with(reasons, "incomplete_cleanup"), reasons
+
+
+@pytest.mark.parametrize(
+    ("kind", "ident"),
+    [("containers", NEW_CONTAINER), ("networks", NEW_NETWORK), ("volumes", NEW_VOLUME)],
+)
+def test_skill_rung_removal_that_leaves_one_behind_is_not_verified(
+    tmp_path: Path, fake_commands: FakeCommands, kind: str, ident: str
+) -> None:
+    source, curie_bin = _skill_source(tmp_path)
+    _with_preexisting(fake_commands)
+    _leave_behind(fake_commands)
+    fake_commands.sticky.add(ident)
+    section = _run_skill_rung(source, curie_bin)
+    cleanup = section["cleanup"]
+    assert cleanup[kind] == [ident]
+    assert [cleanup[k] for k in ("containers", "networks", "volumes") if k != kind] == [[], []]
+    assert cleanup["verified"] is False
+    for preexisting in (PREEXISTING_CONTAINER, PREEXISTING_VOLUME, *DEFAULT_NETWORKS):
+        assert preexisting not in cleanup[kind]
+    reasons = _reasons_with(docker_scenario.judge_skill_rung(section), "incomplete_cleanup")
+    assert any(kind in r and ident in r for r in reasons), reasons
+
+
+def test_skill_rung_never_removes_snapshot_objects(
+    tmp_path: Path, fake_commands: FakeCommands
+) -> None:
+    source, curie_bin = _skill_source(tmp_path)
+    _with_preexisting(fake_commands)
+    section = _run_skill_rung(source, curie_bin)
+    keys = fake_commands.keys()
+    for removal in ("rm", "network rm", "volume rm"):
+        assert removal not in keys, removal
+    assert section["cleanup"]["verified"] is True
+    assert docker_scenario.judge_skill_rung(section) == []
+
+
+@pytest.mark.parametrize("key", list(DAEMON_KINDS_BY_KEY))
+def test_skill_rung_failed_snapshot_listing_builds_nothing(
+    tmp_path: Path, fake_commands: FakeCommands, key: str
+) -> None:
+    source, curie_bin = _skill_source(tmp_path)
+    fake_commands.answers[key] = (1, "", "Cannot connect to the Docker daemon\n")
+    with pytest.raises(docker_scenario.CommandError):
+        _run_skill_rung(source, curie_bin)
+    keys = fake_commands.keys()
+    assert "build" not in keys
+    assert "ladder" not in keys
+    assert "image rm" not in keys
+
+
+@pytest.mark.parametrize("key", list(DAEMON_KINDS_BY_KEY))
+def test_skill_rung_failed_final_listing_is_not_verified(
+    tmp_path: Path, fake_commands: FakeCommands, key: str
+) -> None:
+    source, curie_bin = _skill_source(tmp_path)
+
+    def fail_later(argv: list[str], env: dict[str, str] | None) -> None:
+        fake_commands.answers[key] = (1, "", "Cannot connect to the Docker daemon\n")
+
+    fake_commands.hooks["ladder"] = fail_later
+    section = _run_skill_rung(source, curie_bin)
+    assert section["cleanup"]["verified"] is False
+
+
+def test_skill_rung_reason_names_leftover_networks(skill_section: dict[str, Any]) -> None:
+    skill_section["cleanup"]["networks"] = [NEW_NETWORK]
+    reasons = _reasons_with(docker_scenario.judge_skill_rung(skill_section), "incomplete_cleanup")
+    assert any(r.startswith("incomplete_cleanup: skill rung left networks") for r in reasons), (
+        reasons
+    )
+
+
+# docker env: DOCKER_CONTEXT and BUILDX_BUILDER never reach the collectors' commands
+
+
+def test_compose_and_skill_rung_docker_env_drops_context_and_builder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DOCKER_CONTEXT", "elsewhere")
+    monkeypatch.setenv("BUILDX_BUILDER", "remote-builder")
+    monkeypatch.setenv("DOCKER_HOST", DOCKER_HOST)
+    env = docker_scenario._docker_env()
+    assert "DOCKER_CONTEXT" not in env and "BUILDX_BUILDER" not in env
+    assert env["DOCKER_HOST"] == DOCKER_HOST
+    assert env == {
+        k: v for k, v in os.environ.items() if k not in ("DOCKER_CONTEXT", "BUILDX_BUILDER")
+    }
+    env["DOCKER_HOST"] = "tcp://changed:2375"
+    assert os.environ["DOCKER_HOST"] == DOCKER_HOST
+    assert os.environ["DOCKER_CONTEXT"] == "elsewhere"
+
+
+@pytest.mark.parametrize("collector", ["compose", "skill_rung"])
+def test_compose_and_skill_rung_commands_never_see_context_or_builder(
+    tmp_path: Path, fake_commands: FakeCommands, monkeypatch: pytest.MonkeyPatch, collector: str
+) -> None:
+    monkeypatch.setenv("DOCKER_CONTEXT", "elsewhere")
+    monkeypatch.setenv("BUILDX_BUILDER", "remote-builder")
+    if collector == "compose":
+        _run_compose()
+    else:
+        source, curie_bin = _skill_source(tmp_path)
+        _leave_behind(fake_commands)
+        _run_skill_rung(source, curie_bin)
+    assert fake_commands.calls
+    for argv, _, env in fake_commands.calls:
+        assert env is not None, argv
+        assert "DOCKER_CONTEXT" not in env and "BUILDX_BUILDER" not in env, argv
+        assert env.get("DOCKER_HOST") == DOCKER_HOST, argv
+    if collector == "skill_rung":
+        ladder_env = fake_commands.call("ladder")[2]
+        assert ladder_env is not None
+        assert ladder_env["CURIE_E2E_TIERS"] == "skill"
+        assert ladder_env["CURIE_E2E_LIVE"] == "0"
+
+
+def test_skill_rung_image_still_present_after_removal_is_not_verified(
+    tmp_path: Path, fake_commands: FakeCommands
+) -> None:
+    source, curie_bin = _skill_source(tmp_path)
+
+    def present_after_rm(argv: list[str], env: dict[str, str] | None) -> None:
+        fake_commands.answers["image ls"] = (0, LISTING, "")
+
+    fake_commands.hooks["image rm"] = present_after_rm
+    section = _run_skill_rung(source, curie_bin)
+    assert section["cleanup"]["verified"] is False
+
+
+def _drop(rel: str) -> Callable[[Path, Path], None]:
+    def mutate(source: Path, curie_bin: Path) -> None:
+        path = source / rel
+        if path.is_dir():
+            for child in sorted(path.rglob("*"), reverse=True):
+                child.unlink() if child.is_file() else child.rmdir()
+            path.rmdir()
+        else:
+            path.unlink()
+
+    return mutate
+
+
+SKILL_INPUT_GAPS: list[tuple[str, Callable[[Path, Path], None]]] = [
+    ("curie-bin-absent", lambda source, curie_bin: curie_bin.unlink()),
+    ("curie-bin-not-executable", lambda source, curie_bin: curie_bin.chmod(0o644)),
+    *[(f"missing-{rel}", _drop(rel)) for rel in LADDER_FILES],
+    ("missing-bundle", _drop("examples/weather")),
+    ("missing-dockerfile", _drop("runner/Dockerfile")),
+]
+
+
+@pytest.mark.parametrize(
+    "mutate", [m for _, m in SKILL_INPUT_GAPS], ids=[i for i, _ in SKILL_INPUT_GAPS]
+)
+def test_skill_rung_refuses_missing_inputs_before_any_command(
+    tmp_path: Path, fake_commands: FakeCommands, mutate: Callable[[Path, Path], None]
+) -> None:
+    source, curie_bin = _skill_source(tmp_path)
+    mutate(source, curie_bin)
+    with pytest.raises(docker_scenario.CommandError):
+        _run_skill_rung(source, curie_bin)
+    assert fake_commands.calls == []
+
+
+def test_skill_rung_refuses_a_directory_as_curie_bin(
+    tmp_path: Path, fake_commands: FakeCommands
+) -> None:
+    source, curie_bin = _skill_source(tmp_path)
+    with pytest.raises(docker_scenario.CommandError):
+        _run_skill_rung(source, curie_bin.parent)
+    assert fake_commands.calls == []
+
+
+def test_skill_rung_requires_a_published_host(tmp_path: Path, fake_commands: FakeCommands) -> None:
+    source, curie_bin = _skill_source(tmp_path)
+    with pytest.raises(docker_scenario.CommandError):
+        _run_skill_rung(source, curie_bin, "")
+    assert fake_commands.calls == []
+
+
+@pytest.mark.parametrize("value", [None, ""], ids=["unset", "empty"])
+@pytest.mark.parametrize("collector", ["compose", "skill_rung"])
+def test_compose_and_skill_rung_require_docker_host(
+    tmp_path: Path,
+    fake_commands: FakeCommands,
+    monkeypatch: pytest.MonkeyPatch,
+    collector: str,
+    value: str | None,
+) -> None:
+    if value is None:
+        monkeypatch.delenv("DOCKER_HOST", raising=False)
+    else:
+        monkeypatch.setenv("DOCKER_HOST", value)
+    source, curie_bin = _skill_source(tmp_path)
+    with pytest.raises(docker_scenario.CommandError):
+        if collector == "compose":
+            _run_compose()
+        else:
+            _run_skill_rung(source, curie_bin)
+    assert fake_commands.calls == []
+
+
+# recorded sections (fixtures/docker-scenario, recorded by the docker scenario driver)
+
+
+def _recorded(name: str) -> dict[str, Any]:
+    section = json.loads((FIXTURES / name).read_text())
+    assert isinstance(section, dict), name
+    return section
+
+
+@pytest.fixture
+def compose_section() -> dict[str, Any]:
+    return _recorded("compose-passing.json")
+
+
+@pytest.fixture
+def skill_section() -> dict[str, Any]:
+    return _recorded("skill-rung-passing.json")
+
+
+def _reasons_with(reasons: list[str], prefix: str) -> list[str]:
+    return [r for r in reasons if r.startswith(f"{prefix}: ")]
+
+
+def test_recorded_compose_passing_judges_clean(compose_section: dict[str, Any]) -> None:
+    assert docker_scenario.judge_compose(compose_section) == []
+
+
+def test_recorded_compose_failing_is_an_unreachable_published_port(
+    compose_section: dict[str, Any],
+) -> None:
+    failing = _recorded("compose-failing.json")
+    reasons = docker_scenario.judge_compose(failing)
+    assert _reasons_with(reasons, "compose_published_port_unreachable"), reasons
+    assert failing["published_host"] != compose_section["published_host"]
+    assert failing["published"]["status"] != 200
+    assert failing["reach"]["exit_code"] == 0
+    assert failing["cleanup"]["verified"] is True
+
+
+def test_recorded_skill_rung_passing_judges_clean(skill_section: dict[str, Any]) -> None:
+    assert docker_scenario.judge_skill_rung(skill_section) == []
+
+
+def test_recorded_skill_rung_failing_is_a_failed_ladder() -> None:
+    failing = _recorded("skill-rung-failing.json")
+    reasons = docker_scenario.judge_skill_rung(failing)
+    assert _reasons_with(reasons, "skill_rung_ladder_failed"), reasons
+    assert failing["ladder"]["exit_code"] != 0
+    assert failing["ladder"]["passed"] is False
+    assert failing["cleanup"]["verified"] is True
+
+
+def test_recorded_compose_passing_shapes(compose_section: dict[str, Any]) -> None:
+    section = compose_section
+    expected = section["expected"]
+    assert re.fullmatch(r"curie-compose [0-9a-f]+", expected), expected
+    assert expected.split()[1] in section["project"]
+    assert expected in section["reach"]["body"]
+    assert expected in section["published"]["body"]
+    assert section["reach"]["from"] == "client" and section["reach"]["to"] == "server:8080"
+    port = section["published"]["port"]
+    assert isinstance(port, int) and 1 <= port <= 65535
+    assert section["published"]["url"] == (f"http://{section['published_host']}:{port}/index.html")
+    assert section["published"]["status"] == 200
+    assert sorted(s["service"] for s in section["services"]) == ["client", "server"]
+    assert section["info"]["id"] and section["info"]["name"]
+    assert set(section["files"]) == set(COMPOSE_FILES)
+    assert all(HEX64.fullmatch(d) for d in section["files"].values())
+    assert section["cleanup"]["verified"] is True
+
+
+def test_recorded_skill_rung_passing_shapes(skill_section: dict[str, Any]) -> None:
+    section = skill_section
+    assert docker_scenario.LADDER_PASS in section["ladder"]["output_tail"].splitlines()
+    assert section["ladder"]["exit_code"] == 0 and section["ladder"]["passed"] is True
+    assert section["ladder"]["tiers"] == "skill" and section["ladder"]["live"] == "0"
+    image = section["image"]
+    assert re.fullmatch(r"sha256:[0-9a-f]{64}", image["id"]), image["id"]
+    assert image["tag"] == "curie-runner"
+    assert image["label_nonce"] == section["nonce"]
+    assert image["daemon_id"] == section["info"]["id"]
+    inputs = section["inputs"]
+    assert inputs["bundle"]["path"] == "examples/weather"
+    assert set(inputs["files"]) == set(LADDER_FILES)
+    assert inputs["curie_bin"]["version"]
+    assert re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", inputs["source_revision"])
+    assert section["cleanup"]["image_removed"] is True
+    assert section["cleanup"]["networks"] == []
+    assert section["cleanup"]["verified"] is True
+
+
+def test_recorded_passing_envelope_embeds_the_recorded_sections(
+    envelope: dict[str, Any], compose_section: dict[str, Any], skill_section: dict[str, Any]
+) -> None:
+    identity = envelope["runs"]["a"]["daemon"]["info"]
+    compose = copy.deepcopy(compose_section)
+    compose["info"] = dict(identity)
+    skill = copy.deepcopy(skill_section)
+    skill["info"] = dict(identity)
+    skill["image"]["daemon_id"] = identity["id"]
+    assert envelope["compose"] == compose
+    assert envelope["skill_rung"] == skill
+
+
+# compose and skill_rung judges: one mutation per reason and per required observation
+
+
+def _delete(path: tuple[Any, ...]) -> Callable[[dict[str, Any]], None]:
+    def mutate(section: dict[str, Any]) -> None:
+        node = section
+        for key in path[:-1]:
+            node = node[key]
+        del node[path[-1]]
+
+    return mutate
+
+
+def _service(section: dict[str, Any], name: str) -> dict[str, Any]:
+    return next(s for s in section["services"] if s["service"] == name)
+
+
+def _drop_service(name: str) -> Callable[[dict[str, Any]], None]:
+    def mutate(section: dict[str, Any]) -> None:
+        section["services"] = [s for s in section["services"] if s["service"] != name]
+
+    return mutate
+
+
+def _upper_digest(section: dict[str, Any]) -> None:
+    section["files"]["compose.yaml"] = "ABCDEF" + section["files"]["compose.yaml"][6:]
+
+
+def _other_url_host(section: dict[str, Any]) -> None:
+    port = section["published"]["port"]
+    section["published"]["url"] = f"http://198.51.100.7:{port}/index.html"
+
+
+Mutation = tuple[str, str, Callable[[dict[str, Any]], None]]
+
+COMPOSE_MUTATIONS: list[Mutation] = [
+    *[
+        (f"blank-{field}", "missing_observation", _set((field,), ""))
+        for field in ("docker_host", "published_host", "project")
+    ],
+    *[
+        (f"absent-{field}", "missing_observation", _delete((field,)))
+        for field in ("docker_host", "published_host", "project", "window", "info")
+    ],
+    ("blank-info-id", "missing_observation", _set(("info", "id"), "")),
+    ("blank-info-name", "missing_observation", _set(("info", "name"), "")),
+    ("absent-info-id", "missing_observation", _delete(("info", "id"))),
+    ("window-reversed", "missing_observation", _set(("window",), [20.0, 10.0])),
+    ("window-nan", "missing_observation", _set(("window",), [float("nan"), 1.0])),
+    *[
+        (f"digest-not-hex-{rel}", "missing_observation", _set(("files", rel), "x"))
+        for rel in COMPOSE_FILES
+    ],
+    *[
+        (f"digest-absent-{rel}", "missing_observation", _delete(("files", rel)))
+        for rel in COMPOSE_FILES
+    ],
+    ("digest-uppercase", "missing_observation", _upper_digest),
+    ("build-failed", "compose_build_failed", _set(("build", "exit_code"), 1)),
+    ("up-failed", "compose_up_failed", _set(("up", "exit_code"), 1)),
+    (
+        "server-exited",
+        "compose_service_not_running",
+        lambda s: _service(s, "server").update(state="exited"),
+    ),
+    ("client-absent", "compose_service_not_running", _drop_service("client")),
+    (
+        "server-twice",
+        "compose_service_not_running",
+        lambda s: s["services"].append(copy.deepcopy(_service(s, "server"))),
+    ),
+    ("reach-exit", "compose_service_unreachable", _set(("reach", "exit_code"), 1)),
+    ("reach-no-marker", "compose_service_unreachable", _set(("reach", "body"), "")),
+    *[
+        (
+            f"port-{value!r}",
+            "compose_published_port_unreachable",
+            _set(("published", "port"), value),
+        )
+        for value in (None, 0, 65536, "32768", True)
+    ],
+    ("status-502", "compose_published_port_unreachable", _set(("published", "status"), 502)),
+    ("status-none", "compose_published_port_unreachable", _set(("published", "status"), None)),
+    ("published-no-marker", "compose_published_port_unreachable", _set(("published", "body"), "")),
+    ("url-other-host", "compose_published_port_unreachable", _other_url_host),
+    ("down-failed", "compose_down_failed", _set(("down", "exit_code"), 1)),
+    *[
+        (f"left-{kind}", "incomplete_cleanup", _set(("cleanup", kind), [LISTING.strip()]))
+        for kind, _ in COMPOSE_KINDS
+    ],
+    ("cleanup-unverified", "incomplete_cleanup", _set(("cleanup", "verified"), False)),
+    ("cleanup-verified-text", "incomplete_cleanup", _set(("cleanup", "verified"), "true")),
+]
+
+
+def _bad_daemon(section: dict[str, Any]) -> None:
+    section["image"]["daemon_id"] = "00000000-0000-4000-8000-000000000000"
+
+
+SKILL_RUNG_MUTATIONS: list[Mutation] = [
+    *[
+        (f"blank-{field}", "missing_observation", _set((field,), ""))
+        for field in ("docker_host", "published_host")
+    ],
+    *[
+        (f"absent-{field}", "missing_observation", _delete((field,)))
+        for field in ("docker_host", "published_host", "info", "window")
+    ],
+    ("blank-info-id", "missing_observation", _set(("info", "id"), "")),
+    ("window-reversed", "missing_observation", _set(("window",), [20.0, 10.0])),
+    ("curie-bin-sha-blank", "missing_observation", _set(("inputs", "curie_bin", "sha256"), "")),
+    ("curie-bin-sha-not-hex", "missing_observation", _set(("inputs", "curie_bin", "sha256"), "x")),
+    ("curie-bin-absent", "missing_observation", _delete(("inputs", "curie_bin"))),
+    ("version-blank", "missing_observation", _set(("inputs", "curie_bin", "version"), "")),
+    ("version-absent", "missing_observation", _delete(("inputs", "curie_bin", "version"))),
+    *[
+        (f"digest-not-hex-{rel}", "missing_observation", _set(("inputs", "files", rel), "x"))
+        for rel in LADDER_FILES
+    ],
+    *[
+        (f"digest-absent-{rel}", "missing_observation", _delete(("inputs", "files", rel)))
+        for rel in LADDER_FILES
+    ],
+    (
+        "bundle-other-path",
+        "missing_observation",
+        _set(("inputs", "bundle", "path"), "examples/other"),
+    ),
+    ("bundle-digest-not-hex", "missing_observation", _set(("inputs", "bundle", "digest"), "x")),
+    ("bundle-absent", "missing_observation", _delete(("inputs", "bundle"))),
+    ("revision-short", "missing_observation", _set(("inputs", "source_revision"), "4f1c2b9")),
+    ("revision-absent", "missing_observation", _delete(("inputs", "source_revision"))),
+    ("image-exit", "skill_rung_image_not_built", _set(("image", "exit_code"), 1)),
+    ("image-tag", "skill_rung_image_not_built", _set(("image", "tag"), "curie-runner:other")),
+    ("image-id-blank", "skill_rung_image_not_built", _set(("image", "id"), "")),
+    ("image-id-short", "skill_rung_image_not_built", _set(("image", "id"), "sha256:3b9f")),
+    ("image-id-bare", "skill_rung_image_not_built", _set(("image", "id"), RUNNER_ID[7:])),
+    ("image-dockerfile", "skill_rung_image_not_built", _set(("image", "dockerfile"), "Dockerfile")),
+    (
+        "image-dockerfile-sha",
+        "skill_rung_image_not_built",
+        _set(("image", "dockerfile_sha256"), "x"),
+    ),
+    ("image-label-nonce", "skill_rung_image_not_built", _set(("image", "label_nonce"), "ffffffff")),
+    ("image-daemon-id", "skill_rung_image_not_built", _bad_daemon),
+    ("tiers-all", "skill_rung_wrong_mode", _set(("ladder", "tiers"), "skill,local")),
+    ("live-1", "skill_rung_wrong_mode", _set(("ladder", "live"), "1")),
+    ("live-int", "skill_rung_wrong_mode", _set(("ladder", "live"), 0)),
+    ("ladder-exit", "skill_rung_ladder_failed", _set(("ladder", "exit_code"), 1)),
+    ("ladder-not-passed", "skill_rung_ladder_failed", _set(("ladder", "passed"), False)),
+    ("ladder-passed-text", "skill_rung_ladder_failed", _set(("ladder", "passed"), "true")),
+    ("image-not-removed", "incomplete_cleanup", _set(("cleanup", "image_removed"), False)),
+    ("left-containers", "incomplete_cleanup", _set(("cleanup", "containers"), ["4c1d9e2f7a3b"])),
+    ("left-volumes", "incomplete_cleanup", _set(("cleanup", "volumes"), ["curie-volume"])),
+    ("left-networks", "incomplete_cleanup", _set(("cleanup", "networks"), [NEW_NETWORK])),
+    ("cleanup-networks-absent", "missing_observation", _delete(("cleanup", "networks"))),
+    ("cleanup-networks-text", "missing_observation", _set(("cleanup", "networks"), "none")),
+    ("cleanup-networks-null", "missing_observation", _set(("cleanup", "networks"), None)),
+    ("cleanup-unverified", "incomplete_cleanup", _set(("cleanup", "verified"), False)),
+]
+
+
+def _assert_section_prefix(
+    judge: Callable[[Any], list[str]], section: Any, prefix: str, where: str
+) -> list[str]:
+    reasons = judge(section)
+    assert isinstance(reasons, list) and all(isinstance(r, str) for r in reasons), reasons
+    found = _reasons_with(reasons, prefix)
+    if prefix == "missing_observation":
+        found = [r for r in found if r.startswith(f"missing_observation: {where}")]
+    assert found, (prefix, reasons)
+    return reasons
+
+
+@pytest.mark.parametrize(
+    ("prefix", "mutate"),
+    [(p, m) for _, p, m in COMPOSE_MUTATIONS],
+    ids=[i for i, _, _ in COMPOSE_MUTATIONS],
+)
+def test_compose_mutation_fails_with_reason(
+    compose_section: dict[str, Any], prefix: str, mutate: Callable[[dict[str, Any]], None]
+) -> None:
+    mutate(compose_section)
+    _assert_section_prefix(docker_scenario.judge_compose, compose_section, prefix, "compose")
+
+
+@pytest.mark.parametrize(
+    ("prefix", "mutate"),
+    [(p, m) for _, p, m in SKILL_RUNG_MUTATIONS],
+    ids=[i for i, _, _ in SKILL_RUNG_MUTATIONS],
+)
+def test_skill_rung_mutation_fails_with_reason(
+    skill_section: dict[str, Any], prefix: str, mutate: Callable[[dict[str, Any]], None]
+) -> None:
+    mutate(skill_section)
+    _assert_section_prefix(docker_scenario.judge_skill_rung, skill_section, prefix, "skill_rung")
+
+
+def test_compose_and_skill_rung_every_prefix_has_a_mutation() -> None:
+    assert {p for _, p, _ in COMPOSE_MUTATIONS} == {
+        "missing_observation", "compose_build_failed", "compose_up_failed",
+        "compose_service_not_running", "compose_service_unreachable",
+        "compose_published_port_unreachable", "compose_down_failed", "incomplete_cleanup",
+    }  # fmt: skip
+    assert {p for _, p, _ in SKILL_RUNG_MUTATIONS} == {
+        "missing_observation", "skill_rung_image_not_built", "skill_rung_wrong_mode",
+        "skill_rung_ladder_failed", "incomplete_cleanup",
+    }  # fmt: skip
+
+
+def test_compose_and_skill_rung_reasons_reach_the_envelope_judge(
+    envelope: dict[str, Any],
+) -> None:
+    envelope["compose"]["build"]["exit_code"] = 1
+    envelope["skill_rung"]["ladder"]["exit_code"] = 1
+    reasons = _assert_prefix(envelope, "compose_build_failed")
+    assert _reasons_with(reasons, "skill_rung_ladder_failed"), reasons
+
+
+def _paths(node: Any, prefix: tuple[Any, ...] = ()) -> Iterator[tuple[Any, ...]]:
+    """Every key path into the section, dict keys and the first element of each list."""
+
+    if isinstance(node, dict):
+        for key, value in node.items():
+            yield (*prefix, key)
+            yield from _paths(value, (*prefix, key))
+    elif isinstance(node, list) and node:
+        yield (*prefix, 0)
+        yield from _paths(node[0], (*prefix, 0))
+
+
+GARBAGE: list[Any] = [None, [], "x", 3]
+
+
+@pytest.mark.parametrize("garbage", GARBAGE, ids=repr)
+@pytest.mark.parametrize(
+    ("judge", "name"),
+    [
+        (lambda s: docker_scenario.judge_compose(s), "compose-passing.json"),
+        (lambda s: docker_scenario.judge_skill_rung(s), "skill-rung-passing.json"),
+    ],
+    ids=["compose", "skill_rung"],
+)
+def test_compose_and_skill_rung_garbage_never_raises(
+    judge: Callable[[Any], list[str]], name: str, garbage: Any
+) -> None:
+    reasons = judge(garbage)
+    assert reasons and all(isinstance(r, str) for r in reasons), reasons
+    passing = _recorded(name)
+    for path in _paths(passing):
+        section = copy.deepcopy(passing)
+        _set(path, garbage)(section)
+        reasons = judge(section)
+        assert isinstance(reasons, list) and all(isinstance(r, str) for r in reasons), path
+
+
+# envelope integration
+
+
+IMPOSTOR = "00000000-0000-4000-8000-000000000000"
+
+
+def _set_daemon(envelope: dict[str, Any], section: str, daemon_id: str) -> None:
+    envelope[section]["info"]["id"] = daemon_id
+    if section == "skill_rung":
+        envelope[section]["image"]["daemon_id"] = daemon_id
+
+
+@pytest.mark.parametrize("section", ["compose", "skill_rung"])
+def test_compose_and_skill_rung_daemon_must_be_a_runs_daemon(
+    envelope: dict[str, Any], section: str
+) -> None:
+    _set_daemon(envelope, section, IMPOSTOR)
+    reasons = _assert_prefix(envelope, "identity_mismatch")
+    assert any(section in r and IMPOSTOR in r for r in _reasons_with(reasons, "identity_mismatch"))
+
+
+@pytest.mark.parametrize("section", ["compose", "skill_rung"])
+def test_compose_and_skill_rung_on_run_b_daemon_pass(
+    envelope: dict[str, Any], section: str
+) -> None:
+    _set_daemon(envelope, section, envelope["runs"]["b"]["daemon"]["info"]["id"])
+    assert docker_scenario.judge(envelope) == []
+
+
+def test_assemble_embeds_compose_and_skill_rung_verbatim(
+    envelope: dict[str, Any], lifecycle: dict[str, Any]
+) -> None:
+    compose = {"project": "sentinel-compose"}
+    skill = {"nonce": "sentinel-skill"}
+    assembled = docker_scenario.assemble(
+        NONCE, envelope["runs"], lifecycle, envelope["upgrade"], envelope["ci"], compose, skill
+    )
+    assert assembled["compose"] == compose
+    assert assembled["skill_rung"] == skill
+
+
+def test_cli_assemble_embeds_compose_and_skill_rung(
+    tmp_path: Path, envelope: dict[str, Any]
+) -> None:
+    files = {}
+    for name, value in (
+        ("probe-a", envelope["runs"]["a"]["probe"]),
+        ("daemon-a", envelope["runs"]["a"]["daemon"]),
+        ("probe-b", envelope["runs"]["b"]["probe"]),
+        ("daemon-b", envelope["runs"]["b"]["daemon"]),
+        ("upgrade", envelope["upgrade"]),
+        ("ci", envelope["ci"]),
+        ("compose", envelope["compose"]),
+        ("skill-rung", envelope["skill_rung"]),
+    ):
+        files[name] = tmp_path / f"{name}.json"
+        files[name].write_text(json.dumps(value))
+    out = tmp_path / "envelope.json"
+    args = [
+        str(SCRIPT), "assemble", "--nonce", NONCE,
+        "--run", f"a={files['probe-a']},{files['daemon-a']}",
+        "--run", f"b={files['probe-b']},{files['daemon-b']}",
+        "--claim", f"a={envelope['runs']['a']['claim']}",
+        "--claim", f"b={envelope['runs']['b']['claim']}",
+        "--lifecycle", str(LIFECYCLE), "--upgrade", str(files["upgrade"]),
+        "--ci", str(files["ci"]), "--out", str(out),
+    ]  # fmt: skip
+    for missing in ("--compose", "--skill-rung"):
+        given = {"--compose": files["compose"], "--skill-rung": files["skill-rung"]}
+        del given[missing]
+        extra = [part for flag, path in given.items() for part in (flag, str(path))]
+        result = _run(*args, *extra)
+        assert result.returncode == 2, result.stderr
+        assert missing in result.stderr
+    done = _run(*args, "--compose", str(files["compose"]), "--skill-rung", str(files["skill-rung"]))
+    assert done.returncode == 0, done.stderr
+    assert json.loads(out.read_text()) == envelope
+
+
+def test_help_names_compose_skill_rung_and_the_docker_scenario_driver() -> None:
+    result = _run(str(SCRIPT), "--help")
+    assert result.returncode == 0, result.stderr
+    text = " ".join(result.stdout.split())
+    for word in ("compose", "skill_rung", "skill-rung", "docker scenario driver", "w2 waypoint"):
+        assert word in text, word
+    for command in ("compose", "skill-rung"):
+        sub = _run(str(SCRIPT), command, "--help")
+        assert sub.returncode == 0, sub.stderr
+
+
+def test_cli_compose_writes_the_section_with_the_env_published_host(
+    tmp_path: Path, fake_commands: FakeCommands, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("DOCKER_PUBLISHED_HOST", PUBLISHED_HOST)
+    out = tmp_path / "compose.json"
+    code = docker_scenario.main(
+        ["compose", "--nonce", NONCE, "--image", COMPOSE_IMAGE, "--out", str(out)]
+    )
+    assert code == 0
+    section = json.loads(out.read_text())
+    assert section["published_host"] == PUBLISHED_HOST
+    assert docker_scenario.judge_compose(section) == []
+
+
+def test_cli_compose_exits_1_after_writing_when_cleanup_is_not_verified(
+    tmp_path: Path, fake_commands: FakeCommands
+) -> None:
+    fake_commands.answers["volume ls"] = (0, LISTING, "")
+    out = tmp_path / "compose.json"
+    code = docker_scenario.main(
+        [
+            "compose", "--nonce", NONCE, "--image", COMPOSE_IMAGE,
+            "--published-host", PUBLISHED_HOST, "--out", str(out),
+        ]
+    )  # fmt: skip
+    assert code == 1
+    assert json.loads(out.read_text())["cleanup"]["verified"] is False
+
+
+def _skill_rung_args(source: Path, out: Path) -> list[str]:
+    return [
+        "skill-rung", "--nonce", NONCE, "--source", str(source),
+        "--source-revision", SOURCE_REVISION, "--published-host", PUBLISHED_HOST,
+        "--out", str(out),
+    ]  # fmt: skip
+
+
+def test_cli_skill_rung_curie_bin_defaults_to_env(
+    tmp_path: Path, fake_commands: FakeCommands, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, curie_bin = _skill_source(tmp_path)
+    monkeypatch.setenv("CURIE_BIN", str(curie_bin))
+    provisioned: list[bytes] = []
+    fake_commands.hooks["ladder"] = lambda argv, env: provisioned.append(
+        Path((env or {})["CURIE_BIN"]).read_bytes()
+    )
+    out = tmp_path / "skill-rung.json"
+    assert docker_scenario.main(_skill_rung_args(source, out)) == 0
+    section = json.loads(out.read_text())
+    assert section["inputs"]["curie_bin"]["sha256"] == _sha256(curie_bin.read_bytes())
+    assert provisioned == [curie_bin.read_bytes()]
+    assert docker_scenario.judge_skill_rung(section) == []
+
+
+def test_cli_skill_rung_exits_1_after_writing_when_cleanup_is_not_verified(
+    tmp_path: Path, fake_commands: FakeCommands
+) -> None:
+    source, curie_bin = _skill_source(tmp_path)
+    _leave_behind(fake_commands)
+    fake_commands.sticky.add(NEW_CONTAINER)
+    out = tmp_path / "skill-rung.json"
+    code = docker_scenario.main([*_skill_rung_args(source, out), "--curie-bin", str(curie_bin)])
+    assert code == 1
+    assert json.loads(out.read_text())["cleanup"]["verified"] is False
+
+
+# review round 2: ladder env and process-group timeouts
+
+
+def test_skill_rung_ladder_env_carries_only_its_own_curie_e2e_keys(
+    tmp_path: Path, fake_commands: FakeCommands, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inherited = {
+        "CURIE_E2E_IMAGE": "ghcr.io/example/other-runner:dev",
+        "CURIE_E2E_PORT": "18080",
+        "CURIE_E2E_NETWORK": "other-net",
+        "CURIE_E2E_BUNDLE": "examples/other",
+        "CURIE_E2E_CONNECTOR_BUNDLE": "examples/connector",
+        "CURIE_E2E_HOOK_APPROVAL": "1",
+        "CURIE_E2E_TIERS": "skill,local",
+        "CURIE_E2E_LIVE": "1",
+    }
+    for name, value in inherited.items():
+        monkeypatch.setenv(name, value)
+    source, curie_bin = _skill_source(tmp_path)
+    _run_skill_rung(source, curie_bin)
+    env = fake_commands.call("ladder")[2]
+    assert env is not None
+    assert {k: v for k, v in env.items() if k.startswith("CURIE_E2E_")} == {
+        "CURIE_E2E_TIERS": "skill",
+        "CURIE_E2E_LIVE": "0",
+        "CURIE_E2E_IMAGE": "curie-runner",
+    }
+
+
+def _gone(pid: int) -> bool:
+    """True once pid no longer exists or is a zombie awaiting its reaper."""
+
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    try:
+        state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+    except (OSError, IndexError):
+        return True
+    return state == "Z"
+
+
+def test_skill_rung_command_timeout_kills_the_process_group(tmp_path: Path) -> None:
+    pid_file = tmp_path / "pid"
+    started = time.monotonic()
+    code, _, err = docker_scenario._command(
+        ["bash", "-c", f"sleep 30 >/dev/null 2>&1 & echo $! > {pid_file}; wait"], timeout=1
+    )
+    assert code == 124, err
+    pid = int(pid_file.read_text().strip())
+    deadline = time.monotonic() + 2
+    while not _gone(pid) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    try:
+        assert _gone(pid), f"background sleep {pid} outlived the timed-out command"
+    finally:
+        if not _gone(pid):
+            os.kill(pid, 9)
+    assert time.monotonic() - started < 5
+
+
+def test_skill_rung_command_within_timeout_keeps_code_and_output() -> None:
+    code, out, err = docker_scenario._command(
+        ["bash", "-c", "echo out; echo err >&2; exit 3"], timeout=10
+    )
+    assert (code, out, err) == (3, "out\n", "err\n")
+
+
+def test_skill_rung_command_missing_binary_is_127() -> None:
+    code, out, _ = docker_scenario._command(["curie-no-such-binary-for-tests"], timeout=5)
+    assert (code, out) == (127, "")

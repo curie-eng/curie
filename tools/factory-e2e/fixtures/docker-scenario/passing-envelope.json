@@ -1382,5 +1382,120 @@
   "lifecycle": {
     "schema": "daemon-lifecycle/v1",
     "failures": []
+  },
+  "compose": {
+    "project": "curie-compose-5c0d3a71-5cc379",
+    "window": [
+      1792819242.7541106,
+      1792819254.3097446
+    ],
+    "docker_host": "tcp://curie-docker-sections-a01e0a8:2375",
+    "published_host": "curie-docker-sections-a01e0a8",
+    "info": {
+      "id": "c1c8410e-1137-4ebf-9eb9-586d0a2b134b",
+      "name": "7bd5b54461f4"
+    },
+    "image": "python:3.13.15-slim-bookworm@sha256:ed86c82274b3c69b52fb5820f358f0bd7df0b603332063cb5c6e32bd220c3e6e",
+    "files": {
+      "compose.yaml": "cd4ffc855eb671a21348c2640f255282b359daf0420c02d155854e3f1266f8b9",
+      "server/Dockerfile": "2ba811bd5e79f21a7ec9d7b28540fca3ae4564ceeff0a7065d2a53bad61114fc",
+      "server/index.html": "c3041b7463803a09032cf193a624e1510e892bd9b3fcf930ddd08a57190a6d3c",
+      "client/Dockerfile": "cb72180203c48daa25bec58e437e809ed2d3b1583f6f083ab4124214697e74b6"
+    },
+    "expected": "curie-compose 5c0d3a71",
+    "build": {
+      "exit_code": 0,
+      "output_tail": "curie-compose-5c0d3a71-5cc379-server done\n#11 DONE 0.0s\n\n#12 [client] resolving provenance for metadata file\n#12 DONE 0.0s\n\n#13 [server] resolving provenance for metadata file\n#13 DONE 0.0s\n Image curie-compose-5c0d3a71-5cc379-client Building \n Image curie-compose-5c0d3a71-5cc379-server Building \n Image curie-compose-5c0d3a71-5cc379-client Built \n Image curie-compose-5c0d3a71-5cc379-server Built \n"
+    },
+    "up": {
+      "exit_code": 0,
+      "output_tail": "-compose-5c0d3a71-5cc379-client-1 Creating \n Container curie-compose-5c0d3a71-5cc379-server-1 Created \n Container curie-compose-5c0d3a71-5cc379-client-1 Created \n Container curie-compose-5c0d3a71-5cc379-server-1 Starting \n Container curie-compose-5c0d3a71-5cc379-client-1 Starting \n Container curie-compose-5c0d3a71-5cc379-server-1 Started \n Container curie-compose-5c0d3a71-5cc379-client-1 Started \n"
+    },
+    "services": [
+      {
+        "service": "client",
+        "state": "running"
+      },
+      {
+        "service": "server",
+        "state": "running"
+      }
+    ],
+    "reach": {
+      "from": "client",
+      "to": "server:8080",
+      "exit_code": 0,
+      "body": "curie-compose 5c0d3a71\n"
+    },
+    "published": {
+      "port": 32773,
+      "url": "http://curie-docker-sections-a01e0a8:32773/index.html",
+      "status": 200,
+      "body": "curie-compose 5c0d3a71\n"
+    },
+    "down": {
+      "exit_code": 0,
+      "output_tail": "ie-compose-5c0d3a71-5cc379-client-1 Removed \n Network curie-compose-5c0d3a71-5cc379_default Removing \n Image curie-compose-5c0d3a71-5cc379-server:latest Removing \n Image curie-compose-5c0d3a71-5cc379-client:latest Removing \n Image curie-compose-5c0d3a71-5cc379-server:latest Removed \n Image curie-compose-5c0d3a71-5cc379-client:latest Removed \n Network curie-compose-5c0d3a71-5cc379_default Removed \n"
+    },
+    "cleanup": {
+      "containers": [],
+      "networks": [],
+      "volumes": [],
+      "images": [],
+      "verified": true
+    }
+  },
+  "skill_rung": {
+    "window": [
+      1792819219.9588237,
+      1792819241.1336918
+    ],
+    "docker_host": "tcp://curie-docker-sections-a01e0a8:2375",
+    "published_host": "curie-docker-sections-a01e0a8",
+    "nonce": "3f9b2c64",
+    "info": {
+      "id": "c1c8410e-1137-4ebf-9eb9-586d0a2b134b",
+      "name": "7bd5b54461f4"
+    },
+    "inputs": {
+      "curie_bin": {
+        "sha256": "fbf74889adc7124a6a1dd43a240c8980c68574143fd24d0d77afd714563a2aa5",
+        "version": "curie 0.14.1"
+      },
+      "files": {
+        "cli/scripts/e2e-ladder.sh": "1a46c26d3647731de02fe5cc119e5969b2b470e9d2e332068aa3dbef6af85bfb",
+        "cli/scripts/e2e.sh": "6685ca83577c091bb913094a1437b82f78acd262fbdf5816b7e121a484bbbdf7",
+        "cli/scripts/gnu-process.py": "6dc670b8a3bae3fa6f3ef42e4a9c0b94a2f205ee26d337b813dc5b381e1bd75c"
+      },
+      "bundle": {
+        "path": "examples/weather",
+        "digest": "14dd4b84fe978febd07eeae95d042f076cc2ebccc55016b335725226e8af753a"
+      },
+      "source_revision": "108ea3ca7672c7f3f26b4c367597f518a7876051"
+    },
+    "image": {
+      "tag": "curie-runner",
+      "id": "sha256:898f4ab606531f5a3f5f5bcb6e3f02ad1307ee8f795a292418f411e3501aa134",
+      "label_nonce": "3f9b2c64",
+      "dockerfile": "runner/Dockerfile",
+      "dockerfile_sha256": "930254e6ccafccf5ff2ec3739ea7cf136c4e668fee8f6c48a2e31c15ce424721",
+      "daemon_id": "c1c8410e-1137-4ebf-9eb9-586d0a2b134b",
+      "exit_code": 0,
+      "output_tail": "sr/local/bin/node\n#22 CACHED\n\n#23 [stage-1  8/19] COPY runner/pip-requirements.txt ./runner/pip-requirements.txt\n#23 CACHED\n\n#24 [stage-1 19/19] COPY runner/pip.conf /etc/pip.conf\n#24 CACHED\n\n#25 exporting to image\n#25 exporting layers done\n#25 writing image sha256:898f4ab606531f5a3f5f5bcb6e3f02ad1307ee8f795a292418f411e3501aa134 done\n#25 naming to docker.io/library/curie-runner done\n#25 DONE 0.0s\n"
+    },
+    "ladder": {
+      "tiers": "skill",
+      "live": "0",
+      "exit_code": 0,
+      "passed": true,
+      "output_tail": "ffline, scripted replies)           \u2502\n\u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256f\nskill: no connector containers for a bundle that declares none (project local-1b2006c0-af1f-470c-8baa-c758d23d8f07)\n\nSKIPPING rung 2 (local): not named in CURIE_E2E_TIERS.\n\nSKIPPING rung (local-release): not named in CURIE_E2E_TIERS. Needs the\nrelease-pinned images built and tagged locally first; name it explicitly,\ne.g. CURIE_E2E_TIERS=skill,local,local-release.\n\nSKIPPING rung 3 (cluster): not named in CURIE_E2E_TIERS. It needs a live\nrelease and host-reachable pods, so it is opt-in: CURIE_E2E_TIERS=all.\n\n=== parity summary (what this run actually proved) ===\nrungs run: skill\nbundle identity: 1e4a44cf113dbe895577aaf395b8ae8543a74a1abd5ad371647aa1c685afca2b, reported by rung(s): skill\nnote: only one rung reported a digest, so the CROSS-RUNG digest comparison was vacuous for this tier set -- only that rung's own identity was recorded. This is NOT a cross-rung parity claim.\nsuite: \"weather\" with 1 case(s), resolved by the tier's own loader at rung(s): skill\ncase ids: reports-a-temperature (proven at local/cluster by digest equality; read back directly at skill, and at every rung under CURIE_E2E_LIVE=1)\nmodel mode read off the deployed artifact at rung(s): none\ngrading: PLUMBING-ONLY rungs: skill -- sealed against the fake model, so no rung graded reply content and a green here must never be read as a graded pass (ADR-0055, #612).\n\nLADDER PASS (tiers: skill)\nscaffolded demo at /tmp/tmp.MBhkTBDoIt/try-clean/tmp/curie-try-8dd6cc66-6615-4f08-932e-6a15b5ab9721\nno model credential found; using the scripted fake model\nstarting runner container 'curie-runner-local' from 'curie-runner'\nwaiting for runner: ok (1.0s)\nState recorded in /tmp/tmp.MBhkTBDoIt/try-clean/tmp/curie-try-8dd6cc66-6615-4f08-932e-6a15b5ab9721/.curie/runner.json; run skill down from that directory. skill message, skill eval, and skill status also work there. skill message and skill eval also accept --url.\n  -> [shell request] running shell request\n  !  possible change via shell request: request started; check the outcome before retrying\n  !  possible change via shell request: request finished; check the outcome before retrying\n\u2713 stopped and removed container 'curie-runner-local'\nremoved temporary demo at /tmp/tmp.MBhkTBDoIt/try-clean/tmp/curie-try-8dd6cc66-6615-4f08-932e-6a15b5ab9721\nstarting runner container 'curie-runner-local' from 'curie-runner'\nwaiting for runner: ok (1.0s)\n  -> [shell request] running shell request\n  !  possible change via shell request: request started; check the outcome before retrying\n  !  possible change via shell request: request finished; check the outcome before retrying\n-- final (done)\n\u2713 stopped and removed container 'curie-runner-local'\nrunner http://curie-docker-sections-a01e0a8:7245\nbundle 1e4a44cf113dbe895577aaf395b8ae8543a74a1abd5ad371647aa1c685afca2b\n\u26a0 warn  editable bundle differs from the running snapshot. Run `curie skill up` to load the changes.\n  -> [shell request] running shell request\n  !  possible change via shell request: request started; check the outcome before retrying\n  !  possible change via shell request: request finished; check the outcome before retrying\n-- final (done)\n\u2713 stopped and removed container 'curie-e2e-runner'\n\u2713 removed network 'curie-e2e-runner-net'\n\u26a0 warn  container 'curie-ladder-747-leftover-7200' does not carry the curietech.ai/managed-by=curie-cli label, so it may not be a Curie runner; removing it anyway\n\u2713 stopped and removed container 'curie-ladder-747-leftover-7200'\nno .curie/runner.json was present, so nothing to clear\nstarting runner container 'curie-ladder-hermetic-7200' from 'curie-runner'\nwaiting for runner: ok (1.0s)\nState recorded in /tmp/tmp.wqNmQ5kq2x/bundle-hermetic/.curie/runner.json; run skill down from that directory. skill message, skill eval, and skill status also work there. skill message and skill eval also accept --url.\n\u2713 stopped and removed container 'curie-ladder-hermetic-7200'\n"
+    },
+    "cleanup": {
+      "image_removed": true,
+      "containers": [],
+      "networks": [],
+      "volumes": [],
+      "verified": true
+    }
   }
 }
