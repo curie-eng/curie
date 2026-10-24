@@ -1825,6 +1825,48 @@ class TestSchemaWindowRegistration:
         catalog["revisions"].append("0124")
         self._assert_refused(git_repo, self._prep(git_repo, catalog_text(catalog)), parent)
 
+    @staticmethod
+    def _ambiguous_base() -> dict:
+        # The real catalog has windows carrying a boolean flag (0.8.8, 0.8.9).
+        catalog = schema_catalog()
+        catalog["windows"]["0.9.3"]["artifact_identity_ambiguous"] = True
+        return catalog
+
+    def test_registration_beside_an_untouched_boolean_flag_is_version_only(self, git_repo):
+        # Companion to the True-to-1 refusal: the same base, boolean left
+        # `true`, only the registration added, so that fixture is not refused
+        # for any other reason.
+        parent = self._base(git_repo, self._ambiguous_base())
+        tagged = self._prep(
+            git_repo, catalog_text(registered(self._ambiguous_base(), "0.11.2"))
+        )
+        fetcher = FakeProofFetcher({parent: green_runs()})
+
+        assert self._authorize(git_repo, tagged, [], fetcher) == version_only(parent)
+        assert fetcher.calls == [parent]
+
+    def test_registration_that_turns_a_true_flag_into_one_is_refused(self, git_repo):
+        # Python treats True == 1, so a plain dict comparison would call this
+        # edit "nothing else moved". The Rust consumer reads a bool, not 1.
+        parent = self._base(git_repo, self._ambiguous_base())
+        catalog = registered(self._ambiguous_base(), "0.11.2")
+        catalog["windows"]["0.9.3"]["artifact_identity_ambiguous"] = 1
+        self._assert_refused(git_repo, self._prep(git_repo, catalog_text(catalog)), parent)
+
+    def test_registration_with_a_duplicate_member_in_an_existing_window_is_refused(
+        self, git_repo
+    ):
+        # json.loads collapses duplicate members, so the parsed document equals
+        # the base. The Rust consumer (cli/src/schema_window.rs, serde derive
+        # Deserialize) rejects duplicate fields, so this file would not load.
+        parent = self._base(git_repo)
+        text = catalog_text(registered(schema_catalog(), "0.11.2"))
+        member = '"schema_min": "0041"'
+        assert text.count(member) == 1
+        text = text.replace(member, f"{member},\n      {member}")
+        assert json.loads(text) == registered(schema_catalog(), "0.11.2")
+        self._assert_refused(git_repo, self._prep(git_repo, text), parent)
+
     def test_registered_value_that_is_not_the_candidate_is_refused(self, git_repo):
         parent = self._base(git_repo)
         catalog = schema_catalog()
