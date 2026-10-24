@@ -1671,9 +1671,13 @@ api:
     enabled: true
     intervalSeconds: 30
     batchLimit: 100
+  # limits.memory is unset on purpose: the selected resource profile supplies
+  # it (agentSandbox.resourceProfiles.<profile>.apiMemoryLimit, 512Mi for
+  # `standard`, 2Gi for `factory`). Any explicit limits.memory, including
+  # 512Mi, wins for every install. The schema-migrate Job uses these too.
   resources:
     requests: { cpu: 100m, memory: 256Mi }
-    limits: { cpu: "1", memory: 512Mi }
+    limits: { cpu: "1" }
   # Container securityContext (issue #67). Restricted-PSS baseline: the image runs
   # as non-root uid 1000 (see apps/api/Dockerfile) and needs no Linux
   # capabilities. readOnlyRootFilesystem stays false -- the app writes to its
@@ -2732,6 +2736,13 @@ agentSandbox:
   # schedule it. Raise resourceQuota.hard.requestsMemory / limitsMemory per
   # extra concurrent factory sandbox. Existing pods keep their envelope; a new
   # sandbox picks up a change.
+  #
+  # apiMemoryLimit is install-wide, not per agent: it is the API container's
+  # memory limit (and the schema-migrate Job's) when api.resources.limits.memory
+  # is unset. The profile is `factory` when factory.enabled is true, else
+  # `standard`. The factory 2Gi is a headroom choice, not a measured need:
+  # after #4895 the factory publication listing over 231 pages peaked near
+  # 170 MB under both 512Mi and 2Gi limits.
   resourceProfiles:
     standard:
       resources:
@@ -2741,6 +2752,7 @@ agentSandbox:
       homeSizeLimit: 512Mi
       tmpSizeLimit: 512Mi
       writablePathSizeLimit: 512Mi
+      apiMemoryLimit: 512Mi
     factory:
       resources:
         requests: { cpu: 50m, memory: 8Gi, ephemeral-storage: 10Gi }
@@ -2749,6 +2761,7 @@ agentSandbox:
       homeSizeLimit: 15Gi
       tmpSizeLimit: 4Gi
       writablePathSizeLimit: 512Mi
+      apiMemoryLimit: 2Gi
   # Agents that get a labeled sandbox template and warm pool so connector
   # ingress can select curietech.ai/agent=<name>. A list of agent name strings.
   # Empty by default. Agents already covered by connectorSecrets, registryEgress,

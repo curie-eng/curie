@@ -321,8 +321,11 @@ async def test_revision_verification_requires_a_full_commit_and_actual_parent(bo
         ) == PublicationRevisionCommit(commit_sha=REVISION_HEAD, parent_sha="c" * 40)
 
 
+@pytest.mark.parametrize("adopt_only", [False, True])
 @pytest.mark.parametrize("state", ["open", "closed", "merged"])
-async def test_recovery_adopts_the_api_answer_for_the_expected_head(state: str) -> None:
+async def test_recovery_adopts_the_api_answer_for_the_expected_head(
+    state: str, adopt_only: bool
+) -> None:
     bodies: list[dict[str, object]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -332,46 +335,87 @@ async def test_recovery_adopts_the_api_answer_for_the_expected_head(state: str) 
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         recovered = await _code_host(handler, client).recover_pull_request(
-            PUBLICATION_ID, expected_head_sha=REVISION_HEAD
+            PUBLICATION_ID, expected_head_sha=REVISION_HEAD, adopt_only=adopt_only
         )
 
     assert recovered is not None
     assert (recovered.number, recovered.state, recovered.head_sha) == (123, state, REVISION_HEAD)
-    assert bodies == [{"expected_head_sha": REVISION_HEAD}]
+    assert bodies == [{"expected_head_sha": REVISION_HEAD, "adopt_only": adopt_only}]
 
 
-async def test_recovery_of_an_absent_branch_is_none() -> None:
+@pytest.mark.parametrize("adopt_only", [False, True])
+async def test_recovery_of_an_absent_branch_is_none(adopt_only: bool) -> None:
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(204)
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         recovered = await _code_host(handler, client).recover_pull_request(
-            PUBLICATION_ID, expected_head_sha=REVISION_HEAD
+            PUBLICATION_ID, expected_head_sha=REVISION_HEAD, adopt_only=adopt_only
         )
 
     assert recovered is None
 
 
-async def test_recovery_refuses_a_pull_request_on_another_head() -> None:
+@pytest.mark.parametrize("adopt_only", [False, True])
+async def test_recovery_refuses_a_pull_request_on_another_head(adopt_only: bool) -> None:
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=_pull_out(head_sha="c" * 40))
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         with pytest.raises(PublicationReconcileError, match="does not match the expected commit"):
             await _code_host(handler, client).recover_pull_request(
-                PUBLICATION_ID, expected_head_sha=REVISION_HEAD
+                PUBLICATION_ID, expected_head_sha=REVISION_HEAD, adopt_only=adopt_only
             )
 
 
-async def test_recovery_refuses_an_invalid_expected_head_before_network_access() -> None:
+@pytest.mark.parametrize("adopt_only", [False, True])
+async def test_recovery_refuses_an_invalid_expected_head_before_network_access(
+    adopt_only: bool,
+) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         raise AssertionError(f"unexpected request: {request.url}")
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         with pytest.raises(PublicationReconcileError, match="expected commit is invalid"):
             await _code_host(handler, client).recover_pull_request(
-                PUBLICATION_ID, expected_head_sha="HEAD"
+                PUBLICATION_ID, expected_head_sha="HEAD", adopt_only=adopt_only
             )
+
+
+@pytest.mark.parametrize("timeout_type", [httpx.ReadTimeout, httpx.ConnectTimeout])
+async def test_timeout_recovery_client_preserves_transport_cause_and_distinguishes_other_failures(
+    timeout_type: type[httpx.TimeoutException],
+) -> None:
+    requests: list[httpx.Request] = []
+    status: int | None = None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if status is not None:
+            return httpx.Response(status, json={"detail": "recovery refused"})
+        raise timeout_type("response unavailable", request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        code_host = _code_host(handler, client)
+        with pytest.raises(PublicationReconcileError) as timed_out:
+            await code_host.recover_pull_request(
+                PUBLICATION_ID, expected_head_sha=REVISION_HEAD, adopt_only=False
+            )
+        assert isinstance(timed_out.value.__cause__, timeout_type)
+        assert timed_out.value.__cause__.request is requests[0]
+        for response_status in (409, 503):
+            status = response_status
+            with pytest.raises(PublicationReconcileError) as refused:
+                await code_host.recover_pull_request(
+                    PUBLICATION_ID, expected_head_sha=REVISION_HEAD, adopt_only=False
+                )
+            assert type(refused.value) is not type(timed_out.value)
+        status = None
+        with pytest.raises(PublicationReconcileError) as branch_timeout:
+            await code_host.read_branch_head(PUBLICATION_ID)
+        assert type(branch_timeout.value) is not type(timed_out.value)
+        assert isinstance(branch_timeout.value.__cause__, timeout_type)
+    assert len(requests) == 4
 
 
 async def test_code_host_client_refuses_construction_without_internal_worker_auth() -> None:

@@ -78,11 +78,32 @@ The exposition carries these series, shown with the default prefix:
 | `turn_canary_last_success_timestamp_seconds` | Last successful cycle. |
 | `turn_canary_cleanup_degraded` | 1 while any route has a pending cleanup or an all-route hold remains. |
 | `turn_canary_capacity_skips_total` | Persisted count of capacity skips. |
+| `turn_canary_target_delivery_success{route}` | Last observed delivered lifecycle with a matching request identity and nonblank reply. A nonce mismatch can set this to 1 while target success stays 0. Capacity skips and cleanup holds create no new sample. |
 | `turn_canary_target_success{route}` | Last turn result of the route. Published only for a route whose turn was attempted; a capacity-skipped route publishes no sample in that cycle, and the exporter keeps its previous value. |
 | `turn_canary_target_last_run_timestamp_seconds{route}` | Last cycle that selected the route for a turn or a capacity check. |
-| `turn_canary_target_last_success_timestamp_seconds{route}` | Last delivered turn of the route. |
+| `turn_canary_target_last_success_timestamp_seconds{route}` | Last exact nonce success of the route. |
 | `turn_canary_target_capacity_skipped{route}` | Added. 1 when the route was skipped for capacity in the cycle, 0 when it was turned. |
 | `turn_canary_target_cleanup_degraded{route}` | Added. 1 while the route has a pending cleanup and is not turned, 0 once its cleanup is confirmed or cleared. |
+
+Delivery observation uses the production reply schema and the enqueued turn's
+kind, address, conversation ID, reply reference and completion event ID. Malformed,
+unrelated or duplicate observed completions fail closed. Status and progress
+alone do not count as a text answer. Exact nonce success still controls the last
+success timestamps, cycle success and one-shot exit code. The new gauge shares
+the selected route label layout and metric prefix. Exact nonce success retains
+its original last-update and event-type rules: a later progress update or a
+`reply.post` cannot turn a previously failing sequence into success. An approval
+pause is unsuccessful even though its relay page remains nonterminal.
+
+The exporter retains delivery observations across skipped or held cycles and
+removes them when a successful inventory read drops their route. Delivery is not
+saved in the state file; after restart the sample is absent until a turn is
+attempted. An absent sample is unknown, never a healthy observation. Delivery
+shows an observed relay lifecycle, not model execution, useful task completion,
+policy compliance or final-text provenance. Events arriving after the bounded
+observation returns are outside its evidence. Relay logs add only bounded reason
+codes such as `nonce_mismatch`, `wrong_target`, `malformed_page` and `timeout`,
+without logging response content.
 
 Before this change, a capacity skip published `target_success` 0 and
 `cycle_success` 0, and one unconfirmed cleanup held every route until an

@@ -24,6 +24,7 @@ from .publication_loop import (
     PublicationLineageRefused,
     PublicationPullState,
     PublicationReconcileError,
+    PublicationRecoveryTimeout,
     PublicationRemoteTerminalError,
     PublicationRevisionCommit,
     PublicationTranscriptPermanentError,
@@ -425,20 +426,25 @@ class PublicationCodeHostClient:
         return _pull_state(response)
 
     async def recover_pull_request(
-        self, publication_id: uuid.UUID, *, expected_head_sha: str
+        self, publication_id: uuid.UUID, *, expected_head_sha: str, adopt_only: bool
     ) -> PublicationPullState | None:
-        """Adopt the branch's pull request, or open it when the branch exists."""
+        """Adopt the branch's pull request, opening only when adopt_only is false."""
 
         if _SHA.fullmatch(expected_head_sha) is None:
             raise PublicationReconcileError(
                 "deterministic-head recovery expected commit is invalid"
             )
-        response = await self._call(
-            "POST",
-            self._url(publication_id, "pull-request"),
-            "deterministic-head recovery",
-            body={"expected_head_sha": expected_head_sha},
-        )
+        try:
+            response = await self._call(
+                "POST",
+                self._url(publication_id, "pull-request"),
+                "deterministic-head recovery",
+                body={"expected_head_sha": expected_head_sha, "adopt_only": adopt_only},
+            )
+        except PublicationReconcileError as exc:
+            if not adopt_only and isinstance(exc.__cause__, httpx.TimeoutException):
+                raise PublicationRecoveryTimeout(expected_head_sha) from exc.__cause__
+            raise
         if response.status_code == 204:
             return None
         pull = _pull_state(response)

@@ -70,21 +70,20 @@ const UNSET_ENV_BAIL: &str = "which is not set now";
 /// JSON literal so the fixture cannot drift from the shape the CLI loads.
 fn project_with_recorded_env_key() -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
+    let opts = curie::message::MessageOpts {
+        local: true,
+        timeout_secs: 1,
+        ..Default::default()
+    };
     save_turn(
         dir.path(),
-        &TurnContext {
-            verb: TurnVerb::Local,
-            channel: "C-recorded".into(),
-            thread_ts: "9.9".into(),
-            namespace: "curie".into(),
-            release: "curie".into(),
-            chart: "charts/curie".into(),
-            listen_host: None,
-            timeout_secs: 1,
-            api_url: None,
-            api_key_env: Some("CURIE_API_KEY".into()),
-            agent: None,
-        },
+        &TurnContext::from_turn(
+            &opts,
+            TurnVerb::Local,
+            "C-recorded",
+            "9.9",
+            Some(opts.api_key.clone()),
+        ),
     )
     .expect("save turn");
     dir

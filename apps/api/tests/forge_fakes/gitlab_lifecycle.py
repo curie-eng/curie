@@ -600,7 +600,10 @@ def start_request(request_id: uuid.UUID) -> int:
         try:
             async with AsyncSession(engine) as session:
                 acquired = await acquire(
-                    session, request_id, owner="gitlab-owner", generation=generation,
+                    session,
+                    request_id,
+                    owner="gitlab-owner",
+                    generation=generation,
                     wake=await factory_wake(session, request_id),
                     context=None,
                 )
@@ -743,7 +746,7 @@ def recover_pull_request(
     return install.call(
         "POST",
         f"/v1/internal/publications/{publication_id}/pull-request",
-        json={"expected_head_sha": head_sha},
+        json={"expected_head_sha": head_sha, "adopt_only": False},
     )
 
 

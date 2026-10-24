@@ -215,6 +215,14 @@ Runtime rules (each has a provoking integration test in `tests/eval/test_stream.
   **provision a runner via the sandbox substrate** (the same warm-pool `claim` chat runs
   use, boot env carrying `CURIE_BUNDLE_REF` + budget), eval against it, and tear it
   down in a `finally`. A provisioning failure is a failed run reported and acked.
+- **Hosted connectors retain their authority boundary.** A provisioned eval
+  receives the configured release/namespace and the tenant-scoped agent name,
+  plus an agent-only signed caller when signing is configured. The same agent
+  snapshot supplies its operator approval-required tools: bundle policy cannot
+  remove them during evaluation. Unreadable or malformed stored approval policy
+  prevents provisioning. Partial connector scope emits no scope or caller token;
+  missing signing configuration emits no caller token. No protected run/work-item
+  identity or approval grant is invented, and evals still omit ambient state refs.
 - **XACK only after the report POST attempt completes** (success, or terminally failed
   after bounded retries and logged). A worker crash before that leaves the entry
   pending. The shared runs/eval liveness path promptly transfers a capable dead

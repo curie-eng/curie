@@ -103,6 +103,8 @@ pub struct TurnContext {
     pub verb: TurnVerb,
     pub channel: String,
     pub thread_ts: String,
+    #[serde(default)]
+    pub context: Option<String>,
     pub namespace: String,
     pub release: String,
     pub chart: String,
@@ -129,6 +131,7 @@ impl TurnContext {
             verb,
             channel: channel.to_string(),
             thread_ts: thread_ts.to_string(),
+            context: opts.context.clone(),
             namespace: opts.namespace.clone(),
             release: opts.release.clone(),
             chart: opts.chart.clone(),
@@ -166,6 +169,7 @@ pub fn load_turn(dir: &Path) -> Result<Option<TurnContext>> {
 pub struct CliTurnArgs {
     pub channel: Option<String>,
     pub thread: Option<String>,
+    pub context: Option<String>,
     pub namespace: Option<String>,
     pub release: Option<String>,
     pub chart: Option<String>,
@@ -179,6 +183,7 @@ pub struct CliTurnArgs {
 pub struct ResolvedTurnArgs {
     pub channel: Option<String>,
     pub thread: Option<String>,
+    pub context: Option<String>,
     pub namespace: String,
     pub release: String,
     pub chart: Option<String>,
@@ -225,6 +230,9 @@ pub fn apply_continue(
         thread: cli
             .thread
             .or_else(|| state.as_ref().map(|state| state.thread_ts.clone())),
+        context: cli
+            .context
+            .or_else(|| state.as_ref().and_then(|state| state.context.clone())),
         namespace: cli
             .namespace
             .or_else(|| state.as_ref().map(|state| state.namespace.clone()))
@@ -407,6 +415,7 @@ mod tests {
         CliTurnArgs {
             channel: None,
             thread: None,
+            context: None,
             namespace: None,
             release: None,
             chart: None,
@@ -423,6 +432,7 @@ mod tests {
             verb,
             channel: "C-persisted".into(),
             thread_ts: "9.9".into(),
+            context: None,
             namespace: "persisted-ns".into(),
             release: "persisted-release".into(),
             chart: "charts/persisted".into(),
@@ -441,6 +451,7 @@ mod tests {
             verb: TurnVerb::Cluster,
             channel: "C1".into(),
             thread_ts: "9.9".into(),
+            context: None,
             namespace: "curie-turns".into(),
             release: "curie-turns".into(),
             chart: "charts/curie-turns".into(),
@@ -459,6 +470,73 @@ mod tests {
     }
 
     #[test]
+    fn turn_context_records_resolved_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = MessageOpts {
+            context: Some("selected-ctx".into()),
+            ..MessageOpts::default()
+        };
+        let turn = TurnContext::from_turn(&opts, TurnVerb::Cluster, "C0EXAMPLE1", "9.9", None);
+        save_turn(dir.path(), &turn).unwrap();
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(turn_state_path(dir.path())).unwrap())
+                .unwrap();
+        assert_eq!(raw["context"], "selected-ctx");
+        assert_eq!(load_turn(dir.path()).unwrap(), Some(turn));
+    }
+
+    #[test]
+    fn turn_context_context_precedence() {
+        for (recorded, explicit, expected) in [
+            (Some("recorded-ctx"), None, Some("recorded-ctx")),
+            (
+                Some("recorded-ctx"),
+                Some("explicit-ctx"),
+                Some("explicit-ctx"),
+            ),
+            (None, Some("explicit-ctx"), Some("explicit-ctx")),
+            (None, None, None),
+        ] {
+            let mut saved = persisted_turn(TurnVerb::Cluster);
+            saved.context = recorded.map(str::to_string);
+            saved.api_key_env = None;
+            let mut cli = default_cli_turn_args();
+            cli.context = explicit.map(str::to_string);
+            let resolved = apply_continue(TurnVerb::Cluster, cli, Some(saved), None).unwrap();
+            assert_eq!(resolved.context.as_deref(), expected);
+        }
+    }
+
+    #[test]
+    fn turn_context_without_context_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(STATE_DIR)).unwrap();
+        std::fs::write(
+            turn_state_path(dir.path()),
+            r#"{"verb":"cluster","channel":"C0EXAMPLE1","thread_ts":"9.9",
+                "namespace":"old-ns","release":"old-release","chart":"charts/curie",
+                "listen_host":null,"timeout_secs":123,"api_url":null,"api_key_env":null}"#,
+        )
+        .unwrap();
+        let saved = load_turn(dir.path()).unwrap().unwrap();
+        assert_eq!(saved.context, None);
+        let resolved = apply_continue(
+            TurnVerb::Cluster,
+            default_cli_turn_args(),
+            Some(saved),
+            None,
+        )
+        .unwrap();
+        assert_eq!(resolved.context, None);
+        assert_eq!(resolved.namespace, "old-ns");
+        assert_eq!(resolved.release, "old-release");
+        assert_eq!(resolved.thread.as_deref(), Some("9.9"));
+        assert_eq!(resolved.timeout_secs, 123);
+        std::fs::write(turn_state_path(dir.path()), "{malformed").unwrap();
+        assert!(load_turn(dir.path()).is_err());
+    }
+
+    #[test]
     fn corrupt_turn_state_is_an_error_not_a_silent_none() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(STATE_DIR)).unwrap();
@@ -474,6 +552,7 @@ mod tests {
             channel: None,
             agent: None,
             thread: None,
+            context: None,
             namespace: "curie".into(),
             release: "curie".into(),
             chart: "charts/curie".into(),
@@ -513,6 +592,7 @@ mod tests {
             channel: None,
             agent: None,
             thread: None,
+            context: None,
             namespace: "curie".into(),
             release: "curie".into(),
             chart: "charts/curie".into(),
@@ -616,6 +696,7 @@ mod tests {
             verb: TurnVerb::Cluster,
             channel: "C-persisted".into(),
             thread_ts: "9.9".into(),
+            context: None,
             namespace: "persisted-ns".into(),
             release: "persisted-release".into(),
             chart: "charts/persisted".into(),
@@ -698,6 +779,7 @@ mod tests {
         let cli = || CliTurnArgs {
             channel: None,
             thread: None,
+            context: None,
             namespace: None,
             release: None,
             chart: None,

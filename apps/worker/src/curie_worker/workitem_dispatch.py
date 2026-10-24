@@ -273,12 +273,16 @@ class WorkItemDispatchClient:
         generation: int,
         reason: str,
         capacity: bool,
+        start_failure_detail: str | None,
         budget_s: float = DEFAULT_BUDGET_S,
     ) -> str | None:
         """Defer the request; return its terminal cause if the deferral ended it.
 
         A non-capacity deferral past the start limit settles the request
-        ``failed`` instead of rescheduling it (#4170).
+        ``failed`` instead of rescheduling it (#4170). ``start_failure_detail``
+        is the safe diagnostic of a pre-start workspace preparation fault, sent
+        as JSON null when there is none; the API stores it only on a
+        non-capacity ``not_started:`` deferral (#4930).
         """
 
         body = await self._post_settlement(
@@ -288,6 +292,7 @@ class WorkItemDispatchClient:
                 "generation": generation,
                 "reason": reason,
                 "capacity": capacity,
+                "start_failure_detail": start_failure_detail,
             },
             budget_s=budget_s,
         )
@@ -698,7 +703,7 @@ class WorkItemRun:
             name=f"work-item-acquire-renew-{self.request_id}",
         )
 
-    async def defer(self, reason: str, *, capacity: bool) -> None:
+    async def defer(self, reason: str, *, capacity: bool, start_failure_detail: str | None) -> None:
         self._deferred = True
         terminal_cause = await self._client.defer(
             self.request_id,
@@ -706,6 +711,7 @@ class WorkItemRun:
             generation=self.generation,
             reason=reason,
             capacity=capacity,
+            start_failure_detail=start_failure_detail,
             budget_s=self._write_budget_s(),
         )
         if terminal_cause is not None:

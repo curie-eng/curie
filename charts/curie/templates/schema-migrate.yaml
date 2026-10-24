@@ -180,7 +180,7 @@ spec:
               readOnly: true
           {{- end }}
           resources:
-            {{- toYaml .Values.api.resources | nindent 12 }}
+            {{- include "curie.api.resources" . | nindent 12 }}
       {{- with .Values.api.migrate.provenanceDeclarationsSecret }}
       volumes:
         - name: provenance-declarations

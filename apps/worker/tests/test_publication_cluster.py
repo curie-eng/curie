@@ -684,7 +684,7 @@ class _NoBranchCodeHost:
         raise AssertionError("a failed Job has no revision commit to verify")
 
     async def recover_pull_request(
-        self, publication_id: uuid.UUID, *, expected_head_sha: str
+        self, publication_id: uuid.UUID, *, expected_head_sha: str, adopt_only: bool
     ) -> None:
         return None
 

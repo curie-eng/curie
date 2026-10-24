@@ -12,6 +12,33 @@ These artifacts are produced by the release workflow, so they exist on every
 release published *after* v0.4.0. Nothing below works against v0.4.0 or earlier,
 which shipped bare binaries.
 
+## Full kind proof can reuse a complete run on the same tree
+
+After release authorization, `release-kind-tier` in
+`.github/workflows/release.yaml` uses `release/kind_ci.py` to find one completed,
+successful `.github/workflows/ci.yaml` run whose head commit has exactly the
+tagged commit's tree. The commit SHAs may differ. The job logs the chosen run
+URL and whether it reused proof or dispatched CI.
+
+Reuse requires completed success for every required kind job and all 19
+canonical upgrade shards, including every factory, chart, and admitted agent
+matrix leg, the upgrade negative control, shard listing, and `E2E required`.
+The canonical shard listing determines the expected upgrade set; the observed
+jobs cannot shrink it. Overall success alone is insufficient: push CI omits
+kind, and a PR's smoke-only upgrade matrix is incomplete proof. Missing,
+skipped, incomplete, or unsuccessful required jobs refuse reuse. Nightly-only
+jobs may be skipped. [ADR 0239](adr/0239-release-kind-proof-reuses-a-complete-ci-run-on-the-same-tree.md)
+records the required coverage and decision.
+
+When no run qualifies, the gate dispatches `ci.yaml` on the tag with no workflow
+inputs and polls status GETs for the returned run ID. Transient HTTP 5xx
+responses retry within the same deadline. Only completed success passes;
+failure, cancellation, and deadline expiry keep publication blocked.
+
+This proof gate leaves release authorization unchanged. Reusing kind proof
+does not alter `release/authorize.py` or satisfy its separate ancestry and
+required-check rules.
+
 ## Patch releases name their trigger and live proof
 
 A patch release (`vX.Y.Z` where Z is not 0) names the defects that triggered it

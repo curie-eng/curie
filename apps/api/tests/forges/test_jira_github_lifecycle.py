@@ -780,7 +780,7 @@ def test_jira_github_lifecycle(install: Install, initial_label: bool) -> None:
     github.commits[head]["message"] += f"\n\nCurie-Revision: {publication['id']}\n"
     recovered = install.client.post(
         f"/v1/internal/publications/{publication['id']}/pull-request",
-        json={"expected_head_sha": head},
+        json={"expected_head_sha": head, "adopt_only": False},
         headers=WORKER,
     )
     assert recovered.status_code == 200, recovered.text

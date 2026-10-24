@@ -169,6 +169,7 @@ impl Fixture {
                     .unwrap(),
             )
             .env("PATH", format!("{}:/usr/bin:/bin", self.0.path().display()))
+            .env("KUBECONFIG", self.0.path().join("kubeconfig"))
             .env("UPGRADE_DRIVER_ROOT", self.0.path())
             .env("UPGRADE_DRIVER_SCENARIO", scenario);
         for (key, value) in extra_env {
@@ -209,6 +210,7 @@ impl Fixture {
             .args(extra)
             .current_dir(current_dir)
             .env("PATH", format!("{}:/usr/bin:/bin", self.0.path().display()))
+            .env("KUBECONFIG", self.0.path().join("kubeconfig"))
             .env("UPGRADE_DRIVER_ROOT", self.0.path())
             .env("UPGRADE_DRIVER_SCENARIO", scenario)
             .env("XDG_CACHE_HOME", self.cache_home())
@@ -250,6 +252,7 @@ impl Fixture {
             ])
             .current_dir(self.0.path())
             .env("PATH", format!("{}:/usr/bin:/bin", self.0.path().display()))
+            .env("KUBECONFIG", self.0.path().join("kubeconfig"))
             .env("UPGRADE_DRIVER_ROOT", self.0.path())
             .env("UPGRADE_DRIVER_SCENARIO", scenario)
             .env("XDG_CACHE_HOME", self.cache_home());
@@ -325,6 +328,7 @@ exec "$UPGRADE_DRIVER_ROOT/recorder/helm" "$@"
                     .unwrap(),
             )
             .env("PATH", format!("{}:/usr/bin:/bin", self.0.path().display()))
+            .env("KUBECONFIG", self.0.path().join("kubeconfig"))
             .env("UPGRADE_DRIVER_ROOT", self.0.path())
             .env("UPGRADE_DRIVER_SCENARIO", scenario)
             .output()
@@ -5645,6 +5649,7 @@ fn fail_at_apply_against_soak_namespace_is_refused_without_helm() {
             "PATH",
             format!("{}:/usr/bin:/bin", fixture.0.path().display()),
         )
+        .env("KUBECONFIG", fixture.0.path().join("kubeconfig"))
         .env("UPGRADE_DRIVER_ROOT", fixture.0.path())
         .env("UPGRADE_DRIVER_SCENARIO", "happy")
         .env("CURIE_UPGRADE_TEST_FAIL_AT", "apply")
