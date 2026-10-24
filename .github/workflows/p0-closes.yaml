@@ -22,7 +22,7 @@ permissions:
 jobs:
   remind:
     name: Comment when a Closes targets P0 / release-blocker / sre-bot-e2e-demo
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # A job-level block REPLACES the workflow-level one, so `contents: read` is
     # repeated here. `issues: read` is the label lookup; `pull-requests: write`
     # is the comment. Neither is a required review.

@@ -75,6 +75,7 @@ def _socket_mode_connector(
             credentials.app_token,
             logger=logger,
             slack_identity=slack_identity,
+            identity_name=credentials.name,
             presence=presence,
         )
 

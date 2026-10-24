@@ -50,7 +50,7 @@ jobs:
   authorize-release:
     name: Authorize release publication
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment: release-publish
     env:
       RELEASE_MAIN_BRANCH: *release_main
@@ -101,7 +101,7 @@ jobs:
     name: Run the full kind tier on the tagged commit
     needs: [authorize-release]
     if: startsWith(github.ref, 'refs/tags/v') && needs.authorize-release.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       actions: write
       contents: read
@@ -111,12 +111,14 @@ jobs:
       GH_REPO: ${{ github.repository }}
       CI_REF: ${{ github.ref_name }}
     steps:
-      - name: Dispatch and wait for full CI on the tag
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Reuse complete kind proof or dispatch and wait for full CI
         run: |
-          dispatch=$(gh api --method POST "repos/$GH_REPO/actions/workflows/ci.yaml/dispatches" \
-            -f ref="$CI_REF" -F return_run_details=true)
-          run_id=$(jq -er '.workflow_run_id | select(type == "number" and . > 0 and . == floor)' <<< "$dispatch")
-          gh run watch "$run_id" --exit-status
+          python3 release/kind_ci.py run --repo "$GH_REPO" --ref "$CI_REF" \
+            --commit "$GITHUB_SHA" --timeout-seconds 20400
 
   build:
     permissions:
@@ -178,7 +180,7 @@ jobs:
             context: apps/docker-daemon
             dockerfile: apps/docker-daemon/Dockerfile
           - platform: linux/amd64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
             arch: amd64
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
@@ -297,7 +299,7 @@ jobs:
     if: |
       always() && needs.build.result == 'success' &&
       (!startsWith(github.ref, 'refs/tags/v') || needs.release-kind-tier.result == 'success')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -422,7 +424,7 @@ jobs:
       matrix:
         include:
           - platform: linux/amd64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
             arch: amd64
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
@@ -530,7 +532,7 @@ jobs:
     # Same ancestor-graph skip again (#787); both arch legs must have pushed
     # their digest before this job assembles the overlay's manifest.
     if: always() && needs.worker-local-build.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Download digests
         id: download_digests
@@ -649,7 +651,7 @@ jobs:
       matrix:
         include:
           - platform: linux/amd64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
             arch: amd64
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
@@ -750,7 +752,7 @@ jobs:
     needs: [dark-factory-runner-build]
     # Same ancestor-graph skip again (#787).
     if: always() && needs.dark-factory-runner-build.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Download digests
         id: download_digests
@@ -872,7 +874,7 @@ jobs:
           # not cosmetic and it must not be dropped (#1341).
           #
           # These targets used to build with the runner's own libc headers.
-          # `ubuntu-latest` is Ubuntu 24.04, so the artifacts required
+          # The `ubuntu-24.04` image ships glibc 2.39, so the artifacts required
           # GLIBC_2.39, and glibc is backward compatible but NOT forward: the
           # published binary would not start on anything older. Amazon Linux
           # 2023 ships 2.34, so `curie --version` on the very host this ARM
@@ -881,14 +883,14 @@ jobs:
           # -- no subcommand reachable, the cluster unoperable by its own CLI.
           #
           # Nothing caught it: every runner that executes these artifacts is
-          # also `ubuntu-latest`, so CI and the sre-bot eval lane were green
+          # also `ubuntu-24.04`, so CI and the sre-bot eval lane were green
           # throughout. The `Assert the glibc floor` step below, and the
           # `cli-portability` job in ci.yaml, are what close that hole.
           #
           # 2.28 covers RHEL/Alma 8, Debian 10, Ubuntu 18.04 and AL2023. Lower
           # it only with a host in mind; raising it silently is the bug.
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04
             glibc: "2.28"
           # arm64 Linux is the cheap-cloud target: Graviton and equivalents are
           # ~20% less than x86 for this workload, and a single-node k3s box is a
@@ -903,10 +905,10 @@ jobs:
           # pinned glibc) instead of the host's. That was the whole reason those
           # packages were needed.
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04
             glibc: "2.28"
           - target: aarch64-apple-darwin
-            os: macos-latest
+            os: macos-26
     steps:
       - uses: actions/checkout@v7
         with:
@@ -1002,7 +1004,7 @@ jobs:
     # cancelled merge leg stops the chart.
     needs: [authorize-release, merge]
     if: startsWith(github.ref, 'refs/tags/v') && needs.authorize-release.result == 'success' && needs.merge.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
         with:
@@ -1088,7 +1090,7 @@ jobs:
     name: Attach binaries to the GitHub Release
     if: startsWith(github.ref, 'refs/tags/v') && needs.release-kind-tier.result == 'success'
     needs: [release-kind-tier, merge, cli-binaries, chart, worker-local-merge, dark-factory-runner-merge]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
       # Keyless cosign signing and build provenance both mint a short-lived OIDC
@@ -1200,7 +1202,7 @@ jobs:
     name: Verify the draft release, then publish it
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [release]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       # write, not read: promoting the draft to published is this job's whole
       # point, and a draft is only visible to a token with push access.

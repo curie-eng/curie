@@ -2530,15 +2530,16 @@ no {{ .key }} in this container's env: nothing to stage. This is expected for a 
 {{/*
 Agents that get a per-agent runner SandboxTemplate and warm pool, as a JSON
 array: every connectorSecrets agent, every registryEgress agent (#3083), and
-every runnerImages agent (ADR-0173), every runnerEnv agent, and every workspaceSizeLimits agent (#3523),
-every true factory.sandboxEgress, and every string in agentSandbox.poolAgents.
+every runnerImages agent (ADR-0173), every runnerEnv agent, every workspaceSizeLimits agent (#3523),
+every agentResourceProfiles agent (#4889), every true factory.sandboxEgress, and every string in
+agentSandbox.poolAgents.
 */}}
 {{- define "curie.agentSandboxPoolAgents" -}}
 {{- $extra := list -}}
 {{- if kindIs "slice" .Values.agentSandbox.poolAgents -}}
 {{- $extra = .Values.agentSandbox.poolAgents -}}
 {{- end -}}
-{{- $agents := concat (keys (.Values.agentSandbox.connectorSecrets | default dict)) (keys (.Values.agentSandbox.registryEgress | default dict)) (keys (.Values.agentSandbox.runnerImages | default dict)) (keys (include "curie.agentSandboxRunnerEnv" . | fromJson)) (keys (.Values.agentSandbox.workspaceSizeLimits | default dict)) (include "curie.factory.sandboxAgents" . | fromJsonArray) $extra -}}
+{{- $agents := concat (keys (.Values.agentSandbox.connectorSecrets | default dict)) (keys (.Values.agentSandbox.registryEgress | default dict)) (keys (.Values.agentSandbox.runnerImages | default dict)) (keys (include "curie.agentSandboxRunnerEnv" . | fromJson)) (keys (.Values.agentSandbox.workspaceSizeLimits | default dict)) (keys (get .Values.agentSandbox "agentResourceProfiles" | default dict)) (include "curie.factory.sandboxAgents" . | fromJsonArray) $extra -}}
 {{- $agents | uniq | sortAlpha | toJson -}}
 {{- end -}}
 

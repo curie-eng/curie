@@ -633,6 +633,18 @@ themselves.
   Alertmanager `startsAt` or a provider state transition time. That timestamp
   identifies the reported episode. It does not prove the condition is still
   active and it never replaces a current read.
+- `SRE-ALERT-4`: For a turn-canary alert, read the installed check's contract,
+  same-route fresh delivery and exact-response observations, and bounded
+  diagnostics before attributing a failure. Delivered relay output with a
+  response mismatch is a probe-compliance finding; legacy exact-response
+  failure without delivery telemetry leaves delivery unverified. Failed
+  delivery establishes only that synthetic path's failure, not its cause or
+  user impact. Internal relay delivery does not prove Slack ingress, Slack
+  posting, useful work or policy compliance. Unverified channel capability,
+  healthy adapter probes and rollout timing alone establish neither a Slack
+  permission fault nor an identity-wide outage. Review a mismatching probe
+  against the agent's supported work without weakening the agent's policy;
+  use actual transport errors and user-turn evidence to establish impact.
 
 ## What watches the alert path
 

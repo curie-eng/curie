@@ -1464,6 +1464,43 @@ def test_evicted_pod_does_not_publish_unstructured_status_message() -> None:
     assert termination.detail is None
 
 
+def test_evicted_pod_carries_the_runner_exit_code_and_ignores_sidecars() -> None:
+    def termination_for(statuses: list[SimpleNamespace]) -> Any:
+        api = _FakeApi()
+        api.pod = SimpleNamespace(
+            metadata=SimpleNamespace(name="sbx-1", uid="pod-current"),
+            status=SimpleNamespace(
+                phase="Failed",
+                reason="Evicted",
+                message='Usage of EmptyDir volume "workspace" exceeds the limit "1Gi".',
+                container_statuses=statuses,
+            ),
+        )
+        return _client(api).pod_termination(
+            "sbx-1", request_timeout_seconds=0.5, since=datetime.now(UTC)
+        )
+
+    bare = termination_for([])
+    with_runner = termination_for([_runner_status(SimpleNamespace(reason="Error", exit_code=137))])
+    sidecar_only = termination_for(
+        [
+            SimpleNamespace(
+                name="sidecar",
+                state=SimpleNamespace(terminated=SimpleNamespace(reason="Error", exit_code=42)),
+                last_state=None,
+            )
+        ]
+    )
+
+    assert bare is not None and with_runner is not None and sidecar_only is not None
+    assert with_runner.reason == "Evicted"
+    assert with_runner.detail == bare.detail
+    assert with_runner.exit_code == 137
+    assert sidecar_only.reason == "Evicted"
+    assert sidecar_only.detail == bare.detail
+    assert sidecar_only.exit_code is None
+
+
 def test_failed_pod_reports_other_termination_reason() -> None:
     api = _FakeApi()
     api.pod = SimpleNamespace(
@@ -1511,6 +1548,7 @@ def test_oom_killed_runner_reports_container_termination() -> None:
     assert termination.reason == "OOMKilled"
     assert termination.detail is not None
     assert termination.detail == "exit code 137"
+    assert termination.exit_code == 137
     assert len(api.request_timeouts) == 1
     assert api.request_timeouts[0][0] == "get:pods:test-ns:sbx-1"
     assert 0 < api.request_timeouts[0][1] <= 0.5
@@ -1617,6 +1655,114 @@ def test_recent_eviction_event_explains_a_still_running_pod() -> None:
     assert termination.reason == "Evicted"
 
 
+def test_recent_eviction_event_carries_the_volume_and_limit() -> None:
+    api = _FakeApi()
+    api.pod = SimpleNamespace(
+        metadata=SimpleNamespace(name="sbx-1", uid="pod-current"),
+        status=SimpleNamespace(phase="Running", reason=None, container_statuses=[]),
+    )
+    api.events = [
+        SimpleNamespace(
+            reason="Evicted",
+            message=(
+                'Usage of EmptyDir volume "writable-1" exceeds the limit "384Mi"'
+                ", node has other pressure"
+            ),
+            involved_object=SimpleNamespace(kind="Pod", name="sbx-1", uid="pod-current"),
+            last_timestamp=datetime.now(UTC),
+        )
+    ]
+
+    termination = _client(api).pod_termination(
+        "sbx-1", request_timeout_seconds=0.5, since=datetime.now(UTC) - timedelta(seconds=5)
+    )
+
+    assert termination is not None
+    assert termination.reason == "Evicted"
+    assert (
+        termination.detail == 'Usage of EmptyDir volume "writable-1" exceeds the limit "384Mi"'
+    )
+
+
+def _event_diagnosed_termination(
+    reason: str, message: str, statuses: list[SimpleNamespace], phase: str
+) -> Any:
+    api = _FakeApi()
+    api.pod = SimpleNamespace(
+        metadata=SimpleNamespace(name="sbx-1", uid="pod-current"),
+        status=SimpleNamespace(phase=phase, reason=None, container_statuses=statuses),
+    )
+    api.events = [
+        SimpleNamespace(
+            reason=reason,
+            message=message,
+            involved_object=SimpleNamespace(kind="Pod", name="sbx-1", uid="pod-current"),
+            last_timestamp=datetime.now(UTC),
+        )
+    ]
+    return _client(api).pod_termination(
+        "sbx-1", request_timeout_seconds=0.5, since=datetime.now(UTC) - timedelta(seconds=5)
+    )
+
+
+@pytest.mark.parametrize("reason", ["Evicted", "OOMKilled"])
+def test_event_diagnosis_keeps_the_runner_exit_code_from_pod_status(reason: str) -> None:
+    message = 'Usage of EmptyDir volume "writable-1" exceeds the limit "384Mi"'
+    # What the event alone reports, with no runner container status to read.
+    baseline = _event_diagnosed_termination(reason, message, [], "Failed")
+    assert baseline is not None
+    assert baseline.exit_code is None
+
+    termination = _event_diagnosed_termination(
+        reason,
+        message,
+        [_runner_status(SimpleNamespace(reason="Error", exit_code=137))],
+        "Running",
+    )
+
+    assert termination is not None
+    assert termination.reason == reason
+    assert termination.detail == baseline.detail
+    assert termination.exit_code == 137
+
+
+def test_eviction_event_without_a_runner_termination_still_has_no_exit_code() -> None:
+    termination = _event_diagnosed_termination(
+        "Evicted",
+        'Usage of EmptyDir volume "writable-1" exceeds the limit "384Mi"',
+        [_runner_status(None)],
+        "Running",
+    )
+
+    assert termination is not None
+    assert termination.reason == "Evicted"
+    assert termination.exit_code is None
+
+
+def test_eviction_event_with_an_unstructured_message_has_no_detail() -> None:
+    api = _FakeApi()
+    api.pod = SimpleNamespace(
+        metadata=SimpleNamespace(name="sbx-1", uid="pod-current"),
+        status=SimpleNamespace(phase="Running", reason=None, container_statuses=[]),
+    )
+    api.events = [
+        SimpleNamespace(
+            reason="Evicted",
+            message="The node needed the pod gone for an unstructured reason.",
+            involved_object=SimpleNamespace(kind="Pod", name="sbx-1", uid="pod-current"),
+            last_timestamp=datetime.now(UTC),
+        )
+    ]
+
+    termination = _client(api).pod_termination(
+        "sbx-1", request_timeout_seconds=0.5, since=datetime.now(UTC) - timedelta(seconds=5)
+    )
+
+    assert termination is not None
+    assert termination.reason == "Evicted"
+    assert termination.detail is None
+
+
 def test_oom_event_alone_does_not_identify_runner_in_running_pod() -> None:
     api = _FakeApi()
     api.pod = SimpleNamespace(
@@ -1668,6 +1814,7 @@ def test_terminated_sidecar_does_not_hide_runner_state() -> None:
     )
     assert termination is not None
     assert termination.reason == "OOMKilled"
+    assert termination.exit_code == 137
 
 
 @pytest.mark.parametrize("recent", [True, False])
@@ -1701,6 +1848,7 @@ def test_only_recent_oom_last_state_explains_a_running_pod(recent: bool) -> None
         assert termination is not None
         assert termination.reason == "OOMKilled"
         assert termination.detail == "exit code 137"
+        assert termination.exit_code == 137
     else:
         assert termination is None
 
@@ -2540,6 +2688,7 @@ def test_deleting_pod_with_generic_runner_exit_reports_deleted_with_exit_code() 
     assert termination is not None
     assert termination.reason == "Deleted"
     assert termination.detail == "exit code 143"
+    assert termination.exit_code == 143
 
 
 def test_deleting_pod_with_oom_runner_reports_oom_killed() -> None:
@@ -2558,6 +2707,7 @@ def test_deleting_pod_with_oom_runner_reports_oom_killed() -> None:
     assert termination is not None
     assert termination.reason == "OOMKilled"
     assert termination.detail == "exit code 137"
+    assert termination.exit_code == 137
 
 
 def test_deleting_pod_keeps_deleted_despite_recent_current_uid_oom_event() -> None:
@@ -2581,6 +2731,7 @@ def test_deleting_pod_keeps_deleted_despite_recent_current_uid_oom_event() -> No
     assert termination is not None
     assert termination.reason == "Deleted"
     assert termination.detail == "exit code 143"
+    assert termination.exit_code == 143
 
 
 def test_deleting_running_pod_without_terminated_runner_reports_deleted() -> None:
@@ -2623,6 +2774,7 @@ def test_deleting_pod_with_recent_last_state_oom_reports_oom_killed() -> None:
     assert termination is not None
     assert termination.reason == "OOMKilled"
     assert termination.detail == "exit code 137"
+    assert termination.exit_code == 137
 
 
 def test_deleting_pod_with_stale_last_state_oom_reports_deleted() -> None:

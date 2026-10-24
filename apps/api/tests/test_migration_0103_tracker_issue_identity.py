@@ -350,9 +350,10 @@ def test_0103_keeps_ids_backfills_the_tracker_identity_and_a_replay_dedupes(
             }
         ]
 
-        # The ORM reads the head's columns (0105's trigger label, #4361), so the
-        # typed reads and the replay below run on the head schema.
-        command.upgrade(config, "0105")
+        # The ORM reads the head's columns (0105's trigger label, #4361, and
+        # 0123's last_start_failure_detail, #4930), so the typed reads and the
+        # replay below run on the head schema.
+        command.upgrade(config, "0123")
 
         # The typed derivations over the migrated row are the legacy values.
         async def migrated_issue() -> Any:

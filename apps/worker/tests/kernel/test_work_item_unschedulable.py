@@ -65,6 +65,9 @@ def test_an_unschedulable_execution_defers_as_capacity(make_harness) -> None:
             assert deferred_id == request_id
             assert defer["reason"] == "capacity"
             assert defer["capacity"] is True
+            # A capacity wait is never a start-failure diagnostic (#4930).
+            assert "start_failure_detail" in defer
+            assert defer["start_failure_detail"] is None
             assert "start" not in work_items.calls
             assert work_items.finishes == []
             assert h.runner.opened == []
@@ -96,6 +99,9 @@ def test_a_slow_but_scheduled_execution_keeps_the_claim_timeout(make_harness) ->
             _deferred_id, defer = work_items.defers[0]
             assert str(defer["reason"]).startswith("not_started:")
             assert defer["capacity"] is False
+            # A claim timeout is not a workspace fault: no diagnostic (#4930).
+            assert "start_failure_detail" in defer
+            assert defer["start_failure_detail"] is None
             assert h.runner.opened == []
 
     asyncio.run(exercise())

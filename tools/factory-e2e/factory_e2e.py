@@ -4200,9 +4200,9 @@ def agent_message_from_comment(body: str) -> str | None:
     """The agent's last message from a final issue comment, or None (#3128).
 
     Read only the contiguous quoted block immediately after the exact label.
-    Strip one quote prefix per line and reverse the API's HTML, image, mention
-    and comment-opener substitutions once, then decode ``&amp;`` last to
-    preserve literal entity text.
+    Strip one quote prefix and reverse the API's bracket, URL, backslash,
+    HTML, mention and comment-opener substitutions once, then decode ``&amp;``
+    last to preserve literal entity text.
     """
 
     lines = body.split("\n")
@@ -4223,7 +4223,9 @@ def agent_message_from_comment(body: str) -> str | None:
     return (
         "\n".join(quoted)
         .replace("@\u200b", "@")
-        .replace("!\\[", "![")
+        .replace("\\[", "[")
+        .replace("\\://", "://")
+        .replace("\\\\", "\\")
         .replace("&lt;", "<")
         .replace("<\u200b!--", "<!--")
         .replace("&amp;", "&")
@@ -4408,6 +4410,28 @@ def _work_item_link(p: Preflight, work_item_id: str) -> dict[str, Any] | None:
         "pr_number": number or None,
         "pr_url": url or None,
     }
+
+
+def _no_change_notice(p: Preflight, work_item_id: str) -> dict[str, str | None] | None:
+    """The latest terminal notice for this WorkItem, read while Postgres is up.
+
+    Keyed by work_item_id. The Jira driver never stores execution_request_id
+    on the preflight, and the operator WorkItem payload does not include the
+    notice detail.
+    """
+
+    if not re.fullmatch(r"[0-9A-Za-z-]{1,64}", work_item_id):
+        return None
+    rows = p.sql(
+        "SELECT terminal_cause, detail FROM factory_terminal_notices "
+        f"WHERE work_item_id = '{work_item_id}' "
+        "ORDER BY created_at DESC NULLS LAST, execution_request_id DESC "
+        "LIMIT 1"
+    )
+    if len(rows) != 1:
+        return None
+    cause, detail = (rows[0] + ["", ""])[:2]
+    return {"terminal_cause": cause or None, "detail": detail or None}
 
 
 def _notice_row(p: Preflight, request_id: str) -> dict[str, Any] | None:
@@ -6378,10 +6402,15 @@ def run_loop(p: Preflight, driver: ForgeDriver) -> dict[str, Any]:
     if change is None:
         # Why no change came: the WorkItem's state and how its requests ended.
         detail = p.work_item_detail(work_item_id) or {}
+        notice = _no_change_notice(p, work_item_id)
+        latest = _latest_request(detail) or {}
         obs["no_change"] = {
             "state": detail.get("state"),
             "statuses": _ordered_statuses(detail),
-            "terminal_cause": (_latest_request(detail) or {}).get("terminal_cause"),
+            "terminal_cause": (
+                notice["terminal_cause"] if notice is not None else latest.get("terminal_cause")
+            ),
+            "detail": None if notice is None else notice["detail"],
         }
         _timeline(obs, "request ended without a change", **obs["no_change"])
         obs["tracker"] = driver.tracker_evidence(None, work_item_id)

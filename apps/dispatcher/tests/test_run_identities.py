@@ -51,7 +51,8 @@ def recorded(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         return WebClient(**kwargs)
 
     class RecordingHandler:
-        def __init__(self, app: App, app_token: str) -> None:
+        def __init__(self, app: App, app_token: str, logger: Any = None) -> None:
+            del logger
             calls.handlers.append((app, app_token))
             self.client = SimpleNamespace(
                 message_listeners=[],

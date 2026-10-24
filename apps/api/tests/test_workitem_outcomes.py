@@ -28,6 +28,8 @@ from curie_api import approval_principal, factory_ci, workitem_outcomes
 from curie_api.config import get_settings
 from curie_api.crud import approvals as crud_approvals
 from curie_api.crud import lineages as crud_lineages
+from curie_api.crud import publication_queries as crud_publication_queries
+from curie_api.factory_base import ResolvedBase
 from curie_api.forges.errors import NotFound, Unauthorized, Unavailable
 from curie_api.forges.github.ci import CiDetail
 from curie_api.forges.github.code_host import GitHubCodeHost
@@ -37,6 +39,7 @@ from curie_api.forges.types import (
     GITHUB,
     CheckState,
     CiRollup,
+    Commit,
     NormalizedCheck,
     PullRequestRef,
     ReplyTarget,
@@ -263,6 +266,7 @@ def _facts(
         "objective": OBJECTIVE,
         "requester": REQUESTER,
         "request_id": uuid.uuid4(),
+        "base": ResolvedBase(branch="main", source="default", commit=BASE_SHA),
         "trigger_label": None,
     }
     values.update(overrides)
@@ -501,6 +505,7 @@ def _open_pr(client: TestClient, publication_id: str) -> None:
                     base_ref="main",
                 ),
                 github_html_base="https://github.com",
+                first_parent_proof=await _first_parent_proof(session, publication_id, HEAD_SHA),
             )
             assert (lineage.status, lineage.pr_number, lineage.pr_url) == (
                 "open",
@@ -513,6 +518,45 @@ def _open_pr(client: TestClient, publication_id: str) -> None:
             )
 
     client.portal.call(advance)
+
+
+async def _first_parent_proof(
+    session: AsyncSession, publication_id: str, head_sha: str, *, parent_sha: str | None = None
+) -> Any:
+    from curie_api.publication_verification import publication_base_ref, verify_publication_commit
+
+    publication = await crud_publication_queries.get_publication(session, uuid.UUID(publication_id))
+    assert publication is not None
+    parent = parent_sha or publication.expected_prior_head
+
+    class CodeHostGraph:
+        async def resolve_repository(self, project_id: str) -> RepositoryRef:
+            return RepositoryRef("github", "github.com", "101", REPO, default_branch="main")
+
+        async def branch_head(self, repository: RepositoryRef, branch: str) -> str:
+            assert repository.path == REPO
+            assert branch == "main"
+            return parent
+
+        async def read_commit(self, repository: RepositoryRef, sha: str) -> Commit:
+            assert repository.path == REPO
+            if sha == head_sha:
+                return Commit(
+                    sha=sha,
+                    parents=(parent,),
+                    message=f"Publish\n\nCurie-Revision: {publication.id}\n",
+                )
+            if sha == parent and parent != publication.base_sha:
+                return Commit(sha=sha, parents=(publication.base_sha,), message="Moved base")
+            assert sha == publication.base_sha
+            return Commit(sha=sha, parents=(), message="Approved base")
+
+    code_host = cast(Any, CodeHostGraph())
+    repository = RepositoryRef("github", "github.com", "101", REPO, default_branch="main")
+    base_branch = await publication_base_ref(session, code_host, publication, repository)
+    return await verify_publication_commit(
+        code_host, repository, publication, commit_sha=head_sha, base_branch=base_branch
+    )
 
 
 def _detail(
@@ -598,6 +642,7 @@ def test_capacity_deferral_is_waiting_and_names_capacity(
             generation=1,
             reason="capacity",
             capacity=True,
+            start_failure_detail=None,
         )
 
     with_session(body)
@@ -768,6 +813,7 @@ def test_failed_start_failed_names_the_attempts_and_last_reason(
                 generation=generation,
                 reason="not_started:classified_failure",
                 capacity=False,
+                start_failure_detail=None,
             )
             assert getattr(deferred, "code", None) is None, deferred
 
@@ -782,6 +828,225 @@ def test_failed_start_failed_names_the_attempts_and_last_reason(
     )
     assert body["requests"][-1]["terminal_cause"] == "start_failed"
     _assert_common(body)
+
+
+# --- #4930: the previous start failure is part of the actionable cause -----
+
+START_FAILURE_DETAIL = "workspace archive-size failed: archive exceeds 1048576 bytes"
+PREVIOUS_START_FAILURE = f"; previous start failure: {START_FAILURE_DETAIL}"
+
+
+def _defer_once(request_id: uuid.UUID, *, reason: str, capacity: bool, detail: str | None) -> None:
+    async def body(session: AsyncSession) -> None:
+        generation = await session.scalar(
+            text("SELECT dispatch_generation FROM curie.execution_requests WHERE id = :id"),
+            {"id": request_id},
+        )
+        granted = await acquire(
+            session,
+            request_id,
+            owner=OWNER,
+            generation=generation,
+            wake=await factory_wake(session, request_id),
+            context=None,
+        )
+        assert getattr(granted, "code", None) is None, granted
+        deferred = await defer(
+            session,
+            request_id,
+            owner=OWNER,
+            generation=generation,
+            reason=reason,
+            capacity=capacity,
+            start_failure_detail=detail,
+        )
+        assert getattr(deferred, "code", None) is None, deferred
+
+    with_session(body)
+
+
+def _current_generation(request_id: uuid.UUID) -> int:
+    async def body(session: AsyncSession) -> int:
+        value = await session.scalar(
+            text("SELECT dispatch_generation FROM curie.execution_requests WHERE id = :id"),
+            {"id": request_id},
+        )
+        assert isinstance(value, int)
+        return value
+
+    return with_session(body)
+
+
+def test_work_item_read_exposes_last_start_failure_detail(
+    stack: TestClient, auth_headers: dict[str, str]
+) -> None:
+    agent = _agent(stack, auth_headers)
+    facts = _facts(agent["agent_id"])
+    seeded = _admit(facts)
+
+    fresh = _detail(stack, auth_headers, seeded.work_item_id)
+    assert "last_start_failure_detail" in fresh["requests"][-1]
+    assert fresh["requests"][-1]["last_start_failure_detail"] is None
+    assert "previous start failure" not in fresh["actionable_cause"]
+
+    _defer_once(
+        facts.request_id,
+        reason="not_started:classified_failure",
+        capacity=False,
+        detail=START_FAILURE_DETAIL,
+    )
+    body = _detail(stack, auth_headers, seeded.work_item_id)
+    assert body["state"] == "waiting"
+    assert body["requests"][-1]["last_start_failure_detail"] == START_FAILURE_DETAIL
+    _assert_common(body)
+
+
+def test_waiting_cause_names_the_capacity_wait_and_the_previous_start_failure(
+    stack: TestClient, auth_headers: dict[str, str]
+) -> None:
+    agent = _agent(stack, auth_headers)
+    facts = _facts(agent["agent_id"])
+    seeded = _admit(facts)
+    _defer_once(
+        facts.request_id,
+        reason="not_started:classified_failure",
+        capacity=False,
+        detail=START_FAILURE_DETAIL,
+    )
+
+    started_only = _detail(stack, auth_headers, seeded.work_item_id)
+    assert started_only["state"] == "waiting"
+    prefix = "waiting for sandbox capacity" + PREVIOUS_START_FAILURE + "; waiting deadline "
+    assert started_only["actionable_cause"].startswith(prefix), started_only["actionable_cause"]
+
+    _defer_once(facts.request_id, reason="capacity", capacity=True, detail=None)
+    body = _detail(stack, auth_headers, seeded.work_item_id)
+    assert body["state"] == "waiting"
+    cause = body["actionable_cause"]
+    # After the capacity text, before the deadline suffix.
+    prefix = (
+        "waiting for sandbox capacity; deferred 1 time(s) for capacity, "
+        "last reason: capacity" + PREVIOUS_START_FAILURE + "; waiting deadline "
+    )
+    assert cause.startswith(prefix), cause
+    assert cause.count("previous start failure") == 1
+    request = body["requests"][-1]
+    assert request["capacity_deferrals"] == 1
+    assert request["last_deferral_reason"] == "capacity"
+    assert request["last_start_failure_detail"] == START_FAILURE_DETAIL
+    _assert_common(body)
+
+
+def test_elapsed_and_expired_capacity_wait_name_the_previous_start_failure(
+    stack: TestClient,
+    auth_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = _agent(stack, auth_headers)
+    monkeypatch.setenv("CURIE_WORK_ITEM_WAIT_BUDGET_SECONDS", "3")
+    get_settings.cache_clear()
+    facts = _facts(agent["agent_id"])
+    admitted_at = time.monotonic()
+    seeded = _admit(facts)
+    _defer_once(
+        facts.request_id,
+        reason="not_started:classified_failure",
+        capacity=False,
+        detail=START_FAILURE_DETAIL,
+    )
+    _defer_once(facts.request_id, reason="capacity", capacity=True, detail=None)
+    time.sleep(max(0.0, 3.5 - (time.monotonic() - admitted_at)))
+
+    elapsed = _detail(stack, auth_headers, seeded.work_item_id)
+    assert elapsed["state"] == "waiting"
+    prefix = (
+        "waiting for sandbox capacity; deferred 1 time(s) for capacity, "
+        "last reason: capacity" + PREVIOUS_START_FAILURE + "; the waiting deadline elapsed at "
+    )
+    assert elapsed["actionable_cause"].startswith(prefix), elapsed["actionable_cause"]
+
+    work_item_version, request_version = _versions(facts.request_id)
+
+    async def expire(session: AsyncSession) -> None:
+        result = await workitems.expire_waiting(
+            session,
+            work_item_id=seeded.work_item_id,
+            request_id=facts.request_id,
+            expected_work_item_version=work_item_version,
+            expected_request_version=request_version,
+        )
+        assert isinstance(result, workitems.WorkItemOutcome), result
+
+    with_session(expire)
+
+    expired = _detail(stack, auth_headers, seeded.work_item_id)
+    assert expired["state"] == "expired"
+    assert expired["actionable_cause"] == (
+        "expired: capacity_wait_expired, no sandbox capacity before the waiting deadline"
+        + PREVIOUS_START_FAILURE
+    )
+    assert expired["requests"][-1]["last_start_failure_detail"] == START_FAILURE_DETAIL
+    _assert_common(expired)
+
+
+def test_start_failed_cause_names_the_previous_start_failure(
+    stack: TestClient, auth_headers: dict[str, str]
+) -> None:
+    agent = _agent(stack, auth_headers)
+    facts = _facts(agent["agent_id"])
+    seeded = _admit(facts)
+    for attempt in range(5):
+        _defer_once(
+            facts.request_id,
+            reason="not_started:classified_failure",
+            capacity=False,
+            detail=START_FAILURE_DETAIL if attempt == 0 else None,
+        )
+
+    body = _detail(stack, auth_headers, seeded.work_item_id)
+    assert body["state"] == "failed"
+    assert body["actionable_cause"] == (
+        "failed: start_failed, the sandbox did not start after 5 attempts. "
+        "Last reason: not_started:classified_failure." + PREVIOUS_START_FAILURE
+    )
+    assert body["requests"][-1]["terminal_cause"] == "start_failed"
+    assert body["requests"][-1]["last_start_failure_detail"] == START_FAILURE_DETAIL
+    _assert_common(body)
+
+
+def test_running_and_completed_requests_report_no_start_failure(
+    stack: TestClient, auth_headers: dict[str, str]
+) -> None:
+    agent = _agent(stack, auth_headers)
+    facts = _facts(agent["agent_id"])
+    seeded = _admit(facts)
+    _defer_once(
+        facts.request_id,
+        reason="not_started:classified_failure",
+        capacity=False,
+        detail=START_FAILURE_DETAIL,
+    )
+    waiting = _detail(stack, auth_headers, seeded.work_item_id)
+    assert PREVIOUS_START_FAILURE in waiting["actionable_cause"]
+
+    epoch = _start(facts.request_id, generation=_current_generation(facts.request_id))
+    running = _detail(stack, auth_headers, seeded.work_item_id)
+    assert running["state"] == "running"
+    assert "previous start failure" not in running["actionable_cause"]
+    assert running["requests"][-1]["last_start_failure_detail"] is None
+
+    # Completion needs an opened pull request (see
+    # test_opened_pr_binds_lineage_and_ci_is_unavailable).
+    publication = _publish(stack, agent["deployment_id"])
+    _resolve(stack, auth_headers, publication["approval_id"])
+    _open_pr(stack, publication["id"])
+    _finish(facts.request_id, epoch, "completed", "completed")
+    completed = _detail(stack, auth_headers, seeded.work_item_id)
+    assert completed["state"] == "published"
+    assert completed["requests"][-1]["status"] == "completed"
+    assert "previous start failure" not in completed["actionable_cause"]
+    assert completed["requests"][-1]["last_start_failure_detail"] is None
+    _assert_common(completed)
 
 
 def test_completion_without_a_pull_request_stays_running(
@@ -1067,6 +1332,7 @@ def test_verified_repository_identity_must_match_work_item_to_bind(
                 base_ref="main",
             ),
             github_html_base="https://github.com",
+            first_parent_proof=await _first_parent_proof(session, publication["id"], HEAD_SHA),
         )
         opened = await session.execute(
             text(
@@ -2566,6 +2832,10 @@ def test_ci_gate_applies_the_python_preflight_verdict_to_python_changes(
 
     # The gate reads CI through the code host, which reads it here.
     monkeypatch.setattr(ci, "read_ci_detail", green_ci)
+    monkeypatch.setattr(
+        "curie_api.forges.github.code_host.resolve_repository_credential",
+        lambda repo, *, html_base, credentials: (f"{html_base}/{repo}.git", "Bearer fixture-token"),
+    )
 
     async def settlement(session: AsyncSession) -> Any:
         return await workitems.claim_publication_settlement(session, exclude=frozenset())
@@ -2584,7 +2854,17 @@ def test_ci_gate_applies_the_python_preflight_verdict_to_python_changes(
         engine = create_async_engine(get_settings().database_url)
         maker = async_sessionmaker(engine, expire_on_commit=False)
         try:
-            async with httpx.AsyncClient() as client:
+            def _host(request: httpx.Request) -> httpx.Response:
+                # The CI read is patched. This answers only the required-check
+                # reads: no ruleset, and a branch with no protection.
+                path = request.url.path
+                if "/rules/branches/" in path:
+                    return httpx.Response(404, json={"message": "Not Found"})
+                if "/branches/" in path:
+                    return httpx.Response(200, json={"name": path.rsplit("/", 1)[-1]})
+                return httpx.Response(404, json={"message": "Not Found"})
+
+            async with httpx.AsyncClient(transport=httpx.MockTransport(_host)) as client:
                 return await factory_ci.gate(
                     maker,
                     cast(Any, EmptyValkey()),

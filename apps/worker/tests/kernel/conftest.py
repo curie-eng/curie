@@ -1092,6 +1092,7 @@ async def kernel_harness(
     sibling_limit_factory: Callable[[AsyncRedis, WorkerConfig], object] | None = None,
     progress_factory: Callable[[AsyncRedis, WorkerConfig], object] | None = None,
     sweep_factory: Callable[[AsyncRedis, WorkerConfig], object] | None = None,
+    pod_termination_wait_s: float = 0.0,
     **config_overrides: object,
 ) -> AsyncIterator[Harness]:
     """Assemble a live kernel wired to a fake runner and real Valkey."""
@@ -1220,6 +1221,12 @@ async def kernel_harness(
 
         killswitch = KillSwitch(async_redis, on_kill=kernel.interrupt_agent)
         kernel.attach_killswitch(killswitch)
+    from curie_worker.kernel import constants as kernel_constants
+
+    _wait_existed = hasattr(kernel_constants, "POD_TERMINATION_WAIT_S")
+    _wait_previous = getattr(kernel_constants, "POD_TERMINATION_WAIT_S", None)
+    # raising=False equivalent: the attribute need not exist on a reverted source.
+    kernel_constants.POD_TERMINATION_WAIT_S = pod_termination_wait_s
     try:
         yield Harness(
             substrate,
@@ -1234,6 +1241,10 @@ async def kernel_harness(
             runners,
         )
     finally:
+        if _wait_existed:
+            kernel_constants.POD_TERMINATION_WAIT_S = _wait_previous
+        else:
+            delattr(kernel_constants, "POD_TERMINATION_WAIT_S")
         with contextlib.suppress(Exception):
             await runner_client.close()
         with contextlib.suppress(Exception):

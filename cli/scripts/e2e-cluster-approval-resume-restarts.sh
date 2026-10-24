@@ -437,9 +437,13 @@ if deploy_agent >"$WORKDIR/deploy1.json" 2>"$WORKDIR/deploy1.err"; then
     echo "note: first deploy succeeded before the route was bound"
 else
     # Tolerate ONLY the unbound-route refusal: the agent must now exist and the
-    # refusal must name this route.
-    if approvals_cli --list >/dev/null 2>&1; then
+    # refusal must name this route. Keep the probe's stderr so a failed probe
+    # is diagnosable instead of ending in an unexplained failure.
+    if approvals_cli --list >/dev/null 2>"$WORKDIR/ownership.err"; then
         AGENT_OWNED=1
+    else
+        echo "agent ownership probe failed: curie cluster approvals $AGENT --list" >&2
+        tail -n 40 "$WORKDIR/ownership.err" >&2
     fi
     # With --json the refusal is the JSON error object on stdout; without it,
     # the same text is on stderr. Read both.

@@ -3339,11 +3339,13 @@ export interface paths {
         put?: never;
         /**
          * Recover Publication Pull Request
-         * @description Adopt the branch's pull request, or open it when the branch exists.
+         * @description Adopt the branch's pull request, or open one unless ``adopt_only`` is true.
          *
          *     The contract is the stored publication's title, body and draft flag, the
          *     lineage branch, and the admitted WorkItem's base or else the repository's
          *     default branch (`curie_api.publication_pulls.adopt_or_open`).
+         *
+         *     An absent branch, or no pull request in adoption-only mode, returns 204.
          */
         post: operations["recover_publication_pull_request_v1_internal_publications__publication_id__pull_request_post"];
         delete?: never;
@@ -3389,7 +3391,7 @@ export interface paths {
         put?: never;
         /**
          * Verify Publication Revision
-         * @description Prove a remote commit is this revision's marked commit on its expected parent.
+         * @description Prove the marked revision and its authoritative publication parent.
          */
         post: operations["verify_publication_revision_v1_internal_publications__publication_id__revision_commit_post"];
         delete?: never;
@@ -5892,6 +5894,8 @@ export interface components {
             owner: string;
             /** Reason */
             reason: string;
+            /** Start Failure Detail */
+            start_failure_detail?: string | null;
         };
         /** DeploymentCreate */
         DeploymentCreate: {
@@ -7743,6 +7747,8 @@ export interface components {
          * @description The head of a publication's branch; ``None`` when the branch does not exist.
          */
         PublicationBranchHeadOut: {
+            /** Base Branch */
+            base_branch: string;
             /** Head Sha */
             head_sha: string | null;
         };
@@ -8096,10 +8102,14 @@ export interface components {
         };
         /**
          * PublicationPullRecover
-         * @description Adopt the publication branch's pull request, or open it when the branch
-         *     holds exactly ``expected_head_sha``.
+         * @description Adopt the publication branch's pull request.
+         *
+         *     When ``adopt_only`` is false, open one if the branch holds exactly
+         *     ``expected_head_sha``.
          */
         PublicationPullRecover: {
+            /** Adopt Only */
+            adopt_only: boolean;
             /** Expected Head Sha */
             expected_head_sha: string;
         };
@@ -8131,6 +8141,8 @@ export interface components {
         PublicationRevisionOut: {
             /** Commit Sha */
             commit_sha: string;
+            /** Parent Sha */
+            parent_sha: string;
         };
         /**
          * PublicationRevisionVerify
@@ -9909,6 +9921,8 @@ export interface components {
             execution_deadline: string | null;
             /** Last Deferral Reason */
             last_deferral_reason: string | null;
+            /** Last Start Failure Detail */
+            last_start_failure_detail: string | null;
             /** Sequence */
             sequence: number;
             /** Started At */
@@ -17205,7 +17219,7 @@ export interface operations {
                     "application/json": components["schemas"]["PublicationPullRequestOut"];
                 };
             };
-            /** @description The publication branch does not exist */
+            /** @description Publication branch absent, or no pull request in adoption-only mode */
             204: {
                 headers: {
                     [name: string]: unknown;

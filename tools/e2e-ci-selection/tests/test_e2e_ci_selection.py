@@ -296,6 +296,19 @@ CHART_SCENARIOS: dict[str, _ChartScenario] = {
         ],
         "leg": "workload",
     },
+    "factory-resource-profile": {
+        "step": "Factory resource profile runtime (#4889)",
+        "inputs": [
+            "charts/curie/ci/runtime/factory-resource-profile-runtime.sh",
+            "charts/curie/values.yaml",
+            "charts/curie/values.schema.json",
+            "charts/curie/templates/agent-sandbox.yaml",
+            "charts/curie/templates/_sandbox_envelope.tpl",
+            "charts/curie/templates/_helpers.tpl",
+            *CHART_IMAGE_INPUTS,
+        ],
+        "leg": "workload",
+    },
 }
 CHART_IDS = tuple(sorted(CHART_SCENARIOS))
 
@@ -307,6 +320,7 @@ WORKLOAD_SCENARIOS = frozenset(
         "quota-progress",
         "connector-secret-rotation",
         "failed-first-install-retry",
+        "factory-resource-profile",
     }
 )
 
@@ -881,6 +895,19 @@ def test_registry_maps_each_known_surface(
 )
 def test_selector_and_workflow_paths_do_not_boot_kind(tmp_path: Path, path: str) -> None:
     _assert_selection(tmp_path, path, (), pytest_needed=True)
+
+
+@pytest.mark.parametrize(
+    ("path", "selected"),
+    [
+        (".github/workflows/release.yaml", ("local-release",)),
+        (".github/workflows/release-notes.yaml", ()),
+    ],
+)
+def test_release_workflow_selection_is_exact(
+    tmp_path: Path, path: str, selected: tuple[str, ...]
+) -> None:
+    _assert_selection(tmp_path, path, selected, pytest_needed=True)
 
 
 @pytest.mark.parametrize(
@@ -1838,6 +1865,7 @@ def test_mixed_root_documentation_and_runtime_diff_selects_runtime_tiers(
         pytest_deselect=ALL_CONDITIONAL,
         chart_scenarios=(
             "connector-secret-rotation",
+            "factory-resource-profile",
             "quota-progress",
             "workspace-diagnostic",
         ),
@@ -2395,7 +2423,9 @@ def _changes_filter_script() -> str:
     )
     assert isinstance(run, str)
     assert "github.event_name" in run
-    assert '"$base_ref" = "next"' in run
+    # Pull requests into next select kind tiers by changed paths exactly like
+    # main, so the script has no branch that singles next out.
+    assert '"next"' not in run
     assert run.count("select_tiers.py") == 3
     return run
 
@@ -2426,7 +2456,7 @@ def _assert_changes_filter_route(script: str, event: str, branch: str) -> list[s
         ["--base", f"origin/{branch}", "--head", "HEAD"]
         if event == "pull_request" else ["--push"]
     )
-    if event == "push" or (event == "pull_request" and branch == "next"):
+    if event == "push":
         options.append("--omit-kind")
     assert argv == prefix + options
     fetch = f"git\0fetch\0--quiet\0origin\0{branch}\0" if event == "pull_request" else ""
@@ -2476,6 +2506,7 @@ def test_both_trains_omit_kind_on_push_and_keep_full_dispatch(
         ("push-with-kind", "push", "next"),
         ("dispatch-without-kind", "workflow_dispatch", "main"),
         ("dispatch-without-kind", "workflow_dispatch", "next"),
+        ("next-pr-omits-kind", "pull_request", "next"),
     ],
 )
 def test_changes_filter_rejects_each_push_and_dispatch_route_mutation(
@@ -2496,6 +2527,20 @@ def test_changes_filter_rejects_each_push_and_dispatch_route_mutation(
     elif mutation == "push-with-kind":
         assert script.count("--omit-kind\n") == 1
         script = script.replace("--omit-kind\n", "\n", 1)
+    elif mutation == "next-pr-omits-kind":
+        # Re-add the old shape: next pull requests drop the kind tiers again.
+        fetch = 'git fetch --quiet origin "$base_ref"\n'
+        head = "--head HEAD\n"
+        assert script.count(fetch) == 1
+        assert script.count(head) == 1
+        script = script.replace(
+            fetch,
+            fetch + 'extra=()\nif [ "$base_ref" = "next" ]; then\n  extra=(--omit-kind)\nfi\n',
+            1,
+        )
+        script = script.replace(head, '--head HEAD \\\n  "${extra[@]}"\n', 1)
+        # The mutation touches next only: the main route must still pass.
+        _assert_changes_filter_route(script, "pull_request", "main")
     else:
         before, after = script.rsplit("--push", 1)
         script = before + "--push --omit-kind" + after
@@ -2503,15 +2548,17 @@ def test_changes_filter_rejects_each_push_and_dispatch_route_mutation(
         _assert_changes_filter_route(script, event, branch)
 
 
-def test_push_runs_complete_while_pull_requests_and_dispatches_supersede() -> None:
+def test_pull_requests_supersede_while_pushes_and_dispatches_queue() -> None:
     workflow = yaml.safe_load(WORKFLOW.read_text())
     concurrency = workflow["concurrency"]
     assert set(concurrency) == {"group", "cancel-in-progress"}
     assert concurrency["group"] == (
         "${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}"
     )
-    # Only push runs complete; pull requests and dispatches supersede.
-    assert concurrency["cancel-in-progress"] == "${{ github.event_name != 'push' }}"
+    # Only pull request runs supersede their own in-flight run. A later dispatch
+    # cancelled two dispatched kind runs on 2026-10-20, and a release dispatch
+    # could be cancelled by a scheduled one, so dispatches and pushes queue.
+    assert concurrency["cancel-in-progress"] == "${{ github.event_name == 'pull_request' }}"
     # A new trigger must force a decision about whether its runs cancel.
     assert set(workflow[True]) == {"push", "pull_request", "workflow_dispatch"}
 
@@ -4122,7 +4169,8 @@ WORKLOAD_STAGING_IF = (
     "(contains(fromJSON(needs.changes.outputs.chart_scenarios), 'workspace-diagnostic') "
     "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') "
     "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-secret-rotation') "
-    "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'failed-first-install-retry')) }}"
+    "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'failed-first-install-retry') "
+    "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'factory-resource-profile')) }}"
 )
 
 
@@ -4221,6 +4269,33 @@ def test_failed_first_install_retry_reuses_the_chart_cluster_and_candidate_artif
     )
     assert steps.index(stage) < steps.index(retry)
 
+
+def test_factory_resource_profile_runs_on_the_workload_leg() -> None:
+    chart = yaml.safe_load(WORKFLOW.read_text())["jobs"][CHART_JOB]
+    steps = chart["steps"]
+    name = CHART_SCENARIOS["factory-resource-profile"]["step"]
+    matches = [step for step in steps if step.get("name") == name]
+    assert len(matches) == 1
+    profile = matches[0]
+    workspace = next(
+        step for step in steps if step.get("if") == _chart_step_if("workspace-diagnostic")
+    )
+    assert profile["if"] == _chart_step_if("factory-resource-profile")
+    assert profile["timeout-minutes"] == 30
+    assert "continue-on-error" not in profile
+    assert profile["env"] == workspace["env"]
+    commands = profile["run"].replace("\\\n", " ")
+    assert [" ".join(line.split()) for line in commands.splitlines() if line.strip()] == [
+        "set -euo pipefail",
+        "bash tools/runtime-assertion-gate/run.sh "
+        "charts/curie/ci/runtime/factory-resource-profile-runtime.sh",
+    ]
+    stage = next(
+        step
+        for step in steps
+        if step.get("name") == "Stage the workspace diagnostic images in kind"
+    )
+    assert steps.index(stage) < steps.index(profile)
 
 def test_quota_progress_runs_on_the_workload_leg() -> None:
     chart = yaml.safe_load(WORKFLOW.read_text())["jobs"][CHART_JOB]
@@ -4988,7 +5063,7 @@ def test_nightly_jobs_keep_their_selector_and_reject_a_missing_condition() -> No
 def test_aggregate_rejects_a_skip_on_a_nightly_dispatch(
     overrides: dict[str, str],
 ) -> None:
-    completed = _run_aggregate(**overrides)
+    completed = _run_aggregate(script_transform=None, **overrides)
     assert completed.returncode != 0, completed.stdout + completed.stderr
 
 
@@ -5115,7 +5190,12 @@ def test_controller_preflight_upgrade_scenario_runs_on_chart_pull_requests() -> 
             ("apps/api/src/curie_api/main.py",),
             False,
             False,
-            ("connector-secret-rotation", "quota-progress", "workspace-diagnostic"),
+            (
+                "connector-secret-rotation",
+                "factory-resource-profile",
+                "quota-progress",
+                "workspace-diagnostic",
+            ),
         ),
         (("charts/curie/templates/agent-sandbox.yaml",), False, False, CHART_IDS),
         (
@@ -5137,6 +5217,7 @@ def test_controller_preflight_upgrade_scenario_runs_on_chart_pull_requests() -> 
             (
                 "connector-readiness",
                 "connector-secret-rotation",
+                "factory-resource-profile",
                 "quota-progress",
                 "workspace-diagnostic",
             ),
@@ -5148,6 +5229,7 @@ def test_controller_preflight_upgrade_scenario_runs_on_chart_pull_requests() -> 
             (
                 "connector-readiness",
                 "connector-secret-rotation",
+                "factory-resource-profile",
                 "quota-progress",
                 "workspace-diagnostic",
             ),
@@ -5212,7 +5294,12 @@ def test_chart_scenarios_follow_changed_inputs_and_final_tiers(
         ("charts/curie/ci/postgres-readiness-delay.Dockerfile", ("langfuse-postgres-readiness",)),
         (
             "apps/worker/src/curie_worker/connector_k8s.py.bak",
-            ("connector-secret-rotation", "quota-progress", "workspace-diagnostic"),
+            (
+                "connector-secret-rotation",
+                "factory-resource-profile",
+                "quota-progress",
+                "workspace-diagnostic",
+            ),
         ),
         ("charts/curie/ci/runtime/connector-readiness-runtime.sh.bak", ()),
         ("charts/curie/ci/runtime/connector-readiness-runtime.sh/child", ("connector-readiness",)),
@@ -5260,6 +5347,7 @@ def test_chart_scenario_union_is_sorted_and_deduplicated(tmp_path: Path) -> None
     assert json.loads(_outputs_of(output)["chart_scenarios"]) == [
         "connector-readiness",
         "connector-secret-rotation",
+        "factory-resource-profile",
         "quota-progress",
         "workspace-diagnostic",
     ]
@@ -5560,7 +5648,12 @@ def test_unregistered_chart_scenario_fails_closed_in_each_selection_mode(
     expected = (
         CHART_IDS
         if mode in {"push", "revisions"}
-        else ("connector-secret-rotation", "quota-progress", "workspace-diagnostic")
+        else (
+                "connector-secret-rotation",
+                "factory-resource-profile",
+                "quota-progress",
+                "workspace-diagnostic",
+            )
     )
     assert json.loads(_outputs_of(output)["chart_scenarios"]) == sorted((*expected, "unregistered"))
     # An unregistered step has no leg condition, so it must run in every leg.

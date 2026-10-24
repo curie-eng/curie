@@ -819,6 +819,17 @@ class GitHubRepositoryFake:
             return httpx.Response(200, json={"total_count": len(runs), "check_runs": runs})
         if re.fullmatch(rf"{repo}/check-runs/\d+/annotations", path):
             return httpx.Response(200, json=[])
+        if re.fullmatch(rf"{repo}/rules/branches/.+", path):
+            # HTTP 404 contributes no ruleset names.
+            return httpx.Response(404, json={"message": "Not Found"})
+        matched = re.fullmatch(rf"{repo}/branches/(.+)", path)
+        if matched:
+            name = matched[1]
+            sha = self.branches.get(name)
+            body: dict[str, Any] = {"name": name}
+            if sha is not None:
+                body["commit"] = {"sha": sha}
+            return httpx.Response(200, json=body)
         # No job log is kept, so diagnostics report it unavailable.
         return httpx.Response(404, json={"message": "missing fixture"})
 

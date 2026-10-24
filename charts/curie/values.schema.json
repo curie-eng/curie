@@ -500,7 +500,7 @@
               "properties": {
                 "enabled": {"type": "boolean"},
                 "mountPath": {"const": "/workspace"},
-                "sizeLimit": {"type": "string", "minLength": 2},
+                "sizeLimit": {"type": ["string", "null"], "minLength": 2},
                 "fetchTimeoutSeconds": {"type": "integer", "minimum": 1, "maximum": 150},
                 "extractTimeoutSeconds": {"type": "integer", "minimum": 1, "maximum": 150}
               }

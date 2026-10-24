@@ -548,6 +548,10 @@ class GithubStub:
             }
         if method == "GET" and tail == "collaborators/octocat/permission":
             return 200, {"permission": "write", "user": HUMAN}
+        if method == "GET" and tail.startswith("rules/branches/"):
+            # No ruleset on this fixture. HTTP 404 contributes no required names.
+            # https://docs.github.com/en/rest/repos/rules#get-rules-for-a-branch
+            return 404, {"message": "Not Found"}
         if method == "GET" and tail.startswith("branches/"):
             branch = tail.removeprefix("branches/")
             sha = self._find_ref(branch)

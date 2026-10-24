@@ -27,7 +27,7 @@ env:
 jobs:
   chart-changes:
     name: Detect chart-relevant changes
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       chart: ${{ steps.filter.outputs.chart }}
     steps:
@@ -48,7 +48,7 @@ jobs:
   # shard succeeded.
   chart-lint-and-assertions-1:
     name: Chart lint, kubeconform, and render assertions (1 of 3)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [chart-changes]
     if: ${{ needs.chart-changes.outputs.chart == 'true' }}
     steps:
@@ -112,7 +112,7 @@ jobs:
           rm -f "$kubeconform_archive"
           kubeconform -v
           # The validate steps normalize rendered manifests through PyYAML (see
-          # below). It ships on ubuntu-latest, but ensure it explicitly so this
+          # below). It ships on ubuntu-24.04, but ensure it explicitly so this
           # job is not coupled to the runner image.
           python3 -c "import yaml" 2>/dev/null || pip install --quiet pyyaml
 
@@ -473,7 +473,7 @@ jobs:
 
   chart-assertions-2:
     name: Chart render assertions (2 of 3)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [chart-changes]
     if: ${{ needs.chart-changes.outputs.chart == 'true' }}
     steps:
@@ -512,7 +512,7 @@ jobs:
           rm -f "$kubeconform_archive"
           kubeconform -v
           # The validate steps normalize rendered manifests through PyYAML (see
-          # below). It ships on ubuntu-latest, but ensure it explicitly so this
+          # below). It ships on ubuntu-24.04, but ensure it explicitly so this
           # job is not coupled to the runner image.
           python3 -c "import yaml" 2>/dev/null || pip install --quiet pyyaml
           python3 -m pip install --quiet jsonschema==4.26.0
@@ -1110,7 +1110,7 @@ jobs:
 
   chart-assertions-retained-values:
     name: Chart render assertions (3 of 3, retained values through the real CLI)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [chart-changes]
     if: ${{ needs.chart-changes.outputs.chart == 'true' }}
     steps:
@@ -1147,7 +1147,7 @@ jobs:
           rm -f "$kubeconform_archive"
           kubeconform -v
           # The validate steps normalize rendered manifests through PyYAML (see
-          # below). It ships on ubuntu-latest, but ensure it explicitly so this
+          # below). It ships on ubuntu-24.04, but ensure it explicitly so this
           # job is not coupled to the runner image.
           python3 -c "import yaml" 2>/dev/null || pip install --quiet pyyaml
 
@@ -1167,7 +1167,7 @@ jobs:
 
   helm:
     name: Chart (lint + template + kubeconform)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [chart-changes, chart-lint-and-assertions-1, chart-assertions-2, chart-assertions-retained-values]
     # A completed run must record this check as success or failure. A
     # condition that can be false would mark it skipped and block release
@@ -1188,7 +1188,7 @@ jobs:
 
   reserved-env-upgrade:
     name: Reject legacy extraEnv before upgrade mutation
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [chart-changes]
     if: ${{ needs.chart-changes.outputs.chart == 'true' }}
     timeout-minutes: 10
@@ -1265,7 +1265,7 @@ jobs:
   # inventory the helm-ci step every root script needs.
   automatic-thread-isolation:
     name: Automatic thread isolation (kind)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [chart-changes]
     if: ${{ needs.chart-changes.outputs.chart == 'true' }}
     timeout-minutes: 45

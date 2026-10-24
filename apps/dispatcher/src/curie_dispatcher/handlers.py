@@ -504,6 +504,23 @@ def process_event(
         )
         return None
 
+    # A delivery canary proves Slack still delivers to this identity and
+    # nothing more (#4960): count it and stop before relevance and admission,
+    # so it never asks the API, posts a placeholder or mints a turn.
+    if lane == "mention" and channel in config.slack_delivery_canary_channels:
+        record_metric(
+            "curie.slack.delivery_canary",
+            attributes={"service.name": "curie-dispatcher", "slack_identity": slack_identity},
+        )
+        drop(
+            log,
+            DropReason.DELIVERY_CANARY,
+            event_id=slack_event_id,
+            level=logging.DEBUG,
+            channel=channel,
+        )
+        return None
+
     bots = identity_bots or {}
     # Derive the full Block Kit/attachment body before reading the mark; a
     # non-empty top-level text remains byte-identical (#2006).
@@ -879,7 +896,22 @@ def register_handlers(
     if lookup is not None:
         # Registered first among this app's own middleware: it only submits to a
         # background pool, so it adds nothing to the ack path (#1053/#1077).
-        app.use(principal_observer_middleware(lookup, identity_name=slack_identity))
+        observe = principal_observer_middleware(lookup, identity_name=slack_identity)
+
+        def _observe_non_canary(body: dict[str, Any], next_: Callable[[], None]) -> None:
+            event = body.get("event")
+            if (
+                isinstance(event, dict)
+                and event.get("type") == "app_mention"
+                and str(event.get("channel") or "") in config.slack_delivery_canary_channels
+            ):
+                # Leave envelope validation, counting and refusal to process_event.
+                # Even the log-only lookup would violate the no-API canary path.
+                next_()
+                return
+            observe(body, next_)
+
+        app.use(_observe_non_canary)
     # Resolved once here rather than per listener: the lane filter below drops
     # outside `process_event`, so it needs a logger of its own, and the injected
     # one is the single logger every drop must land on.
@@ -902,6 +934,8 @@ def register_handlers(
         decline with 503 for retry; exact row misses retain 404. Never call
         Slack here, and ask caller admission before dedupe and ownership.
         """
+        if str(event.get("channel") or "") in config.slack_delivery_canary_channels:
+            return next()
         text = _strip_self_mention(derive_text(event), context.get("bot_user_id"))
         driver = declared_driver(config, event)
         command = text[len(MARK) :].strip().split() if text.startswith(MARK) else []

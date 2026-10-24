@@ -94,6 +94,8 @@ async def process_event(
     error: BaseException | None = None
     hook_token = constants._HOOK_RUN_CARRY.set(hooks._HookRunCarry())
     lease_token = constants._DELIVERY_LEASE.set(lease)
+    termination_carry = constants._SandboxTerminationCarry()
+    termination_token = constants._SANDBOX_TERMINATION_CARRY.set(termination_carry)
     # A redelivery must never inherit an earlier delivery's terminal-send mark
     # from this process (#2433).
     self._terminal_reply_attempted.discard(qevent.event_id)
@@ -157,6 +159,20 @@ async def process_event(
                 outcome = "classified_failure" if error is not None else "done"
             if hasattr(span, "set_attribute"):
                 span.set_attribute("outcome", outcome)
+                termination = termination_carry.termination
+                if termination is not None:
+                    reason = termination.reason
+                    span.set_attribute(
+                        constants.SANDBOX_TERMINATION_REASON_ATTRIBUTE,
+                        reason
+                        if reason in constants.SANDBOX_TERMINATION_REASONS
+                        else constants.SANDBOX_TERMINATION_REASON_FALLBACK,
+                    )
+                    exit_code = termination.exit_code
+                    if type(exit_code) is int and 0 <= exit_code <= 255:
+                        span.set_attribute(
+                            constants.SANDBOX_TERMINATION_EXIT_CODE_ATTRIBUTE, exit_code
+                        )
             if hasattr(span, "set_status"):
                 span.set_status(
                     StatusCode.ERROR
@@ -169,6 +185,7 @@ async def process_event(
             constants._LIFECYCLE_SPAN.reset(token)
             constants._HOOK_RUN_CARRY.reset(hook_token)
             constants._DELIVERY_LEASE.reset(lease_token)
+            constants._SANDBOX_TERMINATION_CARRY.reset(termination_token)
     if error is not None:
         raise error
 
@@ -665,7 +682,11 @@ async def _process_event(
                                 ci_fix_round=None,
                             )
                         else:
-                            await factory_run.defer(f"not_started:{refusal}", capacity=False)
+                            await factory_run.defer(
+                                f"not_started:{refusal}",
+                                capacity=False,
+                                start_failure_detail=None,
+                            )
                     except WorkItemConflict as exc:
                         logger.info(
                             "factory refusal settlement for %s refused: %s", event_id, exc.code
@@ -1192,7 +1213,7 @@ async def _process_event(
                 )
                 if run is not None and not run.started:
                     try:
-                        await run.defer("thread_busy", capacity=False)
+                        await run.defer("thread_busy", capacity=False, start_failure_detail=None)
                     except WorkItemConflict as exc:
                         logger.info(
                             "work-item thread_busy defer refused for %s: %s",

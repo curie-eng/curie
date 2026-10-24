@@ -21,12 +21,13 @@ on:
         default: false
 
 # The event name is part of the group so a dispatch is not cancelled by a
-# push to that ref. A pull request or dispatch supersedes its own in-flight
-# run. A push to main or next runs to completion, so a burst of merges still
-# leaves completed results; GitHub replaces only an older pending push run.
+# push to that ref. A pull request supersedes its own in-flight run. Pushes
+# and dispatches run to completion (GitHub keeps one pending run per group
+# and replaces only an older pending one): a later dispatch cancelled two
+# dispatched kind runs on 2026-10-20.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
-  cancel-in-progress: ${{ github.event_name != 'push' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -1300,7 +1301,7 @@ jobs:
     # regression in it was undiscoverable until someone tried the artifact on a
     # real host. #1341 shipped exactly that way: both Linux targets inherited
     # the runner's GLIBC_2.39, and every runner that executes them is also
-    # `ubuntu-latest`, so nothing went red. This job runs the same path a tag
+    # `ubuntu-24.04`, so nothing went red. This job runs the same path a tag
     # would and then runs the result on an OLDER distro, which is the only
     # check that could have caught it.
     steps:
@@ -1356,7 +1357,7 @@ jobs:
       #
       # NOT the same as `curie-x86_64-linux-<sha>` from the build job above:
       # that one is a native build with the runner's glibc floor, exists to feed
-      # the e2e jobs on ubuntu-latest, and will NOT start on an older distro.
+      # the e2e jobs on ubuntu-24.04, and will NOT start on an older distro.
       # These two carry the 2.28 floor and are the ones to install anywhere real.
       # Named like the release assets so `--chart`/install flows read the same.
       #
@@ -1378,7 +1379,7 @@ jobs:
 
   cli-darwin:
     name: CLI builds for macOS (the fourth release target)
-    runs-on: macos-latest
+    runs-on: macos-26
     needs: [changes]
     # Same trigger as `cli-portability`: push to main and next plus the nightly
     # dispatch, never a pull request.
@@ -1391,12 +1392,12 @@ jobs:
     # partial asset set behind an already-pushed tag (#2458).
     #
     # This is the same hole `cli-portability` closes for the two Linux targets,
-    # and it stays a SEPARATE job: that one must remain on `ubuntu-latest`
+    # and it stays a SEPARATE job: that one must remain on `ubuntu-24.04`
     # because its whole point is running the artifact on an old-glibc Linux
     # image. macOS runner minutes bill at a multiple of Linux, so this job does
     # the build and nothing else.
     #
-    # `macos-latest` is arm64, so this is a NATIVE build: no zig, no
+    # `macos-26` is arm64, so this is a NATIVE build: no zig, no
     # cargo-zigbuild, no glibc floor, no cross toolchain. It is the same path a
     # tag takes for this target (release.yaml's non-`glibc` branch).
     defaults:
@@ -2516,7 +2517,7 @@ jobs:
   #
   # Reuses the release binary the Rust job already built and uploaded. The
   # local rung needs a working Docker daemon for `docker compose`;
-  # ubuntu-latest ships one, the same assumption the `compose` job above
+  # ubuntu-24.04 ships one, the same assumption the `compose` job above
   # already relies on. `CURIE_E2E_TIERS` carries the selected skill and local
   # subset. Expect this to be the slowest job in the
   # workflow -- three image builds (runner, api, worker base) plus one more
@@ -2813,8 +2814,10 @@ jobs:
       - name: Install uv (retry)
         if: steps.install_uv.outcome == 'failure'
         uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
-      # Pushes to both release train branches omit kind. Next pull requests
-      # omit it except for changed runtime assertions or upgrade jobs.
+      # Pushes to both release train branches omit kind. Pull requests into
+      # either train select kind tiers by changed paths, because a regression
+      # merged into next with kind omitted was first seen by the nightly run
+      # (6 of 21 failed scheduled runs from 2026-09-24 to 2026-10-20).
       # Dispatches select the full kind tier and upgrade matrix.
       - id: filter
         run: |
@@ -2823,16 +2826,11 @@ jobs:
           base_ref="${{ github.base_ref }}"
           if [ "$event" = "pull_request" ]; then
             git fetch --quiet origin "$base_ref"
-            extra=()
-            if [ "$base_ref" = "next" ]; then
-              extra=(--omit-kind)
-            fi
             uv run --no-project --with pyyaml==6.0.3 python \
               tools/e2e-ci-selection/select_tiers.py \
               --registry .github/e2e-selection.yaml \
               --base "origin/$base_ref" \
-              --head HEAD \
-              "${extra[@]}"
+              --head HEAD
           elif [ "$event" = "push" ]; then
             uv run --no-project --with pyyaml==6.0.3 python \
               tools/e2e-ci-selection/select_tiers.py \
@@ -2849,7 +2847,7 @@ jobs:
       # Added or changed cluster runtime assertions (#3391). `E2E required`
       # refuses a pull request verdict unless each is registered in an
       # enforcing cluster job and left a pass receipt. The selector keeps the
-      # cluster tier for them on next pull requests too. Pushes and dispatches
+      # cluster tier for them on pull requests into either train. Pushes and dispatches
       # list none: every change reaches main or next through a pull request,
       # which is where this gate holds the required verdict.
       - id: runtime
@@ -3276,7 +3274,7 @@ jobs:
           version: v0.24.0
           node_image: kindest/node:v1.31.0
           install_only: true
-      # This ubuntu-latest job owns a disposable hosted runner. The Android,
+      # This ubuntu-24.04 job owns a disposable hosted runner. The Android,
       # .NET and Haskell SDKs are unused here; remove only those preinstalled
       # SDK trees before downloading images to preserve the driver's 30 GB floor.
       - name: Free disk for the disposable factory cluster
@@ -3401,7 +3399,7 @@ jobs:
           version: v0.24.0
           node_image: kindest/node:v1.31.0
           install_only: true
-      # This ubuntu-latest job owns a disposable hosted runner. The Android,
+      # This ubuntu-24.04 job owns a disposable hosted runner. The Android,
       # .NET and Haskell SDKs are unused here; remove only those preinstalled
       # SDK trees before downloading images to preserve the driver's 30 GB floor.
       - name: Free disk for the disposable factory cluster
@@ -3503,7 +3501,7 @@ jobs:
           version: v0.24.0
           node_image: kindest/node:v1.31.0
           install_only: true
-      # This ubuntu-latest job owns a disposable hosted runner. The Android,
+      # This ubuntu-24.04 job owns a disposable hosted runner. The Android,
       # .NET and Haskell SDKs are unused here; remove only those preinstalled
       # SDK trees before downloading images to preserve the driver's 30 GB floor.
       - name: Free disk for the disposable factory cluster
@@ -3753,18 +3751,18 @@ jobs:
           set -euo pipefail
           uv run bash charts/curie/ci/scenarios/controller-preflight-kind.sh
       - name: Download the workspace diagnostic CLI
-        if: ${{ matrix.leg == 'workload' && (contains(fromJSON(needs.changes.outputs.chart_scenarios), 'workspace-diagnostic') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-secret-rotation') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'failed-first-install-retry')) }}
+        if: ${{ matrix.leg == 'workload' && (contains(fromJSON(needs.changes.outputs.chart_scenarios), 'workspace-diagnostic') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-secret-rotation') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'failed-first-install-retry') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'factory-resource-profile')) }}
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: curie-x86_64-linux-${{ github.sha }}
           path: cli/target/release
       - name: Load the workspace diagnostic candidate images
-        if: ${{ matrix.leg == 'workload' && (contains(fromJSON(needs.changes.outputs.chart_scenarios), 'workspace-diagnostic') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-secret-rotation') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'failed-first-install-retry')) }}
+        if: ${{ matrix.leg == 'workload' && (contains(fromJSON(needs.changes.outputs.chart_scenarios), 'workspace-diagnostic') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-secret-rotation') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'failed-first-install-retry') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'factory-resource-profile')) }}
         uses: ./.github/actions/load-ci-images
         with:
           images: "{api,worker,runner}"
       - name: Stage the workspace diagnostic images in kind
-        if: ${{ matrix.leg == 'workload' && (contains(fromJSON(needs.changes.outputs.chart_scenarios), 'workspace-diagnostic') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-secret-rotation') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'failed-first-install-retry')) }}
+        if: ${{ matrix.leg == 'workload' && (contains(fromJSON(needs.changes.outputs.chart_scenarios), 'workspace-diagnostic') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-secret-rotation') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'failed-first-install-retry') || contains(fromJSON(needs.changes.outputs.chart_scenarios), 'factory-resource-profile')) }}
         run: |
           set -euo pipefail
           chmod +x cli/target/release/curie
@@ -3831,6 +3829,22 @@ jobs:
           set -euo pipefail
           bash tools/runtime-assertion-gate/run.sh \
             charts/curie/ci/runtime/failed-first-install-retry-runtime.sh
+      # #4889: a factory agent's real sandbox holds a 1280Mi workspace write for
+      # at least 90 seconds, and the standard envelope evicts the same write.
+      - name: Factory resource profile runtime (#4889)
+        if: ${{ matrix.leg == 'workload' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'factory-resource-profile') }}
+        timeout-minutes: 30
+        env:
+          CURIE_BIN: ${{ github.workspace }}/cli/target/release/curie
+          CURIE_SCENARIO_CONTEXT: kind-curie-e2e
+          CURIE_SCENARIO_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+          CURIE_SCENARIO_API_IMAGE: curie-api:wsdiag-${{ github.sha }}
+          CURIE_SCENARIO_WORKER_IMAGE: curie-worker:wsdiag-${{ github.sha }}
+          CURIE_SCENARIO_RUNNER_IMAGE: curie-runner:wsdiag-${{ github.sha }}
+        run: |
+          set -euo pipefail
+          bash tools/runtime-assertion-gate/run.sh \
+            charts/curie/ci/runtime/factory-resource-profile-runtime.sh
       - name: Dump cluster diagnostics on failure
         if: failure()
         run: |
@@ -5000,6 +5014,52 @@ jobs:
           echo "Released-upgrade assertion rejected the nil-unsafe mutant's blank attester as expected"
           helm uninstall curie-negative -n curie-negative --wait --timeout 5m
           kubectl delete namespace curie-negative --wait=true --timeout=300s
+      # #4889: a factory selected on the released-to-candidate upgrade gets the
+      # full factory sandbox envelope on the live SandboxTemplate, keeps an
+      # explicit per-agent workspace override, and keeps both through a second
+      # plain retained-values upgrade; the generic template stays standard.
+      # v0.8.2 predates factory.sandboxEgress and workspaceSizeLimits, so both
+      # are set at the first candidate upgrade.
+      - name: Factory resource profile survives the released upgrade (#4889)
+        run: |
+          set -euo pipefail
+          ns=curie-profile
+          release=curie-profile
+          context="$(kubectl config current-context)"
+          helm install "$release" "$RELEASED_CHART" \
+            -n "$ns" --create-namespace -f "$LEGACY_VALUES" --timeout 15m \
+            --set api.image.digest=sha256:71aa652c0af87084e4254402268e2d08c0cdbc2f197b6f1f1cf136b49aa93dc0 \
+            --set dispatcher.image.digest=sha256:154e874d735131c64e449af281178bed0c4e30d6dcc7b72ebecda6337aea8f93 \
+            --set worker.image.digest=sha256:5368f1a6be11b79fa28d9cea197539f15b56caae280a4d9dee39b72d47bfdd38 \
+            --set ui.image.digest=sha256:1348c3cc03ecae315829a0cf6170ba5aaa2af8e31436cc76b0d24f12967b74b7 \
+            --set agentSandbox.runner.digest=sha256:bd871217023604c7d2934fd4534c08efb5448a739e5e5603ac35c100f9c8949c
+          # factory.enabled mounts the forge credential Secret into the API.
+          kubectl create secret generic curie-factory-app -n "$ns" \
+            --from-literal=privateKey=not-a-real-key
+          helm upgrade "$release" charts/curie -n "$ns" \
+            --reset-then-reuse-values \
+            -f charts/curie/ci/fixtures/factory-resource-profile.yaml \
+            --set-string agentSandbox.workspaceSizeLimits.acme-factory=18Gi \
+            --set worker.image.repository=curie-worker --set worker.image.tag=upgrade-candidate --set worker.image.digest= --set worker.image.pullPolicy=Never \
+            --timeout 15m
+          bash charts/curie/ci/scenarios/released-upgrade-resource-profile-assertions.sh \
+            --context "$context" --namespace "$ns" --release "$release" \
+            --agent acme-factory --workspace 18Gi
+      # A second ordinary retained-values candidate upgrade, with no new values,
+      # must keep the same envelope. Its own step, so each assertion runs once.
+      - name: Factory resource profile survives a plain retained-values upgrade (#4889)
+        run: |
+          set -euo pipefail
+          ns=curie-profile
+          release=curie-profile
+          context="$(kubectl config current-context)"
+          helm upgrade "$release" charts/curie -n "$ns" \
+            --reset-then-reuse-values --timeout 15m
+          bash charts/curie/ci/scenarios/released-upgrade-resource-profile-assertions.sh \
+            --context "$context" --namespace "$ns" --release "$release" \
+            --agent acme-factory --workspace 18Gi
+          helm uninstall "$release" -n "$ns" --wait --timeout 5m
+          kubectl delete namespace "$ns" --wait=true --timeout=300s
       - name: Dump negative control diagnostics on failure
         if: failure()
         run: |
@@ -5007,10 +5067,14 @@ jobs:
           kubectl get events -n curie-negative --sort-by=.lastTimestamp | tail -50 || true
           kubectl logs -n curie-negative deploy/curie-api --tail=100 || true
           kubectl logs -n curie-negative deploy/curie-worker --tail=100 || true
+          kubectl get events -n curie-profile --sort-by=.lastTimestamp | tail -50 || true
+          kubectl get sandboxtemplates.extensions.agents.x-k8s.io -n curie-profile -o yaml || true
       - name: Tear down the disposable negative control cluster
         if: always()
         run: |
           kubectl delete namespace curie-negative \
+            --ignore-not-found --wait=false 2>/dev/null || true
+          kubectl delete namespace curie-profile \
             --ignore-not-found --wait=false 2>/dev/null || true
           kind delete cluster --name curie-upgrade-negative 2>/dev/null || true
 

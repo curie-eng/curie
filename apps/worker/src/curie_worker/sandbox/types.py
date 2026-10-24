@@ -444,10 +444,15 @@ class SandboxView:
 
 @dataclass(frozen=True)
 class SandboxTermination:
-    """Confirmed termination of the runner pod, with safe diagnostic text."""
+    """Confirmed termination of the runner pod, with safe diagnostic text.
+
+    ``exit_code`` is the runner container's terminated exit code when the pod
+    status reported a real int; it never changes ``detail``.
+    """
 
     reason: str
     detail: str | None = None
+    exit_code: int | None = None
 
 
 OperatingMode = Literal["Running", "Suspended"]

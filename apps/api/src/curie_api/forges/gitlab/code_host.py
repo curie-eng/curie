@@ -20,7 +20,14 @@ from typing import Any
 from curie_api.forges import types
 from curie_api.forges.capabilities import CODE_HOST_OPERATIONS, Operation, Support
 from curie_api.forges.credential_providers import StaticTokenProvider, TokenSnapshot
-from curie_api.forges.errors import Ambiguous, ForgeError, NotFound, Unauthorized, Unavailable
+from curie_api.forges.errors import (
+    Ambiguous,
+    ForgeError,
+    NotFound,
+    Unauthorized,
+    Unavailable,
+    Unsupported,
+)
 from curie_api.forges.gitlab import review
 from curie_api.forges.gitlab.ci import GitLabCi
 from curie_api.forges.gitlab.comments import GitLabMarkedComments
@@ -54,9 +61,10 @@ from curie_api.publication_policy import is_publication_branch
 
 logger = logging.getLogger(__name__)
 
-CODE_HOST_CAPABILITIES: Mapping[Operation, Support] = dict.fromkeys(
-    CODE_HOST_OPERATIONS, Support.SUPPORTED
-)
+CODE_HOST_CAPABILITIES: Mapping[Operation, Support] = {
+    **dict.fromkeys(CODE_HOST_OPERATIONS, Support.SUPPORTED),
+    Operation.REQUIRED_CHECKS: Support.UNSUPPORTED,
+}
 _STATES = {
     "opened": PullRequestState.OPEN,
     "merged": PullRequestState.MERGED,
@@ -377,6 +385,9 @@ class GitLabCodeHost:
 
     async def observe_ci(self, repository: RepositoryRef, head_sha: str) -> CiRollup:
         return await self._ci(repository).observe(head_sha)
+
+    async def required_checks(self, repository: RepositoryRef, branch: str) -> frozenset[str]:
+        raise Unsupported(Operation.REQUIRED_CHECKS)
 
     async def ci_diagnostics(
         self, repository: RepositoryRef, head_sha: str, *, base_ref: str | None

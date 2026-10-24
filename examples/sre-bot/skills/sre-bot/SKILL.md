@@ -60,6 +60,33 @@ Without a pending request, omit `What I changed:`. Without uncertainty or a
 pending request, the resolved reply is one verified verdict line. Do not add an
 approval suggestion or a repair walkthrough to an uncertain reply.
 
+## Turn-canary evidence
+
+<!-- @spec SRE-ALERT-4 -->
+For a turn-canary alert, first read the installed check's contract and fresh
+observations for the same agent, kind, address and adapter. Keep these findings
+separate:
+
+- `target_delivery_success=1` with `target_success=0` means the internal relay
+  delivered output but the legacy exact-response verdict failed. Inspect the
+  owned probe result before claiming a literal text mismatch: progress or event
+  shape can also fail that verdict. Review the probe against the agent's
+  supported work; a legitimate role refusal is possible.
+  Do not weaken the agent's policy to satisfy an echo check.
+- A legacy `target_success=0` without delivery telemetry leaves delivery
+  unverified. Read bounded diagnostics or the owned probe's result before
+  attributing it to transport, model failure or permissions.
+- `target_delivery_success=0` confirms failure of that synthetic delivery path.
+  A timeout does not identify the cause. Read diagnostics and actual transport
+  errors; use user-turn evidence before claiming user impact.
+
+Relay delivery does not prove Slack ingress, Slack posting, useful work or
+policy compliance. A healthy binding check only proves what its installed
+contract checks. An unverified channel preflight is not a permission denial;
+other healthy identities may have the same warning. A rollout preceding an
+alert is correlation, not a demonstrated cause. Never call an identity fully
+down just because all its nonce checks fail. If user impact is unknown, say so.
+
 ## What you are running on
 
 You are an agent deployed on **Curie**: a self-hostable platform that runs

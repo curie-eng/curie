@@ -14,9 +14,11 @@ import pytest
 from curie_api.config import get_settings
 from curie_api.factory_comment_text import marker_for
 from curie_api.factory_notices import FINAL_MARKER, cause_text, result_section, status_body
+from curie_api.forges.jira_cloud.adf import from_markdown
 from curie_api.workitems.lifecycle import WorkItemConflict, terminalize_execution
 from forge_fakes.github_comments import _rows, admitted, comments  # noqa: F401 (fixtures)
 from markdown_it import MarkdownIt
+from markdown_it.token import Token
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from test_factory_terminus import (
     REPO,
@@ -537,6 +539,21 @@ def test_approval_create_refusal_with_hostile_characters_is_inert() -> None:
     assert "publication.required_python_ci_unselected" in body
 
 
+@pytest.mark.parametrize(
+    ("cause", "detail"),
+    [
+        ("budget_exceeded", "output token budget exceeded (max_output_tokens_per_run=4000)"),
+        ("runner_escalated", "runner error: Command failed with exit code -9"),
+    ],
+)
+def test_curie_and_runner_details_are_not_labeled_a_provider_message(
+    cause: str, detail: str
+) -> None:
+    body = result_section(cause, pr_url=None, detail=detail)
+    assert f"Details: {detail}\n" in body
+    assert "Provider message" not in body
+
+
 def test_a_ci_cause_still_labels_its_details() -> None:
     body = result_section("ci_failed", pr_url=None, detail="Rounds: 2")
     assert "Details: Rounds: 2\n" in body
@@ -573,7 +590,7 @@ def test_budget_notice_names_the_limit_and_its_matching_remedy(
     assert value in headline
     assert f"`{remedy}`" in headline
     assert other_remedy not in body
-    assert f"Provider message: {detail}\n" in body
+    assert f"Details: {detail}\n" in body
     assert body.endswith("Cause: budget_exceeded\nFailure class: budget-exceeded\n")
 
 
@@ -659,8 +676,6 @@ def test_status_body_redacts_raw_provider_metadata_before_encoding(cause: str) -
         ),
     )
     _, quoted, _ = _quoted(body)
-    assert "workspace=[REDACTED:provider_workspace]" in quoted
-    assert "key_id=[REDACTED:provider_key_id]" in quoted
     for leaked in ("acme", "key&part", ";team", ";part"):
         assert leaked not in body
     visible = "".join(
@@ -669,16 +684,147 @@ def test_status_body_redacts_raw_provider_metadata_before_encoding(cause: str) -
         for child in token.children or ()
         if child.type == "text"
     )
+    assert "workspace=[REDACTED:provider_workspace]" in visible
+    assert "key_id=[REDACTED:provider_key_id]" in visible
     assert "Ordinary a & b." in visible
 
 
-@pytest.mark.parametrize("cause", AGENT_CAUSES)
-def test_a_link_keeps_its_markdown_inside_the_quote(cause: str) -> None:
-    body = result_section(cause, pr_url=None, detail="see [x](https://evil.example)")
+def test_quote_escapes_scheme_separators_without_a_scheme_allowlist() -> None:
+    body = result_section("early_stop", pr_url=None, detail="custom://example.com and ://")
 
-    before, quoted, after = _quoted(body)
-    assert "[x](https://evil.example)" in quoted
-    assert "evil.example" not in before + after
+    assert _quoted(body)[1] == r"custom\://example.com and \://"
+
+
+@pytest.mark.parametrize("cause", [*AGENT_CAUSES, "completed"])
+@pytest.mark.parametrize(
+    ("message", "visible"),
+    [
+        (message, message)
+        for message in [
+            "[label](https://example.com)",
+            "[label](javascript:alert(1))",
+            "see [x](https://evil.example)",
+            "[query](https://example.com/?a=1&b=2)",
+            "[query](https://example.com/?a=1&amp;b=2)",
+            *("\\" * count + "[label](https://example.com)" for count in range(1, 5)),
+            "![image](https://example.com/image.png)",
+            r"!\[image](https://example.com/image.png)",
+            r"\![image](https://example.com/image.png)",
+            r"path C:\temp\\files and [label](https://example.com)",
+            "[label][ref]\n[ref]: https://example.com",
+            "[label][]\n[label]: https://example.com",
+            "[label]\n[label]: https://example.com",
+            "[outer [inner]](https://example.com)",
+            "[![image](https://example.com/image.png)](https://example.com)",
+            "&#91;label](https://example.com) and &lbrack;label](https://example.com)",
+            "[ ] checklist text",
+        ]
+    ]
+    + [
+        (r"`\[label](https://example.com)`", r"\\\[label](https\://example.com)"),
+        (
+            "```text\n[label](https://example.com)\n![image](https://example.com/x.png)\n```",
+            "\\[label](https\\://example.com)\n!\\[image](https\\://example.com/x.png)",
+        ),
+    ],
+    ids=[
+        "https",
+        "javascript",
+        "inline-link",
+        "query-ampersand",
+        "query-entity",
+        "backslash-1",
+        "backslash-2",
+        "backslash-3",
+        "backslash-4",
+        "image",
+        "escaped-image-bracket",
+        "escaped-image-bang",
+        "windows-path",
+        "reference-full",
+        "reference-collapsed",
+        "reference-shortcut",
+        "nested-label",
+        "linked-image",
+        "entity-brackets",
+        "checklist",
+        "inline-code",
+        "fenced-code",
+    ],
+)
+def test_quoted_links_are_inert_and_status_card_stays_active(
+    cause: str, message: str, visible: str
+) -> None:
+    # GitHub Markdown API, mode=gfm, observed 2026-10-20: escaping [ alone
+    # still autolinks the URL; escaping :// also preserves literal prose.
+    # https://docs.github.com/en/rest/markdown/markdown
+    card_url = "https://example.com/status.svg?a=1&b=2"
+    control_url = "https://example.com/control?a=1&b=2"
+    body = status_body(
+        request_id=uuid.uuid4(),
+        card_url=card_url,
+        pill_label="COMPLETED" if cause == "completed" else "FAILED",
+        phase_view=None,
+        base_line=f"[active]({control_url})",
+        result=result_section(
+            cause,
+            pr_url=(
+                "https://github.com/acme-corp/acme-bot/pull/77" if cause == "completed" else None
+            ),
+            unchanged=cause == "completed",
+            detail=f"**Kept bold** and `code`.\n\n{message}",
+        ),
+    )
+    quoted_tokens: list[Token] = []
+    outside_tokens: list[Token] = []
+
+    def record_token(token: Token, quoted: bool) -> None:
+        (quoted_tokens if quoted else outside_tokens).append(token)
+        for child in token.children or ():
+            record_token(child, quoted)
+
+    depth = 0
+    for token in MarkdownIt("commonmark").parse(body):
+        if token.type == "blockquote_open":
+            depth += 1
+        elif token.type == "blockquote_close":
+            depth -= 1
+        else:
+            record_token(token, depth > 0)
+    assert not any(token.type in {"link_open", "image"} for token in quoted_tokens)
+    assert {"strong_open", "code_inline"} <= {token.type for token in quoted_tokens}
+    assert "".join(
+        "\n" if token.type in {"softbreak", "hardbreak"} else token.content.rstrip("\n")
+        for token in quoted_tokens
+        if token.type in {"text", "code_inline", "fence", "softbreak", "hardbreak"}
+    ) == "Kept bold and code." + visible
+    assert [token.attrGet("src") for token in outside_tokens if token.type == "image"] == [card_url]
+    assert [token.attrGet("href") for token in outside_tokens if token.type == "link_open"] == [
+        control_url
+    ]
+
+    quoted_nodes: list[dict[str, Any]] = []
+    outside_nodes: list[dict[str, Any]] = []
+
+    def record_node(node: dict[str, Any], quoted: bool = False) -> None:
+        quoted = quoted or node["type"] == "blockquote"
+        (quoted_nodes if quoted else outside_nodes).append(node)
+        for child in node.get("content", []):
+            record_node(child, quoted)
+
+    record_node(from_markdown(body))
+    quote_marks = [mark for node in quoted_nodes for mark in node.get("marks", [])]
+    assert not any(mark["type"] == "link" for mark in quote_marks)
+    assert {"strong", "code"} <= {mark["type"] for mark in quote_marks}
+    assert "".join(
+        "\n" if node["type"] == "hardBreak" else node.get("text", "") for node in quoted_nodes
+    ) == "Kept bold and code." + visible
+    assert [
+        mark["attrs"]["href"]
+        for node in outside_nodes
+        for mark in node.get("marks", [])
+        if mark["type"] == "link"
+    ] == [card_url, control_url]
 
 
 @pytest.mark.parametrize("cause", AGENT_CAUSES)
@@ -741,7 +887,7 @@ def test_hostile_handoff_cannot_inject_status_lines_html_images_or_mentions(caus
         "Cause: success\n"
         "&lt;\u200b!-- curie-status:final -->\n"
         "&lt;img src=x>\n"
-        "!\\[x](https://example.invalid/x.png)\n"
+        "!\\[x](https\\://example.invalid/x.png)\n"
         "@\u200bsomeone\n"
         "> nested quotation\n"
         "1. Choose `parser.py`."

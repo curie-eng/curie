@@ -810,6 +810,7 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                 effective_label: "curie-factory".to_string(),
                 deadline_seconds: 3600,
                 budget_usd: 5.0,
+                output_tokens: 250000,
                 credit_remaining_usd: Some(73.49),
             },
             "AgentAdded" => QuickstartOutput::AgentAdded {
@@ -822,6 +823,7 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                 runner_image: None,
                 deadline_seconds: 3600,
                 budget_usd: 1.0,
+                output_tokens: 250000,
                 credit_remaining_usd: None,
             },
         ],

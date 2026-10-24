@@ -7,7 +7,6 @@ apps/api/tests/test_factory_progress.py
 apps/api/tests/test_factory_settings_gate.py
 apps/api/tests/test_gitflow_integration.py
 apps/api/tests/test_gitflow_targets.py
-apps/api/tests/test_publication_lineage_identity.py
 apps/api/tests/test_publications.py
 apps/api/tests/test_schema_window_gate.py
 apps/api/tests/test_slack_channel_default.py
@@ -29,6 +28,7 @@ apps/worker/tests/test_stream_retention.py
 charts/curie/ci/repro/test_classify_recovery.py
 charts/curie/ci/runtime/test_docker_daemon_fixture.py
 charts/curie/ci/test_cron_approval_receipt.py
+charts/curie/ci/test_factory_resource_profile_runtime.py
 charts/curie/ci/test_quota_progress_inputs.py
 charts/curie/ci/test_workspace_diagnostic_inputs.py
 compose/tests/test_cluster_recovery_template.py
@@ -43,6 +43,7 @@ examples/tests/test_alert_path_heartbeat.py
 examples/tests/test_dark_factory_bundle.py
 examples/tests/test_dark_factory_review_gate.py
 examples/tests/test_shipped_connector_tests_are_collected.py
+examples/tests/test_sre_bot_canary_evidence.py
 examples/tests/test_sre_bot_metric_alignment.py
 examples/tests/test_sre_bot_observability_runtime.py
 examples/tests/test_sre_bot_reply_format.py
@@ -57,6 +58,7 @@ packages/test-support/tests/test_pytest_collection.py
 release/tests/test_atlas.py
 release/tests/test_authorize.py
 release/tests/test_get_curie.py
+release/tests/test_kind_ci.py
 release/tests/test_sdk_approval_gate_workflow.py
 runner/tests/test_dark_factory_runner_toolchain.py
 runner/tests/test_dockerfile_registry_layer.py
@@ -67,6 +69,7 @@ runner/tests/test_repository_verification.py
 runner/tests/test_route_callers.py
 runner/tests/test_tool_policy_enforcement.py
 runner/tests/test_workspace_preamble.py
+tests/test_approval_resume_ownership_probe.py
 tests/test_repository_facts.py
 tests/test_scripts_pipefail_grep.py
 tests/test_wire_state.py
@@ -75,6 +78,7 @@ tools/ci-retry-gate/tests/test_ci_flake_retries.py
 tools/ci-retry-gate/tests/test_gitleaks_scope.py
 tools/ci-retry-gate/tests/test_pr_body.py
 tools/ci-retry-gate/tests/test_retry_eligibility.py
+tools/ci-workflow-paths/tests/test_runner_labels.py
 tools/ci-workflow-paths/tests/test_workflow_paths.py
 tools/dependency-audit-paths/tests/test_dependency_audit_paths.py
 tools/doclint/tests/test_adr_citations.py

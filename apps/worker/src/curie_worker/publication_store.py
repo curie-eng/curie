@@ -507,6 +507,10 @@ class PostgresPublicationStore:
         pr_number: int,
         pr_url: str,
         head_sha: str,
+        publication_id: uuid.UUID,
+        expected_publication_version: int,
+        lease_owner: str,
+        first_parent_sha: str | None,
     ) -> None:
         """Persist exact terminal GitHub facts, accepting an identical replay."""
 
@@ -534,36 +538,87 @@ class PostgresPublicationStore:
             raise ValueError("publication lineage pull request URL is invalid")
         if not isinstance(head_sha, str) or re.fullmatch(r"[0-9a-f]{40,64}", head_sha) is None:
             raise ValueError("publication lineage head is invalid")
+        if first_parent_sha is not None and (
+            not isinstance(first_parent_sha, str)
+            or re.fullmatch(r"[0-9a-f]{40,64}", first_parent_sha) is None
+        ):
+            raise ValueError("publication lineage first parent is invalid")
+        if (expected_stored_head is None) != (first_parent_sha is not None):
+            raise PublicationStoreError("publication lineage terminal first parent is unproved")
+        if not isinstance(lease_owner, str) or not lease_owner:
+            raise ValueError("publication lineage lease owner is invalid")
+        parameters = {
+            "lineage_id": lineage_id,
+            "expected_version": expected_version,
+            "expected_stored_head": expected_stored_head,
+            "state": state,
+            "pr_number": pr_number,
+            "pr_url": pr_url,
+            "head_sha": head_sha,
+            "publication_id": publication_id,
+            "expected_publication_version": expected_publication_version,
+            "lease_owner": lease_owner,
+            "first_parent_sha": first_parent_sha,
+        }
         async with self._engine.begin() as connection:
+            publication = (
+                await connection.execute(
+                    text(
+                        f"""
+                        SELECT id FROM {self._table}
+                         WHERE id = :publication_id
+                           AND lineage_id = :lineage_id
+                           AND version = :expected_publication_version
+                           AND lease_owner = :lease_owner
+                           AND lease_expires_at > now()
+                           AND status IN ('approved', 'launching', 'running')
+                         FOR UPDATE
+                        """
+                    ),
+                    parameters,
+                )
+            ).scalar_one_or_none()
+            if publication is None:
+                raise PublicationStoreError("publication lineage terminal CAS was lost")
             updated = (
                 await connection.execute(
                     text(
                         f"""
-                        UPDATE {self._lineages}
+                        UPDATE {self._lineages} l
                            SET status = :state,
                                pr_number = :pr_number,
                                pr_url = :pr_url,
                                head_sha = :head_sha,
-                               version = version + 1,
+                               base_sha = CASE WHEN l.head_sha IS NULL
+                                           THEN :first_parent_sha ELSE l.base_sha END,
+                               version = l.version + 1,
                                updated_at = now()
-                         WHERE id = :lineage_id
-                           AND status = 'open'
-                           AND version = :expected_version
-                           AND head_sha IS NOT DISTINCT FROM :expected_stored_head
-                           AND (pr_number IS NULL OR pr_number = :pr_number)
-                           AND (pr_url IS NULL OR pr_url = :pr_url)
-                     RETURNING version
+                          FROM {self._table} p
+                         WHERE l.id = :lineage_id
+                           AND l.status = 'open'
+                           AND l.version = :expected_version
+                           AND l.head_sha IS NOT DISTINCT FROM :expected_stored_head
+                           AND p.id = :publication_id
+                           AND p.lineage_id = l.id
+                           AND p.version = :expected_publication_version
+                           AND p.lease_owner = :lease_owner
+                           AND p.lease_expires_at > now()
+                           AND p.status IN ('approved', 'launching', 'running')
+                           AND p.revision_number = l.latest_revision
+                           AND (
+                             (CAST(:first_parent_sha AS text) IS NOT NULL
+                              AND l.head_sha IS NULL AND l.pr_number IS NULL
+                              AND l.pr_url IS NULL AND l.base_sha = p.base_sha
+                              AND p.expected_prior_head = p.base_sha)
+                             OR
+                             (CAST(:first_parent_sha AS text) IS NULL
+                              AND l.head_sha IS NOT NULL AND l.pr_number = :pr_number
+                              AND l.pr_url = :pr_url)
+                           )
+                     RETURNING l.version
                         """
                     ),
-                    {
-                        "lineage_id": lineage_id,
-                        "expected_version": expected_version,
-                        "expected_stored_head": expected_stored_head,
-                        "state": state,
-                        "pr_number": pr_number,
-                        "pr_url": pr_url,
-                        "head_sha": head_sha,
-                    },
+                    parameters,
                 )
             ).scalar_one_or_none()
             if updated is not None:
@@ -573,12 +628,15 @@ class PostgresPublicationStore:
                     await connection.execute(
                         text(
                             f"""
-                        SELECT status, pr_number, pr_url, head_sha
-                          FROM {self._lineages}
-                         WHERE id = :lineage_id
+                        SELECT l.status, l.pr_number, l.pr_url, l.head_sha, l.base_sha,
+                               l.latest_revision, p.revision_number
+                          FROM {self._lineages} l
+                          JOIN {self._table} p ON p.lineage_id = l.id
+                         WHERE l.id = :lineage_id AND p.id = :publication_id
+                         FOR UPDATE OF l
                         """
                         ),
-                        {"lineage_id": lineage_id},
+                        parameters,
                     )
                 )
                 .mappings()
@@ -589,6 +647,8 @@ class PostgresPublicationStore:
                 and current["pr_number"] == pr_number
                 and current["pr_url"] == pr_url
                 and current["head_sha"] == head_sha
+                and current["latest_revision"] == current["revision_number"]
+                and (first_parent_sha is None or current["base_sha"] == first_parent_sha)
             ):
                 return
         raise PublicationStoreError("publication lineage terminal CAS was lost")

@@ -284,6 +284,17 @@ class _GitHubComments(BaseHTTPRequestHandler):
         if annotations is not None:
             self._send(200, server.annotations.get(int(annotations.group(1)), []))
             return True
+        rules = re.fullmatch(rf"/repos/{repo}/rules/branches/(.+)", path)
+        if rules is not None:
+            # https://docs.github.com/en/rest/repos/rules#get-rules-for-a-branch
+            name = unquote(rules.group(1))
+            server.requests.append(("GET", path, None))
+            scripted = server.rules.get(name)
+            if scripted is None:
+                self._send(404, {"message": "Not Found"})
+            else:
+                self._send(scripted[0], scripted[1])
+            return True
         branch = re.fullmatch(rf"/repos/{repo}/branches/(.+)", path)
         if branch is not None:
             # Get a branch; the base head's checks are then served by ci_scripts.
@@ -291,10 +302,16 @@ class _GitHubComments(BaseHTTPRequestHandler):
             name = unquote(branch.group(1))
             server.requests.append(("GET", path, None))
             sha = server.branches.get(name)
-            if sha is None:
-                self._send(404, {"message": "Branch not found"})
-            else:
-                self._send(200, {"name": name, "commit": {"sha": sha}})
+            body: dict[str, Any] = {"name": name}
+            if sha is not None:
+                body["commit"] = {"sha": sha}
+            protection = server.protections.get(name)
+            if protection is not None:
+                body["protection"] = protection
+            # An untracked branch still exists here with no protection object, so
+            # a required-check read adds no names. Base CI still needs commit.sha
+            # and treats that absence as an unreadable base.
+            self._send(200, body)
             return True
         return False
 
@@ -423,8 +440,14 @@ class _CommentServer(ThreadingHTTPServer):
         ]
         self.pull_observations: list[int] = []
         self.annotations: dict[int, list[dict[str, Any]]] = {}
-        # #4105. Branch name -> the sha it points to; empty means every base read 404s.
+        # #4105. Branch name -> the sha it points to. An untracked branch answers
+        # 200 with no commit sha, which the base CI read treats as unreadable.
         self.branches: dict[str, str] = {}
+        # Branch name -> (status, body) for GET /rules/branches/{branch}.
+        # Missing means HTTP 404, which contributes no required check names.
+        self.rules: dict[str, tuple[int, Any]] = {}
+        # Branch name -> protection object included on GET /branches/{branch}.
+        self.protections: dict[str, dict[str, Any]] = {}
         # #3741. 403 matches a token with no Actions write permission.
         self.rerun_status = 403
         self.rerun_statuses: list[int] = []

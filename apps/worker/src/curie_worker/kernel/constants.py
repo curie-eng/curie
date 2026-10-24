@@ -5,7 +5,8 @@ import logging
 import re
 import uuid
 from contextvars import ContextVar
-from typing import Any
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 from aci_protocol import (
     PublicationContext,
@@ -20,6 +21,9 @@ from ..turn_progress import (
     TurnProgressPlan,
 )
 from . import attachment_access, channel_read, hooks, memory
+
+if TYPE_CHECKING:
+    from ..sandbox.types import SandboxTermination
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +114,31 @@ _LIFECYCLE_SPAN: ContextVar[Any | None] = ContextVar("curie_worker_lifecycle_spa
 
 _LIFECYCLE_OUTCOME: ContextVar[str | None] = ContextVar(
     "curie_worker_lifecycle_outcome", default=None
+)
+
+# A confirmed runner pod termination as closed turn span attributes (#4940).
+# Only the reason and the exit code are exported; detail never is. These are
+# operation_span caller keys; the exported names come from the curie_telemetry
+# span vocabulary (curie.sandbox.termination.reason and .exit_code).
+SANDBOX_TERMINATION_REASON_ATTRIBUTE = "termination_reason"
+SANDBOX_TERMINATION_EXIT_CODE_ATTRIBUTE = "termination_exit_code"
+SANDBOX_TERMINATION_REASONS = frozenset({"OOMKilled", "Evicted", "Deleted"})
+SANDBOX_TERMINATION_REASON_FALLBACK = "Unknown"
+
+
+@dataclass
+class _SandboxTerminationCarry:
+    """The latest confirmed pod termination in this delivery, if any.
+
+    A mutable carry, installed fresh per delivery by ``process_event``, so a
+    write from a nested task is still visible when the lifecycle span closes.
+    """
+
+    termination: SandboxTermination | None = None
+
+
+_SANDBOX_TERMINATION_CARRY: ContextVar[_SandboxTerminationCarry | None] = ContextVar(
+    "curie_worker_sandbox_termination_carry", default=None
 )
 
 # Agent slug for the per-agent turn counter. Unset until binding resolves.
@@ -233,6 +262,13 @@ WORKER_LOCAL_DISPLAY_CLASSIFICATIONS = frozenset(
 )
 
 _ESCALATION_DETAIL_MAX = 300
+
+# After a ClientError stream drop, re-read pod termination until kubelet posts
+# it. A non-positive window is one read, which the kernel harness uses so
+# unrelated stream-drop tests do not wait.
+POD_TERMINATION_WAIT_S = 10.0
+POD_TERMINATION_INTERVAL_S = 0.5
+POD_TERMINATION_READ_TIMEOUT_S = 3.0
 
 # The factory terminus cause for a classified escalation (#3073). Each cause has
 # its own operator sentence on the issue; anything unnamed stays the generic
