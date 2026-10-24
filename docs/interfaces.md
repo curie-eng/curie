@@ -42,6 +42,7 @@ is documentation of where the code already draws the line, not a new abstraction
 | Protected hook source authority | CLEAN | 1 production resolver (ProvisionedSourceAuthority) + 2 test resolvers | not separately graded | #3603 | [Protected hook source authority](interfaces/protected-hook-source-authority/INTERFACE.md) |
 | Channel read | CLEAN | 1 Slack reader pair (history and canvas) plus HTTP test fakes | not separately graded | ADR-0100, ADR-0200, #2877, #3819 | [Channel read](interfaces/channel-read/INTERFACE.md) |
 | Mail provider | CLEAN | 1 in-tree (AgentMail) + out-of-tree providers loaded from the `curie.mail_provider` entry-point group | not separately graded | ADR-0228 | [Mail provider](interfaces/mail-provider/INTERFACE.md) |
+| Commissioning network producer | CLEAN | ProbeKit (managed-behavioral-v1) and LocalCiliumNetworkProducer (local-cilium-v1) | not separately graded | ADR-0236, ADR-0238, #4557 | [Commissioning network producer](interfaces/commissioning-network-producer/INTERFACE.md) |
 <!-- END GENERATED: seam-table -->
 
 ## Kind legend
