@@ -1,0 +1,558 @@
+{
+  "$defs": {
+    "CanonicalIdentityV1": {
+      "additionalProperties": false,
+      "description": "@spec HTTP-IDENTITY-V1-2.",
+      "properties": {
+        "account_status": {
+          "enum": [
+            "active",
+            "disabled",
+            "revoked"
+          ],
+          "title": "Account Status",
+          "type": "string"
+        },
+        "issuer": {
+          "title": "Issuer",
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "human",
+            "service",
+            "agent"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "subject": {
+          "minLength": 1,
+          "title": "Subject",
+          "type": "string"
+        }
+      },
+      "required": [
+        "issuer",
+        "subject",
+        "kind",
+        "account_status"
+      ],
+      "title": "CanonicalIdentityV1",
+      "type": "object"
+    },
+    "GroupV1": {
+      "additionalProperties": false,
+      "description": "@spec HTTP-IDENTITY-V1-2.",
+      "properties": {
+        "id": {
+          "minLength": 1,
+          "title": "Id",
+          "type": "string"
+        },
+        "issuer": {
+          "title": "Issuer",
+          "type": "string"
+        }
+      },
+      "required": [
+        "issuer",
+        "id"
+      ],
+      "title": "GroupV1",
+      "type": "object"
+    },
+    "LookupRequestV1": {
+      "additionalProperties": false,
+      "description": "@spec HTTP-IDENTITY-V1-1.",
+      "properties": {
+        "authority_version": {
+          "minimum": 1,
+          "title": "Authority Version",
+          "type": "integer"
+        },
+        "purpose": {
+          "enum": [
+            "invocation",
+            "approval"
+          ],
+          "title": "Purpose",
+          "type": "string"
+        },
+        "request_id": {
+          "title": "Request Id",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1,
+          "maximum": 1,
+          "minimum": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "scope": {
+          "$ref": "#/$defs/ScopeV1"
+        }
+      },
+      "required": [
+        "schema_version",
+        "request_id",
+        "purpose",
+        "authority_version",
+        "scope"
+      ],
+      "title": "LookupRequestV1",
+      "type": "object"
+    },
+    "LookupResponseV1": {
+      "additionalProperties": false,
+      "description": "@spec HTTP-IDENTITY-V1-2.",
+      "oneOf": [
+        {
+          "properties": {
+            "identity": {
+              "properties": {
+                "account_status": {
+                  "const": "active"
+                },
+                "kind": {
+                  "const": "human"
+                }
+              },
+              "type": "object"
+            },
+            "identity_observation": {
+              "type": "object"
+            },
+            "membership": {
+              "type": "object"
+            },
+            "outcome": {
+              "const": "resolved"
+            },
+            "sender_kind": {
+              "const": "human"
+            }
+          }
+        },
+        {
+          "properties": {
+            "identity": {
+              "properties": {
+                "account_status": {
+                  "const": "active"
+                },
+                "kind": {
+                  "const": "service"
+                }
+              },
+              "type": "object"
+            },
+            "identity_observation": {
+              "type": "object"
+            },
+            "membership": {
+              "type": "object"
+            },
+            "outcome": {
+              "const": "resolved"
+            },
+            "sender_kind": {
+              "const": "service"
+            }
+          }
+        },
+        {
+          "properties": {
+            "identity": {
+              "properties": {
+                "account_status": {
+                  "const": "active"
+                },
+                "kind": {
+                  "const": "agent"
+                }
+              },
+              "type": "object"
+            },
+            "identity_observation": {
+              "type": "object"
+            },
+            "membership": {
+              "type": "object"
+            },
+            "outcome": {
+              "const": "resolved"
+            },
+            "sender_kind": {
+              "const": "agent"
+            }
+          }
+        },
+        {
+          "properties": {
+            "identity": {
+              "properties": {
+                "account_status": {
+                  "enum": [
+                    "disabled",
+                    "revoked"
+                  ]
+                },
+                "kind": {
+                  "const": "human"
+                }
+              },
+              "type": "object"
+            },
+            "identity_observation": {
+              "type": "object"
+            },
+            "membership": {
+              "type": "null"
+            },
+            "outcome": {
+              "const": "inactive"
+            },
+            "sender_kind": {
+              "const": "human"
+            }
+          }
+        },
+        {
+          "properties": {
+            "identity": {
+              "properties": {
+                "account_status": {
+                  "enum": [
+                    "disabled",
+                    "revoked"
+                  ]
+                },
+                "kind": {
+                  "const": "service"
+                }
+              },
+              "type": "object"
+            },
+            "identity_observation": {
+              "type": "object"
+            },
+            "membership": {
+              "type": "null"
+            },
+            "outcome": {
+              "const": "inactive"
+            },
+            "sender_kind": {
+              "const": "service"
+            }
+          }
+        },
+        {
+          "properties": {
+            "identity": {
+              "properties": {
+                "account_status": {
+                  "enum": [
+                    "disabled",
+                    "revoked"
+                  ]
+                },
+                "kind": {
+                  "const": "agent"
+                }
+              },
+              "type": "object"
+            },
+            "identity_observation": {
+              "type": "object"
+            },
+            "membership": {
+              "type": "null"
+            },
+            "outcome": {
+              "const": "inactive"
+            },
+            "sender_kind": {
+              "const": "agent"
+            }
+          }
+        },
+        {
+          "properties": {
+            "identity": {
+              "type": "null"
+            },
+            "identity_observation": {
+              "type": "object"
+            },
+            "membership": {
+              "type": "null"
+            },
+            "outcome": {
+              "const": "unresolved"
+            }
+          }
+        },
+        {
+          "properties": {
+            "identity": {
+              "type": "null"
+            },
+            "identity_observation": {
+              "type": "null"
+            },
+            "membership": {
+              "type": "null"
+            },
+            "outcome": {
+              "const": "unavailable"
+            },
+            "sender_kind": {
+              "const": "unknown"
+            }
+          }
+        }
+      ],
+      "properties": {
+        "authority_version": {
+          "minimum": 1,
+          "title": "Authority Version",
+          "type": "integer"
+        },
+        "identity": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CanonicalIdentityV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "identity_observation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ObservationV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "membership": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MembershipV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "outcome": {
+          "enum": [
+            "resolved",
+            "inactive",
+            "unresolved",
+            "unavailable"
+          ],
+          "title": "Outcome",
+          "type": "string"
+        },
+        "purpose": {
+          "enum": [
+            "invocation",
+            "approval"
+          ],
+          "title": "Purpose",
+          "type": "string"
+        },
+        "request_id": {
+          "title": "Request Id",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1,
+          "maximum": 1,
+          "minimum": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "scope": {
+          "$ref": "#/$defs/ScopeV1"
+        },
+        "sender_kind": {
+          "enum": [
+            "human",
+            "service",
+            "agent",
+            "unknown"
+          ],
+          "title": "Sender Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_version",
+        "request_id",
+        "purpose",
+        "authority_version",
+        "scope",
+        "outcome",
+        "identity",
+        "sender_kind",
+        "identity_observation",
+        "membership"
+      ],
+      "title": "LookupResponseV1",
+      "type": "object"
+    },
+    "MembershipV1": {
+      "additionalProperties": false,
+      "description": "@spec HTTP-IDENTITY-V1-2.",
+      "properties": {
+        "complete": {
+          "const": true,
+          "title": "Complete",
+          "type": "boolean"
+        },
+        "groups": {
+          "items": {
+            "$ref": "#/$defs/GroupV1"
+          },
+          "title": "Groups",
+          "type": "array",
+          "uniqueItems": true
+        },
+        "observation": {
+          "$ref": "#/$defs/ObservationV1"
+        }
+      },
+      "required": [
+        "complete",
+        "groups",
+        "observation"
+      ],
+      "title": "MembershipV1",
+      "type": "object"
+    },
+    "NamespaceV1": {
+      "additionalProperties": false,
+      "description": "@spec HTTP-IDENTITY-V1-1.",
+      "properties": {
+        "authority": {
+          "title": "Authority",
+          "type": "string"
+        },
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "key": {
+          "minLength": 1,
+          "title": "Key",
+          "type": "string"
+        },
+        "kind": {
+          "minLength": 1,
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "authority",
+        "kind",
+        "key"
+      ],
+      "title": "NamespaceV1",
+      "type": "object"
+    },
+    "ObservationV1": {
+      "additionalProperties": false,
+      "description": "@spec HTTP-IDENTITY-V1-2, HTTP-IDENTITY-V1-4.",
+      "properties": {
+        "as_of": {
+          "title": "As Of",
+          "type": "string"
+        },
+        "max_source_lag_ms": {
+          "minimum": 0,
+          "title": "Max Source Lag Ms",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "as_of",
+        "max_source_lag_ms"
+      ],
+      "title": "ObservationV1",
+      "type": "object"
+    },
+    "ScopeV1": {
+      "additionalProperties": false,
+      "description": "@spec HTTP-IDENTITY-V1-1.",
+      "properties": {
+        "expected_issuer": {
+          "title": "Expected Issuer",
+          "type": "string"
+        },
+        "sender": {
+          "$ref": "#/$defs/SenderV1"
+        },
+        "tenant_id": {
+          "title": "Tenant Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tenant_id",
+        "expected_issuer",
+        "sender"
+      ],
+      "title": "ScopeV1",
+      "type": "object"
+    },
+    "SenderV1": {
+      "additionalProperties": false,
+      "description": "@spec HTTP-IDENTITY-V1-1.",
+      "properties": {
+        "channel_identity_id": {
+          "title": "Channel Identity Id",
+          "type": "string"
+        },
+        "namespace": {
+          "$ref": "#/$defs/NamespaceV1"
+        },
+        "native_id": {
+          "minLength": 1,
+          "title": "Native Id",
+          "type": "string"
+        },
+        "provider": {
+          "minLength": 1,
+          "title": "Provider",
+          "type": "string"
+        },
+        "provider_installation_id": {
+          "title": "Provider Installation Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "provider",
+        "channel_identity_id",
+        "provider_installation_id",
+        "namespace",
+        "native_id"
+      ],
+      "title": "SenderV1",
+      "type": "object"
+    }
+  },
+  "$id": "https://curietech.ai/schemas/http-identity-v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "HTTP identity facts v1"
+}
