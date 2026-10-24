@@ -550,6 +550,8 @@ class ModelProxy:
 
 
 class Lifecycle:
+    agent = AGENT  # the factory agent deploy() creates and binds
+
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.fx = _load("docker_daemon_fixture", FIXTURE_MODULE)
@@ -1205,7 +1207,7 @@ class Lifecycle:
         api_key = base64.b64decode(secret["data"]["apiKey"]).decode()
         api_url = self.port_forward()
         channel = {"kind": "github", "address": REPO}
-        agent = {"name": AGENT, "repo_full_name": REPO, "channel": channel}
+        agent = {"name": self.agent, "repo_full_name": REPO, "channel": channel}
         headers = {"X-API-Key": api_key}
         status, _ = fe.http_json("POST", api_url + "/agents", headers=headers, body=agent)
         self.fx.require(status == 201, f"agent_create_http_{status}")
@@ -1219,7 +1221,7 @@ class Lifecycle:
         build += ["--runner-image", self.images["platform"]["ref"], *platform]
         self.fx.run(build, env=env, timeout=1800)
         deploy = [self.curie, "cluster", "--context", self.args.context, "deploy"]
-        deploy += ["--plugin-dir", str(bundle), "--agent", AGENT, "--env", "prod"]
+        deploy += ["--plugin-dir", str(bundle), "--agent", self.agent, "--env", "prod"]
         deploy += ["--chart", str(self.install_chart())]
         deploy += ["--secret", "GITHUB_PERSONAL_ACCESS_TOKEN", "--namespace", self.ns]
         deploy += ["--release", self.release, "--api-url", api_url]

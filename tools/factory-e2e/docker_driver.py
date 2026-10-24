@@ -12,13 +12,16 @@ The install is daemon_lifecycle.py's: the docker-daemon fixture owns fd-docker-<
 (namespace and Helm release), fd-docker-d-<n> and fd-docker-c-<n>, labelled
 owner=factory-tools and factory-tools/nonce=<n>, and builds the daemon, platform,
 catalog and runner images from the HEAD snapshot into a run-owned registry container
-on the default Docker engine; api and worker build the same way. This driver adds a
-second platform runner (platform-next) for the upgrade, the candidate CLI built for
-the runner's glibc, and a second repository binding. The stub-served acme-corp/acme-bot
-is the custom repository (its receipt declares Dockerfile "Dockerfile", and the stub
-serves it a tree carrying that Dockerfile, the one its runner was built from), and
-acme-corp/acme-catalog is a catalog repository whose runner the upgrade rebuilds; it
-is never cloned and takes no turn. No host path is ever bind-mounted.
+on the default Docker engine; api and worker build the same way. Unlike that driver it
+sets no fullnameOverride, so its workloads are named fd-docker-<n>-curie-* as the CLI
+expects, and its factory agent is "fde" so runner pool names stay within 63
+characters. This driver adds a second platform runner (platform-next) for the upgrade,
+the candidate CLI built for the runner's glibc, and a second repository binding. The
+stub-served acme-corp/acme-bot is the custom repository (its receipt declares
+Dockerfile "Dockerfile", and the stub serves it a tree carrying that Dockerfile, the
+one its runner was built from), and acme-corp/acme-catalog is a catalog repository
+whose runner the upgrade rebuilds; it is never cloned and takes no turn. No host path
+is ever bind-mounted.
 
 The production catalog rebuild always builds linux/amd64 and linux/arm64 and refuses
 the default docker driver for a multi-platform push, so the run creates its own
@@ -87,6 +90,10 @@ ds = fe.load_docker_scenario()
 SCENARIO = SLICE = "docker"
 TRANSCRIPT = HERE / "fixtures" / "docker-scenario" / "transcript.json"
 RUN_ISSUES = {"a": 4106, "b": 4107}
+# The chart names each repository runner pool <fullname>-agent-<agent>-img-<12 hex>-runner-pool
+# and refuses one over 63 characters (charts/curie/templates/_helpers.tpl). With no
+# fullnameOverride the fullname is fd-docker-<n>-curie (24), so the agent gets 3.
+DOCKER_AGENT = "fde"
 CUSTOM_REPO = dl.REPO  # stub-served and cloneable; declares its own Dockerfile
 CATALOG_REPO = "acme-corp/acme-catalog"  # rebuilt by the upgrade, never cloned
 REQUIRED_CHECKS = ("E2E required",)
@@ -186,6 +193,14 @@ def scenario_args(context: str, callback_host: str, nonce: str | None = None) ->
     return args
 
 
+def chart_fullname(release: str) -> str:
+    """The chart's fullname with no override, as the CLI derives it (ops/verbs.rs)."""
+
+    name = release if "curie" in release else f"{release}-curie"
+    name = name[:63]
+    return name[:-1] if name.endswith("-") else name
+
+
 def target_schema_version(source_root: Path) -> str:
     """TARGET_SCHEMA_VERSION of ``source_root``'s cli/src/config_migrate.rs."""
 
@@ -206,6 +221,14 @@ def docker_values(values: Obj, images: dict[str, dict[str, str]], schema_version
     # Stamped as a CLI install stamps it: the upgrade's config migration infers an unstamped
     # release's schema from its chart version and refuses the <v>-fdbase base install.
     out["config"] = dict(out.get("config") or {}) | {"schemaVersion": schema_version}
+    # The CLI's schema probe execs deploy/<chart_fullname(release)>-api, ignoring any
+    # fullnameOverride, so the release keeps the chart's own fullname.
+    out.pop("fullnameOverride", None)
+    for section, key in (("factory", "sandboxEgress"), ("agentSandbox", "runnerEnv")):
+        parent = out.get(section)
+        keyed = parent.get(key) if isinstance(parent, dict) else None
+        if isinstance(parent, dict) and isinstance(keyed, dict) and dl.AGENT in keyed:
+            parent[key] = {DOCKER_AGENT if k == dl.AGENT else k: v for k, v in keyed.items()}
     repos = out["factory"]["bindings"][0]["repos"]
     custom = next(repo for repo in repos if repo["path"] == CUSTOM_REPO)
     # Only the CLI upgrade planner reads the key; the chart and worker ignore it.
@@ -272,7 +295,7 @@ def message_argv(
     callback_host: str,
 ) -> list[str]:
     text = f"Repository: https://github.com/{CUSTOM_REPO}\n{UPGRADE_TEXT}"
-    argv = [curie, "cluster", "--context", context, "message", text, "--agent", dl.AGENT]
+    argv = [curie, "cluster", "--context", context, "message", text, "--agent", DOCKER_AGENT]
     argv += ["--channel", f"C0EXAMPLE{nonce.upper()}", "--thread", f"fd-upgrade-{nonce}"]
     argv += ["--namespace", namespace, "--release", release, "--chart", chart]
     return [*argv, "--listen-host", callback_host, "--timeout-secs", "300", "--json"]
@@ -310,8 +333,11 @@ def _public_values(values: Obj) -> Obj:
 
 
 class DockerScenario(dl.Lifecycle):
+    agent = DOCKER_AGENT
+
     def __init__(self, args: argparse.Namespace, candidate: str | None = None) -> None:
         super().__init__(args)
+        self.full = chart_fullname(self.release)
         self.candidate = candidate or ""
         self.runs: dict[str, Obj] = {}
         self.sections: dict[str, Obj] = {}
