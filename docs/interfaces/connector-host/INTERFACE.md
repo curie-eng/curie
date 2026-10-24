@@ -284,6 +284,19 @@ total replica counts, plus the server container's pinned image. These reads
 make no additional Kubernetes API call, but a second host must supply that
 Deployment shape for capability probes to become eligible.
 
+- **The action executor reads Deployments around the port.** The action executor
+  (`apps/worker/src/curie_worker/action_executor_loop.py`) and the digest recorder
+  (`apps/worker/src/curie_worker/action_digest.py::DigestAttributingRecorder`) each
+  call `read_namespaced_deployment` by name on the raw `AppsV1Api` from
+  `apps/worker/src/curie_worker/connector_k8s.py::connector_deployments_api`, not
+  through `ConnectorClient`. `apps/worker/src/curie_worker/run.py` composes both
+  whenever `WorkerConfig.executor_reads_connectors` is on and an internal worker
+  token is configured (without one, neither the executor nor the recorder wrapper
+  starts), with or without the connector reconciler. A second host therefore needs a Deployment get API too:
+  without a readable Deployment the executor refuses with
+  `connector_digest_unavailable` before any sandbox claim, and the recorder
+  records a null digest.
+
 - **The exchanged type is raw cluster wire JSON.** Every verb trades
   `dict[str, Any]` holding `kind`, `apiVersion` and `metadata`, and reads come
   back as unparsed JSON on purpose — the rest of the reconciler compares against
@@ -322,8 +335,12 @@ Deployment shape for capability probes to become eligible.
   second implementation. Of the two cluster appliers, the CLI applies the same
   rendered objects on the `cluster deploy`
   path (`cli/src/connectors.rs`) with a plain client-side `kubectl apply`, prunes
-  in one bulk labelled delete, mints and deletes the owned Secret, and stamps no
-  drift hash; the reconciler server-side applies, prunes one object at a time,
+  in one bulk labelled delete, mints and deletes the owned Secret, stamps the pod
+  template's `curie.dev/connector-secret-digest` rollout annotation
+  (`CONNECTOR_SECRET_DIGEST`), and stamps no drift hash; the reconciler neither
+  renders nor stamps that annotation and only tolerates it, because its
+  containment drift check ignores keys the live object adds. The reconciler
+  server-side applies, prunes one object at a time,
   never touches that Secret, and stamps a hash on every apply — so a
   CLI-created object reads as drift and is adopted on the reconciler's first
   pass. The ownership label that decides what gets deleted is also two

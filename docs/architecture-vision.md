@@ -87,9 +87,12 @@ rather than render history into system instructions (ADR-0119).
 ### 2. Observability / OTel store (Langfuse today)
 
 **Port:** OTLP into the collector on the write side; our API DTOs on the read
-side. Services never speak Langfuse directly: the runner exports gen_ai spans
+side. On the write side, services reach Langfuse only through the collector,
+except the worker's eval recorder (Job 3,
+`apps/worker/src/curie_worker/eval/recorder.py::LangfuseEvalRecorder`), which
+posts directly to Langfuse's ingestion API. The runner exports gen_ai spans
 over OTLP-HTTP to the collector (`runner/src/curie_runner/otel.py`), and the
-collector is the single component that authenticates and forwards to Langfuse
+collector is the component that authenticates and forwards spans to Langfuse
 (`charts/curie/templates/otel-collector.yaml`, needed because Langfuse OTLP
 ingest is HTTP-only). On the read side the UI consumes only our API's schemas
 (`ObservationNode`, `MetricsSummary` in `apps/api/src/curie_api/schemas/observability.py`).
@@ -114,10 +117,13 @@ tree-building and metrics logic in
 `langfuse.py` is Langfuse-API-shaped (client-side substring scan, the Metrics
 API query object) and would be rewritten, not ported.
 
-**Leakage:** the runner stamps a `langfuse.trace.name` span attribute
-(`runner/src/curie_runner/otel.py`), a vendor attribute on the otherwise
-neutral write path; a clean seam would use a neutral attribute the collector
-maps. The UI also reaches the read adapter through vendor-named routes
+**Leakage:** the runner stamps five vendor span attributes
+(`langfuse.trace.name`, `langfuse.session.id`, `langfuse.user.id`,
+`langfuse.observation.input`, `langfuse.observation.output`) plus the bare
+`model` key (`runner/src/curie_runner/otel.py`, keys declared in
+`packages/telemetry-schema/src/curie_telemetry_schema/__init__.py::SpanAttributeKey`)
+on the otherwise neutral write path; a clean seam would use neutral attributes
+the collector maps. The UI also reaches the read adapter through vendor-named routes
 (`/langfuse/traces` in `apps/ui/src/api/client.ts`), so the vendor name leaks
 into the URL namespace even though the payloads are ours.
 

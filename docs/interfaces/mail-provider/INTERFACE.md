@@ -83,3 +83,11 @@ also drive a verifying test provider end to end.
   provider's settings, secret and egress rules; the neutral `mailAdapter.provider`
   block from the ADR's sketch step 6 is not built yet, so a chart install can select
   only AgentMail.
+- **The neutral adapter still knows AgentMail.**
+  `apps/mail-adapter/src/curie_mail_adapter/adapter.py` imports `AgentMailClient`,
+  `AgentMailProvider` and the bounded HTTP helper `request` (which it also uses for
+  its platform API calls) from `apps/mail-adapter/src/curie_mail_adapter/agentmail.py`,
+  builds `AgentMailProvider` when no provider is passed, and redacts
+  `agentmail_api_key` in `MailAdapter._bounded_cause`. The AgentMail settings
+  (`AGENTMAIL_*` and `CURIE_MAIL_AGENTMAIL_EGRESS_CIDRS`) live in the neutral
+  `apps/mail-adapter/src/curie_mail_adapter/config.py::MailAdapterConfig`.

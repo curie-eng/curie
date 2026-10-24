@@ -85,7 +85,10 @@ contribution directly for its name and aliases. Every other name raises
 `UnsupportedHarnessError`
 (`runner/src/curie_runner/harness/registry.py::UnsupportedHarnessError`) before
 entry point discovery, including an installed and registered nonClaude name.
-No CLI, worker, Compose, or chart selector exposes this internal setting.
+No CLI, Compose, or chart selector exposes this internal setting. The worker's
+protected Kubernetes projection
+(`apps/worker/src/curie_worker/protected_kubernetes_projection.py`) pins
+`CURIE_HARNESS` to `claude-agent-sdk`, which `_resolve_harness` refuses.
 
 ## Implementations today
 
@@ -138,6 +141,16 @@ The session port still receives SDK message objects, and other runner modules
 retain explicit legacy SDK imports. The approval split removes one such edge;
 it does not complete a neutral session payload contract. The import ratchet
 prevents new exceptions outside the Claude package.
+
+The worker's protected Kubernetes projection sets the internal harness
+setting itself. `render_static_environment`
+(`apps/worker/src/curie_worker/protected_kubernetes_projection.py::render_static_environment`)
+writes `CURIE_HARNESS=claude-agent-sdk` from its fixed internal environment, and
+projection validation requires that value. The name is not a key of
+`BUILTIN_HARNESS_CANONICAL_PATHS`
+(`runner/src/curie_runner/harness/registry.py::BUILTIN_HARNESS_CANONICAL_PATHS`),
+whose keys are `claude`, `claude-sdk` and `claude-code`, so a runner booted from
+that projection raises `UnsupportedHarnessError` in `_resolve_harness`.
 
 The registry discovers only distributions installed in the runner image.
 The sealed virtual environment and read only root filesystem provide no
