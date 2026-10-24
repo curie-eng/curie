@@ -1133,12 +1133,18 @@ def _outcome(code: int, out: str, err: str) -> Obj:
     return {"exit_code": code, "output_tail": (out + err)[-400:]}
 
 
+def _ids(argv: list[str]) -> tuple[bool, list[str]]:
+    """(the listing exited 0, the ids it printed)."""
+
+    code, out, _ = _command(argv, env=_docker_env())
+    return code == 0, out.split()
+
+
 def _listing(argv: list[str]) -> tuple[bool, list[str]]:
     """(the listing exited 0 and printed nothing, the ids it printed)."""
 
-    code, out, _ = _command(argv, env=_docker_env())
-    ids = out.split()
-    return code == 0 and not ids, ids
+    ok, ids = _ids(argv)
+    return ok and not ids, ids
 
 
 def _http_get(url: str, timeout: int = 5) -> tuple[int | None, str]:
@@ -1305,13 +1311,6 @@ SKILL_RUNG_REMOVALS = {
     "networks": ["docker", "network", "rm"],
     "volumes": ["docker", "volume", "rm", "-f"],
 }
-
-
-def _ids(argv: list[str]) -> tuple[bool, list[str]]:
-    """(the listing exited 0, the ids it printed)."""
-
-    code, out, _ = _command(argv, env=_docker_env())
-    return code == 0, out.split()
 
 
 def _skill_rung_inputs(source: Path, curie_bin: Path) -> None:
