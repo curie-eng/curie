@@ -1933,7 +1933,7 @@ def test_compose_runs_build_up_exec_port_and_publishes(fake_commands: FakeComman
     assert fake.argvs("compose up") == [[*base, "up", "-d"]]
     assert fake.argvs("compose ps") == [[*base, "ps", "--all", "--format", "json"]]
     exec_argv = fake.call("compose exec")[0]
-    assert exec_argv[: len(base) + 6] == [*base, "exec", "-T", "client", "python3", "-c"]
+    assert exec_argv[: len(base) + 5] == [*base, "exec", "-T", "client", "python3", "-c"]
     assert "http://server:8080/index.html" in exec_argv[-1]
     assert fake.argvs("compose port") == [[*base, "port", "server", "8080"]]
     assert fake.urls == [f"http://{PUBLISHED_HOST}:32768/index.html"]
