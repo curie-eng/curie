@@ -16,12 +16,12 @@ on the default Docker engine; api and worker build the same way. Unlike that dri
 sets no fullnameOverride, so its workloads are named fd-docker-<n>-curie-* as the CLI
 expects, and its factory agent is "fde" so runner pool names stay within 63
 characters. This driver adds a second platform runner (platform-next) for the upgrade,
-the candidate CLI built for the runner's glibc, and a second repository binding. The
+the candidate CLI built for the runner's glibc, and a second repository. The
 stub-served acme-corp/acme-bot is the custom repository (its receipt declares
 Dockerfile "Dockerfile", and the stub serves it a tree carrying that Dockerfile, the
 one its runner was built from), and acme-corp/acme-catalog is a catalog repository
-whose runner the upgrade rebuilds; it is never cloned and takes no turn. No host path
-is ever bind-mounted.
+whose runner the upgrade rebuilds, in a second, inert binding of its own; it is never
+cloned and takes no turn. No host path is ever bind-mounted.
 
 The production catalog rebuild always builds linux/amd64 and linux/arm64 and refuses
 the default docker driver for a multi-platform push, so the run creates its own
@@ -229,15 +229,22 @@ def docker_values(values: Obj, images: dict[str, dict[str, str]], schema_version
         keyed = parent.get(key) if isinstance(parent, dict) else None
         if isinstance(parent, dict) and isinstance(keyed, dict) and dl.AGENT in keyed:
             parent[key] = {DOCKER_AGENT if k == dl.AGENT else k: v for k, v in keyed.items()}
-    repos = out["factory"]["bindings"][0]["repos"]
-    custom = next(repo for repo in repos if repo["path"] == CUSTOM_REPO)
+    bindings = out["factory"]["bindings"]
+    custom = next(repo for repo in bindings[0]["repos"] if repo["path"] == CUSTOM_REPO)
     # Only the CLI upgrade planner reads the key; the chart and worker ignore it.
     custom["runner"]["dockerfile"] = "Dockerfile"
     runner: Obj = {"image": images["runner"]["ref"], "base": images["platform"]["digest"]}
     runner |= {"platformDigests": dict(custom["runner"]["platformDigests"])}
     runner |= {"tools": ["docker-cli"]}
     catalog: Obj = {"alias": "acme-catalog", "codeHost": "github", "projectId": "4402"}
-    repos.append(catalog | {"path": CATALOG_REPO, "runner": runner})
+    catalog |= {"path": CATALOG_REPO, "runner": runner}
+    # A native GitHub binding holds exactly its own repository (curie_api forges/config.py
+    # _check_native), so the catalog gets its own binding. It stays inert: GitHub intake
+    # polls only agent_channels addresses (factory_label_reconcile.py bound_repositories),
+    # the tracker intake skips GitHub trackers (factory_tracker_intake.py), and the harness
+    # creates a channel only for acme-bot.
+    scope = {"tracker": bindings[0]["tracker"], "trackerScopeId": catalog["projectId"]}
+    bindings.append({"name": "acme-catalog", **scope, "repos": [catalog]})
     daemon = out["factory"]["docker"]
     daemon |= {"maxClaimLifetimeSeconds": 3600, "storageSizeLimit": "24Gi"}
     resources = daemon.setdefault("resources", {})
