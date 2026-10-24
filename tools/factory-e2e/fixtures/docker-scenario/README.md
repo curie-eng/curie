@@ -97,8 +97,8 @@ under authorization plugins and `userns` under security options).
    The failing recording passed `--curie-bin /bin/false`, so the ladder
    stopped at `"$BIN" --version` with exit 1 and no `LADDER PASS`, and the
    collector recorded an empty CLI version. Both recordings show nothing left
-   behind: no `curie-runner` image and no container or volume labelled
-   `curietech.ai/managed-by=curie-cli`.
+   behind: no `curie-runner` image and no container, network or volume that
+   was not on the daemon before the collector's snapshot.
 
 9. `compose` and `skill_rung` in `passing-envelope.json` are
    `compose-passing.json` and `skill-rung-passing.json` with one edit: `info`

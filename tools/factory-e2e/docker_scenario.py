@@ -908,7 +908,10 @@ def _skill_rung_ladder(section: Obj) -> list[str]:
 
 def _skill_rung_cleanup(section: Obj) -> list[str]:
     cleanup = section["cleanup"]
-    reasons = _leftovers("skill rung", cleanup, ("containers", "volumes"))
+    for kind in ("containers", "networks", "volumes"):
+        if not isinstance(cleanup[kind], list):
+            raise TypeError(f"skill rung cleanup {kind} is not a list")
+    reasons = _leftovers("skill rung", cleanup, ("containers", "networks", "volumes"))
     if cleanup["image_removed"] is not True:
         reasons.append(f"incomplete_cleanup: skill rung did not remove its {RUNNER_TAG} image")
     return reasons
@@ -1028,6 +1031,16 @@ def _command(
     return done.returncode, done.stdout, done.stderr
 
 
+def _docker_env() -> dict[str, str]:
+    """A copy of this environment without the settings that redirect docker.
+
+    DOCKER_CONTEXT and BUILDX_BUILDER can each send docker away from the daemon
+    DOCKER_HOST names.
+    """
+
+    return {k: v for k, v in os.environ.items() if k not in ("DOCKER_CONTEXT", "BUILDX_BUILDER")}
+
+
 def _cleanup(name: str, nonce: str) -> Obj:
     """Remove the holder and escape volume by name, then verify both are gone."""
 
@@ -1109,7 +1122,7 @@ def _outcome(code: int, out: str, err: str) -> Obj:
 def _listing(argv: list[str]) -> tuple[bool, list[str]]:
     """(the listing exited 0 and printed nothing, the ids it printed)."""
 
-    code, out, _ = _command(argv)
+    code, out, _ = _command(argv, env=_docker_env())
     ids = out.split()
     return code == 0 and not ids, ids
 
@@ -1213,21 +1226,30 @@ def compose(nonce: str, image: str, published_host: str) -> Obj:
             (root / rel).write_text(text)
         base = ["docker", "compose", "-p", project, "-f", str(root / "compose.yaml")]
         try:
-            _, info, _ = _command(["docker", "info", "--format", INFO_FORMAT])
-            build = _outcome(*_command([*base, "build"], timeout=BUILD_TIMEOUT))
+            _, info, _ = _command(["docker", "info", "--format", INFO_FORMAT], env=_docker_env())
+            build = _outcome(*_command([*base, "build"], timeout=BUILD_TIMEOUT, env=_docker_env()))
             if build["exit_code"] == 0:
-                up = _outcome(*_command([*base, "up", "-d"]))
+                up = _outcome(*_command([*base, "up", "-d"], env=_docker_env()))
             if up["exit_code"] == 0:
-                _, ps_out, _ = _command([*base, "ps", "--all", "--format", "json"])
+                _, ps_out, _ = _command(
+                    [*base, "ps", "--all", "--format", "json"], env=_docker_env()
+                )
                 services = _parse_services(ps_out)
                 script = REACH_SCRIPT.format(attempts=HTTP_ATTEMPTS, url=f"http://{to}/index.html")
-                code, out, _ = _command([*base, "exec", "-T", "client", "python3", "-c", script])
+                code, out, _ = _command(
+                    [*base, "exec", "-T", "client", "python3", "-c", script], env=_docker_env()
+                )
                 reach = {**reach, "exit_code": code, "body": out}
-                code, out, _ = _command([*base, "port", "server", str(COMPOSE_PORT)])
+                code, out, _ = _command(
+                    [*base, "port", "server", str(COMPOSE_PORT)], env=_docker_env()
+                )
                 published = _published(published_host, parse_port(out) if code == 0 else None)
         finally:
             down = _outcome(
-                *_command([*base, "down", "--volumes", "--rmi", "local", "--remove-orphans"])
+                *_command(
+                    [*base, "down", "--volumes", "--rmi", "local", "--remove-orphans"],
+                    env=_docker_env(),
+                )
             )
             label = f"label={COMPOSE_LABEL}={project}"
             listings = {
@@ -1259,6 +1281,25 @@ def compose(nonce: str, image: str, published_host: str) -> Obj:
     }
 
 
+SKILL_RUNG_LISTINGS = {
+    "containers": ["docker", "ps", "-aq", "--no-trunc"],
+    "networks": ["docker", "network", "ls", "-q", "--no-trunc"],
+    "volumes": ["docker", "volume", "ls", "-q"],
+}
+SKILL_RUNG_REMOVALS = {
+    "containers": ["docker", "rm", "-f", "-v"],
+    "networks": ["docker", "network", "rm"],
+    "volumes": ["docker", "volume", "rm", "-f"],
+}
+
+
+def _ids(argv: list[str]) -> tuple[bool, list[str]]:
+    """(the listing exited 0, the ids it printed)."""
+
+    code, out, _ = _command(argv, env=_docker_env())
+    return code == 0, out.split()
+
+
 def _skill_rung_inputs(source: Path, curie_bin: Path) -> None:
     """Refuse, before any command runs, a missing CLI or ladder input."""
 
@@ -1274,7 +1315,7 @@ def _skill_rung_inputs(source: Path, curie_bin: Path) -> None:
 def _ladder_env(curie: Path, published_host: str) -> dict[str, str]:
     """This environment for the skill rung, without any model credential or route."""
 
-    env = {key: value for key, value in os.environ.items() if key not in MODEL_ENV}
+    env = {key: value for key, value in _docker_env().items() if key not in MODEL_ENV}
     env.update(
         CURIE_E2E_TIERS="skill",
         CURIE_E2E_LIVE="0",
@@ -1292,6 +1333,9 @@ def skill_rung(
     The candidate CLI and the source checkout are inputs because the runner tool
     catalog has no curie CLI. The runner image is built with the checkout as build
     context; an existing curie-runner image is refused, never replaced or removed.
+    The daemon's containers, networks and volumes are snapshotted before the build and
+    every one new since is removed afterwards, so the collector assumes nothing else
+    creates objects on the daemon while it runs.
     """
 
     docker_host = _docker_host(published_host)
@@ -1315,12 +1359,12 @@ def skill_rung(
         curie.parent.mkdir()
         shutil.copyfile(curie_bin, curie)
         curie.chmod(0o755)
-        code, out, _ = _command([str(curie), "--version"])
+        code, out, _ = _command([str(curie), "--version"], env=_docker_env())
         inputs["curie_bin"]["version"] = out.strip() if code == 0 else ""
 
-        _, info_out, _ = _command(["docker", "info", "--format", INFO_FORMAT])
+        _, info_out, _ = _command(["docker", "info", "--format", INFO_FORMAT], env=_docker_env())
         info = parse_info(info_out)
-        code, out, err = _command(["docker", "image", "ls", "-q", RUNNER_TAG])
+        code, out, err = _command(["docker", "image", "ls", "-q", RUNNER_TAG], env=_docker_env())
         if code != 0:
             raise CommandError(f"docker image ls {RUNNER_TAG} exited {code}: {err.strip()[-400:]}")
         if out.strip():
@@ -1328,6 +1372,12 @@ def skill_rung(
                 f"a {RUNNER_TAG} image ({' '.join(out.split())}) already exists on the daemon; "
                 "refusing to replace an image this collector did not build"
             )
+        before = {}
+        for kind, argv in SKILL_RUNG_LISTINGS.items():
+            code, out, err = _command(argv, env=_docker_env())
+            if code != 0:
+                raise CommandError(f"{' '.join(argv)} exited {code}: {err.strip()[-400:]}")
+            before[kind] = set(out.split())
         image: Obj = {
             "tag": RUNNER_TAG,
             "id": "",
@@ -1350,10 +1400,10 @@ def skill_rung(
                 "docker", "build", "-f", str(dockerfile), "-t", RUNNER_TAG,
                 "--label", f"{NONCE_LABEL}={nonce}", str(source),
             ]  # fmt: skip
-            image.update(_outcome(*_command(build, timeout=BUILD_TIMEOUT)))
+            image.update(_outcome(*_command(build, timeout=BUILD_TIMEOUT, env=_docker_env())))
             if image["exit_code"] == 0:
                 inspect = ["docker", "image", "inspect", "--format", RUNNER_INSPECT_FORMAT]
-                code, out, _ = _command([*inspect, RUNNER_TAG])
+                code, out, _ = _command([*inspect, RUNNER_TAG], env=_docker_env())
                 fields = out.split() if code == 0 else []
                 image["id"] = fields[0] if fields else ""
                 image["label_nonce"] = fields[1] if len(fields) > 1 else ""
@@ -1369,12 +1419,21 @@ def skill_rung(
                     output_tail=(out + err)[-4000:],
                 )
         finally:
-            # The image was proven absent above, so whatever carries the tag now is ours.
-            rm_code, _, _ = _command(["docker", "image", "rm", "-f", RUNNER_TAG])
+            # Everything new since the snapshot is ours; the image was proven absent above.
+            listed_ok = True
+            for kind, remove in SKILL_RUNG_REMOVALS.items():
+                ok, ids = _ids(SKILL_RUNG_LISTINGS[kind])
+                listed_ok = listed_ok and ok
+                new = [i for i in ids if i not in before[kind]]
+                if ok and new:
+                    _command([*remove, *new], env=_docker_env())
+            rm_code, _, _ = _command(["docker", "image", "rm", "-f", RUNNER_TAG], env=_docker_env())
             image_absent, _ = _listing(["docker", "image", "ls", "-q", RUNNER_TAG])
-            managed = f"label={MANAGED_LABEL}"
-            containers_ok, containers = _listing(["docker", "ps", "-aq", "--filter", managed])
-            volumes_ok, volumes = _listing(["docker", "volume", "ls", "-q", "--filter", managed])
+            left: dict[str, list[str]] = {}
+            for kind in SKILL_RUNG_LISTINGS:
+                ok, ids = _ids(SKILL_RUNG_LISTINGS[kind])
+                listed_ok = listed_ok and ok
+                left[kind] = [i for i in ids if i not in before[kind]]
     return {
         "window": [t0, time.time()],
         "docker_host": docker_host,
@@ -1386,9 +1445,8 @@ def skill_rung(
         "ladder": ladder,
         "cleanup": {
             "image_removed": rm_code == 0 and image_absent,
-            "containers": containers,
-            "volumes": volumes,
-            "verified": image_absent and containers_ok and volumes_ok,
+            **left,
+            "verified": listed_ok and image_absent and not any(left.values()),
         },
     }
 

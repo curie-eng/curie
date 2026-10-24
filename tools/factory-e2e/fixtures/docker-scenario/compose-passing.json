@@ -1,8 +1,8 @@
 {
-  "project": "curie-compose-5c0d3a71-90c2f7",
+  "project": "curie-compose-5c0d3a71-aa35ac",
   "window": [
-    1792817605.674444,
-    1792817617.5728695
+    1792818621.0972738,
+    1792818632.7025146
   ],
   "docker_host": "tcp://curie-docker-sections-a01e0a8:2375",
   "published_host": "curie-docker-sections-a01e0a8",
@@ -20,11 +20,11 @@
   "expected": "curie-compose 5c0d3a71",
   "build": {
     "exit_code": 0,
-    "output_tail": "f8423fd58cd65385ea51a5e5448cf done\n#12 naming to docker.io/library/curie-compose-5c0d3a71-90c2f7-server done\n#12 DONE 0.0s\n\n#13 [server] resolving provenance for metadata file\n#13 DONE 0.0s\n Image curie-compose-5c0d3a71-90c2f7-client Building \n Image curie-compose-5c0d3a71-90c2f7-server Building \n Image curie-compose-5c0d3a71-90c2f7-client Built \n Image curie-compose-5c0d3a71-90c2f7-server Built \n"
+    "output_tail": "curie-compose-5c0d3a71-aa35ac-server done\n#11 DONE 0.0s\n\n#12 [client] resolving provenance for metadata file\n#12 DONE 0.0s\n\n#13 [server] resolving provenance for metadata file\n#13 DONE 0.0s\n Image curie-compose-5c0d3a71-aa35ac-client Building \n Image curie-compose-5c0d3a71-aa35ac-server Building \n Image curie-compose-5c0d3a71-aa35ac-client Built \n Image curie-compose-5c0d3a71-aa35ac-server Built \n"
   },
   "up": {
     "exit_code": 0,
-    "output_tail": "-compose-5c0d3a71-90c2f7-client-1 Creating \n Container curie-compose-5c0d3a71-90c2f7-client-1 Created \n Container curie-compose-5c0d3a71-90c2f7-server-1 Created \n Container curie-compose-5c0d3a71-90c2f7-client-1 Starting \n Container curie-compose-5c0d3a71-90c2f7-server-1 Starting \n Container curie-compose-5c0d3a71-90c2f7-client-1 Started \n Container curie-compose-5c0d3a71-90c2f7-server-1 Started \n"
+    "output_tail": "-compose-5c0d3a71-aa35ac-client-1 Creating \n Container curie-compose-5c0d3a71-aa35ac-server-1 Created \n Container curie-compose-5c0d3a71-aa35ac-client-1 Created \n Container curie-compose-5c0d3a71-aa35ac-client-1 Starting \n Container curie-compose-5c0d3a71-aa35ac-server-1 Starting \n Container curie-compose-5c0d3a71-aa35ac-client-1 Started \n Container curie-compose-5c0d3a71-aa35ac-server-1 Started \n"
   },
   "services": [
     {
@@ -43,14 +43,14 @@
     "body": "curie-compose 5c0d3a71\n"
   },
   "published": {
-    "port": 32769,
-    "url": "http://curie-docker-sections-a01e0a8:32769/index.html",
+    "port": 32771,
+    "url": "http://curie-docker-sections-a01e0a8:32771/index.html",
     "status": 200,
     "body": "curie-compose 5c0d3a71\n"
   },
   "down": {
     "exit_code": 0,
-    "output_tail": "ie-compose-5c0d3a71-90c2f7-server-1 Removed \n Network curie-compose-5c0d3a71-90c2f7_default Removing \n Image curie-compose-5c0d3a71-90c2f7-server:latest Removing \n Image curie-compose-5c0d3a71-90c2f7-client:latest Removing \n Image curie-compose-5c0d3a71-90c2f7-server:latest Removed \n Image curie-compose-5c0d3a71-90c2f7-client:latest Removed \n Network curie-compose-5c0d3a71-90c2f7_default Removed \n"
+    "output_tail": "ie-compose-5c0d3a71-aa35ac-client-1 Removed \n Network curie-compose-5c0d3a71-aa35ac_default Removing \n Image curie-compose-5c0d3a71-aa35ac-server:latest Removing \n Image curie-compose-5c0d3a71-aa35ac-client:latest Removing \n Image curie-compose-5c0d3a71-aa35ac-client:latest Removed \n Image curie-compose-5c0d3a71-aa35ac-server:latest Removed \n Network curie-compose-5c0d3a71-aa35ac_default Removed \n"
   },
   "cleanup": {
     "containers": [],

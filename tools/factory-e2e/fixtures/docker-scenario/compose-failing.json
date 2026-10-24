@@ -1,8 +1,8 @@
 {
-  "project": "curie-compose-7a41e09b-c3d7bd",
+  "project": "curie-compose-7a41e09b-7b05d9",
   "window": [
-    1792817624.4859674,
-    1792817665.1131372
+    1792818633.238362,
+    1792818673.838488
   ],
   "docker_host": "tcp://curie-docker-sections-a01e0a8:2375",
   "published_host": "127.0.0.1",
@@ -20,11 +20,11 @@
   "expected": "curie-compose 7a41e09b",
   "build": {
     "exit_code": 0,
-    "output_tail": "36a74e4e87ae58bd834e1d47db6f0 done\n#12 naming to docker.io/library/curie-compose-7a41e09b-c3d7bd-server done\n#12 DONE 0.0s\n\n#13 [server] resolving provenance for metadata file\n#13 DONE 0.0s\n Image curie-compose-7a41e09b-c3d7bd-server Building \n Image curie-compose-7a41e09b-c3d7bd-client Building \n Image curie-compose-7a41e09b-c3d7bd-server Built \n Image curie-compose-7a41e09b-c3d7bd-client Built \n"
+    "output_tail": "curie-compose-7a41e09b-7b05d9-server done\n#11 DONE 0.0s\n\n#12 [client] resolving provenance for metadata file\n#12 DONE 0.0s\n\n#13 [server] resolving provenance for metadata file\n#13 DONE 0.0s\n Image curie-compose-7a41e09b-7b05d9-client Building \n Image curie-compose-7a41e09b-7b05d9-server Building \n Image curie-compose-7a41e09b-7b05d9-client Built \n Image curie-compose-7a41e09b-7b05d9-server Built \n"
   },
   "up": {
     "exit_code": 0,
-    "output_tail": "-compose-7a41e09b-c3d7bd-client-1 Creating \n Container curie-compose-7a41e09b-c3d7bd-client-1 Created \n Container curie-compose-7a41e09b-c3d7bd-server-1 Created \n Container curie-compose-7a41e09b-c3d7bd-server-1 Starting \n Container curie-compose-7a41e09b-c3d7bd-client-1 Starting \n Container curie-compose-7a41e09b-c3d7bd-server-1 Started \n Container curie-compose-7a41e09b-c3d7bd-client-1 Started \n"
+    "output_tail": "-compose-7a41e09b-7b05d9-client-1 Creating \n Container curie-compose-7a41e09b-7b05d9-server-1 Created \n Container curie-compose-7a41e09b-7b05d9-client-1 Created \n Container curie-compose-7a41e09b-7b05d9-client-1 Starting \n Container curie-compose-7a41e09b-7b05d9-server-1 Starting \n Container curie-compose-7a41e09b-7b05d9-client-1 Started \n Container curie-compose-7a41e09b-7b05d9-server-1 Started \n"
   },
   "services": [
     {
@@ -43,14 +43,14 @@
     "body": "curie-compose 7a41e09b\n"
   },
   "published": {
-    "port": 32770,
-    "url": "http://127.0.0.1:32770/index.html",
+    "port": 32772,
+    "url": "http://127.0.0.1:32772/index.html",
     "status": null,
     "body": "<urlopen error [Errno 111] Connection refused>"
   },
   "down": {
     "exit_code": 0,
-    "output_tail": "ie-compose-7a41e09b-c3d7bd-server-1 Removed \n Network curie-compose-7a41e09b-c3d7bd_default Removing \n Image curie-compose-7a41e09b-c3d7bd-server:latest Removing \n Image curie-compose-7a41e09b-c3d7bd-client:latest Removing \n Image curie-compose-7a41e09b-c3d7bd-client:latest Removed \n Image curie-compose-7a41e09b-c3d7bd-server:latest Removed \n Network curie-compose-7a41e09b-c3d7bd_default Removed \n"
+    "output_tail": "ie-compose-7a41e09b-7b05d9-server-1 Removed \n Network curie-compose-7a41e09b-7b05d9_default Removing \n Image curie-compose-7a41e09b-7b05d9-server:latest Removing \n Image curie-compose-7a41e09b-7b05d9-client:latest Removing \n Image curie-compose-7a41e09b-7b05d9-client:latest Removed \n Image curie-compose-7a41e09b-7b05d9-server:latest Removed \n Network curie-compose-7a41e09b-7b05d9_default Removed \n"
   },
   "cleanup": {
     "containers": [],
