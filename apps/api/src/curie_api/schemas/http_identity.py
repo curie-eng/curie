@@ -24,6 +24,16 @@ _UTC_PATTERN = (
     r"^([0-9]{4})-([0-9]{2})-([0-9]{2})T"
     r"([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.([0-9]+))?(?:Z|\+00:00)$"
 )
+_ISSUER_SCHEMA_PATTERN = (
+    r"^(?![\s\S]*\s$)[hH][tT][tT][pP][sS]://"
+    r"(?:\[[^/?#@\]]+\]|[^:/?#@\[\]]+)(?::[^/?#@]*)?"
+    r"(?:/[^?#]*)?(?:\?)?(?:#)?$(?![\s\S])"
+)
+_UTC_SCHEMA_PATTERN = (
+    r"^(?!0000)[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])T"
+    r"(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]"
+    r"(?:\.[0-9]+)?(?:Z|\+00:00)$(?![\s\S])"
+)
 _EPOCH = date(1970, 1, 1)
 _NONINTEGER = object()
 
@@ -96,8 +106,21 @@ def _timestamp(value: str) -> str:
 Text = Annotated[str, BeforeValidator(_text)]
 Opaque = Annotated[Text, Field(min_length=1)]
 CanonicalUUID = Annotated[Text, Field(pattern=_UUID_PATTERN), AfterValidator(_uuid)]
-Issuer = Annotated[Text, AfterValidator(_issuer)]
-UTCInstant = Annotated[Text, Field(pattern=_UTC_PATTERN), AfterValidator(_timestamp)]
+# Schema metadata does not narrow the existing exact-string runtime validators.
+Issuer = Annotated[
+    Text,
+    Field(json_schema_extra={"minLength": 1, "pattern": _ISSUER_SCHEMA_PATTERN}),
+    AfterValidator(_issuer),
+]
+UTCInstant = Annotated[
+    Text,
+    Field(pattern=_UTC_PATTERN, json_schema_extra={
+        "pattern": _UTC_SCHEMA_PATTERN,
+        "format": "date-time",
+        "description": "Enable date-time format assertions to validate calendar dates.",
+    }),
+    AfterValidator(_timestamp),
+]
 Purpose = Annotated[Literal["invocation", "approval"], BeforeValidator(_text)]
 SenderKind = Annotated[Literal["human", "service", "agent", "unknown"], BeforeValidator(_text)]
 Outcome = Annotated[
