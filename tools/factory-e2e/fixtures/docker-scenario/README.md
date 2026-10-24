@@ -63,3 +63,48 @@ passing envelope made inside `tests/test_docker_scenario.py`.
 8. `lifecycle` is `{"schema": "daemon-lifecycle/v1", "failures": []}`, what
    `from_lifecycle` returns for the committed daemon-lifecycle passing envelope
    (whose own judge reports no failures).
+
+## compose and skill rung recordings
+
+`compose-passing.json`, `compose-failing.json`, `skill-rung-passing.json` and
+`skill-rung-failing.json` are each one section exactly as the `compose` or
+`skill-rung` collector wrote it with `--out`; nothing in them was edited. They
+were recorded on the default Docker engine against a Docker-in-Docker daemon
+built from `apps/docker-daemon`, with the `curie-authz` authorization plugin
+loaded and user namespace remapping on (`docker info` listed `curie-authz`
+under authorization plugins and `userns` under security options).
+
+1. The daemon container ran `dockerd -H unix:///var/run/docker.sock -H
+   tcp://0.0.0.0:2375 --tls=false` on its own network with an explicitly
+   allocated subnet that overlapped no route in the daemon container, no route
+   on the engine host and no existing engine network.
+2. The collectors ran in a second container on that network with
+   `DOCKER_HOST=tcp://<daemon container>:2375` and
+   `DOCKER_PUBLISHED_HOST=<daemon container>`, so published ports were dialed
+   at the daemon container's name. That container held the Docker CLI with the
+   compose and buildx plugins, Python, a curie CLI built from the recorded
+   source revision, and that checkout. Everything reached it by build context
+   and `docker cp`; no host path was bind mounted anywhere.
+3. compose used `--image` set to the digest-pinned Python base image of
+   `runner/Dockerfile` (the stack needs `python3`). The failing compose
+   recording passed `--published-host 127.0.0.1`, an address where the
+   daemon's published port does not listen, so the published check was
+   refused while the in-stack reach still worked.
+4. skill-rung used `--source` set to that checkout and the built CLI as
+   `CURIE_BIN`. `curie-runner` was built inside the daemon from the uploaded
+   checkout, the ladder ran `CURIE_E2E_TIERS=skill` on the fake model and
+   printed `LADDER PASS (tiers: skill)`, and the image was removed afterwards.
+   The failing recording passed `--curie-bin /bin/false`, so the ladder
+   stopped at `"$BIN" --version` with exit 1 and no `LADDER PASS`, and the
+   collector recorded an empty CLI version. Both recordings show nothing left
+   behind: no `curie-runner` image and no container or volume labelled
+   `curietech.ai/managed-by=curie-cli`.
+
+9. `compose` and `skill_rung` in `passing-envelope.json` are
+   `compose-passing.json` and `skill-rung-passing.json` with one edit: `info`
+   (and `skill_rung.image.daemon_id`) carry run `a`'s recorded daemon identity
+   instead of the recording daemon's, because the judge requires both sections
+   to come from run `a`'s or run `b`'s daemon and those sections were recorded
+   on a different daemon from the one run `a` was recorded on. The test
+   `test_recorded_passing_envelope_embeds_the_recorded_sections` pins that
+   this identity is the only difference.

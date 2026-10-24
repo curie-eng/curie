@@ -1,0 +1,52 @@
+{
+  "window": [
+    1792817672.9640715,
+    1792817760.9107482
+  ],
+  "docker_host": "tcp://curie-docker-sections-a01e0a8:2375",
+  "published_host": "curie-docker-sections-a01e0a8",
+  "nonce": "3f9b2c64",
+  "info": {
+    "id": "275deac0-10bc-4cf6-857e-3f51f70c36de",
+    "name": "ded1c42cd936"
+  },
+  "inputs": {
+    "curie_bin": {
+      "sha256": "fbf74889adc7124a6a1dd43a240c8980c68574143fd24d0d77afd714563a2aa5",
+      "version": "curie 0.14.1"
+    },
+    "files": {
+      "cli/scripts/e2e-ladder.sh": "1a46c26d3647731de02fe5cc119e5969b2b470e9d2e332068aa3dbef6af85bfb",
+      "cli/scripts/e2e.sh": "6685ca83577c091bb913094a1437b82f78acd262fbdf5816b7e121a484bbbdf7",
+      "cli/scripts/gnu-process.py": "6dc670b8a3bae3fa6f3ef42e4a9c0b94a2f205ee26d337b813dc5b381e1bd75c"
+    },
+    "bundle": {
+      "path": "examples/weather",
+      "digest": "14dd4b84fe978febd07eeae95d042f076cc2ebccc55016b335725226e8af753a"
+    },
+    "source_revision": "108ea3ca7672c7f3f26b4c367597f518a7876051"
+  },
+  "image": {
+    "tag": "curie-runner",
+    "id": "sha256:898f4ab606531f5a3f5f5bcb6e3f02ad1307ee8f795a292418f411e3501aa134",
+    "label_nonce": "3f9b2c64",
+    "dockerfile": "runner/Dockerfile",
+    "dockerfile_sha256": "930254e6ccafccf5ff2ec3739ea7cf136c4e668fee8f6c48a2e31c15ce424721",
+    "daemon_id": "275deac0-10bc-4cf6-857e-3f51f70c36de",
+    "exit_code": 0,
+    "output_tail": "ate-home --shell /usr/sbin/nologin runner     && chown -R 1000:1000 /home/runner\n#23 DONE 0.3s\n\n#24 [stage-1 19/19] COPY runner/pip.conf /etc/pip.conf\n#24 DONE 0.0s\n\n#25 exporting to image\n#25 exporting layers\n#25 exporting layers 1.0s done\n#25 writing image sha256:898f4ab606531f5a3f5f5bcb6e3f02ad1307ee8f795a292418f411e3501aa134 done\n#25 naming to docker.io/library/curie-runner done\n#25 DONE 1.0s\n"
+  },
+  "ladder": {
+    "tiers": "skill",
+    "live": "0",
+    "exit_code": 0,
+    "passed": true,
+    "output_tail": "e (offline, scripted replies)           \u2502\n\u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256f\nskill: no connector containers for a bundle that declares none (project local-7b3de39f-e106-467b-a4ee-642600fa61bf)\n\nSKIPPING rung 2 (local): not named in CURIE_E2E_TIERS.\n\nSKIPPING rung (local-release): not named in CURIE_E2E_TIERS. Needs the\nrelease-pinned images built and tagged locally first; name it explicitly,\ne.g. CURIE_E2E_TIERS=skill,local,local-release.\n\nSKIPPING rung 3 (cluster): not named in CURIE_E2E_TIERS. It needs a live\nrelease and host-reachable pods, so it is opt-in: CURIE_E2E_TIERS=all.\n\n=== parity summary (what this run actually proved) ===\nrungs run: skill\nbundle identity: 1e4a44cf113dbe895577aaf395b8ae8543a74a1abd5ad371647aa1c685afca2b, reported by rung(s): skill\nnote: only one rung reported a digest, so the CROSS-RUNG digest comparison was vacuous for this tier set -- only that rung's own identity was recorded. This is NOT a cross-rung parity claim.\nsuite: \"weather\" with 1 case(s), resolved by the tier's own loader at rung(s): skill\ncase ids: reports-a-temperature (proven at local/cluster by digest equality; read back directly at skill, and at every rung under CURIE_E2E_LIVE=1)\nmodel mode read off the deployed artifact at rung(s): none\ngrading: PLUMBING-ONLY rungs: skill -- sealed against the fake model, so no rung graded reply content and a green here must never be read as a graded pass (ADR-0055, #612).\n\nLADDER PASS (tiers: skill)\nscaffolded demo at /tmp/tmp.RLZ9gjD3CS/try-clean/tmp/curie-try-3e5e5079-e153-490b-88f3-f384a7096ee4\nno model credential found; using the scripted fake model\nstarting runner container 'curie-runner-local' from 'curie-runner'\nwaiting for runner: ok (1.0s)\nState recorded in /tmp/tmp.RLZ9gjD3CS/try-clean/tmp/curie-try-3e5e5079-e153-490b-88f3-f384a7096ee4/.curie/runner.json; run skill down from that directory. skill message, skill eval, and skill status also work there. skill message and skill eval also accept --url.\n  -> [shell request] running shell request\n  !  possible change via shell request: request started; check the outcome before retrying\n  !  possible change via shell request: request finished; check the outcome before retrying\n\u2713 stopped and removed container 'curie-runner-local'\nremoved temporary demo at /tmp/tmp.RLZ9gjD3CS/try-clean/tmp/curie-try-3e5e5079-e153-490b-88f3-f384a7096ee4\nstarting runner container 'curie-runner-local' from 'curie-runner'\nwaiting for runner: ok (1.0s)\n  -> [shell request] running shell request\n  !  possible change via shell request: request started; check the outcome before retrying\n  !  possible change via shell request: request finished; check the outcome before retrying\n-- final (done)\n\u2713 stopped and removed container 'curie-runner-local'\nrunner http://curie-docker-sections-a01e0a8:7245\nbundle 1e4a44cf113dbe895577aaf395b8ae8543a74a1abd5ad371647aa1c685afca2b\n\u26a0 warn  editable bundle differs from the running snapshot. Run `curie skill up` to load the changes.\n  -> [shell request] running shell request\n  !  possible change via shell request: request started; check the outcome before retrying\n  !  possible change via shell request: request finished; check the outcome before retrying\n-- final (done)\n\u2713 stopped and removed container 'curie-e2e-runner'\n\u2713 removed network 'curie-e2e-runner-net'\n\u26a0 warn  container 'curie-ladder-747-leftover-858' does not carry the curietech.ai/managed-by=curie-cli label, so it may not be a Curie runner; removing it anyway\n\u2713 stopped and removed container 'curie-ladder-747-leftover-858'\nno .curie/runner.json was present, so nothing to clear\nstarting runner container 'curie-ladder-hermetic-858' from 'curie-runner'\nwaiting for runner: ok (1.0s)\nState recorded in /tmp/tmp.WKGwNneoWc/bundle-hermetic/.curie/runner.json; run skill down from that directory. skill message, skill eval, and skill status also work there. skill message and skill eval also accept --url.\n\u2713 stopped and removed container 'curie-ladder-hermetic-858'\n"
+  },
+  "cleanup": {
+    "image_removed": true,
+    "containers": [],
+    "volumes": [],
+    "verified": true
+  }
+}
