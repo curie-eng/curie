@@ -286,6 +286,10 @@ class SandboxSubstrate:
             )
         if not agent or not cred:
             return
+        if claim_name is not None:
+            self._affinity.mark_claim_credential_retiring(
+                claim_name, ttl_s=SANDBOX_TOKEN_TTL_SECONDS
+            )
         revoker = self._boot_credential_revoker
         if revoker is None:
             return
@@ -314,6 +318,8 @@ class SandboxSubstrate:
         """Reap retries a report whose claim is already gone."""
 
         for claim_name, _agent, _cred in self._affinity.iter_claim_credentials():
+            if not self._affinity.claim_credential_retiring(claim_name):
+                continue
             try:
                 still_there = self._k8s.get_claim(
                     claim_name, request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S
@@ -1659,25 +1665,28 @@ class SandboxSubstrate:
             if executor_secret_names is not None
             else {}
         )
-        self._k8s.create_claim(
-            name,
-            pool=pool,
-            env=env,
-            labels=labels,
-            runner_resources=runner_resources,
-            agent_name=agent_name,
-            **executor_kwargs,
-        )
-        deadline = time.monotonic() + config.claim_timeout_seconds
         try:
+            self._k8s.create_claim(
+                name,
+                pool=pool,
+                env=env,
+                labels=labels,
+                runner_resources=runner_resources,
+                agent_name=agent_name,
+                **executor_kwargs,
+            )
+            deadline = time.monotonic() + config.claim_timeout_seconds
             sandbox_name = self._await_bound(name, deadline)
             bound = self._await_service_fqdn(sandbox_name, deadline)
-        except Exception:
-            self._retire_claim(
-                name,
-                request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S,
-                env=env,
-            )
+        except BaseException:  # noqa: BLE001 - retire owned resources on creator interruption
+            try:
+                self._retire_claim(
+                    name,
+                    request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S,
+                    env=env,
+                )
+            except Exception as exc:  # noqa: BLE001 - preserve the original failure
+                logger.warning("sandbox claim cleanup failed (%s)", type(exc).__name__)
             raise
 
         credential_agent, credential_id, credential_exp = boot_token_facts(
