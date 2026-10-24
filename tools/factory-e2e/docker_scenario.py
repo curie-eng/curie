@@ -61,6 +61,7 @@ import os
 import re
 import secrets
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -1017,18 +1018,31 @@ def _command(
 ) -> tuple[int, str, str]:
     """(exit code, stdout, stderr); a timeout or missing binary is a nonzero code.
 
-    ``env`` replaces the inherited environment when given.
+    ``env`` replaces the inherited environment when given. The child runs in its own
+    session, and a timeout kills the child's whole process group.
     """
 
     try:
-        done = subprocess.run(
-            argv, capture_output=True, text=True, timeout=timeout, check=False, env=env
+        proc = subprocess.Popen(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+            start_new_session=True,
         )
-    except subprocess.TimeoutExpired:
-        return 124, "", f"{argv[0]}: timed out after {timeout}s"
     except FileNotFoundError:
         return 127, "", f"{argv[0]}: not found on PATH"
-    return done.returncode, done.stdout, done.stderr
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.communicate()
+        return 124, "", f"{argv[0]}: timed out after {timeout}s"
+    return proc.returncode, stdout, stderr
 
 
 def _docker_env() -> dict[str, str]:
@@ -1313,12 +1327,21 @@ def _skill_rung_inputs(source: Path, curie_bin: Path) -> None:
 
 
 def _ladder_env(curie: Path, published_host: str) -> dict[str, str]:
-    """This environment for the skill rung, without any model credential or route."""
+    """This environment for the skill rung, without any model credential or route.
 
-    env = {key: value for key, value in _docker_env().items() if key not in MODEL_ENV}
+    Every inherited CURIE_E2E_ key is dropped, then the rung's own are set, so an
+    inherited CURIE_E2E_IMAGE cannot run it on an image other than the recorded one.
+    """
+
+    env = {
+        key: value
+        for key, value in _docker_env().items()
+        if key not in MODEL_ENV and not key.startswith("CURIE_E2E_")
+    }
     env.update(
         CURIE_E2E_TIERS="skill",
         CURIE_E2E_LIVE="0",
+        CURIE_E2E_IMAGE=RUNNER_TAG,
         CURIE_BIN=str(curie),
         DOCKER_PUBLISHED_HOST=published_host,
     )

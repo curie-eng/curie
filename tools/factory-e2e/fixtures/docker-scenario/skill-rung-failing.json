@@ -1,7 +1,7 @@
 {
   "window": [
-    1792818620.0375717,
-    1792818620.558988
+    1792819241.6721978,
+    1792819242.1939602
   ],
   "docker_host": "tcp://curie-docker-sections-a01e0a8:2375",
   "published_host": "curie-docker-sections-a01e0a8",
@@ -34,14 +34,14 @@
     "dockerfile_sha256": "930254e6ccafccf5ff2ec3739ea7cf136c4e668fee8f6c48a2e31c15ce424721",
     "daemon_id": "275deac0-10bc-4cf6-857e-3f51f70c36de",
     "exit_code": 0,
-    "output_tail": "port_dependency_pins.py\n#22 CACHED\n\n#23 [stage-1  2/19] COPY --from=node /usr/local/bin/node /usr/local/bin/node\n#23 CACHED\n\n#24 [stage-1 19/19] COPY runner/pip.conf /etc/pip.conf\n#24 CACHED\n\n#25 exporting to image\n#25 exporting layers done\n#25 writing image sha256:453d8cf60b37f6c2c3b55b53994b115355d0bbaadbf12368ab262cbf599cd963 done\n#25 naming to docker.io/library/curie-runner done\n#25 DONE 0.0s\n"
+    "output_tail": "1  5/19] WORKDIR /app\n#22 CACHED\n\n#23 [stage-1 14/19] COPY packages/telemetry-schema ./packages/telemetry-schema\n#23 CACHED\n\n#24 [stage-1 19/19] COPY runner/pip.conf /etc/pip.conf\n#24 CACHED\n\n#25 exporting to image\n#25 exporting layers done\n#25 writing image sha256:453d8cf60b37f6c2c3b55b53994b115355d0bbaadbf12368ab262cbf599cd963 done\n#25 naming to docker.io/library/curie-runner done\n#25 DONE 0.0s\n"
   },
   "ladder": {
     "tiers": "skill",
     "live": "0",
     "exit_code": 1,
     "passed": false,
-    "output_tail": "=== Resolve the curie binary ===\nusing prebuilt binary: /tmp/curie-skill-rung-iebdcc1s/bin/curie\nfalse (GNU coreutils) 9.1\nCopyright (C) 2022 Free Software Foundation, Inc.\nLicense GPLv3+: GNU GPL version 3 or later <https://gnu.org/licenses/gpl.html>.\nThis is free software: you are free to change and redistribute it.\nThere is NO WARRANTY, to the extent permitted by law.\n\nWritten by Jim Meyering.\n"
+    "output_tail": "=== Resolve the curie binary ===\nusing prebuilt binary: /tmp/curie-skill-rung-nv4nxhua/bin/curie\nfalse (GNU coreutils) 9.1\nCopyright (C) 2022 Free Software Foundation, Inc.\nLicense GPLv3+: GNU GPL version 3 or later <https://gnu.org/licenses/gpl.html>.\nThis is free software: you are free to change and redistribute it.\nThere is NO WARRANTY, to the extent permitted by law.\n\nWritten by Jim Meyering.\n"
   },
   "cleanup": {
     "image_removed": true,
