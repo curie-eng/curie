@@ -46,6 +46,23 @@ pipeline, and it fails closed on either of two questions:
             commit itself, any other path in the delta, or no green candidate
             within the depth refuses exactly as before.
 
+            ADR-0247
+            (docs/adr/0247-a-tree-identical-parent-or-a-schema-window-registration-reuses-checks.md,
+            issue #4862) amends that exception with two rules under the same
+            precondition. First, before the walk, every parent of the tagged
+            commit (in parent order, a merge's second parent included) whose
+            tree is byte-identical to the tagged commit's tree is a proof
+            candidate: its CI ran on these exact bytes, so the first such
+            parent with all required checks green is the proof commit. A
+            release-PR merge on an unmoved base is proved by its PR head this
+            way. A parent with a different tree is never consulted by this
+            rule. Second, inside the walk, a delta that also touches
+            SCHEMA_WINDOWS_PATH still counts as version-only when the only
+            change to that JSON document is registering this tag's schema
+            window: a new `windows` key (the tag without its `v`) whose value
+            equals the candidate's `candidate` entry, with every other key and
+            window unchanged. Any other edit to that file ends the walk.
+
 Both live as separately-testable functions so the negative case -- an
 unreviewed or check-less commit is refused -- is an ordinary pytest assertion
 against a constructed fixture, not a manual demonstration against the real
@@ -65,6 +82,7 @@ import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from types import ModuleType
+from typing import NamedTuple
 
 
 def _load_sibling(filename: str, module_name: str) -> ModuleType:
@@ -92,6 +110,16 @@ PASSING_CONCLUSIONS = {"success", "neutral"}
 # merge of one, on top of green CI; ten leaves room for a few stacked bumps
 # without letting the walk wander arbitrarily far back.
 VERSION_ONLY_PROOF_DEPTH = 10
+
+# The schema-window catalog `bump-version` edits in the same release
+# preparation commit (ADR-0247, issue #4862). Registering this tag's window
+# there is version identity; any other change to it is not.
+SCHEMA_WINDOWS_PATH = "cli/src/application_schema_windows.json"
+
+# The two rules that may stand a proof commit's checks in for the tagged
+# commit's own, as `Proof.path` labels (ADR-0195 as amended by ADR-0247).
+TREE_IDENTICAL_PARENT = "tree-identical parent"
+VERSION_ONLY_ANCESTOR = "version-only ancestor"
 
 # The check-run names that must be present and green before a tag may
 # publish (issue #733). These are the job `name:` fields from
@@ -160,6 +188,17 @@ REQUIRED_CHECK_NAMES = frozenset(
 
 class AuthorizationError(Exception):
     """A tagged commit is not authorized to publish a release."""
+
+
+class Proof(NamedTuple):
+    """A commit whose green required checks stand in for the tagged commit's.
+
+    `path` names the rule that admitted it: TREE_IDENTICAL_PARENT or
+    VERSION_ONLY_ANCESTOR.
+    """
+
+    commit: str
+    path: str
 
 
 # Semver 2.0.0 with an optional leading `v`. A non-empty prerelease
@@ -239,9 +278,10 @@ def _current_attempts(
     attempt is current.
     """
     recencies = [_check_run_recency(run) for run in runs]
-    if any(recency is None for recency in recencies):
+    ordered = [recency for recency in recencies if recency is not None]
+    if len(ordered) != len(recencies):
         return None
-    latest = max(recencies)
+    latest = max(ordered)
     return [
         run
         for run, recency in zip(runs, recencies, strict=True)
@@ -397,6 +437,100 @@ def _has_contrary_required_evidence(
     return False
 
 
+def find_tree_identical_parent_proof(
+    sha: str,
+    fetch_check_runs: Callable[[str], list[dict[str, object]]],
+    *,
+    cwd: Path | None = None,
+    exclude_run_id: str | None = None,
+    required_names: frozenset[str] | None = None,
+) -> str | None:
+    """The first parent of `sha` with the same tree and green required checks.
+
+    Parents are consulted in parent order, a merge's second parent included
+    (ADR-0247, issue #4862). Only a parent whose tree object equals `sha`'s is
+    fetched; identical trees mean its CI ran on these exact bytes. Returns
+    None when no such parent is green. Git failures raise AuthorizationError.
+    """
+    tree = _git_output(
+        ["rev-parse", f"{sha}^{{tree}}"],
+        cwd=cwd,
+        purpose=f"resolve the tree of {sha}",
+    ).strip()
+    parents = _git_output(
+        ["rev-list", "--parents", "-n", "1", sha],
+        cwd=cwd,
+        purpose=f"list the parents of {sha}",
+    ).split()[1:]
+    for parent in parents:
+        parent_tree = _git_output(
+            ["rev-parse", f"{parent}^{{tree}}"],
+            cwd=cwd,
+            purpose=f"resolve the tree of {parent}",
+        ).strip()
+        if parent_tree != tree:
+            continue
+        runs = exclude_current_workflow_run(fetch_check_runs(parent), exclude_run_id)
+        if not missing_required_checks(runs, required_names):
+            return parent
+    return None
+
+
+def _schema_windows_at(commit: str, *, cwd: Path | None) -> object:
+    """The parsed schema-window catalog at `commit`, or None if unreadable.
+
+    A missing file or malformed JSON is not an error here: it only means the
+    delta cannot be a registration, so the walk refuses on its own terms.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "show", f"{commit}:{SCHEMA_WINDOWS_PATH}"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        raise AuthorizationError(
+            f"could not read {SCHEMA_WINDOWS_PATH} at {commit}: {exc}"
+        ) from exc
+    if result.returncode != 0:
+        return None
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+
+
+def is_schema_window_registration(
+    base: str, sha: str, version: str, *, cwd: Path | None = None
+) -> bool:
+    """Is the catalog change from `base` to `sha` only registering `version`?
+
+    True only when both documents are objects with an object `windows`,
+    `version` is a new key in `windows` whose value equals `base`'s
+    `candidate` (what bump-version promotes), and every other top-level key
+    and every other window is unchanged (ADR-0247, issue #4862).
+    """
+    old = _schema_windows_at(base, cwd=cwd)
+    new = _schema_windows_at(sha, cwd=cwd)
+    if not isinstance(old, dict) or not isinstance(new, dict):
+        return False
+    old_windows = old.get("windows")
+    new_windows = new.get("windows")
+    if not isinstance(old_windows, dict) or not isinstance(new_windows, dict):
+        return False
+    if version in old_windows or version not in new_windows:
+        return False
+    if "candidate" not in old or new_windows[version] != old["candidate"]:
+        return False
+    if {k: v for k, v in new_windows.items() if k != version} != old_windows:
+        return False
+    return {k: v for k, v in new.items() if k != "windows"} == {
+        k: v for k, v in old.items() if k != "windows"
+    }
+
+
 def find_version_only_proof(
     sha: str,
     tag: str,
@@ -411,11 +545,14 @@ def find_version_only_proof(
     Walks at most VERSION_ONLY_PROOF_DEPTH first-parent ancestors, nearest
     first. The diff from each candidate to `sha` is checked against
     `version_only_paths` for `tag` before that candidate's check-runs are
-    fetched; the first candidate outside the set ends the walk. Returns None
-    when no candidate qualifies. Git failures raise AuthorizationError.
+    fetched; the first candidate outside the set ends the walk. A delta that
+    also touches SCHEMA_WINDOWS_PATH stays inside the set only when that
+    change registers this tag's schema window (ADR-0247). Returns None when
+    no candidate qualifies. Git failures raise AuthorizationError.
     """
     version = tag.strip().removeprefix("refs/tags/")
     allowed = _atlas.version_only_paths(version)
+    window_key = version.removeprefix("v")
     ancestors = _git_output(
         [
             "rev-list",
@@ -432,7 +569,11 @@ def find_version_only_proof(
             cwd=cwd,
             purpose=f"diff {candidate} against {sha}",
         ).splitlines()
-        if not {path for path in changed if path} <= allowed:
+        extra = {path for path in changed if path} - allowed
+        if extra and not (
+            extra == {SCHEMA_WINDOWS_PATH}
+            and is_schema_window_registration(candidate, sha, window_key, cwd=cwd)
+        ):
             return None
         runs = exclude_current_workflow_run(fetch_check_runs(candidate), exclude_run_id)
         if not missing_required_checks(runs, required_names):
@@ -453,13 +594,14 @@ def authorize(
     require_nightly: bool = False,
     tag: str | None = None,
     fetch_proof_check_runs: Callable[[str], list[dict[str, object]]] | None = None,
-) -> str | None:
+) -> Proof | None:
     """Raise AuthorizationError unless `sha` may publish a release.
 
-    Returns the proof commit whose checks stood in for `sha`'s own (see the
-    version-only exception in the module docstring, ADR-0195), or None when
-    `sha`'s own required checks were green. The exception needs both `tag`
-    and `fetch_proof_check_runs`; without either the gate is unchanged.
+    Returns the Proof whose commit's checks stood in for `sha`'s own, or None
+    when `sha`'s own required checks were green. A tree-identical parent is
+    tried first, then the version-only walk (see the module docstring,
+    ADR-0195 as amended by ADR-0247). Either needs both `tag` and
+    `fetch_proof_check_runs`; without either the gate is unchanged.
 
     `tag` is the pushed tag name (`v0.7.0`, `v0.7.0-rc.1`). A missing tag
     is treated as final (fail closed) so omitting the class cannot widen
@@ -497,21 +639,34 @@ def authorize(
         required_names = REQUIRED_CHECK_NAMES
     other_runs = exclude_current_workflow_run(check_runs, exclude_run_id)
     missing = missing_required_checks(other_runs, required_names)
-    proof: str | None = None
+    proof: Proof | None = None
     if (
         missing
         and tag is not None
         and fetch_proof_check_runs is not None
         and not _has_contrary_required_evidence(other_runs, required_names)
     ):
-        proof = find_version_only_proof(
+        # Identical bytes are the stronger evidence, so they are tried first.
+        parent = find_tree_identical_parent_proof(
             sha,
-            tag,
             fetch_proof_check_runs,
             cwd=cwd,
             exclude_run_id=exclude_run_id,
             required_names=required_names,
         )
+        if parent is not None:
+            proof = Proof(parent, TREE_IDENTICAL_PARENT)
+        else:
+            ancestor = find_version_only_proof(
+                sha,
+                tag,
+                fetch_proof_check_runs,
+                cwd=cwd,
+                exclude_run_id=exclude_run_id,
+                required_names=required_names,
+            )
+            if ancestor is not None:
+                proof = Proof(ancestor, VERSION_ONLY_ANCESTOR)
     if missing and proof is None:
         raise AuthorizationError(
             f"commit {sha} is missing {len(missing)} required check-run(s) "
@@ -611,11 +766,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     branch = "main"
     nightly_conclusion: str | None = None
-    proof: str | None = None
+    proof: Proof | None = None
     proof_runs: dict[str, list[dict[str, object]]] = {}
 
     def fetch_proof_check_runs(candidate: str) -> list[dict[str, object]]:
-        # Both authorize() calls below walk the same ancestors; fetch each once.
+        # Both authorize() calls below consult the same commits; fetch each once.
         if candidate not in proof_runs:
             proof_runs[candidate] = fetch_check_runs(candidate, args.repo)
         return proof_runs[candidate]
@@ -696,8 +851,9 @@ def main(argv: list[str] | None = None) -> int:
         checked_note = "checked"
     else:
         checked_note = (
-            f"checked via version-only ancestor {proof} "
-            "(its required checks stand in for this commit's, ADR-0195)"
+            f"checked via {proof.path} {proof.commit} "
+            "(its required checks stand in for this commit's, ADR-0195 as "
+            "amended by ADR-0247)"
         )
     print(
         f"OK: {args.sha} is reachable from a reviewed ref "
