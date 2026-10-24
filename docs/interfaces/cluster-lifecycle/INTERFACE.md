@@ -23,11 +23,16 @@ Installing, upgrading and tearing down a Curie release is the one operation that
 can strand every in-flight turn, every pending approval and the database at once.
 The rule this seam holds is that the lifecycle **admits before it mutates**
 (ADR-0144): the admission checks (configuration, credential pair, chart pin,
-schema window and Helm timeout) all run before the first `helm upgrade`, and an
-admission refusal leaves the release's workloads and schema untouched. The
+schema window, Helm timeout, runner layers and repository runner build inputs)
+all run before the first `helm upgrade`. An admission refusal leaves the
+release's workloads and schema untouched. The
 guarantee is limited. Checkpoint ownership and any pending-revision recovery
 happen before validation, and convergence and canary are checked after apply, so
-a failure there fails forward with a recorded reason.
+a failure there fails forward with a recorded reason. Apply first rebuilds
+retained catalog repository runners on the target platform runner, then passes
+their receipts to the single Helm upgrade. A rebuild failure records a
+fail-forward instruction to fix the cause and rerun; installed values stay
+unchanged because Helm has not run.
 
 The seam is SOFT. There is no `Protocol` and no port class an alternative
 installer could implement. `cli/src/ops/upgrade.rs` does declare an
@@ -93,6 +98,16 @@ adding one.
       carries `curie.ai/minimum-helm-timeout-seconds`; the driver uses the larger
       of that and its default, and refuses if the drain Job is missing that
       annotation, is not a `pre-upgrade` hook, or renders more than once.
+   5. Runner layers are compared with the effective target platform runner and
+      planned for retention, compatible stock-layer rebinding or clearing under
+      the layer policy; clearing an incompatible stock layer requires
+      `--allow-stock-layer-clear`. Retained repository runners require a valid
+      literal target runner digest. Catalog-only runners with a different base
+      have their retained tool and probe inputs and rebuild registry validated,
+      with Docker required on PATH. These checks plan the builds; Apply rebuilds
+      them before Helm, validates the complete updated values through the target
+      render, then supplies their receipts in that one upgrade. Custom-Dockerfile
+      runners are preserved with a manual rebuild command (ADR-0216).
 6. **Drain is the chart's, not the CLI's.** The drain_preflight phase only
    confirms the worker workload is reachable. The real gate is the
    `pre-upgrade` hook in `charts/curie/templates/worker-upgrade-drain.yaml`,
@@ -233,4 +248,4 @@ One, in three processes:
 4. **Related seam:** [substrate](../substrate/INTERFACE.md): the agent-sandbox controller that `cluster up` reuses or installs and the controller preflight gates.
 5. **Epic(s):** #2301 (one-command cluster upgrade with resume and proof); #2010 (a routine Helm upgrade must complete in-flight side-effecting turns rather than escalate them)
 6. **Vision doc:** [architecture-vision.md](../../architecture-vision.md): cluster lifecycle is not one of the six swap-readiness Jobs; not separately graded
-7. **ADR(s):** [ADR-0142](../../adr/0142-database-compatibility-windows-and-a-single-upgrade-phase.md): database compatibility is a release contract and migrations run in one upgrade phase; [ADR-0144](../../adr/0144-the-upgrade-lifecycle-admits-before-it-mutates.md) (Draft): admit before mutating, installation-scoped pause authority; [ADR-0193](../../adr/0193-cluster-up-reads-a-missing-runtimeclass-before-install.md): cluster up reads a missing RuntimeClass before install; [ADR-0209](../../adr/0209-pause-authority-after-a-drain-is-a-lease-held-by-a-live-upgrade-step.md): pause authority after a drain is a lease held by a live upgrade step; [ADR-0218](../../adr/0218-cluster-up-infers-gvisor-off-when-the-runtimeclass-matches-no-node.md): infer gVisor off from a readable empty node-selector result; [ADR-0221](../../adr/0221-cluster-up-reads-the-gvisor-runtimeclass-for-a-fake-model-install.md): extend that inference to eligible fake-model auto installs
+7. **ADR(s):** [ADR-0142](../../adr/0142-database-compatibility-windows-and-a-single-upgrade-phase.md): database compatibility is a release contract and migrations run in one upgrade phase; [ADR-0144](../../adr/0144-the-upgrade-lifecycle-admits-before-it-mutates.md) (Draft): admit before mutating, installation-scoped pause authority; [ADR-0193](../../adr/0193-cluster-up-reads-a-missing-runtimeclass-before-install.md): cluster up reads a missing RuntimeClass before install; [ADR-0209](../../adr/0209-pause-authority-after-a-drain-is-a-lease-held-by-a-live-upgrade-step.md): pause authority after a drain is a lease held by a live upgrade step; [ADR-0216](../../adr/0216-a-factory-repository-binding-selects-its-own-runner-image-built-from-a-tool-catalog.md): repository runner selection and catalog-image rebuilds during upgrades; [ADR-0218](../../adr/0218-cluster-up-infers-gvisor-off-when-the-runtimeclass-matches-no-node.md): infer gVisor off from a readable empty node-selector result; [ADR-0221](../../adr/0221-cluster-up-reads-the-gvisor-runtimeclass-for-a-fake-model-install.md): extend that inference to eligible fake-model auto installs
