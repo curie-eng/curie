@@ -108,3 +108,28 @@ under authorization plugins and `userns` under security options).
    on a different daemon from the one run `a` was recorded on. The test
    `test_recorded_passing_envelope_embeds_the_recorded_sections` pins that
    this identity is the only difference.
+
+## Scripted model transcript
+
+`transcript.json` is the scripted-model transcript the docker scenario driver
+(`tools/factory-e2e/docker_driver.py`) serves through `ModelScript`. Every
+exchange uses the lane key of `../daemon-lifecycle/transcript.json`, and the
+exchanges are in this order:
+
+1. Run `a`'s lane, then run `b`'s: ordinals 0 to 5 are each one Bash tool use
+   (timeout 600000 ms) that holds until `/tmp/fd-release` exists, for at most
+   580 s, while `docker info` answers, and ordinal 6 is the end of turn text
+   "Docker scenario run finished.". Six holds keep a turn alive for about an
+   hour, long enough for the skill rung; once the release file exists every
+   remaining hold returns at once, so the turn uses all seven exchanges.
+2. Every exchange of `../daemon-lifecycle/transcript.json`, verbatim and in
+   its order, for the lifecycle scenarios that follow the concurrent runs.
+
+`ModelScript` consumes the first unused exchange for each lane and ordinal, so
+the order matters: runs `a` and `b` run before any lifecycle turn and must take
+the two Docker scenario lanes, and the lifecycle turns then find their own
+exchanges untouched. The file was generated with a short Python snippet that
+built the fourteen lane exchanges, appended the daemon-lifecycle exchanges
+unchanged and wrote the result with `json.dumps(..., indent=2)` plus a trailing
+newline, the formatting of the daemon-lifecycle transcript. Regenerate it the
+same way after changing either part rather than editing it by hand.
