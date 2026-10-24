@@ -260,4 +260,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0237 | [Ordinary hook receipts preserve policy after stream retention](0237-ordinary-hook-receipts-preserve-policy-after-stream-retention.md) | Accepted |
 | 0238 | [A managed CNI installation qualifies through its own behavioral network producer](0238-a-managed-cni-installation-qualifies-through-its-own-behavioral-network-producer.md) | Accepted |
 | 0239 | [Release kind proof reuses a complete CI run on the same tree](0239-release-kind-proof-reuses-a-complete-ci-run-on-the-same-tree.md) | Accepted |
+| 0247 | [A tree-identical parent or a schema window registration reuses checks](0247-a-tree-identical-parent-or-a-schema-window-registration-reuses-checks.md) | Accepted |
 <!-- END GENERATED: adr-index -->
