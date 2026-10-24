@@ -24,11 +24,6 @@ _UTC_PATTERN = (
     r"^([0-9]{4})-([0-9]{2})-([0-9]{2})T"
     r"([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.([0-9]+))?(?:Z|\+00:00)$"
 )
-_ISSUER_SCHEMA_PATTERN = (
-    r"^(?![\s\S]*\s$)[hH][tT][tT][pP][sS]://"
-    r"(?:\[[^/?#@\]]+\]|[^:/?#@\[\]]+)(?::[^/?#@]*)?"
-    r"(?:/[^?#]*)?(?:\?)?(?:#)?$(?![\s\S])"
-)
 _UTC_SCHEMA_PATTERN = (
     r"^(?!0000)[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])T"
     r"(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]"
@@ -36,6 +31,63 @@ _UTC_SCHEMA_PATTERN = (
 )
 _EPOCH = date(1970, 1, 1)
 _NONINTEGER = object()
+
+
+def _issuer_schema_pattern() -> str:
+    """@spec HTTP-IDENTITY-V1-1, HTTP-IDENTITY-V1-5."""
+    # urlsplit removes these controls before parsing, but the identity retains
+    # the original string. Keep them between tokens rather than normalizing it.
+    ignored = r"[\t\r\n]*"
+    colon = f":{ignored}"
+    hextet = f"(?:[0-9a-fA-F]{ignored}){{1,4}}"
+    digit = f"[0-9]{ignored}"
+    two = f"2{ignored}"
+    octet = (
+        f"(?:{two}5{ignored}[0-5]{ignored}|{two}[0-4]{ignored}{digit}|"
+        f"1{ignored}(?:{digit}){{2}}|[1-9]{ignored}{digit}|{digit})"
+    )
+    ipv4 = f"{octet}(?:\\.{ignored}{octet}){{3}}"
+    # Compression must omit at least one of eight hextets. An IPv4 tail
+    # occupies two hextets; enumerate only its prefix and share the tail.
+    compressed = []
+    mixed_prefixes = [f"(?:{hextet}{colon}){{6}}"]
+    for left in range(8):
+        prefix = f"(?:{hextet}{colon}){{{left}}}" if left else colon
+        right = (
+            f"(?:{hextet}(?:{colon}{hextet}){{0,{6 - left}}})?"
+            if left < 7 else ""
+        )
+        compressed.append(f"{prefix}{colon}{right}")
+        if left < 6:
+            mixed_prefixes.append(
+                f"{prefix}{colon}(?:{hextet}{colon}){{0,{5 - left}}}"
+            )
+    ipv6 = (
+        f"(?:{hextet}(?:{colon}{hextet}){{7}}|{'|'.join(compressed)}|"
+        f"(?:{'|'.join(mixed_prefixes)}){ipv4})"
+    )
+    scope = f"(?:%{ignored}(?:[^%/?#@\\]\\t\\r\\n]{ignored})+)?"
+    future = (
+        f"v{ignored}(?:[0-9a-fA-F]{ignored})+\\.{ignored}"
+        f"(?:[^/?#@\\]\\t\\r\\n]{ignored})+"
+    )
+    bracketed = f"\\[{ignored}(?:{future}|{ipv6}{scope})\\]{ignored}"
+    host = f"(?:[^:/?#@\\[\\]\\t\\r\\n]{ignored})+"
+    port = f"(?:{colon}(?:[^/?#@\\[\\]\\t\\r\\n]{ignored})*)?"
+    # _issuer does not read .port; urlsplit leaves this tail opaque.
+    bracketed_port = f"(?:{colon}(?:[^/?#@\\t\\r\\n]{ignored})*)?"
+    scheme = ignored.join(("[hH]", "[tT]", "[tT]", "[pP]", "[sS]", ":", "/", "/"))
+    # Spell out Python str.strip whitespace in the portable ECMA regex dialect.
+    whitespace = (
+        r"[\x09-\x0d\x1c-\x20\x85\xa0\u1680\u2000-\u200a"
+        r"\u2028\u2029\u202f\u205f\u3000]"
+    )
+    return (
+        f"^(?!{whitespace})(?![\\s\\S]*{whitespace}$(?![\\s\\S]))"
+        f"[\\x00-\\x20]*{scheme}{ignored}"
+        f"(?:{bracketed}{bracketed_port}|{host}{port})"
+        r"(?:/[^?#]*)?(?:\?[\t\r\n]*)?(?:#[\t\r\n]*)?$(?![\s\S])"
+    )
 
 
 def _text(value: Any) -> str:
@@ -109,7 +161,15 @@ CanonicalUUID = Annotated[Text, Field(pattern=_UUID_PATTERN), AfterValidator(_uu
 # Schema metadata does not narrow the existing exact-string runtime validators.
 Issuer = Annotated[
     Text,
-    Field(json_schema_extra={"minLength": 1, "pattern": _ISSUER_SCHEMA_PATTERN}),
+    Field(json_schema_extra={
+        "minLength": 1,
+        "pattern": _issuer_schema_pattern(),
+        "description": (
+            "Structural HTTPS issuer constraints preserve exact-string URL parsing "
+            "compatibility. Unicode NFKC netloc checks require semantic validation "
+            "with the pure facts validator; schema validation alone is insufficient."
+        ),
+    }),
     AfterValidator(_issuer),
 ]
 UTCInstant = Annotated[

@@ -47,7 +47,14 @@ pure parser, shape and drift checks in `tests/http_identity`.
 JSON Schema represents required fields, strict scalar shapes, outcome unions
 and complete unique group sets. Exact request correspondence, issuer equality
 across objects, duplicate JSON keys, decoded byte length and freshness require
-the pure validator. The specification remains the semantic reference.
+the pure validator. Issuer patterns represent HTTPS structure and bracketed
+IPv6, scoped IPv6 and IPvFuture hosts, preserving the existing parser's exact
+string compatibility, including controls it removes only while parsing.
+Unicode NFKC netloc checks require the pure validator: standard JSON Schema
+does not normalize strings, and structural schema validation alone does not
+prove full URL validity. Enable `date-time` format assertions to validate real
+calendar dates; timestamp patterns retain UTC syntax and arbitrary fractional
+precision. The specification remains the semantic reference.
 
 The OpenAPI's `x-curie-transport` publishes the two-second total deadline, no
 retries, 64 KiB response bound, no redirects and no positive core identity
