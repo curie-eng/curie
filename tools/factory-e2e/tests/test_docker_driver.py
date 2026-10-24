@@ -67,6 +67,10 @@ HEAD_SHA = "0123456789abcdef0123456789abcdef01234567"
 NAMESPACE = f"fd-docker-{NONCE}"
 DAEMON_NAMESPACE = f"fd-docker-d-{NONCE}"
 CONTROLLER_NAMESPACE = f"fd-docker-c-{NONCE}"
+# The chart's fullname with no fullnameOverride (cli/src/ops/verbs.rs chart_fullname): the
+# CLI's live-schema probe execs deploy/<fullname>-api, so the release must render it.
+FULL = f"fd-docker-{NONCE}-curie"
+DOCKER_AGENT = "fde"
 # The custom repository (its own Dockerfile) is the stub-served, cloneable acme-bot; the
 # catalog repository is only rebuilt by the CLI, never cloned.
 CUSTOM_REPO = "acme-corp/acme-bot"
@@ -564,6 +568,9 @@ def test_install_constants_name_the_scenario() -> None:
     assert docker_driver.RUN_ISSUES == {"a": 4106, "b": 4107}
     assert docker_driver.CUSTOM_REPO == CUSTOM_REPO == dl.REPO
     assert docker_driver.CATALOG_REPO == CATALOG_REPO
+    assert docker_driver.DOCKER_AGENT == DOCKER_AGENT
+    assert docker_driver.DockerScenario.agent == DOCKER_AGENT
+    assert dl.Lifecycle.agent == dl.AGENT
     assert tuple(docker_driver.REQUIRED_CHECKS) == ("E2E required",)
     assert (
         Path(docker_driver.TRANSCRIPT).resolve() == (DOCKER_FIXTURES / "transcript.json").resolve()
@@ -725,6 +732,131 @@ def test_install_docker_values_stamp_the_config_schema_version() -> None:
     assert docker_driver.docker_values(bare, _images(), SCHEMA_VERSION)["config"] == {
         "schemaVersion": SCHEMA_VERSION
     }
+
+
+@pytest.mark.parametrize(
+    ("release", "expected"),
+    [
+        # cli/src/ops/verbs.rs chart_fullname_suffix_cases
+        pytest.param("curie", "curie", id="contains_curie_exact"),
+        pytest.param("curieish", "curieish", id="contains_curie_prefix"),
+        pytest.param("my-curie-prod", "my-curie-prod", id="contains_curie_middle"),
+        pytest.param("platform", "platform-curie", id="no_curie_platform"),
+        pytest.param("acme-prod", "acme-prod-curie", id="no_curie_acme_prod"),
+        pytest.param(NAMESPACE, FULL, id="docker_release"),
+        # release_fullname_from_values: trunc 63, then trimSuffix removes exactly one dash.
+        pytest.param("a" * 70, "a" * 63, id="truncated_to_63"),
+        pytest.param("a" * 62 + "--b-curie", "a" * 62, id="one_dash_trimmed"),
+        pytest.param("a" * 61 + "--b-curie", "a" * 61 + "-", id="only_one_dash_trimmed"),
+        pytest.param("a" * 58 + "x", "a" * 58 + "x-cur", id="suffix_truncated"),
+    ],
+)
+def test_install_chart_fullname_mirrors_the_cli(release: str, expected: str) -> None:
+    assert docker_driver.chart_fullname(release) == expected
+
+
+def test_install_docker_scenario_full_is_the_chart_fullname(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    obj = _scenario(tmp_path, monkeypatch, Commands())
+    assert obj.full == docker_driver.chart_fullname(obj.release) == FULL
+    assert len(FULL) == 24
+
+
+def test_install_docker_values_drop_the_fullname_override_and_rename_the_agent_keys() -> None:
+    source = _lifecycle_values(docker=True)
+    assert source["fullnameOverride"] == f"fd-{NONCE}"
+    egress = source["factory"]["sandboxEgress"]
+    runner_env = source["agentSandbox"]["runnerEnv"]
+    assert list(egress) == [dl.AGENT] and list(runner_env) == [dl.AGENT]
+    snapshot = copy.deepcopy(source)
+    values = docker_driver.docker_values(source, _images(), SCHEMA_VERSION)
+    assert source == snapshot, "docker_values mutated its input"
+    assert "fullnameOverride" not in values
+    assert values["factory"]["sandboxEgress"] == {DOCKER_AGENT: egress[dl.AGENT]}
+    assert values["agentSandbox"]["runnerEnv"] == {DOCKER_AGENT: runner_env[dl.AGENT]}
+    for key in ("ui", "resourceQuota", "priorityClasses", "api", "worker"):
+        assert values[key] == source[key], key
+
+
+def _longest_pool_name(fullname: str, agent: str) -> str:
+    """The chart's repository runner pool name (charts/curie/templates/_helpers.tpl), whose
+    image part is a 12-hex digest prefix; the chart refuses one over 63 characters."""
+
+    return f"{fullname}-agent-{agent}-img-{'0' * 12}-runner-pool"
+
+
+def test_install_repository_runner_pool_names_fit_63_characters() -> None:
+    values = docker_driver.docker_values(_lifecycle_values(docker=True), _images(), SCHEMA_VERSION)
+    assert "fullnameOverride" not in values
+    agents = set(values["agentSandbox"]["runnerEnv"]) | {docker_driver.DockerScenario.agent}
+    fullname = docker_driver.chart_fullname(NAMESPACE)
+    longest = max((_longest_pool_name(fullname, agent) for agent in agents), key=len)
+    assert len(longest) <= 63, longest
+    # daemon_lifecycle keeps its override and its agent, and still fits.
+    lifecycle = _lifecycle_values(docker=True)
+    own = _longest_pool_name(lifecycle["fullnameOverride"], dl.Lifecycle.agent)
+    assert len(own) <= 63, own
+
+
+def _deploy(obj: Any, commands: Commands, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """Run the inherited deploy() against fakes; return what it sent."""
+
+    sent: dict[str, Any] = {"agents": [], "cli": []}
+    secret = f"/api/v1/namespaces/{obj.ns}/secrets/{obj.full}-secrets"
+    encoded = base64.b64encode(API_KEY.encode()).decode()
+    meta = {"name": f"{obj.full}-secrets", "namespace": obj.ns}
+    obj.f.objects[secret] = {"metadata": meta, "data": {"apiKey": encoded}}
+    bundle = obj.f.snapshot / "examples/dark-factory"
+    bundle.mkdir(parents=True)
+    (bundle / "plugin.json").write_text("{}\n")
+
+    def http_json(method: str, url: str, **kwargs: Any) -> tuple[int, Any]:
+        sent["agents"].append((method, url, kwargs.get("body")))
+        return 201, {}
+
+    def cli(argv: list[str], _kwargs: dict[str, Any]) -> Result | None:
+        if argv[0] == obj.curie:
+            sent["cli"].append(argv)
+            return 0, "", ""
+        return None
+
+    commands.handlers.append(cli)
+    monkeypatch.setattr(fe, "http_json", http_json)
+    monkeypatch.setattr(obj, "port_forward", lambda: "http://localhost:18000")
+    monkeypatch.setattr(obj, "github_token", lambda: "example-installation-token")
+    obj.deploy()
+    return sent
+
+
+def _deployed_agent(sent: dict[str, Any]) -> tuple[str, str]:
+    [(method, url, body)] = sent["agents"]
+    assert (method, url) == ("POST", "http://localhost:18000/agents")
+    [deploy] = [argv for argv in sent["cli"] if "deploy" in argv]
+    return body["name"], deploy[deploy.index("--agent") + 1]
+
+
+def test_install_deploy_binds_the_docker_scenario_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    commands = Commands()
+    obj = _scenario(tmp_path, monkeypatch, commands)
+    assert _deployed_agent(_deploy(obj, commands, monkeypatch)) == (DOCKER_AGENT, DOCKER_AGENT)
+
+
+def test_install_deploy_of_daemon_lifecycle_keeps_its_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    commands = Commands()
+    args = docker_driver.scenario_args(CONTEXT, STUB_HOST, nonce=NONCE)
+    obj = dl.Lifecycle(args)
+    obj.f = FakeFixture(tmp_path, commands, args)
+    obj.images, obj.curie = _images(), str(tmp_path / "host-curie")
+    monkeypatch.setattr(obj.fx, "run", commands.fx_run)
+    monkeypatch.setattr(subprocess, "run", commands.subprocess_run)
+    monkeypatch.setattr(subprocess, "Popen", commands.popen)
+    assert obj.full == f"fd-{NONCE}"
+    assert _deployed_agent(_deploy(obj, commands, monkeypatch)) == (dl.AGENT, dl.AGENT)
 
 
 def _rust_constant(path: Path) -> str:
@@ -1313,9 +1445,9 @@ def _concurrent(
     pods = _Pods(behaviors or {}, events)
     commands.handlers.append(pods.handle)
     obj = _scenario(tmp_path, monkeypatch, commands)
-    service = f"/api/v1/namespaces/{NAMESPACE}/services/fd-{NONCE}-api"
+    service = f"/api/v1/namespaces/{NAMESPACE}/services/{FULL}-api"
     obj.f.objects[service] = {
-        "metadata": {"name": f"fd-{NONCE}-api", "namespace": NAMESPACE},
+        "metadata": {"name": f"{FULL}-api", "namespace": NAMESPACE},
         "spec": {"clusterIP": API_IP, "ports": [{"name": "http", "port": 8000}]},
     }
     by_issue = {issue: run for run, issue in docker_driver.RUN_ISSUES.items()}
@@ -1626,7 +1758,7 @@ def test_upgrade_message_argv_turns_on_the_custom_repository() -> None:
     assert argv == [
         "/w/curie", "cluster", "--context", CONTEXT, "message",
         f"Repository: https://github.com/{CUSTOM_REPO}\nRun the Docker scenario upgrade check.",
-        "--agent", dl.AGENT, "--channel", f"C0EXAMPLE{NONCE.upper()}",
+        "--agent", DOCKER_AGENT, "--channel", f"C0EXAMPLE{NONCE.upper()}",
         "--thread", f"fd-upgrade-{NONCE}", "--namespace", NAMESPACE, "--release", NAMESPACE,
         "--chart", "/w/charts/curie", "--listen-host", STUB_HOST,
         "--timeout-secs", "300", "--json",
@@ -1713,9 +1845,9 @@ def _upgrade(
     obj.builder = BUILDER  # created by prepare() in a live run
     fake = _Upgrade(obj.curie, exit_code, output)
     commands.handlers.append(fake.handle)
-    secret = f"/api/v1/namespaces/{NAMESPACE}/secrets/fd-{NONCE}-secrets"
+    secret = f"/api/v1/namespaces/{NAMESPACE}/secrets/{FULL}-secrets"
     encoded = base64.b64encode(API_KEY.encode()).decode()
-    meta = {"name": f"fd-{NONCE}-secrets", "namespace": NAMESPACE}
+    meta = {"name": f"{FULL}-secrets", "namespace": NAMESPACE}
     obj.f.objects[secret] = {"metadata": meta, "data": {"apiKey": encoded}}
     return obj, fake, commands
 
