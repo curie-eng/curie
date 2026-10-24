@@ -8,6 +8,7 @@ from __future__ import annotations
 import copy
 import importlib
 import json
+from datetime import datetime
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -44,11 +45,26 @@ def dereference(document: dict[str, Any], schema: dict[str, Any]) -> dict[str, A
     return schema
 
 
+def artifact_format_checker() -> FormatChecker:
+    checker = FormatChecker()
+
+    @checker.checks("date-time", raises=ValueError)
+    def calendar_instant(value: Any) -> bool:
+        # jsonschema's optional RFC3339 checker is absent in the workspace.
+        # The exported pattern owns syntax; stdlib checks real calendar/time values
+        # without interpreting or rounding fractional precision for freshness.
+        if isinstance(value, str):
+            datetime.fromisoformat(value)
+        return True
+
+    return checker
+
+
 def schema_validator(document: dict[str, Any], shape: dict[str, Any]) -> Draft202012Validator:
     # Keep the root definitions available to local references from either export.
     schema = {**document, **shape}
     Draft202012Validator.check_schema(schema)
-    return Draft202012Validator(schema, format_checker=FormatChecker())
+    return Draft202012Validator(schema, format_checker=artifact_format_checker())
 
 
 @pytest.mark.parametrize(
@@ -140,3 +156,175 @@ def test_provider_openapi_records_transport_obligations_without_implementing_the
     assert obligations["follow_redirects"] is False
     assert obligations["positive_identity_cache"] is False
     assert obligations["transport_implemented"] is False
+
+
+def artifact_model_validator(format_name: str, model_name: str) -> Draft202012Validator:
+    module = exporter()
+    document = json.loads(getattr(module, f"render_{format_name}")())
+    if format_name == "openapi":
+        operation = document["paths"]["/lookup"]["post"]
+        if model_name == "LookupRequestV1":
+            shape = operation["requestBody"]["content"]["application/json"]["schema"]
+        else:
+            shape = operation["responses"]["200"]["content"]["application/json"]["schema"]
+    else:
+        shape = {"$ref": f"#/$defs/{model_name}"}
+    return schema_validator(document, dereference(document, shape))
+
+
+def issuer_example(model_name: str, issuer: str) -> dict[str, Any]:
+    if model_name == "LookupRequestV1":
+        example = copy.deepcopy(VECTORS["request"])
+    else:
+        example = copy.deepcopy(VECTORS["cases"][0]["response"])
+        example["identity"]["issuer"] = issuer
+        example["membership"]["groups"][0]["issuer"] = issuer
+    example["scope"]["expected_issuer"] = issuer
+    return example
+
+
+@pytest.mark.parametrize("format_name", ["openapi", "json_schema"])
+@pytest.mark.parametrize(
+    ("model_name", "issuer_path"),
+    [
+        ("LookupRequestV1", "scope.expected_issuer"),
+        ("LookupResponseV1", "scope.expected_issuer"),
+        ("LookupResponseV1", "identity.issuer"),
+        ("LookupResponseV1", "membership.groups.0.issuer"),
+    ],
+)
+@pytest.mark.parametrize(
+    "issuer",
+    [
+        "",
+        "http://identity.example.test",
+        "https:///directory",
+        "https://user@identity.example.test/directory",
+        "https://identity.example.test/directory?query=1",
+        "https://identity.example.test/directory#fragment",
+        " https://identity.example.test/directory",
+        "https://identity.example.test/directory ",
+    ],
+    ids=[
+        "empty",
+        "http",
+        "missing-host",
+        "userinfo",
+        "query",
+        "fragment",
+        "leading-space",
+        "trailing-space",
+    ],
+)
+def test_artifact_issuer_constraints_agree_with_strict_models(
+    format_name: str,
+    model_name: str,
+    issuer_path: str,
+    issuer: str,
+) -> None:
+    """@spec HTTP-IDENTITY-V1-1 HTTP-IDENTITY-V1-5."""
+    model = getattr(importlib.import_module("curie_api.schemas.http_identity"), model_name)
+    example = issuer_example(model_name, "https://identity.example.test/directory")
+    target = example
+    parts = issuer_path.split(".")
+    for part in parts[:-1]:
+        target = target[int(part)] if isinstance(target, list) else target[part]
+    target[parts[-1]] = issuer
+    with pytest.raises(ValueError):
+        model.model_validate(example)
+    assert not artifact_model_validator(format_name, model_name).is_valid(example), (
+        f"{format_name} accepts model-invalid issuer {issuer!r}"
+    )
+
+
+@pytest.mark.parametrize("format_name", ["openapi", "json_schema"])
+@pytest.mark.parametrize("model_name", ["LookupRequestV1", "LookupResponseV1"])
+@pytest.mark.parametrize(
+    "issuer",
+    [
+        "https://identity.example.test/directory",
+        "HTTPS://IDENTITY.EXAMPLE.TEST/Directory",
+        "https://bücher.example.test/directory",
+        "https://identity.example.test/目录",
+        "https://identity.example.test:443/directory",
+    ],
+    ids=["https", "uppercase-scheme", "unicode-host", "unicode-path", "explicit-port"],
+)
+def test_artifact_issuer_constraints_preserve_model_valid_exact_values(
+    format_name: str,
+    model_name: str,
+    issuer: str,
+) -> None:
+    """@spec HTTP-IDENTITY-V1-1 HTTP-IDENTITY-V1-5."""
+    model = getattr(importlib.import_module("curie_api.schemas.http_identity"), model_name)
+    example = issuer_example(model_name, issuer)
+    validated = model.model_validate(example)
+    assert validated.model_dump(mode="json") == example
+    artifact_model_validator(format_name, model_name).validate(example)
+
+
+@pytest.mark.parametrize("format_name", ["openapi", "json_schema"])
+@pytest.mark.parametrize("observation", ["identity", "membership"])
+@pytest.mark.parametrize(
+    "timestamp",
+    [
+        "2030-01-01T99:99:99Z",
+        "2030-02-30T12:00:00Z",
+        "2030-13-01T12:00:00Z",
+        "2030-01-00T12:00:00Z",
+        "0000-01-01T12:00:00Z",
+        "2030-01-01T12:00:60Z",
+    ],
+    ids=["impossible-clock", "february-30", "month-13", "day-zero", "year-zero", "leap-second"],
+)
+def test_artifact_timestamp_constraints_reject_model_invalid_calendar_instants(
+    format_name: str,
+    observation: str,
+    timestamp: str,
+) -> None:
+    """@spec HTTP-IDENTITY-V1-4 HTTP-IDENTITY-V1-5."""
+    model = importlib.import_module("curie_api.schemas.http_identity").LookupResponseV1
+    example = copy.deepcopy(VECTORS["cases"][0]["response"])
+    target = (
+        example["identity_observation"]
+        if observation == "identity"
+        else example["membership"]["observation"]
+    )
+    target["as_of"] = timestamp
+    with pytest.raises(ValueError):
+        model.model_validate(example)
+    assert not artifact_model_validator(format_name, "LookupResponseV1").is_valid(example), (
+        f"{format_name} accepts model-invalid calendar instant {timestamp!r}"
+    )
+
+
+@pytest.mark.parametrize("format_name", ["openapi", "json_schema"])
+@pytest.mark.parametrize("observation", ["identity", "membership"])
+@pytest.mark.parametrize(
+    "timestamp",
+    [
+        "2030-01-01T12:00:00Z",
+        "2030-01-01T12:00:00+00:00",
+        "2032-02-29T23:59:59Z",
+        "2030-01-01T12:00:00.1234567890123456789Z",
+        "2030-01-01T12:00:00." + "0" * 4400 + "1Z",
+    ],
+    ids=["utc-z", "utc-offset", "leap-day", "fraction", "long-fraction"],
+)
+def test_artifact_timestamp_constraints_preserve_valid_calendar_and_precision(
+    format_name: str,
+    observation: str,
+    timestamp: str,
+) -> None:
+    """@spec HTTP-IDENTITY-V1-4 HTTP-IDENTITY-V1-5."""
+    model = importlib.import_module("curie_api.schemas.http_identity").LookupResponseV1
+    example = copy.deepcopy(VECTORS["cases"][0]["response"])
+    target = (
+        example["identity_observation"]
+        if observation == "identity"
+        else example["membership"]["observation"]
+    )
+    target["as_of"] = timestamp
+    validated = model.model_validate(example)
+    assert validated.model_dump(mode="json") == example
+    artifact_model_validator(format_name, "LookupResponseV1").validate(example)
