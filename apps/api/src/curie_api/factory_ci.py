@@ -24,6 +24,14 @@ pure ``decide``:
   request (``work-item-{id}-ci-{round}``) carrying the failure report;
 - a failure on the last round, a timed-out wait, or unreadable CI ends the
   request with a ``Could not complete:`` notice. Unreadable CI is never success;
+- when the code host supports ``required_checks``, a base-branch required
+  check with no matching run or status on the head stays pending and, at the
+  CI deadline, ends ``ci_unverified``. The notice names each check that never
+  started and says it may need a trigger the factory does not apply (for
+  example a label). The factory does not apply that trigger. A rules HTTP 404
+  or an empty rules list adds no names. A transient required-check read stays
+  pending until the deadline and then ends ``ci_timeout``. Any other unreadable
+  read, including ``github_forbidden``, ends ``ci_unverified`` immediately;
 - a failing check run or commit status whose ``name`` or ``context`` is also
   failing on the commit the PR's base branch points to now is pre-existing,
   not caused by the change (#4105). Only caused failures fail the gate or
@@ -42,7 +50,7 @@ import asyncio
 import json
 import re
 import uuid
-from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
@@ -562,6 +570,7 @@ def decide(
     prior_round_had_checks: bool = False,
     fresh_after: datetime | None = None,
     delegated_checks: Sequence[str] = (),
+    host_required_checks: Collection[str] | None = None,
 ) -> Verdict:
     """The CI verdict for one observation. Pure: time is an argument.
 
@@ -571,6 +580,12 @@ def decide(
     ``delegated_checks`` names required checks that unavailable sandbox
     verification delegated to; each must appear as a check run ``name`` (any
     app) or a commit status ``context`` and pass.
+    ``host_required_checks`` names checks the code host requires on the base
+    branch. ``None`` means the code host does not support that read. A name
+    matches a head check whose normalized key equals the name, or equals
+    ``status:`` plus the name. A required check that never started stays
+    pending until the CI deadline, then unverified. It is never green and
+    never no CI.
 
     A failing or pending check is reported by the state the code host gave:
     a run as ``name`` with ``conclusion`` or ``status``, a commit status as
@@ -718,6 +733,24 @@ def decide(
     ):
         return Verdict(kind="unverified", reason="delegated_ci_failed_on_base", pending=pending)
 
+    if host_required_checks:
+        present = {check.key for check in (*check_runs, *statuses)}
+        missing = sorted(
+            name
+            for name in dict.fromkeys(host_required_checks)
+            if name not in present and status_key(name) not in present
+        )
+        if missing:
+            # Before the Python-CI missing return. A required check that never
+            # started stays pending until the CI deadline even when that name
+            # is also the repository's Python check.
+            return Verdict(
+                kind="unverified" if expired else "pending",
+                pending=pending,
+                reason="required_check_absent",
+                note=_required_absent_note(missing),
+            )
+
     if requires_python_ci and not required_python_runs:
         has_unrelated_checks = bool(check_runs or statuses)
         # Shard jobs stay in the list after they complete, and the aggregate
@@ -768,6 +801,14 @@ def decide(
     if preexisting:
         return Verdict(kind="green", note=_preexisting_note(preexisting))
     return Verdict(kind="green")
+
+
+def _required_absent_note(names: Sequence[str]) -> str:
+    label = "Required check" if len(names) == 1 else "Required checks"
+    return (
+        f"{label} {', '.join(names)} never started on this pull request head. "
+        "It may need a trigger the factory does not apply (for example a label)."
+    )
 
 
 def _preexisting_note(preexisting: Sequence[dict[str, Any]]) -> str:
@@ -962,6 +1003,8 @@ def tried_summary(publications: Iterable[Any], verdict: Verdict, pr_url: str | N
         lines.append(f"Pending checks: {_check_list(verdict.pending)}")
     if verdict.reason:
         lines.append(f"Reason: {verdict.reason}")
+    if verdict.note:
+        lines.append(verdict.note)
     if verdict.reason == "github_forbidden":
         # A 403 on check runs or commit statuses does not say which permission
         # was missing, so the notice names both reads the wait needs.
@@ -1220,6 +1263,22 @@ async def gate(
             now = await lifecycle.database_now(session)
             await session.rollback()
         head_sha = view.head_sha or observed_sha or ""
+        host_required: frozenset[str] | None = None
+        if (
+            supports(code_host.capabilities, Operation.REQUIRED_CHECKS)
+            and isinstance(lineage.base_ref, str)
+            and lineage.base_ref
+        ):
+            try:
+                host_required = await code_host.required_checks(repository, lineage.base_ref)
+            except ForgeError as failure:
+                reason = str(failure) or type(failure).__name__.lower()
+                # A permanent required-check failure is immediate. It is not
+                # hidden behind a transient check-run read.
+                if view.reason is None or (
+                    view.reason in TRANSIENT and reason not in TRANSIENT
+                ):
+                    view = replace(view, reason=reason)
         if metadata_only and fresh_after is None:
             verdict = Verdict(kind="unverified", reason="metadata_update_unverified")
         else:
@@ -1235,6 +1294,7 @@ async def gate(
                 prior_round_had_checks=round_ > 1,
                 fresh_after=fresh_after,
                 delegated_checks=delegated_checks,
+                host_required_checks=host_required,
             )
     if verdict.kind == "pending":
         next_poll[request.id] = now + timedelta(seconds=CI_POLL_SECONDS)

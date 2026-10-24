@@ -812,7 +812,10 @@ class BitbucketPair:
             "UPDATE curie.publications SET status = 'approved' WHERE id = :id",
             {"id": uuid.UUID(publication["id"])},
         )
-        head = self.backend.push(publication["branch"], "Keep the last field of a line")
+        head = self.backend.push(
+            publication["branch"],
+            f"{publication['title']}\n\nCurie-Revision: {publication['id']}\n",
+        )
         return Publication(publication["id"], publication["branch"], publication["body"], head)
 
     def open_publication(self, publication: Publication) -> httpx.Response:
@@ -821,7 +824,7 @@ class BitbucketPair:
 
         return self.client.post(
             f"/v1/internal/publications/{publication.id}/pull-request",
-            json={"expected_head_sha": publication.head_sha},
+            json={"expected_head_sha": publication.head_sha, "adopt_only": False},
             headers=WORKER,
         )
 

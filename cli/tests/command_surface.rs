@@ -10,6 +10,7 @@ fn bin() -> &'static str {
 
 fn run_help(args: &[&str]) -> std::process::Output {
     Command::new(bin())
+        .env("KUBECONFIG", "/dev/null")
         .args(args)
         .arg("--help")
         .output()
@@ -45,6 +46,7 @@ fn output_text(output: &std::process::Output) -> String {
 
 fn live_command_manifest() -> serde_json::Value {
     let output = Command::new(bin())
+        .env("KUBECONFIG", "/dev/null")
         .arg("schema")
         .output()
         .expect("run curie schema");
@@ -59,6 +61,7 @@ fn live_command_manifest() -> serde_json::Value {
 fn cluster_status_plan(env_namespace: &str, flag_namespace: Option<&str>) -> Vec<String> {
     let mut command = Command::new(bin());
     command
+        .env("KUBECONFIG", "/dev/null")
         .arg("--json")
         .args(["cluster", "status", "--dry-run"])
         .env("CURIE_NAMESPACE", env_namespace);
@@ -584,6 +587,7 @@ printf '%s\n' \
     ));
     let path = std::env::join_paths(paths).expect("join fake tool PATH");
     let output = Command::new(bin())
+        .env("KUBECONFIG", "/dev/null")
         .args([
             "dev",
             "e2e-ci-selection",
@@ -627,6 +631,7 @@ printf '%s\n' \
 #[test]
 fn command_manifest_matches_committed_artifact() {
     let output = Command::new(bin())
+        .env("KUBECONFIG", "/dev/null")
         .arg("schema")
         .output()
         .expect("run curie schema");
@@ -761,10 +766,12 @@ fn cluster_namespace_flag_wins_over_environment() {
 #[test]
 fn dump_commands_alias_emits_same_manifest() {
     let schema = Command::new(bin())
+        .env("KUBECONFIG", "/dev/null")
         .arg("schema")
         .output()
         .expect("run curie schema");
     let alias = Command::new(bin())
+        .env("KUBECONFIG", "/dev/null")
         .arg("dump-commands")
         .output()
         .expect("run curie dump-commands");
@@ -1012,6 +1019,7 @@ fn help_never_discloses_the_curie_api_key_value() {
     let mut leaks = Vec::new();
     for path in &paths {
         let output = Command::new(bin())
+            .env("KUBECONFIG", "/dev/null")
             .args(path)
             .arg("--help")
             .env("CURIE_API_KEY", SENTINEL)
@@ -1034,6 +1042,7 @@ fn help_never_discloses_the_curie_api_key_value() {
     ] {
         let mut command = Command::new(bin());
         command
+            .env("KUBECONFIG", "/dev/null")
             .args(path)
             .arg("--help")
             .env("CURIE_API_KEY", SENTINEL);

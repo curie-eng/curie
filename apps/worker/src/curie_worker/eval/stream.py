@@ -35,6 +35,7 @@ import logging
 import os
 import secrets
 import tempfile
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -44,6 +45,7 @@ from typing import Any
 import httpx
 from aci_protocol import (
     STREAM_PAYLOAD_FIELD,
+    BootEnv,
     Budget,
     EvalJob,
     EvalReport,
@@ -59,13 +61,9 @@ from plugin_format import (
 )
 from redis.asyncio import Redis
 
+from .. import caller_token
 from ..binding import (
-    BUDGET_ENV,
-    BUNDLE_REF_ENV,
-    BUNDLE_VERSION_ENV,
-    PLUGIN_DIR_ENV,
-    RUNNER_TOKEN_ENV,
-    SESSION_ID_ENV,
+    SANDBOX_TOKEN_TTL_SECONDS,
     apply_model_env,
     inject_connector_secrets,
 )
@@ -721,10 +719,16 @@ class EvalStreamConsumer(StreamConsumer):
         release_key = f"eval-{uuid.uuid4().hex}"
         try:
             connector_secrets = await self._repo_lookup.secrets_for(item.agent_id)
-            name_for = getattr(self._repo_lookup, "name_for", None)
-            agent_name = await name_for(item.agent_id) if name_for is not None else None
+            settings = await self._repo_lookup.eval_connector_settings_for(item.agent_id)
+            agent_name, required_tools = settings if settings is not None else (None, [])
             env = self._boot_env(
-                item, connector_secrets, thinking, model=model, reviewer_model=reviewer_model
+                item,
+                connector_secrets,
+                thinking,
+                model=model,
+                reviewer_model=reviewer_model,
+                agent_name=agent_name,
+                required_tools=required_tools,
             )
             # Hold a claim slot only across creation/binding (the flood source),
             # not the whole suite run: the semaphore is released the moment the
@@ -779,21 +783,44 @@ class EvalStreamConsumer(StreamConsumer):
         *,
         model: str | None,
         reviewer_model: str | None,
+        agent_name: str | None = None,
+        required_tools: list[str] | None = None,
     ) -> dict[str, str]:
         budget = Budget(
             max_output_tokens_per_run=self._config.default_max_output_tokens_per_run,
             max_usd_per_day=self._config.default_max_usd_per_day,
         )
-        env = {
-            BUDGET_ENV: budget.model_dump_json(),
-            SESSION_ID_ENV: f"eval-{item.version_id}",
-            PLUGIN_DIR_ENV: self._config.bundle_plugin_dir,
-            RUNNER_TOKEN_ENV: secrets.token_urlsafe(32),
-        }
-        if item.bundle_ref is not None:
-            env[BUNDLE_REF_ENV] = item.bundle_ref
-        if item.sha:
-            env[BUNDLE_VERSION_ENV] = item.sha
+        token = None
+        if (
+            agent_name
+            and self._config.connector_release
+            and self._config.connector_namespace
+            and self._config.connector_caller_signing_key.strip()
+        ):
+            token = caller_token.mint(
+                self._config.connector_caller_signing_key,
+                agent=agent_name,
+                exp=int(time.time()) + SANDBOX_TOKEN_TTL_SECONDS,
+            )
+        env = BootEnv.render_worker(
+            plugin_dir=self._config.bundle_plugin_dir,
+            session_id=f"eval-{item.version_id}",
+            budget=budget,
+            memory_ref="",
+            history_ref="",
+            bundle_ref=item.bundle_ref,
+            bundle_version=item.sha or None,
+            runner_token=secrets.token_urlsafe(32),
+            connector_release=self._config.connector_release or None,
+            connector_namespace=self._config.connector_namespace or None,
+            connector_agent=agent_name,
+            connector_caller_token=token,
+            approval_required_tools=required_tools,
+        )
+        # Eval conversations stay isolated from ambient durable state. Use the
+        # shared scope renderer without adding the binding lane's state refs.
+        env.pop(BootEnv.env_key("memory_ref"))
+        env.pop(BootEnv.env_key("history_ref"))
         # Deliver the agent's connector secrets (#429) so an authed-MCP bundle
         # authenticates during eval exactly as it does on a bound run -- otherwise
         # its tool calls fail auth and the eval measures the wrong thing. The

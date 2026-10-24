@@ -24,8 +24,12 @@ import base64
 import hashlib
 import importlib.util
 import json
+import os
 import re
+import stat
+import subprocess
 import sys
+import tarfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -657,3 +661,41 @@ def test_unstartable_failure_does_not_chain_the_raw_error(harness: Harness) -> N
 
     error = raised.value
     assert error.__context__ is None or error.__suppress_context__, repr(error.__context__)
+
+
+# Basename is 102 bytes, past the USTAR 100-byte name field. This is the path
+# that stopped the Forge instance image build while streaming the working tree.
+LONG_CONTEXT_PATH = (
+    "docs/adr/0240-a-hosted-connector-declares-the-routes-its-bundles-"
+    "stdio-servers-call-through-the-caller-proxy.md"
+)
+
+
+def test_build_image_archives_overlong_working_tree_paths(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    target = source / LONG_CONTEXT_PATH
+    target.parent.mkdir(parents=True)
+    target.write_text("context\n", encoding="utf-8")
+    subprocess.run(["git", "init"], cwd=source, check=True, capture_output=True)
+    archive_path = tmp_path / "context.tar"
+    docker = tmp_path / "docker"
+    docker.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, sys\n"
+        "open(os.environ['FORGE_CONTEXT_TAR'], 'wb').write(sys.stdin.buffer.read())\n",
+        encoding="utf-8",
+    )
+    docker.chmod(docker.stat().st_mode | stat.S_IEXEC)
+    candidate = helpers.Candidate(source)
+    candidate.root = tmp_path / "build"
+    candidate.root.mkdir()
+    candidate.env = {
+        **os.environ,
+        "PATH": f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}",
+        "FORGE_CONTEXT_TAR": str(archive_path),
+    }
+
+    candidate.build_image("example.invalid/curie:context", "Dockerfile")
+
+    with tarfile.open(archive_path, "r:") as archive:
+        assert LONG_CONTEXT_PATH in archive.getnames()

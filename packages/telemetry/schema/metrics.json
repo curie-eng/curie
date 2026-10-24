@@ -1917,6 +1917,56 @@
       "type": "counter",
       "unit": "{fire}"
     },
+    "curie.slack.delivery_canary": {
+      "attributes": {
+        "service.name": [
+          "curie-dispatcher"
+        ],
+        "slack_identity": {
+          "ceiling": 16,
+          "kind": "bounded",
+          "overflow": "other",
+          "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
+          "reserved": [
+            "other"
+          ]
+        }
+      },
+      "cardinality_bound": 17,
+      "description": "Delivery-canary mentions the dispatcher handled, by Slack identity.",
+      "monotonic": true,
+      "type": "counter",
+      "unit": "{mention}"
+    },
+    "curie.slack.socket.envelopes": {
+      "attributes": {
+        "service.name": [
+          "curie-dispatcher"
+        ],
+        "slack_identity": {
+          "ceiling": 16,
+          "kind": "bounded",
+          "overflow": "other",
+          "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
+          "reserved": [
+            "other"
+          ]
+        },
+        "type": [
+          "hello",
+          "disconnect",
+          "events_api",
+          "interactive",
+          "slash_commands",
+          "other"
+        ]
+      },
+      "cardinality_bound": 102,
+      "description": "Socket Mode frames Slack delivered, by Slack identity and frame type.",
+      "monotonic": true,
+      "type": "counter",
+      "unit": "{envelope}"
+    },
     "curie.slack.socket.identities": {
       "attributes": {
         "service.name": [

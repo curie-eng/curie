@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -62,6 +63,7 @@ from ..sandbox.types import (
     MissingAgentPoolError,
     SandboxError,
     SandboxHandle,
+    SandboxTermination,
     UnschedulableClaimError,
 )
 from ..turn_progress import (
@@ -96,6 +98,49 @@ from . import (
     workspace,
 )
 from .log import logger
+
+# Tests replace these so the 10 s termination window does not wait on the wall clock.
+_pod_termination_clock = time.monotonic
+_pod_termination_sleep = asyncio.sleep
+
+
+async def _await_pod_termination(
+    read: Callable[[float], Awaitable[SandboxTermination | None]],
+    *,
+    window_s: float,
+    interval_s: float,
+    clock: Callable[[], float],
+    sleep: Callable[[float], Awaitable[None]],
+) -> SandboxTermination | None:
+    """Re-read until a termination or the window elapses.
+
+    A non-positive window is one read with the 3 s bound, matching the
+    historical single read. No read starts once ``window_s`` has passed.
+    A read that raises or times out is no evidence.
+    """
+
+    read_cap = constants.POD_TERMINATION_READ_TIMEOUT_S
+    if window_s <= 0:
+        try:
+            return await asyncio.wait_for(read(read_cap), read_cap)
+        except Exception:  # noqa: BLE001 - a failed diagnosis is no evidence
+            return None
+
+    started = clock()
+    while True:
+        elapsed = clock() - started
+        if elapsed >= window_s:
+            return None
+        timeout = min(read_cap, window_s - elapsed)
+        try:
+            termination = await asyncio.wait_for(read(timeout), timeout)
+        except Exception:  # noqa: BLE001 - a failed diagnosis is no evidence
+            termination = None
+        if termination is not None:
+            return termination
+        if clock() - started >= window_s:
+            return None
+        await sleep(interval_s)
 
 
 async def _attempt(
@@ -419,7 +464,7 @@ async def _attempt_turn(
             if run is not None and not run.started:
                 release_order()
                 try:
-                    await run.defer("capacity", capacity=True)
+                    await run.defer("capacity", capacity=True, start_failure_detail=None)
                 except WorkItemConflict as exc:
                     logger.info(
                         "work-item capacity defer refused for %s: %s",
@@ -661,7 +706,7 @@ async def _attempt_turn(
                     exc,
                 )
                 try:
-                    await run.defer("capacity", capacity=True)
+                    await run.defer("capacity", capacity=True, start_failure_detail=None)
                 except WorkItemConflict as conflict:
                     logger.info(
                         "work-item capacity defer refused for %s: %s",
@@ -1034,23 +1079,30 @@ async def _consume(
         else:
             classification = "runner-error"
             if stream_reading and isinstance(exc, aiohttp.ClientError):
-                try:
-                    termination = await asyncio.wait_for(
-                        asyncio.to_thread(
-                            self._substrate.pod_termination,
-                            handle,
-                            since=stream_started_at,
-                        ),
-                        timeout=3.0,
+
+                async def _read_termination(timeout_s: float) -> SandboxTermination | None:
+                    # The substrate keeps its own Kubernetes request budget.
+                    # ``timeout_s`` is this read's wait bound, observed by tests.
+                    del timeout_s
+                    return await asyncio.to_thread(
+                        self._substrate.pod_termination,
+                        handle,
+                        since=stream_started_at,
                     )
-                except Exception:  # noqa: BLE001 - broad catch kept at a failure boundary
-                    # Diagnosis is best effort; the original stream warning
-                    # above remains the operator record of this failure.
-                    pass
-                else:
-                    if termination is not None:
-                        classification = "sandbox-terminated"
-                        acc.error_message = failures._sandbox_termination_detail(termination)
+
+                termination = await _await_pod_termination(
+                    _read_termination,
+                    window_s=constants.POD_TERMINATION_WAIT_S,
+                    interval_s=constants.POD_TERMINATION_INTERVAL_S,
+                    clock=_pod_termination_clock,
+                    sleep=_pod_termination_sleep,
+                )
+                if termination is not None:
+                    classification = "sandbox-terminated"
+                    acc.error_message = failures._sandbox_termination_detail(termination)
+                    termination_carry = constants._SANDBOX_TERMINATION_CARRY.get()
+                    if termination_carry is not None:
+                        termination_carry.termination = termination
         return failures.TurnOutcome(
             terminal_ok=False,
             saw_side_effect=acc.saw_side_effect,

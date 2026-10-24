@@ -26,7 +26,7 @@ permissions:
 jobs:
   prereqs:
     name: Helm fixture prereqs (Slack optional)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       ready: ${{ steps.check.outputs.ready }}
@@ -46,7 +46,7 @@ jobs:
   two-release:
     name: Two Helm releases, owner-only approval
     needs: [prereqs]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7

@@ -28,9 +28,16 @@ def _event(text: str, *, ref: str | None = "1.1") -> ReplyUpdate:
 def _assert_literal(call: dict[str, object]) -> str:
     blocks = call["blocks"]
     assert isinstance(blocks, list) and len(blocks) == 1
+    # A plain_text section renders its newlines as spaces in the Slack client;
+    # a preformatted rich_text element renders every character and line break.
     assert blocks[0] == {
-        "type": "section",
-        "text": {"type": "plain_text", "text": call["text"], "emoji": False},
+        "type": "rich_text",
+        "elements": [
+            {
+                "type": "rich_text_preformatted",
+                "elements": [{"type": "text", "text": call["text"]}],
+            }
+        ],
     }
     text = call["text"]
     assert isinstance(text, str)
@@ -45,6 +52,7 @@ def _assert_literal(call: dict[str, object]) -> str:
         '```curie-reply\n{"text":"do not parse"}\n```',
         '```curie-reply\n{"text": malformed 🦊\n',
         "**markdown** <@U0EXAMPLE1> & > remain literal\n  ",
+        "Summary\n\n- first *point*\n- second _point_\n    indented  twice\n\n\nEnd.",
     ],
 )
 async def test_verbatim_edit_preserves_structured_like_text(text: str) -> None:

@@ -2389,6 +2389,129 @@ def test_start_execution_spends_exactly_one_attempt(clean_db: None) -> None:
     with_session(body)
 
 
+# --- #4930: the start CAS clears the previous start failure, nothing else does
+
+START_FAILURE_DETAIL = "workspace archive-size failed: archive exceeds 1048576 bytes"
+
+
+async def _seed_start_failure_detail(session: AsyncSession, request_id: uuid.UUID) -> None:
+    # The defer path that writes the column is pinned in
+    # test_workitem_dispatch.py; here only the start/expiry transitions matter.
+    await session.execute(
+        text(
+            "UPDATE curie.execution_requests SET last_start_failure_detail = :detail WHERE id = :id"
+        ),
+        {"id": request_id, "detail": START_FAILURE_DETAIL},
+    )
+    await session.commit()
+
+
+async def _stored_start_failure_detail(session: AsyncSession, request_id: uuid.UUID) -> str | None:
+    value = await session.scalar(
+        text("SELECT last_start_failure_detail FROM curie.execution_requests WHERE id = :id"),
+        {"id": request_id},
+    )
+    assert value is None or isinstance(value, str)
+    return value
+
+
+def test_start_execution_clears_the_start_failure_detail(clean_db: None) -> None:
+    async def body(session: AsyncSession) -> None:
+        waiting = await _request(session, (await _item(session, await _agent(session))).work_item)
+        assert waiting.request is not None
+        await _seed_start_failure_detail(session, waiting.request.id)
+        assert await _stored_start_failure_detail(session, waiting.request.id) == (
+            START_FAILURE_DETAIL
+        )
+        running = await _start(session, waiting)
+        assert running.request is not None
+        assert running.request.status == "running"
+        assert running.request.version == waiting.request.version + 1
+        assert await _stored_start_failure_detail(session, waiting.request.id) is None
+
+    with_session(body)
+
+
+def test_stale_version_start_conflict_keeps_the_start_failure_detail(clean_db: None) -> None:
+    async def body(session: AsyncSession) -> None:
+        agent_id = await _agent(session)
+        waiting = await _request(session, (await _item(session, agent_id)).work_item)
+        request = waiting.request
+        assert request is not None
+        await _seed_start_failure_detail(session, request.id)
+        stale = _conflict(
+            await workitems.start_execution(
+                session,
+                work_item_id=waiting.work_item.id,
+                request_id=request.id,
+                expected_work_item_version=waiting.work_item.version,
+                expected_request_version=request.version + 1,
+            ),
+            "stale_version",
+        )
+        assert stale.request_version == request.version
+        assert await _stored_start_failure_detail(session, request.id) == START_FAILURE_DETAIL
+
+        # An elapsed waiting deadline refuses the start CAS too.
+        late = await _request(
+            session,
+            (await _item(session, agent_id, issue=4930)).work_item,
+            deadline=await _now(session) - timedelta(seconds=1),
+        )
+        assert late.request is not None
+        await _seed_start_failure_detail(session, late.request.id)
+        _conflict(
+            await workitems.start_execution(
+                session,
+                work_item_id=late.work_item.id,
+                request_id=late.request.id,
+                expected_work_item_version=late.work_item.version,
+                expected_request_version=late.request.version,
+            ),
+            "waiting_deadline_elapsed",
+        )
+        assert await _stored_start_failure_detail(session, late.request.id) == (
+            START_FAILURE_DETAIL
+        )
+
+        # Liveness: the current version starts and clears it.
+        running = await _start(session, waiting)
+        assert running.request is not None
+        assert running.request.status == "running"
+        assert await _stored_start_failure_detail(session, request.id) is None
+
+    with_session(body)
+
+
+def test_expired_request_keeps_the_start_failure_detail(clean_db: None) -> None:
+    async def body(session: AsyncSession) -> None:
+        late = await _request(
+            session,
+            (await _item(session, await _agent(session))).work_item,
+            deadline=await _now(session) - timedelta(seconds=1),
+        )
+        assert late.request is not None
+        await _seed_start_failure_detail(session, late.request.id)
+        expired = await workitems.expire_waiting(
+            session,
+            work_item_id=late.work_item.id,
+            request_id=late.request.id,
+            expected_work_item_version=late.work_item.version,
+            expected_request_version=late.request.version,
+        )
+        assert isinstance(expired, workitems.WorkItemOutcome), expired
+        assert expired.request is not None
+        assert (expired.request.status, expired.request.terminal_cause) == (
+            "expired",
+            "capacity_wait_expired",
+        )
+        assert await _stored_start_failure_detail(session, late.request.id) == (
+            START_FAILURE_DETAIL
+        )
+
+    with_session(body)
+
+
 def test_an_opened_pull_request_completes_after_the_execution_deadline(
     clean_db: None,
 ) -> None:

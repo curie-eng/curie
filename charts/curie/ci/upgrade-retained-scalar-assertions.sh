@@ -34,6 +34,16 @@
 #     PyYAML is only a SECONDARY reader here: its implicit resolver does not
 #     treat a bare `y`/`n` as a boolean, so it cannot see the whole class.
 #
+# The same lane also carries a factory release (#4889) through the real CLI:
+# the captured overlay must keep factory.sandboxEgress, the explicit
+# agentResourceProfiles opt-out and every explicit envelope override, so real
+# `helm template` of it renders the full factory envelope for the factory agent
+# and the standard one elsewhere; a release without the factory stays standard.
+# It also carries the API memory limit (#4939): with no retained
+# api.resources.limits.memory the factory release renders the factory
+# profile's 2Gi and the control renders 512Mi; a retained explicit 512Mi stays
+# in the captured overlay and wins over the factory profile.
+#
 # `helm`/`kubectl` are the recording stubs `cli/tests/data/upgrade-driver.py`
 # already provides for `cluster_upgrade_live.rs`, so the run is offline and
 # touches no cluster.
@@ -86,6 +96,7 @@ RETAINED='{
 
 run_capture() {
   # run_capture <label> <root> [extra curie flags...]
+  # The installed release's values are $RETAINED_DOC when set, else $RETAINED.
   local label="$1" root="$2"
   shift 2
   mkdir -p "$root"
@@ -94,7 +105,7 @@ run_capture() {
     cp "$DRIVER" "$root/$name"
     chmod +x "$root/$name"
   done
-  printf '%s\n' "$RETAINED" > "$root/retained.json"
+  printf '%s\n' "${RETAINED_DOC:-$RETAINED}" > "$root/retained.json"
   # A non-zero exit is tolerated: the capture happens during Validate, before
   # any mutation, and the assertions below refuse to pass without one.
   PATH="$root:$PATH" \
@@ -293,4 +304,190 @@ assert_captures "plain upgrade" "$TMP/plain"
 run_capture "--forward-only upgrade" "$TMP/forward" --forward-only
 assert_captures "--forward-only upgrade" "$TMP/forward" expect-forward-only
 
+# --- path 3: the factory sandbox resource profile (#4889) ---------------------
+# A release whose operator selected the factory and moved single fields must
+# get back, through the real `curie cluster upgrade` retained overlay, the full
+# factory envelope with every explicit override still winning: the profile is
+# chart-derived from factory.sandboxEgress plus factory.enabled, so dropping or
+# rewriting any of these keys on the round trip changes what the sandbox gets.
+PROFILE_FIXTURE="$SCRIPT_DIR/fixtures/factory-resource-profile.yaml"
+[[ -f "$PROFILE_FIXTURE" ]] || { echo "FAIL: missing fixture $PROFILE_FIXTURE" >&2; exit 1; }
+FACTORY_RETAINED="$(python3 - "$PROFILE_FIXTURE" <<'PY'
+import json, sys, yaml
+doc = yaml.safe_load(open(sys.argv[1]))
+doc["factory"]["sandboxEgress"]["acme-optout"] = True
+caller_pair = "acme-caller-pair"  # a Secret name, as in the other paths
+doc["connectorCaller"] = {"existingSecret": caller_pair}
+doc["security"] = {"gvisor": {"mode": "off"}}
+doc["agentSandbox"] = {
+    "agentResourceProfiles": {"acme-optout": "standard"},
+    "workspaceSizeLimits": {"acme-factory": "18Gi"},
+    "runner": {"resources": {"limits": {"cpu": "3"}}},
+    "resourceProfiles": {"factory": {"tmpSizeLimit": "6Gi"}},
+}
+print(json.dumps(doc, indent=2))
+PY
+)"
+FACTORY_EXPLICIT_RETAINED="$(printf '%s\n' "$FACTORY_RETAINED" | python3 -c '
+import json, sys
+doc = json.load(sys.stdin)
+doc["api"] = {"resources": {"limits": {"memory": "512Mi"}}}
+print(json.dumps(doc, indent=2))
+')"
+CONTROL_RETAINED="$(python3 -c 'import json; print(json.dumps({"connectorCaller": {"existingSecret": "acme-" + "caller-pair"}, "security": {"gvisor": {"mode": "off"}}}, indent=2))')"
+
+PROFILE_CHECK="$TMP/profile-check.py"
+cat > "$PROFILE_CHECK" <<'PY'
+"""profile-check.py <label> <capture> <rendered> <factory|control>"""
+import sys
+
+import yaml
+
+label, capture, rendered, mode = sys.argv[1:5]
+failures = []
+
+STD = {"cpu": ["50m", "3"], "memory": ["192Mi", "768Mi"], "ephemeral-storage": ["512Mi", "4Gi"],
+       "workspace": "1Gi", "/tmp": "512Mi", "/home/runner": "512Mi"}
+FACTORY = {"cpu": ["50m", "3"], "memory": ["8Gi", "8Gi"], "ephemeral-storage": ["10Gi", "20Gi"],
+           "workspace": "18Gi", "/tmp": "6Gi", "/home/runner": "15Gi"}
+if mode == "factory":
+    want = {"generic": STD, "acme-optout": STD, "acme-factory": FACTORY}
+else:
+    want = {"generic": dict(STD, cpu=["50m", "1"])}
+
+templates = {d["metadata"]["name"]: d for d in yaml.safe_load_all(open(rendered))
+             if d and d.get("kind") == "SandboxTemplate"}
+agents = sorted(n.split("-agent-", 1)[1][: -len("-runner")] for n in templates if "-agent-" in n)
+want_agents = sorted(k for k in want if k != "generic")
+if agents != want_agents:
+    failures.append(f"per-agent SandboxTemplates {agents}, want {want_agents}")
+for key, envelope in want.items():
+    hits = [t for n, t in templates.items()
+            if ("-agent-" not in n if key == "generic" else n.endswith(f"-agent-{key}-runner"))]
+    if len(hits) != 1:
+        failures.append(f"want one {key} SandboxTemplate, got {sorted(templates)}")
+        continue
+    spec = hits[0]["spec"]["podTemplate"]["spec"]
+    runner = next(c for c in spec["containers"] if c["name"] == "runner")
+    mounts = {m["name"]: m["mountPath"] for m in runner.get("volumeMounts", [])}
+    for c in [runner] + list(spec.get("initContainers") or []):
+        res = c.get("resources") or {}
+        for r in ("cpu", "memory", "ephemeral-storage"):
+            pair = [str((res.get(side) or {}).get(r)) for side in ("requests", "limits")]
+            if pair != envelope[r]:
+                failures.append(f"{key}: container {c['name']} {r} {pair}, want {envelope[r]}")
+    sizes = {}
+    for v in spec.get("volumes", []):
+        if v["name"] == "workspace":
+            sizes["workspace"] = str(v["emptyDir"].get("sizeLimit"))
+        elif v["name"].startswith("writable-"):
+            sizes[mounts.get(v["name"], v["name"])] = str(v["emptyDir"].get("sizeLimit"))
+    for label_ in ("workspace", "/tmp", "/home/runner"):
+        if sizes.get(label_) != envelope[label_]:
+            failures.append(f"{key}: volume {label_} sizeLimit {sizes.get(label_)!r}, want {envelope[label_]!r}")
+
+if mode == "factory":
+    doc = yaml.safe_load(open(capture)) or {}
+
+    def at(*keys):
+        node = doc
+        for key in keys:
+            if not isinstance(node, dict) or key not in node:
+                return None
+            node = node[key]
+        return node
+
+    for keys, value in [
+        (("factory", "enabled"), True),
+        (("factory", "sandboxEgress", "acme-factory"), True),
+        (("factory", "sandboxEgress", "acme-optout"), True),
+        (("agentSandbox", "agentResourceProfiles", "acme-optout"), "standard"),
+        (("agentSandbox", "workspaceSizeLimits", "acme-factory"), "18Gi"),
+        (("agentSandbox", "runner", "resources", "limits", "cpu"), "3"),
+        (("agentSandbox", "resourceProfiles", "factory", "tmpSizeLimit"), "6Gi"),
+    ]:
+        if at(*keys) != value:
+            failures.append(f"{'.'.join(keys)} came back as {at(*keys)!r}, want {value!r}")
+
+if failures:
+    print(f"FAIL: {label}: {capture}", file=sys.stderr)
+    for failure in failures:
+        print("  " + failure, file=sys.stderr)
+    raise SystemExit(1)
+PY
+
+API_CHECK="$TMP/api-check.py"
+cat > "$API_CHECK" <<'PY'
+"""api-check.py <label> <capture> <rendered> <want-limit> [retained-limit]
+
+The rendered API Deployment's api container has memory limit <want-limit>,
+request 256Mi and cpu 100m/"1". The captured overlay carries
+api.resources.limits.memory exactly when the release retained one."""
+import sys
+
+import yaml
+
+label, capture, rendered, want = sys.argv[1:5]
+retained = sys.argv[5] if len(sys.argv) > 5 else None
+failures = []
+deployments = [d for d in yaml.safe_load_all(open(rendered))
+               if d and d.get("kind") == "Deployment" and d["metadata"]["name"].endswith("-api")]
+if len(deployments) != 1:
+    failures.append(f"want one API Deployment, got {len(deployments)}")
+else:
+    api = next((c for c in deployments[0]["spec"]["template"]["spec"]["containers"]
+                if c["name"] == "api"), None)
+    res = (api or {}).get("resources") or {}
+    got = {side: {k: str(v) for k, v in (res.get(side) or {}).items()}
+           for side in ("requests", "limits")}
+    expected = {"requests": {"cpu": "100m", "memory": "256Mi"},
+                "limits": {"cpu": "1", "memory": want}}
+    if got != expected:
+        failures.append(f"API container resources {got}, want {expected}")
+doc = yaml.safe_load(open(capture)) or {}
+node = doc
+for key in ("api", "resources", "limits"):
+    node = node.get(key) if isinstance(node, dict) else None
+held = node.get("memory") if isinstance(node, dict) else None
+if held != retained:
+    failures.append(f"captured api.resources.limits.memory is {held!r}, want {retained!r}")
+if failures:
+    print(f"FAIL: {label}: {capture}", file=sys.stderr)
+    for failure in failures:
+        print("  " + failure, file=sys.stderr)
+    raise SystemExit(1)
+PY
+
+assert_profile_captures() {
+  # assert_profile_captures <label> <root> <factory|control> <api-memory> [retained-api-memory]
+  local label="$1" root="$2" mode="$3" api_memory="$4" retained_api="${5:-}"
+  shopt -s nullglob
+  local captures=("$root"/values-*.yaml)
+  shopt -u nullglob
+  local capture
+  for capture in "${captures[@]}"; do
+    if ! helm template t "$CHART" -f "$capture" > "$capture.profile" 2> "$capture.profile.err"; then
+      echo "FAIL: $label: helm refused the overlay curie handed it ($capture)" >&2
+      sed 's/^/    /' "$capture.profile.err" >&2
+      exit 1
+    fi
+    python3 "$PROFILE_CHECK" "$label" "$capture" "$capture.profile" "$mode"
+    python3 "$API_CHECK" "$label" "$capture" "$capture.profile" "$api_memory" \
+      ${retained_api:+"$retained_api"}
+  done
+  echo "OK: $label kept the sandbox resource envelope across the retained-values round trip"
+  echo "OK: $label rendered API memory limit $api_memory"
+}
+
+RETAINED_DOC="$FACTORY_RETAINED" run_capture "factory profile upgrade" "$TMP/factory"
+assert_profile_captures "factory profile upgrade" "$TMP/factory" factory 2Gi
+
+RETAINED_DOC="$FACTORY_EXPLICIT_RETAINED" run_capture "factory explicit API memory upgrade" "$TMP/factory-api"
+assert_profile_captures "factory explicit API memory upgrade" "$TMP/factory-api" factory 512Mi 512Mi
+
+RETAINED_DOC="$CONTROL_RETAINED" run_capture "non-factory control upgrade" "$TMP/control"
+assert_profile_captures "non-factory control upgrade" "$TMP/control" control 512Mi
+
 printf '%s\n' 'Retained-values scalar preservation assertions passed for both overlay paths.'
+printf '%s\n' 'Retained-values factory resource profile assertions passed (factory envelope, overrides, non-factory control).'
+printf '%s\n' 'Retained-values API memory assertions passed (factory 2Gi, explicit 512Mi retained, non-factory 512Mi).'

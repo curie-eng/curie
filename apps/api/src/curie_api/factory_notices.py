@@ -152,7 +152,10 @@ _CAUSE_TEXT = {
     "publication_expired": (
         "the request to open the pull request expired before anyone approved it."
     ),
-    "publication_failed": "the pull request could not be opened.",
+    "publication_failed": (
+        "publishing the pull request failed. A branch or pull request from this run may still "
+        "exist; check the repository before retrying."
+    ),
     "publication_unrecorded": (
         "the agent tried to publish its change, but no valid publication was recorded. "
         "The Details line below gives the reason; the pull request, if any, is unchanged."
@@ -181,17 +184,16 @@ _CAUSE_TEXT = {
     ),
 }
 
-# Infrastructure and CI causes carry details, not a provider message.
-_DETAIL_CAUSES = frozenset(
+# The detail of these causes is text returned by the model service; every other
+# cause that prints a detail labels it "Details".
+_PROVIDER_MESSAGE_CAUSES = frozenset(
     {
-        "sandbox_terminated",
-        "ci_failed",
-        "ci_timeout",
-        "ci_unverified",
-        "merge_conflict",
-        "pr_closed",
-        "approval_create_failed",
-        "publication_unrecorded",
+        "model_credit_exhausted",
+        "model_usage_limited",
+        "model_credential_rejected",
+        "model_rate_limited",
+        "model_error",
+        "model_unreachable",
     }
 )
 # A run that ended without publishing carries the agent's own last message
@@ -498,7 +500,7 @@ def result_section(
             and detail is not None
             and detail.strip()
         ):
-            label = "Details" if cause in _DETAIL_CAUSES else "Provider message"
+            label = "Provider message" if cause in _PROVIDER_MESSAGE_CAUSES else "Details"
             text += f"{label}: {detail.strip()}\n"
         text += f"Cause: {cause}\n"
         if cause == "pull_request_not_adopted" and isinstance(pr_url, str) and pr_url.strip():
@@ -524,9 +526,10 @@ def _agent_message_block(message: str) -> str:
 
     Normalize CRLF and lone CR to LF before quoting every line, so the message
     cannot spoof a top-level ``Cause:`` line. Escape ``&`` before breaking HTML
-    comment openers for the raw marker scan, escaping ``<`` and ``![``, and
-    inserting U+200B after every ``@``. This neutralizes HTML, images and
-    literal or entity-encoded mentions. A blank line separates the quote from
+    comment openers for the raw marker scan. Double backslashes before escaping
+    ``[`` and ``://``; code retains these escapes. Escape ``<`` and
+    insert U+200B after every ``@`` to neutralize HTML and literal or
+    entity-encoded mentions. A blank line separates the quote from
     Curie's following lines.
     """
 
@@ -534,7 +537,13 @@ def _agent_message_block(message: str) -> str:
     message = redact_factory_comment(message)
     message = message.replace("&", "&amp;")
     message = _break_html_comments(message)
-    message = message.replace("<", "&lt;").replace("![", "!\\[").replace("@", "@\u200b")
+    message = (
+        message.replace("\\", "\\\\")
+        .replace("<", "&lt;")
+        .replace("[", "\\[")
+        .replace("://", "\\://")
+        .replace("@", "@\u200b")
+    )
     quoted = "\n".join(f"> {line}" if line else ">" for line in message.split("\n"))
     return f"Agent's last message:\n{quoted}\n\n"
 

@@ -360,7 +360,7 @@ spec:
             - name: FACTORY_INTAKE
               value: {{ get (.Values.factory | default dict) "intake" | default "poll" | quote }}
             - name: FACTORY_CI_WAIT_S
-              value: {{ include "curie.factory.str" (get (.Values.factory | default dict) "ciWaitSeconds" | default 1200) | quote }}
+              value: {{ include "curie.factory.str" (get (.Values.factory | default dict) "ciWaitSeconds" | default 3600) | quote }}
             - name: CURIE_FORGES
               value: {{ include "curie.factory.forgesJson" . | quote }}
             - name: GITHUB_API_URL
@@ -504,7 +504,7 @@ spec:
               port: 8000
             {{- toYaml .Values.api.livenessProbe | nindent 12 }}
           resources:
-            {{- toYaml .Values.api.resources | nindent 12 }}
+            {{- include "curie.api.resources" . | nindent 12 }}
           {{- $codeHostTrust := include "curie.codeHostTrust.name" . }}
           {{- $forgeCredentials := include "curie.factory.hasCredentials" . }}
           {{- if or $codeHostTrust $forgeCredentials }}

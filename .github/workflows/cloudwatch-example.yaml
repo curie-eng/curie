@@ -33,7 +33,7 @@ permissions:
 jobs:
   cloudwatch:
     name: CloudWatch reader and optional rules
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
         with:

@@ -36,8 +36,8 @@ def test_candidate_requires_deploy_notices_after_ledger_schema(resource: str) ->
     )
     # The next-only migrations follow the immutable published 0.12.2 chain.
     # The minimum tracks the newest schema the app reads (#2911's tenant scope);
-    # Attachment cleanup reads the catalog (0130), including with lazy mode off.
-    assert window == {"schema_min": "0130", "schema_head": "0130"}
+    # The join requires both start diagnostics (0123) and attachment catalogs (0130).
+    assert window == {"schema_min": "0131", "schema_head": "0131"}
 
 
 @pytest.mark.parametrize("field", ["cargo", "chart", "app"])
@@ -49,7 +49,7 @@ def test_current_release_fields_match_cli_version(field: str) -> None:
     else:
         chart = yaml.safe_load((ROOT / "charts/curie/Chart.yaml").read_text())
         value = chart["version" if field == "chart" else "appVersion"]
-    assert value == "0.14.0"
+    assert value == "0.14.1"
     assert value in catalog()["windows"]
 
 
@@ -64,7 +64,8 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     assert data["windows"].get("0.13.1") == {"schema_min": "0108", "schema_head": "0108"}
     assert data["windows"].get("0.13.2") == {"schema_min": "0108", "schema_head": "0108"}
     assert data["windows"].get("0.14.0") == {"schema_min": "0122", "schema_head": "0122"}
-    assert data["revisions"][-16:] == [
+    assert data["windows"].get("0.14.1") == {"schema_min": "0123", "schema_head": "0123"}
+    assert data["revisions"][-18:] == [
         "0095",
         "0096",
         "0097",
@@ -80,7 +81,9 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
         "0120",
         "0121",
         "0122",
+        "0123",
         "0130",
+        "0131",
     ]
     kinds = json.loads((ROOT / "apps/api/src/curie_api/revision_kinds.json").read_text())
     assert kinds["0102"] == "expand"
@@ -93,6 +96,8 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     assert kinds["0121"] == "expand"
     assert kinds["0122"] == "expand"
     assert kinds["0130"] == "expand"
+    assert kinds["0123"] == "expand"
+    assert kinds["0131"] == "expand"
 
 
 def test_every_prior_registered_window_is_exactly_preserved() -> None:
@@ -107,7 +112,7 @@ def test_every_prior_registered_window_is_exactly_preserved() -> None:
     assert actual["0.12.1"] == {"schema_min": "0076", "schema_head": "0076"}
     assert set(actual) - set(expected) <= {
         "0.12.1", "0.12.2", "0.12.3", "0.12.4", "0.12.5", "0.13.0", "0.13.1", "0.13.2",
-        "0.14.0"
+        "0.14.0", "0.14.1"
     }
 
 
@@ -149,7 +154,7 @@ def test_released_0076_startup_refuses_without_migrating_then_0101_starts(
         get_settings.cache_clear()
 
 
-@pytest.mark.parametrize("source", ["0105", "0107", "0106"])
+@pytest.mark.parametrize("source", ["0105", "0107", "0106", "0123", "0130"])
 def test_both_train_heads_upgrade_without_losing_existing_rows(
     source: str, isolated_migration_db: IsolatedMigrationDb
 ) -> None:
@@ -167,7 +172,7 @@ def test_both_train_heads_upgrade_without_losing_existing_rows(
 
     command.upgrade(alembic_config(), "head")
 
-    assert current_revision() == "0130"
+    assert current_revision() == "0131"
     assert sql_dicts("SELECT name FROM curie.agents WHERE id = :id", {"id": agent_id}) == [
         {"name": "acme-retained"}
     ]
@@ -181,3 +186,4 @@ def test_both_train_heads_upgrade_without_losing_existing_rows(
     assert {("approvals", "reply_identity"), ("publications", "reply_identity")} <= columns
     assert {("agent_channels", "trigger_label"), ("work_items", "trigger_label")} <= columns
     assert {("attachment_catalogs", "id"), ("attachment_references", "id")} <= columns
+    assert ("execution_requests", "last_start_failure_detail") in columns

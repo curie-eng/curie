@@ -850,7 +850,13 @@ DEFAULT_RUNNER_IMAGE = "ghcr.io/curie-eng/curie-runner"
 CHART_NAME = "curie"
 # The per-agent maps `curie.agentSandboxPoolAgents` unions; `poolAgents` is a
 # list and handled beside them.
-POOL_AGENT_MAPS = ("connectorSecrets", "registryEgress", "runnerImages", "workspaceSizeLimits")
+POOL_AGENT_MAPS = (
+    "connectorSecrets",
+    "registryEgress",
+    "runnerImages",
+    "workspaceSizeLimits",
+    "agentResourceProfiles",
+)
 
 
 def chart_values():

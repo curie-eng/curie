@@ -5045,6 +5045,17 @@
             "minLength": 1,
             "title": "Reason",
             "type": "string"
+          },
+          "start_failure_detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Start Failure Detail"
           }
         },
         "required": [
@@ -9165,6 +9176,12 @@
       "PublicationBranchHeadOut": {
         "description": "The head of a publication's branch; ``None`` when the branch does not exist.",
         "properties": {
+          "base_branch": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Base Branch",
+            "type": "string"
+          },
           "head_sha": {
             "anyOf": [
               {
@@ -9178,7 +9195,8 @@
           }
         },
         "required": [
-          "head_sha"
+          "head_sha",
+          "base_branch"
         ],
         "title": "PublicationBranchHeadOut",
         "type": "object"
@@ -9589,6 +9607,7 @@
         "type": "object"
       },
       "PublicationLineageAdvance": {
+        "additionalProperties": false,
         "description": "Exact compare-and-set facts for one publication revision outcome.",
         "properties": {
           "expected_head_sha": {
@@ -10144,8 +10163,12 @@
         "type": "object"
       },
       "PublicationPullRecover": {
-        "description": "Adopt the publication branch's pull request, or open it when the branch\nholds exactly ``expected_head_sha``.",
+        "description": "Adopt the publication branch's pull request.\n\nWhen ``adopt_only`` is false, open one if the branch holds exactly\n``expected_head_sha``.",
         "properties": {
+          "adopt_only": {
+            "title": "Adopt Only",
+            "type": "boolean"
+          },
           "expected_head_sha": {
             "pattern": "^[0-9a-f]{40,64}$",
             "title": "Expected Head Sha",
@@ -10153,7 +10176,8 @@
           }
         },
         "required": [
-          "expected_head_sha"
+          "expected_head_sha",
+          "adopt_only"
         ],
         "title": "PublicationPullRecover",
         "type": "object"
@@ -10213,12 +10237,19 @@
       "PublicationRevisionOut": {
         "properties": {
           "commit_sha": {
+            "pattern": "^[0-9a-f]{40,64}$",
             "title": "Commit Sha",
+            "type": "string"
+          },
+          "parent_sha": {
+            "pattern": "^[0-9a-f]{40,64}$",
+            "title": "Parent Sha",
             "type": "string"
           }
         },
         "required": [
-          "commit_sha"
+          "commit_sha",
+          "parent_sha"
         ],
         "title": "PublicationRevisionOut",
         "type": "object"
@@ -14298,6 +14329,17 @@
             ],
             "title": "Last Deferral Reason"
           },
+          "last_start_failure_detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Start Failure Detail"
+          },
           "sequence": {
             "title": "Sequence",
             "type": "integer"
@@ -14376,7 +14418,8 @@
           "terminal_cause",
           "termination_observation",
           "capacity_deferrals",
-          "last_deferral_reason"
+          "last_deferral_reason",
+          "last_start_failure_detail"
         ],
         "title": "WorkItemRequestOut",
         "type": "object"
@@ -28597,7 +28640,7 @@
         ]
       },
       "post": {
-        "description": "Adopt the branch's pull request, or open it when the branch exists.\n\nThe contract is the stored publication's title, body and draft flag, the\nlineage branch, and the admitted WorkItem's base or else the repository's\ndefault branch (`curie_api.publication_pulls.adopt_or_open`).",
+        "description": "Adopt the branch's pull request, or open one unless ``adopt_only`` is true.\n\nThe contract is the stored publication's title, body and draft flag, the\nlineage branch, and the admitted WorkItem's base or else the repository's\ndefault branch (`curie_api.publication_pulls.adopt_or_open`).\n\nAn absent branch, or no pull request in adoption-only mode, returns 204.",
         "operationId": "recover_publication_pull_request_v1_internal_publications__publication_id__pull_request_post",
         "parameters": [
           {
@@ -28649,7 +28692,7 @@
             "description": "Successful Response"
           },
           "204": {
-            "description": "The publication branch does not exist"
+            "description": "Publication branch absent, or no pull request in adoption-only mode"
           },
           "422": {
             "content": {
@@ -28730,7 +28773,7 @@
     },
     "/v1/internal/publications/{publication_id}/revision-commit": {
       "post": {
-        "description": "Prove a remote commit is this revision's marked commit on its expected parent.",
+        "description": "Prove the marked revision and its authoritative publication parent.",
         "operationId": "verify_publication_revision_v1_internal_publications__publication_id__revision_commit_post",
         "parameters": [
           {

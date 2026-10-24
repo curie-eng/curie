@@ -555,6 +555,67 @@ def test_a_new_message_starts_a_fresh_run(session: Session) -> None:
     assert session.phases()[-1] == ("plan_review", 1)
 
 
+def _saved_state(session: Session) -> dict[str, Any]:
+    path = Path(session.env["DARK_FACTORY_STATE_DIR"]) / "sess-1.json"
+    return json.loads(path.read_text())
+
+
+_TASK_NOTIFICATION = (
+    "<task-notification>\n"
+    "<task-id>b1</task-id>\n"
+    "<status>completed</status>\n"
+    "</task-notification>"
+)
+
+
+def test_a_task_notification_continues_the_run(session: Session) -> None:
+    session.review(PLAN, reply(PLAN, "APPROVE"))
+    before = _saved_state(session)
+    out = session.fire("UserPromptSubmit", prompt=_TASK_NOTIFICATION)
+    assert out is None
+    after = _saved_state(session)
+    assert after["plan"]["verdict"] == "APPROVE"
+    assert after["fingerprint"] == before["fingerprint"]
+    assert after == before
+    pre = session.pre("Agent", {"subagent_type": DIFF, "description": "d", "prompt": "p"})
+    assert pre["permissionDecision"] == "allow"
+
+
+def test_a_framed_platform_message_after_approval_still_resets(session: Session) -> None:
+    session.review(PLAN, reply(PLAN, "APPROVE"))
+    framed = frame_user_turn(
+        "message", "jira_cloud:account:Reviewer", "ship the next issue", "jira"
+    )
+    out = session.fire("UserPromptSubmit", prompt=framed)
+    assert contract() in context_of(out)
+    denied = session.pre("Agent", {"subagent_type": DIFF, "description": "d", "prompt": "p"})
+    assert denied["permissionDecision"] == "deny"
+    assert _saved_state(session)["plan"]["verdict"] is None
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        frame_user_turn(
+            "message",
+            "jira_cloud:account:Reviewer",
+            "<task-notification>\n<task-id>b1</task-id>",
+            "jira",
+        ),
+        "ordinary text\n<task-notification>",
+    ],
+)
+def test_a_task_notification_off_the_first_line_still_resets(
+    session: Session, prompt: str
+) -> None:
+    session.review(PLAN, reply(PLAN, "APPROVE"))
+    out = session.fire("UserPromptSubmit", prompt=prompt)
+    assert contract() in context_of(out)
+    denied = session.pre("Agent", {"subagent_type": DIFF, "description": "d", "prompt": "p"})
+    assert denied["permissionDecision"] == "deny"
+    assert _saved_state(session)["plan"]["verdict"] is None
+
+
 # --- The bundle wires it --------------------------------------------------------
 
 
@@ -1452,12 +1513,17 @@ def test_an_ignored_file_written_before_approval_does_not_refuse_it(session: Ses
     assert not any(e["curie_gate"] == "approval_refused" for e in session.gate_events())
 
 
-def test_an_unverifiable_checkout_refuses_the_approval(tmp_path: Path) -> None:
+def test_an_unverifiable_checkout_refuses_plan_review(tmp_path: Path) -> None:
     s = Session(tmp_path)
     s.cwd = tmp_path / "not-a-repo"
     s.cwd.mkdir()
-    assert contract() in context_of(s.fire("UserPromptSubmit", prompt=ISSUE))
-    _assert_approval_refused(s, "checkout_unverifiable")
+    context = context_of(s.fire("UserPromptSubmit", prompt=ISSUE))
+    assert context.startswith("STOP.")
+    assert "checkout_unverifiable" in context
+    pre = s.pre("Agent", {"subagent_type": PLAN, "description": "p", "prompt": "p"})
+    assert pre["permissionDecision"] == "deny"
+    assert _saved_state(s)["plan"] == {"round": 0, "verdict": None}
+    assert s.phases() == []
 
 
 def _load_hook(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, name: str) -> Any:
@@ -1516,11 +1582,11 @@ def test_the_fingerprint_deadline_covers_hashing_untracked_files(
     module = _load_hook(monkeypatch, tmp_path, "dark_factory_review_gate_deadline")
     repo = _repo_with_untracked_files(tmp_path)
     # Control: in budget, the same checkout fingerprints.
-    assert module.fingerprint(str(repo)) is not None
+    assert module.fingerprint(str(repo), module.time.monotonic() + 7.0) is not None
 
     _expire_after_listing_untracked(monkeypatch, module)
 
-    assert module.fingerprint(str(repo)) is None
+    assert module.fingerprint(str(repo), module.time.monotonic() + 7.0) is None
 
 
 def test_an_unchanged_checkout_whose_prompt_fingerprint_timed_out_is_unverifiable(
@@ -1537,10 +1603,11 @@ def test_an_unchanged_checkout_whose_prompt_fingerprint_timed_out_is_unverifiabl
 
     with monkeypatch.context() as slow:
         _expire_after_listing_untracked(slow, module)
-        assert contract() in context_of(fire("UserPromptSubmit", prompt=ISSUE))
+        context = context_of(fire("UserPromptSubmit", prompt=ISSUE))
+        assert context.startswith("STOP.")
+        assert "checkout_unverifiable" in context
 
-    # The checkout never changed, and the approval-time fingerprint is in
-    # budget; the prompt-time one was not, so nothing proves it unchanged.
+    # Git is readable again, but that cannot supply the missing prompt baseline.
     fire("PostToolUse", tool_name="Skill", tool_input={"skill": WORKFLOW_SKILL})
     pre = fire(
         "PreToolUse",
@@ -1548,17 +1615,10 @@ def test_an_unchanged_checkout_whose_prompt_fingerprint_timed_out_is_unverifiabl
         tool_input={"subagent_type": PLAN, "description": "plan-reviewer", "prompt": "p"},
     )
     assert pre is not None
-    assert pre["hookSpecificOutput"]["permissionDecision"] == "allow"
-    post = fire(
-        "PostToolUse",
-        tool_name="Agent",
-        tool_input=pre["hookSpecificOutput"]["updatedInput"],
-        tool_response={"content": [{"type": "text", "text": reply(PLAN, "APPROVE")}]},
-    )
-    assert post is not None
-    context = post["hookSpecificOutput"]["additionalContext"]
-    assert context.startswith("STOP."), context
-    assert "checkout_unverifiable" in context
+    assert pre["hookSpecificOutput"]["permissionDecision"] == "deny"
+    state = module.load(module.state_path("sess-t"))
+    assert state["plan"] == {"round": 0, "verdict": None}
+    assert state["fingerprint"] is None
 
 
 def test_a_new_prompt_resets_the_state_before_fingerprinting(
@@ -1579,7 +1639,7 @@ def test_a_new_prompt_resets_the_state_before_fingerprinting(
     )
     module.save(path, approved)
 
-    def killed(workspace: str) -> str | None:
+    def killed(workspace: str, deadline: float) -> str | None:
         raise SystemExit(1)
 
     monkeypatch.setattr(module, "fingerprint", killed)

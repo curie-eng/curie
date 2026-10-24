@@ -801,7 +801,7 @@ async def test_before_open_runs_once_right_before_a_new_pull_request_opens() -> 
     check = _Check(code_host, repository)
 
     opened = await adopt_or_open(
-        code_host, repository, contract, expected_head_sha=head, before_open=check
+        code_host, repository, contract, expected_head_sha=head, adopt_only=False, before_open=check
     )
 
     assert opened is not None and opened.head_ref == BRANCH
@@ -819,7 +819,7 @@ async def test_before_open_is_never_asked_when_the_branch_already_has_its_pull_r
     check.refuse = True
 
     adopted = await adopt_or_open(
-        code_host, repository, contract, expected_head_sha=head, before_open=check
+        code_host, repository, contract, expected_head_sha=head, adopt_only=False, before_open=check
     )
 
     assert adopted is not None and adopted.ref == existing.ref
@@ -840,14 +840,24 @@ async def test_before_open_is_never_asked_for_a_missing_or_moved_branch() -> Non
 
     assert (
         await adopt_or_open(
-            code_host, repository, missing, expected_head_sha=head, before_open=check
+            code_host,
+            repository,
+            missing,
+            expected_head_sha=head,
+            adopt_only=False,
+            before_open=check,
         )
         is None
     )
     code_host.push(repository, BRANCH, "someone else's commit")
     with pytest.raises(PullRequestRefused) as moved:
         await adopt_or_open(
-            code_host, repository, contract, expected_head_sha=head, before_open=check
+            code_host,
+            repository,
+            contract,
+            expected_head_sha=head,
+            adopt_only=False,
+            before_open=check,
         )
 
     assert moved.value.code == "branch_moved"
@@ -863,7 +873,12 @@ async def test_a_refusing_before_open_opens_nothing() -> None:
 
     with pytest.raises(PullRequestRefused) as refused:
         await adopt_or_open(
-            code_host, repository, contract, expected_head_sha=head, before_open=check
+            code_host,
+            repository,
+            contract,
+            expected_head_sha=head,
+            adopt_only=False,
+            before_open=check,
         )
 
     assert refused.value.code == "publication_exists"
@@ -876,6 +891,8 @@ async def test_a_refusing_before_open_opens_nothing() -> None:
 async def test_before_open_is_a_required_keyword() -> None:
     code_host, repository, head, contract = _publishing()
 
-    with pytest.raises(TypeError):
-        await adopt_or_open(code_host, repository, contract, expected_head_sha=head)  # type: ignore[call-arg]
+    with pytest.raises(TypeError, match="before_open"):
+        await adopt_or_open(  # type: ignore[call-arg]
+            code_host, repository, contract, expected_head_sha=head, adopt_only=False
+        )
     assert await code_host.find_pull_request(repository, head_ref=BRANCH) is None

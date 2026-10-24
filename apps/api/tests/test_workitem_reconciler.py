@@ -1474,6 +1474,7 @@ def test_start_failed_request_gets_no_execute_wake_while_a_waiting_sibling_does(
             generation=generation,
             reason=reason,
             capacity=capacity,
+            start_failure_detail=None,
         )
         assert getattr(deferred, "code", None) is None, deferred
 

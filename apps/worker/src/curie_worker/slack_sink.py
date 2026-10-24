@@ -685,12 +685,19 @@ class SlackReplyAdapter:
         for index, part in enumerate(parts):
             payload = (part.text, blocks if len(parts) == 1 else None)
             if verbatim:
+                # A plain_text section shows line breaks as spaces in the client;
+                # preformatted rich text shows every character and line break.
                 payload = (
                     part.content,
                     [
                         {
-                            "type": "section",
-                            "text": {"type": "plain_text", "text": part.content, "emoji": False},
+                            "type": "rich_text",
+                            "elements": [
+                                {
+                                    "type": "rich_text_preformatted",
+                                    "elements": [{"type": "text", "text": part.content}],
+                                }
+                            ],
                         }
                     ],
                 )

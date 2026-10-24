@@ -339,6 +339,7 @@ CHART_RUNTIME_SCRIPTS = [
     "charts/curie/ci/runtime/connector-readiness-runtime.sh",
     "charts/curie/ci/runtime/workspace-dependency-diagnostic-runtime.sh",
     "charts/curie/ci/runtime/idle-capacity-reclamation-runtime.sh",
+    "charts/curie/ci/runtime/factory-resource-profile-runtime.sh",
 ]
 
 

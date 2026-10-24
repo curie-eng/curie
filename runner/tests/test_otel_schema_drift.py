@@ -170,6 +170,13 @@ _PHASE_V1_ADDITIONS = {
     "curie.usage.scope": "str",
 }
 
+# #4940: the closed failure classification and the budget halt's ceiling on a
+# classified-failure root.
+_FAILURE_V1_ADDITIONS = {
+    "curie.terminal.classification": "str",
+    "curie.budget.output_ceiling": "int",
+}
+
 
 def _committed_schema() -> dict:
     return json.loads(_SCHEMA_PATH.read_text())
@@ -216,7 +223,8 @@ def test_phase_keys_are_an_additive_typed_v1_extension() -> None:
     assert {
         key: committed_keys.get(key) for key in _PHASE_V1_ADDITIONS
     } == _PHASE_V1_ADDITIONS
-    assert committed_keys == _ADR_0076_V1_KEYS | _PHASE_V1_ADDITIONS
+    assert {key: committed_keys.get(key) for key in _FAILURE_V1_ADDITIONS} == _FAILURE_V1_ADDITIONS
+    assert committed_keys == (_ADR_0076_V1_KEYS | _PHASE_V1_ADDITIONS | _FAILURE_V1_ADDITIONS)
     assert set(committed_keys.values()) == {"str", "int"}
 
 
@@ -410,7 +418,57 @@ def test_every_declared_key_emits_its_committed_value_type() -> None:
 
     anyio.run(go_result_only)
 
-    for finished in [*exporter.get_finished_spans(), *result_exporter.get_finished_spans()]:
+    # #4940: a budget halt stamps the failure classification and the output
+    # ceiling on the root. Its own provider, for the same reason as above.
+    budget_exporter = InMemorySpanExporter()
+    budget_provider = TracerProvider()
+    budget_provider.add_span_processor(SimpleSpanProcessor(budget_exporter))
+    budget_halt = SessionRunner(
+        max_usd_per_day=None,
+        held_secrets=frozenset(),
+        session_factory=lambda: FakeModelSession(
+            script_factory=lambda: [
+                AssistantMessage(
+                    content=[TextBlock(text="working")],
+                    model="fake-model",
+                    usage={"input_tokens": 1, "output_tokens": 9},
+                ),
+                ResultMessage(
+                    subtype="success",
+                    duration_ms=1,
+                    duration_api_ms=1,
+                    is_error=False,
+                    num_turns=1,
+                    session_id="sdk-session",
+                    result="done",
+                    usage={"input_tokens": 1, "output_tokens": 9},
+                ),
+            ]
+        ),
+        ceiling=4,
+        tracer=RunTracer(budget_provider),
+        classifier=SideEffectClassifier(),
+        trace_name="curie-run:test",
+        model="fake-model",
+    )
+
+    async def go_budget_halt() -> None:
+        await budget_halt.start()
+        try:
+            async for _ in budget_halt.run_turn(
+                Event(type="message", text="go", user="U0EXAMPLE1", ts="3")
+            ):
+                pass
+        finally:
+            await budget_halt.close()
+
+    anyio.run(go_budget_halt)
+
+    for finished in [
+        *exporter.get_finished_spans(),
+        *result_exporter.get_finished_spans(),
+        *budget_exporter.get_finished_spans(),
+    ]:
         if finished.attributes:
             emitted.update(finished.attributes)
 

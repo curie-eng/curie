@@ -70,6 +70,7 @@ CAPABILITIES: Mapping[Operation, Support] = {
     Operation.CI_DIAGNOSTICS: Support.UNSUPPORTED,
     Operation.RERUN_FAILED: Support.UNSUPPORTED,
     Operation.USER_CAN_WRITE: Support.UNSUPPORTED,
+    Operation.REQUIRED_CHECKS: Support.UNSUPPORTED,
 }
 # A feedback listing re-reads this far behind its cursor and drops what it
 # already returned, so a comment stamped late is still listed once (decision 10.5).
@@ -627,6 +628,10 @@ class BitbucketDcCodeHost:
                 continue
             checks.append(_build_check(key, build, head_sha))
         return CiRollup.on_head(head_sha, tuple(checks))
+
+    async def required_checks(self, repository: RepositoryRef, branch: str) -> frozenset[str]:
+        await self.ensure_version(Operation.REQUIRED_CHECKS)
+        raise Unsupported(Operation.REQUIRED_CHECKS)
 
     async def ci_diagnostics(
         self, repository: RepositoryRef, head_sha: str, *, base_ref: str | None

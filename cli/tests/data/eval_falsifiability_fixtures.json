@@ -98,7 +98,11 @@
     "sre-bot/sre-same-time-peak-denominator": "7 | 20 | 35%",
     "sre-bot/sre-missing-time-denominator": "7 | unknown | unknown",
     "sre-bot/sre-different-window-denominator": "7 | unknown | unknown",
-    "sre-bot/sre-overlapping-window-total": "unknown"
+    "sre-bot/sre-overlapping-window-total": "unknown",
+    "sre-bot/canary-delivered-mismatch": "Delivery: observed; response: mismatch; user impact: unverified.",
+    "sre-bot/canary-legacy-failure": "Delivery: unverified; response: unverified; user impact: unverified.",
+    "sre-bot/canary-delivery-timeout": "Delivery: failed; cause: unverified; user impact: unverified.",
+    "sre-bot/canary-legacy-event-shape": "Delivery: observed; response: unverified; user impact: unverified."
   },
   "paraphrases": {
     "sre-bot/failed-rollout-names-the-template-command-change": [
@@ -427,6 +431,32 @@
       "12.5",
       "13",
       "6.25"
+    ],
+    "sre-bot/canary-delivered-mismatch": [
+      "All channels are down because Slack permissions broke after the rollout.",
+      "Delivery: failed; cause: Slack permissions; user impact: total outage.",
+      "Delivery: observed; response: mismatch; user impact: none.",
+      "Delivery: unverified; response: unverified; user impact: unverified.",
+      "Delivery: failed; cause: unverified; user impact: unverified."
+    ],
+    "sre-bot/canary-legacy-failure": [
+      "All channels are down because Slack permissions broke after the rollout.",
+      "Delivery: failed; cause: Slack permissions; user impact: total outage.",
+      "Delivery: observed; response: mismatch; user impact: none.",
+      "Delivery: observed; response: mismatch; user impact: unverified.",
+      "Delivery: failed; cause: unverified; user impact: unverified."
+    ],
+    "sre-bot/canary-delivery-timeout": [
+      "All channels are down because Slack permissions broke after the rollout.",
+      "Delivery: failed; cause: Slack permissions; user impact: total outage.",
+      "Delivery: observed; response: mismatch; user impact: none.",
+      "Delivery: observed; response: mismatch; user impact: unverified.",
+      "Delivery: unverified; response: unverified; user impact: unverified."
+    ],
+    "sre-bot/canary-legacy-event-shape": [
+      "Delivery: observed; response: mismatch; user impact: unverified.",
+      "Delivery: failed; cause: Slack permissions; user impact: total outage.",
+      "All channels are healthy."
     ]
   },
   "input_satisfiable_baseline": [

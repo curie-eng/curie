@@ -1079,6 +1079,30 @@ class BindingResolver:
             value = json.loads(value)
         return value if isinstance(value, dict) else None
 
+    async def eval_connector_settings_for(
+        self, agent_id: uuid.UUID
+    ) -> tuple[str, list[str]] | None:
+        """Read the eval caller identity and operator gates in one tenant-scoped snapshot."""
+        sql = text(
+            f"SELECT name, approval_required_tools FROM {self._config.db_schema}.agents "
+            "WHERE id = :id AND tenant_id = :tenant_id"
+        )
+        async with self._engine.connect() as conn:
+            result = await conn.execute(sql, {"id": agent_id, "tenant_id": self._tenant_id})
+            row = result.first()
+        if row is None:
+            return None
+        policy = row[1]
+        if isinstance(policy, str):
+            policy = json.loads(policy)
+        if policy is None:
+            policy = []
+        if not isinstance(policy, list) or any(
+            not isinstance(tool, str) or not tool.strip() or "," in tool for tool in policy
+        ):
+            raise ValueError("invalid stored approval policy for eval")
+        return row[0], policy
+
     async def name_for(self, agent_id: uuid.UUID) -> str | None:
         """The agent's NAME for eval pool routing (#1488). None if unknown."""
         sql = text(

@@ -324,7 +324,7 @@ class Settings(BaseSettings):
     # push (#3162). The execution deadline still caps it; at most 10800 s, the
     # longest execution deadline (ADR 0171).
     factory_ci_wait_s: int = Field(
-        default=1200,
+        default=3600,
         gt=0,
         le=10800,
         validation_alias="FACTORY_CI_WAIT_S",

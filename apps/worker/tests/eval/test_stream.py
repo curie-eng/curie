@@ -336,6 +336,12 @@ class _StubRepo:
     async def name_for(self, _agent_id: uuid.UUID) -> str | None:
         return None
 
+    async def eval_connector_settings_for(
+        self, agent_id: uuid.UUID
+    ) -> tuple[str, list[str]] | None:
+        name = await self.name_for(agent_id)
+        return (name, []) if name is not None else None
+
     async def model_settings_for(
         self, agent_id: uuid.UUID
     ) -> tuple[str | None, str | None, str | None, dict[str, object] | None]:
@@ -2193,11 +2199,22 @@ def test_eval_boot_env_drops_reserved_connector_secret() -> None:
     assert env.get("CURIE_CONNECTOR_SECRET_KEYS") == "GITHUB_PERSONAL_ACCESS_TOKEN"
 
 
-def test_eval_claim_with_connector_secrets_targets_the_per_agent_pool(monkeypatch) -> None:
+@pytest.mark.parametrize("configured_scope", [True, False])
+@pytest.mark.parametrize("signed_caller", [True, False])
+def test_eval_claim_with_connector_secrets_targets_the_per_agent_pool(
+    monkeypatch, configured_scope: bool, signed_caller: bool
+) -> None:
     """Eval is the sibling of the runs claim path (#1488): secrets + agent name
     must route the claim to the per-agent pool, not the generic one."""
+    import base64
+
+    from aci_protocol import BootEnv
+    from curie_connector_proxy import caller
     from curie_worker.eval import stream as stream_module
     from curie_worker.sandbox.types import AGENT_LABEL
+    from nacl.signing import SigningKey
+
+    signing = SigningKey.generate()
 
     class _NamedSecrets(_StubRepo):
         async def secrets_for(self, _agent_id: uuid.UUID) -> dict[str, str] | None:
@@ -2205,6 +2222,9 @@ def test_eval_claim_with_connector_secrets_targets_the_per_agent_pool(monkeypatc
 
         async def name_for(self, _agent_id: uuid.UUID) -> str | None:
             return "acme-a"
+
+        async def eval_connector_settings_for(self, _agent_id: uuid.UUID) -> tuple[str, list[str]]:
+            return "acme-a", ["mcp__acme__change"]
 
     async def _skip_suite(*_args: object, **_kwargs: object) -> EvalRunResult:
         return EvalRunResult(version="deadbeef", suite="s", results=[])
@@ -2244,7 +2264,14 @@ def test_eval_claim_with_connector_secrets_targets_the_per_agent_pool(monkeypatc
         ),
     )
     consumer = _consumer(
-        WorkerConfig(fake_model=True),
+        WorkerConfig(
+            fake_model=True,
+            connector_release="acme" if configured_scope else "",
+            connector_namespace="acme-system",
+            connector_caller_signing_key=(
+                base64.b64encode(bytes(signing)).decode() if signed_caller else ""
+            ),
+        ),
         bundle_store=_FakeBundleStore(
             _suite_bundle(
                 EvalSuite(
@@ -2269,6 +2296,54 @@ def test_eval_claim_with_connector_secrets_targets_the_per_agent_pool(monkeypatc
     asyncio.run(go())
     assert fake_k8s.created_pools == ["curie-agent-acme-a-runner-pool"]
     assert fake_k8s.created_labels[-1][AGENT_LABEL] == "acme-a"
+
+    # The K8s envVarsInjectionPolicy supplies this substrate-owned identity,
+    # not the worker's claim env (BootEnv.render_worker deliberately omits it).
+    boot = BootEnv.from_env({**fake_k8s.claim_envs[-1], "CURIE_SANDBOX_ID": "eval-test-sandbox"})
+    assert boot.connector_agent == ("acme-a" if configured_scope else None)
+    assert boot.connector_release == ("acme" if configured_scope else None)
+    assert boot.connector_namespace == ("acme-system" if configured_scope else None)
+    assert boot.session.memory_ref is None and boot.history_ref is None
+    from curie_runner.approval import build_approval_gate
+
+    gate = build_approval_gate(
+        operator_tools=boot.approval_required_tools,
+        policy_routes={},
+        connector_servers={"acme"},
+        mcp_servers=set(),
+        bundle_name="acme-bot",
+    )
+    assert gate is not None and gate.requires_approval("mcp__acme__change")
+    assert boot.approval_grant_tool is None and boot.approval_grant_arguments is None
+    if signed_caller and configured_scope:
+        decision = caller.decide(
+            [signing.verify_key],
+            boot.connector_caller_token,
+            admits=frozenset({"acme-a"}),
+            now=int(time.time()),
+        )
+        assert decision.admitted and decision.agent == "acme-a"
+        assert (
+            caller.decide(
+                [signing.verify_key],
+                boot.connector_caller_token,
+                admits=frozenset({"acme-other"}),
+                now=int(time.time()),
+            ).refusal
+            == caller.NOT_ADMITTED
+        )
+        assert (
+            caller.decide(
+                [SigningKey.generate().verify_key],
+                boot.connector_caller_token,
+                admits=frozenset({"acme-a"}),
+                now=int(time.time()),
+            ).refusal
+            == caller.INVALID
+        )
+        assert decision.run is None and decision.work_item is None
+    else:
+        assert boot.connector_caller_token is None
 
 
 @dataclass
@@ -2303,7 +2378,9 @@ class _DelayedDeleteK8s(_FakeK8s):
                 return None
         return super().get_claim(name, request_timeout_seconds=request_timeout_seconds)
 
-    def get_sandbox(self, name: str, *, request_timeout_seconds: float) -> SandboxView | None:
+    def get_sandbox(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> SandboxView | None:
         if name in self.sandbox_gets:
             self.sandbox_gets[name] += 1
             if self.sandbox_gets[name] >= self.sandbox_gone_after_gets:

@@ -617,7 +617,7 @@ def test_persistently_null_pull_mergeability_ends_unverified_at_the_deadline(
     assert _terminal(number) == ("running", None)
     _assert_no_final_result(sink)
 
-    _reconcile_later(1210)
+    _reconcile_later(3610)
 
     assert _terminal(number) == ("failed", "ci_unverified")
     body = _body(sink, published["id"])
@@ -1034,7 +1034,7 @@ def test_recorded_partial_metadata_rerun_reports_the_stale_failure_at_the_deadli
 
     assert _terminal(number) == ("running", None)
     assert len(_ci_turns(published["id"])) == 1
-    _reconcile_later(1300)
+    _reconcile_later(3700)
     turns = _ci_turns(published["id"])
     assert [turn["event_id"] for turn in turns] == [
         f"work-item-{published['id']}-ci-2", f"work-item-{published['id']}-ci-3",
@@ -1140,7 +1140,7 @@ def test_body_only_fix_waits_for_fresh_checks_then_ends_unverified(
     assert len(_ci_turns(published["id"])) == 1
     assert _terminal_notices(published["id"]) == []
 
-    _reconcile_later(1300)
+    _reconcile_later(3700)
     assert _terminal(number) == ("failed", "ci_unverified")
     assert len(_ci_turns(published["id"])) == 1
     assert "Reason: checks_not_rerun" in _body(sink, published["id"])
@@ -1692,7 +1692,7 @@ def test_pending_forever_times_out_inside_the_ci_wait(admitted: Any) -> None:
     _reconcile_later(600)
     assert _terminal(number) == ("running", None)
 
-    _reconcile_later(1300)
+    _reconcile_later(3700)
 
     assert _terminal(number) == ("failed", "ci_timeout")
     body = _body(sink, published["id"])
@@ -1753,7 +1753,7 @@ def test_transient_errors_until_the_deadline_end_as_ci_timeout(admitted: Any) ->
     _reconcile_later(600)
     assert _terminal(number) == ("running", None)
 
-    _reconcile_later(1300)
+    _reconcile_later(3700)
 
     assert _terminal(number) == ("failed", "ci_timeout")
     assert "github_error" in _body(sink, published["id"])
@@ -2342,7 +2342,7 @@ def test_an_outstanding_rerun_times_out_without_an_implementer_round(
     assert sink.reruns == [job_id]
     assert _ci_turns(request_id) == []
 
-    _reconcile_later(1300)
+    _reconcile_later(3700)
 
     assert _ci_turns(request_id) == []
     assert sink.reruns == [job_id]
@@ -2879,3 +2879,83 @@ def test_a_failure_also_failing_on_the_base_completes_the_request(admitted: Any)
     body = _body(sink, published["id"])
     assert body.startswith(f"Completed: {published['pr_url']}")
     assert "Note: Also failing on the base branch, not caused by this change: pip-audit" in body
+
+
+
+def test_required_checks_missing_is_pending_then_unverified_at_the_deadline(admitted: Any) -> None:
+    client, github, sink = admitted
+    number = 9733
+    sink.ci_script = [ci_green()]
+    sink.rules["main"] = (
+        200,
+        [
+            {
+                "type": "required_status_checks",
+                "parameters": {"required_status_checks": [{"context": "label-gate"}]},
+            }
+        ],
+    )
+    published = _published(client, github, sink, number)
+    _set_base_ref(published["work_item_id"], "main")
+
+    _reconcile()
+
+    assert _terminal(number) == ("running", None)
+    assert _terminal_notices(published["id"]) == []
+
+    _reconcile_later(3700)
+
+    assert _terminal(number) == ("failed", "ci_unverified")
+    body = _body(sink, published["id"])
+    assert body.startswith("Could not complete:")
+    assert "label-gate" in body
+    assert "for example a label" in body
+    assert "Cause: ci_unverified" in body
+    assert "Completed:" not in body
+
+
+def test_required_checks_green_completes_when_the_named_check_passed(admitted: Any) -> None:
+    client, github, sink = admitted
+    number = 9734
+    sink.ci_script = [ci_green()]
+    sink.rules["main"] = (
+        200,
+        [
+            {
+                "type": "required_status_checks",
+                "parameters": {"required_status_checks": [{"context": "build"}]},
+            }
+        ],
+    )
+    published = _published(client, github, sink, number)
+    _set_base_ref(published["work_item_id"], "main")
+
+    _reconcile()
+
+    assert _terminal(number) == ("completed", "completed")
+    assert _body(sink, published["id"]).startswith("Completed:")
+
+
+def test_required_checks_not_found_on_rules_keeps_a_green_completion(admitted: Any) -> None:
+    client, github, sink = admitted
+    number = 9735
+    sink.ci_script = [ci_green()]
+    published = _published(client, github, sink, number)
+    _set_base_ref(published["work_item_id"], "main")
+
+    _reconcile()
+
+    assert _terminal(number) == ("completed", "completed")
+
+
+def test_required_checks_empty_rules_list_keeps_a_green_completion(admitted: Any) -> None:
+    client, github, sink = admitted
+    number = 9736
+    sink.ci_script = [ci_green()]
+    sink.rules["main"] = (200, [])
+    published = _published(client, github, sink, number)
+    _set_base_ref(published["work_item_id"], "main")
+
+    _reconcile()
+
+    assert _terminal(number) == ("completed", "completed")

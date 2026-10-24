@@ -367,7 +367,7 @@ def test_run_settlement_retries_transports_but_not_conflicts(
                 elif operation == "hold_for_approval":
                     await run.hold_for_approval()
                 else:
-                    await run.defer("capacity", capacity=True)
+                    await run.defer("capacity", capacity=True, start_failure_detail=None)
 
             if refused:
                 with pytest.raises(WorkItemConflict) as error:
@@ -510,7 +510,12 @@ def _deferring_run(body: object) -> tuple[str | None, WorkItemRun]:
                 api_base_url="http://api.example", worker_token="example-token", client=http
             )
             cause = await client.defer(
-                REQUEST_ID, owner="worker-1", generation=1, reason="thread_busy", capacity=False
+                REQUEST_ID,
+                owner="worker-1",
+                generation=1,
+                reason="thread_busy",
+                capacity=False,
+                start_failure_detail=None,
             )
             run = WorkItemRun(
                 client=client,
@@ -523,7 +528,9 @@ def _deferring_run(body: object) -> tuple[str | None, WorkItemRun]:
                 on_stop=stop,
                 on_stale=stop,
             )
-            await run.defer("not_started:classified_failure", capacity=False)
+            await run.defer(
+                "not_started:classified_failure", capacity=False, start_failure_detail=None
+            )
             return cause, run
 
     return asyncio.run(go())
@@ -562,9 +569,86 @@ def test_a_deferral_with_an_unusable_terminal_cause_is_a_transport_error(
         _run(
             handler,
             lambda c: c.defer(
-                REQUEST_ID, owner="worker-1", generation=1, reason="thread_busy", capacity=False
+                REQUEST_ID,
+                owner="worker-1",
+                generation=1,
+                reason="thread_busy",
+                capacity=False,
+                start_failure_detail=None,
             ),
         )
+
+
+# --- #4930 the pre-start workspace diagnostic rides the defer ---------------
+
+
+def _captured_defer_body(
+    call,  # type: ignore[no-untyped-def]
+) -> dict[str, object]:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json=_NONTERMINAL_DEFER)
+
+    async def go() -> None:
+        async def stop(_thread: str, _run: WorkItemRun) -> None:
+            raise AssertionError("No heartbeat was started")
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            client = WorkItemDispatchClient(
+                api_base_url="http://api.example", worker_token="example-token", client=http
+            )
+            run = WorkItemRun(
+                client=client,
+                request_id=REQUEST_ID,
+                owner="worker-1",
+                grant=_grant(),
+                wake=WAKE,
+                event_id="event",
+                thread_key="slack:C1:thread",
+                on_stop=stop,
+                on_stale=stop,
+            )
+            await call(run)
+            await run.close()
+
+    asyncio.run(go())
+    defers = [r for r in seen if r.url.path.endswith("/defer")]
+    assert len(defers) == 1, [r.url.path for r in seen]
+    assert defers[0].url.path == f"/v1/internal/work-items/requests/{REQUEST_ID}/defer"
+    return json.loads(defers[0].content)
+
+
+def test_defer_posts_the_start_failure_detail() -> None:
+    detail = "workspace archive-size failed: archive exceeds 1048576 bytes"
+    body = _captured_defer_body(
+        lambda run: run.defer(
+            "not_started:classified_failure", capacity=False, start_failure_detail=detail
+        )
+    )
+    assert body == {
+        "owner": "worker-1",
+        "generation": 1,
+        "reason": "not_started:classified_failure",
+        "capacity": False,
+        "start_failure_detail": detail,
+    }
+
+
+def test_defer_posts_a_null_start_failure_detail() -> None:
+    # Explicit null, never an omitted key: the API reads both as "no
+    # diagnostic", but the wire shape is pinned so a new worker always states it.
+    body = _captured_defer_body(
+        lambda run: run.defer("capacity", capacity=True, start_failure_detail=None)
+    )
+    assert body == {
+        "owner": "worker-1",
+        "generation": 1,
+        "reason": "capacity",
+        "capacity": True,
+        "start_failure_detail": None,
+    }
 
 
 class _AcquireRenewClock:
@@ -695,7 +779,7 @@ def test_acquire_renewal_stops_after_start_defer_or_close_at_thirty_seconds(
                 if operation == "start":
                     await run.start(claim_name="acme-claim", sandbox_name="acme-sandbox")
                 elif operation == "defer":
-                    await run.defer("thread_busy", capacity=False)
+                    await run.defer("thread_busy", capacity=False, start_failure_detail=None)
                 else:
                     await run.close()
                 await clock.advance(40.0)
@@ -896,7 +980,9 @@ def test_defer_stops_renewal_before_its_post_returns_or_raises(
             try:
                 await clock.advance(20.0)
                 await clock.advance(30.0)
-                pending = asyncio.create_task(run.defer("thread_busy", capacity=False))
+                pending = asyncio.create_task(
+                    run.defer("thread_busy", capacity=False, start_failure_detail=None)
+                )
                 await defer_entered.wait()
                 await clock.advance(40.0)
                 assert seen == [(20.0, "acquire"), (30.0, "defer")]

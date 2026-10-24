@@ -3283,7 +3283,7 @@ def test_pod_termination_cause_reaches_terminal_notice(
 ) -> None:
     async def go() -> None:
         async with make_harness(max_attempts=1) as h:
-            h.fake_k8s.termination = SimpleNamespace(reason=reason, detail=detail)
+            h.fake_k8s.termination = SandboxTermination(reason, detail)
             h.runner.default_script = [TextDelta(text="partial")]
             h.runner.abort_after_frames = True
             event = qevent("go")
@@ -3330,9 +3330,7 @@ def test_pod_termination_cause_reaches_factory_finish_detail(make_harness) -> No
         ) as h:
             items = _WorkItems()
             h.kernel._work_items = items
-            h.fake_k8s.termination = SimpleNamespace(
-                reason="Evicted", detail="The node was low on memory."
-            )
+            h.fake_k8s.termination = SandboxTermination("Evicted", "The node was low on memory.")
             h.runner.default_script = [TextDelta(text="partial")]
             h.runner.abort_after_frames = True
             event = _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
@@ -3431,6 +3429,173 @@ def test_deleted_pod_without_side_effect_retries(make_harness) -> None:
     asyncio.run(go())
 
 
+def _factory_drop(h, event_id: str):
+    items = _WorkItems()
+    h.kernel._work_items = items
+    event = _turn(event_id, ISSUE_PROMPT)
+    h.runner.default_script = [SideEffectFlag(tool="deploy"), TextDelta(text="partial")]
+    h.runner.hold = _DropAfterSideEffectPersisted(
+        h.async_redis, h.config.side_effect_key(event.event_id)
+    )
+    return items, event
+
+
+def test_late_oomkilled_after_side_effect_finishes_sandbox_terminated(make_harness) -> None:
+    async def go() -> None:
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=_PublicationApi(),
+            max_attempts=1,
+            pod_termination_wait_s=10.0,
+        ) as h:
+            items, event = _factory_drop(h, f"work-item-{uuid.uuid4()}-execute-8")
+            first: dict[str, float | None] = {"at": None}
+            returned: list[object] = []
+
+            def diagnose(name: str, *, request_timeout_seconds: float, since: datetime):
+                assert request_timeout_seconds > 0
+                assert since.tzinfo is not None
+                h.fake_k8s.termination_queries.append(name)
+                now = time.monotonic()
+                if first["at"] is None:
+                    first["at"] = now
+                if now - first["at"] >= 1.2:
+                    found = SandboxTermination("OOMKilled", "exit code 137")
+                else:
+                    found = None
+                returned.append(found)
+                return found
+
+            h.fake_k8s.pod_termination = diagnose
+            await h.kernel.process_event(event)
+
+            assert h.runner.opened == [ISSUE_PROMPT]
+            assert len(items.finishes) == 1
+            finish = items.finishes[0]
+            assert finish["outcome"] == "failed"
+            assert finish["cause"] == "sandbox_terminated"
+            detail = finish["detail"]
+            assert isinstance(detail, str)
+            assert "Kubernetes pod terminated: OOMKilled (exit code 137)." in detail
+            assert "The runner container hit its memory limit." in detail
+            assert returned[-1] is not None
+            assert all(item is None for item in returned[:-1])
+
+    asyncio.run(go())
+
+
+def test_stream_drop_without_termination_ends_runner_error_at_the_10_s_bound(
+    make_harness, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    async def go() -> None:
+        class _Clock:
+            def __init__(self) -> None:
+                self.now = 0.0
+                self.sleeps: list[float] = []
+
+            def read(self) -> float:
+                return self.now
+
+            async def sleep(self, delay: float) -> None:
+                self.sleeps.append(delay)
+                self.now += delay
+
+        clock = _Clock()
+        monkeypatch.setattr(kernel_attempt, "_pod_termination_clock", clock.read)
+        monkeypatch.setattr(kernel_attempt, "_pod_termination_sleep", clock.sleep)
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=_PublicationApi(),
+            max_attempts=1,
+            pod_termination_wait_s=10.0,
+        ) as h:
+            items, event = _factory_drop(h, f"work-item-{uuid.uuid4()}-execute-8")
+            read_at: list[float] = []
+
+            def diagnose(name: str, *, request_timeout_seconds: float, since: datetime):
+                assert request_timeout_seconds > 0
+                h.fake_k8s.termination_queries.append(name)
+                read_at.append(clock.now)
+                return None
+
+            h.fake_k8s.pod_termination = diagnose
+            wall = time.monotonic()
+            await h.kernel.process_event(event)
+            assert time.monotonic() - wall < 2.0
+
+            assert "runner-error" in caplog.text
+            assert len(items.finishes) == 1
+            assert items.finishes[0]["cause"] == "runner_escalated"
+            assert read_at == [i * 0.5 for i in range(20)]
+            assert clock.sleeps
+            assert all(delay == 0.5 for delay in clock.sleeps)
+            assert all(moment < 10.0 for moment in read_at)
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("scenario", ["late", "none"])
+def test_sandbox_release_waits_for_termination_classification(
+    make_harness, monkeypatch: pytest.MonkeyPatch, scenario: str
+) -> None:
+    async def go() -> None:
+        class _Clock:
+            def __init__(self) -> None:
+                self.now = 0.0
+
+            def read(self) -> float:
+                return self.now
+
+            async def sleep(self, delay: float) -> None:
+                self.now += delay
+
+        if scenario == "none":
+            clock = _Clock()
+            monkeypatch.setattr(kernel_attempt, "_pod_termination_clock", clock.read)
+            monkeypatch.setattr(kernel_attempt, "_pod_termination_sleep", clock.sleep)
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=_PublicationApi(),
+            max_attempts=1,
+            pod_termination_wait_s=10.0,
+        ) as h:
+            _items, event = _factory_drop(h, f"work-item-{uuid.uuid4()}-execute-8")
+            order: list[str] = []
+            first: dict[str, float | None] = {"at": None}
+            original_delete = h.fake_k8s.delete_claim
+
+            def diagnose(name: str, *, request_timeout_seconds: float, since: datetime):
+                order.append("pod_termination")
+                h.fake_k8s.termination_queries.append(name)
+                if scenario == "none":
+                    return None
+                now = time.monotonic()
+                if first["at"] is None:
+                    first["at"] = now
+                if now - first["at"] >= 1.2:
+                    return SandboxTermination("OOMKilled", "exit code 137")
+                return None
+
+            def delete_claim(name: str, *, request_timeout_seconds: float) -> None:
+                order.append("delete_claim")
+                original_delete(name, request_timeout_seconds=request_timeout_seconds)
+
+            h.fake_k8s.pod_termination = diagnose
+            h.fake_k8s.delete_claim = delete_claim
+            await h.kernel.process_event(event)
+
+            deletes = [i for i, name in enumerate(order) if name == "delete_claim"]
+            reads = [i for i, name in enumerate(order) if name == "pod_termination"]
+            assert deletes
+            assert reads
+            assert max(reads) < deletes[0]
+
+    asyncio.run(go())
+
+
 def test_first_eviction_survives_generic_failure_on_retry_in_terminal_and_factory(
     make_harness, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -3445,7 +3610,7 @@ def test_first_eviction_survives_generic_failure_on_retry_in_terminal_and_factor
             h.kernel._work_items = items
             diagnoses = iter(
                 [
-                    SimpleNamespace(
+                    SandboxTermination(
                         reason="Evicted",
                         detail=(
                             'Usage of EmptyDir volume "workspace" exceeds the limit "1Gi". '
@@ -3458,7 +3623,7 @@ def test_first_eviction_survives_generic_failure_on_retry_in_terminal_and_factor
 
             def diagnose(
                 name: str, *, request_timeout_seconds: float, since: datetime
-            ) -> SimpleNamespace | None:
+            ) -> SandboxTermination | None:
                 h.fake_k8s.termination_queries.append(name)
                 return next(diagnoses)
 
@@ -5804,9 +5969,7 @@ def test_approval_resume_capacity_keeps_an_earlier_pod_termination(
                 h.fake_k8s.sandboxes.clear()
                 return found
 
-            h.fake_k8s.termination = SimpleNamespace(
-                reason="Evicted", detail="The node was low on memory."
-            )
+            h.fake_k8s.termination = SandboxTermination("Evicted", "The node was low on memory.")
             monkeypatch.setattr(h.fake_k8s, "pod_termination", evicted_then_full)
             h.runner.default_script = [TextDelta(text="partial")]
             h.runner.abort_after_frames = True

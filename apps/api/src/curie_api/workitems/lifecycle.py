@@ -984,6 +984,9 @@ async def start_execution_where(
         "execution_deadline": now + timedelta(seconds=deadline_seconds),
         "version": ExecutionRequest.version + 1,
         "updated_at": func.clock_timestamp(),
+        # A started request is no longer failing preparation (#4930). Cleared
+        # by this same CAS, so a refused or stale start leaves it intact.
+        "last_start_failure_detail": None,
         **extra_values,
     }
     changed_id: uuid.UUID | None = await session.scalar(

@@ -7,7 +7,7 @@
 
 use curie::factory_quickstart::{
     describe, quickstart_plan, PlanInput, ReleaseRead, DEFAULT_AGENT, DEFAULT_BUDGET_USD,
-    DEFAULT_DEADLINE_SECONDS, DEFAULT_KIND_NAME, DEFAULT_MODEL,
+    DEFAULT_DEADLINE_SECONDS, DEFAULT_KIND_NAME, DEFAULT_MODEL, DEFAULT_OUTPUT_TOKENS_PER_RUN,
 };
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -35,6 +35,7 @@ fn base() -> PlanInput {
         org: None,
         execution_deadline_seconds: DEFAULT_DEADLINE_SECONDS,
         budget_usd: DEFAULT_BUDGET_USD,
+        output_tokens: DEFAULT_OUTPUT_TOKENS_PER_RUN,
         chart: "charts/curie".into(),
         credential_in_env: true,
         release_has_real_model: false,

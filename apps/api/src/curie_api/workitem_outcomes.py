@@ -88,6 +88,12 @@ def _deadline_seconds(req: ExecutionRequest) -> str:
     return str(int((req.execution_deadline - req.started_at).total_seconds()))
 
 
+def _previous_start_failure(req: ExecutionRequest) -> str:
+    """The safe diagnostic of the last failed sandbox start, if one is kept (#4930)."""
+    detail = req.last_start_failure_detail
+    return f"; previous start failure: {detail}" if detail else ""
+
+
 def _cause(
     state: WorkItemOutcomeState,
     req: ExecutionRequest | None,
@@ -128,6 +134,7 @@ def _cause(
                 f"; deferred {req.capacity_deferrals} time(s) for capacity, "
                 f"last reason: {req.last_deferral_reason or 'unknown'}"
             )
+        text += _previous_start_failure(req)
         if now >= deadline:
             return (
                 f"{text}; the waiting deadline elapsed at {_iso(deadline)} "
@@ -152,7 +159,7 @@ def _cause(
             return (
                 "expired: capacity_wait_expired, no sandbox capacity before the "
                 "waiting deadline"
-            )
+            ) + _previous_start_failure(req)
         return (
             f"expired: {cause}, the execution exceeded {_deadline_seconds(req)} s "
             "and termination "
@@ -160,8 +167,10 @@ def _cause(
         )
     if state == "failed":
         if cause == "start_failed":
-            return "failed: start_failed, " + start_failed_sentence(
-                req.start_deferrals, req.last_deferral_reason or "unknown"
+            return (
+                "failed: start_failed, "
+                + start_failed_sentence(req.start_deferrals, req.last_deferral_reason or "unknown")
+                + _previous_start_failure(req)
             )
         text = f"failed: {cause}"
         if cause == "deadline_halted":
@@ -379,6 +388,7 @@ def _request_view(req: ExecutionRequest) -> WorkItemRequestOut:
         termination_observation=_safe_termination(req.termination_observation),
         capacity_deferrals=req.capacity_deferrals,
         last_deferral_reason=req.last_deferral_reason,
+        last_start_failure_detail=req.last_start_failure_detail,
     )
 
 

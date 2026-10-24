@@ -9595,6 +9595,17 @@ export const commandManifest = {
             },
             {
               "default_values": [
+                "250000"
+              ],
+              "global": false,
+              "help": "Output token allowance for each run of the deployed agent (max_output_tokens_per_run). Must be > 0",
+              "id": "output_tokens",
+              "long": "output-tokens",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
                 "dark-factory"
               ],
               "global": false,
