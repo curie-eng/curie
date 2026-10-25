@@ -332,3 +332,45 @@ print("pure exporter import and deterministic rendering passed")
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert result.stdout.strip() == "pure exporter import and deterministic rendering passed"
+
+
+@pytest.mark.parametrize(
+    ("target", "path"),
+    [
+        ("policy", "tenant_id"),
+        ("policy", "agent_id"),
+        ("policy", "roles.invocation.filter.entries.0.namespace.id"),
+        ("change", "tenant_id"),
+        ("change", "agent_id"),
+        ("change", "filter.entries.0.namespace.id"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("literal", "valid"),
+    [
+        pytest.param("44444444-4444-4444-4444-444444444444", True, id="canonical-numeric"),
+        pytest.param("abcdefab-cdef-abcd-efab-cdefabcdefab", True, id="canonical-alphabetic"),
+        pytest.param("not-a-uuid", False, id="malformed"),
+        pytest.param("abcdefabcdefabcdefabcdefabcdefab", False, id="hyphenless"),
+        pytest.param("ABCDEFAB-CDEF-ABCD-EFAB-CDEFABCDEFAB", False, id="uppercase"),
+        pytest.param("abcdefab-cdef-abcd-efab-cdefabcdefab\n", False, id="trailing-newline"),
+    ],
+)
+def test_canonical_uuid_fields_agree_with_runtime_parser(
+    target: str, path: str, literal: str, valid: bool
+) -> None:
+    """@spec AGENT-ROLE-FILTER-V1-2 AGENT-ROLE-FILTER-V1-7: imported exact UUID shape."""
+    value = candidate(target)
+    keys = path.split(".")
+    node = value
+    for key in keys[:-1]:
+        node = node[int(key)] if isinstance(node, list) else node[key]
+    node[keys[-1]] = literal
+    if valid:
+        assert parse(encoded(value), target).model_dump(mode="json") == value
+        validator(target).validate(value)
+    else:
+        refuse(encoded(value), target)
+        assert not validator(target).is_valid(value), (
+            f"structural schema accepts noncanonical UUID at {target}.{path}"
+        )
