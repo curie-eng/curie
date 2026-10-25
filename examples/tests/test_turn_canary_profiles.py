@@ -519,3 +519,139 @@ def test_exporter_retains_profile_observations_and_timestamps_until_inventory_re
     monitor.observe(canary.CycleResult(inventory_labels={other}))
     assert "C-EXAMPLE-1" not in monitor.metrics_text()
     assert "C-EXAMPLE-2" in monitor.metrics_text()
+
+
+@pytest.mark.parametrize(
+    "bad_mapping",
+    ["not-a-mapping", {"Bad-Slug": None}, {"sample-agent": {"prompt": "ready"}}, "too-many"],
+)
+def test_direct_cycle_rejects_invalid_profile_mapping_before_platform_io(bad_mapping):
+    """@spec TURN-CANARY-16"""
+    canary = _canary()
+    if bad_mapping == "too-many":
+        bad_mapping = {f"sample-{index}": _profile(canary) for index in range(101)}
+
+    class NoIO:
+        """Reject every attempted runtime boundary access. @spec TURN-CANARY-16"""
+
+        def __getattr__(self, name):
+            """@spec TURN-CANARY-16"""
+            pytest.fail(f"platform access preceded profile validation: {name}")
+
+    with pytest.raises(ValueError):
+        _cycle(canary, NoIO(), probe_profiles=bad_mapping)
+
+
+@pytest.mark.parametrize("case", ["malformed", "wrong_target", "incomplete"])
+def test_polling_matching_text_still_requires_valid_correlated_completion(case):
+    """@spec TURN-CANARY-16"""
+    canary = _canary()
+
+    class Corrupt(ProfilePlatform):
+        """Corrupt only the external reply boundary. @spec TURN-CANARY-16"""
+
+        async def replies(self, reply_ref, after):
+            """@spec TURN-CANARY-16"""
+            page = await super().replies(reply_ref, after)
+            if case == "malformed":
+                page["events"][-1]["version"] = "unsupported"
+            elif case == "wrong_target":
+                page["events"][0]["target"]["address"] = "C-UNRELATED"
+            else:
+                page["events"].pop()
+                page["next_cursor"] = 1
+                page["terminal"] = False
+            return page
+
+    platform = Corrupt()
+    result = _cycle(canary, platform, probe_profiles={"sample-agent": _profile(canary)})
+    assert result.target_probe_success == {ROUTE: False}
+    assert result.target_delivery_success == {ROUTE: False}
+    assert result.target_last_delivery_success == result.target_last_probe_success == {}
+    assert platform.active == 0
+
+
+@pytest.mark.parametrize("standing", [False, True])
+def test_main_carries_environment_profile_into_real_cycle_and_standing_monitor(
+    tmp_path, monkeypatch, standing
+):
+    """Replace only external installation services. @spec TURN-CANARY-16"""
+    canary = _canary()
+    installed = {}
+    signals = []
+    env = _env(json.dumps({"sample-agent": _fields()}))
+    env.update(
+        {
+            "TURN_CANARY_STATE_PATH": str(tmp_path / "state.json"),
+            "TURN_CANARY_METRICS_PATH": str(tmp_path / "metrics.txt"),
+            "TURN_CANARY_TURN_DEADLINE": ".02",
+            "TURN_CANARY_CLEANUP_DEADLINE": ".02",
+            "TURN_CANARY_POLL_PERIOD": ".001",
+        }
+    )
+    if standing:
+        env["TURN_CANARY_LISTEN"] = "127.0.0.1:9464"
+
+    class InstalledPlatform(ProfilePlatform):
+        """A synthetic installation boundary with no live clients. @spec TURN-CANARY-16"""
+
+        def __init__(self, **settings):
+            """@spec TURN-CANARY-16"""
+            super().__init__()
+            installed["platform"] = self
+            self.closed = False
+
+        async def reset_state(self, agent_id, thread_key):
+            """Stop standing mode once the real cycle cleans up. @spec TURN-CANARY-16"""
+            result = await super().reset_state(agent_id, thread_key)
+            if standing:
+                signals[0]()
+            return result
+
+        async def close(self):
+            """@spec TURN-CANARY-16"""
+            self.closed = True
+
+    class InstalledServer:
+        """No socket is required to test monitor wiring. @spec TURN-CANARY-16"""
+
+        def close(self):
+            """@spec TURN-CANARY-16"""
+            installed["server_closed"] = True
+
+        async def wait_closed(self):
+            """@spec TURN-CANARY-16"""
+            installed["server_joined"] = True
+
+    async def install_http(monitor, host, port):
+        """Retain the real monitor and replace its listener only. @spec TURN-CANARY-16"""
+        assert (host, port) == ("127.0.0.1", 9464)
+        installed["monitor"] = monitor
+        return InstalledServer()
+
+    def install_signal(signum, callback):
+        """Replace OS signal registration, retaining its callback. @spec TURN-CANARY-16"""
+        signals.append(callback)
+
+    async def scenario():
+        """Run the real entry point with bounded installation lifetime. @spec TURN-CANARY-16"""
+        monkeypatch.setattr(asyncio.get_running_loop(), "add_signal_handler", install_signal)
+        return await asyncio.wait_for(canary.main(), 1)
+
+    monkeypatch.setattr(canary.os, "environ", env)
+    monkeypatch.setattr(canary, "RuntimePlatform", InstalledPlatform)
+    monkeypatch.setattr(canary, "serve_http", install_http)
+    exit_code = asyncio.run(scenario())
+    platform = installed["platform"]
+    assert platform.turn.text.startswith(PROMPT)
+    assert platform.closed and platform.active == 0
+    if standing:
+        assert exit_code == 0
+        assert installed["server_closed"] and installed["server_joined"]
+        metrics = installed["monitor"].metrics_text()
+    else:
+        assert exit_code == 1  # A passing profile preserves legacy nonce cycle/exit semantics.
+        metrics = (tmp_path / "metrics.txt").read_text()
+    assert _samples(metrics, "turn_canary_target_probe_success")[0].endswith("} 1")
+    assert _samples(metrics, "turn_canary_target_probe_profile")[0].endswith("} 1")
+    assert _samples(metrics, "turn_canary_target_success")[0].endswith("} 0")
