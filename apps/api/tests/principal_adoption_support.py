@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import importlib
 import json
+import secrets
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
@@ -182,6 +184,8 @@ def lookup(
     if response["outcome"] in {"unresolved", "unavailable"}:
         response["identity"] = None
         response["sender_kind"] = "unknown"
+    if response["outcome"] == "unavailable":
+        response["identity_observation"] = None
     return LookupRequestV1.model_validate(req), response
 
 
@@ -244,7 +248,9 @@ async def team(s: AsyncSession, tenant: uuid.UUID, *, synced: bool = True) -> Te
         name="Synthetic group",
         managed_by="synthetic-directory",
         epoch=1 if synced else 0,
+        digest=hashlib.sha256(b"").hexdigest() if synced else None,
         last_synced_at=NOW if synced else None,
+        last_attempt_at=NOW if synced else None,
     )
     s.add(row)
     await s.flush()
@@ -286,7 +292,7 @@ async def connection_fixture(s: AsyncSession, tenant: uuid.UUID) -> tuple[str, I
     )
     s.add(namespace)
     await s.flush()
-    token = "A" * 43
+    token = secrets.token_urlsafe(32)
     s.add(
         IdentityConnectToken(
             token_hash=connect.hash_token(token),

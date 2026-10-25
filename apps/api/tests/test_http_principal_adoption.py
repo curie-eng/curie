@@ -867,9 +867,9 @@ def test_request_echo_parse_and_expiry_refuse_before_any_write(
         elif attack == "echo_purpose":
             response["purpose"] = "approval"
         elif attack == "identity_expiry":
-            response["identity_observation"]["as_of"] = "2030-01-01T11:59:59Z"
+            response["identity_observation"]["as_of"] = "2030-01-01T11:59:58.999999Z"
         elif attack == "membership_expiry":
-            response["membership"]["observation"]["as_of"] = "2030-01-01T11:59:58Z"
+            response["membership"]["observation"]["as_of"] = "2030-01-01T11:59:57.999999Z"
         request = type(request).model_validate(request_value)
         raw = (
             b"{synthetic malformed response"
@@ -1091,3 +1091,33 @@ def test_all_canonical_insert_status_and_principal_session_mints_are_in_inventor
                     observed.add(owner)
                     assert owner in owners, f"add participation test for status writer: {owner}"
     assert owners <= observed
+
+
+@pytest.mark.parametrize("observation", ["identity", "membership"])
+def test_exact_t1_age_limit_is_accepted_independently(clean_db: None, observation: str) -> None:
+    """@spec HTTP-PRINCIPAL-ADOPTION-V1-6. Preserve HTTP-IDENTITY-V1-4 equality."""
+    service = api()
+
+    async def body(f: async_sessionmaker[AsyncSession]) -> None:
+        """@spec HTTP-PRINCIPAL-ADOPTION-V1-6."""
+        tenant, _ = await seed(f)
+        await adopt(f, tenant)
+        cap = await capture(f, tenant)
+        request, response = lookup(cap)
+        if observation == "identity":
+            response["identity_observation"]["as_of"] = "2030-01-01T11:59:59Z"
+        else:
+            response["membership"]["observation"]["as_of"] = "2030-01-01T11:59:58Z"
+        async with f() as s, s.begin():
+            result = await service.apply_http_principal(
+                s,
+                capture=cap,
+                request=request,
+                response_bytes=json.dumps(response).encode(),
+                clock=lambda: NOW,
+            )
+            assert result.outcome == "resolved"
+            assert result.principal_id is not None
+            assert (result.authorization_version, result.lifecycle_generation) == (1, 2)
+
+    run(body)
