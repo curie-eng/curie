@@ -59,7 +59,8 @@ CONTRACT = "0041"
 # channel and WorkItem reads carry the trigger label of 0105 (#4361).
 # The 0108 join requires both stable reply selectors (0106) and identity links (0107).
 # The join requires both start diagnostics (0123) and attachment catalogs (0130).
-APP_SCHEMA_MIN = "0131"
+# @spec HTTP-PRINCIPAL-ADOPTION-V1-2/9: authority reads require the 0132 columns.
+APP_SCHEMA_MIN = "0132"
 REVIEW_SCHEMA_MIN = "0063"
 PREV = "0040"
 
@@ -152,6 +153,7 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0123",
             "0130",
             "0131",
+            "0132",
         } <= pending
         assert not pending & {"0091", "0092", "0093"}
     else:
@@ -174,8 +176,9 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0123",
             "0130",
             "0131",
+            "0132",
         }
-    assert current_revision() == "0131"
+    assert current_revision() == "0132"
     assert sql_rows("SELECT name FROM curie.agents WHERE id=:id", {"id": agent_id}) == [
         ("merge-example",)
     ]
@@ -258,9 +261,9 @@ def test_agent_reads_refuse_the_schema_before_deploy_notification_expand() -> No
     # The directory and connect ORM requires the new identity tables/columns.
     # Migration expand compatibility for older images does not mean this image
     # can serve an older database.
-    for revision in sorted(known - {"0131"}):
+    for revision in sorted(known - {"0132"}):
         assert can_serve(revision, window, known) is False
-    assert can_serve("0131", window, known) is True
+    assert can_serve("0132", window, known) is True
 
 
 def test_planner_refuses_irreversible_before_mutation() -> None:
