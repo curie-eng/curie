@@ -365,12 +365,14 @@ def counts_against_quota(pod, now):
 
 
 def observe():
+    read_started = time.time()
     quota = get("resourcequota", fullname + "-sandbox-quota")
     assert quota["spec"]["hard"]["pods"] == "2", "sandbox pod quota changed from two"
     quota_used = int(quota.get("status", {}).get("used", {}).get("pods", 0))
     assert quota_used <= 2, "observed quota usage exceeded two"
     priority = quota["spec"]["scopeSelector"]["matchExpressions"][0]["values"][0]
-    pods = {pod["metadata"]["uid"]: pod for pod in get("pods")["items"]
+    pod_list = get("pods")
+    pods = {pod["metadata"]["uid"]: pod for pod in pod_list["items"]
             if pod["spec"].get("priorityClassName") == priority}
     # Preserve every observed UID below for reclamation and active-route checks.
     now = time.time()
@@ -381,7 +383,18 @@ def observe():
             phase = pod.get("status", {}).get("phase")
             counts[phase if phase in counts else "other"] += 1
         print("Quota pod diagnostic: " + json.dumps({"chargeable": len(chargeable),
-              "total": len(pods), "quota_used": quota_used, "phase_counts": counts}, sort_keys=True), file=sys.stderr)
+              "total": len(pods), "quota_used": quota_used, "phase_counts": counts,
+              "read_started": read_started, "read_finished": now,
+              "quota_resource_version": quota.get("metadata", {}).get("resourceVersion"),
+              "pod_list_resource_version": pod_list.get("metadata", {}).get("resourceVersion"),
+              "pods": [{"uid": pod["metadata"]["uid"],
+                        "resource_version": pod["metadata"].get("resourceVersion"),
+                        "created": pod["metadata"].get("creationTimestamp"),
+                        "deleted": pod["metadata"].get("deletionTimestamp"),
+                        "grace": pod["metadata"].get("deletionGracePeriodSeconds"),
+                        "phase": pod.get("status", {}).get("phase"),
+                        "chargeable": counts_against_quota(pod, now)} for pod in pods.values()]},
+              sort_keys=True), file=sys.stderr)
     assert len(chargeable) <= 2, "observed more than two chargeable sandbox pods"
     return pods, probe()
 
