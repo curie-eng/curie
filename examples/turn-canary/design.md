@@ -375,6 +375,33 @@ cleanup.
   Alerts opt into the new mode and result and use delivery timestamps plus
   last-run freshness instead of interpreting nonce success as delivery.
 
+- **TURN-CANARY-17: standalone profile schema and source assembly.**
+  `probe_profiles.py`, beside `turn_canary.py`, is the single owner of the
+  profile schema, normalization, literal matcher, strict JSON parser and
+  programmatic mapping validation from TURN-CANARY-16. It depends only on the
+  Python standard library. A consumer can load this helper file alone by
+  `importlib.util.spec_from_file_location` and call `ProbeProfile`,
+  `ProbeProfile.matches`, `parse_probe_profiles` and `validate_probe_profiles`
+  without importing ACI, channel protocol, Pydantic or the runnable checker.
+  Validation, bounds and matching behavior remain TURN-CANARY-16's contract.
+
+  The runnable checker consumes this sibling and re-exports its existing
+  `ProbeProfile` and `parse_probe_profiles` APIs. Both script execution and
+  file-based dynamic import work from a clean source directory containing the
+  two files, with the checker's normal runtime dependencies available. Sibling
+  resolution uses the checker's own source directory, without mutating global
+  import search paths, extracting source fragments, installing dependency
+  substitutes or falling back to another checkout's helper. Shipping the
+  checker requires both files in the same directory. A previously imported
+  helper is reused only when its registered module resolves to this exact
+  sibling file, preserving profile class identity across helper and checker
+  imports. Normal helper imports and file-spec imports registered in
+  `sys.modules` before execution are supported. Repeated checker imports share
+  that sibling; different source directories stay isolated. An unrelated
+  module with the same basename is preserved. A missing helper fails
+  before any platform operation. Factoring the helper changes no prompt,
+  default, wire, lifecycle, cleanup, log or metric behavior.
+
 ## Verification
 
 Unit tests under `examples/tests` exercise the selected binding and
