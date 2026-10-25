@@ -396,3 +396,153 @@ def test_artifact_timestamp_constraints_preserve_valid_calendar_and_precision(
     validated = model.model_validate(example)
     assert validated.model_dump(mode="json") == example
     artifact_model_validator(format_name, "LookupResponseV1").validate(example)
+
+
+# Independently authored examples exercise the wire contract without importing
+# the implementation's UUID grammar or deriving expectations from its validator.
+UUID_EXAMPLES = [
+    pytest.param("a1b2c3d4-5678-0123-abcd-0123456789ef", True, id="canonical"),
+    pytest.param("not-a-uuid", False, id="malformed"),
+    pytest.param("a1b2c3d456780123abcd0123456789ef", False, id="hyphenless"),
+    pytest.param("A1B2C3D4-5678-0123-ABCD-0123456789EF", False, id="uppercase"),
+    pytest.param("a1b2c3d4-5678-0123-abcd-0123456789ef\n", False, id="trailing-newline"),
+]
+UUID_PATHS = [
+    "request_id",
+    "scope.tenant_id",
+    "scope.sender.channel_identity_id",
+    "scope.sender.provider_installation_id",
+    "scope.sender.namespace.id",
+]
+
+
+def uuid_contract_example(model_name: str) -> dict[str, Any]:
+    """@spec HTTP-IDENTITY-V1-1 HTTP-IDENTITY-V1-2 HTTP-IDENTITY-V1-5."""
+    example: dict[str, Any] = {
+        "schema_version": 1,
+        "request_id": "a1b2c3d4-5678-0123-abcd-0123456789ef",
+        "purpose": "invocation",
+        "authority_version": 3,
+        "scope": {
+            "tenant_id": "11111111-2222-3333-4444-555555555555",
+            "expected_issuer": "https://directory.example.test",
+            "sender": {
+                "provider": "chat",
+                "channel_identity_id": "22222222-3333-4444-5555-666666666666",
+                "provider_installation_id": "33333333-4444-5555-6666-777777777777",
+                "namespace": {
+                    "id": "44444444-5555-6666-7777-888888888888",
+                    "authority": "",
+                    "kind": "workspace",
+                    "key": "Space/Alpha",
+                },
+                "native_id": "Native/User-A",
+            },
+        },
+    }
+    if model_name == "LookupResponseV1":
+        observation = {"as_of": "2031-04-05T06:07:08Z", "max_source_lag_ms": 0}
+        example.update({
+            "outcome": "resolved",
+            "identity": {
+                "issuer": "https://directory.example.test",
+                "subject": "Subject/Alpha",
+                "kind": "human",
+                "account_status": "active",
+            },
+            "sender_kind": "human",
+            "identity_observation": observation,
+            "membership": {
+                "complete": True,
+                "groups": [{"issuer": "https://directory.example.test", "id": "Group/A"}],
+                "observation": dict(observation),
+            },
+        })
+    return example
+
+
+def replace_contract_field(example: dict[str, Any], path: str, value: str) -> None:
+    """@spec HTTP-IDENTITY-V1-1 HTTP-IDENTITY-V1-2 HTTP-IDENTITY-V1-5."""
+    target: Any = example
+    parts = path.split(".")
+    for part in parts[:-1]:
+        target = target[int(part)] if isinstance(target, list) else target[part]
+    target[parts[-1]] = value
+
+
+def uuid_contract_validator(surface: str, model_name: str) -> Draft202012Validator:
+    """@spec HTTP-IDENTITY-V1-5."""
+    if surface == "model":
+        model = getattr(importlib.import_module("curie_api.schemas.http_identity"), model_name)
+        document = model.model_json_schema()
+        return schema_validator(document, document)
+    filename = f"http-identity-v1.{surface}.json"
+    document = json.loads((ARTIFACT_DIR / filename).read_bytes())
+    if surface == "openapi":
+        operation = document["paths"]["/lookup"]["post"]
+        envelope = (
+            operation["requestBody"] if model_name == "LookupRequestV1"
+            else operation["responses"]["200"]
+        )
+        shape = envelope["content"]["application/json"]["schema"]
+    else:
+        shape = {"$ref": f"#/$defs/{model_name}"}
+    return schema_validator(document, dereference(document, shape))
+
+
+@pytest.mark.parametrize(("value", "accepted"), UUID_EXAMPLES)
+def test_uuid_scalar_schema_preserves_runtime_contract(value: str, accepted: bool) -> None:
+    """@spec HTTP-IDENTITY-V1-1 HTTP-IDENTITY-V1-5."""
+    from pydantic import TypeAdapter
+
+    alias = importlib.import_module("curie_api.schemas.http_identity").CanonicalUUID
+    adapter = TypeAdapter(alias)
+    if accepted:
+        assert adapter.validate_python(value) == value
+    else:
+        with pytest.raises(ValueError):
+            adapter.validate_python(value)
+    schema = adapter.json_schema()
+    assert schema_validator(schema, schema).is_valid(value) is accepted
+
+
+@pytest.mark.parametrize("surface", ["model", "schema", "openapi"])
+@pytest.mark.parametrize("model_name", ["LookupRequestV1", "LookupResponseV1"])
+@pytest.mark.parametrize("uuid_path", UUID_PATHS)
+@pytest.mark.parametrize(("value", "accepted"), UUID_EXAMPLES)
+def test_uuid_model_and_committed_artifacts_agree_at_every_location(
+    surface: str, model_name: str, uuid_path: str, value: str, accepted: bool
+) -> None:
+    """@spec HTTP-IDENTITY-V1-1 HTTP-IDENTITY-V1-2 HTTP-IDENTITY-V1-5."""
+    model = getattr(importlib.import_module("curie_api.schemas.http_identity"), model_name)
+    example = uuid_contract_example(model_name)
+    replace_contract_field(example, uuid_path, value)
+    if accepted:
+        assert model.model_validate(example).model_dump(mode="json") == example
+    else:
+        with pytest.raises(ValueError):
+            model.model_validate(example)
+    assert uuid_contract_validator(surface, model_name).is_valid(example) is accepted, (
+        f"{surface} UUID acceptance differs at {model_name}.{uuid_path} for {value!r}"
+    )
+
+
+@pytest.mark.parametrize("surface", ["model", "schema", "openapi"])
+@pytest.mark.parametrize(
+    ("model_name", "opaque_path"),
+    [
+        ("LookupRequestV1", "scope.sender.native_id"),
+        ("LookupResponseV1", "scope.sender.native_id"),
+        ("LookupResponseV1", "identity.subject"),
+        ("LookupResponseV1", "membership.groups.0.id"),
+    ],
+)
+def test_uuid_schema_constraints_preserve_non_uuid_opaque_identifiers(
+    surface: str, model_name: str, opaque_path: str
+) -> None:
+    """@spec HTTP-IDENTITY-V1-1 HTTP-IDENTITY-V1-2 HTTP-IDENTITY-V1-5."""
+    model = getattr(importlib.import_module("curie_api.schemas.http_identity"), model_name)
+    example = uuid_contract_example(model_name)
+    replace_contract_field(example, opaque_path, " Opaque/Account:Alpha ")
+    assert model.model_validate(example).model_dump(mode="json") == example
+    uuid_contract_validator(surface, model_name).validate(example)
