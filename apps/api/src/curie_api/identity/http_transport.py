@@ -28,7 +28,7 @@ from curie_api.schemas.http_identity import (
     validate_lookup,
 )
 
-Result = ValidatedFacts | FactsRefusal
+_ValidationResult = ValidatedFacts | FactsRefusal
 _guarded: ContextVar[bool] = ContextVar("identity_dependency_logs", default=False)
 
 
@@ -91,6 +91,63 @@ class ProviderBearer:
         raise TypeError("provider_bearer_not_serializable")
 
 
+class HttpIdentityObservation:
+    """@spec HTTP-IDENTITY-TRANSPORT-1/2/5."""
+
+    __slots__ = ("__facts", "__response_bytes")
+    __facts: ValidatedFacts
+    __response_bytes: bytes
+
+    def __new__(cls, *args: object, **kwargs: object) -> HttpIdentityObservation:
+        """@spec HTTP-IDENTITY-TRANSPORT-5."""
+        raise TypeError("identity_observation_internal") from None
+
+    @property
+    def facts(self) -> ValidatedFacts:
+        """@spec HTTP-IDENTITY-TRANSPORT-2/5."""
+        return self.__facts
+
+    @property
+    def response_bytes(self) -> bytes:
+        """@spec HTTP-IDENTITY-TRANSPORT-2/5."""
+        return self.__response_bytes
+
+    def __setattr__(self, name: str, value: object) -> None:
+        """@spec HTTP-IDENTITY-TRANSPORT-5."""
+        raise AttributeError("immutable_identity_observation") from None
+
+    def __delattr__(self, name: str) -> None:
+        """@spec HTTP-IDENTITY-TRANSPORT-5."""
+        raise AttributeError("immutable_identity_observation") from None
+
+    def __repr__(self) -> str:
+        """@spec HTTP-IDENTITY-TRANSPORT-5."""
+        return "HttpIdentityObservation()"
+
+    def __getstate__(self) -> Never:
+        """@spec HTTP-IDENTITY-TRANSPORT-5."""
+        raise TypeError("identity_observation_not_serializable") from None
+
+    def __reduce__(self) -> Never:
+        """@spec HTTP-IDENTITY-TRANSPORT-5."""
+        raise TypeError("identity_observation_not_serializable") from None
+
+    def __reduce_ex__(self, protocol: SupportsIndex) -> Never:
+        """@spec HTTP-IDENTITY-TRANSPORT-5."""
+        raise TypeError("identity_observation_not_serializable") from None
+
+
+def _observation(facts: ValidatedFacts, response_bytes: bytes) -> HttpIdentityObservation:
+    """@spec HTTP-IDENTITY-TRANSPORT-2/5."""
+    observation = object.__new__(HttpIdentityObservation)
+    object.__setattr__(observation, "_HttpIdentityObservation__facts", facts)
+    object.__setattr__(observation, "_HttpIdentityObservation__response_bytes", response_bytes)
+    return observation
+
+
+Result = HttpIdentityObservation | FactsRefusal
+
+
 @dataclass(frozen=True, slots=True)
 class CloseReport:
     """@spec HTTP-IDENTITY-TRANSPORT-4."""
@@ -132,7 +189,7 @@ class _Operation:
     transport: httpx.AsyncHTTPTransport | None = None
     response: httpx.Response | None = None
     closer: asyncio.Task[None] | None = None
-    parser: Future[Result] | None = None
+    parser: Future[_ValidationResult] | None = None
     network_closed: bool = False
     close_failed: bool = False
 
@@ -169,15 +226,16 @@ def _endpoint(value: str, allow_http: bool) -> None:
 
 def _fresh(result: Result) -> Result:
     """@spec HTTP-IDENTITY-TRANSPORT-3."""
-    if isinstance(result, ValidatedFacts):
+    if isinstance(result, HttpIdentityObservation):
+        facts = result.facts
         now = datetime.now(UTC)
         seconds = (now.toordinal() - datetime(1970, 1, 1).toordinal()) * 86_400
         seconds += now.hour * 3600 + now.minute * 60 + now.second
         exact = Fraction(seconds) + Fraction(now.microsecond, 1_000_000)
         # T1 accepts equality; expiration occurs strictly after the expiry instant.
-        if exact > result.identity_expires_at:
+        if exact > facts.identity_expires_at:
             return FactsRefusal(code="identity_stale")
-        if result.membership_expires_at is not None and exact > result.membership_expires_at:
+        if facts.membership_expires_at is not None and exact > facts.membership_expires_at:
             return FactsRefusal(code="membership_stale")
     return result
 
@@ -212,7 +270,7 @@ class HttpIdentityClient:
         self._allow_http = allow_loopback_http
         self._closing = False
         self._operations: set[_Operation] = set()
-        self._parsers: set[Future[Result]] = set()
+        self._parsers: set[Future[_ValidationResult]] = set()
         self._worker: ThreadPoolExecutor | None = None
         self._joiner: threading.Thread | None = None
         self._changed = asyncio.Event()
@@ -361,6 +419,7 @@ class HttpIdentityClient:
                 if len(entity) + len(chunk) > MAX_RESPONSE_BYTES:
                     return FactsRefusal(code="invalid_response")
                 entity.extend(chunk)
+            response_bytes = bytes(entity)
             while self._parsers and not self._closing:
                 await self._changed.wait()
             if self._closing or asyncio.get_running_loop().time() >= deadline:
@@ -371,9 +430,9 @@ class HttpIdentityClient:
                 )
             loop = asyncio.get_running_loop()
 
-            def parse() -> Result:
+            def parse() -> _ValidationResult:
                 """@spec HTTP-IDENTITY-TRANSPORT-3."""
-                return validate_lookup(bytes(entity), request, limits, now=datetime.now(UTC))
+                return validate_lookup(response_bytes, request, limits, now=datetime.now(UTC))
 
             future = self._worker.submit(parse)
             operation.parser = future
@@ -383,7 +442,11 @@ class HttpIdentityClient:
             )
             wrapped = asyncio.wrap_future(future)
             wrapped.add_done_callback(lambda done: None if done.cancelled() else done.exception())
-            return await asyncio.shield(wrapped)
+            validated = await asyncio.shield(wrapped)
+            return (
+                _observation(validated, response_bytes)
+                if isinstance(validated, ValidatedFacts) else validated
+            )
         except httpx.TransportError:
             return FactsRefusal(code="unavailable")
         finally:
@@ -391,7 +454,7 @@ class HttpIdentityClient:
             assert operation.closer is not None
             await asyncio.shield(operation.closer)
 
-    def _parser_done(self, operation: _Operation, future: Future[Result]) -> None:
+    def _parser_done(self, operation: _Operation, future: Future[_ValidationResult]) -> None:
         """@spec HTTP-IDENTITY-TRANSPORT-3, HTTP-IDENTITY-TRANSPORT-4."""
         if not future.cancelled():
             future.exception()
