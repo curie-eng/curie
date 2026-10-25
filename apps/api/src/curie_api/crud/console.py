@@ -7,11 +7,12 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import delete, func, select, text, update
-from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from .. import principal_authority
 from ..models import ConsoleSession, OidcLoginAttempt, Principal, Tenant
 from ..oidc import OidcClaims, code_challenge, new_code_verifier, new_nonce, new_state
+from ..schemas.http_authority import HttpSelectionV1
 
 # --- console sessions (ADR-0083, #1044) -------------------------------------
 #
@@ -112,6 +113,23 @@ async def exchange_console_login_code(
     row = result.scalar_one_or_none()
     if row is None:
         return None
+    # @spec HTTP-PRINCIPAL-ADOPTION-V1-11. Discovery has taken no row lock.
+    if row.principal_id is not None:
+        principal = await session.get(Principal, row.principal_id, populate_existing=True)
+        if principal is None:
+            return None
+        try:
+            await principal_authority.guarded_principal(
+                session, tenant_id=principal.tenant_id, principal_id=principal.id,
+            )
+        except principal_authority.PrincipalAuthorityRefusal:
+            return None
+        row = await session.scalar(
+            select(ConsoleSession).where(ConsoleSession.id == row.id).with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if row is None:
+            return None
     if row.consumed_at is not None or row.revoked_at is not None:
         return None
     if row.login_code_expires_at <= moment:
@@ -317,46 +335,43 @@ async def consume_oidc_login_attempt(
 async def resolve_principal(
     session: AsyncSession, claims: OidcClaims, *, tenant_id: uuid.UUID = DEFAULT_TENANT_ID
 ) -> Principal:
-    """The principal ``claims`` identify, created on first sight. NOT committed.
+    """Resolve claims within the caller's transaction.
 
-    Matched on ``(tenant_id, issuer, subject)`` only -- never on email, which an
-    IdP lets users change and which two IdPs can both assert. One
-    ``INSERT .. ON CONFLICT DO UPDATE`` both creates and refreshes, so two
-    first logins racing for one identity converge on one row instead of one of
-    them failing on the unique key. The update touches the IdP-owned
-    attributes and ``last_seen_at`` only: ``status`` is Curie's, so a disabled
-    principal logging in again stays disabled.
-
-    Left uncommitted so the caller can roll the refresh back when it refuses
-    the login (an inactive principal or tenant): a refused login changes
-    nothing.
+    @spec HTTP-PRINCIPAL-ADOPTION-V1-9, HTTP-PRINCIPAL-ADOPTION-V1-10.
+    The profile refresh remains uncommitted so a refused login can roll it back.
     """
-    moment = datetime.now(UTC)
-    statement = (
-        insert(Principal)
-        .values(
-            id=uuid.uuid4(),
-            tenant_id=tenant_id,
-            idp_issuer=claims.issuer,
-            idp_subject=claims.subject,
-            type="human",
-            status="active",
-            email=claims.email,
-            display_name=claims.display_name,
-            last_seen_at=moment,
-        )
-        .on_conflict_do_update(
-            constraint="principals_tenant_issuer_subject_key",
-            set_={
-                "email": claims.email,
-                "display_name": claims.display_name,
-                "last_seen_at": moment,
-            },
-        )
-        .returning(Principal)
+    # @spec HTTP-PRINCIPAL-ADOPTION-V1-9, HTTP-PRINCIPAL-ADOPTION-V1-10.
+    tenant, config = await principal_authority.lock_scope(session, tenant_id, require_active=False)
+    if config is not None and config.http_selection is not None:
+        if tenant.status != "active":
+            raise principal_authority.PrincipalAuthorityRefusal("tenant_unavailable")
+        authority = principal_authority.stored_configuration(config)
+        assert isinstance(authority.selection, HttpSelectionV1)
+        if claims.issuer != authority.selection.issuer:
+            raise principal_authority.PrincipalAuthorityRefusal("authority_scope_mismatch")
+    principal = await session.scalar(
+        select(Principal).where(
+            Principal.tenant_id == tenant_id, Principal.idp_issuer == claims.issuer,
+            Principal.idp_subject == claims.subject,
+        ).with_for_update().execution_options(populate_existing=True)
     )
-    result = await session.scalars(statement, execution_options={"populate_existing": True})
-    return result.one()
+    if config is not None and config.http_selection is not None:
+        if principal is None:
+            raise principal_authority.PrincipalAuthorityRefusal("http_principal_not_provisioned")
+        if principal.type != "human":
+            raise principal_authority.PrincipalAuthorityRefusal("principal_kind_conflict")
+    if principal is None:
+        principal = Principal(
+            id=uuid.uuid4(), tenant_id=tenant_id, idp_issuer=claims.issuer,
+            idp_subject=claims.subject, type="human", status="active",
+        )
+        session.add(principal)
+        if config is not None:
+            config.lifecycle_generation += 1
+    principal.email, principal.display_name = claims.email, claims.display_name
+    principal.last_seen_at = datetime.now(UTC)
+    await session.flush()
+    return principal
 
 
 async def principal_is_active(session: AsyncSession, principal: Principal) -> bool:
@@ -390,6 +405,14 @@ async def create_principal_console_session(
     Returns:
         ``(plaintext session token, row)``; only the token's hash is stored.
     """
+    # @spec HTTP-PRINCIPAL-ADOPTION-V1-11. Reload immediately before mint.
+    with session.no_autoflush:
+        tenant_id = await session.scalar(
+            select(Principal.tenant_id).where(Principal.id == principal.id)
+        )
+    await principal_authority.guarded_principal(
+        session, tenant_id=tenant_id or principal.tenant_id, principal_id=principal.id,
+    )
     moment = now or datetime.now(UTC).replace(tzinfo=None)
     token = new_session_token()
     row = ConsoleSession(

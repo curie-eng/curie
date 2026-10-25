@@ -3824,13 +3824,26 @@ class TenantIdentityProvider(Base):
     __table_args__ = (
         CheckConstraint("version >= 1", name="tenant_identity_providers_version_ck"),
         CheckConstraint("identity_epoch >= 0", name="tenant_identity_providers_identity_epoch_ck"),
+        CheckConstraint("lifecycle_generation >= 0", name="tenant_identity_providers_lifecycle_ck"),
+        CheckConstraint(
+            "http_selection IS NULL OR jsonb_typeof(http_selection) = 'object'",
+            name="tenant_identity_providers_http_object_ck",
+        ),
+        CheckConstraint(
+            "(http_selection IS NULL AND governed_domains IS NOT NULL AND managed_by IS NOT NULL) "
+            "OR (http_selection IS NOT NULL AND lifecycle_generation >= 1)",
+            name="tenant_identity_providers_owner_ck",
+        ),
     )
     tenant_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey(f"{SCHEMA}.tenants.id"), primary_key=True
     )
     issuer: Mapped[str] = mapped_column(String)
-    governed_domains: Mapped[list[str]] = mapped_column(JSONB)
-    managed_by: Mapped[str] = mapped_column(String)
+    governed_domains: Mapped[list[str] | None] = mapped_column(JSONB(none_as_null=True))
+    managed_by: Mapped[str | None] = mapped_column(String)
+    # @spec HTTP-PRINCIPAL-ADOPTION-V1-2.
+    http_selection: Mapped[dict[str, Any] | None] = mapped_column(JSONB(none_as_null=True))
+    lifecycle_generation: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0")
     version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
 
     # Shared channel-account ownership spans teams, so team epochs cannot fence it.
