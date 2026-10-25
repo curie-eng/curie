@@ -27,7 +27,8 @@ adapter is connected.
   conversation. The prefix defaults to `eval:turn-canary-`; an operator may
   replace it with any value matching `eval:[A-Za-z0-9._-]{0,48}`, which keeps
   the worker's `eval:` isolate prefix that every conversation-ID check of this
-  example and the worker requires. Any other prefix refuses to start. Its prompt asks only for that nonce and explicitly forbids tools,
+  example and the worker requires. Any other prefix refuses to start. By default its prompt asks only for that nonce; TURN-CANARY-16 permits an
+  explicit role-appropriate question. Every prompt explicitly forbids tools,
   actions, approval requests, and durable changes. It sets `tool_access` to
   `read-only`, `source` to `slack`, and empty attachments and hook run. The
   `ReplyHandle` retains the selected Slack address, uses the reserved
@@ -318,6 +319,61 @@ cleanup.
   longer lists. Exclusion matches the stored kind exactly; agent names,
   addresses and adapters are never exclusion criteria. With the list empty,
   every cycle behaves as before.
+
+- **TURN-CANARY-16: explicit probe profiles.** Nonce-only probes remain the
+  default. An operator may set `TURN_CANARY_PROBE_PROFILES` to a nonempty JSON
+  object from exact inventory agent slugs to objects containing exactly
+  `prompt`, `required_any`, and `forbidden_any`. The parser rejects duplicate
+  keys, unknown or missing fields, malformed JSON, and empty profiles before
+  any enqueue. The JSON is at most 65,536 UTF-8 bytes and names at most 100
+  profiles. Slugs are 1 to 63 lowercase ASCII letters, digits or hyphens,
+  beginning with a letter or digit. Prompts are nonblank strings of at most
+  2,048 characters. `required_any` contains 1 to 8 nonempty lists of 1 to 8
+  marker strings; `forbidden_any` contains 0 to 32 marker strings. Each marker
+  is 1 to 128 characters and nonblank after normalization. These bounds also
+  apply to programmatic construction. An omitted environment variable means
+  no profiles; an explicitly empty value or object is invalid.
+
+  Only a selected route whose exact inventory agent slug has a profile uses
+  its prompt. Missing or unmatched slugs keep the original nonce question.
+  A profile does not select routes or change qualification, isolation, wire
+  correlation, timeout, capacity, cleanup, or agent safety policy. Its question
+  receives the same explicit no-tools, no-actions, no-approvals and
+  no-durable-changes suffix as the nonce question. Operators choose a
+  role-appropriate question answerable without tools; profiles cannot grant
+  permissions or require the agent to override its role.
+
+  A profile passes only after TURN-CANARY-3 establishes delivery of a nonblank
+  final non-progress reply update correlated to the enqueued turn. Normalize
+  the final text and every marker using Unicode NFKC, case folding, and
+  whitespace collapse. Every required group must have at least one literal
+  substring match, and no forbidden marker may occur. No regular expression
+  is evaluated. Progress text cannot satisfy a marker. Missing, blank,
+  malformed, foreign, non-delivered or incomplete replies fail. A refusal
+  is not automatically accepted: the configured affirmative markers must all
+  be present and its forbidden markers absent. Matching is a deterministic
+  text contract, not a semantic judgment or proof of useful work beyond that
+  contract. Operators should include known refusal markers in forbidden_any.
+
+  `target_probe_success` independently reports this result, or exact nonce
+  success for an unprofiled route. `target_probe_profile` is 1 for a configured
+  profile and 0 for the nonce default. Both have only the existing route labels;
+  profile prompts and marker text never become labels or logs. Profile logs
+  use only `profile_match` or `profile_mismatch` in the probe phase, while
+  relay lifecycle reason codes remain unchanged. Enqueue and relay failures
+  publish probe failure. Capacity skips and cleanup holds publish neither
+  probe field, retaining previous observations in standing mode.
+
+  `target_last_probe_success_timestamp_seconds` records an independently
+  passing configured probe (or exact nonce default).
+  `target_last_delivery_success_timestamp_seconds` records actual delivery
+  success, independently of nonce or profile matching. Both timestamps are retained across
+  exporter rotations until inventory removes the route, but is not restored
+  after restart; a missing timestamp is not healthy delivery. Existing
+  exact_nonce, target_success, nonce success timestamps, cycle success and
+  exit status retain their original meaning, including when a profile passes.
+  Alerts opt into the new mode and result and use delivery timestamps plus
+  last-run freshness instead of interpreting nonce success as delivery.
 
 ## Verification
 
