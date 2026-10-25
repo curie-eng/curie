@@ -488,6 +488,12 @@ class HttpIdentityClient:
         self, exc_type: object, exc: BaseException | None, traceback: object,
     ) -> None:
         """@spec HTTP-IDENTITY-TRANSPORT-4."""
-        report = await self.aclose()
+        try:
+            report = await self.aclose()
+        except asyncio.CancelledError:
+            if exc is None:
+                raise
+            # Shutdown remains owned; returning lets the context raise its original error.
+            return
         if exc is None and report.state != "closed":
             raise IdentityShutdownIncomplete(report) from None
