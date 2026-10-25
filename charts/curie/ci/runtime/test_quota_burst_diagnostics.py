@@ -78,9 +78,16 @@ class Clock:
         """@spec QUOTA-TIMEOUT-DIAGNOSTIC-3."""
         self.now = 0.0
         self.sleeps: list[float] = []
+        self.calls = 0
+        self.fail_on_call: int | None = None
+        self.failures = 0
 
     def monotonic(self) -> float:
         """@spec QUOTA-TIMEOUT-DIAGNOSTIC-3."""
+        self.calls += 1
+        if self.calls == self.fail_on_call:
+            self.failures += 1
+            raise RuntimeError(SECRET)
         return self.now
 
     def sleep(self, seconds: float) -> None:
@@ -154,7 +161,7 @@ class Burst:
         self.emitter_error: Exception | None = None
         self.globals: dict[str, Any] = {
             "time": SimpleNamespace(monotonic=self.clock.monotonic, sleep=self.clock.sleep,
-                                    time=self.clock.monotonic, strftime=time.strftime,
+                                    time=lambda: self.clock.now, strftime=time.strftime,
                                     gmtime=time.gmtime, strptime=time.strptime),
             "calendar": calendar, "json": json, "sys": sys,
             "start": self.start, "finished": self.finished, "get": self.get,
@@ -492,3 +499,93 @@ def test_output_failure_cannot_fail_a_successful_burst() -> None:
     burst.emitter_error = OSError(SECRET)
     burst.invoke()
     assert burst.followups == ["observe", "logs"]
+
+
+@pytest.mark.parametrize("boundary", ["completion_sample", "observation_finally", "exit_sample"])
+def test_added_clock_fault_preserves_original_exception_fallback_and_cleanup(
+    boundary: str, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """@spec QUOTA-TIMEOUT-DIAGNOSTIC-1/2/3: timing cannot mask an original failure."""
+    burst = Burst()
+    original = RuntimeError("synthetic existing observation or listener failure")
+    burst.exit_on_observation = False
+    burst.observation_durations = [7.5]
+    if boundary == "exit_sample":
+        burst.listener_error = original
+        burst.clock.fail_on_call = 2  # Original deadline, then diagnostic final sample.
+    else:
+        burst.observation_error = original
+        # The original deadline precedes the added completion and duration samples.
+        burst.clock.fail_on_call = 2 if boundary == "completion_sample" else 3
+    with pytest.raises(RuntimeError) as raised:
+        try:
+            burst.invoke()
+        finally:
+            assert all(process.actions == [] for process in burst.processes)
+            burst.processes[-1].wait_timeout = True
+            burst.cleanup()
+    assert raised.value is original
+    assert burst.clock.failures == 1
+    assert summary(capsys) == {"schema_version": 1, "diagnostic_unavailable": True}
+    assert burst.processes[-1].actions == ["terminate", "wait", "kill", "wait"]
+    assert all(process.actions == ["wait"] for process in burst.processes[:-1])
+    assert burst.observations == (0 if boundary == "exit_sample" else 1)
+    assert burst.followups == []
+
+
+def test_diagnostic_exit_clock_fault_does_not_fail_success(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """@spec QUOTA-TIMEOUT-DIAGNOSTIC-1/2/3: failed timing still logs once on success."""
+    burst = Burst()
+    burst.processes[-1].code = 0
+    burst.observation_durations = [0.5]
+    burst.clock.fail_on_call = 4  # Deadline, sample, observation duration, exit sample.
+    burst.invoke()
+    assert burst.clock.failures == 1
+    assert summary(capsys, markers=("finalized_16", "unmatched_parks_0")) == {
+        "schema_version": 1, "diagnostic_unavailable": True,
+    }
+    assert burst.followups == ["observe", "logs"]
+    assert all(process.actions == [] for process in burst.processes)
+
+
+def test_private_driver_prelude_imports_helper_from_actual_chart_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """@spec QUOTA-TIMEOUT-DIAGNOSTIC-2/3: exercise the actual private-driver import."""
+    tree = driver_tree()
+    imports = [index for index, node in enumerate(tree.body)
+               if isinstance(node, ast.ImportFrom) and node.module == "quota_burst_diagnostics"]
+    assert len(imports) == 1, "expected exactly one actual driver helper import"
+    prelude = ast.Module(body=tree.body[:imports[0] + 1], type_ignores=[])
+    driver_directory = tmp_path / "private-driver"
+    driver_directory.mkdir()
+    driver = driver_directory / "driver.py"
+    namespace: dict[str, Any] = {"__name__": "__main__", "__file__": str(driver)}
+
+    def forbidden(*args: Any, **kwargs: Any) -> Any:
+        """@spec QUOTA-TIMEOUT-DIAGNOSTIC-2/3: no setup or operational calls."""
+        pytest.fail("driver prelude attempted an operational call")
+
+    with monkeypatch.context() as patch:
+        patch.chdir(driver_directory)
+        patch.setattr(sys, "argv", [str(driver), str(tmp_path / "output"), "synthetic-cli",
+                                   "synthetic-context", "synthetic-namespace", "synthetic-release",
+                                   "synthetic-fullname", "synthetic-agent", str(HERE.parents[1])])
+        patch.setattr(sys, "path", [str(driver_directory), *[
+            entry for entry in sys.path if Path(entry or ".").resolve() != HERE
+        ]])
+        # Force a fresh import and let monkeypatch restore the original module entry.
+        patch.setitem(sys.modules, "quota_burst_diagnostics", None)
+        del sys.modules["quota_burst_diagnostics"]
+        for target, name in ((subprocess, "Popen"), (subprocess, "run"), (os, "getenv"),
+                             (socket, "create_connection"), (Path, "write_text")):
+            patch.setattr(target, name, forbidden)
+        exec(compile(prelude, str(driver), "exec"), namespace)
+        imported = sys.modules["quota_burst_diagnostics"]
+        assert Path(imported.__file__).resolve() == HELPER
+        assert namespace["emit_summary"] is imported.emit_summary
+        namespace["emit_summary"](**inputs())
+    assert "children" not in namespace and "kube" not in namespace
+    assert set(summary(capsys)) == KEYS
