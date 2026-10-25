@@ -70,6 +70,21 @@ def test_no_row_read_and_existing_local_projection_are_exact(clean_db: None) -> 
             }
             row = await s.get(TenantIdentityProvider, local)
             assert row.http_selection is None and row.lifecycle_generation == 0
+            sql_shape = (
+                (
+                    await s.execute(
+                        text(
+                            "SELECT http_selection IS NULL AS is_sql_null, "
+                            "jsonb_typeof(http_selection) AS json_type "
+                            "FROM curie.tenant_identity_providers WHERE tenant_id=:tenant"
+                        ),
+                        {"tenant": local},
+                    )
+                )
+                .mappings()
+                .one()
+            )
+            assert dict(sql_shape) == {"is_sql_null": True, "json_type": None}
             assert (
                 row.issuer,
                 row.governed_domains,
@@ -113,6 +128,28 @@ def test_adoption_is_flush_only_preserves_scope_and_has_bounded_audit(
                 assert row.issuer == ISSUER and row.identity_epoch == (7 if local else 0)
                 assert row.governed_domains == (["example.test"] if local else None)
                 assert row.managed_by == ("synthetic-directory" if local else None)
+                sql_shape = (
+                    (
+                        await s.execute(
+                            text(
+                                "SELECT governed_domains IS NULL AS domains_sql_null, "
+                                "managed_by IS NULL AS manager_sql_null, "
+                                "http_selection IS NULL AS selection_sql_null, "
+                                "jsonb_typeof(http_selection) AS selection_json_type "
+                                "FROM curie.tenant_identity_providers WHERE tenant_id=:tenant"
+                            ),
+                            {"tenant": tenant},
+                        )
+                    )
+                    .mappings()
+                    .one()
+                )
+                assert dict(sql_shape) == {
+                    "domains_sql_null": not local,
+                    "manager_sql_null": not local,
+                    "selection_sql_null": False,
+                    "selection_json_type": "object",
+                }
                 person_row = await principal(s, tenant)
                 assert (
                     person_row.id,
@@ -1119,5 +1156,53 @@ def test_exact_t1_age_limit_is_accepted_independently(clean_db: None, observatio
             assert result.outcome == "resolved"
             assert result.principal_id is not None
             assert (result.authorization_version, result.lifecycle_generation) == (1, 2)
+
+    run(body)
+
+
+@pytest.mark.parametrize("payload", ["null", "[]", "0"], ids=["json-null", "array", "scalar"])
+def test_nonobject_http_json_cannot_cross_sql_null_owner_boundary(
+    clean_db: None, payload: str
+) -> None:
+    """@spec HTTP-PRINCIPAL-ADOPTION-V1-2. SQL NULL alone denotes local ownership."""
+    from sqlalchemy.exc import IntegrityError
+
+    api()
+
+    async def body(f: async_sessionmaker[AsyncSession]) -> None:
+        """@spec HTTP-PRINCIPAL-ADOPTION-V1-2."""
+        tenant, _ = await seed(f, local=True)
+        async with f() as s, s.begin():
+            with pytest.raises(IntegrityError) as exc:
+                async with s.begin_nested():
+                    await s.execute(
+                        text(
+                            "UPDATE curie.tenant_identity_providers "
+                            "SET http_selection=CAST(:payload AS jsonb), lifecycle_generation=1 "
+                            "WHERE tenant_id=:tenant"
+                        ),
+                        {"payload": payload, "tenant": tenant},
+                    )
+            assert getattr(exc.value.orig, "sqlstate", None) == "23514"
+        async with f() as s:
+            sql_shape = (
+                (
+                    await s.execute(
+                        text(
+                            "SELECT http_selection IS NULL AS is_sql_null, "
+                            "jsonb_typeof(http_selection) AS json_type, lifecycle_generation "
+                            "FROM curie.tenant_identity_providers WHERE tenant_id=:tenant"
+                        ),
+                        {"tenant": tenant},
+                    )
+                )
+                .mappings()
+                .one()
+            )
+            assert dict(sql_shape) == {
+                "is_sql_null": True,
+                "json_type": None,
+                "lifecycle_generation": 0,
+            }
 
     run(body)

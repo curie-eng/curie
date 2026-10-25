@@ -51,6 +51,12 @@ def test_upgrade_preserves_old_local_values_and_enforces_authority_storage(
         params,
     ) == [{"http_selection": None, "lifecycle_generation": 0}]
     assert sql_dicts(
+        "SELECT http_selection IS NULL AS is_sql_null, "
+        "jsonb_typeof(http_selection) AS json_type "
+        "FROM curie.tenant_identity_providers WHERE tenant_id=:tenant",
+        params,
+    ) == [{"is_sql_null": True, "json_type": None}]
+    assert sql_dicts(
         "SELECT data_type,is_nullable FROM information_schema.columns "
         "WHERE table_schema='curie' AND table_name='tenant_identity_providers' "
         "AND column_name='lifecycle_generation'"
