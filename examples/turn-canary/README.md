@@ -146,7 +146,41 @@ marker. Blank fields, empty profiles, missing or unknown fields, duplicate keys
 and malformed JSON refuse startup. An unset variable disables profiles;
 an explicitly empty value or object is an error. Programmatic consumers use
 `parse_probe_profiles(raw)` and the immutable `ProbeProfile.matches(text)`
-matcher from this example to share the same contract.
+matcher from the standalone [probe_profiles.py](probe_profiles.py) helper.
+This file uses only the Python standard library, so a configuration validator
+can ship it alone without installing the checker's runtime dependencies.
+`validate_probe_profiles` checks programmatic profile mappings. The checker
+re-exports these APIs and keeps the same parsing and matching behavior.
+
+When shipping the runnable checker, place both `turn_canary.py` and
+`probe_profiles.py` in the same source directory and retain the normal Python
+workspace dependencies. The checker resolves its exact sibling, so copying only
+the executable fails before any platform operation. Script execution and
+dynamic file import both work without adding a source checkout to `sys.path`.
+The helper alone needs no installed checkout or third-party dependency.
+
+A normal `import probe_profiles` from that source directory is supported.
+For a helper loaded from an explicit file path, use Python's module registration
+protocol before execution so the checker can reuse its exact profile class:
+
+```python
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("canary_profiles", "/path/to/probe_profiles.py")
+assert spec is not None and spec.loader is not None
+profiles = importlib.util.module_from_spec(spec)
+if spec.name in sys.modules:
+    raise ImportError("choose an unused module name")
+sys.modules[spec.name] = profiles
+spec.loader.exec_module(profiles)
+validated = profiles.parse_probe_profiles(raw_json)
+```
+
+The checker reuses a registered module only if its resolved file is the exact
+sibling it ships with. Repeated imports share that class; different source
+directories remain isolated, and an unrelated module with the same basename
+is preserved. The checker never changes global import search paths.
 
 The probe result, mode and both new success timestamps are retained across
 rotation, capacity skips and cleanup holds, and removed when inventory drops
