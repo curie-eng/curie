@@ -313,3 +313,35 @@ print('isolated-source-identities-ok')
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert result.stdout.strip() == "isolated-source-identities-ok"
+
+
+def test_checker_first_then_normal_helper_import_preserves_profile_identity(tmp_path):
+    """A vacant canonical name must support either import order. @spec TURN-CANARY-17"""
+    directory = _assembly(tmp_path)
+    program = """
+# @spec TURN-CANARY-17
+import importlib.util
+import sys
+from pathlib import Path
+
+assert 'probe_profiles' not in sys.modules
+directory = Path.cwd()
+before = list(sys.path)
+spec = importlib.util.spec_from_file_location('checker_first_consumer',
+                                             directory / 'turn_canary.py')
+runtime = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(runtime)
+import probe_profiles as helper
+assert sys.path == before
+assert Path(helper.__file__).resolve() == directory / 'probe_profiles.py'
+assert sys.modules['probe_profiles'] is helper
+assert runtime.ProbeProfile is helper.ProbeProfile
+assert runtime.parse_probe_profiles is helper.parse_probe_profiles
+profiles = helper.parse_probe_profiles(
+    '{"sample-agent":{"prompt":"Question?","required_any":[["ready"]],"forbidden_any":[]}}')
+assert runtime._check_probe_profiles(profiles) == profiles
+print('checker-first-profile-identity-ok')
+"""
+    result = _run(["-c", program], directory)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip() == "checker-first-profile-identity-ok"
