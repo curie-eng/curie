@@ -277,6 +277,9 @@ import time
 
 root, binary, context, namespace, release, fullname, agent, chart = sys.argv[1:]
 root = pathlib.Path(root)
+sys.path.insert(0, str(pathlib.Path(chart) / "ci" / "runtime"))
+from quota_burst_diagnostics import emit_summary
+
 kube = ["kubectl", "--context", context, "-n", namespace]
 message = [binary, "--json", "cluster", "--context", context, "message", "--namespace", namespace,
            "--release", release, "--chart", chart, "--agent", agent, "--channel", "C0EXAMPLE1", "--timeout-secs", "300"]
@@ -578,6 +581,7 @@ assert len(users) == 2 and users[0] == sys.argv[1] and users[1] == sys.argv[2], 
 
 
 def burst_sixteen():
+    # @spec QUOTA-TIMEOUT-DIAGNOSTIC-1/2: observations never update the verdict sample.
     started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     turns = [start(f"burst16-{index}", "held-open capacity probe burst16 " + str(index))
              for index in range(16)]
@@ -594,13 +598,52 @@ def burst_sixteen():
         assert len(pods) <= 2, "observed more than two chargeable sandbox pods"
 
     deadline = time.monotonic() + 320
-    while True:
-        completed = [finished(turn) for turn in turns]
-        quota_pods()
-        if all(completed):
-            break
-        assert time.monotonic() < deadline, "sixteen-thread burst exceeded its bounded runtime"
-        time.sleep(0.2)
+    diagnostic_origin = deadline - 320
+    prior_completed_count = None
+    prior_sample_time = None
+    last_observation_seconds = 0
+    max_observation_seconds = 0
+    try:
+        while True:
+            completed = [finished(turn) for turn in turns]
+            prior_completed_count = sum(completed)
+            try:
+                prior_sample_time = observation_started = time.monotonic()
+            except Exception:
+                prior_sample_time = observation_started = None
+            try:
+                quota_pods()
+            finally:
+                try:
+                    last_observation_seconds = time.monotonic() - observation_started
+                    max_observation_seconds = max(max_observation_seconds, last_observation_seconds)
+                except Exception:
+                    last_observation_seconds = max_observation_seconds = None
+            if all(completed):
+                break
+            assert time.monotonic() < deadline, "sixteen-thread burst exceeded its bounded runtime"
+            time.sleep(0.2)
+    finally:
+        elapsed_seconds = prior_sample_age_seconds = returncodes = None
+        try:
+            sampled_at = time.monotonic()
+            elapsed_seconds = sampled_at - diagnostic_origin
+            prior_sample_age_seconds = (None if prior_sample_time is None
+                                        else sampled_at - prior_sample_time)
+            returncodes = [turn["process"].poll() for turn in turns]
+        except Exception:
+            returncodes = None
+        try:
+            emit_summary(
+                elapsed_seconds=elapsed_seconds,
+                prior_completed_count=prior_completed_count,
+                prior_sample_age_seconds=prior_sample_age_seconds,
+                last_observation_seconds=last_observation_seconds,
+                max_observation_seconds=max_observation_seconds,
+                returncodes=returncodes,
+            )
+        except Exception:
+            pass
     last = None
     for _attempt in range(5):
         try:
