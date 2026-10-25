@@ -157,7 +157,15 @@ def _timestamp(value: str) -> str:
 
 Text = Annotated[str, BeforeValidator(_text)]
 Opaque = Annotated[Text, Field(min_length=1)]
-CanonicalUUID = Annotated[Text, Field(pattern=_UUID_PATTERN), AfterValidator(_uuid)]
+# @spec HTTP-IDENTITY-V1-5: validation-chain schemas can omit the later UUID pattern.
+CanonicalUUID = Annotated[
+    Text,
+    Field(
+        pattern=_UUID_PATTERN,
+        json_schema_extra={"pattern": _UUID_PATTERN + r"(?![\s\S])"},
+    ),
+    AfterValidator(_uuid),
+]
 # Schema metadata does not narrow the existing exact-string runtime validators.
 Issuer = Annotated[
     Text,

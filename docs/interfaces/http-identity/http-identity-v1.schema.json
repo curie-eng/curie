@@ -86,6 +86,7 @@
           "type": "string"
         },
         "request_id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$(?![\\s\\S])",
           "title": "Request Id",
           "type": "string"
         },
@@ -376,6 +377,7 @@
           "type": "string"
         },
         "request_id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$(?![\\s\\S])",
           "title": "Request Id",
           "type": "string"
         },
@@ -453,6 +455,7 @@
           "type": "string"
         },
         "id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$(?![\\s\\S])",
           "title": "Id",
           "type": "string"
         },
@@ -515,6 +518,7 @@
           "$ref": "#/$defs/SenderV1"
         },
         "tenant_id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$(?![\\s\\S])",
           "title": "Tenant Id",
           "type": "string"
         }
@@ -532,6 +536,7 @@
       "description": "@spec HTTP-IDENTITY-V1-1.",
       "properties": {
         "channel_identity_id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$(?![\\s\\S])",
           "title": "Channel Identity Id",
           "type": "string"
         },
@@ -549,6 +554,7 @@
           "type": "string"
         },
         "provider_installation_id": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$(?![\\s\\S])",
           "title": "Provider Installation Id",
           "type": "string"
         }
