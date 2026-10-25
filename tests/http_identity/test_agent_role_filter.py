@@ -150,7 +150,11 @@ def test_exact_selectors_and_namespace_lifetime(path: str, replacement: str) -> 
     """@spec AGENT-ROLE-FILTER-V1-2: distinct exact selectors survive readback."""
     candidate = policy()
     entries = candidate["roles"]["invocation"]["filter"]["entries"]
-    entries.append(changed(entries[0], path, replacement))
+    distinct = changed(entries[0], path, replacement)
+    if path == "provider":
+        # A different provider descriptor belongs to a different namespace row.
+        distinct["namespace"]["id"] = OTHER_UUID
+    entries.append(distinct)
     assert readback(candidate) == candidate
 
 
