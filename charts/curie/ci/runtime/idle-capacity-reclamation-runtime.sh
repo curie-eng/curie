@@ -364,7 +364,7 @@ def counts_against_quota(pod, now):
     return True
 
 
-def observe():
+def quota_pods():
     read_started = time.time()
     quota = get("resourcequota", fullname + "-sandbox-quota")
     assert quota["spec"]["hard"]["pods"] == "2", "sandbox pod quota changed from two"
@@ -396,7 +396,11 @@ def observe():
                         "chargeable": counts_against_quota(pod, now)} for pod in pods.values()]},
               sort_keys=True), file=sys.stderr)
     assert len(chargeable) <= 2, "observed more than two chargeable sandbox pods"
-    return pods, probe()
+    return pods
+
+
+def observe():
+    return quota_pods(), probe()
 
 
 def thread():
@@ -594,18 +598,6 @@ def burst_sixteen():
     started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     turns = [start(f"burst16-{index}", "held-open capacity probe burst16 " + str(index))
              for index in range(16)]
-    def quota_pods():
-        quota = get("resourcequota", fullname + "-sandbox-quota")
-        assert quota["spec"]["hard"]["pods"] == "2", "sandbox pod quota changed from two"
-        quota_used = int(quota.get("status", {}).get("used", {}).get("pods", 0))
-        assert quota_used <= 2, "observed quota usage exceeded two"
-        priority = quota["spec"]["scopeSelector"]["matchExpressions"][0]["values"][0]
-        pods = [pod for pod in get("pods")["items"]
-                if pod["spec"].get("priorityClassName") == priority]
-        now = time.time()
-        chargeable = [pod for pod in pods if counts_against_quota(pod, now)]
-        assert len(chargeable) <= 2, "observed more than two chargeable sandbox pods"
-
     deadline = time.monotonic() + 320
     while True:
         completed = [finished(turn) for turn in turns]
