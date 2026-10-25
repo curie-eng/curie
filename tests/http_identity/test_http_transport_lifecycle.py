@@ -576,10 +576,12 @@ def test_context_exit_reports_incomplete_shutdown_or_preserves_body_exception(
     run_transport(scenario)
 
 
+@pytest.mark.parametrize("body_failure", ["error", "cancellation"])
 def test_cancellation_during_context_exit_preserves_original_body_exception_and_drains(
     support: Any,
     run_transport: Any,
     monkeypatch: pytest.MonkeyPatch,
+    body_failure: str,
 ) -> None:
     """@spec HTTP-IDENTITY-TRANSPORT-4: cancellation during exit preserves the body error."""
     module = support.api()
@@ -597,7 +599,11 @@ def test_cancellation_during_context_exit_preserves_original_body_exception_and_
         monkeypatch.setattr(module, "validate_lookup", parse)
         listener = await rig.listen()
         client = rig.client(module, allow_loopback_http=True)
-        body_error = RuntimeError("Synthetic body exception before cancelled context exit")
+        body_error = (
+            asyncio.CancelledError("Synthetic original body cancellation")
+            if body_failure == "cancellation"
+            else RuntimeError("Synthetic original body exception")
+        )
 
         async def context_user() -> None:
             """@spec HTTP-IDENTITY-TRANSPORT-4."""
@@ -619,7 +625,7 @@ def test_cancellation_during_context_exit_preserves_original_body_exception_and_
                 await asyncio.sleep(0.005)
         # The public closing state proves exit has begun its bounded close wait.
         assert client.close_status().pending_parsers == 1
-        task.cancel()
+        task.cancel("Synthetic later cancellation during context exit")
         observed: BaseException | None = None
         try:
             await task
@@ -635,7 +641,7 @@ def test_cancellation_during_context_exit_preserves_original_body_exception_and_
                 await asyncio.sleep(0.01)
         assert report.worker_joined and not report.close_failed
         assert report.pending_exchanges == report.pending_parsers == 0
-        assert observed is body_error, f"context exit replaced the body error with {type(observed)}"
+        assert observed is body_error, f"context exit replaced the body error: {observed!r}"
 
     run_transport(scenario)
 
