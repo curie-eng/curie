@@ -189,14 +189,15 @@ def test_capture_closes_scope_and_global_fence_before_return(clean_db: None) -> 
 
 @pytest.mark.parametrize("expiry", ["identity", "membership"])
 @pytest.mark.parametrize("wait_on", ["tenant", "principal"])
-def test_freshness_clock_runs_after_real_lock_wait_at_equality(
-    clean_db: None, expiry: str, wait_on: str
+@pytest.mark.parametrize("boundary", ["equal", "later"])
+def test_freshness_clock_after_real_lock_wait_preserves_t1_equality(
+    clean_db: None, expiry: str, wait_on: str, boundary: str
 ) -> None:
-    """@spec HTTP-PRINCIPAL-ADOPTION-V1-6. Equality at commit is expired."""
+    """@spec HTTP-PRINCIPAL-ADOPTION-V1-6. T1 equality is fresh; strictly later is stale."""
     service = api()
 
     async def body(f: async_sessionmaker[AsyncSession]) -> None:
-        """@spec HTTP-PRINCIPAL-ADOPTION-V1-6. Equality at commit is expired."""
+        """@spec HTTP-PRINCIPAL-ADOPTION-V1-6. Revalidate at the post-lock clock."""
         tenant, person_id = await seed(f, status="active")
         async with f() as s, s.begin():
             await service.adopt_http_authority(
@@ -225,23 +226,32 @@ def test_freshness_clock_runs_after_real_lock_wait_at_equality(
             task = asyncio.create_task(apply(writer, cap, clock=clock))
             try:
                 await blocked(observer, writer_pid, holder_pid)
-                clock_value = NOW + timedelta(seconds=1)
+                clock_value = NOW + timedelta(
+                    seconds=1, microseconds=1 if boundary == "later" else 0
+                )
                 await holder.commit()
-                with pytest.raises(
-                    service.PrincipalAuthorityRefusal, match=f"^identity_facts_{expiry}_stale$"
-                ):
-                    await task
-                # Caller catches and commits; savepoint rollback still erases effects.
+                if boundary == "later":
+                    with pytest.raises(
+                        service.PrincipalAuthorityRefusal, match=f"^identity_facts_{expiry}_stale$"
+                    ):
+                        await task
+                else:
+                    result = await task
+                    assert result.authorization_version == 4
+                    assert result.lifecycle_generation == 2
+                # A caught refusal followed by commit still cannot persist effects.
                 await writer.commit()
             finally:
                 if not task.done():
                     task.cancel()
                     await asyncio.gather(task, return_exceptions=True)
-        assert calls and calls[-1] == NOW + timedelta(seconds=1)
+        assert calls and calls[-1] == clock_value
         async with f() as s:
             row = await principal(s, tenant)
             assert (row.status, row.authorization_version) == ("active", 4)
-            assert (await s.get(TenantIdentityProvider, tenant)).lifecycle_generation == 1
+            assert (await s.get(TenantIdentityProvider, tenant)).lifecycle_generation == (
+                1 if boundary == "later" else 2
+            )
 
     run(body)
 
@@ -413,7 +423,14 @@ def test_discovery_never_locks_token_namespace_or_session_before_scope(
                 )
                 await probe.rollback()
                 await scope.commit()
-                await task
+                if consumer == "locked_team":
+                    # Scope-first locking does not grant a displaced directory writer authority.
+                    with pytest.raises(
+                        directory_sync.DirectoryConflict, match="^authority_owned_by_http$"
+                    ):
+                        await task
+                else:
+                    await task
                 await consumer_session.commit()
             finally:
                 if not task.done():
