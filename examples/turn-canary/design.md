@@ -397,8 +397,12 @@ cleanup.
   sibling file, preserving profile class identity across helper and checker
   imports. Normal helper imports and file-spec imports registered in
   `sys.modules` before execution are supported. Repeated checker imports share
-  that sibling; different source directories stay isolated. An unrelated
-  module with the same basename is preserved. A missing helper fails
+  that sibling; different source directories stay isolated. If the canonical
+  `probe_profiles` module name is vacant, the checker registers the exact
+  sibling under that name too, preserving profile class identity for normal
+  helper imports before or after checker loading. An occupied canonical name
+  is never overwritten. Arbitrary duplicate file-spec executions under new
+  names retain Python's normal independent module identities. A missing helper fails
   before any platform operation. Factoring the helper changes no prompt,
   default, wire, lifecycle, cleanup, log or metric behavior.
 
