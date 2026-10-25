@@ -519,6 +519,37 @@ def test_lookup_rejects_unsafe_or_nonabsolute_or_coerced_url_shapes(url: Any) ->
     refuse(validate(changed(configuration(), "selection.lookup_url", url)))
 
 
+@pytest.mark.parametrize(
+    "whitespace",
+    [
+        pytest.param(" ", id="ascii-space"),
+        pytest.param("\u00a0", id="no-break-space"),
+        pytest.param("\u2003", id="em-space"),
+    ],
+)
+@pytest.mark.parametrize(
+    "url_template",
+    [
+        pytest.param("https://identity{}example/lookup", id="hostname"),
+        pytest.param("https://identity.example/has{}space", id="path"),
+    ],
+)
+def test_lookup_rejects_interior_ascii_and_unicode_whitespace(
+    whitespace: str, url_template: str
+) -> None:
+    """@spec HTTP-AUTHORITY-CONFIG-V1-3."""
+    candidate = changed(configuration(), "selection.lookup_url", url_template.format(whitespace))
+    refuse(validate(candidate))
+
+
+def test_lookup_preserves_percent_encoded_path_space_in_exact_readback() -> None:
+    """@spec HTTP-AUTHORITY-CONFIG-V1-3 HTTP-AUTHORITY-CONFIG-V1-6."""
+    candidate = changed(
+        configuration(), "selection.lookup_url", "https://Identity.example/has%20space"
+    )
+    assert readback(validate(candidate)) == candidate
+
+
 @pytest.mark.parametrize("control", [chr(n) for n in range(32)] + [chr(127)])
 def test_lookup_rejects_ascii_controls_before_a_url_parser_can_strip_them(control: str) -> None:
     """@spec HTTP-AUTHORITY-CONFIG-V1-3."""
