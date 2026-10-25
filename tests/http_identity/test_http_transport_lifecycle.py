@@ -576,6 +576,70 @@ def test_context_exit_reports_incomplete_shutdown_or_preserves_body_exception(
     run_transport(scenario)
 
 
+def test_cancellation_during_context_exit_preserves_original_body_exception_and_drains(
+    support: Any,
+    run_transport: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """@spec HTTP-IDENTITY-TRANSPORT-4: cancellation during exit preserves the body error."""
+    module = support.api()
+
+    async def scenario(rig: Any) -> None:
+        entered, release = threading.Event(), rig.event(thread=True)
+        original = support.facts().validate_lookup
+
+        def parse(*args: Any, **kwargs: Any) -> Any:
+            """@spec HTTP-IDENTITY-TRANSPORT-4: hold actual owned parser work through exit."""
+            entered.set()
+            assert release.wait(8), "fixture failed to release the parser"
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(module, "validate_lookup", parse)
+        listener = await rig.listen()
+        client = rig.client(module, allow_loopback_http=True)
+        body_error = RuntimeError("Synthetic body exception before cancelled context exit")
+
+        async def context_user() -> None:
+            """@spec HTTP-IDENTITY-TRANSPORT-4."""
+            async with client:
+                rig.task(
+                    client.lookup(
+                        target=support.target(module, listener.url),
+                        bearer=module.ProviderBearer(support.token),
+                        request=support.request(),
+                        limits=support.limits(),
+                    )
+                )
+                await wait_thread_event(entered)
+                raise body_error
+
+        task = rig.task(context_user())
+        async with asyncio.timeout(1):
+            while client.close_status().state != "closing":
+                await asyncio.sleep(0.005)
+        # The public closing state proves exit has begun its bounded close wait.
+        assert client.close_status().pending_parsers == 1
+        task.cancel()
+        observed: BaseException | None = None
+        try:
+            await task
+        except (RuntimeError, asyncio.CancelledError) as error:
+            observed = error
+        report = client.close_status()
+        assert report.state == "closing" and report.pending_parsers == 1
+        assert not report.worker_joined and not report.close_failed
+        assert listener.connections == 1
+        release.set()
+        async with asyncio.timeout(1.5):
+            while (report := await client.aclose()).state != "closed":
+                await asyncio.sleep(0.01)
+        assert report.worker_joined and not report.close_failed
+        assert report.pending_exchanges == report.pending_parsers == 0
+        assert observed is body_error, f"context exit replaced the body error with {type(observed)}"
+
+    run_transport(scenario)
+
+
 def test_unused_client_closes_without_starting_worker_and_remains_closed(
     support: Any,
     run_transport: Any,
