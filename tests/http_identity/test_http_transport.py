@@ -10,7 +10,9 @@ import dataclasses
 import gzip
 import json
 import logging
+import pickle
 import ssl
+from datetime import datetime
 from typing import Any
 
 import pytest
@@ -56,7 +58,7 @@ def test_exact_exchange_dedicated_bearer_no_ambient_state_and_no_cookie_cache(
                 request=support.request(),
                 limits=support.limits(),
             )
-            assert isinstance(result, support.facts().ValidatedFacts)
+            assert isinstance(result, module.HttpIdentityObservation)
             assert support.token not in repr(result)
         assert endpoint.connections == 2 and proxy.connections == 0
         for first, headers, body in endpoint.requests:
@@ -104,7 +106,7 @@ def test_verified_tls_positive_control_and_real_tls_negatives(
                 request=support.request(),
                 limits=support.limits(),
             )
-            assert isinstance(result, support.facts().ValidatedFacts)
+            assert isinstance(result, module.HttpIdentityObservation)
             assert listener.requests[0][1]["authorization"] == "Bearer " + support.token
 
     run_transport(scenario)
@@ -220,7 +222,7 @@ def test_secret_representation_serialization_and_valid_token_without_extra_lengt
             request=support.request(),
             limits=support.limits(),
         )
-        assert isinstance(result, support.facts().ValidatedFacts)
+        assert isinstance(result, module.HttpIdentityObservation)
         assert listener.requests[0][1]["authorization"] == "Bearer " + secret
 
     run_transport(scenario)
@@ -392,7 +394,7 @@ def test_allowed_media_and_identity_encoding_preserve_facts(
             request=support.request(),
             limits=support.limits(),
         )
-        assert isinstance(result, support.facts().ValidatedFacts)
+        assert isinstance(result, module.HttpIdentityObservation)
 
     run_transport(scenario)
 
@@ -478,17 +480,19 @@ def test_compressed_valid_json_and_bomb_are_both_refused(support: Any, run_trans
 
 @pytest.mark.parametrize("framing", ["length", "chunked", "eof"])
 @pytest.mark.parametrize("size", [65_536, 65_537])
+@pytest.mark.parametrize("outcome", ["resolved", "inactive", "unresolved"])
 def test_raw_entity_exact_byte_boundary_across_real_framing_and_chunks(
     support: Any,
     run_transport: Any,
     framing: str,
     size: int,
+    outcome: str,
 ) -> None:
     """@spec HTTP-IDENTITY-TRANSPORT-2: transfer framing never counts as entity bytes."""
     module = support.api()
 
     async def scenario(rig: Any) -> None:
-        body = support.response()
+        body = support.response(outcome=outcome)
         body += b" " * (size - len(body))
         listener = await rig.listen(payload=support.wire(body, framing=framing))
         client = rig.client(module, allow_loopback_http=True)
@@ -499,7 +503,10 @@ def test_raw_entity_exact_byte_boundary_across_real_framing_and_chunks(
             limits=support.limits(),
         )
         if size == 65_536:
-            assert isinstance(result, support.facts().ValidatedFacts)
+            assert isinstance(result, module.HttpIdentityObservation)
+            assert isinstance(result.facts, support.facts().ValidatedFacts)
+            assert result.facts.outcome == outcome
+            assert result.response_bytes == body
         else:
             support.refusal(result, "invalid_response")
 
@@ -590,7 +597,7 @@ def test_complete_malformed_entity_and_incomplete_protocol_have_distinct_results
     run_transport(scenario)
 
 
-@pytest.mark.parametrize("outcome", ["unresolved", "unavailable"])
+@pytest.mark.parametrize("outcome", ["resolved", "inactive", "unresolved", "unavailable"])
 def test_complete_t1_outcome_is_preserved(support: Any, run_transport: Any, outcome: str) -> None:
     """@spec HTTP-IDENTITY-TRANSPORT-2: transport adds no policy to T1 outcomes."""
     module = support.api()
@@ -607,8 +614,10 @@ def test_complete_t1_outcome_is_preserved(support: Any, run_transport: Any, outc
         if outcome == "unavailable":
             support.refusal(result, "unavailable")
         else:
-            assert isinstance(result, support.facts().ValidatedFacts)
-            assert result.outcome == "unresolved" and result.identity is None
+            assert isinstance(result, module.HttpIdentityObservation)
+            assert result.facts.outcome == outcome
+            if outcome == "unresolved":
+                assert result.facts.identity is None
 
     run_transport(scenario)
 
@@ -679,5 +688,306 @@ def test_real_tls_handshake_stall_uses_same_result_deadline(
         support.refusal(result, "unavailable")
         elapsed = asyncio.get_running_loop().time() - start
         assert 1.8 <= elapsed < 2.35
+
+    run_transport(scenario)
+
+
+@pytest.mark.parametrize("outcome", ["resolved", "inactive", "unresolved"])
+@pytest.mark.parametrize("at_cap", [False, True])
+def test_one_t1_call_hands_off_same_exact_noncanonical_multichunk_entity(
+    support: Any,
+    run_transport: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+    at_cap: bool,
+) -> None:
+    """@spec HTTP-IDENTITY-TRANSPORT-2 HTTP-IDENTITY-TRANSPORT-3: no reconstruction."""
+    module = support.api()
+
+    async def scenario(rig: Any) -> None:
+        value = json.loads(support.response(outcome=outcome))
+        body = json.dumps(dict(reversed(list(value.items()))), indent=3).encode()
+        body = b"\n " + body.replace(b'"outcome"', b'"\\u006futcome"') + b"\r\n\t "
+        if at_cap:
+            body += b" " * (65_536 - len(body))
+            assert len(body) == 65_536
+        assert json.loads(body) == value
+        assert body != json.dumps(value, separators=(",", ":")).encode()
+        original = support.facts().validate_lookup
+        seen: list[tuple[bytes, Any, Any, datetime, Any]] = []
+
+        def parse(raw: bytes, request: Any, limits: Any, *, now: datetime) -> Any:
+            """@spec HTTP-IDENTITY-TRANSPORT-3: observe the sole real pure T1 call."""
+            facts = original(raw, request, limits, now=now)
+            seen.append((raw, request, limits, now, facts))
+            return facts
+
+        monkeypatch.setattr(module, "validate_lookup", parse)
+
+        async def chunks(reader: Any, writer: Any) -> None:
+            """@spec HTTP-IDENTITY-TRANSPORT-2: actual separate HTTP/1.1 transfer chunks."""
+            writer.write(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                b"Transfer-Encoding: chunked\r\n\r\n"
+            )
+            for part in (body[:7], body[7:300], body[300:32_000], body[32_000:]):
+                if part:
+                    writer.write(f"{len(part):x}\r\n".encode() + part + b"\r\n")
+                    await writer.drain()
+                    await asyncio.sleep(0)
+            writer.write(b"0\r\n\r\n")
+            await writer.drain()
+
+        listener = await rig.listen(chunks)
+        client = rig.client(module, allow_loopback_http=True)
+        result = await client.lookup(
+            target=support.target(module, listener.url),
+            bearer=module.ProviderBearer(support.token),
+            request=support.request(),
+            limits=support.limits(),
+        )
+        assert isinstance(result, module.HttpIdentityObservation)
+        assert len(seen) == 1
+        raw, request, limits, now, facts = seen[0]
+        assert isinstance(facts, support.facts().ValidatedFacts)
+        assert result.facts is facts and result.response_bytes is raw
+        assert raw == body and result.facts.outcome == outcome
+        independently_checked = original(body, request, limits, now=now)
+        assert isinstance(independently_checked, support.facts().ValidatedFacts)
+        assert result.facts.model_dump() == independently_checked.model_dump()
+        assert listener.connections == 1
+        await client.aclose()
+        assert result.response_bytes is raw and result.response_bytes == body
+        assert result.facts is facts
+
+    run_transport(scenario)
+
+
+def test_concurrent_and_later_observations_never_cross_pair_or_overwrite_evidence(
+    support: Any,
+    run_transport: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """@spec HTTP-IDENTITY-TRANSPORT-2 HTTP-IDENTITY-TRANSPORT-4: per-exchange ownership."""
+    module = support.api()
+
+    async def scenario(rig: Any) -> None:
+        original = support.facts().validate_lookup
+        seen: list[tuple[bytes, Any]] = []
+        bodies: list[bytes] = []
+        for subject in ("FirstIndependentSubject", "SecondIndependentSubject"):
+            value = json.loads(support.response())
+            value["identity"]["subject"] = subject
+            bodies.append(b" \n" + json.dumps(value, indent=2).encode() + b"\t\n")
+
+        def parse(raw: bytes, *args: Any, **kwargs: Any) -> Any:
+            """@spec HTTP-IDENTITY-TRANSPORT-3."""
+            facts = original(raw, *args, **kwargs)
+            seen.append((raw, facts))
+            return facts
+
+        monkeypatch.setattr(module, "validate_lookup", parse)
+        listeners = [await rig.listen(payload=support.wire(body)) for body in bodies]
+        client = rig.client(module, allow_loopback_http=True)
+
+        async def lookup(index: int) -> Any:
+            """@spec HTTP-IDENTITY-TRANSPORT-2."""
+            return await client.lookup(
+                target=support.target(module, listeners[index].url),
+                bearer=module.ProviderBearer(support.token),
+                request=support.request(),
+                limits=support.limits(),
+            )
+
+        first, second = await asyncio.gather(lookup(0), lookup(1))
+        later = await lookup(0)
+        assert len(seen) == 3
+        observations = (first, second, later)
+        for observation, body in zip(observations, (bodies[0], bodies[1], bodies[0]), strict=True):
+            assert isinstance(observation, module.HttpIdentityObservation)
+            assert observation.response_bytes == body
+            assert observation.facts.identity.subject == json.loads(body)["identity"]["subject"]
+            assert (
+                sum(
+                    observation.facts is facts and observation.response_bytes is raw
+                    for raw, facts in seen
+                )
+                == 1
+            )
+        assert first is not second and later is not first
+        assert first != second and first != later
+        assert first == first and len({first, second, later}) == 3
+        assert hash(first) == hash(first) == object.__hash__(first)
+        assert [listener.connections for listener in listeners] == [2, 1]
+        await client.aclose()
+        assert all(
+            observation.response_bytes == body
+            for observation, body in zip(
+                observations, (bodies[0], bodies[1], bodies[0]), strict=True
+            )
+        )
+
+    run_transport(scenario)
+
+
+def test_observation_is_opaque_immutable_and_only_explicit_access_retains_sensitive_facts(
+    support: Any,
+    run_transport: Any,
+) -> None:
+    """@spec HTTP-IDENTITY-TRANSPORT-1 HTTP-IDENTITY-TRANSPORT-5."""
+    module = support.api()
+
+    async def scenario(rig: Any) -> None:
+        value = json.loads(support.response())
+        value["identity"]["subject"] = support.token + support.marker
+        value["membership"]["groups"][0]["id"] = support.marker
+        body = json.dumps(value, indent=2).encode()
+        listener = await rig.listen(payload=support.wire(body))
+        client = rig.client(module, allow_loopback_http=True)
+        observation = await client.lookup(
+            target=support.target(module, listener.url),
+            bearer=module.ProviderBearer(support.token),
+            request=support.request(),
+            limits=support.limits(),
+        )
+        assert isinstance(observation, module.HttpIdentityObservation)
+        assert isinstance(observation.facts, support.facts().ValidatedFacts)
+        assert type(observation.response_bytes) is bytes
+        assert observation.response_bytes == body
+        assert observation.facts.identity.subject == support.token + support.marker
+        assert str(observation) == repr(observation) == "HttpIdentityObservation()"
+        assert not dataclasses.is_dataclass(observation)
+        for name in (
+            "__dict__",
+            "__iter__",
+            "__bytes__",
+            "model_dump",
+            "to_dict",
+            "outcome",
+            "identity",
+            "request",
+            "groups",
+        ):
+            assert not hasattr(observation, name)
+        for name, replacement in (("facts", None), ("response_bytes", b"replacement")):
+            with pytest.raises((AttributeError, TypeError)) as error:
+                setattr(observation, name, replacement)
+            assert support.token not in str(error.value) and support.marker not in str(error.value)
+            with pytest.raises((AttributeError, TypeError)):
+                delattr(observation, name)
+        facts = observation.facts
+        mutations = [
+            (facts, "outcome", "unresolved"),
+            (facts.request, "authority_version", 99),
+            (facts.request.scope, "expected_issuer", "https://other.example.test"),
+            (facts.request.scope.sender, "native_id", "OtherAccount"),
+            (facts.request.scope.sender.namespace, "key", "OtherNamespace"),
+            (facts.identity, "subject", "OtherSubject"),
+            (facts.groups[0], "id", "OtherGroup"),
+            (facts.identity_observation, "as_of", "2000-01-01T00:00:00Z"),
+            (facts.membership_observation, "as_of", "2000-01-01T00:00:00Z"),
+        ]
+        for model, field, replacement in mutations:
+            with pytest.raises((AttributeError, TypeError, ValueError)):
+                setattr(model, field, replacement)
+        assert isinstance(facts.groups, tuple)
+        with pytest.raises(TypeError):
+            facts.groups[0] = facts.groups[0]
+        for args, kwargs in [
+            ((), {}),
+            ((facts, body), {}),
+            ((), {"facts": facts, "response_bytes": body}),
+        ]:
+            with pytest.raises(TypeError) as error:
+                module.HttpIdentityObservation(*args, **kwargs)
+            assert str(error.value) == "identity_observation_internal"
+            assert error.value.__cause__ is None
+            assert error.value.__context__ is None
+        for state_conversion in [
+            observation.__getstate__,
+            observation.__reduce__,
+            *[
+                lambda protocol=protocol: observation.__reduce_ex__(protocol)
+                for protocol in range(6)
+            ],
+            *[
+                lambda protocol=protocol: pickle.dumps(observation, protocol=protocol)
+                for protocol in range(6)
+            ],
+        ]:
+            with pytest.raises(TypeError) as error:
+                state_conversion()
+            assert str(error.value) == "identity_observation_not_serializable"
+            assert error.value.__cause__ is None and error.value.__context__ is None
+        for conversion in (vars, dict, list, bytes, dataclasses.asdict, json.dumps):
+            with pytest.raises((TypeError, AttributeError)) as error:
+                conversion(observation)
+            assert support.token not in str(error.value) and support.marker not in str(error.value)
+            assert support.token not in repr(error.value) and support.marker not in repr(
+                error.value
+            )
+        assert json.dumps(observation, default=repr) == '"HttpIdentityObservation()"'
+        assert json.dumps(observation, default=str) == '"HttpIdentityObservation()"'
+        assert support.token not in repr(client.close_status())
+        assert support.marker not in repr(client.close_status())
+        assert all(
+            support.token not in task.get_name() and support.marker not in task.get_name()
+            for task in asyncio.all_tasks()
+        )
+        await client.aclose()
+        assert observation.facts is facts and observation.response_bytes == body
+        assert observation.facts.identity.subject == support.token + support.marker
+
+    run_transport(scenario)
+
+
+@pytest.mark.parametrize(
+    ("failure", "code"),
+    [
+        ("malformed", "invalid_response"),
+        ("scoped", "scope_mismatch"),
+        ("unsupported", "unsupported_version"),
+        ("unavailable", "unavailable"),
+        ("identity_stale", "identity_stale"),
+        ("membership_stale", "membership_stale"),
+    ],
+)
+def test_t1_refusals_withhold_all_accepted_evidence(
+    support: Any,
+    run_transport: Any,
+    failure: str,
+    code: str,
+) -> None:
+    """@spec HTTP-IDENTITY-TRANSPORT-2 HTTP-IDENTITY-TRANSPORT-3."""
+    module = support.api()
+
+    async def scenario(rig: Any) -> None:
+        value = json.loads(
+            support.response(outcome="unavailable" if failure == "unavailable" else "resolved")
+        )
+        if failure == "scoped":
+            value["request_id"] = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        elif failure == "unsupported":
+            value["schema_version"] = 2
+        elif failure == "identity_stale":
+            value["identity_observation"]["as_of"] = "2000-01-01T00:00:00Z"
+        elif failure == "membership_stale":
+            value["membership"]["observation"]["as_of"] = "2000-01-01T00:00:00Z"
+        body = (
+            json.dumps(value).encode()
+            if failure != "malformed"
+            else b'{"secret":"' + support.marker.encode()
+        )
+        listener = await rig.listen(payload=support.wire(body))
+        client = rig.client(module, allow_loopback_http=True)
+        result = await client.lookup(
+            target=support.target(module, listener.url),
+            bearer=module.ProviderBearer(support.token),
+            request=support.request(),
+            limits=support.limits(),
+        )
+        support.refusal(result, code)
+        assert support.marker not in repr(result) and support.token not in repr(result)
+        assert listener.connections == 1
 
     run_transport(scenario)

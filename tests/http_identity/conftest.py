@@ -42,6 +42,7 @@ def transport_api() -> ModuleType:
         "LookupTarget",
         "ProviderBearer",
         "HttpIdentityClient",
+        "HttpIdentityObservation",
         "CloseReport",
         "IdentityTransportInternalError",
         "IdentityShutdownIncomplete",
@@ -75,7 +76,7 @@ def limits(**changes: int) -> Any:
 
 def response(*, outcome: str = "resolved") -> bytes:
     """@spec HTTP-IDENTITY-TRANSPORT-2: fresh synthetic facts, never a live identity."""
-    index = {"resolved": 0, "unavailable": 11, "unresolved": 7}[outcome]
+    index = {"resolved": 0, "inactive": 3, "unavailable": 11, "unresolved": 7}[outcome]
     body = copy.deepcopy(VECTORS["cases"][index]["response"])
     stamp = (datetime.now(UTC) - timedelta(milliseconds=20)).isoformat()
     if body["identity_observation"]:
@@ -103,6 +104,7 @@ def refusal(value: Any, code: str) -> None:
     """@spec HTTP-IDENTITY-TRANSPORT-2: no raw provider information escapes."""
     assert isinstance(value, facts_api().FactsRefusal)
     assert value.model_dump(mode="json") == {"code": code}
+    assert not hasattr(value, "facts") and not hasattr(value, "response_bytes")
 
 
 def report_fields(report: Any) -> tuple[Any, ...]:

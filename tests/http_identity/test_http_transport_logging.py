@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import logging.handlers
 import queue
@@ -67,6 +68,10 @@ def test_actual_emitters_suppress_reflection_before_queue_while_unrelated_http_r
     async def scenario(rig: Any) -> None:
         release, arrived = rig.event(), asyncio.Event()
         reflected = (support.token + support.marker).encode()
+        accepted = json.loads(support.response())
+        accepted["identity"]["subject"] = support.token + support.marker
+        accepted["membership"]["groups"][0]["id"] = support.marker
+        accepted_body = json.dumps(accepted, indent=2).encode()
 
         async def hostile(reader: Any, writer: Any) -> None:
             """@spec HTTP-IDENTITY-TRANSPORT-5: send provider-controlled wire diagnostics."""
@@ -89,7 +94,7 @@ def test_actual_emitters_suppress_reflection_before_queue_while_unrelated_http_r
             else:
                 writer.write(
                     support.wire(
-                        support.response(),
+                        accepted_body,
                         status=b"200 " + reflected,
                         headers=[
                             (b"Content-Type", b"application/json"),
@@ -126,7 +131,13 @@ def test_actual_emitters_suppress_reflection_before_queue_while_unrelated_http_r
         else:
             result = await protected
             if provider == "success":
-                assert isinstance(result, support.facts().ValidatedFacts)
+                assert isinstance(result, module.HttpIdentityObservation)
+                assert result.response_bytes == accepted_body
+                assert result.facts.identity.subject == support.token + support.marker
+                assert result.facts.groups[0].id == support.marker
+                assert str(result) == repr(result) == "HttpIdentityObservation()"
+                assert support.token not in json.dumps(result, default=repr)
+                assert support.marker not in json.dumps(result, default=str)
             else:
                 support.refusal(result, "unavailable")
             assert support.token not in repr(result) and support.marker not in repr(result)
@@ -180,11 +191,11 @@ def test_concurrent_clients_keep_one_stable_guard_and_distinct_credentials(
                 limits=support.limits(),
             )
 
-        assert isinstance(await lookup(0), support.facts().ValidatedFacts)
+        assert isinstance(await lookup(0), module.HttpIdentityObservation)
         stable = [tuple(map(id, logger.filters)) for logger in loggers]
         for _ in range(2):
             for result in await asyncio.gather(lookup(0), lookup(1)):
-                assert isinstance(result, support.facts().ValidatedFacts)
+                assert isinstance(result, module.HttpIdentityObservation)
             assert [tuple(map(id, logger.filters)) for logger in loggers] == stable
         seen = [headers["authorization"] for _, headers, _ in listener.requests]
         assert seen.count("Bearer " + tokens[0]) == 3
@@ -224,7 +235,7 @@ def test_private_dependency_guard_restores_nested_tokens_and_child_cleanup_conte
                 request=support.request(),
                 limits=support.limits(),
             ),
-            support.facts().ValidatedFacts,
+            module.HttpIdentityObservation,
         )
         guard = module._dependency_log_guard
         release_child, release_unrelated = rig.event(), rig.event()

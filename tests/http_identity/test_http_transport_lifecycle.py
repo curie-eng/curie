@@ -71,7 +71,7 @@ def test_timed_out_parser_retains_its_physical_slot_and_never_delivers_late_fact
             while client.close_status().pending_parsers:
                 await asyncio.sleep(0.005)
         third = await client.lookup(**kwargs)
-        assert isinstance(third, support.facts().ValidatedFacts)
+        assert isinstance(third, module.HttpIdentityObservation)
         assert len(calls) == 2 and len(set(calls)) == 1
         assert first.result() is first_result and second_result.code == "unavailable"
 
@@ -176,7 +176,7 @@ def test_two_operation_slots_cancelled_waiter_snapshot_and_close_wakeup(
         object.__setattr__(captured, "authority_version", 99)
         release.set()
         for result in await asyncio.gather(first, second, third):
-            assert isinstance(result, support.facts().ValidatedFacts)
+            assert isinstance(result, module.HttpIdentityObservation)
         assert listener.connections == 3
         third_wire = __import__("json").loads(listener.requests[2][2])
         assert third_wire["authority_version"] == 7
@@ -448,7 +448,7 @@ def test_parse_now_is_sampled_when_worker_starts_after_slot_wait(
         await asyncio.sleep(0.25)
         released_at = datetime.now(UTC)
         release.set()
-        assert isinstance(await second, support.facts().ValidatedFacts)
+        assert isinstance(await second, module.HttpIdentityObservation)
         assert len(samples) == 2 and samples[1] >= released_at
 
     run_transport(scenario)
@@ -771,7 +771,7 @@ def test_external_transport_close_failure_is_sanitized_retained_and_retryable(
                 request=support.request(),
                 limits=support.limits(),
             )
-            if isinstance(result, support.facts().ValidatedFacts):
+            if isinstance(result, module.HttpIdentityObservation):
                 assert failed_transport[0] in acknowledged
             else:
                 support.refusal(result, "unavailable")
@@ -801,3 +801,65 @@ def test_external_transport_close_failure_is_sanitized_retained_and_retryable(
 
     run_transport(scenario)
     assert support.marker not in caplog.text and support.token not in caplog.text
+
+
+def test_completed_facts_are_withheld_until_actual_network_close_and_discarded_at_deadline(
+    support: Any,
+    run_transport: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """@spec HTTP-IDENTITY-TRANSPORT-3 HTTP-IDENTITY-TRANSPORT-4."""
+    module = support.api()
+
+    async def scenario(rig: Any) -> None:
+        entered, release = asyncio.Event(), rig.event()
+        original_close = httpx.AsyncHTTPTransport.aclose
+        original_parse = support.facts().validate_lookup
+        seen: list[Any] = []
+        acknowledged: list[Any] = []
+
+        async def close(transport: Any) -> None:
+            """@spec HTTP-IDENTITY-TRANSPORT-4: delay then perform actual public HTTPX close."""
+            entered.set()
+            await release.wait()
+            await original_close(transport)
+            acknowledged.append(transport)
+
+        def parse(*args: Any, **kwargs: Any) -> Any:
+            """@spec HTTP-IDENTITY-TRANSPORT-3: retain the pure T1 seam result."""
+            facts = original_parse(*args, **kwargs)
+            seen.append(facts)
+            return facts
+
+        monkeypatch.setattr(httpx.AsyncHTTPTransport, "aclose", close)
+        monkeypatch.setattr(module, "validate_lookup", parse)
+        listener = await rig.listen()
+        client = rig.client(module, allow_loopback_http=True)
+        start = asyncio.get_running_loop().time()
+        task = rig.task(
+            client.lookup(
+                target=support.target(module, listener.url),
+                bearer=module.ProviderBearer(support.token),
+                request=support.request(),
+                limits=support.limits(),
+            )
+        )
+        await asyncio.wait_for(entered.wait(), 1)
+        assert len(seen) == 1 and isinstance(seen[0], support.facts().ValidatedFacts)
+        result = await task
+        support.refusal(result, "unavailable")
+        assert 1.8 <= asyncio.get_running_loop().time() - start < 2.35
+        assert not acknowledged and client.close_status().pending_exchanges == 1
+        report = await client.aclose()
+        assert report.state == "closing" and report.pending_exchanges == 1
+        assert not report.close_failed
+        release.set()
+        async with asyncio.timeout(1.5):
+            while (report := await client.aclose()).state != "closed":
+                await asyncio.sleep(0.01)
+        assert len(acknowledged) == 1
+        assert report.pending_exchanges == report.pending_parsers == 0 and report.worker_joined
+        assert task.result() is result
+        support.refusal(task.result(), "unavailable")
+
+    run_transport(scenario)
