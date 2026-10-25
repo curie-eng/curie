@@ -79,6 +79,10 @@ The exposition carries these series, shown with the default prefix:
 | `turn_canary_cleanup_degraded` | 1 while any route has a pending cleanup or an all-route hold remains. |
 | `turn_canary_capacity_skips_total` | Persisted count of capacity skips. |
 | `turn_canary_target_delivery_success{route}` | Last observed delivered lifecycle with a matching request identity and nonblank reply. A nonce mismatch can set this to 1 while target success stays 0. Capacity skips and cleanup holds create no new sample. |
+| `turn_canary_target_probe_success{route}` | Last configured profile verdict, or exact nonce verdict when no profile applies. |
+| `turn_canary_target_probe_profile{route}` | 1 when the last attempted turn used an explicit profile, 0 for the nonce default. |
+| `turn_canary_target_last_delivery_success_timestamp_seconds{route}` | Last successful delivery observation, independent of nonce or profile verdict. |
+| `turn_canary_target_last_probe_success_timestamp_seconds{route}` | Last passing profile verdict, or exact nonce verdict for the default. |
 | `turn_canary_target_success{route}` | Last turn result of the route. Published only for a route whose turn was attempted; a capacity-skipped route publishes no sample in that cycle, and the exporter keeps its previous value. |
 | `turn_canary_target_last_run_timestamp_seconds{route}` | Last cycle that selected the route for a turn or a capacity check. |
 | `turn_canary_target_last_success_timestamp_seconds{route}` | Last exact nonce success of the route. |
@@ -104,6 +108,55 @@ policy compliance or final-text provenance. Events arriving after the bounded
 observation returns are outside its evidence. Relay logs add only bounded reason
 codes such as `nonce_mismatch`, `wrong_target`, `malformed_page` and `timeout`,
 without logging response content.
+
+### Role-appropriate probe contracts
+
+The default question still asks for an exact nonce. A role-restricted agent may
+correctly refuse that question. Operators can instead supply a read-only question
+that the agent's role permits, together with an explicit affirmative text contract:
+
+```sh
+TURN_CANARY_PROBE_PROFILES='{"catalog-helper":{"prompt":"Describe your read-only catalog role without looking anything up.","required_any":[["catalog"],["read-only","read only"]],"forbidden_any":["cannot comply","approval required"]}}'
+```
+
+Profiles apply by exact inventory agent slug, only after normal route selection.
+An unmatched slug keeps the nonce default; check the emitted
+`target_probe_profile` flag to verify coverage. Configuration never changes the
+agent's safety policy. Every question retains the same prohibition on tools,
+actions, approval requests and durable changes, and the same read-only wire,
+isolation, request correlation and owned cleanup. Choose a question answerable
+without tools and include known refusal markers in `forbidden_any`.
+
+The latest non-progress final reply must be delivered and correctly correlated.
+Unicode NFKC normalization, case folding and whitespace collapse apply to both
+reply and markers. Every required group needs one literal substring match and
+no forbidden marker may appear. Metacharacters have no special meaning. A
+refusal is not automatically useful completion; a matching reply proves only
+the declared text contract. The legacy nonce verdict, cycle success, nonce
+success timestamps and one-shot exit status retain their original meaning,
+even when a configured profile passes. Use `target_probe_success` for an alert
+about the explicit contract and `target_delivery_success` with delivery
+freshness for an alert about availability.
+
+The strict configuration bounds are specified in
+[TURN-CANARY-16](design.md): 65,536 UTF-8 JSON bytes, 100 profiles, 63-character
+lowercase ASCII slugs, 2,048-character prompts, 1 to 8 required groups with
+1 to 8 alternatives each, 0 to 32 forbidden markers and 128 characters per
+marker. Blank fields, empty profiles, missing or unknown fields, duplicate keys
+and malformed JSON refuse startup. An unset variable disables profiles;
+an explicitly empty value or object is an error. Programmatic consumers use
+`parse_probe_profiles(raw)` and the immutable `ProbeProfile.matches(text)`
+matcher from this example to share the same contract.
+
+The probe result, mode and both new success timestamps are retained across
+rotation, capacity skips and cleanup holds, and removed when inventory drops
+the route. They are not restored after restart. A missing sample is unknown.
+Combine the result with last-run freshness, and delivery success with its own
+last-success timestamp, rather than using nonce timestamps to date delivery.
+Profile logs expose only `profile_match` or `profile_mismatch`; the existing
+relay reason remains independent. Prompts, markers and replies never become
+metric labels or log fields. These deterministic checks do not establish live
+model or protected runtime qualification.
 
 Before this change, a capacity skip published `target_success` 0 and
 `cycle_success` 0, and one unconfirmed cleanup held every route until an
