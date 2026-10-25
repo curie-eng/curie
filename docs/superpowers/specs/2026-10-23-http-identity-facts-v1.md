@@ -11,7 +11,8 @@ identity provider or authorization consumer.
 All fields below are required; null is permitted only where stated. Objects
 reject unknown fields. Integers are JSON integers, never booleans, strings or
 fractional numbers. UUIDs are lowercase hyphenated canonical UUID strings;
-no particular UUID version is required. Opaque identifiers are nonempty,
+no particular UUID version is required. The entire string must match, including
+rejection of trailing newline characters. Opaque identifiers are nonempty,
 case-sensitive strings, compared without trimming, case folding or inference.
 No identifier or collection ceilings are added beyond the response-byte bound.
 
@@ -170,6 +171,12 @@ and JSON Schema artifacts. Independently authored synthetic facts vectors
 exercise the contract. The proposed later
 interface pointer is docs/interfaces/http-identity/INTERFACE.md, with generated
 http-identity-v1.openapi.json and http-identity-v1.schema.json beside it.
+Every canonical UUID occurrence must retain its complete, whole-string UUID
+grammar in generated model schemas and both standalone artifacts. This is an
+expressible structural constraint, including lowercase, hyphenation and true
+end-of-string matching; it is not a semantic-only exception. Derive it from the
+shared annotated UUID type rather than copying identifier grammars into each
+exporter. Opaque account, subject and group identifiers remain opaque.
 The artifacts describe a provider-hosted reference operation POST /lookup;
 deployment maps the configured lookup URL to that operation. It is not a
 Curie API route; URL configuration is outside this facts contract.
