@@ -63,7 +63,7 @@ def _integer(value: Any) -> int:
 def _lookup_url(value: str) -> str:
     """@spec HTTP-AUTHORITY-CONFIG-V1-3."""
     if (
-        value != value.strip() or any(ord(char) < 32 or ord(char) == 127 for char in value)
+        any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in value)
         or any(char in value for char in "?#\\")
     ):
         raise ValueError("invalid lookup URL")
