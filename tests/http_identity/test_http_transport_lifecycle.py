@@ -226,12 +226,24 @@ def test_two_operation_slots_cancelled_waiter_snapshot_and_close_wakeup(
 def test_waiting_for_operation_slot_has_no_fresh_two_second_budget(
     support: Any,
     run_transport: Any,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """@spec HTTP-IDENTITY-TRANSPORT-3: admission time consumes the original deadline."""
     module = support.api()
 
     async def scenario(rig: Any) -> None:
         release = rig.event()
+        exchange_starts: list[tuple[float, dict[str, float]]] = []
+        original = httpx.AsyncHTTPTransport.handle_async_request
+
+        async def exchange(transport: Any, request: Any) -> Any:
+            """@spec HTTP-IDENTITY-TRANSPORT-3: observe starts, delegating real HTTP I/O."""
+            exchange_starts.append(
+                (asyncio.get_running_loop().time(), dict(request.extensions["timeout"]))
+            )
+            return await original(transport, request)
+
+        monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", exchange)
 
         async def stall(reader: Any, writer: Any) -> None:
             """@spec HTTP-IDENTITY-TRANSPORT-3."""
@@ -249,16 +261,23 @@ def test_waiting_for_operation_slot_has_no_fresh_two_second_budget(
         async with asyncio.timeout(1):
             while listener.connections != 2:
                 await asyncio.sleep(0.005)
+        assert len(exchange_starts) == 2
         start = asyncio.get_running_loop().time()
         queued = rig.task(client.lookup(**kwargs))
         support.refusal(await queued, "unavailable")
         assert 1.8 <= asyncio.get_running_loop().time() - start < 2.35
         # The older operations may drain just before this waiter's D and allow
         # one brief exchange. Neither admission nor that exchange restarts D.
-        at_return = listener.connections
-        assert 2 <= at_return <= 3
+        at_return = tuple(exchange_starts)
+        assert 2 <= len(at_return) <= 3
+        for began, timeout in at_return[2:]:
+            assert began < start + 2.0
+            assert all(0 < value <= start + 2.0 - began + 0.01 for value in timeout.values())
         await asyncio.sleep(0.03)
-        assert listener.connections == at_return
+        assert tuple(exchange_starts) == at_return
+        # A connection begun before D can be accepted by the listener after
+        # lookup returns; server scheduling does not mark the exchange start.
+        assert 2 <= listener.connections <= 3
         for result in await asyncio.gather(*active):
             support.refusal(result, "unavailable")
 
