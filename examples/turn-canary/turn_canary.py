@@ -42,6 +42,7 @@ def _load_probe_profiles_module() -> ModuleType:
             continue
         origin = candidate.__dict__.get("__file__")
         if isinstance(origin, str) and Path(origin).resolve() == sibling:
+            sys.modules.setdefault("probe_profiles", candidate)
             return candidate
     name = "_curie_turn_canary_profiles_" + hashlib.sha256(str(sibling).encode()).hexdigest()
     if name in sys.modules:
@@ -57,6 +58,7 @@ def _load_probe_profiles_module() -> ModuleType:
         if sys.modules.get(name) is module:
             del sys.modules[name]
         raise
+    sys.modules.setdefault("probe_profiles", module)
     return module
 
 

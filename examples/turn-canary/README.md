@@ -159,7 +159,10 @@ the executable fails before any platform operation. Script execution and
 dynamic file import both work without adding a source checkout to `sys.path`.
 The helper alone needs no installed checkout or third-party dependency.
 
-A normal `import probe_profiles` from that source directory is supported.
+A normal `import probe_profiles` from that source directory is supported
+before or after loading the checker. When that module name is vacant, the
+checker registers its exact sibling under the canonical name as well as its
+private source cache key. Both normal import orders then share the same class.
 For a helper loaded from an explicit file path, use Python's module registration
 protocol before execution so the checker can reuse its exact profile class:
 
@@ -181,6 +184,9 @@ The checker reuses a registered module only if its resolved file is the exact
 sibling it ships with. Repeated imports share that class; different source
 directories remain isolated, and an unrelated module with the same basename
 is preserved. The checker never changes global import search paths.
+Executing the helper file again under a new arbitrary module name creates a
+separate Python module with its own class identity. Reuse an existing imported
+helper or the checker's re-exported APIs when exchanging profile instances.
 
 The probe result, mode and both new success timestamps are retained across
 rotation, capacity skips and cleanup holds, and removed when inventory drops
