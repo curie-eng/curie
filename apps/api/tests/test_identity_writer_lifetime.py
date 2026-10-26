@@ -872,7 +872,15 @@ def test_protected_request_replays_exact_chunked_body_once(migrated: None, kind:
 
 
 @pytest.mark.parametrize(
-    "failure", ["unauthenticated", "timeout", "declared_oversize", "chunked_oversize"]
+    "failure",
+    [
+        "unauthenticated",
+        "timeout",
+        "declared_oversize",
+        "chunked_oversize",
+        "cookie_missing_origin",
+        "cookie_wrong_origin",
+    ],
 )
 def test_prepare_refusals_keep_real_app_telemetry_and_perform_no_writer_sql(
     migrated: None, monkeypatch: pytest.MonkeyPatch, failure: str
@@ -883,6 +891,7 @@ def test_prepare_refusals_keep_real_app_telemetry_and_perform_no_writer_sql(
     async def body() -> None:
         """@spec IDENTITY-WRITER-LIFETIME-V1-1/8."""
         import curie_api.main as main
+        from curie_api.auth import CONSOLE_SESSION_COOKIE
 
         app = create_app()
         metrics, spans, locks = [], [], []
@@ -926,14 +935,26 @@ def test_prepare_refusals_keep_real_app_telemetry_and_perform_no_writer_sql(
                     async with httpx.AsyncClient(
                         transport=httpx.ASGITransport(app=app), base_url="http://testserver"
                     ) as client:
-                        request_headers = {} if failure == "unauthenticated" else headers()
+                        request_headers = (
+                            {}
+                            if failure == "unauthenticated" or failure.startswith("cookie_")
+                            else headers()
+                        )
+                        if failure.startswith("cookie_"):
+                            request_headers["Cookie"] = (
+                                f"{CONSOLE_SESSION_COOKIE}=synthetic-invalid-console-token"
+                            )
+                            if failure == "cookie_wrong_origin":
+                                request_headers["Origin"] = "https://untrusted.example.test"
                         if failure == "declared_oversize":
                             request_headers["Content-Length"] = str(16 * 1024 * 1024 + 1)
                         response = await client.patch(
                             f"/agents/{uuid.uuid4()}", headers=request_headers, content=contents()
                         )
                     expected = (
-                        401
+                        403
+                        if failure.startswith("cookie_")
+                        else 401
                         if failure == "unauthenticated"
                         else 408
                         if failure == "timeout"
@@ -942,8 +963,8 @@ def test_prepare_refusals_keep_real_app_telemetry_and_perform_no_writer_sql(
                     assert response.status_code == expected
                     if failure == "timeout":
                         assert response.json() == {"detail": "request body timeout"}
-                    assert response.headers["Cache-Control"] == "private, no-store"
-                    assert response.headers["Referrer-Policy"] == "no-referrer"
+                    if failure.startswith("cookie_"):
+                        assert response.json() == {"detail": "console session origin rejected"}
                     assert locks == []
                     assert (
                         await app.state.valkey.get(identity_fence.FENCE_KEY) == b"stable:unchanged"
@@ -961,6 +982,8 @@ def test_prepare_refusals_keep_real_app_telemetry_and_perform_no_writer_sql(
         assert requests[-1]["attributes"]["outcome"] == "4xx"
         active = [args[0] for name, args, _ in metrics if name == "curie.http.server.active"]
         assert active == [1, -1]
+        assert response.headers["Referrer-Policy"] == "no-referrer"
+        assert response.headers["Cache-Control"] == "private, no-store"
 
     run(body)
 
