@@ -102,7 +102,7 @@ from ..delivery import (
 from ..deps import SessionDep
 from ..identity import connect
 from ..identity.slack import SlackEvidence
-from ..models import AgentChannel
+from ..models import AgentChannel, TenantIdentityProvider
 from ..wirebody import read_bounded_body
 from .identity_connect import public_api_prefix
 
@@ -615,6 +615,7 @@ async def ingest_turn(
     response: Response,
     session: SessionDep,
     x_api_key: Annotated[str | None, Header()] = None,
+    x_curie_receiver_proof: Annotated[str | None, Header()] = None,
 ) -> TurnAccepted:
     """Enqueue one inbound delivery for the binding the body names.
 
@@ -668,6 +669,20 @@ async def ingest_turn(
         # The mint's refusal, on the ingress. Enqueuing here would hand the
         # worker a turn with nowhere to reply and no credential to reply with.
         raise _unroutable(body.kind, body.address)
+
+    # @spec HTTP-INVOCATION-EXECUTION-2 HTTP-INVOCATION-EXECUTION-3
+    # SQL presence keeps corrupt JSON null out of the legacy authorization path.
+    http_mode = await session.scalar(
+        select(TenantIdentityProvider.http_selection.is_not(None)).where(
+            TenantIdentityProvider.tenant_id == row.tenant_id,
+        )
+    )
+    if http_mode is True or x_curie_receiver_proof is not None:
+        if claims is None or not x_curie_receiver_proof:
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid_http_receiver")
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "identity_authority_unavailable",
+        )
 
     # ADR 0175: the one admission check, after the credential proved it speaks
     # for this binding and before anything is claimed or queued. The adapter is
