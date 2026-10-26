@@ -662,3 +662,57 @@ def test_cli_returns_only_safe_json_for_actual_collector_protocol(
     report = json.loads(output.out)
     safe(report)
     assert report["complete"] is True
+
+
+@pytest.mark.parametrize("operation", ["namespace", "api_services", "resource:secrets"])
+def test_json_null_is_invalid_evidence_and_never_silent_complete_unknown_state(
+    operation: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """@spec NAMESPACE-CLEANUP-EVIDENCE-2 NAMESPACE-CLEANUP-EVIDENCE-3."""
+    module, world = load(), Kubernetes()
+    world.overrides[operation] = "null"
+    report = collect(module, world, monkeypatch)
+    safe(report)
+    assert report["complete"] is False, "JSON null silently became complete unknown/empty evidence"
+    assert "invalid_projection" in {error["reason"] for error in errors(report)}
+    if operation == "namespace":
+        assert report["namespaces"][0]["errors"]
+
+
+@pytest.mark.parametrize("operation", ["namespace", "api_services"])
+def test_empty_json_object_cannot_attest_namespace_or_api_service_state(
+    operation: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """@spec NAMESPACE-CLEANUP-EVIDENCE-2 NAMESPACE-CLEANUP-EVIDENCE-3."""
+    module, world = load(), Kubernetes()
+    world.overrides[operation] = "{}"
+    report = collect(module, world, monkeypatch)
+    safe(report)
+    assert report["complete"] is False
+    assert "invalid_projection" in {error["reason"] for error in errors(report)}
+
+
+def test_unexpected_workload_projection_fields_refuse_without_sensitive_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """@spec NAMESPACE-CLEANUP-EVIDENCE-2: only the three projected fields are valid."""
+    module, world = load(), Kubernetes()
+    world.projections["secrets"][0]["data"] = {"credential": SECRET}
+    report = collect(module, world, monkeypatch)
+    safe(report)
+    assert report["complete"] is False
+    assert "invalid_projection" in {error["reason"] for error in errors(report)}
+
+
+def test_enormous_integer_budget_uses_fixed_input_refusal_before_commands(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """@spec NAMESPACE-CLEANUP-EVIDENCE-1: overflow must not escape validation."""
+    module, world = load(), Kubernetes()
+    monkeypatch.setattr(module, "_run", world.run)
+    with pytest.raises(ValueError) as caught:
+        module.collect_cleanup_evidence(CONTEXT, [NAMESPACE], budget_s=10**1000)
+    assert str(caught.value) == "invalid_cleanup_evidence_input"
+    assert world.calls == []
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None or caught.value.__suppress_context__
