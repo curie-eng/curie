@@ -387,7 +387,9 @@ def test_profile_cycle_reports_independent_probe_delivery_and_nonce_results(text
     assert result.target_last_delivery_success[ROUTE] > 0
     assert bool(result.target_last_probe_success) is matched
     assert result.target_success == {ROUTE: False}
-    assert not result.success and result.last_success is None and result.target_last_success == {}
+    assert result.success is matched
+    assert bool(result.last_success) is matched
+    assert result.target_last_success == {}
     assert {"phase": "relay", "outcome": "nonce_mismatch"} in result.logs
     assert {
         "phase": "probe",
@@ -650,7 +652,8 @@ def test_main_carries_environment_profile_into_real_cycle_and_standing_monitor(
         assert installed["server_closed"] and installed["server_joined"]
         metrics = installed["monitor"].metrics_text()
     else:
-        assert exit_code == 1  # A passing profile preserves legacy nonce cycle/exit semantics.
+        # The configured probe qualifies the cycle independently of its nonce.
+        assert exit_code == 0
         metrics = (tmp_path / "metrics.txt").read_text()
     assert _samples(metrics, "turn_canary_target_probe_success")[0].endswith("} 1")
     assert _samples(metrics, "turn_canary_target_probe_profile")[0].endswith("} 1")
