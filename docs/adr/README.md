@@ -267,4 +267,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0244 | [Attachments are fetched on demand through scoped platform tools](0244-attachments-are-fetched-on-demand-through-scoped-platform-tools.md) | Accepted |
 | 0245 | [Protected lifecycle evidence binds host-owned contexts to actual SDK closure](0245-protected-lifecycle-evidence-binds-host-owned-contexts-to-actual-sdk-closure.md) | Accepted |
 | 0246 | [Common admission resolves an optional HTTP identity before authorized enqueue](0246-common-admission-resolves-an-optional-http-identity-before-authorized-enqueue.md) | Accepted |
+| 0248 | [A Slack bot can follow its callers into any channel](0248-a-slack-bot-can-follow-its-callers-into-any-channel.md) | Draft |
 <!-- END GENERATED: adr-index -->
