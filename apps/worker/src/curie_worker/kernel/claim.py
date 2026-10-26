@@ -798,6 +798,9 @@ async def _route_and_start(
                 f"thread {thread_key} has a live session; deferring the {deferred_kind} turn"
             )
     else:
+        from .identity import check
+
+        await check(self, "steer")
         active_before_steer = False
         live_turn_before_steer: str | None = None
         channel_read_supported = False
@@ -1204,6 +1207,9 @@ async def _claim_or_resume(
     # route without ever cold-creating one; this avoids the old
     # lookup-then-claim gap, where the route could disappear and ``claim``
     # would create a sandbox without a freshly prepared workspace ref.
+    from .identity import check
+
+    await check(self, "claim_or_resume")
     if workspace_deployment_id is not None:
         handoff_budget_started = clock.time.monotonic()
 
@@ -1314,24 +1320,57 @@ async def _claim_or_resume(
         # Prepare once, then let the substrate decide cold claim versus
         # suspended-route resume. Either branch materializes the same fresh,
         # verified archive before the runner can start.
-        workspace_claim = await asyncio.to_thread(
-            self._workspace.claim_or_resume_with_handle,
-            thread_key=thread_key,
-            deployment_id=workspace_deployment_id,
-            env=boot_env,
-            agent_name=agent_name,
-            runner_resources=runner_resources,
-            repo_full_name=workspace_repo,
-            replace_handle=replace_handle,
-            revalidate_before_handoff=handoff_revalidation,
-            validate_candidate=candidate_validation,
-            lineage_branch=lineage_branch,
-            lineage_head=lineage_head,
-            lineage_base_sha=lineage_base_sha,
-            publication_visible_outcome_revision=(publication_visible_outcome_revision),
-            fresh_only=attachment_fresh_only,
-            caller_run=caller_run,
-        )
+        # @spec HTTP-INVOCATION-EXECUTION-18: coordinator calls after verified preparation.
+        from .identity import CURRENT, is_live
+
+        carry = CURRENT.get()
+        identity_arguments: dict[str, Any] = {}
+        if carry is not None and carry.context is not None:
+            identity_loop = asyncio.get_running_loop()
+
+            def current_before_claim() -> None:
+                """@spec HTTP-INVOCATION-EXECUTION-18."""
+                from ..identity_authority import TurnAuthorityUnavailable
+
+                if not is_live(carry):
+                    raise TurnAuthorityUnavailable()
+                probe = asyncio.run_coroutine_threadsafe(
+                    check(self, "claim_or_resume"), identity_loop,
+                )
+                try:
+                    probe.result(timeout=5.5)
+                except TimeoutError:
+                    probe.cancel()
+                    raise TurnAuthorityUnavailable() from None
+                if not is_live(carry):
+                    raise TurnAuthorityUnavailable()
+
+            identity_arguments["revalidate_before_claim"] = current_before_claim
+        try:
+            workspace_claim = await asyncio.to_thread(
+                self._workspace.claim_or_resume_with_handle,
+                thread_key=thread_key,
+                deployment_id=workspace_deployment_id,
+                env=boot_env,
+                agent_name=agent_name,
+                runner_resources=runner_resources,
+                repo_full_name=workspace_repo,
+                replace_handle=replace_handle,
+                revalidate_before_handoff=handoff_revalidation,
+                validate_candidate=candidate_validation,
+                lineage_branch=lineage_branch,
+                lineage_head=lineage_head,
+                lineage_base_sha=lineage_base_sha,
+                publication_visible_outcome_revision=(publication_visible_outcome_revision),
+                fresh_only=attachment_fresh_only,
+                caller_run=caller_run,
+                **identity_arguments,
+            )
+        except asyncio.CancelledError:
+            # @spec HTTP-INVOCATION-EXECUTION-18: only unfinished cancellation ends this carry.
+            if carry is not None and carry.context is not None:
+                carry.active = False
+            raise
         if not isinstance(workspace_claim.handle, SandboxHandle):
             raise WorkspacePreparationError(
                 "claim", "workspace substrate returned an invalid sandbox handle"
@@ -1368,6 +1407,7 @@ async def _claim_or_resume(
         # ref, budget, refs): a suspended pod was deleted (ADR-0003), so
         # the replacement boots from env alone; without this it would come
         # up generic, without the agent's bundle.
+        await check(self, "claim_or_resume")
         handle = await asyncio.to_thread(
             self._substrate.resume,
             thread_key,

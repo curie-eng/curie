@@ -62,6 +62,7 @@ from .eval import EvalReporter, EvalStreamConsumer, LangfuseEvalRecorder
 from .heartbeat import run_heartbeat
 from .hook_runs import HookRunRecorder
 from .hook_source_guard import CronHookSourceGuard
+from .identity_authority import HttpTurnAuthorityClient
 from .kernel.channel_read import drain_pending_channel_read_closes
 from .kernel.core import Kernel
 from .kernel.memory import drain_pending_memory_closes
@@ -702,6 +703,13 @@ def build(
         markers=Markers(async_redis, config),
         config=config,
         binding=binding,
+        identity_authority=(
+            HttpTurnAuthorityClient(
+                api_base_url=config.api_base_url, worker_token=config.internal_worker_token,
+                client=eval_http,
+            )
+            if config.internal_worker_token else None
+        ),
         workspace=workspace,
         attachments=attachments,
         attachment_access=attachment_access_client,

@@ -20,6 +20,7 @@ from ..binding import (
 from ..bundle_store import BundleReader
 from ..config import WorkerConfig
 from ..hook_runs import HookRunRecorder
+from ..identity_authority import HttpTurnAuthorityClient
 from ..killswitch import KillSwitch
 from ..ledger_client import ThreadAttachmentLedgerClient
 from ..markers import Markers
@@ -79,6 +80,7 @@ class Kernel:
         markers: Markers,
         config: WorkerConfig,
         binding: BindingResolver | None = None,
+        identity_authority: HttpTurnAuthorityClient | None = None,
         workspace: WorkspaceClaimCoordinator | None = None,
         attachments: AttachmentCoordinator | None = None,
         attachment_ledger: ThreadAttachmentLedgerClient | None = None,
@@ -120,6 +122,7 @@ class Kernel:
         # Deployment-to-runtime binding and the kill switch are optional: when
         # absent the kernel runs a generic sandbox (the F1 behavior); when present
         # it resolves channel -> agent -> bundle/budget and gates killed agents.
+        self._identity_authority = identity_authority
         self._binding = binding
         revoker = getattr(self._substrate, "set_boot_credential_revoker", None)
         poster = (

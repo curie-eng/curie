@@ -70,6 +70,7 @@ from . import (
     delivery,
     failures,
     hooks,
+    identity,
     log,
     memory,
     routing,
@@ -79,7 +80,8 @@ from .log import logger
 
 
 async def process_event(
-    self: Kernel, qevent: QueuedTurn, *, lease: DeliveryLease | None = None
+    self: Kernel, qevent: QueuedTurn, *, lease: DeliveryLease | None = None,
+    http_identity_context: str | None = None, original_payload_sha256: str | None = None,
 ) -> None:
     """Observe one kernel lifecycle while preserving its ``None`` result.
 
@@ -92,6 +94,8 @@ async def process_event(
 
     routing._check_targetless_shape(qevent)
     error: BaseException | None = None
+    identity_carry = identity.HttpTurnCarry(qevent, http_identity_context, original_payload_sha256)
+    identity_token = identity.CURRENT.set(identity_carry)
     hook_token = constants._HOOK_RUN_CARRY.set(hooks._HookRunCarry())
     lease_token = constants._DELIVERY_LEASE.set(lease)
     termination_carry = constants._SandboxTerminationCarry()
@@ -116,6 +120,12 @@ async def process_event(
                 await self._process_event(qevent)
             else:
                 await self._process_event(qevent, lease=lease)
+        except identity.HttpIdentityRefused:
+            if lease is not None:
+                lease.raise_if_lost()
+            await self._markers.mark_done(qevent.event_id, marker_value="1")
+            constants._LIFECYCLE_OUTCOME.set("classified_failure")
+            logger.info("HTTP invocation refused before further execution")
         except asyncio.CancelledError as exc:
             error = exc
             await self._close_hook_run_after_error(
@@ -180,6 +190,8 @@ async def process_event(
                     else StatusCode.OK
                 )
             span.add_event("turn.processing.completed", {"outcome": outcome})
+            identity_carry.active = False
+            identity.CURRENT.reset(identity_token)
             constants._LIFECYCLE_OUTCOME.reset(outcome_token)
             constants._TURN_AGENT.reset(agent_token)
             constants._LIFECYCLE_SPAN.reset(token)
@@ -255,6 +267,7 @@ async def _process_event(
             await self._reemit_pending_completion(event_id)
             return
 
+        await identity.prepare(self)
         if qevent.source is TurnSource.CRON:
             if self._hook_runs is None or qevent.hook_run is None:
                 logger.error(

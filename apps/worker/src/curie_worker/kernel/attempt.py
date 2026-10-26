@@ -256,8 +256,14 @@ async def _attempt_turn(
     placeholder = None if handle is None else handle.placeholder
     defer_job_booting = placeholder is None and qevent.source.is_job
     defer_review_booting = placeholder is None and review_candidate
+    # @spec HTTP-INVOCATION-EXECUTION-3/18: adopted work posts only after actual start.
+    from .identity import CURRENT
+
+    identity_carry = CURRENT.get()
+    http_delivery = identity_carry is not None and identity_carry.context is not None
     if (
-        handle is not None
+        not http_delivery
+        and handle is not None
         and not self._config.slack_no_edit_streaming
         and not (defer_job_booting or defer_review_booting)
     ):

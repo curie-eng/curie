@@ -37,12 +37,13 @@ retry a poison entry forever -- the exact stall this cap exists to end.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import time
 from contextlib import nullcontext
 from datetime import UTC, datetime
 
-from aci_protocol import QueuedTurn
+from aci_protocol import STREAM_PAYLOAD_FIELD, QueuedTurn
 from curie_dispatcher.queue import from_stream_fields
 from curie_telemetry import (
     TRACEPARENT_STREAM_FIELD,
@@ -70,6 +71,7 @@ from .completion_health import observe_completion_outbox
 from .config import WorkerConfig
 from .consumer_liveness import ConsumerLivenessStore
 from .delivery_lease import DeliveryLease, DeliveryLeaseStore, LeaseLostError
+from .identity_authority import TurnAuthorityUnavailable
 from .kernel.core import Kernel
 from .kernel.routing import _thread_key_for
 from .markers import Markers
@@ -343,6 +345,10 @@ class Consumer(StreamConsumer):
         task.add_done_callback(self._inflight.discard)
 
     async def _send_wait_notice(self, record: CapacityWaitRecord) -> None:
+        # @spec HTTP-INVOCATION-EXECUTION-18: no unverified courtesy or false delivery flag.
+        if "curie_identity_context_v1" in record.fields:
+            await self._waits.suppress_http_notices(record.event_id, record.generation)
+            return
         token = await self._waits.claim_notice(record.event_id, record.generation)
         if token is None:
             return
@@ -396,6 +402,9 @@ class Consumer(StreamConsumer):
 
     async def _repair_expiry_notices(self) -> None:
         for record in await self._waits.expiry_notices_due():
+            if "curie_identity_context_v1" in record.fields:
+                await self._waits.suppress_http_notices(record.event_id, record.generation)
+                continue
             token = await self._waits.claim_expiry_notice(record.event_id, record.generation)
             if token is None:
                 continue
@@ -467,14 +476,19 @@ class Consumer(StreamConsumer):
         record = await self._waits.get(qevent.event_id)
         if record is None:
             return
+        http_delivery = "curie_identity_context_v1" in record.fields
+        notice_arguments = {"send_notice": False} if http_delivery else {}
         delivered, reply_ref = await self._kernel.expire_capacity_wait(
             qevent,
             lease=lease,
             cause=record.cause,
             grant_epoch=record.grant_epoch,
+            **notice_arguments,
         )
         if not await self._waits.mark_terminal(qevent.event_id, generation):
             return
+        if http_delivery:
+            await self._waits.suppress_http_notices(qevent.event_id, generation)
         if delivered:
             await self._waits.finish_expiry_notice(
                 qevent.event_id,
@@ -527,6 +541,17 @@ class Consumer(StreamConsumer):
                         # race.
                         return
                     try:
+                        # @spec HTTP-INVOCATION-EXECUTION-18: hash before any wire rewrite.
+                        identity_arguments: dict[str, str] = {}
+                        if "curie_identity_context_v1" in fields:
+                            raw_payload = fields[STREAM_PAYLOAD_FIELD]
+                            context = fields["curie_identity_context_v1"]
+                            identity_arguments = {
+                                "http_identity_context": context if type(context) is str else "",
+                                "original_payload_sha256": hashlib.sha256(
+                                    raw_payload.encode("utf-8"),
+                                ).hexdigest(),
+                            }
                         qevent = from_stream_fields(fields)
                     except Exception as exc:
                         if hasattr(span, "set_status"):
@@ -692,7 +717,18 @@ class Consumer(StreamConsumer):
                                 if wait_generation is not None
                                 else nullcontext()
                             ):
-                                await self._kernel.process_event(qevent, lease=lease)
+                                await self._kernel.process_event(
+                                    qevent, lease=lease, **identity_arguments,
+                                )
+                        except TurnAuthorityUnavailable:
+                            logger.warning(
+                                "Current invocation authority unavailable; keeping pending"
+                            )
+                            record_metric(
+                                "curie.queue.settle",
+                                attributes={**metric_attributes, "outcome": "pending"},
+                            )
+                            return
                         except CapacityWaitExpired:
                             if wait_generation is None:
                                 raise
