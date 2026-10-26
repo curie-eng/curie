@@ -86,7 +86,7 @@ from aci_protocol.turn import (
 from curie_internal import sandbox_token
 from curie_internal.sealing_key import is_sealing_key_name
 from plugin_format import is_reserved_boot_env_name
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -313,6 +313,18 @@ def _parse_resume_event_id(event_id: str) -> uuid.UUID | None:
 # a second tenant exists. A frozen copy: this package does not import the API's.
 DEFAULT_TENANT_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
 
+# @spec HTTP-INVOCATION-EXECUTION-17
+_IDENTITY_BINDING_SQL = """
+SELECT c.id AS binding_id, c.agent_id, c.tenant_id,
+       c.generation AS binding_generation, c.kind, c.address, c.endpoint, c.adapter,
+       (i.http_selection IS NOT NULL) AS http_identity_required
+FROM {schema}.agent_channels c
+JOIN {schema}.agents a ON a.id = c.agent_id AND a.tenant_id = c.tenant_id
+LEFT JOIN {schema}.tenant_identity_providers i ON i.tenant_id = c.tenant_id
+WHERE c.kind = :kind AND c.address = :address AND c.tenant_id = :tenant_id
+"""
+
+
 # The trailing `d.id DESC` carries no meaning of its own -- id order is not a
 # precedence rule and nothing may start reading one into it. It exists only to
 # make the order TOTAL: two active deployments in the same environment with an
@@ -437,6 +449,18 @@ WHERE c.kind = :kind AND lower(c.address) = lower(:address) AND c.adapter IS NOT
 ORDER BY c.adapter
 LIMIT 1
 """
+
+
+class HttpIdentityBinding(BaseModel):
+    """Classification, not permission. @spec HTTP-INVOCATION-EXECUTION-17."""
+
+    model_config = ConfigDict(strict=True, frozen=True, extra="forbid")
+
+    tenant_id: uuid.UUID
+    agent_id: uuid.UUID
+    binding_id: uuid.UUID
+    binding_generation: int = Field(strict=True, ge=1, le=2**63 - 1)
+    http_identity_required: bool
 
 
 class ResolvedDeployment(BaseModel):
@@ -707,11 +731,33 @@ class BindingResolver:
         self._tenant_id = tenant_id
         # Table identifiers are not user input; the schema comes from config.
         self._sql = text(_RESOLVE_SQL.format(schema=config.db_schema))
+        self._identity_binding_sql = text(_IDENTITY_BINDING_SQL.format(schema=config.db_schema))
         self._resolve_factory_sql = text(_RESOLVE_FACTORY_SQL.format(schema=config.db_schema))
         self._factory_binding_sql = text(_FACTORY_BINDING_SQL.format(schema=config.db_schema))
         self._undeployed_binding_sql = text(_UNDEPLOYED_BINDING_SQL.format(schema=config.db_schema))
         self._resolve_agent_sql = text(_RESOLVE_AGENT_SQL.format(schema=config.db_schema))
         self._address_identity_sql = text(_ADDRESS_IDENTITY_SQL.format(schema=config.db_schema))
+
+    async def identity_binding(
+        self, kind: str, adapter: str | None, address: str,
+    ) -> HttpIdentityBinding | None:
+        """@spec HTTP-INVOCATION-EXECUTION-9 HTTP-INVOCATION-EXECUTION-17."""
+        if not _valid_slack_selector(kind, adapter):
+            return None
+        params = {"kind": kind, "address": address, "tenant_id": self._tenant_id}
+        async with self._engine.connect() as connection:
+            rows = (await connection.execute(self._identity_binding_sql, params)).all()
+        matches = matching_routes(rows, kind, address, adapter)
+        if not matches:
+            return None
+        mapped = [dict(row._mapping) for row in matches]
+        refuse_several_agents(kind, address, mapped)
+        current = mapped[0]
+        return HttpIdentityBinding(
+            tenant_id=current["tenant_id"], agent_id=current["agent_id"],
+            binding_id=current["binding_id"], binding_generation=current["binding_generation"],
+            http_identity_required=current["http_identity_required"],
+        )
 
     async def resolve(
         self, kind: str, adapter: str | None, address: str
