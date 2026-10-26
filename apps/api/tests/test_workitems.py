@@ -2737,7 +2737,7 @@ def test_start_uses_1800_when_the_agent_deadline_is_null(clean_db: None) -> None
     with_session(body)
 
 
-@pytest.mark.parametrize("seconds", [59, 10801])
+@pytest.mark.parametrize("seconds", [59, 43201])
 def test_agent_execution_deadline_column_check_refuses_out_of_range(
     clean_db: None, seconds: int
 ) -> None:
@@ -2783,17 +2783,17 @@ async def _insert_running_with_span(session: AsyncSession, seconds: int) -> None
     await session.commit()
 
 
-@pytest.mark.parametrize("seconds", [90, 10800])
-def test_execution_request_check_accepts_deadlines_up_to_10800(
+@pytest.mark.parametrize("seconds", [90, 10800, 43200])
+def test_execution_request_check_accepts_deadlines_up_to_43200(
     clean_db: None, seconds: int
 ) -> None:
     with_session(lambda session: _insert_running_with_span(session, seconds))
 
 
-def test_execution_request_check_refuses_a_deadline_past_10800(clean_db: None) -> None:
+def test_execution_request_check_refuses_a_deadline_past_43200(clean_db: None) -> None:
     async def body(session: AsyncSession) -> None:
         with pytest.raises(IntegrityError) as excinfo:
-            await _insert_running_with_span(session, 10801)
+            await _insert_running_with_span(session, 43201)
         assert "execution_requests_deadline_ck" in str(excinfo.value)
 
     with_session(body)

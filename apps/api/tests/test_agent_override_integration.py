@@ -401,7 +401,7 @@ def test_patch_omitting_execution_deadline_leaves_it_unchanged(
     assert _read(client, auth_headers, agent["id"])["execution_deadline_seconds"] == 90
 
 
-@pytest.mark.parametrize("value", [60, 10800], ids=["lower-bound", "upper-bound"])
+@pytest.mark.parametrize("value", [60, 43200], ids=["lower-bound", "upper-bound"])
 def test_patch_accepts_the_bounds(
     client: Any, auth_headers: dict[str, str], clean_db: None, value: int
 ) -> None:
@@ -413,7 +413,7 @@ def test_patch_accepts_the_bounds(
 
 @pytest.mark.parametrize(
     "value",
-    [59, 10801, 0, -1],
+    [59, 43201, 0, -1],
     ids=["below-lower-bound", "above-upper-bound", "zero", "negative"],
 )
 def test_patch_rejects_out_of_range_and_keeps_the_stored_value(
