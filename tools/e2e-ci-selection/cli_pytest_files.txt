@@ -27,6 +27,7 @@ apps/worker/tests/test_publication_validation.py
 apps/worker/tests/test_stream_retention.py
 charts/curie/ci/repro/test_classify_recovery.py
 charts/curie/ci/runtime/test_docker_daemon_fixture.py
+charts/curie/ci/runtime/test_quota_observation_clock.py
 charts/curie/ci/test_cron_approval_receipt.py
 charts/curie/ci/test_factory_resource_profile_runtime.py
 charts/curie/ci/test_quota_progress_inputs.py
