@@ -3124,6 +3124,8 @@ class PrincipalTeam(Base):
 class AgentAccessPolicy(Base):
     """Which teams may invoke an agent and approve for it (#4585, ADR 0220 s.8).
 
+    @spec AGENT-ROLE-PERSISTENCE-V1-2.
+
     One row per agent, absent until an operator sets one; a missing row and a
     NULL role both mean today's behavior for that role. Each team reference
     carries ``tenant_id``, so a policy cannot name another tenant's team, and a
@@ -3135,6 +3137,11 @@ class AgentAccessPolicy(Base):
     __tablename__ = "agent_access_policies"
     __table_args__ = (
         CheckConstraint("version >= 1", name="agent_access_policies_version_ck"),
+        # @spec AGENT-ROLE-PERSISTENCE-V1-2.
+        CheckConstraint(
+            "role_configuration IS NULL OR jsonb_typeof(role_configuration) = 'object'",
+            name="agent_access_policies_role_object_ck",
+        ),
         ForeignKeyConstraint(
             ["tenant_id", "agent_id"],
             [f"{SCHEMA}.agents.tenant_id", f"{SCHEMA}.agents.id"],
@@ -3160,6 +3167,10 @@ class AgentAccessPolicy(Base):
     )
     approver_team_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), default=None
+    )
+    # @spec AGENT-ROLE-PERSISTENCE-V1-2: absence is SQL NULL, never JSON null.
+    role_configuration: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB(none_as_null=True), nullable=True, default=None
     )
     version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
     updated_at: Mapped[datetime] = mapped_column(
