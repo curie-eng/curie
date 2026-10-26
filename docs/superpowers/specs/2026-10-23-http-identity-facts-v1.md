@@ -108,6 +108,21 @@ level, non-finite numbers, unpaired Unicode surrogates, invalid syntax and
 trailing non-whitespace. Do not coerce scalar types, UUIDs or enum values.
 Schema version is the integer 1 on both request and response.
 
+The existing facts schema module owns the shared internal byte-decoding stage
+`decode_json_bytes(data: bytes, *, max_bytes: int) -> Any`. Its explicit byte
+bound is inclusive and must be an actual nonnegative integer; a boolean,
+noninteger or negative programmer argument raises ValueError before decoding.
+Zero admits no valid JSON document. Preserve the existing bytes-instance
+acceptance and strict decoding grammar above. Decimal/exponent tokens retain
+an opaque noninteger marker until the caller's version/model stage; the marker
+is not a public value API. Size-fitting integer tokens retain arbitrary integer
+precision without changing the process-wide digit guard. The helper returns
+untrusted decoded values and may raise raw decoding exceptions; it performs
+no version, context, model or refusal classification. The facts validator uses
+its unchanged 65,536-byte bound and validates caller context before invoking
+this stage. Each consuming boundary owns its existing sanitized refusal and
+validation order; exposing this helper creates no HTTP surface or schema change.
+
 Validation order is byte/JSON validity, supported version, strict shape/union,
 request correspondence, then identity freshness and membership freshness.
 Failures produce `FactsRefusal` with only a stable code: `invalid_response`,
