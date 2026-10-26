@@ -2175,3 +2175,44 @@ def test_shards_partition_the_unfiltered_collection(tmp_path: Path) -> None:
     for index, owned in enumerate(files):
         for other in files[index + 1 :]:
             assert not owned & other, "a file group straddled two shards"
+
+
+def test_commissioning_runner_peer_shares_the_protected_xdist_group() -> None:
+    files = (
+        "apps/worker/tests/test_commissioning_record_refusal.py",
+        "apps/worker/tests/test_protected_retirement_server.py",
+        "apps/worker/tests/test_protected_recovery_source.py",
+        "apps/worker/tests/test_delivery_lease.py",
+    )
+    probe = """
+import sys
+import pytest
+
+class Groups:
+    def pytest_collection_finish(self, session):
+        groups = {
+            (item.path.relative_to(session.config.rootpath).as_posix(), marker.args[0])
+            for item in session.items
+            for marker in item.iter_markers("xdist_group")
+        }
+        for path, group in sorted(groups):
+            print("RUNNER_GROUP", path, group)
+
+raise SystemExit(pytest.main(sys.argv[1:], plugins=[Groups()]))
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", probe, "--collect-only", "-q", *files],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    groups = {
+        fields[1]: fields[2]
+        for line in completed.stdout.splitlines()
+        if (fields := line.split()) and fields[0] == "RUNNER_GROUP"
+    }
+    assert set(groups) == set(files)
+    assert groups[files[0]] == groups[files[1]] == groups[files[2]]
+    assert groups[files[3]] != groups[files[0]]
