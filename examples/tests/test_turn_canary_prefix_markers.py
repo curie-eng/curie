@@ -249,7 +249,7 @@ def test_main_configuration_and_cycle_use_prefix_contract_without_changing_nonce
     monkeypatch.setattr(canary.os, "environ", env)
     monkeypatch.setattr(canary, "RuntimePlatform", InstalledPlatform)
     exit_code = asyncio.run(canary.main())
-    assert exit_code == 1
+    assert exit_code == (0 if matches else 1)
     assert installed[0].turn.text.startswith(PROMPT)
     assert installed[0].closed and installed[0].active == 0
     output = metrics.read_text()
