@@ -400,8 +400,11 @@ class HttpIdentityClient:
                     "Content-Type": "application/json", "Accept": "application/json",
                     "Accept-Encoding": "identity", "Authorization": "Bearer " + secret,
                 },
-                extensions={"timeout": httpx.Timeout(remaining).as_dict()},
             )
+            remaining = deadline - asyncio.get_running_loop().time()
+            if self._closing or remaining <= 0:
+                return FactsRefusal(code="unavailable")
+            outbound.extensions["timeout"] = httpx.Timeout(remaining).as_dict()
             operation.response = await operation.transport.handle_async_request(outbound)
             response = operation.response
             if response.status_code != 200:
