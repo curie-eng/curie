@@ -22,6 +22,7 @@ from curie_worker.binding import (
     HISTORY_TOKEN_ENV,
     MEMORY_TOKEN_ENV,
     BindingResolver,
+    HttpIdentityBinding,
     ResolvedDeployment,
     boot_token_facts,
 )
@@ -42,6 +43,19 @@ _qevent = functools.partial(qevent, channel=CHANNEL)
 
 class _ReleasingBinding:
     """Real boot env mints; records the credentials the substrate releases."""
+
+    async def identity_binding(
+        self, kind: str, adapter: str | None, address: str,
+    ) -> HttpIdentityBinding | None:
+        """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+        agent_id = AGENT_ID
+        return HttpIdentityBinding(
+            tenant_id=uuid.UUID("00000000-0000-4000-8000-000000000001"),
+            agent_id=agent_id,
+            binding_id=uuid.uuid5(uuid.NAMESPACE_URL, repr((kind, adapter, address))),
+            binding_generation=1, http_identity_required=False,
+        )
+
 
     def __init__(self) -> None:
         self.released: list[str] = []

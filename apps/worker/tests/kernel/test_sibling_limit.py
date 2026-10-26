@@ -20,7 +20,13 @@ from aci_protocol.turn import CLUSTER_MESSAGE_ADAPTER, route_identity
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 from curie_worker.behaviorpacks import BehaviorPacks
-from curie_worker.binding import BUDGET_ENV, BUNDLE_REF_ENV, PLUGIN_DIR_ENV, ResolvedDeployment
+from curie_worker.binding import (
+    BUDGET_ENV,
+    BUNDLE_REF_ENV,
+    PLUGIN_DIR_ENV,
+    HttpIdentityBinding,
+    ResolvedDeployment,
+)
 from curie_worker.config import WorkerConfig
 from curie_worker.reply_sink import (
     ObservedReplySink,
@@ -98,6 +104,22 @@ class _AdapterCapture:
 
 class _TripleBinding:
     """Canned resolutions keyed on the route triple, like the real resolver."""
+
+    async def identity_binding(
+        self, kind: str, adapter: str | None, address: str,
+    ) -> HttpIdentityBinding | None:
+        """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+        resolved = self._routes.get((kind, route_identity(kind, adapter), address))
+        if resolved is None:
+            return None
+        agent_id = resolved.agent_id
+        return HttpIdentityBinding(
+            tenant_id=uuid.UUID("00000000-0000-4000-8000-000000000001"),
+            agent_id=agent_id,
+            binding_id=uuid.uuid5(uuid.NAMESPACE_URL, repr((kind, adapter, address))),
+            binding_generation=1, http_identity_required=False,
+        )
+
 
     def __init__(self, routes: dict[tuple[str, str | None, str], ResolvedDeployment]) -> None:
         self._routes = routes

@@ -491,6 +491,13 @@ def test_a_polite_drop_is_not_overwritten_by_the_notice(make_harness) -> None:
     class _UnmappedBinding:
         """Resolves nothing, which is the polite-drop route."""
 
+        async def identity_binding(
+            self, kind: str, adapter: str | None, address: str,
+        ) -> None:
+            """@spec HTTP-INVOCATION-EXECUTION-18: this fixture has no mapped route."""
+            return None
+
+
         async def resolve(self, kind: str, adapter: str | None, address: str) -> None:
             return None
 

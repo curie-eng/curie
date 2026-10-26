@@ -38,6 +38,7 @@ from curie_worker import consumer as consumer_module
 from curie_worker import delivery_lease as delivery_lease_module
 from curie_worker import stream_consumer as stream_consumer_module
 from curie_worker.behaviorpacks import BehaviorPacks
+from curie_worker.binding import HttpIdentityBinding
 from curie_worker.capacity_wait import (
     WAIT_GENERATION_FIELD,
     WAIT_TERMINAL_ONLY_FIELD,
@@ -4966,6 +4967,19 @@ def _workspace_binding(deployment_id: uuid.UUID) -> object:
             self.workspace_enabled = True
 
     class WorkspaceBinding:
+
+        async def identity_binding(
+            self, kind: str, adapter: str | None, address: str,
+        ) -> HttpIdentityBinding | None:
+            """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+            agent_id = WorkspaceResolved().agent_id
+            return HttpIdentityBinding(
+                tenant_id=uuid.UUID("00000000-0000-4000-8000-000000000001"),
+                agent_id=agent_id,
+                binding_id=uuid.uuid5(uuid.NAMESPACE_URL, repr((kind, adapter, address))),
+                binding_generation=1, http_identity_required=False,
+            )
+
         async def resolve(
             self, _kind: str, _adapter: str | None, _channel: str
         ) -> WorkspaceResolved:

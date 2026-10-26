@@ -92,6 +92,7 @@ import pytest
 from aci_protocol import Attachment, Final, QueuedTurn, SessionStatus, TextDelta
 from curie_worker.attachments import AttachmentCoordinator, AttachmentLimits
 from curie_worker.behaviorpacks import BehaviorPacks
+from curie_worker.binding import HttpIdentityBinding
 from curie_worker.kernel import routing
 from curie_worker.kernel.core import Kernel
 from curie_worker.ledger_client import ThreadAttachmentLedgerClient
@@ -146,6 +147,19 @@ class _Binding:
     ``max_turns`` changes the boot env between turns, which is how the turn
     budget fence (#3071) replaces an idle live route with a handoff.
     """
+
+    async def identity_binding(
+        self, kind: str, adapter: str | None, address: str,
+    ) -> HttpIdentityBinding | None:
+        """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+        agent_id = self.resolved.agent_id
+        return HttpIdentityBinding(
+            tenant_id=uuid.UUID("00000000-0000-4000-8000-000000000001"),
+            agent_id=agent_id,
+            binding_id=uuid.uuid5(uuid.NAMESPACE_URL, repr((kind, adapter, address))),
+            binding_generation=1, http_identity_required=False,
+        )
+
 
     def __init__(self) -> None:
         self.resolved = SimpleNamespace(

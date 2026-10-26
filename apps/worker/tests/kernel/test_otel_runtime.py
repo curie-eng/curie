@@ -38,6 +38,7 @@ from curie_worker import threadlock as threadlock_module
 from curie_worker.approvals import ApprovalRequest, CreatedApproval
 from curie_worker.attachments import AttachmentResolutionError
 from curie_worker.behaviorpacks import BehaviorPacks
+from curie_worker.binding import HttpIdentityBinding
 from curie_worker.consumer import Consumer
 from curie_worker.delivery_lease import DeliveryLeaseStore
 from curie_worker.kernel import constants as kernel_constants
@@ -279,6 +280,19 @@ def test_a_resolved_agent_labels_only_the_agent_turn_counter(
             self.adapter = None
 
     class _Binding:
+
+        async def identity_binding(
+            self, kind: str, adapter: str | None, address: str,
+        ) -> HttpIdentityBinding | None:
+            """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+            agent_id = _Resolved().agent_id
+            return HttpIdentityBinding(
+                tenant_id=uuid.UUID("00000000-0000-4000-8000-000000000001"),
+                agent_id=agent_id,
+                binding_id=uuid.uuid5(uuid.NAMESPACE_URL, repr((kind, adapter, address))),
+                binding_generation=1, http_identity_required=False,
+            )
+
         async def resolve(self, _kind: str, _adapter: str | None, _channel: str) -> _Resolved:
             return _Resolved()
 

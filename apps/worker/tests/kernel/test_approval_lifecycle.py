@@ -41,7 +41,7 @@ from curie_worker.approvals import (
     SettledApproval,
 )
 from curie_worker.behaviorpacks import BehaviorPacks
-from curie_worker.binding import GRANT_TOOL_ENV, FactoryContext, FactoryWake
+from curie_worker.binding import GRANT_TOOL_ENV, FactoryContext, FactoryWake, HttpIdentityBinding
 from curie_worker.kernel.workspace import _WorkspaceInferenceCarry
 from curie_worker.reply_sink import TargetRoute, _ClusterMessageReplyAdapter
 from curie_worker.runner_client import RunnerError
@@ -2379,6 +2379,19 @@ def test_publication_create_stops_retrying_when_its_budget_is_spent() -> None:
 class _FactoryBinding:
     """A workspace-enabled deployment for a factory execute turn."""
 
+    async def identity_binding(
+        self, kind: str, adapter: str | None, address: str,
+    ) -> HttpIdentityBinding | None:
+        """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+        agent_id = uuid.UUID("11111111-1111-4111-8111-111111114180")
+        return HttpIdentityBinding(
+            tenant_id=uuid.UUID("00000000-0000-4000-8000-000000000001"),
+            agent_id=agent_id,
+            binding_id=uuid.uuid5(uuid.NAMESPACE_URL, repr((kind, adapter, address))),
+            binding_generation=1, http_identity_required=False,
+        )
+
+
     def _deployment(self) -> object:
         return SimpleNamespace(
             agent_id=uuid.UUID("11111111-1111-4111-8111-111111114180"),
@@ -3527,6 +3540,19 @@ class GrantBinding:
     mirroring the worker's real derivation from durable approval state.
     """
 
+    async def identity_binding(
+        self, kind: str, adapter: str | None, address: str,
+    ) -> HttpIdentityBinding | None:
+        """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+        agent_id = self.agent_id
+        return HttpIdentityBinding(
+            tenant_id=uuid.UUID("00000000-0000-4000-8000-000000000001"),
+            agent_id=agent_id,
+            binding_id=uuid.uuid5(uuid.NAMESPACE_URL, repr((kind, adapter, address))),
+            binding_generation=1, http_identity_required=False,
+        )
+
+
     def __init__(self, *, grant_event_id: str, grant_tool: str, decision: str = "approved") -> None:
         self.grant_event_id = grant_event_id
         self.grant_tool = grant_tool
@@ -3928,6 +3954,19 @@ def _awaiting_routed_script(summary: str, route: str) -> list:
 
 class RoutedBinding:
     """A minimal binding stand-in: one channel -> one agent with route bindings."""
+
+    async def identity_binding(
+        self, kind: str, adapter: str | None, address: str,
+    ) -> HttpIdentityBinding | None:
+        """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+        agent_id = self.agent_id
+        return HttpIdentityBinding(
+            tenant_id=uuid.UUID("00000000-0000-4000-8000-000000000001"),
+            agent_id=agent_id,
+            binding_id=uuid.uuid5(uuid.NAMESPACE_URL, repr((kind, adapter, address))),
+            binding_generation=1, http_identity_required=False,
+        )
+
 
     def __init__(self, routes: dict | None) -> None:
         self.routes = routes
@@ -5960,6 +5999,19 @@ def test_publication_with_named_unbound_route_escalates_and_creates_nothing(
 class _WorkspacelessBinding:
     """A deployment with repository workspaces off, as `curie cluster message`
     installs it: a deployment id (so selection runs) and no bound repository."""
+
+    async def identity_binding(
+        self, kind: str, adapter: str | None, address: str,
+    ) -> HttpIdentityBinding | None:
+        """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+        agent_id = uuid.UUID("22222222-2222-4222-8222-222222222828")
+        return HttpIdentityBinding(
+            tenant_id=uuid.UUID("00000000-0000-4000-8000-000000000001"),
+            agent_id=agent_id,
+            binding_id=uuid.uuid5(uuid.NAMESPACE_URL, repr((kind, adapter, address))),
+            binding_generation=1, http_identity_required=False,
+        )
+
 
     def __init__(self, deployment_id: uuid.UUID) -> None:
         self.deployment_id = deployment_id
