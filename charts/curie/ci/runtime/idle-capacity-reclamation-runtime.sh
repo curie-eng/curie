@@ -587,8 +587,10 @@ def burst_sixteen():
         quota_used = int(quota.get("status", {}).get("used", {}).get("pods", 0))
         assert quota_used <= 2, "observed quota usage exceeded two"
         priority = quota["spec"]["scopeSelector"]["matchExpressions"][0]["values"][0]
+        # @spec QUOTA-OBSERVATION-CLOCK-1.
+        observed_pods = get("pods")["items"]
         now = time.time()
-        pods = [pod for pod in get("pods")["items"]
+        pods = [pod for pod in observed_pods
                 if pod["spec"].get("priorityClassName") == priority
                 and counts_against_quota(pod, now)]
         assert len(pods) <= 2, "observed more than two chargeable sandbox pods"
