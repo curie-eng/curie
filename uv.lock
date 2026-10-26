@@ -933,6 +933,7 @@ name = "curie-internal"
 version = "0.0.0"
 source = { editable = "packages/curie-internal" }
 dependencies = [
+    { name = "aci-protocol" },
     { name = "pydantic" },
     { name = "redis" },
     { name = "sqlalchemy", extra = ["asyncio"] },
@@ -940,6 +941,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "aci-protocol", editable = "packages/aci-protocol" },
     { name = "pydantic", specifier = ">=2.9" },
     { name = "redis", specifier = ">=5.2" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0" },
