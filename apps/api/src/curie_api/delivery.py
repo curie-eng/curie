@@ -24,10 +24,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import re
 import secrets
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
+from uuid import UUID
 
 import redis.asyncio as redis
 from fastapi import Response
@@ -64,7 +66,64 @@ _FAILED_DELIVERY_CLEANUP_TIMEOUT_S = 5.0
 # same `delivery_id` win a fresh `SET NX` once it lapses, enqueue a second time,
 # and answer the correspondent twice -- silently, and only for the deliveries a
 # caller happens to retry after the window.
-_ENQUEUE_SCRIPT = """
+# @spec GUARDED-DELIVERY-V1-4, GUARDED-DELIVERY-V1-7.
+_DELIVERY_WINDOW_LUA = """
+local function delivery_limb(raw, minimum, maximum, canonical, width)
+  if type(raw) ~= 'string' or #raw == 0 or #raw > width
+     or not string.match(raw, '^%-?%d+$') then return nil end
+  local n = tonumber(raw)
+  if not n or n < minimum or n > maximum then return nil end
+  if canonical and raw ~= '0' and not string.match(raw, '^[1-9]%d*$')
+     and not string.match(raw, '^%-[1-9]%d*$') then return nil end
+  return n
+end
+local function delivery_window_bounds(ls, lu, us, uu)
+  local a = delivery_limb(ls, -62135596800, 253402300799, true, 13)
+  local b = delivery_limb(lu, 0, 999999, true, 6)
+  local c = delivery_limb(us, -62135596800, 253402300799, true, 13)
+  local d = delivery_limb(uu, 0, 999999, true, 6)
+  if not a or not b or not c or not d or a > c or (a == c and b > d) then
+    return nil
+  end
+  return {a, b, c, d}
+end
+local function delivery_window_contains(bounds, seconds, micros)
+  local s = delivery_limb(seconds, -62135596800, 253402300799, false, 13)
+  local u = delivery_limb(micros, 0, 999999, false, 6)
+  if not s or not u then return -5 end
+  if s < bounds[1] or (s == bounds[1] and u < bounds[2])
+     or s > bounds[3] or (s == bounds[3] and u > bounds[4]) then return -3 end
+  return 1
+end
+"""
+
+_ENQUEUE_SCRIPT = _DELIVERY_WINDOW_LUA + """
+-- @spec GUARDED-DELIVERY-V1-4, GUARDED-DELIVERY-V1-5.
+local mode = ARGV[8] or ''
+local guarded = mode == 'identity_guard_v1'
+local bounds = nil
+if guarded then
+  if #KEYS ~= 4 or #ARGV ~= 14 or ARGV[7] ~= '' then
+    return redis.error_reply('invalid guarded delivery protocol')
+  end
+  for i = 1, 4 do
+    if KEYS[i] == '' then return redis.error_reply('invalid guarded delivery protocol') end
+    for j = i + 1, 4 do
+      if KEYS[i] == KEYS[j] then
+        return redis.error_reply('invalid guarded delivery protocol')
+      end
+    end
+  end
+  if not string.match(ARGV[1], '^pending:[0-9a-f]+$') or #ARGV[1] ~= 40
+     or string.sub(ARGV[9], 1, 7) ~= 'stable:' or #ARGV[9] <= 7
+     or not string.match(ARGV[10], '^[0-9a-f]+$') or #ARGV[10] ~= 32 then
+    return redis.error_reply('invalid guarded delivery protocol')
+  end
+  bounds = delivery_window_bounds(ARGV[11], ARGV[12], ARGV[13], ARGV[14])
+  if not bounds then return redis.error_reply('invalid guarded delivery protocol') end
+elseif mode ~= '' or #KEYS == 4 then
+  return redis.error_reply('invalid guarded delivery protocol')
+end
 local function append()
   if ARGV[5] ~= '' then
     return redis.call('XADD', KEYS[2], '*', ARGV[3], ARGV[2], ARGV[5], ARGV[6])
@@ -72,7 +131,7 @@ local function append()
   return redis.call('XADD', KEYS[2], '*', ARGV[3], ARGV[2])
 end
 -- @spec HOOK-RECEIPT-1, HOOK-RECEIPT-5. Optional metadata never touches legacy callers.
-local with_receipt = #KEYS == 3
+local with_receipt = not guarded and #KEYS == 3
 if with_receipt then
   local kind = redis.call('TYPE', KEYS[1]).ok
   if kind ~= 'none' and kind ~= 'string' then return {-1, ''} end
@@ -82,6 +141,14 @@ if with_receipt then
 end
 local cur = redis.call('GET', KEYS[1])
 if cur == ARGV[1] or not cur then
+  if guarded then
+    if redis.call('GET', KEYS[3]) ~= ARGV[9] then return {-2, ''} end
+    if redis.call('GET', KEYS[4]) ~= ARGV[10] then return {-4, ''} end
+    local now = redis.call('TIME')
+    if type(now) ~= 'table' or #now ~= 2 then return {-5, ''} end
+    local valid = delivery_window_contains(bounds, now[1], now[2])
+    if valid ~= 1 then return {valid, ''} end
+  end
   if with_receipt and redis.call('EXISTS', KEYS[3]) == 1 then return {-1, ''} end
   if not cur then redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[4]) end
   local id = append()
@@ -192,6 +259,133 @@ class BacklogReservation:
         return f"{self.counter_key}:attempt:{self.token}"
 
 
+@dataclass(frozen=True)
+class DeliveryValidityWindow:
+    """Inclusive server time bounds. @spec GUARDED-DELIVERY-V1-2."""
+
+    lower_seconds: int
+    lower_microseconds: int
+    upper_seconds: int
+    upper_microseconds: int
+
+    def __post_init__(self) -> None:
+        """@spec GUARDED-DELIVERY-V1-2."""
+        seconds = (self.lower_seconds, self.upper_seconds)
+        micros = (self.lower_microseconds, self.upper_microseconds)
+        if (
+            any(type(value) is not int for value in (*seconds, *micros))
+            or any(not -62135596800 <= value <= 253402300799 for value in seconds)
+            or any(not 0 <= value <= 999999 for value in micros)
+            or (self.lower_seconds, self.lower_microseconds)
+            > (self.upper_seconds, self.upper_microseconds)
+        ):
+            raise ValueError("invalid_delivery_validity")
+
+
+@dataclass(frozen=True)
+class DeliveryEnqueueGuard:
+    """Conditional write inputs, not permission. @spec GUARDED-DELIVERY-V1-2."""
+
+    fence_key: str = field(repr=False)
+    expected_stable: str = field(repr=False)
+    validity: DeliveryValidityWindow = field(repr=False)
+    reservation: BacklogReservation = field(repr=False)
+
+    def __post_init__(self) -> None:
+        """@spec GUARDED-DELIVERY-V1-2."""
+        try:
+            if (
+                type(self.fence_key) is not str or not self.fence_key
+                or type(self.expected_stable) is not str
+                or not self.expected_stable.startswith("stable:")
+                or type(self.validity) is not DeliveryValidityWindow
+                or type(self.reservation) is not BacklogReservation
+            ):
+                raise ValueError
+            UUID(self.expected_stable.removeprefix("stable:"))
+            DeliveryValidityWindow.__post_init__(self.validity)
+            reservation = self.reservation
+            if (
+                type(reservation.counter_key) is not str or not reservation.counter_key
+                or type(reservation.token) is not str
+                or re.fullmatch(r"[0-9a-f]{32}", reservation.token) is None
+                or type(reservation.window_s) is not int or reservation.window_s <= 0
+            ):
+                raise ValueError
+        except (ValueError, TypeError, AttributeError):
+            raise ValueError("invalid_delivery_guard") from None
+
+
+class DeliveryGuardRefusal(RuntimeError):
+    """Bounded conditional append refusal. @spec GUARDED-DELIVERY-V1-6."""
+
+    def __init__(self, code: str) -> None:
+        """@spec GUARDED-DELIVERY-V1-6."""
+        if type(code) is not str or code not in {
+            "fence_changed", "outside_validity", "reservation_lost", "clock_unavailable",
+        }:
+            raise ValueError("invalid_delivery_guard_refusal")
+        self.code = code
+        super().__init__(code)
+
+
+def _guarded_enqueue_result(result: Any) -> tuple[bool, str]:
+    """Decode only the guarded protocol. @spec GUARDED-DELIVERY-V1-6."""
+    if (
+        type(result) not in (list, tuple) or len(result) != 2
+        or type(result[0]) is not int
+    ):
+        raise RuntimeError("invalid_guarded_delivery_result")
+    status, current = result
+    refusals = {
+        -2: "fence_changed", -3: "outside_validity",
+        -4: "reservation_lost", -5: "clock_unavailable",
+    }
+    if status in refusals:
+        raise DeliveryGuardRefusal(refusals[status])
+    if status not in (0, 1) or not isinstance(current, (str, bytes, bytearray)):
+        raise RuntimeError("invalid_guarded_delivery_result")
+    try:
+        value = text(current)
+    except UnicodeError:
+        raise RuntimeError("invalid_guarded_delivery_result") from None
+    if not value:
+        raise RuntimeError("invalid_guarded_delivery_result")
+    return status == 1, value
+
+
+def _guard_arguments(
+    guard: DeliveryEnqueueGuard, *, key: str, stream: str, owner: str,
+    receipt_key: str | None, receipt_prefix: str | None,
+) -> tuple[list[str], list[str]]:
+    """Validate again before the first await. @spec GUARDED-DELIVERY-V1-2."""
+    try:
+        if type(guard) is not DeliveryEnqueueGuard:
+            raise ValueError
+        DeliveryEnqueueGuard.__post_init__(guard)
+        if receipt_key is not None or receipt_prefix is not None:
+            raise ValueError
+        if type(owner) is not str or re.fullmatch(r"pending:[0-9a-f]{32}", owner) is None:
+            raise ValueError
+        keys = [key, stream, guard.fence_key, guard.reservation.token_key]
+        all_keys = [*keys, guard.reservation.counter_key]
+        if any(type(value) is not str or not value for value in all_keys):
+            raise ValueError
+        for value in all_keys:
+            value.encode("utf-8")
+        if len(set(all_keys)) != len(all_keys):
+            raise ValueError
+        validity = guard.validity
+        arguments = [
+            "identity_guard_v1", guard.expected_stable, guard.reservation.token,
+            str(validity.lower_seconds), str(validity.lower_microseconds),
+            str(validity.upper_seconds), str(validity.upper_microseconds),
+        ]
+        return keys, arguments
+    except (ValueError, TypeError, AttributeError):
+        raise ValueError("invalid_delivery_guard") from None
+
+
 def backlog_reservation(*, key_prefix: str, window_s: int) -> BacklogReservation:
     """Fix the window and token before taking a claim or quota slot."""
 
@@ -265,8 +459,11 @@ async def enqueue_owned(
     transport_value: str | None = None,
     receipt_key: str | None = None,
     receipt_prefix: str | None = None,
+    guard: DeliveryEnqueueGuard | None = None,
 ) -> tuple[bool, str]:
     """Enqueue the payload if this request still owns the claim.
+
+    @spec GUARDED-DELIVERY-V1-1, GUARDED-DELIVERY-V1-4.
 
     Args:
         client: The Valkey client.
@@ -284,13 +481,21 @@ async def enqueue_owned(
         naming the current owner when it did not.
     """
 
+    # @spec GUARDED-DELIVERY-V1-2, GUARDED-DELIVERY-V1-4.
+    guarded_arguments: list[str] = []
+    if guard is not None:
+        keys, guarded_arguments = _guard_arguments(
+            guard, key=key, stream=stream, owner=owner,
+            receipt_key=receipt_key, receipt_prefix=receipt_prefix,
+        )
+    else:
+        keys = [key, stream] if receipt_key is None else [key, stream, receipt_key]
     # @spec HOOK-RECEIPT-1, HOOK-RECEIPT-5. The hook codec validates and bounds this prefix
     # before claiming. Lua only appends the server's canonical stream ID.
     if (receipt_key is None) != (receipt_prefix is None):
         raise ValueError("receipt key and prefix must be supplied together")
     if receipt_key in (key, stream):
         raise ValueError("receipt key must be separate from claim and stream")
-    keys = [key, stream] if receipt_key is None else [key, stream, receipt_key]
     result: Any = await client.eval(
         _ENQUEUE_SCRIPT,
         len(keys),
@@ -302,7 +507,10 @@ async def enqueue_owned(
         transport_field or "",
         transport_value or "",
         receipt_prefix or "",
+        *guarded_arguments,
     )
+    if guard is not None:
+        return _guarded_enqueue_result(result)
     enqueued, current = result
     if enqueued == -1:
         raise DeliveryReceiptConflict("invalid hook receipt evidence")
