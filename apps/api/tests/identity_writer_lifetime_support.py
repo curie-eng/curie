@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from collections.abc import Awaitable, Callable
+from contextlib import asynccontextmanager
 from typing import Any
 
 from curie_api.config import get_settings
@@ -147,3 +148,100 @@ class ConnectionObserver:
 def headers() -> dict[str, str]:
     """@spec IDENTITY-WRITER-LIFETIME-V1-1. Follow the configured synthetic API key."""
     return {"X-API-Key": get_settings().api_key}
+
+
+def api() -> Any:
+    """@spec IDENTITY-WRITER-LIFETIME-V1-2. Missing interfaces fail only inside bodies."""
+    from curie_api import deps, identity_fence
+
+    for name in ("IdentityWriterUnavailable", "IdentityFenceMiddleware", "request_owned_session"):
+        assert hasattr(identity_fence, name), f"writer lifetime interface is missing: {name}"
+    assert hasattr(deps, "request_session"), "request_session borrowing is not implemented"
+    return identity_fence
+
+
+class AckLost(RuntimeError):
+    """@spec IDENTITY-WRITER-LIFETIME-V1-5/6. Synthetic client-local lost acknowledgement."""
+
+
+class AckClient:
+    """@spec IDENTITY-WRITER-LIFETIME-V1-5. Delegate real I/O; fault only its acknowledgement."""
+
+    def __init__(self, client: Any, mode: str) -> None:
+        """@spec IDENTITY-WRITER-LIFETIME-V1-5."""
+        self.client, self.mode = client, mode
+        self.sent: list[str] = []
+
+    async def set(self, *args: Any, **kwargs: Any) -> Any:
+        """@spec IDENTITY-WRITER-LIFETIME-V1-5. Record whether pending reached the server."""
+        if self.mode == "pending_before":
+            raise AckLost("pending_ack_lost")
+        result = await self.client.set(*args, **kwargs)
+        self.sent.append("set")
+        if self.mode == "pending_after":
+            raise AckLost("pending_ack_lost")
+        return False if self.mode == "pending_false" else result
+
+    async def eval(self, *args: Any, **kwargs: Any) -> Any:
+        """@spec IDENTITY-WRITER-LIFETIME-V1-5. Lost ACK is not a server nonexecution claim."""
+        if self.mode == "stable_before":
+            raise AckLost("stable_ack_lost")
+        result = await self.client.eval(*args, **kwargs)
+        self.sent.append("eval")
+        if self.mode == "stable_after":
+            raise AckLost("stable_ack_lost")
+        return result
+
+    def __getattr__(self, name: str) -> Any:
+        """@spec IDENTITY-WRITER-LIFETIME-V1-5. No datastore or lock operation is replaced."""
+        return getattr(self.client, name)
+
+
+@asynccontextmanager
+async def backend() -> Any:
+    """@spec IDENTITY-WRITER-LIFETIME-V1-10. Own clients, not shared service lifecycle."""
+    import redis.asyncio as redis
+    from curie_api import identity_fence
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    engine = create_async_engine(get_settings().database_url, pool_size=5, max_overflow=0)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    client = redis.from_url(get_settings().valkey_dsn())
+    try:
+        await client.set(identity_fence.FENCE_KEY, "stable:synthetic-before")
+        yield engine, factory, client
+    finally:
+        await client.delete(identity_fence.FENCE_KEY)
+        await client.aclose()
+        await engine.dispose()
+
+
+def request(factory: Any) -> Any:
+    """@spec IDENTITY-WRITER-LIFETIME-V1-2. No get_session override or ambient factory switch."""
+    from types import SimpleNamespace
+
+    from starlette.requests import Request
+
+    return Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/identity/synthetic",
+            "query_string": b"",
+            "headers": [],
+            "state": {},
+            "app": SimpleNamespace(state=SimpleNamespace(sessionmaker=factory)),
+        }
+    )
+
+
+async def wait_locks(observer: ConnectionObserver, count: int) -> None:
+    """@spec IDENTITY-WRITER-LIFETIME-V1-3. Wait for observed SQL; elapsed sleep is no proof."""
+    async with asyncio.timeout(4):
+        while len(observer.lock_connections) < count:
+            await asyncio.sleep(0.005)
+
+
+def driver(connection: AsyncConnection) -> Any:
+    """@spec IDENTITY-WRITER-LIFETIME-V1-3/4. Public driver identity, no owner internals."""
+    return connection.sync_connection.connection.driver_connection
