@@ -37,6 +37,8 @@ A guarded call cannot supply hook receipt key/prefix arguments. Reject this comb
 
 The pure helper accepts actual ValidatedFacts and FreshnessLimits, revalidates their ordinary model shape and rejects incoherent outcome/observation/expiry pairs. Resolved facts require identity and membership evidence; inactive and unresolved facts carry identity observation only, with their existing T1 outcome shapes. The caller must supply a successful T1 result and the same limits used to obtain it. Shape validation cannot authenticate coherent fabricated Python values or prove which limit object originally produced an expiry. Invalid or incoherent inputs and empty intersections raise ValueError with fixed text `invalid_identity_delivery_window`, no sensitive input or exception chain, before any I/O.
 
+For each supplied observation use the public owner helper utc_instant to require exact correspondence `E == A + Fraction(M-G-S, 1000)` before conversion. This rejects inconsistent expiry/limit inputs without authenticating their origin; a coherently fabricated value remains indistinguishable from trusted computation. Do not duplicate timestamp grammar or reconstruct provider response bytes.
+
 Use the exact Fraction expiry E already supplied by [T1](2026-10-23-http-identity-facts-v1.md). For an observation with age limit M milliseconds, source lag G milliseconds and skew S milliseconds, its accepted interval is closed:
 
 ```text
