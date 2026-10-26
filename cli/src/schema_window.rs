@@ -563,10 +563,10 @@ print(json.dumps(graph))
     #[test]
     fn candidate_window_tracks_the_catalog_without_changing_released_windows() {
         // @spec DEPLOY-NOTICE-RELEASE-1.
-        // @spec HTTP-PRINCIPAL-ADOPTION-V1-2/9: current authority reads require 0132.
+        // @spec AGENT-ROLE-PERSISTENCE-V1-9: current policy reads require 0133.
         let candidate = source_candidate_window();
-        assert_eq!(candidate.schema_min, "0132");
-        assert_eq!(candidate.schema_head, "0132");
+        assert_eq!(candidate.schema_min, "0133");
+        assert_eq!(candidate.schema_head, "0133");
         assert_eq!(
             candidate.schema_head.as_str(),
             catalog().revisions.last().unwrap()

@@ -797,6 +797,8 @@ def test_legacy_preflush_preserves_caller_work_through_guard_and_actual_write_fa
                     assert s.in_transaction() and s.is_active
                     if pending != "deleted":
                         key = row.id if pending == "new" else key
+                        # Nested rollback may expire the row it changed; read the DB explicitly.
+                        await s.refresh(row)
                         assert (
                             getattr(row, "deployment_id" if pending == "new" else field) == marker
                         )
