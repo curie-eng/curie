@@ -63,10 +63,16 @@ updates `publications` / `approvals` under `FOR UPDATE ... SKIP LOCKED`). Table 
 column names are a second, ORM-independent coupling a conforming DB must honor.
 - **Migrations**: the target DB must apply the **whole Alembic chain in `apps/api/alembic/versions/`**, in revision order, ending at `alembic heads`. The chain grows with the product, so it is deliberately not enumerated here: `ls apps/api/alembic/versions/` is the list, and `alembic heads` is the tip a conforming DB must reach. A single head is the invariant — a fork means two branches each added a migration (rebase and merge the heads before swapping anything). Two recent expand revisions make authenticated review feedback part of this schema contract: `0042_review_lineage_authority.py` adds immutable App-observed authority to publication lineages and the `publication_review_reservations` concurrency table; `0043_github_review_feedback.py` adds the `github_review_deliveries` audit table and the `github_review_feedback` durable feedback/outbox table. The latter stores normalized feedback and a credential-free queued turn, never a raw webhook body or GitHub credential.
 
-The current application schema window is `schema_min: "0108"` and
-`schema_head: "0108"`, as recorded in
-`apps/api/src/curie_api/schema_compat.json`. Revision `0108` merges the `0107`
-and `0106` histories (`apps/api/alembic/versions/0108_merge_stable_reply_identity.py`).
+The current application schema window is `schema_min: "0123"` and
+`schema_head: "0123"`, as recorded in
+`apps/api/src/curie_api/schema_compat.json`. Revision `0123` follows the linear
+`0120` to `0122` chain: team sync state
+(`apps/api/alembic/versions/0120_team_sync_state.py`), agent access policies
+(`apps/api/alembic/versions/0121_agent_access_policies.py`), and directory identity
+(`apps/api/alembic/versions/0122_directory_identity.py`). Revision `0123` adds
+the nullable `execution_requests.last_start_failure_detail` diagnostic, with a
+nonblank, 2000-character bound
+(`apps/api/alembic/versions/0123_execution_request_start_failure_detail.py`).
 These values describe this candidate, not a historical release window.
 
 The `channel_canvas_edits` table (`apps/api/src/curie_api/models.py::ChannelCanvasEdit`,
@@ -416,7 +422,13 @@ is a judgement call, not something derivable from the tree.
    `apps/api/src/curie_api/crud/channels.py::refuse_routeless_pair_sharing`; and per GitHub
    issue in `apps/api/src/curie_api/github_factory.py::lock_issue`. The factory poll
    intake instead holds a session-scoped `pg_try_advisory_lock` on one connection
-   (`apps/api/src/curie_api/factory_poll_intake.py::poll_once`). The two-argument
+   (`apps/api/src/curie_api/factory_poll_intake.py::poll_once`). The global identity
+   admission fence uses bigint key `2250220`:
+   `apps/api/src/curie_api/identity_fence.py::mutation` holds the exclusive
+   transaction lock across identity mutation and cache-generation publication,
+   while `apps/api/src/curie_api/identity_fence.py::lock_identity_reader` holds
+   the shared transaction lock to keep authorization stable until commit.
+   The two-argument
    int4 form and the bigint form are separate lock spaces, so a port must keep the
    key derivation as written.
 

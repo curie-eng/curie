@@ -289,6 +289,10 @@ class SandboxSubstrate:
             )
         if not agent or not cred:
             return
+        if claim_name is not None:
+            self._affinity.mark_claim_credential_retiring(
+                claim_name, ttl_s=SANDBOX_TOKEN_TTL_SECONDS
+            )
         revoker = self._boot_credential_revoker
         if revoker is None:
             return
@@ -400,6 +404,8 @@ class SandboxSubstrate:
         """Reap retries a report whose claim is already gone."""
 
         for claim_name, _agent, _cred in self._affinity.iter_claim_credentials():
+            if not self._affinity.claim_credential_retiring(claim_name):
+                continue
             try:
                 still_there = self._k8s.get_claim(
                     claim_name, request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S
@@ -1848,7 +1854,7 @@ class SandboxSubstrate:
             bound = self._await_service_fqdn(sandbox_name, deadline)
             if provisioned is not None:
                 tool_daemon.await_ready(self._k8s, provisioned, deadline, _poll_sleeps(config))
-        except Exception as exc:
+        except BaseException as exc:  # noqa: BLE001 - retire owned resources on creator interruption
             # A 409 means the name is someone else's claim: never retire it.
             if created and not isinstance(exc, ClaimNameConflict):
                 self._retire_claim_quietly(name, env=env, daemon=False)

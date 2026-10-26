@@ -27,7 +27,8 @@ adapter is connected.
   conversation. The prefix defaults to `eval:turn-canary-`; an operator may
   replace it with any value matching `eval:[A-Za-z0-9._-]{0,48}`, which keeps
   the worker's `eval:` isolate prefix that every conversation-ID check of this
-  example and the worker requires. Any other prefix refuses to start. Its prompt asks only for that nonce and explicitly forbids tools,
+  example and the worker requires. Any other prefix refuses to start. By default its prompt asks only for that nonce; TURN-CANARY-16 permits an
+  explicit role-appropriate question. Every prompt explicitly forbids tools,
   actions, approval requests, and durable changes. It sets `tool_access` to
   `read-only`, `source` to `slack`, and empty attachments and hook run. The
   `ReplyHandle` retains the selected Slack address, uses the reserved
@@ -318,6 +319,114 @@ cleanup.
   longer lists. Exclusion matches the stored kind exactly; agent names,
   addresses and adapters are never exclusion criteria. With the list empty,
   every cycle behaves as before.
+
+- **TURN-CANARY-16: explicit probe profiles.** Nonce-only probes remain the
+  default. An operator may set `TURN_CANARY_PROBE_PROFILES` to a nonempty JSON
+  object from exact inventory agent slugs to objects containing the required
+  `prompt`, `required_any`, and `forbidden_any` fields, with the optional
+  prefix exclusion defined by TURN-CANARY-18. The parser rejects duplicate
+  keys, unknown or missing fields, malformed JSON, and empty profiles before
+  any enqueue. The JSON is at most 65,536 UTF-8 bytes and names at most 100
+  profiles. Slugs are 1 to 63 lowercase ASCII letters, digits or hyphens,
+  beginning with a letter or digit. Prompts are nonblank strings of at most
+  2,048 characters. `required_any` contains 1 to 8 nonempty lists of 1 to 8
+  marker strings; `forbidden_any` contains 0 to 32 marker strings. Each marker
+  is 1 to 128 characters and nonblank after normalization. These bounds also
+  apply to programmatic construction. An omitted environment variable means
+  no profiles; an explicitly empty value or object is invalid.
+
+  Only a selected route whose exact inventory agent slug has a profile uses
+  its prompt. Missing or unmatched slugs keep the original nonce question.
+  A profile does not select routes or change qualification, isolation, wire
+  correlation, timeout, capacity, cleanup, or agent safety policy. Its question
+  receives the same explicit no-tools, no-actions, no-approvals and
+  no-durable-changes suffix as the nonce question. Operators choose a
+  role-appropriate question answerable without tools; profiles cannot grant
+  permissions or require the agent to override its role.
+
+  A profile passes only after TURN-CANARY-3 establishes delivery of a nonblank
+  final non-progress reply update correlated to the enqueued turn. Normalize
+  the final text and every marker using Unicode NFKC, case folding, and
+  whitespace collapse. Every required group must have at least one literal
+  substring match, and no forbidden marker may occur. No regular expression
+  is evaluated. Progress text cannot satisfy a marker. Missing, blank,
+  malformed, foreign, non-delivered or incomplete replies fail. A refusal
+  is not automatically accepted: the configured affirmative markers must all
+  be present and its forbidden markers absent. Matching is a deterministic
+  text contract, not a semantic judgment or proof of useful work beyond that
+  contract. Operators should include known refusal markers in forbidden_any.
+
+  `target_probe_success` independently reports this result, or exact nonce
+  success for an unprofiled route. `target_probe_profile` is 1 for a configured
+  profile and 0 for the nonce default. Both have only the existing route labels;
+  profile prompts and marker text never become labels or logs. Profile logs
+  use only `profile_match` or `profile_mismatch` in the probe phase, while
+  relay lifecycle reason codes remain unchanged. Enqueue and relay failures
+  publish probe failure. Capacity skips and cleanup holds publish neither
+  probe field, retaining previous observations in standing mode.
+
+  `target_last_probe_success_timestamp_seconds` records an independently
+  passing configured probe (or exact nonce default).
+  `target_last_delivery_success_timestamp_seconds` records actual delivery
+  success, independently of nonce or profile matching. Both timestamps are retained across
+  exporter rotations until inventory removes the route, but is not restored
+  after restart; a missing timestamp is not healthy delivery. Existing
+  exact_nonce, target_success, nonce success timestamps, cycle success and
+  exit status retain their original meaning, including when a profile passes.
+  Alerts opt into the new mode and result and use delivery timestamps plus
+  last-run freshness instead of interpreting nonce success as delivery.
+
+- **TURN-CANARY-17: standalone profile schema and source assembly.**
+  `probe_profiles.py`, beside `turn_canary.py`, is the single owner of the
+  profile schema, normalization, literal matcher, strict JSON parser and
+  programmatic mapping validation from TURN-CANARY-16. It depends only on the
+  Python standard library. A consumer can load this helper file alone by
+  `importlib.util.spec_from_file_location` and call `ProbeProfile`,
+  `ProbeProfile.matches`, `parse_probe_profiles` and `validate_probe_profiles`
+  without importing ACI, channel protocol, Pydantic or the runnable checker.
+  Validation, bounds and matching behavior remain TURN-CANARY-16's contract.
+
+  The runnable checker consumes this sibling and re-exports its existing
+  `ProbeProfile` and `parse_probe_profiles` APIs. Both script execution and
+  file-based dynamic import work from a clean source directory containing the
+  two files, with the checker's normal runtime dependencies available. Sibling
+  resolution uses the checker's own source directory, without mutating global
+  import search paths, extracting source fragments, installing dependency
+  substitutes or falling back to another checkout's helper. Shipping the
+  checker requires both files in the same directory. A previously imported
+  helper is reused only when its registered module resolves to this exact
+  sibling file, preserving profile class identity across helper and checker
+  imports. Normal helper imports and file-spec imports registered in
+  `sys.modules` before execution are supported. Repeated checker imports share
+  that sibling; different source directories stay isolated. If the canonical
+  `probe_profiles` module name is vacant, the checker registers the exact
+  sibling under that name too, preserving profile class identity for normal
+  helper imports before or after checker loading. An occupied canonical name
+  is never overwritten. Arbitrary duplicate file-spec executions under new
+  names retain Python's normal independent module identities. A missing helper fails
+  before any platform operation. Factoring the helper changes no prompt,
+  default, wire, lifecycle, cleanup, log or metric behavior.
+
+- **TURN-CANARY-18: optional response-prefix exclusions.** A profile may add
+  `forbidden_prefix_any`, defaulting to an empty list in JSON and an empty
+  immutable tuple in `ProbeProfile`. Existing three-field JSON and three-argument
+  programmatic construction remain compatible. The optional field contains
+  0 to 32 marker strings with TURN-CANARY-16's existing nonblank, 128-character
+  marker bound and immutable canonicalization. Invalid collection types,
+  non-string, empty, blank or overbound markers refuse parsing/construction.
+  The strict parser accepts the three required fields plus this optional field
+  only; all other unknown fields, duplicate keys and the existing total JSON
+  byte bound remain rejected.
+
+  Apply TURN-CANARY-16's Unicode NFKC, case folding and whitespace collapse to
+  the response and prefix markers. A response fails when its normalized text
+  starts with any normalized prefix marker. The same literal wording later
+  in the response does not trigger this prefix exclusion. Required marker
+  groups still all apply, and `forbidden_any` continues to reject matching
+  text anywhere. No regex, language inference or sentence parsing is used.
+  The standalone schema module remains the sole owner. Source assembly,
+  module identity, default nonce behavior, wire and lifecycle validation,
+  cleanup, logs and metrics retain TURN-CANARY-16/17's meanings.
 
 ## Verification
 

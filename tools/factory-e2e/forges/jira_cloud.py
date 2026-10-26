@@ -440,11 +440,22 @@ class JiraCloudDriver:
             return None
         return remote_link_count(body, change.url)
 
-    def _pr_body_has_key(self, key: str, change: fe.ChangeRef | None) -> bool:
-        if change is None:
-            return False
+    def _github_pr_body(self, change: fe.ChangeRef) -> str | None:
+        """The pull request body on GitHub, the code host this driver delegates to."""
+
         status, pr = self.p.as_actor("GET", f"/repos/{self.p.config.repo}/pulls/{change.number}")
         text = pr.get("body") if status == 200 and isinstance(pr, dict) else None
+        return text if isinstance(text, str) else None
+
+    def _pr_body_has_key(
+        self,
+        key: str,
+        change: fe.ChangeRef | None,
+        pr_body: Callable[[fe.ChangeRef], str | None],
+    ) -> bool:
+        if change is None:
+            return False
+        text = pr_body(change)
         if not isinstance(text, str):
             return False
         return key in text and f"https://{self.site.site}/browse/{key}" in text
@@ -466,13 +477,23 @@ class JiraCloudDriver:
                 return False if read else None
             time.sleep(fe.POLL_SECONDS)
 
-    def tracker_evidence(self, change: fe.ChangeRef | None, work_item_id: str) -> dict[str, Any]:
+    def tracker_evidence(
+        self,
+        change: fe.ChangeRef | None,
+        work_item_id: str,
+        *,
+        pr_body: Callable[[fe.ChangeRef], str | None] | None = None,
+    ) -> dict[str, Any]:
+        """The tracker's side of the loop; `pr_body` reads the change body on the code
+        host, and None reads it from GitHub."""
+
         key = self.key or ""
+        read_body = pr_body or self._github_pr_body
         return {
             "key": key,
             "status_comments": self._status_comments(key),
             "remote_links": self._remote_links(key, change),
-            "pr_body_has_key": self._pr_body_has_key(key, change),
+            "pr_body_has_key": self._pr_body_has_key(key, change, read_body),
             "bot_label_admitted": self._bot_label_admitted(),
         }
 

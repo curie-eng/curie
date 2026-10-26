@@ -1,12 +1,15 @@
-"""Opt-in, bounded synthetic turn checker. @spec TURN-CANARY-1 TURN-CANARY-10"""
+"""Opt-in, bounded synthetic turn checker. @spec TURN-CANARY-1 TURN-CANARY-17"""
 
 import asyncio
 import fcntl
+import hashlib
+import importlib.util
 import json
 import math
 import os
 import re
 import secrets
+import sys
 import tempfile
 import time
 import uuid
@@ -15,7 +18,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Literal, Protocol, TextIO
+from types import ModuleType
+from typing import TYPE_CHECKING, Any, Literal, Protocol, TextIO
 from urllib.parse import urlsplit
 
 from aci_protocol import READER_CONTEXT, QueuedTurn, ReplyHandle, TurnSource
@@ -28,6 +32,51 @@ from channel_protocol import (
     scoped_conversation_id,
 )
 from pydantic import TypeAdapter, ValidationError
+
+
+def _load_probe_profiles_module() -> ModuleType:
+    """Reuse only this exact shipped sibling, without search paths. @spec TURN-CANARY-17"""
+    sibling = Path(__file__).with_name("probe_profiles.py").resolve(strict=True)
+    for candidate in tuple(sys.modules.values()):
+        if not isinstance(candidate, ModuleType):
+            continue
+        origin = candidate.__dict__.get("__file__")
+        if isinstance(origin, str) and Path(origin).resolve() == sibling:
+            sys.modules.setdefault("probe_profiles", candidate)
+            return candidate
+    name = "_curie_turn_canary_profiles_" + hashlib.sha256(str(sibling).encode()).hexdigest()
+    if name in sys.modules:
+        raise ImportError("turn canary profile module cache key is occupied")
+    spec = importlib.util.spec_from_file_location(name, sibling)
+    if spec is None or spec.loader is None:
+        raise ImportError("turn canary profile sibling is not loadable")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        if sys.modules.get(name) is module:
+            del sys.modules[name]
+        raise
+    sys.modules.setdefault("probe_profiles", module)
+    return module
+
+
+if TYPE_CHECKING:
+    from probe_profiles import (
+        ProbeProfile,
+        ProbeReason,
+        parse_probe_profiles,
+        validate_probe_profiles,
+    )
+else:
+    _profiles = _load_probe_profiles_module()
+    ProbeProfile = _profiles.ProbeProfile
+    ProbeReason = _profiles.ProbeReason
+    parse_probe_profiles = _profiles.parse_probe_profiles
+    validate_probe_profiles = _profiles.validate_probe_profiles
+
+_check_probe_profiles = validate_probe_profiles
 
 
 class Platform(Protocol):
@@ -118,6 +167,9 @@ def _check_prefix(prefix: str) -> str:
     return prefix
 
 
+PROBE_SAFETY_SUFFIX = ". Do not use tools, take actions, request approval, or make durable changes."
+
+
 @dataclass(frozen=True)
 class Limits:
     """Finite operator bounds in seconds and selected routes. @spec TURN-CANARY-5"""
@@ -146,13 +198,17 @@ class Limits:
 
 @dataclass
 class CycleResult:
-    """Safe, bounded observations. @spec TURN-CANARY-5 TURN-CANARY-6"""
+    """Safe, bounded observations. @spec TURN-CANARY-5 TURN-CANARY-6 TURN-CANARY-16"""
 
     success: bool = False
     cleanup_degraded: bool = False
     capacity_skips: int = 0
     target_success: dict[str, bool] = field(default_factory=dict)
     target_delivery_success: dict[str, bool] = field(default_factory=dict)
+    target_probe_success: dict[str, bool] = field(default_factory=dict)
+    target_probe_profile: dict[str, bool] = field(default_factory=dict)
+    target_last_delivery_success: dict[str, float] = field(default_factory=dict)
+    target_last_probe_success: dict[str, float] = field(default_factory=dict)
     target_capacity_skipped: dict[str, bool] = field(default_factory=dict)
     target_cleanup_degraded: dict[str, bool] = field(default_factory=dict)
     target_last_run: dict[str, float] = field(default_factory=dict)
@@ -600,8 +656,9 @@ def build_turn(
     reply_ref: str,
     event_id: str,
     received_at: str,
+    profile: ProbeProfile | None = None,
 ) -> QueuedTurn:
-    """One owned, read-only request on the installed wire. @spec TURN-CANARY-2"""
+    """One owned, read-only request on the installed wire. @spec TURN-CANARY-2 TURN-CANARY-16"""
     if not conversation_id.startswith("eval:") or not nonce:
         raise ValueError("canary requires an owned conversation and nonce")
     parsed = uuid.UUID(reply_ref)
@@ -612,9 +669,11 @@ def build_turn(
         conversation_id=conversation_id,
         author="turn-canary",
         text=(
-            "Reply with exactly this nonce and no other text: "
-            + nonce
-            + ". Do not use tools, take actions, request approval, or make durable changes."
+            (
+                profile.prompt if profile is not None
+                else "Reply with exactly this nonce and no other text: " + nonce
+            )
+            + PROBE_SAFETY_SUFFIX
         ),
         reply_handle=ReplyHandle(
             kind="slack",
@@ -638,38 +697,54 @@ RelayReason = Literal[
     "malformed_event", "wrong_target", "wrong_event_id",
     "malformed_page", "terminal_mismatch", "timeout",
 ]
-_REPLY_EVENT = TypeAdapter(ReplyEvent)
+_REPLY_EVENT: TypeAdapter[ReplyEvent] = TypeAdapter(ReplyEvent)
 
 
 @dataclass(frozen=True)
 class RelayAssessment:
-    """Bounded lifecycle evidence, independent of nonce compliance. @spec TURN-CANARY-3"""
+    """Independent lifecycle and probe evidence. @spec TURN-CANARY-3 TURN-CANARY-16"""
 
     exact_nonce: bool = False
     delivery_success: bool = False
     reason: RelayReason = "missing_completion"
+    probe_success: bool = False
+    probe_reason: ProbeReason | None = None
+
+
+def _relay_failure(
+    reason: RelayReason, profile: ProbeProfile | None, *, exact_nonce: bool = False,
+) -> RelayAssessment:
+    """Keep profile failure separate from legacy lifecycle reasons. @spec TURN-CANARY-16"""
+    return RelayAssessment(
+        exact_nonce=exact_nonce, reason=reason,
+        probe_success=exact_nonce if profile is None else False,
+        probe_reason="profile_mismatch" if profile is not None else None,
+    )
 
 
 def assess_relay(
-    events: list[dict[str, Any]], *, nonce: str, turn: QueuedTurn | None = None
+    events: list[dict[str, Any]], *, nonce: str, turn: QueuedTurn | None = None,
+    profile: ProbeProfile | None = None,
 ) -> RelayAssessment:
     """Validate every observed event; the runtime always supplies its turn.
 
     Without a turn, the Boolean compatibility helper can check only internal
     target consistency, not correlation to an enqueued request.
-    @spec TURN-CANARY-3
+    @spec TURN-CANARY-3 TURN-CANARY-16
     """
+    if profile is not None and turn is None:
+        return _relay_failure("wrong_target", profile)
     if not isinstance(events, list):
-        return RelayAssessment(reason="malformed_event")
+        return _relay_failure("malformed_event", profile)
     try:
         parsed = [_REPLY_EVENT.validate_python(item) for item in events]
     except ValidationError:
-        return RelayAssessment(reason="malformed_event")
+        return _relay_failure("malformed_event", profile)
     expected = None
     if turn is not None:
         handle = turn.reply_handle
         if handle is None:
-            return RelayAssessment(reason="wrong_target")
+            return _relay_failure("wrong_target", profile)
         expected = ReplyTarget(
             kind=handle.kind, address=handle.channel,
             conversation_id=turn.conversation_id, reply_ref=handle.placeholder,
@@ -677,16 +752,16 @@ def assess_relay(
     elif parsed:
         expected = parsed[0].target
     if any(event.target != expected for event in parsed):
-        return RelayAssessment(reason="wrong_target")
+        return _relay_failure("wrong_target", profile)
     completed = [event for event in parsed if isinstance(event, TurnCompleted)]
     if not completed:
-        return RelayAssessment(reason="missing_completion")
+        return _relay_failure("missing_completion", profile)
     if len(completed) != 1:
-        return RelayAssessment(reason="duplicate_completion")
+        return _relay_failure("duplicate_completion", profile)
     if turn is not None and completed[0].event_id != turn.event_id:
-        return RelayAssessment(reason="wrong_event_id")
+        return _relay_failure("wrong_event_id", profile)
     if completed[0].outcome != "delivered":
-        return RelayAssessment(reason="not_delivered")
+        return _relay_failure("not_delivered", profile)
     updates = [event for event in parsed if isinstance(event, ReplyUpdate)]
     # Delivery observations must not broaden the original exact nonce verdict:
     # its last update includes progress edits, and reply.post was never allowed.
@@ -700,10 +775,14 @@ def assess_relay(
     answers = [event for event in updates if event.progress is None]
     text = answers[-1].text if answers else None
     if text is None:
-        return RelayAssessment(exact_nonce=exact, reason="missing_reply")
+        return _relay_failure("missing_reply", profile, exact_nonce=exact)
     if not text.strip():
-        return RelayAssessment(exact_nonce=exact, reason="blank_reply")
-    return RelayAssessment(exact, True, "exact_nonce" if exact else "nonce_mismatch")
+        return _relay_failure("blank_reply", profile, exact_nonce=exact)
+    matched = profile.matches(text) if profile is not None else exact
+    return RelayAssessment(
+        exact, True, "exact_nonce" if exact else "nonce_mismatch", matched,
+        ("profile_match" if matched else "profile_mismatch") if profile is not None else None,
+    )
 
 
 def relay_outcome(
@@ -732,11 +811,16 @@ def cleanup_confirmed(state: dict[str, Any]) -> bool:
 
 
 async def _await_relay(
-    platform: Platform, turn: QueuedTurn, nonce: str, deadline: float, poll: float
+    platform: Platform, turn: QueuedTurn, nonce: str, deadline: float, poll: float,
+    profile: ProbeProfile | None = None,
 ) -> RelayAssessment:
-    """Consume the relay's count cursor under the turn deadline. @spec TURN-CANARY-3"""
+    """Consume the relay count cursor under the deadline.
+
+    @spec TURN-CANARY-3 TURN-CANARY-16
+    """
     assert turn.reply_handle is not None
     reply_ref = turn.reply_handle.placeholder
+    assert reply_ref is not None
     cursor = 0
     events: list[dict[str, Any]] = []
     end = time.monotonic() + deadline
@@ -750,13 +834,13 @@ async def _await_relay(
                     or type(page.get("next_cursor")) is not int
                     or type(page.get("terminal")) is not bool
                 ):
-                    return RelayAssessment(reason="malformed_page")
+                    return _relay_failure("malformed_page", profile)
                 batch = page["events"]
                 next_cursor = page["next_cursor"]
                 if next_cursor != cursor + len(batch):
-                    return RelayAssessment(reason="malformed_page")
+                    return _relay_failure("malformed_page", profile)
                 events.extend(batch)
-                observed = assess_relay(events, nonce=nonce, turn=turn)
+                observed = assess_relay(events, nonce=nonce, turn=turn, profile=profile)
                 if observed.reason in {
                     "malformed_event", "wrong_target", "wrong_event_id", "duplicate_completion"
                 }:
@@ -770,14 +854,14 @@ async def _await_relay(
                     for item in events
                 )
                 if page["terminal"] != terminal:
-                    return RelayAssessment(reason="terminal_mismatch")
+                    return _relay_failure("terminal_mismatch", profile)
                 if completed:
                     return observed
                 cursor = next_cursor
                 await asyncio.sleep(min(poll, max(0, end - time.monotonic())))
     except TimeoutError:
         pass
-    return RelayAssessment(reason="timeout")
+    return _relay_failure("timeout", profile)
 
 
 async def _await_reset(
@@ -859,10 +943,11 @@ async def run_cycle(
     binding_health_path: str | None = None,
     coverage: bool = False,
     exclude_kinds: Sequence[str] = (),
+    probe_profiles: Mapping[str, ProbeProfile] | None = None,
 ) -> CycleResult:
     """Probe serially; hold only routes with uncertain cleanup.
 
-    @spec TURN-CANARY-1 TURN-CANARY-15
+    @spec TURN-CANARY-1 TURN-CANARY-15 TURN-CANARY-16
     """
     Limits(
         turn_deadline=turn_deadline,
@@ -870,6 +955,7 @@ async def run_cycle(
         poll_period=poll_period,
         max_targets=max_targets,
     )
+    profiles = _check_probe_profiles(probe_profiles)
     _check_conversation_prefix(conversation_prefix)
     if discover == (selected is not None):
         raise ValueError("configure exactly one of explicit routes or discovery")
@@ -895,6 +981,7 @@ async def run_cycle(
             binding_health_path=binding_health_path,
             coverage=coverage,
             exclude_kinds=exclude_kinds,
+            probe_profiles=profiles,
         )
     finally:
         for route in journal.pending_routes:
@@ -928,7 +1015,9 @@ async def _run_cycle(
     binding_health_path: str | None,
     coverage: bool,
     exclude_kinds: Sequence[str],
+    probe_profiles: Mapping[str, ProbeProfile],
 ) -> None:
+    """Inventory-to-probe cycle wiring. @spec TURN-CANARY-1 TURN-CANARY-16"""
     if adapters:
         await _probe_adapters(platform, adapters, result)
     if journal.pending is not None or journal.pending_routes:
@@ -996,6 +1085,7 @@ async def _run_cycle(
             cleanup_deadline,
             poll_period,
             conversation_prefix,
+            probe_profiles,
         )
     if binding_checks:
         await _check_bindings(platform, rows, set(result.target_last_run), identity_kinds, result)
@@ -1018,8 +1108,9 @@ async def _turn_targets(
     cleanup_deadline: float,
     poll_period: float,
     conversation_prefix: str = CONVERSATION_PREFIX,
+    probe_profiles: Mapping[str, ProbeProfile] | None = None,
 ) -> None:
-    """The owned, serial turn path of TURN-CANARY-2 to 4. @spec TURN-CANARY-4"""
+    """The owned, serial turn path. @spec TURN-CANARY-4 TURN-CANARY-16"""
     all_ok = True
     attempted = False
     for binding in targets:
@@ -1040,6 +1131,9 @@ async def _turn_targets(
             result.record("capacity", "skipped")
             continue
         result.target_capacity_skipped[target_label] = False
+        profile = (probe_profiles or {}).get(binding.get("agent", ""))
+        result.target_probe_profile[target_label] = profile is not None
+        result.target_probe_success[target_label] = False
         conversation_id = conversation_prefix + str(uuid.uuid4())
         reply_ref = str(uuid.uuid4())
         nonce = secrets.token_urlsafe(24)
@@ -1050,6 +1144,7 @@ async def _turn_targets(
             reply_ref=reply_ref,
             event_id="EvCANARY-" + uuid.uuid4().hex,
             received_at=datetime.now(UTC).isoformat(),
+            profile=profile,
         )
         key = scoped_reset_key(binding, conversation_id)
         journal.record_intent(binding["agent_id"], key, route=target_label)
@@ -1065,10 +1160,15 @@ async def _turn_targets(
         if enqueued:
             try:
                 assessment = await _await_relay(
-                    platform, turn, nonce, turn_deadline, poll_period
+                    platform, turn, nonce, turn_deadline, poll_period, profile
                 )
                 result.target_success[target_label] = assessment.exact_nonce
                 result.target_delivery_success[target_label] = assessment.delivery_success
+                result.target_probe_success[target_label] = assessment.probe_success
+                if assessment.delivery_success:
+                    result.target_last_delivery_success[target_label] = time.time()
+                if assessment.probe_success:
+                    result.target_last_probe_success[target_label] = time.time()
                 result.record("relay", assessment.reason)
                 result.record(
                     "turn", "delivered" if result.target_success[target_label] else "failed"
@@ -1080,6 +1180,12 @@ async def _turn_targets(
             all_ok = all_ok and result.target_success[target_label]
             if result.target_success[target_label]:
                 result.target_last_success[target_label] = time.time()
+        if profile is not None:
+            result.record(
+                "probe",
+                ("profile_match" if result.target_probe_success[target_label]
+                 else "profile_mismatch"),
+            )
         try:
             await platform.reset(binding["agent_id"], key)
             state = await _await_reset(
@@ -1322,7 +1428,7 @@ def _check_layout(labels: str) -> str:
 def prometheus_text(
     result: CycleResult, prefix: str = "turn_canary", labels: str = "route"
 ) -> str:
-    """Portable bounded exposition of the last cycle. @spec TURN-CANARY-6 TURN-CANARY-14"""
+    """Portable bounded exposition. @spec TURN-CANARY-6 TURN-CANARY-14 TURN-CANARY-16"""
     _check_prefix(prefix)
     _check_layout(labels)
 
@@ -1361,6 +1467,12 @@ def prometheus_text(
             )
     for route, delivered in sorted(result.target_delivery_success.items()):
         output.append(line("target_delivery_success", int(delivered), route_labels(route)))
+    for name in ("target_probe_success", "target_probe_profile"):
+        for route, value in sorted(getattr(result, name).items()):
+            output.append(line(name, int(value), route_labels(route)))
+    for name in ("target_last_delivery_success", "target_last_probe_success"):
+        for route, timestamp in sorted(getattr(result, name).items()):
+            output.append(line(name + "_timestamp_seconds", timestamp, route_labels(route)))
     for route, skipped in sorted(result.target_capacity_skipped.items()):
         label = route_labels(route)
         output.append(line("target_capacity_skipped", int(skipped), label))
@@ -1432,7 +1544,7 @@ class Monitor:
         return self._clock() - reference <= self.stale_after
 
     def observe(self, result: CycleResult) -> None:
-        """Merge one cycle, keeping rotated routes until inventory drops them."""
+        """Merge retained observations. @spec TURN-CANARY-10 TURN-CANARY-16"""
         view = self._view or CycleResult()
         view.success = result.success
         view.cleanup_degraded = result.cleanup_degraded
@@ -1452,6 +1564,10 @@ class Monitor:
         per_route = (
             "target_success",
             "target_delivery_success",
+            "target_probe_success",
+            "target_probe_profile",
+            "target_last_delivery_success",
+            "target_last_probe_success",
             "target_last_run",
             "target_last_success",
             "target_capacity_skipped",
@@ -1567,7 +1683,7 @@ async def serve_http(monitor: Monitor, host: str, port: int) -> asyncio.Server:
 
 @dataclass(frozen=True)
 class Config:
-    """Validated environment configuration. @spec TURN-CANARY-7 TURN-CANARY-10"""
+    """Validated configuration. @spec TURN-CANARY-7 TURN-CANARY-10 TURN-CANARY-16"""
 
     database_url: str
     valkey_url: str
@@ -1598,6 +1714,7 @@ class Config:
     coverage: bool = False
     route_labels: str = "route"
     exclude_kinds: tuple[str, ...] = ()
+    probe_profiles: dict[str, ProbeProfile] = field(default_factory=dict)
 
 
 def _routes(raw: str, name: str) -> list[Route]:
@@ -1648,7 +1765,7 @@ def _listen(raw: str) -> tuple[str, int]:
 def parse_config(environ: Mapping[str, str]) -> Config:
     """Read explicit installation settings; nothing is defaulted from a tenant.
 
-    @spec TURN-CANARY-7 TURN-CANARY-10
+    @spec TURN-CANARY-7 TURN-CANARY-10 TURN-CANARY-16
     """
     required = (
         "TURN_CANARY_DATABASE_URL",
@@ -1694,6 +1811,10 @@ def parse_config(environ: Mapping[str, str]) -> Config:
             max_targets=int(environ.get("TURN_CANARY_MAX_TARGETS", "5")),
         ),
         routes=_routes(raw_routes, "TURN_CANARY_ROUTES") if raw_routes else None,
+        probe_profiles=(
+            parse_probe_profiles(environ["TURN_CANARY_PROBE_PROFILES"])
+            if "TURN_CANARY_PROBE_PROFILES" in environ else {}
+        ),
         discover=discover,
         exclude=_routes(environ.get("TURN_CANARY_DISCOVER_EXCLUDE", "[]"), "exclusions"),
         binding_checks=environ.get("TURN_CANARY_BINDING_CHECKS") == "1",
@@ -1735,7 +1856,7 @@ def _print_log(item: dict[str, str]) -> None:
 
 
 async def main() -> int:
-    """Run one cycle, or the exporter, from explicit settings. @spec TURN-CANARY-1 TURN-CANARY-10"""
+    """Run one cycle, or the exporter, from explicit settings. @spec TURN-CANARY-1 TURN-CANARY-16"""
     config = parse_config(os.environ)
     limits = config.limits
     platform = RuntimePlatform(
@@ -1773,6 +1894,7 @@ async def main() -> int:
                 binding_health_path=config.binding_health_path,
                 coverage=config.coverage,
                 exclude_kinds=config.exclude_kinds,
+                probe_profiles=config.probe_profiles,
             )
             journal.save_result(result)
         return result

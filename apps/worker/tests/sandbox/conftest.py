@@ -20,7 +20,7 @@ import tempfile
 import threading
 import time
 import uuid
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -354,21 +354,32 @@ def _seed_source(client: _RecordingDocker, target: str) -> Path:
 
 
 @pytest.fixture
-def redis_client() -> Iterator[redis.Redis]:
+def redis_client(request: pytest.FixtureRequest) -> redis.Redis:
+    client: redis.Redis | None = None
+
+    def cleanup() -> None:
+        if client is not None:
+            client.close()
+
+    request.addfinalizer(cleanup)
     client = connect_or_skip(decode_responses=False)
-    yield client
-    client.close()
+    return client
 
 
 @pytest.fixture
-def key_prefix(redis_client: redis.Redis) -> Iterator[str]:
+def key_prefix(redis_client: redis.Redis, request: pytest.FixtureRequest) -> str:
     """Per-test-unique key prefix on the shared Valkey, cleaned up after."""
 
     prefix = f"test:curie:sandbox:{uuid.uuid4().hex}"
-    yield prefix
-    keys = list(redis_client.scan_iter(match=f"{prefix}:*"))
-    if keys:
-        redis_client.delete(*keys)
+
+    def cleanup() -> None:
+        keys = list(redis_client.scan_iter(match=f"{prefix}:*"))
+        if keys:
+            redis_client.delete(*keys)
+        assert not list(redis_client.scan_iter(match=f"{prefix}:*"))
+
+    request.addfinalizer(cleanup)
+    return prefix
 
 
 @pytest.fixture
@@ -394,14 +405,15 @@ def affinity(
     redis_client: redis.Redis,
     pressure_redis_factory: Callable[[], AsyncRedis],
     key_prefix: str,
-) -> Iterator[AffinityStore]:
+    request: pytest.FixtureRequest,
+) -> AffinityStore:
     pressure_client = pressure_redis_factory()
-    yield AffinityStore(
+    request.addfinalizer(lambda: asyncio.run(pressure_client.aclose()))
+    return AffinityStore(
         redis_client,
         pressure_client=pressure_client,
         key_prefix=key_prefix,
     )
-    asyncio.run(pressure_client.aclose())
 
 
 @pytest.fixture

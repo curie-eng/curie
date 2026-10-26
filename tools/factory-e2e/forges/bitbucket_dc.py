@@ -272,13 +272,22 @@ class BitbucketDcDriver:
         # The Jira driver closes and unlabels every issue it opened.
         return tuple(self._tracker().teardowns())
 
+    def _pr_description(self, change: fe.ChangeRef) -> str | None:
+        """The pull request body, which Data Center carries in its `description` field."""
+
+        status, pr = self._call("GET", f"/pull-requests/{change.number}")
+        if status != 200 or not isinstance(pr, dict):
+            return None
+        text = pr.get("description", "")
+        return text if isinstance(text, str) else None
+
     def tracker_evidence(self, change: fe.ChangeRef | None, work_item_id: str) -> dict[str, Any]:
-        # The Jira tracker evidence is the jira_cloud+github entry's; this
-        # pairing asserts the loop only.
-        return {}
+        # The Jira driver judges the same tracker results as jira_cloud+github,
+        # reading the pull request body from this code host.
+        return self._tracker().tracker_evidence(change, work_item_id, pr_body=self._pr_description)
 
     def judge_tracker(self, evidence: Mapping[str, Any]) -> list[str]:
-        return []
+        return self._tracker().judge_tracker(evidence)
 
     def await_change(self, work_item_id: str) -> fe.ChangeRef | None:
         return fe.await_work_item_change(self.p, work_item_id)

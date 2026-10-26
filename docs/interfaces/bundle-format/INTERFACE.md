@@ -98,6 +98,14 @@ files**, each absent from a bundle that needs none, all three invisible to Claud
   `connectors.config_name_reserved`), may not repeat (`connectors.duplicate_config`), may not also
   appear in `secrets`, `secret_files` or `sealed_secrets` (`connectors.config_is_secret`), and a
   `url` connector cannot declare `config` (`connectors.remote_has_config`). A hosted connector may
+  declare `proxy_upstream_host` ([ADR 0229](../../adr/0229-a-hosted-connector-may-declare-the-host-the-caller-proxy-presents-upstream.md)),
+  the Host its caller proxy presents to the server on admitted loopback requests.
+  It accepts `localhost` or a canonically spelled loopback IP address without a
+  port or brackets; the proxy adds the server port and brackets IPv6. Omission
+  preserves the caller's Host. Invalid values are `connectors.bad_proxy_upstream_host`,
+  and a `url` connector cannot declare it (`connectors.remote_has_proxy_upstream_host`).
+  The field renders only into the caller proxy, leaving direct requests unchanged.
+  A hosted connector may
   declare `readiness_path`, an HTTP path the server answers when it can serve. Set, the server
   container's readiness probe is exactly `httpGet` on that path and the `http` port
   (`initialDelaySeconds: 2`, `periodSeconds: 10`, `timeoutSeconds: 5`, `failureThreshold: 3`) and
@@ -406,6 +414,20 @@ delivery mode, platforms, and source digest. A Claude Code consumer ignores the 
 consumer that wired the connectors up by hand would get no digest pin and no guarantee it runs the
 image the bundle version was built and deployed with. `deploy.yaml` degrades
 harmlessly by comparison, since routing is Curie's concern and Claude Code has nothing to route.
+
+The runner also reads a strict Curie-only root sidecar, `curie.bundle.json`,
+outside `validate_bundle`
+(`runner/src/curie_runner/plugin.py::_load_bundle_config`). Its only accepted keys
+are `webSearch`, a JSON boolean defaulting to true
+([ADR 0138](../../adr/0138-provider-side-web-search-is-a-default-on-bundle-capability.md)),
+and `finalAnswer`, the opt-in versioned publication-validation policy
+([ADR 0227](../../adr/0227-opt-in-final-answer-publication-validation.md), parsed by
+`runner/src/curie_runner/final_answer.py::FinalAnswerPolicy.parse`). Unknown or
+duplicate keys, malformed content and invalid values fail runner loading; an
+absent file keeps the defaults. Claude Code ignores this sidecar, so neither
+Curie's web-search setting nor its final-answer publication gate travels with
+the bundle to that consumer. Passing `validate_bundle` alone does not validate
+this file.
 
 The outbound gate covers this unevenly, and the gap is worth naming.
 `examples/tests/test_plugin_compat_coverage.py` pins that each of the original six manifest extensions

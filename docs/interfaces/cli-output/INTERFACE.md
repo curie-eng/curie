@@ -93,6 +93,9 @@ This is the catalog's first **Rust** seam. It is listed here because the agent-f
   it emits one object even when the bundle declares nothing to build, because
   under `--json` an agent cannot tell "nothing to build" from "the command
   produced nothing" — the #485 failure this seam exists to prevent.
+  `TestEnvOutput` (`cli/src/commands/dev.rs`) is the `curie dev test-env`
+  receipt: the profile and private project, resolved `ports` and `networks`,
+  `child_exit_code` (or `null` when no child started), and `cleanup_verified`.
   `RepoRunnerBuildOutput` (`cli/src/commands/repo_runner_build.rs`, type in
   `cli/src/repo_runner.rs`) is the `curie build --repo-runner` receipt (ADR 0216):
   the Helm `runner` values block, rendered as YAML for humans.
