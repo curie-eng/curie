@@ -215,6 +215,14 @@ Runtime rules (each has a provoking integration test in `tests/eval/test_stream.
   **provision a runner via the sandbox substrate** (the same warm-pool `claim` chat runs
   use, boot env carrying `CURIE_BUNDLE_REF` + budget), eval against it, and tear it
   down in a `finally`. A provisioning failure is a failed run reported and acked.
+- **Hosted connectors retain their authority boundary.** A provisioned eval
+  receives the configured release/namespace and the tenant-scoped agent name,
+  plus an agent-only signed caller when signing is configured. The same agent
+  snapshot supplies its operator approval-required tools: bundle policy cannot
+  remove them during evaluation. Unreadable or malformed stored approval policy
+  prevents provisioning. Partial connector scope emits no scope or caller token;
+  missing signing configuration emits no caller token. No protected run/work-item
+  identity or approval grant is invented, and evals still omit ambient state refs.
 - **XACK only after the report POST attempt completes** (success, or terminally failed
   after bounded retries and logged). A worker crash before that leaves the entry
   pending. The shared runs/eval liveness path promptly transfers a capable dead
@@ -301,7 +309,7 @@ Rules (detailed-architecture 2b), each with an integration test that provokes it
   confirmed sandbox termination. When Kubernetes confirms that the sandbox pod
   terminated during the stream, the worker classifies the failure as
   `sandbox-terminated`; the terminal notice includes the Kubernetes termination
-  reason so an operator can diagnose it before retrying.
+  reason so an operator can diagnose it before retrying. The worker waits up to 10 s for Kubernetes to confirm a termination before it classifies a dropped stream.
   `workspace-error` is a managed-workspace preparation FAULT before the turn was
   ever accepted (#2004): the clone, the archive, or the upload. It is told apart
   from `runner-error` for the same
@@ -1091,7 +1099,12 @@ only when the remaining delivery budget is at least 70 seconds plus
 turn waits durably for capacity under its original event identity, with a
 fixed deadline set by `CURIE_CAPACITY_WAIT_BUDGET_S` (24 hours by default).
 The worker acknowledges a parked stream delivery, then wakes the turn through
-the same stream when its retry is due. Waiting does not use a runner attempt or
+the same stream when its retry is due. Each refused retry is due 5000 ms after
+that park, or at the original deadline when less time remains. The delay does
+not grow with earlier refusals. A queued notice that was already delivered is
+not sent again on those retries when no sandbox grant was confirmed and the
+grant outcome is not unknown. A failed notice stays queued for another try.
+A confirmed or unknown grant keeps the existing notice retry. Waiting does not use a runner attempt or
 hold a conversation lock. Its placeholder says queued while waiting and
 receives an expiry message if the deadline passes. An approval resume does not
 wait. It runs the same reclamation pass after its own quota refusal, and when
@@ -1304,3 +1317,38 @@ Receipt and CLI progress metadata use the same reference-boundary vector as
 approval displays. Closing code quotes end a sentence reference just as closing
 parentheses, brackets and ordinary quotes do; requested filenames and paths stay
 literal. This wording changes neither answers nor stored actions.
+
+### On-demand attachment rollout
+
+The attachment lane remains off by default. With `CURIE_ATTACHMENT_ENABLED=true`,
+`CURIE_ATTACHMENT_MODE=eager` preserves the existing complete-set handoff and its
+positive byte budgets. Explicit `CURIE_ATTACHMENT_MODE=lazy` registers inbound
+metadata before routing, including references above the legacy byte budgets, and
+starts without downloading provider file bodies. Text-only follow-ups register
+no files and do not rebuild attachment history. The real runner exposes
+`list_attachments` and `fetch_attachment` through its existing platform tool
+server; only a selected file is streamed into its private writable cache.
+
+Lazy activation requires matching API, worker, broker and runner support. The
+worker refuses a runner that does not advertise literal `attachment_access:
+true`; the API refuses a missing or incompatible private broker. There is no
+eager fallback. Fake-model runs cannot enable this mode. Every logical opener
+owns a scoped finite lease for the actual sandbox session and route generation.
+A steer renews that opener; completion, cancellation and failed start revoke
+only the ending owner's authority. A crash or unavailable revoke is bounded by
+the independently renewed 90-second lease.
+
+The broker listens on a private worker port (`CURIE_ATTACHMENT_BROKER_PORT`,
+default `8093`) and accepts only internal worker authentication. Channel
+credentials stay in the worker. The API alone exposes the runner-facing facade;
+capabilities are carried on authenticated ACI events, never in boot environment
+variables. Broker concurrency defaults to eight transfers and each transfer has
+a 300-second deadline. Cache storage remains finite; an incomplete transfer or
+capacity failure returns no usable final path. Removing policy byte ceilings
+does not expand the sandbox's storage or memory resources.
+
+The Docker substrate uses a claim-owned named tmpfs volume, bounded by
+`CURIE_ATTACHMENT_CACHE_SIZE_BYTES` (default 512 MiB). These cached bytes consume
+effective memory resources in addition to the model process; a file under the
+volume capacity is not guaranteed to fit the runner's remaining memory. This is
+a resource capacity limit, not a catalog selection or per-file policy ceiling.

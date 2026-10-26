@@ -53,7 +53,7 @@ from curie_worker.kernel import failures
 from curie_worker.kernel.failures import ThreadBusyError
 from curie_worker.reply_sink import ReplySink, TargetRoute, build_reply_sink
 from curie_worker.runner_client import RunnerWorkspaceSnapshot
-from curie_worker.sandbox import SuspendedThreadError
+from curie_worker.sandbox import SandboxError, SuspendedThreadError
 from curie_worker.workitem_dispatch import (
     WorkItemAcquireGrant,
     WorkItemConflict,
@@ -1053,6 +1053,113 @@ def test_workspace_retry_fault_finishes_with_redacted_bounded_stage_and_reason(
             assert "SYNTHETIC-PRIVATE-MATERIAL" not in detail
             assert "-----BEGIN PRIVATE KEY-----" not in detail
             assert "-----END PRIVATE KEY-----" not in detail
+
+    asyncio.run(exercise())
+
+
+class _DeferRecordingWorkItems(_WorkItems):
+    """Records every ``defer`` with its full keyword set (#4930)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.defers: list[tuple[uuid.UUID, dict[str, object]]] = []
+
+    async def defer(self, request_id: uuid.UUID, **kwargs: object) -> str | None:
+        self.calls.append("defer")
+        self.defers.append((request_id, kwargs))
+        return None
+
+
+def test_pre_start_archive_fault_defers_with_its_redacted_bounded_stage_and_reason(
+    make_harness,
+) -> None:
+    """#4930: an unstarted workspace fault carries its safe diagnostic to defer.
+
+    The archive stage fails before ``start``; the request stays waiting, so the
+    only durable reader of the cause is the deferral. The diagnostic is the
+    same redacted, whitespace-collapsed, 300-char ``TurnOutcome.error_message``
+    the #4367 finish path carries.
+    """
+
+    token = "ghp_" + "A" * 36
+    reason = f"archive exceeds 1048576 bytes; token {token} {'x' * 1000}"
+
+    class ArchiveTooLarge(_Workspace):
+        def claim_or_resume_with_handle(self, **kwargs: object) -> object:
+            self.claimed.append(kwargs.get("repo_full_name"))
+            raise WorkspacePreparationError("archive-size", reason)
+
+    async def exercise() -> None:
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=ArchiveTooLarge,
+            publication_creator=_NoExistingPublication(),
+            max_attempts=2,
+        ) as h:
+            work_items = _DeferRecordingWorkItems()
+            h.kernel._work_items = work_items
+            request_id = uuid.uuid4()
+
+            await h.kernel.process_event(
+                _turn(f"work-item-{request_id}-execute-1", f"Resolve {ISSUE_URL}")
+            )
+
+            assert h.kernel._workspace.claimed, work_items.calls
+            assert h.runner.opened == []
+            assert "start" not in work_items.calls
+            assert work_items.finishes == []
+            assert len(work_items.defers) == 1, work_items.calls
+            deferred_id, defer = work_items.defers[0]
+            assert deferred_id == request_id
+            assert defer["reason"] == "not_started:classified_failure"
+            assert defer["capacity"] is False
+            detail = defer["start_failure_detail"]
+            assert isinstance(detail, str)
+            assert detail.startswith(
+                "workspace archive-size failed: archive exceeds 1048576 bytes; token "
+            )
+            assert len(detail) <= 300
+            assert "ghp_A" not in detail
+            assert "[REDACTED:github_pat]" in detail
+
+    asyncio.run(exercise())
+
+
+def test_pre_start_non_workspace_failure_defers_without_a_diagnostic(make_harness) -> None:
+    """#4930: only a ``workspace-error`` fault is a start-failure diagnostic.
+
+    A sandbox fault before start (here the claim itself raises) still defers
+    ``not_started:``, with an explicit ``None`` detail on the wire.
+    """
+
+    class ClaimFails(_Workspace):
+        def claim_or_resume_with_handle(self, **kwargs: object) -> object:
+            self.claimed.append(kwargs.get("repo_full_name"))
+            raise SandboxError("sandbox claim failed: example control plane fault")
+
+    async def exercise() -> None:
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=ClaimFails,
+            publication_creator=_NoExistingPublication(),
+            max_attempts=2,
+        ) as h:
+            work_items = _DeferRecordingWorkItems()
+            h.kernel._work_items = work_items
+            request_id = uuid.uuid4()
+
+            await h.kernel.process_event(
+                _turn(f"work-item-{request_id}-execute-1", f"Resolve {ISSUE_URL}")
+            )
+
+            assert h.kernel._workspace.claimed, work_items.calls
+            assert "start" not in work_items.calls
+            assert len(work_items.defers) == 1, work_items.calls
+            _deferred_id, defer = work_items.defers[0]
+            assert str(defer["reason"]).startswith("not_started:")
+            assert defer["capacity"] is False
+            assert "start_failure_detail" in defer
+            assert defer["start_failure_detail"] is None
 
     asyncio.run(exercise())
 

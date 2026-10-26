@@ -13,10 +13,12 @@ class and regenerates the committed schema and types.
 
 from .conformance import ConformanceReport, Producer, run_conformance
 from .events import (
+    ATTACHMENT_ACCESS_STATUS_FIELD,
     CHANNEL_READ_STATUS_FIELD,
     OUTBOUND_EVENT_TYPES,
     READER_CONTEXT,
     TOOL_ACCESS_STATUS_FIELD,
+    AttachmentAccessCapability,
     ChannelReadCapability,
     ErrorEvent,
     Event,
@@ -56,7 +58,7 @@ from .service_config import (
 )
 from .session import BootEnv, Budget, OtelConfig, SessionConfig
 from .session import Producer as EnvProducer
-from .turn import Attachment, HookRunRef, QueuedTurn, ReplyHandle, TurnSource
+from .turn import Attachment, HookRunRef, PrincipalRef, QueuedTurn, ReplyHandle, TurnSource
 from .version import PROTOCOL_VERSION, is_compatible
 from .wire import ApprovalRequest, EvalJob, EvalReport, GateKind
 
@@ -74,6 +76,7 @@ __all__ = [
     "BootEnv",
     "EnvProducer",
     # queue turn payload (the ingress job the worker consumes)
+    "PrincipalRef",
     "QueuedTurn",
     "ReplyHandle",
     "TurnSource",
@@ -98,6 +101,8 @@ __all__ = [
     "Event",
     "PublicationContext",
     "ChannelReadCapability",
+    "AttachmentAccessCapability",
+    "ATTACHMENT_ACCESS_STATUS_FIELD",
     "CHANNEL_READ_STATUS_FIELD",
     # per-turn tool access (TOOL-ACCESS)
     "ToolAccess",

@@ -500,6 +500,16 @@
           "/approvals/identity-report",
           "/approvals/{approval_id}/recover",
           "/channel-canvas",
+          "/attachment-access/list",
+          "/attachment-access/authorize",
+          "/attachment-access/fetch",
+          "/attachment-access/completion",
+          "/v1/internal/attachment-access/register",
+          "/v1/internal/attachment-access/context",
+          "/v1/internal/attachment-access/renew",
+          "/v1/internal/attachment-access/revoke",
+          "/v1/internal/attachment-access/redeem",
+          "/v1/internal/attachment-access/complete",
           "/channel-read",
           "/channels/admission",
           "/channels/token",
@@ -543,6 +553,22 @@
           "/provider-installations/{installation_id}",
           "/identity/resolve",
           "/identity/slack-reports",
+          "/identity/admin/{tenant_id}/{resource}",
+          "/directory/binding",
+          "/directory/config/{tenant_id}",
+          "/directory/credentials",
+          "/directory/teams",
+          "/directory/teams/{team_id}",
+          "/directory/teams/{team_id}/snapshot",
+          "/directory/teams/{team_id}/attempt",
+          "/directory/people",
+          "/directory/people/status",
+          "/directory/namespaces",
+          "/identity/connect/{token}",
+          "/identity/connect/{token}/confirm",
+          "/teams",
+          "/teams/metrics",
+          "/agents/{agent_id}/access-policy",
           "/publications",
           "/publications/precheck",
           "/publications/{publication_id}",
@@ -617,7 +643,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 1424,
+      "cardinality_bound": 1632,
       "description": "Active HTTP server requests.",
       "monotonic": false,
       "type": "up_down_counter",
@@ -705,6 +731,16 @@
           "/approvals/identity-report",
           "/approvals/{approval_id}/recover",
           "/channel-canvas",
+          "/attachment-access/list",
+          "/attachment-access/authorize",
+          "/attachment-access/fetch",
+          "/attachment-access/completion",
+          "/v1/internal/attachment-access/register",
+          "/v1/internal/attachment-access/context",
+          "/v1/internal/attachment-access/renew",
+          "/v1/internal/attachment-access/revoke",
+          "/v1/internal/attachment-access/redeem",
+          "/v1/internal/attachment-access/complete",
           "/channel-read",
           "/channels/admission",
           "/channels/token",
@@ -748,6 +784,22 @@
           "/provider-installations/{installation_id}",
           "/identity/resolve",
           "/identity/slack-reports",
+          "/identity/admin/{tenant_id}/{resource}",
+          "/directory/binding",
+          "/directory/config/{tenant_id}",
+          "/directory/credentials",
+          "/directory/teams",
+          "/directory/teams/{team_id}",
+          "/directory/teams/{team_id}/snapshot",
+          "/directory/teams/{team_id}/attempt",
+          "/directory/people",
+          "/directory/people/status",
+          "/directory/namespaces",
+          "/identity/connect/{token}",
+          "/identity/connect/{token}/confirm",
+          "/teams",
+          "/teams/metrics",
+          "/agents/{agent_id}/access-policy",
           "/publications",
           "/publications/precheck",
           "/publications/{publication_id}",
@@ -829,7 +881,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 7120,
+      "cardinality_bound": 8160,
       "description": "HTTP server requests.",
       "monotonic": true,
       "type": "counter",
@@ -917,6 +969,16 @@
           "/approvals/identity-report",
           "/approvals/{approval_id}/recover",
           "/channel-canvas",
+          "/attachment-access/list",
+          "/attachment-access/authorize",
+          "/attachment-access/fetch",
+          "/attachment-access/completion",
+          "/v1/internal/attachment-access/register",
+          "/v1/internal/attachment-access/context",
+          "/v1/internal/attachment-access/renew",
+          "/v1/internal/attachment-access/revoke",
+          "/v1/internal/attachment-access/redeem",
+          "/v1/internal/attachment-access/complete",
           "/channel-read",
           "/channels/admission",
           "/channels/token",
@@ -960,6 +1022,22 @@
           "/provider-installations/{installation_id}",
           "/identity/resolve",
           "/identity/slack-reports",
+          "/identity/admin/{tenant_id}/{resource}",
+          "/directory/binding",
+          "/directory/config/{tenant_id}",
+          "/directory/credentials",
+          "/directory/teams",
+          "/directory/teams/{team_id}",
+          "/directory/teams/{team_id}/snapshot",
+          "/directory/teams/{team_id}/attempt",
+          "/directory/people",
+          "/directory/people/status",
+          "/directory/namespaces",
+          "/identity/connect/{token}",
+          "/identity/connect/{token}/confirm",
+          "/teams",
+          "/teams/metrics",
+          "/agents/{agent_id}/access-policy",
           "/publications",
           "/publications/precheck",
           "/publications/{publication_id}",
@@ -1041,7 +1119,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 7120,
+      "cardinality_bound": 8160,
       "description": "HTTP server request duration.",
       "monotonic": false,
       "type": "histogram",
@@ -1886,6 +1964,56 @@
       "monotonic": true,
       "type": "counter",
       "unit": "{fire}"
+    },
+    "curie.slack.delivery_canary": {
+      "attributes": {
+        "service.name": [
+          "curie-dispatcher"
+        ],
+        "slack_identity": {
+          "ceiling": 16,
+          "kind": "bounded",
+          "overflow": "other",
+          "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
+          "reserved": [
+            "other"
+          ]
+        }
+      },
+      "cardinality_bound": 17,
+      "description": "Delivery-canary mentions the dispatcher handled, by Slack identity.",
+      "monotonic": true,
+      "type": "counter",
+      "unit": "{mention}"
+    },
+    "curie.slack.socket.envelopes": {
+      "attributes": {
+        "service.name": [
+          "curie-dispatcher"
+        ],
+        "slack_identity": {
+          "ceiling": 16,
+          "kind": "bounded",
+          "overflow": "other",
+          "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
+          "reserved": [
+            "other"
+          ]
+        },
+        "type": [
+          "hello",
+          "disconnect",
+          "events_api",
+          "interactive",
+          "slash_commands",
+          "other"
+        ]
+      },
+      "cardinality_bound": 102,
+      "description": "Socket Mode frames Slack delivered, by Slack identity and frame type.",
+      "monotonic": true,
+      "type": "counter",
+      "unit": "{envelope}"
     },
     "curie.slack.socket.identities": {
       "attributes": {

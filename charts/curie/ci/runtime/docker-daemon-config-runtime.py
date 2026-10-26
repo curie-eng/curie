@@ -11,6 +11,7 @@ import json
 import sqlite3
 import subprocess
 import sys
+import time
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -410,6 +411,118 @@ def admission(f: FixtureAPI, pod: Json, policy: Json, identity: str) -> None:
     f.note("admission_negatives", len(cases) + 1)
 
 
+def objects_admission(f: FixtureAPI, manifest: Json, policy: Json, identity: str) -> None:
+    name = policy["metadata"]["name"]
+    validations = policy["spec"]["validations"]
+    peer_message = next(v["message"] for v in validations if "ingress.all" in v["expression"])
+    egress_message = next(v["message"] for v in validations if "policyTypes" in v["expression"])
+    deadline = time.monotonic() + 90
+
+    def attempt(obj: Json) -> subprocess.CompletedProcess[str]:
+        remaining = deadline - time.monotonic()
+        require(remaining > 0, "objects_admission_deadline")
+        result = f.k(
+            "--as",
+            identity,
+            "create",
+            "--dry-run=server",
+            "-f",
+            "-",
+            "-o",
+            "json",
+            data=json.dumps(obj),
+            check=False,
+            timeout=min(10, remaining),
+        )
+        remaining = deadline - time.monotonic()
+        require(remaining > 0, "objects_admission_deadline")
+        absent = f.k("get", "--raw", object_path(obj), check=False, timeout=min(10, remaining))
+        require(
+            absent.returncode != 0 and "(NotFound)" in absent.stderr,
+            "dry_run_policy_persisted_or_unavailable",
+        )
+        return result
+
+    def denied(result: subprocess.CompletedProcess[str], message: str) -> bool:
+        return bool(
+            result.returncode
+            and f"ValidatingAdmissionPolicy '{name}'" in result.stderr
+            and "denied request" in result.stderr
+            and message in result.stderr
+            and result.stderr.count("ValidatingAdmissionPolicy '") == 1
+            and not any(
+                error in result.stderr.lower()
+                for error in (
+                    "failed expression",
+                    "evaluation error",
+                    "failed to evaluate",
+                    "error evaluating",
+                    "expression resulted in error",
+                )
+            )
+        )
+
+    claim_label = "curietech.ai/sandbox-claim"
+    missing = copy.deepcopy(manifest)
+    peer_labels = missing["spec"]["ingress"][0]["from"][0]["podSelector"]["matchLabels"]
+    peer_labels.pop(claim_label)
+    peer_labels["example.com/unrelated"] = "present"
+    while not (attempt(manifest).returncode == 0 and denied(attempt(missing), peer_message)):
+        remaining = deadline - time.monotonic()
+        require(remaining > 0, "objects_admission_not_enforcing")
+        time.sleep(min(1, remaining))
+
+    cases: list[tuple[str, Json, str]] = [("missing-claim-extra-label", missing, peer_message)]
+    for category, field, key, value in (
+        ("wrong-claim", "podSelector", claim_label, "another-claim"),
+        (
+            "wrong-namespace",
+            "namespaceSelector",
+            "kubernetes.io/metadata.name",
+            "another-namespace",
+        ),
+        ("wrong-component", "podSelector", "app.kubernetes.io/component", "another-component"),
+        ("wrong-instance", "podSelector", "app.kubernetes.io/instance", "another-release"),
+    ):
+        changed = copy.deepcopy(manifest)
+        changed["spec"]["ingress"][0]["from"][0][field]["matchLabels"][key] = value
+        cases.append((category, changed, peer_message))
+    blocked = copy.deepcopy(manifest)
+    blocked["spec"]["ingress"][0]["from"] = [{"ipBlock": {"cidr": "192.0.2.0/24"}}]
+    cases.insert(2, ("ipblock-only", blocked, peer_message))
+    for category, port_key, port_value in (
+        ("missing-end-port", "endPort", None),
+        ("partial-start", "port", 2),
+        ("partial-end", "endPort", 65534),
+        ("udp", "protocol", "UDP"),
+    ):
+        changed = copy.deepcopy(manifest)
+        port = changed["spec"]["ingress"][0]["ports"][0]
+        if port_value is None:
+            port.pop(port_key, None)
+        else:
+            port[port_key] = port_value
+        cases.append((category, changed, peer_message))
+    for category, field in (("missing-peers", "from"), ("missing-ports", "ports")):
+        changed = copy.deepcopy(manifest)
+        changed["spec"]["ingress"][0].pop(field)
+        cases.append((category, changed, peer_message))
+    changed = copy.deepcopy(manifest)
+    changed["spec"]["egress"] = [{}]
+    cases.append(("daemon-egress", changed, egress_message))
+    observations: dict[str, bool] = {}
+    require(attempt(manifest).returncode == 0, "objects_valid_before_refused")
+    observations["valid-before"] = True
+    f.note("objects_admission", observations)
+    for category, changed, message in cases:
+        require(denied(attempt(changed), message), "objects_wrong_denial:" + category)
+        observations[category] = True
+        f.note("objects_admission", observations)
+    require(attempt(manifest).returncode == 0, "objects_valid_after_refused")
+    observations["valid-after"] = True
+    f.note("objects_admission", observations)
+
+
 SERVER = """from http.server import BaseHTTPRequestHandler, HTTPServer
 class H(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -468,6 +581,249 @@ check('userns', any('userns' in s for s in info.get('SecurityOptions') or []))
 print(json.dumps({'mtls': True, 'negative_tls': True, 'docker_cli': True}))
 """
 
+PUBLISH = """import json, re, subprocess, sys, time
+host, api_port, port, nonce, image, mode, expected_id = sys.argv[1:]
+name, body = 'fd-published-' + nonce, 'published-' + nonce
+deadline = time.monotonic() + (150 if mode == 'start' else 30)
+tls = ['--tlsverify', '--tlscacert=/test-certs/ca.pem']
+tls += ['--tlscert=/test-certs/client-cert.pem', '--tlskey=/test-certs/client-key.pem']
+def cli(*args):
+    remaining = deadline - time.monotonic()
+    assert remaining > 0, 'published_docker_deadline'
+    return subprocess.run(
+        ['docker', f'--host=tcp://{host}:{api_port}', *tls, *args],
+        capture_output=True, text=True, timeout=min(90, remaining))
+def checked(*args):
+    result = cli(*args)
+    assert result.returncode == 0, 'published_docker_command_failed:' + args[0]
+    return result.stdout.strip()
+if mode == 'start':
+    checked('pull', image)
+    cid = checked(
+        'run', '--detach', '--name', name, '--label', 'example.com/fixture-nonce=' + nonce,
+        '--publish', port + ':8080/tcp', image, 'sh', '-c',
+        'mkdir -p /www && printf %s "$1" > /www/index.html && exec httpd -f -p 8080 -h /www',
+        'sh', body)
+    assert re.fullmatch('[0-9a-f]{64}', cid), 'published_container_id_invalid'
+    state = json.loads(checked('inspect', cid))[0]
+    binding = state['NetworkSettings']['Ports']['8080/tcp']
+    assert state['State']['Running'] and binding, 'published_container_not_running'
+    assert all(p['HostPort'] == port and p['HostIp'] in ('0.0.0.0', '::') for p in binding)
+    print(json.dumps({'container_id': cid, 'binding': binding, 'image': image}))
+else:
+    ids = checked('container', 'ls', '--all', '--quiet', '--no-trunc',
+                  '--filter', 'name=^/' + name + '$').splitlines()
+    assert len(ids) <= 1, 'published_cleanup_ambiguous'
+    for cid in ids:
+        state = json.loads(checked('inspect', cid))[0]
+        assert state['Config']['Labels']['example.com/fixture-nonce'] == nonce
+        assert not expected_id or cid == expected_id, 'published_cleanup_identity'
+        checked('rm', '--force', cid)
+    assert not checked('container', 'ls', '--all', '--quiet',
+                       '--filter', 'name=^/' + name + '$'), 'published_container_remains'
+    print(json.dumps({'removed': True}))
+"""
+
+PUBLISHED_PROBE = """import http.client, json, socket, sys, time
+host, port, body, addresses, mode = sys.argv[1:]
+port, expected = int(port), set(json.loads(addresses))
+local = http.client.HTTPConnection('127.0.0.1', 8080, timeout=3)
+try:
+    local.request('GET', '/')
+    response = local.getresponse()
+    assert response.status == 200 and response.read() == b'OK', 'local_http_failed'
+finally:
+    local.close()
+resolved = {a[4][0] for a in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)}
+assert resolved == expected and resolved, 'published_dns_wrong_pod'
+deadline, refused = time.monotonic() + 45, 0
+while time.monotonic() < deadline:
+    remaining = deadline - time.monotonic()
+    conn = None
+    if mode == 'refused':
+        try:
+            conn = socket.create_connection((host, port), timeout=min(2, remaining))
+        except (ConnectionRefusedError, TimeoutError):
+            refused += 1
+        else:
+            refused = 0
+        finally:
+            if conn:
+                conn.close()
+        if refused == 3:
+            print(json.dumps({'refused': refused, 'dns': sorted(resolved), 'local_http': True}))
+            sys.exit(0)
+    else:
+        conn = http.client.HTTPConnection(host, port, timeout=min(2, remaining))
+        try:
+            conn.request('GET', '/')
+            response = conn.getresponse()
+            assert response.status == 200, 'published_status_wrong'
+            assert response.read().decode() == body, 'published_body_wrong'
+            print(json.dumps({'connected': True, 'body': body, 'dns': sorted(resolved),
+                              'local_http': True}))
+            sys.exit(0)
+        except (OSError, http.client.HTTPException):
+            pass
+        finally:
+            conn.close()
+    remaining = deadline - time.monotonic()
+    if remaining > 0:
+        time.sleep(min(1, remaining))
+raise AssertionError('published_probe_deadline:' + mode)
+"""
+
+
+def published_ports(
+    f: FixtureAPI, config: Json, runner_name: str, negative_name: str, claim: str, dns: str
+) -> None:
+    namespace = f.args.namespace
+    claim_label = "curietech.ai/sandbox-claim"
+    pod_path = f"/api/v1/namespaces/{namespace}/pods/"
+    own = f.get(pod_path + runner_name)
+    negative = f.get(pod_path + negative_name)
+    uids = {runner_name: own["metadata"]["uid"], negative_name: negative["metadata"]["uid"]}
+    ignored = {claim_label, helper.OWNER, helper.NONCE, helper.REQUEST}
+    require(
+        {k: v for k, v in own["metadata"]["labels"].items() if k not in ignored}
+        == {k: v for k, v in negative["metadata"]["labels"].items() if k not in ignored},
+        "negative_runner_labels_differ",
+    )
+    for field in (
+        "containers",
+        "initContainers",
+        "volumes",
+        "serviceAccountName",
+        "automountServiceAccountToken",
+        "nodeName",
+        "securityContext",
+        "runtimeClassName",
+        "restartPolicy",
+        "dnsPolicy",
+    ):
+        require(
+            own["spec"].get(field) == negative["spec"].get(field),
+            "negative_runner_spec:" + field,
+        )
+    daemon = f.get(f"/api/v1/namespaces/{config['namespace']}/pods/{claim}")
+    addresses = [
+        p["ip"] for p in daemon["status"].get("podIPs", [{"ip": daemon["status"]["podIP"]}])
+    ]
+    service = f.get(f"/api/v1/namespaces/{config['namespace']}/services/{claim}")
+    require(service["spec"]["clusterIP"] == "None", "published_service_not_headless")
+    values = yaml.safe_load((f.snapshot / "charts/curie/values.yaml").read_text())
+    image = values["agentSandbox"]["runner"]["bundleFetch"]["extractImage"]
+    require(image.startswith("busybox:") and "@sha256:" in image, "published_probe_image_unpinned")
+    port, cid = 38081, ""
+    require(port != config["port"], "published_port_is_api_port")
+    observations: Json = {}
+    docker_args = (dns, str(config["port"]), str(port), f.args.nonce, image)
+
+    def probe(pod: str, mode: str, expected_claim: str | None) -> Json:
+        current = f.get(pod_path + pod)
+        require(
+            current["metadata"]["uid"] == uids[pod]
+            and current["metadata"]["labels"].get(claim_label) == expected_claim,
+            "published_probe_identity_or_claim_mismatch",
+        )
+        result = f.k(
+            "-n",
+            namespace,
+            "exec",
+            pod,
+            "-c",
+            "runner",
+            "--",
+            "python3",
+            "-c",
+            PUBLISHED_PROBE,
+            dns,
+            str(port),
+            "published-" + f.args.nonce,
+            json.dumps(addresses),
+            mode,
+            check=False,
+            timeout=60,
+        )
+        require(result.returncode == 0, "published_probe_failed:" + mode)
+        observation: Json = json.loads(result.stdout.strip().splitlines()[-1])
+        return observation
+
+    try:
+        started = f.k(
+            "-n",
+            namespace,
+            "exec",
+            runner_name,
+            "-c",
+            "runner",
+            "--",
+            "python3",
+            "-c",
+            PUBLISH,
+            *docker_args,
+            "start",
+            "",
+            check=False,
+            timeout=180,
+        )
+        require(started.returncode == 0, "published_container_start_failed")
+        container = json.loads(started.stdout.strip().splitlines()[-1])
+        cid = container["container_id"]
+        observations["container"] = container
+        f.note("published_ports", observations)
+        for key, pod, mode, expected_claim in (
+            ("own-before", runner_name, "success", claim),
+            ("no-claim-before", negative_name, "refused", None),
+            ("own-after-denial", runner_name, "success", claim),
+        ):
+            observations[key] = probe(pod, mode, expected_claim)
+            f.note("published_ports", observations)
+        f.k("-n", namespace, "label", "pod", negative_name, claim_label + "=" + claim)
+        observations["same-pod-with-claim"] = probe(negative_name, "success", claim)
+        f.note("published_ports", observations)
+        f.k("-n", namespace, "label", "pod", negative_name, claim_label + "-")
+        observations["same-pod-claim-removed"] = probe(negative_name, "refused", None)
+        observations["own-after-toggle"] = probe(runner_name, "success", claim)
+        f.note("published_ports", observations)
+        require(
+            all(
+                key in observations
+                for key in (
+                    "container",
+                    "own-before",
+                    "no-claim-before",
+                    "own-after-denial",
+                    "same-pod-with-claim",
+                    "same-pod-claim-removed",
+                    "own-after-toggle",
+                )
+            ),
+            "published_observations_incomplete",
+        )
+    finally:
+        cleaned = f.k(
+            "-n",
+            namespace,
+            "exec",
+            runner_name,
+            "-c",
+            "runner",
+            "--",
+            "python3",
+            "-c",
+            PUBLISH,
+            *docker_args,
+            "cleanup",
+            cid,
+            check=False,
+            timeout=45,
+        )
+        require(cleaned.returncode == 0, "published_container_cleanup_failed")
+        result = json.loads(cleaned.stdout.strip().splitlines()[-1])
+        require(result.get("removed") is True, "published_container_cleanup_unverified")
+        f.note("published_container_cleanup", result)
+
 
 def observed(f: FixtureAPI, path: str) -> bool:
     policy = f.get(path)
@@ -496,6 +852,41 @@ def live(f: FixtureAPI, docs: list[Json], config: Json, images: Json) -> None:
         meta = {"name": name, "namespace": ns, "labels": labels.copy()}
         return {"apiVersion": api, "kind": kind, "metadata": meta, **data}
 
+    policies = [d for d in docs if d["kind"] == "ValidatingAdmissionPolicy"]
+    for policy in policies:
+        path = object_path(policy)
+        f.wait(functools.partial(observed, f, path))
+        # Other expressions carry existing multi-kind and quantity warnings.
+        checks = f.get(path).get("status", {}).get("typeChecking", {})
+        argv = {
+            f"spec.validations[{i}].expression"
+            for i, rule in enumerate(policy["spec"]["validations"])
+            if "c.args ==" in rule["expression"]
+        }
+        warned = {w["fieldRef"] for w in checks.get("expressionWarnings", [])}
+        require(not argv & warned, "admission_type_warnings")
+    policy_code = """import json, sys
+from curie_worker.sandbox.daemon_config import ToolDaemonConfig
+from curie_worker.sandbox.tool_daemon import _network_policy
+config = ToolDaemonConfig.model_validate(json.load(sys.stdin))
+print(json.dumps(_network_policy(config, sys.argv[1], sys.argv[2])))
+"""
+    ingress: Json = json.loads(
+        run(
+            [
+                "uv", "run", "--project", str(f.snapshot), "--frozen", "python3", "-c",
+                policy_code, claim, namespace,
+            ],
+            cwd=f.snapshot,
+            data=json.dumps(config),
+        ).stdout
+    )
+    ingress["metadata"]["namespace"] = daemon_ns
+    objects_policy = next(
+        p for p in policies if p["metadata"]["name"].endswith("-docker-daemon-objects")
+    )
+    objects_admission(f, ingress, objects_policy, identity)
+    f.create(ingress, identity=identity)
     dns = f"{claim}.{daemon_ns}.svc"
     server_files, client_files = certificates(f, dns)
     secret = {"type": "Opaque", "stringData": server_files}
@@ -510,19 +901,8 @@ def live(f: FixtureAPI, docs: list[Json], config: Json, images: Json) -> None:
     runner_labels = {
         "app.kubernetes.io/component": "runner-sandbox",
         "app.kubernetes.io/instance": f.args.release,
-        "fixture-claim": claim,
+        "curietech.ai/sandbox-claim": claim,
     }
-    peer = {
-        "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": namespace}},
-        "podSelector": {"matchLabels": runner_labels},
-    }
-    ingress = {
-        "podSelector": {"matchLabels": {"curietech.ai/sandbox-claim": claim}},
-        "policyTypes": ["Ingress"],
-        "ingress": [{"from": [peer], "ports": [{"protocol": "TCP", "port": config["port"]}]}],
-    }
-    policy_api = "networking.k8s.io/v1"
-    f.create(obj("NetworkPolicy", daemon_ns, {"spec": ingress}, policy_api), identity=identity)
     container = {
         "name": "dockerd",
         "image": config["image"],
@@ -556,20 +936,6 @@ def live(f: FixtureAPI, docs: list[Json], config: Json, images: Json) -> None:
         ],
     }
     pod = obj("Pod", daemon_ns, {"spec": pod_spec})
-    policies = [d for d in docs if d["kind"] == "ValidatingAdmissionPolicy"]
-    for policy in policies:
-        path = object_path(policy)
-        f.wait(functools.partial(observed, f, path))
-        # Other expressions already carry type-checker warnings for multi-kind and
-        # quantity fields; they still enforce. Only the TLS argv rule is this change's.
-        checks = f.get(path).get("status", {}).get("typeChecking", {})
-        argv = {
-            f"spec.validations[{i}].expression"
-            for i, rule in enumerate(policy["spec"]["validations"])
-            if "c.args ==" in rule["expression"]
-        }
-        warned = {w["fieldRef"] for w in checks.get("expressionWarnings", [])}
-        require(not argv & warned, "admission_type_warnings")
     pods_policy = next(p for p in policies if p["metadata"]["name"].endswith("-docker-daemon-pods"))
     admission(f, pod, pods_policy, identity)
     created = f.create(pod, identity=identity)
@@ -615,9 +981,24 @@ def live(f: FixtureAPI, docs: list[Json], config: Json, images: Json) -> None:
         return str(status.get("sandbox", {}).get("name", "")) if ready else ""
 
     runner_name = f.wait(ready_claim)
+    own = f.wait(
+        functools.partial(ready_pod, f, f"/api/v1/namespaces/{namespace}/pods/{runner_name}")
+    )
+    negative_name = claim + "-no-claim"
+    negative_labels = own["metadata"]["labels"].copy()
+    require(negative_labels.pop("curietech.ai/sandbox-claim") == claim, "own_claim_label_missing")
+    f.create(
+        {
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": negative_name, "namespace": namespace, "labels": negative_labels},
+            "spec": copy.deepcopy(ps),
+        }
+    )
     for name, ns, image, expected in (
         (claim, daemon_ns, daemon, "dockerd"),
         (runner_name, namespace, runner, "runner"),
+        (negative_name, namespace, runner, "runner"),
     ):
         current = f.wait(functools.partial(ready_pod, f, f"/api/v1/namespaces/{ns}/pods/{name}"))
         actual = next(c for c in current["spec"]["containers"] if c["name"] == expected)
@@ -625,7 +1006,14 @@ def live(f: FixtureAPI, docs: list[Json], config: Json, images: Json) -> None:
         require(
             actual["image"] == image["ref"]
             and actual["imagePullPolicy"] == "IfNotPresent"
-            and status["imageID"].split("@")[-1] in {image["manifest"], image["config"]},
+            and status["imageID"].split("@")[-1] in {image["manifest"], image["config"]}
+            and status["ready"]
+            and current["spec"]["nodeName"] == f.node
+            and not current["metadata"].get("deletionTimestamp")
+            and any(
+                c["type"] == "Ready" and c["status"] == "True"
+                for c in current["status"].get("conditions", [])
+            ),
             "live_image_identity_mismatch",
         )
         if ns == daemon_ns:
@@ -650,6 +1038,7 @@ def live(f: FixtureAPI, docs: list[Json], config: Json, images: Json) -> None:
     result = json.loads(lines[-1]) if lines else {"failed": "no_output"}
     f.note("runtime", result)
     require(outcome.returncode == 0 and "failed" not in result, "runtime_ping_failed")
+    published_ports(f, config, runner_name, negative_name, claim, dns)
     require(created["metadata"]["uid"], "daemon_uid_missing")
 
 
@@ -685,7 +1074,10 @@ def execute(args: argparse.Namespace) -> int:
                 "runner_admission_identical",
                 "startup_and_schema",
                 "admission_negatives",
+                "objects_admission",
                 "runtime",
+                "published_ports",
+                "published_container_cleanup",
             )
         },
     }

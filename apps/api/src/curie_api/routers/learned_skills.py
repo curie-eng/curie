@@ -1,4 +1,4 @@
-"""Learned skills (ADR 0237): an agent's own Markdown skills, with history.
+"""Learned skills (ADR 0247): an agent's own Markdown skills, with history.
 
 The runner reads them at boot with its broad ``state`` credential and changes
 them with the per-turn credential the worker mints (``skills: "write"``); the
@@ -127,7 +127,7 @@ async def _writer(
     if not sender:
         raise _forbidden("this credential names no sender")
     # An approval continuation of a scheduled run names the approver as its
-    # sender, so the signed ``scheduled`` claim (ADR 0238) marks it instead.
+    # sender, so the signed ``scheduled`` claim (ADR 0248) marks it instead.
     if principal.scheduled is True or sender == NO_PERSON or sender.startswith("cron:"):
         raise _forbidden(SCHEDULED)
     if not principal.turn or not principal.conversation:

@@ -1,7 +1,8 @@
 import { test, expect } from "@playwright/test";
 import { execFileSync } from "node:child_process";
-import { readdir, readFile } from "node:fs/promises";
-import { join, relative, resolve } from "node:path";
+import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, relative } from "node:path";
 
 // Inspect every artifact, including deferred chunks and generated manifests.
 async function artifactPaths(directory: string): Promise<string[]> {
@@ -18,8 +19,23 @@ test("production assets contain no platform key or browser key resolution", asyn
   test.setTimeout(150_000);
   // Rebuild even when PW_BASE_URL or an existing preview bypasses webServer.
   // The scanned artifacts must come from this candidate on every invocation.
-  execFileSync("pnpm", ["build"], { cwd: process.cwd(), stdio: "pipe", timeout: 120_000 });
-  const dist = resolve(process.cwd(), "dist");
+  // Build into a fresh temporary directory, never dist: the preview under test
+  // serves dist, and rebuilding it mid-run removed chunks that other specs were
+  // still loading, which crashed the preview.
+  const dist = await mkdtemp(join(tmpdir(), "curie-console-assets-"));
+  try {
+    await scanBuild(dist);
+  } finally {
+    await rm(dist, { recursive: true, force: true });
+  }
+});
+
+async function scanBuild(dist: string): Promise<void> {
+  execFileSync("pnpm", ["exec", "vite", "build", "--outDir", dist, "--emptyOutDir"], {
+    cwd: process.cwd(),
+    stdio: "pipe",
+    timeout: 120_000,
+  });
   const paths = await artifactPaths(dist);
   expect(paths.length, "production build contains artifacts").toBeGreaterThan(0);
   expect(paths.some((path) => relative(dist, path) === "index.html"), "production index exists").toBe(true);
@@ -54,4 +70,4 @@ test("production assets contain no platform key or browser key resolution", asyn
       `${name} contains no URLSearchParams credential construction`,
     ).toBe(false);
   }
-});
+}

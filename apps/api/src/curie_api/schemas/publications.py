@@ -205,6 +205,8 @@ class PublicationPrecheckResult(BaseModel):
 class PublicationLineageAdvance(BaseModel):
     """Exact compare-and-set facts for one publication revision outcome."""
 
+    model_config = ConfigDict(extra="forbid")
+
     expected_version: int = Field(ge=1)
     expected_head_sha: str | None
     # The worker's claimed publication version and lease owner fence a stale
@@ -321,6 +323,7 @@ class PublicationBranchHeadOut(BaseModel):
     """The head of a publication's branch; ``None`` when the branch does not exist."""
 
     head_sha: str | None
+    base_branch: str = Field(min_length=1, max_length=1024)
 
 
 class PublicationRevisionVerify(BaseModel):
@@ -336,11 +339,16 @@ class PublicationRevisionVerify(BaseModel):
 
 
 class PublicationRevisionOut(BaseModel):
-    commit_sha: str
+    commit_sha: str = Field(pattern=_COMMIT_SHA_PATTERN)
+    parent_sha: str = Field(pattern=_COMMIT_SHA_PATTERN)
 
 
 class PublicationPullRecover(BaseModel):
-    """Adopt the publication branch's pull request, or open it when the branch
-    holds exactly ``expected_head_sha``."""
+    """Adopt the publication branch's pull request.
+
+    When ``adopt_only`` is false, open one if the branch holds exactly
+    ``expected_head_sha``.
+    """
 
     expected_head_sha: str = Field(pattern=_COMMIT_SHA_PATTERN)
+    adopt_only: bool

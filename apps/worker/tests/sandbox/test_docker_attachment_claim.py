@@ -401,7 +401,9 @@ def _refused(client: _RecordingDocker, env: dict[str, str], *, because: str) -> 
     """Drive a claim that must be refused, and hand back the refusal."""
 
     try:
-        client.create_claim("claim-attachments", pool="pool", env=env)
+        client.create_claim(
+            "claim-attachments", pool="pool", env=env, deadline=time.monotonic() + 300
+        )
     except AttachmentResolutionError as exc:
         assert client.calls == [], "invalid attachments must be rejected before any Docker call"
         return exc
@@ -442,10 +444,14 @@ def test_a_turn_with_no_attachments_produces_todays_container_spec_exactly(
     """
 
     baseline = _client()
-    baseline.create_claim("claim-plain", pool="pool", env=dict(_BASE_ENV))
+    baseline.create_claim(
+        "claim-plain", pool="pool", env=dict(_BASE_ENV), deadline=time.monotonic() + 300
+    )
 
     client = _client()
-    client.create_claim("claim-plain", pool="pool", env={**_BASE_ENV, **extra})
+    client.create_claim(
+        "claim-plain", pool="pool", env={**_BASE_ENV, **extra}, deadline=time.monotonic() + 300
+    )
 
     attempt_prefix = "curietech.ai/claim-attempt="
     attempts = [
@@ -490,6 +496,7 @@ def test_attachments_are_materialized_and_seeded_into_read_only_volume(
             _ref(url=report_url, name="report.csv", payload=report),
             _ref(url=notes_url, name="notes.txt", payload=notes),
         ),
+        deadline=time.monotonic() + 300,
     )
 
     volume, mode = _attachment_mount(client)
@@ -536,6 +543,7 @@ def test_the_mount_path_agrees_with_the_runner_and_the_chart(
         "claim-attachments",
         pool="pool",
         env=_env(_ref(url=url, name="report.csv", payload=payload)),
+        deadline=time.monotonic() + 300,
     )
 
     mounts = _volume_mounts(client.runner_argv)
@@ -576,7 +584,7 @@ def test_the_signed_reference_never_reaches_the_runner_container(
     url = objects.add("https://objects.example.test/attachments/a/000.bin", payload)
     env = _env(_ref(url=url, name="report.csv", payload=payload))
     client = _client()
-    client.create_claim("claim-attachments", pool="pool", env=env)
+    client.create_claim("claim-attachments", pool="pool", env=env, deadline=time.monotonic() + 300)
 
     argv = client.runner_argv
     forwarded = [e for e in _flag_values(argv, "-e") if e.startswith(f"{ATTACHMENTS_REF_ENV}=")]
@@ -607,6 +615,7 @@ def test_the_materialized_tree_is_readable_by_the_nonroot_runner(
         "claim-attachments",
         pool="pool",
         env=_env(_ref(url=url, name="report.csv", payload=payload)),
+        deadline=time.monotonic() + 300,
     )
 
     volume, _mode = _attachment_mount(client)
@@ -706,6 +715,7 @@ def test_a_file_just_under_the_cap_is_materialized_whole(
         "claim-attachments",
         pool="pool",
         env=_env(_ref(url=url, name="report.csv", payload=payload)),
+        deadline=time.monotonic() + 300,
     )
 
     volume, _mode = _attachment_mount(client)
@@ -906,7 +916,7 @@ def test_the_docker_driver_matches_the_shared_init_outcome_vector(
         _assert_common(case, by_url, objects.requested, objects)
         return
 
-    client.create_claim("claim-attachments", pool="pool", env=env)
+    client.create_claim("claim-attachments", pool="pool", env=env, deadline=time.monotonic() + 300)
     volume, mode = _attachment_mount(client)
     assert mode == "ro"
     files = client.volume_files[volume]
@@ -954,7 +964,7 @@ def test_the_attachment_manifest_is_forwarded_to_the_runner(
     manifest = "eyJ2IjoxfQ"
     env = {**_env(_ref(url=url, name="report.csv", payload=payload)), _MANIFEST_ENV: manifest}
     client = _client()
-    client.create_claim("claim-attachments", pool="pool", env=env)
+    client.create_claim("claim-attachments", pool="pool", env=env, deadline=time.monotonic() + 300)
 
     forwarded = [
         e for e in _flag_values(client.runner_argv, "-e") if e.startswith(f"{_MANIFEST_ENV}=")
@@ -979,6 +989,7 @@ def test_deleting_the_claim_removes_the_materialized_directory(
         "claim-attachments",
         pool="pool",
         env=_env(_ref(url=url, name="report.csv", payload=payload)),
+        deadline=time.monotonic() + 300,
     )
     volume, _mode = _attachment_mount(client)
     root = _seed_source(client, _runner_attachments_dir())
@@ -1029,6 +1040,7 @@ def test_a_failed_container_boot_removes_the_materialized_directory(
             "claim-attachments",
             pool="pool",
             env=_env(_ref(url=url, name="report.csv", payload=payload)),
+            deadline=time.monotonic() + 300,
         )
 
     assert staged, (

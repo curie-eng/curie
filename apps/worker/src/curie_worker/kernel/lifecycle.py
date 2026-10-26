@@ -95,6 +95,8 @@ async def process_event(
     error: BaseException | None = None
     hook_token = constants._HOOK_RUN_CARRY.set(hooks._HookRunCarry())
     lease_token = constants._DELIVERY_LEASE.set(lease)
+    termination_carry = constants._SandboxTerminationCarry()
+    termination_token = constants._SANDBOX_TERMINATION_CARRY.set(termination_carry)
     # A redelivery must never inherit an earlier delivery's terminal-send mark
     # from this process (#2433).
     self._terminal_reply_attempted.discard(qevent.event_id)
@@ -158,6 +160,20 @@ async def process_event(
                 outcome = "classified_failure" if error is not None else "done"
             if hasattr(span, "set_attribute"):
                 span.set_attribute("outcome", outcome)
+                termination = termination_carry.termination
+                if termination is not None:
+                    reason = termination.reason
+                    span.set_attribute(
+                        constants.SANDBOX_TERMINATION_REASON_ATTRIBUTE,
+                        reason
+                        if reason in constants.SANDBOX_TERMINATION_REASONS
+                        else constants.SANDBOX_TERMINATION_REASON_FALLBACK,
+                    )
+                    exit_code = termination.exit_code
+                    if type(exit_code) is int and 0 <= exit_code <= 255:
+                        span.set_attribute(
+                            constants.SANDBOX_TERMINATION_EXIT_CODE_ATTRIBUTE, exit_code
+                        )
             if hasattr(span, "set_status"):
                 span.set_status(
                     StatusCode.ERROR
@@ -170,6 +186,7 @@ async def process_event(
             constants._LIFECYCLE_SPAN.reset(token)
             constants._HOOK_RUN_CARRY.reset(hook_token)
             constants._DELIVERY_LEASE.reset(lease_token)
+            constants._SANDBOX_TERMINATION_CARRY.reset(termination_token)
     if error is not None:
         raise error
 
@@ -481,8 +498,8 @@ async def _process_event(
             # A targetless turn owns no card: it never paused for approval.
             await self._finalize_settled_card(qevent, route)
 
-        # Crash-safety: a prior attempt executed a side effect but never
-        # reached done (worker died mid-run). Do not auto-retry the action.
+        # Crash-safety: prior observed or unconfirmed execution latched the
+        # retry fence but never reached done. Do not auto-retry the action.
         if await self._markers.saw_side_effect(event_id):
             # This path is NOT silent: it is the one message a human most
             # needs to see. It runs before binding resolution, so it emits
@@ -504,7 +521,7 @@ async def _process_event(
             await self._escalate(
                 qevent,
                 route,
-                "A prior attempt started an action before the worker restarted; "
+                "A prior attempt may already have executed an action; "
                 "not retrying automatically. Flagging for a human.",
                 failure_class="prior-side-effect",
             )
@@ -599,10 +616,19 @@ async def _process_event(
             # No kind/address: there is no binding to scope the state
             # namespace to. No approval grant, resumed kind or decision
             # either: a targetless turn is never a resume.
+            # ADR 0240 decision 2: passed only when the bundle declares
+            # routes, so a binding that predates the keyword still boots.
+            route_connectors = await self._route_connectors(
+                getattr(resolved, "bundle_ref", None), str(agent_name or "")
+            )
+            targetless_kwargs: dict[str, Any] = (
+                {"route_connectors": route_connectors} if route_connectors else {}
+            )
             boot_env = binding.boot_env(
                 resolved,
                 thread_key,
                 token_ttl_s=self._runner.turn_deadline_s(claim._remaining_budget(lease)),
+                **targetless_kwargs,
             )
             workspace_deployment_id = resolved.deployment_id
             if resolved.deployment_id is not None:
@@ -657,7 +683,11 @@ async def _process_event(
                                 ci_fix_round=None,
                             )
                         else:
-                            await factory_run.defer(f"not_started:{refusal}", capacity=False)
+                            await factory_run.defer(
+                                f"not_started:{refusal}",
+                                capacity=False,
+                                start_failure_detail=None,
+                            )
                     except WorkItemConflict as exc:
                         logger.info(
                             "factory refusal settlement for %s refused: %s", event_id, exc.code
@@ -784,7 +814,7 @@ async def _process_event(
                     )
             if memory_writes:
                 resolved = resolved.model_copy(update={"memory_writes": True})
-            # Agent schedules (ADR 0238) are read beside memory writes, for
+            # Agent schedules (ADR 0248) are read beside memory writes, for
             # the same schema reason, and degrade to off the same way. This
             # read is the one every resolve path converges on.
             agent_schedules = False
@@ -817,7 +847,7 @@ async def _process_event(
                 else None
             )
             from_cron = False
-            # Learned skills read the same claim (ADR 0237 refuses scheduled
+            # Learned skills read the same claim (ADR 0247 refuses scheduled
             # writes), so the origin is read when they are on too.
             learned_skills = bool(getattr(resolved, "learned_skills", False))
             if is_resume and (agent_schedules or learned_skills or schedule_id is not None):
@@ -837,7 +867,7 @@ async def _process_event(
                         from_cron = True
             scheduled = scheduled or from_cron
             if schedule_id is not None and from_cron:
-                # ADR 0238: an approved continuation of an agent schedule
+                # ADR 0248: an approved continuation of an agent schedule
                 # firing runs only while that schedule still allows it;
                 # checked here and again under its lock at start or steer.
                 # Start and steer guard only the schedule_resume set below,
@@ -924,6 +954,12 @@ async def _process_event(
                 boot_env_kwargs["caller_run"] = str(caller_for_boot.request_id)
                 boot_env_kwargs["caller_work_item"] = str(caller_for_boot.work_item_id)
                 boot_env_kwargs["caller_exp_ceiling"] = caller_ceiling
+            # ADR 0240 decision 2, passed only when the bundle declares routes.
+            route_connectors = await self._route_connectors(
+                getattr(resolved, "bundle_ref", None), str(getattr(resolved, "agent_name", ""))
+            )
+            if route_connectors:
+                boot_env_kwargs["route_connectors"] = route_connectors
             boot_env = self._binding.boot_env(
                 resolved,
                 thread_key,
@@ -1215,7 +1251,7 @@ async def _process_event(
             except failures._WorkItemDeferred:
                 return
             except hooks.ScheduleResumeRefused as exc:
-                # ADR 0238: the schedule changed under its lock between intake
+                # ADR 0248: the schedule changed under its lock between intake
                 # and the start or steer. Dropped with a log line, no reply.
                 logger.info("approval resume %s refused at start: %s; dropping", event_id, exc)
                 await self._complete(
@@ -1274,7 +1310,7 @@ async def _process_event(
                 )
                 if run is not None and not run.started:
                     try:
-                        await run.defer("thread_busy", capacity=False)
+                        await run.defer("thread_busy", capacity=False, start_failure_detail=None)
                     except WorkItemConflict as exc:
                         logger.info(
                             "work-item thread_busy defer refused for %s: %s",
@@ -1508,8 +1544,13 @@ async def _process_event(
                     failures._escalation_text(
                         qevent,
                         lead=failures._with_guidance(
-                            f"The run hit an error ({token}) after starting an action; "
-                            "not retrying automatically.",
+                            (
+                                "The runner accepted a continuation whose execution could not be "
+                                "confirmed; not retrying automatically."
+                                if outcome.execution_uncertain
+                                else f"The run hit an error ({token}) after starting an action; "
+                                "not retrying automatically."
+                            ),
                             token,
                             delivered_max_turns=(boot_env or {}).get(MAX_TURNS_ENV),
                         ),

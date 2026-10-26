@@ -76,3 +76,18 @@ def test_scan_stops_at_the_trace_scan_cap() -> None:
 
     # 500-item cap at 100 per page -> at most 5 pages, never the whole 10k.
     assert len(backend.requests) == 5
+
+
+def test_tag_listing_without_projection_preserves_provider_default() -> None:
+    backend = _RecordingBackend(total=250)
+    client = _client(backend)
+
+    traces = asyncio.run(client.list_traces_by_tags(["eval", "suite:acme-suite"]))
+
+    assert len(traces) == 250
+    assert len(backend.requests) == 3
+    assert all("fields" not in params for params in backend.requests)
+    assert all("orderBy" not in params for params in backend.requests)
+    assert all(
+        params.get_list("tags") == ["eval", "suite:acme-suite"] for params in backend.requests
+    )

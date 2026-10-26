@@ -1,4 +1,4 @@
-"""The learned-skills tools on their own in-process SDK MCP server (ADR 0237).
+"""The learned-skills tools on their own in-process SDK MCP server (ADR 0247).
 
 ``list`` and ``read`` use the boot read token. ``create``, ``patch``,
 ``delete`` and ``revert`` use the turn's own credential and are refused here on

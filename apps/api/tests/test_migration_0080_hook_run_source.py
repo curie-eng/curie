@@ -14,6 +14,7 @@ from alembic import command
 from alembic.config import Config
 from alembic.script import ScriptDirectory
 from curie_api.config import get_settings
+from curie_protected_hooks.schema_serving import load_window
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -91,9 +92,12 @@ def test_0080_is_expand_after_0079_and_precedes_the_single_candidate_head() -> N
     assert revision.down_revision == BELOW
     # #2911 appends tenant scope (0101) after the OIDC login revision, and #3831
     # the reply target (0102), tracker identity (0103), trigger label (0105),
-    # identity links (0107), stable history join (0108), schedule safety,
-    # learned skills, agent schedules and twin memory follow that.
-    assert script.get_heads() == ["selfimp_memory_0001"]
+    # identity links (0107), stable history join (0108), team sync state
+    # (0120), agent access policies (0121), directory identity (0122), start
+    # failure detail (0123), attachment catalogs (0130) and their merge (0131),
+    # then schedule safety, learned skills, agent schedules and twin memory
+    # follow that.
+    assert script.get_heads() == [load_window().schema_head]
     candidate = script.get_revision("0081")
     assert candidate is not None
     assert candidate.down_revision == REVISION

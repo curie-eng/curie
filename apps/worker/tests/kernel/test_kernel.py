@@ -1801,7 +1801,6 @@ def test_late_workspace_candidate_attestation_uses_exact_authenticated_handle(
         pytest.param("sandbox_id", "other-sandbox", id="sandbox-id"),
         pytest.param("managed_workspace", False, id="managed-workspace"),
         pytest.param("cwd", "/tmp", id="cwd"),
-        pytest.param("ready", False, id="ready"),
         pytest.param("status", SessionStatus.DONE.value, id="status"),
         pytest.param("turn_active", True, id="turn-active"),
         pytest.param("history_durable", False, id="history-durable"),
@@ -1838,6 +1837,7 @@ def test_late_workspace_candidate_attestation_mismatch_refuses_handoff(
                 workspace_repo="acme-corp/acme-bot",
                 generation=old.generation + 1,
             )
+            candidate_reads: list[str] = []
 
             async def status(
                 base_url: str,
@@ -1855,8 +1855,13 @@ def test_late_workspace_candidate_attestation_mismatch_refuses_handoff(
                     }
                 assert base_url == candidate.base_url
                 assert token == candidate.token
+                candidate_reads.append(field)
                 payload = _safe_candidate_status(candidate)
                 payload[field] = invalid_value
+                # A still-connecting candidate is polled, so each real mismatch
+                # here also reports ``ready`` false: the refusal must still be
+                # immediate rather than waiting out the readiness budget.
+                payload["ready"] = False
                 return payload
 
             h.kernel._runner.status = status  # type: ignore[method-assign]
@@ -1875,7 +1880,9 @@ def test_late_workspace_candidate_attestation_mismatch_refuses_handoff(
 
             h.kernel._workspace = WorkspaceProbe()  # type: ignore[assignment]
 
-            with pytest.raises(ThreadBusyError):
+            with pytest.raises(
+                ThreadBusyError, match="did not attest the expected managed checkout"
+            ):
                 await h.kernel._claim_or_resume(
                     thread_key,
                     {
@@ -1885,7 +1892,296 @@ def test_late_workspace_candidate_attestation_mismatch_refuses_handoff(
                     workspace_deployment_id=deployment_id,
                     workspace_repo="acme-corp/acme-bot",
                     replace_handle=old,
+                    remaining_s=5.0,
                 )
+
+            # Exactly one read: a real mismatch is refused without polling.
+            assert candidate_reads == [field]
+
+    asyncio.run(go())
+
+
+def _late_candidate_handles(
+    h: Any, thread_key: str, history_ref: str
+) -> tuple[SandboxHandle, SandboxHandle]:
+    old = h.substrate.claim(
+        thread_key,
+        env={
+            "CURIE_RUNNER_TOKEN": "old-runner-token",
+            "CURIE_SESSION_ID": "logical-session",
+            "CURIE_HISTORY_REF": history_ref,
+        },
+    )
+    candidate = SandboxHandle(
+        thread_key=thread_key,
+        claim_name="candidate-claim",
+        sandbox_name="candidate-sandbox",
+        namespace=old.namespace,
+        service_fqdn="candidate.test-ns.svc.cluster.local",
+        port=old.port,
+        session_id=old.session_id,
+        history_ref=old.history_ref,
+        token="candidate-runner-token",
+        workspace_repo="acme-corp/acme-bot",
+        generation=old.generation + 1,
+    )
+    return old, candidate
+
+
+def test_late_workspace_candidate_still_connecting_is_polled_until_ready(
+    make_harness,
+) -> None:
+    """#4777: a candidate whose runner is up but whose session is still
+    connecting reports ``ready: False`` with every other fact safe. The
+    handoff keeps reading its status and accepts the same handle once it
+    turns ready, instead of refusing on the first not-ready read."""
+
+    deployment_id = uuid.uuid4()
+
+    async def go() -> None:
+        async with make_harness(binding=_workspace_binding(deployment_id)) as h:
+            thread_key = _thread_key("tCandidateConnecting")
+            old, candidate = _late_candidate_handles(h, thread_key, "history/tCandidateConnecting")
+            ordering: list[str] = []
+            candidate_reads: list[bool] = []
+
+            async def status(
+                base_url: str,
+                *,
+                token: str | None = None,
+                remaining_s: float | None = None,
+            ) -> dict[str, object]:
+                del remaining_s
+                if base_url == old.base_url:
+                    assert token == old.token
+                    ordering.append("old-runner-revalidated")
+                    return {
+                        "status": SessionStatus.DONE.value,
+                        "turn_active": False,
+                        "history_durable": True,
+                    }
+                assert base_url == candidate.base_url
+                assert token == candidate.token
+                ready = len(candidate_reads) >= 3
+                candidate_reads.append(ready)
+                ordering.append("candidate-attested")
+                payload = _safe_candidate_status(candidate)
+                payload["ready"] = ready
+                return payload
+
+            h.kernel._runner.status = status  # type: ignore[method-assign]
+
+            class WorkspaceProbe:
+                def claim_or_resume_with_handle(self, **kwargs: object) -> object:
+                    ordering.append("prepared-and-verified")
+                    revalidate = kwargs.get("revalidate_before_handoff")
+                    assert callable(revalidate)
+                    revalidate()
+                    validate_candidate = kwargs.get("validate_candidate")
+                    assert callable(validate_candidate)
+                    validate_candidate(candidate)
+                    return SimpleNamespace(handle=candidate, prepared=None)
+
+            h.kernel._workspace = WorkspaceProbe()  # type: ignore[assignment]
+
+            # The explicit budget bounds a regression that never stops
+            # polling, so it fails instead of hanging.
+            result = await asyncio.wait_for(
+                h.kernel._claim_or_resume(
+                    thread_key,
+                    {
+                        "CURIE_SESSION_ID": old.session_id,
+                        "CURIE_HISTORY_REF": old.history_ref or "",
+                    },
+                    workspace_deployment_id=deployment_id,
+                    workspace_repo="acme-corp/acme-bot",
+                    replace_handle=old,
+                    remaining_s=10.0,
+                ),
+                timeout=20.0,
+            )
+
+            assert result is candidate
+            assert candidate_reads == [False, False, False, True]
+            assert ordering == [
+                "prepared-and-verified",
+                "old-runner-revalidated",
+                "candidate-attested",
+                "candidate-attested",
+                "candidate-attested",
+                "candidate-attested",
+            ]
+
+    asyncio.run(go())
+
+
+def test_late_workspace_candidate_never_ready_refuses_once_budget_is_spent(
+    make_harness,
+) -> None:
+    """#4777: polling a not-ready candidate is bounded by the delivery's
+    remaining budget. A candidate that never turns ready is refused with
+    the attestation failure, not the bridge timeout, once that budget is
+    spent, after more than one read."""
+
+    deployment_id = uuid.uuid4()
+    budget_s = 3.0
+
+    async def go() -> None:
+        async with make_harness(binding=_workspace_binding(deployment_id)) as h:
+            thread_key = _thread_key("tCandidateNeverReady")
+            old, candidate = _late_candidate_handles(h, thread_key, "history/tCandidateNeverReady")
+            candidate_reads = 0
+
+            async def status(
+                base_url: str,
+                *,
+                token: str | None = None,
+                remaining_s: float | None = None,
+            ) -> dict[str, object]:
+                nonlocal candidate_reads
+                if base_url == old.base_url:
+                    assert token == old.token
+                    return {
+                        "status": SessionStatus.DONE.value,
+                        "turn_active": False,
+                        "history_durable": True,
+                    }
+                assert base_url == candidate.base_url
+                assert token == candidate.token
+                if remaining_s is not None:
+                    assert remaining_s <= budget_s
+                candidate_reads += 1
+                payload = _safe_candidate_status(candidate)
+                payload["ready"] = False
+                return payload
+
+            h.kernel._runner.status = status  # type: ignore[method-assign]
+
+            class WorkspaceProbe:
+                def claim_or_resume_with_handle(self, **kwargs: object) -> object:
+                    revalidate = kwargs.get("revalidate_before_handoff")
+                    assert callable(revalidate)
+                    revalidate()
+                    validate_candidate = kwargs.get("validate_candidate")
+                    assert callable(validate_candidate)
+                    validate_candidate(candidate)
+                    raise AssertionError("a never-ready candidate must never be returned")
+
+            h.kernel._workspace = WorkspaceProbe()  # type: ignore[assignment]
+
+            started = time.monotonic()
+            with pytest.raises(
+                ThreadBusyError, match="did not attest the expected managed checkout"
+            ):
+                await asyncio.wait_for(
+                    h.kernel._claim_or_resume(
+                        thread_key,
+                        {
+                            "CURIE_SESSION_ID": old.session_id,
+                            "CURIE_HISTORY_REF": old.history_ref or "",
+                        },
+                        workspace_deployment_id=deployment_id,
+                        workspace_repo="acme-corp/acme-bot",
+                        replace_handle=old,
+                        remaining_s=budget_s,
+                    ),
+                    timeout=budget_s + 10.0,
+                )
+            elapsed = time.monotonic() - started
+
+            # Polled, not refused on the first not-ready read, and with a
+            # pause between reads rather than a tight loop.
+            assert 1 < candidate_reads < 1000
+            # The match above proves the probe's own deadline fired rather than
+            # the coordinator bridge timeout; this bounds how long it took.
+            assert elapsed < budget_s + 3.0
+
+    asyncio.run(go())
+
+
+def test_late_workspace_candidate_never_ready_refuses_on_configured_deadline_alone(
+    make_harness,
+) -> None:
+    """#4777: with no explicit ``remaining_s`` the only bound on polling a
+    not-ready candidate is the configured ``runner_total_timeout_s``. A
+    candidate that never turns ready is still refused with the attestation
+    failure within that ceiling, after more than one read, and no status
+    call is given a longer budget than the ceiling."""
+
+    deployment_id = uuid.uuid4()
+    ceiling_s = 3.0
+
+    async def go() -> None:
+        async with make_harness(
+            binding=_workspace_binding(deployment_id),
+            runner_total_timeout_s=ceiling_s,
+        ) as h:
+            thread_key = _thread_key("tCandidateConfigDeadline")
+            old, candidate = _late_candidate_handles(
+                h, thread_key, "history/tCandidateConfigDeadline"
+            )
+            candidate_reads = 0
+            seen_remaining: list[float | None] = []
+
+            async def status(
+                base_url: str,
+                *,
+                token: str | None = None,
+                remaining_s: float | None = None,
+            ) -> dict[str, object]:
+                nonlocal candidate_reads
+                if base_url == old.base_url:
+                    assert token == old.token
+                    return {
+                        "status": SessionStatus.DONE.value,
+                        "turn_active": False,
+                        "history_durable": True,
+                    }
+                assert base_url == candidate.base_url
+                assert token == candidate.token
+                seen_remaining.append(remaining_s)
+                candidate_reads += 1
+                payload = _safe_candidate_status(candidate)
+                payload["ready"] = False
+                return payload
+
+            h.kernel._runner.status = status  # type: ignore[method-assign]
+
+            class WorkspaceProbe:
+                def claim_or_resume_with_handle(self, **kwargs: object) -> object:
+                    revalidate = kwargs.get("revalidate_before_handoff")
+                    assert callable(revalidate)
+                    revalidate()
+                    validate_candidate = kwargs.get("validate_candidate")
+                    assert callable(validate_candidate)
+                    validate_candidate(candidate)
+                    raise AssertionError("a never-ready candidate must never be returned")
+
+            h.kernel._workspace = WorkspaceProbe()  # type: ignore[assignment]
+
+            started = time.monotonic()
+            with pytest.raises(
+                ThreadBusyError, match="did not attest the expected managed checkout"
+            ):
+                await asyncio.wait_for(
+                    h.kernel._claim_or_resume(
+                        thread_key,
+                        {
+                            "CURIE_SESSION_ID": old.session_id,
+                            "CURIE_HISTORY_REF": old.history_ref or "",
+                        },
+                        workspace_deployment_id=deployment_id,
+                        workspace_repo="acme-corp/acme-bot",
+                        replace_handle=old,
+                        remaining_s=None,
+                    ),
+                    timeout=ceiling_s + 10.0,
+                )
+            elapsed = time.monotonic() - started
+
+            assert candidate_reads > 1
+            assert all(r is None or r <= ceiling_s for r in seen_remaining)
+            assert elapsed < ceiling_s + 1.0
 
     asyncio.run(go())
 
@@ -2987,7 +3283,7 @@ def test_pod_termination_cause_reaches_terminal_notice(
 ) -> None:
     async def go() -> None:
         async with make_harness(max_attempts=1) as h:
-            h.fake_k8s.termination = SimpleNamespace(reason=reason, detail=detail)
+            h.fake_k8s.termination = SandboxTermination(reason, detail)
             h.runner.default_script = [TextDelta(text="partial")]
             h.runner.abort_after_frames = True
             event = qevent("go")
@@ -3034,9 +3330,7 @@ def test_pod_termination_cause_reaches_factory_finish_detail(make_harness) -> No
         ) as h:
             items = _WorkItems()
             h.kernel._work_items = items
-            h.fake_k8s.termination = SimpleNamespace(
-                reason="Evicted", detail="The node was low on memory."
-            )
+            h.fake_k8s.termination = SandboxTermination("Evicted", "The node was low on memory.")
             h.runner.default_script = [TextDelta(text="partial")]
             h.runner.abort_after_frames = True
             event = _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
@@ -3135,6 +3429,173 @@ def test_deleted_pod_without_side_effect_retries(make_harness) -> None:
     asyncio.run(go())
 
 
+def _factory_drop(h, event_id: str):
+    items = _WorkItems()
+    h.kernel._work_items = items
+    event = _turn(event_id, ISSUE_PROMPT)
+    h.runner.default_script = [SideEffectFlag(tool="deploy"), TextDelta(text="partial")]
+    h.runner.hold = _DropAfterSideEffectPersisted(
+        h.async_redis, h.config.side_effect_key(event.event_id)
+    )
+    return items, event
+
+
+def test_late_oomkilled_after_side_effect_finishes_sandbox_terminated(make_harness) -> None:
+    async def go() -> None:
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=_PublicationApi(),
+            max_attempts=1,
+            pod_termination_wait_s=10.0,
+        ) as h:
+            items, event = _factory_drop(h, f"work-item-{uuid.uuid4()}-execute-8")
+            first: dict[str, float | None] = {"at": None}
+            returned: list[object] = []
+
+            def diagnose(name: str, *, request_timeout_seconds: float, since: datetime):
+                assert request_timeout_seconds > 0
+                assert since.tzinfo is not None
+                h.fake_k8s.termination_queries.append(name)
+                now = time.monotonic()
+                if first["at"] is None:
+                    first["at"] = now
+                if now - first["at"] >= 1.2:
+                    found = SandboxTermination("OOMKilled", "exit code 137")
+                else:
+                    found = None
+                returned.append(found)
+                return found
+
+            h.fake_k8s.pod_termination = diagnose
+            await h.kernel.process_event(event)
+
+            assert h.runner.opened == [ISSUE_PROMPT]
+            assert len(items.finishes) == 1
+            finish = items.finishes[0]
+            assert finish["outcome"] == "failed"
+            assert finish["cause"] == "sandbox_terminated"
+            detail = finish["detail"]
+            assert isinstance(detail, str)
+            assert "Kubernetes pod terminated: OOMKilled (exit code 137)." in detail
+            assert "The runner container hit its memory limit." in detail
+            assert returned[-1] is not None
+            assert all(item is None for item in returned[:-1])
+
+    asyncio.run(go())
+
+
+def test_stream_drop_without_termination_ends_runner_error_at_the_10_s_bound(
+    make_harness, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    async def go() -> None:
+        class _Clock:
+            def __init__(self) -> None:
+                self.now = 0.0
+                self.sleeps: list[float] = []
+
+            def read(self) -> float:
+                return self.now
+
+            async def sleep(self, delay: float) -> None:
+                self.sleeps.append(delay)
+                self.now += delay
+
+        clock = _Clock()
+        monkeypatch.setattr(kernel_attempt, "_pod_termination_clock", clock.read)
+        monkeypatch.setattr(kernel_attempt, "_pod_termination_sleep", clock.sleep)
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=_PublicationApi(),
+            max_attempts=1,
+            pod_termination_wait_s=10.0,
+        ) as h:
+            items, event = _factory_drop(h, f"work-item-{uuid.uuid4()}-execute-8")
+            read_at: list[float] = []
+
+            def diagnose(name: str, *, request_timeout_seconds: float, since: datetime):
+                assert request_timeout_seconds > 0
+                h.fake_k8s.termination_queries.append(name)
+                read_at.append(clock.now)
+                return None
+
+            h.fake_k8s.pod_termination = diagnose
+            wall = time.monotonic()
+            await h.kernel.process_event(event)
+            assert time.monotonic() - wall < 2.0
+
+            assert "runner-error" in caplog.text
+            assert len(items.finishes) == 1
+            assert items.finishes[0]["cause"] == "runner_escalated"
+            assert read_at == [i * 0.5 for i in range(20)]
+            assert clock.sleeps
+            assert all(delay == 0.5 for delay in clock.sleeps)
+            assert all(moment < 10.0 for moment in read_at)
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("scenario", ["late", "none"])
+def test_sandbox_release_waits_for_termination_classification(
+    make_harness, monkeypatch: pytest.MonkeyPatch, scenario: str
+) -> None:
+    async def go() -> None:
+        class _Clock:
+            def __init__(self) -> None:
+                self.now = 0.0
+
+            def read(self) -> float:
+                return self.now
+
+            async def sleep(self, delay: float) -> None:
+                self.now += delay
+
+        if scenario == "none":
+            clock = _Clock()
+            monkeypatch.setattr(kernel_attempt, "_pod_termination_clock", clock.read)
+            monkeypatch.setattr(kernel_attempt, "_pod_termination_sleep", clock.sleep)
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=_PublicationApi(),
+            max_attempts=1,
+            pod_termination_wait_s=10.0,
+        ) as h:
+            _items, event = _factory_drop(h, f"work-item-{uuid.uuid4()}-execute-8")
+            order: list[str] = []
+            first: dict[str, float | None] = {"at": None}
+            original_delete = h.fake_k8s.delete_claim
+
+            def diagnose(name: str, *, request_timeout_seconds: float, since: datetime):
+                order.append("pod_termination")
+                h.fake_k8s.termination_queries.append(name)
+                if scenario == "none":
+                    return None
+                now = time.monotonic()
+                if first["at"] is None:
+                    first["at"] = now
+                if now - first["at"] >= 1.2:
+                    return SandboxTermination("OOMKilled", "exit code 137")
+                return None
+
+            def delete_claim(name: str, *, request_timeout_seconds: float) -> None:
+                order.append("delete_claim")
+                original_delete(name, request_timeout_seconds=request_timeout_seconds)
+
+            h.fake_k8s.pod_termination = diagnose
+            h.fake_k8s.delete_claim = delete_claim
+            await h.kernel.process_event(event)
+
+            deletes = [i for i, name in enumerate(order) if name == "delete_claim"]
+            reads = [i for i, name in enumerate(order) if name == "pod_termination"]
+            assert deletes
+            assert reads
+            assert max(reads) < deletes[0]
+
+    asyncio.run(go())
+
+
 def test_first_eviction_survives_generic_failure_on_retry_in_terminal_and_factory(
     make_harness, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -3149,7 +3610,7 @@ def test_first_eviction_survives_generic_failure_on_retry_in_terminal_and_factor
             h.kernel._work_items = items
             diagnoses = iter(
                 [
-                    SimpleNamespace(
+                    SandboxTermination(
                         reason="Evicted",
                         detail=(
                             'Usage of EmptyDir volume "workspace" exceeds the limit "1Gi". '
@@ -3162,7 +3623,7 @@ def test_first_eviction_survives_generic_failure_on_retry_in_terminal_and_factor
 
             def diagnose(
                 name: str, *, request_timeout_seconds: float, since: datetime
-            ) -> SimpleNamespace | None:
+            ) -> SandboxTermination | None:
                 h.fake_k8s.termination_queries.append(name)
                 return next(diagnoses)
 
@@ -5508,9 +5969,7 @@ def test_approval_resume_capacity_keeps_an_earlier_pod_termination(
                 h.fake_k8s.sandboxes.clear()
                 return found
 
-            h.fake_k8s.termination = SimpleNamespace(
-                reason="Evicted", detail="The node was low on memory."
-            )
+            h.fake_k8s.termination = SandboxTermination("Evicted", "The node was low on memory.")
             monkeypatch.setattr(h.fake_k8s, "pod_termination", evicted_then_full)
             h.runner.default_script = [TextDelta(text="partial")]
             h.runner.abort_after_frames = True

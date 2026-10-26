@@ -178,7 +178,9 @@ fn stable_v0100_sorts_after_its_release_candidate_for_fail_forward() {
 /// canvas edits expansion 0084, action executions expansion 0085, OIDC login
 /// expansion 0100, tenant-scope expansion 0101, reply target expansion 0102, the
 /// tracker identity contract 0103, trigger label expansion 0105, and identity
-/// links expansion 0107 and train join 0108, so the upgrade is forward-only.
+/// links expansion 0107 and train join 0108, then team sync state 0120 and
+/// agent access policies 0121, directory identity 0122 and the attachment
+/// catalog 0130, so the upgrade is forward-only.
 #[test]
 fn v091_source_upgrades_through_the_packaged_chart_graph() {
     let source = window_for("0.9.1").expect("0.9.1 is catalogued");
@@ -267,6 +269,12 @@ fn v091_source_upgrades_through_the_packaged_chart_graph() {
             "0107",
             "0106",
             "0108",
+            "0120",
+            "0121",
+            "0122",
+            "0123",
+            "0130",
+            "0131",
             "selfimp_safety_0001",
             "selfimp_skills_0001",
             "selfimp_sched_0001",
@@ -378,6 +386,12 @@ fn released_v0101_upgrades_through_the_new_feature_train_revision() {
             "0107",
             "0106",
             "0108",
+            "0120",
+            "0121",
+            "0122",
+            "0123",
+            "0130",
+            "0131",
             "selfimp_safety_0001",
             "selfimp_skills_0001",
             "selfimp_sched_0001",
@@ -415,7 +429,8 @@ fn released_v0101_upgrades_through_the_new_feature_train_revision() {
 /// identities, and remediation tables, plus OIDC login expansion 0100 and
 /// tenant-scope expansion 0101, reply target expansion 0102, the tracker
 /// identity contract 0103, trigger label expansion 0105 and identity links
-/// expansion 0107 and train join 0108.
+/// expansion 0107 and train join 0108, then team sync state 0120 and agent
+/// access policies 0121, directory identity 0122 and the attachment catalog 0130.
 #[test]
 fn released_v0102_upgrades_through_the_feature_train_revisions() {
     // @spec DEPLOY-NOTICE-RELEASE-1.
@@ -485,6 +500,12 @@ fn released_v0102_upgrades_through_the_feature_train_revisions() {
             "0107",
             "0106",
             "0108",
+            "0120",
+            "0121",
+            "0122",
+            "0123",
+            "0130",
+            "0131",
             "selfimp_safety_0001",
             "selfimp_skills_0001",
             "selfimp_sched_0001",
@@ -523,7 +544,9 @@ fn released_v0102_upgrades_through_the_feature_train_revisions() {
 /// released factory queue migration for runner resources. Route identity 0070
 /// is a contract step; expansions 0071 through 0102 follow it, then the
 /// tracker identity contract 0103, the trigger label expansion 0105, and the
-/// identity links expansion 0107 and train join 0108.
+/// identity links expansion 0107 and train join 0108, then team sync state
+/// expansion 0120, agent access policies 0121, directory identity 0122 and the
+/// attachment catalog 0130.
 #[test]
 fn released_v0103_upgrades_through_the_renumbered_feature_train() {
     // @spec DEPLOY-NOTICE-RELEASE-1.
@@ -592,6 +615,12 @@ fn released_v0103_upgrades_through_the_renumbered_feature_train() {
             "0107",
             "0106",
             "0108",
+            "0120",
+            "0121",
+            "0122",
+            "0123",
+            "0130",
+            "0131",
             "selfimp_safety_0001",
             "selfimp_skills_0001",
             "selfimp_sched_0001",
@@ -726,12 +755,19 @@ impl RollbackFixture {
     }
 
     fn run(&self, extra: &[&str]) -> Output {
+        let home = self.dir.path().join("home");
+        let kubeconfig = home.join(".kube").join("config");
+        fs::create_dir_all(home.join(".kube")).expect("create private kubeconfig directory");
+        fs::write(&kubeconfig, "").expect("write empty kubeconfig");
         let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_curie"));
         cmd.args(["cluster", "rollback"])
             .args(["--namespace", "agent-ns", "--release", "prod-release"])
             .args(["--yes", "--json"])
             .args(extra)
             .env("PATH", fake_tool_path(self.dir.path()))
+            .env("HOME", &home)
+            .env("KUBECONFIG", &kubeconfig)
+            .env("TMPDIR", self.dir.path())
             .env("NO_COLOR", "1");
         cmd.output().expect("run curie cluster rollback")
     }
@@ -739,12 +775,19 @@ impl RollbackFixture {
     /// Same command as `run` but without `--json`, so the human error
     /// presenter (stderr `Error: <message>`) is what the caller observes.
     fn run_human(&self, extra: &[&str]) -> Output {
+        let home = self.dir.path().join("home");
+        let kubeconfig = home.join(".kube").join("config");
+        fs::create_dir_all(home.join(".kube")).expect("create private kubeconfig directory");
+        fs::write(&kubeconfig, "").expect("write empty kubeconfig");
         let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_curie"));
         cmd.args(["cluster", "rollback"])
             .args(["--namespace", "agent-ns", "--release", "prod-release"])
             .args(["--yes"])
             .args(extra)
             .env("PATH", fake_tool_path(self.dir.path()))
+            .env("HOME", &home)
+            .env("KUBECONFIG", &kubeconfig)
+            .env("TMPDIR", self.dir.path())
             .env("NO_COLOR", "1");
         cmd.output().expect("run curie cluster rollback")
     }
@@ -1146,11 +1189,18 @@ fn unambiguous_v090_does_not_read_retained_manifest() {
 }
 
 fn run_rollback_json(dir: &Path) -> std::process::Output {
+    let home = dir.join("home");
+    let kubeconfig = home.join(".kube").join("config");
+    fs::create_dir_all(home.join(".kube")).expect("create private kubeconfig directory");
+    fs::write(&kubeconfig, "").expect("write empty kubeconfig");
     std::process::Command::new(env!("CARGO_BIN_EXE_curie"))
         .args(["cluster", "rollback"])
         .args(["--namespace", "agent-ns", "--release", "prod-release"])
         .args(["--yes", "--json"])
         .env("PATH", fake_tool_path(dir))
+        .env("HOME", &home)
+        .env("KUBECONFIG", &kubeconfig)
+        .env("TMPDIR", dir)
         .env("NO_COLOR", "1")
         .output()
         .expect("run curie cluster rollback --json")

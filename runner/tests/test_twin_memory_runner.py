@@ -1,4 +1,4 @@
-"""Twin memory in the runner (ADR 0239, Contract r4): boot composition and tools.
+"""Twin memory in the runner (ADR 0249, Contract r4): boot composition and tools.
 
 Every case drives the process entrypoint ``__main__._serve`` with the real
 ``build_runner``: ``web.run_app`` is captured instead of serving, the capability
@@ -55,6 +55,7 @@ from curie_runner.approval import APPROVAL_SERVER_NAME
 from curie_runner.mcp_tool_capability import McpToolCapabilityProbe
 from curie_runner.memory_facts import DEFAULT_GUIDANCE
 from curie_runner.server import RUNNER
+from runner_boot_session import initialized_session_sync
 
 # --------------------------------------------------------------------------- #
 # Constants
@@ -819,7 +820,7 @@ def _booted(
         boot._serve()  # noqa: SLF001 -- the process entrypoint is the subject
         [app] = apps
         runner = app[RUNNER]
-        options = runner._factory().options  # noqa: SLF001 - read the built options
+        options = initialized_session_sync(runner).options
         assert isinstance(options.system_prompt, str)
         yield Booted(runner, options, options.system_prompt, api)
 

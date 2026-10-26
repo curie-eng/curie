@@ -1,4 +1,4 @@
-"""Twin memory (ADR 0239) through the source CLI and real candidate services.
+"""Twin memory (ADR 0249) through the source CLI and real candidate services.
 
 Deterministic cases stand up a private Compose API on real Postgres and drive
 the real `curie` binary at both tiers: typed fact metadata, archive, restore,

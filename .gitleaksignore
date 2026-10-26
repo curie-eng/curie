@@ -161,3 +161,58 @@ a6ad6a14d49962754a56754da7c216469acd3bb6:runner/tests/test_redact.py:generic-api
 # commit on the same branch derives it at runtime; this fingerprint stays
 # because the first commit is still reachable from the pull request branch.
 79fb0fbeea09d12ea223ca4382c9e443dc235bd7:tools/factory-e2e/tests/test_forge_instance_harness.py:generic-api-key:93
+
+# Fixture findings from the 2026-10-19 full-history scan (run 39210493051).
+# Each fingerprint is one historical test or demo line. A later edit is a new fingerprint.
+# Fixture in examples/dark-factory/preparation/evals/publication-cases.json.
+655a83ef1f70ec9434d33665e5a0376da50dc756:examples/dark-factory/preparation/evals/publication-cases.json:cross-repo-issue-ref:50
+# Fixture in examples/dark-factory/preparation/evals/publication-cases.json.
+655a83ef1f70ec9434d33665e5a0376da50dc756:examples/dark-factory/preparation/evals/publication-cases.json:cross-repo-issue-ref:73
+# Fixture in examples/dark-factory/preparation/evals/publication-cases.json.
+655a83ef1f70ec9434d33665e5a0376da50dc756:examples/dark-factory/preparation/evals/publication-cases.json:cross-repo-issue-ref:222
+# Fixture in examples/dark-factory/preparation/evals/publication-cases.json.
+655a83ef1f70ec9434d33665e5a0376da50dc756:examples/dark-factory/preparation/evals/publication-cases.json:cross-repo-issue-ref:227
+# Fixture in runner/tests/test_redact.py.
+d3383d0cbcd7b0ff5f3d1fcdf2744e12fbd2fb2f:runner/tests/test_redact.py:generic-api-key:724
+# Fixture in runner/tests/test_redact.py.
+d3383d0cbcd7b0ff5f3d1fcdf2744e12fbd2fb2f:runner/tests/test_redact.py:generic-api-key:734
+# Fixture in cli/tests/provider_harness_test.py.
+42aa9781fac41748647c7fd5559b07e49fda9aff:cli/tests/provider_harness_test.py:aws-account-id:1037
+# Fixture in cli/tests/provider_harness_test.py.
+42aa9781fac41748647c7fd5559b07e49fda9aff:cli/tests/provider_harness_test.py:aws-account-id:1039
+# Fixture in cli/tests/provider_harness_test.py.
+42aa9781fac41748647c7fd5559b07e49fda9aff:cli/tests/provider_harness_test.py:aws-account-id:1046
+# Fixture in apps/api/tests/test_provider_installations.py.
+234823b488f3737a19e30db808337fa75bb8e88c:apps/api/tests/test_provider_installations.py:generic-api-key:45
+# Fixture in apps/api/tests/test_provider_installations.py.
+234823b488f3737a19e30db808337fa75bb8e88c:apps/api/tests/test_provider_installations.py:generic-api-key:1133
+# Fixture in apps/api/tests/test_screens.py.
+46f045cdd447b8293d9bbeafd7698d12fe8763c1:apps/api/tests/test_screens.py:slack-conversation-id:534
+# Fixture in apps/api/tests/test_screens.py.
+46f045cdd447b8293d9bbeafd7698d12fe8763c1:apps/api/tests/test_screens.py:slack-conversation-id:546
+# Fixture in apps/api/tests/test_screens.py.
+46f045cdd447b8293d9bbeafd7698d12fe8763c1:apps/api/tests/test_screens.py:slack-conversation-id:550
+# Fixture in apps/api/tests/test_fleet.py.
+46f045cdd447b8293d9bbeafd7698d12fe8763c1:apps/api/tests/test_fleet.py:slack-conversation-id:71
+# Fixture in apps/api/tests/test_fleet.py.
+46f045cdd447b8293d9bbeafd7698d12fe8763c1:apps/api/tests/test_fleet.py:slack-conversation-id:72
+# Fixture in examples/curie-control/demo/seed.py.
+46f045cdd447b8293d9bbeafd7698d12fe8763c1:examples/curie-control/demo/seed.py:slack-conversation-id:16
+# Fixture in examples/curie-control/demo/seed.py.
+46f045cdd447b8293d9bbeafd7698d12fe8763c1:examples/curie-control/demo/seed.py:slack-conversation-id:17
+# Fixture in examples/curie-control/demo/seed.py.
+46f045cdd447b8293d9bbeafd7698d12fe8763c1:examples/curie-control/demo/seed.py:slack-conversation-id:18
+# Fixture in examples/curie-control/demo/seed.py.
+46f045cdd447b8293d9bbeafd7698d12fe8763c1:examples/curie-control/demo/seed.py:slack-conversation-id:19
+
+# Invented tracker display keys in the factory-e2e acceptance evidence
+# fixtures (#4866): the placeholder scope joined with "/fixture" and issue
+# ids 3, 41 and 7, written as single literals at the first publication commit
+# of PR #4933 -- never a downstream reference. The current lines are split
+# across the slash so the `cross-repo-issue-ref` rule no longer reads them;
+# these fingerprints stay because that commit is still reachable from the
+# pull request branch, exactly like the Forge harness redaction fixtures
+# (#4706) above.
+5f98d1bce852a94c4545c27a599d24a314a23f59:tools/factory-e2e/tests/test_gitlab_acceptance.py:cross-repo-issue-ref:447
+5f98d1bce852a94c4545c27a599d24a314a23f59:tools/factory-e2e/tests/test_acceptance.py:cross-repo-issue-ref:626
+5f98d1bce852a94c4545c27a599d24a314a23f59:tools/factory-e2e/tests/test_factory_e2e_loop.py:cross-repo-issue-ref:978

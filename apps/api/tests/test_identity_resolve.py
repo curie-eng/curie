@@ -917,7 +917,10 @@ def _cleanup() -> None:
     # test body rather than every fixture.
     _sql(
         "DO $$ BEGIN "
-        "IF to_regclass('curie.identity_links') IS NOT NULL THEN "
+        "IF to_regclass('curie.identity_connect_tokens') IS NOT NULL THEN "
+        "TRUNCATE curie.identity_connect_tokens, curie.identity_links, "
+        "curie.identity_namespaces; "
+        "ELSIF to_regclass('curie.identity_links') IS NOT NULL THEN "
         "TRUNCATE curie.identity_links, curie.identity_namespaces; END IF; "
         "TRUNCATE curie.channel_identities, curie.provider_installations; END $$"
     )

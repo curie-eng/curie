@@ -69,6 +69,7 @@ CAPABILITIES: Mapping[Operation, Support] = {
     Operation.CI_DIAGNOSTICS: Support.UNSUPPORTED,
     Operation.RERUN_FAILED: Support.UNSUPPORTED,
     Operation.USER_CAN_WRITE: Support.UNSUPPORTED,
+    Operation.REQUIRED_CHECKS: Support.UNSUPPORTED,
 }
 # A feedback listing re-reads this far behind its cursor and drops what it
 # already returned, so a comment stamped late is still listed once (decision 10.5).
@@ -427,8 +428,10 @@ class BitbucketCloudCodeHost:
         (``GET /2.0/user`` answers 403, see `bitbucket_cloud.comments`), so
         ownership cannot be checked here. Every same-repository pull request
         whose branch is publication shaped is listed, a writer's lookalike
-        included, and rediscovery drops every unverified publication, so it never treats one
-        as evidence and does not suppress a reinstall on Bitbucket Cloud.
+        included. Rediscovery never treats one as proof of the factory's own
+        work, but an open one naming the issue refuses admission as
+        ``unconfirmed`` and asks the operator to confirm it (#4747), so a
+        reinstall does not open a duplicate pull request.
 
         ``GET /repositories/{workspace}/{slug}/pullrequests`` with every
         ``state`` (https://developer.atlassian.com/cloud/bitbucket/rest/api-group-pullrequests/#api-repositories-workspace-repo-slug-pullrequests-get)
@@ -575,6 +578,9 @@ class BitbucketCloudCodeHost:
                 latest[key] = status
         checks = tuple(_status_check(key, status, head_sha) for key, status in latest.items())
         return CiRollup.on_head(head_sha, checks)
+
+    async def required_checks(self, repository: RepositoryRef, branch: str) -> frozenset[str]:
+        raise Unsupported(Operation.REQUIRED_CHECKS)
 
     async def ci_diagnostics(
         self, repository: RepositoryRef, head_sha: str, *, base_ref: str | None

@@ -55,7 +55,7 @@ STATE_TOKEN_ENV = BootEnv.env_key("state_token")
 # Namespaces already owned by the memory (#264) and history (#20) ports. A skill
 # must not read or write them through the general state door, so both are fenced
 # off in one place (a bundle that wants durable memory uses the remember tool).
-# ``agent_schedules`` (ADR 0238) and ``learned_skills`` (ADR 0237) are never
+# ``agent_schedules`` (ADR 0248) and ``learned_skills`` (ADR 0247) are never
 # stored here; each has its own router as the door.
 RESERVED_NAMESPACES = frozenset({"memory", "transcript", "agent_schedules", "learned_skills"})
 

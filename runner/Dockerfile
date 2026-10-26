@@ -24,7 +24,7 @@
 # and an amd64 CI runner both work -- a hardcoded tarball URL would not).
 # Floating tags would still pick up upstream OS security patches without a
 # commit; Dependabot's docker ecosystem raises those base moves as PRs instead.
-FROM node:22.23.2-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5 AS node
+FROM node:22.23.4-bookworm-slim@sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d AS node
 
 FROM python:3.13.15-slim-bookworm@sha256:ed86c82274b3c69b52fb5820f358f0bd7df0b603332063cb5c6e32bd220c3e6e
 

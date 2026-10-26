@@ -3,7 +3,7 @@
 The ranking matches the worker cron loop: prod outranks dev, then the newest
 active deployment. Declarations are read from that version's bundle. ``hook_runs``
 supplies the newest slot of each source for a name the bundle still declares.
-Agent-created schedules (ADR 0238) are listed beside them, and pause and resume
+Agent-created schedules (ADR 0248) are listed beside them, and pause and resume
 accept their ``agent-schedule:<id>`` names.
 """
 

@@ -16,9 +16,10 @@ One script handles every hook event the bundle registers:
 ``PreToolUse`` on ``Edit``/``Write``/``MultiEdit``/``NotebookEdit``
     An edit under the workspace's root ``.github`` directory stops the run in
     every phase, matching the first path component case-insensitively. No
-    repository edit before the workflow is loaded and the plan reviewer
-    approved. Right after approval (phase ``failing_test``) only test edits may
-    run: an edit to a test file, or an edit that adds a test (an inline Rust
+    repository edit before the workflow is loaded and the one plan review
+    completed with ``VERDICT: APPROVE`` or ``VERDICT: CHANGES`` (CHANGES is
+    advice, not a block). Right after it (phase ``failing_test``) only test
+    edits may run: an edit to a test file, or an edit that adds a test (an inline Rust
     ``#[test]`` module, a ``def test_`` function, and so on): its inserted text
     holds more test markers than the text it replaces (for ``Write``, the file
     on disk), and a notebook cell outside a test path counts only when
@@ -51,22 +52,26 @@ One script handles every hook event the bundle registers:
     it names a reviewer, otherwise inferred from the description and prompt.
     ``isolation`` and ``model`` are stripped and ``run_in_background`` is forced
     to ``false``. The call is refused out of order: no diff review before the
-    plan is approved, and no plan review after it (a diff rejection returns to
-    implement, not to plan). Before a diff review, a changed or untracked root
+    plan review completed, and no second plan review in the run (a diff
+    rejection returns to implement, not to plan). Before a diff review, a changed or untracked root
     ``.github`` path stops the run; an unreadable git status lets review proceed.
     The hook numbers the round itself and writes the
     ``plan_review`` or ``review_diff`` phase line to the pod log. It appends
     the bundle's verification contract to the prompt, the same bytes for both
     reviewers, followed by the bundle's ``verification/checks.json`` when the
     bundle declares one, fenced as declared data. When either cannot be read
-    the call is denied and the run stops.
+    the call is denied and the run stops. A missing prompt fingerprint denies
+    plan review before spending a round; it cannot be captured later in the run.
 
 ``PostToolUse`` / ``PostToolUseFailure`` on ``Agent``/``Task``
     Reads the reviewer's ``REVIEWER:`` and ``VERDICT:`` lines. A reply without
-    them, or a call that errored, fails the run. ``VERDICT: CHANGES`` on round
-    ``MAX_ROUNDS`` caps the loop. A plan ``APPROVE`` is refused, and the run
-    stops, when the checkout fingerprint differs from the one taken at the
-    prompt or cannot be computed. After a real verdict the reviewer's
+    them, or a call that errored, fails the run. Either plan verdict opens
+    phase ``failing_test``; a plan ``CHANGES`` is advice whose findings the
+    implementer keeps, fixes when blocking, and hands to the diff reviewer.
+    A diff ``VERDICT: CHANGES`` on round ``MAX_ROUNDS`` caps the diff loop.
+    Either plan verdict is refused, and the run stops, when the checkout
+    fingerprint differs from the one taken at the prompt or cannot be
+    computed. After a real verdict the reviewer's
     ``VERIFICATION:`` block is written as one ``curie_gate:
     verification_classified`` line (stage, round, verdict and each
     criterion's route); a reply without the block is recorded as absent. A
@@ -95,8 +100,15 @@ One script handles every hook event the bundle registers:
 
 ``UserPromptSubmit``
     A new message starts a new run: the reset state is saved, then the checkout
-    fingerprint is taken under a deadline that also bounds hashing untracked
-    files. A CI fix round starts at ``implement``. A fresh run and a CI fix
+    fingerprint is taken with at most two attempts sharing a seven-second
+    deadline that also bounds hashing untracked files. If neither succeeds,
+    the run stops with the prerequisite failure. A prompt whose first line is
+    exactly ``<task-notification>`` (the text before the first newline,
+    compared with no stripping) continues the current run: saved state is
+    loaded and left as it is, the fingerprint is
+    not retaken, and the hook returns no additional context. Every other
+    prompt, including one that contains that line anywhere else, still starts
+    a new run. A CI fix round starts at ``implement``. A fresh run and a CI fix
     round both return the verification contract as additional context; an
     unreadable contract stops the run instead.
 
@@ -130,6 +142,10 @@ from typing import Any
 
 MAX_ROUNDS = 3
 PLAN, DIFF = "dark-factory:plan-reviewer", "dark-factory:diff-reviewer"
+# Either verdict from the one plan review opens phase failing_test; CHANGES is advice.
+ADVISORY_PLAN_VERDICTS = ("APPROVE", "CHANGES")
+# One plan review per run; the diff loop keeps its cap.
+ROUND_CAP = {PLAN: 1, DIFF: MAX_ROUNDS}
 PHASE = {PLAN: "plan_review", DIFF: "review_diff"}
 LOOP = {PLAN: "plan", DIFF: "diff"}
 BACK_TO = {PLAN: "plan", DIFF: "implement"}
@@ -153,6 +169,11 @@ TEST_FILES = ("test_*", "*_test.*", "*.test.*", "*.spec.*", "*_spec.*", "conftes
 # The hook itself has 10 seconds; the git calls share most of it.
 GIT_BUDGET_SECONDS = 7.0
 GIT_CALL_SECONDS = 3.0
+FINGERPRINT_MISSING = (
+    "The initial checkout fingerprint could not be captured (checkout_unverifiable). "
+    "Ensure the checkout is readable by Git within the seven-second budget, "
+    "then submit a new prompt before plan review."
+)
 # The one verification contract for the implementer and both reviewers (#3874).
 CONTRACT_PATH = Path(__file__).resolve().parents[1] / "verification" / "contract.md"
 CONTRACT_HEADER = (
@@ -254,8 +275,8 @@ def _fresh(prompt: str = "") -> dict[str, Any]:
     hook's own marker, written by the platform; the runner frames the message
     with its sender header first); a match anywhere else,
     including inside the untrusted CI JSON that follows, has no effect. A CI
-    fix round starts with the plan already approved (plan review already
-    happened), the workflow loaded, the stage at ``implement``, and the diff
+    fix round starts with the plan review already completed (stored as
+    ``APPROVE``), the workflow loaded, the stage at ``implement``, and the diff
     loop at round 0.
     """
     lines = _message_lines(prompt)
@@ -423,7 +444,7 @@ def _github_changed_path(workspace: str) -> str | None:
     return None
 
 
-def fingerprint(workspace: str) -> str | None:
+def fingerprint(workspace: str, deadline: float) -> str | None:
     """A sha256 over the checkout's HEAD, status, diff and untracked files.
 
     ``None`` when any part cannot be read in time: the caller treats that as an
@@ -431,7 +452,6 @@ def fingerprint(workspace: str) -> str | None:
     """
     if not workspace:
         return None
-    deadline = time.monotonic() + GIT_BUDGET_SECONDS
     digest = hashlib.sha256()
     try:
         top, head = _git(workspace, deadline, "rev-parse", "--show-toplevel", "HEAD").split()
@@ -457,7 +477,7 @@ def fingerprint(workspace: str) -> str | None:
                             return None
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
-    return digest.hexdigest()
+    return digest.hexdigest() if time.monotonic() < deadline else None
 
 
 def is_test_path(path: str, workspace: str) -> bool:
@@ -839,13 +859,19 @@ def pre_agent(state: dict[str, Any], tool_input: dict[str, Any]) -> dict[str, An
     if kind == DIFF and (path := _github_changed_path(state["workspace"])) is not None:
         return _deny(_stop_for_github_path(state, path))
     plan, diff = state["plan"], state["diff"]
-    if kind == DIFF and plan["verdict"] != "APPROVE":
-        return _deny("The plan reviewer has not approved the plan yet; run the plan review first.")
-    if kind == PLAN and plan["verdict"] == "APPROVE":
+    if kind == DIFF and not plan_reviewed(state):
+        return _deny("The plan review has not completed yet; run the plan review first.")
+    if kind == PLAN and plan_reviewed(state):
         return _deny(
-            "The plan is already approved. A diff review rejection returns to "
-            "implement, not to plan: fix the diff and call the diff reviewer."
+            "The one advisory plan review already completed with VERDICT: "
+            f"{plan['verdict']}. Carry its findings into phase failing_test. A diff "
+            "review rejection returns to implement, not to plan: fix the diff and "
+            "call the diff reviewer."
         )
+    if kind == PLAN and state["fingerprint"] is None:
+        state["stopped"] = FINGERPRINT_MISSING
+        emit_gate(state, "fingerprint_unavailable", stage="plan_review")
+        return _deny(_stop_text(state["stopped"]))
     if kind == DIFF and diff["verdict"] == "APPROVE":
         return _deny("The diff reviewer already approved; go to publish.")
     contract = contract_text()
@@ -859,8 +885,8 @@ def pre_agent(state: dict[str, Any], tool_input: dict[str, Any]) -> dict[str, An
         return _deny(_stop_text(state["stopped"]))
     loop = state[LOOP[kind]]
     round_ = loop["round"] + 1
-    if round_ > MAX_ROUNDS:
-        state["stopped"] = f"The {PHASE[kind]} loop hit its {MAX_ROUNDS} round cap."
+    if round_ > ROUND_CAP[kind]:
+        state["stopped"] = f"The {PHASE[kind]} loop hit its {ROUND_CAP[kind]} round cap."
         return _deny(_stop_text(state["stopped"]))
     loop["round"] = round_
     loop["verdict"] = None
@@ -899,10 +925,11 @@ def pre_edit(state: dict[str, Any], tool: str, tool_input: dict[str, Any]) -> di
             "No repository edit before the workflow is loaded. Call the Skill tool "
             "with skill 'dark-factory:implement-issue' and follow it."
         )
-    elif state["plan"]["verdict"] != "APPROVE":
+    elif not plan_reviewed(state):
         reason = (
-            "No repository edit before plan review approves the plan. Finish phase "
-            f"plan and call {PLAN!r}; edits open after its VERDICT: APPROVE."
+            "No repository edit before the plan review completes. Finish phase "
+            f"plan and call {PLAN!r}; edits open after its completed verdict "
+            "(VERDICT: APPROVE or VERDICT: CHANGES)."
         )
     elif state["stage"] == "failing_test" and not is_test_edit(state, tool, path, tool_input):
         reason = (
@@ -958,9 +985,18 @@ def post_skill(state: dict[str, Any], tool_input: dict[str, Any]) -> None:
         emit_gate(state, "workflow_loaded", skill=tool_input["skill"])
 
 
+def plan_reviewed(state: dict[str, Any]) -> bool:
+    """Whether the one plan review completed with a recognized verdict."""
+    return state["plan"]["verdict"] in ADVISORY_PLAN_VERDICTS
+
+
 def refuse_approval(state: dict[str, Any]) -> str | None:
-    """The stop cause when the checkout moved before plan approval, else ``None``."""
-    now = fingerprint(state["workspace"])
+    """The stop cause when the checkout moved before the plan review completed, else ``None``."""
+    now = (
+        fingerprint(state["workspace"], time.monotonic() + GIT_BUDGET_SECONDS)
+        if state["fingerprint"] is not None
+        else None
+    )
     if state["fingerprint"] is None or now is None:
         cause = "checkout_unverifiable"
     elif now != state["fingerprint"]:
@@ -986,15 +1022,24 @@ def post_agent(
         )
         return _context(event, _stop_text(state["stopped"]))
     record_verification(state, kind, round_, verdict, response)
-    if kind == PLAN and verdict == "APPROVE":
+    if kind == PLAN and verdict in ADVISORY_PLAN_VERDICTS:
         cause = refuse_approval(state)
         if cause is not None:
             state["stopped"] = (
-                f"The plan approval on round {round_} is refused ({cause}): the "
-                "repository checkout must not change before the plan reviewer approves."
+                f"The plan review on round {round_} is refused ({cause}): the "
+                "repository checkout must not change before the plan review completes."
             )
             return _context(event, _stop_text(state["stopped"]))
         state["stage"] = "failing_test"
+        loop["verdict"] = verdict
+        if verdict == "CHANGES":
+            return _context(
+                event,
+                f"{PHASE[kind]} round {round_}: CHANGES. This was the one advisory plan "
+                "review. Go to phase failing_test. Keep every finding, fix each blocking "
+                "finding before the diff review, list each finding and its resolution in "
+                "the diff review prompt, and never run the plan review again.",
+            )
     loop["verdict"] = verdict
     if verdict == "APPROVE":
         nxt = "failing_test" if kind == PLAN else "publish"
@@ -1019,18 +1064,45 @@ def pre_publish(state: dict[str, Any]) -> dict[str, Any]:
     return _allow("diff review approved")
 
 
+_TASK_NOTIFICATION_LINE = "<task-notification>"
+
+
+def _continues_current_run(prompt: str) -> bool:
+    """True when the CLI's own background-task wake opens the prompt.
+
+    The first line is the text before the first newline, compared exactly,
+    with no stripping. A platform message always opens with the sender frame,
+    so only the CLI's own framing can match.
+    """
+    first, _, _ = prompt.partition("\n")
+    return first == _TASK_NOTIFICATION_LINE
+
+
 def handle(data: dict[str, Any]) -> dict[str, Any] | None:
     event = data.get("hook_event_name", "")
     path = state_path(str(data.get("session_id") or ""))
     if event == "UserPromptSubmit":
-        state = _fresh(str(data.get("prompt") or ""))
+        prompt = str(data.get("prompt") or "")
+        if _continues_current_run(prompt):
+            load(path)
+            return None
+        state = _fresh(prompt)
         state["workspace"] = os.environ.get("DARK_FACTORY_WORKSPACE") or str(data.get("cwd") or "")
         ci_round = state["ci_round"]
         if not ci_round:
             # Saved first: a hook killed mid-fingerprint must not leave the last
             # run's approvals in place.
             save(path, state)
-            state["fingerprint"] = fingerprint(state["workspace"])
+            deadline = time.monotonic() + GIT_BUDGET_SECONDS
+            for _ in range(2):
+                if time.monotonic() >= deadline:
+                    break
+                state["fingerprint"] = fingerprint(state["workspace"], deadline)
+                if state["fingerprint"] is not None:
+                    break
+            if state["fingerprint"] is None:
+                state["stopped"] = FINGERPRINT_MISSING
+                emit_gate(state, "fingerprint_unavailable", stage="prompt")
         else:
             emit_phase(
                 state, "wait_ci", ci_round, f"checks failed; fix round {ci_round} of {MAX_ROUNDS}"
@@ -1040,7 +1112,7 @@ def handle(data: dict[str, Any]) -> dict[str, Any] | None:
             state["stopped"] = CONTRACT_MISSING
             emit_gate(state, "contract_unavailable", stage="prompt")
         save(path, state)
-        if contract is None:
+        if contract is None or state["stopped"]:
             return _context("UserPromptSubmit", _stop_text(state["stopped"]))
         if ci_round:
             return _context(

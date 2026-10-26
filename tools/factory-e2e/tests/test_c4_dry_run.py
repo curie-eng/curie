@@ -58,6 +58,20 @@ import yaml
 ROOT = Path(__file__).resolve().parents[3]
 PREFIX = "test-4626"
 NAMESPACE = "test-4626-dry-run"
+# Every release state, so a dry run that left a pending or failed release is
+# still seen. Helm 4 removed `list --all`; these state flags exist in Helm 3
+# and Helm 4 alike, and a bare `list` shows only deployed releases.
+RELEASE_LIST = (
+    "list",
+    "--deployed",
+    "--failed",
+    "--pending",
+    "--superseded",
+    "--uninstalled",
+    "--uninstalling",
+    "-o",
+    "json",
+)
 RELEASE = "test-4626"
 FULLNAME = "test-4626"
 RECORDED_MODEL = "acme-recorded-model"
@@ -100,14 +114,14 @@ def primary_lines(release: str, namespace: str) -> list[str]:
     return lines
 
 
-def shared_lines(release: str, namespace: str) -> list[str]:
+def shared_lines(release: str, namespace: str, context: str) -> list[str]:
     """The conditional plan for the shared controller namespace, in order."""
     return [
         f"# not read under --dry-run: whether namespace {SHARED_NAMESPACE} and Deployment "
         f"{CONTROLLER} already exist; a live run checks them before helm runs",
         f"#   if namespace {SHARED_NAMESPACE} does not exist before helm runs and exists "
-        f"after: kubectl label namespace {SHARED_NAMESPACE} {CREATED_BY}={release} "
-        f"{CREATED_IN}={namespace} --overwrite",
+        f"after: kubectl --context {context} label namespace {SHARED_NAMESPACE} "
+        f"{CREATED_BY}={release} {CREATED_IN}={namespace} --overwrite",
         f"#   if namespace {SHARED_NAMESPACE} already exists: use it and leave its labels "
         "unchanged",
     ]
@@ -252,7 +266,7 @@ def _count(plan: list[str], line: str) -> int:
 
 def _no_namespace_stamp(plan: list[str]) -> bool:
     return not any(
-        line.startswith(("kubectl label namespace", "kubectl annotate namespace")) for line in plan
+        re.match(r"kubectl\b.*\s(?:label|annotate)\s+namespace\b", line) for line in plan
     )
 
 
@@ -917,7 +931,7 @@ class Installation:
         return values
 
     def releases(self) -> list[dict[str, Any]]:
-        listed = json.loads(self.helm("list", "-o", "json").stdout or "[]")
+        listed = json.loads(self.helm(*RELEASE_LIST).stdout or "[]")
         if not isinstance(listed, list):
             raise InfrastructureError("Helm did not return a release list")
         return [entry for entry in listed if isinstance(entry, dict)]
@@ -1115,6 +1129,36 @@ def _assert_same_lines(
     return plan
 
 
+def test_release_listing_parses_on_the_installed_helm(tmp_path: Path) -> None:
+    """The listing that proves a dry run installed nothing parses on this helm.
+
+    An unreachable context makes helm fail after flag parsing, so a refusal
+    other than an unknown flag shows the arguments themselves are accepted.
+    """
+    helm = shutil.which("helm")
+    if helm is None:
+        pytest.skip("helm is not installed")
+    kubeconfig = tmp_path / "kubeconfig"
+    kubeconfig.write_text("")
+    env = {
+        "PATH": os.environ["PATH"],
+        "HOME": str(tmp_path),
+        "KUBECONFIG": str(kubeconfig),
+        "HELM_DRIVER": "secret",
+    }
+    result = subprocess.run(
+        [helm, "--kube-context", f"{PREFIX}-absent", "--namespace", NAMESPACE, *RELEASE_LIST],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert "unknown flag" not in result.stderr, result.stderr
+    assert "unknown shorthand flag" not in result.stderr, result.stderr
+    assert result.returncode != 0, "helm listed releases without a reachable cluster"
+
+
 def test_offline_plan_does_not_claim_unobserved_live_actions(install: Installation) -> None:
     secrets = install.secrets
 
@@ -1126,7 +1170,7 @@ def test_offline_plan_does_not_claim_unobserved_live_actions(install: Installati
         assert not _leaks(result, secrets), "a dry run printed a fixture credential"
     listing = "\n".join(plan)
     assert _no_namespace_stamp(plan), "a dry run planned an unobserved stamp:\n" + listing
-    for line in shared_lines(RELEASE, NAMESPACE) + [REUSE_LINE]:
+    for line in shared_lines(RELEASE, NAMESPACE, install.context) + [REUSE_LINE]:
         assert _count(plan, line) == 1, f"expected exactly once: {line}\n" + "\n".join(plan)
     assert _count(plan, REFUSE_LINE) == 0, "\n".join(plan)
     for line in primary_lines(RELEASE, NAMESPACE):
@@ -1406,12 +1450,12 @@ def test_cluster_up_dry_run_is_offline_and_honors_disabled_controller(
         for line in primary_lines(RELEASE, NAMESPACE):
             assert _count(plan, line) == 1, f"expected exactly once: {line}\n" + "\n".join(plan)
 
-    for line in shared_lines(RELEASE, NAMESPACE) + [REUSE_LINE]:
+    for line in shared_lines(RELEASE, NAMESPACE, context) + [REUSE_LINE]:
         assert _count(plain, line) == 1, f"expected exactly once: {line}\n" + "\n".join(plain)
     assert _count(plain, REFUSE_LINE) == 0, "\n".join(plain)
 
     assert not [line for line in disabled if SHARED_NAMESPACE in line], "\n".join(disabled)
 
-    for line in shared_lines(RELEASE, NAMESPACE) + [REFUSE_LINE]:
+    for line in shared_lines(RELEASE, NAMESPACE, context) + [REFUSE_LINE]:
         assert _count(enabled, line) == 1, f"expected exactly once: {line}\n" + "\n".join(enabled)
     assert _count(enabled, REUSE_LINE) == 0, "\n".join(enabled)

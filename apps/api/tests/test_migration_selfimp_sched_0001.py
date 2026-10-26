@@ -1,4 +1,4 @@
-"""Migration selfimp_sched_0001 adds agent-created schedules (ADR 0238).
+"""Migration selfimp_sched_0001 adds agent-created schedules (ADR 0248).
 
 Expand-only: three new tables (`agent_schedules`, `agent_schedule_revisions`,
 `agent_schedule_runs`) and four agent columns with defaults, so an agent that

@@ -1,4 +1,4 @@
-"""ADR 0238: the per-turn state credential carries the schedules claims.
+"""ADR 0248: the per-turn state credential carries the schedules claims.
 
 The worker mints the per-turn ``scope="state"`` credential when the agent has
 memory writes OR agent schedules on. ``memory`` is ``"write"`` only with memory

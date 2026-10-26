@@ -1,4 +1,4 @@
-"""Agent-managed schedules: client, config load and guidance (ADR 0238).
+"""Agent-managed schedules: client, config load and guidance (ADR 0248).
 
 The runner reads the agent's schedule settings at boot from the dedicated
 ``/agents/<id>/schedules`` router, reached from the agent prefix of

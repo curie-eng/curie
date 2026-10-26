@@ -13,12 +13,15 @@ import os
 import sqlite3
 import threading
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Literal
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+# The provider every state file written before schema 4 came from: AgentMail was
+# the only mail service the adapter could talk to (ADR 0228, sketch step 4).
+LEGACY_PROVIDER = "agentmail"
 LEASE_SECONDS = 300.0
 BODY_FAILURE_BACKOFF_SECONDS = 60.0
 TERMINAL_RECEIPT_MAX = 4096
@@ -221,6 +224,96 @@ class MailState:
                 """
             )
 
+        if version < 4:
+            self._migrate_to_provider_interface(version)
+
+    def _migrate_to_provider_interface(self, version: int) -> None:
+        """Schema 4: the mail provider interface (ADR 0228, sketch step 4).
+
+        A file written before this schema came from AgentMail, so it records
+        ``agentmail`` as its provider; a new file records its provider on first
+        boot instead. Every row still ``body_pending`` or ``ingress_pending`` is
+        settled ``rejected`` and the reply slot a stored turn opened is closed,
+        which is what the first retry pass already did to those rows. Every
+        ``summary_json`` becomes the id-only receipt, so no row keeps AgentMail's
+        raw listing and no provider ever reads another service's shape.
+        Completion events gain the time a send was last attempted, which a
+        provider with a visibility bound needs on a retry.
+        """
+        now = time.time()
+        connection = self.connection
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.execute(
+                "ALTER TABLE completion_events ADD COLUMN send_attempted_at REAL"
+            )
+            if version > 0:
+                connection.execute(
+                    "INSERT INTO metadata(key, value) VALUES('provider', ?) "
+                    "ON CONFLICT(key) DO NOTHING",
+                    (LEGACY_PROVIDER,),
+                )
+            for conversation_id, reply_ref in connection.execute(
+                "SELECT conversation_id, reply_ref FROM deliveries "
+                "WHERE state='ingress_pending' AND turn_json IS NOT NULL"
+            ).fetchall():
+                connection.execute(
+                    "UPDATE reply_state SET text=NULL, active=0, updated_at=? "
+                    "WHERE conversation_id=? AND reply_ref=?",
+                    (now, conversation_id, reply_ref),
+                )
+            connection.execute(
+                "UPDATE deliveries SET state='rejected', turn_json=NULL, updated_at=? "
+                "WHERE state IN ('body_pending', 'ingress_pending')",
+                (now,),
+            )
+            for (message_id,) in connection.execute(
+                "SELECT message_id FROM deliveries"
+            ).fetchall():
+                connection.execute(
+                    "UPDATE deliveries SET summary_json=? WHERE message_id=?",
+                    (_receipt_json(message_id), message_id),
+                )
+            connection.execute("PRAGMA user_version=4")
+            connection.commit()
+        except BaseException:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+
+    def bind_provider(self, name: str) -> None:
+        """Record this file's provider on first boot; refuse a different one later.
+
+        Ids from two mail services must never mix in one state file. A new
+        volume is a first boot.
+
+        Raises:
+            RuntimeError: the file belongs to another provider.
+        """
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT value FROM metadata WHERE key='provider'"
+            ).fetchone()
+            if row is None:
+                connection.execute(
+                    "INSERT INTO metadata(key, value) VALUES('provider', ?)", (name,)
+                )
+                return
+        if row[0] != name:
+            raise RuntimeError(
+                f"mail state {self.path} belongs to mail provider {row[0]!r}, and "
+                f"CURIE_MAIL_PROVIDER is {name!r}; ids from two mail services must not "
+                "share one state file, so start this provider on a new volume"
+            )
+
+    def provider(self) -> str | None:
+        """The provider this file is bound to, or None before first boot."""
+        with self.lock:
+            row = self.connection.execute(
+                "SELECT value FROM metadata WHERE key='provider'"
+            ).fetchone()
+        return None if row is None else str(row[0])
+
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
         """Begin one serialized write and roll it back on every failure."""
@@ -259,8 +352,13 @@ class MailState:
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
             )
 
-    def admit(self, message: dict[str, Any]) -> DeliveryAdmission:
-        """Persist a listing claim, refusing before eviction when at capacity."""
+    def admit(self, message: Mapping[str, Any]) -> DeliveryAdmission:
+        """Persist a listing claim, refusing before eviction when at capacity.
+
+        Only the ids are kept: the stored summary is the id-only receipt, so a
+        pending row never holds a provider's listing (ADR 0228). ``message``
+        carries ``message_id`` and, optionally, ``thread_id``.
+        """
         message_id = str(message["message_id"])
         conversation_id = str(message.get("thread_id") or message_id)
         now = time.time()
@@ -289,7 +387,7 @@ class MailState:
                         message_id,
                         conversation_id,
                         message_id,
-                        json.dumps(message, separators=(",", ":"), sort_keys=True),
+                        _receipt_json(message_id),
                         now,
                         now,
                     ),
@@ -436,7 +534,8 @@ class MailState:
     def pending(self) -> list[dict[str, Any]]:
         with self.lock:
             rows = self.connection.execute(
-                "SELECT message_id, summary_json, turn_json, state FROM deliveries "
+                "SELECT message_id, summary_json, turn_json, state, conversation_id "
+                "FROM deliveries "
                 "WHERE state IN ('body_pending', 'ingress_pending') AND retry_at<=? "
                 "ORDER BY created_at",
                 (time.time(),),
@@ -447,6 +546,7 @@ class MailState:
                 "summary": json.loads(row[1]),
                 "turn": json.loads(row[2]) if row[2] else None,
                 "state": row[3],
+                "conversation_id": row[4],
             }
             for row in rows
         ]
@@ -585,6 +685,29 @@ class MailState:
                 (time.time(), conversation_id, reply_ref),
             )
             self._compact_terminal_completions(connection)
+
+    def record_send_attempt(self, event_id: str) -> None:
+        """Durably note that a send for this event is about to be attempted.
+
+        Written before ``send_reply`` for a provider whose sent copy becomes
+        visible only within a bound, so a retry can tell "not visible yet" from
+        "never landed" (ADR 0228 decision 2).
+        """
+        with self.transaction() as connection:
+            connection.execute(
+                "UPDATE completion_events SET send_attempted_at=?, updated_at=? "
+                "WHERE event_id=?",
+                (time.time(), time.time(), event_id),
+            )
+
+    def send_attempted_at(self, event_id: str) -> float | None:
+        """When a send for this event was last attempted, or None."""
+        with self.lock:
+            row = self.connection.execute(
+                "SELECT send_attempted_at FROM completion_events WHERE event_id=?",
+                (event_id,),
+            ).fetchone()
+        return None if row is None or row[0] is None else float(row[0])
 
     def finish_event(self, event_id: str) -> None:
         with self.transaction() as connection:

@@ -69,6 +69,7 @@ class WorkItemRequestOut(BaseModel):
     termination_observation: str | None
     capacity_deferrals: int
     last_deferral_reason: str | None
+    last_start_failure_detail: str | None
 
 
 class WorkItemPrOut(BaseModel):

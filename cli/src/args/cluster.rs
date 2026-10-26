@@ -922,18 +922,18 @@ pub(crate) enum ClusterAction {
         #[arg(long, value_name = "on|off", value_parser = ["on", "off"])]
         memory_writes: Option<String>,
         /// Opt the agent in to agent-wide learning, or out (`agent_wide_learning`,
-        /// ADR 0239). On selects the learning default guidance and lets standing
+        /// ADR 0249). On selects the learning default guidance and lets standing
         /// instructions load and be saved; it never turns memory writes on.
         /// Off keeps the existing default guidance byte for byte. Takes effect
         /// at the next sandbox boot.
         #[arg(long, value_name = "on|off", value_parser = ["on", "off"])]
         agent_wide_learning: Option<String>,
         /// Let the agent create and manage its own schedules on or off
-        /// (`agent_schedules`, ADR 0238). Off stops creating and changing them;
+        /// (`agent_schedules`, ADR 0248). Off stops creating and changing them;
         /// stored schedules and history stay.
         #[arg(long, value_name = "on|off", value_parser = ["on", "off"])]
         agent_schedules: Option<String>,
-        /// Turn the agent's learned skills on or off (ADR 0237). Off stops
+        /// Turn the agent's learned skills on or off (ADR 0247). Off stops
         /// loading and editing them; stored skills and history stay.
         #[arg(long, value_name = "on|off", value_parser = ["on", "off"])]
         learned_skills: Option<String>,
@@ -1041,6 +1041,53 @@ pub(crate) enum ClusterAction {
         #[command(flatten)]
         conn: ClusterConn,
         /// Print what would be done and exit without making a request.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Show or change which IdP teams may invoke the agent and approve for it
+    /// (`GET`/`PUT /agents/{id}/access-policy`, ADR 0220).
+    ///
+    /// With no team flag this shows the policy. A team is named by its id, as
+    /// `GET /teams` lists it, and must be an IdP group team of the agent's
+    /// tenant. A role left unmentioned keeps its team. The write sends back
+    /// the version it read, so a concurrent change is refused rather than
+    /// overwritten. Each configured role is enforced on every channel.
+    AccessPolicy {
+        /// Agent name or id.
+        agent: String,
+        /// The team whose members may start a turn with the agent.
+        #[arg(long, value_name = "TEAM_ID", conflicts_with = "clear_invocation_team")]
+        invocation_team: Option<String>,
+        /// The team whose members may resolve the agent's approvals.
+        #[arg(long, value_name = "TEAM_ID", conflicts_with = "clear_approver_team")]
+        approver_team: Option<String>,
+        /// Remove the invocation team, so today's caller rules apply.
+        #[arg(long)]
+        clear_invocation_team: bool,
+        /// Remove the approver team, so each route's approvers apply.
+        #[arg(long)]
+        clear_approver_team: bool,
+        #[command(flatten)]
+        conn: ClusterConn,
+        /// Print what would be done and exit without making a request.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Inspect tenant identities or apply IdP configuration, namespace or team JSON.
+    /// Writes use the API's expected-version contract; links and people are read-only.
+    Directory {
+        #[arg(long)]
+        tenant: uuid::Uuid,
+        #[arg(long, value_parser = ["config", "people", "links", "namespaces", "teams"])]
+        resource: String,
+        /// JSON request file. Config uses PUT; namespaces and teams use POST.
+        #[arg(long)]
+        apply: Option<std::path::PathBuf>,
+        /// Continue a bounded people, links or namespaces page.
+        #[arg(long)]
+        after: Option<uuid::Uuid>,
+        #[command(flatten)]
+        conn: ClusterConn,
         #[arg(long)]
         dry_run: bool,
     },
@@ -1192,7 +1239,7 @@ pub(crate) enum ClusterAction {
     /// List an agent's individual facts and memory log. `--channel KIND=ADDRESS`
     /// selects one bound channel; `--delete FACT_ID` removes one fact.
     /// `--archive`, `--restore`, `--revert FACT_ID --to-version N` and
-    /// `--history` act on one entry under its current version (ADR 0239); a
+    /// `--history` act on one entry under its current version (ADR 0249); a
     /// fresh session is required before a change reaches boot memory.
     /// `--add <content>` seeds an operator-authored record; a fresh session is
     /// required before it is injected at boot. `--guidance` shows the guidance
@@ -1221,12 +1268,13 @@ pub(crate) enum ClusterAction {
         #[command(subcommand)]
         verb: ActionsCommand<ClusterConn>,
     },
-    /// An agent's learned skills (ADR 0237): list, show, diff, history,
+    /// An agent's learned skills (ADR 0247): list, show, diff, history,
     /// revert, delete and export.
     Skills(SkillsArgs<ClusterHookConn>),
     /// A protected hook's remediation policy: show it, apply a document, arm,
     /// disarm or remove it, or close an open circuit breaker. Writes run as the
-    /// operator principal in CURIE_APPROVAL_PRINCIPAL_TOKEN.
+    /// operator principal in CURIE_APPROVAL_PRINCIPAL_TOKEN; apply and arm also
+    /// need the remediation authority in CURIE_REMEDIATION_AUTHORITY_KEY.
     RemediationPolicy {
         #[command(subcommand)]
         verb: RemediationPolicyCommand<ClusterConn>,

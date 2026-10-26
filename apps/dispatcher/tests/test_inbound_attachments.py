@@ -262,8 +262,8 @@ def test_malformed_files_never_raise_and_yield_no_refs(
     already visible in the thread, so a raise here is strictly worse than a
     dropped ref: Bolt has acked, the claim survives, the placeholder sits in the
     channel forever, and Slack's redelivery is refused as an already-seen
-    delivery (`queue.py::release_event`'s asymmetry, #2006). A ref that cannot
-    be built is therefore skipped, and the turn is minted anyway.
+    delivery (the claim is held from the placeholder post on). A ref that
+    cannot be built is therefore skipped, and the turn is minted anyway.
 
     An entry missing `id` or missing `name` is skipped rather than defaulted:
     `Attachment` requires both, and inventing either would produce a ref that

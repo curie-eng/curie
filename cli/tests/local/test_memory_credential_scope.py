@@ -280,7 +280,7 @@ def _sandbox(api_url: str, *, memory_writes: bool) -> Sandbox:
     )
     assert second.status == 201, second
     # The API refuses a sandbox write unless the agent's stored memory_writes
-    # is on (ADR 0239), so mirror the worker-side switch on the API agent.
+    # is on (ADR 0249), so mirror the worker-side switch on the API agent.
     if memory_writes:
         writes = _http(f"{api_url}/agents/{agent_id}", "PATCH", {"memory_writes": True})
         assert writes.status == 200, writes
@@ -313,7 +313,7 @@ def _other_channel(sandbox: Sandbox) -> str:
 
 
 def _fact(statement: str, author: str) -> dict[str, object]:
-    # The typed canonical shape (ADR 0239); the API stamps author, stated_at
+    # The typed canonical shape (ADR 0249); the API stamps author, stated_at
     # and conversation for a sandbox writer.
     return {
         "kind": "fact",

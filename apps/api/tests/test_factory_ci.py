@@ -152,11 +152,17 @@ def _pull(
     mergeable: bool | None = None,
     mergeable_state: str | None = None,
     merged: bool | None = None,
+    state: str = "open",
 ) -> dict[str, Any]:
-    """The mergeability fields of GitHub's pull request payload:
+    """The mergeability and state fields of GitHub's pull request payload:
     https://docs.github.com/en/rest/pulls/pulls#get-a-pull-request"""
 
-    return {"mergeable": mergeable, "mergeable_state": mergeable_state, "merged": merged}
+    return {
+        "mergeable": mergeable,
+        "mergeable_state": mergeable_state,
+        "merged": merged,
+        "state": state,
+    }
 
 
 def _decide(
@@ -216,7 +222,7 @@ def test_bounds_are_the_planned_constants() -> None:
 
 def test_ci_causes_match_the_literal_set_in_workitems() -> None:
     assert factory_ci.CI_CAUSES == frozenset(
-        {"ci_failed", "ci_timeout", "ci_unverified", "merge_conflict"}
+        {"ci_failed", "ci_timeout", "ci_unverified", "merge_conflict", "pr_closed"}
     )
     assert "ci_fix_unpublished" not in factory_ci.CI_CAUSES
     source = ast.parse(inspect.getsource(lifecycle.terminalize_execution))
@@ -278,9 +284,35 @@ def test_marker_is_the_bundle_contract() -> None:
         assert factory_ci.MARKER.match(line) is None
 
 
-def test_the_ci_wait_is_an_operator_setting_defaulting_to_1200() -> None:
-    assert Settings().factory_ci_wait_s == 1200
-    assert Settings(FACTORY_CI_WAIT_S=3600).factory_ci_wait_s == 3600
+def test_the_ci_wait_is_an_operator_setting_defaulting_to_3600() -> None:
+    assert Settings().factory_ci_wait_s == 3600
+    assert Settings(FACTORY_CI_WAIT_S=1200).factory_ci_wait_s == 1200
+    assert Settings(FACTORY_CI_WAIT_S=10800).factory_ci_wait_s == 10800
+
+
+def test_default_ci_wait_budget_keeps_1500_pending() -> None:
+    """The unset budget is Settings.factory_ci_wait_s. An explicit 1200 stays on _decide."""
+    wait = Settings().factory_ci_wait_s
+    assert wait == 3600
+    long_deadline = PUBLISHED + timedelta(seconds=10800)
+    pending_detail = _detail(_run("build", status="in_progress"))
+    pending = _decide(
+        pending_detail, 1500, execution_deadline=long_deadline, ci_wait_seconds=wait
+    )
+    assert pending.kind == "pending"
+    green = _decide(
+        _detail(_run("build")), 1800, execution_deadline=long_deadline, ci_wait_seconds=wait
+    )
+    assert green.kind == "green"
+    timed_out = _decide(
+        pending_detail, 3600, execution_deadline=long_deadline, ci_wait_seconds=wait
+    )
+    assert timed_out.kind == "timed_out"
+    early = PUBLISHED + timedelta(seconds=600)
+    assert (
+        _decide(pending_detail, 600, execution_deadline=early, ci_wait_seconds=wait).kind
+        == "timed_out"
+    )
 
 
 @pytest.mark.parametrize("value", [0, -1, 10801])
@@ -643,6 +675,37 @@ def test_merge_conflict_precedes_the_metadata_revision_wait() -> None:
     )
     assert verdict.kind == "merge_conflict"
     assert verdict.reason == "merge_conflict"
+
+
+@pytest.mark.parametrize("seconds", [0, 119, 121])
+def test_a_closed_unmerged_pull_is_pr_closed_without_checks(seconds: int) -> None:
+    pull = _pull(mergeable=True, mergeable_state="clean", merged=False, state="closed")
+    verdict = _decide(_detail(), seconds, pull=pull)
+    assert verdict.kind == "pr_closed"
+    assert verdict.reason == "pr_closed"
+
+
+@pytest.mark.parametrize(
+    "runs",
+    [
+        (_run("build"),),
+        (_run("build", conclusion="failure"),),
+        (_run("build", status="in_progress", conclusion=None),),
+    ],
+)
+def test_a_closed_unmerged_pull_is_pr_closed_whatever_its_checks(
+    runs: tuple[dict[str, Any], ...],
+) -> None:
+    pull = _pull(mergeable=False, mergeable_state="dirty", merged=False, state="closed")
+    verdict = _decide(_detail(*runs), 30, pull=pull)
+    assert verdict.kind == "pr_closed"
+    assert verdict.failing == []
+
+
+def test_a_merged_pull_is_never_pr_closed() -> None:
+    pull = _pull(mergeable=None, mergeable_state="clean", merged=True, state="closed")
+    assert _decide(_detail(_run("build")), 30, pull=pull).kind == "green"
+    assert _decide(_detail(), 121, pull=pull).kind == "no_ci"
 
 
 @pytest.mark.parametrize("mergeable", [None, False])
@@ -2265,3 +2328,64 @@ def test_recorded_metadata_reruns_match_normalized_identity_not_display_name(
         fresh_after=PUBLISHED,
     )
     assert green.kind == "green"
+
+
+def test_required_checks_missing_stays_pending_then_unverified() -> None:
+    detail = _detail(_run("build"))
+    clean = _pull(mergeable=True)
+    pending = _decide(detail, 30, pull=clean, host_required_checks=("label-gate",))
+    assert pending.kind == "pending"
+    assert pending.reason == "required_check_absent"
+    expired = _decide(detail, 1200, pull=clean, host_required_checks=("label-gate",))
+    assert expired.kind == "unverified"
+    assert expired.reason == "required_check_absent"
+    assert expired.note is not None
+    assert "label-gate" in expired.note
+    assert "for example a label" in expired.note
+    summary = factory_ci.tried_summary([], expired, PR_URL)
+    assert "label-gate" in summary
+    assert "for example a label" in summary
+
+
+def test_required_checks_green_when_the_check_or_status_is_present() -> None:
+    by_run = _decide(_detail(_run("label-gate")), 30, host_required_checks=("label-gate",))
+    assert by_run.kind == "green"
+    by_status = _decide(
+        _detail(statuses=(_status("label-gate", "success"),)),
+        30,
+        host_required_checks=("label-gate",),
+    )
+    assert by_status.kind == "green"
+
+
+def test_required_checks_empty_set_keeps_todays_no_ci() -> None:
+    empty = _detail()
+    clean = _pull(mergeable=True)
+    assert _decide(empty, 130, pull=clean, host_required_checks=()).kind == "no_ci"
+    assert _decide(empty, 130, pull=clean, host_required_checks=None).kind == "no_ci"
+
+
+def test_required_checks_missing_python_check_stays_pending_with_its_name() -> None:
+    policy = conversion_python_ci()
+    detail = _detail(_run("lint"))
+    pending = _decide(
+        detail,
+        30,
+        changed_paths=["unitconv/convert.py"],
+        python_ci=policy,
+        host_required_checks=("Unit conversion suite",),
+    )
+    assert pending.kind == "pending"
+    assert pending.reason == "required_check_absent"
+    assert pending.note is not None
+    assert "Unit conversion suite" in pending.note
+    expired = _decide(
+        detail,
+        1200,
+        changed_paths=["unitconv/convert.py"],
+        python_ci=policy,
+        host_required_checks=("Unit conversion suite",),
+    )
+    assert expired.kind == "unverified"
+    assert expired.note is not None
+    assert "for example a label" in expired.note

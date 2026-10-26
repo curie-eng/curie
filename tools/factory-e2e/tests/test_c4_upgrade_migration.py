@@ -672,9 +672,12 @@ def candidate_curie(request: pytest.FixtureRequest) -> _Candidate:
 
 
 class _Installation:
-    def __init__(self, candidate: _Candidate, request: pytest.FixtureRequest) -> None:
+    def __init__(
+        self, candidate: _Candidate, request: pytest.FixtureRequest, *, required_ci: bool = True,
+    ) -> None:
         self.candidate = candidate
         self.request = request
+        self.required_ci = required_ci
         self.identity = uuid.uuid4().hex[:10]
         self.cluster = f"curie-c4-{self.identity}"
         self.context = f"kind-{self.cluster}"
@@ -885,12 +888,6 @@ class _Installation:
                         "bases": ["main", "maint", "release"], "default_base": "maint"
                     }
                 },
-                "githubFactoryPythonCi": {
-                    "Acme-Corp/Acme-Bot": {
-                        "check": REQUIRED_CHECK, "paths": ["src", "tests"],
-                        "pendingCheckPrefix": SHARD_PREFIX,
-                    }
-                },
                 "githubFactoryMetadataCi": {
                     "Acme-Corp/Acme-Bot": {
                         "checks": [METADATA_CHECK], "statuses": [METADATA_STATUS]
@@ -914,6 +911,13 @@ class _Installation:
             },
             "resourceQuota": {"hard": {"sandboxPodCount": "3"}},
         }
+        if self.required_ci:
+            values["api"]["githubFactoryPythonCi"] = {
+                "Acme-Corp/Acme-Bot": {
+                    "check": REQUIRED_CHECK, "paths": ["src", "tests"],
+                    "pendingCheckPrefix": SHARD_PREFIX,
+                }
+            }
         images: dict[str, Any] = {}
         for component in ("api", "worker", "ui"):
             repository, digest = self.candidate.old_images[component].split("@", 1)
@@ -993,7 +997,8 @@ class _Installation:
             old_api.get("githubFactoryLabel") != LABEL
             or old_api.get("githubFactoryMention") != MENTION
             or old_api.get("githubFactoryIntake") != "poll"
-            or old_api.get("githubFactoryPythonCi") != values["api"]["githubFactoryPythonCi"]
+            or old_api.get("githubFactoryPythonCi")
+            != values["api"].get("githubFactoryPythonCi", {})
             or self.baseline.get("factory")
             or old_api.get("githubCloneBase") != "https://github.com"
         ):
@@ -1482,6 +1487,63 @@ def released_factory(candidate_curie: _Candidate, request: pytest.FixtureRequest
     request.addfinalizer(installation.cleanup)
     installation.setup()
     return installation
+
+
+@pytest.fixture
+def released_factory_without_required_ci(
+    candidate_curie: _Candidate, request: pytest.FixtureRequest,
+) -> _Installation:
+    installation = _Installation(candidate_curie, request, required_ci=False)
+    request.addfinalizer(installation.cleanup)
+    installation.setup()
+    return installation
+
+
+def test_v0125_factory_without_required_ci_upgrade_dry_run(
+    released_factory_without_required_ci: _Installation,
+) -> None:
+    run = released_factory_without_required_ci
+    released_api = run.values(computed=True)["api"]
+    assert released_api["githubFactoryPythonCi"] == {}
+    assert released_api["githubFactoryMetadataCi"] == {
+        "Acme-Corp/Acme-Bot": {
+            "checks": [METADATA_CHECK], "statuses": [METADATA_STATUS],
+        }
+    }
+    history = run.history()
+    assert history[-1]["chart"] == "curie-0.12.5"
+    assert history[-1]["status"] == "deployed"
+    before = run.snapshot()
+    storage = run.factory_storage_digest()
+    status, agent = run.api("GET", f"/agents/{run.agent_id}")
+    assert status == 200
+    agent_digest = _digest(agent)
+    assert run.pause_keys() == []
+
+    dry_run = run.upgrade("--dry-run")
+    after = run.snapshot()
+    values_absent = run.upgrade_values_absent(dry_run, METADATA_CHECK, METADATA_STATUS)
+    assert dry_run.returncode == 0, (
+        "factory without required CI must pass candidate schema validation"
+    )
+    plan = dry_run.document()
+    assert plan["dry_run"] is True
+    assert "error" not in plan
+    assert not any(line.startswith("refusal at validate:") for line in plan["plan"])
+    plan_names_present = all(value in json.dumps(plan) for value in ("factory", "githubFactory"))
+    assert plan_names_present
+    assert values_absent, "dry-run must report setting names without fixture values"
+    assert after == before
+    assert run.history() == history
+    assert int(run.history()[-1]["revision"]) == run.baseline_revision
+    assert run.factory_storage_digest() == storage
+    assert run.app_secret_digest() == run.released_secret_digest
+    assert run.pause_keys() == []
+    status, agent = run.api("GET", f"/agents/{run.agent_id}")
+    assert status == 200
+    assert _digest(agent) == agent_digest
+    assert run.api("GET", "/health")[0] == 200
+    assert not run.stub.unknown_requests
 
 
 def test_v0125_factory_upgrade_uses_supported_flow(released_factory: _Installation) -> None:

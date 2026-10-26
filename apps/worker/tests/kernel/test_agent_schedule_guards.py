@@ -1,4 +1,4 @@
-"""ADR 0238: approval-resume revalidation and the agent_schedules toggle copy.
+"""ADR 0248: approval-resume revalidation and the agent_schedules toggle copy.
 
 ``HookRunRecorder.resume_guard(agent_id, schedule_id, approval_id)`` decides
 whether an approved continuation of a scheduled firing may still start. The

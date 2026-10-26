@@ -59,14 +59,18 @@ def _sandbox_termination_detail(termination: SandboxTermination) -> str:
     if re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", reason) is None:
         reason = "Unknown"
     lead = f"Kubernetes pod terminated: {reason}"
+    # Truncate the redacted detail first so this sentence is never cut.
+    oom_sentence = " The runner container hit its memory limit." if reason == "OOMKilled" else ""
     detail = termination.detail
     if not isinstance(detail, str):
-        return f"{lead}."
+        return f"{lead}.{oom_sentence}"
     safe_detail = " ".join(redact_text(detail).split())
     if not safe_detail:
-        return f"{lead}."
-    max_detail = constants._ESCALATION_DETAIL_MAX - len(lead) - len(" ().")
-    return f"{lead} ({safe_detail[:max_detail]})."
+        return f"{lead}.{oom_sentence}"
+    max_detail = constants._ESCALATION_DETAIL_MAX - len(lead) - len(" ().") - len(oom_sentence)
+    if max_detail < 0:
+        max_detail = 0
+    return f"{lead} ({safe_detail[:max_detail]}).{oom_sentence}"
 
 
 def _display_error_classification(raw: str | None) -> str:
@@ -192,6 +196,7 @@ class TurnOutcome:
     terminal_ok: bool
     answer: ReplyUpdate | None = None
     saw_side_effect: bool = False
+    execution_uncertain: bool = False
     classification: str | None = None
     error_message: str | None = None
     text: str = ""

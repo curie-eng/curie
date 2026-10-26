@@ -79,8 +79,15 @@
             "type": "boolean"
           },
           "authorizer": {
-            "title": "Authorizer",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Authorizer"
           },
           "created_at": {
             "format": "date-time",
@@ -114,6 +121,40 @@
               }
             ],
             "title": "Reason"
+          },
+          "team_digest": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Team Digest"
+          },
+          "team_epoch": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Team Epoch"
+          },
+          "team_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Team Id"
           }
         },
         "required": [
@@ -635,6 +676,20 @@
         "title": "ActionUndoOut",
         "type": "object"
       },
+      "Active": {
+        "additionalProperties": false,
+        "properties": {
+          "active": {
+            "title": "Active",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "active"
+        ],
+        "title": "Active",
+        "type": "object"
+      },
       "Activity": {
         "additionalProperties": false,
         "properties": {
@@ -888,6 +943,16 @@
           "kind": {
             "title": "Kind",
             "type": "string"
+          },
+          "slack": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SlackEvidence"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
@@ -904,6 +969,17 @@
             "title": "Allowed",
             "type": "boolean"
           },
+          "connect_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Connect Url"
+          },
           "install_restricted": {
             "title": "Install Restricted",
             "type": "boolean"
@@ -919,6 +995,113 @@
           "install_restricted"
         ],
         "title": "AdmissionOut",
+        "type": "object"
+      },
+      "AgentAccessPolicyOut": {
+        "description": "An agent's policy; version 0 and no ``updated_at`` mean none was set.",
+        "properties": {
+          "agent_id": {
+            "format": "uuid",
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "approver_team_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Approver Team Id"
+          },
+          "invocation_team_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Invocation Team Id"
+          },
+          "tenant_id": {
+            "format": "uuid",
+            "title": "Tenant Id",
+            "type": "string"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          },
+          "version": {
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "agent_id",
+          "tenant_id",
+          "invocation_team_id",
+          "approver_team_id",
+          "version",
+          "updated_at"
+        ],
+        "title": "AgentAccessPolicyOut",
+        "type": "object"
+      },
+      "AgentAccessPolicyWrite": {
+        "additionalProperties": false,
+        "description": "Replace an agent's policy.\n\nBoth team keys are required so a write states the whole policy; ``null``\nclears that role back to today's behavior. ``expected_version`` is the\nversion the writer last read: 0 when the agent has no policy yet.",
+        "properties": {
+          "approver_team_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Approver Team Id"
+          },
+          "expected_version": {
+            "minimum": 0.0,
+            "title": "Expected Version",
+            "type": "integer"
+          },
+          "invocation_team_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Invocation Team Id"
+          }
+        },
+        "required": [
+          "invocation_team_id",
+          "approver_team_id",
+          "expected_version"
+        ],
+        "title": "AgentAccessPolicyWrite",
         "type": "object"
       },
       "AgentCreate": {
@@ -1554,7 +1737,7 @@
         "type": "object"
       },
       "AgentScheduleOut": {
-        "description": "One agent-created schedule (ADR 0238). ``conversation`` and ``turn`` are\nshown to the platform caller only; a sandbox response leaves them unset.",
+        "description": "One agent-created schedule (ADR 0248). ``conversation`` and ``turn`` are\nshown to the platform caller only; a sandbox response leaves them unset.",
         "properties": {
           "agent": {
             "title": "Agent",
@@ -2500,8 +2683,15 @@
             "type": "boolean"
           },
           "authorizer": {
-            "title": "Authorizer",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Authorizer"
           },
           "created_at": {
             "format": "date-time",
@@ -2569,6 +2759,40 @@
               }
             ],
             "title": "Reason"
+          },
+          "team_digest": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Team Digest"
+          },
+          "team_epoch": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Team Epoch"
+          },
+          "team_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Team Id"
           }
         },
         "required": [
@@ -3805,6 +4029,21 @@
         "title": "BehaviorPacksConfig",
         "type": "object"
       },
+      "Body_confirm_connection_identity_connect__token__confirm_post": {
+        "properties": {
+          "csrf": {
+            "maxLength": 43,
+            "minLength": 43,
+            "title": "Csrf",
+            "type": "string"
+          }
+        },
+        "required": [
+          "csrf"
+        ],
+        "title": "Body_confirm_connection_identity_connect__token__confirm_post",
+        "type": "object"
+      },
       "Body_upload_bundle_agents__agent_id__versions__version_id__bundle_put": {
         "properties": {
           "file": {
@@ -4041,6 +4280,30 @@
           "rows"
         ],
         "title": "CanvasTable",
+        "type": "object"
+      },
+      "Capability": {
+        "additionalProperties": false,
+        "properties": {
+          "expires_at": {
+            "title": "Expires At",
+            "type": "integer"
+          },
+          "lease_seconds": {
+            "title": "Lease Seconds",
+            "type": "integer"
+          },
+          "token": {
+            "title": "Token",
+            "type": "string"
+          }
+        },
+        "required": [
+          "token",
+          "expires_at",
+          "lease_seconds"
+        ],
+        "title": "Capability",
         "type": "object"
       },
       "ChannelAddress": {
@@ -5162,6 +5425,65 @@
         "title": "ClusterMessageReplyPage",
         "type": "object"
       },
+      "Completed": {
+        "additionalProperties": false,
+        "properties": {
+          "sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Sha256",
+            "type": "string"
+          },
+          "size_bytes": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Size Bytes",
+            "type": "integer"
+          },
+          "transfer_id": {
+            "maxLength": 128,
+            "minLength": 32,
+            "title": "Transfer Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "transfer_id",
+          "sha256",
+          "size_bytes"
+        ],
+        "title": "Completed",
+        "type": "object"
+      },
+      "Completion": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "sha256": {
+            "title": "Sha256",
+            "type": "string"
+          },
+          "size_bytes": {
+            "title": "Size Bytes",
+            "type": "integer"
+          },
+          "status": {
+            "const": "complete",
+            "default": "complete",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "sha256",
+          "size_bytes"
+        ],
+        "title": "Completion",
+        "type": "object"
+      },
       "ConnectorManifests": {
         "description": "Kubernetes objects derived from a version's ``connectors.yaml``.\n\nThe API renders; the caller applies. Rendering is a pure function of the\nbundle plus the deployment context the caller supplies, so producing this\nneeds no cluster access and the API's read-only RBAC is untouched\n(ADR-0086, #1063).",
         "properties": {
@@ -5292,6 +5614,75 @@
         "title": "ConsoleSessionOut",
         "type": "object"
       },
+      "Context": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": {
+            "format": "uuid",
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "deployment_id": {
+            "format": "uuid",
+            "title": "Deployment Id",
+            "type": "string"
+          },
+          "event_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Event Id",
+            "type": "string"
+          },
+          "owner": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Owner",
+            "type": "string"
+          },
+          "route_generation": {
+            "minimum": 0.0,
+            "title": "Route Generation",
+            "type": "integer"
+          },
+          "sandbox_name": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Sandbox Name",
+            "type": "string"
+          },
+          "session_id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Session Id",
+            "type": "string"
+          },
+          "thread_key": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Thread Key",
+            "type": "string"
+          },
+          "ttl_s": {
+            "default": 3600,
+            "maximum": 3600.0,
+            "minimum": 1.0,
+            "title": "Ttl S",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "agent_id",
+          "thread_key",
+          "event_id",
+          "owner",
+          "deployment_id",
+          "session_id",
+          "sandbox_name",
+          "route_generation"
+        ],
+        "title": "Context",
+        "type": "object"
+      },
       "CostReport": {
         "description": "Daily spend series + total for an agent (L1 Cost view).",
         "properties": {
@@ -5415,6 +5806,17 @@
             "minLength": 1,
             "title": "Reason",
             "type": "string"
+          },
+          "start_failure_detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Start Failure Detail"
           }
         },
         "required": [
@@ -5533,6 +5935,709 @@
           "deployed_at"
         ],
         "title": "DeploymentOut",
+        "type": "object"
+      },
+      "DirectoryAccountIn": {
+        "additionalProperties": false,
+        "properties": {
+          "identity_namespace_id": {
+            "format": "uuid",
+            "title": "Identity Namespace Id",
+            "type": "string"
+          },
+          "provider_native_id": {
+            "maxLength": 320,
+            "minLength": 1,
+            "title": "Provider Native Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "identity_namespace_id",
+          "provider_native_id"
+        ],
+        "title": "DirectoryAccountIn",
+        "type": "object"
+      },
+      "DirectoryAttemptIn": {
+        "additionalProperties": false,
+        "properties": {
+          "error": {
+            "enum": [
+              "provider_unavailable",
+              "provider_rejected",
+              "invalid_snapshot"
+            ],
+            "title": "Error",
+            "type": "string"
+          },
+          "expected_epoch": {
+            "minimum": 0.0,
+            "title": "Expected Epoch",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "expected_epoch",
+          "error"
+        ],
+        "title": "DirectoryAttemptIn",
+        "type": "object"
+      },
+      "DirectoryBindingOut": {
+        "additionalProperties": false,
+        "properties": {
+          "config_version": {
+            "title": "Config Version",
+            "type": "integer"
+          },
+          "expires_at": {
+            "format": "date-time",
+            "title": "Expires At",
+            "type": "string"
+          },
+          "identity_epoch": {
+            "title": "Identity Epoch",
+            "type": "integer"
+          },
+          "issuer": {
+            "title": "Issuer",
+            "type": "string"
+          },
+          "managed_by": {
+            "title": "Managed By",
+            "type": "string"
+          },
+          "namespace_ids": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "title": "Namespace Ids",
+            "type": "array"
+          },
+          "team_ids": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "title": "Team Ids",
+            "type": "array"
+          },
+          "tenant_id": {
+            "format": "uuid",
+            "title": "Tenant Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenant_id",
+          "issuer",
+          "managed_by",
+          "team_ids",
+          "namespace_ids",
+          "config_version",
+          "identity_epoch",
+          "expires_at"
+        ],
+        "title": "DirectoryBindingOut",
+        "type": "object"
+      },
+      "DirectoryConfigIn": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_version": {
+            "minimum": 0.0,
+            "title": "Expected Version",
+            "type": "integer"
+          },
+          "governed_domains": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 100,
+            "title": "Governed Domains",
+            "type": "array"
+          },
+          "issuer": {
+            "maxLength": 2048,
+            "title": "Issuer",
+            "type": "string"
+          },
+          "managed_by": {
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+            "title": "Managed By",
+            "type": "string"
+          }
+        },
+        "required": [
+          "issuer",
+          "governed_domains",
+          "managed_by",
+          "expected_version"
+        ],
+        "title": "DirectoryConfigIn",
+        "type": "object"
+      },
+      "DirectoryConfigOut": {
+        "additionalProperties": false,
+        "properties": {
+          "governed_domains": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Governed Domains",
+            "type": "array"
+          },
+          "issuer": {
+            "title": "Issuer",
+            "type": "string"
+          },
+          "managed_by": {
+            "title": "Managed By",
+            "type": "string"
+          },
+          "tenant_id": {
+            "format": "uuid",
+            "title": "Tenant Id",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "tenant_id",
+          "issuer",
+          "governed_domains",
+          "managed_by",
+          "version"
+        ],
+        "title": "DirectoryConfigOut",
+        "type": "object"
+      },
+      "DirectoryCredentialIn": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_config_version": {
+            "minimum": 1.0,
+            "title": "Expected Config Version",
+            "type": "integer"
+          },
+          "expires_in_seconds": {
+            "default": 3600,
+            "maximum": 86400.0,
+            "minimum": 60.0,
+            "title": "Expires In Seconds",
+            "type": "integer"
+          },
+          "namespace_ids": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "maxItems": 1000,
+            "title": "Namespace Ids",
+            "type": "array"
+          },
+          "team_ids": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "maxItems": 1000,
+            "minItems": 1,
+            "title": "Team Ids",
+            "type": "array"
+          },
+          "tenant_id": {
+            "format": "uuid",
+            "title": "Tenant Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenant_id",
+          "expected_config_version",
+          "team_ids",
+          "namespace_ids"
+        ],
+        "title": "DirectoryCredentialIn",
+        "type": "object"
+      },
+      "DirectoryCredentialOut": {
+        "additionalProperties": false,
+        "properties": {
+          "credential": {
+            "title": "Credential",
+            "type": "string"
+          },
+          "expires_at": {
+            "format": "date-time",
+            "title": "Expires At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "credential",
+          "expires_at"
+        ],
+        "title": "DirectoryCredentialOut",
+        "type": "object"
+      },
+      "DirectoryNamespaceIn": {
+        "additionalProperties": false,
+        "properties": {
+          "authority": {
+            "default": "",
+            "maxLength": 256,
+            "title": "Authority",
+            "type": "string"
+          },
+          "key": {
+            "maxLength": 253,
+            "minLength": 1,
+            "title": "Key",
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "slack_workspace",
+              "email_domain"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "provider": {
+            "enum": [
+              "slack",
+              "email"
+            ],
+            "title": "Provider",
+            "type": "string"
+          },
+          "tenant_id": {
+            "format": "uuid",
+            "title": "Tenant Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenant_id",
+          "provider",
+          "kind",
+          "key"
+        ],
+        "title": "DirectoryNamespaceIn",
+        "type": "object"
+      },
+      "DirectoryNamespaceOut": {
+        "additionalProperties": false,
+        "properties": {
+          "authority": {
+            "title": "Authority",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "key": {
+            "title": "Key",
+            "type": "string"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "provider": {
+            "title": "Provider",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "tenant_id": {
+            "format": "uuid",
+            "title": "Tenant Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "tenant_id",
+          "provider",
+          "authority",
+          "kind",
+          "key",
+          "status"
+        ],
+        "title": "DirectoryNamespaceOut",
+        "type": "object"
+      },
+      "DirectoryPeopleOut": {
+        "additionalProperties": false,
+        "properties": {
+          "next_after_subject": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next After Subject"
+          },
+          "people": {
+            "items": {
+              "$ref": "#/components/schemas/DirectoryPersonOut"
+            },
+            "title": "People",
+            "type": "array"
+          }
+        },
+        "required": [
+          "people",
+          "next_after_subject"
+        ],
+        "title": "DirectoryPeopleOut",
+        "type": "object"
+      },
+      "DirectoryPersonIn": {
+        "additionalProperties": false,
+        "properties": {
+          "accounts": {
+            "items": {
+              "$ref": "#/components/schemas/DirectoryAccountIn"
+            },
+            "maxItems": 1000,
+            "title": "Accounts",
+            "type": "array"
+          },
+          "display_name": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Display Name"
+          },
+          "email": {
+            "anyOf": [
+              {
+                "maxLength": 320,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Email"
+          },
+          "status": {
+            "default": "active",
+            "enum": [
+              "active",
+              "disabled",
+              "revoked"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "subject": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Subject",
+            "type": "string"
+          }
+        },
+        "required": [
+          "subject"
+        ],
+        "title": "DirectoryPersonIn",
+        "type": "object"
+      },
+      "DirectoryPersonOut": {
+        "additionalProperties": false,
+        "properties": {
+          "authorization_version": {
+            "title": "Authorization Version",
+            "type": "integer"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "subject": {
+            "title": "Subject",
+            "type": "string"
+          }
+        },
+        "required": [
+          "subject",
+          "status",
+          "authorization_version"
+        ],
+        "title": "DirectoryPersonOut",
+        "type": "object"
+      },
+      "DirectorySnapshotIn": {
+        "additionalProperties": false,
+        "properties": {
+          "complete": {
+            "title": "Complete",
+            "type": "boolean"
+          },
+          "expected_epoch": {
+            "minimum": 0.0,
+            "title": "Expected Epoch",
+            "type": "integer"
+          },
+          "expected_identity_epoch": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Required for credentials with namespaces. Read identity_epoch from GET /directory/binding before observing provider data. After a conflict, read a fresh binding and refetch provider data; never relabel a stale payload.",
+            "title": "Expected Identity Epoch"
+          },
+          "people": {
+            "items": {
+              "$ref": "#/components/schemas/DirectoryPersonIn"
+            },
+            "maxItems": 10000,
+            "title": "People",
+            "type": "array"
+          }
+        },
+        "required": [
+          "expected_epoch",
+          "complete",
+          "people"
+        ],
+        "title": "DirectorySnapshotIn",
+        "type": "object"
+      },
+      "DirectorySnapshotOut": {
+        "additionalProperties": false,
+        "properties": {
+          "digest": {
+            "title": "Digest",
+            "type": "string"
+          },
+          "epoch": {
+            "title": "Epoch",
+            "type": "integer"
+          },
+          "member_count": {
+            "title": "Member Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "epoch",
+          "member_count",
+          "digest"
+        ],
+        "title": "DirectorySnapshotOut",
+        "type": "object"
+      },
+      "DirectoryStatusIn": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_version": {
+            "minimum": 1.0,
+            "title": "Expected Version",
+            "type": "integer"
+          },
+          "status": {
+            "enum": [
+              "active",
+              "disabled",
+              "revoked"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "subject": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Subject",
+            "type": "string"
+          }
+        },
+        "required": [
+          "subject",
+          "expected_version",
+          "status"
+        ],
+        "title": "DirectoryStatusIn",
+        "type": "object"
+      },
+      "DirectoryStatusOut": {
+        "additionalProperties": false,
+        "properties": {
+          "authorization_version": {
+            "title": "Authorization Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "authorization_version"
+        ],
+        "title": "DirectoryStatusOut",
+        "type": "object"
+      },
+      "DirectoryTeamIn": {
+        "additionalProperties": false,
+        "properties": {
+          "external_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "External Id",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "tenant_id": {
+            "format": "uuid",
+            "title": "Tenant Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenant_id",
+          "external_id",
+          "name"
+        ],
+        "title": "DirectoryTeamIn",
+        "type": "object"
+      },
+      "DirectoryTeamOut": {
+        "additionalProperties": false,
+        "properties": {
+          "digest": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Digest"
+          },
+          "epoch": {
+            "title": "Epoch",
+            "type": "integer"
+          },
+          "external_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "External Id"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "last_attempt_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Attempt At"
+          },
+          "last_error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Error"
+          },
+          "last_synced_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Synced At"
+          },
+          "managed_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Managed By"
+          },
+          "member_count": {
+            "title": "Member Count",
+            "type": "integer"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "tenant_id": {
+            "format": "uuid",
+            "title": "Tenant Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "tenant_id",
+          "external_id",
+          "name",
+          "managed_by",
+          "epoch",
+          "member_count",
+          "digest",
+          "last_synced_at",
+          "last_attempt_at",
+          "last_error"
+        ],
+        "title": "DirectoryTeamOut",
         "type": "object"
       },
       "Environment": {
@@ -6510,6 +7615,66 @@
           "conversation_id"
         ],
         "title": "FactoryWake",
+        "type": "object"
+      },
+      "FileDescriptor": {
+        "additionalProperties": false,
+        "properties": {
+          "current": {
+            "title": "Current",
+            "type": "boolean"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "mime_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mime Type"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "sha256": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sha256"
+          },
+          "size_bytes": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Size Bytes"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "mime_type",
+          "size_bytes",
+          "sha256",
+          "current"
+        ],
+        "title": "FileDescriptor",
         "type": "object"
       },
       "FinishBody": {
@@ -7800,6 +8965,32 @@
         "title": "ListedTargets",
         "type": "object"
       },
+      "Listing": {
+        "additionalProperties": false,
+        "properties": {
+          "cursor": {
+            "anyOf": [
+              {
+                "maxLength": 36,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cursor"
+          },
+          "limit": {
+            "default": 50,
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Limit",
+            "type": "integer"
+          }
+        },
+        "title": "Listing",
+        "type": "object"
+      },
       "LoadPackConfig": {
         "description": "Rotating \"working...\" load lines for one agent. Mirrors the worker's\ncurie_worker.behaviorpacks.LoadPack (packs ride on agent config, not the\nfrozen ACI contract, so the shape is duplicated across the layers the way\nBudgetConfig mirrors the ACI Budget).",
         "properties": {
@@ -8021,7 +9212,7 @@
         "type": "object"
       },
       "MemoryGuidanceOut": {
-        "description": "The agent's effective memory guidance and where it comes from (#1461).\n\n``source`` is ``operator`` when guidance is stored for the agent; else\n``learning_default`` when the agent is opted in to agent-wide learning and\n``text`` is the learning default (ADR 0239); else ``default`` and ``text``\nis the platform default.",
+        "description": "The agent's effective memory guidance and where it comes from (#1461).\n\n``source`` is ``operator`` when guidance is stored for the agent; else\n``learning_default`` when the agent is opted in to agent-wide learning and\n``text`` is the learning default (ADR 0249); else ``default`` and ``text``\nis the platform default.",
         "properties": {
           "source": {
             "enum": [
@@ -8190,7 +9381,7 @@
         "type": "object"
       },
       "MemoryRecordOut": {
-        "description": "One canonical memory entry (a fact or a standing instruction).\n\n``author`` and ``stated_at`` are null only for an entry stored before ADR\n0239 that never named them; the migration does not invent provenance.\n``conversation`` is the signed source conversation of the last sandbox\nwrite, null for operator writes and migrated entries.",
+        "description": "One canonical memory entry (a fact or a standing instruction).\n\n``author`` and ``stated_at`` are null only for an entry stored before ADR\n0249 that never named them; the migration does not invent provenance.\n``conversation`` is the signed source conversation of the last sandbox\nwrite, null for operator writes and migrated entries.",
         "properties": {
           "archived": {
             "title": "Archived",
@@ -8874,6 +10065,42 @@
         "title": "ObservationNode",
         "type": "object"
       },
+      "Owner": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": {
+            "format": "uuid",
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "event_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Event Id",
+            "type": "string"
+          },
+          "owner": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Owner",
+            "type": "string"
+          },
+          "thread_key": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Thread Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "agent_id",
+          "thread_key",
+          "event_id",
+          "owner"
+        ],
+        "title": "Owner",
+        "type": "object"
+      },
       "OwnerLostBody": {
         "properties": {
           "owner": {
@@ -8892,6 +10119,35 @@
           "runtime_epoch"
         ],
         "title": "OwnerLostBody",
+        "type": "object"
+      },
+      "Page": {
+        "additionalProperties": false,
+        "properties": {
+          "files": {
+            "items": {
+              "$ref": "#/components/schemas/FileDescriptor"
+            },
+            "title": "Files",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          }
+        },
+        "required": [
+          "files",
+          "next_cursor"
+        ],
+        "title": "Page",
         "type": "object"
       },
       "PhaseDeclaration": {
@@ -9005,6 +10261,25 @@
           "status"
         ],
         "title": "PrincipalOut",
+        "type": "object"
+      },
+      "PrincipalRef": {
+        "description": "Initiating principal provenance. @spec INITIATING-PRINCIPAL-1",
+        "properties": {
+          "authorization_version": {
+            "title": "Authorization Version",
+            "type": "integer"
+          },
+          "principal_id": {
+            "title": "Principal Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "principal_id",
+          "authorization_version"
+        ],
+        "title": "PrincipalRef",
         "type": "object"
       },
       "PrincipalResolutionOut": {
@@ -9454,6 +10729,12 @@
       "PublicationBranchHeadOut": {
         "description": "The head of a publication's branch; ``None`` when the branch does not exist.",
         "properties": {
+          "base_branch": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Base Branch",
+            "type": "string"
+          },
           "head_sha": {
             "anyOf": [
               {
@@ -9467,7 +10748,8 @@
           }
         },
         "required": [
-          "head_sha"
+          "head_sha",
+          "base_branch"
         ],
         "title": "PublicationBranchHeadOut",
         "type": "object"
@@ -9878,6 +11160,7 @@
         "type": "object"
       },
       "PublicationLineageAdvance": {
+        "additionalProperties": false,
         "description": "Exact compare-and-set facts for one publication revision outcome.",
         "properties": {
           "expected_head_sha": {
@@ -10433,8 +11716,12 @@
         "type": "object"
       },
       "PublicationPullRecover": {
-        "description": "Adopt the publication branch's pull request, or open it when the branch\nholds exactly ``expected_head_sha``.",
+        "description": "Adopt the publication branch's pull request.\n\nWhen ``adopt_only`` is false, open one if the branch holds exactly\n``expected_head_sha``.",
         "properties": {
+          "adopt_only": {
+            "title": "Adopt Only",
+            "type": "boolean"
+          },
           "expected_head_sha": {
             "pattern": "^[0-9a-f]{40,64}$",
             "title": "Expected Head Sha",
@@ -10442,7 +11729,8 @@
           }
         },
         "required": [
-          "expected_head_sha"
+          "expected_head_sha",
+          "adopt_only"
         ],
         "title": "PublicationPullRecover",
         "type": "object"
@@ -10502,12 +11790,19 @@
       "PublicationRevisionOut": {
         "properties": {
           "commit_sha": {
+            "pattern": "^[0-9a-f]{40,64}$",
             "title": "Commit Sha",
+            "type": "string"
+          },
+          "parent_sha": {
+            "pattern": "^[0-9a-f]{40,64}$",
+            "title": "Parent Sha",
             "type": "string"
           }
         },
         "required": [
-          "commit_sha"
+          "commit_sha",
+          "parent_sha"
         ],
         "title": "PublicationRevisionOut",
         "type": "object"
@@ -10540,7 +11835,7 @@
         "type": "object"
       },
       "QueuedTurn": {
-        "description": "A normalized inbound turn ready for the worker to route and run.\n\nThe channel-neutral promotion of the dispatcher's former ``QueuedSlackEvent``.\nThe Valkey Stream carries this model as a single ``payload`` JSON field; the\nstream-encoding helpers live with the producer (the dispatcher), not on this\nfrozen model, so the contract stays transport-agnostic.\n\n``source`` defaults to ``SLACK`` so a pre-upgrade producer that does not set\nit still decodes, which is what makes this addition a PATCH under this\npackage's change-class table rather than a breaking minor. The default is a\ncompatibility affordance and not a licence to omit it: every first-party mint\nsite sets it explicitly, exactly as ``ReplyHandle.adapter`` does. Defaulting\nto the non-job value is also the safe direction -- an unset ``source`` reads\nas a person's message, so a job can never be created by omission.\n\n``attachments`` defaults to the EMPTY LIST for the same reason and with the\nsame consequence: a pre-upgrade producer that omits the key still decodes,\nwhich is what makes adding it a PATCH under this package's change-class table\nrather than a breaking minor. The default is a compatibility affordance and\nnot a licence to omit it -- every first-party mint site that can see files\npasses them explicitly, exactly as ``source`` and ``ReplyHandle.adapter`` are\nset explicitly. The default is the empty collection and not ``None`` so a\nconsumer can write ``for ref in turn.attachments`` with no guard; \"this\nchannel reported no files\" and \"this producer predates the field\" are\ndeliberately the same value, because nothing downstream acts differently on\nthe two.\n\n``hook_run`` carries the scheduled hook identity when a hook produced the\nturn. It defaults to ``None`` so ordinary turns and pre-upgrade producers keep\ndecoding unchanged.\n\n``reply_handle`` is absent only for a targetless cron turn. That turn must\ncarry a complete, nonblank ``hook_run`` so the worker has explicit agent and\nscheduled run identity without inventing a reply route. Every targeted turn,\nincluding cron, keeps the existing reply handle contract unchanged.\n\n``tool_access`` asks for this one turn to be restricted (TOOL-ACCESS-1);\na worker implementing TOOL-ACCESS-6 forwards it as ``Event.tool_access``,\nand one that does not drops it. It defaults to ``None``, today's\nunrestricted turn, so a pre-upgrade producer keeps decoding unchanged. No\nfirst-party ingress sets it.",
+        "description": "A normalized inbound turn ready for the worker to route and run.\n\nThe channel-neutral promotion of the dispatcher's former ``QueuedSlackEvent``.\nThe Valkey Stream carries this model as a single ``payload`` JSON field; the\nstream-encoding helpers live with the producer (the dispatcher), not on this\nfrozen model, so the contract stays transport-agnostic.\n\n``source`` defaults to ``SLACK`` so a pre-upgrade producer that does not set\nit still decodes, which is what makes this addition a PATCH under this\npackage's change-class table rather than a breaking minor. The default is a\ncompatibility affordance and not a licence to omit it: every first-party mint\nsite sets it explicitly, exactly as ``ReplyHandle.adapter`` does. Defaulting\nto the non-job value is also the safe direction -- an unset ``source`` reads\nas a person's message, so a job can never be created by omission.\n\n``attachments`` defaults to the EMPTY LIST for the same reason and with the\nsame consequence: a pre-upgrade producer that omits the key still decodes,\nwhich is what makes adding it a PATCH under this package's change-class table\nrather than a breaking minor. The default is a compatibility affordance and\nnot a licence to omit it -- every first-party mint site that can see files\npasses them explicitly, exactly as ``source`` and ``ReplyHandle.adapter`` are\nset explicitly. The default is the empty collection and not ``None`` so a\nconsumer can write ``for ref in turn.attachments`` with no guard; \"this\nchannel reported no files\" and \"this producer predates the field\" are\ndeliberately the same value, because nothing downstream acts differently on\nthe two.\n\n``hook_run`` carries the scheduled hook identity when a hook produced the\nturn. It defaults to ``None`` so ordinary turns and pre-upgrade producers keep\ndecoding unchanged.\n\n``reply_handle`` is absent only for a targetless cron turn. That turn must\ncarry a complete, nonblank ``hook_run`` so the worker has explicit agent and\nscheduled run identity without inventing a reply route. Every targeted turn,\nincluding cron, keeps the existing reply handle contract unchanged.\n\n``tool_access`` asks for this one turn to be restricted (TOOL-ACCESS-1);\na worker implementing TOOL-ACCESS-6 forwards it as ``Event.tool_access``,\nand one that does not drops it. It defaults to ``None``, today's\nunrestricted turn, so a pre-upgrade producer keeps decoding unchanged. No\nfirst-party ingress sets it.\n\n``author_principal`` is the initiating subject admission resolved ``author``\nto (INITIATING-PRINCIPAL-1). ``author`` keeps its existing meaning. The\nexecuting actor, the agent, is never this principal. This is provenance,\nnot authority: neither its presence nor its absence grants anything.",
         "properties": {
           "attachments": {
             "default": [],
@@ -10553,6 +11848,16 @@
           "author": {
             "title": "Author",
             "type": "string"
+          },
+          "author_principal": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PrincipalRef"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "conversation_id": {
             "title": "Conversation Id",
@@ -10645,6 +11950,139 @@
           "pointer"
         ],
         "title": "ReadArguments",
+        "type": "object"
+      },
+      "Reference": {
+        "additionalProperties": false,
+        "properties": {
+          "file_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "File Id",
+            "type": "string"
+          },
+          "mime_type": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mime Type"
+          },
+          "name": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "ordinal": {
+            "maximum": 1000.0,
+            "minimum": 0.0,
+            "title": "Ordinal",
+            "type": "integer"
+          },
+          "route_adapter": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Route Adapter"
+          },
+          "route_identity": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Route Identity",
+            "type": "string"
+          },
+          "route_kind": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Route Kind",
+            "type": "string"
+          },
+          "size_bytes": {
+            "anyOf": [
+              {
+                "maximum": 9.223372036854776e+18,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Size Bytes"
+          }
+        },
+        "required": [
+          "file_id",
+          "ordinal",
+          "name",
+          "route_kind",
+          "route_identity"
+        ],
+        "title": "Reference",
+        "type": "object"
+      },
+      "Registered": {
+        "additionalProperties": false,
+        "properties": {
+          "appended": {
+            "title": "Appended",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "appended"
+        ],
+        "title": "Registered",
+        "type": "object"
+      },
+      "Registration": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": {
+            "format": "uuid",
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "event_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Event Id",
+            "type": "string"
+          },
+          "refs": {
+            "items": {
+              "$ref": "#/components/schemas/Reference"
+            },
+            "maxItems": 1000,
+            "title": "Refs",
+            "type": "array"
+          },
+          "thread_key": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Thread Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "agent_id",
+          "thread_key",
+          "event_id",
+          "refs"
+        ],
+        "title": "Registration",
         "type": "object"
       },
       "RemediationBreakerClose": {
@@ -11401,6 +12839,55 @@
           "target"
         ],
         "title": "RemediationVerifierRunStart",
+        "type": "object"
+      },
+      "Renewal": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": {
+            "format": "uuid",
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "current_event_id": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current Event Id"
+          },
+          "event_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Event Id",
+            "type": "string"
+          },
+          "owner": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Owner",
+            "type": "string"
+          },
+          "thread_key": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Thread Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "agent_id",
+          "thread_key",
+          "event_id",
+          "owner"
+        ],
+        "title": "Renewal",
         "type": "object"
       },
       "ReplyHandle": {
@@ -12351,7 +13838,7 @@
         "type": "object"
       },
       "ScheduleListOut": {
-        "description": "Every in-force cron hook the platform can see, and every active agent\nschedule (ADR 0238).",
+        "description": "Every in-force cron hook the platform can see, and every active agent\nschedule (ADR 0248).",
         "properties": {
           "agent_schedules": {
             "items": {
@@ -12373,6 +13860,21 @@
           "agent_schedules"
         ],
         "title": "ScheduleListOut",
+        "type": "object"
+      },
+      "Selection": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "title": "Selection",
         "type": "object"
       },
       "SettingConfig": {
@@ -12812,7 +14314,7 @@
         "type": "object"
       },
       "StateEntryPut": {
-        "description": "Write a durable state entry (#23). ``expected_version`` opts into\ncompare-and-set: the write is rejected with 409 unless it matches the stored\nversion (omit it for a blind upsert). ``value`` is any JSON value (object,\narray, or scalar); an array value is what ``append`` grows.\n\nOn a canonical memory key (``memory`` / ``fact-<32 hex>``, ADR 0239) the\nvalue must be the typed entry shape, a create sends no ``expected_version``\n(or 0), and an update must send the head's version (428 when omitted).",
+        "description": "Write a durable state entry (#23). ``expected_version`` opts into\ncompare-and-set: the write is rejected with 409 unless it matches the stored\nversion (omit it for a blind upsert). ``value`` is any JSON value (object,\narray, or scalar); an array value is what ``append`` grows.\n\nOn a canonical memory key (``memory`` / ``fact-<32 hex>``, ADR 0249) the\nvalue must be the typed entry shape, a create sends no ``expected_version``\n(or 0), and an update must send the head's version (428 when omitted).",
         "properties": {
           "expected_version": {
             "anyOf": [
@@ -12858,6 +14360,141 @@
           "last_updated"
         ],
         "title": "StateNamespaceOut",
+        "type": "object"
+      },
+      "TeamSyncOut": {
+        "properties": {
+          "digest": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Digest"
+          },
+          "epoch": {
+            "title": "Epoch",
+            "type": "integer"
+          },
+          "external_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "External Id"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "last_attempt_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Attempt At"
+          },
+          "last_error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Error"
+          },
+          "last_synced_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Synced At"
+          },
+          "managed_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Managed By"
+          },
+          "member_count": {
+            "title": "Member Count",
+            "type": "integer"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "source": {
+            "enum": [
+              "idp_group",
+              "curie_managed"
+            ],
+            "title": "Source",
+            "type": "string"
+          },
+          "sync_age_seconds": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sync Age Seconds"
+          },
+          "synced": {
+            "title": "Synced",
+            "type": "boolean"
+          },
+          "tenant_id": {
+            "format": "uuid",
+            "title": "Tenant Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "tenant_id",
+          "source",
+          "external_id",
+          "name",
+          "managed_by",
+          "epoch",
+          "member_count",
+          "digest",
+          "last_synced_at",
+          "last_attempt_at",
+          "last_error",
+          "synced",
+          "sync_age_seconds"
+        ],
+        "title": "TeamSyncOut",
         "type": "object"
       },
       "TerminationBody": {
@@ -13199,6 +14836,22 @@
         "title": "ThreadResetState",
         "type": "object"
       },
+      "Ticket": {
+        "additionalProperties": false,
+        "properties": {
+          "ticket": {
+            "maxLength": 128,
+            "minLength": 32,
+            "title": "Ticket",
+            "type": "string"
+          }
+        },
+        "required": [
+          "ticket"
+        ],
+        "title": "Ticket",
+        "type": "object"
+      },
       "TipsPackConfig": {
         "description": "Rotating capability tips for one agent (mirrors behaviorpacks.TipsPack).\nSeparate from LoadPackConfig: a load line is what the agent is doing now, a\ntip advertises what it can do.",
         "properties": {
@@ -13315,6 +14968,22 @@
           "issue_id"
         ],
         "title": "TrackerIssueIn",
+        "type": "object"
+      },
+      "Transfer": {
+        "additionalProperties": false,
+        "properties": {
+          "transfer_id": {
+            "maxLength": 128,
+            "minLength": 32,
+            "title": "Transfer Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "transfer_id"
+        ],
+        "title": "Transfer",
         "type": "object"
       },
       "TurnAccepted": {
@@ -14225,6 +15894,17 @@
             ],
             "title": "Last Deferral Reason"
           },
+          "last_start_failure_detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Start Failure Detail"
+          },
           "sequence": {
             "title": "Sequence",
             "type": "integer"
@@ -14303,7 +15983,8 @@
           "terminal_cause",
           "termination_observation",
           "capacity_deferrals",
-          "last_deferral_reason"
+          "last_deferral_reason",
+          "last_start_failure_detail"
         ],
         "title": "WorkItemRequestOut",
         "type": "object"
@@ -16033,6 +17714,132 @@
           }
         },
         "summary": "Update Agent",
+        "tags": [
+          "agents"
+        ]
+      }
+    },
+    "/agents/{agent_id}/access-policy": {
+      "get": {
+        "operationId": "get_agent_access_policy_agents__agent_id__access_policy_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentAccessPolicyOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Agent Access Policy",
+        "tags": [
+          "agents"
+        ]
+      },
+      "put": {
+        "operationId": "put_agent_access_policy_agents__agent_id__access_policy_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AgentAccessPolicyWrite"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentAccessPolicyOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Put Agent Access Policy",
         "tags": [
           "agents"
         ]
@@ -19134,7 +20941,7 @@
         ]
       },
       "get": {
-        "description": "The agent's effective memory guidance and its source (#1461, ADR 0239).",
+        "description": "The agent's effective memory guidance and its source (#1461, ADR 0249).",
         "operationId": "get_memory_guidance_agents__agent_id__memory_guidance_get",
         "parameters": [
           {
@@ -20522,7 +22329,7 @@
     },
     "/agents/{agent_id}/state/_memory/context": {
       "get": {
-        "description": "The bounded boot memory (ADR 0239): the learning toggle, the effective\nguidance, at most 20 active standing instructions and the titles of at most\n50 active facts from agent memory plus the caller's own channel, with\ntotals and omitted counts. No fact statement is ever in it.\n\nA sandbox credential sees its own binding (none when it names none). The\nplatform key sees agent memory, plus one binding when it names both\n``channel_kind`` and ``channel_address``.",
+        "description": "The bounded boot memory (ADR 0249): the learning toggle, the effective\nguidance, at most 20 active standing instructions and the titles of at most\n50 active facts from agent memory plus the caller's own channel, with\ntotals and omitted counts. No fact statement is ever in it.\n\nA sandbox credential sees its own binding (none when it names none). The\nplatform key sees agent memory, plus one binding when it names both\n``channel_kind`` and ``channel_address``.",
         "operationId": "memory_context_agents__agent_id__state__memory_context_get",
         "parameters": [
           {
@@ -23460,6 +25267,240 @@
         ]
       }
     },
+    "/attachment-access/authorize": {
+      "post": {
+        "operationId": "authorize_attachment_access_authorize_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Attachment-Access",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Attachment-Access"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Selection"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FileDescriptor"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Authorize",
+        "tags": [
+          "attachment-access"
+        ]
+      }
+    },
+    "/attachment-access/completion": {
+      "post": {
+        "operationId": "completion_attachment_access_completion_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Attachment-Access",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Attachment-Access"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Transfer"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Completion"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Completion",
+        "tags": [
+          "attachment-access"
+        ]
+      }
+    },
+    "/attachment-access/fetch": {
+      "post": {
+        "operationId": "fetch_attachment_access_fetch_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Attachment-Access",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Attachment-Access"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Selection"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Fetch",
+        "tags": [
+          "attachment-access"
+        ]
+      }
+    },
+    "/attachment-access/list": {
+      "post": {
+        "operationId": "list_files_attachment_access_list_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Attachment-Access",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Attachment-Access"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Listing"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Files",
+        "tags": [
+          "attachment-access"
+        ]
+      }
+    },
     "/channel-canvas": {
       "post": {
         "operationId": "channel_canvas_channel_canvas_post",
@@ -24985,6 +27026,765 @@
         ]
       }
     },
+    "/directory/binding": {
+      "get": {
+        "operationId": "read_directory_binding_directory_binding_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Directory-Credential",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Directory-Credential"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DirectoryBindingOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Read Directory Binding",
+        "tags": [
+          "directory"
+        ]
+      }
+    },
+    "/directory/config/{tenant_id}": {
+      "get": {
+        "operationId": "get_directory_config_directory_config__tenant_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Tenant Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DirectoryConfigOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Directory Config",
+        "tags": [
+          "directory"
+        ]
+      },
+      "put": {
+        "operationId": "put_directory_config_directory_config__tenant_id__put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Tenant Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DirectoryConfigIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DirectoryConfigOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Put Directory Config",
+        "tags": [
+          "directory"
+        ]
+      }
+    },
+    "/directory/credentials": {
+      "post": {
+        "operationId": "issue_directory_credential_directory_credentials_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DirectoryCredentialIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DirectoryCredentialOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Issue Directory Credential",
+        "tags": [
+          "directory"
+        ]
+      }
+    },
+    "/directory/namespaces": {
+      "post": {
+        "operationId": "provision_directory_namespace_directory_namespaces_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DirectoryNamespaceIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DirectoryNamespaceOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Provision Directory Namespace",
+        "tags": [
+          "directory"
+        ]
+      }
+    },
+    "/directory/people": {
+      "get": {
+        "operationId": "list_directory_people_directory_people_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "after_subject",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 512,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After Subject"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Directory-Credential",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Directory-Credential"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DirectoryPeopleOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Directory People",
+        "tags": [
+          "directory"
+        ]
+      }
+    },
+    "/directory/people/status": {
+      "post": {
+        "operationId": "change_directory_account_status_directory_people_status_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Directory-Credential",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Directory-Credential"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DirectoryStatusIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DirectoryStatusOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Change Directory Account Status",
+        "tags": [
+          "directory"
+        ]
+      }
+    },
+    "/directory/teams": {
+      "post": {
+        "operationId": "provision_directory_team_directory_teams_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DirectoryTeamIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DirectoryTeamOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Provision Directory Team",
+        "tags": [
+          "directory"
+        ]
+      }
+    },
+    "/directory/teams/{team_id}": {
+      "get": {
+        "operationId": "read_directory_team_directory_teams__team_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "team_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Team Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Directory-Credential",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Directory-Credential"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DirectoryTeamOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Read Directory Team",
+        "tags": [
+          "directory"
+        ]
+      }
+    },
+    "/directory/teams/{team_id}/attempt": {
+      "post": {
+        "operationId": "record_directory_attempt_directory_teams__team_id__attempt_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "team_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Team Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Directory-Credential",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Directory-Credential"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DirectoryAttemptIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Record Directory Attempt",
+        "tags": [
+          "directory"
+        ]
+      }
+    },
+    "/directory/teams/{team_id}/snapshot": {
+      "put": {
+        "operationId": "apply_directory_snapshot_directory_teams__team_id__snapshot_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "team_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Team Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Directory-Credential",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Directory-Credential"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DirectorySnapshotIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DirectorySnapshotOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Apply Directory Snapshot",
+        "tags": [
+          "directory"
+        ]
+      }
+    },
     "/evals/matrix": {
       "get": {
         "operationId": "eval_matrix_evals_matrix_get",
@@ -25720,6 +28520,204 @@
         "summary": "Probe Hook Support",
         "tags": [
           "hooks"
+        ]
+      }
+    },
+    "/identity/admin/{tenant_id}/{resource}": {
+      "get": {
+        "operationId": "identity_view_identity_admin__tenant_id___resource__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Tenant Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "resource",
+            "required": true,
+            "schema": {
+              "enum": [
+                "people",
+                "links",
+                "namespaces"
+              ],
+              "title": "Resource",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Identity View Identity Admin  Tenant Id   Resource  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Identity View",
+        "tags": [
+          "identity-admin"
+        ]
+      }
+    },
+    "/identity/connect/{token}": {
+      "get": {
+        "operationId": "identity_connect_page_identity_connect__token__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "token",
+            "required": true,
+            "schema": {
+              "title": "Token",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Identity Connect Page",
+        "tags": [
+          "identity-connect"
+        ]
+      }
+    },
+    "/identity/connect/{token}/confirm": {
+      "post": {
+        "operationId": "confirm_connection_identity_connect__token__confirm_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "token",
+            "required": true,
+            "schema": {
+              "title": "Token",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_confirm_connection_identity_connect__token__confirm_post"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Confirm Connection",
+        "tags": [
+          "identity-connect"
         ]
       }
     },
@@ -27372,6 +30370,136 @@
         ]
       }
     },
+    "/teams": {
+      "get": {
+        "operationId": "list_team_sync_status_teams_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "tenant_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Tenant Id"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/TeamSyncOut"
+                  },
+                  "title": "Response List Team Sync Status Teams Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Team Sync Status",
+        "tags": [
+          "teams"
+        ]
+      }
+    },
+    "/teams/metrics": {
+      "get": {
+        "description": "Export current age and durable failure counts; never expire membership.",
+        "operationId": "directory_metrics_teams_metrics_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "tenant_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Tenant Id"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Directory Metrics",
+        "tags": [
+          "teams"
+        ]
+      }
+    },
     "/v1/factory/cards/{token}.svg": {
       "get": {
         "operationId": "factory_status_card_v1_factory_cards__token__svg_get",
@@ -27407,6 +30535,362 @@
         "summary": "Factory Status Card",
         "tags": [
           "factory-status"
+        ]
+      }
+    },
+    "/v1/internal/attachment-access/complete": {
+      "post": {
+        "operationId": "complete_v1_internal_attachment_access_complete_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Completed"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Completion"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Complete",
+        "tags": [
+          "internal-attachment-access"
+        ]
+      }
+    },
+    "/v1/internal/attachment-access/context": {
+      "post": {
+        "operationId": "context_v1_internal_attachment_access_context_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Context"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Capability"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Context",
+        "tags": [
+          "internal-attachment-access"
+        ]
+      }
+    },
+    "/v1/internal/attachment-access/redeem": {
+      "post": {
+        "operationId": "redeem_v1_internal_attachment_access_redeem_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Ticket"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Redeem V1 Internal Attachment Access Redeem Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Redeem",
+        "tags": [
+          "internal-attachment-access"
+        ]
+      }
+    },
+    "/v1/internal/attachment-access/register": {
+      "post": {
+        "operationId": "register_v1_internal_attachment_access_register_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Registration"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Registered"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Register",
+        "tags": [
+          "internal-attachment-access"
+        ]
+      }
+    },
+    "/v1/internal/attachment-access/renew": {
+      "post": {
+        "operationId": "renew_v1_internal_attachment_access_renew_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Renewal"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Active"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Renew",
+        "tags": [
+          "internal-attachment-access"
+        ]
+      }
+    },
+    "/v1/internal/attachment-access/revoke": {
+      "post": {
+        "operationId": "revoke_v1_internal_attachment_access_revoke_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Owner"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Active"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Revoke",
+        "tags": [
+          "internal-attachment-access"
         ]
       }
     },
@@ -28318,7 +31802,7 @@
         ]
       },
       "post": {
-        "description": "Adopt the branch's pull request, or open it when the branch exists.\n\nThe contract is the stored publication's title, body and draft flag, the\nlineage branch, and the admitted WorkItem's base or else the repository's\ndefault branch (`curie_api.publication_pulls.adopt_or_open`).",
+        "description": "Adopt the branch's pull request, or open one unless ``adopt_only`` is true.\n\nThe contract is the stored publication's title, body and draft flag, the\nlineage branch, and the admitted WorkItem's base or else the repository's\ndefault branch (`curie_api.publication_pulls.adopt_or_open`).\n\nAn absent branch, or no pull request in adoption-only mode, returns 204.",
         "operationId": "recover_publication_pull_request_v1_internal_publications__publication_id__pull_request_post",
         "parameters": [
           {
@@ -28370,7 +31854,7 @@
             "description": "Successful Response"
           },
           "204": {
-            "description": "The publication branch does not exist"
+            "description": "Publication branch absent, or no pull request in adoption-only mode"
           },
           "422": {
             "content": {
@@ -28451,7 +31935,7 @@
     },
     "/v1/internal/publications/{publication_id}/revision-commit": {
       "post": {
-        "description": "Prove a remote commit is this revision's marked commit on its expected parent.",
+        "description": "Prove the marked revision and its authoritative publication parent.",
         "operationId": "verify_publication_revision_v1_internal_publications__publication_id__revision_commit_post",
         "parameters": [
           {

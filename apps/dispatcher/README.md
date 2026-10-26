@@ -58,7 +58,9 @@ bot-authored `app_mention` posted at the root of a channel is ingested, so an al
 Still refused: a bot-authored `app_mention` that carries a `thread_ts`, as a loop guard
 between two Curie installations in one workspace, unless its exact sender/channel pair
 is explicitly trusted as described below; a `message` event outside the DM lane, which the app
-never subscribed to; a redelivery whose dedupe key is already claimed; and a button click
+never subscribed to; a mention in a delivery-canary channel, which is counted and never
+starts a turn (see *One app per identity*); a redelivery whose dedupe key is already
+claimed; and a button click
 with nowhere to reply — an App Home or modal click, which carries no channel and no
 message.
 
@@ -202,7 +204,7 @@ parenthetical is what the Slack adapter maps onto each one:
 | `conversation_id` | canonical thread/conversation key (the thread ts) |
 | `author` | who authored the message (the Slack user id) |
 | `text` | message text |
-| `reply_handle` | where the reply is delivered: a `ReplyHandle` of `channel`, required nullable `placeholder`, and an optional per turn `endpoint`. It may be absent only on a cron turn with complete nonblank `hook_run` identity. Generated clients cannot enforce that cross field rule. The Slack adapter always supplies the ts of its already posted placeholder. The worker currently rejects targetless execution. |
+| `reply_handle` | where the reply is delivered: a `ReplyHandle` of `channel`, required nullable `placeholder`, and an optional per turn `endpoint`. It may be absent only on a cron turn with complete nonblank `hook_run` identity. Generated clients cannot enforce that cross field rule. The Slack adapter supplies the ts of its already posted placeholder, or `null` when posting the placeholder failed (see Dedupe below). The worker currently rejects targetless execution. |
 | `received_at` | ISO-8601 UTC timestamp the adapter received it |
 
 The worker reconstructs it with `from_stream_fields(fields)`, a module-level
@@ -223,6 +225,15 @@ acked, never re-posted, never re-enqueued). Chosen over stream-side dedupe becau
 it is O(1), TTL-bounded (no unbounded dedupe set to prune), and needs no Stream
 scan. Order is claim -> post placeholder -> `XADD`, so a duplicate never produces
 a second placeholder.
+
+A failed placeholder never costs the request. Bolt acks a Socket Mode envelope
+before the listener runs, so Slack does not normally redeliver an event whose
+handling failed. If posting the placeholder fails for any reason, the dispatcher
+logs a warning, keeps the claim, and still enqueues the turn with a `null`
+placeholder; the worker then posts the answer, or its failure notice, as a fresh
+reply in the thread. When the failure was ambiguous (a dropped connection,
+`fatal_error`), a placeholder may already be in the thread, and the answer then
+arrives as a separate reply below it.
 
 ## Reconnect supervision and shutdown
 
@@ -282,6 +293,44 @@ check closes a dead socket without calling any listener, and the heartbeat file
 keeps its mtime fresh either way. Alert when `connected` stays below
 `configured`. The gauge carries no identity attribute.
 
+An open socket is not proof that events arrive (#4960). Slack can stop routing
+events to a socket that still answers pings, and frames that do arrive may never
+reach a listener. Either way the gauge stays at `connected`. Two counters cover
+that gap, and both carry the identity:
+
+- `curie.slack.socket.envelopes` (`curie_slack_socket_envelopes_total`) counts
+  every frame Slack hands an identity's Socket Mode client. It has attributes
+  `slack_identity` and `type`: the frame's Socket Mode type (`hello`,
+  `disconnect`, `events_api`, `interactive`, `slash_commands`), or `other` for
+  any other type or an unparseable frame. The count is taken where the SDK
+  enqueues the raw frame, before any listener runs, so it says whether Slack
+  sent something. It does not say whether a listener handled it. Each socket
+  gets a `hello` when it opens, and per
+  [Slack's Socket Mode documentation](https://docs.slack.dev/apis/events-api/using-socket-mode/)
+  a `disconnect` before Slack refreshes it, so even a quiet identity's count
+  moves.
+- `curie.slack.delivery_canary` (`curie_slack_delivery_canary_total`) counts the
+  delivery-canary mentions an identity's mention listener handled. It has
+  attribute `slack_identity`. A delivery canary is an `app_mention` in a channel
+  listed in `CURIE_SLACK_DELIVERY_CANARY_CHANNELS`. It is counted, logged as the
+  `delivery_canary` drop at DEBUG, and refused before admission, dedupe,
+  placeholder and enqueue: no turn, no reply, no API call. To prove delivery
+  for each identity, post one root message that mentions every identity into
+  such a channel on a schedule. Alert when an identity's
+  `increase(curie_slack_delivery_canary_total[30m])` is zero while the poster
+  is succeeding. If `curie_slack_socket_envelopes_total{type="events_api"}` is
+  still rising at that point, events reach the socket but not the listener.
+
+`slack_identity` is the declared identity name, `default` for a stock install.
+Names past 16, or names that are not a short slug, share `other`.
+
+Each identity's Socket Mode client logs to its own logger,
+`curie_dispatcher.slack_socket.<identity>`, a child of the dispatcher's
+service logger. slack_sdk's session lifecycle lines go out at INFO through the
+dispatcher's redacted JSON handler, and the record's `logger` field names the
+identity: a session established, a CLOSE received, a stale connection
+disconnected, a reconnect to a new endpoint. Its DEBUG frame traces stay off.
+
 ## Config surface (env vars)
 
 Read from the environment by `DispatcherConfig()` (a `pydantic_settings.BaseSettings`).
@@ -297,6 +346,7 @@ Read from the environment by `DispatcherConfig()` (a `pydantic_settings.BaseSett
 | `VALKEY_PASSWORD` | "" | Valkey password (compose dev: `valkeypass`) |
 | `VALKEY_DB` | `0` | Valkey db index |
 | `CURIE_SLACK_THREADED_BOT_ALLOWLIST` | `[]` | exact `{channel_id, bot_id}` pairs allowed to mention the agent inside channel threads |
+| `CURIE_SLACK_DELIVERY_CANARY_CHANNELS` | `[]` | JSON list of channel ids (`C…` or `G…`) whose mentions are delivery canaries: counted on `curie.slack.delivery_canary` and refused before admission (see *One app per identity*). The chart sets it through `dispatcher.extraEnv` |
 | `VALKEY_TLS` | `false` | when `true`, the client connects over TLS and verifies against the system CA bundle; the chart sets this from `valkey.tls` |
 | `CURIE_STREAM` | `curie:runs` | Stream the jobs land on |
 | `CURIE_DEDUPE_PREFIX` | `curie:dedupe:` | dedupe key prefix |

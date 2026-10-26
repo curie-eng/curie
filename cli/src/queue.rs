@@ -210,6 +210,7 @@ pub fn synthetic_turn(
         // `local message` and `cluster message` send unrestricted turns; no CLI
         // flag sets a tool access yet. Stated for the same reason `source` is.
         tool_access: None,
+        author_principal: None,
     }
 }
 
@@ -651,6 +652,7 @@ mod tests {
                 // key names stay one shape across both lanes.
                 "attachments",
                 "author",
+                "author_principal",
                 "conversation_id",
                 "event_id",
                 "hook_run",
@@ -794,6 +796,7 @@ mod tests {
             attachments: Vec::new(),
             hook_run: None,
             tool_access: None,
+            author_principal: None,
         };
         (stream_id.to_string(), payload_json(&turn).unwrap())
     }

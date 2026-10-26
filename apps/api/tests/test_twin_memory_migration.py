@@ -1,4 +1,4 @@
-"""The twin memory expansion (ADR 0239): selfimp_sched_0001 -> selfimp_memory_0001.
+"""The twin memory expansion (ADR 0249): selfimp_sched_0001 -> selfimp_memory_0001.
 
 The revision adds ``agents.agent_wide_learning`` (default false) and the
 immutable ``memory_revisions`` table, and enriches every valid canonical fact

@@ -1205,3 +1205,40 @@ def test_dispatcher_mints_shared_test_driver_wire_vector() -> None:
         now=vector["issued_at"],
     )
     assert token == vector["test_driver"]["token"]
+
+
+def test_dispatcher_mints_shared_slack_evidence_vector() -> None:
+    vector = json.loads(
+        (Path(__file__).parents[3] / "tests/vectors/approval-principal.json").read_text()
+    )
+    claims = vector["chat_slack"]["claims"]
+    token = mint_chat_principal(vector["secret"], subject=claims["sub"],
+                                actor_channel=claims["actor_channel"],
+                                approval_id=claims["approval_id"], now=vector["issued_at"],
+                                slack=claims["slack"])
+    assert token == vector["chat_slack"]["token"]
+
+
+def test_click_signs_sender_team_evidence_inside_principal() -> None:
+    import base64
+
+    from curie_dispatcher.approval_actions import resolve_approval_action
+
+    captured = []
+    def transport(request):
+        captured.append(request)
+        return httpx.Response(200, json={"status": "approved", "resolved_by": "U0EXAMPLE1"})
+
+    http = httpx.Client(transport=httpx.MockTransport(transport))
+    resolver = ApprovalResolveClient(api_base_url="https://api.example.com", api_key="",
+                                      approval_chat_attester_secret="example-attester", client=http)
+    body = _approval_click("example", action_id=APPROVE_ACTION_ID, user="U0EXAMPLE1").payload
+    body["user"]["team_id"] = "TEXAMPLE1"
+    outcome = resolve_approval_action(body=body, decision="approved", resolver=resolver)
+    assert outcome is not None and outcome.outcome.status_code == 200
+    wire = captured[0].headers["X-Curie-Approval-Principal"].split(".")[1]
+    claims = json.loads(base64.urlsafe_b64decode(wire + "=" * (-len(wire) % 4)))
+    assert claims["slack"]["interaction_user_team_id"] == "TEXAMPLE1"
+    assert claims["slack"]["user_id"] == "U0EXAMPLE1"
+    assert "slack" not in json.loads(captured[0].content)
+    http.close()

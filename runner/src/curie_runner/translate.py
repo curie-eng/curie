@@ -461,8 +461,10 @@ def _translate_assistant(
         # below closes the generation, so a later block in a parallel tool
         # response would otherwise be dropped. Tool names only, never arguments.
         for block in message.content:
-            if isinstance(block, TextBlock) and block.text and not nested:
-                gen.observe_output(block.text)
+            if isinstance(block, TextBlock):
+                # #4940: an errored message's text is provider error text; never export it.
+                if block.text and not nested and not error:
+                    gen.observe_output(block.text)
             elif isinstance(block, ToolUseBlock):
                 gen.observe_output(f"[tool_use {block.name}]")
     for block in message.content:

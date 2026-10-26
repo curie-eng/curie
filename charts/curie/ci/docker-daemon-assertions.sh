@@ -27,9 +27,9 @@
 #       volumeDevices, userns and authz plugin flags, no added
 #       capabilities, service account token, emptyDir sizeLimit and secret
 #       volumes, host namespaces and ports, positive quantity() resources and
-#       sizeLimit, activeDeadlineSeconds); the objects policy checks every
-#       per-run ingress peer (namespaceSelector on the release namespace,
-#       runner-sandbox podSelector, no ipBlock, the daemon port); the pods
+#       sizeLimit, activeDeadlineSeconds); ingress peer restrictions and the
+#       full TCP range are present together in ONE objects validation; the
+#       separate runtime proof checks server admission behaviour; the pods
 #       policy also matches pods/ephemeralcontainers UPDATE; no validation in
 #       the three policies short-circuits with `true ||` or `|| true`; and
 #       every validation has a message. The cluster proof covers CEL behaviour.
@@ -214,12 +214,18 @@ for rule in role.get("rules", []):
                 triples.add((g, r, v))
 want_triples = set()
 for g, r, verbs in (("", "pods", "create get list delete"), ("", "pods/log", "get"),
+                    ("", "pods/portforward", "create get"),
                     ("", "services", "create get list delete"), ("", "secrets", "create delete"),
                     ("networking.k8s.io", "networkpolicies", "create get list delete")):
+    if r in ("pods/exec", "pods/proxy"):
+        fail(f"Role must not grant {r}")
     for v in verbs.split():
         want_triples.add((g, r, v))
 if triples != want_triples:
     fail(f"Role rules differ: extra {sorted(triples - want_triples)} missing {sorted(want_triples - triples)}")
+for absent in ("pods/exec", "pods/proxy"):
+    if any(resource == absent for _, resource, _ in triples):
+        fail(f"Role must not grant {absent}")
 binding = find("RoleBinding", role_name)
 in_ns(binding, ns)
 if binding["roleRef"] != {"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": role_name}:
@@ -314,7 +320,7 @@ else:
         "policyTypes": ["Egress"],
         "egress": [{"to": [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": ns}},
                             "podSelector": {"matchLabels": DAEMON_SEL}}],
-                    "ports": [{"protocol": "TCP", "port": port}]}],
+                    "ports": [{"protocol": "TCP", "port": 1, "endPort": 65535}]}],
     }
     if spec != want_spec:
         fail(f"Rail 1 allow spec {json.dumps(spec, sort_keys=True)} != {json.dumps(want_spec, sort_keys=True)}")
@@ -432,27 +438,31 @@ for c in non_classes:
 objects_need = {
     "claim and managed-by labels": ["curietech.ai/sandbox-claim", "'curie-sandbox-substrate'"],
     "ingress-only per-claim policy": ["['Ingress']", "egress", "podSelector"],
-    # Every ingress rule names its peers, each peer is this release's runner
-    # sandbox in the release namespace, never an ipBlock, on the daemon port.
-    "ingress peers": ["ingress", "from", "namespaceSelector", "kubernetes.io/metadata.name", f"'{REL_NS}'",
-                      "podSelector", "'runner-sandbox'", "app.kubernetes.io/instance", "ipBlock", "ports",
-                      str(port),
-                      # The peer carries a matchLabels key beyond the three
-                      # release selector keys, not merely three keys.
-                      "matchLabels.exists(", "'app.kubernetes.io/name'", "'app.kubernetes.io/instance'",
-                      "'app.kubernetes.io/component'",
-                      # No port ranges past the daemon port.
-                      "endPort"],
+    "ingress peers": [
+        "object.spec.ingress.all(r,", "has(r.from)", "size(r.from) > 0",
+        "r.from.all(p,", "!has(p.ipBlock)",
+        "has(p.namespaceSelector)", "has(p.namespaceSelector.matchLabels)",
+        "'kubernetes.io/metadata.name' in p.namespaceSelector.matchLabels",
+        f"p.namespaceSelector.matchLabels['kubernetes.io/metadata.name'] == '{REL_NS}'",
+        "has(p.podSelector)", "has(p.podSelector.matchLabels)",
+        "'app.kubernetes.io/component' in p.podSelector.matchLabels",
+        "p.podSelector.matchLabels['app.kubernetes.io/component'] == 'runner-sandbox'",
+        "'app.kubernetes.io/instance' in p.podSelector.matchLabels",
+        "p.podSelector.matchLabels['app.kubernetes.io/instance'] == 't'",
+        "'curietech.ai/sandbox-claim' in p.podSelector.matchLabels",
+        "p.podSelector.matchLabels['curietech.ai/sandbox-claim'] == "
+        "object.metadata.labels['curietech.ai/sandbox-claim']",
+        "has(r.ports)", "size(r.ports) > 0", "r.ports.all(q,",
+        "has(q.port) && q.port == 1 && has(q.endPort) && q.endPort == 65535 &&",
+        "(!has(q.protocol) || q.protocol == 'TCP')",
+    ],
     "secret type": ["Opaque", "'kubernetes.io/tls'"],
     "service type": ["ClusterIP", "externalIPs"],
 }
 for rule, needles in objects_need.items():
     in_one_validation("objects", objects_validations, rule, needles)
-# Counting matchLabels keys proves nothing, since three keys can all be release
-# selector keys (name, instance, component) and select every sandbox.
-for e in objects_validations:
-    if "ipBlock" in e and "namespaceSelector" in e and ">= 3" in e:
-        fail(f"objects policy ingress peers still count matchLabels keys (>= 3): {e[:120]}")
+if re.search(r"\bmatchLabels\.exists\s*\(", objects_text):
+    fail("objects policy retains the obsolete matchLabels.exists predicate")
 in_one_validation("cleanup", cleanup_validations, "claim label",
                   ["oldObject.metadata.labels", "'curietech.ai/sandbox-claim'"])
 

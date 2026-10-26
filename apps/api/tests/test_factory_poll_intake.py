@@ -39,14 +39,16 @@ import pytest
 import redis.asyncio as aioredis
 from curie_api.config import Settings, get_settings
 from curie_api.main import create_app
+from curie_api.threadkeys import route_thread_key
 from curie_api.workitem_reconciler import WorkItemReconciler
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
 from fastapi.testclient import TestClient
-from sqlalchemy import make_url
+from sqlalchemy import make_url, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from forge_fakes import jira as jira_fake  # noqa: E402
 from forge_fakes.github import (  # noqa: E402
     INSTALLATION_ID,
     LABEL,
@@ -61,6 +63,7 @@ from forge_fakes.github import (  # noqa: E402
     factory_env,
     fake_installation_tokens,
     forges_document,
+    forges_env_json,
     github_repository_binding,
 )
 from test_github_factory_ingress import _rows  # noqa: E402
@@ -1187,6 +1190,141 @@ def test_poll_admits_review_feedback_once(
     _run_once(github)
 
     assert [row["id"] for row in _requests(number)] == [row["id"] for row in rows]
+
+
+def _hand_to_jira(work_item_id: uuid.UUID) -> None:
+    """Rewrite a WorkItem and its pull request lineage as a Jira issue whose
+    code host is the GitHub repository: the rows a Jira admission writes. The
+    identity trigger guards these columns, so it is off for this one
+    transaction."""
+
+    issue_id = "10042"
+
+    async def go() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(text("SET LOCAL session_replication_role = replica"))
+                await conn.execute(
+                    text(
+                        "UPDATE curie.work_items SET tracker_kind = 'jira_cloud', "
+                        "tracker_host = :site, tracker_scope_id = :cloud, "
+                        "tracker_issue_id = :issue, tracker_display_key = 'PROJ-42', "
+                        "conversation_id = :conversation WHERE id = :id"
+                    ),
+                    {
+                        "site": jira_fake.SITE_HOST,
+                        "cloud": jira_fake.CLOUD_ID,
+                        "issue": issue_id,
+                        "conversation": route_thread_key(
+                            "jira", None, jira_fake.BINDING_NAME, f"issue-{issue_id}"
+                        ),
+                        "id": work_item_id,
+                    },
+                )
+                await conn.execute(
+                    text(
+                        "UPDATE curie.thread_publication_lineages l "
+                        "SET conversation_id = w.conversation_id FROM curie.work_items w "
+                        "WHERE w.id = :id AND l.id = w.publication_lineage_id"
+                    ),
+                    {"id": work_item_id},
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(go())
+
+
+def _make_feedback_only(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """The agent's surface is the Jira binding, not the GitHub repository: no
+    GitHub surface serves it, so the poll pass walks it for another tracker's
+    pull requests (#4358 plan D10) with serves False and feedback True."""
+
+    _execute(
+        "UPDATE curie.agent_channels SET kind = 'jira', address = :binding WHERE kind = 'github'",
+        {"binding": jira_fake.BINDING_NAME},
+    )
+    document = forges_document(api_url=get_settings().github_api_url)
+    jira = jira_fake.jira_document()
+    document["trackers"].extend(jira["trackers"])
+    document["bindings"].extend(jira["bindings"])
+    monkeypatch.setenv("CURIE_FORGES", forges_env_json(document, tmp_path / "forges"))
+    get_settings.cache_clear()
+
+
+def _work_item_requests(work_item_id: uuid.UUID) -> list[uuid.UUID]:
+    rows = _rows(
+        "SELECT id FROM curie.execution_requests WHERE work_item_id = :id ORDER BY sequence",
+        {"id": work_item_id},
+    )
+    return [row["id"] for row in rows]
+
+
+def _jira_owned_pull(client: TestClient, github: PollGitHub) -> tuple[uuid.UUID, int]:
+    _number, first = _admit_label(client, github)
+    pull = github.plant_pull()
+    _own_pull_request(first["work_item_id"], pull)
+    _complete(first["id"])
+    _hand_to_jira(first["work_item_id"])
+    return first["work_item_id"], pull
+
+
+def test_poll_feedback_only_conversation_comment_admits_one_revision(
+    poll_factory: tuple[TestClient, PollGitHub],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A plain conversation comment on a Jira-owned pull request admits a
+    revision, as a review body on it does (#4910)."""
+
+    client, github = poll_factory
+    work_item_id, pull = _jira_owned_pull(client, github)
+    _make_feedback_only(monkeypatch, tmp_path)
+    before = _work_item_requests(work_item_id)
+    comment_id = 73201
+    github.add_issue_comment(pull, comment_id, f"@{MENTION} please rename the helper")
+
+    _run_once(github)
+
+    after = _work_item_requests(work_item_id)
+    assert after[: len(before)] == before
+    assert after[len(before) :] == [_feedback_request_id("issue_comment", comment_id)]
+
+    _run_once(github)
+
+    assert _work_item_requests(work_item_id) == after
+
+
+def test_poll_feedback_only_issue_mention_does_not_admit(
+    poll_factory: tuple[TestClient, PollGitHub],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A repository walked for feedback only admits no issue intake: a mention
+    on a GitHub factory issue there is not read as a notice (#4910)."""
+
+    client, github = poll_factory
+    _jira_owned_pull(client, github)
+    # A GitHub factory issue still open in the repository: its number is one
+    # the mention branch would match.
+    number, row = _admit_label(client, github)
+    _complete(row["id"])
+    _make_feedback_only(monkeypatch, tmp_path)
+    before = [found["id"] for found in _requests(number)]
+    comment_id = 73211
+    github.add_issue_comment(number, comment_id, f"@{MENTION} please revise the helper")
+    github.calls.clear()
+
+    _run_once(github)
+
+    assert [found["id"] for found in _requests(number)] == before
+    # The listing is read, but the mention is never verified: no read of the
+    # comment and no permission read for its author.
+    paths = [request.url.path for request in github.calls]
+    assert f"/repos/{REPO}/issues/comments" in paths
+    assert f"/repos/{REPO}/issues/comments/{comment_id}" not in paths
+    assert f"/repos/{REPO}/collaborators/{SENDER}/permission" not in paths
 
 
 def test_webhook_of_a_polled_label_stays_one_request(

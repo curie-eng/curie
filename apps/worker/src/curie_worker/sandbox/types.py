@@ -11,11 +11,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import socket
 from collections.abc import Mapping
+from contextlib import AbstractContextManager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from enum import StrEnum
-from typing import TYPE_CHECKING, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from aci_protocol import BootEnv
 from aci_protocol.service_config import API_KEY_ENV
@@ -442,13 +444,54 @@ class SandboxView:
 
 @dataclass(frozen=True)
 class SandboxTermination:
-    """Confirmed termination of the runner pod, with safe diagnostic text."""
+    """Confirmed termination of the runner pod, with safe diagnostic text.
+
+    ``exit_code`` is the runner container's terminated exit code when the pod
+    status reported a real int; it never changes ``detail``.
+    """
 
     reason: str
     detail: str | None = None
+    exit_code: int | None = None
 
 
 OperatingMode = Literal["Running", "Suspended"]
+
+# The objects of one claim's Docker daemon (ADR 0217). The worker Role may
+# create and delete daemon Secrets but never list or read them.
+DaemonObjectKind = Literal["Pod", "Service", "NetworkPolicy", "Secret"]
+ListableDaemonKind = Literal["Pod", "Service", "NetworkPolicy"]
+
+
+@dataclass(frozen=True)
+class DaemonObjectView:
+    """What the substrate reads back about one daemon object.
+
+    ``claim`` is its ``curietech.ai/sandbox-claim`` label; ``created_at`` is
+    tz-aware, and None (unknown age) is never swept. ``phase`` is a Pod's;
+    ``ready`` is a Pod's Ready condition, false once it is terminating.
+    """
+
+    kind: DaemonObjectKind
+    name: str
+    uid: str
+    claim: str | None
+    created_at: datetime | None
+    phase: str | None = None
+    ready: bool = False
+
+
+@dataclass(frozen=True)
+class ToolDaemonMount:
+    """What the runner of a Docker-enabled claim receives (ADR 0217).
+
+    ``files`` (ca.pem, cert.pem, key.pem) ride the per-claim token Secret and
+    are mounted read-only; ``env`` holds the four non-secret DOCKER_* values.
+    """
+
+    files: Mapping[str, str] = field(repr=False)
+    env: Mapping[str, str]
+    active_deadline_seconds: int
 
 
 class SandboxClient(Protocol):
@@ -468,8 +511,10 @@ class SandboxClient(Protocol):
         env: dict[str, str] | None = None,
         labels: dict[str, str] | None = None,
         runner_resources: dict[str, object] | None = None,
+        deadline: float,
         agent_name: str | None = None,
         executor_secret_names: frozenset[str] | None = None,
+        tool_daemon: ToolDaemonMount | None = None,
     ) -> None:
         """Create a claim after excluding host credentials from the child environment.
 
@@ -480,6 +525,11 @@ class SandboxClient(Protocol):
         (possibly empty) marks an executor claim (@spec ACTION-EXECUTOR-5): the
         runner gets no model credential, no model env-key declaration, and no
         connector secret outside the set, whatever the pool template carries.
+
+        ``deadline`` (``time.monotonic()`` based) bounds every request; one
+        that has passed raises ClaimTimeoutError. ``tool_daemon`` hands the
+        runner its daemon's client files and env. An HTTP 409 on a claim-name
+        create raises ClaimNameConflict.
         """
 
         ...
@@ -525,9 +575,53 @@ class SandboxClient(Protocol):
 
     def set_sandbox_mode(self, name: str, mode: OperatingMode) -> None: ...
 
+    def create_daemon_object(
+        self, namespace: str, manifest: Mapping[str, Any], *, request_timeout_seconds: float
+    ) -> str:
+        """Create one daemon object and return its uid; 409 is ClaimNameConflict."""
+
+        ...
+
+    def list_daemon_objects(
+        self,
+        namespace: str,
+        kind: ListableDaemonKind,
+        *,
+        label_selector: str,
+        request_timeout_seconds: float,
+    ) -> list[DaemonObjectView]: ...
+
+    def delete_daemon_object(
+        self,
+        namespace: str,
+        kind: DaemonObjectKind,
+        name: str,
+        *,
+        uid: str,
+        request_timeout_seconds: float,
+    ) -> None:
+        """Delete exactly the object with ``uid``; absent or replaced is success."""
+
+        ...
+
+    def get_daemon_pod(
+        self, namespace: str, name: str, *, request_timeout_seconds: float
+    ) -> DaemonObjectView | None: ...
+
+    def open_daemon_stream(
+        self, namespace: str, pod: str, port: int, *, timeout_seconds: float
+    ) -> AbstractContextManager[socket.socket]:
+        """A raw byte stream to ``pod:port``; TLS is the caller's."""
+
+        ...
+
 
 class SandboxError(Exception):
     """Base error for the sandbox substrate."""
+
+
+class ClaimNameConflict(SandboxError):
+    """An object at a claim's name already exists (HTTP 409): it is someone else's."""
 
 
 class ClaimTimeoutError(SandboxError):
@@ -595,10 +689,21 @@ class RepoRunnerPoolRefused(MissingAgentPoolError):
                 f"{pool} was not rendered (missing_pool); redeploy its runner with {fix}"
             )
         else:
+            rebuild = (
+                f"`curie cluster factory --repo-runner {repo}=<spec> --registry <registry> "
+                "--namespace <namespace> --release <release> --context <context>`"
+            )
+            remedy = (
+                "pin agentSandbox.runner.digest in this installation's release values first, "
+                f"then rebuild and rebind it with {rebuild}"
+                if platform_digest is None
+                else f"rebuild and rebind it on the installed pinned platform runner with {rebuild}"
+            )
             message = (
                 f"repository {repo} runner image was built on platform runner {base}, "
                 f"not this installation's {platform_digest or 'unpinned runner image'} "
-                f"(stale_base); rebuild it with {fix}"
+                f"(stale_base); {remedy}; use a repository runner spec containing its retained "
+                "tools, probes and Dockerfile declaration"
             )
         SandboxError.__init__(self, message)
 

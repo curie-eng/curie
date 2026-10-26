@@ -33,7 +33,7 @@ class TurnMemoryGrant:
     kind: str
     address: str
     thread_key: str
-    # A scheduled run, or the approval continuation of one (ADR 0238): the
+    # A scheduled run, or the approval continuation of one (ADR 0248): the
     # credential then says so, and the API refuses schedule changes with it.
     scheduled: bool = False
 

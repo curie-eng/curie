@@ -59,8 +59,11 @@ def test_connect_or_skip_fails_for_an_unreachable_valkey_when_required(
     listener = _configure_unreachable_valkey(monkeypatch)
 
     with listener:
-        with pytest.raises(UNREACHABLE):
+        with pytest.raises(UNREACHABLE) as info:
             valkey.connect_or_skip()
+        message = "\n".join(info.value.__notes__)
+        port = listener.getsockname()[1]
+        assert f"could not connect to Valkey at 127.0.0.1:{port}" in message
 
 
 def test_connect_or_skip_client_has_no_retry_and_a_connect_timeout(

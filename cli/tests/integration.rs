@@ -4,6 +4,7 @@
 
 mod support;
 
+mod access_policy_verb;
 mod actions_cli;
 mod agent_schedules_cli;
 mod agent_update_body;
@@ -22,6 +23,7 @@ mod approvals_list_truncation;
 mod approvals_manifest_unreadable;
 mod artifacts_fetch;
 mod boot_env_contract;
+mod budget_factory_allowance;
 mod callers_verb;
 mod channel_token_verb;
 mod chart_check;
@@ -69,6 +71,7 @@ mod connector_lock;
 mod connector_mount_visibility;
 mod connector_rollout;
 mod connector_rollout_live;
+mod connector_secret_digest;
 mod connector_selection;
 mod connector_start_wait;
 mod connector_startup_events;
@@ -82,6 +85,7 @@ mod delivery_pin;
 mod deploy_environment;
 mod deploy_transport;
 mod dev_model_credit;
+mod dev_test_env;
 mod docker_no_host_binds;
 mod docker_subpath_preflight;
 mod doctor_api;

@@ -220,7 +220,7 @@ def test_memory_writes_for_is_called_on_the_turn_path() -> None:
 def test_learned_skills_for_reads_the_agent_setting(
     row: tuple[object, ...] | None, expected: bool
 ) -> None:
-    # ADR 0237: the same tenant-scoped, separate read as memory_writes_for.
+    # ADR 0247: the same tenant-scoped, separate read as memory_writes_for.
     resolver, engine = _reader(row)
     assert asyncio.run(resolver.learned_skills_for(_AGENT)) is expected
     [(sql, params)] = engine.statements

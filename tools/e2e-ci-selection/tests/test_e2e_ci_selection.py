@@ -9,13 +9,14 @@ import importlib.util
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tomllib
 from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
-from typing import Any
+from typing import Any, Literal, TypedDict
 
 import pytest
 import yaml
@@ -28,6 +29,18 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 SELECTOR = REPO_ROOT / "tools" / "e2e-ci-selection" / "select_tiers.py"
 REGISTRY = REPO_ROOT / ".github" / "e2e-selection.yaml"
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yaml"
+CI_POLICY_DIRS = (
+    "tools/ci-retry-gate",
+    "tools/ci-workflow-paths",
+    "tools/ci-release-target-parity",
+    "tools/e2e-ci-selection",
+    "tools/helm-ci-gate",
+    "tools/fix-pin-ci",
+    "tools/p0-closes-ci",
+    "tools/runtime-assertion-gate",
+    "tools/dependency-audit-paths",
+    "tools/close-on-next",
+)
 INITIAL_BINDING_MODULE = "tools/factory-e2e/tests/test_c4_initial_binding.py"
 CLUSTER_UP_MODULE = "tools/factory-e2e/tests/test_c4_cluster_up.py"
 INITIAL_BINDING_INPUTS = (
@@ -48,9 +61,11 @@ STATIC_TOKEN_ROTATION_MODULE = "tools/factory-e2e/tests/test_c4_static_token_rot
 FORGE_INSTANCE_JOB = "forge-instance-regression"
 ADMITTED_AGENT_JOB = "factory-admitted-agent"
 FACTORY_SIBLING_RESULTS = {
-    "forge_instance_result": "FORGE_INSTANCE_RESULT",
     "admitted_agent_result": "ADMITTED_AGENT_RESULT",
 }
+NIGHTLY_DISPATCH = (
+    "github.event_name == 'workflow_dispatch' && inputs.nightly == true"
+)
 FORGE_INSTANCE_MODULE = "tools/factory-e2e/tests/test_c4_forge_instances.py"
 FORGE_INSTANCE_LEGS = {
     "second-gitlab": "test_second_gitlab_registration_preserves_first",
@@ -182,18 +197,37 @@ CHART_IMAGE_INPUTS = (
     "pyproject.toml",
     "uv.lock",
 )
-CHART_SCENARIOS = {
+
+
+class _ChartScenario(TypedDict):
+    step: str
+    inputs: list[str]
+    leg: str
+
+
+CHART_SCENARIOS: dict[str, _ChartScenario] = {
+    "failed-first-install-retry": {
+        "step": "Failed first install retry recreates data volumes",
+        "inputs": [
+            "charts/curie/ci/runtime/failed-first-install-retry-runtime.sh",
+            "cli/src/ops/up.rs",
+        ],
+        "leg": "workload",
+    },
     "installation-identity": {
         "step": "Installation identity Secret lifecycle",
         "inputs": ["charts/curie/ci/runtime/upgrade-drain-installation-runtime.sh"],
+        "leg": "chart",
     },
     "connector-identity": {
         "step": "End to end connector identity is denied outside its scope",
         "inputs": ["charts/curie/ci/runtime/e2e-connector-identity-runtime.sh"],
+        "leg": "chart",
     },
     "runner-resources-render": {
         "step": "Per-agent runner resource override renders",
         "inputs": ["charts/curie/ci/runtime/runner-resources-assertions.sh"],
+        "leg": "chart",
     },
     "langfuse-postgres-readiness": {
         "step": "Langfuse web waits for delayed Postgres without restarting",
@@ -201,6 +235,7 @@ CHART_SCENARIOS = {
             "charts/curie/ci/runtime/langfuse-postgres-readiness-runtime.sh",
             "charts/curie/ci/postgres-readiness-delay.Dockerfile",
         ],
+        "leg": "chart",
     },
     "connector-readiness": {
         "step": "Connector that never listens stays not-Ready until it binds",
@@ -211,14 +246,30 @@ CHART_SCENARIOS = {
             "pyproject.toml",
             "uv.lock",
         ],
+        "leg": "chart",
+    },
+    "connector-secret-rotation": {
+        "step": "Hosted connector credential rotation rolls only that connector",
+        "inputs": [
+            "charts/curie/ci/runtime/connector-secret-rotation-runtime.sh",
+            "cli",
+            "apps/api",
+            "apps/worker",
+            "packages",
+            "pyproject.toml",
+            "uv.lock",
+        ],
+        "leg": "workload",
     },
     "runner-template-admission": {
         "step": "Runner template admission refuses host escapes, token mounts, and unlisted images",
         "inputs": ["charts/curie/ci/runtime/runner-template-admission-runtime.sh"],
+        "leg": "chart",
     },
     "runner-byo-egress": {
         "step": "Runner BYO egress enforces (not just rendered)",
         "inputs": ["scripts/check-runner-byo-egress.sh"],
+        "leg": "chart",
     },
     "controller-preflight": {
         "step": "Controller preflight accepts a serving upgrade and refuses broken RBAC",
@@ -227,6 +278,7 @@ CHART_SCENARIOS = {
             "pyproject.toml",
             "uv.lock",
         ],
+        "leg": "chart",
     },
     "workspace-diagnostic": {
         "step": "Workspace dependency failure reaches the terminal diagnostic",
@@ -234,6 +286,7 @@ CHART_SCENARIOS = {
             "charts/curie/ci/runtime/workspace-dependency-diagnostic-runtime.sh",
             *CHART_IMAGE_INPUTS,
         ],
+        "leg": "workload",
     },
     "quota-progress": {
         "step": "Quota progress regression",
@@ -241,15 +294,56 @@ CHART_SCENARIOS = {
             "charts/curie/ci/runtime/idle-capacity-reclamation-runtime.sh",
             *CHART_IMAGE_INPUTS,
         ],
+        "leg": "workload",
+    },
+    "factory-resource-profile": {
+        "step": "Factory resource profile runtime (#4889)",
+        "inputs": [
+            "charts/curie/ci/runtime/factory-resource-profile-runtime.sh",
+            "charts/curie/values.yaml",
+            "charts/curie/values.schema.json",
+            "charts/curie/templates/agent-sandbox.yaml",
+            "charts/curie/templates/_sandbox_envelope.tpl",
+            "charts/curie/templates/_helpers.tpl",
+            *CHART_IMAGE_INPUTS,
+        ],
+        "leg": "workload",
     },
 }
 CHART_IDS = tuple(sorted(CHART_SCENARIOS))
 
 
-def _chart_step_if(scenario: str) -> str:
-    if scenario == "quota-progress":
-        return "${{ false }}"
-    return "${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), '" + scenario + "') }}"
+CHART_LEGS = ("chart", "workload")
+WORKLOAD_SCENARIOS = frozenset(
+    {
+        "workspace-diagnostic",
+        "quota-progress",
+        "connector-secret-rotation",
+        "failed-first-install-retry",
+        "factory-resource-profile",
+    }
+)
+
+
+def _chart_leg_clause(leg: str) -> str:
+    return "matrix.leg == '" + leg + "'"
+
+
+def _chart_step_if(scenario: str, leg: str | None = None) -> str:
+    return (
+        "${{ "
+        + _chart_leg_clause(CHART_SCENARIOS[scenario]["leg"] if leg is None else leg)
+        + " && contains(fromJSON(needs.changes.outputs.chart_scenarios), '"
+        + scenario
+        + "') }}"
+    )
+
+
+def _expected_chart_legs(scenarios: tuple[str, ...] | list[str]) -> list[str]:
+    # An unregistered step carries no leg condition, so it selects every leg.
+    if "unregistered" in scenarios:
+        return list(CHART_LEGS)
+    return sorted({CHART_SCENARIOS[scenario]["leg"] for scenario in scenarios})
 
 
 def _matches_chart_input(path: str, value: str) -> bool:
@@ -380,8 +474,314 @@ def _expected_conditional_deselect(*paths: str, pytest_needed: bool = True) -> s
     )
 
 
+def _expected_ci_policy_files(
+    *paths: str, registry: Path = REGISTRY, push: bool = False
+) -> tuple[str, ...]:
+    entries = yaml.safe_load(registry.read_text())["ci_policy_tests"]
+    return tuple(sorted(
+        module for module, inputs in entries.items()
+        if push or any(
+            path == prefix or path.startswith(prefix + "/")
+            for path in paths for prefix in inputs
+        )
+    ))
+
+
+def _assert_ci_policy_registry(root: Path, entries: dict[str, list[str]]) -> None:
+    root = root.resolve()
+    discovered = {
+        path.relative_to(root).as_posix()
+        for directory in CI_POLICY_DIRS
+        for path in (root / directory / "tests").rglob("test_*.py")
+        if path.is_file()
+    }
+    assert set(entries) == discovered, (
+        f"missing modules: {sorted(discovered - set(entries))}; "
+        f"stale modules: {sorted(set(entries) - discovered)}"
+    )
+    for module in sorted(discovered):
+        inputs = entries[module]
+        owner = next(
+            directory for directory in CI_POLICY_DIRS if module.startswith(directory + "/")
+        )
+        assert ".github" in inputs, f"{module}: missing .github input"
+        assert owner in inputs, f"{module}: missing {owner} input"
+        assert not {"", ".", "./"}.intersection(inputs), module
+        try:
+            tree = ast.parse((root / module).read_text(), filename=module)
+        except (OSError, UnicodeError, SyntaxError) as error:
+            raise AssertionError(f"{module}: cannot parse required source: {error}") from error
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+                continue
+            literal = node.value
+            if "/" not in literal or Path(literal).is_absolute():
+                continue
+            try:
+                target = (root / literal).resolve()
+                relative = target.relative_to(root).as_posix()
+                exists = target.exists()
+            except (OSError, ValueError):
+                continue
+            if relative == "." or not exists:
+                continue
+            assert any(
+                relative == prefix or relative.startswith(prefix + "/") for prefix in inputs
+            ), f"{module}: undeclared repository path {relative}"
+
+
+def test_ci_policy_registry_covers_modules_and_existing_path_literals() -> None:
+    _assert_ci_policy_registry(REPO_ROOT, yaml.safe_load(REGISTRY.read_text())["ci_policy_tests"])
+
+
+def _policy_guard_fixture(tmp_path: Path) -> dict[str, list[str]]:
+    entries: dict[str, list[str]] = yaml.safe_load(REGISTRY.read_text())["ci_policy_tests"]
+    for directory in CI_POLICY_DIRS:
+        for source in (REPO_ROOT / directory / "tests").rglob("test_*.py"):
+            destination = tmp_path / source.relative_to(REPO_ROOT)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, destination)
+    return entries
+
+
+def test_ci_policy_guard_covers_existing_ignored_build_directories(tmp_path: Path) -> None:
+    entries = _policy_guard_fixture(tmp_path)
+    for directory in ("target", "dist"):
+        (tmp_path / "cli" / directory).mkdir(parents=True, exist_ok=True)
+    _assert_ci_policy_registry(tmp_path, entries)
+
+    module = "tools/ci-workflow-paths/tests/test_workflow_paths.py"
+    entries[module].remove("cli")
+    with pytest.raises(
+        AssertionError, match=re.escape(module) + r": undeclared repository path cli/(target|dist)"
+    ):
+        _assert_ci_policy_registry(tmp_path, entries)
+    entries[module].append("cli")
+    _assert_ci_policy_registry(tmp_path, entries)
+
+
+def test_ci_policy_guard_rejects_missing_entry(tmp_path: Path) -> None:
+    entries = _policy_guard_fixture(tmp_path)
+    _assert_ci_policy_registry(tmp_path, entries)
+    module = "tools/ci-release-target-parity/tests/test_release_target_parity.py"
+    del entries[module]
+    with pytest.raises(AssertionError, match=re.escape(module)):
+        _assert_ci_policy_registry(tmp_path, entries)
+
+
+def test_ci_policy_guard_rejects_undeclared_literal_and_accepts_covered_literal(
+    tmp_path: Path,
+) -> None:
+    entries = _policy_guard_fixture(tmp_path)
+    module = "tools/ci-release-target-parity/tests/test_release_target_parity.py"
+    literal = "/".join(("inputs", "undeclared.txt"))
+    target = tmp_path / literal
+    target.parent.mkdir()
+    target.write_text("input\n")
+    source = tmp_path / module
+    source.write_text(source.read_text() + f"\nNEW_INPUT = {literal!r}\n")
+    diagnostic = module + ": undeclared repository path " + literal
+    with pytest.raises(AssertionError, match=re.escape(diagnostic)):
+        _assert_ci_policy_registry(tmp_path, entries)
+    entries[module].append("inputs")
+    _assert_ci_policy_registry(tmp_path, entries)
+
+
+def test_ci_policy_guard_accepts_registered_new_nested_module(tmp_path: Path) -> None:
+    entries = _policy_guard_fixture(tmp_path)
+    module = "tools/ci-release-target-parity/tests/nested/test_added_policy.py"
+    source = tmp_path / module
+    source.parent.mkdir()
+    source.write_text("INPUT = './tools/ci-release-target-parity/tests/../tests'\n")
+    with pytest.raises(AssertionError, match=re.escape(module)):
+        _assert_ci_policy_registry(tmp_path, entries)
+    entries[module] = [".github", "tools/ci-release-target-parity"]
+    _assert_ci_policy_registry(tmp_path, entries)
+
+
+@pytest.mark.parametrize(
+    "mutation", ["missing", "unreadable", "syntax", "stale", "github", "owner"]
+)
+def test_ci_policy_guard_fails_closed_on_required_source_and_inputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
+) -> None:
+    entries = _policy_guard_fixture(tmp_path)
+    module = "tools/ci-release-target-parity/tests/test_release_target_parity.py"
+    source = tmp_path / module
+    if mutation == "missing":
+        source.unlink()
+    elif mutation == "unreadable":
+        read_text = Path.read_text
+
+        def read(path: Path, *args: Any, **kwargs: Any) -> str:
+            if path == source:
+                raise PermissionError("required source is unreadable")
+            return read_text(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", read)
+    elif mutation == "syntax":
+        source.write_text("def broken(\n")
+    elif mutation == "stale":
+        entries[module + ".missing"] = entries[module]
+    else:
+        prefix = ".github" if mutation == "github" else "tools/ci-release-target-parity"
+        entries[module].remove(prefix)
+    with pytest.raises(AssertionError, match=re.escape(module)):
+        _assert_ci_policy_registry(tmp_path, entries)
+
+
+def _assert_policy_output(output: str, expected: tuple[str, ...]) -> None:
+    values = _outputs_of(output)
+    assert values["ci_policy"] == str(bool(expected)).lower()
+    assert values["ci_policy_files"] == ",".join(expected)
+    assert output.count("ci_policy=") == output.count("ci_policy_files=") == 1
+
+
+def test_ci_policy_unrelated_path_is_checked_against_registry(tmp_path: Path) -> None:
+    path = "README.md"
+    assert (REPO_ROOT / path).is_file()
+    assert _expected_ci_policy_files(path) == ()
+    completed, output = _invoke_selector(tmp_path, path)
+    assert completed.returncode == 0, completed.stderr
+    _assert_policy_output(output, ())
+
+
+@pytest.mark.parametrize("directory", CI_POLICY_DIRS)
+def test_ci_policy_tool_change_selects_its_modules_and_guard(
+    tmp_path: Path, directory: str
+) -> None:
+    paths = [
+        path.relative_to(REPO_ROOT).as_posix()
+        for path in (REPO_ROOT / directory / "tests").rglob("test_*.py")
+    ]
+    assert paths
+    expected = _expected_ci_policy_files(paths[0])
+    assert set(paths) <= set(expected)
+    assert Path(__file__).relative_to(REPO_ROOT).as_posix() in expected
+    completed, output = _invoke_selector(tmp_path, paths[0])
+    assert completed.returncode == 0, completed.stderr
+    _assert_policy_output(output, expected)
+
+
+@pytest.mark.parametrize("push,omit_kind", [(False, False), (True, False), (True, True)])
+def test_ci_policy_workflow_and_push_select_all_modules(
+    tmp_path: Path, push: bool, omit_kind: bool
+) -> None:
+    path = ".github/workflows/ci.yaml"
+    entries = yaml.safe_load(REGISTRY.read_text())["ci_policy_tests"]
+    assert all(".github" in inputs for inputs in entries.values())
+    completed, output = _invoke_selector(
+        tmp_path, *(() if push else (path,)), push=push, omit_kind=omit_kind
+    )
+    assert completed.returncode == 0, completed.stderr
+    _assert_policy_output(output, tuple(sorted(entries)))
+
+
+def test_ci_policy_selective_inputs_union_and_order_are_deterministic(tmp_path: Path) -> None:
+    path = "scripts/check-pr-body.sh"
+    expected = _expected_ci_policy_files(path)
+    assert 0 < len(expected) < len(_expected_ci_policy_files(push=True))
+    for paths in ((path,), (path, "README.md", path), ("README.md", path)):
+        completed, output = _invoke_selector(tmp_path, *paths)
+        assert completed.returncode == 0, completed.stderr
+        _assert_policy_output(output, expected)
+    second = ".gitleaks.toml"
+    union = tuple(sorted(set(expected) | set(_expected_ci_policy_files(second))))
+    assert set(expected) < set(union)
+    for paths in ((path, second, path), (second, path)):
+        completed, output = _invoke_selector(tmp_path, *paths)
+        assert completed.returncode == 0, completed.stderr
+        _assert_policy_output(output, union)
+
+
+@pytest.mark.parametrize(
+    "path", ["tools/close-on-next-other/tests/test_new.py", "scripts/check-pr-body.sh.backup"]
+)
+def test_ci_policy_prefix_near_misses_and_unknown_paths_have_no_fallback(
+    tmp_path: Path, path: str
+) -> None:
+    expected = _expected_ci_policy_files(path)
+    target = (
+        "tools/close-on-next/tests/test_close_on_next.py" if path.startswith("tools/")
+        else "tools/ci-retry-gate/tests/test_pr_body.py"
+    )
+    assert target not in expected
+    completed, output = _invoke_selector(tmp_path, path)
+    assert completed.returncode == 0, completed.stderr
+    _assert_policy_output(output, expected)
+
+
+def test_ci_policy_revision_selection_matches_paths_and_empty_diff(tmp_path: Path) -> None:
+    repository = _new_repository(tmp_path)
+    base = _commit_files(repository, {"README.md": "base\n"}, "base")
+    completed, output = _invoke_selector(tmp_path, base=base, head=base, cwd=repository)
+    assert completed.returncode == 0, completed.stderr
+    _assert_policy_output(output, ())
+    assert _outputs_of(output)["pytest"] == "true"
+    path = "scripts/check-pr-body.sh"
+    head = _commit_files(repository, {path: "changed\n"}, "policy input")
+    completed, output = _invoke_selector(tmp_path, base=base, head=head, cwd=repository)
+    assert completed.returncode == 0, completed.stderr
+    _assert_policy_output(output, _expected_ci_policy_files(path))
+    path_mode, path_output = _invoke_selector(tmp_path, path)
+    assert path_mode.returncode == 0, path_mode.stderr
+    assert output == path_output
+
+
+@pytest.mark.parametrize("mutation", [
+    "absent", "not-mapping", "empty", "nonstring-key", "absolute", "traversal", "trailing-slash",
+    "not-test", "comma", "newline", "space", "empty-inputs", "nonlist-inputs", "duplicate-inputs",
+    "absolute-input", "traversal-input", "duplicate-key",
+])
+def test_ci_policy_registry_rejects_malformed_entries(tmp_path: Path, mutation: str) -> None:
+    data = yaml.safe_load(VALID_REGISTRY)
+    module = "tools/e2e-ci-selection/tests/test_e2e_ci_selection.py"
+    entries = data["ci_policy_tests"]
+    if mutation == "absent":
+        del data["ci_policy_tests"]
+    elif mutation in {"not-mapping", "empty"}:
+        data["ci_policy_tests"] = [] if mutation == "not-mapping" else {}
+    elif mutation in {
+        "empty-inputs", "nonlist-inputs", "duplicate-inputs", "absolute-input", "traversal-input"
+    }:
+        entries[module] = {
+            "empty-inputs": [], "nonlist-inputs": ".github",
+            "duplicate-inputs": [".github", ".github"],
+            "absolute-input": ["/tmp/input"], "traversal-input": ["../input"],
+        }[mutation]
+    elif mutation != "duplicate-key":
+        key = {
+            "nonstring-key": 1, "absolute": "/" + module, "traversal": "../" + module,
+            "trailing-slash": module + "/", "not-test": "tools/e2e-ci-selection/readme.py",
+            "comma": module + ",other.py", "newline": module + "\nother.py",
+            "space": module + " other.py",
+        }[mutation]
+        data["ci_policy_tests"] = {key: entries[module]}
+    contents = yaml.safe_dump(data)
+    if mutation == "duplicate-key":
+        contents = VALID_REGISTRY.replace(
+            "ci_policy_tests:\n", "ci_policy_tests:\n  " + module + ": [.github]\n"
+        )
+    registry = tmp_path / "registry.yaml"
+    registry.write_text(contents)
+    completed, output = _invoke_selector(tmp_path, "README.md", registry=registry)
+    assert completed.returncode != 0, completed.stdout + completed.stderr
+    assert output == ""
+
+
+def test_ci_policy_valid_synthetic_registry_remains_live(tmp_path: Path) -> None:
+    registry = tmp_path / "registry.yaml"
+    registry.write_text(VALID_REGISTRY)
+    completed, output = _invoke_selector(tmp_path, ".github/workflows/ci.yaml", registry=registry)
+    assert completed.returncode == 0, completed.stderr
+    _assert_policy_output(
+        output, _expected_ci_policy_files(".github/workflows/ci.yaml", registry=registry)
+    )
+
+
 def _expected_output(
     *selected: str,
+    ci_policy_files: tuple[str, ...],
     pytest_needed: bool = True,
     pytest_deselect: str = "",
     pytest_scope: str = "full",
@@ -402,6 +802,8 @@ def _expected_output(
     lines.append(f"pytest={'true' if pytest_needed else 'false'}")
     lines.append(f"pytest_deselect={pytest_deselect}")
     lines.append(f"pytest_scope={pytest_scope}")
+    lines.append(f"ci_policy={str(bool(ci_policy_files)).lower()}")
+    lines.append("ci_policy_files=" + ",".join(ci_policy_files))
     lines.append(f"images={'true' if images_needed else 'false'}")
     lines.append(f"cli_release={'true' if cli_release_needed else 'false'}")
     lines.append(f"released_upgrade_full={'true' if released_upgrade_full else 'false'}")
@@ -409,10 +811,9 @@ def _expected_output(
     lines.append(f"factory={'true' if factory else 'false'}")
     lines.append(f"approval_resume={'true' if approval_resume else 'false'}")
     scenarios = CHART_IDS if chart_scenarios is None else chart_scenarios
-    lines.append(
-        "chart_scenarios="
-        + json.dumps(list(scenarios) if "cluster" in selected_tiers else [], separators=(",", ":"))
-    )
+    rendered = list(scenarios) if "cluster" in selected_tiers else []
+    lines.append("chart_scenarios=" + json.dumps(rendered, separators=(",", ":")))
+    lines.append("chart_legs=" + json.dumps(_expected_chart_legs(rendered), separators=(",", ":")))
     return "\n".join(lines) + "\n"
 
 
@@ -443,8 +844,9 @@ def _assert_selection(
         cli_release_needed=(
             _path_needs_cli_release(path) if cli_release_needed is None else cli_release_needed
         ),
-        released_upgrade_full=path == "cli/src/ops/upgrade.rs",
+        released_upgrade_full=False,
         chart_scenarios=_expected_chart_for_path(path),
+        ci_policy_files=_expected_ci_policy_files(path),
     )
 
 
@@ -493,6 +895,19 @@ def test_registry_maps_each_known_surface(
 )
 def test_selector_and_workflow_paths_do_not_boot_kind(tmp_path: Path, path: str) -> None:
     _assert_selection(tmp_path, path, (), pytest_needed=True)
+
+
+@pytest.mark.parametrize(
+    ("path", "selected"),
+    [
+        (".github/workflows/release.yaml", ("local-release",)),
+        (".github/workflows/release-notes.yaml", ()),
+    ],
+)
+def test_release_workflow_selection_is_exact(
+    tmp_path: Path, path: str, selected: tuple[str, ...]
+) -> None:
+    _assert_selection(tmp_path, path, selected, pytest_needed=True)
 
 
 @pytest.mark.parametrize(
@@ -652,9 +1067,9 @@ def _python_input_source(source: str) -> str:
     changed = True
     while changed:
         changed = False
-        for owner, targets, values in assignments:
+        for owner, target_names, values in assignments:
             used = consumed.setdefault(owner, set())
-            if targets & used and not values <= used:
+            if target_names & used and not values <= used:
                 used.update(values)
                 changed = True
 
@@ -1448,14 +1863,23 @@ def test_mixed_root_documentation_and_runtime_diff_selects_runtime_tiers(
         "local-release",
         "cluster",
         pytest_deselect=ALL_CONDITIONAL,
-        chart_scenarios=("quota-progress", "workspace-diagnostic"),
+        chart_scenarios=(
+            "connector-secret-rotation",
+            "factory-resource-profile",
+            "quota-progress",
+            "workspace-diagnostic",
+        ),
+        ci_policy_files=_expected_ci_policy_files("ARCHITECTURE.md", "apps/api/main.py"),
     )
 
 
 def test_unknown_and_union_selection_are_deterministic(tmp_path: Path) -> None:
     unknown, unknown_output = _invoke_selector(tmp_path, "new-surface/module.py")
     assert unknown.returncode == 0, unknown.stderr
-    assert unknown_output == _expected_output(*BASE_TIERS)
+    assert unknown_output == _expected_output(
+        *BASE_TIERS,
+        ci_policy_files=_expected_ci_policy_files("new-surface/module.py"),
+    )
 
     forward, forward_output = _invoke_selector(
         tmp_path,
@@ -1479,11 +1903,15 @@ def test_unknown_and_union_selection_are_deterministic(tmp_path: Path) -> None:
             "local-release",
             "cluster",
             "released-upgrade",
+            ci_policy_files=_expected_ci_policy_files(
+                "charts/curie/values.yaml", "compose.dev.yaml", "otel/collector.yaml"
+            ),
         )
     )
 
 
 def test_push_selects_every_tier_without_a_repository(tmp_path: Path) -> None:
+    """Dispatches use --push without kind omission."""
     completed, output = _invoke_selector(tmp_path, push=True)
     assert completed.returncode == 0, completed.stderr
     assert output == _expected_output(
@@ -1493,6 +1921,7 @@ def test_push_selects_every_tier_without_a_repository(tmp_path: Path) -> None:
         released_upgrade_full=True,
         factory=True,
         approval_resume=True,
+        ci_policy_files=_expected_ci_policy_files(push=True),
     )
 
 
@@ -1503,14 +1932,20 @@ def test_pull_request_released_upgrade_runs_the_smoke_shard_only(
     outputs = _selector_outputs(tmp_path, "charts/curie/values.yaml")
     assert outputs["released_upgrade"] == "true"
     assert outputs["released_upgrade_full"] == "false"
+    _assert_upgrade_smoke_shards(tmp_path, outputs)
 
 
 def test_omit_kind_drops_cluster_tiers_and_keeps_the_rest(tmp_path: Path) -> None:
     kept = tuple(tier for tier in TIERS if tier not in {"cluster", "released-upgrade"})
     completed, output = _invoke_selector(tmp_path, push=True, omit_kind=True)
     assert completed.returncode == 0, completed.stderr
-    # The next push omits kind, so it runs no upgrade job at all.
-    assert output == _expected_output(*kept, images_needed=True, cli_release_needed=True)
+    # Pushes to both trains omit kind, so they run no upgrade job.
+    assert output == _expected_output(
+        *kept,
+        images_needed=True,
+        cli_release_needed=True,
+        ci_policy_files=_expected_ci_policy_files(push=True),
+    )
 
     chart, chart_output = _invoke_selector(
         tmp_path,
@@ -1518,7 +1953,10 @@ def test_omit_kind_drops_cluster_tiers_and_keeps_the_rest(tmp_path: Path) -> Non
         omit_kind=True,
     )
     assert chart.returncode == 0, chart.stderr
-    assert chart_output == _expected_output(pytest_needed=True)
+    assert chart_output == _expected_output(
+        pytest_needed=True,
+        ci_policy_files=_expected_ci_policy_files("charts/curie/values.yaml"),
+    )
 
     untouched, untouched_output = _invoke_selector(
         tmp_path,
@@ -1529,6 +1967,7 @@ def test_omit_kind_drops_cluster_tiers_and_keeps_the_rest(tmp_path: Path) -> Non
         "cluster",
         "released-upgrade",
         pytest_needed=True,
+        ci_policy_files=_expected_ci_policy_files("charts/curie/values.yaml"),
     )
 
 
@@ -1584,7 +2023,11 @@ def test_revisions_select_changed_paths_and_unknown_fallback(tmp_path: Path) -> 
         cwd=repository,
     )
     assert known.returncode == 0, known.stderr
-    assert known_output == _expected_output("local", pytest_deselect=ALL_CONDITIONAL)
+    assert known_output == _expected_output(
+        "local",
+        pytest_deselect=ALL_CONDITIONAL,
+        ci_policy_files=_expected_ci_policy_files("compose.dev.yaml"),
+    )
 
     (repository / "new-surface.txt").write_text("new\n")
     subprocess.run(["git", "add", "."], cwd=repository, check=True)
@@ -1603,7 +2046,10 @@ def test_revisions_select_changed_paths_and_unknown_fallback(tmp_path: Path) -> 
         cwd=repository,
     )
     assert unknown.returncode == 0, unknown.stderr
-    assert unknown_output == _expected_output(*BASE_TIERS)
+    assert unknown_output == _expected_output(
+        *BASE_TIERS,
+        ci_policy_files=_expected_ci_policy_files("new-surface.txt"),
+    )
 
 
 # The exact five files of the real v0.11.2 preparation PR #3845, with the
@@ -1625,19 +2071,25 @@ def _version_only_paths(version: str) -> tuple[str, ...]:
 
 # What #3858 runs for a version-only diff: the local-release rung, which
 # exercises version identity on the new commit, and nothing heavier.
-VERSION_ONLY_SELECTION = _expected_output(
-    "local-release",
-    pytest_needed=False,
-    cli_release_needed=True,
-    version_only=True,
-)
+def _version_only_selection() -> str:
+    return _expected_output(
+        "local-release",
+        pytest_needed=False,
+        cli_release_needed=True,
+        version_only=True,
+        ci_policy_files=_expected_ci_policy_files(*_version_only_paths(_repo_version())),
+    )
+
+
 # What the same five paths selected before #3858, and still select whenever
 # the delta is not version-only.
-FULL_PREP_SELECTION = _expected_output(
-    *TIERS,
-    pytest_deselect=_expected_conditional_deselect(*_version_only_paths(_repo_version())),
-    cli_release_needed=True,
-)
+def _full_prep_selection() -> str:
+    return _expected_output(
+        *TIERS,
+        pytest_deselect=_expected_conditional_deselect(*_version_only_paths(_repo_version())),
+        cli_release_needed=True,
+        ci_policy_files=_expected_ci_policy_files(*_version_only_paths(_repo_version())),
+    )
 
 
 @pytest.mark.parametrize("omit_kind", [False, True])
@@ -1649,7 +2101,7 @@ def test_version_only_release_prep_selects_only_the_local_release_rung(
         tmp_path, *_version_only_paths(_repo_version()), omit_kind=omit_kind
     )
     assert completed.returncode == 0, completed.stderr
-    assert output == VERSION_ONLY_SELECTION
+    assert output == _version_only_selection()
 
 
 def test_another_releases_snapshot_is_not_version_only(tmp_path: Path) -> None:
@@ -1657,7 +2109,7 @@ def test_another_releases_snapshot_is_not_version_only(tmp_path: Path) -> None:
     assert _repo_version() != "v9.9.9"
     completed, output = _invoke_selector(tmp_path, *_version_only_paths("v9.9.9"))
     assert completed.returncode == 0, completed.stderr
-    assert output == FULL_PREP_SELECTION
+    assert output == _full_prep_selection()
 
 
 @pytest.mark.parametrize("extra", ["cli/src/main.rs", "README.md"])
@@ -1665,7 +2117,7 @@ def test_any_other_path_makes_the_prep_diff_not_version_only(tmp_path: Path, ext
     """#3858: one path outside the set restores today's selection."""
     completed, output = _invoke_selector(tmp_path, *_version_only_paths(_repo_version()), extra)
     assert completed.returncode == 0, completed.stderr
-    assert output == FULL_PREP_SELECTION
+    assert output == _full_prep_selection()
 
 
 def test_push_is_never_version_only(tmp_path: Path) -> None:
@@ -1734,7 +2186,7 @@ def test_revision_mode_reads_the_version_from_the_head_commit(tmp_path: Path) ->
 
     completed, output = _invoke_selector(tmp_path, base=base, head=head, cwd=repository)
     assert completed.returncode == 0, completed.stderr
-    assert output == VERSION_ONLY_SELECTION
+    assert output == _version_only_selection()
 
     # Negative control: a snapshot named for a version head does not declare
     # is not version-only.
@@ -1774,6 +2226,8 @@ pytest_scopes:
     python_prefixes: [cli/tests]
     test_files: tools/e2e-ci-selection/cli_pytest_files.txt
 conditional_pytest_files: {}
+ci_policy_tests:
+  tools/e2e-ci-selection/tests/test_e2e_ci_selection.py: [.github, tools/e2e-ci-selection]
 rules:
   exact:
     compose.dev.yaml: [local]
@@ -1807,11 +2261,18 @@ def test_exact_path_under_ignored_prefix_is_selected(tmp_path: Path) -> None:
     )
     selected, selected_output = _invoke_selector(tmp_path, "scripts/selected.sh", registry=registry)
     assert selected.returncode == 0, selected.stderr
-    assert selected_output == _expected_output("cluster", chart_scenarios=())
+    assert selected_output == _expected_output(
+        "cluster",
+        chart_scenarios=(),
+        ci_policy_files=_expected_ci_policy_files("scripts/selected.sh", registry=registry),
+    )
     for path in ("scripts/other.sh", "scripts/selected.sh/child.sh"):
         ignored, ignored_output = _invoke_selector(tmp_path, path, registry=registry)
         assert ignored.returncode == 0, ignored.stderr
-        assert ignored_output == _expected_output(pytest_needed=False)
+        assert ignored_output == _expected_output(
+            pytest_needed=False,
+            ci_policy_files=_expected_ci_policy_files(path, registry=registry),
+        )
 
 
 @pytest.mark.parametrize(
@@ -1883,11 +2344,17 @@ def test_exact_ignore_under_selected_prefix_does_not_hide_siblings(tmp_path: Pat
         tmp_path, "charts/curie/README.md/runtime-check.sh", registry=registry
     )
     assert ignored.returncode == sibling.returncode == 0
-    assert ignored_output == _expected_output(pytest_needed=False)
+    assert ignored_output == _expected_output(
+        pytest_needed=False,
+        ci_policy_files=_expected_ci_policy_files("charts/curie/README.md", registry=registry),
+    )
     assert sibling_output == _expected_output(
         "cluster",
         "released-upgrade",
         chart_scenarios=(),
+        ci_policy_files=_expected_ci_policy_files(
+            "charts/curie/README.md/runtime-check.sh", registry=registry
+        ),
     )
 
 
@@ -1896,19 +2363,27 @@ def test_more_specific_ignored_child_of_selected_prefix_is_allowed(tmp_path: Pat
     registry.write_text(VALID_REGISTRY.replace("    docs: []", "    docs: []\n    charts/ci: []"))
     ignored, ignored_output = _invoke_selector(tmp_path, "charts/ci/probe.sh", registry=registry)
     assert ignored.returncode == 0, ignored.stderr
-    assert ignored_output == _expected_output(pytest_needed=False)
+    assert ignored_output == _expected_output(
+        pytest_needed=False,
+        ci_policy_files=_expected_ci_policy_files("charts/ci/probe.sh", registry=registry),
+    )
 
     selected, selected_output = _invoke_selector(
         tmp_path, "charts/curie/values.yaml", registry=registry
     )
     assert selected.returncode == 0, selected.stderr
-    assert selected_output == _expected_output("cluster", "released-upgrade")
+    assert selected_output == _expected_output(
+        "cluster",
+        "released-upgrade",
+        ci_policy_files=_expected_ci_policy_files("charts/curie/values.yaml", registry=registry),
+    )
 
 
 AGGREGATE_EXPRESSIONS = {
     "changes_result": "${{ needs.changes.result }}",
     "registration_result": "${{ needs.runtime-assertion-registration.result }}",
     "event_name": "${{ github.event_name }}",
+    "nightly": "${{ inputs.nightly }}",
     "skill_selected": "${{ needs.changes.outputs.skill }}",
     "local_selected": "${{ needs.changes.outputs.local }}",
     "local_release_selected": "${{ needs.changes.outputs.local_release }}",
@@ -1935,41 +2410,412 @@ AGGREGATE_EXPRESSIONS = {
 }
 
 
-def test_next_omits_kind_and_dispatch_keeps_it() -> None:
+def _changes_filter_script() -> str:
     workflow = yaml.safe_load(WORKFLOW.read_text())
     trigger = workflow[True]
-    assert trigger["workflow_dispatch"] is None
+    nightly = trigger["workflow_dispatch"]["inputs"]["nightly"]
+    assert nightly["type"] == "boolean"
+    assert nightly["default"] is False
     group = workflow["concurrency"]["group"]
     assert group == ("${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}")
     run = next(
         step["run"] for step in workflow["jobs"]["changes"]["steps"] if step.get("id") == "filter"
     )
+    assert isinstance(run, str)
     assert "github.event_name" in run
-    assert "refs/heads/next" in run
-    assert '"$base_ref" = "next"' in run
+    # Pull requests into next select kind tiers by changed paths exactly like
+    # main, so the script has no branch that singles next out.
+    assert '"next"' not in run
     assert run.count("select_tiers.py") == 3
-    pull_request, rest = run.split("elif", 1)
-    assert "git fetch" in pull_request
-    assert "--omit-kind" in pull_request
-    next_push, main_or_dispatch = rest.split("else", 1)
-    assert "--omit-kind" in next_push
-    assert "--push" in next_push
-    assert "workflow_dispatch" in main_or_dispatch
-    assert "--push" in main_or_dispatch
-    assert "--omit-kind" not in main_or_dispatch
+    return run
 
 
-def test_push_runs_complete_while_pull_requests_and_dispatches_supersede() -> None:
+def _assert_changes_filter_route(script: str, event: str, branch: str) -> list[str]:
+    for expression, value in {
+        "github.event_name": event,
+        "github.ref": f"refs/heads/{branch}",
+        "github.base_ref": branch if event == "pull_request" else "",
+    }.items():
+        script = script.replace("${{ " + expression + " }}", value)
+    assert "${{" not in script
+    completed = subprocess.run(
+        [
+            "bash", "--noprofile", "--norc", "-c",
+            "git() { printf '%s\\0' git \"$@\" >&2; }\n"
+            "uv() { printf '%s\\0' \"$@\"; }\n" + script,
+        ],
+        cwd=REPO_ROOT, capture_output=True, text=True, check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    argv = completed.stdout.removesuffix("\0").split("\0")
+    prefix = [
+        "run", "--no-project", "--with", "pyyaml==6.0.3", "python",
+        "tools/e2e-ci-selection/select_tiers.py", "--registry", ".github/e2e-selection.yaml",
+    ]
+    options = (
+        ["--base", f"origin/{branch}", "--head", "HEAD"]
+        if event == "pull_request" else ["--push"]
+    )
+    if event == "push":
+        options.append("--omit-kind")
+    assert argv == prefix + options
+    fetch = f"git\0fetch\0--quiet\0origin\0{branch}\0" if event == "pull_request" else ""
+    assert completed.stderr == fetch
+    return argv[len(prefix):]
+
+
+@pytest.mark.parametrize("event", ("push", "workflow_dispatch", "pull_request"))
+@pytest.mark.parametrize("branch", ("main", "next"))
+def test_both_trains_omit_kind_on_push_and_keep_full_dispatch(
+    tmp_path: Path, event: str, branch: str
+) -> None:
+    options = _assert_changes_filter_route(_changes_filter_script(), event, branch)
+    if event == "pull_request":
+        return
+    output = tmp_path / "filter-output"
+    completed = subprocess.run(
+        [sys.executable, str(SELECTOR), "--registry", str(REGISTRY), *options],
+        cwd=REPO_ROOT, env={**os.environ, "GITHUB_OUTPUT": str(output)},
+        capture_output=True, text=True, check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    full = event == "workflow_dispatch"
+    assert output.read_text() == _expected_output(
+        *(TIERS if full else TIERS[:3]),
+        ci_policy_files=_expected_ci_policy_files(".github/workflows/ci.yaml"),
+        images_needed=True, cli_release_needed=True, released_upgrade_full=full,
+        factory=full, approval_resume=full,
+    )
+    if full:
+        listed = subprocess.run(
+            ["bash", str(UPGRADE_MATRIX), "--list-shards", "--json"],
+            cwd=REPO_ROOT, capture_output=True, text=True, check=True,
+        )
+        expected = [shard["id"] for shard in json.loads(listed.stdout)["shards"]]
+        flags = _outputs_of(output.read_text())
+        matrix = _list_shards(tmp_path, flags["released_upgrade_full"])
+        assert json.loads(matrix.removeprefix("shards=")) == expected
+
+
+@pytest.mark.parametrize(
+    ("mutation", "event", "branch"),
+    [
+        ("next-only", "push", "main"),
+        ("main-only", "push", "next"),
+        ("push-with-kind", "push", "main"),
+        ("push-with-kind", "push", "next"),
+        ("dispatch-without-kind", "workflow_dispatch", "main"),
+        ("dispatch-without-kind", "workflow_dispatch", "next"),
+        ("next-pr-omits-kind", "pull_request", "next"),
+    ],
+)
+def test_changes_filter_rejects_each_push_and_dispatch_route_mutation(
+    mutation: str, event: str, branch: str
+) -> None:
+    script = _changes_filter_script()
+    _assert_changes_filter_route(script, event, branch)
+    push_route = 'elif [ "$event" = "push" ]; then'
+    assert script.count(push_route) == 1
+    if mutation in {"next-only", "main-only"}:
+        train = mutation.removesuffix("-only")
+        script = script.replace(
+            push_route,
+            'elif [ "$event" = "push" ] && '
+            f'[ "${{{{ github.ref }}}}" = "refs/heads/{train}" ]; then',
+            1,
+        )
+    elif mutation == "push-with-kind":
+        assert script.count("--omit-kind\n") == 1
+        script = script.replace("--omit-kind\n", "\n", 1)
+    elif mutation == "next-pr-omits-kind":
+        # Re-add the old shape: next pull requests drop the kind tiers again.
+        fetch = 'git fetch --quiet origin "$base_ref"\n'
+        head = "--head HEAD\n"
+        assert script.count(fetch) == 1
+        assert script.count(head) == 1
+        script = script.replace(
+            fetch,
+            fetch + 'extra=()\nif [ "$base_ref" = "next" ]; then\n  extra=(--omit-kind)\nfi\n',
+            1,
+        )
+        script = script.replace(head, '--head HEAD \\\n  "${extra[@]}"\n', 1)
+        # The mutation touches next only: the main route must still pass.
+        _assert_changes_filter_route(script, "pull_request", "main")
+    else:
+        before, after = script.rsplit("--push", 1)
+        script = before + "--push --omit-kind" + after
+    with pytest.raises(AssertionError):
+        _assert_changes_filter_route(script, event, branch)
+
+
+def test_pull_requests_supersede_while_pushes_and_dispatches_queue() -> None:
     workflow = yaml.safe_load(WORKFLOW.read_text())
     concurrency = workflow["concurrency"]
     assert set(concurrency) == {"group", "cancel-in-progress"}
     assert concurrency["group"] == (
         "${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}"
     )
-    # Only push runs complete; pull requests and dispatches supersede.
-    assert concurrency["cancel-in-progress"] == "${{ github.event_name != 'push' }}"
+    # Only pull request runs supersede their own in-flight run. A later dispatch
+    # cancelled two dispatched kind runs on 2026-10-20, and a release dispatch
+    # could be cancelled by a scheduled one, so dispatches and pushes queue.
+    assert concurrency["cancel-in-progress"] == "${{ github.event_name == 'pull_request' }}"
     # A new trigger must force a decision about whether its runs cancel.
     assert set(workflow[True]) == {"push", "pull_request", "workflow_dispatch"}
+
+
+IMAGE_PROOFS_IF = (
+    "${{ !cancelled() && needs.changes.result == 'success' && "
+    "(needs.ci-images.result == 'success' || needs.ci-images.result == 'skipped') }}"
+)
+IMAGE_GROUP_IF = "${{ !cancelled() && needs.changes.outputs.images == 'true' }}"
+DOCKER_GROUP_IF = "${{ !cancelled() && steps.scope.outputs.run == 'true' }}"
+IMAGE_PROOF_GROUPS = {
+    "Docker daemon: ": (
+        "Checkout",
+        "Scope",
+        "Toolchain",
+        "Cargo cache",
+        "Fmt",
+        "Clippy",
+        "Test",
+        "Entrypoint test",
+        "Pull Docker Hub images through the mirror",
+        "Set up Buildx",
+        "Back off before retrying Set up Buildx",
+        "Set up Buildx (retry)",
+        "Build both release arches (no push)",
+        "Build the amd64 candidate",
+        "Escape test against the candidate",
+    ),
+    "Dispatcher: ": (
+        "Checkout",
+        "Load the dispatcher image built by the ci-images job",
+        "Tag the dispatcher image for this smoke test",
+        "Entrypoint imports resolve in the built image",
+    ),
+    "Mail adapter: ": (
+        "Checkout",
+        "Load the mail-adapter image built by the ci-images job",
+        "Tag the mail-adapter image for this smoke test",
+        "Entrypoint imports resolve in the built image",
+    ),
+    "UI: ": (
+        "Checkout",
+        "Load the ui image built by the ci-images job",
+        "Tag the ui image for this smoke test",
+        "Start the stub API upstream",
+        "Start the UI container",
+        "Assert response headers",
+        "Tear down the UI container and its API upstream",
+    ),
+    "Toolchain: ": (
+        "Checkout",
+        "Install uv",
+        "Back off before retrying Install uv",
+        "Install uv (retry)",
+        "Sync workspace",
+        "Required setting is present (negative control)",
+        "Absent image fails in required mode (negative control)",
+        "Load the runner image built by the ci-images job",
+        "Tag the runner image as the harness default (curie-runner)",
+        "Repository toolchain proof",
+    ),
+}
+
+
+def _assert_image_proofs(workflow: dict[str, Any]) -> None:
+    jobs = workflow["jobs"]
+    assert (
+        not {
+            "docker-daemon",
+            "dispatcher-image-smoke",
+            "mail-adapter-image-smoke",
+            "ui-image-smoke",
+            "repo-toolchain-proof",
+        }
+        & jobs.keys()
+    )
+    assert "image-proofs" in jobs
+    job = jobs["image-proofs"]
+    assert job["name"] == "Image proofs (smoke, Docker daemon, toolchain)"
+    assert job["runs-on"] == "ubuntu-24.04"
+    assert job["needs"] == ["changes", "ci-images"]
+    assert job["if"] == IMAGE_PROOFS_IF
+    assert job["env"] == {"CURIE_REPO_TOOLCHAIN_PROOF": "required"}
+    assert not {"defaults", "continue-on-error", "timeout-minutes"} & job.keys()
+    steps = job["steps"]
+    assert len(steps) == 40
+    assert [step["name"] for step in steps] == [
+        prefix + name for prefix, names in IMAGE_PROOF_GROUPS.items() for name in names
+    ], "all former steps must retain group order, with UI before Toolchain"
+    by_name = {step["name"]: step for step in steps}
+    assert [
+        (step["name"], step["with"]["images"])
+        for step in steps
+        if step.get("uses") == "./.github/actions/load-ci-images"
+    ] == [
+        (prefix + f"Load the {image} image built by the ci-images job", image)
+        for prefix, image in (
+            ("Dispatcher: ", "dispatcher"),
+            ("Mail adapter: ", "mail-adapter"),
+            ("UI: ", "ui"),
+            ("Toolchain: ", "runner"),
+        )
+    ]
+    for prefix in IMAGE_PROOF_GROUPS:
+        checkout = by_name[prefix + "Checkout"]
+        assert checkout["uses"].startswith("actions/checkout@")
+        assert checkout["with"] == (
+            {"fetch-depth": 0, "persist-credentials": False}
+            if prefix == "Docker daemon: "
+            else {"persist-credentials": False}
+        )
+    assert sum(step.get("uses", "").startswith("actions/checkout@") for step in steps) == 5
+    scope = by_name["Docker daemon: Scope"]
+    assert scope["id"] == "scope"
+    assert scope["env"] == {
+        "EVENT_NAME": "${{ github.event_name }}",
+        "BASE_REF": "${{ github.base_ref }}",
+    }
+    assert by_name["Docker daemon: Set up Buildx"]["id"] == "set_up_buildx"
+    assert by_name["Toolchain: Install uv"]["id"] == "install_uv"
+    assert {step["name"] for step in steps if "continue-on-error" in step} == {
+        "Docker daemon: Set up Buildx",
+        "Toolchain: Install uv",
+    }
+    for name in ("Docker daemon: Set up Buildx", "Toolchain: Install uv"):
+        assert by_name[name]["continue-on-error"] is True
+    inherited = {"Toolchain", "Fmt", "Clippy", "Test", "Back off before retrying Set up Buildx"}
+    workspace = {
+        "Scope",
+        "Entrypoint test",
+        "Pull Docker Hub images through the mirror",
+        "Escape test against the candidate",
+    }
+    for step in steps:
+        name = step["name"]
+        docker = name.startswith("Docker daemon: ")
+        gate = DOCKER_GROUP_IF if docker else IMAGE_GROUP_IF
+        if name in ("Docker daemon: Checkout", "Docker daemon: Scope"):
+            gate = "${{ !cancelled() }}"
+        elif name in (
+            "Docker daemon: Back off before retrying Set up Buildx",
+            "Docker daemon: Set up Buildx (retry)",
+            "Toolchain: Back off before retrying Install uv",
+            "Toolchain: Install uv (retry)",
+        ):
+            attempt = "set_up_buildx" if docker else "install_uv"
+            gate = gate.removesuffix(" }}") + f" && steps.{attempt}.outcome == 'failure'" + " }}"
+        elif name == "UI: Tear down the UI container and its API upstream":
+            gate = "${{ !cancelled() && needs.changes.outputs.images == 'true' && always() }}"
+        assert step.get("if") == gate, f"step gate: {name}"
+        label = name.removeprefix("Docker daemon: ")
+        if docker and label in inherited:
+            directory = "apps/docker-daemon"
+        elif docker and label in workspace:
+            directory = "${{ github.workspace }}"
+        else:
+            directory = None
+        assert step.get("working-directory") == directory, name
+
+
+def test_image_proofs_workflow_contract() -> None:
+    _assert_image_proofs(yaml.safe_load(WORKFLOW.read_text()))
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "Dispatcher: Entrypoint imports resolve in the built image",
+        "Mail adapter: Entrypoint imports resolve in the built image",
+        "UI: Assert response headers",
+        "Toolchain: Repository toolchain proof",
+    ],
+)
+def test_image_proofs_rejects_a_group_losing_its_image_gate(name: str) -> None:
+    workflow = yaml.safe_load(WORKFLOW.read_text())
+    _assert_image_proofs(workflow)
+    step = next(step for step in workflow["jobs"]["image-proofs"]["steps"] if step["name"] == name)
+    step["if"] = step["if"].replace(" && needs.changes.outputs.images == 'true'", "")
+    with pytest.raises(AssertionError, match="step gate"):
+        _assert_image_proofs(workflow)
+
+
+@pytest.mark.parametrize(
+    ("name", "clause"),
+    [
+        ("Docker daemon: Scope", "!cancelled()"),
+        ("Docker daemon: Fmt", "steps.scope.outputs.run == 'true'"),
+        (
+            "Docker daemon: Back off before retrying Set up Buildx",
+            "steps.scope.outputs.run == 'true'",
+        ),
+        ("Docker daemon: Set up Buildx (retry)", "steps.set_up_buildx.outcome == 'failure'"),
+        (
+            "Toolchain: Back off before retrying Install uv",
+            "needs.changes.outputs.images == 'true'",
+        ),
+        ("Toolchain: Install uv (retry)", "steps.install_uv.outcome == 'failure'"),
+        ("UI: Tear down the UI container and its API upstream", "always()"),
+    ],
+)
+def test_image_proofs_rejects_a_changed_step_gate(name: str, clause: str) -> None:
+    workflow = yaml.safe_load(WORKFLOW.read_text())
+    _assert_image_proofs(workflow)
+    step = next(step for step in workflow["jobs"]["image-proofs"]["steps"] if step["name"] == name)
+    step["if"] = step["if"].replace(clause, "true")
+    with pytest.raises(AssertionError, match="step gate"):
+        _assert_image_proofs(workflow)
+
+
+@pytest.mark.parametrize(
+    "mutation", ["missing-step", "toolchain-first", "union-load", "scoped-bootstrap"]
+)
+def test_image_proofs_rejects_a_changed_group_contract(mutation: str) -> None:
+    workflow = yaml.safe_load(WORKFLOW.read_text())
+    _assert_image_proofs(workflow)
+    steps = workflow["jobs"]["image-proofs"]["steps"]
+    if mutation == "missing-step":
+        steps.pop()
+    elif mutation == "toolchain-first":
+        steps[23:] = steps[30:] + steps[23:30]
+    elif mutation == "union-load":
+        load = next(
+            step for step in steps if step.get("uses") == "./.github/actions/load-ci-images"
+        )
+        load["with"]["images"] = "dispatcher,mail-adapter,ui,runner"
+    else:
+        steps[1]["if"] = DOCKER_GROUP_IF
+    with pytest.raises(AssertionError):
+        _assert_image_proofs(workflow)
+
+
+def _nightly_if(selection: str) -> str:
+    return "${{ " + NIGHTLY_DISPATCH + " && " + selection + " }}"
+
+
+def _assert_upgrade_job_gates(workflow: dict[str, Any]) -> None:
+    jobs = workflow["jobs"]
+    positive = jobs["e2e-released-upgrade"]["if"]
+    assert positive == _nightly_if("needs.changes.outputs.released_upgrade_full == 'true'")
+    negative = jobs["e2e-released-upgrade-negative"]["if"]
+    assert negative == "${{ needs.changes.outputs.released_upgrade == 'true' }}"
+    assert NIGHTLY_DISPATCH not in negative
+
+
+@pytest.mark.parametrize(
+    ("job", "flag"),
+    [
+        ("e2e-released-upgrade-negative", "released_upgrade_full"),
+        ("e2e-released-upgrade", "released_upgrade"),
+    ],
+)
+def test_upgrade_job_gates_reject_using_the_other_selection(job: str, flag: str) -> None:
+    workflow = yaml.safe_load(WORKFLOW.read_text())
+    _assert_upgrade_job_gates(workflow)
+    workflow["jobs"][job]["if"] = "${{ needs.changes.outputs." + flag + " == 'true' }}"
+    with pytest.raises(AssertionError):
+        _assert_upgrade_job_gates(workflow)
 
 
 def test_workflow_consumes_each_selection_output_exactly() -> None:
@@ -1981,6 +2827,7 @@ def test_workflow_consumes_each_selection_output_exactly() -> None:
         "local_release": "${{ steps.filter.outputs.local_release }}",
         "cluster": "${{ steps.filter.outputs.cluster }}",
         "chart_scenarios": "${{ steps.filter.outputs.chart_scenarios }}",
+        "chart_legs": "${{ steps.filter.outputs.chart_legs }}",
         "released_upgrade": "${{ steps.filter.outputs.released_upgrade }}",
         "released_upgrade_full": ("${{ steps.filter.outputs.released_upgrade_full }}"),
         "skill_local_tiers": "${{ steps.filter.outputs.skill_local_tiers }}",
@@ -1990,6 +2837,8 @@ def test_workflow_consumes_each_selection_output_exactly() -> None:
         "pytest": "${{ steps.filter.outputs.pytest }}",
         "pytest_deselect": "${{ steps.filter.outputs.pytest_deselect }}",
         "pytest_scope": "${{ steps.filter.outputs.pytest_scope }}",
+        "ci_policy": "${{ steps.filter.outputs.ci_policy }}",
+        "ci_policy_files": "${{ steps.filter.outputs.ci_policy_files }}",
         "version_only": "${{ steps.filter.outputs.version_only }}",
         "factory": "${{ steps.filter.outputs.factory }}",
         "approval_resume": "${{ steps.filter.outputs.approval_resume }}",
@@ -2012,10 +2861,7 @@ def test_workflow_consumes_each_selection_output_exactly() -> None:
         "${{ needs.changes.outputs.local_release == 'true' }}"
     )
     assert jobs["e2e-ladder-cluster"]["if"] == ("${{ needs.changes.outputs.cluster == 'true' }}")
-    assert jobs["e2e-released-upgrade"]["if"] == (
-        "${{ needs.changes.outputs.released_upgrade_full == 'true' }}"
-    )
-    assert jobs["e2e-released-upgrade-negative"]["if"] == (jobs["e2e-released-upgrade"]["if"])
+    _assert_upgrade_job_gates(workflow)
     assert set(jobs["e2e-released-upgrade-negative"]["needs"]) == set(
         jobs["e2e-released-upgrade"]["needs"]
     )
@@ -2025,16 +2871,143 @@ def test_workflow_consumes_each_selection_output_exactly() -> None:
     assert "if" not in jobs["e2e-cluster-upgrade-matrix-shards"]
     assert jobs["images"]["if"] == "${{ needs.changes.outputs.images == 'true' }}"
     assert "worker-local-image" not in jobs
-    assert jobs["dispatcher-image-smoke"]["if"] == jobs["images"]["if"]
-    assert jobs["mail-adapter-image-smoke"]["if"] == jobs["images"]["if"]
-    assert jobs["ui-image-smoke"]["if"] == jobs["images"]["if"]
-    assert jobs["repo-toolchain-proof"]["if"] == jobs["images"]["if"]
+    _assert_image_proofs(workflow)
     assert jobs["cli-portability"]["if"] == (
         "${{ github.event_name != 'pull_request' && needs.changes.outputs.cli_release == 'true' }}"
     )
     assert jobs["cli-darwin"]["if"] == jobs["cli-portability"]["if"]
     assert "changes" in jobs["rust-build"]["needs"]
     assert jobs["eval-falsifiability"]["if"] == ("${{ needs.changes.outputs.skill == 'true' }}")
+
+
+def _connector_image_contexts() -> set[str]:
+    return {
+        str(server.parent.relative_to(REPO_ROOT))
+        for server in REPO_ROOT.glob("examples/*/connectors/*/server.py")
+        if (server.parent / "Dockerfile").is_file()
+    }
+
+
+def _assert_connector_image_import_coverage(job: dict[str, Any]) -> None:
+    assert job["name"] == "Build ${{ matrix.name }} image (no push)"
+    assert job["runs-on"] == "ubuntu-24.04"
+    assert job["strategy"]["fail-fast"] is False
+    rows = job["strategy"]["matrix"]["include"]
+    contexts = _connector_image_contexts()
+    assert contexts, "the repository must contain Python connector image contexts"
+    matrix_contexts = [row["context"] for row in rows]
+    assert len(matrix_contexts) == len(set(matrix_contexts)), "matrix contexts must be unique"
+    assert contexts <= set(matrix_contexts), "every connector image context needs a matrix row"
+    connectors = [row for row in rows if (REPO_ROOT / row["context"] / "server.py").is_file()]
+    assert connectors, "the images matrix must cover Python connector servers"
+    steps = job["steps"]
+    builds = [
+        (index, step)
+        for index, step in enumerate(steps)
+        if str(step.get("uses", "")).startswith("docker/build-push-action@")
+    ]
+    assert len(builds) == 2, "connectors need both multiarch and native image builds"
+    (multiarch_index, multiarch), (native_index, native) = builds
+    imports = [
+        (index, step)
+        for index, step in enumerate(steps)
+        if step.get("name") == "Import the connector server"
+    ]
+    assert len(imports) == 1, "connectors need an import check in their built image"
+    import_index, import_step = imports[0]
+    assert multiarch_index < native_index < import_index
+    assert "if" not in multiarch
+    assert native["uses"] == multiarch["uses"]
+    condition = "${{ hashFiles(format('{0}/server.py', matrix.context)) != '' }}"
+    assert native.get("if") == condition, "native builds must cover every server.py row"
+    assert import_step.get("if") == condition, "imports must cover every server.py row"
+    for step in (multiarch, native, import_step):
+        assert not step.get("continue-on-error")
+
+    def expand(value: str, row: dict[str, Any]) -> str:
+        return re.sub(r"\$\{\{\s*matrix\.(\w+)\s*\}\}", lambda m: row[m[1]], value)
+
+    for row in connectors:
+        expected_cache = {
+            "cache-from": f"type=gha,scope={row['name']}",
+            "cache-to": f"type=gha,mode=max,scope={row['name']}",
+        }
+        expected_inputs = {
+            "context": row["context"],
+            "file": row["dockerfile"],
+            "push": False,
+            **expected_cache,
+        }
+        assert set(row["platforms"].split(",")) == {"linux/amd64", "linux/arm64"}
+        for step, expected in (
+            (multiarch, {**expected_inputs, "platforms": row["platforms"], "load": False}),
+            (
+                native,
+                {
+                    **expected_inputs,
+                    "platforms": "linux/amd64",
+                    "load": True,
+                    "tags": f"curie-ci-connector/{row['name']}:candidate",
+                },
+            ),
+        ):
+            actual = {
+                key: expand(value, row) if isinstance(value, str) else value
+                for key, value in step["with"].items()
+            }
+            assert actual == expected, row["name"]
+        command = expand(import_step["run"], row).strip()
+        assert command == (
+            "docker run --rm --entrypoint python "
+            f'curie-ci-connector/{row["name"]}:candidate -c "import server"'
+        ), row["name"]
+
+
+def test_connector_image_workflow_imports_every_python_server() -> None:
+    job = yaml.safe_load(WORKFLOW.read_text())["jobs"]["images"]
+    _assert_connector_image_import_coverage(job)
+
+
+@pytest.mark.parametrize("context", sorted(_connector_image_contexts()))
+def test_connector_image_import_coverage_rejects_deleted_row(context: str) -> None:
+    job = yaml.safe_load(WORKFLOW.read_text())["jobs"]["images"]
+    _assert_connector_image_import_coverage(job)
+    mutated = copy.deepcopy(job)
+    rows = mutated["strategy"]["matrix"]["include"]
+    rows[:] = [row for row in rows if row["context"] != context]
+    with pytest.raises(AssertionError):
+        _assert_connector_image_import_coverage(mutated)
+
+
+@pytest.mark.parametrize(
+    "step_name", ["Build the native connector image", "Import the connector server"]
+)
+def test_connector_image_import_coverage_rejects_deleted_step(step_name: str) -> None:
+    job = yaml.safe_load(WORKFLOW.read_text())["jobs"]["images"]
+    _assert_connector_image_import_coverage(job)
+    mutated = copy.deepcopy(job)
+    mutated["steps"] = [step for step in mutated["steps"] if step.get("name") != step_name]
+    with pytest.raises(AssertionError):
+        _assert_connector_image_import_coverage(mutated)
+
+
+@pytest.mark.parametrize(
+    "step_name", ["Build the native connector image", "Import the connector server"]
+)
+def test_connector_image_import_coverage_rejects_one_skipped_row(step_name: str) -> None:
+    job = yaml.safe_load(WORKFLOW.read_text())["jobs"]["images"]
+    _assert_connector_image_import_coverage(job)
+    for row in job["strategy"]["matrix"]["include"]:
+        if not (REPO_ROOT / row["context"] / "server.py").is_file():
+            continue
+        mutated = copy.deepcopy(job)
+        step = next(step for step in mutated["steps"] if step.get("name") == step_name)
+        step["if"] = (
+            "${{ hashFiles(format('{0}/server.py', matrix.context)) != '' && "
+            f"matrix.name != '{row['name']}' }}}}"
+        )
+        with pytest.raises(AssertionError):
+            _assert_connector_image_import_coverage(mutated)
 
 
 def test_upgrade_matrix_shards_job_gates_coverage_and_lists_shards() -> None:
@@ -2071,6 +3044,12 @@ def _list_shards(tmp_path: Path, full: str, smoke: str | None = None) -> str:
     )
     assert completed.returncode == 0, completed.stderr
     return output.read_text()
+
+
+def _assert_upgrade_smoke_shards(tmp_path: Path, output: dict[str, str]) -> None:
+    assert output["released_upgrade"] == "true"
+    assert output["released_upgrade_full"] == "false"
+    assert _list_shards(tmp_path, output["released_upgrade_full"]) == 'shards=["s01"]\n'
 
 
 def test_upgrade_matrix_lists_every_shard_on_full_runs_and_one_on_prs(
@@ -2302,7 +3281,8 @@ def test_released_upgrade_workflow_pins_issue_2194_runtime_contract() -> None:
         "E2E released chart upgrade negative control (nil unsafe helpers)"
     )
     assert negative_job["runs-on"] == "ubuntu-24.04"
-    assert negative_job["if"] == job["if"]
+    assert negative_job["if"] == "${{ needs.changes.outputs.released_upgrade == 'true' }}"
+    assert job["if"] == _nightly_if("needs.changes.outputs.released_upgrade_full == 'true'")
     assert set(negative_job["needs"]) == set(job["needs"])
     negative_steps = {
         step["name"]: step for step in negative_job["steps"] if isinstance(step.get("name"), str)
@@ -2581,6 +3561,36 @@ def _aggregate_contract() -> tuple[str, dict[str, str]]:
     return step["run"], bindings
 
 
+class _AggregateOverrides(TypedDict, total=False):
+    changes_result: str
+    registration_result: str
+    event_name: str
+    nightly: str
+    skill_selected: str
+    local_selected: str
+    local_release_selected: str
+    cluster_selected: str
+    chart_scenarios: str
+    released_upgrade_selected: str
+    released_upgrade_full: str
+    approval_resume_selected: str
+    factory_selected: str
+    skill_local_result: str
+    oidc_result: str
+    local_release_result: str
+    cluster_result: str
+    cluster_chart_result: str
+    rollout_recovery_result: str
+    approval_resume_result: str
+    factory_result: str
+    forge_instance_result: str
+    admitted_agent_result: str
+    released_upgrade_result: str
+    released_upgrade_negative_result: str
+    upgrade_matrix_shards_result: str
+    upgrade_matrix_result: str
+
+
 def _run_aggregate(
     *,
     script_transform: Callable[[str], str] | None = None,
@@ -2593,6 +3603,7 @@ def _run_aggregate(
         "changes_result": "success",
         "registration_result": "success",
         "event_name": "push",
+        "nightly": "false",
         "skill_selected": "false",
         "local_selected": "false",
         "local_release_selected": "false",
@@ -2616,12 +3627,20 @@ def _run_aggregate(
         "upgrade_matrix_result": "skipped",
     }
     state.update(overrides)
-    # The forge instance and admitted agent jobs are gated
-    # exactly like the scripted factory job, so they follow the scripted
-    # result unless a test overrides them.
+    # Admitted agent stays on the scripted factory gate. Forge runs only on a
+    # nightly dispatch, so a test that does not name it gets a skip unless
+    # that dispatch selected factory.
     for name in FACTORY_SIBLING_RESULTS:
         if name not in overrides:
             state[name] = state["factory_result"]
+    if "forge_instance_result" not in overrides:
+        nightly = (
+            state["event_name"] == "workflow_dispatch" and state["nightly"] == "true"
+        )
+        if nightly and state["factory_selected"] == "true":
+            state["forge_instance_result"] = state["factory_result"]
+        else:
+            state["forge_instance_result"] = "skipped"
     if "chart_scenarios" not in overrides and state["cluster_selected"] == "true":
         state["chart_scenarios"] = '["workspace-diagnostic"]'
     environment = os.environ.copy()
@@ -2648,7 +3667,10 @@ def test_e2e_required_fails_unless_runtime_assertion_registration_succeeds(value
 def test_e2e_required_validates_docs_only_ladder_skips(tmp_path: Path) -> None:
     selected, output = _invoke_selector(tmp_path, "ARCHITECTURE.md")
     assert selected.returncode == 0, selected.stderr
-    assert output == _expected_output(pytest_needed=False)
+    assert output == _expected_output(
+        pytest_needed=False,
+        ci_policy_files=_expected_ci_policy_files("ARCHITECTURE.md"),
+    )
     outputs = dict(line.split("=", maxsplit=1) for line in output.splitlines())
 
     skipped = _run_aggregate(
@@ -2680,7 +3702,7 @@ def test_e2e_required_accepts_a_version_only_selection(tmp_path: Path) -> None:
     assert selected.returncode == 0, selected.stderr
     outputs = _outputs_of(output)
     assert outputs["version_only"] == "true"
-    selection = {
+    selection: _AggregateOverrides = {
         "event_name": "pull_request",
         "skill_selected": outputs["skill"],
         "local_selected": outputs["local"],
@@ -2715,7 +3737,7 @@ def test_e2e_required_accepts_a_version_only_selection(tmp_path: Path) -> None:
             "local_release_result": "success",
             "cluster_result": "success",
             "cluster_chart_result": "success",
-            "rollout_recovery_result": "success",
+            "rollout_recovery_result": "skipped",
         },
         {
             "event_name": "pull_request",
@@ -2726,12 +3748,15 @@ def test_e2e_required_accepts_a_version_only_selection(tmp_path: Path) -> None:
         },
         {
             "event_name": "workflow_dispatch",
+            "nightly": "true",
             "cluster_selected": "true",
             "cluster_result": "success",
             "cluster_chart_result": "success",
             "rollout_recovery_result": "success",
         },
         {
+            "event_name": "workflow_dispatch",
+            "nightly": "true",
             "released_upgrade_selected": "true",
             "released_upgrade_full": "true",
             "released_upgrade_result": "success",
@@ -2740,13 +3765,15 @@ def test_e2e_required_accepts_a_version_only_selection(tmp_path: Path) -> None:
         },
     ],
 )
-def test_aggregate_accepts_exact_selected_outcomes(state: dict[str, str]) -> None:
+def test_aggregate_accepts_exact_selected_outcomes(state: _AggregateOverrides) -> None:
     completed = _run_aggregate(**state)
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
 def test_aggregate_requires_upgrade_matrix_when_released_upgrade_is_selected() -> None:
     ok = _run_aggregate(
+        event_name="workflow_dispatch",
+        nightly="true",
         released_upgrade_selected="true",
         released_upgrade_full="true",
         released_upgrade_result="success",
@@ -2756,6 +3783,8 @@ def test_aggregate_requires_upgrade_matrix_when_released_upgrade_is_selected() -
     assert ok.returncode == 0, ok.stdout + ok.stderr
     for result in ("skipped", "failure", "cancelled"):
         rejected = _run_aggregate(
+            event_name="workflow_dispatch",
+            nightly="true",
             released_upgrade_selected="true",
             released_upgrade_full="true",
             released_upgrade_result="success",
@@ -2773,27 +3802,115 @@ def test_aggregate_requires_upgrade_matrix_skip_when_released_upgrade_is_not_sel
         assert rejected.returncode != 0, result
 
 
-def test_aggregate_pull_request_smoke_runs_matrix_without_released_trio() -> None:
+@pytest.mark.parametrize(
+    ("result_name", "result"),
+    [
+        (name, result)
+        for name, results in (
+            ("upgrade_matrix_result", ("skipped", "failure", "cancelled")),
+            ("released_upgrade_negative_result", ("skipped", "failure", "cancelled")),
+            ("released_upgrade_result", ("success", "failure", "cancelled")),
+        )
+        for result in results
+    ],
+)
+def test_aggregate_pull_request_smoke_runs_matrix_and_negative_only(
+    result_name: str, result: str
+) -> None:
+    state = {
+        "event_name": "pull_request",
+        "released_upgrade_selected": "true",
+        "released_upgrade_full": "false",
+        "released_upgrade_result": "skipped",
+        "released_upgrade_negative_result": "success",
+        "upgrade_matrix_result": "success",
+    }
     ok = _run_aggregate(
-        released_upgrade_selected="true",
-        released_upgrade_full="false",
-        upgrade_matrix_result="success",
+        event_name=state["event_name"],
+        released_upgrade_selected=state["released_upgrade_selected"],
+        released_upgrade_full=state["released_upgrade_full"],
+        released_upgrade_result=state["released_upgrade_result"],
+        released_upgrade_negative_result=state["released_upgrade_negative_result"],
+        upgrade_matrix_result=state["upgrade_matrix_result"],
     )
     assert ok.returncode == 0, ok.stdout + ok.stderr
-    for matrix, positive, negative in (
-        ("skipped", "skipped", "skipped"),
-        ("failure", "skipped", "skipped"),
-        ("success", "success", "skipped"),
-        ("success", "skipped", "success"),
-    ):
-        rejected = _run_aggregate(
-            released_upgrade_selected="true",
-            released_upgrade_full="false",
-            upgrade_matrix_result=matrix,
-            released_upgrade_result=positive,
-            released_upgrade_negative_result=negative,
+    state[result_name] = result
+    rejected = _run_aggregate(
+        event_name=state["event_name"],
+        released_upgrade_selected=state["released_upgrade_selected"],
+        released_upgrade_full=state["released_upgrade_full"],
+        released_upgrade_result=state["released_upgrade_result"],
+        released_upgrade_negative_result=state["released_upgrade_negative_result"],
+        upgrade_matrix_result=state["upgrade_matrix_result"],
+    )
+    assert rejected.returncode != 0, (result_name, result)
+
+
+@pytest.mark.parametrize(
+    "result_name", ("released_upgrade_result", "released_upgrade_negative_result")
+)
+@pytest.mark.parametrize("result", ("success", "failure", "cancelled"))
+def test_aggregate_requires_released_jobs_skip_when_unselected(
+    result_name: str, result: str
+) -> None:
+    ok = _run_aggregate()
+    assert ok.returncode == 0, ok.stdout + ok.stderr
+    state = {
+        "released_upgrade_result": "skipped",
+        "released_upgrade_negative_result": "skipped",
+    }
+    state[result_name] = result
+    rejected = _run_aggregate(
+        released_upgrade_result=state["released_upgrade_result"],
+        released_upgrade_negative_result=state["released_upgrade_negative_result"],
+    )
+    assert rejected.returncode != 0, (result_name, result)
+
+
+@pytest.mark.parametrize("mutation", ("omit-negative", "full-only-negative"))
+def test_aggregate_rejects_missing_or_full_only_negative_expectation(mutation: str) -> None:
+    state = {
+        "event_name": "pull_request",
+        "released_upgrade_selected": "true",
+        "released_upgrade_full": "false",
+        "released_upgrade_negative_result": "success",
+        "upgrade_matrix_result": "success",
+    }
+    unmutated = _run_aggregate(
+        event_name=state["event_name"],
+        released_upgrade_selected=state["released_upgrade_selected"],
+        released_upgrade_full=state["released_upgrade_full"],
+        released_upgrade_negative_result=state["released_upgrade_negative_result"],
+        upgrade_matrix_result=state["upgrade_matrix_result"],
+    )
+    assert unmutated.returncode == 0, unmutated.stdout + unmutated.stderr
+    check = '"$RELEASED_UPGRADE_NEGATIVE_RESULT" != "$released_upgrade_negative_expected" ||'
+
+    def change_negative(script: str) -> str:
+        assert script.count(check) == 1
+        replacement = (
+            "" if mutation == "omit-negative"
+            else check.replace("$released_upgrade_negative_expected", "$released_upgrade_expected")
         )
-        assert rejected.returncode != 0, (matrix, positive, negative)
+        return script.replace(check, replacement, 1)
+
+    rejected = _run_aggregate(
+        script_transform=change_negative,
+        event_name=state["event_name"],
+        released_upgrade_selected=state["released_upgrade_selected"],
+        released_upgrade_full=state["released_upgrade_full"],
+        released_upgrade_negative_result=state["released_upgrade_negative_result"],
+        upgrade_matrix_result=state["upgrade_matrix_result"],
+    )
+    output = rejected.stdout + rejected.stderr
+    assert rejected.returncode != 0, output
+    if mutation == "omit-negative":
+        assert (
+            "Selected and skipped negative control failed for RELEASED_UPGRADE_NEGATIVE_RESULT"
+            in output
+        )
+    else:
+        assert "E2E required failed" in output
 
 
 @pytest.mark.parametrize("full", ["", "yes"])
@@ -2871,20 +3988,18 @@ def test_aggregate_requires_upgrade_matrix_shards_success(result: str) -> None:
         },
     ],
 )
-def test_aggregate_rejects_inconsistent_outcomes(state: dict[str, str]) -> None:
+def test_aggregate_rejects_inconsistent_outcomes(state: _AggregateOverrides) -> None:
     completed = _run_aggregate(**state)
     assert completed.returncode != 0
 
 
-@pytest.mark.parametrize("event_name", ["push", "workflow_dispatch"])
 @pytest.mark.parametrize("result", ["failure", "skipped", "cancelled"])
-def test_aggregate_requires_rollout_recovery_success_when_selected(
-    event_name: str, result: str
+def test_aggregate_requires_rollout_recovery_success_when_nightly_selected(
+    result: str,
 ) -> None:
-    # failure is the 2026-09-29 next dispatch run 36551160014 shape: the
-    # rollout recovery job failed while E2E required stayed green.
     completed = _run_aggregate(
-        event_name=event_name,
+        event_name="workflow_dispatch",
+        nightly="true",
         cluster_selected="true",
         cluster_result="success",
         cluster_chart_result="success",
@@ -2909,11 +4024,21 @@ def test_aggregate_rollout_recovery_must_skip_when_not_expected(result: str) -> 
         rollout_recovery_result=result,
     )
     assert unselected.returncode != 0
+    plain_dispatch = _run_aggregate(
+        event_name="workflow_dispatch",
+        nightly="false",
+        cluster_selected="true",
+        cluster_result="success",
+        cluster_chart_result="success",
+        rollout_recovery_result=result,
+    )
+    assert plain_dispatch.returncode != 0
 
 
 def test_negative_control_covers_rollout_recovery_result() -> None:
-    state = {
-        "event_name": "push",
+    state: _AggregateOverrides = {
+        "event_name": "workflow_dispatch",
+        "nightly": "true",
         "cluster_selected": "true",
         "cluster_result": "success",
         "cluster_chart_result": "success",
@@ -3035,10 +4160,18 @@ def test_single_regression_proofs_run_outside_the_cluster_rung() -> None:
     assert "e2e-cluster-chart-regressions" in jobs["e2e-required"]["needs"]
 
     rollout = jobs["e2e-cluster-rollout-recovery"]
-    assert rollout["if"] == (
-        "${{ github.event_name != 'pull_request' && needs.changes.outputs.cluster == 'true' }}"
-    )
+    assert rollout["if"] == _nightly_if("needs.changes.outputs.cluster == 'true'")
     assert "e2e-cluster-rollout-recovery" in jobs["e2e-required"]["needs"]
+
+
+WORKLOAD_STAGING_IF = (
+    "${{ matrix.leg == 'workload' && "
+    "(contains(fromJSON(needs.changes.outputs.chart_scenarios), 'workspace-diagnostic') "
+    "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') "
+    "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-secret-rotation') "
+    "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'failed-first-install-retry') "
+    "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'factory-resource-profile')) }}"
+)
 
 
 def test_workspace_diagnostic_reuses_the_chart_cluster_and_candidate_artifacts() -> None:
@@ -3081,10 +4214,7 @@ def test_workspace_diagnostic_reuses_the_chart_cluster_and_candidate_artifacts()
     assert steps.index(staging[1]) < steps.index(staging[2]) < steps.index(workspace)
     assert workspace["if"] == _chart_step_if("workspace-diagnostic")
     for step in staging:
-        assert step["if"] == (
-            "${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'workspace-diagnostic') "
-            "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') }}"
-        ), step
+        assert step["if"] == WORKLOAD_STAGING_IF, step
         assert "continue-on-error" not in step
     download, load, stage = staging
     assert download["uses"].startswith("actions/download-artifact@")
@@ -3109,12 +4239,70 @@ def test_workspace_diagnostic_reuses_the_chart_cluster_and_candidate_artifacts()
         assert f"curie-{component}:wsdiag-${{{{ github.sha }}}}" in image_load
 
 
-def test_quota_progress_is_intentionally_disabled_pending_idle_capacity_repair() -> None:
+def test_failed_first_install_retry_reuses_the_chart_cluster_and_candidate_artifacts() -> None:
+    chart = yaml.safe_load(WORKFLOW.read_text())["jobs"][CHART_JOB]
+    steps = chart["steps"]
+    matches = [
+        step
+        for step in steps
+        if step.get("name") == CHART_SCENARIOS["failed-first-install-retry"]["step"]
+    ]
+    assert len(matches) == 1
+    retry = matches[0]
+    workspace = next(
+        step for step in steps if step.get("if") == _chart_step_if("workspace-diagnostic")
+    )
+    assert retry["if"] == _chart_step_if("failed-first-install-retry")
+    assert retry["timeout-minutes"] == 30
+    assert retry["env"] == workspace["env"]
+    assert "continue-on-error" not in retry
+    commands = retry["run"].replace("\\\n", " ")
+    assert [" ".join(line.split()) for line in commands.splitlines() if line.strip()] == [
+        "set -euo pipefail",
+        "bash tools/runtime-assertion-gate/run.sh "
+        "charts/curie/ci/runtime/failed-first-install-retry-runtime.sh",
+    ]
+    stage = next(
+        step
+        for step in steps
+        if step.get("name") == "Stage the workspace diagnostic images in kind"
+    )
+    assert steps.index(stage) < steps.index(retry)
+
+
+def test_factory_resource_profile_runs_on_the_workload_leg() -> None:
+    chart = yaml.safe_load(WORKFLOW.read_text())["jobs"][CHART_JOB]
+    steps = chart["steps"]
+    name = CHART_SCENARIOS["factory-resource-profile"]["step"]
+    matches = [step for step in steps if step.get("name") == name]
+    assert len(matches) == 1
+    profile = matches[0]
+    workspace = next(
+        step for step in steps if step.get("if") == _chart_step_if("workspace-diagnostic")
+    )
+    assert profile["if"] == _chart_step_if("factory-resource-profile")
+    assert profile["timeout-minutes"] == 30
+    assert "continue-on-error" not in profile
+    assert profile["env"] == workspace["env"]
+    commands = profile["run"].replace("\\\n", " ")
+    assert [" ".join(line.split()) for line in commands.splitlines() if line.strip()] == [
+        "set -euo pipefail",
+        "bash tools/runtime-assertion-gate/run.sh "
+        "charts/curie/ci/runtime/factory-resource-profile-runtime.sh",
+    ]
+    stage = next(
+        step
+        for step in steps
+        if step.get("name") == "Stage the workspace diagnostic images in kind"
+    )
+    assert steps.index(stage) < steps.index(profile)
+
+def test_quota_progress_runs_on_the_workload_leg() -> None:
     chart = yaml.safe_load(WORKFLOW.read_text())["jobs"][CHART_JOB]
     steps = [step for step in chart["steps"] if step.get("name") == "Quota progress regression"]
     assert len(steps) == 1
     quota = steps[0]
-    assert quota["if"] == "${{ false }}"
+    assert quota["if"] == _chart_step_if("quota-progress")
     assert quota["timeout-minutes"] == 30
     assert "continue-on-error" not in quota
     assert quota["env"] == {
@@ -3200,12 +4388,12 @@ def test_approval_resume_follows_push_and_kind_omission(tmp_path: Path) -> None:
 def test_aggregate_requires_approval_resume_success_when_selected(
     event_name: str,
 ) -> None:
-    state = {
+    state: _AggregateOverrides = {
         "event_name": event_name,
         "cluster_selected": "true",
         "cluster_result": "success",
         "cluster_chart_result": "success",
-        "rollout_recovery_result": ("skipped" if event_name == "pull_request" else "success"),
+        "rollout_recovery_result": "skipped",
         "approval_resume_selected": "true",
     }
     ok = _run_aggregate(**state, approval_resume_result="success")
@@ -3230,7 +4418,7 @@ def test_aggregate_rejects_malformed_approval_resume_selection(selected: str) ->
 
 
 def test_negative_control_covers_approval_resume_result() -> None:
-    state = {
+    state: _AggregateOverrides = {
         "event_name": "pull_request",
         "approval_resume_selected": "true",
         "approval_resume_result": "success",
@@ -3365,7 +4553,7 @@ def test_unrelated_paths_do_not_select_admitted_agent_factory(tmp_path: Path, pa
 def test_aggregate_requires_scripted_factory_success_when_selected(
     event_name: str, result: str
 ) -> None:
-    state = {"event_name": event_name, "factory_selected": "true"}
+    state: _AggregateOverrides = {"event_name": event_name, "factory_selected": "true"}
     ok = _run_aggregate(**state, factory_result="success")
     assert ok.returncode == 0, ok.stdout + ok.stderr
 
@@ -3389,29 +4577,39 @@ def test_aggregate_requires_scripted_factory_skip_when_not_selected(
 @pytest.mark.parametrize("event_name", ["pull_request", "push", "workflow_dispatch"])
 @pytest.mark.parametrize("selected", ["true", "false"])
 def test_aggregate_requires_factory_sibling_results_to_follow_factory_selection(
-    event_name: str, selected: str, sibling: str
+    event_name: str,
+    selected: str,
+    sibling: Literal["forge_instance_result", "admitted_agent_result"],
 ) -> None:
     expected, wrong = ("success", "skipped") if selected == "true" else ("skipped", "success")
-    state = {"event_name": event_name, "factory_selected": selected, "factory_result": expected}
-    ok = _run_aggregate(**state, **{sibling: expected})
+    state: _AggregateOverrides = {
+        "event_name": event_name,
+        "factory_selected": selected,
+        "factory_result": expected,
+    }
+    state[sibling] = expected
+    ok = _run_aggregate(**state)
     assert ok.returncode == 0, ok.stdout + ok.stderr
     for result in (wrong, "failure", "cancelled", ""):
-        rejected = _run_aggregate(**state, **{sibling: result})
+        state[sibling] = result
+        rejected = _run_aggregate(**state)
         assert rejected.returncode != 0, rejected.stdout + rejected.stderr
 
 
 @pytest.mark.parametrize("sibling", sorted(FACTORY_SIBLING_RESULTS))
 @pytest.mark.parametrize(("selected", "result"), [("true", "success"), ("false", "skipped")])
 def test_negative_control_covers_factory_sibling_results(
-    selected: str, result: str, sibling: str
+    selected: str,
+    result: str,
+    sibling: Literal["forge_instance_result", "admitted_agent_result"],
 ) -> None:
     variable = FACTORY_SIBLING_RESULTS[sibling]
-    state = {
+    state: _AggregateOverrides = {
         "event_name": "pull_request",
         "factory_selected": selected,
         "factory_result": result,
-        sibling: result,
     }
+    state[sibling] = result
     check = f'"${variable}" != "$factory_expected" ||'
 
     def accept_drift(script: str) -> str:
@@ -3432,7 +4630,7 @@ def test_aggregate_rejects_malformed_scripted_factory_selection(selected: str) -
 
 @pytest.mark.parametrize(("selected", "result"), [("true", "success"), ("false", "skipped")])
 def test_negative_control_covers_scripted_factory_result(selected: str, result: str) -> None:
-    state = {
+    state: _AggregateOverrides = {
         "event_name": "pull_request",
         "factory_selected": selected,
         "factory_result": result,
@@ -3465,7 +4663,9 @@ def test_registration_seam_changes_select_the_factory_runtime(tmp_path: Path, pa
 @pytest.mark.parametrize("path", ("cli/src/ops/convergence.rs", CLUSTER_UP_MODULE))
 @pytest.mark.parametrize("omit_kind", (False, True))
 def test_convergence_changes_select_the_fresh_install_runtime(
-    tmp_path: Path, path: str, omit_kind: bool,
+    tmp_path: Path,
+    path: str,
+    omit_kind: bool,
 ) -> None:
     completed, output = _invoke_selector(tmp_path, path, omit_kind=omit_kind)
     assert completed.returncode == 0, completed.stderr
@@ -3529,8 +4729,7 @@ SCRIPTED_FACTORY_LEGS = (
     ),
     (
         "fresh-install",
-        lambda run: run
-        == f"uv run pytest -q -n 0 {CLUSTER_UP_MODULE}::{FRESH_INSTALL_TEST}",
+        lambda run: run == f"uv run pytest -q -n 0 {CLUSTER_UP_MODULE}::{FRESH_INSTALL_TEST}",
     ),
 )
 SCRIPTED_FACTORY_EVIDENCE_STEP = "Upload scripted factory evidence"
@@ -3682,7 +4881,8 @@ def test_scripted_factory_job_runs_on_pull_requests_and_gates_e2e_required(tmp_p
 
 @pytest.mark.parametrize("exit_code", (0, 17))
 def test_fresh_cluster_up_runtime_is_serial_and_propagates_failure(
-    tmp_path: Path, exit_code: int,
+    tmp_path: Path,
+    exit_code: int,
 ) -> None:
     jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
     job = jobs[SCRIPTED_FACTORY_JOB]
@@ -3709,26 +4909,39 @@ def test_fresh_cluster_up_runtime_is_serial_and_propagates_failure(
     executed = subprocess.run(
         ["bash", "-e", "-o", "pipefail", "-c", runtime["run"]],
         cwd=tmp_path,
-        env={**os.environ, "PATH": f"{binaries}:{os.environ['PATH']}",
-             "RUNTIME_ARGV": str(log)},
-        capture_output=True, text=True, check=False,
+        env={
+            **os.environ,
+            "PATH": f"{binaries}:{os.environ['PATH']}",
+            "RUNTIME_ARGV": str(log),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
     )
     assert executed.returncode == exit_code, executed.stdout + executed.stderr
     argv = json.loads(log.read_text())
     assert argv[:2] == ["run", "pytest"]
     assert argv[argv.index("-n") + 1] == "0"
-    assert any(target in argv for target in (
-        CLUSTER_UP_MODULE,
-        CLUSTER_UP_MODULE + "::test_fresh_cluster_up_converges_without_rerun",
-    ))
+    assert any(
+        target in argv
+        for target in (
+            CLUSTER_UP_MODULE,
+            CLUSTER_UP_MODULE + "::test_fresh_cluster_up_converges_without_rerun",
+        )
+    )
     assert not any(arg.startswith(("-k", "-m", "--deselect", "--ignore")) for arg in argv)
 
 
 @functools.cache
 def _collect_forge_instance_cases(*pytest_args: str) -> tuple[str, ...]:
     collected = subprocess.run(
-        [sys.executable, "-m", "pytest", "--collect-only",
-         *(pytest_args or ("-q", "-n", "0", FORGE_INSTANCE_MODULE))],
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "--collect-only",
+            *(pytest_args or ("-q", "-n", "0", FORGE_INSTANCE_MODULE)),
+        ],
         cwd=REPO_ROOT,
         env={**os.environ, "PYTEST_ADDOPTS": ""},
         capture_output=True,
@@ -3738,7 +4951,8 @@ def _collect_forge_instance_cases(*pytest_args: str) -> tuple[str, ...]:
     )
     assert collected.returncode == 0, collected.stdout + collected.stderr
     cases = tuple(
-        line.strip() for line in collected.stdout.splitlines()
+        line.strip()
+        for line in collected.stdout.splitlines()
         if line.startswith(FORGE_INSTANCE_MODULE + "::")
     )
     assert cases, collected.stdout + collected.stderr
@@ -3746,7 +4960,8 @@ def _collect_forge_instance_cases(*pytest_args: str) -> tuple[str, ...]:
 
 
 def _assert_forge_instance_legs_map_one_to_one(
-    job: dict[str, Any], collected: tuple[str, ...],
+    job: dict[str, Any],
+    collected: tuple[str, ...],
 ) -> None:
     matrix = job["strategy"]["matrix"]
     assert set(matrix) == {"include"}
@@ -3764,12 +4979,15 @@ def test_forge_instance_job_is_gated_like_the_scripted_factory_and_required() ->
     assert job["timeout-minutes"] == 165
     assert job["strategy"] == {
         "fail-fast": False,
-        "matrix": {"include": [
-            {"suite": suite, "test": test} for suite, test in FORGE_INSTANCE_LEGS.items()
-        ]},
+        "matrix": {
+            "include": [
+                {"suite": suite, "test": test} for suite, test in FORGE_INSTANCE_LEGS.items()
+            ]
+        },
     }
     assert not job.get("continue-on-error")
-    assert job["if"] == jobs[SCRIPTED_FACTORY_JOB]["if"]
+    assert job["if"] == _nightly_if("needs.changes.outputs.factory == 'true'")
+    assert job["if"] != jobs[SCRIPTED_FACTORY_JOB]["if"]
     assert "needs.changes.outputs.factory == 'true'" in job["if"]
     assert job["needs"] == ["changes"]
     assert FORGE_INSTANCE_JOB in jobs["e2e-required"]["needs"]
@@ -3790,11 +5008,63 @@ def test_forge_instance_job_is_gated_like_the_scripted_factory_and_required() ->
         "${{ needs.forge-instance-regression.result }}"
     )
     script = required["run"]
-    assert '"$FORGE_INSTANCE_RESULT" != "$factory_expected"' in script
-    assert (
-        "FACTORY_RESULT FORGE_INSTANCE_RESULT ADMITTED_AGENT_RESULT"
-        in script
-    )
+    assert '"$FORGE_INSTANCE_RESULT" != "$forge_instance_expected"' in script
+    assert "FACTORY_RESULT FORGE_INSTANCE_RESULT ADMITTED_AGENT_RESULT" in script
+
+
+NIGHTLY_JOBS = {
+    FORGE_INSTANCE_JOB: "needs.changes.outputs.factory == 'true'",
+    "e2e-cluster-rollout-recovery": "needs.changes.outputs.cluster == 'true'",
+    "e2e-released-upgrade": "needs.changes.outputs.released_upgrade_full == 'true'",
+}
+
+
+def test_nightly_jobs_keep_their_selector_and_reject_a_missing_condition() -> None:
+    jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
+    for job_id, selection in NIGHTLY_JOBS.items():
+        assert jobs[job_id]["if"] == _nightly_if(selection)
+        missing = jobs[job_id]["if"].replace("inputs.nightly == true && ", "")
+        assert missing != jobs[job_id]["if"]
+        assert "inputs.nightly" not in missing
+    for unchanged in ("cli-portability", "cli-darwin", "e2e-released-upgrade-negative"):
+        assert "inputs.nightly" not in jobs[unchanged]["if"]
+    assert jobs["cli-portability"]["if"] == jobs["cli-darwin"]["if"]
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {
+            "event_name": "workflow_dispatch",
+            "nightly": "true",
+            "factory_selected": "true",
+            "factory_result": "success",
+            "forge_instance_result": "skipped",
+        },
+        {
+            "event_name": "workflow_dispatch",
+            "nightly": "true",
+            "cluster_selected": "true",
+            "cluster_result": "success",
+            "cluster_chart_result": "success",
+            "rollout_recovery_result": "skipped",
+        },
+        {
+            "event_name": "workflow_dispatch",
+            "nightly": "true",
+            "released_upgrade_selected": "true",
+            "released_upgrade_full": "true",
+            "released_upgrade_result": "skipped",
+            "released_upgrade_negative_result": "success",
+            "upgrade_matrix_result": "success",
+        },
+    ],
+)
+def test_aggregate_rejects_a_skip_on_a_nightly_dispatch(
+    overrides: dict[str, str],
+) -> None:
+    completed = _run_aggregate(script_transform=None, **overrides)
+    assert completed.returncode != 0, completed.stdout + completed.stderr
 
 
 @pytest.mark.parametrize("mutation", ("extra-case", "missing-leg", "duplicate-leg"))
@@ -3816,7 +5086,8 @@ def test_forge_instance_leg_mapping_rejects_missing_or_duplicate_coverage(mutati
 
 @pytest.mark.parametrize("failing_suite", (None, *FORGE_INSTANCE_LEGS))
 def test_forge_instance_matrix_executes_each_case_and_propagates_failure(
-    tmp_path: Path, failing_suite: str | None,
+    tmp_path: Path,
+    failing_suite: str | None,
 ) -> None:
     jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
     job = jobs[FORGE_INSTANCE_JOB]
@@ -3831,7 +5102,7 @@ def test_forge_instance_matrix_executes_each_case_and_propagates_failure(
         "sys.exit(int(os.environ['FORGE_EXIT_CODE']))\n"
     )
     uv.chmod(0o755)
-    selected = []
+    selected: list[str] = []
     results = []
     for leg in job["strategy"]["matrix"]["include"]:
         log = tmp_path / f"{leg['suite']}.json"
@@ -3843,9 +5114,17 @@ def test_forge_instance_matrix_executes_each_case_and_propagates_failure(
         executed = subprocess.run(
             ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", runtime["run"]],
             cwd=tmp_path,
-            env={**os.environ, **environment, "PATH": f"{binaries}:{os.environ['PATH']}",
-                 "FORGE_ARGV": str(log), "FORGE_EXIT_CODE": str(exit_code)},
-            capture_output=True, text=True, check=False, timeout=30,
+            env={
+                **os.environ,
+                **environment,
+                "PATH": f"{binaries}:{os.environ['PATH']}",
+                "FORGE_ARGV": str(log),
+                "FORGE_EXIT_CODE": str(exit_code),
+            },
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
         )
         assert executed.returncode == exit_code, executed.stdout + executed.stderr
         argv = json.loads(log.read_text())
@@ -3857,7 +5136,8 @@ def test_forge_instance_matrix_executes_each_case_and_propagates_failure(
         results.append(executed.returncode)
     assert sorted(selected) == sorted(_collect_forge_instance_cases())
     aggregate = _run_aggregate(
-        event_name="pull_request",
+        event_name="workflow_dispatch",
+        nightly="true",
         factory_selected="true",
         factory_result="success",
         forge_instance_result="failure" if any(results) else "success",
@@ -3910,7 +5190,12 @@ def test_controller_preflight_upgrade_scenario_runs_on_chart_pull_requests() -> 
             ("apps/api/src/curie_api/main.py",),
             False,
             False,
-            ("quota-progress", "workspace-diagnostic"),
+            (
+                "connector-secret-rotation",
+                "factory-resource-profile",
+                "quota-progress",
+                "workspace-diagnostic",
+            ),
         ),
         (("charts/curie/templates/agent-sandbox.yaml",), False, False, CHART_IDS),
         (
@@ -3929,13 +5214,25 @@ def test_controller_preflight_upgrade_scenario_runs_on_chart_pull_requests() -> 
             ("packages/plugin-format/src/plugin_format/connector_render.py",),
             False,
             False,
-            ("connector-readiness", "quota-progress", "workspace-diagnostic"),
+            (
+                "connector-readiness",
+                "connector-secret-rotation",
+                "factory-resource-profile",
+                "quota-progress",
+                "workspace-diagnostic",
+            ),
         ),
         (
             ("apps/worker/src/curie_worker/connector_k8s.py",),
             False,
             False,
-            ("connector-readiness", "quota-progress", "workspace-diagnostic"),
+            (
+                "connector-readiness",
+                "connector-secret-rotation",
+                "factory-resource-profile",
+                "quota-progress",
+                "workspace-diagnostic",
+            ),
         ),
         (("docs/adr/AGENTS.md",), False, False, ()),
         (("newtoplevel/file.txt",), False, False, CHART_IDS),
@@ -3979,6 +5276,9 @@ def test_chart_scenarios_follow_changed_inputs_and_final_tiers(
     assert _outputs_of(output)["chart_scenarios"] == rendered
     assert output.count("chart_scenarios=") == 1
     assert f"chart_scenarios={rendered}" in completed.stdout
+    legs = json.dumps(_expected_chart_legs(expected), separators=(",", ":"))
+    assert _outputs_of(output)["chart_legs"] == legs
+    assert f"chart_legs={legs}" in completed.stdout
     if expected:
         assert _outputs_of(output)["cluster"] == "true"
 
@@ -3994,7 +5294,12 @@ def test_chart_scenarios_follow_changed_inputs_and_final_tiers(
         ("charts/curie/ci/postgres-readiness-delay.Dockerfile", ("langfuse-postgres-readiness",)),
         (
             "apps/worker/src/curie_worker/connector_k8s.py.bak",
-            ("quota-progress", "workspace-diagnostic"),
+            (
+                "connector-secret-rotation",
+                "factory-resource-profile",
+                "quota-progress",
+                "workspace-diagnostic",
+            ),
         ),
         ("charts/curie/ci/runtime/connector-readiness-runtime.sh.bak", ()),
         ("charts/curie/ci/runtime/connector-readiness-runtime.sh/child", ("connector-readiness",)),
@@ -4012,6 +5317,23 @@ def test_chart_scenario_input_matching_keeps_the_existing_prefix_rules(
     assert json.loads(_outputs_of(output)["chart_scenarios"]) == list(expected)
 
 
+def test_failed_first_install_retry_script_alone_selects_its_scenario(tmp_path: Path) -> None:
+    completed, output = _invoke_selector(
+        tmp_path, "charts/curie/ci/runtime/failed-first-install-retry-runtime.sh"
+    )
+    assert completed.returncode == 0, completed.stderr
+    selected = _outputs_of(output)
+    assert selected["cluster"] == "true"
+    assert json.loads(selected["chart_scenarios"]) == ["failed-first-install-retry"]
+    assert json.loads(selected["chart_legs"]) == ["workload"]
+
+
+def test_failed_first_install_retry_tracks_the_production_discard_path(tmp_path: Path) -> None:
+    completed, output = _invoke_selector(tmp_path, "cli/src/ops/up.rs")
+    assert completed.returncode == 0, completed.stderr
+    assert "failed-first-install-retry" in json.loads(_outputs_of(output)["chart_scenarios"])
+
+
 def test_chart_scenario_union_is_sorted_and_deduplicated(tmp_path: Path) -> None:
     paths = (
         "charts/curie/ci/runtime/connector-readiness-runtime.sh",
@@ -4024,6 +5346,8 @@ def test_chart_scenario_union_is_sorted_and_deduplicated(tmp_path: Path) -> None
     assert output == reversed_output
     assert json.loads(_outputs_of(output)["chart_scenarios"]) == [
         "connector-readiness",
+        "connector-secret-rotation",
+        "factory-resource-profile",
         "quota-progress",
         "workspace-diagnostic",
     ]
@@ -4044,7 +5368,9 @@ def _chart_consistency_problems(workflow: dict[str, Any], registry: dict[str, An
             continue
         if name not in by_step:
             problems.append(f"unregistered scenario step: {name}")
-        elif step.get("if") != _chart_step_if(by_step[name]):
+        elif scenarios[by_step[name]].get("leg") not in CHART_LEGS:
+            problems.append(f"scenario without a leg: {by_step[name]}")
+        elif step.get("if") != _chart_step_if(by_step[name], scenarios[by_step[name]]["leg"]):
             problems.append(f"noncanonical scenario condition: {name}")
     for entry in scenarios.values():
         if entry["step"] not in steps:
@@ -4065,7 +5391,9 @@ def test_chart_scenario_registry_and_real_workflow_are_consistent() -> None:
     assert not _chart_consistency_problems(workflow, registry)
 
 
-@pytest.mark.parametrize("mutation", ["unregistered", "orphan", "missing-if", "wrong-if"])
+@pytest.mark.parametrize(
+    "mutation", ["unregistered", "orphan", "missing-if", "wrong-if", "missing-leg", "wrong-leg"]
+)
 def test_chart_consistency_check_rejects_workflow_drift(mutation: str) -> None:
     workflow = yaml.safe_load(WORKFLOW.read_text())
     registry = yaml.safe_load(REGISTRY.read_text())
@@ -4078,9 +5406,153 @@ def test_chart_consistency_check_rejects_workflow_drift(mutation: str) -> None:
         entry["step"] = "Absent scenario step"
     elif mutation == "missing-if":
         step.pop("if")
+    elif mutation == "missing-leg":
+        # The pre-#4722 condition: the step would run in both legs.
+        step["if"] = (
+            "${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), "
+            "'connector-readiness') }}"
+        )
+    elif mutation == "wrong-leg":
+        step["if"] = _chart_step_if("connector-readiness", "workload")
     else:
         step["if"] = _chart_step_if("controller-preflight")
     assert _chart_consistency_problems(workflow, registry)
+
+
+def test_every_chart_scenario_belongs_to_exactly_one_leg() -> None:
+    scenarios = yaml.safe_load(REGISTRY.read_text())["chart_scenarios"]["scenarios"]
+    assert set(scenarios) == set(CHART_SCENARIOS)
+    for scenario, entry in scenarios.items():
+        assert isinstance(entry.get("leg"), str), scenario
+        assert entry["leg"] in CHART_LEGS, scenario
+    workload = {scenario for scenario, entry in scenarios.items() if entry["leg"] == "workload"}
+    assert workload == WORKLOAD_SCENARIOS
+    loaded = _SELECTOR_MODULE._load_registry(REGISTRY).chart_scenarios.scenarios
+    assert {scenario: loaded[scenario].leg for scenario in loaded} == {
+        scenario: entry["leg"] for scenario, entry in scenarios.items()
+    }
+
+
+@pytest.mark.parametrize(
+    ("paths", "push", "scenarios", "legs"),
+    [
+        (
+            ("charts/curie/ci/runtime/idle-capacity-reclamation-runtime.sh",),
+            False,
+            ["quota-progress"],
+            ["workload"],
+        ),
+        (
+            ("charts/curie/ci/runtime/connector-readiness-runtime.sh",),
+            False,
+            ["connector-readiness"],
+            ["chart"],
+        ),
+        ((), True, list(CHART_IDS), ["chart", "workload"]),
+        (("docs/adr/AGENTS.md",), False, [], []),
+    ],
+    ids=("quota-only", "chart-only", "push", "docs"),
+)
+def test_chart_legs_follow_the_selected_scenarios(
+    tmp_path: Path,
+    paths: tuple[str, ...],
+    push: bool,
+    scenarios: list[str],
+    legs: list[str],
+) -> None:
+    completed, output = _invoke_selector(tmp_path, *paths, push=push)
+    assert completed.returncode == 0, completed.stderr
+    outputs = _outputs_of(output)
+    assert json.loads(outputs["chart_scenarios"]) == scenarios
+    rendered = json.dumps(legs, separators=(",", ":"))
+    assert outputs["chart_legs"] == rendered
+    assert output.count("chart_legs=") == 1
+    # The legs line follows the scenarios line it is derived from.
+    keys = [line.split("=", 1)[0] for line in output.splitlines()]
+    assert keys.index("chart_legs") == keys.index("chart_scenarios") + 1
+    assert f"chart_legs={rendered}" in completed.stdout
+
+
+@pytest.mark.parametrize("mutation", ["missing-leg", "unknown-leg", "nonstring-leg"])
+def test_chart_scenario_registry_rejects_a_scenario_without_a_valid_leg(
+    tmp_path: Path, mutation: str
+) -> None:
+    valid = tmp_path / "valid.yaml"
+    valid.write_text(VALID_REGISTRY)
+    # Liveness: the unmutated registry, with a leg on every scenario, loads.
+    _SELECTOR_MODULE._load_registry(valid)
+    registry = yaml.safe_load(VALID_REGISTRY)
+    entry = registry["chart_scenarios"]["scenarios"]["connector-readiness"]
+    if mutation == "missing-leg":
+        del entry["leg"]
+    elif mutation == "unknown-leg":
+        entry["leg"] = "upgrade"
+    else:
+        entry["leg"] = ["chart"]
+    path = tmp_path / "registry.yaml"
+    path.write_text(yaml.safe_dump(registry))
+    with pytest.raises(_SELECTOR_MODULE.RegistryError, match="leg"):
+        _SELECTOR_MODULE._load_registry(path)
+
+
+CHART_FIXTURE_STEPS = (
+    "Load the Postgres readiness fixture built by the ci-images job",
+    "Tag the Postgres readiness fixture",
+    "Load the Postgres readiness fixture into the kind cluster",
+)
+WORKLOAD_STAGING_STEPS = (
+    "Download the workspace diagnostic CLI",
+    "Load the workspace diagnostic candidate images",
+    "Stage the workspace diagnostic images in kind",
+)
+
+
+def test_chart_job_runs_one_leg_per_runner_from_the_selected_legs() -> None:
+    jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
+    chart = jobs[CHART_JOB]
+    assert chart["name"] == "E2E chart runtime regressions (kind, Calico, ${{ matrix.leg }})"
+    assert chart["strategy"] == {
+        "fail-fast": False,
+        "matrix": {"leg": "${{ fromJSON(needs.changes.outputs.chart_legs) }}"},
+    }
+    assert chart["if"] == CHART_JOB_IF
+    steps = {step.get("name"): step for step in chart["steps"]}
+    for name in CHART_FIXTURE_STEPS:
+        assert steps[name].get("if") == "${{ matrix.leg == 'chart' }}", name
+    for name in WORKLOAD_STAGING_STEPS:
+        assert steps[name].get("if") == WORKLOAD_STAGING_IF, name
+    upload = steps["Upload runtime assertion receipts"]
+    assert upload["with"]["name"] == (
+        "runtime-assertion-receipts-${{ github.job }}-${{ matrix.leg }}"
+    )
+    # Every step that names a scenario is bound to that scenario's leg.
+    for name, step in steps.items():
+        condition = str(step.get("if", ""))
+        named = [scenario for scenario in CHART_IDS if f"'{scenario}'" in condition]
+        if not named:
+            continue
+        legs = {CHART_SCENARIOS[scenario]["leg"] for scenario in named}
+        assert len(legs) == 1, name
+        assert condition.startswith("${{ " + _chart_leg_clause(legs.pop()) + " && "), name
+
+
+def test_a_failing_chart_leg_fails_e2e_required() -> None:
+    jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
+    # A matrix job's result is the aggregate of its legs, so either failing
+    # leg reaches E2E required through this one needs entry.
+    assert CHART_JOB in jobs["e2e-required"]["needs"]
+    _script, bindings = _aggregate_contract()
+    assert bindings["cluster_chart_result"] == "CLUSTER_CHART_RESULT"
+    state: _AggregateOverrides = {
+        "event_name": "pull_request",
+        "cluster_selected": "true",
+        "cluster_result": "success",
+        "chart_scenarios": '["connector-readiness","quota-progress"]',
+    }
+    passing = _run_aggregate(cluster_chart_result="success", **state)
+    assert passing.returncode == 0, passing.stdout + passing.stderr
+    failing = _run_aggregate(cluster_chart_result="failure", **state)
+    assert failing.returncode != 0, failing.stdout + failing.stderr
 
 
 @pytest.mark.parametrize(
@@ -4174,12 +5646,22 @@ def test_unregistered_chart_scenario_fails_closed_in_each_selection_mode(
     completed, output = _invoke_selector(tmp_path, *paths, **options)
     assert completed.returncode == 0, completed.stderr
     expected = (
-        CHART_IDS if mode in {"push", "revisions"} else ("quota-progress", "workspace-diagnostic")
+        CHART_IDS
+        if mode in {"push", "revisions"}
+        else (
+                "connector-secret-rotation",
+                "factory-resource-profile",
+                "quota-progress",
+                "workspace-diagnostic",
+            )
     )
     assert json.loads(_outputs_of(output)["chart_scenarios"]) == sorted((*expected, "unregistered"))
+    # An unregistered step has no leg condition, so it must run in every leg.
+    assert json.loads(_outputs_of(output)["chart_legs"]) == ["chart", "workload"]
     docs, docs_output = _invoke_selector(tmp_path, "docs/example.md", cwd=repository)
     assert docs.returncode == 0, docs.stderr
     assert _outputs_of(docs_output)["chart_scenarios"] == "[]"
+    assert _outputs_of(docs_output)["chart_legs"] == "[]"
 
 
 @pytest.mark.parametrize(
@@ -4227,7 +5709,7 @@ def test_e2e_required_rejects_chart_scenarios_without_list_delimiters(chart_scen
 
 
 def test_negative_control_still_covers_the_chart_job_result() -> None:
-    state = {
+    state: _AggregateOverrides = {
         "event_name": "pull_request",
         "cluster_selected": "true",
         "cluster_result": "success",
@@ -4245,3 +5727,26 @@ def test_negative_control_still_covers_the_chart_job_result() -> None:
     mutated = _run_aggregate(script_transform=omit_chart_check, **state)
     assert mutated.returncode != 0, mutated.stdout + mutated.stderr
     assert "Selected and skipped negative control failed" in mutated.stdout + mutated.stderr
+
+
+def test_connector_secret_rotation_selects_candidate_runtime(tmp_path: Path) -> None:
+    positive = (
+        "charts/curie/ci/runtime/connector-secret-rotation-runtime.sh",
+        "cli/src/connectors.rs",
+        "apps/api/src/curie_api/bundles.py",
+        "apps/worker/src/curie_worker/connector_reconcile.py",
+        "packages/plugin-format/src/plugin_format/connector_render.py",
+        "pyproject.toml",
+        "uv.lock",
+    )
+    for path in positive:
+        completed, output = _invoke_selector(tmp_path, path)
+        assert completed.returncode == 0, completed.stderr
+        selected = json.loads(_outputs_of(output)["chart_scenarios"])
+        if "connector-secret-rotation" not in selected:
+            raise AssertionError("changed connector rotation input was not selected")
+    completed, output = _invoke_selector(tmp_path, "docs/agents.md")
+    assert completed.returncode == 0, completed.stderr
+    selected = json.loads(_outputs_of(output)["chart_scenarios"])
+    if "connector-secret-rotation" in selected:
+        raise AssertionError("an unrelated path selected connector rotation")

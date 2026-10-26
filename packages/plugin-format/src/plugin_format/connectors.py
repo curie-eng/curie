@@ -223,6 +223,47 @@ def is_valid_readiness_path(text: str) -> bool:
     )
 
 
+# ADR 0240 decision 1. The MCP path every hosted entry dials
+# (``connector_render.mcp_entry``); a route may not shadow it.
+MCP_PATH: Final = "/mcp"
+ROUTE_METHODS: Final = ("POST", "PUT")
+ROUTE_MAX_BODY_BYTES_CEILING: Final = 256 * 1024 * 1024
+_ROUTE_SEGMENT_RE = re.compile(r"[A-Za-z0-9._~-]+")
+
+
+def is_valid_route_path(text: str) -> bool:
+    """Whether ``text`` may be a declared route's ``path`` (ADR 0240 decision 1).
+
+    Absolute, matched exactly, so only unreserved characters and ``/``: no
+    empty, ``.`` or ``..`` segment, no percent encoding, and nothing at or
+    under the MCP path.
+    """
+
+    if not text.startswith("/") or text == MCP_PATH or text.startswith(MCP_PATH + "/"):
+        return False
+    segments = text[1:].split("/")
+    return all(
+        _ROUTE_SEGMENT_RE.fullmatch(segment) is not None and segment not in {".", ".."}
+        for segment in segments
+    )
+
+
+class ConnectorRoute(BaseModel):
+    """One non-MCP route a hosted connector serves its bundle's stdio servers.
+
+    ADR 0240 decision 1. ``callers`` names stdio servers in the bundle's own MCP
+    config; ``validate_bundle`` checks them, because this file cannot see that
+    config.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str
+    methods: list[str] = Field(default_factory=lambda: ["POST"])
+    max_body_bytes: int = Field(strict=True)
+    callers: list[str]
+
+
 class ConnectorSpec(BaseModel):
     """One declared connector. Exactly one of ``image``, ``build`` or ``url``.
 
@@ -280,6 +321,11 @@ class ConnectorSpec(BaseModel):
     # `tcpSocket` check; a probe carries exactly one handler. None keeps the
     # `tcpSocket` probe. The caller proxy's probe never changes.
     readiness_path: str | None = None
+
+    # Non-MCP routes the caller proxy admits a connector-scoped route token on,
+    # each with its own body limit and the bundle stdio servers that may call
+    # it (ADR 0240). Empty leaves the proxy exactly as it is.
+    routes: list[ConnectorRoute] = Field(default_factory=list)
 
     # The server container's requests and limits, merged per key over
     # DEFAULT_SERVER_RESOURCES. None renders the defaults unchanged.
@@ -977,6 +1023,8 @@ def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[st
                         f"{spec.readiness_path!r}",
                     )
                 )
+        if spec.routes:
+            _validate_routes(where, spec, errors)
         if spec.resources is not None:
             if spec.url is not None:
                 errors.append(
@@ -1159,3 +1207,72 @@ def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[st
         _validate_build("runner", parsed.runner.build, errors)
 
     return (parsed if not errors else None), errors
+
+
+def _validate_routes(where: str, spec: ConnectorSpec, errors: list[tuple[str, str]]) -> None:
+    """ADR 0240 decision 1, for everything this file can see."""
+
+    if spec.url is not None:
+        errors.append(
+            (
+                "connectors.remote_has_routes",
+                f"{where}: `routes` are served through the caller proxy Curie puts in "
+                "front of a connector it hosts; a `url` connector has no such proxy",
+            )
+        )
+        return
+    seen_paths: set[str] = set()
+    for index, route in enumerate(spec.routes):
+        at = f"{where}.routes[{index}]"
+        if not is_valid_route_path(route.path):
+            errors.append(
+                (
+                    "connectors.bad_route_path",
+                    f"{at}: `path` must start with `/` and hold only letters, digits, "
+                    "`.`, `_`, `~`, `-` and `/`, with no empty, `.` or `..` segment, and "
+                    f"must not be or sit under {MCP_PATH}, got {route.path!r}",
+                )
+            )
+        elif route.path == spec.readiness_path:
+            errors.append(
+                (
+                    "connectors.route_is_readiness_path",
+                    f"{at}: `path` {route.path!r} is the connector's `readiness_path`",
+                )
+            )
+        if route.path in seen_paths:
+            errors.append(
+                (
+                    "connectors.duplicate_route",
+                    f"{at}: `path` {route.path!r} is declared more than once",
+                )
+            )
+        seen_paths.add(route.path)
+        if (
+            not route.methods
+            or len(set(route.methods)) != len(route.methods)
+            or any(method not in ROUTE_METHODS for method in route.methods)
+        ):
+            errors.append(
+                (
+                    "connectors.bad_route_methods",
+                    f"{at}: `methods` must be a non-empty list drawn from "
+                    f"{', '.join(ROUTE_METHODS)} with no repeats, got {route.methods!r}",
+                )
+            )
+        if not 0 < route.max_body_bytes <= ROUTE_MAX_BODY_BYTES_CEILING:
+            errors.append(
+                (
+                    "connectors.bad_route_max_body_bytes",
+                    f"{at}: `max_body_bytes` must be a positive integer no larger than "
+                    f"{ROUTE_MAX_BODY_BYTES_CEILING}, got {route.max_body_bytes!r}",
+                )
+            )
+        if not route.callers or any(not caller for caller in route.callers):
+            errors.append(
+                (
+                    "connectors.route_without_callers",
+                    f"{at}: `callers` must name at least one of the bundle's stdio "
+                    "servers, and no name may be empty",
+                )
+            )

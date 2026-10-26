@@ -1,4 +1,4 @@
-"""Pure time helpers for agent-created schedules (ADR 0238).
+"""Pure time helpers for agent-created schedules (ADR 0248).
 
 `curie_api.agent_schedule_time` decides the minimum interval a cron expression
 can fire at, the next run of a cron or one-shot schedule in its zone, the label

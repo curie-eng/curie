@@ -2580,7 +2580,7 @@ def test_factory_token_remint_and_label_edit_preserve_current_binding_authority(
     asyncio.run(go())
 
 
-# --- learned skills (ADR 0237) ---------------------------------------------------
+# --- learned skills (ADR 0247) ---------------------------------------------------
 
 
 async def _set_learned_skills(engine: AsyncEngine, agent_id: uuid.UUID, on: bool) -> None:

@@ -1,4 +1,4 @@
-"""The agent-schedule tools on their own in-process SDK MCP server (ADR 0238).
+"""The agent-schedule tools on their own in-process SDK MCP server (ADR 0248).
 
 ``list_schedules`` uses the boot read token. ``create_schedule``,
 ``update_schedule``, ``cancel_schedule`` and ``revert_schedule`` use the turn's

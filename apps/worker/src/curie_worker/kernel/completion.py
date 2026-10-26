@@ -156,6 +156,12 @@ async def _complete(
                     cause = "no_pull_request"
                 else:
                     cause = failures._unpublished_cause(turn.tools_called)
+                if (
+                    cause == "no_pull_request"
+                    and run.recorded_pr_url is not None
+                    and run.recorded_pr_url.strip()
+                ):
+                    cause = "revision_unchanged"
                 try:
                     await self._finish_or_settle(
                         run,
@@ -206,8 +212,23 @@ async def _complete(
                 run.finished = True
             return
     elif run is not None and not run.started:
+        # #4930: the safe stage and reason of a workspace preparation fault,
+        # already redacted and bounded in attempt.py, so the waiting request
+        # keeps why its last start failed.
+        start_failure_detail = (
+            turn.error_message
+            if turn is not None
+            and turn.classification == "workspace-error"
+            and turn.error_message
+            and turn.error_message.strip()
+            else None
+        )
         try:
-            await run.defer(f"not_started:{telemetry_outcome}", capacity=False)
+            await run.defer(
+                f"not_started:{telemetry_outcome}",
+                capacity=False,
+                start_failure_detail=start_failure_detail,
+            )
         except WorkItemConflict as exc:
             logger.info(
                 "work-item unstarted defer refused for %s: %s",

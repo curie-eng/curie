@@ -585,10 +585,17 @@ print(json.dumps(graph))
         ] {
             assert!(!live_in_window(below, &current), "{below}");
         }
-        // learned skills adds agents.learned_skills, which the Agent ORM reads (ADR 0237),
-        // agent schedules add agents columns it reads (ADR 0238), and twin memory adds
-        // the learning toggle it also reads (ADR 0239).
+        // learned skills adds agents.learned_skills, which the Agent ORM reads (ADR 0247),
+        // agent schedules add agents columns it reads (ADR 0248), and twin memory adds
+        // the learning toggle it also reads (ADR 0249). Agent access policies (0121, #4585)
+        // and the later next revisions chain below them.
         assert!(!live_in_window("0108", &current));
+        assert!(!live_in_window("0120", &current));
+        assert!(!live_in_window("0121", &current));
+        assert!(!live_in_window("0122", &current));
+        assert!(!live_in_window("0123", &current));
+        assert!(!live_in_window("0130", &current));
+        assert!(!live_in_window("0131", &current));
         assert!(!live_in_window("selfimp_safety_0001", &current));
         assert!(!live_in_window("selfimp_skills_0001", &current));
         assert!(!live_in_window("selfimp_sched_0001", &current));
@@ -617,10 +624,13 @@ print(json.dumps(graph))
         for revision in ["0082", "0091a", "0098", "0099"] {
             assert!(!live_in_window(revision, &published_stable));
         }
-        let candidate_release = window_for("0.13.0").expect("feature candidate is catalogued");
+        // v0.13.0 is published: its window stays at the 0108 join while the
+        // candidate advances to agent access policies (0121, #4585).
+        let candidate_release = window_for("0.13.0").expect("published 0.13.0 is catalogued");
         assert_eq!(candidate_release.schema_min, "0108");
         assert_eq!(candidate_release.schema_head, "0108");
         assert!(live_in_window("0108", &candidate_release));
+        assert!(!live_in_window("0120", &candidate_release));
         assert!(!live_in_window("0100", &candidate_release));
         assert!(!live_in_window("0075", &candidate_release));
         let published =

@@ -1,0 +1,508 @@
+{
+  "request": {
+    "schema_version": 1,
+    "request_id": "11111111-1111-1111-1111-111111111111",
+    "purpose": "invocation",
+    "authority_version": 7,
+    "scope": {
+      "tenant_id": "22222222-2222-2222-2222-222222222222",
+      "expected_issuer": "https://identity.example.test/directory",
+      "sender": {
+        "provider": "sample-chat",
+        "channel_identity_id": "33333333-3333-3333-3333-333333333333",
+        "provider_installation_id": "44444444-4444-4444-4444-444444444444",
+        "namespace": {
+          "id": "55555555-5555-5555-5555-555555555555",
+          "authority": "",
+          "kind": "workspace",
+          "key": "ExampleWorkspace"
+        },
+        "native_id": "SampleAccount"
+      }
+    }
+  },
+  "now": "2030-01-01T12:00:01+00:00",
+  "limits": {
+    "max_identity_age_ms": 2000,
+    "max_membership_age_ms": 3000,
+    "max_clock_skew_ms": 0
+  },
+  "cases": [
+    {
+      "name": "resolved-human-active",
+      "response": {
+        "schema_version": 1,
+        "request_id": "11111111-1111-1111-1111-111111111111",
+        "purpose": "invocation",
+        "authority_version": 7,
+        "scope": {
+          "tenant_id": "22222222-2222-2222-2222-222222222222",
+          "expected_issuer": "https://identity.example.test/directory",
+          "sender": {
+            "provider": "sample-chat",
+            "channel_identity_id": "33333333-3333-3333-3333-333333333333",
+            "provider_installation_id": "44444444-4444-4444-4444-444444444444",
+            "namespace": {
+              "id": "55555555-5555-5555-5555-555555555555",
+              "authority": "",
+              "kind": "workspace",
+              "key": "ExampleWorkspace"
+            },
+            "native_id": "SampleAccount"
+          }
+        },
+        "outcome": "resolved",
+        "sender_kind": "human",
+        "identity": {
+          "issuer": "https://identity.example.test/directory",
+          "subject": "SampleSubject",
+          "kind": "human",
+          "account_status": "active"
+        },
+        "identity_observation": {
+          "as_of": "2030-01-01T12:00:00Z",
+          "max_source_lag_ms": 0
+        },
+        "membership": {
+          "complete": true,
+          "groups": [
+            {
+              "issuer": "https://identity.example.test/directory",
+              "id": "SampleGroup"
+            }
+          ],
+          "observation": {
+            "as_of": "2030-01-01T12:00:00Z",
+            "max_source_lag_ms": 0
+          }
+        }
+      },
+      "expected": "facts"
+    },
+    {
+      "name": "resolved-service-active",
+      "response": {
+        "schema_version": 1,
+        "request_id": "11111111-1111-1111-1111-111111111111",
+        "purpose": "invocation",
+        "authority_version": 7,
+        "scope": {
+          "tenant_id": "22222222-2222-2222-2222-222222222222",
+          "expected_issuer": "https://identity.example.test/directory",
+          "sender": {
+            "provider": "sample-chat",
+            "channel_identity_id": "33333333-3333-3333-3333-333333333333",
+            "provider_installation_id": "44444444-4444-4444-4444-444444444444",
+            "namespace": {
+              "id": "55555555-5555-5555-5555-555555555555",
+              "authority": "",
+              "kind": "workspace",
+              "key": "ExampleWorkspace"
+            },
+            "native_id": "SampleAccount"
+          }
+        },
+        "outcome": "resolved",
+        "sender_kind": "service",
+        "identity": {
+          "issuer": "https://identity.example.test/directory",
+          "subject": "SampleSubject",
+          "kind": "service",
+          "account_status": "active"
+        },
+        "identity_observation": {
+          "as_of": "2030-01-01T12:00:00Z",
+          "max_source_lag_ms": 0
+        },
+        "membership": {
+          "complete": true,
+          "groups": [
+            {
+              "issuer": "https://identity.example.test/directory",
+              "id": "SampleGroup"
+            }
+          ],
+          "observation": {
+            "as_of": "2030-01-01T12:00:00Z",
+            "max_source_lag_ms": 0
+          }
+        }
+      },
+      "expected": "facts"
+    },
+    {
+      "name": "resolved-agent-active",
+      "response": {
+        "schema_version": 1,
+        "request_id": "11111111-1111-1111-1111-111111111111",
+        "purpose": "invocation",
+        "authority_version": 7,
+        "scope": {
+          "tenant_id": "22222222-2222-2222-2222-222222222222",
+          "expected_issuer": "https://identity.example.test/directory",
+          "sender": {
+            "provider": "sample-chat",
+            "channel_identity_id": "33333333-3333-3333-3333-333333333333",
+            "provider_installation_id": "44444444-4444-4444-4444-444444444444",
+            "namespace": {
+              "id": "55555555-5555-5555-5555-555555555555",
+              "authority": "",
+              "kind": "workspace",
+              "key": "ExampleWorkspace"
+            },
+            "native_id": "SampleAccount"
+          }
+        },
+        "outcome": "resolved",
+        "sender_kind": "agent",
+        "identity": {
+          "issuer": "https://identity.example.test/directory",
+          "subject": "SampleSubject",
+          "kind": "agent",
+          "account_status": "active"
+        },
+        "identity_observation": {
+          "as_of": "2030-01-01T12:00:00Z",
+          "max_source_lag_ms": 0
+        },
+        "membership": {
+          "complete": true,
+          "groups": [
+            {
+              "issuer": "https://identity.example.test/directory",
+              "id": "SampleGroup"
+            }
+          ],
+          "observation": {
+            "as_of": "2030-01-01T12:00:00Z",
+            "max_source_lag_ms": 0
+          }
+        }
+      },
+      "expected": "facts"
+    },
+    {
+      "name": "inactive-human-disabled",
+      "response": {
+        "schema_version": 1,
+        "request_id": "11111111-1111-1111-1111-111111111111",
+        "purpose": "invocation",
+        "authority_version": 7,
+        "scope": {
+          "tenant_id": "22222222-2222-2222-2222-222222222222",
+          "expected_issuer": "https://identity.example.test/directory",
+          "sender": {
+            "provider": "sample-chat",
+            "channel_identity_id": "33333333-3333-3333-3333-333333333333",
+            "provider_installation_id": "44444444-4444-4444-4444-444444444444",
+            "namespace": {
+              "id": "55555555-5555-5555-5555-555555555555",
+              "authority": "",
+              "kind": "workspace",
+              "key": "ExampleWorkspace"
+            },
+            "native_id": "SampleAccount"
+          }
+        },
+        "outcome": "inactive",
+        "sender_kind": "human",
+        "identity": {
+          "issuer": "https://identity.example.test/directory",
+          "subject": "SampleSubject",
+          "kind": "human",
+          "account_status": "disabled"
+        },
+        "identity_observation": {
+          "as_of": "2030-01-01T12:00:00Z",
+          "max_source_lag_ms": 0
+        },
+        "membership": null
+      },
+      "expected": "facts"
+    },
+    {
+      "name": "inactive-human-revoked",
+      "response": {
+        "schema_version": 1,
+        "request_id": "11111111-1111-1111-1111-111111111111",
+        "purpose": "invocation",
+        "authority_version": 7,
+        "scope": {
+          "tenant_id": "22222222-2222-2222-2222-222222222222",
+          "expected_issuer": "https://identity.example.test/directory",
+          "sender": {
+            "provider": "sample-chat",
+            "channel_identity_id": "33333333-3333-3333-3333-333333333333",
+            "provider_installation_id": "44444444-4444-4444-4444-444444444444",
+            "namespace": {
+              "id": "55555555-5555-5555-5555-555555555555",
+              "authority": "",
+              "kind": "workspace",
+              "key": "ExampleWorkspace"
+            },
+            "native_id": "SampleAccount"
+          }
+        },
+        "outcome": "inactive",
+        "sender_kind": "human",
+        "identity": {
+          "issuer": "https://identity.example.test/directory",
+          "subject": "SampleSubject",
+          "kind": "human",
+          "account_status": "revoked"
+        },
+        "identity_observation": {
+          "as_of": "2030-01-01T12:00:00Z",
+          "max_source_lag_ms": 0
+        },
+        "membership": null
+      },
+      "expected": "facts"
+    },
+    {
+      "name": "inactive-service-disabled",
+      "response": {
+        "schema_version": 1,
+        "request_id": "11111111-1111-1111-1111-111111111111",
+        "purpose": "invocation",
+        "authority_version": 7,
+        "scope": {
+          "tenant_id": "22222222-2222-2222-2222-222222222222",
+          "expected_issuer": "https://identity.example.test/directory",
+          "sender": {
+            "provider": "sample-chat",
+            "channel_identity_id": "33333333-3333-3333-3333-333333333333",
+            "provider_installation_id": "44444444-4444-4444-4444-444444444444",
+            "namespace": {
+              "id": "55555555-5555-5555-5555-555555555555",
+              "authority": "",
+              "kind": "workspace",
+              "key": "ExampleWorkspace"
+            },
+            "native_id": "SampleAccount"
+          }
+        },
+        "outcome": "inactive",
+        "sender_kind": "service",
+        "identity": {
+          "issuer": "https://identity.example.test/directory",
+          "subject": "SampleSubject",
+          "kind": "service",
+          "account_status": "disabled"
+        },
+        "identity_observation": {
+          "as_of": "2030-01-01T12:00:00Z",
+          "max_source_lag_ms": 0
+        },
+        "membership": null
+      },
+      "expected": "facts"
+    },
+    {
+      "name": "inactive-agent-revoked",
+      "response": {
+        "schema_version": 1,
+        "request_id": "11111111-1111-1111-1111-111111111111",
+        "purpose": "invocation",
+        "authority_version": 7,
+        "scope": {
+          "tenant_id": "22222222-2222-2222-2222-222222222222",
+          "expected_issuer": "https://identity.example.test/directory",
+          "sender": {
+            "provider": "sample-chat",
+            "channel_identity_id": "33333333-3333-3333-3333-333333333333",
+            "provider_installation_id": "44444444-4444-4444-4444-444444444444",
+            "namespace": {
+              "id": "55555555-5555-5555-5555-555555555555",
+              "authority": "",
+              "kind": "workspace",
+              "key": "ExampleWorkspace"
+            },
+            "native_id": "SampleAccount"
+          }
+        },
+        "outcome": "inactive",
+        "sender_kind": "agent",
+        "identity": {
+          "issuer": "https://identity.example.test/directory",
+          "subject": "SampleSubject",
+          "kind": "agent",
+          "account_status": "revoked"
+        },
+        "identity_observation": {
+          "as_of": "2030-01-01T12:00:00Z",
+          "max_source_lag_ms": 0
+        },
+        "membership": null
+      },
+      "expected": "facts"
+    },
+    {
+      "name": "unresolved-human",
+      "response": {
+        "schema_version": 1,
+        "request_id": "11111111-1111-1111-1111-111111111111",
+        "purpose": "invocation",
+        "authority_version": 7,
+        "scope": {
+          "tenant_id": "22222222-2222-2222-2222-222222222222",
+          "expected_issuer": "https://identity.example.test/directory",
+          "sender": {
+            "provider": "sample-chat",
+            "channel_identity_id": "33333333-3333-3333-3333-333333333333",
+            "provider_installation_id": "44444444-4444-4444-4444-444444444444",
+            "namespace": {
+              "id": "55555555-5555-5555-5555-555555555555",
+              "authority": "",
+              "kind": "workspace",
+              "key": "ExampleWorkspace"
+            },
+            "native_id": "SampleAccount"
+          }
+        },
+        "outcome": "unresolved",
+        "sender_kind": "human",
+        "identity": null,
+        "identity_observation": {
+          "as_of": "2030-01-01T12:00:00Z",
+          "max_source_lag_ms": 0
+        },
+        "membership": null
+      },
+      "expected": "facts"
+    },
+    {
+      "name": "unresolved-service",
+      "response": {
+        "schema_version": 1,
+        "request_id": "11111111-1111-1111-1111-111111111111",
+        "purpose": "invocation",
+        "authority_version": 7,
+        "scope": {
+          "tenant_id": "22222222-2222-2222-2222-222222222222",
+          "expected_issuer": "https://identity.example.test/directory",
+          "sender": {
+            "provider": "sample-chat",
+            "channel_identity_id": "33333333-3333-3333-3333-333333333333",
+            "provider_installation_id": "44444444-4444-4444-4444-444444444444",
+            "namespace": {
+              "id": "55555555-5555-5555-5555-555555555555",
+              "authority": "",
+              "kind": "workspace",
+              "key": "ExampleWorkspace"
+            },
+            "native_id": "SampleAccount"
+          }
+        },
+        "outcome": "unresolved",
+        "sender_kind": "service",
+        "identity": null,
+        "identity_observation": {
+          "as_of": "2030-01-01T12:00:00Z",
+          "max_source_lag_ms": 0
+        },
+        "membership": null
+      },
+      "expected": "facts"
+    },
+    {
+      "name": "unresolved-agent",
+      "response": {
+        "schema_version": 1,
+        "request_id": "11111111-1111-1111-1111-111111111111",
+        "purpose": "invocation",
+        "authority_version": 7,
+        "scope": {
+          "tenant_id": "22222222-2222-2222-2222-222222222222",
+          "expected_issuer": "https://identity.example.test/directory",
+          "sender": {
+            "provider": "sample-chat",
+            "channel_identity_id": "33333333-3333-3333-3333-333333333333",
+            "provider_installation_id": "44444444-4444-4444-4444-444444444444",
+            "namespace": {
+              "id": "55555555-5555-5555-5555-555555555555",
+              "authority": "",
+              "kind": "workspace",
+              "key": "ExampleWorkspace"
+            },
+            "native_id": "SampleAccount"
+          }
+        },
+        "outcome": "unresolved",
+        "sender_kind": "agent",
+        "identity": null,
+        "identity_observation": {
+          "as_of": "2030-01-01T12:00:00Z",
+          "max_source_lag_ms": 0
+        },
+        "membership": null
+      },
+      "expected": "facts"
+    },
+    {
+      "name": "unresolved-unknown",
+      "response": {
+        "schema_version": 1,
+        "request_id": "11111111-1111-1111-1111-111111111111",
+        "purpose": "invocation",
+        "authority_version": 7,
+        "scope": {
+          "tenant_id": "22222222-2222-2222-2222-222222222222",
+          "expected_issuer": "https://identity.example.test/directory",
+          "sender": {
+            "provider": "sample-chat",
+            "channel_identity_id": "33333333-3333-3333-3333-333333333333",
+            "provider_installation_id": "44444444-4444-4444-4444-444444444444",
+            "namespace": {
+              "id": "55555555-5555-5555-5555-555555555555",
+              "authority": "",
+              "kind": "workspace",
+              "key": "ExampleWorkspace"
+            },
+            "native_id": "SampleAccount"
+          }
+        },
+        "outcome": "unresolved",
+        "sender_kind": "unknown",
+        "identity": null,
+        "identity_observation": {
+          "as_of": "2030-01-01T12:00:00Z",
+          "max_source_lag_ms": 0
+        },
+        "membership": null
+      },
+      "expected": "facts"
+    },
+    {
+      "name": "unavailable-unknown",
+      "response": {
+        "schema_version": 1,
+        "request_id": "11111111-1111-1111-1111-111111111111",
+        "purpose": "invocation",
+        "authority_version": 7,
+        "scope": {
+          "tenant_id": "22222222-2222-2222-2222-222222222222",
+          "expected_issuer": "https://identity.example.test/directory",
+          "sender": {
+            "provider": "sample-chat",
+            "channel_identity_id": "33333333-3333-3333-3333-333333333333",
+            "provider_installation_id": "44444444-4444-4444-4444-444444444444",
+            "namespace": {
+              "id": "55555555-5555-5555-5555-555555555555",
+              "authority": "",
+              "kind": "workspace",
+              "key": "ExampleWorkspace"
+            },
+            "native_id": "SampleAccount"
+          }
+        },
+        "outcome": "unavailable",
+        "sender_kind": "unknown",
+        "identity": null,
+        "identity_observation": null,
+        "membership": null
+      },
+      "expected": "unavailable"
+    }
+  ]
+}

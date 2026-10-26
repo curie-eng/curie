@@ -27,7 +27,7 @@ HookRunReason = Literal[
     "daily_budget",
     "schedule_changed",
 ]
-# What an agent schedule reads back as (ADR 0238): stored active, cancelled or
+# What an agent schedule reads back as (ADR 0248): stored active, cancelled or
 # done, with paused derived from ``schedule_controls`` while active.
 AgentScheduleState = Literal["active", "paused", "cancelled", "done"]
 
@@ -74,7 +74,7 @@ class AgentScheduleDestinationOut(BaseModel):
 
 
 class AgentScheduleOut(BaseModel):
-    """One agent-created schedule (ADR 0238). ``conversation`` and ``turn`` are
+    """One agent-created schedule (ADR 0248). ``conversation`` and ``turn`` are
     shown to the platform caller only; a sandbox response leaves them unset."""
 
     id: uuid.UUID
@@ -105,7 +105,7 @@ class AgentScheduleOut(BaseModel):
 
 class ScheduleListOut(BaseModel):
     """Every in-force cron hook the platform can see, and every active agent
-    schedule (ADR 0238)."""
+    schedule (ADR 0248)."""
 
     schedules: list[AgentSchedulesOut]
     agent_schedules: list[AgentScheduleOut]

@@ -428,7 +428,7 @@ run_self_test() {
     fi
     if awk '/^exclusive_kind_tag\(\)/,/^}/' "$script_path" | awk '
         index($0, "\"$EXCLUSIVE_KIND_TAG\" == \"$keep\"") { early=NR }
-        /kind load docker-image/ { if (!load) load=NR }
+        /load_kind_images/ { if (!load) load=NR }
         index($0, "EXCLUSIVE_KIND_TAG=\"$keep\"") { set=NR }
         /untag_kind_siblings/ { last_untag=NR }
         END { exit (early && load && early < load && set > last_untag) ? 0 : 1 }
@@ -451,7 +451,7 @@ run_self_test() {
     fi
     if awk '/^exclusive_kind_tag\(\)/,/^}/' "$script_path" | awk '
         /untag_kind_siblings/ { untag++ }
-        /kind load docker-image/ { load=1 }
+        /load_kind_images/ { load=1 }
         END { exit (untag >= 2 && load) ? 0 : 1 }
     '; then
         log "exclusive_kind_tag untags siblings before and after load"
@@ -1117,6 +1117,26 @@ EOF
         unset CURIE_SETTLE_STATE CURIE_SETTLE_LOG CURIE_SETTLE_KIND_CLUSTER
         rm -rf "$probe"
     fi
+    current=$'helm --kube-context kind-curie-upgrade-matrix rollback t2590 3 -n acme-2590'
+    takeover=$(printf '%s\n' \
+        "$current --wait --timeout 15m" \
+        'helm upgrade t2590 /example/charts/curie-0.10.1.tgz -n acme-2590 --wait --timeout 21900s -f <retained-values>')
+    if check_explicit_helm_plan fixture-takeover "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1].splitlines()))' "$takeover")" \
+        t2590 3 acme-2590 \
+        && check_explicit_helm_plan fixture-rollback-target "$(python3 -c 'import json,sys; print(json.dumps([sys.argv[1]]))' "$current")" \
+            t2590 3 acme-2590 \
+        && ! check_explicit_helm_plan fixture-rollback-target "$(python3 -c 'import json,sys; print(json.dumps(["helm rollback t2590 3 -n acme-2590"]))')" \
+            t2590 3 acme-2590 \
+        && ! check_explicit_helm_plan fixture-rollback-target "$(python3 -c 'import json,sys; print(json.dumps([sys.argv[1]]))' "$current")" \
+            t2590 9 acme-2590 \
+        && ! check_explicit_helm_plan fixture-takeover "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1].splitlines()[::-1]))' "$takeover")" \
+            t2590 3 acme-2590
+    then
+        log "helm plan parser accepts context-prefixed rollback before unprefixed upgrade"
+    else
+        log "self-test: helm plans must keep rollback context, target, namespace, wait, timeout, and order before unprefixed upgrade"
+        failed=1
+    fi
     (( failed == 0 )) || die "self-test failed"
     log "self-test passed"
     if (( JSON )); then
@@ -1506,6 +1526,18 @@ retag_candidate_versions() {
     done
 }
 
+load_kind_images() {
+    local platform archive status=0
+    platform="$(docker version --format '{{.Server.Os}}/{{.Server.Arch}}')" || return $?
+    archive="$(mktemp "$WORKDIR/kind-images.XXXXXX.tar")" || return $?
+    docker image save --platform "$platform" --output "$archive" "$@" || status=$?
+    if (( status == 0 )); then
+        kind load image-archive "$archive" --name "$KIND_CLUSTER" || status=$?
+    fi
+    rm -f "$archive"
+    return "$status"
+}
+
 load_tag_images() {
     local tag="$1" img ref
     EXCLUSIVE_KIND_TAG=""
@@ -1520,9 +1552,9 @@ load_tag_images() {
             docker pull "$ref"
         fi
         log "kind load $ref"
-        kind load docker-image "$ref" --name "$KIND_CLUSTER"
+        load_kind_images "$ref"
         if docker image inspect "${img}:${tag}" >/dev/null 2>&1; then
-            kind load docker-image "${img}:${tag}" --name "$KIND_CLUSTER" || true
+            load_kind_images "${img}:${tag}" || true
         fi
     done
 }
@@ -1583,7 +1615,7 @@ exclusive_kind_tag() {
             continue
         fi
         log "kind load $ref"
-        kind load docker-image "$ref" --name "$KIND_CLUSTER"
+        load_kind_images "$ref"
     done
     untag_kind_siblings "$keep"
     EXCLUSIVE_KIND_TAG="$keep"
@@ -2543,6 +2575,72 @@ run_previous_serves() {
     log "fail-forward retry after previous-serves kill succeeded"
 }
 
+check_explicit_helm_plan() {
+    python3 - "$@" <<'PY'
+import json, shlex, sys
+
+def explicit(argv):
+    if (
+        len(argv) < 4
+        or argv[0] != "helm"
+        or argv[1] != "--kube-context"
+        or not argv[2]
+        or argv[2].startswith("-")
+    ):
+        raise SystemExit(
+            "helm plan line lacks --kube-context <context> before the verb: " + shlex.join(argv)
+        )
+    return argv[3], argv[4:]
+
+def helm_rows(plan):
+    rows = []
+    for line in plan:
+        if isinstance(line, str) and line.startswith("helm "):
+            argv = shlex.split(line)
+            if argv[1:2] == ["upgrade"]:
+                rows.append(("upgrade", argv[2:]))
+            else:
+                verb, rest = explicit(argv)
+                if verb == "rollback":
+                    rows.append((verb, rest))
+    return rows
+
+mode = sys.argv[1]
+if mode.startswith("fixture-"):
+    plan = json.loads(sys.argv[2])
+    mode = mode.removeprefix("fixture-")
+else:
+    plan = json.load(open(sys.argv[2]))["plan"]
+rows = helm_rows(plan)
+release, revision, namespace = sys.argv[3:6]
+if mode == "takeover":
+    rollback = next(
+        (
+            index
+            for index, (verb, rest) in enumerate(rows)
+            if verb == "rollback"
+            and rest == [release, revision, "-n", namespace, "--wait", "--timeout", "15m"]
+        ),
+        None,
+    )
+    upgrade = next((index for index, (verb, _rest) in enumerate(rows) if verb == "upgrade"), None)
+    if rollback is None:
+        raise SystemExit("dry run did not plan an explicit-context helm rollback")
+    if upgrade is None:
+        raise SystemExit("dry run did not plan an unprefixed helm upgrade")
+    if rollback >= upgrade:
+        raise SystemExit("dry run did not plan rollback before upgrade")
+elif mode == "rollback-target":
+    if not any(
+        verb == "rollback" and rest[:4] == [release, revision, "-n", namespace]
+        for verb, rest in rows
+    ):
+        raise SystemExit("dry run does not name the revision in its Helm rollback command")
+else:
+    raise SystemExit("unknown helm plan check " + mode)
+PY
+}
+
 run_apply_kill_takeover() {
     [[ "$(helm_version)" == "0.10.0" && "$(helm_release_status)" == deployed ]] \
         || die "apply-kill-takeover must start from the shard's deployed 0.10.0 state"
@@ -2559,7 +2657,7 @@ EOF
         from_id="$(docker image inspect --format '{{.Id}}' "$from_image")"
         to_id="$(docker image inspect --format '{{.Id}}' "$to_image")"
         [[ "$from_id" != "$to_id" ]] || die "$img 0.10.0 and 0.10.1 image digests must differ"
-        kind load docker-image "$from_image" "$to_image" --name "$KIND_CLUSTER"
+        load_kind_images "$from_image" "$to_image"
         log "$img has distinct 0.10.0 and 0.10.1 image digests on kind"
     done
 
@@ -2660,18 +2758,15 @@ assert any(int(row["revision"]) == int(sys.argv[3]) and row["status"] == "deploy
         --namespace "$NAMESPACE" --release "$RELEASE" --chart "$CHART_0101" \
         >"$EVIDENCE_DIR/apply-kill-takeover-dry-plan.json" 2>"$EVIDENCE_DIR/apply-kill-takeover-dry-plan.err"
     python3 -c '
-import json, shlex, sys
+import json, sys
 document = json.load(open(sys.argv[1]))
 assert document["dry_run"] is True, "matching takeover did not emit a dry-run plan"
 plan = document["plan"]
 assert "phase plan: 0.10.0 -> 0.10.1" in plan, "dry run did not plan from serving version 0.10.0"
 assert f"take over upgrade ownership from {sys.argv[2]}" in plan, "dry run did not plan the named takeover"
-commands = [shlex.split(line) for line in plan if line.startswith("helm ")]
-rollback = next(index for index, argv in enumerate(commands) if argv[:4] == ["helm", "rollback", sys.argv[3], sys.argv[4]])
-upgrade = next(index for index, argv in enumerate(commands) if argv[:2] == ["helm", "upgrade"])
-assert rollback < upgrade, "dry run did not plan rollback before upgrade"
-assert commands[rollback][4:] == ["-n", sys.argv[5], "--wait", "--timeout", "15m"], "dry run rollback did not use the prescribed namespace, wait and timeout"
-' "$EVIDENCE_DIR/apply-kill-takeover-dry-plan.json" "$holder" "$RELEASE" "$serving_revision" "$NAMESPACE"
+' "$EVIDENCE_DIR/apply-kill-takeover-dry-plan.json" "$holder"
+    check_explicit_helm_plan takeover "$EVIDENCE_DIR/apply-kill-takeover-dry-plan.json" \
+        "$RELEASE" "$serving_revision" "$NAMESPACE"
     [[ "$(kubectl_ns get configmap "$cm" -o jsonpath='{.metadata.resourceVersion}')" == "$resource_version" ]] \
         || die "refused runs or dry-run plans mutated upgrade ownership"
     [[ "$(helm_revision)" == "$killed_revision" && "$(helm_release_status)" == pending-upgrade ]] \
@@ -2866,17 +2961,17 @@ if not any(int(r["revision"]) == int(serving) and r["status"] == "deployed" and 
         || status=$?
     (( status == 0 )) || die "rollback-to-serving dry run exited $status"
     python3 -c '
-import json, shlex, sys
+import json, sys
 doc = json.load(sys.stdin)
 release, serving, pending, version = sys.argv[1:]
 plan = doc["plan"]
 summary = f"selected revision {serving} (deployed, curie-{version}) from revision {pending}; skipped none"
-commands = [shlex.split(line) for line in plan]
 if doc.get("dry_run") is not True or summary not in plan:
     raise SystemExit("dry run does not identify the serving and pending revisions")
-if not any(args[:4] == ["helm", "rollback", release, serving] for args in commands):
-    raise SystemExit("dry run does not name the serving revision in its Helm rollback command")
 ' "$RELEASE" "$serving" "$pending" "$V" <"$EVIDENCE_DIR/rollback-serving-dry-run.json" \
+        || die "rollback-to-serving dry run selected the wrong target"
+    check_explicit_helm_plan rollback-target "$EVIDENCE_DIR/rollback-serving-dry-run.json" \
+        "$RELEASE" "$serving" "$NAMESPACE" \
         || die "rollback-to-serving dry run selected the wrong target"
 
     status=0
@@ -3019,22 +3114,22 @@ if not any(int(r["revision"]) == int(newer) and r["status"] == "deployed" for r 
         || status=$?
     (( status == 0 )) || die "rollback-interrupted dry run exited $status"
     python3 -c '
-import json, shlex, sys
+import json, sys
 doc = json.load(sys.stdin)
 release, target, pending, version = sys.argv[1:]
 plan = doc["plan"]
 resuming = f"revision {pending} is an interrupted rollback to revision {target}; resuming it"
 summary = f"selected revision {target} (superseded, curie-{version}) from revision {pending}; skipped none"
-commands = [shlex.split(line) for line in plan]
 if doc.get("dry_run") is not True:
     raise SystemExit("dry run output is not marked dry_run")
 if resuming not in plan:
     raise SystemExit("dry run does not name the interrupted rollback")
 if summary not in plan:
     raise SystemExit("dry run does not select revision A from the pending revision")
-if not any(args[:4] == ["helm", "rollback", release, target] for args in commands):
-    raise SystemExit("dry run does not name revision A in its Helm rollback command")
 ' "$RELEASE" "$target" "$pending" "$V" <"$EVIDENCE_DIR/rollback-interrupted-dry-run.json" \
+        || die "rollback-interrupted dry run did not resume the interrupted rollback"
+    check_explicit_helm_plan rollback-target "$EVIDENCE_DIR/rollback-interrupted-dry-run.json" \
+        "$RELEASE" "$target" "$NAMESPACE" \
         || die "rollback-interrupted dry run did not resume the interrupted rollback"
 
     status=0
@@ -3356,7 +3451,7 @@ run_runner_layer_retire() {
         docker tag "$target_runner" curie-runner:0.10.1
     fi
     EXCLUSIVE_KIND_TAG=""
-    kind load docker-image "$target_runner" --name "$KIND_CLUSTER" >&2
+    load_kind_images "$target_runner" >&2
     target_digest="$(kind_runner_digest "$target_runner")"
     [[ "$target_digest" != "$(kind_runner_digest "$current_runner")" ]] \
         || die "runner-layer-retire needs distinct 0.10.0 and 0.10.1 runner digests"
@@ -3369,7 +3464,7 @@ run_runner_layer_retire() {
     layer_tag="ghcr.io/acme-corp/acme-runner:matrix-${KIND_CLUSTER}"
     docker tag "$current_runner" "$layer_tag"
     RETIRE_LAYER_TAG="$layer_tag"
-    kind load docker-image "$layer_tag" --name "$KIND_CLUSTER" >&2
+    load_kind_images "$layer_tag" >&2
     layer_digest="$(kind_runner_digest "$layer_tag")"
     layer_image="${layer_tag%:*}@${layer_digest}"
     docker exec "$node" ctr -n k8s.io images tag --force "$layer_tag" "$layer_image" >/dev/null

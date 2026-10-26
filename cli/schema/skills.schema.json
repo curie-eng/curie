@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://schemas.curietech.ai/cli/skills/v1.0.json",
   "title": "curie <tier> skills --json",
-  "description": "The agent-facing payload of `curie <tier> skills <agent> <verb>` (ADR 0237): `list` prints an array of skills; `show`, `revert` and `delete` print the skill as the API now holds it (`deleted` true after a delete); `history` prints every revision oldest first; `diff` prints the unified diff of two revisions' generated SKILL.md; `export` prints the files it wrote.",
+  "description": "The agent-facing payload of `curie <tier> skills <agent> <verb>` (ADR 0247): `list` prints an array of skills; `show`, `revert` and `delete` print the skill as the API now holds it (`deleted` true after a delete); `history` prints every revision oldest first; `diff` prints the unified diff of two revisions' generated SKILL.md; `export` prints the files it wrote.",
   "$defs": {
     "skill": {
       "type": "object",

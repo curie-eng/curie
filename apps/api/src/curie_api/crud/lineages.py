@@ -1,5 +1,6 @@
 """Database access for lineages."""
 
+import re
 import uuid
 from typing import Any
 
@@ -12,6 +13,7 @@ from sqlalchemy.sql.elements import ColumnElement
 from curie_api.schemas.publications import PublicationLineageAdvance, ReviewRevisionReserve
 
 from ..config import get_settings
+from ..forges.errors import Unavailable
 from ..forges.types import GITHUB
 from ..models import (
     AgentChannel,
@@ -24,6 +26,7 @@ from ..models import (
     WorkItem,
 )
 from ..publication_authority import CodeHostPublicationIdentity, PublicationIdentity
+from ..publication_verification import VerifiedPublicationCommit, stored_publication_base_ref
 from ..repository_access import thread_repository
 from ..threadkeys import route_thread_key_matches, thread_key_forms
 from ..workspace_policy import repository_allowed
@@ -453,6 +456,7 @@ async def advance_publication_lineage(
     data: PublicationLineageAdvance,
     *,
     github_html_base: str,
+    first_parent_proof: VerifiedPublicationCommit | None,
     identity: PublicationIdentity | None = None,
 ) -> ThreadPublicationLineage:
     """Atomically advance one approved revision and its exact lineage head."""
@@ -470,13 +474,19 @@ async def advance_publication_lineage(
             "publication.lineage_absent",
             "publication has no thread pull request lineage",
         )
+    execution_request: ExecutionRequest | None = None
+    work_item: WorkItem | None = None
     if publication.execution_request_id is not None:
-        await session.scalar(
-            select(WorkItem.id)
+        result = await session.execute(
+            select(WorkItem, ExecutionRequest)
             .join(ExecutionRequest, ExecutionRequest.work_item_id == WorkItem.id)
             .where(ExecutionRequest.id == publication.execution_request_id)
-            .with_for_update(of=WorkItem)
+            .with_for_update(of=(WorkItem, ExecutionRequest))
+            .execution_options(populate_existing=True)
         )
+        row = result.one_or_none()
+        if row is not None:
+            work_item, execution_request = row
     lineage = await session.scalar(
         select(ThreadPublicationLineage)
         .where(ThreadPublicationLineage.id == publication.lineage_id)
@@ -498,6 +508,62 @@ async def advance_publication_lineage(
     )
     if conflict is not None:
         raise conflict
+
+    if (lineage.head_sha is None) != (lineage.pr_number is None):
+        raise PublicationLineageConflict(
+            "publication.lineage_stale", "stored publication lineage is incomplete"
+        )
+    first_publication = lineage.head_sha is None and lineage.pr_number is None
+    if first_publication and first_parent_proof is None:
+        raise PublicationLineageConflict(
+            "publication.lineage_stale", "first publication requires a verified commit proof"
+        )
+    base_values: dict[str, str] = {}
+    if first_parent_proof is not None:
+        proof = first_parent_proof
+        if (
+            not isinstance(proof, VerifiedPublicationCommit)
+            or proof.publication_id != publication.id
+            or proof.publication_version != publication.version
+            or proof.lineage_id != lineage.id
+            or proof.lineage_version != lineage.version
+            or proof.approved_base_sha != publication.base_sha
+            or proof.expected_prior_head != publication.expected_prior_head
+            or proof.commit_sha != data.head_sha
+            or proof.first_publication != first_publication
+            or re.fullmatch(r"[0-9a-f]{40,64}", proof.parent_sha) is None
+            or proof.parent_sha == proof.commit_sha
+            or (identity is not None and identity.base_ref != proof.base_branch)
+        ):
+            raise PublicationLineageConflict(
+                "publication.lineage_stale", "verified publication commit proof is stale"
+            )
+        try:
+            base_branch = stored_publication_base_ref(
+                publication, lineage, execution_request, work_item
+            )
+        except Unavailable:
+            raise PublicationLineageConflict(
+                "publication.lineage_stale", "the persisted publication base is unproved"
+            ) from None
+        if base_branch is not None and base_branch != proof.base_branch:
+            raise PublicationLineageConflict(
+                "publication.lineage_stale", "the authoritative publication base branch changed"
+            )
+        if first_publication:
+            if (
+                lineage.base_sha != publication.base_sha
+                or publication.expected_prior_head != publication.base_sha
+                or publication.patch_bytes == b""
+            ):
+                raise PublicationLineageConflict(
+                    "publication.lineage_stale", "the approved first publication base changed"
+                )
+            base_values["base_sha"] = proof.parent_sha
+        elif proof.parent_sha != publication.expected_prior_head:
+            raise PublicationLineageConflict(
+                "publication.lineage_stale", "verified revision has the wrong expected parent"
+            )
 
     identity_values: dict[str, Any] = {}
     if identity is not None:
@@ -541,6 +607,7 @@ async def advance_publication_lineage(
         )
         .values(
             **identity_values,
+            **base_values,
             pr_number=data.pr_number,
             pr_url=data.pr_url,
             head_sha=data.head_sha,

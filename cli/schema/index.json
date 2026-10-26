@@ -4,6 +4,12 @@
   "discovery": "These schema files are bundled into released `curie` CLI binaries and printed on demand: `curie schema-index` emits this index, `curie schema-index <name>` emits a named schema. In a source checkout they live at cli/schema/.",
   "results": [
     {
+      "result": "AccessPolicyOutput",
+      "kind": "CliOutput",
+      "schema": "access-policy.schema.json",
+      "version": "1.0"
+    },
+    {
       "result": "ActionsOutput",
       "kind": "CliOutput",
       "schema": "actions.schema.json",
@@ -146,6 +152,12 @@
       "kind": "CliOutput",
       "schema": "diff.schema.json",
       "version": "2.3"
+    },
+    {
+      "result": "DirectoryOutput",
+      "kind": "CliOutput",
+      "schema": "directory.schema.json",
+      "version": "1.0"
     },
     {
       "result": "DoctorOutput",
@@ -334,6 +346,12 @@
       "version": "2.0"
     },
     {
+      "result": "TestEnvOutput",
+      "kind": "CliOutput",
+      "schema": "test-env.schema.json",
+      "version": "1.0"
+    },
+    {
       "result": "PublicationPolicyOutput",
       "kind": "CliOutput",
       "schema": "publication-policy.schema.json",
@@ -343,7 +361,7 @@
       "result": "QuickstartOutput",
       "kind": "CliOutput",
       "schema": "factory-quickstart.schema.json",
-      "version": "1.2"
+      "version": "1.3"
     },
     {
       "result": "ReleaseAcceptOutput",

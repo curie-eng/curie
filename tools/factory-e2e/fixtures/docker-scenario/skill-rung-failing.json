@@ -1,0 +1,53 @@
+{
+  "window": [
+    1792819241.6721978,
+    1792819242.1939602
+  ],
+  "docker_host": "tcp://curie-docker-sections-a01e0a8:2375",
+  "published_host": "curie-docker-sections-a01e0a8",
+  "nonce": "9e27d105",
+  "info": {
+    "id": "275deac0-10bc-4cf6-857e-3f51f70c36de",
+    "name": "ded1c42cd936"
+  },
+  "inputs": {
+    "curie_bin": {
+      "sha256": "7faadececbd287e494595d6a8203bc521e4463c682a496569187a77e761156bc",
+      "version": ""
+    },
+    "files": {
+      "cli/scripts/e2e-ladder.sh": "1a46c26d3647731de02fe5cc119e5969b2b470e9d2e332068aa3dbef6af85bfb",
+      "cli/scripts/e2e.sh": "6685ca83577c091bb913094a1437b82f78acd262fbdf5816b7e121a484bbbdf7",
+      "cli/scripts/gnu-process.py": "6dc670b8a3bae3fa6f3ef42e4a9c0b94a2f205ee26d337b813dc5b381e1bd75c"
+    },
+    "bundle": {
+      "path": "examples/weather",
+      "digest": "14dd4b84fe978febd07eeae95d042f076cc2ebccc55016b335725226e8af753a"
+    },
+    "source_revision": "108ea3ca7672c7f3f26b4c367597f518a7876051"
+  },
+  "image": {
+    "tag": "curie-runner",
+    "id": "sha256:453d8cf60b37f6c2c3b55b53994b115355d0bbaadbf12368ab262cbf599cd963",
+    "label_nonce": "9e27d105",
+    "dockerfile": "runner/Dockerfile",
+    "dockerfile_sha256": "930254e6ccafccf5ff2ec3739ea7cf136c4e668fee8f6c48a2e31c15ce424721",
+    "daemon_id": "275deac0-10bc-4cf6-857e-3f51f70c36de",
+    "exit_code": 0,
+    "output_tail": "1  5/19] WORKDIR /app\n#22 CACHED\n\n#23 [stage-1 14/19] COPY packages/telemetry-schema ./packages/telemetry-schema\n#23 CACHED\n\n#24 [stage-1 19/19] COPY runner/pip.conf /etc/pip.conf\n#24 CACHED\n\n#25 exporting to image\n#25 exporting layers done\n#25 writing image sha256:453d8cf60b37f6c2c3b55b53994b115355d0bbaadbf12368ab262cbf599cd963 done\n#25 naming to docker.io/library/curie-runner done\n#25 DONE 0.0s\n"
+  },
+  "ladder": {
+    "tiers": "skill",
+    "live": "0",
+    "exit_code": 1,
+    "passed": false,
+    "output_tail": "=== Resolve the curie binary ===\nusing prebuilt binary: /tmp/curie-skill-rung-nv4nxhua/bin/curie\nfalse (GNU coreutils) 9.1\nCopyright (C) 2022 Free Software Foundation, Inc.\nLicense GPLv3+: GNU GPL version 3 or later <https://gnu.org/licenses/gpl.html>.\nThis is free software: you are free to change and redistribute it.\nThere is NO WARRANTY, to the extent permitted by law.\n\nWritten by Jim Meyering.\n"
+  },
+  "cleanup": {
+    "image_removed": true,
+    "containers": [],
+    "networks": [],
+    "volumes": [],
+    "verified": true
+  }
+}

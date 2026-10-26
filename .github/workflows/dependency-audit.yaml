@@ -37,7 +37,7 @@ permissions:
 jobs:
   cargo-audit:
     name: cargo audit
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
         with:
@@ -58,7 +58,7 @@ jobs:
 
   python-audit:
     name: pip-audit (uv workspace)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
         with:
@@ -99,7 +99,7 @@ jobs:
 
   js-audit:
     name: pnpm audit (apps/ui)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
         with:
@@ -124,7 +124,7 @@ jobs:
 
   contract-codegen-audit:
     name: pnpm audit (tools/contract-codegen)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
         with:

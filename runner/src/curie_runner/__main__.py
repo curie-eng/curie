@@ -2,8 +2,11 @@
 
 Reads the ACI ``CURIE_*`` / ``OTEL_EXPORTER_OTLP_*`` env into a RunnerConfig,
 wires the real claude-agent-sdk session (validated plugin bundle, budget, OTel),
-and serves the HTTP channel. The session is started in ``on_startup`` so a plugin
-or connect failure fails the process visibly rather than after the port is up.
+and serves the HTTP channel. Boot refusals (credential, approval policy, plugin
+bundle) still fail the process before the port is up. The declared verification
+preflight and the session connect run after it binds (#4777), so a slow check
+never holds the readiness probe; a turn waits for them, and their failure fails
+each turn visibly.
 """
 
 from __future__ import annotations
@@ -12,7 +15,7 @@ import contextlib
 import json
 import logging
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -51,6 +54,14 @@ from .approval import (
     policy_disallowed_tools,
     resolve_approval_policy,
 )
+from .attachment_access import (
+    LAZY_ATTACHMENT_NOTICE,
+    AttachmentAccess,
+    AttachmentAccessTurn,
+)
+from .attachment_access import (
+    TOOL_NAMES as ATTACHMENT_TOOL_NAMES,
+)
 from .attachments import (
     MANIFEST_ENV,
     AttachmentView,
@@ -84,6 +95,7 @@ from .harness.claude.approval import (
     build_memory_tools,
     memory_tool_live_names,
 )
+from .harness.claude.attachment_access import build_attachment_tools
 from .harness.claude.learned_skill_tools import build_learned_skills_server
 from .harness.claude.platform_slack import build_channel_read_server
 from .harness.claude.preflight_blocked import PreflightBlockedSession
@@ -159,6 +171,13 @@ from .progress import (
 )
 from .publication_precheck import PublicationPrecheck
 from .redact import collect_held_secrets, install_stdout_redaction
+from .route_callers import (
+    connector_urls,
+    mount_route_callers,
+    route_caller_lock_library,
+    route_callers,
+    take_route_tokens,
+)
 from .sdk_auth import (
     CREDENTIALS_ENV,
     DEFAULT_CREDENTIAL_ENV_KEYS,
@@ -696,7 +715,7 @@ def _compose_system_prompt(
     Image tools (ADR 0216) and the remote Docker contract (ADR 0217) sit beside
     the workspace verification block, before bundle instructions.
 
-    The learned-skills guidance (ADR 0237) follows the memory guidance it is
+    The learned-skills guidance (ADR 0247) follows the memory guidance it is
     contrasted with, present only when learned skills loaded.
     """
 
@@ -814,10 +833,10 @@ def build_runner(
     ``memory_facts_preamble`` is the rendered standing-instruction and fact
     index blocks and ``memory_guidance`` the selected guidance text (None falls
     back to ``DEFAULT_GUIDANCE``), both from the boot memory context (#1461,
-    ADR 0239).
+    ADR 0249).
 
     ``learned_skills`` is the session's materialized ``curie-learned`` plugin
-    (ADR 0237), None when the toggle is off or the store was unreachable.
+    (ADR 0247), None when the toggle is off or the store was unreachable.
     """
 
     # Resolve the active harness's contribution (ADR-0060): its manifest is the
@@ -837,7 +856,6 @@ def build_runner(
     # operator silently replace the prompt the bundle ships (#488) -- and the
     # bundle's plugins feed the session factory below.
     compiled = harness.compile_bundle(config.session.plugin_dir)
-    system_prompt = compiled.system_prompt
     tool_manifest = _load_tool_manifest()
     if tool_manifest is not None:
         logger.info("runner tool manifest loaded: %d tools", tool_manifest.tool_count)
@@ -852,29 +870,9 @@ def build_runner(
         and (workspace_path / ".git").exists()
         else None
     )
-    verification: dict[str, Any] | None = None
-    if mounted_workspace is not None and not fake_model:
-        verification_url = os.environ.get(PROGRESS_URL_ENV)
-        verification_token = os.environ.get(PROGRESS_TOKEN_ENV)
-        if verification_url and verification_token:
-            verification = anyio.run(
-                preflight_workspace_verification,
-                mounted_workspace,
-                Path(config.session.plugin_dir),
-                verification_url,
-                verification_token,
-            )
-    # A declared check that could not run here and is not delegated to CI is
-    # blocked (#3873): the session factory then answers offline and the model
-    # never starts. A rejected report already raised above, before this point.
+    # Set by ``initialize`` below, which runs the declared verification
+    # preflight after the listener binds (#4777).
     preflight_block: str | None = None
-    if blocked_checks(verification):
-        assert verification is not None
-        logger.warning(
-            "verification preflight blocked; the model will not start checks=%s",
-            ",".join(str(check.get("id")) for check in blocked_checks(verification)),
-        )
-        preflight_block = _preflight_blocked_explanation(verification)
     # Prior memory (#264) still leads the system prompt. Workspace facts are a
     # mounted-only boot block after memory. Conversation history (#20)
     # deliberately does not: ADR-0119 sends its ordered messages through the
@@ -913,7 +911,7 @@ def build_runner(
         )
         else None
     )
-    # The memory tools (#1461, ADR-0167, ADR 0239) mount only on the real-model
+    # The memory tools (#1461, ADR-0167, ADR 0249) mount only on the real-model
     # path, which is the only path that mounts platform MCP servers at all, and
     # only with a memory token and the typed memory routes the worker's refs
     # locate. ``read_memory`` mounts whenever memory is readable, writes on or
@@ -942,7 +940,7 @@ def build_runner(
     memory_mutators_mounted = (
         memory_readable and config.memory_writes_on and channel_facts_store is not None
     )
-    # Agent schedules (ADR 0238) and learned skills (ADR 0237) mount on the
+    # Agent schedules (ADR 0248) and learned skills (ADR 0247) mount on the
     # real-model path only. Their tools read the author and the write
     # credential from the same per-turn holder, so it exists whenever memory is
     # readable or either of these sets of tools is mounted.
@@ -1005,30 +1003,43 @@ def build_runner(
         else []
     )
     memory_tool_names = memory_tool_live_names(memory_tools)
-    system_prompt = _compose_system_prompt(
-        system_prompt,
-        memory_preamble,
-        model=config.model,
-        workspace_preamble=format_workspace_preamble(
-            mounted_workspace, verification, tools_declared=tool_manifest is not None
-        ),
-        tool_manifest_preamble=_format_tool_manifest_preamble(tool_manifest),
-        remote_docker_preamble=_format_remote_docker_preamble(),
-        attachment_preamble=format_attachment_preamble(attachment_view),
-        progress_preamble=PROGRESS_PREAMBLE if turn_progress is not None else None,
-        facts_preamble=memory_facts_preamble,
-        guidance_preamble=(
-            (memory_guidance or DEFAULT_GUIDANCE)
-            if memory_mutators_mounted
-            else WRITES_OFF_NOTICE
-            if channel_memory_readable and not config.memory_writes_on
-            else None
-        ),
-        schedules_preamble=(
-            schedules_guidance(schedules.timezone) if schedules is not None else None
-        ),
-        learned_skills_preamble=LEARNED_SKILLS_GUIDANCE if learned is not None else None,
-    )
+
+    # Image tools and the remote Docker contract are boot facts, read here as
+    # before #4777; only the workspace block waits for the preflight.
+    tool_manifest_preamble = _format_tool_manifest_preamble(tool_manifest)
+    remote_docker_preamble = _format_remote_docker_preamble()
+
+    def compose_system_prompt(verification: dict[str, Any] | None) -> str | None:
+        # The workspace block names the preflight result, so the prompt is
+        # composed only once ``initialize`` has it.
+        return _compose_system_prompt(
+            compiled.system_prompt,
+            memory_preamble,
+            model=config.model,
+            workspace_preamble=format_workspace_preamble(
+                mounted_workspace, verification, tools_declared=tool_manifest is not None
+            ),
+            tool_manifest_preamble=tool_manifest_preamble,
+            remote_docker_preamble=remote_docker_preamble,
+            attachment_preamble=(
+                LAZY_ATTACHMENT_NOTICE if config.attachment_access_enabled
+                else format_attachment_preamble(attachment_view)
+            ),
+            progress_preamble=PROGRESS_PREAMBLE if turn_progress is not None else None,
+            facts_preamble=memory_facts_preamble,
+            guidance_preamble=(
+                (memory_guidance or DEFAULT_GUIDANCE)
+                if memory_mutators_mounted
+                else WRITES_OFF_NOTICE
+                if channel_memory_readable and not config.memory_writes_on
+                else None
+            ),
+            schedules_preamble=(
+                schedules_guidance(schedules.timezone) if schedules is not None else None
+            ),
+            learned_skills_preamble=LEARNED_SKILLS_GUIDANCE if learned is not None else None,
+        )
+
     # In-bundle PreToolUse guardrails declared in the manifest hooks field (#272),
     # translated into SDK HookMatcher callbacks. None when the bundle declares none.
     bundle_hooks = load_bundle_hooks(config.session.plugin_dir)
@@ -1054,6 +1065,29 @@ def build_runner(
         frozenset() if fake_model else load_bundle_platform_slack_grants(config.session.plugin_dir)
     )
     channel_read_mounted = bool(platform_slack_grants)
+    attachment_access = None
+    attachment_turn = None
+    if config.attachment_access_enabled and not fake_model:
+        origin = url_origin(os.environ.get(BootEnv.env_key("state_url")))
+        if attachments_path is None or origin is None:
+            raise ValueError(
+                "on-demand attachments require a writable attachments mount and trusted state URL"
+            )
+        # Open exclusively through the actual mount now; activation fails closed.
+        directory = os.open(attachments_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        probe = f".attachment-probe-{os.getpid()}"
+        try:
+            fd = os.open(
+                probe, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW,
+                0o600, dir_fd=directory,
+            )
+            os.close(fd)
+            os.unlink(probe, dir_fd=directory)
+        finally:
+            os.close(directory)
+        attachment_turn = AttachmentAccessTurn(trusted_origin=origin)
+        attachment_access = AttachmentAccess(attachment_turn, attachments_path)
+
     try:
         resolution = resolve_approval_policy(config.session.plugin_dir)
         approval_gate = build_approval_gate(
@@ -1073,7 +1107,12 @@ def build_runner(
             bundle_name=resolution.bundle_name,
             mcp_servers=resolution.mcp_servers,
             connector_servers=_with_channel_read_server(
-                resolution.connector_servers, channel_read_mounted
+                (
+                    set(resolution.connector_servers) | {APPROVAL_SERVER_NAME}
+                    if attachment_turn is not None and resolution.connector_servers is not None
+                    else resolution.connector_servers
+                ),
+                channel_read_mounted,
             ),
             managed_workspace=mounted_workspace is not None,
             tool_policy=resolution.tool_policy,
@@ -1190,17 +1229,53 @@ def build_runner(
     # env. Bash and hooks must not inherit it (#3550).
     if spawn_env is os.environ:
         materialize_connector_caller_headers(derived_mcp_servers, os.environ)
+        route_tokens = take_route_tokens(os.environ)
     else:
         materialize_connector_caller_headers(derived_mcp_servers, spawn_env, os.environ)
+        route_tokens = take_route_tokens(spawn_env, os.environ)
+    # ADR 0240 decision 4: a stdio server a connector route names as a caller
+    # runs under the runner, not the CLI, and gets its route tokens on a pipe.
+    declared_callers = route_callers(config.session.plugin_dir, agent=config.connector_agent)
+    # Fake-model boots never execute bundle servers, including startup code
+    # that could call an external service before the first tool invocation.
+    if declared_callers and not fake_model:
+        route_relays = mount_route_callers(
+            bundle_servers,
+            callers=declared_callers,
+            tokens=route_tokens,
+            connector_urls=connector_urls(
+                config.session.plugin_dir,
+                release=config.connector_release,
+                agent=config.connector_agent,
+                namespace=config.connector_namespace,
+            ),
+            source_env=os.environ,
+            lock_library=route_caller_lock_library(os.environ),
+            # The bundle root, as the capability probe uses, never a
+            # directory Bash writes.
+            cwd=str(config.session.plugin_dir),
+        )
+        # Started now, at boot, before the runner serves any turn, so no turn's
+        # Bash exists yet when a caller starts and reads its routes.
+        for key in sorted(route_relays):
+            bundle_servers[key]["instance"].start()
+    # The route tokens are held values too: redact them like the caller token.
+    held_secrets = held_secrets | frozenset(route_tokens.values())
 
     real_options: ClaudeAgentOptions | None = None
+    build_real_options: Callable[[str | None], ClaudeAgentOptions] | None = None
     observed_readonly_tools: frozenset[str] = frozenset()
 
     def session_tool_access(observed: frozenset[str]) -> TurnToolAccess:
         # @spec RUNNER-TOOL-ACCESS-1: the classifier's set, built once per boot.
         # The learned list/read tools are in the classifier's platform set.
         return TurnToolAccess(
-            _readonly_tools(harness, observed, approval_gate)
+            _readonly_tools(
+                harness,
+                observed | (frozenset({"mcp__curie__list_attachments"})
+                            if attachment_turn is not None else frozenset()),
+                approval_gate,
+            )
             | (AGENT_SCHEDULE_READ_ONLY_TOOL_NAMES if schedules is not None else frozenset())
             | (LEARNED_SKILL_READ_ONLY_TOOL_NAMES if learned is not None else frozenset()),
             requires_approval=(
@@ -1273,6 +1348,7 @@ def build_runner(
                 # The probe never sees an in-process server, so the mounted
                 # curie-slack tools join the projection by their published names.
                 capability.observed_tools
+                | (ATTACHMENT_TOOL_NAMES if attachment_turn is not None else frozenset())
                 | (
                     platform_slack_tool_names(platform_slack_grants)
                     if channel_read_turn is not None
@@ -1315,6 +1391,10 @@ def build_runner(
                 ),
                 memory_tools=memory_tools,
                 issue_tool=(build_issue_tool(*issue_read) if issue_read is not None else None),
+                attachment_tools=(
+                    build_attachment_tools(attachment_access)
+                    if attachment_access is not None else ()
+                ),
             ),
             **(
                 {
@@ -1359,81 +1439,121 @@ def build_runner(
                 else {}
             ),
         }
-        structured_resume = build_structured_resume(
-            conversation_replay.messages,
-            curie_session_id=config.session.session_id,
-            cwd=workspace_cwd,
-            harness_replay=conversation_replay.harness_replay,
-            system_prompt=system_prompt,
-        )
-        real_options = build_options(
-            plugins=[
-                *compiled.plugins,
-                *([SdkPluginConfig(type="local", path=learned.root)] if learned else []),
-            ],
-            model=config.model,
-            reviewer_model=config.reviewer_model,
-            system_prompt=system_prompt,
-            max_turns=config.max_turns,
-            max_budget_usd=config.max_usd_per_day,
-            # Curie's durable contract is ordered role/content messages. The
-            # Claude adapter prefers its optional opaque checkpoint to preserve
-            # native cache shape, and otherwise materializes a deterministic
-            # process-local SDK resume envelope from the portable messages.
-            resume=structured_resume.resume,
-            session_id=structured_resume.session_id,
-            session_store=structured_resume.session_store,
-            # Operator-set thinking depth (#1182, ADR-0098); None omits the SDK
-            # option entirely rather than defaulting it.
-            thinking=config.thinking,
-            task_budget_hint=config.session.budget.task_budget_hint,
-            env=sdk_env or {},
-            # The approval gate's PreToolUse matcher rides here alongside the
-            # bundle's own (#1852): can_use_tool is skipped by any permission
-            # rule that already allows the call (claude_agent_sdk/types.py:
-            # 1932-1948), and a skill's allowed-tools frontmatter is exactly
-            # such a rule, so the hook is the only layer that sees every call.
-            hooks=session_hooks,
-            # Only the bundle's own skills are listed to the model (#3766,
-            # ADR-0189); the CLI's built-in skills stay hidden.
-            # Learned skills (ADR 0237) are the one generated plugin admitted beside it.
-            skills=[
-                *bundle_skill_names(config.session.plugin_dir),
-                *(learned.qualified_names if learned else []),
-            ],
-            # Platform tools and connectors share the SDK MCP channel. The
-            # generic policy pager is present only on an actionable surface;
-            # state and publication remain independent platform capabilities.
-            mcp_servers={
-                # strict_mcp_config drops plugin-loaded servers (#2899), so the
-                # bundle's own servers ride the same channel under the name the
-                # plugin loader would have given them.
-                **bundle_servers,
-                **build_mcp_servers(
-                    platform=platform_servers,
-                    derived=derived_mcp_servers,
+
+        def options_for(system_prompt: str | None) -> ClaudeAgentOptions:
+            # Built by ``initialize`` once the preflight has shaped the prompt.
+            structured_resume = build_structured_resume(
+                conversation_replay.messages,
+                curie_session_id=config.session.session_id,
+                cwd=workspace_cwd,
+                harness_replay=conversation_replay.harness_replay,
+                system_prompt=system_prompt,
+            )
+            return build_options(
+                plugins=[
+                    *compiled.plugins,
+                    *([SdkPluginConfig(type="local", path=learned.root)] if learned else []),
+                ],
+                model=config.model,
+                reviewer_model=config.reviewer_model,
+                system_prompt=system_prompt,
+                max_turns=config.max_turns,
+                max_budget_usd=config.max_usd_per_day,
+                # Curie's durable contract is ordered role/content messages. The
+                # Claude adapter prefers its optional opaque checkpoint to preserve
+                # native cache shape, and otherwise materializes a deterministic
+                # process-local SDK resume envelope from the portable messages.
+                resume=structured_resume.resume,
+                session_id=structured_resume.session_id,
+                session_store=structured_resume.session_store,
+                # Operator-set thinking depth (#1182, ADR-0098); None omits the SDK
+                # option entirely rather than defaulting it.
+                thinking=config.thinking,
+                task_budget_hint=config.session.budget.task_budget_hint,
+                env=sdk_env or {},
+                # The approval gate's PreToolUse matcher rides here alongside the
+                # bundle's own (#1852): can_use_tool is skipped by any permission
+                # rule that already allows the call (claude_agent_sdk/types.py:
+                # 1932-1948), and a skill's allowed-tools frontmatter is exactly
+                # such a rule, so the hook is the only layer that sees every call.
+                hooks=session_hooks,
+                # Only the bundle's own skills are listed to the model (#3766,
+                # ADR-0189); the CLI's built-in skills stay hidden.
+                # Learned skills (ADR 0247) are the one generated plugin admitted beside it.
+                skills=[
+                    *bundle_skill_names(config.session.plugin_dir),
+                    *(learned.qualified_names if learned else []),
+                ],
+                # Platform tools and connectors share the SDK MCP channel. The
+                # generic policy pager is present only on an actionable surface;
+                # state and publication remain independent platform capabilities.
+                mcp_servers={
+                    # strict_mcp_config drops plugin-loaded servers (#2899), so the
+                    # bundle's own servers ride the same channel under the name the
+                    # plugin loader would have given them.
+                    **bundle_servers,
+                    **build_mcp_servers(
+                        platform=platform_servers,
+                        derived=derived_mcp_servers,
+                    ),
+                },
+                # Fronted only when a gate exists: with no callback the session keeps
+                # bypassPermissions, where the PreToolUse front above is the refusal
+                # layer (RUNNER-TOOL-ACCESS-7).
+                can_use_tool=(
+                    front_can_use_tool(build_can_use_tool(approval_gate), tool_access)
+                    if approval_gate is not None
+                    else None
                 ),
-            },
-            # Fronted only when a gate exists: with no callback the session keeps
-            # bypassPermissions, where the PreToolUse front above is the refusal
-            # layer (RUNNER-TOOL-ACCESS-7).
-            can_use_tool=(
-                front_can_use_tool(build_can_use_tool(approval_gate), tool_access)
-                if approval_gate is not None
-                else None
-            ),
-            cwd=workspace_cwd,
-            web_search_enabled=web_search_enabled,
-            policy_disallowed_tools=policy_hidden_tools,
-            disallowed_tools=config.catalogue_disallowed_tools,
-            hidden_restore_tools=hidden_restore_tools(
-                derived_mcp_servers,
-                capability.observed_tools,
-                frozenset(capability.failures)
-                | frozenset(failure.connector for failure in boot_connector_failures),
-                probe_complete=capability.complete,
-            ),
-        )
+                cwd=workspace_cwd,
+                web_search_enabled=web_search_enabled,
+                policy_disallowed_tools=policy_hidden_tools,
+                disallowed_tools=config.catalogue_disallowed_tools,
+                hidden_restore_tools=hidden_restore_tools(
+                    derived_mcp_servers,
+                    capability.observed_tools,
+                    frozenset(capability.failures)
+                    | frozenset(failure.connector for failure in boot_connector_failures),
+                    probe_complete=capability.complete,
+                ),
+            )
+
+        build_real_options = options_for
+
+    # Read at boot, as before #4777, so the preflight sees the env this build saw.
+    verification_url = os.environ.get(PROGRESS_URL_ENV)
+    verification_token = os.environ.get(PROGRESS_TOKEN_ENV)
+
+    async def initialize() -> None:
+        # Runs in the runner's shared start task after the listener binds
+        # (#4777): the preflight can take minutes, past the worker's claim.
+        nonlocal preflight_block, real_options
+        verification: dict[str, Any] | None = None
+        if (
+            mounted_workspace is not None
+            and not fake_model
+            and verification_url
+            and verification_token
+        ):
+            # A rejected report raises here and fails every turn.
+            verification = await preflight_workspace_verification(
+                mounted_workspace,
+                Path(config.session.plugin_dir),
+                verification_url,
+                verification_token,
+            )
+        # A declared check that could not run here and is not delegated to CI
+        # is blocked (#3873): the session factory then answers offline and the
+        # model never starts.
+        if blocked_checks(verification):
+            assert verification is not None
+            logger.warning(
+                "verification preflight blocked; the model will not start checks=%s",
+                ",".join(str(check.get("id")) for check in blocked_checks(verification)),
+            )
+            preflight_block = _preflight_blocked_explanation(verification)
+        if build_real_options is not None:
+            real_options = build_real_options(compose_system_prompt(verification))
 
     sdk_generation = 0
 
@@ -1530,9 +1650,14 @@ def build_runner(
             history_capacity_exceeded=history_capacity_exceeded,
             memory_turn=memory_turn,
             channel_read=channel_read_turn,
+            attachment_access=attachment_turn,
             tool_access=tool_access,
-            attachment_notice=format_attachment_notice(attachment_view),
+            attachment_notice=(
+                None if config.attachment_access_enabled
+                else format_attachment_notice(attachment_view)
+            ),
             channel_kind=config.channel_kind,
+            initializer=initialize,
         ),
         session_id=config.session.session_id,
         sandbox_id=config.session.sandbox_id,
@@ -1577,7 +1702,7 @@ def _memory_context_failure(exc: Exception) -> str:
 
 
 async def _load_memory_facts(config: RunnerConfig) -> tuple[str | None, str | None]:
-    """Load the typed memory context at boot (#1461, ADR 0239).
+    """Load the typed memory context at boot (#1461, ADR 0249).
 
     One ``GET .../state/_memory/context`` with the session's read token returns
     the agent-wide learning switch, the selected guidance, the standing
@@ -1762,7 +1887,7 @@ class _BootFetches:
     mcp_capability: McpToolCapabilityProbe | None
     connector_failures: tuple[ConnectorCapabilityFailure, ...] = ()
     history_capacity_exceeded: bool = False
-    # Memory blocks and guidance from the boot context (#1461, ADR 0239); field names match the
+    # Memory blocks and guidance from the boot context (#1461, ADR 0249); field names match the
     # build_runner parameters they feed.
     memory_facts_preamble: str | None = None
     memory_guidance: str | None = None
@@ -1918,6 +2043,8 @@ def _serve_executor(config: RunnerConfig, serving_token: str | None) -> None:
     )
     materialize_hosted_bearer_headers(connectors, os.environ)
     materialize_connector_caller_headers(connectors, os.environ)
+    # An executor runs one connector tool and mounts no bundle stdio server.
+    take_route_tokens(os.environ)
     app = create_executor_app(
         connectors,
         token=serving_token,
@@ -2053,17 +2180,8 @@ def _serve() -> None:
 
     snapshot_callback = capture_mounted_workspace if workspace_path is not None else None
 
+    # create_app schedules the runner's start on startup without awaiting it.
     app = create_app(runner, token=serving_token, snapshotter=snapshot_callback)
-
-    async def _startup(_app: web.Application) -> None:
-        try:
-            await runner.start()
-        except Exception as exc:
-            logger.error("session start failed error_class=%s: %s", type(exc).__name__, exc)
-            raise
-        logger.info("session started session=%s", config.session.session_id)
-
-    app.on_startup.append(_startup)
     web.run_app(app, host="0.0.0.0", port=config.port)
 
 

@@ -8,7 +8,7 @@ worker now tells the API when a turn ends, on the internal route
 ``/v1/internal`` routes), and the API refuses a write made with a closed turn's
 credential even before it expires. Reads are unaffected.
 
-ADR 0239: write credentials also carry the signed ``conversation`` claim, the
+ADR 0249: write credentials also carry the signed ``conversation`` claim, the
 agent's stored ``memory_writes`` must be on, and fact values carry the typed
 shape (``kind``, ``title``).
 

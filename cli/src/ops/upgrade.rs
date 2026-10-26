@@ -35,6 +35,7 @@ const MINIMUM_HELM_TIMEOUT_ANNOTATION: &str = "curie.ai/minimum-helm-timeout-sec
 const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const TEST_FAIL_AT_ENV: &str = "CURIE_UPGRADE_TEST_FAIL_AT";
 const TEST_INTERRUPT_AFTER_ENV: &str = "CURIE_UPGRADE_TEST_INTERRUPT_AFTER";
+const REPOSITORY_RUNNER_REBUILD_PREFIX: &str = "repository runner rebuild:";
 
 /// Durable phases of a cluster upgrade. Order is load-bearing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -791,6 +792,49 @@ pub(crate) fn target_runner_ref(
     crate::cluster_secrets::effective_runner_ref(&values, Some(to))
 }
 
+/// Retained repository declarations, with the indices used to replace only
+/// their receipt fields in the final Apply document.
+fn repository_runner_entries(
+    values: &serde_json::Value,
+) -> Vec<(usize, usize, &serde_json::Value)> {
+    let mut entries = Vec::new();
+    if let Some(bindings) = values
+        .pointer("/factory/bindings")
+        .and_then(serde_json::Value::as_array)
+    {
+        for (bi, binding) in bindings.iter().enumerate() {
+            if let Some(repos) = binding.get("repos").and_then(serde_json::Value::as_array) {
+                for (ri, repo) in repos.iter().enumerate() {
+                    if repo.get("runner").is_some_and(|runner| !runner.is_null()) {
+                        entries.push((bi, ri, repo));
+                    }
+                }
+            }
+        }
+    }
+    entries
+}
+
+fn repository_runner_dockerfile(runner: &serde_json::Value) -> Option<&str> {
+    runner.get("dockerfile").and_then(serde_json::Value::as_str)
+}
+
+/// Recover the recorded registry without confusing its port with an image
+/// tag. The registry is everything before the image's last path segment, for
+/// catalog and custom receipts alike; a catalog rebuild pushes to
+/// `<registry>/curie-repo-runner` whatever name the recorded receipt used.
+fn repository_runner_registry(image: &str) -> Result<String> {
+    crate::repo_runner::bare_digest(image)?;
+    let syntax = regex::Regex::new(
+        r"^([A-Za-z0-9][A-Za-z0-9._/:-]*)/([A-Za-z0-9][A-Za-z0-9._-]*)(?::[A-Za-z0-9_][A-Za-z0-9_.-]*)?@sha256:[0-9a-f]{64}$",
+    )
+    .expect("static repository runner image syntax");
+    let captures = syntax
+        .captures(image)
+        .context("repository runner image must name a digest-pinned registry repository")?;
+    Ok(captures[1].to_string())
+}
+
 /// Select claims still on an old or unresolved runner after Apply (#4332).
 /// The claim's `status.sandbox.name` identifies its pod, whose named `runner`
 /// container carries the rendered image. Compare that string exactly as the
@@ -1541,6 +1585,17 @@ trait UpgradeDriver {
     fn runner_layer_plan(&self) -> RunnerLayerPlan {
         RunnerLayerPlan::default()
     }
+    fn runner_layer_pending(&self) -> Option<String> {
+        None
+    }
+    fn repository_runner_plan_lines(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// Work Apply finishes before Helm runs (ADR 0216 repository runner
+    /// rebuilds). A failure here leaves the release unchanged.
+    fn prepare_apply(&mut self) -> Result<()> {
+        Ok(())
+    }
     /// Retire the SandboxClaims of every agent [`Self::runner_layer_plan`]
     /// rebinds or clears after Apply (#3422, #4321), so a live thread's next
     /// turn cold-starts on its new runner instead of keeping the old layer.
@@ -1622,6 +1677,8 @@ async fn run_lifecycle_inner<H: UpgradeDriver>(
         &host.runner_layer_plan(),
         host.helm_timeout_seconds(),
     );
+    plan.extend(host.runner_layer_pending());
+    plan.extend(host.repository_runner_plan_lines());
     if same_version {
         // #2861: the rerun runs no Helm upgrade, so the plan must not show one.
         plan.retain(|line| {
@@ -1631,6 +1688,7 @@ async fn run_lifecycle_inner<H: UpgradeDriver>(
                 && !line.starts_with("phase drain_preflight:")
                 && !line.starts_with("phase checkpoint:")
                 && !line.starts_with("phase migrate:")
+                && !line.starts_with(REPOSITORY_RUNNER_REBUILD_PREFIX)
         });
         plan.insert(
             2,
@@ -1848,6 +1906,19 @@ fn execute_phase<H: UpgradeDriver>(
         UpgradePhase::Checkpoint => Ok(PhaseOutcome::Continue),
         UpgradePhase::Migrate => Ok(PhaseOutcome::Continue),
         UpgradePhase::Apply => {
+            if let Err(error) = host.prepare_apply() {
+                // Nothing has reached Helm yet, so the release is unchanged and
+                // rollback is the wrong remedy: the operator reruns the upgrade.
+                record.fail_forward = Some(fail_forward_for(
+                    opts,
+                    false,
+                    &format!(
+                        "repository runner rebuild failed before Helm ran, so installed values are unchanged; fix the cause and rerun the upgrade: {}",
+                        truncate_reason(&host.redact(&format!("{error:#}")))
+                    ),
+                ));
+                return Ok(PhaseOutcome::Failed);
+            }
             if let Err(error) = host.apply_target(&opts.to) {
                 // A Helm render or apply error used to leave the checkpoint
                 // at migrate / in_progress (#3849). Store the same terminal
@@ -2067,6 +2138,14 @@ fn create_lost_race(stderr: &str) -> bool {
         || reason.contains("object has been modified")
 }
 
+struct RepositoryRunnerBuild {
+    binding_index: usize,
+    repo_index: usize,
+    repo: String,
+    registry: String,
+    spec: crate::repo_runner::RepoRunnerSpec,
+}
+
 struct LiveHost {
     opts: UpgradeOpts,
     current: Option<String>,
@@ -2077,9 +2156,9 @@ struct LiveHost {
     fail_at: Option<UpgradePhase>,
     interrupt_after: Option<UpgradePhase>,
     secret: Option<String>,
-    /// The migrated retained overlay Apply hands Helm via `-f`, computed ONCE
-    /// before the lifecycle runs (Ruling 8.8): `refuse_config` takes `&self`,
-    /// and the overlay Apply applies must be the overlay Validate approved.
+    /// The migrated retained overlay approved before the lifecycle runs
+    /// (Ruling 8.8). Apply may replace repository receipt fields only after
+    /// admitting the complete candidate again with the target Helm render.
     overlay: Option<String>,
     /// Why the configuration migration refused, if it did (#2299, R7).
     config_refusal: Option<String>,
@@ -2095,10 +2174,16 @@ struct LiveHost {
     schema_refusal: Option<String>,
     /// What the upgrade does to each layered agent (#3218, #4321).
     runner_layers: RunnerLayerPlan,
-    /// The target chart's own `fullnameOverride` and `nameOverride` defaults,
-    /// read once with the runner defaults; the canary names templates from
-    /// them under the retained overlay (#4321).
-    chart_name_defaults: Option<serde_json::Value>,
+    runner_layer_pending: Option<String>,
+    /// One target reference shared by agent-layer and repository planning.
+    /// Repository builds require its literal validated digest.
+    target_runner: Option<String>,
+    repository_runner_builds: Vec<RepositoryRunnerBuild>,
+    repository_runner_plan: Vec<String>,
+    repository_runner_refusal: Option<String>,
+    /// Target chart defaults read once for the shared runner reference and
+    /// the chart's template naming rules under the retained overlay.
+    chart_defaults: Option<serde_json::Value>,
     /// The target chart's rendered drain budget, computed with the exact
     /// retained overlay that Apply will hand to Helm.
     helm_timeout_seconds: u64,
@@ -2108,6 +2193,10 @@ struct LiveHost {
     checkpoint_data_present: bool,
     checkpoint_record: Option<serde_json::Value>,
     recovery_plan: Vec<String>,
+    /// Whether Apply was already complete or unnecessary before this
+    /// invocation ran any phase. Set once in `compute_pre_mutation`; unlike
+    /// `apply_is_skipped()`, it does not change when this run completes Apply.
+    apply_skipped_at_start: bool,
 }
 
 /// Ruling 2: Helm SILENTLY IGNORES `--version` for a local directory or
@@ -2311,7 +2400,12 @@ impl LiveHost {
             schema_decision: None,
             schema_refusal: None,
             runner_layers: RunnerLayerPlan::default(),
-            chart_name_defaults: None,
+            runner_layer_pending: None,
+            target_runner: None,
+            repository_runner_builds: Vec::new(),
+            repository_runner_plan: Vec::new(),
+            repository_runner_refusal: None,
+            chart_defaults: None,
             helm_timeout_seconds: HELM_TIMEOUT_DEFAULT_SECS,
             timeout_refusal: None,
             holder: uuid::Uuid::new_v4().to_string(),
@@ -2319,6 +2413,7 @@ impl LiveHost {
             checkpoint_data_present: false,
             checkpoint_record: None,
             recovery_plan: Vec::new(),
+            apply_skipped_at_start: false,
         })
     }
 
@@ -2790,10 +2885,14 @@ impl LiveHost {
     }
 
     /// Available pre-mutation refusals and the migrated overlay are computed
-    /// ONCE before any phase runs (Ruling 8.8). Apply then hands Helm exactly
-    /// this overlay. A cold release dry-run keeps only target-dependent checks
-    /// pending; retained configuration checks still run.
+    /// ONCE before any phase runs (Ruling 8.8). Apply admits any rebuilt
+    /// repository receipts with a final render before replacing that overlay.
+    /// A cold release dry-run keeps only target-dependent checks pending;
+    /// retained configuration checks still run.
     fn compute_pre_mutation(&mut self) {
+        // Record, current and known_good are loaded by now and no phase has
+        // run, so this is the state the invocation started from.
+        self.apply_skipped_at_start = self.apply_is_skipped();
         match self.retained_overlay() {
             Ok(Some((overlay, schema_plan))) => {
                 self.overlay = Some(overlay);
@@ -2867,9 +2966,10 @@ impl LiveHost {
             }
         }
         // #4321 with @spec CLUSTER-VALUES-FILES c3-c4: runner rebinding is
-        // part of the final effective overlay, so metadata admission and the
-        // timeout render must see the same document that Apply receives.
+        // part of the effective overlay used by schema admission. Repository
+        // receipt changes receive their own final timeout/template render in Apply.
         self.compute_runner_layers();
+        self.compute_repository_runners();
         if self.opts.chart.pending_release().is_none() {
             self.compute_schema_compat();
             if self.current.is_some()
@@ -2877,7 +2977,7 @@ impl LiveHost {
                 && self.config_refusal.is_none()
                 && self.schema_refusal.is_none()
             {
-                match self.render_target_helm_timeout() {
+                match self.render_target_helm_timeout(self.overlay.as_deref()) {
                     Ok(seconds) => self.helm_timeout_seconds = seconds,
                     Err(error) => self.timeout_refusal = Some(format!("{error:#}")),
                 }
@@ -2890,12 +2990,14 @@ impl LiveHost {
     /// The deploy guard guarantees every bound layer was built on the current
     /// installation's runner, so they all stop matching exactly when the
     /// target runner's digest differs from the current one. A release with no
-    /// layered agent costs no extra read. Either runner being unknown counts
+    /// layered agent costs no extra read. Either observed runner being unknown counts
     /// as a change: keeping an old layer under a new worker is the failure this
     /// exists to prevent, and running the platform runner is always servable.
     /// A stock dark factory binding asks the registry for the layer published
     /// for `--to` and is rebound to it when its base is the target runner.
-    /// Otherwise Validate refuses unless the operator consents to clearing it.
+    /// An unobserved target runner in a cold release defers stock rebinding
+    /// until chart download and verification by the live run. Otherwise
+    /// Validate refuses unless the operator consents to clearing it.
     fn compute_runner_layers(&mut self) {
         let Some(overlay) = self
             .overlay
@@ -2904,26 +3006,95 @@ impl LiveHost {
         else {
             return;
         };
-        let bindings = crate::cluster_secrets::layered_bindings(&overlay);
-        if bindings.is_empty() {
+        let mut bindings = crate::cluster_secrets::layered_bindings(&overlay);
+        let has_repository_runners = !repository_runner_entries(&overlay).is_empty();
+        if bindings.is_empty() && !has_repository_runners {
             return;
         }
-        let chart_default = self.target_chart_values();
-        if let Some(defaults) = &chart_default {
-            self.chart_name_defaults = Some(effective_name_values(
-                Some(defaults),
-                &serde_json::Value::Null,
-            ));
+        // Preserve ordinary-layer naming on reruns that have no repository
+        // runners. Repository reruns use installed naming values in Canary.
+        if !has_repository_runners {
+            self.chart_defaults = self.target_chart_values();
         }
         // A same-version known-good rerun skips Apply, so no binding can
         // change: every one is kept and Canary checks the retained ones. A
         // transient runner or registry failure must not plan a clear here.
-        let to = Some(self.opts.to.as_str());
-        if self.current.as_deref() == to && self.known_good.as_deref() == to {
+        // A durable Apply likewise needs no target or registry lookup.
+        if self.apply_is_skipped() {
             self.runner_layers = RunnerLayerPlan {
                 kept: bindings.into_iter().collect(),
                 ..RunnerLayerPlan::default()
             };
+            return;
+        }
+        if has_repository_runners {
+            self.chart_defaults = self.target_chart_values();
+        }
+        let raw_target = target_runner_ref(self.chart_defaults.as_ref(), &overlay, &self.opts.to);
+        if self.opts.chart.pending_release().is_some() && raw_target.is_none() {
+            let stock_agents: Vec<_> = bindings
+                .iter()
+                .filter(|(_, binding)| is_stock_layer(binding))
+                .map(|(agent, _)| agent.as_str())
+                .collect();
+            if !stock_agents.is_empty() {
+                self.runner_layer_pending = Some(format!(
+                    "runner layers conditional rebind: {} to the dark factory runner layer \
+                     published for {} if the platform runner changes and the published layer \
+                     matches the target runner base; the target runner is unobserved until \
+                     release chart download, so runner and published-layer compatibility \
+                     checks are pending",
+                    stock_agents.join(", "),
+                    self.opts.to
+                ));
+            }
+            bindings.retain(|_, binding| !is_stock_layer(binding));
+            if bindings.is_empty() {
+                return;
+            }
+        }
+        let target = if has_repository_runners && self.opts.chart.pending_release().is_none() {
+            let pinned = raw_target
+                .as_deref()
+                .context("the effective target platform runner image is unknown")
+                .and_then(|reference| {
+                    crate::repo_runner::bare_digest(reference)?;
+                    let syntax =
+                        regex::Regex::new(r"^[A-Za-z0-9][A-Za-z0-9._/:-]*@sha256:[0-9a-f]{64}$")
+                            .expect("static platform runner reference syntax");
+                    if !syntax.is_match(reference) {
+                        bail!("the effective target platform runner reference is malformed");
+                    }
+                    tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current()
+                            .block_on(crate::cluster_secrets::pin_runner_reference(reference))
+                    })
+                });
+            match pinned {
+                Ok(reference) => Some(reference),
+                Err(error) => {
+                    self.repository_runner_refusal = Some(format!(
+                        "repository runners require the effective target platform runner to carry \
+                         a valid literal sha256 digest: {error:#}; retry with \
+                         --values-file <values-file> setting agentSandbox.runner.digest to the \
+                         chosen target digest. Removing runner image or digest overrides alone \
+                         is not sufficient unless the chart defaults still provide a literal \
+                         target digest"
+                    ));
+                    return;
+                }
+            }
+        } else {
+            raw_target.and_then(|reference| {
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current()
+                        .block_on(crate::cluster_secrets::pin_runner_reference(&reference))
+                })
+                .ok()
+            })
+        };
+        self.target_runner = target.clone();
+        if bindings.is_empty() {
             return;
         }
         let current = tokio::task::block_in_place(|| {
@@ -2932,15 +3103,6 @@ impl LiveHost {
         })
         .ok()
         .map(|(_, pinned)| pinned);
-        let target = target_runner_ref(chart_default.as_ref(), &overlay, &self.opts.to).and_then(
-            |reference| {
-                tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current()
-                        .block_on(crate::cluster_secrets::pin_runner_reference(&reference))
-                })
-                .ok()
-            },
-        );
         let stock = if needs_stock_lookup(&bindings, current.as_deref(), target.as_deref()) {
             let published = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current()
@@ -2959,7 +3121,19 @@ impl LiveHost {
         self.runner_layer_refusal = if self.opts.allow_stock_layer_clear {
             None
         } else {
-            stock_runner_layer_refusal(&self.runner_layers, &self.opts.to)
+            stock_runner_layer_refusal(&self.runner_layers, &self.opts.to).map(|refusal| {
+                if has_repository_runners {
+                    format!(
+                        "{refusal} Repository runners also require the effective target platform \
+                         runner to carry a literal sha256 digest. Removing image or digest \
+                         overrides alone is not sufficient unless the chart defaults provide \
+                         that digest; use --values-file <values-file> to set \
+                         agentSandbox.runner.digest to the chosen target digest."
+                    )
+                } else {
+                    refusal
+                }
+            })
         };
         if self.runner_layer_refusal.is_some() {
             return;
@@ -3004,6 +3178,154 @@ impl LiveHost {
         }
     }
 
+    fn apply_is_skipped(&self) -> bool {
+        let to = Some(self.opts.to.as_str());
+        (self.current.as_deref() == to && self.known_good.as_deref() == to)
+            || self.record.as_ref().is_some_and(|record| {
+                record.target_version == self.opts.to
+                    && record.status == "in_progress"
+                    && record.completed.contains(&UpgradePhase::Apply)
+            })
+    }
+
+    /// Plan from the effective overlay after ordinary layer rebinds/clears.
+    /// Build inputs stay in memory until the durable Apply phase begins.
+    fn compute_repository_runners(&mut self) {
+        if self.apply_is_skipped() || self.repository_runner_refusal.is_some() {
+            return;
+        }
+        if let Err(error) = self.plan_repository_runners() {
+            self.repository_runner_refusal = Some(format!("{error:#}"));
+        }
+    }
+
+    fn plan_repository_runners(&mut self) -> Result<()> {
+        let Some(raw) = self.overlay.as_deref() else {
+            return Ok(());
+        };
+        let values: serde_json::Value = serde_json::from_str(raw)?;
+        let entries = repository_runner_entries(&values);
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let pending = self.opts.chart.pending_release().is_some();
+        let target_base = if pending {
+            None
+        } else {
+            Some(crate::repo_runner::bare_digest(
+                self.target_runner
+                    .as_deref()
+                    .context("repository runners have no validated target platform runner")?,
+            )?)
+        };
+        for (binding_index, repo_index, repo) in entries {
+            let path = repo
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .context("a retained repository runner has no repository path")?;
+            let runner = &repo["runner"];
+            if target_base.as_deref().is_some_and(|base| {
+                runner.get("base").and_then(serde_json::Value::as_str) == Some(base)
+            }) {
+                continue;
+            }
+            let image = runner
+                .get("image")
+                .and_then(serde_json::Value::as_str)
+                .with_context(|| format!("repository {path} runner has no image"))?;
+            if let Some(dockerfile) = repository_runner_dockerfile(runner) {
+                let registry = repository_runner_registry(image)
+                    .with_context(|| format!("repository {path} manual rebuild registry"))?;
+                let command = self.custom_repository_rebuild_command(path, &registry)?;
+                self.repository_runner_plan.push(format!(
+                    "custom repository runner preserved: {path} declares Dockerfile {dockerfile}; \
+                     after this upgrade, from the directory of a repo-runner.yaml spec containing \
+                     its retained tools, probes and Dockerfile declaration, run: {command}"
+                ));
+                continue;
+            }
+            let mut spec: crate::repo_runner::RepoRunnerSpec = serde_json::from_value(
+                serde_json::json!({
+                    "tools": runner.get("tools").context("repository runner has no tools")?,
+                    "probes": runner.get("probes").cloned().unwrap_or_else(|| serde_json::json!([])),
+                }),
+            )
+            .with_context(|| format!("repository {path} catalog build inputs"))?;
+            crate::repo_runner::validate_spec(&spec)
+                .with_context(|| format!("repository {path} catalog build inputs"))?;
+            spec.tools = crate::repo_runner::selected_entries(&spec)
+                .iter()
+                .map(|entry| entry.name.clone())
+                .collect();
+            let registry = repository_runner_registry(image)
+                .with_context(|| format!("repository {path} catalog rebuild registry"))?;
+            if pending {
+                self.repository_runner_plan.push(format!(
+                    "phase validate pending: repository runner {path} catalog rebuild in {registry} \
+                     depends on the target chart's effective pinned platform runner"
+                ));
+                continue;
+            }
+            if !crate::ops::on_path("docker") {
+                bail!(
+                    "repository {path} requires a catalog runner rebuild, but Docker is not \
+                     installed or not on PATH; install Docker and retry"
+                );
+            }
+            let target = self
+                .target_runner
+                .as_deref()
+                .expect("validated target runner");
+            self.repository_runner_plan.push(format!(
+                "{REPOSITORY_RUNNER_REBUILD_PREFIX} build catalog repository {path} in {registry} \
+                 on {target} during Apply, then apply its receipt in the single Helm upgrade"
+            ));
+            self.repository_runner_builds.push(RepositoryRunnerBuild {
+                binding_index,
+                repo_index,
+                repo: path.to_string(),
+                registry,
+                spec,
+            });
+        }
+        Ok(())
+    }
+
+    fn custom_repository_rebuild_command(&self, repo: &str, registry: &str) -> Result<String> {
+        let mut args = vec![
+            plain("cluster"),
+            plain("factory"),
+            plain("--repo-runner"),
+            plain(format!("{repo}=repo-runner.yaml")),
+            plain("--registry"),
+            plain(registry),
+            plain("--namespace"),
+            plain(&self.opts.common.namespace),
+            plain("--release"),
+            plain(&self.opts.common.release),
+        ];
+        if let Ok(context) = std::env::var("HELM_KUBECONTEXT") {
+            if !context.trim().is_empty() {
+                args.push(plain("--context"));
+                args.push(plain(context));
+            }
+        }
+        if self.opts.chart.pending_release().is_none() {
+            let chart = if self.opts.chart.is_available_local() {
+                std::path::Path::new(self.chart_ref())
+                    .canonicalize()
+                    .context("resolve the chart for the post-upgrade repository rebuild")?
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                self.chart_ref().to_string()
+            };
+            args.push(plain("--chart"));
+            args.push(plain(chart));
+        }
+        Ok(OpsCommand::new("curie", args).display())
+    }
+
     /// The target chart's own default values document, when the chart is
     /// available to read. A pending release asset is not.
     fn target_chart_values(&self) -> Option<serde_json::Value> {
@@ -3022,7 +3344,7 @@ impl LiveHost {
         serde_norway::from_str(&out).ok()
     }
 
-    fn render_target_helm_timeout(&self) -> Result<u64> {
+    fn render_target_helm_timeout(&self, overlay: Option<&str>) -> Result<u64> {
         let mut args = vec![
             plain("template"),
             plain(&self.opts.common.release),
@@ -3036,7 +3358,7 @@ impl LiveHost {
             args.push(plain(&self.opts.to));
         }
         let tmp = tempfile::NamedTempFile::new().context("upgrade values tempfile")?;
-        if let Some(overlay) = &self.overlay {
+        if let Some(overlay) = overlay {
             std::fs::write(tmp.path(), overlay).context("could not write upgrade values")?;
             args.push(plain("-f"));
             args.push(plain(tmp.path().to_string_lossy().into_owned()));
@@ -3639,6 +3961,76 @@ impl LiveHost {
         Ok(())
     }
 
+    /// Every build and registry readback finishes before any receipt changes
+    /// the retained document. The complete candidate must then pass the same
+    /// target Helm render whose bytes and timeout Apply uses.
+    fn rebuild_repository_runners(&mut self) -> Result<()> {
+        if self.repository_runner_builds.is_empty() {
+            return Ok(());
+        }
+        let base = self
+            .target_runner
+            .as_deref()
+            .context("repository runner rebuilds have no validated target platform runner")?;
+        let mut receipts: Vec<(&RepositoryRunnerBuild, crate::repo_runner::RunnerRecord)> =
+            Vec::new();
+        for request in &self.repository_runner_builds {
+            let receipt = if let Some((_, receipt)) = receipts
+                .iter()
+                .find(|(built, _)| built.registry == request.registry && built.spec == request.spec)
+            {
+                receipt.clone()
+            } else {
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(
+                        crate::commands::build_catalog_repo_runner(
+                            &request.spec,
+                            &request.registry,
+                            base,
+                        ),
+                    )
+                })
+                .with_context(|| format!("rebuild repository runner for {}", request.repo))?
+                .runner
+            };
+            receipts.push((request, receipt));
+        }
+        let mut candidate: serde_json::Value = serde_json::from_str(
+            self.overlay
+                .as_deref()
+                .context("repository runner rebuilds have no retained values document")?,
+        )?;
+        for (request, receipt) in receipts {
+            let pointer = format!(
+                "/factory/bindings/{}/repos/{}/runner",
+                request.binding_index, request.repo_index
+            );
+            let runner = candidate
+                .pointer_mut(&pointer)
+                .and_then(serde_json::Value::as_object_mut)
+                .with_context(|| format!("repository {} lost its retained runner", request.repo))?;
+            let digest = crate::repo_runner::bare_digest(&receipt.image)?;
+            runner.insert(
+                "image".into(),
+                serde_json::Value::String(format!(
+                    "{}/{}@{digest}",
+                    request.registry,
+                    crate::repo_runner::IMAGE_NAME
+                )),
+            );
+            runner.insert("base".into(), serde_json::Value::String(receipt.base));
+            runner.insert(
+                "platformDigests".into(),
+                serde_json::to_value(receipt.platform_digests)?,
+            );
+        }
+        let candidate = helm_values_document(&candidate)?;
+        let timeout = self.render_target_helm_timeout(Some(&candidate))?;
+        self.overlay = Some(candidate);
+        self.helm_timeout_seconds = timeout;
+        Ok(())
+    }
+
     /// R3: the integrated observer answers this, not a hand-rolled
     /// `kubectl get deploy,sts,ds` read. `super::convergence` compares live
     /// containers, generations, replicas, selectors and Helm hooks against
@@ -3662,18 +4054,69 @@ impl LiveHost {
         // Convergence is not re-observed: the Converge phase has already
         // failed the run unless it was exact.
         let version_ok = self.inspect_version().as_deref() == Some(self.opts.to.as_str());
-        let issues = if expected.is_empty() {
+        let mut overlay = self
+            .overlay
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .unwrap_or(serde_json::Value::Null);
+        // When Apply ran in this invocation, the overlay is the admitted
+        // candidate Helm applied. When it was already skipped at the start
+        // of this invocation (a resume after a durable Apply, or a
+        // known-good rerun; judged before any phase so completing Apply
+        // here does not flip it), the overlay merges the
+        // operator's values file over the installed values, so a file still
+        // carrying an old receipt would replace the one Helm serves. Check
+        // the receipts Helm applied instead, and fail closed if unreadable.
+        // The rule does not depend on the overlay: a values file that dropped
+        // every runner still leaves the served release carrying catalog
+        // templates, so the served document is always the naming and receipt
+        // source here.
+        if self.apply_skipped_at_start {
+            match self.served_user_values() {
+                Ok(served) => overlay = served,
+                Err(error) => {
+                    return Ok(CanaryVerdict {
+                        canary: Canary { passed: false },
+                        issues: vec![format!(
+                            "could not read the serving release's applied repository \
+                             receipts: {error:#}"
+                        )],
+                    });
+                }
+            }
+        }
+        let repository_runners = repository_runner_entries(&overlay);
+        let has_catalog_runners = repository_runners
+            .iter()
+            .any(|(_, _, repo)| repository_runner_dockerfile(&repo["runner"]).is_none());
+        let needs_installed_names = !repository_runners.is_empty() && self.chart_defaults.is_none();
+        let issues = if expected.is_empty() && !has_catalog_runners {
             Vec::new()
         } else {
-            // #4321: every layered agent's rendered template must carry the
-            // runner the upgrade planned. An unreadable list fails closed.
+            // #4321 and ADR 0216: agent layers and catalog repository
+            // templates must carry their exact planned or retained receipts.
+            // An unreadable list fails closed, including after resumed Apply.
             match self.read_sandbox_templates() {
                 Ok(observed) => {
-                    template_canary_issues(&self.release_fullname(), expected, &observed)
+                    if has_catalog_runners || needs_installed_names {
+                        match self.repository_template_canary_issues(&overlay, &observed) {
+                            Ok((fullname, repository_issues)) => {
+                                let mut issues =
+                                    template_canary_issues(&fullname, expected, &observed);
+                                issues.extend(repository_issues);
+                                issues
+                            }
+                            Err(error) => vec![format!(
+                                "could not confirm repository SandboxTemplates: {error:#}"
+                            )],
+                        }
+                    } else {
+                        template_canary_issues(&self.release_fullname(), expected, &observed)
+                    }
                 }
                 Err(error) => vec![format!(
                     "could not read the release's SandboxTemplates to confirm the planned runner \
-                     layers: {error:#}"
+                     layers and repository receipts: {error:#}"
                 )],
             }
         };
@@ -3685,6 +4128,30 @@ impl LiveHost {
         })
     }
 
+    /// The serving revision's user-supplied values (`helm get values`, not
+    /// `--all`): exactly the document Helm applied, without chart defaults.
+    fn served_user_values(&self) -> Result<serde_json::Value> {
+        let history = self
+            .release_history()?
+            .context("the release has no serving revision")?;
+        let revision =
+            crate::cluster_secrets::serving_revision(&history, &self.opts.common.release)
+                .map_err(anyhow::Error::msg)?;
+        let cmd =
+            crate::cluster_secrets::helm_get_json(&self.opts.common, "values", false, revision);
+        let (ok, out, err) = self.run(&cmd)?;
+        if !ok {
+            bail!(
+                "could not read installed values: {}",
+                crate::schema_window::redact_probe_text(err.trim())
+            );
+        }
+        if out.trim().is_empty() {
+            return Ok(serde_json::Value::Null);
+        }
+        serde_norway::from_str::<serde_json::Value>(&out).context("installed values are malformed")
+    }
+
     /// The release's `curie.fullname` under the retained overlay Apply hands
     /// Helm (#4321). No overlay, or one that does not parse, renders with the
     /// chart defaults, as Helm would.
@@ -3694,8 +4161,110 @@ impl LiveHost {
             .as_deref()
             .and_then(|raw| serde_norway::from_str::<serde_json::Value>(raw).ok())
             .unwrap_or(serde_json::Value::Null);
-        let values = effective_name_values(self.chart_name_defaults.as_ref(), &overlay);
+        let values = effective_name_values(self.chart_defaults.as_ref(), &overlay);
         release_fullname_from_values(&self.opts.common.release, &values)
+    }
+
+    fn repository_template_canary_issues(
+        &self,
+        overlay: &serde_json::Value,
+        observed: &ObservedTemplates,
+    ) -> Result<(String, Vec<String>)> {
+        // A completed Apply or known-good rerun must not resolve a target
+        // chart or runner. Installed computed values supply only the chart's
+        // naming defaults; receipts come from `overlay`, which is the applied
+        // candidate or, when Apply was skipped, the serving user values.
+        let defaults = match &self.chart_defaults {
+            Some(defaults) => defaults.clone(),
+            None => {
+                let history = self
+                    .release_history()?
+                    .context("the serving release has no template naming values")?;
+                let revision =
+                    crate::cluster_secrets::serving_revision(&history, &self.opts.common.release)
+                        .map_err(anyhow::Error::msg)?;
+                let cmd = crate::cluster_secrets::helm_get_json(
+                    &self.opts.common,
+                    "values",
+                    true,
+                    revision,
+                );
+                let (ok, out, err) = self.run(&cmd)?;
+                if !ok {
+                    bail!(
+                        "could not read installed template naming values: {}",
+                        crate::schema_window::redact_probe_text(err.trim())
+                    );
+                }
+                serde_norway::from_str::<serde_json::Value>(&out)
+                    .context("installed template naming values are malformed")?
+            }
+        };
+        let names = effective_name_values(Some(&defaults), overlay);
+        let fullname = release_fullname_from_values(&self.opts.common.release, &names);
+        let catalog_runners: Vec<_> = repository_runner_entries(overlay)
+            .into_iter()
+            .filter(|(_, _, repo)| repository_runner_dockerfile(&repo["runner"]).is_none())
+            .collect();
+        if catalog_runners.is_empty() {
+            return Ok((fullname, Vec::new()));
+        }
+        let mut egress = defaults
+            .pointer("/factory/sandboxEgress")
+            .and_then(serde_json::Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(declared) = overlay.pointer("/factory/sandboxEgress") {
+            if declared.is_null() {
+                egress.clear();
+            } else if let Some(fields) = declared.as_object() {
+                for (agent, enabled) in fields {
+                    if enabled.is_null() {
+                        egress.remove(agent);
+                    } else {
+                        egress.insert(agent.clone(), enabled.clone());
+                    }
+                }
+            }
+        }
+        let agents: Vec<_> = egress
+            .iter()
+            .filter(|(_, enabled)| enabled.as_bool() == Some(true))
+            .map(|(agent, _)| agent)
+            .collect();
+        if agents.len() != 1 {
+            bail!("repository templates require exactly one true factory.sandboxEgress agent");
+        }
+        let mut issues = Vec::new();
+        for (_, _, repo) in catalog_runners {
+            let runner = &repo["runner"];
+            let path = repo
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .context("catalog repository template has no repository path")?;
+            let image = runner
+                .get("image")
+                .and_then(serde_json::Value::as_str)
+                .with_context(|| format!("repository {path} runner has no image"))?;
+            let digest = crate::repo_runner::bare_digest(image)?;
+            let prefix = &digest["sha256:".len()..][..12];
+            let name = format!("{fullname}-agent-{}-img-{prefix}-runner", agents[0]);
+            match observed.items.iter().find(|(found, _)| found == &name) {
+                None => issues.push(format!(
+                    "repository {path}: SandboxTemplate {name} is missing, but its retained \
+                     runner receipt requires {image}"
+                )),
+                Some((_, rendered)) if rendered.as_deref() != Some(image) => {
+                    issues.push(format!(
+                        "repository {path}: SandboxTemplate {name} renders {}, but its retained \
+                         runner receipt requires {image}",
+                        rendered.as_deref().unwrap_or("no runner image")
+                    ));
+                }
+                _ => {}
+            }
+        }
+        Ok((fullname, issues))
     }
 
     /// The release's SandboxTemplates for retirement and the canary (#4321, #4332).
@@ -3861,6 +4430,13 @@ impl UpgradeDriver for LiveHost {
     fn runner_layer_plan(&self) -> RunnerLayerPlan {
         self.runner_layers.clone()
     }
+    fn repository_runner_plan_lines(&self) -> Vec<String> {
+        self.repository_runner_plan.clone()
+    }
+
+    fn runner_layer_pending(&self) -> Option<String> {
+        self.runner_layer_pending.clone()
+    }
 
     fn helm_timeout_seconds(&self) -> u64 {
         self.helm_timeout_seconds
@@ -3870,6 +4446,7 @@ impl UpgradeDriver for LiveHost {
             .clone()
             .or_else(|| self.config_refusal.clone())
             .or_else(|| self.runner_layer_refusal.clone())
+            .or_else(|| self.repository_runner_refusal.clone())
             .or_else(|| self.timeout_refusal.clone())
             .or_else(|| self.schema_refusal.clone())
     }
@@ -3887,6 +4464,9 @@ impl UpgradeDriver for LiveHost {
     }
     fn drain_preflight_once(&mut self) -> Result<bool> {
         self.live_drain_preflight()
+    }
+    fn prepare_apply(&mut self) -> Result<()> {
+        self.rebuild_repository_runners()
     }
     fn apply_target(&mut self, to: &str) -> Result<()> {
         let fullname = self.release_fullname();

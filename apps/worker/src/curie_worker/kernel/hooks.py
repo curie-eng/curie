@@ -59,7 +59,7 @@ class _HookRunCarry:
     successor_maybe_published: bool = False
     # A coverage notice owed by a close that took effect, until it is posted (#2878).
     notice_pending: str | None = None
-    # An approval continuation of an agent schedule firing (ADR 0238), as
+    # An approval continuation of an agent schedule firing (ADR 0248), as
     # (agent, schedule, approval), checked at intake: its runner start and
     # steer are guarded again under the schedule's lock.
     schedule_resume: tuple[uuid.UUID, uuid.UUID, uuid.UUID] | None = None
@@ -67,7 +67,7 @@ class _HookRunCarry:
 
 class ScheduleResumeRefused(RuntimeError):
     """An approved continuation of an agent schedule firing may no longer run
-    (ADR 0238): the schedule changed, was cancelled or paused, the toggle went
+    (ADR 0248): the schedule changed, was cancelled or paused, the toggle went
     off, or its destination is gone. The delivery completes dropped."""
 
 
@@ -231,6 +231,9 @@ async def _start_turn_under_hook_control(
     # reason, and only after the runner advertises enforcement does it ride
     # the event. Every open, the attachment handoff included, comes through.
     event = await self._with_channel_read(event, handle, remaining_s)
+    from .attachment_access import with_attachment_access
+
+    event = await with_attachment_access(self, event, handle, remaining_s)
     carry = constants._HOOK_RUN_CARRY.get()
     if carry is not None and carry.recorder is not None and carry.ref is not None:
         async with carry.recorder.start_guard(carry.ref) as allowed:
@@ -254,7 +257,7 @@ async def _start_turn_under_hook_control(
             return turn
     resume = carry.schedule_resume if carry is not None else None
     if resume is not None:
-        # ADR 0238: the schedule's lock is held across the start, so a change
+        # ADR 0248: the schedule's lock is held across the start, so a change
         # to the schedule, its toggle or its destination lands before or after
         # this continuation starts, never between the check and the start.
         recorder = self._hook_runs

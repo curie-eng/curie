@@ -18,7 +18,8 @@ reviewer subagents check it on a stronger model. The skill walks nine phases:
 3. `plan`: read the repository's own guidance, find its test commands, and
    write a plan.
 4. `plan_review`: [`agents/plan-reviewer.md`](agents/plan-reviewer.md)
-   approves the plan or sends it back to `plan`.
+   reviews the plan once. Either verdict, `APPROVE` or `CHANGES`, moves on to
+   `failing_test`; `CHANGES` findings are advice the agent must resolve.
 5. `failing_test`: write a failing test first where one is feasible.
 6. `implement`: make the smallest change and run the repository's own checks.
 7. `review_diff`: [`agents/diff-reviewer.md`](agents/diff-reviewer.md) reviews
@@ -43,10 +44,17 @@ does not enforce it, and a different bundle can choose differently.
 
 ## Review loops
 
-Each loop (`plan` and `plan_review`, `implement` and `review_diff`, and
-`wait_ci` back to `implement`) runs at most 3 rounds. When a reviewer still asks for changes on round 3, or a review
-call fails, the run publishes nothing. It ends its reply with `Could not complete:` and the
-reviewer's unresolved findings and open questions, and the platform's status
+The plan gets exactly one review per run. `VERDICT: CHANGES` on it is
+truthful advice, not a stop: the agent keeps every finding, fixes each
+blocking one during `implement`, and gives the diff reviewer each finding with
+its resolution. The diff reviewer treats an unresolved blocking plan finding
+as a blocking diff finding, and its final `VERDICT: APPROVE` stays mandatory
+for publication.
+
+Each remaining loop (`implement` and `review_diff`, and `wait_ci` back to
+`implement`) runs at most 3 rounds. When the diff reviewer still asks for
+changes on round 3, or a review call fails, the run publishes nothing. It
+ends its reply with `Could not complete:` and the reviewer's unresolved findings and open questions, and the platform's status
 comment on the issue carries that result.
 
 A reviewer tags every finding `blocking` (the change would be incorrect or
@@ -60,8 +68,8 @@ approved. Notes never start another review round.
 [`hooks/review_gate.py`](hooks/review_gate.py) enforces this, because the main
 model does not follow the protocol reliably. It routes every sub-agent call to
 the right reviewer, strips `isolation` and `model`, forces
-`run_in_background: false`, refuses reviews out of order, counts rounds and
-applies the cap, stops the run on a reviewer reply without a verdict, and
+`run_in_background: false`, refuses reviews out of order and a second plan
+review, counts rounds and applies the cap, stops the run on a reviewer reply without a verdict, and
 refuses `publish_changes` until the diff reviewer approves. It also writes the
 `plan_review` and `review_diff` phase lines, with the round, to the pod log.
 It hands the agent and both reviewers the same verification contract,
@@ -75,8 +83,8 @@ Without the contract no review runs.
 
 The same hook gates repository edits. `Edit`, `Write`, `MultiEdit` and
 `NotebookEdit` are refused until the `dark-factory:implement-issue` skill is
-loaded and the plan reviewer approves. After approval only test edits may run:
-an edit to a test file, or an edit to a source file that adds a test (an
+loaded and the plan review completes with either verdict. After it only test
+edits may run: an edit to a test file, or an edit to a source file that adds a test (an
 inline Rust `#[test]` module, a `def test_` function, and the like) beyond the
 ones the replaced text already held. The model writes the failing test (a
 test file, or an inline test that adds a test), runs it with Bash, then calls
@@ -86,9 +94,9 @@ event that opens source edits; no Bash command does. The hook records evidence
 only: after a test edit it counts finished Bash commands and failed ones,
 never their text, and writes `test_edited`, `bash_after_test_edit` and
 `bash_failed_after_test_edit` on its `implement` phase line. It never claims
-a test ran. The hook fingerprints the checkout at the prompt and refuses the plan
-approval, stopping the run, if the checkout changed before it (for example
-through Bash). Its evidence lines share one `seq` counter per run:
+a test ran. The hook fingerprints the checkout at the prompt and refuses the
+plan review's verdict, stopping the run, if the checkout changed before it
+(for example through Bash). Its evidence lines share one `seq` counter per run:
 `curie_phase` lines carry `source: "hook"`, `curie_reported` lines record each
 `report_progress` call with the hook's last observed phase and `late: true`
 when the report trails it, and `curie_gate` lines record refusals.
@@ -376,27 +384,12 @@ Cargo cache used 585 MiB, and UI modules used 223 MiB. After
 These are measured values for this checkout; other repositories and build
 profiles can need different amounts. The chart's default 1 GiB workspace,
 512 MiB home scratch, and 4 GiB runner ephemeral storage limit cannot hold this
-workload. Give the factory agent its own workspace ceiling with
-`agentSandbox.workspaceSizeLimits`, which applies to that agent's sandboxes
-only. Merge these values into the same Helm values file as the registry routes:
-
-```yaml
-agentSandbox:
-  workspaceSizeLimits:
-    dark-factory: 24Gi
-  runner:
-    hardening:
-      writablePathSizeLimit: 2Gi
-```
-
-The kubelet counts the workspace against the pod's `ephemeral-storage` limit
-too, so raise the factory agent's runner resources to match. This override
-applies to the `dark-factory` agent only:
-
-```bash
-curie cluster overrides dark-factory --runner-resources \
-  '{"requests":{"cpu":"500m","memory":"2Gi","ephemeral-storage":"16Gi"},"limits":{"cpu":"2","memory":"6Gi","ephemeral-storage":"28Gi"}}'
-```
+workload. The chart's `factory` resource profile is sized for it, and the
+`values.yaml` in this directory selects it for the `dark-factory` agent with
+`agentSandbox.agentResourceProfiles`. No per-key sizing recipe is needed. The
+profile gives that agent's sandboxes 8Gi of memory (request and limit), 2 CPU,
+10Gi to 20Gi of ephemeral storage, a 15Gi workspace, a 15Gi home volume and a
+4Gi tmp volume. Other agents keep the `standard` profile.
 
 With these settings, a sandbox running this layer built every `cli/` test
 target (`cargo test --locked --manifest-path cli/Cargo.toml --no-run`) in about
@@ -404,11 +397,31 @@ three minutes. The workspace peaked at 8.8 GiB and the build used the full 6 GiB
 of memory. With a 2 GiB memory limit, the same build was OOMKilled while
 linking.
 
-`writablePathSizeLimit` still applies to every sandbox runner in this Helm
-release. The larger home scratch holds the default uv, Cargo and pnpm caches;
-a run can instead put them under `/workspace`. Repeat the frozen installs and
-Rust build in a pod with these values, measure peak disk and memory use, and
-raise the limits if the completed build needs more room.
+The volume ceilings are independent upper bounds, and the 20Gi
+ephemeral-storage limit also caps their combined use, so a pod is evicted if any
+one volume passes its ceiling or the total passes 20Gi. The home volume holds
+the default uv, Cargo and pnpm caches; a run can instead put them under
+`/workspace`. Each factory sandbox requests 8Gi of memory, so the default
+`resourceQuota.hard.requestsMemory` of `8Gi` admits one at a time; raise
+`resourceQuota.hard.*` for concurrency. Sandboxes created before an upgrade keep
+the limits they started with.
+
+To change one field, override it on the profile in your Helm values. For
+example, to give the workspace 24Gi while keeping the rest of the profile:
+
+```yaml
+agentSandbox:
+  resourceProfiles:
+    factory:
+      workspaceSizeLimit: 24Gi
+```
+
+A per-agent `agentSandbox.workspaceSizeLimits.dark-factory` value takes
+precedence over the profile for the workspace only, and
+`curie cluster overrides dark-factory --runner-resources` still applies on top
+at claim time. Repeat the frozen installs and Rust build in a pod, measure peak
+disk and memory use, and raise the limits if the completed build needs more
+room.
 
 The $100 cap is an example for this three hour recipe. Tune it to the model
 and expected workload. The SDK applies it to each session; it does not meter

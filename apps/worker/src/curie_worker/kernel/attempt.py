@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -62,6 +63,7 @@ from ..sandbox.types import (
     MissingAgentPoolError,
     SandboxError,
     SandboxHandle,
+    SandboxTermination,
     UnschedulableClaimError,
 )
 from ..turn_progress import (
@@ -83,6 +85,7 @@ if TYPE_CHECKING:
 
 from . import (
     approval,
+    attachment_access,
     channel_read,
     claim,
     clock,
@@ -95,6 +98,49 @@ from . import (
     workspace,
 )
 from .log import logger
+
+# Tests replace these so the 10 s termination window does not wait on the wall clock.
+_pod_termination_clock = time.monotonic
+_pod_termination_sleep = asyncio.sleep
+
+
+async def _await_pod_termination(
+    read: Callable[[float], Awaitable[SandboxTermination | None]],
+    *,
+    window_s: float,
+    interval_s: float,
+    clock: Callable[[], float],
+    sleep: Callable[[float], Awaitable[None]],
+) -> SandboxTermination | None:
+    """Re-read until a termination or the window elapses.
+
+    A non-positive window is one read with the 3 s bound, matching the
+    historical single read. No read starts once ``window_s`` has passed.
+    A read that raises or times out is no evidence.
+    """
+
+    read_cap = constants.POD_TERMINATION_READ_TIMEOUT_S
+    if window_s <= 0:
+        try:
+            return await asyncio.wait_for(read(read_cap), read_cap)
+        except Exception:  # noqa: BLE001 - a failed diagnosis is no evidence
+            return None
+
+    started = clock()
+    while True:
+        elapsed = clock() - started
+        if elapsed >= window_s:
+            return None
+        timeout = min(read_cap, window_s - elapsed)
+        try:
+            termination = await asyncio.wait_for(read(timeout), timeout)
+        except Exception:  # noqa: BLE001 - a failed diagnosis is no evidence
+            termination = None
+        if termination is not None:
+            return termination
+        if clock() - started >= window_s:
+            return None
+        await sleep(interval_s)
 
 
 async def _attempt(
@@ -132,6 +178,8 @@ async def _attempt(
 
     record = memory._AttemptMemoryTurns(agent_id=agent_id)
     reset = constants._MEMORY_TURNS.set(record)
+    aa_record = attachment_access.AttemptAttachmentAccess()
+    aa_reset = constants._ATTACHMENT_ACCESS_ATTEMPT.set(aa_record)
     cr_record = channel_read._AttemptChannelRead()
     cr_reset = constants._CHANNEL_READ_TURNS.set(cr_record)
     try:
@@ -153,6 +201,7 @@ async def _attempt(
             channel_read_grant=channel_read_grant,
         )
     finally:
+        constants._ATTACHMENT_ACCESS_ATTEMPT.reset(aa_reset)
         constants._MEMORY_TURNS.reset(reset)
         constants._CHANNEL_READ_TURNS.reset(cr_reset)
         # The lease heartbeat is a child of this attempt: it stops here, so a
@@ -163,6 +212,7 @@ async def _attempt(
             self._settle_memory_turns(record)
         if cr_record.pending():
             self._settle_channel_read(cr_record)
+        await attachment_access.close_attachment_access(self, aa_record)
 
 
 async def _attempt_turn(
@@ -232,7 +282,16 @@ async def _attempt_turn(
         else channel_read._ChannelReadMint(qevent=qevent, grant=channel_read_grant)
     )
 
-    attachment_intent = self._attachments is not None and bool(qevent.attachments)
+    lazy = self._config.attachment_enabled and self._config.attachment_mode == "lazy"
+    attachment_turn = (
+        attachment_access.AttachmentAccessTurn(
+            str(agent_id), str(workspace_deployment_id), thread_key, qevent.event_id
+        )
+        if lazy and agent_id is not None and workspace_deployment_id is not None
+        else None
+    )
+    aa_turn = constants._ATTACHMENT_ACCESS_TURN.set(attachment_turn)
+    attachment_intent = not lazy and self._attachments is not None and bool(qevent.attachments)
 
     # Critical section: decide steer-vs-new-turn and, if new, open the turn so
     # it is active before we release the Valkey lock (rule 1: no two live
@@ -298,6 +357,48 @@ async def _attempt_turn(
                     )
                 verified_review = verified
                 review_receipt = verified.receipt
+            if lazy:
+                if (
+                    self._attachment_access is None
+                    or agent_id is None
+                    or workspace_deployment_id is None
+                ):
+                    from ..attachment_access_client import AttachmentAccessUnavailable
+
+                    raise AttachmentAccessUnavailable(
+                        "On-demand attachments require a bound agent and compatible API."
+                    )
+                from aci_protocol.turn import route_identity
+
+                from ..binding import binding_adapter_for_handle
+
+                inbound = qevent.reply_handle
+                refs = []
+                if qevent.attachments:
+                    if inbound is None:
+                        raise ValueError("attachment references require an inbound route")
+                    adapter = binding_adapter_for_handle(inbound)
+                    refs = [
+                        dict(
+                            file_id=ref.id,
+                            ordinal=index,
+                            name=ref.name,
+                            mime_type=ref.mime_type,
+                            size_bytes=ref.size_bytes,
+                            route_kind=inbound.kind,
+                            route_adapter=adapter,
+                            route_identity=route_identity(inbound.kind, adapter),
+                        )
+                        for index, ref in enumerate(qevent.attachments)
+                    ]
+                # Empty registration establishes the current catalog incarnation
+                # after a reset, without reading any provider body or adding files.
+                await self._attachment_access.register(
+                    agent_id=str(agent_id),
+                    thread_key=thread_key,
+                    event_id=qevent.event_id,
+                    refs=refs,
+                )
             if attachment_intent:
                 routed = await self._route_attachment_and_start(
                     qevent,
@@ -344,6 +445,7 @@ async def _attempt_turn(
             await close_routed_turn()
             raise
         finally:
+            constants._ATTACHMENT_ACCESS_TURN.reset(aa_turn)
             constants._MEMORY_MINT.reset(memory_mint)
             constants._CHANNEL_READ_MINT.reset(cr_mint)
     except CapacityExhaustedError as exc:
@@ -362,7 +464,7 @@ async def _attempt_turn(
             if run is not None and not run.started:
                 release_order()
                 try:
-                    await run.defer("capacity", capacity=True)
+                    await run.defer("capacity", capacity=True, start_failure_detail=None)
                 except WorkItemConflict as exc:
                     logger.info(
                         "work-item capacity defer refused for %s: %s",
@@ -604,7 +706,7 @@ async def _attempt_turn(
                     exc,
                 )
                 try:
-                    await run.defer("capacity", capacity=True)
+                    await run.defer("capacity", capacity=True, start_failure_detail=None)
                 except WorkItemConflict as conflict:
                     logger.info(
                         "work-item capacity defer refused for %s: %s",
@@ -732,6 +834,7 @@ async def _attempt_turn(
                 ),
                 memory_grant=memory_grant,
                 channel_read_grant=channel_read_grant,
+                attachment_turn=attachment_turn,
             )
         outcome.workspace_inferred_repo = inferred
         if verified_review is not None:
@@ -976,23 +1079,30 @@ async def _consume(
         else:
             classification = "runner-error"
             if stream_reading and isinstance(exc, aiohttp.ClientError):
-                try:
-                    termination = await asyncio.wait_for(
-                        asyncio.to_thread(
-                            self._substrate.pod_termination,
-                            handle,
-                            since=stream_started_at,
-                        ),
-                        timeout=3.0,
+
+                async def _read_termination(timeout_s: float) -> SandboxTermination | None:
+                    # The substrate keeps its own Kubernetes request budget.
+                    # ``timeout_s`` is this read's wait bound, observed by tests.
+                    del timeout_s
+                    return await asyncio.to_thread(
+                        self._substrate.pod_termination,
+                        handle,
+                        since=stream_started_at,
                     )
-                except Exception:  # noqa: BLE001 - broad catch kept at a failure boundary
-                    # Diagnosis is best effort; the original stream warning
-                    # above remains the operator record of this failure.
-                    pass
-                else:
-                    if termination is not None:
-                        classification = "sandbox-terminated"
-                        acc.error_message = failures._sandbox_termination_detail(termination)
+
+                termination = await _await_pod_termination(
+                    _read_termination,
+                    window_s=constants.POD_TERMINATION_WAIT_S,
+                    interval_s=constants.POD_TERMINATION_INTERVAL_S,
+                    clock=_pod_termination_clock,
+                    sleep=_pod_termination_sleep,
+                )
+                if termination is not None:
+                    classification = "sandbox-terminated"
+                    acc.error_message = failures._sandbox_termination_detail(termination)
+                    termination_carry = constants._SANDBOX_TERMINATION_CARRY.get()
+                    if termination_carry is not None:
+                        termination_carry.termination = termination
         return failures.TurnOutcome(
             terminal_ok=False,
             saw_side_effect=acc.saw_side_effect,

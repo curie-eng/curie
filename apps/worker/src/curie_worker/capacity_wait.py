@@ -23,6 +23,7 @@ WAIT_REPLY_REF_FIELD = "curie_capacity_wait_reply_ref"
 WAIT_TERMINAL_ONLY_FIELD = "curie_capacity_wait_terminal_only"
 
 _NOTICE_RETRY_MS = 30_000
+_PARK_RETRY_MS = 5_000
 _NOTICE_LOCK_MS = 60_000
 _NOTICE_SEND_TIMEOUT_S = 30.0
 _BATCH = 64
@@ -127,18 +128,28 @@ local first = tonumber(redis.call('HGET', record, 'first_wait_ms')) or now
 local deadline = tonumber(redis.call('HGET', record, 'deadline_ms')) or (now + budget_ms)
 local deferrals = tonumber(redis.call('HGET', record, 'deferrals')) or 0
 deferrals = deferrals + 1
-local delay = math.min(120000, 10000 * math.pow(2, math.min(deferrals - 1, 7)))
-local next_due = math.min(deadline, now + delay)
+local retry_ms = tonumber(ARGV[12])
+local next_due = math.min(deadline, now + retry_ms)
 local retained_until = deadline + retention_ms
+local grant_confirmed = redis.call('HGET', record, 'grant_confirmed') == '1'
+local grant_unknown = redis.call('HGET', record, 'grant_unknown') == '1'
+local notice_delivered = redis.call('HGET', record, 'notice_pending') == '0'
+local suppress_notice = state and notice_delivered and (not grant_confirmed) and (not grant_unknown)
+local notice_flag = '0'
+if not suppress_notice then notice_flag = '1' end
 if not state then redis.call('HSET', record, 'fields', payload) end
 redis.call('HSET', record,
   'state', 'waiting', 'generation', generation, 'first_wait_ms', first,
   'deadline_ms', deadline, 'due_ms', next_due, 'deferrals', deferrals,
-  'cause', '', 'notice_pending', '1')
+  'cause', '', 'notice_pending', notice_flag)
 redis.call('PEXPIREAT', record, retained_until)
 redis.call('ZADD', due, next_due, ARGV[11])
 redis.call('ZADD', waiting, retained_until, ARGV[11])
-redis.call('ZADD', notices, now, ARGV[11])
+if suppress_notice then
+  redis.call('ZREM', notices, ARGV[11])
+else
+  redis.call('ZADD', notices, now, ARGV[11])
+end
 redis.call('ZREM', active, ARGV[11])
 redis.call('ZREM', flight, ARGV[11])
 redis.call('XACK', stream, group, entry)
@@ -549,7 +560,7 @@ class CapacityWaitStore:
             lease.owner, str(lease.generation), fields.get(WAIT_GENERATION_FIELD, ""),
             json.dumps(fields, separators=(",", ":")),
             str(int(self._config.capacity_wait_budget_s * 1000)),
-            str(self._retention_ms), event_id,
+            str(self._retention_ms), event_id, str(_PARK_RETRY_MS),
         )
         if int(raw[0]) != 1:
             raise CapacityWaitRefused(str(raw[1]))

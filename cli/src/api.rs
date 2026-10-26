@@ -9,11 +9,12 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::api_requests::{
-    ActionUndo, AgentCreate, AgentScheduleCancel, AgentScheduleRevert, AgentScheduleUpdate,
-    AgentUpdate, ApprovalPrincipalMint, ApprovalRecover, ApprovalResolve, ChannelBindingWrite,
-    ChannelCallersWrite, ChannelTokenRequest, ConsoleLoginCodeMint, DeploymentCreate,
-    EvalTriggerRequest, LearnedSkillRevert, MemoryEntryCreate, MemoryGuidanceIn, MemoryLifecycleIn,
-    MemoryRevertIn, RemediationBreakerClose, RemediationPolicyMutation, RemediationPolicyWrite,
+    ActionUndo, AgentAccessPolicyWrite, AgentCreate, AgentScheduleCancel, AgentScheduleRevert,
+    AgentScheduleUpdate, AgentUpdate, ApprovalPrincipalMint, ApprovalRecover, ApprovalResolve,
+    ChannelBindingWrite, ChannelCallersWrite, ChannelTokenRequest, ConsoleLoginCodeMint,
+    DeploymentCreate, DirectoryConfigIn, DirectoryNamespaceIn, DirectoryTeamIn, EvalTriggerRequest,
+    LearnedSkillRevert, MemoryEntryCreate, MemoryGuidanceIn, MemoryLifecycleIn, MemoryRevertIn,
+    RemediationBreakerClose, RemediationPolicyMutation, RemediationPolicyWrite,
     RemediationQualificationWrite, RemediationVerifierRunStart, ResolveTargetRequest,
     RoutingCheckRequest, VersionCreate,
 };
@@ -280,6 +281,18 @@ impl ChannelBinding {
     }
 }
 
+/// An agent's invocation and approver teams (`AgentAccessPolicyOut`, ADR 0220).
+/// Version 0 with no `updated_at` means no policy was ever set.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AgentAccessPolicy {
+    pub agent_id: String,
+    pub tenant_id: String,
+    pub invocation_team_id: Option<String>,
+    pub approver_team_id: Option<String>,
+    pub version: u64,
+    pub updated_at: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Agent {
     pub id: String,
@@ -349,27 +362,27 @@ pub struct Agent {
     /// as off, which is what it does.
     #[serde(default)]
     pub memory_writes: bool,
-    /// Whether this agent opted in to agent-wide learning (ADR 0239): the
+    /// Whether this agent opted in to agent-wide learning (ADR 0249): the
     /// learning default guidance and standing instructions. Independent of
     /// `memory_writes`. Absent deserializes as `None`: the platform did not
     /// report it, and consumers refuse rather than assume it is off.
     #[serde(default)]
     pub agent_wide_learning: Option<bool>,
-    /// Whether the agent may create and change its own schedules (ADR 0238).
+    /// Whether the agent may create and change its own schedules (ADR 0248).
     /// Defaulted to off, the `AgentOut` default.
     #[serde(default)]
     pub agent_schedules: bool,
-    /// The zone a schedule without its own timezone runs in (ADR 0238).
+    /// The zone a schedule without its own timezone runs in (ADR 0248).
     #[serde(default = "default_schedule_timezone")]
     pub schedule_timezone: String,
-    /// How many active schedules the agent may hold (ADR 0238).
+    /// How many active schedules the agent may hold (ADR 0248).
     #[serde(default = "default_schedule_max_active")]
     pub schedule_max_active: u32,
-    /// The shortest cron interval the agent may schedule, in minutes (ADR 0238).
+    /// The shortest cron interval the agent may schedule, in minutes (ADR 0248).
     #[serde(default = "default_schedule_min_interval_minutes")]
     pub schedule_min_interval_minutes: u32,
     /// Whether the runner loads and may edit this agent's learned skills
-    /// (ADR 0237). Defaulted so an older platform reads as off.
+    /// (ADR 0247). Defaulted so an older platform reads as off.
     #[serde(default)]
     pub learned_skills: bool,
     /// Who resolves publication approval. Missing responses stay on human approval.
@@ -442,7 +455,7 @@ fn default_publication_policy_version() -> i64 {
     1
 }
 
-// The `AgentOut` defaults for the ADR 0238 schedule settings.
+// The `AgentOut` defaults for the ADR 0248 schedule settings.
 fn default_schedule_timezone() -> String {
     "UTC".to_string()
 }
@@ -455,7 +468,7 @@ fn default_schedule_min_interval_minutes() -> u32 {
     15
 }
 
-/// An agent's stored ADR 0238 schedule settings, as `<tier> overrides` and the
+/// An agent's stored ADR 0248 schedule settings, as `<tier> overrides` and the
 /// `<tier> schedules` policy setters print them.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct AgentSchedulePolicy {
@@ -846,13 +859,13 @@ pub struct ForgeCredentialHealthReport {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ScheduleList {
     pub schedules: Vec<AgentSchedules>,
-    /// Agent-created and operator-created schedules (ADR 0238), kept as the
+    /// Agent-created and operator-created schedules (ADR 0248), kept as the
     /// API sent them. Required: a list without it is refused, not read as none.
     pub agent_schedules: Vec<serde_json::Value>,
 }
 
 /// `GET /agents/{id}/schedules/{id}/revisions` (`AgentScheduleRevisions`,
-/// ADR 0238). Only the object form is accepted; each revision is kept as the
+/// ADR 0248). Only the object form is accepted; each revision is kept as the
 /// API sent it.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AgentScheduleRevisions {
@@ -899,7 +912,7 @@ pub struct MemoryEntry {
     pub provenance: MemoryProvenance,
 }
 
-/// One learned skill (`LearnedSkillOut`, ADR 0237). `author` and
+/// One learned skill (`LearnedSkillOut`, ADR 0247). `author` and
 /// `conversation` come from the head's latest revision.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LearnedSkill {
@@ -961,7 +974,7 @@ pub struct StateEntry {
 }
 
 /// One canonical memory head as the typed memory routes return it
-/// (`MemoryRecordOut`, ADR 0239). Serialized back verbatim as the archive and
+/// (`MemoryRecordOut`, ADR 0249). Serialized back verbatim as the archive and
 /// restore result, so the CLI cannot drop a field by hand-picking one.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MemoryRecord {
@@ -1043,7 +1056,7 @@ impl<'a> MemoryScope<'a> {
 /// An agent's effective memory guidance (`MemoryGuidanceOut`, #1461): the
 /// text the runner shows beside its memory tools, and whether it is the
 /// platform `default`, the `learning_default` for an agent that opted in to
-/// agent-wide learning (ADR 0239), or `operator`-set.
+/// agent-wide learning (ADR 0249), or `operator`-set.
 #[derive(Debug, Clone, Deserialize)]
 pub struct MemoryGuidance {
     pub text: String,
@@ -1454,6 +1467,21 @@ pub struct RemediationBreaker {
     pub closed_by: Option<String>,
     pub close_reason: Option<String>,
 }
+
+// @spec AUTOMATED-REMEDIATION-3
+/// The header binding (`PUT`) and arming a remediation policy carry the
+/// remediation authority in (ADR 0231). Disarm, delete and breaker close never
+/// send it.
+pub const REMEDIATION_AUTHORITY_HEADER: &str = "X-Curie-Remediation-Authority";
+
+// @spec AUTOMATED-REMEDIATION-3
+/// Where the operator finds the remediation authority (ADR 0231): the value the
+/// API holds as `CURIE_REMEDIATION_AUTHORITY_KEY`.
+pub const REMEDIATION_AUTHORITY_FIX: &str =
+    "export the API's remediation authority as CURIE_REMEDIATION_AUTHORITY_KEY: in a cluster \
+     it is the remediationAuthorityKey entry of the release's <release>-secrets Secret \
+     (chart value api.remediationAuthorityKey); for the local stack it is \
+     CURIE_REMEDIATION_AUTHORITY_KEY in its .env (default curie-dev-remediation-authority)";
 
 // @spec AUTOMATED-REMEDIATION-3 @spec AUTOMATED-REMEDIATION-20 @spec AUTOMATED-REMEDIATION-22
 /// What a `404` from a remediation route tells the operator to check.
@@ -2451,7 +2479,7 @@ pub(crate) fn memory_state_url(
     Ok(url)
 }
 
-/// Build the typed memory detail route (ADR 0239):
+/// Build the typed memory detail route (ADR 0249):
 /// `/agents/{id}/state/_memory/entries/{fact_id}?scope=agent|channel` plus the
 /// exact `channel_kind` and `channel_address` for channel scope. Identities
 /// travel as path segments and query values, never interpolated.
@@ -2487,6 +2515,77 @@ pub(crate) fn memory_entry_url(
 }
 
 impl ApiClient {
+    /// Read a route selected by the directory verb's bounded resource inventory.
+    pub async fn directory_admin_read(&self, path: &str) -> Result<serde_json::Value> {
+        let response = self
+            .http
+            .get(format!("{}{path}", self.base_url))
+            .header("X-API-Key", &self.api_key)
+            .send()
+            .await
+            .context("directory administration request")?;
+        Self::expect_ok(response, "directory administration")
+            .await?
+            .json()
+            .await
+            .context("decoding directory administration response")
+    }
+
+    pub async fn put_directory_config(
+        &self,
+        tenant_id: &str,
+        body: &DirectoryConfigIn,
+    ) -> Result<serde_json::Value> {
+        let response = self
+            .http
+            .put(format!("{}/directory/config/{tenant_id}", self.base_url))
+            .header("X-API-Key", &self.api_key)
+            .json::<DirectoryConfigIn>(body)
+            .send()
+            .await
+            .context("directory configuration request")?;
+        Self::expect_ok(response, "directory configuration")
+            .await?
+            .json()
+            .await
+            .context("decoding directory configuration response")
+    }
+
+    pub async fn create_directory_namespace(
+        &self,
+        body: &DirectoryNamespaceIn,
+    ) -> Result<serde_json::Value> {
+        let response = self
+            .http
+            .post(format!("{}/directory/namespaces", self.base_url))
+            .header("X-API-Key", &self.api_key)
+            .json::<DirectoryNamespaceIn>(body)
+            .send()
+            .await
+            .context("directory namespace request")?;
+        Self::expect_ok(response, "directory namespace")
+            .await?
+            .json()
+            .await
+            .context("decoding directory namespace response")
+    }
+
+    pub async fn create_directory_team(&self, body: &DirectoryTeamIn) -> Result<serde_json::Value> {
+        let response = self
+            .http
+            .post(format!("{}/directory/teams", self.base_url))
+            .header("X-API-Key", &self.api_key)
+            .json::<DirectoryTeamIn>(body)
+            .send()
+            .await
+            .context("directory team request")?;
+        Self::expect_ok(response, "directory team")
+            .await?
+            .json()
+            .await
+            .context("decoding directory team response")
+    }
+
     /// The server caps `/approvals` results at this many rows
     /// (`apps/api/.../routers/approvals.py`: `min(max(limit, 1), 200)`); the CLI
     /// requests exactly the cap so hitting it is how the caller detects possible
@@ -3080,6 +3179,47 @@ impl ApiClient {
             .json()
             .await
             .context("decoding the agent after the caller list write")
+    }
+
+    /// Read an agent's access policy: `GET /agents/{id}/access-policy`
+    /// (ADR 0220). An agent with no policy answers version 0.
+    pub async fn get_agent_access_policy(&self, agent_id: &str) -> Result<AgentAccessPolicy> {
+        let resp = self
+            .http
+            .get(format!("{}/agents/{agent_id}/access-policy", self.base_url))
+            .header("X-API-Key", &self.api_key)
+            .send()
+            .await
+            .context("GET /agents/{id}/access-policy")?;
+        Self::expect_ok(resp, "reading the agent's access policy")
+            .await?
+            .json()
+            .await
+            .context("decoding the agent's access policy")
+    }
+
+    /// Replace an agent's access policy: `PUT /agents/{id}/access-policy`
+    /// (ADR 0220). The API refuses with 409 when `expected_version` is not the
+    /// stored version, and with 422 when a team is not an IdP group team of
+    /// the agent's tenant; it answers the policy as stored.
+    pub async fn put_agent_access_policy(
+        &self,
+        agent_id: &str,
+        body: &AgentAccessPolicyWrite,
+    ) -> Result<AgentAccessPolicy> {
+        let resp = self
+            .http
+            .put(format!("{}/agents/{agent_id}/access-policy", self.base_url))
+            .header("X-API-Key", &self.api_key)
+            .json::<AgentAccessPolicyWrite>(body)
+            .send()
+            .await
+            .context("PUT /agents/{id}/access-policy")?;
+        Self::expect_ok(resp, "setting the agent's access policy")
+            .await?
+            .json()
+            .await
+            .context("decoding the agent's access policy")
     }
 
     /// Mint a scoped `chn` token for one binding (`POST /channels/token`).
@@ -3917,7 +4057,7 @@ impl ApiClient {
             .context("decoding schedule list")
     }
 
-    /// `GET /agents/{agent_id}/schedules/{schedule_id}` (ADR 0238), as sent.
+    /// `GET /agents/{agent_id}/schedules/{schedule_id}` (ADR 0248), as sent.
     pub async fn get_agent_schedule(
         &self,
         agent_id: &str,
@@ -4173,7 +4313,7 @@ impl ApiClient {
         Ok(())
     }
 
-    /// A typed memory route's refusal (ADR 0239). A 409 means the head moved
+    /// A typed memory route's refusal (ADR 0249). A 409 means the head moved
     /// after the CLI read it: that is reported as a stale version and never
     /// retried, because a retry would overwrite a change nobody reviewed.
     async fn expect_memory_ok(resp: reqwest::Response, what: &str) -> Result<reqwest::Response> {
@@ -4787,14 +4927,15 @@ impl ApiClient {
 
     // @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-3
     /// Bind or replace a hook's policy: `PUT .../remediation-policy` with the
-    /// CAS pair and the document, on the platform key and the operator
-    /// principal.
+    /// CAS pair and the document, on the platform key, the operator principal
+    /// and the ADR 0231 remediation authority.
     pub async fn put_remediation_policy(
         &self,
         agent_id: &str,
         hook: &str,
         body: &RemediationPolicyWrite,
         principal_token: &str,
+        authority: &str,
     ) -> Result<RemediationPolicyGeneration> {
         let resp = self
             .send_request(
@@ -4805,6 +4946,7 @@ impl ApiClient {
                     ))
                     .header("X-API-Key", &self.api_key)
                     .header("X-Curie-Approval-Principal", principal_token)
+                    .header(REMEDIATION_AUTHORITY_HEADER, authority)
                     .json::<RemediationPolicyWrite>(body),
                 "PUT /agents/{id}/hooks/{hook}/remediation-policy",
             )
@@ -4817,13 +4959,15 @@ impl ApiClient {
     }
 
     // @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-3
-    /// Arm the current policy: `POST .../remediation-policy/arm`.
+    /// Arm the current policy: `POST .../remediation-policy/arm`, which also
+    /// needs the ADR 0231 remediation authority.
     pub async fn arm_remediation_policy(
         &self,
         agent_id: &str,
         hook: &str,
         body: &RemediationPolicyMutation,
         principal_token: &str,
+        authority: &str,
     ) -> Result<RemediationPolicyGeneration> {
         let resp = self
             .send_request(
@@ -4834,6 +4978,7 @@ impl ApiClient {
                     ))
                     .header("X-API-Key", &self.api_key)
                     .header("X-Curie-Approval-Principal", principal_token)
+                    .header(REMEDIATION_AUTHORITY_HEADER, authority)
                     .json::<RemediationPolicyMutation>(body),
                 "POST /agents/{id}/hooks/{hook}/remediation-policy/arm",
             )
@@ -5179,6 +5324,9 @@ impl ApiClient {
                 )
             }
             (StatusCode::NOT_FOUND, _) => CliError::failure(message).with_fix(not_found_fix),
+            (StatusCode::FORBIDDEN, Some("remediation_authority_required")) => {
+                CliError::failure(message).with_fix(REMEDIATION_AUTHORITY_FIX)
+            }
             (StatusCode::FORBIDDEN, _) => CliError::failure(message).with_fix(
                 "export an operator principal as CURIE_APPROVAL_PRINCIPAL_TOKEN (mint one with \
                  `curie <local|cluster> approvals <AGENT> --mint-operator-principal <SUBJECT>`)",

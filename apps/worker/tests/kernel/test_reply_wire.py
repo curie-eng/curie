@@ -431,8 +431,8 @@ def test_the_already_done_skip_still_lowers_the_shimmer(make_harness) -> None:
 def test_the_prior_side_effect_escalate_emits_through_the_reply_handle_route(
     make_harness,
 ) -> None:
-    # T-B15(b). This is the "a prior attempt started an action before the worker
-    # restarted" escalation -- the one message a human most needs to see -- and
+    # T-B15(b). This is the "a prior attempt may already have executed an action"
+    # escalation -- the one message a human most needs to see -- and
     # revision 3's shape suppressed it. It runs BEFORE binding resolution, so its
     # route comes from the server-minted ``reply_handle`` (EB-B6's trust
     # argument: after phase 2 no adapter writes to the stream at all).
@@ -464,7 +464,7 @@ def test_the_prior_side_effect_escalate_emits_through_the_reply_handle_route(
             await h.kernel.process_event(ev)
 
             assert len(h.sink.updates) == 1
-            assert "prior attempt started an action" in h.sink.updates[0][2]
+            assert "prior attempt may already have executed an action" in h.sink.updates[0][2]
             # The route is the reply handle's, verbatim -- not a lookup, not a
             # default, and never the Slack credential standing in for a missing
             # adapter (the second mutation named in AC10f).

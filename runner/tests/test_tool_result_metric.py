@@ -405,7 +405,7 @@ def test_platform_tools_count_as_platform_and_log_nothing(
 def test_learned_skills_tools_count_as_platform_and_log_nothing(
     reader: InMemoryMetricReader, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Curie's own learned-skills tools (ADR 0237) are not connectors.
+    """Curie's own learned-skills tools (ADR 0247) are not connectors.
 
     Every tool of the ``learned_skills`` server, a failed write included, is
     platform origin and logs no connector WARNING.
