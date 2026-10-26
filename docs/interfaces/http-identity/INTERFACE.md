@@ -61,6 +61,9 @@ retries, 64 KiB response bound, no redirects and no positive core identity
 cache required by
 [ADR 0246](../../adr/0246-common-admission-resolves-an-optional-http-identity-before-authorized-enqueue.md).
 Those are transport obligations, not runtime behavior implemented by these artifacts.
+The [HTTP identity transport v1 specification](../../superpowers/specs/2026-10-23-http-identity-transport-v1.md)
+defines the standalone bounded client, verified trust, identity-only streaming
+and cancellation/drain contract; its publication does not activate a consumer.
 
 ## Completion boundary
 
