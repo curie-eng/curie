@@ -906,3 +906,87 @@ def test_expired_http_wait_delivery_settles_without_an_unverified_reply(make_har
             assert retained.expiry_notice_pending and retained.reply_ref is None
             assert h.runner.opened == [] and h.fake_k8s.claim_envs == []
     asyncio.run(run())
+
+
+def test_completed_workspace_failure_retries_with_current_authority_in_the_same_delivery(
+    make_harness, tmp_path, monkeypatch: pytest.MonkeyPatch,
+):
+    """@spec HTTP-INVOCATION-EXECUTION-18."""
+    async def run() -> None:
+        """@spec HTTP-INVOCATION-EXECUTION-18."""
+        binding, core = Binding(), Core()
+        binding.resolved.deployment_id = uuid.uuid4()
+        async with make_harness(
+            binding=binding, identity_authority=core, max_attempts=2,
+        ) as h:
+            preparer, _commands, _objects = workspace_tests._preparer(workspace_module, tmp_path)
+            actual_prepare, actual_redeem = preparer.prepare, preparer.credentials.redeem
+            preparations = 0
+
+            def redeem(deployment: Any, _thread: str) -> Any:
+                """@spec HTTP-INVOCATION-EXECUTION-18."""
+                return actual_redeem(deployment, "1700000000.000100")
+
+            def select(*_args: Any) -> str:
+                """@spec HTTP-INVOCATION-EXECUTION-18."""
+                return "acme-corp/acme-bot"
+
+            def fail_first_prepare(**kwargs: Any) -> Any:
+                """@spec HTTP-INVOCATION-EXECUTION-18: synthetic external transient failure."""
+                nonlocal preparations
+                preparations += 1
+                if preparations == 1:
+                    raise workspace_module.WorkspacePreparationError(
+                        "clone", "synthetic first-attempt preparation failure",
+                    )
+                return actual_prepare(**kwargs)
+
+            preparer.credentials.redeem, preparer.credentials.select = redeem, select
+            preparer.prepare = fail_first_prepare
+            coordinator = workspace_module.WorkspaceClaimCoordinator(
+                preparer=preparer, substrate=h.substrate,
+            )
+            h.kernel._workspace = coordinator
+            process_calls, returned = [], []
+            actual_process = h.kernel.process_event
+
+            async def observe_process(event: Any, **kwargs: Any) -> None:
+                """@spec HTTP-INVOCATION-EXECUTION-18: delegate the complete actual lifecycle."""
+                process_calls.append(event.event_id)
+                await actual_process(event, **kwargs)
+                returned.append(event.event_id)
+
+            monkeypatch.setattr(h.kernel, "process_event", observe_process)
+            leases = DeliveryLeaseStore(h.async_redis, h.config)
+            consumer = Consumer(
+                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=leases,
+            )
+            event = qevent("Use https://github.com/acme-corp/acme-bot", thread="retry-workspace")
+            fields = {"payload": event.model_dump_json(), "curie_identity_context_v1": CAPSULE}
+            entry_id, observed = await pending_entry(h, consumer, fields)
+            try:
+                initial = await h.async_redis.xpending_range(
+                    h.config.stream, h.config.consumer_group, entry_id, entry_id, 1,
+                )
+                assert initial[0]["times_delivered"] == 1
+                await consumer._handle(entry_id, observed)
+                assert h.runner.opened == [event.text], "same-delivery workspace retry never ran"
+                assert process_calls == returned == [event.event_id]
+                assert preparations == 2 and len(h.fake_k8s.claim_envs) == 1
+                checks = [
+                    request for request in core.requests if request.stage == "claim_or_resume"
+                ]
+                assert len(checks) >= 2 and len({r.request_id for r in checks}) == len(checks)
+                assert all(
+                    r.event_id == event.event_id and r.context == CAPSULE
+                    and r.payload_sha256 == hashlib.sha256(fields["payload"].encode()).hexdigest()
+                    for r in checks
+                )
+                assert await h.async_redis.exists(h.config.done_key(event.event_id))
+                assert (
+                    await h.async_redis.xpending(h.config.stream, h.config.consumer_group)
+                )["pending"] == 0
+            finally:
+                await asyncio.to_thread(coordinator.release, "slack:C1:retry-workspace")
+                await asyncio.to_thread(h.substrate.release, "slack:C1:retry-workspace")
+    asyncio.run(run())
