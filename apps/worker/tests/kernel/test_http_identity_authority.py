@@ -22,12 +22,13 @@ from curie_worker.binding import HttpIdentityBinding
 from curie_worker.capacity_wait import WAIT_REPLY_REF_FIELD
 from curie_worker.consumer import Consumer
 from curie_worker.delivery_lease import DeliveryLeaseStore
-from curie_worker.identity_authority import TurnAuthorityUnavailable
+from curie_worker.identity_authority import HttpTurnAuthorityClient, TurnAuthorityUnavailable
 from curie_worker.kernel.core import Kernel
 from curie_worker.sandbox import SuspendedThreadError
 
 from .. import test_workspace as workspace_tests
 from ..queue_fixtures import qevent, wait_until
+from ..test_sibling_wiring import built as built
 from .test_attachment_claim import _FakeAttachmentLane, _WorkspaceProbe
 from .test_binding_integration import StubBinding, _resolved
 
@@ -615,3 +616,43 @@ def test_unavailable_http_delivery_stays_pending_until_the_existing_cap_dead_let
             finally:
                 await h.async_redis.delete(dead_stream)
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("defect", ["non-ascii", "oversized", "missing-digest", "invalid-digest"])
+def test_invalid_recognized_carrier_is_terminal_before_any_execution_effect(make_harness, defect):
+    """@spec HTTP-INVOCATION-EXECUTION-18: malformed recognized work cannot become legacy."""
+    require_execution_interface()
+    async def run() -> None:
+        """@spec HTTP-INVOCATION-EXECUTION-18."""
+        binding, core = Binding(), Core()
+        context, digest = CAPSULE, ORIGINAL_HASH
+        if defect == "non-ascii":
+            context = "curie-context-v1.é." + "A" * 43
+        elif defect == "oversized":
+            context = CAPSULE + "A" * (16385 - len(CAPSULE))
+            assert len(context) == 16385
+        elif defect == "missing-digest":
+            digest = None
+        else:
+            digest = "A" * 64
+        async with make_harness(binding=binding, identity_authority=core) as h:
+            event = qevent("invalid recognized carrier")
+            await process(h, event, context=context, digest=digest)
+            assert binding.boots == [] and binding.mints == []
+            assert h.fake_k8s.claim_envs == [] and h.runner.opened == [] and h.runner.steers == []
+            assert core.requests == [] and h.sink.events == []
+            assert await h.async_redis.exists(h.config.done_key(event.event_id))
+    asyncio.run(run())
+
+
+def test_normal_worker_factory_supplies_the_current_authority_client(built):
+    """@spec HTTP-INVOCATION-EXECUTION-18: actual build/Kernel, blocked external constructors."""
+    kwargs = built(
+        {}, internal_worker_token="synthetic-current-check-worker-token",
+        api_base_url="http://synthetic-core.invalid",
+        database_url="postgresql+asyncpg://synthetic:synthetic@127.0.0.1:1/synthetic",
+        valkey_host="127.0.0.1", valkey_port=1,
+    )
+    assert isinstance(kwargs.get("identity_authority"), HttpTurnAuthorityClient), (
+        "normal worker build leaves HTTP current authority unwired"
+    )
