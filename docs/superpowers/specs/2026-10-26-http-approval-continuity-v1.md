@@ -1,0 +1,169 @@
+# HTTP approval continuity v1
+
+This realizing contract implements Accepted [ADR 0246](../../adr/0246-common-admission-resolves-an-optional-http-identity-before-authorized-enqueue.md), including independent answering-actor authority, and [HTTP invocation execution](2026-10-26-http-invocation-execution-v1.md) criteria 5, 8 and 10. It completes the selected Slack session-approval path; it does not turn invocation permission into approval permission. Existing local-mode behavior and frozen ACI models remain unchanged. The specification precedes independent failing tests and implementation.
+
+## 1. Ownership and classification
+
+<!-- @spec HTTP-APPROVAL-CONTINUITY-1 -->
+
+Use existing Approval persistence/CAS/audit, approval principal authentication, role-policy/lifecycle owners, worker ApprovalClient and pause path, ResumeQueue, expiry and resume reconciliation. Add no admission ledger, management service, second Socket Mode owner or worker signing key. Worker imports only supported internal DTOs. API owns all continuity verification and sealing.
+
+A non-null recognized identity capsule always selects core verification, including after an authority-mode change. Null provenance does not establish legacy authority: classify known current tenant/agent and original reply binding through authoritative configuration before every create, resolve, recovery, expiry, grant or resume publication. An adopted HTTP binding with missing provenance refuses. Ambiguous scope, malformed configuration or unavailable classification cannot fall back. Public creation checks both the supplied agent and the route-selected binding, refusing disagreement; an existing dedupe row additionally supplies authoritative stored scope and provenance. Null agent_id or changed request routing cannot hide an existing HTTP approval. A genuinely generic no-agent/unbound legacy topology remains unchanged and explicitly unqualified for an HTTP installation, as in invocation criterion18; do not fabricate positive local authority or ban that shipped generic path. Forged unbound routes cannot acquire an HTTP grant because creation, stored-record classification and current binding/resume checks still require matching supported scope. Preserve genuine unselected local requests.
+
+This version supports purpose=session, original Slack invocation and Slack answering interactions with qualified registrations. Selected HTTP publication, remediation, undo/executor, GitHub, operator/system approval grants, other channel answers and unqualified console answers refuse before insertion, resolution or grant; their existing local paths remain. Expiry is a non-grant system transition explicitly supported below. These are bounded realization surfaces, not replacement business policies or permanent removal of the other ADR 0246 paths.
+
+## 2. Shared types and bounds
+
+<!-- @spec HTTP-APPROVAL-CONTINUITY-2 -->
+
+Publish types in curie_internal.identity_approval. New models are strict, frozen, extra-forbid, revalidate_instances=always, with actual-type validation and forbidden boolean conversion. Every field is required, including nullable fields. Reuse identity_context Version, CanonicalUUID, Generation, KeyId, Digest, Identifier, Conversation, ContextNamespaceV1, ContextCanonicalV1 and ContextPrincipalV1 exactly; never coerce booleans to numbers or strings. TurnAuthorityScopeV1 remains exactly four fields.
+
+Context strings are actual nonempty ASCII, at most16,384 bytes. Original payload is an actual UTF-8 string, 1..262,144 encoded bytes, retaining exact whitespace and key order. Internal creation bodies are bounded to2,097,152 bytes before JSON parsing. All new raw JSON boundaries reject duplicate keys, nonfinite numbers and invalid UTF-8 before typed parsing. Responses and answer bodies are bounded to65,536 bytes. No context, original payload, signed actor proof or secret appears in logs, exception text, model fields or public approval DTOs.
+
+Canonical digest encoding is UTF-8 JSON with sorted keys, compact separators, ensure_ascii=False and allow_nan=False; arrays keep order. UUIDs use canonical lowercase strings. Stored datetime values use UTC with six fractional digits and Z; existing naive database timestamps mean UTC. No normalization of native identifiers.
+
+## 3. Internal creation transport
+
+<!-- @spec HTTP-APPROVAL-CONTINUITY-3 -->
+
+Exact DTOs:
+
+| Type | Fields |
+|---|---|
+| ApprovalCreationIdentityV1 | schema_version=1, context (bounded ASCII token), payload (bounded exact UTF-8 string), scope (TurnAuthorityScopeV1) |
+| ApprovalCreationRequestV1 | schema_version=1, request_id (CanonicalUUID), approval (unchanged aci_protocol.ApprovalRequest), identity (ApprovalCreationIdentityV1) |
+| ApprovalCreationResponseV1 | schema_version=1, request_id (CanonicalUUID), id (CanonicalUUID), status (pending/approved/rejected/expired), duplicate (actual bool), requested_by (Identifier or null) |
+
+POST /v1/internal/identity/approvals uses require_internal_worker_token and Cache-Control:no-store. The internal credential permits authenticated creation transport, never attesting a human or supplying a signing key. A new row returns201/duplicate=false; an identical historical row returns200/duplicate=true and its actual status. Fixed errors:401 invalid credential,403 caller_not_allowed,409 approval_provenance_conflict or unsupported_approval,413 body_too_large,422 invalid_approval_context,503 authority_unavailable. Do not echo submitted values. Unsupported content never retries through public /approvals.
+
+ApprovalClient.create(request, *, budget_s=existing_default, identity:ApprovalCreationIdentityV1|None=None) retains its existing CreatedApproval result. With identity, use this endpoint and worker headers, a fresh request UUID, one attempt, no redirects and a total deadline min(5 seconds,budget_s) including receipt read/strict decoding; response request_id/status/duplicate must match the transport outcome. Cancellation propagates; malformed, mismatched and unknown outcomes are fixed unavailable. Later ordinary worker redelivery may retry the identical creation intent. Without identity preserve the existing legacy transport, subject to API classification. ACI ApprovalRequest receives no field.
+
+## 4. Exact original bytes and creation checks
+
+<!-- @spec HTTP-APPROVAL-CONTINUITY-4 -->
+
+The consumer passes original_payload alongside http_identity_context and original_payload_sha256 into the existing per-delivery carry. It is the exact stream payload before placeholder rewrites; its hash must equal the digest already carried. Capacity parking, reclaim and copying preserve it. It is private transport data, never a new QueuedTurn field. The live owning task supplies ApprovalCreationIdentityV1 immediately before creation; missing bytes, mismatched digest, missing scope or canceled ownership refuses before suspension/card publication. A resumed turn may suspend again using its exact current resume payload/context, while retaining the original invoker from verified provenance.
+
+Core verifies the incoming invocation or resume MAC and payload hash, scope and current authority. Incoming event_id must equal approval.dedupe_key. Parse the authenticated payload with the existing QueuedTurn parser; compare conversation_id, original wire author and immutable reply kind/channel/adapter/identity/endpoint to the creation request. For a resumed notification the wire author may be resolved_by/system; it never changes the capsule's original invoker. The stored reply_placeholder may be the worker's delivered reference, as the current pause contract requires; it grants no authority and cannot change the destination.
+
+Invocation provenance has no manifest approval-route name. Validate the requested route through the existing current agent route-binding owner, resolve its resolution target server-side, and compare card_channel; named missing/malformed routes refuse. Bind the selected route and target in the saved capsule. Do not claim the incoming invocation MAC attests a runner's proposed tool: effect scope remains the existing worker/runner gate contract, validated through its existing owners. No summary-prefix grant fallback for selected HTTP requests; permission gates require explicit granted_tool and non-null granted_arguments, where {} is valid. Policy gates keep existing manifest-authorized grantability; null granted_tool remains no grant.
+
+## 5. One private column and replay identity
+
+<!-- @spec HTTP-APPROVAL-CONTINUITY-5 -->
+
+Add nullable text Approval.identity_context with SQL NULL default and a check limiting non-null storage to16,384 bytes. Migration performs no backfill, authority conversion or status change. Public create/read/update schemas do not expose it. Legacy public creation refuses an adopted HTTP route rather than inserting null. No HTTP or worker endpoint accepts an editable stored capsule.
+
+Preallocate the Approval UUID inside the API owner, insert through existing CRUD, flush server timestamps, seal the row and positively commit both together. creation_request_sha256 hashes the complete validated ApprovalRequest model_dump(mode=json), including nullable/default values; exclude request_id and transport identity. source_context_sha256 hashes exact incoming token ASCII; source_payload_sha256 hashes exact incoming payload. These stable values identify retries even after the row has resolved. Equality also requires incoming scope/event/conversation and verified original association. Compare on both the initial lookup and a uniqueness-race reread. A conflict never replaces the stored capsule or row. An identical retry returns the historical result without reasserting current permission or creating another card/approval.
+
+approval_record_sha256 hashes the canonical map of these existing row columns: id, agent_id, conversation_id, author, summary, reply_kind, reply_channel, reply_placeholder, reply_endpoint, reply_adapter, reply_identity, route, card_channel, dedupe_key, status, expires_at, resolved_by, resolution_note, created_at, resolved_at, gate_kind, granted_tool, granted_arguments, purpose, policy_identity, policy_version. Exclude identity_context, traceparent and resumed_at. Mutations to a protected column must reseal under the supported owner in the same transaction; old identity-repair/update paths cannot edit HTTP rows around this check.
+
+## 6. Flat sealed continuity format
+
+<!-- @spec HTTP-APPROVAL-CONTINUITY-6 -->
+
+Keep InvocationContextV1 and its event_id==original_event_id invariant unchanged. Add ApprovalContextV1, prefix curie-approval-context-v1, purpose="approval", and ResumeContextV1, prefix curie-resume-context-v1, purpose="resume". Use the existing API-only core keyring and HMAC-SHA256 algorithm with the entire distinct prefix in the MAC input. Reuse bounded canonical JSON/base64url parsing and constant-time MAC verification; reject cross-purpose tokens, unknown keys/generations and oversize envelopes before parsing. In curie_internal.identity_approval expose exactly seal_approval_context(value:ApprovalContextV1,keyring:IdentityKeyring)->str, open_approval_context(token:str,keyring:IdentityKeyring)->ApprovalContextV1|ContextRefusal, seal_resume_context(value:ResumeContextV1,keyring:IdentityKeyring)->str and open_resume_context(token:str,keyring:IdentityKeyring)->ResumeContextV1|ContextRefusal. Sealing validates/detaches the typed model and raises fixed ValueError("invalid_identity_context") for invalid inputs. Opening returns the existing ContextRefusal(code="invalid_identity_context") on ordinary validation/MAC failures. Maintain purpose/key ownership through a supported shared codec owner; no cross-module private-key-field access. Functions are purpose-specific, not a public signing endpoint or arbitrary-payload signer.
+
+Both models have exactly these fields (each name separated by commas denotes a separate required field):
+
+| Fields | Types |
+|---|---|
+| schema_version, purpose, key_id, key_generation | 1, model-specific literal, KeyId, Generation |
+| approval_id, original_event_id, source_event_id, conversation_id | CanonicalUUID, Identifier, Identifier, Conversation |
+| creation_request_sha256, source_context_sha256, source_payload_sha256, original_payload_sha256, approval_record_sha256 | Digest each |
+| scope | original InvocationScopeV1, including original invoker native_id |
+| receiver_id, receiver_generation, independent_human | original CanonicalUUID, Generation, bool |
+| provider_issuer, provider_version, provider_credential_id, provider_credential_generation, lifecycle_generation, role_policy_version | original Issuer, Generation, Identifier, Generation, Generation, Generation |
+| outcome, canonical, principal | original resolved/inactive/unresolved, ContextCanonicalV1 or null, ContextPrincipalV1 or null |
+| status | pending/approved/rejected/expired |
+| actor_scope | ApprovalActorScopeV1 or null |
+| actor_receiver_id, actor_receiver_generation, actor_independent_human | CanonicalUUID or null, Generation or null, bool or null |
+| actor_provider_issuer, actor_provider_version, actor_provider_credential_id, actor_provider_credential_generation, actor_lifecycle_generation, actor_role_policy_version | Issuer or null, Generation or null, Identifier or null, Generation or null, Generation or null, Generation or null |
+| actor_outcome, actor_canonical, actor_principal | resolved/inactive/unresolved or null, ContextCanonicalV1 or null, ContextPrincipalV1 or null |
+
+ApprovalActorScopeV1 has exactly tenant_id, channel_identity_id, provider_installation_id (CanonicalUUID); provider, native_id, actor_channel (Identifier); namespace (ContextNamespaceV1). It is receiving scope, not a fabricated agent binding. ResumeContextV1 additionally has event_id (Identifier), payload_sha256 (Digest); ApprovalContextV1 has neither. Resume status excludes pending, event_id equals existing resume_event_id(approval_id), and original_event_id remains the root invocation ID. original_payload_sha256 and original canonical/principal association never change across suspension chains. There is no nested token, text, provider body, secret or unbounded chain.
+
+Pending/expired have all actor fields null. Approved/rejected have complete actor provenance; canonical/principal nullability follows the invocation codec's outcome coherence. Actor scope tenant equals original tenant. Approved status alone never establishes a grant. Any protected row/hash mismatch refuses. Current versions are checked within each new lookup, not required to equal the historical values forever.
+
+## 7. Authenticated Slack answers
+
+<!-- @spec HTTP-APPROVAL-CONTINUITY-7 -->
+
+Reuse the existing 60-second apr chat attestation, X-Curie-Approval-Principal, authenticate_principal, approval_slack_evidence and Slack sender derivation. Selected HTTP answers additionally require X-Curie-Approval-Receiver-Proof, a new bounded receiver-key token with prefix curie-approval-receiver-v1. ApprovalAnswerProofV1 has exactly schema_version=1, purpose="approval_answer", operation (resolve/recover), receiver_id, receiver_generation, channel_identity_id, provider_installation_id, approval_id (existing UUID/generation types), body_sha256, attestation_sha256 (Digest), native_channel_id (Identifier), slack (ReceiverSlackEvidenceV1). Its key selection is the existing receiver UUID/generation registration; domain separation includes the new prefix. Do not reuse or derive receiver/core keys from the chat attester secret. In curie_internal.identity_approval expose sign_approval_answer_proof(value:ApprovalAnswerProofV1,keyring:IdentityKeyring)->str and verify_approval_answer_proof(token:str,keyring:IdentityKeyring)->ApprovalAnswerProofV1|ContextRefusal. Signing validates/detaches the typed model and raises fixed ValueError("invalid_receiver_proof"); verification returns existing ContextRefusal(code="invalid_receiver_proof") for ordinary invalid input/MAC outcomes. No generic receiver signing endpoint or arbitrary-payload signer exists.
+
+Verify exact submitted body and apr bytes, operation/path/approval ID, both signatures, apr expiry and subject/channel equality with signed Slack evidence. Require block_actions or view_submission and actual interaction user.team_id. Apply current registration, namespace/installation/non-Grid checks and registered independent-human evidence; never infer humanity from a platform key, a bot token, a console session, user display data or the act of signing. Unknown/stale registration refuses. The originating binding ID must appear in that receiver registration's existing binding_ids, and its tenant must match; this reuses an explicit registration restriction without inventing a channel binding for the actor. The answering receiver may differ from the original invocation receiver: server-resolved approval target determines its required identity/installation, not caller input.
+
+No new attestation oracle is exposed. Only the existing authenticated Bolt action/modal listener can call the selected runtime's bounded answer submission; it serializes the decision/note or existing recovery body once, mints the existing chat attestation and signs those exact bytes. Use a fresh owned AsyncClient on the existing listener thread, a total five-second deadline, no redirects or ambient credentials, and one attempt. ACK remains before HTTP. Unknown outcomes never invoke legacy resolution or direct queue writes. Existing note bounds and approval-ID/card association checks remain. Recovery action must additionally satisfy the existing recovery endpoint's administrative prerequisites; chat evidence does not remove them. Until that authenticated interaction exists, selected recovery remains refused rather than impersonated.
+
+## 8. Current caller and independent approver composition
+
+<!-- @spec HTTP-APPROVAL-CONTINUITY-8 -->
+
+Refactor the existing common authority phases to accept an authenticated source, provider purpose and role. Caller uses purpose=invocation/role=invocation; actor uses purpose=approval/role=approver. Use the current stored role filter and explicit migration for that role, preserving binding caller narrowing, retained role team and explicit approval-route restrictions under their existing owners. A migrated approver role does not acquire the legacy implicit card-channel membership default as an additional team restriction; retain the existing team_restriction selection semantics. A nonmigrated role preserves its existing default behavior.
+
+No stale PrincipalTeam/link or positive cached provider result establishes HTTP authority. Required Slack route-group membership uses its existing membership owner with a fresh lookup and unavailable refusal. All external HTTP runs outside transactions/fences. Apply global tenant/agent/scope and explicit canonical human-kind denials before role matching. The independent exact migrated raw selector exception remains per role, after a definitive provider result and independent human proof, with retained narrowing. Provider outage never falls through.
+
+Before resolving, check current original invoker and current actor independently; requester equality neither grants nor vetoes actor permission. Before approved resume publication and every worker current boundary, repeat both checks against their preserved associations. A changed canonical subject cannot inherit either historical canonical/group-only grant; the already specified same-source exact raw exception remains. Rejected/expired notifications require fresh original-invoker authority and carry no grant; they do not reauthorize the resolving actor to execute an approved effect. Invocation permission never authorizes undo or recovery.
+
+## 9. Lifecycle and explicit approval write owner
+
+<!-- @spec HTTP-APPROVAL-CONTINUITY-9 -->
+
+Preserve the existing caller composition's final SQL-read-only boundary. Add an explicit operation-specific approval commit owner, not a write hidden inside that yield. Its ordered phases are:
+
+1. Short reader capture of current registration, tenant/IdP credential/configuration/lifecycle, agent/role-policy/binding, approval row/hash and route snapshot for every required source. Release every SQL transaction before external work.
+2. Independent bounded provider lookups, each retaining exact response bytes and the existing two-second total lookup deadline; caller and actor may run concurrently. Evaluate required route membership outside SQL too. Cancellation joins owned work. No positive cache.
+3. Acquire the prescribed global, tenant/IdP, agent/policy/binding, principal and approval boundary in consistent order. Compare every captured fingerprint before applying lifecycle. Reuse apply_http_principal in the borrowed transaction, validating the same bytes with fresh T1. For two subjects under one tenant, chain only the lifecycle generation returned by this transaction's preceding application; never recapture external facts to hide a competing change. Final generation is shared by the operation. Contradictory canonical observations for the same subject refuse. Positively commit lifecycle and settle the writer; an uncertain commit or writer lifetime is unavailable.
+4. New clean reader rechecks all fingerprints, final lifecycle, principals, registration, route and unchanged approval snapshot; revalidates the same bytes with fresh UTC/T1 and recomputes both permissions. This reader writes nothing and releases before the next phase.
+5. For create/resolve/recover/expire only, acquire a new explicit mutation and the same ordered locks, compare the verified captures/final lifecycle/row version again, and revalidate T1 and permission before the existing insert or status CAS. No external call here. Seal the updated protected row, append applicable audit, and commit atomically. Borrowed CRUD performs no nested independent commit. Positively acknowledge commit and mutation settlement before publishing success or resume work.
+
+A conflict/expiry anywhere discards the observation; never salvage it with new captures. Generation chaining is only the operation's own known writes under the same mutation. For read-only current checks/resume publication, phase5 is absent; final read authority cannot be reused after its boundary. An approval mutation does not promise to undo already executing effects.
+
+## 10. Resolution, expiry, recovery and bypass closure
+
+<!-- @spec HTTP-APPROVAL-CONTINUITY-10 -->
+
+The existing resolve route dispatches selected HTTP rows to the new owner before legacy admission/team lookup or CAS. It verifies classification even when identity_context is null. The actor proof authenticates one existing resolve/recover request, never a worker-supplied resolved_by. Preserve pending-only CAS, expiry deadline, lost-race409 and expired410 semantics. Status, actor provenance, protected row digest and successful audit commit together; a failed post-commit enqueue remains an owed wake.
+
+Expiry sweeper and resolve-time expiry verify the stored capsule/row and current authoritative classification. A valid pending HTTP session row may expire under the existing deadline without inventing an actor or grant. Seal expired/null-actor status atomically with the expiry CAS; no caller lookup is required merely to record elapsed time. Its notification still requires current invoker authority. Missing/malformed provenance on an adopted row cannot be silently expired through the legacy writer.
+
+Administrative recovery keeps its existing eligibility, recovery-key replay and pending-to-rejected transaction. A selected row additionally needs authenticated current actor approval authority and original-invoker authority; record that actor and reseal in the same recovery/audit CAS. Platform-key-only recovery, reply-identity repair, direct CRUD, automatic policy resolution and no-wake purpose branches cannot bypass selected classification or resealing. Unsupported selected operations refuse before mutation. Reconciliation is not a human resolution and cannot manufacture an actor, approve a row or widen its effect.
+
+## 11. Core-owned resume construction and guarded publication
+
+<!-- @spec HTTP-APPROVAL-CONTINUITY-11 -->
+
+Add ResumeQueue.enqueue_approval(approval_id, *, parent=None)->str. The API-owned path loads and verifies the committed row, classifies it, and calls the existing status-to-turn builder itself. Legacy rows keep existing semantics. Existing enqueue(turn) detects approval resume IDs and delegates by ID; selected rows never accept caller-authored replacement payloads. All resolve/expiry/recovery/reconciler paths converge here. Preserve deterministic event IDs and note framing. Set the original PrincipalRef from verified continuity, independently of the notification's resolved_by/system author. Serialize once, seal ResumeContextV1 against those exact bytes, and publish them together in the existing curie_identity_context_v1 field.
+
+For selected rows retain the final reader boundary through publication. Extend the existing ResumeQueue with a private typed guard carrying exact stable fence, bounded context and complete intersected T1 window for required caller/actor observations. Its atomic script takes exactly two distinct keys (runs stream, existing identity fence), and arguments mode="identity_resume_v1", payload, context, stable_fence, valid_from_us, valid_until_us, traceparent (empty when absent). Validate count, strings, token size, integer grammar/range, window and recognized mode before mutation; compare fence and datastore TIME in the inclusive T1 interval, then perform one XADD with payload/context and optional validated traceparent. No second context write, arbitrary field map, new claim ledger or fabricated ingress backlog reservation. Legacy queue layout remains unchanged. Authority refusal, unknown fence or invalid time performs no XADD.
+
+Reconciler must release its SQL row-claim transaction before any lookup, then reacquire/revalidate current row under the authority owner; no provider request runs beneath FOR UPDATE SKIP LOCKED. Redundant racing wakes retain existing deterministic worker claim/done-marker safety and TTL limits, not a new exactly-once claim. Confirmed append precedes mark_approval_resumed. Unknown append retains existing undelivered/grace recovery duties; denial/unavailability leaves the obligation unmarked and grants nothing. Recovery/expiry cannot publish context-free successors. A fresh retry rebuilds from the committed row and rechecks authority; old capsule digests are provenance, not cached permission.
+
+## 12. Worker current checks and exact grant scope
+
+<!-- @spec HTTP-APPROVAL-CONTINUITY-12 -->
+
+TurnAuthorityRequestV1/ResponseV1, endpoint and five-second one-attempt client contract remain unchanged. Invocation contexts require approval_id=null; resume contexts require exact parsed approval ID and event/payload/scope equality. Stored ApprovalContextV1 is never a runnable stream context. Verify the current protected row digest/status, current registration and original invoker; approved resumes also require preserved answering actor and fresh approver authority. Return existing bounded invalid_context/caller_not_allowed/unsupported_resume/authority_unavailable outcomes, with complete echoes. Unsupported purpose and malformed approval provenance never continue.
+
+At prepare, claim_or_resume, start and steer retain existing checks. Do not cache the earlier prepare observation across preparation or waits. The worker derives approval ID from the existing parser and scope from the binding owner, never unverified claims. Grant verification adds one concrete internal interface in the same owner/client:
+
+- ApprovalGrantExpectationV1 has exactly approval_id, agent_id (CanonicalUUID), conversation_id (Conversation), gate_kind (permission/policy), granted_tool (Identifier or null), granted_arguments_json (actual canonical JSON string or null). The non-null string encodes a finite JSON object using criterion2's canonical encoding and is at most16,384 UTF-8 bytes. Require exact canonical equality after strict duplicate/nonfinite rejection. Empty object is the string "{}", distinct from null. Apply this selected-HTTP bound at creation too. All expectation fields are immutable scalar values: a frozen model containing a mutable dict is insufficient.
+- ApprovalGrantAuthorityRequestV1 has exactly schema_version=1, check (TurnAuthorityRequestV1), grant (ApprovalGrantExpectationV1). check.approval_id must be non-null and equal grant.approval_id; stage is prepare.
+- ApprovalGrantAuthorityResponseV1 has exactly schema_version=1, check (TurnAuthorityResponseV1), grant_sha256 (Digest of the canonical complete submitted grant model). Echo every check field under the existing response rules and the exact grant digest, for continue/refuse/unavailable alike.
+- POST /v1/internal/identity/approval-grant/check uses existing worker authentication, strict body bound65,536 bytes before parsing, no-store, and returns ApprovalGrantAuthorityResponseV1. Oversized/malformed input refuses with fixed413/422; never downgrade to another endpoint. The client exposes check_grant(request)->ApprovalGrantAuthorityResponseV1, preserving a five-second total budget, one attempt, receipt bound65,536, strict decoding, no redirects/default authentication/cookies, fixed private errors and cancellation.
+
+Add binding.approval_grant_snapshot(event_id, agent_id)->ApprovalGrantExpectationV1|None. It reads status, agent/conversation and exact gate/tool/arguments in one coherent existing-row read, requires approved status and matching agent, and returns a detached immutable scalar snapshot. It canonically encodes the arguments before releasing the read; it retains no mutable ORM/dict references. The worker supplies this exact snapshot to check_grant after the normal prepare check and before boot_env consumes it. API compares every grant field to the committed row and its sealed digest and recomputes fresh caller/actor authority. A continue applies only to that submitted snapshot and boundary. Validate the response's check echoes and grant digest, then use only that same snapshot without binding rereads or replacement values. The exact arguments JSON string crosses into the existing boot environment unchanged; do not mutate a parsed copy after authorization. Repeat normal claim/start checks later. Wrong snapshot, changed protected row or mixed status/effect fields refuse. No worker-generated scope or summary can retag or expand a grant.
+
+HTTP permission resumes require explicit non-null arguments and the exact stored tool; policy resumes keep their existing manifest-defined scope. Rejected/expired have no tool/argument grant regardless of legacy summary shape. Preserve kernel ownership, side-effect flags, capacity/reclaim budgets and substrate behavior. Recognized unavailable work follows existing bounded pending/dead-letter handling; definitive denial starts nothing. No check promises atomicity with later remote execution or interrupts an action already running.
+
+## 13. Verification and activation
+
+<!-- @spec HTTP-APPROVAL-CONTINUITY-13 -->
+
+Independent tests precede implementation. Cover every numbered criterion with actual API/worker/dispatcher paths and isolated real SQL/Valkey where relevant: exact-body tampering; duplicate/nonfinite/oversize DTOs and cross-purpose tokens; public-create/null-agent bypasses; missing provenance in each mutation/queue path; identical/conflicting/racing creation; placeholder rewrite with immutable route; recursive suspension without invoker retagging; receiver/attester substitution and generation rotation; bot/unknown kind and requester equality; fresh role-specific raw/canonical/group grants and retained route/team denials; provider/policy/route/registration/approval changes across every phase; acknowledged/unknown commit and writer settlement; lifecycle generation chaining; no external work under SQL locks; resolve/expiry/recovery races; enqueue/mark ambiguity; missing actor and changed grant arguments before boot; rejected/expired notifications with no grant; unsupported privileged purposes; cancellation and ownership cleanup; unchanged local controls. Mutation tests remove each check and must provoke the corresponding refusal assertions.
+
+This specification is not activation evidence. Record local wiring versus actual provider mapping/kind and independent identity/membership freshness, key custody/effective mounts, participating writers, all enabled consumers and actual Slack interactions separately. Clear old provenance-free suspended/queued work through the existing coordinated transition; do not backfill trust. Required implementation tiers are local and external integration; skill applies to actual approval/grant runner behavior; cluster applies to any effective-runtime/mount changes; live-provider applies to claimed real-model or integration-credential qualification. Local-release/factory are not implied by this selected session path and become required if their surfaces change. Protected activation and human review remain separate gates.
+
+## Architectural boundary
+
+This realization reuses the Accepted ADR's ownership and policies. It authorizes no new business-policy ruling. A proposal to grant from a platform credential, accept an unregistered answering source, replace retained route/team narrowing, let a worker mint contexts, create a general authority ledger, or widen approved effects would change those architectural decisions and requires a separately accepted ADR. Such a proposal must not be hidden in this implementation.
