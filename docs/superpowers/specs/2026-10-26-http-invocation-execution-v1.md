@@ -66,6 +66,8 @@ Extend the delivery owner with explicit identity_guard_v2, preserving v1 and leg
 
 Validate the whole layout, bounded context, digests and five distinct keys before mutation. Before an append require the same fence/marker/TIME conditions as v1. Atomically retain the permanent stream receipt and canonical JSON metadata {schema_version:1,intent_digest,context_digest,stream_id} using the existing MSET receipt pattern. Intent binds original signed receiver claims and body, so same-delivery conflicting content cannot masquerade as a newly accepted retry. An exact historical receipt is a duplicate, not fresh permission. Missing, conflicting or malformed v2 receipt metadata refuses rather than replacing it. Unknown datastore outcomes retain existing settlement duties. This adds no SQL admission ledger.
 
+A historical duplicate compares the stable signed intent and validates the retained receipt's original stream ID/digest grammar. It does not compare a newly minted context digest with the stored digest: received_at, lifecycle and current policy observations may differ on a later attempt. Return the original receipt without publishing replacement payload/context or claiming a new authorization. The retained context digest identifies the original append.
+
 ## 8. Current core operation
 
 <!-- @spec HTTP-INVOCATION-EXECUTION-8 -->
