@@ -268,4 +268,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0245 | [Protected lifecycle evidence binds host-owned contexts to actual SDK closure](0245-protected-lifecycle-evidence-binds-host-owned-contexts-to-actual-sdk-closure.md) | Accepted |
 | 0246 | [Common admission resolves an optional HTTP identity before authorized enqueue](0246-common-admission-resolves-an-optional-http-identity-before-authorized-enqueue.md) | Accepted |
 | 0247 | [A tree-identical parent or a schema window registration reuses checks](0247-a-tree-identical-parent-or-a-schema-window-registration-reuses-checks.md) | Accepted |
+| 0249 | [A factory run may take twelve hours](0249-a-factory-run-may-take-twelve-hours.md) | Accepted |
 <!-- END GENERATED: adr-index -->
