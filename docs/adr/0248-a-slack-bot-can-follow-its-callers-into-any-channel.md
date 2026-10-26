@@ -76,9 +76,12 @@ Three facts about today's code matter here.
 - Admission already writes. It records refusal audits and can issue account
   connect tokens (`apps/api/src/curie_api/routers/channels.py`).
 - The dispatcher builds Slack evidence, including `is_ext_shared_channel`,
-  only when the event names a human user
-  (`apps/dispatcher/src/curie_dispatcher/identity.py`). A bot-authored event
-  carries no sharing flag.
+  only when the event names a `user`
+  (`apps/dispatcher/src/curie_dispatcher/identity.py`). A bot event with no
+  `user` carries no sharing flag. A bot event that also names a bot user,
+  beside its `bot_id`, does carry one, so the evidence alone cannot tell a
+  human from a bot. The `bot_id` reaches admission only mixed into the caller
+  ids.
 
 Several decisions shape any change here.
 
@@ -181,9 +184,8 @@ on the current split path.
 When admission sees a Slack route with no binding, and the route's identity
 names a follow agent, it decides in this order:
 
-1. Refuse unless the event comes from a human caller with Slack identity
-   evidence. A bot-authored event is refused here even when its bot id is on
-   the caller list, and logged as `follow_human_only` (section 4).
+1. Refuse a bot-authored event, logged as `follow_human_only`, even when
+   its bot id is on the caller list (section 4).
 2. Refuse unless the evidence reports `is_ext_shared_channel` as exactly
    `false`. A missing value counts as shared. The refusal is logged as
    `follow_shared_channel`. An operator can still bind such a channel by hand.
@@ -225,12 +227,18 @@ and two follow conditions on every event, not only the first.
   stops admitting, logged as `follow_shared_channel`. It stays silent until an
   operator converts it into a declared binding or removes it. Nothing is
   deleted.
-- **Bot-authored events do not reach follow.** The dispatcher sends no sharing
-  flag for them, so they never pass the check above. Listed bots therefore
-  cannot start turns in a followed channel, and never create one. They keep
-  working in declared bindings. This is deliberate: anyone can make an invited
-  bot speak, and ADR 0246 decision 4 already denies non-human invocation until
-  its own policy is qualified. Open question 6 covers lifting it later.
+- **Bot-authored events are refused.** An event is bot-authored when Slack
+  marks it with a `bot_id`, whether or not it also names a user. Follow
+  refuses it at first contact and on an existing followed binding, logged as
+  `follow_human_only`, whatever its sharing evidence says. The dispatcher
+  passes that marker to admission as its own field of the Slack evidence,
+  not inferred from the caller ids or from a missing `user`. Once ADR 0246
+  decision 4's authenticated principal kind exists, it replaces this marker.
+  Listed bots therefore cannot start turns in a followed channel, and never
+  create one. They keep working in declared bindings. This is deliberate:
+  anyone can make an invited bot speak, and ADR 0246 decision 4 already
+  denies non-human invocation until its own policy is qualified. Open
+  question 6 covers lifting it later.
 
 A declared binding carries neither condition. Converting a followed binding
 removes both.
@@ -413,8 +421,10 @@ These are realizing paths for after acceptance, not work this Draft starts.
    followed bindings in `apps/api/src/curie_api/deploy_notice.py`; declared
    create replacing a followed row in `apps/api/src/curie_api/crud/channels.py`.
 2. `apps/dispatcher`: skipping followed bindings in
-   `apps/dispatcher/src/curie_dispatcher/preflight.py`; no change to the
-   Slack app manifest. Its separate admission call goes away with ADR 0246's
+   `apps/dispatcher/src/curie_dispatcher/preflight.py`; the bot-authored
+   marker in the Slack evidence built by
+   `apps/dispatcher/src/curie_dispatcher/identity.py`; no change to the Slack
+   app manifest. Its separate admission call goes away with ADR 0246's
    migration, not with this decision.
 3. `apps/worker`: no follow-specific change. Followed bindings get ADR 0246
    decision 4's current authority recheck like every other binding.
@@ -431,6 +441,9 @@ proven by running it:
 - an externally shared channel at first contact is refused, and a followed
   channel that later reports shared, or no flag, stops admitting;
 - a bot-only first contact from a listed bot id is refused, with no row;
+- a bot event that carries `user`, `bot_id` and `is_ext_shared_channel`
+  `false` is refused, both on an unbound route and on an existing followed
+  binding;
 - removing the last caller restriction is refused while followed bindings
   exist, after follow is cleared;
 - a caller list change that commits between decision and enqueue leaves no
@@ -515,7 +528,7 @@ change.
 5. **Who may turn follow on?** Recommended: operators only, through the API
    and `curie`. No self-service switch in Slack.
 6. **Should listed bots work in followed channels?** Recommended: not in this
-   decision. It needs the dispatcher to send the sharing flag apart from human
-   identity evidence, and ADR 0246's non-human invocation policy to be
-   qualified. Even then, a bot's first contact should not create a followed
+   decision. It needs ADR 0246's authenticated principal kind and its
+   non-human invocation policy to be qualified, and the sharing flag sent for
+   every bot event. Even then, a bot's first contact should not create a followed
    binding.
