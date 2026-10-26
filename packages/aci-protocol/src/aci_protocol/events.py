@@ -129,6 +129,39 @@ TOOL_ACCESS_STATUS_FIELD: TypingFinal = "tool_access"
 #: This prerequisite defines the marker but advertises no enforcement.
 CHANNEL_READ_STATUS_FIELD: TypingFinal = "channel_read"
 
+# Advertise literal true only when scoped attachment tools, lifecycle and
+# revocation are enforced. A field's presence alone is not runtime support.
+ATTACHMENT_ACCESS_STATUS_FIELD: TypingFinal = "attachment_access"
+
+
+class AttachmentAccessCapability(_AciModel):
+    """Platform attachment authority for one admitted logical turn (ADR 0244).
+
+    Only the kernel sends this on authenticated event/steer requests after the
+    runner advertises enforcement. The URL is a trusted configured platform
+    facade, never a channel or arbitrary download destination. Implementations
+    verify the origin independently of HTTP syntax. The capability authorizes
+    only catalog membership and requested reads for its agent, canonical thread,
+    active logical turn, current sandbox route generation and finite lifetime.
+
+    A steer renews the opener's logical authority without extending file scope.
+    Missing/null context clears local authority; a new logical turn replaces
+    it. Completion from an older turn must not clear its successor. Terminal,
+    reset and route-replacement paths revoke reads, including local-cache hits.
+    Provider credentials remain in the worker. Tokens never enter environment,
+    model/tool text, subprocesses, logs, transcripts or persisted checkpoints.
+    These transport models implement none of those authorization behaviors.
+    """
+
+    url: str = Field(min_length=1, strict=True, json_schema_extra={"format": "uri"})
+    token: str = Field(min_length=1, strict=True, repr=False)
+
+    @field_validator("url")
+    @classmethod
+    def _validate_facade_url(cls, value: str) -> str:
+        HttpUrl(value)
+        return value
+
 
 class ChannelReadCapability(_AciModel):
     """Dedicated proxy authority for one admitted logical turn under ADR 0100.
@@ -245,6 +278,9 @@ class Event(_AciModel):
     tool_access: ToolAccess | None = None  # @spec TOOL-ACCESS-1 TOOL-ACCESS-2
     memory_token: str | None = Field(default=None, repr=False)  # @spec MEMORY-TOKEN-1
     channel_read: ChannelReadCapability | None = Field(default=None, repr=False)
+    # Optional for tolerant older readers. Never overload attachments_manifest:
+    # references available to fetch are not files already present on disk.
+    attachment_access: AttachmentAccessCapability | None = Field(default=None, repr=False)
 
 
 class Interrupt(_AciModel):

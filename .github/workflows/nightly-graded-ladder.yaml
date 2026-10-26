@@ -36,7 +36,7 @@ jobs:
   # download it as an artifact.
   build-cli:
     name: Build the curie release binary
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     defaults:
       run:
@@ -87,7 +87,7 @@ jobs:
   # cluster the runner can reach, or a report-only grade; either is a follow-up.
   ladder-skill-local:
     name: Graded parity ladder (skill + local, ${{ matrix.mode }} bundle)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     needs: build-cli
     strategy:
@@ -215,7 +215,7 @@ jobs:
   # from), so this job builds them first and then names the rung explicitly.
   ladder-local-release:
     name: Graded parity ladder (local-release, live model)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     needs: build-cli
     steps:
@@ -367,7 +367,7 @@ jobs:
   # step is armed live.
   ladder-cluster:
     name: Graded parity ladder (cluster rung on kind, live model)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     needs: build-cli
     steps:
@@ -622,7 +622,7 @@ jobs:
         needs.ladder-local-release.result == 'failure' ||
         needs.ladder-cluster.result == 'failure'
       )
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       issues: write

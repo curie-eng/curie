@@ -1,4 +1,4 @@
-"""Database access for learned skills (ADR 0237).
+"""Database access for learned skills (ADR 0247).
 
 A skill is a head row plus insert-only revisions. Every change goes through
 ``record``, which appends the next revision and moves the head to it inside

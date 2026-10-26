@@ -91,7 +91,7 @@ from .hook_source_guard import CronHookSourceGuard, CronSourceContext
 logger = logging.getLogger(__name__)
 
 # How long after its slot an agent one-shot may still fire, on first sight or
-# on a deferred retry (ADR 0238). Past it the slot is recorded skipped.
+# on a deferred retry (ADR 0248). Past it the slot is recorded skipped.
 ONE_SHOT_CATCH_UP = timedelta(hours=1)
 
 
@@ -393,7 +393,7 @@ RETURNING id
 """
 
 
-# Agent-created schedules (ADR 0238): the active ones of agents whose toggle is
+# Agent-created schedules (ADR 0248): the active ones of agents whose toggle is
 # on. Cancelled and done schedules never fire, and a toggled-off agent's
 # schedules are not read at all.
 _AGENT_SCHEDULES_SQL = """
@@ -477,7 +477,7 @@ FROM {schema}.agent_schedules s WHERE s.id = :id
 
 @dataclass(frozen=True)
 class _AgentSchedule:
-    """One active agent-created schedule as a pass read it (ADR 0238)."""
+    """One active agent-created schedule as a pass read it (ADR 0248)."""
 
     id: uuid.UUID
     agent_id: uuid.UUID
@@ -1421,7 +1421,7 @@ class CronSchedulerLoop:
     async def _agent_schedules(
         self, agent_id: uuid.UUID | None = None, schedule_id: uuid.UUID | None = None
     ) -> dict[uuid.UUID, list[_AgentSchedule]]:
-        """Active agent schedules of toggled-on agents, by agent (ADR 0238)."""
+        """Active agent schedules of toggled-on agents, by agent (ADR 0248)."""
 
         async with self._engine.connect() as conn:
             rows = (
@@ -1464,7 +1464,7 @@ class CronSchedulerLoop:
         now: datetime,
         summary: CronPassSummary,
     ) -> None:
-        """One agent schedule through the guarded admission path (ADR 0238).
+        """One agent schedule through the guarded admission path (ADR 0248).
 
         Recurring schedules take the bundle trigger path (deferred retry,
         bounded catch-up, admission) with the window floored at the
@@ -1531,7 +1531,7 @@ class CronSchedulerLoop:
         *,
         source_context: CronSourceContext | None = None,
     ) -> None:
-        """Reconcile, then admit, one agent one-shot (ADR 0238).
+        """Reconcile, then admit, one agent one-shot (ADR 0248).
 
         Exactly once rests on the hook_runs unique key at the revision's slot,
         not on the stored state. Only ``source = 'schedule'`` rows count. A

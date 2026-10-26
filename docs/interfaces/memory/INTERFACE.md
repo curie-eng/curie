@@ -82,7 +82,7 @@ starts with `eval:` (#1909): that path omits the ref so the runner boots
 Beside the legacy `log`, memory also holds canonical **entries**, read and
 written by `runner/src/curie_runner/memory_facts.py::MemoryFactsStore` rather
 than through the `MemoryStore` port. An entry is one key `fact-<32 hex>`. Since
-[ADR 0239](../../adr/0239-twin-memory-standing-instructions-and-a-bounded-index.md)
+[ADR 0249](../../adr/0249-twin-memory-standing-instructions-and-a-bounded-index.md)
 its value is `{kind, title, statement, author, stated_at, session_id,
 conversation, archived}`: `kind` is `fact` or `instruction` and never changes,
 `title` is one line of at most 80 characters, `statement` is at most 500
@@ -180,7 +180,7 @@ There are two sandbox credentials, both `scope="state"` tokens:
   only when the agent has memory writes on, the turn names a binding and it is
   not eval-isolated, with claims `{binding, memory: "write", sender, turn, conversation}`.
   `sender` is the turn's `event.user`, or `<no person>`; `conversation` is the
-  turn's thread key, which the API stamps on every entry and revision (ADR 0239); `turn` is the queued
+  turn's thread key, which the API stamps on every entry and revision (ADR 0249); `turn` is the queued
   event id plus a random suffix unique to each mint
   (`apps/worker/src/curie_worker/kernel/memory.py::_with_memory_token`), so a retry or
   continuation carries its own claim. It expires at the turn's stream deadline,

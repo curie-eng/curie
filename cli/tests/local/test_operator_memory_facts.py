@@ -81,7 +81,7 @@ def _state_path(agent_id: str, key: str | None = None, channel: tuple[str, str] 
 def _fact(
     statement: str, author: str, day: str, *, kind: str = "fact", title: str | None = None
 ) -> dict[str, Any]:
-    # The typed canonical value (ADR 0239, Contract r4). The platform key keeps
+    # The typed canonical value (ADR 0249, Contract r4). The platform key keeps
     # the body's provenance fields; a sandbox write has them stamped instead.
     return {
         "kind": kind,

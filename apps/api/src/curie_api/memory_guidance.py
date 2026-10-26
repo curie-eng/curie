@@ -1,4 +1,4 @@
-"""The platform default memory guidance (#1461, ADR-0167; ADR 0239).
+"""The platform default memory guidance (#1461, ADR-0167; ADR 0249).
 
 The runner shows the model this text beside its memory tools when the agent has
 no operator guidance stored at ``memory/guidance``. The API reports it as the
@@ -7,7 +7,7 @@ runner keeps its own copies (``curie_runner.memory_facts.DEFAULT_GUIDANCE`` and
 ``LEARNING_GUIDANCE``); ``tests/test_memory_guidance_parity.py`` pins each pair
 byte for byte. Change both together, or neither.
 
-Selection (ADR 0239), in order: nonblank operator text verbatim; else
+Selection (ADR 0249), in order: nonblank operator text verbatim; else
 ``LEARNING_MEMORY_GUIDANCE`` when the agent is opted in to agent-wide learning;
 else ``DEFAULT_MEMORY_GUIDANCE``, whose bytes must never change.
 """
@@ -55,7 +55,7 @@ Nothing is kept for later unless a memory call succeeds. Never say you saved, no
 
 
 def effective_guidance(stored: Any, agent_wide_learning: bool) -> tuple[str, GuidanceSource]:
-    """The guidance text an agent runs with and where it comes from (ADR 0239).
+    """The guidance text an agent runs with and where it comes from (ADR 0249).
 
     ``stored`` is the ``memory/guidance`` value, or None when there is none. A
     stored value that is not ``{"text": <non-blank str>}`` reads as absent,

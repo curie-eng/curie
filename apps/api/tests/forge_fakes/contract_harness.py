@@ -166,6 +166,7 @@ class InMemoryHarness:
             code_caps[Operation.RERUN_FAILED] = Support.NOOP
             code_caps[Operation.CI_DIAGNOSTICS] = Support.UNSUPPORTED
             code_caps[Operation.USER_CAN_WRITE] = Support.UNSUPPORTED
+            code_caps[Operation.REQUIRED_CHECKS] = Support.UNSUPPORTED
         self._tracker = InMemoryTracker(
             kind=types.MEMORY_TRACKER_ONLY if minimal else types.MEMORY,
             label=LABEL,

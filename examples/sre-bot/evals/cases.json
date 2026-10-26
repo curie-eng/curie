@@ -243,6 +243,74 @@
         "expected": "(?s)^[\\s*_]*(⚠|🔴|✅)[^\\n]*\\n.*cause:[^\\n]*(queue|backlog|pod|depth)[^\\n]*(not act|won't act|will not act|alert text|not an approval).*\\nref:[^\\n]*acmequeuedepthhigh[^\\n]*\\s*$",
         "case_sensitive": false
       }
+    },
+    {
+      "id": "sre-same-time-peak-denominator",
+      "input": "Use only these supplied synthetic measurements; no tools are needed. The series describe the same workload. Return exactly three pipe-separated fields: the peak slow-claim estimate, the total-claim estimate at that peak timestamp for the same trailing window, and the slow percentage. Use unknown for unsupported fields. All samples use trailing 5-minute windows. Slow estimates: 2025-01-01T00:00:00Z=2, 00:01:00Z=6, 00:02:00Z=7, 00:03:00Z=3. Total estimates arrive in this order: 00:02:00Z=20, 00:00:00Z=900, 00:03:00Z=40, 00:01:00Z=60.",
+      "grader": {
+        "kind": "regex",
+        "expected": "^\\s*7(?:\\.0)?\\s*\\|\\s*20(?:\\.0)?\\s*\\|\\s*35(?:\\.0)?%\\s*$"
+      }
+    },
+    {
+      "id": "sre-missing-time-denominator",
+      "input": "Use only these supplied synthetic measurements; no tools are needed. The series describe the same workload. Return exactly three pipe-separated fields: the peak slow-claim estimate, the total-claim estimate at that peak timestamp for the same trailing window, and the slow percentage. Use unknown for unsupported fields. All samples use trailing 5-minute windows on 2025-01-01. Slow estimates: 00:00:00Z=2, 00:01:00Z=6, 00:02:00Z=7, 00:03:00Z=3. Total estimates: 00:00:00Z=900, 00:01:00Z=60, 00:03:00Z=40.",
+      "grader": {
+        "kind": "regex",
+        "expected": "^\\s*7(?:\\.0)?\\s*\\|\\s*unknown\\s*\\|\\s*unknown\\s*$"
+      }
+    },
+    {
+      "id": "sre-different-window-denominator",
+      "input": "Use only these supplied synthetic measurements; no tools are needed. The series describe the same workload. Return exactly three pipe-separated fields: the peak slow-claim estimate, the total-claim estimate at that peak timestamp for the same trailing window, and the slow percentage. Use unknown for unsupported fields. At 2025-01-01T00:02:00Z the only slow estimate is 7 over a trailing 5-minute window; the only total estimate is 20 over a trailing 1-minute window. No other samples are supplied.",
+      "grader": {
+        "kind": "regex",
+        "expected": "^\\s*7(?:\\.0)?\\s*\\|\\s*unknown\\s*\\|\\s*unknown\\s*$"
+      }
+    },
+    {
+      "id": "sre-overlapping-window-total",
+      "input": "Use only these synthetic measurements; no tools are needed. A slow-claim counter has trailing 5-minute increase estimates on 2025-01-01: 00:04:00Z=2.5, 00:05:00Z=6.25, 00:06:00Z=3.75. No raw counter samples or event records are supplied. How many distinct slow claims occurred across these overlapping windows? Return only the exact distinct-event count, or unknown if it is not established.",
+      "grader": {
+        "kind": "regex",
+        "expected": "^\\s*unknown\\s*$"
+      }
+    },
+    {
+      "id": "canary-delivered-mismatch",
+      "input": "Fresh same-route readings for an example turn canary: target_delivery_success=1, target_success=0, the owned probe result is a legitimate role refusal instead of the requested nonce. No user-turn or Slack transport evidence is available. Classify only the supplied evidence. Reply in one sentence using the fields Delivery, response, and user impact, separated by semicolons. Do not add a repair action.",
+      "grader": {
+        "kind": "regex",
+        "expected": "(?i)^Delivery:\\ observed;\\ response:\\ mismatch;\\ user\\ impact:\\ unverified\\.$",
+        "case_sensitive": false
+      }
+    },
+    {
+      "id": "canary-legacy-failure",
+      "input": "The installed legacy turn canary requires an exact nonce response. Fresh target_success=0; no delivery metric or diagnostics are exported. No user-turn evidence is available. Classify only the supplied evidence. Reply in one sentence using the fields Delivery, response, and user impact, separated by semicolons. Do not add a repair action.",
+      "grader": {
+        "kind": "regex",
+        "expected": "(?i)^Delivery:\\ unverified;\\ response:\\ unverified;\\ user\\ impact:\\ unverified\\.$",
+        "case_sensitive": false
+      }
+    },
+    {
+      "id": "canary-delivery-timeout",
+      "input": "Fresh same-route turn-canary readings: target_delivery_success=0, diagnostic timeout. Binding health passes; channel capability preflight is unverified. No transport error or user-turn evidence is available. Classify only the supplied evidence. Reply in one sentence using the fields Delivery, cause, and user impact, separated by semicolons. Do not add a repair action.",
+      "grader": {
+        "kind": "regex",
+        "expected": "(?i)^Delivery:\\ failed;\\ cause:\\ unverified;\\ user\\ impact:\\ unverified\\.$",
+        "case_sensitive": false
+      }
+    },
+    {
+      "id": "canary-legacy-event-shape",
+      "input": "Fresh same-route turn-canary readings show target_delivery_success=1 and target_success=0. The installed checker preserves a legacy verdict that can also fail on progress edits or event shape; the owned probe result is unavailable. Classify only the supplied evidence. Reply in one sentence using the fields Delivery, response, and user impact, separated by semicolons. Do not add a repair action.",
+      "grader": {
+        "kind": "regex",
+        "expected": "(?i)^Delivery:\\ observed;\\ response:\\ unverified;\\ user\\ impact:\\ unverified\\.$",
+        "case_sensitive": false
+      }
     }
   ]
 }

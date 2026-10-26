@@ -1,4 +1,4 @@
-"""Learned skills (ADR 0237): request and response bodies.
+"""Learned skills (ADR 0247): request and response bodies.
 
 Content limits (slug, description, body) are judged by the router after the
 caller is authorized, so a patch is held to them on its result, not its input.

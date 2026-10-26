@@ -39,9 +39,11 @@ BELOW = "0086"
 # of the feature train follow the policy one, the OIDC login migration (#2908)
 # follows all of it, #2911's tenant scope (0101) follows that, #3831's reply
 # target (0102), tracker identity (0103) and the trigger label (0105) revisions
-# follow that, then the train join revision (0108), schedule safety, learned
-# skills (selfimp_skills_0001), agent schedules (selfimp_sched_0001) and twin
-# memory (selfimp_memory_0001), which is last.
+# follow that, the train join revision (0108) follows them, then team sync
+# state (0120), agent access policies (0121), directory identity (0122), start
+# failure detail (0123), attachment catalogs (0130) and their merge (0131), then
+# schedule safety, learned skills (selfimp_skills_0001), agent schedules
+# (selfimp_sched_0001) and twin memory (selfimp_memory_0001), which is last.
 HEAD = "selfimp_memory_0001"
 
 POLICY_COLUMNS = {"agent_id", "hook", "generation", "operation_id", "armed", "active", "updated_at"}

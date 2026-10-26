@@ -39,7 +39,29 @@ impl ForgeFixtureAction {
 }
 
 #[derive(Subcommand)]
+pub(crate) enum TestEnvAction {
+    /// Run COMMAND with isolated backing services and verified cleanup.
+    Run {
+        /// Backing service profile: core or full.
+        #[arg(long, default_value = "core")]
+        profile: String,
+        /// Command and arguments to run after --.
+        #[arg(
+            value_name = "COMMAND",
+            trailing_var_arg = true,
+            allow_hyphen_values = true
+        )]
+        command: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
 pub(crate) enum DevAction {
+    /// Run commands with private backing services.
+    TestEnv {
+        #[command(subcommand)]
+        action: TestEnvAction,
+    },
     /// Check the committed change before opening or updating a pull request.
     Preflight {
         /// Run only the fast tier; the full tier is the default.

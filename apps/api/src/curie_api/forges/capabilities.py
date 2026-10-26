@@ -55,6 +55,7 @@ class Operation(enum.StrEnum):
     RERUN_FAILED = "code_host.rerun_failed"
     USER_CAN_WRITE = "code_host.user_can_write"
     LIST_FACTORY_PUBLICATIONS = "code_host.list_factory_publications"
+    REQUIRED_CHECKS = "code_host.required_checks"
     # MarkedComments, exposed by both ports
     FIND_MARKED = "marked_comments.find_marked"
     UPSERT_MARKED = "marked_comments.upsert_marked"
@@ -83,6 +84,7 @@ OPTIONAL_OPERATIONS: frozenset[Operation] = frozenset(
         Operation.CI_DIAGNOSTICS,
         Operation.RERUN_FAILED,
         Operation.USER_CAN_WRITE,
+        Operation.REQUIRED_CHECKS,
     }
 )
 

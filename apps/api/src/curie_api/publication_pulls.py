@@ -96,9 +96,10 @@ async def adopt_or_open(
     contract: PullRequestContract,
     *,
     expected_head_sha: str,
+    adopt_only: bool,
     before_open: Callable[[], Awaitable[None]],
 ) -> PullRequest | None:
-    """The branch's pull request, adopted or opened; None when the branch is absent.
+    """Adopt the branch's pull request, or open one unless ``adopt_only`` is true.
 
     Any pull request from the branch, in any state, is adopted only when it
     matches the contract and ``expected_head_sha``. Otherwise the branch must
@@ -111,6 +112,10 @@ async def adopt_or_open(
     ``before_open`` runs only when a new pull request is about to be opened:
     the branch has none and holds ``expected_head_sha``. It refuses by raising
     (`PullRequestRefused`), and then nothing is opened (#4629).
+
+    An absent branch returns None in either mode. In adoption-only mode, a
+    branch at ``expected_head_sha`` without a pull request also returns None,
+    without running ``before_open``.
     """
 
     existing = await _find(code_host, repository, contract.branch)
@@ -123,6 +128,8 @@ async def adopt_or_open(
         raise PullRequestRefused(
             "branch_moved", "the publication branch no longer matches the expected commit"
         )
+    if adopt_only:
+        return None
     await before_open()
     try:
         opened = await code_host.open_pull_request(

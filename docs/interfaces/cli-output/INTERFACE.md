@@ -1,7 +1,7 @@
 ---
 seam: CLI output (agent-facing `--json`)
 kind: CLEAN
-impls: 79 outputs behind one trait
+impls: 82 outputs behind one trait
 grade: not separately graded
 epics:
   - "#456"
@@ -13,7 +13,7 @@ order: 18
 > Part of the Curie swappable-seam catalog — see the [seam index](../../interfaces.md).
 
 <!-- BEGIN GENERATED: header (curie dev docs-lint) -->
-> **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** 79 outputs behind one trait &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
+> **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** 82 outputs behind one trait &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
 <!-- END GENERATED: header -->
 
 **Kind legend:** CLEAN = a real `Protocol`/typed port class · SOFT = swap via env/URL/prefix/wire, no code interface · NONE = not built yet.
@@ -66,7 +66,7 @@ This is the catalog's first **Rust** seam. It is listed here because the agent-f
 
 ## Implementations today
 
-79 `CliOutput` implementations, all in the CLI crate, grouped by owning module:
+82 `CliOutput` implementations, all in the CLI crate, grouped by owning module:
 
 - **`DryRunPlan`** (`cli/src/ui.rs`) — the generic `--dry-run` plan; JSON is
   `{"dry_run":true,"plan":[lines]}` and the human render is the same lines verbatim,
@@ -82,14 +82,15 @@ This is the catalog's first **Rust** seam. It is listed here because the agent-f
   `BudgetOutput`, `ResetThreadOutput`,
   `DeleteOutput`, `VersionsOutput`, `MemoryOutput`, `MemoryGuidanceOutput`, `HookOutput`, `ApprovalsOutput`,
   `SkillApprovalsOutput`, `OverridesOutput`, `AgentOverridesOutput` (the `local`/`cluster overrides` verbs: `OverridesOutput` plus the stored agent-schedule settings), `PublicationPolicyOutput`, `WorkItemsOutput`,
-  `SchedulesOutput`, `AgentScheduleOutput`, `HookFireOutput`, `ChannelsOutput`, `CallersOutput`,
+  `SchedulesOutput`, `AgentScheduleOutput`, `HookFireOutput`, `ChannelsOutput`, `CallersOutput`, `AccessPolicyOutput`,
+  `DirectoryOutput` (a directory administration plan or tenant/resource API receipt),
   `ActionsOutput` (the `local`/`cluster actions` verbs and the action executor receipt),
   `RemediationPolicyOutput` (the `local`/`cluster remediation-policy` verbs: one policy generation, the breaker `close-breaker` closed, or a hook's `breakers`),
   `RemediationOutput` (the `local`/`cluster remediation` receipt verbs: a nomination list or one nomination's receipt),
   `RemediationQualificationOutput` (the `local`/`cluster remediation-qualification` verbs: a qualification record or a verifier run),
   `SkillOutput`, `SkillListOutput`, `SkillHistoryOutput`, `SkillDiffOutput`, and
   `SkillExportOutput` (`cli/src/commands/learned_skills.rs`, the `local`/`cluster skills`
-  verbs for learned skills, ADR 0237; schema `cli/schema/skills.schema.json`),
+  verbs for learned skills, ADR 0247; schema `cli/schema/skills.schema.json`),
   `ConnectorBuildOutput`. The last is
   the `curie build --plugin-dir` receipt for connector source builds (ADR-0113):
   it emits one object even when the bundle declares nothing to build, because
@@ -144,10 +145,10 @@ That set is not hand-maintained prose: `cli/schema/index.json` carries one
   result. This syntactic inventory does not prove that every verb returns a
   `CliOutput` or honors the one-object JSON contract.
 2. **Committed JSON Schemas with a drift gate (since #841).** Each `to_json` is no
-  longer schema-free: there are 74 committed schemas under `cli/schema/` with an
+  longer schema-free: there are 77 committed schemas under `cli/schema/` with an
   index (`cli/schema/index.json`), a `syn`-based inventory gate over every `impl
   CliOutput`, and per-family output validation — result families are validated
-  against real `to_json()` output across 84 tests in `cli/tests/json_contract.rs`.
+  against real `to_json()` output across 85 tests in `cli/tests/json_contract.rs`.
   The dark factory render receipt uses schema version 2. Its `runner_image`
   and `runner_note` fields are required and accept a string or `null`; the
   binary render tests validate the actual receipt against the committed schema.

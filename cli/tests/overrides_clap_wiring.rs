@@ -844,7 +844,7 @@ fn overrides_write_of_another_field_still_reports_memory_writes() {
     );
 }
 
-// --- `--agent-wide-learning on|off` (ADR 0239) ------------------------------
+// --- `--agent-wide-learning on|off` (ADR 0249) ------------------------------
 //
 // A non-null boolean independent of `memory_writes`: the PATCH carries a JSON
 // boolean under `agent_wide_learning` only when the flag is given, and every

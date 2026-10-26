@@ -178,6 +178,22 @@ def ingress(
         get_settings.cache_clear()
 
 
+def _assert_receipt_metadata(ingress: Ingress, stream_id: str) -> None:
+    """@spec HOOK-RECEIPT-1, HOOK-RECEIPT-5: optional metadata stays hook-only."""
+    metadata = ingress.valkey.get(ingress.claim_key + ":receipt")
+    if ingress.kind == "channel":
+        assert metadata is None
+        return
+    assert metadata is not None
+    assert json.loads(metadata) == {
+        "version": 1,
+        "stream_id": stream_id,
+        "conversation_id": ingress.entries()[0][1].conversation_id,
+        "tool_access": None,
+    }
+    assert ingress.valkey.ttl(ingress.claim_key + ":receipt") == -1
+
+
 def _assert_retry_enqueues_once(ingress: Ingress) -> None:
     accepted = ingress.post()
     assert accepted.status_code == 200, accepted.text
@@ -187,6 +203,7 @@ def _assert_retry_enqueues_once(ingress: Ingress) -> None:
     assert len(entries) == 1
     assert entries[0][0] == accepted.json()["stream_id"]
     assert ingress.valkey.get(ingress.claim_key) == accepted.json()["stream_id"]
+    _assert_receipt_metadata(ingress, accepted.json()["stream_id"])
     assert ingress.charges() == 1
     replay = ingress.post()
     assert replay.status_code == 200, replay.text
@@ -287,6 +304,7 @@ def test_failure_refunds_the_slot_and_retry_enqueues_once(
         _assert_retry_enqueues_once(ingress)
         return
     assert not ingress.valkey.exists(ingress.claim_key)
+    assert not ingress.valkey.exists(ingress.claim_key + ":receipt")
     assert ingress.entries() == []
     assert ingress.charges() == 0
     _assert_retry_enqueues_once(ingress)
@@ -455,6 +473,7 @@ def test_cancelled_request_refunds_counter_directly(
     assert isinstance(error, asyncio.CancelledError)
     assert error.args == ("injected ingress request cancellation",)
     assert not ingress.valkey.exists(ingress.claim_key)
+    assert not ingress.valkey.exists(ingress.claim_key + ":receipt")
     assert ingress.entries() == []
     # No second delivery or retry is needed to prove a refund. The quota
     # applied before either cancellation, including the unobserved take result.
@@ -582,10 +601,28 @@ def test_committed_enqueue_keeps_receipt_entry_and_quota_charge(
     stream_id = entries[0][0]
     assert ingress.valkey.get(ingress.claim_key) == stream_id
     assert ingress.valkey.ttl(ingress.claim_key) == -1
+    _assert_receipt_metadata(ingress, stream_id)
     assert ingress.charges() == 1
     replay = ingress.post()
     assert replay.status_code == 200, replay.text
     assert replay.json()["duplicate"] is True
     assert replay.json()["stream_id"] == stream_id
+    assert len(ingress.entries()) == 1
+    assert ingress.charges() == 1
+
+
+@pytest.mark.parametrize("ingress", ["channel"], indirect=True)
+def test_channel_ingress_ignores_unrelated_receipt_sidekey(ingress: Ingress) -> None:
+    """@spec HOOK-RECEIPT-1, HOOK-RECEIPT-6: optional hook metadata is not global."""
+    sidekey = ingress.claim_key + ":receipt"
+    ingress.valkey.rpush(sidekey, "unrelated-non-string-metadata")
+    saved = ingress.valkey.dump(sidekey)
+    accepted = ingress.post()
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["duplicate"] is False
+    replay = ingress.post()
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["stream_id"] == accepted.json()["stream_id"]
+    assert ingress.valkey.dump(sidekey) == saved
     assert len(ingress.entries()) == 1
     assert ingress.charges() == 1

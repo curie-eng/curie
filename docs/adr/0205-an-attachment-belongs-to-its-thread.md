@@ -4,6 +4,10 @@ Date: 2026-10-06
 
 Status: Accepted
 
+Partially amended by [ADR 0244](0244-attachments-are-fetched-on-demand-through-scoped-platform-tools.md)
+for opt-in on-demand registration, retrieval and removal of application byte
+ceilings; legacy eager delivery retains this ADR's original contract.
+
 Accepted 2026-10-06 with explicit maintainer approval from Junwon Jung
 (jw3329), who owns the attachment lane, given in the implementation planning
 for [#4079](https://github.com/curie-eng/curie/issues/4079). The realizing code

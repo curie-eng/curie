@@ -97,6 +97,9 @@ class DeferBody(BaseModel):
     generation: int = Field(ge=1)
     reason: str = Field(min_length=1)
     capacity: bool
+    # #4930: a pre-start workspace preparation diagnostic. Stored only on a
+    # non-capacity `not_started:` defer, redacted and clipped by the API.
+    start_failure_detail: str | None = None
 
 
 class StartBody(BaseModel):
@@ -317,6 +320,7 @@ async def defer_work_item_request(
         generation=body.generation,
         reason=body.reason,
         capacity=body.capacity,
+        start_failure_detail=body.start_failure_detail,
     )
     if isinstance(result, DispatchConflict):
         _raise_conflict(result)

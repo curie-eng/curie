@@ -1,4 +1,4 @@
-"""ADR 0238: approval-resume revalidation and the agent_schedules toggle copy.
+"""ADR 0248: approval-resume revalidation and the agent_schedules toggle copy.
 
 ``HookRunRecorder.resume_guard(agent_id, schedule_id, approval_id)`` decides
 whether an approved continuation of a scheduled firing may still start. The
@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from aci_protocol import Final, OutboundEvent, SessionStatus, TextDelta, ToolNote
+from curie_test_support.postgres import pg_connect_or_skip
 from curie_worker.hook_runs import HookRunRecorder, retry_event_id
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
@@ -141,6 +142,11 @@ class ScheduleSeed:
 @contextlib.asynccontextmanager
 async def seeded(*, one_shot: bool = False) -> AsyncIterator[ScheduleSeed]:
     engine = create_async_engine(_DB_URL)
+    try:
+        await pg_connect_or_skip(engine)
+    except BaseException:
+        await engine.dispose()
+        raise
     token = uuid.uuid4().hex
     agent_id, version_id, schedule_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
     address = "C" + token[:10].upper()

@@ -118,6 +118,18 @@ rules:
   - apiGroups: [""]
     resources: ["pods/log"]
     verbs: ["get"]
+{{- if eq (include "curie.actionExecutorConnectorReads" .) "true" }}
+{{/*
+#4800, ACTION-EXECUTOR-12/-14 as amended: the executor's own connector reads,
+with the connector reconciler off. The same single-object `get` on Deployments
+the executor gains beside the reconciler, in its own rule, and none of the
+reconciler's create/list/patch/delete rules. No `list`, no `watch`, no other
+kind. The helper refuses this with the executor off or the reconciler on.
+*/}}
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get"]
+{{- end }}
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["list"]
@@ -324,6 +336,16 @@ spec:
             python reads 3.3554432e+07 as the number -- so the two sides are
             compared NUMERICALLY by ci/attachment-init-assertions.sh.
             */}}
+            - name: CURIE_ATTACHMENT_MODE
+              value: {{ .Values.worker.attachments.mode | default "eager" | quote }}
+            - name: CURIE_ATTACHMENT_BROKER_HOST
+              value: "0.0.0.0"
+            - name: CURIE_ATTACHMENT_BROKER_PORT
+              value: {{ (dig "broker" "port" 8093 .Values.worker.attachments) | quote }}
+            - name: CURIE_ATTACHMENT_BROKER_MAX_CONCURRENT
+              value: {{ (dig "broker" "maxConcurrent" 8 .Values.worker.attachments) | quote }}
+            - name: CURIE_ATTACHMENT_TRANSFER_TIMEOUT_SECONDS
+              value: {{ (dig "broker" "transferTimeoutSeconds" 300 .Values.worker.attachments) | quote }}
             - name: CURIE_ATTACHMENT_ENABLED
               value: {{ .Values.worker.attachments.enabled | quote }}
             - name: CURIE_ATTACHMENT_MAX_FILE_BYTES
@@ -344,7 +366,7 @@ spec:
             {{- $threadMaxFiles := .Values.worker.attachments.threadMaxFiles | default 20 | int64 }}
             {{- $threadMaxBytes := .Values.worker.attachments.threadMaxBytes | default 268435456 | int64 }}
             {{- $runnerAttachments := .Values.agentSandbox.runner.attachments | default dict }}
-            {{- if and .Values.worker.attachments.enabled $runnerAttachments.enabled }}
+            {{- if and .Values.worker.attachments.enabled $runnerAttachments.enabled (ne (.Values.worker.attachments.mode | default "eager") "lazy") }}
             {{- $volumeBytes := include "curie.capacity.memBytes" $runnerAttachments.sizeLimit | int64 }}
             {{- if gt $threadMaxBytes $volumeBytes }}
             {{- fail (printf "worker.attachments.threadMaxBytes (%d) exceeds agentSandbox.runner.attachments.sizeLimit (%s, %d bytes): one boot of a thread's files would overflow the sandbox's attachments volume. Lower threadMaxBytes or raise sizeLimit (ADR 0205 decision 7)." $threadMaxBytes (toString $runnerAttachments.sizeLimit) $volumeBytes) }}
@@ -465,6 +487,16 @@ spec:
                   name: {{ include "curie.secretName" . }}
                   key: installationId
                   optional: false
+{{- if eq (include "curie.actionExecutorConnectorReads" .) "true" }}
+            # The executor's own connector reads (#4800): the worker reads the
+            # acting connector's Deployment by name and the in-force digest
+            # with the reconcile loop off. The app name is part of the render
+            # the in-force digest comes from, as for the reconciler below.
+            - name: CURIE_ACTION_EXECUTOR_CONNECTOR_READS
+              value: "true"
+            - name: CURIE_CONNECTOR_APP_NAME
+              value: {{ include "curie.name" . | quote }}
+{{- end }}
 {{- if .Values.worker.connectorReconciler.enabled }}
             # Connector reconciler (ADR-0090, #1184). It reuses CURIE_NAMESPACE
             # and CURIE_RELEASE above deliberately: the runner dials a connector
@@ -688,7 +720,9 @@ spec:
               value: {{ .Values.agentSandbox.runner.bundleFetch.bucket | quote }}
             {{- include "curie.env.otel" (dict "root" . "extraEnv" .Values.worker.extraEnv) | nindent 12 }}
             {{- $checksumExtraEnv | nindent 12 }}
-          # No HTTP port on the worker, so an exec probe checks a heartbeat file
+          # Liveness uses an exec heartbeat file; the optional private attachment
+          # broker is a separate control-plane listener, not a liveness endpoint.
+          # The exec probe checks a heartbeat file
           # the asyncio event loop touches each tick. A wedged loop stops
           # touching it -> the file goes stale -> the probe fails -> restart.
           {{- include "curie.heartbeatProbes" . | nindent 10 }}

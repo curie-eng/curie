@@ -525,13 +525,15 @@ impl ExpectedSandboxInventory {
             Some(serde_json::Value::Bool(value)) => *value,
             Some(_) => anyhow::bail!("agentSandbox.deploy in Helm values is not a boolean"),
         };
-        // Mirrors every source in the chart's curie.agentSandboxPoolAgents.
+        // Mirrors every map source in the chart's curie.agentSandboxPoolAgents
+        // (agentResourceProfiles, #4889, included).
         let mut agents = Vec::new();
         for key in [
             "connectorSecrets",
             "registryEgress",
             "runnerImages",
             "workspaceSizeLimits",
+            "agentResourceProfiles",
         ] {
             match sandbox.and_then(|value| value.get(key)) {
                 None | Some(serde_json::Value::Null) => {}
@@ -783,6 +785,7 @@ mod expected_sandbox_inventory_tests {
             "agentSandbox": {
                 "runnerImages": {"layered": format!("registry.example.com/acme/runner@sha256:{}", "a".repeat(64))},
                 "workspaceSizeLimits": {"workspace": "24Gi"},
+                "agentResourceProfiles": {"profiled": "factory"},
                 "poolAgents": ["explicit", "layered"]
             },
             "factory": {"sandboxEgress": {"factory": true, "disabled": false}}
@@ -790,7 +793,7 @@ mod expected_sandbox_inventory_tests {
         let inventory = ExpectedSandboxInventory::from_values(Some(&values)).unwrap();
         assert_eq!(
             inventory.agents,
-            vec!["explicit", "factory", "layered", "workspace"]
+            vec!["explicit", "factory", "layered", "profiled", "workspace"]
         );
         assert!(inventory.repository_pools.is_empty());
     }

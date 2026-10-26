@@ -1,4 +1,4 @@
-"""End to end proof of agent-created schedules (ADR 0238) on a running local stack.
+"""End to end proof of agent-created schedules (ADR 0248) on a running local stack.
 
 Drives a real model through a persistent HTTP test channel
 (``tests/e2e/http_test_channel.py``) and records every observation in one JSON

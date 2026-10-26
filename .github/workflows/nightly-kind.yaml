@@ -1,50 +1,113 @@
-name: Nightly kind on next
+name: Scheduled kind CI
 
-# Kind jobs (cluster rung, released chart upgrade, upgrade matrix) are not
-# selected for next pull requests or for pushes to next. This schedule puts
-# them back once a day by dispatching CI on next.
-#
-# The schedule has to live on the default branch. A cron in a workflow that
-# exists only on next never fires. CI on next treats workflow_dispatch as a
-# full run, so this dispatch selects kind again.
-
+# Scheduled workflows live on the default branch and dispatch full CI on
+# the selected release train ref.
 on:
   schedule:
-    # 09:30 UTC. Off the hour, and after the 08:00 graded ladder.
     - cron: "30 9 * * *"
+    - cron: "15 6 * * *"
+    - cron: "15 0 * * *"
+    - cron: "15 12 * * *"
+    - cron: "15 18 * * *"
   workflow_dispatch:
+    inputs:
+      ref:
+        description: Release train ref
+        required: true
+        type: choice
+        options: [main, next]
+        default: next
+      nightly:
+        description: Run the nightly kind jobs
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: read
 
 jobs:
   dispatch:
-    name: Dispatch kind CI on next
-    runs-on: ubuntu-latest
+    name: Dispatch scheduled kind CI
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       actions: write
       contents: read
     outputs:
+      target_ref: ${{ steps.target.outputs.ref }}
       run_id: ${{ steps.dispatch_ci.outputs.run_id }}
       run_url: ${{ steps.dispatch_ci.outputs.run_url }}
+      error: ${{ steps.dispatch_ci.outputs.error }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GH_REPO: ${{ github.repository }}
     steps:
-      - name: Dispatch the CI workflow on next
-        id: dispatch_ci
+      - name: Select the target ref
+        id: target
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          SCHEDULE: ${{ github.event.schedule }}
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_NIGHTLY: ${{ inputs.nightly }}
         run: |
-          dispatch=$(gh api --method POST "repos/$GH_REPO/actions/workflows/ci.yaml/dispatches" \
-            -f ref=next -F return_run_details=true)
+          set -euo pipefail
+          case "$EVENT_NAME" in
+            schedule)
+              case "$SCHEDULE" in
+                '30 9 * * *') target_ref=next ;;
+                '15 6 * * *') target_ref=main ;;
+                '15 0 * * *'|'15 12 * * *'|'15 18 * * *') target_ref=main ;;
+                *) echo "Unknown kind schedule" >&2; exit 1 ;;
+              esac
+              case "$SCHEDULE" in
+                '30 9 * * *'|'15 6 * * *') nightly=true ;;
+                *) nightly=false ;;
+              esac
+              ;;
+            workflow_dispatch)
+              case "$INPUT_REF" in
+                main|next) target_ref="$INPUT_REF" ;;
+                *) echo "Invalid kind target ref" >&2; exit 1 ;;
+              esac
+              case "$INPUT_NIGHTLY" in
+                true|false) nightly="$INPUT_NIGHTLY" ;;
+                *) echo "Invalid nightly input" >&2; exit 1 ;;
+              esac
+              ;;
+            *) echo "Unsupported kind trigger" >&2; exit 1 ;;
+          esac
+          printf 'ref=%s\nnightly=%s\n' "$target_ref" "$nightly" >> "$GITHUB_OUTPUT"
+      - name: Dispatch the CI workflow
+        id: dispatch_ci
+        env:
+          TARGET_REF: ${{ steps.target.outputs.ref }}
+          NIGHTLY: ${{ steps.target.outputs.nightly }}
+        # The dispatch error used to reach only this step log, so five nights of
+        # "not a git repository" (2026-09-24..28) and the 2026-10-20 HTTP 422 for an
+        # undeclared input showed only "No CI run was confirmed" in the tracking
+        # issue. Export it as a one-line annotation and a job output for the report.
+        # GitHub still reads GITHUB_OUTPUT from a step that then exits nonzero.
+        run: |
+          set -euo pipefail
+          error_file=$(mktemp "${RUNNER_TEMP:-/tmp}/dispatch-error.XXXXXX")
+          if ! dispatch=$(gh api --method POST "repos/$GH_REPO/actions/workflows/ci.yaml/dispatches" \
+            -f "ref=$TARGET_REF" -f "inputs[nightly]=$NIGHTLY" -F return_run_details=true 2> "$error_file"); then
+            error=$(tr -s '[:space:]' ' ' < "$error_file" | sed -e 's/^ //')
+            error=${error:0:500}
+            error=${error% }
+            echo "::error title=CI dispatch failed::Dispatch to $TARGET_REF failed: $error"
+            printf 'error=%s\n' "$error" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
           run_id=$(jq -er '.workflow_run_id | select(type == "number" and . > 0 and . == floor)' <<< "$dispatch")
           run_url=$(jq -er '.html_url | select(type == "string" and length > 0)' <<< "$dispatch")
           printf 'run_id=%s\nrun_url=%s\n' "$run_id" "$run_url" >> "$GITHUB_OUTPUT"
 
   verify:
-    name: Verify kind CI on next
+    name: Verify scheduled kind CI
     needs: dispatch
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 350
     permissions:
       actions: read
@@ -56,44 +119,251 @@ jobs:
       - name: Wait for the dispatched CI result
         env:
           CI_RUN_ID: ${{ needs.dispatch.outputs.run_id }}
-        run: gh run watch "$CI_RUN_ID" --exit-status
+        # gh run watch refreshes every 3 seconds and exits on HTTP 403, so a
+        # long kind run spends the shared installation rate limit and the guard
+        # goes red while CI is green. Poll the run object slowly and wait out
+        # a rate-limit response for its Retry-After (or the reset time).
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import time
+
+          POLL_SECONDS = int(os.environ.get("KIND_POLL_INTERVAL_SECONDS", "120"))
+          FALLBACK_WAIT = int(os.environ.get("KIND_RATE_LIMIT_FALLBACK_SECONDS", "60"))
+
+
+          def split_response(stdout):
+              text = stdout.replace("\r\n", "\n")
+              status = 0
+              headers = {}
+              body = text
+              head, separator, rest = text.partition("\n\n")
+              pieces = head.split()
+              if text.startswith("HTTP/") and separator and len(pieces) > 1 and pieces[1].isdigit():
+                  status = int(pieces[1])
+                  body = rest
+                  for line in head.splitlines()[1:]:
+                      name, colon, value = line.partition(":")
+                      if colon:
+                          headers[name.strip().lower()] = value.strip()
+              return status, headers, body
+
+
+          def rate_limited(status, body, stderr):
+              # GitHub documents a primary or secondary limit as HTTP 403 or 429
+              # with a message, and the GraphQL API as HTTP 200 whose errors
+              # text says the rate limit was exceeded. gh prints that text on
+              # stderr and often omits the status code.
+              # https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api
+              # https://docs.github.com/en/graphql/overview/rate-limits-and-node-limits-for-the-graphql-api
+              texts = [stderr]
+              parsed = json.loads(body) if body.lstrip().startswith("{") else None
+              if isinstance(parsed, dict):
+                  message = parsed.get("message")
+                  if isinstance(message, str):
+                      texts.append(message)
+                  for error in parsed.get("errors") or []:
+                      if isinstance(error, dict) and isinstance(error.get("message"), str):
+                          texts.append(error["message"])
+              blob = "\n".join(texts).lower()
+              if "rate limit" not in blob:
+                  return False
+              if status in (0, 200, 403, 429):
+                  return True
+              return "403" in blob or "429" in blob
+
+
+          def wait_seconds(headers, stderr):
+              retry_after = headers.get("retry-after", "")
+              if retry_after.isdigit():
+                  return int(retry_after)
+              reset = headers.get("x-ratelimit-reset", "")
+              if reset.isdigit():
+                  delay = int(reset) - int(time.time())
+                  if delay > 0:
+                      return delay
+              match = re.search(r"retry-after:\s*(\d+)", stderr, re.IGNORECASE)
+              if match:
+                  return int(match.group(1))
+              return FALLBACK_WAIT
+
+
+          def get_json(endpoint):
+              while True:
+                  proc = subprocess.run(
+                      ["gh", "api", "--include", endpoint],
+                      capture_output=True,
+                      text=True,
+                      check=False,
+                  )
+                  status, headers, body = split_response(proc.stdout)
+                  if rate_limited(status, body, proc.stderr):
+                      time.sleep(wait_seconds(headers, proc.stderr))
+                      continue
+                  if proc.returncode != 0 or status >= 400:
+                      detail = (proc.stderr or body).strip()
+                      raise SystemExit(detail or f"GitHub API failed ({status or proc.returncode})")
+                  return json.loads(body)
+
+
+          run_id = os.environ["CI_RUN_ID"]
+          if not run_id.isdigit() or int(run_id) <= 0:
+              raise SystemExit("Missing dispatched run id")
+          endpoint = f"repos/{os.environ['GH_REPO']}/actions/runs/{run_id}"
+          while True:
+              run = get_json(endpoint)
+              if run.get("status") == "completed":
+                  raise SystemExit(0 if run.get("conclusion") == "success" else 1)
+              time.sleep(POLL_SECONDS)
+          PY
 
   report:
-    name: Report nightly kind CI result
+    name: Report scheduled kind CI result
     needs: [dispatch, verify]
     if: ${{ always() }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
+    runs-on: ubuntu-24.04
+    # Long enough to sleep until an hourly Actions token window resets, then
+    # still file or close the tracking issue. A 5 minute cap died on the same
+    # 403 that ended Verify, so the red guard run left no issue.
+    timeout-minutes: 75
     permissions:
       issues: write
       actions: read
     steps:
-      - name: Update the nightly tracking issue
+      - name: Update the tracking issue for the target ref
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           CI_RUN_ID: ${{ needs.dispatch.outputs.run_id }}
           CI_RUN_URL: ${{ needs.dispatch.outputs.run_url }}
+          TARGET_REF: ${{ needs.dispatch.outputs.target_ref }}
           DISPATCH_RESULT: ${{ needs.dispatch.result }}
+          DISPATCH_ERROR: ${{ needs.dispatch.outputs.error }}
           VERIFY_RESULT: ${{ needs.verify.result }}
           NIGHTLY_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           python3 - <<'PY'
           import json
           import os
+          import re
           import subprocess
+          import time
+
+          FALLBACK_WAIT = int(os.environ.get("KIND_RATE_LIMIT_FALLBACK_SECONDS", "60"))
 
           repo = os.environ["GH_REPO"]
-          title = "Nightly kind CI on next is failing"
+          target_ref = os.environ["TARGET_REF"]
+          if target_ref not in {"main", "next"}:
+              raise SystemExit("Invalid kind target ref")
+          label = {
+              "main": "Scheduled kind CI on main",
+              "next": "Nightly kind CI on next",
+          }[target_ref]
+          title = f"{label} is failing"
           failed_conclusions = {"failure", "timed_out", "cancelled"}
 
-          def gh(*arguments, capture_output=False):
-              return subprocess.run(
-                  ["gh", *arguments], check=True, capture_output=capture_output, text=True)
+          def split_response(stdout):
+              text = stdout.replace("\r\n", "\n")
+              status = 0
+              headers = {}
+              body = text
+              head, separator, rest = text.partition("\n\n")
+              pieces = head.split()
+              if text.startswith("HTTP/") and separator and len(pieces) > 1 and pieces[1].isdigit():
+                  status = int(pieces[1])
+                  body = rest
+                  for line in head.splitlines()[1:]:
+                      name, colon, value = line.partition(":")
+                      if colon:
+                          headers[name.strip().lower()] = value.strip()
+              return status, headers, body
+
+          def rate_limited(status, body, stderr):
+              # Same rule as Verify. A GraphQL limit is HTTP 200 plus an errors
+              # message, and gh often prints only that message.
+              texts = [stderr]
+              parsed = json.loads(body) if body.lstrip().startswith("{") else None
+              if isinstance(parsed, dict):
+                  message = parsed.get("message")
+                  if isinstance(message, str):
+                      texts.append(message)
+                  for error in parsed.get("errors") or []:
+                      if isinstance(error, dict) and isinstance(error.get("message"), str):
+                          texts.append(error["message"])
+              blob = "\n".join(texts).lower()
+              if "rate limit" not in blob:
+                  return False
+              if status in (0, 200, 403, 429):
+                  return True
+              return "403" in blob or "429" in blob
+
+          def wait_seconds(headers, stderr):
+              retry_after = headers.get("retry-after", "")
+              if retry_after.isdigit():
+                  return int(retry_after)
+              reset = headers.get("x-ratelimit-reset", "")
+              if reset.isdigit():
+                  delay = int(reset) - int(time.time())
+                  if delay > 0:
+                      return delay
+              match = re.search(r"retry-after:\s*(\d+)", stderr, re.IGNORECASE)
+              if match:
+                  return int(match.group(1))
+              return FALLBACK_WAIT
+
+          def request(method, endpoint, payload=None):
+              # One client so a 403 still exposes Retry-After. Issue writes use
+              # REST for the same reason. gh issue uses GraphQL and hides it.
+              # https://docs.github.com/en/rest/issues/issues#create-an-issue
+              # https://docs.github.com/en/rest/issues/comments#create-an-issue-comment
+              # https://docs.github.com/en/rest/issues/issues#update-an-issue
+              while True:
+                  command = ["gh", "api", "--include", endpoint]
+                  stdin = None
+                  if method != "GET":
+                      command = [
+                          "gh", "api", "--include", "--method", method, "--input", "-", endpoint]
+                      stdin = json.dumps(payload)
+                  proc = subprocess.run(
+                      command, input=stdin, capture_output=True, text=True, check=False)
+                  status, headers, response = split_response(proc.stdout)
+                  if rate_limited(status, response, proc.stderr):
+                      time.sleep(wait_seconds(headers, proc.stderr))
+                      continue
+                  if proc.returncode != 0 or status >= 400:
+                      raise subprocess.CalledProcessError(
+                          proc.returncode or status, command, response, proc.stderr)
+                  return headers, response
+
+          def next_page(headers):
+              for part in headers.get("link", "").split(","):
+                  if 'rel="next"' in part:
+                      start = part.find("<")
+                      end = part.find(">")
+                      if 0 <= start < end:
+                          url = part[start + 1:end]
+                          marker = "://api.github.com/"
+                          if marker in url:
+                              return url.split(marker, 1)[1]
+                          return url
+              return ""
 
           def read_pages(endpoint):
-              result = gh("api", "--paginate", "--slurp", endpoint, capture_output=True)
-              return json.loads(result.stdout)
+              # gh --paginate hides Retry-After, so follow Link one page at a time.
+              pages = []
+              current = endpoint
+              while current:
+                  headers, response = request("GET", current)
+                  pages.append(json.loads(response))
+                  current = next_page(headers)
+              return pages
+
+          def write_json(method, endpoint, payload):
+              _headers, response = request(method, endpoint, payload)
+              return json.loads(response) if response.strip() else {}
 
           issue_number = min(
               (issue["number"]
@@ -113,12 +383,12 @@ jobs:
               if issue_number is None:
                   raise SystemExit(0)
               body = (
-                  "Nightly kind CI on next passed.\n\n"
+                  f"{label} passed.\n\n"
                   f"Nightly workflow: {nightly_url}\n"
                   f"Dispatched CI run: {run_url}")
           else:
               lines = [
-                  "Nightly kind CI on next did not succeed.",
+                  f"{label} did not succeed.",
                   "",
                   f"Nightly workflow: {nightly_url}",
                   f"Dispatch result: {dispatch_result}",
@@ -151,11 +421,21 @@ jobs:
               else:  # Dispatch did not confirm a CI run.
                   lines.append(
                       "No CI run was confirmed. Inspect the nightly workflow logs for the dispatch failure.")
+                  dispatch_error = os.environ["DISPATCH_ERROR"]
+                  if dispatch_error:
+                      lines.extend(["", f"Dispatch error: {dispatch_error}"])
+                      if "Unexpected inputs" in dispatch_error:
+                          hint = (
+                              f"The ci.yaml on {target_ref} does not declare an input this workflow sends. "
+                              f"Merge main into {target_ref} so both release trains accept the same dispatch inputs.")
+                          lines.extend(["", hint])
               body = "\n".join(lines)
           if issue_number is None:
-              gh("issue", "create", "--repo", repo, "--title", title, "--body", body)
+              write_json("POST", f"repos/{repo}/issues", {"title": title, "body": body})
           else:  # Reuse the existing bot tracking issue.
-              gh("issue", "comment", str(issue_number), "--repo", repo, "--body", body)
+              comment_endpoint = f"repos/{repo}/issues/{issue_number}/comments"
+              write_json("POST", comment_endpoint, {"body": body})
               if green:
-                  gh("issue", "close", str(issue_number), "--repo", repo, "--reason", "completed")
+                  close_endpoint = f"repos/{repo}/issues/{issue_number}"
+                  write_json("PATCH", close_endpoint, {"state": "closed", "state_reason": "completed"})
           PY

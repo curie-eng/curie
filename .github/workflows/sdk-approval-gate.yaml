@@ -45,7 +45,7 @@ jobs:
   # never silently go dark; over-triggering only costs one live run.
   detect:
     name: Detect a claude-agent-sdk lock change
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       changed: ${{ steps.detect.outputs.changed }}
@@ -85,7 +85,7 @@ jobs:
     name: Live approval-gate proof (claude-agent-sdk changed)
     needs: [detect]
     if: needs.detect.outputs.changed == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7

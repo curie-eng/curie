@@ -63,7 +63,7 @@ _READ_ONLY_COMMANDS = (
     r"git diff(?: --stat)?",
 )
 
-# The platform memory tools (#1461, ADR-0167, ADR-0239). Reading, saving,
+# The platform memory tools (#1461, ADR-0167, ADR-0249). Reading, saving,
 # changing, archiving, reverting or forgetting a remembered entry is not a change
 # to the world the person asked about, so the action is still recorded but never
 # announced: a receipt line per save would be noise under every answer. Live

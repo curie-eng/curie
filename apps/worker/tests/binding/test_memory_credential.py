@@ -6,10 +6,10 @@ Two credentials, both ``scope="state"`` so an old API still accepts them:
   carries ``{binding, memory: "read"}``;
 * the per-turn token from ``BindingResolver.turn_memory_token`` carries
   ``{binding, memory, sender, turn, conversation, skills}`` and a short expiry;
-  ``conversation`` is the turn's thread key (ADR 0239), the signed source
+  ``conversation`` is the turn's thread key (ADR 0249), the signed source
   conversation the API stamps on a memory write and on a learned-skill change.
   It is only minted when the agent has memory writes or learned skills on
-  (ADR 0237), the turn names a binding, and the thread is not eval-isolated.
+  (ADR 0247), the turn names a binding, and the thread is not eval-isolated.
   ``memory`` is ``"write"`` only with memory writes on; ``skills`` is
   ``"write"`` only with learned skills on.
 
@@ -164,7 +164,7 @@ def test_turn_token_claims_and_bounded_expiry() -> None:
     assert claims["turn"] == "evt-0001"
     # The conversation the turn belongs to rides along (agent schedules and
     # learned skills stamp it as provenance); learned skills off leaves the
-    # skills claim null. Agent schedules (ADR 0238) add the schedules and
+    # skills claim null. Agent schedules (ADR 0248) add the schedules and
     # scheduled claims.
     assert claims["conversation"] == _THREAD
     assert claims["skills"] is None
@@ -239,7 +239,7 @@ def test_eval_isolated_turn_gets_no_turn_token() -> None:
 
 
 def test_turn_token_signs_the_thread_key_as_conversation() -> None:
-    # ADR 0239: the API stamps a memory write's source conversation from this
+    # ADR 0249: the API stamps a memory write's source conversation from this
     # signed claim, never from the request body, so the worker must sign the
     # exact thread key the turn runs in. Two threads on one binding get two
     # different conversations.
@@ -258,7 +258,7 @@ def test_turn_token_signs_the_thread_key_as_conversation() -> None:
     assert "conversation" not in _claims(env["CURIE_MEMORY_TOKEN"])
 
 
-# --- learned skills (ADR 0237) -------------------------------------------------------
+# --- learned skills (ADR 0247) -------------------------------------------------------
 
 
 def test_learned_skills_alone_mints_a_skills_writer_that_reads_memory() -> None:
@@ -277,7 +277,7 @@ def test_learned_skills_alone_mints_a_skills_writer_that_reads_memory() -> None:
     assert claims["conversation"] == "slack:C0123:1700000000.000100"
     assert claims["sender"] == "U0SENDER1"
     assert claims["turn"] == "evt-0002"
-    # Agent schedules off leaves the schedules claim null (ADR 0238).
+    # Agent schedules off leaves the schedules claim null (ADR 0248).
     assert claims["schedules"] is None
     assert set(claims) == {
         "agent",

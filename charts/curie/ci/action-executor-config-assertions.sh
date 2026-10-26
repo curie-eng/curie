@@ -26,6 +26,17 @@
 #       adds no other rule; and nothing is cluster-scoped.
 #   (e) With the executor off (reconciler on), Deployments carry no `get`: the
 #       grant follows the executor switch.
+#   (f) #4800: `actionExecutor.connectorReadsWithoutReconciler` is declared with
+#       default false, and the default render carries no
+#       CURIE_ACTION_EXECUTOR_CONNECTOR_READS and no Deployments rule at all.
+#   (g) With the executor on, the reconciler off and that setting on, the worker
+#       Role differs from the executor-on, reconciler-off Role by exactly one
+#       rule, `get` on apps/deployments alone; it carries none of the
+#       reconciler's verbs on the connector kinds; the worker renders
+#       CURIE_ACTION_EXECUTOR_CONNECTOR_READS="true" and CURIE_CONNECTOR_APP_NAME,
+#       and no CURIE_CONNECTOR_RECONCILE.
+#   (h) The setting is refused at render with the executor off, and with the
+#       reconciler on.
 #
 # Runnable locally (from anywhere) and from CI. Render-only: no cluster.
 set -euo pipefail
@@ -224,5 +235,101 @@ if "get" in seen_off.get(("apps", "deployments"), set()):
     print("FAIL [e] apps/deployments grants `get` with the executor disabled", file=sys.stderr)
     sys.exit(1)
 PY
+
+# (f) The executor's own connector reads (#4800): declared, default off, and the
+# default render is unchanged by them.
+python3 - "$CHART/values.yaml" <<'PY' || exit 1
+import sys, yaml
+section = yaml.safe_load(open(sys.argv[1])).get("actionExecutor") or {}
+if section.get("connectorReadsWithoutReconciler", "<absent>") is not False:
+    print(
+        "FAIL [f] values.yaml must declare actionExecutor.connectorReadsWithoutReconciler: false, "
+        f"got {section.get('connectorReadsWithoutReconciler', '<absent>')!r}",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+PY
+
+worker_env() {
+  local manifest; manifest=$(mktemp "$WORK/manifest.XXXXXX"); printf '%s' "$1" >"$manifest"
+  python3 - "$manifest" <<'PY'
+import json, sys, yaml
+docs = [d for d in yaml.safe_load_all(open(sys.argv[1]).read()) if d]
+workers = [
+    d for d in docs
+    if d.get("kind") == "Deployment"
+    and d["metadata"].get("labels", {}).get("app.kubernetes.io/component") == "worker"
+]
+if len(workers) != 1:
+    print(f"expected one worker Deployment, got {len(workers)}", file=sys.stderr)
+    sys.exit(2)
+env = {}
+for c in workers[0]["spec"]["template"]["spec"]["containers"]:
+    for e in c.get("env") or []:
+        env.setdefault(e["name"], []).append(e.get("value", "<valueFrom>"))
+print(json.dumps(env))
+PY
+}
+
+DEFAULT_WORKER="$(render -s templates/worker.yaml)"
+python3 - "$(worker_role_rules "$DEFAULT_WORKER")" "$(worker_env "$DEFAULT_WORKER")" <<'PY' || exit 1
+import json, sys, yaml
+rules = yaml.safe_load(sys.argv[1])
+env = json.loads(sys.argv[2])
+if "CURIE_ACTION_EXECUTOR_CONNECTOR_READS" in env:
+    print("FAIL [f] the default render sets CURIE_ACTION_EXECUTOR_CONNECTOR_READS", file=sys.stderr)
+    sys.exit(1)
+if any("deployments" in r["resources"] for r in rules):
+    print(f"FAIL [f] the default worker Role grants on deployments: {rules!r}", file=sys.stderr)
+    sys.exit(1)
+PY
+
+# (g) On: exactly one extra rule, `get` on apps/deployments alone.
+READS_BASE="$(render -s templates/worker.yaml --set actionExecutor.enabled=true)"
+READS_ON="$(render -s templates/worker.yaml --set actionExecutor.enabled=true --set actionExecutor.connectorReadsWithoutReconciler=true)"
+if grep -qE '^kind: ClusterRole' <<<"$READS_ON"; then
+  fail g "the worker template rendered a ClusterRole with the executor's own connector reads on"
+fi
+python3 - "$(worker_role_rules "$READS_BASE")" "$(worker_role_rules "$READS_ON")" "$(worker_env "$READS_ON")" <<'PY' || exit 1
+import json, sys, yaml
+
+base = yaml.safe_load(sys.argv[1])
+on = yaml.safe_load(sys.argv[2])
+env = json.loads(sys.argv[3])
+
+extra = [r for r in on if r not in base]
+missing = [r for r in base if r not in on]
+want = {"apiGroups": ["apps"], "resources": ["deployments"], "verbs": ["get"]}
+if missing or extra != [want]:
+    print(f"FAIL [g] the reads add {extra!r} and drop {missing!r}; expected exactly [{want!r}]", file=sys.stderr)
+    sys.exit(1)
+for rule in on:
+    for kind in ("deployments", "services", "networkpolicies"):
+        if kind in rule["resources"] and set(rule["verbs"]) - {"get"}:
+            print(f"FAIL [g] a reconciler verb on {kind} rendered without the reconciler: {rule!r}", file=sys.stderr)
+            sys.exit(1)
+if env.get("CURIE_ACTION_EXECUTOR_CONNECTOR_READS") != ["true"]:
+    print(f"FAIL [g] worker CURIE_ACTION_EXECUTOR_CONNECTOR_READS is {env.get('CURIE_ACTION_EXECUTOR_CONNECTOR_READS')!r}", file=sys.stderr)
+    sys.exit(1)
+app = env.get("CURIE_CONNECTOR_APP_NAME") or []
+if len(app) != 1 or not app[0]:
+    print(f"FAIL [g] worker CURIE_CONNECTOR_APP_NAME is {app!r}, expected one non-empty value", file=sys.stderr)
+    sys.exit(1)
+if "CURIE_CONNECTOR_RECONCILE" in env:
+    print("FAIL [g] the executor's own connector reads turned the reconcile loop on", file=sys.stderr)
+    sys.exit(1)
+PY
+
+# (h) Refused combinations fail the render, each with its own message.
+if out="$(render -s templates/worker.yaml --set actionExecutor.connectorReadsWithoutReconciler=true 2>&1)"; then
+  fail h "the executor's own connector reads rendered with the executor off"
+fi
+grep -q "requires actionExecutor.enabled=true" <<<"$out" ||
+  fail h "executor-off refusal names the wrong cause: $out"
+if out="$(render -s templates/worker.yaml --set actionExecutor.enabled=true --set worker.connectorReconciler.enabled=true --set actionExecutor.connectorReadsWithoutReconciler=true 2>&1)"; then
+  fail h "the executor's own connector reads rendered with the reconciler on"
+fi
+grep -q "is for worker.connectorReconciler.enabled=false" <<<"$out" ||
+  fail h "reconciler-on refusal names the wrong cause: $out"
 
 echo "action-executor-config-assertions: all assertions passed"

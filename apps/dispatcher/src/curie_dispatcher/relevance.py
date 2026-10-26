@@ -67,6 +67,7 @@ class DropReason(StrEnum):
     UNADDRESSABLE_ACTION = "unaddressable_action"
     CALLER_NOT_ALLOWED = "caller_not_allowed"
     ADMISSION_UNAVAILABLE = "admission_unavailable"
+    DELIVERY_CANARY = "delivery_canary"
 
 
 #: One documented sentence per reason. Asserted total in both directions -- a
@@ -137,6 +138,12 @@ DROP_RATIONALES: Mapping[DropReason, str] = MappingProxyType(
             "than admitted unchecked (ADR 0175 fails closed). This is an outage "
             "signal, not a list typo: the route may carry no list at all."
         ),
+        DropReason.DELIVERY_CANARY: (
+            "The mention arrived in a channel listed as a delivery canary, whose only "
+            "job is to prove Slack still delivers to this identity; it is counted on "
+            "curie.slack.delivery_canary and never asks the API, posts a placeholder "
+            "or mints a turn (#4960)."
+        ),
     }
 )
 
@@ -171,9 +178,10 @@ def drop(
 
     Exactly one record per drop is the property the anti-silent-swallow suite
     rests on, so this must not grow a second emit. The record is INFO unless
-    the caller passes ``level``; only ``CALLER_NOT_ALLOWED`` does, at DEBUG,
-    because a busy shared channel can refuse most of its messages and the
-    ``curie.turn.refused`` counter already counts them. Values are rendered with
+    the caller passes ``level``; ``CALLER_NOT_ALLOWED`` and ``DELIVERY_CANARY``
+    do, at DEBUG, because a busy shared channel can refuse most of its messages
+    and a canary arrives on a schedule, and a counter already counts each
+    (``curie.turn.refused``, ``curie.slack.delivery_canary``). Values are rendered with
     ``%r`` so a newline or control character inside a Slack-supplied id cannot
     forge an extra log line; message bodies are never logged at all.
 

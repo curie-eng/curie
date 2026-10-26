@@ -16,6 +16,8 @@ from pathlib import Path
 import httpx
 import pytest
 
+from examples.tests.test_turn_canary import reply_events
+
 CANARY = Path(__file__).resolve().parents[1] / "turn-canary" / "turn_canary.py"
 FAST = {"turn_deadline": 0.02, "cleanup_deadline": 0.02, "poll_period": 0.005}
 WRITES = {"enqueue", "reset"}
@@ -76,6 +78,7 @@ class MonitorPlatform:
         self.adapters = adapters or {}
         self.calls: list[tuple[str, object]] = []
         self.nonces: dict[str, str] = {}
+        self.turns = {}
         self.cleanup_blocked = False
 
     async def inventory(self):
@@ -94,13 +97,11 @@ class MonitorPlatform:
         self.calls.append(("enqueue", turn.reply_handle.channel))
         nonce = turn.text.split("no other text: ", 1)[1].split(". Do not", 1)[0]
         self.nonces[turn.reply_handle.placeholder] = nonce
+        self.turns[turn.reply_handle.placeholder] = turn
 
     async def replies(self, reply_ref, after):
         self.calls.append(("replies", after))
-        events = [
-            {"event": "reply.update", "text": self.nonces[reply_ref]},
-            {"event": "turn.completed", "outcome": "delivered"},
-        ]
+        events = reply_events(self.turns[reply_ref], self.nonces[reply_ref])
         return {"events": events, "next_cursor": after + len(events), "terminal": True}
 
     async def reset(self, agent_id, thread_key):

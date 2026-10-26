@@ -1,0 +1,785 @@
+{
+  "total_count": 65,
+  "check_runs": [
+    {
+      "id": 119647663003,
+      "name": "Rust (fmt + clippy + test)",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-10-22T04:57:44Z",
+      "completed_at": "2026-10-22T04:57:48Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119647484007,
+      "name": "Python (ruff + mypy + pytest)",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-10-22T04:57:07Z",
+      "completed_at": "2026-10-22T04:57:17Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642567438,
+      "name": "Rust convergence regressions (kind)",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-10-22T04:40:12Z",
+      "completed_at": "2026-10-22T04:57:42Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642567368,
+      "name": "Rust test (partition 1/3)",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-10-22T04:40:11Z",
+      "completed_at": "2026-10-22T04:43:46Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642567336,
+      "name": "Rust test (partition 3/3)",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-10-22T04:40:11Z",
+      "completed_at": "2026-10-22T04:42:45Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642567300,
+      "name": "Rust test (partition 2/3)",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-10-22T04:40:11Z",
+      "completed_at": "2026-10-22T04:43:56Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642257590,
+      "name": "CodeQL",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-10-22T04:39:04Z",
+      "completed_at": "2026-10-22T04:39:07Z",
+      "app": {
+        "slug": "github-advanced-security"
+      }
+    },
+    {
+      "id": 119642166704,
+      "name": "Rust test build",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-10-22T04:38:47Z",
+      "completed_at": "2026-10-22T04:40:09Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642160383,
+      "name": "E2E required",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-10-22T04:38:46Z",
+      "completed_at": "2026-10-22T04:38:53Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642157817,
+      "name": "E2E cluster upgrade matrix (${{ matrix.shard }})",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "skipped",
+      "started_at": "2026-10-22T04:38:43Z",
+      "completed_at": "2026-10-22T04:38:43Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642110408,
+      "name": "Eval falsifiability gate (fake model, offline)",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "skipped",
+      "started_at": "2026-10-22T04:38:33Z",
+      "completed_at": "2026-10-22T04:38:33Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642110392,
+      "name": "E2E approval resume after worker and store restarts (kind)",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "skipped",
+      "started_at": "2026-10-22T04:38:33Z",
+      "completed_at": "2026-10-22T04:38:33Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642110377,
+      "name": "E2E released chart upgrade negative control (nil unsafe helpers)",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "skipped",
+      "started_at": "2026-10-22T04:38:33Z",
+      "completed_at": "2026-10-22T04:38:33Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642110172,
+      "name": "E2E OIDC console login (real Dex)",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "skipped",
+      "started_at": "2026-10-22T04:38:33Z",
+      "completed_at": "2026-10-22T04:38:33Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642110152,
+      "name": "E2E parity ladder (local-release, fake model)",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "skipped",
+      "started_at": "2026-10-22T04:38:33Z",
+      "completed_at": "2026-10-22T04:38:33Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642110146,
+      "name": "E2E scripted factory (kind, scripted model, ${{ matrix.suite }})",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "skipped",
+      "started_at": "2026-10-22T04:38:33Z",
+      "completed_at": "2026-10-22T04:38:33Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642110106,
+      "name": "E2E chart runtime regressions (kind, Calico, ${{ matrix.leg }})",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "skipped",
+      "started_at": "2026-10-22T04:38:33Z",
+      "completed_at": "2026-10-22T04:38:33Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642110094,
+      "name": "E2E rollout-free invocation and dead-consumer recovery (kind)",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "skipped",
+      "started_at": "2026-10-22T04:38:33Z",
+      "completed_at": "2026-10-22T04:38:33Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642110015,
+      "name": "CLI runs on old glibc (and publishes per-commit binaries)",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "skipped",
+      "started_at": "2026-10-22T04:38:33Z",
+      "completed_at": "2026-10-22T04:38:33Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642109991,
+      "name": "CLI builds for macOS (the fourth release target)",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "skipped",
+      "started_at": "2026-10-22T04:38:33Z",
+      "completed_at": "2026-10-22T04:38:33Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642109925,
+      "name": "E2E parity ladder (skill + local, fake model)",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "skipped",
+      "started_at": "2026-10-22T04:38:33Z",
+      "completed_at": "2026-10-22T04:38:33Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642109883,
+      "name": "E2E released chart upgrade (released install to candidate)",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "skipped",
+      "started_at": "2026-10-22T04:38:33Z",
+      "completed_at": "2026-10-22T04:38:33Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642109811,
+      "name": "E2E parity ladder (cluster rung on kind, fake model)",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "skipped",
+      "started_at": "2026-10-22T04:38:33Z",
+      "completed_at": "2026-10-22T04:38:33Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642109739,
+      "name": "Forge instance regression (kind, ${{ matrix.suite }})",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "skipped",
+      "started_at": "2026-10-22T04:38:33Z",
+      "completed_at": "2026-10-22T04:38:33Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642109654,
+      "name": "Build the curie release binary",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "skipped",
+      "started_at": "2026-10-22T04:38:33Z",
+      "completed_at": "2026-10-22T04:38:33Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642109646,
+      "name": "Build CI images (no push)",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "skipped",
+      "started_at": "2026-10-22T04:38:33Z",
+      "completed_at": "2026-10-22T04:38:33Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642109592,
+      "name": "Admitted agent runtime regressions (kind, shard ${{ matrix.shard }}/5)",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "skipped",
+      "started_at": "2026-10-22T04:38:33Z",
+      "completed_at": "2026-10-22T04:38:33Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642109387,
+      "name": "Build ${{ matrix.name }} image (no push)",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "skipped",
+      "started_at": "2026-10-22T04:38:33Z",
+      "completed_at": "2026-10-22T04:38:33Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642108943,
+      "name": "Image proofs (smoke, Docker daemon, toolchain)",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-10-22T04:38:35Z",
+      "completed_at": "2026-10-22T04:38:48Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642108527,
+      "name": "Python pytest (shard 3/6)",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-10-22T04:38:36Z",
+      "completed_at": "2026-10-22T04:54:14Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642108491,
+      "name": "Python dry run fixture (pytest)",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-10-22T04:38:36Z",
+      "completed_at": "2026-10-22T04:49:27Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642108456,
+      "name": "Python pytest (shard 4/6)",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-10-22T04:38:36Z",
+      "completed_at": "2026-10-22T04:51:49Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642108417,
+      "name": "Python pytest (shard 5/6)",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-10-22T04:38:35Z",
+      "completed_at": "2026-10-22T04:47:44Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642108410,
+      "name": "Runtime assertion registration",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-10-22T04:38:35Z",
+      "completed_at": "2026-10-22T04:38:43Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642108405,
+      "name": "Python pytest (shard 1/6)",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-10-22T04:38:36Z",
+      "completed_at": "2026-10-22T04:57:04Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642108402,
+      "name": "Python pytest (shard 2/6)",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-10-22T04:38:35Z",
+      "completed_at": "2026-10-22T04:50:48Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642108399,
+      "name": "E2E cluster upgrade matrix shards",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-10-22T04:38:35Z",
+      "completed_at": "2026-10-22T04:38:43Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642108382,
+      "name": "Python pytest (shard 6/6)",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-10-22T04:38:35Z",
+      "completed_at": "2026-10-22T04:50:52Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642108339,
+      "name": "Python static gates",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-10-22T04:38:35Z",
+      "completed_at": "2026-10-22T04:39:25Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642108333,
+      "name": "Python container fixtures (pytest)",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-10-22T04:38:35Z",
+      "completed_at": "2026-10-22T04:45:06Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642108281,
+      "name": "CI policy (workflow meta-tests)",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-10-22T04:38:35Z",
+      "completed_at": "2026-10-22T04:41:31Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642108256,
+      "name": "Select Rust tests",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-10-22T04:38:35Z",
+      "completed_at": "2026-10-22T04:38:45Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642079057,
+      "name": "Chart lint, kubeconform, and render assertions (1 of 3)",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "skipped",
+      "started_at": "2026-10-22T04:38:26Z",
+      "completed_at": "2026-10-22T04:38:26Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642078482,
+      "name": "Chart render assertions (2 of 3)",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "skipped",
+      "started_at": "2026-10-22T04:38:26Z",
+      "completed_at": "2026-10-22T04:38:26Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642078455,
+      "name": "Automatic thread isolation (kind)",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "skipped",
+      "started_at": "2026-10-22T04:38:26Z",
+      "completed_at": "2026-10-22T04:38:26Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642078424,
+      "name": "Reject legacy extraEnv before upgrade mutation",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "skipped",
+      "started_at": "2026-10-22T04:38:26Z",
+      "completed_at": "2026-10-22T04:38:26Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642078338,
+      "name": "Chart render assertions (3 of 3, retained values through the real CLI)",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "skipped",
+      "started_at": "2026-10-22T04:38:26Z",
+      "completed_at": "2026-10-22T04:38:26Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642077916,
+      "name": "Chart (lint + template + kubeconform)",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-10-22T04:38:29Z",
+      "completed_at": "2026-10-22T04:38:36Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642013649,
+      "name": "UI (lint + vitest + build + Playwright)",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-10-22T04:38:16Z",
+      "completed_at": "2026-10-22T04:40:19Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642013626,
+      "name": "Preserve next on release merge",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-10-22T04:38:16Z",
+      "completed_at": "2026-10-22T04:38:23Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642013609,
+      "name": "Action SHA pins",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-10-22T04:38:16Z",
+      "completed_at": "2026-10-22T04:38:29Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642013569,
+      "name": "Turn canary contract",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-10-22T04:38:16Z",
+      "completed_at": "2026-10-22T04:38:46Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642013544,
+      "name": "Rust (fmt + clippy)",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-10-22T04:38:16Z",
+      "completed_at": "2026-10-22T04:40:37Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642013523,
+      "name": "Compose (release stack validates)",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-10-22T04:38:16Z",
+      "completed_at": "2026-10-22T04:38:26Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642013510,
+      "name": "Select end to end tiers",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-10-22T04:38:16Z",
+      "completed_at": "2026-10-22T04:38:32Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642013509,
+      "name": "Contracts (generated TypeScript compiles)",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-10-22T04:38:15Z",
+      "completed_at": "2026-10-22T04:38:36Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642013485,
+      "name": "Commit messages (no AI attribution)",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-10-22T04:38:16Z",
+      "completed_at": "2026-10-22T04:38:25Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642013399,
+      "name": "SRE bot adapter credential reconciliation",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-10-22T04:38:16Z",
+      "completed_at": "2026-10-22T04:38:38Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642013101,
+      "name": "Detect chart-relevant changes",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-10-22T04:38:16Z",
+      "completed_at": "2026-10-22T04:38:26Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642012964,
+      "name": "Analyze (python)",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-10-22T04:38:15Z",
+      "completed_at": "2026-10-22T04:40:33Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642012907,
+      "name": "Comment when a Closes targets P0 / release-blocker / sre-bot-e2e-demo",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-10-22T04:38:16Z",
+      "completed_at": "2026-10-22T04:38:25Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642012770,
+      "name": "Analyze (javascript-typescript)",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-10-22T04:38:15Z",
+      "completed_at": "2026-10-22T04:39:13Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642012633,
+      "name": "gitleaks (full history)",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-10-22T04:38:15Z",
+      "completed_at": "2026-10-22T04:38:28Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642012547,
+      "name": "PR body (real newlines)",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-10-22T04:38:15Z",
+      "completed_at": "2026-10-22T04:38:39Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    },
+    {
+      "id": 119642012546,
+      "name": "Fix pin verification",
+      "head_sha": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-10-22T04:38:15Z",
+      "completed_at": "2026-10-22T04:38:36Z",
+      "app": {
+        "slug": "github-actions"
+      }
+    }
+  ]
+}

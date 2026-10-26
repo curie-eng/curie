@@ -323,18 +323,18 @@ class Agent(Base):
     # agent (#1461, ADR-0167). Operator-owned; off by default. When on, the
     # worker hands the runner the binding-scoped channel memory URL.
     memory_writes: Mapped[bool] = mapped_column(default=False, server_default="false")
-    # Whether this agent is opted in to agent-wide learning (ADR 0239). Operator
+    # Whether this agent is opted in to agent-wide learning (ADR 0249). Operator
     # owned and off by default, independent of ``memory_writes``: it authorizes
     # standing instructions (kind ``instruction``) and selects the learning
     # default guidance. It never turns memory writes on.
     agent_wide_learning: Mapped[bool] = mapped_column(default=False, server_default="false")
-    # Whether the agent may create and change its own schedules (ADR 0238), and
+    # Whether the agent may create and change its own schedules (ADR 0248), and
     # the limits it is held to. Operator-owned; off by default.
     agent_schedules: Mapped[bool] = mapped_column(default=False, server_default="false")
     schedule_timezone: Mapped[str] = mapped_column(Text, default="UTC", server_default="UTC")
     schedule_max_active: Mapped[int] = mapped_column(default=20, server_default="20")
     schedule_min_interval_minutes: Mapped[int] = mapped_column(default=15, server_default="15")
-    # Whether the agent loads and may edit its learned skills (ADR 0237).
+    # Whether the agent loads and may edit its learned skills (ADR 0247).
     # Operator-owned; off by default, like ``memory_writes``.
     learned_skills: Mapped[bool] = mapped_column(default=False, server_default="false")
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
@@ -974,6 +974,15 @@ class WorkItem(Base):
         )
 
 
+# #4930: a stored start failure detail is nonblank (a POSIX class, so a value of
+# only tabs or newlines is refused too, which btrim alone would let through)
+# and within the API's clip bound.
+LAST_START_FAILURE_DETAIL_CHECK = (
+    "last_start_failure_detail IS NULL OR "
+    "(last_start_failure_detail ~ '[^[:space:]]' "
+    "AND length(last_start_failure_detail) <= 2000)"
+)
+
 # The typed reply target's shape. Migration 0078 carries a frozen copy.
 REPLY_TARGET_CHECK = (
     "((reply_target_kind = 'issue' AND reply_target_pr_number IS NULL "
@@ -1119,6 +1128,10 @@ class ExecutionRequest(Base):
             name="execution_requests_snapshot_ck",
         ),
         CheckConstraint(REPLY_TARGET_CHECK, name="execution_requests_reply_target_ck"),
+        CheckConstraint(
+            LAST_START_FAILURE_DETAIL_CHECK,
+            name="execution_requests_last_start_failure_detail_ck",
+        ),
         UniqueConstraint(
             "work_item_id",
             "sequence",
@@ -1199,6 +1212,7 @@ class ExecutionRequest(Base):
     capacity_deferrals: Mapped[int] = mapped_column(default=0, server_default="0")
     start_deferrals: Mapped[int] = mapped_column(default=0, server_default="0")
     last_deferral_reason: Mapped[str | None] = mapped_column(Text, default=None)
+    last_start_failure_detail: Mapped[str | None] = mapped_column(Text, default=None)
     execution_attempts: Mapped[int] = mapped_column(default=0, server_default="0")
     runtime_owner: Mapped[str | None] = mapped_column(Text, default=None)
     runtime_epoch: Mapped[int] = mapped_column(
@@ -1837,7 +1851,8 @@ class ApprovalAuditEntry(Base):
     decision: Mapped[str]
     # The authorizer snapshot: which implementation decided, its verdict, and
     # its stated reason at the time of the attempt.
-    authorizer: Mapped[str]
+    # Null when no legacy approver set was evaluated (IdP team-only decision).
+    authorizer: Mapped[str | None] = mapped_column(default=None)
     authorized: Mapped[bool]
     reason: Mapped[str | None] = mapped_column(default=None)
     # The membership facts the authorizer decided on (#420): the group ID and
@@ -1846,6 +1861,9 @@ class ApprovalAuditEntry(Base):
     # sweeper) must leave it NULL rather than fabricate one, and because rows
     # written before this column existed have none.
     evidence: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
+    team_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), default=None)
+    team_epoch: Mapped[int | None] = mapped_column(Integer, default=None)
+    team_digest: Mapped[str | None] = mapped_column(default=None)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
 
@@ -2061,7 +2079,10 @@ class ActionAuditEntry(Base):
     actor_channel: Mapped[str | None] = mapped_column(default=None)
     # The authorizer snapshot, as on an approval: which implementation decided,
     # its verdict, and its stated reason at the time of the attempt.
-    authorizer: Mapped[str]
+    authorizer: Mapped[str | None] = mapped_column(default=None)
+    team_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), default=None)
+    team_epoch: Mapped[int | None] = mapped_column(Integer, default=None)
+    team_digest: Mapped[str | None] = mapped_column(default=None)
     authorized: Mapped[bool]
     reason: Mapped[str | None] = mapped_column(default=None)
     # For a conflict refusal, the two states that disagreed. Naming both is the
@@ -2311,7 +2332,7 @@ class WorkflowStateEntry(Base):
 
 
 class MemoryRevision(Base):
-    """One immutable revision of a canonical memory entry (ADR 0239).
+    """One immutable revision of a canonical memory entry (ADR 0249).
 
     Every successful create, update, delete, archive, restore and revert of a
     ``memory`` / ``fact-<hex>`` head appends exactly one row here in the same
@@ -2446,6 +2467,89 @@ class ThreadAttachmentRef(Base):
     mime_type: Mapped[str | None] = mapped_column(Text, default=None)
     size_bytes: Mapped[int | None] = mapped_column(BigInteger, default=None)
     sha256: Mapped[str] = mapped_column(Text)
+    route_kind: Mapped[str] = mapped_column(Text)
+    route_adapter: Mapped[str | None] = mapped_column(Text, default=None)
+    route_identity: Mapped[str] = mapped_column(Text)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class AttachmentCatalog(Base):
+    """A transcript-lifetime incarnation, including catalogs with no files."""
+
+    __tablename__ = "attachment_catalogs"
+    __table_args__ = (
+        UniqueConstraint("agent_id", "thread_key", name="uq_attachment_catalog_thread"),
+        Index("ix_attachment_catalog_expiry", "agent_id", "expires_at"),
+    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE")
+    )
+    thread_key: Mapped[str] = mapped_column(Text)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class AttachmentReference(Base):
+    """An unfetched or verified reference in a thread catalog (ADR 0244).
+
+    Keyed exactly like ``ThreadTranscript`` and removed with it
+    (``curie_api.thread_attachments``). Only the worker writes it, through the
+    internal routes. It records the channel's file id and the route it came
+    from, never an endpoint, a URL or bytes. ``seq`` is the arrival order;
+    ``disk_name`` is the stable public display basename, unique in the thread.
+    The runner chooses its own local cache path after verified completion.
+    """
+
+    __tablename__ = "attachment_references"
+    __table_args__ = (
+        UniqueConstraint(
+            "agent_id",
+            "binding_scope",
+            "thread_key",
+            "event_id",
+            "file_id",
+            name="uq_attachment_references_event_file",
+            postgresql_nulls_not_distinct=True,
+        ),
+        UniqueConstraint(
+            "agent_id",
+            "binding_scope",
+            "thread_key",
+            "disk_name",
+            name="uq_attachment_references_disk_name",
+            postgresql_nulls_not_distinct=True,
+        ),
+        Index(
+            "ix_attachment_references_thread_seq",
+            "agent_id",
+            "binding_scope",
+            "thread_key",
+            "seq",
+        ),
+        Index("ix_attachment_references_expires_at", "expires_at"),
+        # The orphan sweep runs on every transcript write, scoped to one agent.
+        Index("ix_attachment_references_agent_expires_at", "agent_id", "expires_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    seq: Mapped[int] = mapped_column(BigInteger, Identity(always=True))
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE")
+    )
+    binding_scope: Mapped[str | None] = mapped_column(Text, default=None)
+    thread_key: Mapped[str] = mapped_column(Text)
+    event_id: Mapped[str] = mapped_column(Text)
+    file_id: Mapped[str] = mapped_column(Text)
+    ordinal: Mapped[int] = mapped_column(Integer)
+    name: Mapped[str] = mapped_column(Text)
+    disk_name: Mapped[str] = mapped_column(Text)
+    mime_type: Mapped[str | None] = mapped_column(Text, default=None)
+    size_bytes: Mapped[int | None] = mapped_column(BigInteger, default=None)
+    sha256: Mapped[str | None] = mapped_column(Text, default=None)
+    version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
     route_kind: Mapped[str] = mapped_column(Text)
     route_adapter: Mapped[str | None] = mapped_column(Text, default=None)
     route_identity: Mapped[str] = mapped_column(Text)
@@ -2965,6 +3069,13 @@ class Team(Base):
 
     An ``idp_group`` team carries the IdP's group id in ``external_id``; the
     IdP stays the system of record for its membership.
+
+    The sync columns (migration 0120, ADR 0220 sections 5 and 6) say which
+    complete snapshot the team holds and how the last attempt went. Epoch 0
+    means no snapshot was ever applied, so the team admits nobody once
+    enforcement lands; an applied snapshot always carries its digest and time.
+    A failed attempt sets ``last_attempt_at`` and ``last_error`` only, so the
+    last snapshot stays authoritative. This state is reported, never enforced.
     """
 
     __tablename__ = "teams"
@@ -2975,6 +3086,21 @@ class Team(Base):
         CheckConstraint(
             "source <> 'idp_group' OR external_id IS NOT NULL",
             name="teams_idp_group_external_id_ck",
+        ),
+        CheckConstraint("epoch >= 0", name="teams_epoch_ck"),
+        CheckConstraint("member_count >= 0", name="teams_member_count_ck"),
+        CheckConstraint(
+            "(epoch = 0 AND member_count = 0 AND digest IS NULL AND last_synced_at IS NULL)"
+            " OR (epoch > 0 AND digest IS NOT NULL AND last_synced_at IS NOT NULL)",
+            name="teams_sync_state_ck",
+        ),
+        CheckConstraint(
+            "managed_by IS NULL OR (source = 'idp_group' AND length(managed_by) > 0)",
+            name="teams_managed_by_ck",
+        ),
+        CheckConstraint(
+            "last_error IS NULL OR length(last_error) BETWEEN 1 AND 200",
+            name="teams_last_error_ck",
         ),
         UniqueConstraint(
             "tenant_id",
@@ -2991,6 +3117,17 @@ class Team(Base):
     source: Mapped[str] = mapped_column(String)
     external_id: Mapped[str | None] = mapped_column(default=None)
     name: Mapped[str] = mapped_column(String)
+    epoch: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    member_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    digest: Mapped[str | None] = mapped_column(default=None)
+    last_synced_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    last_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    last_error: Mapped[str | None] = mapped_column(default=None)
+    managed_by: Mapped[str | None] = mapped_column(default=None)
 
 
 class PrincipalTeam(Base):
@@ -3030,6 +3167,52 @@ class PrincipalTeam(Base):
     source: Mapped[str] = mapped_column(String)
     version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
     synced_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class AgentAccessPolicy(Base):
+    """Which teams may invoke an agent and approve for it (#4585, ADR 0220 s.8).
+
+    One row per agent, absent until an operator sets one; a missing row and a
+    NULL role both mean today's behavior for that role. Each team reference
+    carries ``tenant_id``, so a policy cannot name another tenant's team, and a
+    team a policy names cannot be deleted from under it. Deleting the agent
+    deletes its policy. ``version`` is the optimistic concurrency token a write
+    must name.
+    """
+
+    __tablename__ = "agent_access_policies"
+    __table_args__ = (
+        CheckConstraint("version >= 1", name="agent_access_policies_version_ck"),
+        ForeignKeyConstraint(
+            ["tenant_id", "agent_id"],
+            [f"{SCHEMA}.agents.tenant_id", f"{SCHEMA}.agents.id"],
+            ondelete="CASCADE",
+            name="agent_access_policies_agent_fkey",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "invocation_team_id"],
+            [f"{SCHEMA}.teams.tenant_id", f"{SCHEMA}.teams.id"],
+            name="agent_access_policies_invocation_team_fkey",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "approver_team_id"],
+            [f"{SCHEMA}.teams.tenant_id", f"{SCHEMA}.teams.id"],
+            name="agent_access_policies_approver_team_fkey",
+        ),
+    )
+
+    agent_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    invocation_team_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), default=None
+    )
+    approver_team_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), default=None
+    )
+    version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
 
@@ -3572,8 +3755,15 @@ class IdentityNamespace(Base):
 
     __tablename__ = "identity_namespaces"
     __table_args__ = (
-        CheckConstraint(_PROVIDER_CK, name="identity_namespaces_provider_ck"),
-        CheckConstraint("kind IN ('slack_workspace')", name="identity_namespaces_kind_ck"),
+        CheckConstraint(_PROVIDER_CK[:-1] + ", 'email')", name="identity_namespaces_provider_ck"),
+        CheckConstraint(
+            "kind IN ('slack_workspace', 'email_domain')", name="identity_namespaces_kind_ck"
+        ),
+        CheckConstraint(
+            "kind <> 'email_domain' OR (provider = 'email' AND key = lower(key) AND "
+            "position('@' in key) = 0)",
+            name="identity_namespaces_email_domain_ck",
+        ),
         CheckConstraint("status IN ('active', 'disabled')", name="identity_namespaces_status_ck"),
         CheckConstraint(
             "kind <> 'slack_workspace' OR (provider = 'slack' AND key ~ '^T[A-Z0-9]{2,}$')",
@@ -3601,9 +3791,7 @@ class IdentityNamespace(Base):
     kind: Mapped[str] = mapped_column(String)
     key: Mapped[str] = mapped_column(String)
     status: Mapped[str] = mapped_column(String, default="active", server_default="active")
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class IdentityLink(Base):
@@ -3622,8 +3810,15 @@ class IdentityLink(Base):
             "(principal_id IS NULL) <> (bot_id IS NULL)", name="identity_links_target_xor_ck"
         ),
         CheckConstraint(
-            "verification_source IN ('provider_event_verified', 'admin_mapped')",
+            "verification_source IN ('provider_event_verified', 'admin_mapped', 'idp_directory')",
             name="identity_links_verification_source_ck",
+        ),
+        CheckConstraint(
+            "(verification_source = 'idp_directory' AND created_by_principal_id IS NULL "
+            "AND created_by_directory IS NOT NULL AND length(created_by_directory) > 0) OR "
+            "(verification_source <> 'idp_directory' AND created_by_principal_id IS NOT NULL "
+            "AND created_by_directory IS NULL)",
+            name="identity_links_creator_ck",
         ),
         CheckConstraint("length(provider_native_id) > 0", name="identity_links_native_id_ck"),
         ForeignKeyConstraint(
@@ -3662,15 +3857,96 @@ class IdentityLink(Base):
     principal_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), default=None)
     bot_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), default=None)
     verification_source: Mapped[str] = mapped_column(String)
-    created_by_principal_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    created_by_principal_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), default=None
+    )
+    created_by_directory: Mapped[str | None] = mapped_column(default=None)
     verified_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
 
 
+class TenantIdentityProvider(Base):
+    """Versioned authority configuration, separate from its directory projection."""
+
+    __tablename__ = "tenant_identity_providers"
+    __table_args__ = (
+        CheckConstraint("version >= 1", name="tenant_identity_providers_version_ck"),
+        CheckConstraint("identity_epoch >= 0", name="tenant_identity_providers_identity_epoch_ck"),
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.tenants.id"), primary_key=True
+    )
+    issuer: Mapped[str] = mapped_column(String)
+    governed_domains: Mapped[list[str]] = mapped_column(JSONB)
+    managed_by: Mapped[str] = mapped_column(String)
+    version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+
+    # Shared channel-account ownership spans teams, so team epochs cannot fence it.
+    identity_epoch: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0")
+
+
+class IdentityAuditEvent(Base):
+    """Immutable identity evidence; the writer shares its caller's transaction."""
+
+    __tablename__ = "identity_audit_events"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["tenant_id", "principal_id"],
+            [f"{SCHEMA}.principals.tenant_id", f"{SCHEMA}.principals.id"],
+            name="identity_audit_principal_fkey",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "team_id"],
+            [f"{SCHEMA}.teams.tenant_id", f"{SCHEMA}.teams.id"],
+            name="identity_audit_team_fkey",
+        ),
+    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey(f"{SCHEMA}.tenants.id"))
+    event_type: Mapped[str] = mapped_column(String)
+    actor: Mapped[str] = mapped_column(String)
+    principal_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), default=None)
+    team_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), default=None)
+    details: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, server_default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class IdentityConnectToken(Base):
+    """Hashed single-use proof binding one channel account to an OIDC sign-in."""
+
+    __tablename__ = "identity_connect_tokens"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["tenant_id", "identity_namespace_id"],
+            [f"{SCHEMA}.identity_namespaces.tenant_id", f"{SCHEMA}.identity_namespaces.id"],
+            name="identity_connect_namespace_fkey",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "verified_principal_id"],
+            [f"{SCHEMA}.principals.tenant_id", f"{SCHEMA}.principals.id"],
+            name="identity_connect_principal_fkey",
+        ),
+    )
+    token_hash: Mapped[str] = mapped_column(String, primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey(f"{SCHEMA}.tenants.id"))
+    identity_namespace_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    provider_native_id: Mapped[str] = mapped_column(String)
+    idp_issuer: Mapped[str] = mapped_column(String)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    browser_proof_hash: Mapped[str | None] = mapped_column(String(64), default=None)
+    verified_email: Mapped[str | None] = mapped_column(String(320), default=None)
+    verified_principal_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), default=None
+    )
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class AgentSchedule(Base):
-    """One schedule an agent (or its operator) created (ADR 0238).
+    """One schedule an agent (or its operator) created (ADR 0248).
 
     Exactly one of ``cron`` (recurring) and ``run_at`` (one-shot) is set.
     ``revision`` is the configuration revision: it moves only when the prompt,
@@ -3719,7 +3995,7 @@ class AgentSchedule(Base):
 
 
 class AgentScheduleRevision(Base):
-    """One insert-only entry in a schedule's change log (ADR 0238). Several
+    """One insert-only entry in a schedule's change log (ADR 0248). Several
     entries share a ``revision``: pause, resume, cancel and completion are
     logged without moving it. ``state`` is the read-back state after it."""
 
@@ -3758,7 +4034,7 @@ class AgentScheduleRevision(Base):
 
 
 class AgentScheduleRun(Base):
-    """What one hook run of an agent schedule fired (ADR 0238): an immutable
+    """What one hook run of an agent schedule fired (ADR 0248): an immutable
     snapshot keyed by its ``hook_runs`` row, read by the start guard."""
 
     __tablename__ = "agent_schedule_runs"
@@ -3785,7 +4061,7 @@ class AgentScheduleRun(Base):
 
 
 class LearnedSkill(Base):
-    """One learned skill's head (ADR 0237): its current content and the revision
+    """One learned skill's head (ADR 0247): its current content and the revision
     number every change compare-and-sets. History is ``LearnedSkillRevision``."""
 
     __tablename__ = "learned_skills"
@@ -3817,7 +4093,7 @@ class LearnedSkill(Base):
 
 
 class LearnedSkillRevision(Base):
-    """One immutable, insert-only change to a learned skill (ADR 0237). ``deleted``
+    """One immutable, insert-only change to a learned skill (ADR 0247). ``deleted``
     is the skill's state after this revision, so a revert restores it too."""
 
     __tablename__ = "learned_skill_revisions"

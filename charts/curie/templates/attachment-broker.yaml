@@ -1,0 +1,51 @@
+{{- if not (has (.Values.worker.attachments.mode | default "eager") (list "eager" "lazy")) }}
+{{- fail "worker.attachments.mode must be eager or lazy" }}
+{{- end }}
+{{- if and .Values.worker.attachments.enabled (eq (.Values.worker.attachments.mode | default "eager") "lazy") }}
+{{- if not .Values.worker.deploy }}
+{{- fail "lazy attachments require worker.deploy for the private attachment broker" }}
+{{- end }}
+{{- if not .Values.agentSandbox.runner.attachments.enabled }}
+{{- fail "lazy attachments require agentSandbox.runner.attachments.enabled for the writable cache" }}
+{{- end }}
+{{- if and .Values.agentSandbox.runner.fakeModel (not .Values.inference.deploy) }}
+{{- fail "lazy attachments require a real runner; fake-model runs stay offline" }}
+{{- end }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "curie.fullname" . }}-attachment-broker
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: attachment-broker
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "curie.selectorLabels" (dict "root" . "component" "worker") | nindent 4 }}
+  ports:
+    - name: attachment-broker
+      port: {{ (dig "broker" "port" 8093 .Values.worker.attachments) }}
+      targetPort: {{ (dig "broker" "port" 8093 .Values.worker.attachments) }}
+      protocol: TCP
+---
+# Broker ingress is API-only, even when the optional runner policy rail is off.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "curie.fullname" . }}-attachment-broker-ingress
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "curie.selectorLabels" (dict "root" . "component" "worker") | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "curie.selectorLabels" (dict "root" . "component" "api") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ (dig "broker" "port" 8093 .Values.worker.attachments) }}
+{{- end }}

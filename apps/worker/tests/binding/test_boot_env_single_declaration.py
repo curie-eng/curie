@@ -93,10 +93,23 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # off switch, the per-file size cap and the reference/retention TTLs,
         # read from the WORKER's env by WorkerConfig at startup and consumed by
         # run.build and AttachmentCoordinator. Never injected into a sandbox
-        # claim -- the only attachment name that crosses into a claim is
-        # CURIE_ATTACHMENTS_REF, classified below beside CURIE_WORKSPACE_REF for
-        # the same reason.
+        # claim -- runner-bound refs and attachment-access enablement use the
+        # separately declared BootEnv contract.
         "CURIE_ATTACHMENT_ENABLED",
+        # ADR 0244: WorkerConfig selects the worker's eager/lazy routing in
+        # run.build and Kernel. BindingResolver emits only the separately
+        # declared BootEnv attachment-access flag, never this operator mode.
+        "CURIE_ATTACHMENT_MODE",
+        # run._sandbox_client passes this physical cache capacity to
+        # DockerSandboxClient's claim-owned volume; the runner never reads it.
+        "CURIE_ATTACHMENT_CACHE_SIZE_BYTES",
+        # run._run_runtime binds the worker's private broker TCPSite here.
+        "CURIE_ATTACHMENT_BROKER_HOST",
+        "CURIE_ATTACHMENT_BROKER_PORT",
+        # run.build passes the broker's own finite transfer envelope to
+        # AttachmentBroker, not to the sandbox process environment.
+        "CURIE_ATTACHMENT_BROKER_MAX_CONCURRENT",
+        "CURIE_ATTACHMENT_TRANSFER_TIMEOUT_SECONDS",
         "CURIE_ATTACHMENT_MAX_FILE_BYTES",
         "CURIE_ATTACHMENT_REFERENCE_TTL_SECONDS",
         "CURIE_ATTACHMENT_RETENTION_TTL_SECONDS",
@@ -307,6 +320,10 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # executor amendment E9): read by the API settings and by WorkerConfig
         # at startup. Never a sandbox boot key.
         "CURIE_ACTION_EXECUTOR_MAX_CONCURRENT_SANDBOXES",
+        # The executor's own connector reads without the reconcile loop (#4800):
+        # read by WorkerConfig at startup to build the Deployment reader. Never a
+        # sandbox boot key.
+        "CURIE_ACTION_EXECUTOR_CONNECTOR_READS",
         # End to end namespace reaper (#3245), read by the worker process only.
         # The test cluster kubeconfig is not among them: the reaper reads it
         # from the connector Secret at sweep time.
@@ -412,8 +429,14 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # header only when it is set. It is not a BootEnv field: the caller
         # token contract stays unchanged.
         "CURIE_CONNECTOR_TOOL_GRANT",
+        # ADR 0240 decision 2: the route tokens, written beside BootEnv the
+        # same way, and the descriptor the runner hands a declared caller.
+        # Neither is a BootEnv field, so the ACI contract stays unchanged.
+        "CURIE_CONNECTOR_ROUTE_TOKENS",
+        "CURIE_CONNECTOR_ROUTES_FD",
         # The connector proxy process, not the sandbox. The API render writes
         # these onto the proxy container.
+        "CURIE_CALLER_PROXY_ROUTES",
         "CURIE_CALLER_PROXY_GATED_TOOLS",
         "CURIE_CALLER_PROXY_CONNECTOR",
         "CURIE_CALLER_PROXY_GRANT_STORE",

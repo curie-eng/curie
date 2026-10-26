@@ -1,5 +1,5 @@
 //! Integration: the `skills` verb group and `overrides --learned-skills` at
-//! BOTH tiers (epic #4780, ADR 0237).
+//! BOTH tiers (epic #4780, ADR 0247).
 //!
 //! The tests drive the BUILT BINARY against an in-process mock of the platform
 //! API and assert the HTTP requests the CLI makes and what it prints. Nothing

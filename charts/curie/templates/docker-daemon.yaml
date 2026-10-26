@@ -103,6 +103,9 @@ rules:
     resources: ["pods/log"]
     verbs: ["get"]
   - apiGroups: [""]
+    resources: ["pods/portforward"]
+    verbs: ["create", "get"]
+  - apiGroups: [""]
     resources: ["services"]
     verbs: ["create", "get", "list", "delete"]
   - apiGroups: [""]
@@ -250,10 +253,9 @@ spec:
 {{- /* Rail 1 (decision 7.1): runner sandboxes are default-deny egress, so
        they need this allow to dial a daemon. Only the factory agent's
        sandboxes get it, since repository runners belong to exactly one factory
-       agent. It admits any daemon pod in the daemon namespace on the daemon
-       port; it composes with the default-deny ingress there, which only the
-       worker's per-run ingress policy opens, for that run's sandbox alone. So
-       a sandbox reaches only its own daemon. */}}
+       agent. It admits this release's daemon pods on TCP ports 1 through
+       65535; the worker's per-run ingress policy restricts each daemon to its
+       own claim's runner. */}}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -278,7 +280,8 @@ spec:
               {{- $daemonSelector | nindent 14 }}
       ports:
         - protocol: TCP
-          port: {{ $port }}
+          port: 1
+          endPort: 65535
 {{- end }}
 ---
 {{- /* Decisions 4 and 5: the only privileged pod Curie creates. This policy
@@ -460,8 +463,8 @@ spec:
         object.spec.podSelector.matchLabels['curietech.ai/sandbox-claim'] == object.metadata.labels['curietech.ai/sandbox-claim'])
       message: per-run daemon NetworkPolicies are ingress-only and select only their own claim's daemon
     {{- /* Decision 7.2: every peer is one of this release's runner sandboxes
-           in the release namespace, narrowed by a label key outside the release
-           selector keys, and only on the daemon port with no endPort. */}}
+           in the release namespace, matching the policy's claim label, on TCP
+           ports 1 through 65535. */}}
     - expression: >-
         request.resource.resource != 'networkpolicies' ||
         !has(object.spec.ingress) ||
@@ -476,10 +479,12 @@ spec:
         p.podSelector.matchLabels['app.kubernetes.io/component'] == 'runner-sandbox' &&
         'app.kubernetes.io/instance' in p.podSelector.matchLabels &&
         p.podSelector.matchLabels['app.kubernetes.io/instance'] == '{{ .Release.Name }}' &&
-        p.podSelector.matchLabels.exists(k, !(k in ['app.kubernetes.io/name', 'app.kubernetes.io/instance', 'app.kubernetes.io/component']))) &&
+        'curietech.ai/sandbox-claim' in p.podSelector.matchLabels &&
+        p.podSelector.matchLabels['curietech.ai/sandbox-claim'] == object.metadata.labels['curietech.ai/sandbox-claim']) &&
         has(r.ports) && size(r.ports) > 0 &&
-        r.ports.all(q, has(q.port) && q.port == {{ $port }} && !has(q.endPort) && (!has(q.protocol) || q.protocol == 'TCP')))
-      message: per-run daemon NetworkPolicy ingress admits only this release's runner sandbox, selected by a label beyond the release selector keys, in the release namespace, on TCP factory.docker.port with no endPort range, with no ipBlock
+        r.ports.all(q, has(q.port) && q.port == 1 && has(q.endPort) && q.endPort == 65535 &&
+        (!has(q.protocol) || q.protocol == 'TCP')))
+      message: per-run daemon NetworkPolicy ingress admits only this release's runner sandbox with the policy's exact claim label in the release namespace, on TCP port 1 with endPort 65535, with no ipBlock
     - expression: >-
         request.resource.resource != 'secrets' ||
         !has(object.type) || object.type == 'Opaque' || object.type == 'kubernetes.io/tls'

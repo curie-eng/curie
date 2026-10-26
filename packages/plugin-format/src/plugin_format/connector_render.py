@@ -703,6 +703,25 @@ def _proxy_container(
         env.append(
             {"name": "CURIE_CALLER_PROXY_UPSTREAM_HOST", "value": spec.proxy_upstream_host}
         )
+    # ADR 0240 decision 3. `callers` stays out: the proxy cannot tell one
+    # sandbox process from another, so the runner enforces it.
+    if spec.routes:
+        env.append(
+            {
+                "name": "CURIE_CALLER_PROXY_ROUTES",
+                "value": json.dumps(
+                    [
+                        {
+                            "path": route.path,
+                            "methods": list(route.methods),
+                            "max_body_bytes": route.max_body_bytes,
+                        }
+                        for route in spec.routes
+                    ],
+                    separators=(",", ":"),
+                ),
+            }
+        )
     return {
         "name": CALLER_PROXY_CONTAINER,
         "image": proxy.image,

@@ -34,6 +34,7 @@ from curie_runner.history import (
     resolve_history,
 )
 from curie_runner.sender_frame import frame_user_turn
+from runner_boot_session import initialized_session_sync
 from runner_state_fake import CappedCasState
 
 _STATE_VALUE_MAX_BYTES = 65_536
@@ -1475,7 +1476,7 @@ def test_build_runner_forwards_configured_model_to_session_prompt(tmp_path) -> N
         }
     )
     runner = build_runner(config, fake_model=False)
-    session = runner._factory()
+    session = initialized_session_sync(runner)
     assert isinstance(session, ClaudeAgentSession)
     options = session._options
 

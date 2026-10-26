@@ -80,17 +80,21 @@ BLANKS = ("", "   ")
 # for -- it WIDENS the sweep onto those bodies rather than exempting them.
 KNOWN_BODY_MODULES = frozenset(
     {
+        "curie_api.schemas.directory",
+        "curie_api.routers.identity_connect",
         "curie_api.factory_progress",
         "curie_api.factory_usage",
         "curie_api.schemas.action_executions",
         "curie_api.hook_source_policy_schemas",
         "curie_api.identity.slack",
         "curie_api.schemas.actions",
+        "curie_api.schemas.agent_access",
         "curie_api.schemas.agent_schedules",
         "curie_api.schemas.agents",
         "curie_api.schemas.approvals",
         "curie_api.schemas.channel_identities",
         "curie_api.schemas.channels",
+        "curie_api.schemas.attachment_access",
         "curie_api.schemas.channel_read",
         "curie_api.schemas.common",
         "curie_api.schemas.console",

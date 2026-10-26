@@ -9,7 +9,6 @@ use crate::support;
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
@@ -756,13 +755,12 @@ fn unknown_trace_and_unavailable_api_are_distinct_semantic_failures() {
         "the fix points to bounded trace discovery: {unknown_json}"
     );
 
-    // Reserve an ephemeral address and close it immediately. Both siblings
-    // drive the same real reqwest connection refusal; only the actionable
-    // recovery differs because local owns a start command while cluster owns a
-    // discovered or explicitly supplied endpoint.
-    let listener = TcpListener::bind("127.0.0.1:0").expect("reserve closed test port");
-    let unavailable_url = format!("http://{}", listener.local_addr().unwrap());
-    drop(listener);
+    // Hold an ephemeral address bound but not listening for the whole loop.
+    // Both siblings drive the same real reqwest connection refusal; only the
+    // actionable recovery differs because local owns a start command while
+    // cluster owns a discovered or explicitly supplied endpoint.
+    let closed_port = support::closed_port::ClosedPort::new();
+    let unavailable_url = closed_port.url();
     let mut failures = Vec::new();
     for (tier, expected_fix) in [
         (

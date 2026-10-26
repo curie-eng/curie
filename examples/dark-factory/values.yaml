@@ -3,3 +3,8 @@ agentSandbox:
   runnerEnv:
     dark-factory:
       CLAUDE_CODE_MAX_OUTPUT_TOKENS: "16000"
+  # The manual recipe does not enroll the agent in factory.sandboxEgress, so
+  # select the factory sandbox profile (8Gi memory, 15Gi workspace) here
+  # (#4889). Set it to `standard` to opt out.
+  agentResourceProfiles:
+    dark-factory: factory

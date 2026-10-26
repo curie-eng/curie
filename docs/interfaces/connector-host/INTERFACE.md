@@ -217,9 +217,59 @@ missing grant store or a failed spend refuses the call. A body with two or more
 gated calls is refused before any grant is spent. The grant header is stripped
 before the forward. A refused grant check answers with the JSON-RPC refusal
 below, reason `grant_required`
-(`apps/worker/src/curie_connector_proxy/caller.py::GRANT_REQUIRED`). A body
-over 1 MiB is refused with a plain-text 403, not the JSON-RPC refusal, and never
-reaches the server.
+(`apps/worker/src/curie_connector_proxy/caller.py::GRANT_REQUIRED`). On a path
+the connector does not declare as a route, a body over 1 MiB is refused with a
+plain-text 403, not the JSON-RPC refusal, and never reaches the server. That
+holds for every method: a POST is read first, and any other method is streamed
+but counted as it is relayed.
+
+Only the runner holds a caller token, and it gives the token only to the
+derived hosted entries
+(`runner/src/curie_runner/connectors.py::materialize_connector_caller_headers`).
+A bundle's own stdio server, its hooks and Bash never receive it.
+
+A hosted connector may declare `routes:`, non-MCP routes its bundle's own
+stdio servers call through the proxy
+([ADR 0240](../../adr/0240-a-hosted-connector-declares-the-routes-its-bundles-stdio-servers-call-through-the-caller-proxy.md)).
+The render gives the proxy each route's path, methods and `max_body_bytes` as
+`CURIE_CALLER_PROXY_ROUTES` and leaves `callers` out
+(`packages/plugin-format/src/plugin_format/connector_render.py::_proxy_container`).
+A request whose method and exact raw path match a route is admitted only with
+a `ccr` route token that verifies, has not expired, names an admitted agent
+and names this connector
+(`apps/worker/src/curie_connector_proxy/caller.py::decide_route`). A `cct`
+there is `invalid`, a `ccr` anywhere else is `invalid`, and so is any token on
+the route's path with another method or on another spelling of it
+(`apps/worker/src/curie_connector_proxy/server.py::_shadows_route`). A route
+body is never buffered. A `Content-Length` past the route's limit is refused
+before the server is contacted, and a body without one is counted as it is
+relayed, so the caller gets a plain-text `413` unless the server answered
+before the limit was reached
+(`apps/worker/src/curie_connector_proxy/server.py::_CountedBody`). A route has
+no grant check: the runner's gate on the stdio tool call that sends it is the
+approval boundary.
+
+The worker reads which mounted hosted connectors declare routes from the
+version's stored bundle, cached by bundle and agent, and only when it holds a
+caller key (`apps/worker/src/curie_worker/kernel/route_tokens.py::route_connectors`).
+It mints one `ccr` per such connector with the caller token's claims and
+expiry into `CURIE_CONNECTOR_ROUTE_TOKENS`
+(`apps/worker/src/curie_worker/binding.py::CONNECTOR_ROUTE_TOKENS_ENV`), which
+the per-claim Secret delivers
+(`apps/worker/src/curie_worker/sandbox/claim_tokens.py::WORKER_TOKEN_ENVS`).
+No caller key, no connector scope or an unreadable bundle mints none, and the
+route then refuses `missing`. The runner removes the name from every env at
+boot (`runner/src/curie_runner/route_callers.py::take_route_tokens`). It starts
+each declared caller itself, at boot and before it serves a turn, from the
+bundle root, and mounts it behind an in-process SDK MCP relay under the name
+the plugin loader would have used
+(`runner/src/curie_runner/route_callers.py::CallerRelay`). The caller gets the
+shell and hook env plus its own `env` block and the environ lock library in
+`LD_PRELOAD`. Its routes arrive on one inherited pipe named by
+`CURIE_CONNECTOR_ROUTES_FD`, written only once `/proc` shows the caller is no
+longer dumpable (`runner/src/curie_runner/route_callers.py::proc_locked`). A
+caller with no route this boot, or with no lock library to load, is left to
+the CLI with no routes.
 
 A request the token check does not admit gets a 403 carrying a JSON-RPC error and no
 challenge, and never reaches the server; the shape is frozen in

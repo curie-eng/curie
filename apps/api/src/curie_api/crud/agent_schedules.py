@@ -1,4 +1,4 @@
-"""Database access for agent-created schedules (ADR 0238).
+"""Database access for agent-created schedules (ADR 0248).
 
 One lock order everywhere a schedule changes: the per (agent, name)
 transaction advisory lock the worker's admission takes (``lock``), then the

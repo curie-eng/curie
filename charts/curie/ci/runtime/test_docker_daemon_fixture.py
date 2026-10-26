@@ -39,7 +39,6 @@ CLUSTER_KINDS = {"CustomResourceDefinition", "ClusterRole", "ClusterRoleBinding"
 OBJECT = re.compile(r"(/api/v1|/apis/[^/]+/[^/]+)(?:/namespaces/([^/]+))?/([^/]+)/([^/]+)")
 COLLECTION = re.compile(r"(/api/v1|/apis/[^/]+/[^/]+)(?:/namespaces/([^/]+))?/([^/]+)")
 CONTEXT = "ctx-under-test"
-NODE_CTR = "node-ctr --as engine.example"
 MUTATING = {"create", "delete", "patch", "apply", "replace", "rollout", "edit", "label", "scale"}
 
 
@@ -80,7 +79,7 @@ CRD_PATHS = {CRD + doc["metadata"]["name"] for doc in vendored_crds()}
 
 
 class FakeCluster:
-    """Stands in for module `run`, interpreting kubectl/docker/ctr/git argv.
+    """Stands in for module `run`, interpreting kubectl/docker/git argv.
 
     Shapes mirror live kubectl output from a single-node k3s cluster on 2026-10-16:
     `get --raw` of a CRD returns metadata.uid/resourceVersion and
@@ -208,8 +207,6 @@ class FakeCluster:
             return ""
         if argv[:2] == ["git", "rev-parse"]:
             return "a" * 40 + "\n"
-        if argv[:5] == [*NODE_CTR.split(), "-n", "k8s.io"][:5] and argv[-2:] == ["images", "list"]:
-            return "REF TYPE DIGEST SIZE PLATFORMS LABELS\n"
         raise AssertionError(f"unexpected command: {argv}")
 
     def kubectl(self, argv: list[str], data: str | None) -> tuple[int, str, str]:
@@ -390,7 +387,6 @@ def root(mod: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Pa
     resolved = tmp_path.resolve()
     monkeypatch.setattr(mod, "ROOT", resolved)
     monkeypatch.setenv("DOCKER_HOST", "ssh://user@engine.example")
-    monkeypatch.setenv("FD_NODE_CTR", NODE_CTR)
     monkeypatch.delenv("FD_FIXTURE_FAULT", raising=False)
     return resolved
 
@@ -492,17 +488,6 @@ def test_symlinked_work_component_is_refused(
         mod.arguments(argv=argv_for())
     assert list((root / "elsewhere").iterdir()) == []
     assert fake.calls == []
-
-
-def test_setup_refuses_unset_node_ctr_before_any_create(
-    make: Callable[..., Any], fake: FakeCluster, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.delenv("FD_NODE_CTR")
-    fixture = make(prime=False)
-    with pytest.raises(RuntimeError, match="^node_ctr_unset$"):
-        fixture.setup()
-    assert fake.mutations == []
-    assert not (fixture.work / "snapshot").exists()
 
 
 @pytest.mark.parametrize(
@@ -809,11 +794,10 @@ def test_cleanup_records_and_deletes_an_intent_whose_create_was_lost(
     assert fixture.meta()["cleanup_complete"] is True
 
 
-def test_kube_only_cleanup_issues_no_docker_or_ctr_command(
+def test_kube_only_cleanup_issues_no_docker_command(
     make: Callable[..., Any], fake: FakeCluster, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv("DOCKER_HOST", raising=False)
-    monkeypatch.delenv("FD_NODE_CTR")
     fixture = make()
     fixture.create({**NS, "metadata": {"name": fixture.args.namespace}})
     fixture.cleanup()
@@ -821,14 +805,95 @@ def test_kube_only_cleanup_issues_no_docker_or_ctr_command(
     assert all(call[0] == "kubectl" for call in fake.calls)
 
 
-def test_import_cleanup_uses_the_caller_node_ctr_prefix(
-    make: Callable[..., Any], fake: FakeCluster
+DIGEST = "sha256:" + "b" * 64
+PROBE_POD = "/api/v1/namespaces/{namespace}/pods/fd-probe-daemon"
+
+
+def prepare_probe(
+    fixture: Any, fake: FakeCluster, monkeypatch: pytest.MonkeyPatch, status: Json | None
+) -> str:
+    """Primes the digests probe reads and, when `status` is given, sets it on the created Pod
+    just before each wait; returns the Pod path."""
+    fixture.note("daemon_digests", {"ref": "localhost:5000/fd/daemon@" + DIGEST, "digest": DIGEST})
+    path = PROBE_POD.format(namespace=fixture.args.daemon_namespace)
+    real_wait = fixture.wait
+
+    def wait(predicate: Callable[[], Any], seconds: float = 300) -> Any:
+        if status is not None:
+            fake.objects[path]["status"] = copy.deepcopy(status)
+        return real_wait(predicate, seconds)
+
+    monkeypatch.setattr(fixture, "wait", wait)
+    return path
+
+
+def test_probe_creates_if_not_present_digest_pod_and_accepts_matching_image_id(
+    make: Callable[..., Any], fake: FakeCluster, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     fixture = make()
-    fixture.asset("import", "localhost:5000/fd/daemon@sha256:" + "b" * 64, "sha256:" + "b" * 64)
-    fixture.cleanup()
-    ctr = [c for c in fake.calls if c[: len(NODE_CTR.split())] == NODE_CTR.split()]
-    assert ctr and all(c[len(NODE_CTR.split()) :][:2] == ["-n", "k8s.io"] for c in ctr)
+    done = {
+        "phase": "Succeeded",
+        "containerStatuses": [
+            {
+                "name": "daemon",
+                "imageID": "localhost:5000/fd/daemon@" + DIGEST,
+                "state": {"terminated": {"exitCode": 0}},
+            }
+        ],
+    }
+    path = prepare_probe(fixture, fake, monkeypatch, done)
+    fixture.probe("daemon", fixture.args.daemon_namespace, ["dockerd", "--version"], False)
+    container = fake.objects[path]["spec"]["containers"][0]
+    assert container["imagePullPolicy"] == "IfNotPresent"
+    assert container["image"] == "localhost:5000/fd/daemon@" + DIGEST
+    assert container["command"] == ["dockerd", "--version"]
+
+
+@pytest.mark.parametrize("reason", ["ImagePullBackOff", "ErrImagePull"])
+def test_probe_fails_fast_when_the_node_cannot_pull_the_image(
+    mod: ModuleType,
+    make: Callable[..., Any],
+    fake: FakeCluster,
+    monkeypatch: pytest.MonkeyPatch,
+    reason: str,
+) -> None:
+    fixture = make()
+    pending = {
+        "phase": "Pending",
+        "containerStatuses": [{"name": "daemon", "state": {"waiting": {"reason": reason}}}],
+    }
+    prepare_probe(fixture, fake, monkeypatch, pending)
+
+    def no_sleep(_: float) -> None:
+        raise AssertionError("probe kept waiting after the image pull failed")
+
+    monkeypatch.setattr(mod.time, "sleep", no_sleep)
+    with pytest.raises(RuntimeError, match="^image_pull_failed$"):
+        fixture.probe("daemon", fixture.args.daemon_namespace, ["dockerd", "--version"], False)
+
+
+def test_probe_keeps_waiting_while_the_container_is_still_creating(
+    make: Callable[..., Any], fake: FakeCluster, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = make()
+    creating = {
+        "phase": "Pending",
+        "containerStatuses": [
+            {"name": "daemon", "state": {"waiting": {"reason": "ContainerCreating"}}}
+        ],
+    }
+    path = prepare_probe(fixture, fake, monkeypatch, None)
+    seen: list[Any] = []
+
+    def wait(predicate: Callable[[], Any], seconds: float = 300) -> Any:
+        fake.objects[path]["status"] = copy.deepcopy(creating)
+        seen.append(predicate())
+        raise RuntimeError("stop_after_one_poll")
+
+    monkeypatch.setattr(fixture, "wait", wait)
+    with pytest.raises(RuntimeError, match="^stop_after_one_poll$"):
+        fixture.probe("daemon", fixture.args.daemon_namespace, ["dockerd", "--version"], False)
+    assert seen == [{}]
 
 
 @pytest.mark.parametrize("target", ["crd", "deployment"])

@@ -4,6 +4,13 @@ Date: 2026-10-17
 
 Status: Accepted
 
+Partially superseded by
+[ADR 0243](0243-network-case-five-measures-new-connection-denial-after-replacement-or-policy-change.md)
+only for the retained-connection requirement under "Network producers are selected per CNI".
+The remaining decision stays in force.
+
+Partially superseded by [ADR 0241](0241-a-commissioning-run-separates-destructive-trials-from-final-acceptance.md) for destructive-trial evidence composition and the final accepting campaign; all other boundaries remain in force.
+
 Accepted on 2026-10-17 with explicit maintainer approval.
 
 Tracked in [#4557](https://github.com/curie-eng/curie/issues/4557).

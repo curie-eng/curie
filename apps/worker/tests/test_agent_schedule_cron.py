@@ -1,4 +1,4 @@
-"""Agent-created schedules through the cron loop (ADR 0238).
+"""Agent-created schedules through the cron loop (ADR 0248).
 
 Every test drives ``CronSchedulerLoop.one_pass(now=...)`` against a real
 migrated Postgres clone and real Valkey, as ``test_source_cron_integration``

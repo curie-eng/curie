@@ -171,7 +171,7 @@ pub struct SchedulesOpts {
     pub dry_run: bool,
 }
 
-/// Inputs for an agent-schedule verb of `<tier> schedules --agent X` (ADR 0238).
+/// Inputs for an agent-schedule verb of `<tier> schedules --agent X` (ADR 0248).
 pub struct AgentScheduleOpts {
     pub api_url: String,
     pub api_key: String,
@@ -216,7 +216,7 @@ impl crate::ui::CliOutput for AgentScheduleOutput {
     }
 }
 
-/// One agent-schedule verb of `<tier> schedules --agent X` (ADR 0238). The
+/// One agent-schedule verb of `<tier> schedules --agent X` (ADR 0248). The
 /// schedule verbs hit `/agents/{id}/schedules/..`; the `Set*` verbs patch the
 /// agent's schedule policy columns.
 #[derive(Debug, Clone)]

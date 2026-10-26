@@ -1612,3 +1612,201 @@ def test_no_client_auth_blank_reason_is_refused(reason: str) -> None:
             }
         }
     )
+
+
+# --------------------------------------------------------------------------- #
+# `routes`: non-MCP routes a bundle's stdio servers call through the caller
+# proxy (ADR 0240)
+# --------------------------------------------------------------------------- #
+def _route(**overrides: object) -> dict[str, object]:
+    route: dict[str, object] = {
+        "path": "/v1/review",
+        "methods": ["POST"],
+        "max_body_bytes": 64 * 1024 * 1024,
+        "callers": ["review-tools"],
+    }
+    route.update(overrides)
+    return route
+
+
+def _route_codes(*routes: dict[str, object], **spec: object) -> list[str]:
+    return _codes({"connectors": {"reviewer": {"image": "x:1", **spec, "routes": list(routes)}}})
+
+
+def test_a_hosted_connector_may_declare_a_route() -> None:
+    # @spec ADR-0240 d1
+    parsed, errors = validate_connectors(
+        {"connectors": {"reviewer": {"image": "x:1", "routes": [_route()]}}}
+    )
+    assert errors == []
+    assert parsed is not None
+    (route,) = parsed.connectors["reviewer"].routes
+    assert route.path == "/v1/review"
+    assert route.methods == ["POST"]
+    assert route.max_body_bytes == 64 * 1024 * 1024
+    assert route.callers == ["review-tools"]
+
+
+def test_routes_default_to_none_and_methods_to_post() -> None:
+    # @spec ADR-0240 d1
+    parsed, errors = validate_connectors({"connectors": {"grafana": {"image": "x:1"}}})
+    assert errors == []
+    assert parsed is not None
+    assert parsed.connectors["grafana"].routes == []
+    route = {key: value for key, value in _route().items() if key != "methods"}
+    parsed, errors = validate_connectors(
+        {"connectors": {"reviewer": {"image": "x:1", "routes": [route]}}}
+    )
+    assert errors == []
+    assert parsed is not None
+    assert parsed.connectors["reviewer"].routes[0].methods == ["POST"]
+
+
+def test_a_route_may_take_put_and_the_platform_ceiling() -> None:
+    # @spec ADR-0240 d1
+    assert _route_codes(_route(methods=["PUT", "POST"], max_body_bytes=256 * 1024 * 1024)) == []
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "v1/review",
+        "/",
+        "/v1/review/",
+        "/v1//review",
+        "/v1/./review",
+        "/v1/../mcp",
+        "/v1/re%20view",
+        "/v1/review?x=1",
+        "/v1/review#x",
+        "/v1/re view",
+        "/mcp",
+        "/mcp/upload",
+        "",
+    ],
+)
+def test_a_malformed_or_mcp_route_path_is_refused(path: str) -> None:
+    # @spec ADR-0240 d1: matched exactly, so only unreserved characters, and
+    # never the MCP path a hosted entry dials.
+    assert _route_codes(_route(path=path)) == ["connectors.bad_route_path"]
+
+
+def test_a_route_on_the_readiness_path_is_refused() -> None:
+    # @spec ADR-0240 d1
+    assert _route_codes(_route(path="/healthz"), readiness_path="/healthz") == [
+        "connectors.route_is_readiness_path"
+    ]
+
+
+def test_a_route_path_declared_twice_is_refused() -> None:
+    # @spec ADR-0240 d1
+    assert _route_codes(_route(), _route(methods=["PUT"])) == ["connectors.duplicate_route"]
+
+
+@pytest.mark.parametrize("methods", [[], ["GET"], ["post"], ["POST", "POST"], ["DELETE"]])
+def test_route_methods_outside_post_and_put_are_refused(methods: list[str]) -> None:
+    # @spec ADR-0240 d1
+    assert _route_codes(_route(methods=methods)) == ["connectors.bad_route_methods"]
+
+
+@pytest.mark.parametrize("limit", [0, -1, 256 * 1024 * 1024 + 1])
+def test_a_route_body_limit_outside_the_ceiling_is_refused(limit: int) -> None:
+    # @spec ADR-0240 d1
+    assert _route_codes(_route(max_body_bytes=limit)) == ["connectors.bad_route_max_body_bytes"]
+
+
+@pytest.mark.parametrize("limit", ["64Mi", True, 1.5, None])
+def test_a_route_body_limit_must_be_an_integer(limit: object) -> None:
+    # @spec ADR-0240 d1: there is no default and no coercion.
+    assert _route_codes(_route(max_body_bytes=limit)) == ["connectors.invalid"]
+
+
+def test_a_route_without_its_body_limit_is_refused() -> None:
+    # @spec ADR-0240 d1
+    route = {key: value for key, value in _route().items() if key != "max_body_bytes"}
+    assert _route_codes(route) == ["connectors.invalid"]
+
+
+@pytest.mark.parametrize("callers", [[], [""]])
+def test_a_route_without_callers_is_refused(callers: list[str]) -> None:
+    # @spec ADR-0240 d1
+    assert _route_codes(_route(callers=callers)) == ["connectors.route_without_callers"]
+
+
+def test_routes_on_a_remote_connector_are_refused() -> None:
+    # @spec ADR-0240 d1
+    assert _codes(
+        {"connectors": {"internal": {"url": "https://mcp.example.com/mcp", "routes": [_route()]}}}
+    ) == ["connectors.remote_has_routes"]
+
+
+def test_an_unknown_route_key_is_refused() -> None:
+    # @spec ADR-0240 d1
+    assert _route_codes(_route(stream=True)) == ["connectors.invalid"]
+
+
+_ROUTE_YAML = (
+    "connectors:\n  reviewer:\n    image: x:1\n    routes:\n"
+    "      - path: /v1/review\n        max_body_bytes: 67108864\n"
+    "        callers: [review-tools]\n"
+)
+
+
+def _with_mcp(root: Path, servers: dict[str, object]) -> Path:
+    (root / ".mcp.json").write_text(json.dumps({"mcpServers": servers}), encoding="utf-8")
+    return root
+
+
+def test_bundle_accepts_a_declared_stdio_route_caller(tmp_path: Path) -> None:
+    # @spec ADR-0240 d1
+    root = _with_mcp(
+        _bundle(tmp_path, _ROUTE_YAML),
+        {"review-tools": {"command": "python", "args": ["review.py"]}},
+    )
+    result = validate_bundle(str(root))
+    assert result.valid, [e.code for e in result.errors]
+
+
+def test_bundle_refuses_an_undeclared_route_caller(tmp_path: Path) -> None:
+    # @spec ADR-0240 d1
+    root = _with_mcp(_bundle(tmp_path, _ROUTE_YAML), {"other": {"command": "python"}})
+    result = validate_bundle(str(root))
+    assert [e.code for e in result.errors] == ["connectors.route_caller_undeclared"]
+
+
+def test_bundle_refuses_a_route_caller_with_no_mcp_config(tmp_path: Path) -> None:
+    # @spec ADR-0240 d1
+    result = validate_bundle(str(_bundle(tmp_path, _ROUTE_YAML)))
+    assert [e.code for e in result.errors] == ["connectors.route_caller_undeclared"]
+
+
+@pytest.mark.parametrize(
+    "server",
+    [
+        {"type": "http", "url": "https://mcp.example.com/mcp"},
+        {"type": "sse", "url": "https://mcp.example.com/sse"},
+    ],
+)
+def test_bundle_refuses_a_remote_route_caller(tmp_path: Path, server: dict[str, str]) -> None:
+    # @spec ADR-0240 d1: only a process the runner starts can receive a token.
+    root = _with_mcp(_bundle(tmp_path, _ROUTE_YAML), {"review-tools": server})
+    result = validate_bundle(str(root))
+    assert [e.code for e in result.errors] == ["connectors.route_caller_not_stdio"]
+
+
+def test_bundle_accepts_a_route_caller_declared_in_the_manifest(tmp_path: Path) -> None:
+    # @spec ADR-0240 d1: either declaration surface names a caller.
+    root = _bundle(tmp_path, _ROUTE_YAML)
+    (root / ".claude-plugin" / "plugin.json").write_text(
+        json.dumps(
+            {
+                "name": "b",
+                "version": "0.1.0",
+                "description": "t",
+                "mcpServers": {"review-tools": {"command": "python"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    result = validate_bundle(str(root))
+    assert result.valid, [e.code for e in result.errors]

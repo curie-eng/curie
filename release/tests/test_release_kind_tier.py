@@ -1,7 +1,6 @@
-"""Release kind gate conditions and executable dispatch contract for #4720."""
+"""Release kind gate conditions and executable reuse contract for #4863 and #4720."""
 
 import json
-import os
 import re
 import subprocess
 from copy import deepcopy
@@ -11,12 +10,23 @@ from typing import Any, cast
 import pytest
 import yaml
 
-WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/release.yaml"
+from release.tests.test_kind_ci import (
+    COMMIT,
+    HISTORY,
+    PREFIX,
+    REPOSITORY,
+    ROOT,
+    RUN_ID,
+    RUN_URL,
+    STATUS,
+    TAG,
+    GitHub,
+    assert_dispatch,
+)
+
+WORKFLOW = ROOT / ".github/workflows/release.yaml"
 KIND_JOB = "release-kind-tier"
-REPOSITORY = "acme-corp/acme-bot"
-TAG = "v0.0.0-test"
 TAG_REF = f"refs/tags/{TAG}"
-CI_RUN_ID = "7601"
 RESULTS = ("success", "failure", "cancelled", "skipped")
 
 
@@ -154,146 +164,87 @@ def test_build_does_not_wait_for_kind_but_still_requires_tag_authorization() -> 
 
 
 @pytest.fixture
-def github(tmp_path: Path) -> dict[str, str]:
-    executable = tmp_path / "gh"
-    executable.write_text(
-        """#!/usr/bin/env python3
-import json
-import os
-import subprocess
-import sys
-
-args = sys.argv[1:]
-assert os.environ.get("GH_TOKEN") == "test-token", "missing workflow GitHub token"
-with open(os.environ["TEST_GH_CALLS"], "a", encoding="utf-8") as calls:
-    calls.write(json.dumps(args) + "\\n")
-if args[:1] == ["api"]:
-    payload = os.environ["TEST_DISPATCH_RESPONSE"]
-    if "--jq" in args:
-        result = subprocess.run(
-            ["jq", "-r", args[args.index("--jq") + 1]],
-            input=payload, text=True, capture_output=True, check=True)
-        print(result.stdout, end="")
-    else:
-        print(payload)
-    sys.exit(0)
-if args[:2] == ["run", "watch"]:
-    assert os.environ.get("GH_REPO") == os.environ["GITHUB_REPOSITORY"], "wrong watch repository"
-    sys.exit(int(os.environ["TEST_WATCH_EXIT"]) if "--exit-status" in args else 0)
-raise SystemExit("Unexpected GitHub command: " + repr(args))
-""",
-        encoding="utf-8",
-    )
-    executable.chmod(0o755)
-    return {
-        "PATH": f"{tmp_path}:{os.environ['PATH']}",
-        "GITHUB_REPOSITORY": REPOSITORY,
-        "GITHUB_REF": TAG_REF,
-        "GITHUB_REF_NAME": TAG,
-        "GITHUB_EVENT_NAME": "push",
-        "TEST_GH_CALLS": str(tmp_path / "calls.jsonl"),
-        # https://docs.github.com/en/rest/actions/workflows#create-a-workflow-dispatch-event
-        "TEST_DISPATCH_RESPONSE": json.dumps(
-            {
-                "workflow_run_id": int(CI_RUN_ID),
-                "html_url": f"https://github.com/{REPOSITORY}/actions/runs/{CI_RUN_ID}",
-            }
-        ),
-        # https://cli.github.com/manual/gh_run_watch documents --exit-status.
-        "TEST_WATCH_EXIT": "0",
-    }
+def github(tmp_path: Path) -> GitHub:
+    return GitHub(tmp_path)
 
 
-def _assert_dispatch_and_watch(
-    job: dict[str, Any], tmp_path: Path, github: dict[str, str], exit_code: int = 0
+def _assert_kind_command(
+    job: dict[str, Any], github: GitHub, *, reused: bool = False, success: bool = True
 ) -> None:
     context = {
         "github.repository": REPOSITORY,
         "github.ref": TAG_REF,
         "github.ref_name": TAG,
         "github.event_name": "push",
+        "github.sha": COMMIT,
         "secrets.GITHUB_TOKEN": "test-token",
     }
 
     def render(value: str) -> str:
         return re.sub(r"\$\{\{\s*(.*?)\s*\}\}", lambda match: context[match[1]], value)
 
-    environment = {**github, "TEST_WATCH_EXIT": str(exit_code)}
+    environment = {
+        **github.env,
+        "GITHUB_REPOSITORY": REPOSITORY,
+        "GITHUB_REF": TAG_REF,
+        "GITHUB_REF_NAME": TAG,
+        "GITHUB_EVENT_NAME": "push",
+    }
     for key, value in job.get("env", {}).items():
         environment[key] = render(value)
         context[f"env.{key}"] = environment[key]
     returncode = 0
     log = ""
-    for index, step in enumerate(job["steps"]):
+    for step in job["steps"]:
         if "run" not in step:
             continue
-        assert "if" not in step, "dispatch and watch must run unconditionally within the kind job"
-        output = tmp_path / f"step-{index}.output"
-        output.write_text("", encoding="utf-8")
+        assert "if" not in step, "the kind proof command must run unconditionally"
         result = subprocess.run(
             ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", render(step["run"])],
-            cwd=tmp_path,
+            cwd=ROOT,
             env={
                 **environment,
                 **{key: render(value) for key, value in step.get("env", {}).items()},
-                "GITHUB_OUTPUT": str(output),
             },
             capture_output=True,
             text=True,
             timeout=10,
         )
         log += result.stdout + result.stderr
-        for line in output.read_text(encoding="utf-8").splitlines():
-            key, separator, value = line.partition("=")
-            assert separator, line
-            context[f"steps.{step.get('id')}.outputs.{key}"] = value
         returncode = result.returncode
         if returncode:
             break
-    assert returncode == exit_code, log
-    calls_path = Path(github["TEST_GH_CALLS"])
-    assert calls_path.exists(), "kind must dispatch and watch CI"
-    calls = [json.loads(line) for line in calls_path.read_text(encoding="utf-8").splitlines()]
-    assert len(calls) == 2, calls
-    dispatch, watch = calls
-    assert dispatch[0] == "api", dispatch
-    assert dispatch[dispatch.index("--method") + 1] == "POST", dispatch
-    assert f"repos/{REPOSITORY}/actions/workflows/ci.yaml/dispatches" in dispatch, dispatch
-    fields = [
-        dispatch[index + 1]
-        for index, argument in enumerate(dispatch)
-        if argument in ("-f", "-F", "--raw-field", "--field")
-    ]
-    assert sorted(fields) == sorted([f"ref={TAG}", "return_run_details=true"]), (
-        "dispatch must target the tag, return its run ID, and pass no workflow inputs",
-        dispatch,
-    )
-    typed_fields = [
-        dispatch[index + 1]
-        for index, argument in enumerate(dispatch)
-        if argument in ("-F", "--field")
-    ]
-    assert "return_run_details=true" in typed_fields, "return_run_details must be a JSON boolean"
-    assert not any(argument.split("=", 1)[0] == "--input" for argument in dispatch), (
-        "dispatch must not supply workflow inputs"
-    )
-    assert watch == ["run", "watch", CI_RUN_ID, "--exit-status"], (
-        "watch must wait for the dispatched run with --exit-status",
-        watch,
-    )
+    assert (returncode == 0) == success, f"child result must determine the gate: {log}"
+    commit_reads = [path for path, _ in github.calls("GET") if "/commits/" in path]
+    assert commit_reads and commit_reads[0] == f"{PREFIX}/commits/{COMMIT}", log
+    if reused:
+        assert not github.calls("POST"), "complete recorded proof must avoid dispatch"
+    else:
+        assert_dispatch(github)
+    if success:
+        payload = json.loads(result.stdout)
+        assert payload == {
+            "mode": "reused" if reused else "dispatched",
+            "run_id": HISTORY["run"]["id"] if reused else RUN_ID,
+            "run_url": HISTORY["run"]["html_url"] if reused else RUN_URL,
+        }
+        assert payload["run_url"] in log
 
 
-def test_dispatch_targets_the_tag_and_watches_the_returned_run(
-    tmp_path: Path, github: dict[str, str]
-) -> None:
-    _assert_dispatch_and_watch(_workflow()["jobs"][KIND_JOB], tmp_path, github)
+def test_workflow_reuses_recorded_same_tree_kind_proof(github: GitHub) -> None:
+    _assert_kind_command(_workflow()["jobs"][KIND_JOB], github, reused=True)
 
 
-@pytest.mark.parametrize("exit_code", [1, 8])
-def test_unsuccessful_ci_or_watch_failure_keeps_kind_red(
-    tmp_path: Path, github: dict[str, str], exit_code: int
-) -> None:
-    _assert_dispatch_and_watch(_workflow()["jobs"][KIND_JOB], tmp_path, github, exit_code)
+def test_workflow_dispatch_targets_the_tag_and_waits_for_returned_run(github: GitHub) -> None:
+    github.history([])
+    _assert_kind_command(_workflow()["jobs"][KIND_JOB], github)
+
+
+@pytest.mark.parametrize("conclusion", ["failure", "cancelled"])
+def test_unsuccessful_child_keeps_workflow_kind_gate_red(github: GitHub, conclusion: str) -> None:
+    github.history([])
+    github.reply(STATUS, {"status": "completed", "conclusion": conclusion})
+    _assert_kind_command(_workflow()["jobs"][KIND_JOB], github, success=False)
 
 
 @pytest.mark.parametrize("name", [KIND_JOB, "merge", "release"])
@@ -306,14 +257,15 @@ def test_contract_rejects_a_removed_need(name: str) -> None:
         _assert_dependencies(jobs)
 
 
-def test_contract_rejects_watch_without_exit_status(tmp_path: Path, github: dict[str, str]) -> None:
+def test_contract_rejects_ignoring_failed_child(github: GitHub) -> None:
+    github.history([])
+    github.reply(STATUS, {"status": "completed", "conclusion": "failure"})
     job = deepcopy(_workflow()["jobs"][KIND_JOB])
-    assert any("--exit-status" in step.get("run", "") for step in job["steps"])
     for step in job["steps"]:
         if "run" in step:
-            step["run"] = step["run"].replace("--exit-status", "")
-    with pytest.raises(AssertionError, match="watch must wait"):
-        _assert_dispatch_and_watch(job, tmp_path, github)
+            step["run"] = step["run"].rstrip() + " || true\n"
+    with pytest.raises(AssertionError, match="child result must determine the gate"):
+        _assert_kind_command(job, github, success=False)
 
 
 @pytest.mark.parametrize("name", ["merge", "release"])

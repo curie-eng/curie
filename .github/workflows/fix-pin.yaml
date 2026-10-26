@@ -11,7 +11,7 @@ permissions:
 jobs:
   fix-pin:
     name: Fix pin verification
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # #2230 measured the Python job as the sole critical path. On run
     # 34528877480 it was 26.4 minutes, and two of its steps were this gate: a
     # cold 251s `cargo build --release` plus a 127s verification, both appended

@@ -1,4 +1,4 @@
-"""Pure time helpers for agent-created schedules (ADR 0238). No database.
+"""Pure time helpers for agent-created schedules (ADR 0248). No database.
 
 A cron expression is five fields read in a schedule's IANA zone's wall time,
 the way the worker cron loop reads it (``curie_worker.cron_loop.resolve_slots``,

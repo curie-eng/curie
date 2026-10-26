@@ -1037,13 +1037,16 @@ def test_a_runner_pool_refusal_for_another_repository_is_not_this_turns_refusal(
 
 
 def test_the_live_unpinned_stale_base_reply_is_a_base_mismatch() -> None:
-    # Recorded verbatim from the worker in a live reproduction, before the
-    # install pinned the platform runner.
+    # The worker's whole reply on an installation that has not pinned the
+    # platform runner, written out rather than built from the exception.
     reply = (
         f"This agent cannot start: repository {REPO_X} runner image was built on platform "
         f"runner {_digest('6')}, not this installation's unpinned runner image (stale_base); "
-        f"rebuild it with `curie cluster factory --repo {REPO_X}`. An operator has to make "
-        "that change."
+        "pin agentSandbox.runner.digest in this installation's release values first, then "
+        f"rebuild and rebind it with `curie cluster factory --repo-runner {REPO_X}=<spec> "
+        "--registry <registry> --namespace <namespace> --release <release> --context "
+        "<context>`; use a repository runner spec containing its retained tools, probes and "
+        "Dockerfile declaration. An operator has to make that change."
     )
     outcome = _reply_outcome(THREAD_X, reply)
     assert repo_runner.refusal_reason(outcome, REPO_X) == "repo_runner_base_mismatch"

@@ -5,6 +5,11 @@ use super::*;
 /// Run one parsed `dev` subcommand.
 pub(super) async fn run(action: DevAction) -> Result<()> {
     match action {
+        DevAction::TestEnv { action } => match action {
+            TestEnvAction::Run { profile, command } => {
+                emit(commands::dev_test_env(&profile, &command).await?)
+            }
+        },
         DevAction::Preflight {
             fast,
             base,

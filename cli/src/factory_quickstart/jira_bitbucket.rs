@@ -96,6 +96,7 @@ struct Plan {
     deploy_chart: Option<String>,
     deadline_seconds: u32,
     budget_usd: f64,
+    output_tokens: u64,
 }
 
 fn usage(message: impl Into<String>, fix: impl Into<String>) -> anyhow::Error {
@@ -282,6 +283,7 @@ fn settings(plan: &Plan) -> Vec<(Vec<String>, &'static str)> {
         &plan.release,
         plan.deadline_seconds,
         plan.budget_usd,
+        plan.output_tokens,
     )
 }
 
@@ -674,6 +676,7 @@ pub(super) async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput>
         deploy_chart: opts.chart_explicit.then(|| opts.chart.clone()),
         deadline_seconds: opts.execution_deadline_seconds,
         budget_usd: opts.budget_usd,
+        output_tokens: opts.output_tokens,
     };
     if opts.dry_run {
         return Ok(QuickstartOutput::DryRun(DryRunPlan {
@@ -799,6 +802,7 @@ async fn execute_jira_bitbucket(mut plan: Plan, opts: &QuickstartOpts) -> Result
         runner_image: image,
         deadline_seconds: plan.deadline_seconds,
         budget_usd: plan.budget_usd,
+        output_tokens: plan.output_tokens,
         credit_remaining_usd,
     })
 }

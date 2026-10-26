@@ -1,5 +1,5 @@
 {
-  "description": "ADR 0239 twin memory wire shapes (Contract r4). Example payloads for the typed memory routes under /agents/{agent_id}/state/_memory: GET /context returns memory_context_out, GET /entries/{fact_id} and POST /revert return memory_detail_out, GET /search returns memory_search_out, POST /archive and POST /restore return memory_record_out. apps/api/tests/test_twin_memory.py pins the key sets of each object here, recursively, to what the real API produces. Every identifier and value is a synthetic placeholder.",
+  "description": "ADR 0249 twin memory wire shapes (Contract r4). Example payloads for the typed memory routes under /agents/{agent_id}/state/_memory: GET /context returns memory_context_out, GET /entries/{fact_id} and POST /revert return memory_detail_out, GET /search returns memory_search_out, POST /archive and POST /restore return memory_record_out. apps/api/tests/test_twin_memory.py pins the key sets of each object here, recursively, to what the real API produces. Every identifier and value is a synthetic placeholder.",
   "memory_record_out": {
     "id": "fact-00000000000000000000000000000002",
     "scope": "channel",

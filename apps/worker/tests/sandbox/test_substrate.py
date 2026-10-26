@@ -2562,8 +2562,9 @@ def test_terminate_thread_observes_absence_of_labelled_and_sql_names(
         "extra-labelled-claim",
         pool="test-pool",
         labels={THREAD_HASH_LABEL: thread_hash},
+        deadline=time.monotonic() + 300,
     )
-    fake_k8s.create_claim("sql-claim", pool="test-pool")
+    fake_k8s.create_claim("sql-claim", pool="test-pool", deadline=time.monotonic() + 300)
     sql_claim = "sql-claim"
     sql_sandbox = fake_k8s.claims[sql_claim].sandbox_name
 

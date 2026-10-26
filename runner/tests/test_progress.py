@@ -87,7 +87,7 @@ def test_the_dark_factory_bundle_declares_nine_phases_and_three_loops() -> None:
     assert declared is not None
     assert [phase["id"] for phase in declared["phases"]] == BUNDLE_PHASES
     assert [(loop["start"], loop["review"], loop["cap"]) for loop in declared["loops"]] == [
-        ("plan", "plan_review", 3),
+        ("plan", "plan_review", 1),
         ("implement", "review_diff", 3),
         ("implement", "wait_ci", 3),
     ]
@@ -192,6 +192,7 @@ def test_the_tool_is_named_report_progress_and_enumerates_the_phases() -> None:
         ({"phase": "explore_repo"}, "read_issue"),
         ({"phase": "read_issue", "round": 2}, "round"),
         ({"phase": "plan", "round": 4}, "round"),
+        ({"phase": "plan", "round": 2}, "round"),
         ({"phase": "plan", "round": 0}, "round"),
     ],
 )
@@ -222,7 +223,7 @@ def test_a_valid_report_posts_the_wire_body_with_the_token_header() -> None:
     async def go() -> dict[str, Any]:
         async with TestServer(recorder.app()) as server:
             tool = _tool(str(server.make_url("/v1/work-item-progress/example-request")), activity)
-            return await tool.handler({"phase": "plan", "note": "Drafting the plan", "round": 2})
+            return await tool.handler({"phase": "plan", "note": "Drafting the plan", "round": 1})
 
     result = anyio.run(go)
     assert result.get("is_error") is not True
@@ -234,7 +235,7 @@ def test_a_valid_report_posts_the_wire_body_with_the_token_header() -> None:
     assert body == {
         "phase": "plan",
         "note": "Drafting the plan",
-        "round": 2,
+        "round": 1,
         "declaration": declared,
         "activity": {
             "model": "glm-5.3-flash",

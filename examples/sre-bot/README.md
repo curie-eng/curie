@@ -33,6 +33,11 @@ Installations can also opt into [scheduled job health alerts](docs/SCHEDULED-JOB
 The renderer requires an explicit namespace and impact description; it does not
 change the default installation or treat intentionally suspended templates as healthy.
 
+Installations preparing automated remediation can opt into the
+[remediation scaler connector](#remediation-scaler-connector-opt-in), an
+acting connector whose replies the platform can record and qualify. The default
+bundle does not declare it.
+
 Installations with existing paired adapter reply credentials can opt into
 the worker map reconciler described in
 [`docs/ADAPTER-CREDENTIALS.md`](docs/ADAPTER-CREDENTIALS.md). Its inventory is
@@ -279,6 +284,70 @@ A leaked connector token can still select the platform-upgrader ServiceAccount
 on Job create (PR #2163). Draft ADR-0141 proposes the admission pin; the
 installer does not apply it.
 
+## Remediation scaler connector (opt-in)
+
+Automated remediation
+([ADR 0203](../../docs/adr/0203-automated-remediation-is-a-pre-qualified-action-the-platform-executes-and-verifies.md),
+[operator guide](../../docs/operations.md#automated-remediation)) runs an action
+only through a connector whose replies the platform can record: a sealed prior
+state, the version the write left, and the target
+([writing a reversible connector](../../docs/writing-a-reversible-connector.md)).
+The pinned Kubernetes connector replies in plain text, so no action through it
+can be qualified, idempotent or reversible. The `scaler` connector in
+[`connectors/scaler`](connectors/scaler/server.py) is the acting connector for
+one such action, restoring a stopped workload by setting its replica count.
+
+It is **off by default**. The bundle does not declare it, `plugin.json` names
+none of its tools, and the installer applies nothing for it, so an installation
+that does not opt in is unchanged.
+
+What it serves:
+
+- `scale_deployment(name, replicas)`: sets one allowlisted Deployment's replica
+  count to exactly `replicas` through the `scale` subresource, in the one
+  namespace it is configured for. It is gated for the model. The arguments are
+  flat scalars, so a remediation policy can bound them: `name` as the target
+  argument with the allowed names, and `replicas` as a range.
+- `observe_version(target)`: the live version, read-only and never gated.
+- `restore(target, prior_state, expected_version)`: puts the sealed prior count
+  back. The runner hides it from the model; only the platform's executor calls
+  it, and an undo always needs a person's approval.
+
+The version names the state a write left, the Deployment's uid and its replica
+count, not a random value per write. Scaling to a count already in force writes
+nothing and replies with the same version, which is what an idempotent
+qualification compares: two approved forwards with the same arguments that left
+the same `post_version`. Any change of the count, or the Deployment deleted and
+recreated, is a different version, so an undo refuses with `version_conflict`
+after someone has moved the count. A concurrent change between the connector's
+read and its write is refused the same way, because the write carries the read's
+`resourceVersion`.
+
+To opt in, in your copy of the bundle:
+
+1. Merge [`connectors/scaler/opt-in.yaml`](connectors/scaler/opt-in.yaml): its
+   `connector` entry into `connectors.yaml` and its `plugin` entries into
+   `.claude-plugin/plugin.json`. Set `SCALER_NAMESPACE`, `SCALER_DEPLOYMENTS` and
+   `SCALER_MAX_REPLICAS` for your workload. An empty namespace or allowlist
+   refuses every call.
+2. Edit and apply [`manifests/scaler-access.yaml`](manifests/scaler-access.yaml)
+   so its Role's namespace and `resourceNames` match those settings. It is a
+   separate identity from `manifests/kubernetes-access.yaml`, limited to `get`
+   and `update` on `deployments/scale` for the named Deployments.
+3. Assemble a kubeconfig for `sre-bot-scaler` from its token Secret and store it
+   as the connector secret `SCALER_KUBECONFIG`.
+4. Create the Kubernetes Secret `sre-bot-scaler-sealing` with the keys
+   `SNAPSHOT_SEALING_KEY` (`<kid>:<base64 of 32 bytes>`) and
+   `SNAPSHOT_SEALING_KEYS_RETAINED` (empty until a key rotation).
+5. Build the connector image with `curie build --plugin-dir <bundle> --registry <ref>`,
+   then deploy the bundle.
+
+The connector does not make anything automatic. A remediation policy, its
+qualification drills and a verifier through a different connector are still
+required, in the [drill order](../../docs/operations.md#qualifying-an-action-the-drill-order).
+`examples/tests/test_sre_bot_scaler_opt_in.py` applies the opt-in file to the
+shipped bundle and runs the intake validators on the result.
+
 ## Live demo
 
 The six Slack scenarios (read, approved scale, one-shot re-arm, configuration
@@ -299,6 +368,14 @@ sign webhook bodies. The signer runs the checked in `server.py` in a pinned
 Python image. Its Service is named `alert-signer` in Alertmanager's namespace.
 The webhook overlay mounts only the bearer token into Alertmanager; the
 derived Curie hook secret stays in the signer pod.
+
+Signer diagnostics (`SIGNER-DIAGNOSTICS-1`): upstream non-success responses
+remain HTTP 502 to the source and emit one warning with only the numeric upstream
+status. Transport failures also return 502 and emit only the fixed reason
+`transport_error`. No diagnostic includes a URL, response body, payload, delivery
+identity, authentication header or exception text. Successful forwarding and
+local authentication or payload refusals do not emit this warning. A 502 never
+changes the stable delivery ID or retries inside the signer.
 
 For an existing installation, update the API and every custom signer together
 to the context format in the [trigger contract](../../docs/interfaces/triggers/INTERFACE.md).
@@ -400,6 +477,62 @@ A genuine signed alert creates one partitioned investigation. Missing,
 ambiguous, or unauthorized mappings visibly stop coding. Invalid signatures
 and replayed delivery ids do not multiply work.
 
+#### Protected source mode (opt-in)
+
+The commands above install an ordinary source: it signs with the shared agent
+secret, and `tool_access=read-only` in the hook URL is an optional request the
+ordinary path honors without proving runtime enforcement. The signer also has
+a protected mode for a hook an administrator bound to a mandatory read-only
+source policy under
+[ADR 0190](../../docs/adr/0190-automated-hook-sources-cannot-widen-their-tool-access.md)
+and [ADR 0191](../../docs/adr/0191-protected-hook-delivery-authority.md)
+(`HOOK-SOURCE-POLICY-6`). The default stays ordinary, and an installation that
+does not set the mode keeps the behavior above.
+
+In protected mode the `alert-signer-hook` Secret holds `CURIE_HOOK_URL`,
+`CURIE_HOOK_SOURCE_MODE` set to `protected`, and `CURIE_HOOK_SOURCE_SECRET`,
+the hook's scoped key from `GET /agents/{agent_id}/hooks/{hook}/source-policy/secret`.
+It must not hold `CURIE_HOOK_SECRET`. The hook URL must request
+`tool_access=read-only` and must not carry explicit reply query parameters,
+which protected ingress refuses. The signer refuses to start on any other
+combination, so it never falls back to the shared key or to an optional policy.
+
+For each alert the signer then:
+
+1. Posts the signed support probe `POST /hooks/{agent_id}/{hook}/support` with
+   the body `{"tool_access":"read-only"}`. The probe creates no hook claim,
+   queue entry, Slack post or turn. The signer forwards only when the API
+   answers 200 with `supported` and read-only effective policy. A shared or
+   revoked key (401), an unconfigured or closed hook, an unavailable runtime, or
+   an API without the probe is refused before any delivery.
+2. Forwards the delivery signed under the scoped key with `read-only` in the
+   signed context.
+3. Checks the receipt: `requested_tool_access`, `effective_tool_access` and
+   `tool_access` must each be `read-only`, `source_generation` must equal the
+   generation the support probe reported,
+   and `acceptance_status` must be `accepted` or `preparing`. A duplicate is
+   checked the same way.
+
+A refusal answers HTTP 502 to Alertmanager and logs one warning,
+`protected hook delivery refused (reason=<reason>)`, whose reason is a fixed
+token such as `support_source_unconfigured`, `support_unauthenticated` or
+`receipt_not_read_only`; it never contains a credential, URL or payload.
+Two other failures also answer 502 with one fixed warning. A transport failure
+on the probe or the delivery logs
+`hook ingress forwarding failed (reason=transport_error)`. A delivery the
+ingress answers with a non-2xx status after a supported probe logs
+`hook ingress rejected delivery (status=<status>)`.
+Alertmanager retries with the same delivery ID and counts the failures in
+`alertmanager_notifications_failed_total`, which is the signal to alert on. A
+receipt refusal means the API answered a delivery the source cannot attest as
+read-only; investigate it rather than relaxing the check.
+
+A supported answer needs the protected delivery lane, a qualified runtime and
+current readiness evidence. Until those exist for an installation the probe
+reports the missing piece and the protected signer delivers nothing, which is
+the intended result: ADR 0190 keeps the automated intake uninstalled wherever
+runtime read-only guarantees are required.
+
 ### Slack Email alert source (opt-in)
 
 When the alert provider delivers email into Slack instead of calling
@@ -500,6 +633,18 @@ themselves.
   Alertmanager `startsAt` or a provider state transition time. That timestamp
   identifies the reported episode. It does not prove the condition is still
   active and it never replaces a current read.
+- `SRE-ALERT-4`: For a turn-canary alert, read the installed check's contract,
+  same-route fresh delivery and exact-response observations, and bounded
+  diagnostics before attributing a failure. Delivered relay output with a
+  response mismatch is a probe-compliance finding; legacy exact-response
+  failure without delivery telemetry leaves delivery unverified. Failed
+  delivery establishes only that synthetic path's failure, not its cause or
+  user impact. Internal relay delivery does not prove Slack ingress, Slack
+  posting, useful work or policy compliance. Unverified channel capability,
+  healthy adapter probes and rollout timing alone establish neither a Slack
+  permission fault nor an identity-wide outage. Review a mismatching probe
+  against the agent's supported work without weakening the agent's policy;
+  use actual transport errors and user-turn evidence to establish impact.
 
 ## What watches the alert path
 

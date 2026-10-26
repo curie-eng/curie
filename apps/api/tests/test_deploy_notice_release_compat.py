@@ -43,23 +43,26 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
     # Feature migrations append after the published v0.12.2 head; published
     # application windows remain fixed while the candidate advances. The
     # minimum is the join containing both the stable reply selector columns
-    # and the feature train schema; the Agent ORM reads agents.learned_skills
-    # (ADR 0237), the agent schedule columns (ADR 0238) and
-    # agents.agent_wide_learning (ADR 0239), so twin memory, which follows
+    # and the feature train schema. The released v0.13.0 window stays at that
+    # join while the candidate advances to team sync state (0120), agent access
+    # policies (0121), directory authority (0122), and attachment catalogs (0130),
+    # then the self-improving revisions. The Agent ORM reads
+    # agents.learned_skills (ADR 0247), the agent schedule columns (ADR 0248)
+    # and agents.agent_wide_learning (ADR 0249), so twin memory, which follows
     # agent schedules, is the floor.
+    released_0130 = {"schema_min": "0108", "schema_head": "0108"}
     candidate = {"schema_min": "selfimp_memory_0001", "schema_head": "selfimp_memory_0001"}
-    released_013 = {"schema_min": "0108", "schema_head": "0108"}
     assert catalog["windows"]["0.12.0"] == released
     assert catalog["windows"]["0.12.0-rc.1"] == released
     assert catalog["windows"]["0.12.1"] == stable
     assert catalog["windows"]["0.12.2"] == {"schema_min": "0076", "schema_head": "0081"}
     assert catalog["windows"]["0.12.3"] == {"schema_min": "0076", "schema_head": "0093"}
     assert catalog["candidate"] == candidate
-    assert catalog["windows"]["0.13.0"] == released_013
-    assert catalog["revisions"][-16:] == [
+    assert catalog["windows"]["0.13.0"] == released_0130
+    assert catalog["revisions"][-22:] == [
         "0095", "0096", "0097", "0098", "0099", "0100", "0101", "0102", "0103",
-        "0105", "0107", "0108", "selfimp_safety_0001", "selfimp_skills_0001",
-        "selfimp_sched_0001",
+        "0105", "0107", "0108", "0120", "0121", "0122", "0123", "0130", "0131",
+        "selfimp_safety_0001", "selfimp_skills_0001", "selfimp_sched_0001",
         "selfimp_memory_0001",
     ]
     assert "0074" not in catalog["revisions"]

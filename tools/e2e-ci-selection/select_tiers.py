@@ -87,25 +87,9 @@ UPGRADE_WORKFLOW_JOBS = frozenset(
         "e2e-cluster-upgrade-matrix",
     }
 )
-FACTORY_UPGRADE_PATHS = frozenset(
-    {
-        "charts/curie/files/legacy-factory-keys.yaml",
-        "charts/curie/files/legacy-factory-env.yaml",
-        "cli/src/config_migrate.rs",
-        "cli/src/factory_app.rs",
-        "cli/src/factory_config_migrate.rs",
-        "cli/src/github_app.rs",
-        "cli/src/ops/up.rs",
-        "cli/src/ops/upgrade.rs",
-        "tools/factory-e2e/factory_e2e.py",
-        "tools/factory-e2e/scripted_kind.py",
-        "tools/factory-e2e/scripted_scenario.py",
-        "tools/factory-e2e/tests/test_c4_upgrade_migration.py",
-        "tools/github-stub/github_stub.py",
-    }
-)
 WORKFLOW_PATH = ".github/workflows/ci.yaml"
 CHART_JOB = "e2e-cluster-chart-regressions"
+CHART_LEGS = ("chart", "workload")
 SCENARIO_SCRIPT = re.compile(r"^(?:charts/curie/ci|scripts)/[^\s]+\.sh(?:$|[;|&])")
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CARGO_MANIFEST = "cli/Cargo.toml"
@@ -152,6 +136,7 @@ UniqueKeyLoader.add_constructor(
 class ChartScenario:
     step: str
     inputs: tuple[str, ...]
+    leg: str
 
 
 @dataclass(frozen=True)
@@ -179,6 +164,7 @@ class Registry:
     chart_scenarios: ChartScenarios
     conditional_pytest_files: dict[str, tuple[str, ...]]
     pytest_scopes: dict[str, PytestScope]
+    ci_policy_tests: dict[str, tuple[str, ...]]
 
 
 def _mapping(value: object, label: str) -> dict[str, object]:
@@ -248,15 +234,20 @@ def _chart_registry(value: object) -> ChartScenarios:
             raise RegistryError("chart_scenarios contains an invalid scenario id")
         label = f"chart_scenarios.scenarios.{scenario_id}"
         entry = _mapping(value, label)
-        if set(entry) != {"step", "inputs"}:
-            raise RegistryError(f"{label} must define step and inputs")
+        if set(entry) != {"step", "inputs", "leg"}:
+            raise RegistryError(f"{label} must define step, inputs, and leg")
         step = entry["step"]
         if not isinstance(step, str) or not step:
             raise RegistryError(f"{label}.step must be a nonempty string")
+        leg = entry["leg"]
+        if not isinstance(leg, str) or leg not in CHART_LEGS:
+            raise RegistryError(f"{label}.leg must be one of chart, workload")
         if step in step_names:
             raise RegistryError(f"duplicate chart scenario step: {step}")
         step_names.add(step)
-        scenarios[scenario_id] = ChartScenario(step, _inputs(entry["inputs"], f"{label}.inputs"))
+        scenarios[scenario_id] = ChartScenario(
+            step, _inputs(entry["inputs"], f"{label}.inputs"), leg
+        )
     return ChartScenarios(CHART_JOB, shared_inputs, scenarios)
 
 
@@ -309,6 +300,25 @@ def _pytest_scopes(value: object) -> dict[str, PytestScope]:
             f"{label}.test_files must name a readable tracked file: {test_files}"
         ) from exc
     return {"cli": PytestScope(prefixes, excluded_prefixes, python_prefixes, test_files)}
+
+
+def _ci_policy_tests(value: object) -> dict[str, tuple[str, ...]]:
+    entries = _mapping(value, "ci_policy_tests")
+    if not entries:
+        raise RegistryError("ci_policy_tests must not be empty")
+    tests: dict[str, tuple[str, ...]] = {}
+    for test_file, value in entries.items():
+        if not re.fullmatch(
+            r"tools/[A-Za-z0-9_-]+/tests/(?:[A-Za-z0-9_-]+/)*test_[A-Za-z0-9_-]+\.py",
+            test_file,
+        ):
+            raise RegistryError("ci_policy_tests contains an invalid test file path")
+        label = f"ci_policy_tests.{test_file}"
+        inputs = _scope_prefixes(value, label)
+        if len(set(inputs)) != len(inputs):
+            raise RegistryError(f"{label} contains duplicate inputs")
+        tests[test_file] = inputs
+    return tests
 
 
 def _matches_pytest_scope(scope: PytestScope, path: str) -> bool:
@@ -475,6 +485,7 @@ def _load_registry(path: Path) -> Registry:
         chart_scenarios,
         conditional_pytest_files,
         _pytest_scopes(root.get("pytest_scopes")),
+        _ci_policy_tests(root.get("ci_policy_tests")),
     )
 
 
@@ -573,6 +584,15 @@ def _select_chart_scenarios(
     ):
         selected.add("unregistered")
     return sorted(selected)
+
+
+def _chart_legs(registry: Registry, chart_scenarios: list[str]) -> list[str]:
+    # An unregistered step carries no leg condition, so it runs in whichever leg
+    # runs. Selecting every leg keeps the fail-closed behavior.
+    if "unregistered" in chart_scenarios:
+        return list(CHART_LEGS)
+    scenarios = registry.chart_scenarios.scenarios
+    return sorted({scenarios[item].leg for item in chart_scenarios if item in scenarios})
 
 
 def _changed_paths(base: str, head: str) -> list[str]:
@@ -758,6 +778,7 @@ def _render(
     pytest_needed: bool,
     pytest_deselect: list[str],
     pytest_scope: str,
+    ci_policy_files: list[str],
     images_needed: bool,
     cli_release_needed: bool,
     released_upgrade_full: bool,
@@ -765,6 +786,7 @@ def _render(
     factory_needed: bool,
     approval_resume_needed: bool,
     chart_scenarios: list[str],
+    chart_legs: list[str],
 ) -> str:
     lines = [f"{OUTPUT_KEYS[tier]}={'true' if tier in selected else 'false'}" for tier in TIERS]
     skill_local = ",".join(tier for tier in TIERS[:2] if tier in selected)
@@ -772,6 +794,8 @@ def _render(
     lines.append(f"pytest={'true' if pytest_needed else 'false'}")
     lines.append("pytest_deselect=" + ",".join(pytest_deselect))
     lines.append(f"pytest_scope={pytest_scope}")
+    lines.append(f"ci_policy={'true' if ci_policy_files else 'false'}")
+    lines.append("ci_policy_files=" + ",".join(ci_policy_files))
     lines.append(f"images={'true' if images_needed else 'false'}")
     lines.append(f"cli_release={'true' if cli_release_needed else 'false'}")
     lines.append(f"released_upgrade_full={'true' if released_upgrade_full else 'false'}")
@@ -779,6 +803,7 @@ def _render(
     lines.append(f"factory={'true' if factory_needed else 'false'}")
     lines.append(f"approval_resume={'true' if approval_resume_needed else 'false'}")
     lines.append("chart_scenarios=" + json.dumps(chart_scenarios, separators=(",", ":")))
+    lines.append("chart_legs=" + json.dumps(chart_legs, separators=(",", ":")))
     return "\n".join(lines) + "\n"
 
 
@@ -890,18 +915,21 @@ def _run() -> None:
     ):
         pytest_scope = "cli"
 
-    # Ordinary pull requests run one upgrade matrix smoke shard. Factory
-    # migration paths and upgrade job changes run the full matrix and released
-    # chart jobs before merge, as do pushes and dispatches (the nightly).
-    released_upgrade_full = (
-        args.push
-        or workflow_upgrade_changed
-        or any(path in FACTORY_UPGRADE_PATHS for path in paths)
-    ) and "released-upgrade" in selected
+    ci_policy_files = sorted(
+        test_file
+        for test_file, inputs in registry.ci_policy_tests.items()
+        if args.push or any(_matches_prefix(path, prefix) for path in paths for prefix in inputs)
+    )
+
+    # Dispatch callers use --push without --omit-kind for the full matrix.
+    # Pull requests selecting released-upgrade run the smoke shard.
+    released_upgrade_full = args.push and not args.omit_kind
     chart_scenarios = _select_chart_scenarios(
         registry, paths, selected, args.push, args.head if not args.path else None
     )
+    chart_legs = _chart_legs(registry, chart_scenarios)
     print("chart_scenarios=" + json.dumps(chart_scenarios, separators=(",", ":")))
+    print("chart_legs=" + json.dumps(chart_legs, separators=(",", ":")))
 
     output_path = os.environ.get("GITHUB_OUTPUT")
     if not output_path:
@@ -913,6 +941,7 @@ def _run() -> None:
                 pytest_needed,
                 pytest_deselect,
                 pytest_scope,
+                ci_policy_files,
                 images_needed,
                 cli_release_needed,
                 released_upgrade_full,
@@ -920,6 +949,7 @@ def _run() -> None:
                 factory_needed,
                 approval_resume_needed,
                 chart_scenarios,
+                chart_legs,
             )
         )
 

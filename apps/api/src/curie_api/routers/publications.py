@@ -46,7 +46,7 @@ from ..auth import (
 )
 from ..config import get_settings
 from ..deps import SessionDep
-from ..factory_rediscovery import issue_marker
+from ..factory_rediscovery import issue_marker, publishing_code_host
 from ..forges.config import RepositoryBindingConfig
 from ..forges.errors import ForgeError, NotFound, Unauthorized, Unavailable
 from ..forges.hosts import code_host_for, forge_code_host, pull_request_url
@@ -75,6 +75,7 @@ from ..publication_authority import (
 )
 from ..publication_policy import policy_still_authorizes
 from ..publication_precheck_token import PublicationPrecheckClaims, metadata_digest, mint
+from ..publication_pulls import PullRequestRefused
 from ..publication_truth import (
     PRECHECK_TIMEOUT_SECONDS,
     PublicationPrecheckRefused,
@@ -82,6 +83,12 @@ from ..publication_truth import (
     PublicationPullRequestNotAdopted,
     read_publication_authority,
     read_publication_metadata,
+)
+from ..publication_verification import (
+    VerifiedPublicationCommit,
+    forge_failure,
+    publication_base_ref,
+    verify_publication_commit,
 )
 from ..repository_access import (
     issue_stored_credential,
@@ -763,13 +770,34 @@ async def advance_publication_lineage(
         if publication is None or publication.lineage is None:
             raise LookupError("publication lineage not found")
         identity = await _verified_identity(request, session, publication, data)
+        first_parent_proof: VerifiedPublicationCommit | None = None
+        if publication.lineage.head_sha is None or publication.lineage.pr_number is None:
+            repository = await lineage_repository(session, settings, publication.lineage)
+            code_host = publishing_code_host(settings, request.app.state.http_client, repository)
+            base_branch = await publication_base_ref(session, code_host, publication, repository)
+            first_parent_proof = await verify_publication_commit(
+                code_host,
+                repository,
+                publication,
+                commit_sha=data.head_sha,
+                base_branch=base_branch,
+            )
         lineage = await crud_lineages.advance_publication_lineage(
             session,
             publication_id,
             data,
             github_html_base=settings.github_html_base,
+            first_parent_proof=first_parent_proof,
             identity=identity,
         )
+    except PullRequestRefused as exc:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            {"code": f"publication.{exc.code}", "message": exc.message},
+            headers={"Cache-Control": "no-store"},
+        ) from None
+    except ForgeError as exc:
+        raise forge_failure(exc) from None
     except PublicationRemoteTerminal as exc:
         raise HTTPException(
             status.HTTP_409_CONFLICT,

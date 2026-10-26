@@ -1,4 +1,4 @@
-"""Learned skills (ADR 0237, epic #4780 slice 1): the store, its revisions and who may touch it.
+"""Learned skills (ADR 0247, epic #4780 slice 1): the store, its revisions and who may touch it.
 
 Everything here goes through the real HTTP app against the disposable Postgres
 and the compose Valkey the conftest provisions; nothing is mocked. Sandbox
@@ -1135,7 +1135,7 @@ def test_a_scheduled_run_reads_but_cannot_change_skills(
 
 def _continuation(aid: str, channel: str, *, scheduled: bool) -> dict[str, str]:
     """An approval continuation's credential: the approver is the sender, and
-    ``scheduled`` (ADR 0238) says whether its chain started at a cron event."""
+    ``scheduled`` (ADR 0248) says whether its chain started at a cron event."""
     claims = {
         "binding": f"slack:{channel}",
         "memory": "read",

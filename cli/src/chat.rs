@@ -392,30 +392,28 @@ impl SlackStub {
     /// detected. The advertised port is the actually-bound port, so an ephemeral
     /// `port: 0` still produces a correct URL.
     pub async fn start(bind_host: &str, port: u16, advertise_host: &str) -> Result<Self> {
-        let listener = TcpListener::bind(format!("{bind_host}:{port}"))
-            .await
-            .with_context(|| {
-                // A bound `port` (not 0) means the caller pinned a fixed listen
-                // port, so a bind failure here is almost always "someone else is
-                // already listening there" rather than an OS-level refusal. Two
-                // things look identical from this error alone: another `local`/
-                // `cluster message` that is legitimately running right now, or a
-                // stale CLI process left over from a prior run whose stub never got
-                // torn down (the #751 leak this fixes: a timed-out turn used to
-                // exit via `std::process::exit`, which skips `Drop` and leaves the
-                // listener bound). We cannot tell those apart from here, so name
-                // both possibilities and point at how to check rather than
-                // overclaiming which one it is.
-                format!(
-                    "binding the Slack stub on {bind_host}:{port}: the port is already in use. \
+        let listener = bind_unshadowed(bind_host, port).await.with_context(|| {
+            // A bound `port` (not 0) means the caller pinned a fixed listen
+            // port, so a bind failure here is almost always "someone else is
+            // already listening there" rather than an OS-level refusal. Two
+            // things look identical from this error alone: another `local`/
+            // `cluster message` that is legitimately running right now, or a
+            // stale CLI process left over from a prior run whose stub never got
+            // torn down (the #751 leak this fixes: a timed-out turn used to
+            // exit via `std::process::exit`, which skips `Drop` and leaves the
+            // listener bound). We cannot tell those apart from here, so name
+            // both possibilities and point at how to check rather than
+            // overclaiming which one it is.
+            format!(
+                "binding the Slack stub on {bind_host}:{port}: the port is already in use. \
                      Either another `local message`/`cluster message` is genuinely running right \
                      now (safe to wait for it to finish, or rerun with a different \
                      --listen-port), or a previous invocation left a stale process still holding \
                      the port. Find the holder with `lsof -nP -iTCP:{port} -sTCP:LISTEN` (macOS) \
                      or `ss -ltnp 'sport = :{port}'` (Linux); if it is not a `message` invocation \
                      you expect to still be running, kill it and retry."
-                )
-            })?;
+            )
+        })?;
         let addr = listener
             .local_addr()
             .context("reading the stub's local addr")?;
@@ -453,6 +451,18 @@ impl SlackStub {
             self.deferred_calls.push_front(call);
         }
     }
+}
+
+/// Bind the stub's listener, refusing a fixed port that another process already
+/// holds on loopback. A wildcard bind on macOS succeeds beside such a listener,
+/// and Docker Desktop delivers the worker's `host.docker.internal` calls to that
+/// loopback holder rather than to the stub (#4823). Claiming the loopback port
+/// first makes the holder fail the bind exactly as it does on Linux.
+async fn bind_unshadowed(bind_host: &str, port: u16) -> std::io::Result<TcpListener> {
+    if port != 0 && bind_host == "0.0.0.0" {
+        drop(TcpListener::bind(("127.0.0.1", port)).await?);
+    }
+    TcpListener::bind(format!("{bind_host}:{port}")).await
 }
 
 async fn handle_call(
@@ -1741,6 +1751,24 @@ mod tests {
              Awaiting approval ({id}): run the deploy"
         );
         assert_eq!(parse_approval_id(&text), None);
+    }
+
+    /// #4823: a stub on the wildcard address must refuse a fixed port another
+    /// process holds on loopback instead of starting silently shadowed.
+    #[tokio::test]
+    async fn a_wildcard_stub_refuses_a_port_another_listener_holds_on_loopback() {
+        let holder = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind a loopback holder");
+        let port = holder.local_addr().expect("holder addr").port();
+
+        let error = match SlackStub::start("0.0.0.0", port, "host.docker.internal").await {
+            Ok(_) => panic!("the stub must not start beside a loopback listener on port {port}"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(
+            error.contains("already in use"),
+            "the refusal names the held port: {error}"
+        );
+        drop(holder);
     }
 
     // --- SlackStub teardown on a timed-out turn (#751) ----------------------

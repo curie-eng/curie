@@ -64,7 +64,9 @@ async def _seed(suite: str, sha_a: str, sha_b: str) -> None:
         await recorder.record(_result(sha_b, suite, c1=True, c2=True))
 
 
-async def _seed_same_sha_runs(suite: str, sha: str) -> None:
+async def _seed_same_sha_runs(suite: str, sha: str) -> tuple[str, str]:
+    enqueue_ms = time.time_ns() // 1_000_000
+    old_stream, new_stream = f"{enqueue_ms}-0", f"{enqueue_ms + 1}-0"
     settings = get_settings()
     async with httpx.AsyncClient(timeout=30.0) as http:
         recorder = LangfuseEvalRecorder(
@@ -77,7 +79,7 @@ async def _seed_same_sha_runs(suite: str, sha: str) -> None:
             EvalRunResult(
                 version=sha,
                 suite=suite,
-                stream_id="1000-0",
+                stream_id=old_stream,
                 scorer=EvalScorer.GRADER,
                 results=[
                     EvalCaseResult(
@@ -93,7 +95,7 @@ async def _seed_same_sha_runs(suite: str, sha: str) -> None:
             EvalRunResult(
                 version=sha,
                 suite=suite,
-                stream_id="2000-0",
+                stream_id=new_stream,
                 scorer=EvalScorer.TRAJECTORY,
                 results=[
                     EvalCaseResult(
@@ -106,6 +108,8 @@ async def _seed_same_sha_runs(suite: str, sha: str) -> None:
                 ],
             )
         )
+
+    return old_stream, new_stream
 
 
 def test_matrix_reflects_seeded_multi_version_scores(
@@ -146,7 +150,7 @@ def test_matrix_stream_id_filters_to_one_authoritative_run(
 ) -> None:
     suite = f"stream-matrix-{secrets.token_hex(4)}"
     sha = "sha" + secrets.token_hex(3)
-    asyncio.run(_seed_same_sha_runs(suite, sha))
+    old_stream, new_stream = asyncio.run(_seed_same_sha_runs(suite, sha))
 
     deadline = time.time() + 60
     unfiltered: dict[str, Any] = {}
@@ -157,7 +161,7 @@ def test_matrix_stream_id_filters_to_one_authoritative_run(
         )
         filtered_response = client.get(
             "/evals/matrix",
-            params={"suite": suite, "stream_id": "1000-0"},
+            params={"suite": suite, "stream_id": old_stream},
             headers=auth_headers,
         )
         assert unfiltered_response.status_code == 200, unfiltered_response.text
@@ -175,19 +179,19 @@ def test_matrix_stream_id_filters_to_one_authoritative_run(
                 for row in filtered["rows"]
                 for cell in row["cells"]
             }
-            if unfiltered_streams == {"2000-0"} and filtered_streams == {"1000-0"}:
+            if unfiltered_streams == {new_stream} and filtered_streams == {old_stream}:
                 break
         time.sleep(2)
 
     unfiltered_cells = unfiltered["rows"][0]["cells"]
     assert len(unfiltered_cells) == 1
-    assert unfiltered_cells[0]["stream_id"] == "2000-0"
+    assert unfiltered_cells[0]["stream_id"] == new_stream
     assert unfiltered_cells[0]["status"] == "fail"
     assert unfiltered_cells[0]["case_count"] == 1
 
     filtered_cells = filtered["rows"][0]["cells"]
     assert len(filtered_cells) == 1
-    assert filtered_cells[0]["stream_id"] == "1000-0"
+    assert filtered_cells[0]["stream_id"] == old_stream
     assert filtered_cells[0]["status"] == "pass"
     assert filtered_cells[0]["case_count"] == 1
 

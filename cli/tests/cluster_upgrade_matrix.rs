@@ -761,42 +761,118 @@ fn apply_kill_takeover_dry_plan_accepts_prose_and_rejects_reversed_recovery_comm
         })
         .map(|(python, _)| python)
         .expect("matching dry takeover Python assertion");
+    let helper_at = source
+        .find("check_explicit_helm_plan() {")
+        .expect("explicit helm plan helper");
+    let helper = &source[helper_at
+        ..helper_at
+            + source[helper_at..]
+                .find("\nrun_apply_kill_takeover() {")
+                .expect("helper ends before apply-kill-takeover")];
     let fixture = tempfile::tempdir().expect("dry plan fixture");
     let plan_path = fixture.path().join("plan.json");
-    let run_assertion = |plan: &[&str]| {
+    let write_plan = |plan: &[&str]| {
         fs::write(
             &plan_path,
             serde_json::to_vec(&serde_json::json!({"dry_run": true, "plan": plan}))
                 .expect("serialize dry plan"),
         )
         .expect("write dry plan fixture");
+    };
+    let run_prose = |plan: &[&str]| {
+        write_plan(plan);
         Command::new("python3")
             .args(["-c", assertion])
             .arg(&plan_path)
-            .args(["stale-holder", "acme-release", "2", "ns"])
+            .args(["example-holder", "acme-release", "2", "ns"])
             .output()
-            .expect("run the matrix dry takeover Python assertion")
+            .expect("run the matrix dry takeover prose assertion")
+    };
+    let run_order = |plan: &[&str]| {
+        write_plan(plan);
+        Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                "{helper}\ncheck_explicit_helm_plan takeover \"$1\" acme-release 2 ns"
+            ))
+            .arg("check_explicit_helm_plan")
+            .arg(&plan_path)
+            .output()
+            .expect("run the matrix explicit helm plan helper")
     };
     let mut plan = [
         "phase plan: 0.10.0 -> 0.10.1",
-        "phase validate: inspect the serving revision's values",
-        "take over upgrade ownership from stale-holder",
-        "helm rollback acme-release 2 -n ns --wait --timeout 15m",
-        "phase drain_preflight: the worker's hook handles its own drain",
-        "helm upgrade acme-release charts/curie -n ns --wait --timeout 15m -f <retained-values>",
+        "phase validate: configuration overlay migration and pre-mutation refusals",
+        "take over upgrade ownership from example-holder",
+        "helm --kube-context example-context rollback acme-release 2 -n ns --wait --timeout 15m",
+        "phase drain_preflight: confirm the worker workload is reachable; the worker upgrade drain gate itself runs later, inside Apply's Helm pre-upgrade hook (issue 2010)",
+        "phase checkpoint: persist recoverable release state",
+        "phase migrate: checkpoint boundary only; the chart's pre-upgrade hook Job performs schema migration during apply",
+        "helm upgrade acme-release /example/charts/curie-0.10.1.tgz -n ns --wait --timeout 21900s -f <retained-values>",
+        "phase converge: exact images, generations, replicas, unavailable=0, hooks, queues, manifest",
+        "phase canary: target-version smoke",
+        "phase commit: record known-good version",
+        "config schema: 0.8.8 -> 0.9.0",
     ];
-    let valid = run_assertion(&plan);
+    let prose = run_prose(&plan);
+    assert!(
+        prose.status.success(),
+        "ordinary apostrophes in plan prose must not be parsed as shell commands\n{}",
+        output_text(&prose)
+    );
+    let valid = run_order(&plan);
     assert!(
         valid.status.success(),
-        "ordinary apostrophes in plan prose must not be parsed as shell commands\n{}",
+        "captured plan with context-prefixed rollback before unprefixed upgrade must pass\n{}",
         output_text(&valid)
     );
 
-    plan.swap(3, 5);
-    let reversed = run_assertion(&plan);
+    for (original, replacement) in [
+        ("rollback acme-release", "rollback acme-other-release"),
+        ("acme-release 2", "acme-release 9"),
+        ("-n ns", "-n acme-other-namespace"),
+        ("--kube-context example-context ", ""),
+        ("--kube-context example-context", "--kube-context ''"),
+        ("--wait ", ""),
+        ("--wait", "--wait=false"),
+        (" --timeout 15m", ""),
+        ("--timeout 15m", "--timeout 5m"),
+    ] {
+        let rollback = plan[3].replace(original, replacement);
+        let mut invalid_plan = plan;
+        invalid_plan[3] = &rollback;
+        let invalid = run_order(&invalid_plan);
+        assert!(
+            !invalid.status.success(),
+            "takeover must reject rollback replacement {original:?} -> {replacement:?}\n{}",
+            output_text(&invalid)
+        );
+    }
+
+    let prefixed_upgrade = plan[7].replace(
+        "helm upgrade",
+        "helm --kube-context example-context upgrade",
+    );
+    let mut invalid_plan = plan;
+    invalid_plan[7] = &prefixed_upgrade;
+    let invalid = run_order(&invalid_plan);
+    assert!(
+        !invalid.status.success(),
+        "takeover must require the unprefixed upgrade emitted by helm_upgrade_argv\n{}",
+        output_text(&invalid)
+    );
+
+    plan.swap(3, 7);
+    let prose_reversed = run_prose(&plan);
+    assert!(
+        prose_reversed.status.success(),
+        "plan prose stays valid when recovery commands are reversed\n{}",
+        output_text(&prose_reversed)
+    );
+    let reversed = run_order(&plan);
     assert!(
         !reversed.status.success(),
-        "the same Python assertion must reject upgrade before rollback"
+        "the explicit helm plan helper must reject upgrade before rollback"
     );
     assert!(
         output_text(&reversed).contains("dry run did not plan rollback before upgrade"),

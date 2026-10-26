@@ -1,4 +1,4 @@
-"""Wire shapes of the typed twin memory routes (ADR 0239, Contract r4).
+"""Wire shapes of the typed twin memory routes (ADR 0249, Contract r4).
 
 The routes live under ``/agents/{agent_id}/state/_memory`` on the state router.
 ``tests/vectors/twin-memory.json`` holds an example of every response object
@@ -24,7 +24,7 @@ class MemoryRecordOut(BaseModel):
     """One canonical memory entry (a fact or a standing instruction).
 
     ``author`` and ``stated_at`` are null only for an entry stored before ADR
-    0239 that never named them; the migration does not invent provenance.
+    0249 that never named them; the migration does not invent provenance.
     ``conversation`` is the signed source conversation of the last sandbox
     write, null for operator writes and migrated entries."""
 

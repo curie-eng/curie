@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: &str = "0.5.23";
+pub const PROTOCOL_VERSION: &str = "0.5.25";
 
 pub const RUNS_STREAM_DEFAULT: &str = "curie:runs";
 
@@ -191,6 +191,8 @@ pub struct BootEnv {
     #[serde(default)]
     pub attachments_manifest: Option<String>,
     #[serde(default)]
+    pub attachment_access_enabled: Option<bool>,
+    #[serde(default)]
     pub approval_required_tools: Option<Vec<String>>,
     #[serde(default)]
     pub approval_grant_tool: Option<String>,
@@ -255,6 +257,7 @@ pub mod env_keys {
     pub const CURIE_APPROVAL_REQUIRED_TOOLS: &str = "CURIE_APPROVAL_REQUIRED_TOOLS";
     pub const CURIE_APPROVAL_RESUMED_KIND: &str = "CURIE_APPROVAL_RESUMED_KIND";
     pub const CURIE_ATTACHMENTS_MANIFEST: &str = "CURIE_ATTACHMENTS_MANIFEST";
+    pub const CURIE_ATTACHMENT_ACCESS_ENABLED: &str = "CURIE_ATTACHMENT_ACCESS_ENABLED";
     pub const CURIE_BUDGET: &str = "CURIE_BUDGET";
     pub const CURIE_BUNDLE_REF: &str = "CURIE_BUNDLE_REF";
     pub const CURIE_BUNDLE_VERSION: &str = "CURIE_BUNDLE_VERSION";
@@ -335,6 +338,12 @@ pub struct HookRunRef {
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct PrincipalRef {
+    pub principal_id: String,
+    pub authorization_version: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct QueuedTurn {
     pub event_id: String,
     pub conversation_id: String,
@@ -351,6 +360,8 @@ pub struct QueuedTurn {
     pub hook_run: Option<HookRunRef>,
     #[serde(default)]
     pub tool_access: Option<ToolAccess>,
+    #[serde(default)]
+    pub author_principal: Option<PrincipalRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -445,6 +456,22 @@ impl std::fmt::Debug for ChannelReadCapability {
     }
 }
 
+#[derive(Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct AttachmentAccessCapability {
+    pub url: String,
+    pub token: String,
+}
+
+impl std::fmt::Debug for AttachmentAccessCapability {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AttachmentAccessCapability")
+            .field("url", &self.url)
+            .field("token", &"[REDACTED]")
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum InboundMessage {
@@ -466,6 +493,8 @@ pub enum InboundMessage {
         memory_token: Option<String>,
         #[serde(default)]
         channel_read: Option<ChannelReadCapability>,
+        #[serde(default)]
+        attachment_access: Option<AttachmentAccessCapability>,
     },
     #[serde(rename = "interrupt")]
     Interrupt {
@@ -605,6 +634,7 @@ mod tests {
             tool_access: Some(ToolAccess::ReadOnly),
             memory_token: None,
             channel_read: None,
+            attachment_access: None,
         };
         let encoded = serde_json::to_string(&message).unwrap();
         assert!(encoded.contains(r#""tool_access":"read-only""#));
@@ -637,6 +667,7 @@ mod tests {
             tool_access: None,
             memory_token: None,
             channel_read: Some(capability),
+            attachment_access: None,
         };
         for rendered in [format!("{:?}", message), format!("{:#?}", message)] {
             assert!(!rendered.contains(token));
@@ -733,6 +764,31 @@ mod tests {
         assert!(error.to_string().contains("missing field `placeholder`"));
     }
 
+#[cfg(test)]
+mod attachment_access_tests {
+    use super::*;
+
+    #[test]
+    fn optional_attachment_context_roundtrips_without_debug_disclosure() {
+        let mut frame = serde_json::json!({
+            "kind": "event", "type": "message", "text": "Inspect the file",
+            "user": "U0EXAMPLE1", "ts": "1.0"
+        });
+        let old: InboundMessage = serde_json::from_value(frame.clone()).unwrap();
+        assert!(matches!(old, InboundMessage::Event { attachment_access: None, .. }));
+        frame["attachment_access"] = serde_json::json!({
+            "url": "https://api.example.com/attachment-access",
+            "token": "attachment.example.signature-sentinel"
+        });
+        let current: InboundMessage = serde_json::from_value(frame.clone()).unwrap();
+        let output = serde_json::to_value(&current).unwrap();
+        assert_eq!(output["attachment_access"], frame["attachment_access"]);
+        assert!(!format!("{current:?}").contains("signature-sentinel"));
+        frame["attachment_access"] = serde_json::json!({"url": "https://api.example.com"});
+        assert!(serde_json::from_value::<InboundMessage>(frame).is_err());
+    }
+}
+
     #[test]
     fn rejects_incompatible_version_event() {
         let raw = r#"{"type":"final","version":"9.9.9","text":"x","status":"done"}"#;
@@ -747,13 +803,13 @@ mod tests {
 
     #[test]
     fn accepts_compatible_patch() {
-        let raw = r#"{"type":"final","version":"0.5.24","text":"x","status":"done"}"#;
+        let raw = r#"{"type":"final","version":"0.5.26","text":"x","status":"done"}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_ok());
     }
 
     #[test]
     fn accepts_unknown_fields() {
-        let raw = r#"{"type":"final","version":"0.5.23","text":"x","status":"done","extra":1}"#;
+        let raw = r#"{"type":"final","version":"0.5.25","text":"x","status":"done","extra":1}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_ok());
     }
 }

@@ -1960,7 +1960,7 @@ export const commandManifest = {
           ]
         },
         {
-          "about": "List an agent's individual facts and memory log. `--channel KIND=ADDRESS` selects one bound channel; `--delete FACT_ID` removes one fact. `--archive`, `--restore`, `--revert FACT_ID --to-version N` and `--history` act on one entry under its current version (ADR 0239); a fresh session is required before a change reaches boot memory. `--add <content>` seeds an operator-authored record; a fresh session is required before it is injected at boot. `--guidance` shows the guidance the agent gets beside its memory tools, `--guidance-from <file>` replaces it and `--reset-guidance` restores the platform default",
+          "about": "List an agent's individual facts and memory log. `--channel KIND=ADDRESS` selects one bound channel; `--delete FACT_ID` removes one fact. `--archive`, `--restore`, `--revert FACT_ID --to-version N` and `--history` act on one entry under its current version (ADR 0249); a fresh session is required before a change reaches boot memory. `--add <content>` seeds an operator-authored record; a fresh session is required before it is injected at boot. `--guidance` shows the guidance the agent gets beside its memory tools, `--guidance-from <file>` replaces it and `--reset-guidance` restores the platform default",
           "args": [
             {
               "global": false,
@@ -2256,7 +2256,7 @@ export const commandManifest = {
           ]
         },
         {
-          "about": "An agent's learned skills (ADR 0237): list, show, diff, history, revert, delete and export",
+          "about": "An agent's learned skills (ADR 0247): list, show, diff, history, revert, delete and export",
           "args": [
             {
               "global": false,
@@ -2401,7 +2401,7 @@ export const commandManifest = {
           ]
         },
         {
-          "about": "A protected hook's remediation policy: show it, apply a document, arm, disarm or remove it, or close an open circuit breaker. Writes run as the operator principal in CURIE_APPROVAL_PRINCIPAL_TOKEN",
+          "about": "A protected hook's remediation policy: show it, apply a document, arm, disarm or remove it, or close an open circuit breaker. Writes run as the operator principal in CURIE_APPROVAL_PRINCIPAL_TOKEN; apply and arm also need the remediation authority in CURIE_REMEDIATION_AUTHORITY_KEY",
           "hidden": false,
           "name": "remediation-policy",
           "subcommands": [
@@ -2448,7 +2448,7 @@ export const commandManifest = {
               "name": "show"
             },
             {
-              "about": "Bind or replace a hook's policy from a JSON document (`PUT`). The document is validated with the platform's rules before any request",
+              "about": "Bind or replace a hook's policy from a JSON document (`PUT`). The document is validated with the platform's rules before any request. Needs the remediation authority in CURIE_REMEDIATION_AUTHORITY_KEY",
               "args": [
                 {
                   "global": false,
@@ -2514,7 +2514,7 @@ export const commandManifest = {
               "name": "apply"
             },
             {
-              "about": "Arm the current policy so its automatic actions may run (`POST .../arm`)",
+              "about": "Arm the current policy so its automatic actions may run (`POST .../arm`). Needs the remediation authority in CURIE_REMEDIATION_AUTHORITY_KEY",
               "args": [
                 {
                   "global": false,
@@ -3620,7 +3620,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Opt the agent in to agent-wide learning, or out (`agent_wide_learning`, ADR 0239). On selects the learning default guidance and lets standing instructions load and be saved; it never turns memory writes on. Off keeps the existing default guidance byte for byte. Takes effect at the next sandbox boot",
+              "help": "Opt the agent in to agent-wide learning, or out (`agent_wide_learning`, ADR 0249). On selects the learning default guidance and lets standing instructions load and be saved; it never turns memory writes on. Off keeps the existing default guidance byte for byte. Takes effect at the next sandbox boot",
               "id": "agent_wide_learning",
               "long": "agent-wide-learning",
               "positional": false,
@@ -3632,7 +3632,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Let the agent create and manage its own schedules on or off (`agent_schedules`, ADR 0238). Off stops creating and changing them; stored schedules and history stay",
+              "help": "Let the agent create and manage its own schedules on or off (`agent_schedules`, ADR 0248). Off stops creating and changing them; stored schedules and history stay",
               "id": "agent_schedules",
               "long": "agent-schedules",
               "positional": false,
@@ -3644,7 +3644,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Turn the agent's learned skills on or off (ADR 0237). Off stops loading and editing them; stored skills and history stay",
+              "help": "Turn the agent's learned skills on or off (ADR 0247). Off stops loading and editing them; stored skills and history stay",
               "id": "learned_skills",
               "long": "learned-skills",
               "positional": false,
@@ -6764,7 +6764,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Opt the agent in to agent-wide learning, or out (`agent_wide_learning`, ADR 0239). On selects the learning default guidance and lets standing instructions load and be saved; it never turns memory writes on. Off keeps the existing default guidance byte for byte. Takes effect at the next sandbox boot",
+              "help": "Opt the agent in to agent-wide learning, or out (`agent_wide_learning`, ADR 0249). On selects the learning default guidance and lets standing instructions load and be saved; it never turns memory writes on. Off keeps the existing default guidance byte for byte. Takes effect at the next sandbox boot",
               "id": "agent_wide_learning",
               "long": "agent-wide-learning",
               "positional": false,
@@ -6776,7 +6776,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Let the agent create and manage its own schedules on or off (`agent_schedules`, ADR 0238). Off stops creating and changing them; stored schedules and history stay",
+              "help": "Let the agent create and manage its own schedules on or off (`agent_schedules`, ADR 0248). Off stops creating and changing them; stored schedules and history stay",
               "id": "agent_schedules",
               "long": "agent-schedules",
               "positional": false,
@@ -6788,7 +6788,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Turn the agent's learned skills on or off (ADR 0237). Off stops loading and editing them; stored skills and history stay",
+              "help": "Turn the agent's learned skills on or off (ADR 0247). Off stops loading and editing them; stored skills and history stay",
               "id": "learned_skills",
               "long": "learned-skills",
               "positional": false,
@@ -7191,6 +7191,210 @@ export const commandManifest = {
           "hidden": false,
           "long_about": "Show, set, or clear who may talk to the bot through one surface (`PUT /agents/{id}/channels/callers`, ADR 0175).\n\nWith neither `--set` nor `--clear` this shows the list. `--set` replaces it with exactly the ids given; `--clear` removes it so everyone may talk to the bot again. Anyone not on a list gets no reply at all. Editing the list does not revoke the surface's adapter token.",
           "name": "callers"
+        },
+        {
+          "about": "Show or change which IdP teams may invoke the agent and approve for it (`GET`/`PUT /agents/{id}/access-policy`, ADR 0220)",
+          "args": [
+            {
+              "global": false,
+              "help": "Agent name or id",
+              "id": "agent",
+              "positional": true,
+              "required": true
+            },
+            {
+              "global": false,
+              "help": "The team whose members may start a turn with the agent",
+              "id": "invocation_team",
+              "long": "invocation-team",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "The team whose members may resolve the agent's approvals",
+              "id": "approver_team",
+              "long": "approver-team",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Remove the invocation team, so today's caller rules apply",
+              "id": "clear_invocation_team",
+              "long": "clear-invocation-team",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Remove the approver team, so each route's approvers apply",
+              "id": "clear_approver_team",
+              "long": "clear-approver-team",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "env": "CURIE_API_URL",
+              "global": false,
+              "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
+              "id": "api_url",
+              "long": "api-url",
+              "positional": false,
+              "required": false
+            },
+            {
+              "env": "CURIE_API_KEY",
+              "global": false,
+              "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+              "id": "api_key",
+              "long": "api-key",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "env": "CURIE_NAMESPACE",
+              "global": false,
+              "help": "Kubernetes namespace of the release. Default: curie",
+              "id": "namespace",
+              "long": "namespace",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "global": false,
+              "help": "Helm release name. Default: curie",
+              "id": "release",
+              "long": "release",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Print what would be done and exit without making a request",
+              "id": "dry_run",
+              "long": "dry-run",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "long_about": "Show or change which IdP teams may invoke the agent and approve for it (`GET`/`PUT /agents/{id}/access-policy`, ADR 0220).\n\nWith no team flag this shows the policy. A team is named by its id, as `GET /teams` lists it, and must be an IdP group team of the agent's tenant. A role left unmentioned keeps its team. The write sends back the version it read, so a concurrent change is refused rather than overwritten. Each configured role is enforced on every channel.",
+          "name": "access-policy"
+        },
+        {
+          "about": "Inspect tenant identities or apply IdP configuration, namespace or team JSON. Writes use the API's expected-version contract; links and people are read-only",
+          "args": [
+            {
+              "global": false,
+              "id": "tenant",
+              "long": "tenant",
+              "positional": false,
+              "required": true
+            },
+            {
+              "global": false,
+              "id": "resource",
+              "long": "resource",
+              "positional": false,
+              "possible_values": [
+                "config",
+                "people",
+                "links",
+                "namespaces",
+                "teams"
+              ],
+              "required": true
+            },
+            {
+              "global": false,
+              "help": "JSON request file. Config uses PUT; namespaces and teams use POST",
+              "id": "apply",
+              "long": "apply",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Continue a bounded people, links or namespaces page",
+              "id": "after",
+              "long": "after",
+              "positional": false,
+              "required": false
+            },
+            {
+              "env": "CURIE_API_URL",
+              "global": false,
+              "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
+              "id": "api_url",
+              "long": "api-url",
+              "positional": false,
+              "required": false
+            },
+            {
+              "env": "CURIE_API_KEY",
+              "global": false,
+              "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+              "id": "api_key",
+              "long": "api-key",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "env": "CURIE_NAMESPACE",
+              "global": false,
+              "help": "Kubernetes namespace of the release. Default: curie",
+              "id": "namespace",
+              "long": "namespace",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "global": false,
+              "help": "Helm release name. Default: curie",
+              "id": "release",
+              "long": "release",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "id": "dry_run",
+              "long": "dry-run",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "directory"
         },
         {
           "about": "Mint or inspect the mail adapter's channel token (`POST /channels/token`)",
@@ -8232,7 +8436,7 @@ export const commandManifest = {
           ]
         },
         {
-          "about": "List an agent's individual facts and memory log. `--channel KIND=ADDRESS` selects one bound channel; `--delete FACT_ID` removes one fact. `--archive`, `--restore`, `--revert FACT_ID --to-version N` and `--history` act on one entry under its current version (ADR 0239); a fresh session is required before a change reaches boot memory. `--add <content>` seeds an operator-authored record; a fresh session is required before it is injected at boot. `--guidance` shows the guidance the agent gets beside its memory tools, `--guidance-from <file>` replaces it and `--reset-guidance` restores the platform default",
+          "about": "List an agent's individual facts and memory log. `--channel KIND=ADDRESS` selects one bound channel; `--delete FACT_ID` removes one fact. `--archive`, `--restore`, `--revert FACT_ID --to-version N` and `--history` act on one entry under its current version (ADR 0249); a fresh session is required before a change reaches boot memory. `--add <content>` seeds an operator-authored record; a fresh session is required before it is injected at boot. `--guidance` shows the guidance the agent gets beside its memory tools, `--guidance-from <file>` replaces it and `--reset-guidance` restores the platform default",
           "args": [
             {
               "global": false,
@@ -8630,7 +8834,7 @@ export const commandManifest = {
           ]
         },
         {
-          "about": "An agent's learned skills (ADR 0237): list, show, diff, history, revert, delete and export",
+          "about": "An agent's learned skills (ADR 0247): list, show, diff, history, revert, delete and export",
           "args": [
             {
               "global": false,
@@ -8795,7 +8999,7 @@ export const commandManifest = {
           ]
         },
         {
-          "about": "A protected hook's remediation policy: show it, apply a document, arm, disarm or remove it, or close an open circuit breaker. Writes run as the operator principal in CURIE_APPROVAL_PRINCIPAL_TOKEN",
+          "about": "A protected hook's remediation policy: show it, apply a document, arm, disarm or remove it, or close an open circuit breaker. Writes run as the operator principal in CURIE_APPROVAL_PRINCIPAL_TOKEN; apply and arm also need the remediation authority in CURIE_REMEDIATION_AUTHORITY_KEY",
           "hidden": false,
           "name": "remediation-policy",
           "subcommands": [
@@ -8862,7 +9066,7 @@ export const commandManifest = {
               "name": "show"
             },
             {
-              "about": "Bind or replace a hook's policy from a JSON document (`PUT`). The document is validated with the platform's rules before any request",
+              "about": "Bind or replace a hook's policy from a JSON document (`PUT`). The document is validated with the platform's rules before any request. Needs the remediation authority in CURIE_REMEDIATION_AUTHORITY_KEY",
               "args": [
                 {
                   "global": false,
@@ -8948,7 +9152,7 @@ export const commandManifest = {
               "name": "apply"
             },
             {
-              "about": "Arm the current policy so its automatic actions may run (`POST .../arm`)",
+              "about": "Arm the current policy so its automatic actions may run (`POST .../arm`). Needs the remediation authority in CURIE_REMEDIATION_AUTHORITY_KEY",
               "args": [
                 {
                   "global": false,
@@ -10077,6 +10281,17 @@ export const commandManifest = {
             },
             {
               "default_values": [
+                "250000"
+              ],
+              "global": false,
+              "help": "Output token allowance for each run of the deployed agent (max_output_tokens_per_run). Must be > 0",
+              "id": "output_tokens",
+              "long": "output-tokens",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
                 "dark-factory"
               ],
               "global": false,
@@ -10833,6 +11048,42 @@ export const commandManifest = {
       "long_about": "Run a repo dev script (contracts, chart-check, e2e) -- source checkout only.\n\nThin wrappers over the repo's dev scripts so contributors get a unified `curie <command>` surface; the scripts stay the implementation. A release binary has no scripts and errors clearly.",
       "name": "dev",
       "subcommands": [
+        {
+          "about": "Run commands with private backing services",
+          "hidden": false,
+          "name": "test-env",
+          "subcommands": [
+            {
+              "about": "Run COMMAND with isolated backing services and verified cleanup",
+              "args": [
+                {
+                  "default_values": [
+                    "core"
+                  ],
+                  "global": false,
+                  "help": "Backing service profile: core or full",
+                  "id": "profile",
+                  "long": "profile",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Command and arguments to run after --",
+                  "id": "command",
+                  "num_args": {
+                    "max": 18446744073709552000,
+                    "min": 1
+                  },
+                  "positional": true,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "run"
+            }
+          ]
+        },
         {
           "about": "Check the committed change before opening or updating a pull request",
           "args": [

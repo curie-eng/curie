@@ -20,6 +20,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
 TOOL = ROOT / "tools/preflight/preflight.py"
+TEST_ENV = ROOT / "tools/test-env/test_env.py"
 FIXTURES = Path(__file__).with_name("fixtures")
 # Sanitized GitHub check-runs response fields, with conclusions seeded for
 # success, failure and pending coverage. The provider owns this response shape:
@@ -29,6 +30,15 @@ PYTHON_CHECK = "Python (ruff + mypy + pytest)"
 
 def load_tool():
     spec = importlib.util.spec_from_file_location("curie_full_preflight_test_subject", TOOL)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_helper():
+    spec = importlib.util.spec_from_file_location("curie_full_preflight_test_env_subject", TEST_ENV)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
@@ -407,7 +417,7 @@ def test_private_service_environment_replaces_a_conflicting_ambient_contract(
         "CURIE_RELEASED_UPGRADE_POSTGRES_HOST": "localhost",
         "CURIE_RELEASED_UPGRADE_POSTGRES_PORT": "25432",
     }
-    environment = load_tool().private_service_environment(
+    environment = load_helper().private_service_environment(
         base, postgres=43210, valkey=43211, s3=43212, otel=43213
     )
     assert base["CURIE_RELEASED_UPGRADE_COMPOSE_PROJECT"] == "someone-elses-stack"
@@ -465,7 +475,7 @@ def test_private_service_environment_unavailable_postgres_fails_the_real_gate_te
     # The private project has no containers, so `docker compose ps -q postgres`
     # succeeds with empty output and the gate fixture reaches its "not running" branch.
     project = "curie-preflight-absent-" + uuid.uuid4().hex[:8]
-    environment = load_tool().private_service_environment(
+    environment = load_helper().private_service_environment(
         private_base_environment(project, tmp_path / "override.yaml"),
         postgres=unused_port(),
         valkey=unused_port(),
@@ -704,17 +714,56 @@ def test_ci_only_selector_reports_tiers_and_kind_jobs(repository: Path) -> None:
     assert "approval" in text
 
 
+@pytest.mark.parametrize("base", ("main", "next"))
+@pytest.mark.parametrize(
+    "path",
+    (
+        "charts/curie/templates/api.yaml",
+        "cli/src/config_migrate.rs",
+        ".github/workflows/ci.yaml",
+    ),
+    ids=("chart", "factory", "upgrade-workflow"),
+)
+def test_ci_only_pr_upgrade_smoke_reports_negative_without_positive(
+    repository: Path, base: str, path: str
+) -> None:
+    if base == "next":
+        git(repository, "update-ref", "refs/remotes/origin/next", "origin/main")
+    if path == ".github/workflows/ci.yaml":
+        workflow = repository / path
+        text = workflow.read_text()
+        name = "    name: E2E released chart upgrade (released install to candidate)\n"
+        assert text.count(name) == 1
+        workflow.write_text(text.replace(name, "    name: Example released chart upgrade\n", 1))
+    head = commit_paths(repository, [path])
+
+    selected = load_tool().select_ci_only(repository, [path], base, head)
+
+    upgrade_selected = base == "main" or path == ".github/workflows/ci.yaml"
+    for entry in (
+        "released-upgrade", "e2e-cluster-upgrade-matrix", "e2e-released-upgrade-negative",
+    ):
+        assert (entry in selected) is upgrade_selected, selected
+    assert "e2e-released-upgrade" not in selected
+    if base == "next":
+        assert "cluster" not in selected
+
+
 def test_ci_only_cli_text_and_json_agree(repository: Path, recorded_gh: Path) -> None:
     commit_paths(repository, ["charts/curie/templates/api.yaml"])
     result = full_preflight(repository, "--dry-run", "--json")
     assert result.returncode == 0, result.stdout + result.stderr
     report = json.loads(result.stdout)
     assert any("cluster" in entry for entry in report["ci_only"])
+    assert "e2e-cluster-upgrade-matrix" in report["ci_only"]
+    assert "e2e-released-upgrade-negative" in report["ci_only"]
+    assert "e2e-released-upgrade" not in report["ci_only"]
     readable = full_preflight(repository, "--dry-run")
     assert readable.returncode == 0, readable.stdout + readable.stderr
     text = readable.stdout + readable.stderr
     assert "runs in CI only" in text
     assert all(entry in text for entry in report["ci_only"])
+    assert "e2e-released-upgrade: runs in CI only" not in text
 
 
 def test_ci_only_docs_change_has_no_tiers(repository: Path) -> None:
@@ -766,8 +815,9 @@ def test_private_services_shared_worktree_lock_refuses_detached_checkout(
     # No Compose source is present, so even a broken lock cannot start services.
     with (scratch / f"{project}.lock").open("w") as owner:
         fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        with pytest.raises(ValueError, match="Another full preflight owns"):
-            with load_tool().private_services(checkout, worktree):
+        helper = load_helper()
+        with pytest.raises(helper.TransientError, match="Another full preflight owns"):
+            with helper.private_services(checkout, worktree):
                 pytest.fail("A second invocation acquired the existing owner's project")
 
 
@@ -790,7 +840,7 @@ def test_private_services_unavailable_daemon_is_transient_error(
     # inventory or startup can reach a daemon. Do not replace the Docker tool.
     monkeypatch.setenv("DOCKER_HOST", f"unix://{socket_path}")
     monkeypatch.delenv("DOCKER_CONTEXT", raising=False)
-    module = load_tool()
+    module = load_helper()
     with pytest.raises(module.TransientError, match="Docker"):
         with module.private_services(ROOT, worktree):
             pytest.fail("An unavailable daemon cannot yield usable private services")
@@ -816,7 +866,7 @@ def test_private_config_accepts_loopback_binding_and_owned_network() -> None:
         },
     }
     assert (
-        load_tool().validate_private_config(
+        load_helper().validate_private_config(
             configuration, project, {"postgres": [5432]}, subnets
         )
         is None
@@ -843,7 +893,7 @@ def test_private_config_shared_binding_is_gate_failure(host_ip: str | None) -> N
             },
         },
     }
-    module = load_tool()
+    module = load_helper()
     with pytest.raises(module.GateFailure, match="shared binding"):
         module.validate_private_config(configuration, project, {"postgres": [5432]}, subnets)
 
@@ -851,7 +901,9 @@ def test_private_config_shared_binding_is_gate_failure(host_ip: str | None) -> N
 def test_private_config_shared_network_is_gate_failure() -> None:
     subnets = ("10.240.0.0/24", "10.240.1.0/24")
     configuration = {
-        "services": {"postgres": {"ports": [{"host_ip": "127.0.0.1", "target": 5432}]}},
+        "services": {
+            "postgres": {"ports": [{"host_ip": "127.0.0.1", "target": 5432, "published": "35432"}]}
+        },
         "networks": {
             "default": {
                 "name": "curie-preflight-example_default",
@@ -863,7 +915,7 @@ def test_private_config_shared_network_is_gate_failure() -> None:
             },
         },
     }
-    module = load_tool()
+    module = load_helper()
     with pytest.raises(module.GateFailure, match="incorrect owner"):
         module.validate_private_config(
             configuration, "curie-preflight-example", {"postgres": [5432]}, subnets
@@ -871,7 +923,7 @@ def test_private_config_shared_network_is_gate_failure() -> None:
 
 
 def test_private_preflight_networks_skip_occupied_subnets() -> None:
-    module = load_tool()
+    module = load_helper()
     occupied = [
         f"10.240.{octet}.0/24" for octet in range(16) if octet not in {0, 1}
     ]
@@ -886,7 +938,7 @@ def test_private_preflight_networks_skip_occupied_subnets() -> None:
 
 
 def test_private_preflight_networks_fail_when_reserved_pool_is_full() -> None:
-    module = load_tool()
+    module = load_helper()
     occupied = [f"10.240.{octet}.0/24" for octet in range(16)]
     occupied.extend(f"172.31.{octet}.0/24" for octet in range(240, 256))
     occupied.extend(f"192.168.{octet}.0/24" for octet in range(240, 256))

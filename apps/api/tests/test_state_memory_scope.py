@@ -10,7 +10,7 @@ The two credential shapes (plan section 2):
 - long-lived: ``{binding, memory: "read"}``, handed to the sandbox at boot;
 - per-turn: ``{binding, memory: "write", sender, turn, conversation}``,
   carried on the turn's ACI ``Event``; ``conversation`` is the thread key the
-  API stamps as a fact's source conversation (ADR 0239).
+  API stamps as a fact's source conversation (ADR 0249).
 
 Sandbox writes also need the agent's stored ``memory_writes`` on, so every agent
 here turns it on. Canonical fact values carry the typed shape (``kind``,
@@ -307,7 +307,7 @@ def test_append_on_memory_refused_for_sandbox(
 ) -> None:
     # Facts are written with PUT; POST append on memory is always refused for a
     # sandbox credential, whatever the key and whichever credential. On a
-    # canonical fact key it is a 422 for every principal (ADR 0239); on the
+    # canonical fact key it is a 422 for every principal (ADR 0249); on the
     # legacy log it stays the sandbox's 403.
     aid = _agent_with_two_channels(client, auth_headers)
     for headers in (_writer(aid), _reader(aid), _legacy(aid)):
@@ -373,7 +373,7 @@ def test_platform_key_keeps_body_author(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
     # The operator is trusted to say who they are; the conversation is the
-    # server's, and a platform-key write names none (ADR 0239).
+    # server's, and a platform-key write names none (ADR 0249).
     aid = _agent_with_two_channels(client, auth_headers)
     for base in (_agent_memory(aid), _channel(aid, CHANNEL_A)):
         url = f"{base}/{FACT}"
@@ -396,7 +396,7 @@ def test_non_object_fact_value_is_422(
         resp = client.put(url, json={"value": value}, headers=_writer(aid))
         assert resp.status_code == 422, f"{value!r}: {resp.status_code} {resp.text}"
     assert client.get(url, headers=auth_headers).status_code == 404
-    # The platform key is held to the typed fact shape too (ADR 0239).
+    # The platform key is held to the typed fact shape too (ADR 0249).
     assert (
         client.put(url, json={"value": "operator string"}, headers=auth_headers).status_code == 422
     )

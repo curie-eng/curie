@@ -29,6 +29,7 @@ use crate::scaffold::{
 };
 use crate::state::{self, RunnerState};
 
+mod access_policy;
 mod actions;
 mod agent_actions;
 mod agents;
@@ -39,6 +40,7 @@ mod connector_images;
 mod credential_env;
 mod deploy;
 mod dev;
+mod directory_admin;
 mod eval;
 mod init;
 mod learned_skills;
@@ -52,6 +54,7 @@ mod skill_approvals;
 mod skill_unavailable;
 mod work;
 
+pub use access_policy::*;
 pub use actions::*;
 pub use agent_actions::*;
 pub use agents::*;
@@ -62,6 +65,7 @@ pub use connector_images::*;
 pub use credential_env::*;
 pub use deploy::*;
 pub use dev::*;
+pub use directory_admin::*;
 pub use eval::*;
 pub use init::*;
 pub use learned_skills::*;

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import uuid
 
 from ..actions import ActionRecorder
@@ -9,6 +10,7 @@ from ..approvals import (
     ApprovalReader,
     PublicationCreator,
 )
+from ..attachment_access_client import AttachmentAccessClient
 from ..attachments import (
     AttachmentCoordinator,
 )
@@ -54,6 +56,7 @@ from . import (
     lifecycle,
     memory,
     publication,
+    route_tokens,
     routing,
     sweep_slices,
     work_items,
@@ -79,6 +82,7 @@ class Kernel:
         workspace: WorkspaceClaimCoordinator | None = None,
         attachments: AttachmentCoordinator | None = None,
         attachment_ledger: ThreadAttachmentLedgerClient | None = None,
+        attachment_access: AttachmentAccessClient | None = None,
         killswitch: KillSwitch | None = None,
         approvals: ApprovalCreator | None = None,
         publication_creator: PublicationCreator | None = None,
@@ -145,6 +149,7 @@ class Kernel:
         # boot for a thread rebuilds the thread's whole file set from it, and a
         # file turn appends its files once they are installed.
         self._attachment_ledger = attachment_ledger
+        self._attachment_access = attachment_access
         self._killswitch = killswitch
         # The approval-record backend (#244). When absent (unwired tests, a
         # deployment without the API), an awaiting-approval run degrades to an
@@ -181,6 +186,10 @@ class Kernel:
         # The grant each bundle declares, by bundle ref (a stored bundle is
         # write once). Cleared past 4096 entries.
         self._bundle_grants: dict[str, bool] = {}
+        # ADR 0240: the hosted connectors each (bundle, agent) declares routes
+        # on, read from the same stored bundle. Cleared past 4096 entries.
+        self._bundle_routes: dict[tuple[str, str], frozenset[str]] = {}
+        self._bundle_route_lookups: dict[tuple[str, str], asyncio.Future[frozenset[str]]] = {}
         # Keyed by request id, never thread key: a steered follow-up shares the
         # thread and must not see or remove this run.
         self._work_item_runs: dict[uuid.UUID, WorkItemRun] = {}
@@ -314,6 +323,7 @@ class Kernel:
     _record_turn_deadline = memory._record_turn_deadline
     _settle_memory_turns = memory._settle_memory_turns
     _close_memory_turns = memory._close_memory_turns
+    _route_connectors = route_tokens.route_connectors
     _with_channel_read = channel_read._with_channel_read
     _steer_channel_read = channel_read._steer_channel_read
     _settle_channel_read = channel_read._settle_channel_read

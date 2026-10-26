@@ -328,7 +328,7 @@ def test_unknown_mergeability_waits_then_expires_unverified(
     assert _finals(pair, published.request_id) == []
     assert _mergeability_reads(fake, published.pr, since=published.seen)
 
-    _gate_pass(later=1210)
+    _gate_pass(later=3610)
 
     assert _status(published.request_id) == ("failed", "ci_unverified")
     body = _final(pair, published.request_id)
@@ -372,7 +372,7 @@ def test_mergeability_of_a_moved_head_does_not_decide_the_published_head(
     assert fake.statuses.get(published.head_sha) is None
     assert fake.statuses.get(moved) is None
 
-    _gate_pass(later=1210)
+    _gate_pass(later=3610)
 
     assert _status(published.request_id) == ("failed", "ci_unverified")
     body = _final(pair, published.request_id)

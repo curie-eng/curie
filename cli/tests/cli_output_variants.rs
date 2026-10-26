@@ -35,15 +35,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use curie::api::{
-    ApprovalRecord, ChannelBinding, HookFireRecord, MemoryDetail, MemoryEntry, MemoryRecord,
-    MemoryRevision, MetricPoint, MetricSeries, MetricsSummary, ScheduleList, Version,
+    AgentAccessPolicy, ApprovalRecord, ChannelBinding, HookFireRecord, MemoryDetail, MemoryEntry,
+    MemoryRecord, MemoryRevision, MetricPoint, MetricSeries, MetricsSummary, ScheduleList, Version,
 };
 use curie::channel_token::ChannelTokenOutput;
 use curie::commands::{
-    ActionsOutput, ApprovalsOutput, BudgetOutput, CallersOutput, ChannelsOutput, DeleteOutput,
-    HookFireOutput, HookOutput, KillOutput, MemoryChannel, MemoryOutput, OverridesOutput,
-    PublicationPolicyOutput, ResetThreadOutput, ResumeOutput, SchedulesOutput,
-    SkillApprovalsOutput, VersionsOutput, WorkItemsOutput,
+    AccessPolicyOutput, ActionsOutput, ApprovalsOutput, BudgetOutput, CallersOutput,
+    ChannelsOutput, DeleteOutput, DirectoryOutput, HookFireOutput, HookOutput, KillOutput,
+    MemoryChannel, MemoryOutput, OverridesOutput, PublicationPolicyOutput, ResetThreadOutput,
+    ResumeOutput, SchedulesOutput, SkillApprovalsOutput, VersionsOutput, WorkItemsOutput,
 };
 use curie::comms::CommsOutput;
 use curie::factory_intake::FactoryIntakeOutput;
@@ -422,6 +422,24 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
         ],
     );
     m.insert(
+        "AccessPolicyOutput",
+        samples![
+            "DryRun" => AccessPolicyOutput::DryRun(plan()),
+            "Done" => AccessPolicyOutput::Done {
+                agent: "a".to_string(),
+                policy: AgentAccessPolicy {
+                    agent_id: "00000000-0000-0000-0000-0000000000a1".to_string(),
+                    tenant_id: "00000000-0000-0000-0000-000000000001".to_string(),
+                    invocation_team_id: Some("00000000-0000-0000-0000-0000000000b1".to_string()),
+                    approver_team_id: None,
+                    version: 1,
+                    updated_at: Some("2026-10-14T00:00:00Z".to_string()),
+                },
+                changed: true,
+            },
+        ],
+    );
+    m.insert(
         "CallersOutput",
         samples![
             "DryRun" => CallersOutput::DryRun(plan()),
@@ -437,6 +455,17 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                     trigger_label: None,
                 },
                 changed: true,
+            },
+        ],
+    );
+    m.insert(
+        "DirectoryOutput",
+        samples![
+            "DryRun" => DirectoryOutput::DryRun(plan()),
+            "Done" => DirectoryOutput::Done {
+                tenant_id: "00000000-0000-0000-0000-000000000001".into(),
+                resource: "people".into(),
+                result: serde_json::json!({"items":[],"next_cursor":null}),
             },
         ],
     );
@@ -827,6 +856,7 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                 effective_label: "curie-factory".to_string(),
                 deadline_seconds: 3600,
                 budget_usd: 5.0,
+                output_tokens: 250000,
                 credit_remaining_usd: Some(73.49),
             },
             "AgentAdded" => QuickstartOutput::AgentAdded {
@@ -839,6 +869,7 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                 runner_image: None,
                 deadline_seconds: 3600,
                 budget_usd: 1.0,
+                output_tokens: 250000,
                 credit_remaining_usd: None,
             },
         ],

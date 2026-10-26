@@ -16,7 +16,7 @@ Names this file pins that the build spec did not spell out: the store class
 ``MemoryFactsStore(url, token)`` and the ``platform_tool_names`` keyword
 ``memory_tool_names`` (the exact mounted memory tool-name set, Contract r4).
 
-Contract r4 (ADR 0239) moved boot to one ``GET .../state/_memory/context`` read and
+Contract r4 (ADR 0249) moved boot to one ``GET .../state/_memory/context`` read and
 gave the tools kinds, titles and caller-observed versions. The fake below serves
 that context route when a test sets ``context``, the typed entry read, and the raw
 canonical routes with compare-and-set. Boot composition, the injection record and
@@ -44,6 +44,7 @@ from curie_runner import __main__ as boot
 from curie_runner.__main__ import build_runner
 from curie_runner.approval import APPROVAL_SERVER_NAME
 from curie_runner.mcp_tool_capability import McpToolCapabilityProbe
+from runner_boot_session import initialized_session
 
 MEMORY_TOKEN = "mem-tok"
 AGENT_NS = "/agents/A/state/memory"
@@ -430,7 +431,7 @@ def _boot_options(
                 monkeypatch.delenv("CURIE_MEMORY_TOKEN", raising=False)
             config = RunnerConfig.from_env(env)
             runner = await _fetch_and_build(config, monkeypatch)
-            session = runner._factory()
+            session = await initialized_session(runner)
             captured["options"] = session.options
 
     anyio.run(go)
@@ -1136,7 +1137,7 @@ def _gated_boot(
             runner = build_runner(config, fake_model=fake_model, mcp_capability=_PROBE)
             captured["gate"] = runner._approval_gate
             if not fake_model:
-                captured["options"] = runner._factory().options
+                captured["options"] = (await initialized_session(runner)).options
 
     anyio.run(go)
     gate = captured["gate"]

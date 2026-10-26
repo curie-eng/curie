@@ -4,7 +4,7 @@ A fire still claims a ``hook_runs`` row and still skips when that hook already
 has a run in flight. The queued turn is the same shape the scheduler enqueues,
 so the worker settles the row when the turn ends.
 
-An agent schedule (ADR 0238) fires by its ``agent-schedule:<id>`` name: its
+An agent schedule (ADR 0248) fires by its ``agent-schedule:<id>`` name: its
 prompt, to its stored destination binding exactly (kind, address and adapter),
 with a run snapshot beside the manual row. A manual row never consumes or
 completes a one-shot; only scheduler rows do.

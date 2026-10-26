@@ -6,7 +6,7 @@ The API must not import the runner, so each keeps its own copy and this
 repo-level test pins them byte for byte: an operator reading ``curie ... memory
 --guidance`` must see exactly what the agent is told.
 
-ADR 0239 adds a second default, selected when the operator turns on agent-wide
+ADR 0249 adds a second default, selected when the operator turns on agent-wide
 learning and stores no guidance of their own: the API's
 ``LEARNING_MEMORY_GUIDANCE`` and the runner's ``LEARNING_GUIDANCE``. Those are
 pinned to each other the same way. The original default must not change at
@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import hashlib
 
-# UTF-8 SHA-256 and length of the default guidance before ADR 0239.
+# UTF-8 SHA-256 and length of the default guidance before ADR 0249.
 ORIGINAL_DEFAULT_SHA256 = "ac65ffde36f1252cd369d9d5c6226ca006782cf045c3cf758a5704fbf9338e2f"
 ORIGINAL_DEFAULT_BYTES = 1412
 

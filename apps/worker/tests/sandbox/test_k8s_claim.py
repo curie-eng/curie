@@ -14,6 +14,9 @@ import json
 import math
 import os
 import secrets
+import socket
+import threading
+import time
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
@@ -28,7 +31,14 @@ from curie_worker.sandbox.k8s import (
     _claim_view,
 )
 from curie_worker.sandbox.substrate import REAP_GRACE_MARGIN_SECONDS
-from curie_worker.sandbox.types import KubeTransientError, SubstrateConfig
+from curie_worker.sandbox.types import (
+    ClaimNameConflict,
+    ClaimTimeoutError,
+    KubeTransientError,
+    SandboxError,
+    SubstrateConfig,
+    ToolDaemonMount,
+)
 from kubernetes.client import ApiException
 from urllib3.exceptions import MaxRetryError, ReadTimeoutError
 
@@ -921,6 +931,7 @@ def test_bundle_ref_targets_init_containers_by_name() -> None:
         "claim-1",
         pool="pool",
         env={"CURIE_BUNDLE_REF": "bundles/x.tar.gz", "CURIE_BUDGET": "{}"},
+        deadline=time.monotonic() + 300,
     )
     entries = _env_entries(api)
 
@@ -950,6 +961,7 @@ def test_bundle_version_reaches_the_runner_not_the_init_containers() -> None:
             "CURIE_BUNDLE_VERSION": "abc123def456",
             "CURIE_BUDGET": "{}",
         },
+        deadline=time.monotonic() + 300,
     )
     entries = _env_entries(api)
 
@@ -961,7 +973,10 @@ def test_bundle_version_reaches_the_runner_not_the_init_containers() -> None:
 def test_no_named_env_without_bundle_ref() -> None:
     api = _FakeApi()
     _client(api).create_claim(
-        "claim-1", pool="pool", env={"CURIE_BUDGET": "{}", "CURIE_SESSION_ID": "s"}
+        "claim-1",
+        pool="pool",
+        env={"CURIE_BUDGET": "{}", "CURIE_SESSION_ID": "s"},
+        deadline=time.monotonic() + 300,
     )
     entries = _env_entries(api)
     assert entries  # the main-container env is still present
@@ -980,6 +995,7 @@ def test_workspace_capability_targets_only_workspace_init_containers() -> None:
             "CURIE_WORKSPACE_REF": workspace_ref,
             "CURIE_WORKSPACE_SHA256": workspace_sha256,
         },
+        deadline=time.monotonic() + 300,
     )
     entries = _env_entries(api)
 
@@ -1004,6 +1020,7 @@ def test_credential_is_never_written_to_the_claim() -> None:
         "claim-1",
         pool="pool",
         env={"CURIE_BUDGET": "{}", "CURIE_CREDENTIALS": "super-secret-token"},
+        deadline=time.monotonic() + 300,
     )
     entries = _env_entries(api)
     assert all(e.get("name") != "CURIE_CREDENTIALS" for e in entries)
@@ -1036,7 +1053,9 @@ def test_host_credentials_are_never_written_to_the_claim(
     monkeypatch.delenv("CURIE_CONNECTOR_SECRET_KEYS", raising=False)
 
     api = _FakeApi()
-    _client(api).create_claim("claim-credentials", pool="pool", env=os.environ)
+    _client(api).create_claim(
+        "claim-credentials", pool="pool", env=os.environ, deadline=time.monotonic() + 300
+    )
 
     claim_env_names = {entry["name"] for entry in _env_entries(api)}
     assert denied_names.isdisjoint(claim_env_names)
@@ -1062,6 +1081,7 @@ def test_the_caller_token_rides_the_claim_secret_and_its_signing_key_never_does(
             "CURIE_CONNECTOR_CALLER_TOKEN": "cct.payload.signature",
             "CURIE_CONNECTOR_CALLER_SIGNING_KEY": "placeholder-signing-key",
         },
+        deadline=time.monotonic() + 300,
     )
     entries = _env_entries(api)
     assert all(e.get("name") != "CURIE_CONNECTOR_CALLER_TOKEN" for e in entries)
@@ -1090,6 +1110,7 @@ def test_no_slack_identity_token_reaches_the_claim() -> None:
             "CURIE_SLACK_SIGNING_SECRET__0": "placeholder",
             "CURIE_SLACK_IDENTITIES": "[]",
         },
+        deadline=time.monotonic() + 300,
     )
 
     claim_env_names = {entry["name"] for entry in _env_entries(api)}
@@ -1120,6 +1141,7 @@ def test_runner_token_rides_the_claim_secret_and_the_credential_is_excluded() ->
             "CURIE_RUNNER_TOKEN": "tok-26",
             "CURIE_CREDENTIALS": "super-secret-token",
         },
+        deadline=time.monotonic() + 300,
     )
     entries = _env_entries(api)
     assert all(e.get("name") != "CURIE_RUNNER_TOKEN" for e in entries)
@@ -1291,6 +1313,7 @@ def test_connector_secrets_are_never_written_to_the_claim() -> None:
             "API_KEY": "k-secret",
             "CURIE_CONNECTOR_SECRET_KEYS": "API_KEY,GITHUB_PERSONAL_ACCESS_TOKEN",
         },
+        deadline=time.monotonic() + 300,
     )
     entries = _env_entries(api)
     # Neither the secret values nor the marker land on the claim.
@@ -1317,6 +1340,7 @@ def test_claim_metadata_agent_label_is_not_additional_pod_metadata() -> None:
         pool="curie-agent-acme-a-runner-pool",
         labels={"curietech.ai/agent": "acme-a"},
         env={"CURIE_BUDGET": "{}"},
+        deadline=time.monotonic() + 300,
     )
     body = _claim_body(api)
     assert body["metadata"]["labels"]["curietech.ai/agent"] == "acme-a"
@@ -1440,6 +1464,43 @@ def test_evicted_pod_does_not_publish_unstructured_status_message() -> None:
     assert termination.detail is None
 
 
+def test_evicted_pod_carries_the_runner_exit_code_and_ignores_sidecars() -> None:
+    def termination_for(statuses: list[SimpleNamespace]) -> Any:
+        api = _FakeApi()
+        api.pod = SimpleNamespace(
+            metadata=SimpleNamespace(name="sbx-1", uid="pod-current"),
+            status=SimpleNamespace(
+                phase="Failed",
+                reason="Evicted",
+                message='Usage of EmptyDir volume "workspace" exceeds the limit "1Gi".',
+                container_statuses=statuses,
+            ),
+        )
+        return _client(api).pod_termination(
+            "sbx-1", request_timeout_seconds=0.5, since=datetime.now(UTC)
+        )
+
+    bare = termination_for([])
+    with_runner = termination_for([_runner_status(SimpleNamespace(reason="Error", exit_code=137))])
+    sidecar_only = termination_for(
+        [
+            SimpleNamespace(
+                name="sidecar",
+                state=SimpleNamespace(terminated=SimpleNamespace(reason="Error", exit_code=42)),
+                last_state=None,
+            )
+        ]
+    )
+
+    assert bare is not None and with_runner is not None and sidecar_only is not None
+    assert with_runner.reason == "Evicted"
+    assert with_runner.detail == bare.detail
+    assert with_runner.exit_code == 137
+    assert sidecar_only.reason == "Evicted"
+    assert sidecar_only.detail == bare.detail
+    assert sidecar_only.exit_code is None
+
+
 def test_failed_pod_reports_other_termination_reason() -> None:
     api = _FakeApi()
     api.pod = SimpleNamespace(
@@ -1487,6 +1548,7 @@ def test_oom_killed_runner_reports_container_termination() -> None:
     assert termination.reason == "OOMKilled"
     assert termination.detail is not None
     assert termination.detail == "exit code 137"
+    assert termination.exit_code == 137
     assert len(api.request_timeouts) == 1
     assert api.request_timeouts[0][0] == "get:pods:test-ns:sbx-1"
     assert 0 < api.request_timeouts[0][1] <= 0.5
@@ -1593,6 +1655,114 @@ def test_recent_eviction_event_explains_a_still_running_pod() -> None:
     assert termination.reason == "Evicted"
 
 
+def test_recent_eviction_event_carries_the_volume_and_limit() -> None:
+    api = _FakeApi()
+    api.pod = SimpleNamespace(
+        metadata=SimpleNamespace(name="sbx-1", uid="pod-current"),
+        status=SimpleNamespace(phase="Running", reason=None, container_statuses=[]),
+    )
+    api.events = [
+        SimpleNamespace(
+            reason="Evicted",
+            message=(
+                'Usage of EmptyDir volume "writable-1" exceeds the limit "384Mi"'
+                ", node has other pressure"
+            ),
+            involved_object=SimpleNamespace(kind="Pod", name="sbx-1", uid="pod-current"),
+            last_timestamp=datetime.now(UTC),
+        )
+    ]
+
+    termination = _client(api).pod_termination(
+        "sbx-1", request_timeout_seconds=0.5, since=datetime.now(UTC) - timedelta(seconds=5)
+    )
+
+    assert termination is not None
+    assert termination.reason == "Evicted"
+    assert (
+        termination.detail == 'Usage of EmptyDir volume "writable-1" exceeds the limit "384Mi"'
+    )
+
+
+def _event_diagnosed_termination(
+    reason: str, message: str, statuses: list[SimpleNamespace], phase: str
+) -> Any:
+    api = _FakeApi()
+    api.pod = SimpleNamespace(
+        metadata=SimpleNamespace(name="sbx-1", uid="pod-current"),
+        status=SimpleNamespace(phase=phase, reason=None, container_statuses=statuses),
+    )
+    api.events = [
+        SimpleNamespace(
+            reason=reason,
+            message=message,
+            involved_object=SimpleNamespace(kind="Pod", name="sbx-1", uid="pod-current"),
+            last_timestamp=datetime.now(UTC),
+        )
+    ]
+    return _client(api).pod_termination(
+        "sbx-1", request_timeout_seconds=0.5, since=datetime.now(UTC) - timedelta(seconds=5)
+    )
+
+
+@pytest.mark.parametrize("reason", ["Evicted", "OOMKilled"])
+def test_event_diagnosis_keeps_the_runner_exit_code_from_pod_status(reason: str) -> None:
+    message = 'Usage of EmptyDir volume "writable-1" exceeds the limit "384Mi"'
+    # What the event alone reports, with no runner container status to read.
+    baseline = _event_diagnosed_termination(reason, message, [], "Failed")
+    assert baseline is not None
+    assert baseline.exit_code is None
+
+    termination = _event_diagnosed_termination(
+        reason,
+        message,
+        [_runner_status(SimpleNamespace(reason="Error", exit_code=137))],
+        "Running",
+    )
+
+    assert termination is not None
+    assert termination.reason == reason
+    assert termination.detail == baseline.detail
+    assert termination.exit_code == 137
+
+
+def test_eviction_event_without_a_runner_termination_still_has_no_exit_code() -> None:
+    termination = _event_diagnosed_termination(
+        "Evicted",
+        'Usage of EmptyDir volume "writable-1" exceeds the limit "384Mi"',
+        [_runner_status(None)],
+        "Running",
+    )
+
+    assert termination is not None
+    assert termination.reason == "Evicted"
+    assert termination.exit_code is None
+
+
+def test_eviction_event_with_an_unstructured_message_has_no_detail() -> None:
+    api = _FakeApi()
+    api.pod = SimpleNamespace(
+        metadata=SimpleNamespace(name="sbx-1", uid="pod-current"),
+        status=SimpleNamespace(phase="Running", reason=None, container_statuses=[]),
+    )
+    api.events = [
+        SimpleNamespace(
+            reason="Evicted",
+            message="The node needed the pod gone for an unstructured reason.",
+            involved_object=SimpleNamespace(kind="Pod", name="sbx-1", uid="pod-current"),
+            last_timestamp=datetime.now(UTC),
+        )
+    ]
+
+    termination = _client(api).pod_termination(
+        "sbx-1", request_timeout_seconds=0.5, since=datetime.now(UTC) - timedelta(seconds=5)
+    )
+
+    assert termination is not None
+    assert termination.reason == "Evicted"
+    assert termination.detail is None
+
+
 def test_oom_event_alone_does_not_identify_runner_in_running_pod() -> None:
     api = _FakeApi()
     api.pod = SimpleNamespace(
@@ -1644,6 +1814,7 @@ def test_terminated_sidecar_does_not_hide_runner_state() -> None:
     )
     assert termination is not None
     assert termination.reason == "OOMKilled"
+    assert termination.exit_code == 137
 
 
 @pytest.mark.parametrize("recent", [True, False])
@@ -1677,6 +1848,7 @@ def test_only_recent_oom_last_state_explains_a_running_pod(recent: bool) -> None
         assert termination is not None
         assert termination.reason == "OOMKilled"
         assert termination.detail == "exit code 137"
+        assert termination.exit_code == 137
     else:
         assert termination is None
 
@@ -1854,6 +2026,7 @@ def test_no_scoped_token_value_reaches_the_claim() -> None:
             "CURIE_BUNDLE_REF": "bundles/x.tar.gz",
             **tokens,
         },
+        deadline=time.monotonic() + 300,
     )
 
     # Both what the worker sent and what the API server now holds.
@@ -1896,6 +2069,7 @@ def test_tokens_ride_a_secret_owned_by_the_claim_template() -> None:
         pool="curie-agent-acme-a-runner-pool",
         labels={"curietech.ai/agent": "acme-a"},
         env={"CURIE_BUDGET": "{}", **tokens},
+        deadline=time.monotonic() + 300,
     )
 
     template = api.objects[("sandboxtemplates", f"{claim}-resources")]
@@ -1974,6 +2148,7 @@ def test_per_claim_template_copies_the_pool_source_template() -> None:
         claim,
         pool="curie-agent-acme-a-runner-pool",
         env={"CURIE_BUDGET": "{}", "CURIE_RUNNER_TOKEN": "f3b2c1d0"},
+        deadline=time.monotonic() + 300,
     )
 
     template = api.objects[("sandboxtemplates", f"{claim}-resources")]
@@ -2012,6 +2187,7 @@ def test_claim_create_failure_deletes_the_claim_template() -> None:
             claim,
             pool="curie-agent-acme-a-runner-pool",
             env={"CURIE_BUDGET": "{}", "CURIE_STATE_TOKEN": "sbx.state.sig"},
+            deadline=time.monotonic() + 300,
         )
 
     assert ("sandboxtemplates", f"{claim}-resources") in api.deletes
@@ -2035,6 +2211,7 @@ def test_secret_create_failure_deletes_the_claim_template_and_creates_no_claim()
             claim,
             pool="curie-agent-acme-a-runner-pool",
             env={"CURIE_BUDGET": "{}", "CURIE_STATE_TOKEN": "sbx.state.sig"},
+            deadline=time.monotonic() + 300,
         )
 
     assert ("sandboxtemplates", f"{claim}-resources") not in api.objects
@@ -2056,6 +2233,7 @@ def test_owner_patch_failure_deletes_claim_and_template() -> None:
             claim,
             pool="curie-agent-acme-a-runner-pool",
             env={"CURIE_BUDGET": "{}", "CURIE_STATE_TOKEN": "sbx.state.sig"},
+            deadline=time.monotonic() + 300,
         )
 
     # The claim existed, so it is deleted, not left to boot a sandbox whose
@@ -2086,6 +2264,7 @@ def test_a_source_template_without_a_runner_container_is_refused_before_any_writ
             _claim_name(),
             pool="curie-agent-acme-a-runner-pool",
             env={"CURIE_BUDGET": "{}", "CURIE_RUNNER_TOKEN": "f3b2c1d0"},
+            deadline=time.monotonic() + 300,
         )
     _assert_no_writes(api)
 
@@ -2098,6 +2277,7 @@ def test_a_missing_source_pool_is_refused_before_any_write() -> None:
             _claim_name(),
             pool="curie-agent-acme-a-runner-pool",
             env={"CURIE_BUDGET": "{}", "CURIE_RUNNER_TOKEN": "f3b2c1d0"},
+            deadline=time.monotonic() + 300,
         )
     _assert_no_writes(api)
 
@@ -2112,6 +2292,7 @@ def test_a_missing_source_template_is_refused_before_any_write() -> None:
             _claim_name(),
             pool="curie-agent-acme-a-runner-pool",
             env={"CURIE_BUDGET": "{}", "CURIE_RUNNER_TOKEN": "f3b2c1d0"},
+            deadline=time.monotonic() + 300,
         )
     _assert_no_writes(api)
 
@@ -2125,6 +2306,7 @@ def test_an_over_long_token_claim_name_is_refused_before_any_write() -> None:
             "c" * 49,
             pool="curie-agent-acme-a-runner-pool",
             env={"CURIE_BUDGET": "{}", "CURIE_RUNNER_TOKEN": "f3b2c1d0"},
+            deadline=time.monotonic() + 300,
         )
     _assert_no_writes(api)
 
@@ -2140,6 +2322,7 @@ def test_invalid_runner_resources_on_a_token_claim_are_refused_before_any_write(
             agent_name="acme-a",
             runner_resources={"requests": _OVERRIDE["requests"]},
             env={"CURIE_BUDGET": "{}", "CURIE_RUNNER_TOKEN": "f3b2c1d0"},
+            deadline=time.monotonic() + 300,
         )
     _assert_no_writes(api)
 
@@ -2158,6 +2341,7 @@ def test_runner_resources_on_a_token_claim_land_on_the_per_claim_template() -> N
         agent_name="acme-a",
         runner_resources=_OVERRIDE,
         env={"CURIE_BUDGET": "{}", "CURIE_RUNNER_TOKEN": "f3b2c1d0"},
+        deadline=time.monotonic() + 300,
     )
 
     pod = api.objects[("sandboxtemplates", f"{claim}-resources")]["spec"]["podTemplate"]["spec"]
@@ -2178,6 +2362,7 @@ def test_token_free_claim_keeps_the_existing_paths() -> None:
         claim,
         pool="curie-agent-acme-a-runner-pool",
         env={"CURIE_BUDGET": "{}", "CURIE_SESSION_ID": "s-1", "CURIE_RUNNER_TOKEN": ""},
+        deadline=time.monotonic() + 300,
     )
 
     assert api.secrets == {}
@@ -2200,6 +2385,7 @@ def test_token_free_claim_with_runner_resources_keeps_the_agent_resources_path()
         agent_name="acme-a",
         runner_resources=_OVERRIDE,
         env={"CURIE_BUDGET": "{}"},
+        deadline=time.monotonic() + 300,
     )
 
     assert api.secrets == {}
@@ -2368,6 +2554,7 @@ def test_token_claim_preparation_bounds_every_kubernetes_call() -> None:
         pool="curie-agent-acme-a-runner-pool",
         agent_name="acme-a",
         env={"CURIE_BUDGET": "{}", **_scoped_token_env()},
+        deadline=time.monotonic() + 300,
     )
 
     made = [(verb, plural) for verb, plural, _ in api.calls]
@@ -2501,6 +2688,7 @@ def test_deleting_pod_with_generic_runner_exit_reports_deleted_with_exit_code() 
     assert termination is not None
     assert termination.reason == "Deleted"
     assert termination.detail == "exit code 143"
+    assert termination.exit_code == 143
 
 
 def test_deleting_pod_with_oom_runner_reports_oom_killed() -> None:
@@ -2519,6 +2707,7 @@ def test_deleting_pod_with_oom_runner_reports_oom_killed() -> None:
     assert termination is not None
     assert termination.reason == "OOMKilled"
     assert termination.detail == "exit code 137"
+    assert termination.exit_code == 137
 
 
 def test_deleting_pod_keeps_deleted_despite_recent_current_uid_oom_event() -> None:
@@ -2542,6 +2731,7 @@ def test_deleting_pod_keeps_deleted_despite_recent_current_uid_oom_event() -> No
     assert termination is not None
     assert termination.reason == "Deleted"
     assert termination.detail == "exit code 143"
+    assert termination.exit_code == 143
 
 
 def test_deleting_running_pod_without_terminated_runner_reports_deleted() -> None:
@@ -2584,6 +2774,7 @@ def test_deleting_pod_with_recent_last_state_oom_reports_oom_killed() -> None:
     assert termination is not None
     assert termination.reason == "OOMKilled"
     assert termination.detail == "exit code 137"
+    assert termination.exit_code == 137
 
 
 def test_deleting_pod_with_stale_last_state_oom_reports_deleted() -> None:
@@ -2740,3 +2931,588 @@ def test_kube_read_403_is_reraised_unchanged() -> None:
         _raising_client(error).get_claim("c", request_timeout_seconds=1.0)
 
     assert excinfo.value is error
+
+
+# -- ADR 0217: Docker-enabled claims and the daemon seam ----------------------------
+
+_DAEMON_NS = "acme-docker"
+_DOCKER_FILE_NAMES = ("ca.pem", "cert.pem", "key.pem")
+
+
+def _tool_daemon(claim: str, lifetime: int = 86400) -> ToolDaemonMount:
+    host = f"{claim}.{_DAEMON_NS}.svc"
+    return ToolDaemonMount(
+        # Unique placeholders stand in for the PEM files so a leak is findable.
+        files={name: f"fixture-file-{name}-{claim}" for name in _DOCKER_FILE_NAMES},
+        env={
+            "DOCKER_HOST": f"tcp://{host}:2376",
+            "DOCKER_PUBLISHED_HOST": host,
+            "DOCKER_TLS_VERIFY": "1",
+            "DOCKER_CERT_PATH": "/var/run/curie/docker",
+        },
+        active_deadline_seconds=lifetime,
+    )
+
+
+@pytest.mark.parametrize("with_tokens", [False, True], ids=["token-free", "with-tokens"])
+def test_a_docker_claim_takes_the_per_claim_path_and_mounts_its_client_files(
+    with_tokens: bool,
+) -> None:
+    api = _FakeApi()
+    _seed_chart(api)
+    claim = _claim_name()
+    mount = _tool_daemon(claim, lifetime=4321)
+    tokens = {"CURIE_RUNNER_TOKEN": "f3b2c1d0"} if with_tokens else {}
+
+    _client(api).create_claim(
+        claim,
+        pool="curie-agent-acme-a-runner-pool",
+        env={"CURIE_BUDGET": "{}", **tokens},
+        deadline=time.monotonic() + 300,
+        tool_daemon=mount,
+    )
+
+    # The client files ride the existing per-claim -tokens Secret, with the tokens.
+    secret = _token_secret(api, claim)
+    assert secret["stringData"] == {**tokens, **mount.files}
+    assert api.secret_namespaces == ["test-ns"]
+    template = api.objects[("sandboxtemplates", f"{claim}-resources")]
+    pod = template["spec"]["podTemplate"]["spec"]
+    assert pod["activeDeadlineSeconds"] == 4321
+    runner = _runner_container(template["spec"])
+    (cert_mount,) = [
+        m for m in runner.get("volumeMounts") or [] if m["mountPath"] == "/var/run/curie/docker"
+    ]
+    assert cert_mount["readOnly"] is True
+    (volume,) = [v for v in pod["volumes"] if v["name"] == cert_mount["name"]]
+    assert volume["secret"]["secretName"] == f"{claim}-tokens"
+    for name, value in mount.env.items():
+        assert {"name": name, "value": value} in runner["env"]
+    claim_obj = api.objects[("sandboxclaims", claim)]
+    assert claim_obj["spec"]["warmPoolRef"] == {"name": f"{claim}-resources-pool"}
+
+    # Nothing Docker-shaped and no file content reaches the value-only claim,
+    # and the template carries no file content either.
+    for body in (json.dumps(_claim_body(api)), json.dumps(claim_obj)):
+        assert "DOCKER_" not in body
+        for value in mount.files.values():
+            assert value not in body
+    for value in mount.files.values():
+        assert value not in json.dumps(template)
+
+
+def test_a_claim_without_a_tool_daemon_keeps_the_chart_pool() -> None:
+    api = _FakeApi()
+    _seed_chart(api)
+    claim = _claim_name()
+    _client(api).create_claim(
+        claim,
+        pool="curie-agent-acme-a-runner-pool",
+        env={"CURIE_BUDGET": "{}"},
+        deadline=time.monotonic() + 300,
+        tool_daemon=None,
+    )
+    assert api.secrets == {}
+    assert _claim_body(api)["spec"]["warmPoolRef"] == {"name": "curie-agent-acme-a-runner-pool"}
+
+
+@pytest.mark.parametrize(
+    "env",
+    [{"CURIE_BUDGET": "{}"}, {"CURIE_BUDGET": "{}", "CURIE_STATE_TOKEN": "sbx.state.sig"}],
+    ids=["token-free", "per-claim"],
+)
+def test_a_spent_deadline_refuses_the_claim_before_any_write(env: dict[str, str]) -> None:
+    api = _FakeApi()
+    _seed_chart(api)
+    with pytest.raises(ClaimTimeoutError):
+        _client(api).create_claim(
+            _claim_name(),
+            pool="curie-agent-acme-a-runner-pool",
+            env=env,
+            deadline=time.monotonic() - 0.01,
+        )
+    _assert_no_writes(api)
+
+
+@pytest.mark.parametrize(
+    "env",
+    [{"CURIE_BUDGET": "{}"}, {"CURIE_BUDGET": "{}", "CURIE_STATE_TOKEN": "sbx.state.sig"}],
+    ids=["token-free", "per-claim"],
+)
+def test_every_claim_request_is_bounded_by_the_shared_deadline(env: dict[str, str]) -> None:
+    api = _FakeApi()
+    _seed_chart(api)
+    remaining = 1.5
+    _client(api).create_claim(
+        _claim_name(),
+        pool="curie-agent-acme-a-runner-pool",
+        env=env,
+        deadline=time.monotonic() + remaining,
+    )
+    assert ("create", "sandboxclaims") in [(verb, plural) for verb, plural, _ in api.calls]
+    for verb, plural, kwargs in api.calls:
+        timeout = kwargs.get("_request_timeout")
+        assert _finite_positive(timeout), (verb, plural, timeout)
+        assert _bound(timeout) <= remaining, (verb, plural, timeout)
+
+
+def test_a_token_free_claim_name_collision_is_a_name_conflict() -> None:
+    api = _FakeApi()
+    claim = _claim_name()
+    existing = api.seed("sandboxclaims", claim, {"warmPoolRef": {"name": "pool"}})
+
+    with pytest.raises(ClaimNameConflict):
+        _client(api).create_claim(
+            claim, pool="pool", env={"CURIE_BUDGET": "{}"}, deadline=time.monotonic() + 300
+        )
+    assert api.objects[("sandboxclaims", claim)] == existing
+    assert ("sandboxclaims", claim) not in api.deletes
+
+
+def test_a_docker_claim_name_collision_keeps_the_other_claim() -> None:
+    api = _FakeApi()
+    _seed_chart(api)
+    claim = _claim_name()
+    existing = api.seed("sandboxclaims", claim, {"warmPoolRef": {"name": "pool"}})
+
+    with pytest.raises(ClaimNameConflict):
+        _client(api).create_claim(
+            claim,
+            pool="curie-agent-acme-a-runner-pool",
+            env={"CURIE_BUDGET": "{}"},
+            deadline=time.monotonic() + 300,
+            tool_daemon=_tool_daemon(claim),
+        )
+    assert api.objects[("sandboxclaims", claim)] == existing
+    assert ("sandboxclaims", claim) not in api.deletes
+    # This attempt's own per-claim objects are rolled back.
+    assert ("sandboxtemplates", f"{claim}-resources") not in api.objects
+    assert f"{claim}-tokens" not in api.secrets
+
+
+def test_a_per_claim_template_collision_leaves_the_other_template() -> None:
+    api = _FakeApi()
+    _seed_chart(api)
+    claim = _claim_name()
+    theirs = api.seed(
+        "sandboxtemplates",
+        f"{claim}-resources",
+        _chart_template_spec(),
+        labels={_CLAIM_LABEL: claim, _MANAGED_BY[0]: _MANAGED_BY[1]},
+    )
+
+    with pytest.raises(ClaimNameConflict):
+        _client(api).create_claim(
+            claim,
+            pool="curie-agent-acme-a-runner-pool",
+            env={"CURIE_BUDGET": "{}", "CURIE_STATE_TOKEN": "sbx.state.sig"},
+            deadline=time.monotonic() + 300,
+        )
+    assert api.objects[("sandboxtemplates", f"{claim}-resources")] == theirs
+    assert ("sandboxtemplates", f"{claim}-resources") not in api.deletes
+    assert not [b for b in api.created if b.get("kind") == "SandboxClaim"]
+
+
+def _api_error(status: int) -> ApiException:
+    """The kubernetes client's ApiException for an HTTP status.
+
+    These mirror kubernetes ApiException status codes: 404 NotFound (absent),
+    409 AlreadyExists on create or Conflict on a failed uid precondition, and
+    503 ServiceUnavailable (a transient apiserver failure).
+    """
+
+    reasons = {404: "NotFound", 409: "Conflict", 503: "ServiceUnavailable"}
+    return k8s_module.k8s_client.ApiException(status=status, reason=reasons[status])
+
+
+def _model(data: dict[str, Any], klass: str) -> Any:
+    """Deserialize wire JSON into the typed model the generated client returns."""
+
+    return k8s_module.k8s_client.ApiClient()._ApiClient__deserialize(data, klass)  # type: ignore[attr-defined]
+
+
+class _DaemonApi(_FakeApi):
+    """CoreV1Api + NetworkingV1Api for the daemon namespace, as the API server answers.
+
+    Objects are stored by ``(plural, namespace, name)`` with a uid and a
+    creation timestamp. A duplicate create is a 409, a read or delete of an
+    absent object is a 404, and a delete whose ``preconditions.uid`` does not
+    match the stored object is a 409. Deleting a Pod garbage-collects the
+    Secrets that name its uid in ``ownerReferences``.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.daemon: dict[tuple[str, str, str], dict[str, Any]] = {}
+        self.daemon_calls: list[tuple[str, str, dict[str, Any]]] = []
+
+    def _record(self, verb: str, plural: str, kwargs: dict[str, Any]) -> None:
+        self.daemon_calls.append((verb, plural, dict(kwargs)))
+        self._fail(verb, plural)
+
+    def _create(self, plural: str, klass: str, namespace: str, body: Any, kwargs: Any) -> Any:
+        self._record("create", plural, kwargs)
+        wire = k8s_module.k8s_client.ApiClient().sanitize_for_serialization(body)
+        name = wire["metadata"]["name"]
+        if (plural, namespace, name) in self.daemon:
+            raise _api_error(409)
+        wire["metadata"].update(
+            namespace=namespace, uid=self._next_uid(), creationTimestamp="2026-10-03T12:00:00Z"
+        )
+        if plural == "pods":
+            wire["status"] = {"phase": "Pending"}
+        self.daemon[(plural, namespace, name)] = wire
+        return _model(copy.deepcopy(wire), klass)
+
+    def _list(self, plural: str, klass: str, namespace: str, kwargs: dict[str, Any]) -> Any:
+        self._record("list", plural, kwargs)
+        selector = kwargs.get("label_selector")
+        items = [
+            copy.deepcopy(obj)
+            for (stored, ns, _), obj in self.daemon.items()
+            if stored == plural
+            and ns == namespace
+            and _selector_matches(obj["metadata"].get("labels") or {}, selector)
+        ]
+        return _model({"items": items, "metadata": {}}, klass)
+
+    def _delete(self, plural: str, name: str, namespace: str, kwargs: dict[str, Any]) -> Any:
+        self._record("delete", plural, kwargs)
+        body = kwargs.get("body")
+        wire = k8s_module.k8s_client.ApiClient().sanitize_for_serialization(body) or {}
+        uid = (wire.get("preconditions") or {}).get("uid")
+        assert uid, "every daemon delete must carry a uid precondition"
+        stored = self.daemon.get((plural, namespace, name))
+        if stored is None:
+            raise _api_error(404)
+        if stored["metadata"]["uid"] != uid:
+            raise _api_error(409)
+        del self.daemon[(plural, namespace, name)]
+        if plural == "pods":
+            for key, obj in list(self.daemon.items()):
+                refs = obj["metadata"].get("ownerReferences") or []
+                if key[0] == "secrets" and any(ref.get("uid") == uid for ref in refs):
+                    del self.daemon[key]
+        return {"kind": "Status", "status": "Success"}
+
+    def create_namespaced_pod(self, namespace: str, body: Any, **kwargs: Any) -> Any:
+        return self._create("pods", "V1Pod", namespace, body, kwargs)
+
+    def create_namespaced_service(self, namespace: str, body: Any, **kwargs: Any) -> Any:
+        return self._create("services", "V1Service", namespace, body, kwargs)
+
+    def create_namespaced_network_policy(self, namespace: str, body: Any, **kwargs: Any) -> Any:
+        return self._create("networkpolicies", "V1NetworkPolicy", namespace, body, kwargs)
+
+    def create_namespaced_secret(self, namespace: str, body: Any, **kwargs: Any) -> Any:
+        if namespace != _DAEMON_NS:
+            return super().create_namespaced_secret(namespace, body, **kwargs)
+        return self._create("secrets", "V1Secret", namespace, body, kwargs)
+
+    def list_namespaced_pod(self, namespace: str, **kwargs: Any) -> Any:
+        return self._list("pods", "V1PodList", namespace, kwargs)
+
+    def list_namespaced_service(self, namespace: str, **kwargs: Any) -> Any:
+        return self._list("services", "V1ServiceList", namespace, kwargs)
+
+    def list_namespaced_network_policy(self, namespace: str, **kwargs: Any) -> Any:
+        return self._list("networkpolicies", "V1NetworkPolicyList", namespace, kwargs)
+
+    def delete_namespaced_pod(self, name: str, namespace: str, **kwargs: Any) -> Any:
+        return self._delete("pods", name, namespace, kwargs)
+
+    def delete_namespaced_service(self, name: str, namespace: str, **kwargs: Any) -> Any:
+        return self._delete("services", name, namespace, kwargs)
+
+    def delete_namespaced_network_policy(self, name: str, namespace: str, **kwargs: Any) -> Any:
+        return self._delete("networkpolicies", name, namespace, kwargs)
+
+    def delete_namespaced_secret(self, name: str, namespace: str, **kwargs: Any) -> Any:
+        return self._delete("secrets", name, namespace, kwargs)
+
+    def read_namespaced_pod(self, name: str, namespace: str, **kwargs: Any) -> object:
+        if namespace != _DAEMON_NS:
+            return super().read_namespaced_pod(name, namespace, **kwargs)
+        self._record("get", "pods", kwargs)
+        stored = self.daemon.get(("pods", namespace, name))
+        if stored is None:
+            raise _api_error(404)
+        return _model(copy.deepcopy(stored), "V1Pod")
+
+
+def _daemon_client(api: _DaemonApi) -> KubernetesSandboxClient:
+    client = _client(api)
+    client._networking_api = api  # type: ignore[attr-defined]
+    client._configuration = k8s_module.k8s_client.Configuration()  # type: ignore[attr-defined]
+    return client
+
+
+def _manifest(kind: str, name: str = "claim-d", **labels: str) -> dict[str, Any]:
+    return {
+        "apiVersion": "networking.k8s.io/v1" if kind == "NetworkPolicy" else "v1",
+        "kind": kind,
+        "metadata": {
+            "name": name,
+            "labels": {_CLAIM_LABEL: name, _MANAGED_BY[0]: _MANAGED_BY[1], **labels},
+        },
+        "spec": {"containers": [{"name": "dockerd", "image": "d"}]} if kind == "Pod" else {},
+    }
+
+
+_PLURAL = {
+    "Pod": "pods",
+    "Service": "services",
+    "NetworkPolicy": "networkpolicies",
+    "Secret": "secrets",
+}
+
+
+@pytest.mark.parametrize("kind", ["NetworkPolicy", "Service", "Pod", "Secret"])
+def test_create_daemon_object_returns_the_uid_and_is_bounded(kind: str) -> None:
+    api = _DaemonApi()
+    uid = _daemon_client(api).create_daemon_object(
+        _DAEMON_NS, _manifest(kind), request_timeout_seconds=2.5
+    )
+    stored = api.daemon[(_PLURAL[kind], _DAEMON_NS, "claim-d")]
+    assert uid == stored["metadata"]["uid"]
+    ((verb, plural, kwargs),) = api.daemon_calls
+    assert (verb, plural) == ("create", _PLURAL[kind])
+    assert 0 < _bound(kwargs["_request_timeout"]) <= 2.5
+
+
+def test_create_daemon_object_maps_already_exists_to_a_name_conflict() -> None:
+    api = _DaemonApi()
+    client = _daemon_client(api)
+    first = client.create_daemon_object(
+        _DAEMON_NS, _manifest("Service"), request_timeout_seconds=1.0
+    )
+    with pytest.raises(ClaimNameConflict):
+        client.create_daemon_object(_DAEMON_NS, _manifest("Service"), request_timeout_seconds=1.0)
+    assert api.daemon[("services", _DAEMON_NS, "claim-d")]["metadata"]["uid"] == first
+
+
+def test_list_daemon_objects_filters_by_selector_and_reports_age_and_phase() -> None:
+    api = _DaemonApi()
+    client = _daemon_client(api)
+    pod_uid = client.create_daemon_object(_DAEMON_NS, _manifest("Pod"), request_timeout_seconds=1.0)
+    client.create_daemon_object(
+        _DAEMON_NS, _manifest("Pod", "claim-other"), request_timeout_seconds=1.0
+    )
+    api.daemon[("pods", _DAEMON_NS, "claim-d")]["status"]["phase"] = "Running"
+
+    views = client.list_daemon_objects(
+        _DAEMON_NS,
+        "Pod",
+        label_selector=f"{_CLAIM_LABEL}=claim-d,{_MANAGED_BY[0]}={_MANAGED_BY[1]}",
+        request_timeout_seconds=1.0,
+    )
+
+    (view,) = views
+    assert (view.kind, view.name, view.uid, view.claim, view.phase) == (
+        "Pod",
+        "claim-d",
+        pod_uid,
+        "claim-d",
+        "Running",
+    )
+    assert view.created_at == datetime(2026, 10, 3, 12, tzinfo=UTC)
+    assert view.created_at is not None and view.created_at.tzinfo is not None
+    ((_verb, _plural, kwargs),) = [c for c in api.daemon_calls if c[0] == "list"]
+    assert kwargs["label_selector"] == f"{_CLAIM_LABEL}=claim-d,{_MANAGED_BY[0]}={_MANAGED_BY[1]}"
+    assert _finite_positive(kwargs["_request_timeout"])
+
+
+@pytest.mark.parametrize(
+    ("ready", "deleting", "expected"),
+    [("True", False, True), ("False", False, False), ("True", True, False), (None, False, False)],
+    ids=["ready", "not-ready", "terminating", "no-condition"],
+)
+def test_get_daemon_pod_reports_ready_only_for_a_ready_live_pod(
+    ready: str | None, deleting: bool, expected: bool
+) -> None:
+    """Ready is the Pod's Ready condition (what the headless Service's endpoints
+    follow) and never true once deletionTimestamp is set (a terminating Pod
+    leaves the endpoints). Shapes per the core/v1 Pod API."""
+
+    api = _DaemonApi()
+    client = _daemon_client(api)
+    client.create_daemon_object(_DAEMON_NS, _manifest("Pod"), request_timeout_seconds=1.0)
+    wire = api.daemon[("pods", _DAEMON_NS, "claim-d")]
+    wire["status"] = {"phase": "Running"}
+    if ready is not None:
+        wire["status"]["conditions"] = [
+            {"type": "PodScheduled", "status": "True"},
+            {"type": "Ready", "status": ready},
+        ]
+    if deleting:
+        wire["metadata"]["deletionTimestamp"] = "2026-10-03T12:05:00Z"
+
+    view = client.get_daemon_pod(_DAEMON_NS, "claim-d", request_timeout_seconds=1.0)
+
+    assert view is not None and view.phase == "Running"
+    assert view.ready is expected
+
+
+def test_delete_daemon_object_is_fenced_by_uid_and_idempotent() -> None:
+    api = _DaemonApi()
+    client = _daemon_client(api)
+    uid = client.create_daemon_object(
+        _DAEMON_NS, _manifest("NetworkPolicy"), request_timeout_seconds=1.0
+    )
+
+    # A replaced object (another uid) is not ours: a 409 precondition, no error.
+    client.delete_daemon_object(
+        _DAEMON_NS, "NetworkPolicy", "claim-d", uid="not-" + uid, request_timeout_seconds=1.0
+    )
+    assert ("networkpolicies", _DAEMON_NS, "claim-d") in api.daemon
+
+    client.delete_daemon_object(
+        _DAEMON_NS, "NetworkPolicy", "claim-d", uid=uid, request_timeout_seconds=1.0
+    )
+    assert ("networkpolicies", _DAEMON_NS, "claim-d") not in api.daemon
+    # Absent is success.
+    client.delete_daemon_object(
+        _DAEMON_NS, "NetworkPolicy", "claim-d", uid=uid, request_timeout_seconds=1.0
+    )
+    for verb, _plural, kwargs in api.daemon_calls:
+        if verb == "delete":
+            assert _finite_positive(kwargs["_request_timeout"])
+
+
+def test_deleting_the_daemon_pod_collects_its_owned_secret() -> None:
+    api = _DaemonApi()
+    client = _daemon_client(api)
+    pod_uid = client.create_daemon_object(_DAEMON_NS, _manifest("Pod"), request_timeout_seconds=1.0)
+    secret = _manifest("Secret")
+    secret["metadata"]["ownerReferences"] = [
+        {"apiVersion": "v1", "kind": "Pod", "name": "claim-d", "uid": pod_uid}
+    ]
+    client.create_daemon_object(_DAEMON_NS, secret, request_timeout_seconds=1.0)
+
+    client.delete_daemon_object(
+        _DAEMON_NS, "Pod", "claim-d", uid=pod_uid, request_timeout_seconds=1.0
+    )
+    assert api.daemon == {}
+
+
+def test_a_transient_daemon_delete_failure_is_raised() -> None:
+    api = _DaemonApi()
+    client = _daemon_client(api)
+    uid = client.create_daemon_object(_DAEMON_NS, _manifest("Pod"), request_timeout_seconds=1.0)
+    api.failures[("delete", "pods")] = _api_error(503)
+    with pytest.raises((SandboxError, ApiException)):
+        client.delete_daemon_object(
+            _DAEMON_NS, "Pod", "claim-d", uid=uid, request_timeout_seconds=1.0
+        )
+    assert ("pods", _DAEMON_NS, "claim-d") in api.daemon
+
+
+def test_get_daemon_pod_reads_phase_absence_and_transient_failure() -> None:
+    api = _DaemonApi()
+    client = _daemon_client(api)
+    assert client.get_daemon_pod(_DAEMON_NS, "claim-d", request_timeout_seconds=1.0) is None
+
+    uid = client.create_daemon_object(_DAEMON_NS, _manifest("Pod"), request_timeout_seconds=1.0)
+    view = client.get_daemon_pod(_DAEMON_NS, "claim-d", request_timeout_seconds=1.0)
+    assert view is not None and (view.uid, view.phase) == (uid, "Pending")
+
+    api.failures[("get", "pods")] = _api_error(503)
+    with pytest.raises(KubeTransientError):
+        client.get_daemon_pod(_DAEMON_NS, "claim-d", request_timeout_seconds=1.0)
+
+
+class _PortForward:
+    """What ``kubernetes.stream.portforward`` returns: a local socket per port."""
+
+    def __init__(self, port: int) -> None:
+        self.port = port
+        self.local, self.remote = socket.socketpair()
+        self.closed = threading.Event()
+
+    def socket(self, port: int) -> socket.socket:
+        assert port == self.port
+        return self.local
+
+    def error(self, port: int) -> str | None:
+        return None
+
+    @property
+    def connected(self) -> bool:
+        return not self.closed.is_set()
+
+    def close(self) -> None:
+        self.closed.set()
+        self.remote.close()
+
+
+def _patch_portforward(monkeypatch: pytest.MonkeyPatch, fake: Any) -> None:
+    import kubernetes.stream
+
+    monkeypatch.setattr(kubernetes.stream, "portforward", fake)
+    monkeypatch.setattr(k8s_module, "portforward", fake, raising=False)
+
+
+def test_open_daemon_stream_connects_through_the_api_port_forward(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    forwards: list[_PortForward] = []
+    seen: list[tuple[Any, ...]] = []
+
+    def portforward(*args: Any, **kwargs: Any) -> _PortForward:
+        seen.append((args[1:], kwargs))
+        forwards.append(_PortForward(int(kwargs["ports"])))
+        return forwards[-1]
+
+    _patch_portforward(monkeypatch, portforward)
+    client = _daemon_client(_DaemonApi())
+
+    with client.open_daemon_stream(_DAEMON_NS, "claim-d", 2376, timeout_seconds=2.0) as stream:
+        stream.sendall(b"ping")
+        assert forwards[0].remote.recv(4) == b"ping"
+
+    ((args, kwargs),) = seen
+    assert args[:2] == ("claim-d", _DAEMON_NS)
+    assert str(kwargs["ports"]) == "2376"
+    assert forwards[0].closed.wait(2.0), "the port-forward is closed after use"
+
+
+def test_open_daemon_stream_is_bounded_when_the_port_forward_hangs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = threading.Event()
+    late: list[_PortForward] = []
+
+    def hanging(*args: Any, **kwargs: Any) -> _PortForward:
+        release.wait(10.0)
+        late.append(_PortForward(int(kwargs["ports"])))
+        return late[-1]
+
+    _patch_portforward(monkeypatch, hanging)
+    client = _daemon_client(_DaemonApi())
+
+    started = time.monotonic()
+    with pytest.raises(SandboxError):
+        with client.open_daemon_stream(_DAEMON_NS, "claim-d", 2376, timeout_seconds=0.3):
+            pass
+    assert time.monotonic() - started < 0.3 + 0.5
+
+    # The connect that finished after the caller gave up is closed, not leaked.
+    release.set()
+    deadline = time.monotonic() + 3.0
+    while not late and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert late and late[0].closed.wait(3.0)
+
+
+def test_open_daemon_stream_maps_an_api_failure_to_a_sandbox_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def refused(*args: Any, **kwargs: Any) -> _PortForward:
+        raise _api_error(404)
+
+    _patch_portforward(monkeypatch, refused)
+    with pytest.raises(SandboxError):
+        with _daemon_client(_DaemonApi()).open_daemon_stream(
+            _DAEMON_NS, "claim-gone", 2376, timeout_seconds=1.0
+        ):
+            pass

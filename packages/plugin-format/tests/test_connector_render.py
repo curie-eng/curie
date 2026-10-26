@@ -2399,3 +2399,30 @@ def test_no_client_auth_secrets_keep_pod_side_delivery() -> None:
             "name": name,
             "valueFrom": {"secretKeyRef": {"name": "conn-secrets", "key": name, "optional": False}},
         }
+
+
+_ROUTE = {"path": "/v1/review", "methods": ["POST"], "max_body_bytes": 64 * 1024 * 1024}
+
+
+# @spec ADR-0240 d3
+def test_declared_routes_reach_the_proxy_env_without_their_callers() -> None:
+    from plugin_format.connectors import ConnectorRoute
+
+    spec = HOSTED.model_copy(
+        update={"routes": [ConnectorRoute(**_ROUTE, callers=["review-tools"])]}
+    )
+    objs = _proxied(spec=spec)
+    assert json.loads(_proxy_env(objs)["CURIE_CALLER_PROXY_ROUTES"]) == [_ROUTE]
+    # The proxy cannot tell sandbox processes apart; callers are the runner's.
+    assert "review-tools" not in json.dumps(objs)
+    server = _containers(objs)["server"]
+    assert "CURIE_CALLER_PROXY_ROUTES" not in json.dumps(server)
+    baseline = _proxied()
+    for key in ("Service", "Service/direct", "NetworkPolicy/Egress", "NetworkPolicy/Ingress"):
+        assert objs[key] == baseline[key], key
+    assert server == _containers(baseline)["server"]
+
+
+# @spec ADR-0240 d3
+def test_without_declared_routes_the_proxy_env_does_not_name_any() -> None:
+    assert "CURIE_CALLER_PROXY_ROUTES" not in _proxy_env(_proxied())

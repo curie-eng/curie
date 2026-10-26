@@ -248,14 +248,26 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0225 | [Turn action receipts are opt-in](0225-turn-action-receipts-are-opt-in.md) | Accepted |
 | 0226 | [Persist terminal answers before channel delivery](0226-persist-terminal-answers-before-channel-delivery.md) | Accepted |
 | 0227 | [Opt-in final-answer publication validation](0227-opt-in-final-answer-publication-validation.md) | Accepted |
+| 0228 | [Mail services plug into one email adapter, which owns approvals by email](0228-mail-services-plug-into-one-email-adapter-which-owns-approvals-by-email.md) | Accepted |
 | 0229 | [A hosted connector may declare the Host the caller proxy presents upstream](0229-a-hosted-connector-may-declare-the-host-the-caller-proxy-presents-upstream.md) | Accepted |
 | 0230 | [Cluster upgrade and rollback report outcomes from one lifecycle record checked against the cluster](0230-upgrade-and-rollback-report-from-one-lifecycle-record-checked-against-the-cluster.md) | Draft |
 | 0231 | [Remediation policy bind and arm need an authority the platform key cannot derive](0231-remediation-policy-bind-and-arm-need-an-authority-the-platform-key-cannot-derive.md) | Accepted |
 | 0232 | [A contract migration ships one release after the code stops using what it drops](0232-a-contract-migration-ships-one-release-after-the-code-stops-using-what-it-drops.md) | Accepted |
 | 0233 | [Factory publication recovery requires explicit operator adoption](0233-factory-publication-recovery-requires-explicit-operator-adoption.md) | Draft |
 | 0234 | [Factory-owned pull requests accept authorized feedback without a mention](0234-factory-owned-pull-requests-accept-authorized-feedback-without-a-mention.md) | Accepted |
+| 0235 | [Bitbucket Cloud publication discovery trusts tracker-authenticated receipts](0235-bitbucket-cloud-publication-discovery-trusts-tracker-authenticated-receipts.md) | Draft |
 | 0236 | [The commissioning operator splits provisioner and control processes](0236-the-commissioning-operator-splits-provisioner-and-control-processes.md) | Accepted |
-| 0237 | [Learned skills are a mutable, Markdown-only skill source](0237-learned-skills-are-a-mutable-markdown-skill-source.md) | Accepted |
-| 0238 | [Agent-created schedules run under operator-delegated authority](0238-agent-created-schedules-run-under-operator-delegated-authority.md) | Accepted |
-| 0239 | [Twin memory: standing instructions and a bounded index](0239-twin-memory-standing-instructions-and-a-bounded-index.md) | Accepted |
+| 0237 | [Ordinary hook receipts preserve policy after stream retention](0237-ordinary-hook-receipts-preserve-policy-after-stream-retention.md) | Accepted |
+| 0238 | [A managed CNI installation qualifies through its own behavioral network producer](0238-a-managed-cni-installation-qualifies-through-its-own-behavioral-network-producer.md) | Accepted |
+| 0239 | [Release kind proof reuses a complete CI run on the same tree](0239-release-kind-proof-reuses-a-complete-ci-run-on-the-same-tree.md) | Accepted |
+| 0240 | [A hosted connector declares the routes its bundle's stdio servers call through the caller proxy](0240-a-hosted-connector-declares-the-routes-its-bundles-stdio-servers-call-through-the-caller-proxy.md) | Accepted |
+| 0241 | [A commissioning run separates destructive trials from final acceptance](0241-a-commissioning-run-separates-destructive-trials-from-final-acceptance.md) | Accepted |
+| 0242 | [Commissioning session scope makes the last observer finite](0242-commissioning-session-scope-makes-the-last-observer-finite.md) | Accepted |
+| 0243 | [Network case five measures new connection denial after replacement or policy change](0243-network-case-five-measures-new-connection-denial-after-replacement-or-policy-change.md) | Accepted |
+| 0244 | [Attachments are fetched on demand through scoped platform tools](0244-attachments-are-fetched-on-demand-through-scoped-platform-tools.md) | Accepted |
+| 0245 | [Protected lifecycle evidence binds host-owned contexts to actual SDK closure](0245-protected-lifecycle-evidence-binds-host-owned-contexts-to-actual-sdk-closure.md) | Accepted |
+| 0246 | [Common admission resolves an optional HTTP identity before authorized enqueue](0246-common-admission-resolves-an-optional-http-identity-before-authorized-enqueue.md) | Accepted |
+| 0247 | [Learned skills are a mutable, Markdown-only skill source](0247-learned-skills-are-a-mutable-markdown-skill-source.md) | Accepted |
+| 0248 | [Agent-created schedules run under operator-delegated authority](0248-agent-created-schedules-run-under-operator-delegated-authority.md) | Accepted |
+| 0249 | [Twin memory: standing instructions and a bounded index](0249-twin-memory-standing-instructions-and-a-bounded-index.md) | Accepted |
 <!-- END GENERATED: adr-index -->

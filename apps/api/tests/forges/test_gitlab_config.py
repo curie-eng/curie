@@ -95,7 +95,10 @@ def test_the_declared_capabilities_follow_decisions_14_and_19() -> None:
         Operation.DEPENDENCIES: Support.NOOP,
         Operation.GROUP_MEMBERSHIP: Support.UNSUPPORTED,
     }
-    assert dict(code_host.capabilities) == dict.fromkeys(CODE_HOST_OPERATIONS, Support.SUPPORTED)
+    assert dict(code_host.capabilities) == {
+        **dict.fromkeys(CODE_HOST_OPERATIONS, Support.SUPPORTED),
+        Operation.REQUIRED_CHECKS: Support.UNSUPPORTED,
+    }
     for side in (tracker, code_host):
         assert dict(side.marked_comments.capabilities) == dict.fromkeys(
             MARKED_COMMENT_OPERATIONS, Support.SUPPORTED
