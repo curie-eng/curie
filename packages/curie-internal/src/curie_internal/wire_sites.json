@@ -2,11 +2,19 @@
   "producers": {
     "apps/api/src/curie_api/delivery.py:module:1": {
       "language": "lua",
-      "purpose": "Runs enqueue with transport identity under an ownership checked Lua claim"
+      "purpose": "Guarded invocation enqueue with sealed context and transport identity"
     },
     "apps/api/src/curie_api/delivery.py:module:2": {
       "language": "lua",
-      "purpose": "Runs enqueue without transport identity under an ownership checked Lua claim"
+      "purpose": "Guarded invocation enqueue with sealed context without transport identity"
+    },
+    "apps/api/src/curie_api/delivery.py:module:3": {
+      "language": "lua",
+      "purpose": "Legacy and v1 runs enqueue with transport identity under an ownership checked Lua claim"
+    },
+    "apps/api/src/curie_api/delivery.py:module:4": {
+      "language": "lua",
+      "purpose": "Legacy and v1 runs enqueue without transport identity under an ownership checked Lua claim"
     },
     "apps/api/src/curie_api/deploy_notice.py:module:1": {
       "language": "lua",
