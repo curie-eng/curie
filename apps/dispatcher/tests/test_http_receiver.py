@@ -209,11 +209,15 @@ def test_operator_models_are_strict_frozen_and_runtime_calls_actual_auth_test() 
     for cls, bad in (
         (module.HttpReceiverScopeV1, scope_body(schema_version=True)),
         (module.HttpReceiverBindingV1, binding_body(binding_generation=True)),
+        (module.HttpReceiverBindingV1, binding_body(binding_generation=-1)),
         (module.HttpReceiverBindingV1, binding_body(channel_credential="é")),
         (module.HttpReceiverBindingV1, binding_body(channel_credential="x" * 16385)),
     ):
         with pytest.raises(ValueError):
             cls.model_validate(bad)
+    # @spec HTTP-INVOCATION-EXECUTION-19: a never-rebound binding is generation 0.
+    never_rebound = module.HttpReceiverBindingV1.model_validate(binding_body(binding_generation=0))
+    assert type(never_rebound.binding_generation) is int and never_rebound.binding_generation == 0
 
 
 @pytest.mark.parametrize(

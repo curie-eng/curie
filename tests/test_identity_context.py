@@ -181,7 +181,7 @@ def test_exact_canonical_token_and_round_trip_includes_every_explicit_null(kind:
 @pytest.mark.parametrize(("kind", "path", "invalid"), [
     ("receiver", "schema_version", True), ("context", "schema_version", True),
     ("receiver", "receiver_generation", True), ("receiver", "binding_generation", 1.0),
-    ("context", "key_generation", MAX_INT + 1), ("context", "scope.binding_generation", 0),
+    ("context", "key_generation", MAX_INT + 1), ("context", "scope.binding_generation", -1),
     ("receiver", "receiver_id", RECEIVER.upper()),
     ("context", "scope.tenant_id", UUID.replace("-", "")),
     ("receiver", "body_sha256", "A" * 64), ("context", "payload_sha256", "a" * 63),
@@ -232,8 +232,8 @@ def test_all_generations_accept_maximum_and_reject_boolean_or_overflow(kind: str
     """@spec HTTP-INVOCATION-EXECUTION-13."""
     module = api()
     model = endpoints(module, kind)[0]
-    paths = (["receiver_generation", "binding_generation"] if kind == "receiver" else [
-        "key_generation", "receiver_generation", "scope.binding_generation", "provider_version",
+    paths = (["receiver_generation"] if kind == "receiver" else [
+        "key_generation", "receiver_generation", "provider_version",
         "provider_credential_generation", "lifecycle_generation", "role_policy_version",
         "principal.authorization_version",
     ])
@@ -242,6 +242,27 @@ def test_all_generations_accept_maximum_and_reject_boolean_or_overflow(kind: str
         for invalid in (True, 0, MAX_INT + 1, "1"):
             with pytest.raises(ValueError):
                 model.model_validate(replace(body(kind), path, invalid))
+
+
+@pytest.mark.parametrize("kind", ["receiver", "context"])
+def test_binding_generation_is_the_channel_generation_including_never_rebound_zero(
+    kind: str,
+) -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-13: 0 is a binding that was never rebound."""
+    module = api()
+    model, sign, verify, _, _ = endpoints(module, kind)
+    path = "binding_generation" if kind == "receiver" else "scope.binding_generation"
+    keyring = ring(module, kind)
+    for valid in (0, MAX_INT):
+        value = model.model_validate(replace(body(kind), path, valid))
+        opened = verify(sign(value, keyring), keyring)
+        assert isinstance(opened, model)
+        assert opened.model_dump(mode="json") == value.model_dump(mode="json")
+        target = opened if kind == "receiver" else opened.scope
+        assert type(target.binding_generation) is int and target.binding_generation == valid
+    for invalid in (True, False, -1, MAX_INT + 1, "0", 0.0, None):
+        with pytest.raises(ValueError):
+            model.model_validate(replace(body(kind), path, invalid))
 
 
 @pytest.mark.parametrize("outcome", ["resolved", "inactive", "unresolved"])

@@ -153,7 +153,8 @@ def test_every_wire_field_is_required_even_nullable_approval(kind: str, field: s
         ("event_id", "x" * 257),
         ("event_id", "\ud800"),
         ("scope.binding_generation", True),
-        ("scope.binding_generation", 0),
+        ("scope.binding_generation", -1),
+        ("scope.binding_generation", False),
         ("scope.binding_generation", 2**63),
         ("scope.binding_generation", float("nan")),
         ("scope.binding_generation", float("inf")),
@@ -205,6 +206,17 @@ def test_inclusive_bounds_exact_strings_and_explicit_null_approval() -> None:
     assert value.model_dump(mode="json") == wire
     wire["approval_id"] = None
     assert module.TurnAuthorityRequestV1.model_validate(wire).model_dump()["approval_id"] is None
+
+
+@pytest.mark.parametrize("kind", ["request", "response"])
+def test_never_rebound_binding_generation_zero_is_an_exact_scope(kind: str) -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-16: binding_generation is the channel generation."""
+    module = api()
+    wire = replaced(body(kind), "scope.binding_generation", 0)
+    value = model(module, kind).model_validate(wire)
+    assert value.model_dump(mode="json") == wire
+    assert type(value.scope.binding_generation) is int and value.scope.binding_generation == 0
+    assert value.scope != model(module, kind).model_validate(body(kind)).scope
 
 
 @pytest.mark.parametrize(

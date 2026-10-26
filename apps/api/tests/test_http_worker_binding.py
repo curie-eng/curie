@@ -42,8 +42,12 @@ async def _seed_scope(
     *,
     address: str | None = None,
     adapter: str | None = None,
+    generation: int | None = 7,
 ) -> dict[str, Any]:
-    """@spec HTTP-INVOCATION-EXECUTION-17: authoritative committed, undeployed API rows."""
+    """@spec HTTP-INVOCATION-EXECUTION-17: authoritative committed, undeployed API rows.
+
+    ``generation=None`` leaves the column to the existing writer default.
+    """
     tenant, agent = await seed(factory)
     address = address or "C0EXAMPLE1-" + uuid.uuid4().hex
     adapter = adapter or "synthetic-" + uuid.uuid4().hex[:12]
@@ -55,7 +59,7 @@ async def _seed_scope(
             address=address,
             adapter=adapter,
             endpoint=None,
-            generation=7,
+            **({} if generation is None else {"generation": generation}),
         )
         session.add(binding)
         if mode != "absent":
@@ -86,11 +90,17 @@ async def _seed_scope(
                 ),
                 {"value": json.dumps(value), "tenant": tenant},
             )
+        stored = (
+            await session.execute(
+                text("SELECT generation FROM curie.agent_channels WHERE id=:id"),
+                {"id": binding.id},
+            )
+        ).scalar_one()
         return {
             "tenant": tenant,
             "agent": agent,
             "binding": binding.id,
-            "generation": 7,
+            "generation": stored,
             "address": address,
             "adapter": adapter,
         }
@@ -238,6 +248,25 @@ def test_current_binding_classifies_sql_nullness_independently_of_deployment(
         scope["generation"] += 1
         current = await resolver.identity_binding("slack", scope["adapter"], scope["address"])
         _assert_binding(module, current, scope, required)
+
+    run(check)
+
+
+@pytest.mark.parametrize("mode,required", [("absent", False), ("http", True)])
+def test_never_rebound_binding_classifies_at_generation_zero(
+    clean_db: None,
+    mode: str,
+    required: bool,
+) -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-17: the writer default 0 is an ordinary current binding."""
+    module = api()
+
+    async def check(factory: async_sessionmaker[AsyncSession]) -> None:
+        scope = await _seed_scope(factory, mode, generation=None)
+        assert scope["generation"] == 0
+        resolver = await _resolver(factory, scope)
+        value = await resolver.identity_binding("slack", scope["adapter"], scope["address"])
+        _assert_binding(module, value, scope, required)
 
     run(check)
 
@@ -413,7 +442,7 @@ def test_database_failure_propagates_instead_of_becoming_absent_or_legacy(clean_
     run(check)
 
 
-@pytest.mark.parametrize("generation", [1, 2**63 - 1])
+@pytest.mark.parametrize("generation", [0, 1, 2**63 - 1])
 @pytest.mark.parametrize("required", [True, False])
 def test_binding_value_is_frozen_with_actual_integer_and_boolean(
     generation: int, required: bool
@@ -437,7 +466,7 @@ def test_binding_value_is_frozen_with_actual_integer_and_boolean(
     [
         ("binding_generation", True),
         ("binding_generation", False),
-        ("binding_generation", 0),
+        ("binding_generation", -1),
         ("binding_generation", 2**63),
         ("binding_generation", 1.0),
         ("binding_generation", "1"),
