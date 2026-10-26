@@ -50,7 +50,7 @@ def test_current_release_fields_match_cli_version(field: str) -> None:
     else:
         chart = yaml.safe_load((ROOT / "charts/curie/Chart.yaml").read_text())
         value = chart["version" if field == "chart" else "appVersion"]
-    assert value == "0.14.1"
+    assert value == "0.14.2"
     assert value in catalog()["windows"]
 
 
@@ -66,6 +66,7 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     assert data["windows"].get("0.13.2") == {"schema_min": "0108", "schema_head": "0108"}
     assert data["windows"].get("0.14.0") == {"schema_min": "0122", "schema_head": "0122"}
     assert data["windows"].get("0.14.1") == {"schema_min": "0123", "schema_head": "0123"}
+    assert data["windows"].get("0.14.2") == {"schema_min": "0123", "schema_head": "0123"}
     assert data["revisions"][-16:] == [
         "0095",
         "0096",
@@ -108,7 +109,7 @@ def test_every_prior_registered_window_is_exactly_preserved() -> None:
     assert actual["0.12.1"] == {"schema_min": "0076", "schema_head": "0076"}
     assert set(actual) - set(expected) <= {
         "0.12.1", "0.12.2", "0.12.3", "0.12.4", "0.12.5", "0.13.0", "0.13.1", "0.13.2",
-        "0.14.0", "0.14.1"
+        "0.14.0", "0.14.1", "0.14.2"
     }
 
 
