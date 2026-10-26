@@ -42,7 +42,7 @@ AuthorityConfigV1 = {
 }
 ```
 
-`tenant_id` uses the lowercase hyphenated canonical UUID representation already specified by T1. `issuer` uses T1's existing issuer validation semantics, remains an exact string, and has the existing `DirectoryConfigIn.issuer` 2,048-character configuration ceiling. This configuration ceiling does not narrow T1's independent provider-facts representation. Local `managed_by` and governed-domain validation/canonical domain ordering reuse `DirectoryConfigIn`; do not duplicate or change their grammar. Thus the existing intentional sorted governed-domain list is the sole collection normalization inherited here; issuer and identifier strings remain exact.
+`tenant_id` uses the lowercase hyphenated canonical UUID representation already specified by T1. `issuer` uses T1's existing issuer validation semantics, remains an exact string, and has the existing `DirectoryConfigIn.issuer` 2,048-character configuration ceiling. This configuration ceiling does not narrow T1's independent provider-facts representation. Reuse the facts module's public `Text`, `Issuer` and `CanonicalUUID` annotations through public validation adapters; do not import its private validator functions. Local `managed_by` and governed-domain validation/canonical domain ordering reuse `DirectoryConfigIn`; do not duplicate or change their grammar. Thus the existing intentional sorted governed-domain list is the sole collection normalization inherited here; issuer and identifier strings remain exact.
 
 The captured configured scope is `(tenant_id, selection.issuer)` when that mode has an issuer. No issuer exists in a disabled selection. HTTP lookup construction later copies these values to T1 `scope.tenant_id` and `scope.expected_issuer`; provider results cannot substitute either. Channel identity, installation, namespace and native sender remain authenticated operation-specific inputs, not configurable sender overrides in this object. There is no principal UUID, group grant, role filter, human-kind override, policy verdict or message text in this configuration.
 
@@ -140,7 +140,7 @@ Unresolved remains independently established human plus exact explicit raw-role 
 - `apps/api/src/curie_api/schemas/directory.py` (`DirectoryConfigIn`, `DirectoryConfigOut`, `DirectoryCredentialIn`): DirectoryConfigIn, DirectoryConfigOut, credential config_version naming and exact existing bounds.
 - `apps/api/src/curie_api/directory_service.py` (`update_configuration`, `authenticate`): existing configuration expected_version comparison, create/update version behavior and credential invalidation checks.
 - `docs/superpowers/specs/2026-10-23-http-identity-facts-v1.md`: request scope/authority_version, strict UUID/issuer semantics, independent explicit freshness inputs and later-slice gates.
-- `apps/api/src/curie_api/schemas/http_identity.py` (`_uuid`, `_issuer`): exact issuer/UUID validation behavior; reuse rather than invent normalization.
+- `apps/api/src/curie_api/schemas/http_identity.py` (`CanonicalUUID`, `Issuer`, `Text`): exact issuer/UUID/string validation behavior; reuse rather than invent normalization.
 - `apps/api/src/curie_api/forges/loader.py` (`load_forges_json`): protected token-file/no-inline-secret precedent only; this contract adds no loader.
 - `apps/api/src/curie_api/hook_signing.py` (`derive` and module rationale): database secret-storage limitation and derived hook-secret mechanism; not reused for the independent HTTP credential.
 
