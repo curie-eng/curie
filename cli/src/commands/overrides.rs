@@ -101,10 +101,10 @@ impl OverrideChange {
     ///
     /// Returns:
     ///   The intent, or a usage error when both were passed, the value is not
-    ///   an integer, or it falls outside 60..=10800 seconds.
+    ///   an integer, or it falls outside 60..=43200 seconds.
     pub fn resolve_execution_deadline(value: Option<String>, clear: bool) -> Result<Self> {
         const MIN_SECONDS: i64 = 60;
-        const MAX_SECONDS: i64 = 10800;
+        const MAX_SECONDS: i64 = 43200;
         match (value, clear) {
             (Some(_), true) => Err(crate::exit::usage(
                 "--execution-deadline and --clear-execution-deadline contradict each other; \

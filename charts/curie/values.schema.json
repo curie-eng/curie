@@ -364,14 +364,14 @@
         "deliveryBudgetSeconds": {
           "type": "integer",
           "minimum": 60,
-          "maximum": 10800,
-          "description": "Overall wall-clock deadline for one delivery (ADR-0131). The shipped default is 10800, equal to the factory maximum execution deadline. Below 60s a budget cannot cover claim + one runner request + settle; at most 10800s (three hours, #3071). The rendered termination grace follows it: max(terminationGracePeriodSeconds, this + deliveryShutdownReserveSeconds). runnerTotalTimeoutSeconds must be no greater than deliveryBudgetSeconds."
+          "maximum": 43200,
+          "description": "Overall wall-clock deadline for one delivery (ADR-0131). The shipped default is 10800, equal to the factory maximum execution deadline. Below 60s a budget cannot cover claim + one runner request + settle; at most 43200s (twelve hours, #5067). The rendered termination grace follows it: max(terminationGracePeriodSeconds, this + deliveryShutdownReserveSeconds). runnerTotalTimeoutSeconds must be no greater than deliveryBudgetSeconds."
         },
         "runnerTotalTimeoutSeconds": {
           "type": "number",
           "exclusiveMinimum": 0,
-          "maximum": 10800,
-          "description": "Positive per-request ceiling for runner work. The shipped default is 10800, equal to the factory maximum execution deadline, and at most 10800 seconds. Must be no greater than worker.deliveryBudgetSeconds; the worker template enforces this cross-field relationship at render time."
+          "maximum": 43200,
+          "description": "Positive per-request ceiling for runner work. The shipped default is 10800, equal to the factory maximum execution deadline, and at most 43200 seconds (twelve hours, #5067). Must be no greater than worker.deliveryBudgetSeconds; the worker template enforces this cross-field relationship at render time."
         },
         "deliveryLeaseTtlSeconds": {
           "type": "integer",
