@@ -205,6 +205,29 @@ def test_main_dry_run_lists_github_github(capsys: pytest.CaptureFixture[str]) ->
         assert step.name in out
 
 
+@pytest.mark.parametrize(
+    "key", ["jira_cloud+github", "jira_cloud+bitbucket_cloud", "jira_cloud+bitbucket_dc"]
+)
+def test_dry_run_of_every_jira_entry_lists_the_jira_tracker_assertions(
+    key: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert fe.main(["acceptance", "--pairing", key, "--dry-run"]) == 0
+    out = capsys.readouterr().out.splitlines()
+    lines = [line.strip() for line in out]
+    for line in (
+        "scenario.tracker.status_comments == 1",
+        "scenario.tracker.remote_links == 1",
+        "scenario.tracker.pr_body_has_key == true",
+        "scenario.tracker.bot_label_admitted == false",
+        "the ticket carries exactly one status comment from the factory account",
+        "a second ticket labelled by the factory account admits no WorkItem",
+    ):
+        assert line in lines, line
+    assert any("body names the ticket key and its browse URL" in line for line in lines)
+    assert any("carries exactly one remote link" in line for line in lines)
+    assert "denied_label_admitted" not in "\n".join(out)
+
+
 def _forbid_launch(monkeypatch: pytest.MonkeyPatch) -> None:
     def boom(*_a: Any, **_k: Any) -> Any:
         raise AssertionError("a not-installed pairing must launch nothing")
@@ -703,10 +726,11 @@ def test_every_entry_asserts_its_pairing_and_a_jira_tracker_its_tracker_evidence
     tracker, code_host = _forges(key)
     assert persisted["scenario.pairing"] == key
     if tracker == "jira_cloud" and code_host.startswith("bitbucket"):
-        # The Bitbucket driver delegates the ticket and its teardown to the
-        # Jira driver and asserts the loop only.
+        # The Bitbucket driver delegates the ticket, its teardown and the
+        # tracker evidence to the Jira driver, so it asserts the same results.
         assert persisted["forge"] == persisted["scenario.forge"] == code_host
-        assert not [f for f in persisted if f.startswith("scenario.tracker.")]
+        for field, expected in TRACKER_ASSERTIONS.items():
+            assert persisted[field] == expected, field
         assert CLOSE_JIRA in _teardown_names(key)
     elif tracker == "jira_cloud":
         assert persisted["forge"] == persisted["scenario.forge"] == "jira_cloud"
