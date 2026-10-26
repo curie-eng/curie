@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import time
 from datetime import UTC, datetime
 from typing import Any
 
@@ -20,6 +21,22 @@ async def wait_thread_event(event: threading.Event) -> None:
     async with asyncio.timeout(1):
         while not event.is_set():
             await asyncio.sleep(0.005)
+
+
+def observe_operation_deadlines(
+    module: Any, monkeypatch: pytest.MonkeyPatch,
+) -> dict[Any, float]:
+    """@spec HTTP-IDENTITY-TRANSPORT-3: delegate with the actual lookup-entry D unchanged."""
+    original = module.HttpIdentityClient._run
+    deadlines: dict[Any, float] = {}
+
+    async def observed(client: Any, *args: Any, **kwargs: Any) -> Any:
+        """@spec HTTP-IDENTITY-TRANSPORT-3: capture the passed D, never create a new budget."""
+        deadlines[asyncio.current_task()] = kwargs["deadline"] if "deadline" in kwargs else args[-1]
+        return await original(client, *args, **kwargs)
+
+    monkeypatch.setattr(module.HttpIdentityClient, "_run", observed)
+    return deadlines
 
 
 def test_timed_out_parser_retains_its_physical_slot_and_never_delivers_late_facts(
@@ -230,16 +247,20 @@ def test_waiting_for_operation_slot_has_no_fresh_two_second_budget(
 ) -> None:
     """@spec HTTP-IDENTITY-TRANSPORT-3: admission time consumes the original deadline."""
     module = support.api()
+    deadlines = observe_operation_deadlines(module, monkeypatch)
 
     async def scenario(rig: Any) -> None:
         release = rig.event()
-        exchange_starts: list[tuple[float, dict[str, float]]] = []
+        exchange_starts: list[tuple[float, dict[str, float], float]] = []
         original = httpx.AsyncHTTPTransport.handle_async_request
 
         async def exchange(transport: Any, request: Any) -> Any:
             """@spec HTTP-IDENTITY-TRANSPORT-3: observe starts, delegating real HTTP I/O."""
             exchange_starts.append(
-                (asyncio.get_running_loop().time(), dict(request.extensions["timeout"]))
+                (
+                    asyncio.get_running_loop().time(), dict(request.extensions["timeout"]),
+                    deadlines[asyncio.current_task()],
+                )
             )
             return await original(transport, request)
 
@@ -270,9 +291,9 @@ def test_waiting_for_operation_slot_has_no_fresh_two_second_budget(
         # one brief exchange. Neither admission nor that exchange restarts D.
         at_return = tuple(exchange_starts)
         assert 2 <= len(at_return) <= 3
-        for began, timeout in at_return[2:]:
-            assert began < start + 2.0
-            assert all(0 < value <= start + 2.0 - began + 0.01 for value in timeout.values())
+        for began, timeout, deadline in at_return[2:]:
+            assert began < deadline
+            assert all(0 < value <= deadline - began + 0.01 for value in timeout.values())
         await asyncio.sleep(0.03)
         assert tuple(exchange_starts) == at_return
         # A connection begun before D can be accepted by the listener after
@@ -280,6 +301,97 @@ def test_waiting_for_operation_slot_has_no_fresh_two_second_budget(
         assert 2 <= listener.connections <= 3
         for result in await asyncio.gather(*active):
             support.refusal(result, "unavailable")
+
+    run_transport(scenario)
+
+
+def test_request_construction_exhausting_actual_deadline_starts_no_exchange(
+    support: Any, run_transport: Any, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """@spec HTTP-IDENTITY-TRANSPORT-3: real synchronous construction consumes D."""
+    module = support.api()
+    deadlines = observe_operation_deadlines(module, monkeypatch)
+
+    async def scenario(rig: Any) -> None:
+        """@spec HTTP-IDENTITY-TRANSPORT-3: keep actual network and cleanup ownership."""
+        constructed: list[tuple[float, float]] = []
+        exchanges: list[float] = []
+        original_request = httpx.Request.__init__
+        original_exchange = httpx.AsyncHTTPTransport.handle_async_request
+
+        def delayed(request: Any, *args: Any, **kwargs: Any) -> None:
+            """@spec HTTP-IDENTITY-TRANSPORT-3: delegate real construction, then real work."""
+            original_request(request, *args, **kwargs)
+            time.sleep(2.05)
+            constructed.append(
+                (asyncio.get_running_loop().time(), deadlines[asyncio.current_task()])
+            )
+
+        async def exchange(transport: Any, request: Any) -> Any:
+            """@spec HTTP-IDENTITY-TRANSPORT-3: a late call remains observable before real I/O."""
+            exchanges.append(asyncio.get_running_loop().time())
+            return await original_exchange(transport, request)
+
+        monkeypatch.setattr(httpx.Request, "__init__", delayed)
+        monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", exchange)
+        listener = await rig.listen()
+        client = rig.client(module, allow_loopback_http=True)
+        result = await client.lookup(
+            target=support.target(module, listener.url),
+            bearer=module.ProviderBearer(support.token),
+            request=support.request(), limits=support.limits(),
+        )
+        support.refusal(result, "unavailable")
+        assert len(constructed) == 1 and constructed[0][0] >= constructed[0][1]
+        assert exchanges == [], "exchange started after real Request construction exhausted D"
+        assert listener.connections == 0
+
+    run_transport(scenario)
+
+
+def test_request_construction_refreshes_every_phase_from_postconstruction_budget(
+    support: Any, run_transport: Any, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """@spec HTTP-IDENTITY-TRANSPORT-3: use a postconstruction sample, not exchange latency."""
+    module = support.api()
+    deadlines = observe_operation_deadlines(module, monkeypatch)
+
+    async def scenario(rig: Any) -> None:
+        """@spec HTTP-IDENTITY-TRANSPORT-3: successful facts still traverse real HTTP."""
+        postconstruction: list[tuple[float, float]] = []
+        timeouts: list[dict[str, float]] = []
+        original_request = httpx.Request.__init__
+        original_exchange = httpx.AsyncHTTPTransport.handle_async_request
+
+        def delayed(request: Any, *args: Any, **kwargs: Any) -> None:
+            """@spec HTTP-IDENTITY-TRANSPORT-3: measure only after delegated construction/work."""
+            original_request(request, *args, **kwargs)
+            time.sleep(0.05)
+            postconstruction.append(
+                (asyncio.get_running_loop().time(), deadlines[asyncio.current_task()])
+            )
+
+        async def exchange(transport: Any, request: Any) -> Any:
+            """@spec HTTP-IDENTITY-TRANSPORT-3: observe public timeout values, delegate I/O."""
+            timeouts.append(dict(request.extensions["timeout"]))
+            return await original_exchange(transport, request)
+
+        monkeypatch.setattr(httpx.Request, "__init__", delayed)
+        monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", exchange)
+        listener = await rig.listen()
+        client = rig.client(module, allow_loopback_http=True)
+        result = await client.lookup(
+            target=support.target(module, listener.url),
+            bearer=module.ProviderBearer(support.token),
+            request=support.request(), limits=support.limits(),
+        )
+        assert isinstance(result, module.HttpIdentityObservation)
+        assert listener.connections == 1 and len(postconstruction) == len(timeouts) == 1
+        sampled, deadline = postconstruction[0]
+        assert set(timeouts[0]) == {"connect", "read", "write", "pool"}
+        assert all(0 < value <= deadline - sampled for value in timeouts[0].values()), (
+            timeouts[0], deadline - sampled,
+        )
 
     run_transport(scenario)
 
