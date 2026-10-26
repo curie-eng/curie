@@ -16,10 +16,12 @@ from typing import Any
 import pytest
 from aci_protocol.service_config import HEARTBEAT_FILE_ENV, STREAM_ENV
 from curie_protected_hooks.schema_serving import load_window
+from curie_test_support.postgres import pg_connect_or_skip
 from curie_test_support.valkey import connect_or_skip
 from curie_worker import run
 from curie_worker.config import WorkerConfig
 from sqlalchemy.engine import make_url
+from sqlalchemy.ext.asyncio import create_async_engine
 
 ROOT = Path(__file__).resolve().parents[3]
 
@@ -34,11 +36,20 @@ def migration_support() -> Any:
     return module
 
 
+async def _postgres_reachable_or_skip(base: Any) -> None:
+    engine = create_async_engine(base)
+    try:
+        await pg_connect_or_skip(engine)
+    finally:
+        await engine.dispose()
+
+
 @pytest.fixture(scope="module")
 def worker_templates() -> Iterator[Any]:
     """@spec PROTECTED-HOOK-SOURCE-2/10."""
     support = migration_support()
     base = make_url(support.get_settings().database_url)
+    asyncio.run(_postgres_reachable_or_skip(base))
     templates = support.MigrationTemplates(base)
     try:
         yield support, base, templates

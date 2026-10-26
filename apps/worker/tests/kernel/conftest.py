@@ -40,6 +40,7 @@ from channel_protocol.reply import (
     TurnCompleted,
     TurnStatus,
 )
+from curie_test_support.postgres import pg_connect_or_skip
 from curie_test_support.valkey import (
     VALKEY_HOST as _VALKEY_HOST,
 )
@@ -140,6 +141,11 @@ def make_hook_run() -> Callable[..., contextlib.AbstractAsyncContextManager[Hook
     @contextlib.asynccontextmanager
     async def seed(*, outcome: str | None = None) -> AsyncIterator[HookRunSeed]:
         engine = create_async_engine(_DB_URL)
+        try:
+            await pg_connect_or_skip(engine)
+        except BaseException:
+            await engine.dispose()
+            raise
         token = uuid.uuid4().hex
         agent_id = uuid.uuid4()
         version_id = uuid.uuid4()
