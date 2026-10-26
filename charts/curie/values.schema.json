@@ -357,7 +357,7 @@
               "type": "integer",
               "minimum": 3600,
               "maximum": 31536000,
-              "description": "Seconds a settled stream entry is kept before the worker trims it (ADR 0184). At least 3600, above the three-hour delivery budget ceiling, and at most 31536000 (one year). Integer for the same reason as routeTtlSeconds."
+              "description": "Seconds a settled stream entry is kept before the worker trims it (ADR 0184). At least 3600; the default day keeps the trim clear of any delivery still inside its budget (at most 43200 seconds). At most 31536000 (one year). Integer for the same reason as routeTtlSeconds."
             }
           }
         },
@@ -365,13 +365,13 @@
           "type": "integer",
           "minimum": 60,
           "maximum": 43200,
-          "description": "Overall wall-clock deadline for one delivery (ADR-0131). The shipped default is 10800, equal to the factory maximum execution deadline. Below 60s a budget cannot cover claim + one runner request + settle; at most 43200s (twelve hours, #5067). The rendered termination grace follows it: max(terminationGracePeriodSeconds, this + deliveryShutdownReserveSeconds). runnerTotalTimeoutSeconds must be no greater than deliveryBudgetSeconds."
+          "description": "Overall wall-clock deadline for one delivery (ADR-0131). The shipped default is 10800 (a three hour run). Below 60s a budget cannot cover claim + one runner request + settle; at most 43200s (twelve hours, the factory maximum execution deadline, #5067). The rendered termination grace follows it: max(terminationGracePeriodSeconds, this + deliveryShutdownReserveSeconds). runnerTotalTimeoutSeconds must be no greater than deliveryBudgetSeconds."
         },
         "runnerTotalTimeoutSeconds": {
           "type": "number",
           "exclusiveMinimum": 0,
           "maximum": 43200,
-          "description": "Positive per-request ceiling for runner work. The shipped default is 10800, equal to the factory maximum execution deadline, and at most 43200 seconds (twelve hours, #5067). Must be no greater than worker.deliveryBudgetSeconds; the worker template enforces this cross-field relationship at render time."
+          "description": "Positive per-request ceiling for runner work. The shipped default is 10800 (a three hour run), and at most 43200 seconds (twelve hours, the factory maximum execution deadline, #5067). Must be no greater than worker.deliveryBudgetSeconds; the worker template enforces this cross-field relationship at render time."
         },
         "deliveryLeaseTtlSeconds": {
           "type": "integer",

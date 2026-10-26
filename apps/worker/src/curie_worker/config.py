@@ -1433,8 +1433,10 @@ class WorkerConfig(BaseSettings):
         default=15.0, gt=0, validation_alias="CURIE_WORK_ITEM_ORPHAN_SWEEP_INTERVAL_S"
     )
     # Settled stream entries are trimmed once they are older than this window
-    # (ADR 0184). The floor sits above the twelve-hour delivery budget ceiling;
-    # the ceiling is the one year shared by the other seconds knobs.
+    # (ADR 0184). Trimming touches only settled entries, and the
+    # default day keeps the pass clear of any delivery still inside its budget
+    # (at most 43200 s). The ceiling is the one year shared by the other
+    # seconds knobs.
     stream_retention_min_age_s: int = Field(
         default=86400,
         ge=3600,
