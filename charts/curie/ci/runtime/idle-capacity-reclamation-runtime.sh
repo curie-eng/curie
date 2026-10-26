@@ -375,6 +375,7 @@ def quota_pods():
     pods = {pod["metadata"]["uid"]: pod for pod in pod_list["items"]
             if pod["spec"].get("priorityClassName") == priority}
     # Preserve every observed UID below for reclamation and active-route checks.
+    # @spec QUOTA-OBSERVATION-CLOCK-1.
     now = time.time()
     chargeable = [pod for pod in pods.values() if counts_against_quota(pod, now)]
     if len(chargeable) > 2:
