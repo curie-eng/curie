@@ -19,7 +19,7 @@ from curie_api.schemas.http_identity import (
     LookupRequestV1,
     SenderV1,
     ValidatedFacts,
-    _clock,
+    utc_clock_instant,
 )
 
 Reason = Literal[
@@ -139,7 +139,7 @@ def evaluate_role_filter_layer(
         return _refuse("invalid_context")
     try:
         context = RoleFilterContext.model_validate(context)
-        current = _clock(now)
+        current = utc_clock_instant(now)
     except (ValueError, TypeError, RecursionError):
         return _refuse("invalid_context")
 
