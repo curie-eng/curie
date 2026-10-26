@@ -1460,4 +1460,6 @@ def test_tracker_judgement_reads_the_key_from_the_pull_request_description(
 
     urls = [call.url.split("?")[0] for call in http.calls]
     assert pr_url in urls
-    assert not [url for url in urls if "api.github.com" in url]
+    # The host is the parsed hostname, so a URL that merely mentions the
+    # GitHub API host in a path or query is not treated as a GitHub request.
+    assert all(urllib.parse.urlsplit(url).hostname != "api.github.com" for url in urls)
