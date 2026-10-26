@@ -122,6 +122,7 @@ tools/factory-e2e/tests/test_c4_static_token_rotation.py
 tools/factory-e2e/tests/test_c4_tracker_scope.py
 tools/factory-e2e/tests/test_c4_upgrade_migration.py
 tools/factory-e2e/tests/test_daemon_lifecycle.py
+tools/factory-e2e/tests/test_docker_driver.py
 tools/factory-e2e/tests/test_docker_scenario.py
 tools/factory-e2e/tests/test_factory_e2e.py
 tools/factory-e2e/tests/test_factory_e2e_loop.py

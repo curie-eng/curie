@@ -550,6 +550,8 @@ class ModelProxy:
 
 
 class Lifecycle:
+    agent = AGENT  # the factory agent deploy() creates and binds
+
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.fx = _load("docker_daemon_fixture", FIXTURE_MODULE)
@@ -1025,7 +1027,7 @@ class Lifecycle:
         control = self.values(docker=False)
         values = self.f.work / "control.values.json"
         private_file(values, json.dumps({"factory": {"bindings": control["factory"]["bindings"]}}))
-        chart = str(self.f.snapshot / "charts/curie")
+        chart = str(self.install_chart())
         upgrade = (chart, "-n", self.ns, "--reuse-values", "-f", str(values), "--timeout", "15m")
         self.helm("upgrade", *upgrade)
         self.rollout("api", "worker")
@@ -1054,12 +1056,24 @@ class Lifecycle:
         result["turn_delivered"] = (row.get("status"), row.get("cause")) == DELIVERY
         self.envelope["control"] = result
 
+    def install_chart(self) -> Path:
+        """The chart the release is installed and control-upgraded from."""
+        return cast(Path, self.f.snapshot / "charts/curie")
+
     def values(self, *, docker: bool) -> Obj:
         names = {"nonce": self.nonce, "daemon_namespace": self.dns, "release": self.release}
         names |= {"arch": self.f.arch}
         return lifecycle_values(self.base_values, self.images, docker=docker, **names)
 
-    def build_image(self, name: str) -> dict[str, str]:
+    def build_image(
+        self,
+        name: str,
+        *,
+        builder: str = "default",
+        platform: str | None = None,
+        dockerfile: Path | None = None,
+        labels: tuple[str, ...] = (),
+    ) -> dict[str, str]:
         """API and worker images, built exactly as Fixture.images() builds its own."""
         fx, f = self.fx, self.f
         tag = f"{f.registry}/fd-{self.nonce}/{name}:candidate"
@@ -1067,11 +1081,14 @@ class Lifecycle:
         request = uuid.uuid4().hex
         f.asset("tag_intent", tag, request)
         metadata = f.work / (name + "-build.json")
-        argv = ["docker", "buildx", "build", "--builder", "default", "--platform"]
-        argv += ["linux/" + f.arch]
+        argv = ["docker", "buildx", "build", "--builder", builder, "--platform"]
+        argv += [platform or "linux/" + f.arch]
         argv += ["--label", f"{fx.REQUEST}={request}", "--label", f"{fx.NONCE}={self.nonce}"]
+        for label in labels:
+            argv += ["--label", label]
         argv += ["--provenance=false", "--push", "--metadata-file", str(metadata), "-t", tag]
-        argv += ["-f", str(f.snapshot / "apps" / name / "Dockerfile"), str(f.snapshot)]
+        dockerfile = dockerfile or f.snapshot / "apps" / name / "Dockerfile"
+        argv += ["-f", str(dockerfile), str(f.snapshot)]
         fx.run(argv, timeout=7200)
         top = str(fx.loads(metadata.read_text())["containerimage.digest"])
         fx.require(re.fullmatch(SHA256, top), "invalid_image_digest")
@@ -1160,7 +1177,7 @@ class Lifecycle:
         self.k("label", "namespace", self.ns, "--overwrite", psa)
         self.f.note("app_namespace_psa", "baseline")
         self.install_attempted = True
-        chart = str(self.f.snapshot / "charts/curie")
+        chart = str(self.install_chart())
         files = ("-f", chart + "/values-dev.yaml", "-f", str(values_file), "--timeout", "15m")
         self.helm("install", chart, "-n", self.ns, "--skip-crds", *files)
         self.rollout("api", "worker")
@@ -1201,7 +1218,7 @@ class Lifecycle:
         api_key = base64.b64decode(secret["data"]["apiKey"]).decode()
         api_url = self.port_forward()
         channel = {"kind": "github", "address": REPO}
-        agent = {"name": AGENT, "repo_full_name": REPO, "channel": channel}
+        agent = {"name": self.agent, "repo_full_name": REPO, "channel": channel}
         headers = {"X-API-Key": api_key}
         status, _ = fe.http_json("POST", api_url + "/agents", headers=headers, body=agent)
         self.fx.require(status == 201, f"agent_create_http_{status}")
@@ -1215,8 +1232,8 @@ class Lifecycle:
         build += ["--runner-image", self.images["platform"]["ref"], *platform]
         self.fx.run(build, env=env, timeout=1800)
         deploy = [self.curie, "cluster", "--context", self.args.context, "deploy"]
-        deploy += ["--plugin-dir", str(bundle), "--agent", AGENT, "--env", "prod"]
-        deploy += ["--chart", str(self.f.snapshot / "charts/curie")]
+        deploy += ["--plugin-dir", str(bundle), "--agent", self.agent, "--env", "prod"]
+        deploy += ["--chart", str(self.install_chart())]
         deploy += ["--secret", "GITHUB_PERSONAL_ACCESS_TOKEN", "--namespace", self.ns]
         deploy += ["--release", self.release, "--api-url", api_url]
         self.fx.run(deploy, env=env, timeout=600)
