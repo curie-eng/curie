@@ -251,3 +251,18 @@ async def wait_locks(observer: ConnectionObserver, count: int) -> None:
 def driver(connection: AsyncConnection) -> Any:
     """@spec IDENTITY-WRITER-LIFETIME-V1-3/4. Public driver identity, no owner internals."""
     return connection.sync_connection.connection.driver_connection
+
+
+def install_lifetime_route(app: Any, endpoint: Any) -> str:
+    """@spec IDENTITY-WRITER-LIFETIME-V1-8. Shadow one catalogued slot on this test app only."""
+    from curie_api.auth import require_platform_key
+    from fastapi import Depends
+
+    path = "/identity/slack-reports"
+    app.add_api_route(
+        path, endpoint, methods=["POST"], dependencies=[Depends(require_platform_key)]
+    )
+    owned_route = app.router.routes.pop()
+    assert owned_route.path == path and owned_route.methods == {"POST"}
+    app.router.routes.insert(0, owned_route)
+    return path

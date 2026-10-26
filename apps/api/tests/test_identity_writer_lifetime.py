@@ -24,6 +24,7 @@ from identity_writer_lifetime_support import (
     blocking,
     driver,
     headers,
+    install_lifetime_route,
     models,
     request,
     run,
@@ -674,7 +675,8 @@ def test_unconfirmed_discard_retains_quarantine_guards_until_delayed_original_ch
                     if event.contains(engine.sync_engine, "after_cursor_execute", unlock_ack):
                         event.remove(engine.sync_engine, "after_cursor_execute", unlock_ack)
                     if actual is not None:
-                        await original_invalidate(actual)
+                        if not actual.closed:
+                            await original_invalidate(actual)
                         await original_close(actual)
 
     run(body)
@@ -740,7 +742,7 @@ def test_full_asgi_body_and_finalizer_lifetime(
                 background=BackgroundTask(finish, session) if phase == "background" else None,
             )
 
-        app.add_api_route("/identity/lifetime-test", endpoint, methods=["POST"])
+        path = install_lifetime_route(app, endpoint)
 
         async def observed(scope: Any, receive: Any, send: Any) -> None:
             """@spec IDENTITY-WRITER-LIFETIME-V1-8. Record the actual response-start fact."""
@@ -760,9 +762,7 @@ def test_full_asgi_body_and_finalizer_lifetime(
             ) as client:
                 with monkeypatch.context() as patch:
                     with ConnectionObserver(app.state.engine, patch) as observed_connections:
-                        task = asyncio.create_task(
-                            client.post("/identity/lifetime-test", headers=headers())
-                        )
+                        task = asyncio.create_task(client.post(path, headers=headers()))
                         second = None
                         try:
                             await asyncio.wait_for(entered.wait(), timeout=5)
@@ -844,7 +844,7 @@ def test_protected_request_replays_exact_chunked_body_once(migrated: None, kind:
             assert await session.scalar(text("SELECT 1")) == 1
             return Response(b"ok")
 
-        app.add_api_route("/identity/body-test", endpoint, methods=["POST"])
+        path = install_lifetime_route(app, endpoint)
 
         async def chunks() -> Any:
             """@spec IDENTITY-WRITER-LIFETIME-V1-8."""
@@ -856,7 +856,7 @@ def test_protected_request_replays_exact_chunked_body_once(migrated: None, kind:
                 transport=httpx.ASGITransport(app=app), base_url="http://testserver"
             ) as client:
                 response = await client.post(
-                    "/identity/body-test",
+                    path,
                     content=chunks(),
                     headers={
                         **headers(),
@@ -1364,7 +1364,7 @@ def test_stream_disconnect_finishes_dependency_before_owner_disposition(migrated
 
             return StreamingResponse(chunks())
 
-        app.add_api_route("/identity/disconnect-test", endpoint, methods=["POST"])
+        path = install_lifetime_route(app, endpoint)
         async with app.router.lifespan_context(app):
             delivered = False
 
@@ -1388,8 +1388,8 @@ def test_stream_disconnect_finishes_dependency_before_owner_disposition(migrated
                 "asgi": {"version": "3.0", "spec_version": "2.3"},
                 "method": "POST",
                 "scheme": "http",
-                "path": "/identity/disconnect-test",
-                "raw_path": b"/identity/disconnect-test",
+                "path": path,
+                "raw_path": path.encode(),
                 "query_string": b"",
                 "headers": [
                     (b"host", b"testserver"),
