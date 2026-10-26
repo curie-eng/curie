@@ -36,9 +36,10 @@
 # release itself rejects fails here instead of quietly testing nothing.
 #
 # On the newest source it also proves the sandbox resource profiles (#4889):
-# released values keep each released template envelope,
-# candidate values give a factory agent the full factory profile, and explicit
-# overrides win on both.
+# released values keep each released template envelope, and the factory agent
+# matches the released factory profile (factory_env, with explicit cpu and
+# workspace overrides). Candidate values give a factory agent the full factory
+# profile, and explicit overrides win on both.
 #
 # Negative control: reverting #3544's nil guard on `connectorCaller` in a copy
 # of the candidate must make the v0.10.3 render fail with a nil dereference.
@@ -269,14 +270,17 @@ echo "OK: v$LATEST_VERSION layered binding upgrades when the stale key is remove
 # --- sandbox resource profiles across the upgrade paths (#4889) ---------------
 # The candidate adds agentSandbox.resourceProfiles / agentResourceProfiles and
 # leaves the generic runner.resources, workspace.sizeLimit and
-# writablePathSizeLimit unset so the selected profile fills them. A release
-# made by an older chart stores none of that: under --reuse-values its
-# values.yaml still carries the old generic numbers, which then read as
-# explicit. Proves, on the newest release's values:
+# writablePathSizeLimit unset so the selected profile fills them. The current
+# release already stores those profiles, so under --reuse-values the factory
+# agent resolves the released factory envelope. Proves, on the newest release's
+# values:
 #   * released values (helm upgrade --reuse-values from that release): the
 #     generic template renders byte for byte what the released chart renders,
-#     and the factory agent retains its released envelope; explicit per-agent
-#     workspace and cpu overrides still win.
+#     and the factory agent matches the released acme-factory template
+#     (factory_env, including init containers and emptyDir size limits);
+#     explicit per-agent workspace and cpu overrides still win, both against
+#     the released override render and as factory_env with cpu limit 3 and
+#     workspace 18Gi.
 #   * candidate values (helm upgrade --reset-then-reuse-values, curie cluster
 #     upgrade, and a later --reuse-values once the release runs the candidate):
 #     the factory agent gets the full factory profile, explicit overrides win,
@@ -394,13 +398,17 @@ shape_is "released values: the generic template changed under --reuse-values" \
   "$TMP/profile-reuse.yaml" generic same "$TMP/profile-released.yaml" generic
 shape_is "released values: the factory agent envelope changed under --reuse-values" \
   "$TMP/profile-reuse.yaml" acme-factory same "$TMP/profile-released.yaml" acme-factory
+shape_is "released values: the factory agent envelope is not the factory profile" \
+  "$TMP/profile-reuse.yaml" acme-factory "$(factory_env)"
 profile_render "--reuse-values from v$LATEST_VERSION with explicit overrides" \
   upgrade "$profile_reuse" "$TMP/profile-reuse-ovr.yaml" "$TMP/profile-overrides.json"
 shape_is "released values: explicit workspace and cpu overrides lost" \
   "$TMP/profile-reuse-ovr.yaml" acme-factory same "$TMP/profile-released-ovr.yaml" acme-factory
+shape_is "released values: explicit overrides are not the factory profile" \
+  "$TMP/profile-reuse-ovr.yaml" acme-factory "$(factory_env 3 18Gi)"
 shape_is "released values: generic template changed under explicit overrides" \
   "$TMP/profile-reuse-ovr.yaml" generic same "$TMP/profile-released-ovr.yaml" generic
-echo "OK: v$LATEST_VERSION --reuse-values keeps each released template envelope and honors explicit overrides"
+echo "OK: v$LATEST_VERSION --reuse-values keeps each released template envelope, the factory profile, and explicit overrides"
 
 # Candidate values (--reset-then-reuse-values, curie cluster upgrade).
 profile_render "candidate upgrade with the factory fixture" upgrade "$CHART" "$TMP/profile-cand.yaml" "$PROFILE_FIXTURE"

@@ -29,10 +29,11 @@ The jira_cloud+github entry is driven by the jira_cloud driver (`--forge
 jira_cloud`), which delegates the change, CI, review and merge steps to the
 GitHub driver, so it asserts the same loop plus the tracker evidence. A
 Bitbucket entry is driven by its code host's driver, which delegates the
-ticket to the jira_cloud driver and asserts the loop only. Every Jira entry
-asserts the "close Jira test issues" teardown. jira_cloud+bitbucket_dc brings
-a Bitbucket Data Center fixture up for the run unless
-CURIE_BITBUCKET_DC_FIXTURE names one, and removes the one it started.
+ticket and the tracker evidence to the jira_cloud driver, reading the pull
+request body from its own code host, so it asserts the same tracker results.
+Every Jira entry asserts the "close Jira test issues" teardown.
+jira_cloud+bitbucket_dc brings a Bitbucket Data Center fixture up for the run
+unless CURIE_BITBUCKET_DC_FIXTURE names one, and removes the one it started.
 jira_cloud+bitbucket_cloud reads its test repository, the two token files and
 the reviewer's account id from CURIE_BITBUCKET_CLOUD_* variables.
 
@@ -240,7 +241,7 @@ def _remote(tracker: str, code_host: str) -> tuple[str, ...]:
     change = _CHANGE_NAMES[code_host]
     host = _FORGE_LABELS[code_host]
     tracker_lines: tuple[str, ...] = ()
-    if _driver(tracker, code_host) == "jira_cloud":
+    if tracker == "jira_cloud":
         tracker_lines = (
             "the ticket carries exactly one status comment from the factory account",
             f"the ticket carries exactly one remote link to the {change}",
@@ -263,7 +264,7 @@ def _remote(tracker: str, code_host: str) -> tuple[str, ...]:
 def _persisted(
     scenario: str, forge: str, pairing: str, teardown_steps: tuple[str, ...]
 ) -> tuple[Any, ...]:
-    tracker = _JIRA_TRACKER_ASSERTIONS if forge == "jira_cloud" else ()
+    tracker = _JIRA_TRACKER_ASSERTIONS if pairing.partition("+")[0] == "jira_cloud" else ()
     return (
         ("result", "passed"),
         ("mode", f"run:{scenario}"),

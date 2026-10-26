@@ -5,7 +5,7 @@ impls: 0 active providers; facts-only v1 contract and synthetic vectors
 grade: not separately graded
 epics:
   - "#4890"
-order: 31
+order: 32
 ---
 # INTERFACE: HTTP identity facts
 

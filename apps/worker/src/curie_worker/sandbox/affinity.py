@@ -108,6 +108,15 @@ class AffinityStore:
     def _claim_cred_key(self, claim_name: str) -> str:
         return f"{self._prefix}:claim-cred:{claim_name}"
 
+    def _claim_cred_retiring_key(self, claim_name: str) -> str:
+        return f"{self._prefix}:claim-cred-retiring:{claim_name}"
+
+    def mark_claim_credential_retiring(self, claim_name: str, *, ttl_s: int) -> None:
+        self._redis.set(self._claim_cred_retiring_key(claim_name), "1", nx=True, ex=ttl_s)
+
+    def claim_credential_retiring(self, claim_name: str) -> bool:
+        return bool(self._redis.exists(self._claim_cred_retiring_key(claim_name)))
+
     def remember_claim_credential(
         self, claim_name: str, agent: str, credential: str, *, ttl_s: int
     ) -> None:
@@ -130,7 +139,9 @@ class AffinityStore:
         return agent, credential
 
     def forget_claim_credential(self, claim_name: str) -> None:
-        self._redis.delete(self._claim_cred_key(claim_name))
+        self._redis.delete(
+            self._claim_cred_key(claim_name), self._claim_cred_retiring_key(claim_name)
+        )
 
     # A Docker-enabled claim's daemon (ADR 0217). The marker, valued with the
     # daemon namespace, is written before the first daemon object and has no

@@ -72,13 +72,19 @@ For other hosts it first calls `verify_code_host_identity`
 (`apps/api/src/curie_api/publication_authority.py::verify_code_host_identity`)
 through the forge `CodeHost`, then checks the outcome against that read's URL
 (`apps/api/src/curie_api/routers/publications.py::_verified_identity`).
+On a first publication the route also calls `verify_publication_commit`
+(`apps/api/src/curie_api/publication_verification.py::verify_publication_commit`)
+through the publishing code host. The writer refuses an advance without that
+proof or with a stale one, and records the verified parent as the lineage
+`base_sha`.
 The stored writer repeats the outcome checks under row locks
 (`apps/api/src/curie_api/crud/lineages.py::publication_lineage_outcome_conflict`,
 `apps/api/src/curie_api/crud/lineages.py::advance_publication_lineage`). The
 lineage must remain open, its latest revision and pull request identity must
 match, and both expected versions, expected head, lease owner, and approved
 publication state must still be current. One transaction advances the head and
-lineage version, settles the publication, clears its lease, and records the
+lineage version, records the verified first parent on a first publication,
+settles the publication, clears its lease, and records the
 outcome. A stale comparison refuses the transition.
 
 The client distinguishes refusal from unavailability:
