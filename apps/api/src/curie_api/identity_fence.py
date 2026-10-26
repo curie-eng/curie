@@ -255,8 +255,6 @@ class IdentityFenceMiddleware:
             status = error.status_code if isinstance(error, HTTPException) else 408
             detail = error.detail if isinstance(error, HTTPException) else "request body timeout"
             headers = {"Cache-Control": "private, no-store", "Referrer-Policy": "no-referrer"}
-            if isinstance(error, HTTPException) and error.headers:
-                headers.update(error.headers)
             await JSONResponse({"detail": detail}, status_code=status, headers=headers)(
                 scope, receive, send
             )
