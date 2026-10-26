@@ -4,6 +4,7 @@ version = "0.0.0"
 description = "Shared internal Curie wire state and validation"
 requires-python = ">=3.13"
 dependencies = [
+    "pydantic>=2.9",
     "redis>=5.2",
     "sqlalchemy[asyncio]>=2.0",
 ]
