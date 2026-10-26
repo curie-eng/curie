@@ -1092,10 +1092,11 @@ async def kernel_harness(
     sibling_limit_factory: Callable[[AsyncRedis, WorkerConfig], object] | None = None,
     progress_factory: Callable[[AsyncRedis, WorkerConfig], object] | None = None,
     sweep_factory: Callable[[AsyncRedis, WorkerConfig], object] | None = None,
+    identity_authority: object | None = None,
     pod_termination_wait_s: float = 0.0,
     **config_overrides: object,
 ) -> AsyncIterator[Harness]:
-    """Assemble a live kernel wired to a fake runner and real Valkey."""
+    """Assemble a live kernel. @spec HTTP-INVOCATION-EXECUTION-18."""
     config = make_config(names, **config_overrides)
     if binding_factory is not None:
         assert binding is None
@@ -1214,6 +1215,7 @@ async def kernel_harness(
             else {}
         ),
         **({"sweep": sweep_factory(async_redis, config)} if sweep_factory is not None else {}),
+        **({"identity_authority": identity_authority} if identity_authority is not None else {}),
     )
     killswitch = None
     if with_killswitch:
