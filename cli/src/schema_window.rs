@@ -589,7 +589,9 @@ print(json.dumps(graph))
         assert!(!live_in_window("0123", &current));
         assert!(!live_in_window("0130", &current));
         assert!(!live_in_window("0131", &current));
-        assert!(live_in_window("0132", &current));
+        // @spec AGENT-ROLE-PERSISTENCE-V1-9: policy ORM requires 0133.
+        assert!(!live_in_window("0132", &current));
+        assert!(live_in_window("0133", &current));
         assert!(!live_in_window("0075", &current));
         assert!(!live_in_window("0076", &current));
         let retained = window_for("0.12.0").expect("published foundation remains catalogued");

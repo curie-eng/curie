@@ -62,7 +62,9 @@ def graph_payload() -> dict[str, Any]:
         ("0130", False),
         # @spec HTTP-PRINCIPAL-ADOPTION-V1-2/9: authority ORM reads require 0132.
         ("0131", False),
-        ("0132", True),
+        # @spec AGENT-ROLE-PERSISTENCE-V1-9: policy ORM requires 0133.
+        ("0132", False),
+        ("0133", True),
         ("0000", True),
         ("future-expand", True),
     ],

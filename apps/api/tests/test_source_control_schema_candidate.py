@@ -37,8 +37,8 @@ def test_candidate_requires_deploy_notices_after_ledger_schema(resource: str) ->
     # The next-only migrations follow the immutable published 0.12.2 chain.
     # The minimum tracks the newest schema the app reads (#2911's tenant scope);
     # The join requires both start diagnostics (0123) and attachment catalogs (0130).
-    # @spec HTTP-PRINCIPAL-ADOPTION-V1-2/9: authority reads require 0132.
-    assert window == {"schema_min": "0132", "schema_head": "0132"}
+    # @spec AGENT-ROLE-PERSISTENCE-V1-9: policy ORM reads require 0133.
+    assert window == {"schema_min": "0133", "schema_head": "0133"}
 
 
 @pytest.mark.parametrize("field", ["cargo", "chart", "app"])
@@ -67,7 +67,7 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     assert data["windows"].get("0.14.0") == {"schema_min": "0122", "schema_head": "0122"}
     assert data["windows"].get("0.14.1") == {"schema_min": "0123", "schema_head": "0123"}
     assert data["windows"].get("0.14.2") == {"schema_min": "0123", "schema_head": "0123"}
-    assert data["revisions"][-19:] == [
+    assert data["revisions"][-20:] == [
         "0095",
         "0096",
         "0097",
@@ -87,6 +87,7 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
         "0130",
         "0131",
         "0132",
+        "0133",
     ]
     kinds = json.loads((ROOT / "apps/api/src/curie_api/revision_kinds.json").read_text())
     assert kinds["0102"] == "expand"
@@ -102,6 +103,7 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     assert kinds["0123"] == "expand"
     assert kinds["0131"] == "expand"
     assert kinds["0132"] == "expand"
+    assert kinds["0133"] == "expand"
 
 
 def test_every_prior_registered_window_is_exactly_preserved() -> None:
@@ -176,7 +178,7 @@ def test_both_train_heads_upgrade_without_losing_existing_rows(
 
     command.upgrade(alembic_config(), "head")
 
-    assert current_revision() == "0132"
+    assert current_revision() == "0133"
     assert sql_dicts("SELECT name FROM curie.agents WHERE id = :id", {"id": agent_id}) == [
         {"name": "acme-retained"}
     ]
