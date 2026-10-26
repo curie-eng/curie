@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from aci_protocol import QueuedTurn
+from curie_internal.identity_approval import ApprovalCreationIdentityV1
 from curie_internal.identity_authority import (
     Stage,
     TurnAuthorityRequestV1,
@@ -45,6 +46,8 @@ class HttpTurnCarry:
     active: bool = True
     legacy: bool = False
     owner: asyncio.Task[object] | None = field(default_factory=asyncio.current_task, repr=False)
+    # Exact stream bytes before any rewrite. @spec HTTP-APPROVAL-CONTINUITY-4.
+    original_payload: str | None = field(default=None, repr=False)
 
 
 CURRENT: ContextVar[HttpTurnCarry | None] = ContextVar("http_turn_authority", default=None)
@@ -129,6 +132,33 @@ async def classify_skip(self: Kernel) -> None:
         await prepare(self)
     except (TurnAuthorityUnavailable, HttpIdentityRefused):
         carry.legacy = False
+
+
+def selected() -> bool:
+    """A recognized HTTP context selects core continuity. @spec HTTP-APPROVAL-CONTINUITY-1."""
+    carry = CURRENT.get()
+    return carry is not None and carry.context is not None
+
+
+def creation_identity() -> ApprovalCreationIdentityV1:
+    """The live owner's exact creation carry. @spec HTTP-APPROVAL-CONTINUITY-4."""
+    carry = CURRENT.get()
+    if carry is None or carry.context is None:
+        raise HttpIdentityRefused()
+    if not is_live(carry):
+        raise TurnAuthorityUnavailable()
+    payload = carry.original_payload
+    if (
+        carry.scope is None or type(payload) is not str or type(carry.payload_sha256) is not str
+        or hashlib.sha256(payload.encode("utf-8")).hexdigest() != carry.payload_sha256
+    ):
+        raise HttpIdentityRefused()
+    try:
+        return ApprovalCreationIdentityV1(
+            schema_version=1, context=carry.context, payload=payload, scope=carry.scope,
+        )
+    except (ValueError, TypeError):
+        raise HttpIdentityRefused() from None
 
 
 async def check(self: Kernel, stage: Stage) -> None:

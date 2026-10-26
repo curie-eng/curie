@@ -82,6 +82,7 @@ from .log import logger
 async def process_event(
     self: Kernel, qevent: QueuedTurn, *, lease: DeliveryLease | None = None,
     http_identity_context: str | None = None, original_payload_sha256: str | None = None,
+    original_payload: str | None = None,
 ) -> None:
     """Observe one kernel lifecycle while preserving its ``None`` result.
 
@@ -94,7 +95,10 @@ async def process_event(
 
     routing._check_targetless_shape(qevent)
     error: BaseException | None = None
-    identity_carry = identity.HttpTurnCarry(qevent, http_identity_context, original_payload_sha256)
+    identity_carry = identity.HttpTurnCarry(
+        qevent, http_identity_context, original_payload_sha256,
+        original_payload=original_payload,
+    )
     identity_token = identity.CURRENT.set(identity_carry)
     hook_token = constants._HOOK_RUN_CARRY.set(hooks._HookRunCarry())
     lease_token = constants._DELIVERY_LEASE.set(lease)
