@@ -22,6 +22,7 @@ from curie_worker.binding import (
     BUNDLE_REF_ENV,
     PLUGIN_DIR_ENV,
     BindingResolver,
+    HttpIdentityBinding,
     ResolvedDeployment,
 )
 from curie_worker.config import WorkerConfig
@@ -54,6 +55,24 @@ class StubBinding:
     ) -> None:
         self._by_route = by_route
         self._undeployed = undeployed or {}
+        self._local_tenant_id = uuid.uuid4()
+        self._local_binding_ids: dict[tuple[str, str], uuid.UUID] = {}
+
+    async def identity_binding(
+        self, kind: str, adapter: str | None, address: str
+    ) -> HttpIdentityBinding | None:
+        """@spec HTTP-INVOCATION-EXECUTION-18: these canned bindings are explicitly local."""
+        route = (kind, address)
+        resolved = self._by_route.get(route)
+        if resolved is None:
+            resolved = self._undeployed.get(route)
+        if resolved is None:
+            return None
+        binding_id = self._local_binding_ids.setdefault(route, uuid.uuid4())
+        return HttpIdentityBinding(
+            tenant_id=self._local_tenant_id, agent_id=resolved.agent_id,
+            binding_id=binding_id, binding_generation=1, http_identity_required=False,
+        )
 
     async def resolve(
         self, kind: str, adapter: str | None, address: str
@@ -187,6 +206,12 @@ def test_unmapped_channel_with_legacy_binding_double_is_a_polite_drop(make_harne
     """Older binding doubles need not implement the diagnostic lookup."""
 
     class LegacyBinding:
+        async def identity_binding(
+            self, kind: str, adapter: str | None, address: str
+        ) -> None:
+            """@spec HTTP-INVOCATION-EXECUTION-18: genuinely absent route, no diagnostic lookup."""
+            return None
+
         async def resolve(self, kind: str, adapter: str | None, address: str) -> None:
             return None
 
