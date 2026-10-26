@@ -716,3 +716,17 @@ def test_enormous_integer_budget_uses_fixed_input_refusal_before_commands(
     assert world.calls == []
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None or caught.value.__suppress_context__
+
+
+@pytest.mark.parametrize("timestamp", [False, 0, []])
+def test_namespace_deletion_timestamp_presence_rejects_nonstring_shapes(
+    timestamp: Any, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """@spec NAMESPACE-CLEANUP-EVIDENCE-2 NAMESPACE-CLEANUP-EVIDENCE-3."""
+    module, world = load(), Kubernetes()
+    world.namespace["metadata"]["deletionTimestamp"] = timestamp
+    report = collect(module, world, monkeypatch)
+    safe(report)
+    assert report["complete"] is False, "malformed deletion timestamp became complete evidence"
+    assert report["namespaces"][0]["errors"]
+    assert "invalid_projection" in {error["reason"] for error in errors(report)}
