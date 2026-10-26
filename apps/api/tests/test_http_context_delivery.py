@@ -385,13 +385,17 @@ def test_context_is_validated_frozen_redacted_and_hashes_exact_capsule_bytes() -
     assert not any(field in repr(value) for field in (CAPSULE, INTENT, scope.receipt))
     with pytest.raises((FrozenInstanceError, AttributeError)):
         value.capsule = LATER_CAPSULE
-    largest = "curie-context-v1." + "A" * (16384 - 16 - 1 - 43) + "." + "A" * 43
+    prefix = "curie-context-v1."
+    largest = prefix + "A" * (16384 - len(prefix) - 1 - 43) + "." + "A" * 43
+    too_large = prefix + "A" + largest[len(prefix):]
     assert len(largest) == 16384
+    assert len(too_large) == 16385
     assert (
         scope.context(capsule=largest).context_digest
         == hashlib.sha256(largest.encode()).hexdigest()
     )
     for fields in (
+        {"capsule": too_large},
         {"capsule": b"not-a-string"}, {"capsule": CAPSULE + "="},
         {"capsule": "curie-context-v1.." + "A" * 43},
         {"capsule": "curie-context-v1.e30." + "A" * 42},
