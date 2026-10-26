@@ -11,7 +11,7 @@ from curie_api.schemas.agent_access import (
     RoleConfigurationV1,
     RoleFilterRefusal,
 )
-from curie_api.schemas.http_identity import _integer, _nonfinite, _noninteger, _pairs, _unicode
+from curie_api.schemas.http_identity import decode_json_bytes
 
 MAX_CONFIGURATION_BYTES = 65_536
 _ROLE: TypeAdapter[RoleConfigurationV1] = TypeAdapter(RoleConfigurationV1)
@@ -27,25 +27,10 @@ def _version(value: Any) -> RoleFilterRefusal | None:
     return None if value["schema_version"] == 1 else _UNSUPPORTED
 
 
-def _decode(data: bytes) -> Any:
-    """@spec AGENT-ROLE-FILTER-V1-6."""
-    if not isinstance(data, bytes) or len(data) > MAX_CONFIGURATION_BYTES:
-        raise ValueError("invalid configuration bytes")
-    text = data.decode("utf-8")
-    if text.startswith("\ufeff"):
-        raise ValueError("unexpected BOM")
-    value = json.loads(
-        text, object_pairs_hook=_pairs, parse_constant=_nonfinite,
-        parse_int=_integer, parse_float=_noninteger,
-    )
-    _unicode(value)
-    return value
-
-
 def parse_agent_role_policy_v1(data: bytes) -> AgentRolePolicyV1 | RoleFilterRefusal:
     """@spec AGENT-ROLE-FILTER-V1-1 to AGENT-ROLE-FILTER-V1-6."""
     try:
-        value = _decode(data)
+        value = decode_json_bytes(data, max_bytes=MAX_CONFIGURATION_BYTES)
         refusal = _version(value)
         if refusal is not None:
             return refusal
@@ -69,7 +54,7 @@ def parse_agent_role_policy_v1(data: bytes) -> AgentRolePolicyV1 | RoleFilterRef
 def parse_agent_role_change_v1(data: bytes) -> AgentRoleChangeV1 | RoleFilterRefusal:
     """@spec AGENT-ROLE-FILTER-V1-1, AGENT-ROLE-FILTER-V1-4 to AGENT-ROLE-FILTER-V1-6."""
     try:
-        value = _decode(data)
+        value = decode_json_bytes(data, max_bytes=MAX_CONFIGURATION_BYTES)
         refusal = _version(value)
         if refusal is not None:
             return refusal

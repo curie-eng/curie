@@ -445,6 +445,23 @@ def _unicode(value: Any) -> None:
             _unicode(item)
 
 
+def decode_json_bytes(data: bytes, *, max_bytes: int) -> Any:
+    """Decode untrusted identity JSON. @spec HTTP-IDENTITY-V1-3."""
+    if type(max_bytes) is not int or max_bytes < 0:
+        raise ValueError("invalid byte bound")
+    if not isinstance(data, bytes) or len(data) > max_bytes:
+        raise ValueError("invalid JSON bytes")
+    text = data.decode("utf-8")
+    if text.startswith("\ufeff"):
+        raise ValueError("unexpected BOM")
+    value = json.loads(
+        text, object_pairs_hook=_pairs, parse_constant=_nonfinite,
+        parse_int=_integer, parse_float=_noninteger,
+    )
+    _unicode(value)
+    return value
+
+
 def _clock(now: datetime) -> Fraction:
     """@spec HTTP-IDENTITY-V1-4."""
     if not isinstance(now, datetime) or now.utcoffset() != timedelta(0):
@@ -483,16 +500,7 @@ def validate_lookup(
     current = _clock(now)
     invalid = FactsRefusal(code="invalid_response")
     try:
-        if not isinstance(response_bytes, bytes) or len(response_bytes) > MAX_RESPONSE_BYTES:
-            return invalid
-        text = response_bytes.decode("utf-8")
-        if text.startswith("\ufeff"):
-            return invalid
-        value = json.loads(
-            text, object_pairs_hook=_pairs, parse_constant=_nonfinite,
-            parse_int=_integer, parse_float=_noninteger,
-        )
-        _unicode(value)
+        value = decode_json_bytes(response_bytes, max_bytes=MAX_RESPONSE_BYTES)
         if type(value) is not dict or type(value.get("schema_version")) is not int:
             return invalid
         if value["schema_version"] != 1:
