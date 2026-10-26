@@ -136,6 +136,32 @@ These observations justify the chosen mechanisms, not claims about complete prod
 <!-- @spec IDENTITY-WRITER-LIFETIME-V1-10 -->
 Use actual disposable PostgreSQL and Valkey with synthetic records. Fault seams are client-local acknowledgement loss, controlled awaited barriers, and closing/invalidation of the test's exactly observed owned client session/connection. No backend/PID termination, ACL changes, server-wide fault injection or mocked datastore/lock substitutes.
 
+The API test harness must partition fence authority consistently with its
+independent pytest SQL authorities. Allocate one test key per run/worker at
+session scope, then install and restore the API writer and dispatcher reader
+constants at function scope for API tests. Ordinary API modules receive this
+fixture without opt-in imports. Production/default wire constants remain
+unchanged; restoration must precede unrelated dispatcher default-key tests.
+Namespace allocation/installation performs no I/O, endpoint/stream change,
+settings mutation or new backend prerequisite.
+
+Test-only helpers `fence_key_for_worker`, `installed_fence_key`, `fence_child_env`
+and `create_namespaced_app` own this namespace and explicit child propagation.
+A dedicated namespaced child returns actual production create_app; existing
+`python -m curie_api` entrypoint/logging tests retain their original launch.
+The existing factory-based child explicitly receives the same key. Do not add
+a production test setting or alternate application. Real backend owners clean
+only their exact recorded test keys after all consumers join; do not delete a
+shared authority key merely because one inner client context ends.
+
+Independent harness proof must demonstrate the old two-process/two-SQL-authority
+shared-cache collision, isolated authorities both committing/publishing, and
+same-authority serialization. Also prove ordinary fixture discovery, paired
+reader/writer restoration, default unmodified imports and actual parent/child
+agreement. Verify an affected multi-file selection with CI's four-worker
+loadgroup shape before corrected-head CI; serial passes alone do not qualify
+that topology. No strict acknowledgement check is relaxed for test isolation.
+
 The primary fix regression uses the existing real API app, actual get_session path and existing protected PATCH-agent handler. Observe its lock connection through real engine events; pause W1 before its handler write, invalidate only that owned connection, let W2 mutate a different agent and publish its stable value, then resume W1. The authoritative assertion is W1's persisted field remains unchanged while W2's change persists; W1 must not append a late write underneath W2's token. Reversing only product changes must fail that data-state assertion on old source, not a missing-new-symbol import. Do not replace the datastore or handler SQL with a fake. Test helpers may pause/wrap the existing service call while delegating its real operation.
 
 The complete matrix is mandatory:
