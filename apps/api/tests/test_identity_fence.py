@@ -20,8 +20,6 @@ from identity_writer_lifetime_support import (
 from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from .identity_fence_support import identity_fence_backend  # noqa: F401
-
 
 def test_pending_fence_brackets_mutation_and_rotates_on_error(migrated):
     """@spec IDENTITY-WRITER-LIFETIME-V1-2/5. Known healthy settlement rotates even on refusal."""

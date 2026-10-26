@@ -35,8 +35,6 @@ from sqlalchemy.exc import ResourceClosedError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession, create_async_engine
 from starlette.requests import Request
 
-from .identity_fence_support import identity_fence_backend  # noqa: F401
-
 
 def test_protected_handler_cannot_commit_after_its_lock_connection_is_invalidated(
     migrated: None, monkeypatch: pytest.MonkeyPatch

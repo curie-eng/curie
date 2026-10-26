@@ -27,12 +27,11 @@ from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
-from .identity_fence_support import identity_fence_backend  # noqa: F401
-from .test_access_log_redaction import plain_api  # noqa: F401 - real entrypoint fixture
+from .test_access_log_redaction import namespaced_identity_api  # noqa: F401 - real app fixture
 from .test_team_authorization import seed
 
 
-def test_real_api_snapshot_and_status_revoke_cached_dispatcher_allow(plain_api):  # noqa: F811
+def test_real_api_snapshot_and_status_revoke_cached_dispatcher_allow(namespaced_identity_api):  # noqa: F811
     engine = create_async_engine(get_settings().database_url, poolclass=NullPool)
     factory = async_sessionmaker(engine, expire_on_commit=False)
 
@@ -46,10 +45,14 @@ def test_real_api_snapshot_and_status_revoke_cached_dispatcher_allow(plain_api):
     cache = redis.Redis.from_url(get_settings().valkey_dsn())
     prefix = f"curie:j6-test:{uuid.uuid4().hex}"
     try:
-        with httpx.Client(base_url=plain_api.url, timeout=10, trust_env=False) as http:
+        with httpx.Client(
+            base_url=namespaced_identity_api.url, timeout=10, trust_env=False
+        ) as http:
             gate = AdmissionGate(
                 AdmissionClient(
-                    api_base_url=plain_api.url, api_key="access-log-test-key", client=http
+                    api_base_url=namespaced_identity_api.url,
+                    api_key="access-log-test-key",
+                    client=http
                 ),
                 ttl_s=300,
                 stale_s=600,
@@ -199,17 +202,17 @@ def test_real_api_snapshot_and_status_revoke_cached_dispatcher_allow(plain_api):
         asyncio.run(cleanup())
 
 
-def test_incomplete_unauthenticated_body_cannot_block_other_admission(plain_api):  # noqa: F811
+def test_incomplete_unauthenticated_body_cannot_block_other_admission(namespaced_identity_api):  # noqa: F811
     import socket
     from urllib.parse import urlsplit
 
-    origin = urlsplit(plain_api.url)
+    origin = urlsplit(namespaced_identity_api.url)
     with socket.create_connection((origin.hostname, origin.port), timeout=3) as slow:
         slow.sendall(
             b"POST /directory/teams HTTP/1.1\r\nHost: localhost\r\n"
             b"Content-Type: application/json\r\nContent-Length: 1000\r\n\r\n{"
         )
-        with httpx.Client(base_url=plain_api.url, timeout=2, trust_env=False) as http:
+        with httpx.Client(base_url=namespaced_identity_api.url, timeout=2, trust_env=False) as http:
             response = http.post(
                 "/channels/admission",
                 headers={"X-API-Key": "access-log-test-key"},
