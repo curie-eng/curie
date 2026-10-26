@@ -138,6 +138,24 @@ even when a configured profile passes. Use `target_probe_success` for an alert
 about the explicit contract and `target_delivery_success` with delivery
 freshness for an alert about availability.
 
+For a literal exclusion that applies only at the start of the response, add
+optional `forbidden_prefix_any` to a profile. For example, a synthetic status
+contract can require `status` and `ready`, set `forbidden_any` to an empty list,
+and set `forbidden_prefix_any` to `["status unavailable"]`. It rejects
+`Status unavailable; ready details follow`, while allowing
+`Status ready; earlier status unavailable entries are documented`.
+The same NFKC, case folding and whitespace collapse apply before the start
+comparison, so leading whitespace does not bypass it. `forbidden_any` still
+rejects matching wording anywhere, and every required marker group still
+applies. Neither exclusion performs regex or language analysis.
+
+The prefix field defaults to an empty immutable tuple; existing three-argument
+`ProbeProfile` calls and three-field JSON continue to work. An explicit empty
+JSON list also disables prefix exclusions. At most 32 nonblank prefix markers
+are accepted, each bounded to 128 characters like other markers. This optional
+field is the only added JSON key; unknown keys remain invalid. The complete
+JSON still has the same byte limit. See [TURN-CANARY-18](design.md).
+
 The strict configuration bounds are specified in
 [TURN-CANARY-16](design.md): 65,536 UTF-8 JSON bytes, 100 profiles, 63-character
 lowercase ASCII slugs, 2,048-character prompts, 1 to 8 required groups with

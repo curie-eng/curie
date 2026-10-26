@@ -322,8 +322,9 @@ cleanup.
 
 - **TURN-CANARY-16: explicit probe profiles.** Nonce-only probes remain the
   default. An operator may set `TURN_CANARY_PROBE_PROFILES` to a nonempty JSON
-  object from exact inventory agent slugs to objects containing exactly
-  `prompt`, `required_any`, and `forbidden_any`. The parser rejects duplicate
+  object from exact inventory agent slugs to objects containing the required
+  `prompt`, `required_any`, and `forbidden_any` fields, with the optional
+  prefix exclusion defined by TURN-CANARY-18. The parser rejects duplicate
   keys, unknown or missing fields, malformed JSON, and empty profiles before
   any enqueue. The JSON is at most 65,536 UTF-8 bytes and names at most 100
   profiles. Slugs are 1 to 63 lowercase ASCII letters, digits or hyphens,
@@ -405,6 +406,27 @@ cleanup.
   names retain Python's normal independent module identities. A missing helper fails
   before any platform operation. Factoring the helper changes no prompt,
   default, wire, lifecycle, cleanup, log or metric behavior.
+
+- **TURN-CANARY-18: optional response-prefix exclusions.** A profile may add
+  `forbidden_prefix_any`, defaulting to an empty list in JSON and an empty
+  immutable tuple in `ProbeProfile`. Existing three-field JSON and three-argument
+  programmatic construction remain compatible. The optional field contains
+  0 to 32 marker strings with TURN-CANARY-16's existing nonblank, 128-character
+  marker bound and immutable canonicalization. Invalid collection types,
+  non-string, empty, blank or overbound markers refuse parsing/construction.
+  The strict parser accepts the three required fields plus this optional field
+  only; all other unknown fields, duplicate keys and the existing total JSON
+  byte bound remain rejected.
+
+  Apply TURN-CANARY-16's Unicode NFKC, case folding and whitespace collapse to
+  the response and prefix markers. A response fails when its normalized text
+  starts with any normalized prefix marker. The same literal wording later
+  in the response does not trigger this prefix exclusion. Required marker
+  groups still all apply, and `forbidden_any` continues to reject matching
+  text anywhere. No regex, language inference or sentence parsing is used.
+  The standalone schema module remains the sole owner. Source assembly,
+  module identity, default nonce behavior, wire and lifecycle validation,
+  cleanup, logs and metrics retain TURN-CANARY-16/17's meanings.
 
 ## Verification
 
