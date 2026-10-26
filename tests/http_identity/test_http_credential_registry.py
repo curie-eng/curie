@@ -568,6 +568,9 @@ sys.meta_path.insert(0, RuntimeForbidden())
 # These existing owners may load ordinary Python dependencies and a passive lock.
 from curie_api.schemas.http_authority import AuthorityConfigV1
 from curie_api.identity.http_transport import ProviderBearer
+from pydantic.plugin import _loader
+plugin_setting = os.getenv("PYDANTIC_DISABLE_PLUGINS")
+framework_reads = []
 configuration = AuthorityConfigV1.model_validate(json.loads(sys.argv[1]))
 token = ProviderBearer(sys.argv[2])
 def no_io(*args, **kwargs):
@@ -580,7 +583,14 @@ class NoClock(clock_module.datetime):
     # @spec HTTP-CREDENTIAL-REGISTRY-V1-5
     now = utcnow = today = staticmethod(no_io)
 clock_module.datetime = NoClock
-os.getenv = no_io
+def framework_getenv(key, default=None):
+    # @spec HTTP-CREDENTIAL-REGISTRY-V1-5: one measured schema-loader call at import.
+    if (key != "PYDANTIC_DISABLE_PLUGINS"
+            or sys._getframe(1).f_code is not _loader.get_plugins.__code__):
+        no_io()
+    framework_reads.append(key)
+    return default if plugin_setting is None else plugin_setting
+os.getenv = framework_getenv
 os.environ = NoEnvironment()
 threading.Thread.start = no_io
 threading.Lock = threading.RLock = no_io
@@ -595,6 +605,8 @@ def audit(event, args):
             no_io()
 sys.addaudithook(audit)
 from curie_api.identity.http_credential_registry import build_provider_credential_registry
+assert framework_reads == ["PYDANTIC_DISABLE_PLUGINS"]
+os.getenv = no_io
 builtins.open = io.open = os.open = no_io
 result = build_provider_credential_registry(((configuration, token),))
 for _ in range(2):
