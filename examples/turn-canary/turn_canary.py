@@ -1,22 +1,25 @@
-"""Opt-in, bounded synthetic turn checker. @spec TURN-CANARY-1 TURN-CANARY-16"""
+"""Opt-in, bounded synthetic turn checker. @spec TURN-CANARY-1 TURN-CANARY-17"""
 
 import asyncio
 import fcntl
+import hashlib
+import importlib.util
 import json
 import math
 import os
 import re
 import secrets
+import sys
 import tempfile
 import time
-import unicodedata
 import uuid
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Literal, Protocol, TextIO
+from types import ModuleType
+from typing import TYPE_CHECKING, Any, Literal, Protocol, TextIO
 from urllib.parse import urlsplit
 
 from aci_protocol import READER_CONTEXT, QueuedTurn, ReplyHandle, TurnSource
@@ -29,6 +32,51 @@ from channel_protocol import (
     scoped_conversation_id,
 )
 from pydantic import TypeAdapter, ValidationError
+
+
+def _load_probe_profiles_module() -> ModuleType:
+    """Reuse only this exact shipped sibling, without search paths. @spec TURN-CANARY-17"""
+    sibling = Path(__file__).with_name("probe_profiles.py").resolve(strict=True)
+    for candidate in tuple(sys.modules.values()):
+        if not isinstance(candidate, ModuleType):
+            continue
+        origin = candidate.__dict__.get("__file__")
+        if isinstance(origin, str) and Path(origin).resolve() == sibling:
+            sys.modules.setdefault("probe_profiles", candidate)
+            return candidate
+    name = "_curie_turn_canary_profiles_" + hashlib.sha256(str(sibling).encode()).hexdigest()
+    if name in sys.modules:
+        raise ImportError("turn canary profile module cache key is occupied")
+    spec = importlib.util.spec_from_file_location(name, sibling)
+    if spec is None or spec.loader is None:
+        raise ImportError("turn canary profile sibling is not loadable")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        if sys.modules.get(name) is module:
+            del sys.modules[name]
+        raise
+    sys.modules.setdefault("probe_profiles", module)
+    return module
+
+
+if TYPE_CHECKING:
+    from probe_profiles import (
+        ProbeProfile,
+        ProbeReason,
+        parse_probe_profiles,
+        validate_probe_profiles,
+    )
+else:
+    _profiles = _load_probe_profiles_module()
+    ProbeProfile = _profiles.ProbeProfile
+    ProbeReason = _profiles.ProbeReason
+    parse_probe_profiles = _profiles.parse_probe_profiles
+    validate_probe_profiles = _profiles.validate_probe_profiles
+
+_check_probe_profiles = validate_probe_profiles
 
 
 class Platform(Protocol):
@@ -120,112 +168,6 @@ def _check_prefix(prefix: str) -> str:
 
 
 PROBE_SAFETY_SUFFIX = ". Do not use tools, take actions, request approval, or make durable changes."
-ProbeReason = Literal["profile_match", "profile_mismatch"]
-
-
-def _normalize_probe_text(text: str) -> str:
-    """Canonical literal matching, never a regular expression. @spec TURN-CANARY-16"""
-    return " ".join(unicodedata.normalize("NFKC", text).casefold().split())
-
-
-def _probe_slug(slug: object) -> bool:
-    """Bound the configuration key independently of route labels. @spec TURN-CANARY-16"""
-    return (
-        isinstance(slug, str)
-        and 1 <= len(slug) <= 63
-        and slug[0] in "abcdefghijklmnopqrstuvwxyz0123456789"
-        and all(char in "abcdefghijklmnopqrstuvwxyz0123456789-" for char in slug)
-    )
-
-
-@dataclass(frozen=True)
-class ProbeProfile:
-    """Explicit read-only text contract; bounds live in TURN-CANARY-16. @spec TURN-CANARY-16"""
-
-    prompt: str
-    required_any: tuple[tuple[str, ...], ...]
-    forbidden_any: tuple[str, ...]
-
-    def __post_init__(self) -> None:
-        """Validate and freeze programmatic as well as parsed inputs. @spec TURN-CANARY-16"""
-        if not isinstance(self.prompt, str) or not self.prompt.strip() or len(self.prompt) > 2048:
-            raise ValueError("probe prompt must be a bounded nonblank string")
-        if not isinstance(self.required_any, (list, tuple)) or not 1 <= len(self.required_any) <= 8:
-            raise ValueError("probe required groups must be bounded and nonempty")
-        if not isinstance(self.forbidden_any, (list, tuple)) or len(self.forbidden_any) > 32:
-            raise ValueError("probe forbidden markers must be a bounded list")
-
-        def marker(value: object) -> str:
-            """Reject empty and unbounded literal markers. @spec TURN-CANARY-16"""
-            if (
-                not isinstance(value, str) or not 1 <= len(value) <= 128
-                or not _normalize_probe_text(value)
-            ):
-                raise ValueError("probe markers must be bounded nonblank strings")
-            return value
-
-        groups = []
-        for group in self.required_any:
-            if not isinstance(group, (list, tuple)) or not 1 <= len(group) <= 8:
-                raise ValueError("probe alternatives must be bounded and nonempty")
-            groups.append(tuple(marker(value) for value in group))
-        object.__setattr__(self, "required_any", tuple(groups))
-        object.__setattr__(
-            self, "forbidden_any", tuple(marker(value) for value in self.forbidden_any)
-        )
-
-    def matches(self, text: str) -> bool:
-        """Evaluate the declared literal groups, without semantic inference. @spec TURN-CANARY-16"""
-        normalized = _normalize_probe_text(text)
-        return bool(normalized) and all(
-            any(_normalize_probe_text(marker) in normalized for marker in group)
-            for group in self.required_any
-        ) and not any(_normalize_probe_text(marker) in normalized for marker in self.forbidden_any)
-
-
-def _check_probe_profiles(
-    profiles: Mapping[str, ProbeProfile] | None,
-) -> dict[str, ProbeProfile]:
-    """Validate direct cycle callers before any platform operation. @spec TURN-CANARY-16"""
-    if profiles is None:
-        return {}
-    if not isinstance(profiles, Mapping) or len(profiles) > 100 or not all(
-        _probe_slug(slug) and isinstance(profile, ProbeProfile)
-        for slug, profile in profiles.items()
-    ):
-        raise ValueError("probe profiles must be a bounded slug-to-profile mapping")
-    return dict(profiles)
-
-
-def parse_probe_profiles(raw: str) -> dict[str, ProbeProfile]:
-    """Parse one strict, bounded public profile configuration. @spec TURN-CANARY-16"""
-    if len(raw.encode("utf-8")) > 65536:
-        raise ValueError("probe profile JSON exceeds its byte limit")
-
-    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-        """Reject duplicate keys at every object nesting level. @spec TURN-CANARY-16"""
-        values = dict(pairs)
-        if len(values) != len(pairs):
-            raise ValueError("probe profile JSON contains duplicate keys")
-        return values
-
-    try:
-        values = json.loads(raw, object_pairs_hook=unique_object)
-    except RecursionError as exc:
-        raise ValueError("probe profile JSON nesting exceeds parser limits") from exc
-    if not isinstance(values, dict) or not 1 <= len(values) <= 100:
-        raise ValueError("probe profiles must be a nonempty bounded object")
-    profiles = {}
-    for slug, value in values.items():
-        if not _probe_slug(slug) or not isinstance(value, dict) or set(value) != {
-            "prompt", "required_any", "forbidden_any"
-        }:
-            raise ValueError("probe profile has invalid slug or fields")
-        profiles[slug] = ProbeProfile(
-            prompt=value["prompt"], required_any=value["required_any"],
-            forbidden_any=value["forbidden_any"],
-        )
-    return profiles
 
 
 @dataclass(frozen=True)
