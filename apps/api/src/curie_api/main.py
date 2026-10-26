@@ -88,6 +88,7 @@ from .routers import (
     hooks,
     identity,
     identity_admin,
+    identity_authority,
     identity_connect,
     memory,
     observability,
@@ -640,6 +641,7 @@ def create_app(
     app.include_router(provider_installations.router)
     app.include_router(channel_identities.router)
     app.include_router(identity_admin.router)
+    app.include_router(identity_authority.router)
     app.include_router(directory.router)
     app.include_router(identity_connect.router)
     app.include_router(identity.router)

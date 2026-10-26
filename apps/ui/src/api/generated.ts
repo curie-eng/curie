@@ -3164,6 +3164,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/internal/identity/turn-authority/check": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Check Turn Authority
+         * @description @spec HTTP-INVOCATION-EXECUTION-8/16.
+         */
+        post: operations["check_turn_authority_v1_internal_identity_turn_authority_check_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/internal/memory/closed-turns": {
         parameters: {
             query?: never;
@@ -9601,6 +9621,80 @@ export interface components {
             stream_id: string | null;
         };
         /**
+         * TurnAuthorityRequestV1
+         * @description @spec HTTP-INVOCATION-EXECUTION-16.
+         */
+        TurnAuthorityRequestV1: {
+            /** Approval Id */
+            approval_id: string | null;
+            /** Context */
+            context: string;
+            /** Event Id */
+            event_id: string;
+            /** Payload Sha256 */
+            payload_sha256: string;
+            /** Request Id */
+            request_id: string;
+            /**
+             * Schema Version
+             * @constant
+             */
+            schema_version: 1;
+            scope: components["schemas"]["TurnAuthorityScopeV1"];
+            /**
+             * Stage
+             * @enum {string}
+             */
+            stage: "prepare" | "claim_or_resume" | "start" | "steer";
+        };
+        /**
+         * TurnAuthorityResponseV1
+         * @description @spec HTTP-INVOCATION-EXECUTION-16.
+         */
+        TurnAuthorityResponseV1: {
+            /** Context Sha256 */
+            context_sha256: string;
+            /**
+             * Decision
+             * @enum {string}
+             */
+            decision: "continue" | "refuse" | "unavailable";
+            /** Event Id */
+            event_id: string;
+            /**
+             * Reason
+             * @enum {string}
+             */
+            reason: "current_authority" | "caller_not_allowed" | "invalid_context" | "unsupported_resume" | "authority_unavailable";
+            /** Request Id */
+            request_id: string;
+            /**
+             * Schema Version
+             * @constant
+             */
+            schema_version: 1;
+            scope: components["schemas"]["TurnAuthorityScopeV1"];
+            /**
+             * Stage
+             * @enum {string}
+             */
+            stage: "prepare" | "claim_or_resume" | "start" | "steer";
+        };
+        /**
+         * TurnAuthorityScopeV1
+         * @description @spec HTTP-INVOCATION-EXECUTION-16.
+         */
+        TurnAuthorityScopeV1: {
+            /** Agent Id */
+            agent_id: string;
+            /** Binding Generation */
+            binding_generation: number;
+            /** Binding Id */
+            binding_id: string;
+            /** Tenant Id */
+            tenant_id: string;
+        };
+        /**
          * TurnProgressBody
          * @description A ``ProgressCommand`` and the worker/runner position for it.
          *
@@ -14231,6 +14325,7 @@ export interface operations {
             query?: never;
             header?: {
                 "x-api-key"?: string | null;
+                "x-curie-receiver-proof"?: string | null;
             };
             path?: never;
             cookie?: never;
@@ -16825,6 +16920,41 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ReviewVerificationOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    check_turn_authority_v1_internal_identity_turn_authority_check_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TurnAuthorityRequestV1"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TurnAuthorityResponseV1"];
                 };
             };
             /** @description Validation Error */

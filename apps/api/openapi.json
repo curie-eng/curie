@@ -13452,6 +13452,173 @@
         "title": "TurnAccepted",
         "type": "object"
       },
+      "TurnAuthorityRequestV1": {
+        "additionalProperties": false,
+        "description": "@spec HTTP-INVOCATION-EXECUTION-16.",
+        "properties": {
+          "approval_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Approval Id"
+          },
+          "context": {
+            "title": "Context",
+            "type": "string"
+          },
+          "event_id": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Event Id",
+            "type": "string"
+          },
+          "payload_sha256": {
+            "title": "Payload Sha256",
+            "type": "string"
+          },
+          "request_id": {
+            "title": "Request Id",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/TurnAuthorityScopeV1"
+          },
+          "stage": {
+            "enum": [
+              "prepare",
+              "claim_or_resume",
+              "start",
+              "steer"
+            ],
+            "title": "Stage",
+            "type": "string"
+          }
+        },
+        "required": [
+          "schema_version",
+          "request_id",
+          "stage",
+          "context",
+          "payload_sha256",
+          "event_id",
+          "scope",
+          "approval_id"
+        ],
+        "title": "TurnAuthorityRequestV1",
+        "type": "object"
+      },
+      "TurnAuthorityResponseV1": {
+        "additionalProperties": false,
+        "description": "@spec HTTP-INVOCATION-EXECUTION-16.",
+        "properties": {
+          "context_sha256": {
+            "title": "Context Sha256",
+            "type": "string"
+          },
+          "decision": {
+            "enum": [
+              "continue",
+              "refuse",
+              "unavailable"
+            ],
+            "title": "Decision",
+            "type": "string"
+          },
+          "event_id": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Event Id",
+            "type": "string"
+          },
+          "reason": {
+            "enum": [
+              "current_authority",
+              "caller_not_allowed",
+              "invalid_context",
+              "unsupported_resume",
+              "authority_unavailable"
+            ],
+            "title": "Reason",
+            "type": "string"
+          },
+          "request_id": {
+            "title": "Request Id",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/TurnAuthorityScopeV1"
+          },
+          "stage": {
+            "enum": [
+              "prepare",
+              "claim_or_resume",
+              "start",
+              "steer"
+            ],
+            "title": "Stage",
+            "type": "string"
+          }
+        },
+        "required": [
+          "schema_version",
+          "request_id",
+          "stage",
+          "event_id",
+          "context_sha256",
+          "scope",
+          "decision",
+          "reason"
+        ],
+        "title": "TurnAuthorityResponseV1",
+        "type": "object"
+      },
+      "TurnAuthorityScopeV1": {
+        "additionalProperties": false,
+        "description": "@spec HTTP-INVOCATION-EXECUTION-16.",
+        "properties": {
+          "agent_id": {
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "binding_generation": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Binding Generation",
+            "type": "integer"
+          },
+          "binding_id": {
+            "title": "Binding Id",
+            "type": "string"
+          },
+          "tenant_id": {
+            "title": "Tenant Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenant_id",
+          "agent_id",
+          "binding_id",
+          "binding_generation"
+        ],
+        "title": "TurnAuthorityScopeV1",
+        "type": "object"
+      },
       "TurnProgressBody": {
         "additionalProperties": false,
         "description": "A ``ProgressCommand`` and the worker/runner position for it.\n\nClosed like the command: an unknown field is refused. ``generation`` is\nallocated durably by the worker and ``seq`` orders commands within it.",
@@ -28016,6 +28183,66 @@
         "summary": "Verify Review",
         "tags": [
           "internal-github-reviews"
+        ]
+      }
+    },
+    "/v1/internal/identity/turn-authority/check": {
+      "post": {
+        "description": "@spec HTTP-INVOCATION-EXECUTION-8/16.",
+        "operationId": "check_turn_authority_v1_internal_identity_turn_authority_check_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TurnAuthorityRequestV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TurnAuthorityResponseV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Check Turn Authority",
+        "tags": [
+          "internal-identity-authority"
         ]
       }
     },

@@ -10,13 +10,16 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from types import MappingProxyType
-from typing import Annotated, Any, Never, Self, SupportsIndex
+from typing import Annotated, Any, Literal, Never, Self, SupportsIndex
 
 from aci_protocol import PrincipalRef
 from curie_internal import identity_context as codec
+from curie_internal.identity_authority import TurnAuthorityRequestV1, TurnAuthorityResponseV1
 from fastapi import HTTPException, Request
 from pydantic import Field, model_validator
+from redis.exceptions import RedisError
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from curie_api import (
@@ -224,12 +227,61 @@ class _Capture:
     retained_group: tuple[str, str] | None
 
 
+@dataclass(frozen=True)
+class _AuthenticatedSource:
+    """Core-authenticated source, never worker claims. @spec HTTP-INVOCATION-EXECUTION-2/8."""
+
+    binding_id: str
+    binding_generation: int
+    sender: SenderV1
+    agent_id: str | None = None
+    address: str | None = None
+
+
+def _receiver_source(
+    registration: ReceiverRegistrationV1, proof: codec.ReceiverProofV1,
+    claims: channel_token.ChannelClaims, body: Any,
+) -> _AuthenticatedSource:
+    """@spec HTTP-INVOCATION-EXECUTION-2/15."""
+    if (
+        proof.binding_id != claims.channel_id or proof.binding_generation != claims.generation
+        or proof.channel_identity_id != registration.channel_identity_id
+        or proof.provider_installation_id != registration.provider_installation_id
+        or proof.slack.delivery != "app_mention" or proof.slack.is_ext_shared_channel is not False
+        or body.kind != "slack" or body.address != proof.native_channel_id
+        or body.delivery_id != proof.delivery_id or body.conversation_id != proof.conversation_id
+    ):
+        _invalid_receiver()
+    evidence = SlackEvidence.model_validate(proof.slack.model_dump(mode="json"))
+    sender = derive(
+        evidence,
+        identity_attributes={AUTH_TEST_KEY: {
+            "team_id": registration.installation_account, "user_id": registration.bot_user_id,
+            "enterprise_id": None, "is_enterprise_install": False,
+        }},
+        installation_authority=registration.namespace.authority,
+        installation_account=registration.installation_account,
+    )
+    if (
+        not isinstance(sender, tuple) or sender[0] != registration.namespace.key
+        or sender[1] != body.author
+    ):
+        _invalid_receiver()
+    return _AuthenticatedSource(
+        claims.channel_id, claims.generation,
+        SenderV1(
+            provider="slack", channel_identity_id=registration.channel_identity_id,
+            provider_installation_id=registration.provider_installation_id,
+            namespace=registration.namespace, native_id=sender[1],
+        ),
+        address=proof.native_channel_id,
+    )
+
+
 async def _capture(
     session: AsyncSession,
     registration: ReceiverRegistrationV1,
-    proof: codec.ReceiverProofV1,
-    claims: channel_token.ChannelClaims,
-    body: Any,
+    source: _AuthenticatedSource,
     *,
     writer_agent: uuid.UUID | None = None,
 ) -> tuple[_Capture, AgentChannel]:
@@ -252,22 +304,22 @@ async def _capture(
     config = principal_authority.stored_configuration(idp)
     if not isinstance(config.selection, HttpSelectionV1):
         _unavailable()
-    binding_query = select(AgentChannel).where(AgentChannel.id == uuid.UUID(claims.channel_id))
+    binding_query = select(AgentChannel).where(AgentChannel.id == uuid.UUID(source.binding_id))
     if writer_agent is not None:
         binding_query = binding_query.with_for_update()
     binding = await session.scalar(binding_query.execution_options(populate_existing=True))
     if (
         binding is None or str(binding.id) not in registration.binding_ids
-        or binding.tenant_id != tenant_id or binding.generation != claims.generation
-        or proof.binding_id != claims.channel_id or proof.binding_generation != claims.generation
-        or binding.kind != "slack" or body.kind != binding.kind
-        or body.address != binding.address or proof.native_channel_id != binding.address
+        or binding.tenant_id != tenant_id or binding.generation != source.binding_generation
+        or binding.kind != "slack"
+        or (source.address is not None and source.address != binding.address)
+        or (source.agent_id is not None and source.agent_id != str(binding.agent_id))
         or (binding.adapter or "default") != registration.channel_identity_name
         or binding.endpoint is not None
-        or body.delivery_id != proof.delivery_id or body.conversation_id != proof.conversation_id
-        or proof.channel_identity_id != registration.channel_identity_id
-        or proof.provider_installation_id != registration.provider_installation_id
-        or proof.slack.delivery != "app_mention" or proof.slack.is_ext_shared_channel is not False
+        or source.sender.provider != "slack"
+        or source.sender.channel_identity_id != registration.channel_identity_id
+        or source.sender.provider_installation_id != registration.provider_installation_id
+        or source.sender.namespace != registration.namespace
     ):
         _invalid_receiver()
     agent = await session.get(Agent, binding.agent_id, populate_existing=True)
@@ -305,28 +357,6 @@ async def _capture(
         or namespace.key != registration.namespace.key
     ):
         _invalid_receiver()
-    # This evidence comes from the independently registered receiver's connection,
-    # never the platform-editable identity report.
-    evidence = SlackEvidence.model_validate(proof.slack.model_dump(mode="json"))
-    sender = derive(
-        evidence,
-        identity_attributes={AUTH_TEST_KEY: {
-            "team_id": registration.installation_account, "user_id": registration.bot_user_id,
-            "enterprise_id": None, "is_enterprise_install": False,
-        }},
-        installation_authority=installation.authority,
-        installation_account=installation.external_account_id,
-    )
-    if (
-        not isinstance(sender, tuple) or sender[0] != namespace.key
-        or sender[1] != body.author
-    ):
-        _invalid_receiver()
-    source = SenderV1(
-        provider="slack", channel_identity_id=str(identity.id),
-        provider_installation_id=str(installation.id), namespace=registration.namespace,
-        native_id=sender[1],
-    )
     role = None if policy is None else policy.roles.invocation
     team_id = None if policy_row is None else policy_row.invocation_team_id
     group = None
@@ -358,7 +388,8 @@ async def _capture(
     }, sort_keys=True, separators=(",", ":"))
     return _Capture(
         principal_authority.AuthorityCapture(config, idp.lifecycle_generation), agent.id,
-        fingerprint, source, policy, None if policy_row is None else policy_row.version, group,
+        fingerprint, source.sender, policy,
+        None if policy_row is None else policy_row.version, group,
     ), binding
 
 
@@ -380,6 +411,7 @@ def _facts(
 
 def _permission(
     capture: _Capture, binding: AgentChannel, facts: ValidatedFacts, independent_human: bool,
+    original: codec.InvocationContextV1 | None = None,
 ) -> None:
     """@spec HTTP-INVOCATION-EXECUTION-5/15."""
     if not admission.admit(binding, [capture.sender.native_id]).allowed:
@@ -404,6 +436,15 @@ def _permission(
             now=datetime.now(UTC),
         )
         if result.status != "match":
+            _deny()
+    if original is not None and facts.outcome == "resolved":
+        identity = facts.identity
+        assert identity is not None
+        association_matches = original.canonical is not None and (
+            original.canonical.issuer == identity.issuer
+            and original.canonical.subject == identity.subject
+        )
+        if not association_matches and not (raw and independent_human):
             _deny()
     if capture.retained_group is not None and (
         facts.groups is None
@@ -430,6 +471,7 @@ class CurrentHttpInvocation:
     _application: principal_authority.PrincipalApplication = field(repr=False)
     _stable: str = field(repr=False)
     _validity: DeliveryValidityWindow = field(repr=False)
+    _sealable: bool = field(default=True, repr=False)
     _open: bool = field(default=True, repr=False)
 
     def seal_payload(
@@ -437,7 +479,7 @@ class CurrentHttpInvocation:
         reservation: BacklogReservation, receipt_key: str,
     ) -> tuple[DeliveryIdentityContext, DeliveryEnqueueGuard]:
         """@spec HTTP-INVOCATION-EXECUTION-6/15."""
-        if not self._open or not self.session.in_transaction():
+        if not self._sealable or not self._open or not self.session.in_transaction():
             _unavailable()
         config = self._capture.authority.configuration
         selection = config.selection
@@ -510,12 +552,27 @@ async def current_http_invocation(
     registration = runtime._receivers.get((proof.receiver_id, proof.receiver_generation))
     if registration is None or proof.body_sha256 != hashlib.sha256(submitted_bytes).hexdigest():
         _invalid_receiver()
+    source = _receiver_source(registration, proof, claims, body)
+    async with _current_source_authority(
+        request, runtime=runtime, client=client, registration=registration, source=source,
+        intent_digest=hashlib.sha256(receiver_proof.encode("ascii")).hexdigest(),
+    ) as current:
+        yield current
+
+
+@asynccontextmanager
+async def _current_source_authority(
+    request: Request, *, runtime: HttpInvocationRuntime, client: HttpIdentityClient,
+    registration: ReceiverRegistrationV1, source: _AuthenticatedSource,
+    intent_digest: str = "", original: codec.InvocationContextV1 | None = None,
+) -> AsyncIterator[CurrentHttpInvocation]:
+    """One lookup/application/reader owner. @spec HTTP-INVOCATION-EXECUTION-4/5/8."""
     factory = request.app.state.sessionmaker
     valkey = request.app.state.valkey
     try:
         async with factory() as session, session.begin():
             await identity_fence.lock_identity_reader(session)
-            captured, _ = await _capture(session, registration, proof, claims, body)
+            captured, _ = await _capture(session, registration, source)
             credential = runtime._providers.resolve(captured.authority.configuration)
             if not isinstance(credential, ResolvedProviderCredential):
                 _unavailable()
@@ -536,7 +593,7 @@ async def current_http_invocation(
         async with identity_fence.mutation(factory, valkey) as writer:
             async with writer.begin():
                 current, _ = await _capture(
-                    writer, registration, proof, claims, body, writer_agent=captured.agent_id,
+                    writer, registration, source, writer_agent=captured.agent_id,
                 )
                 if current != captured:
                     _unavailable()
@@ -554,7 +611,7 @@ async def current_http_invocation(
     async with factory() as session, session.begin():
         try:
             await identity_fence.lock_identity_reader(session)
-            current, binding = await _capture(session, registration, proof, claims, body)
+            current, binding = await _capture(session, registration, source)
             if (
                 current.fingerprint != captured.fingerprint
                 or current.authority.lifecycle_generation != application.lifecycle_generation
@@ -575,7 +632,7 @@ async def current_http_invocation(
                     _unavailable()
             _permission(
                 current, binding, facts,
-                current.sender.native_id in registration.human_native_ids,
+                current.sender.native_id in registration.human_native_ids, original,
             )
             stable = await valkey.get(identity_fence.FENCE_KEY)
             if isinstance(stable, bytes):
@@ -592,8 +649,9 @@ async def current_http_invocation(
                     authorization_version=application.authorization_version,
                 )
             live = CurrentHttpInvocation(
-                binding, session, hashlib.sha256(receiver_proof.encode("ascii")).hexdigest(),
+                binding, session, intent_digest,
                 principal_ref, runtime, registration, current, facts, application, stable, validity,
+                _sealable=original is None,
             )
         except HTTPException:
             raise
@@ -603,3 +661,77 @@ async def current_http_invocation(
             yield live
         finally:
             object.__setattr__(live, "_open", False)
+
+
+def _check_response(
+    check: TurnAuthorityRequestV1,
+    decision: Literal["continue", "refuse", "unavailable"],
+    reason: Literal[
+        "current_authority", "caller_not_allowed", "invalid_context", "unsupported_resume",
+        "authority_unavailable",
+    ],
+) -> TurnAuthorityResponseV1:
+    """@spec HTTP-INVOCATION-EXECUTION-8/16."""
+    return TurnAuthorityResponseV1(
+        schema_version=1, request_id=check.request_id, stage=check.stage,
+        event_id=check.event_id,
+        context_sha256=hashlib.sha256(check.context.encode("ascii")).hexdigest(),
+        scope=check.scope, decision=decision, reason=reason,
+    )
+
+
+async def check_http_turn_authority(
+    request: Request, check: TurnAuthorityRequestV1,
+) -> TurnAuthorityResponseV1:
+    """@spec HTTP-INVOCATION-EXECUTION-5/8/16."""
+    runtime = getattr(request.app.state, "http_identity_runtime", None)
+    client = getattr(request.app.state, "http_identity_client", None)
+    if type(runtime) is not HttpInvocationRuntime or not isinstance(client, HttpIdentityClient):
+        return _check_response(check, "unavailable", "authority_unavailable")
+    context = codec.open_invocation_context(check.context, runtime._context_keys)
+    if not isinstance(context, codec.InvocationContextV1):
+        return _check_response(check, "refuse", "invalid_context")
+    scope = context.scope
+    if (
+        check.payload_sha256 != context.payload_sha256 or check.event_id != context.event_id
+        or check.scope.tenant_id != scope.tenant_id or check.scope.agent_id != scope.agent_id
+        or check.scope.binding_id != scope.binding_id
+        or check.scope.binding_generation != scope.binding_generation
+    ):
+        return _check_response(check, "refuse", "invalid_context")
+    registration = runtime._receivers.get((context.receiver_id, context.receiver_generation))
+    if (
+        registration is None or registration.tenant_id != scope.tenant_id
+        or scope.binding_id not in registration.binding_ids or scope.provider != "slack"
+        or registration.channel_identity_id != scope.channel_identity_id
+        or registration.provider_installation_id != scope.provider_installation_id
+        or registration.namespace.model_dump() != scope.namespace.model_dump()
+        or context.independent_human != (scope.native_id in registration.human_native_ids)
+    ):
+        return _check_response(check, "refuse", "invalid_context")
+    if check.approval_id is not None:
+        return _check_response(check, "refuse", "unsupported_resume")
+    source = _AuthenticatedSource(
+        scope.binding_id, scope.binding_generation,
+        SenderV1(
+            provider=scope.provider, channel_identity_id=scope.channel_identity_id,
+            provider_installation_id=scope.provider_installation_id,
+            namespace=registration.namespace, native_id=scope.native_id,
+        ),
+        agent_id=scope.agent_id,
+    )
+    try:
+        async with _current_source_authority(
+            request, runtime=runtime, client=client, registration=registration,
+            source=source, original=context,
+        ):
+            result = _check_response(check, "continue", "current_authority")
+        return result
+    except HTTPException as error:
+        if error.status_code == 401:
+            return _check_response(check, "refuse", "invalid_context")
+        if error.status_code == 403:
+            return _check_response(check, "refuse", "caller_not_allowed")
+        return _check_response(check, "unavailable", "authority_unavailable")
+    except (SQLAlchemyError, RedisError, identity_fence.IdentityWriterUnavailable):
+        return _check_response(check, "unavailable", "authority_unavailable")
