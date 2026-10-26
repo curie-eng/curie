@@ -8,7 +8,7 @@ import pytest
 
 
 def _convert(now: object) -> Fraction:
-    """Resolve the public helper in the test body so its absence is a test failure."""
+    """@spec HTTP-IDENTITY-V1-4: resolve helper in-body so absence fails a test."""
     module = import_module("curie_api.schemas.http_identity")
     converter = getattr(module, "utc_clock_instant", None)
     assert callable(converter), "public utc_clock_instant helper is missing"
@@ -55,7 +55,7 @@ def test_utc_clock_instant_accepts_datetime_subclass() -> None:
     """@spec HTTP-IDENTITY-V1-4: existing datetime instances include benign subclasses."""
 
     class Clock(datetime):
-        pass
+        """@spec HTTP-IDENTITY-V1-4: an ordinary datetime subclass remains accepted."""
 
     now = Clock(2000, 1, 1, tzinfo=UTC)
     assert _convert(now) == Fraction(946_684_800)
