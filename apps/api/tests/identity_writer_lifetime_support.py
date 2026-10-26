@@ -180,7 +180,11 @@ class AckClient:
         self.sent.append("set")
         if self.mode == "pending_after":
             raise AckLost("pending_ack_lost")
-        return False if self.mode == "pending_false" else result
+        if self.mode == "pending_false":
+            return False
+        if self.mode == "pending_truthy_invalid":
+            return 1
+        return result
 
     async def eval(self, *args: Any, **kwargs: Any) -> Any:
         """@spec IDENTITY-WRITER-LIFETIME-V1-5. Lost ACK is not a server nonexecution claim."""
@@ -190,6 +194,8 @@ class AckClient:
         self.sent.append("eval")
         if self.mode == "stable_after":
             raise AckLost("stable_ack_lost")
+        if self.mode == "stable_truthy_invalid":
+            return "synthetic-not-ok"
         return result
 
     def __getattr__(self, name: str) -> Any:

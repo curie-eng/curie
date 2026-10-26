@@ -177,16 +177,24 @@ def test_request_borrowing_and_closed_marker_never_fall_back(migrated: None) -> 
     async def body() -> None:
         """@spec IDENTITY-WRITER-LIFETIME-V1-2."""
         async with backend() as (_, factory, client):
+            ids = await agents(factory)
             req = request(factory)
             assert service.request_owned_session(req) is None
             async with deps.request_session(req) as ordinary:
                 assert isinstance(ordinary, AsyncSession)
             async with service.mutation(factory, client, request=req) as owner:
                 assert service.request_owned_session(req) is owner
+                connection = await owner.connection()
+                physical = driver(connection)
                 async with deps.request_session(req) as borrowed:
                     assert borrowed is owner
-                    await borrowed.execute(text("SELECT 1"))
-                assert await owner.scalar(text("SELECT 2")) == 2
+                    assert await borrowed.connection() is connection
+                    await borrowed.execute(update_model(ids[0], "synthetic-borrowed-write"))
+                assert owner.in_transaction(), "borrower exit ended unfinished owner work"
+                assert await owner.connection() is connection and driver(connection) is physical
+                await owner.commit()
+                assert await models(factory, ids[:1]) == ["synthetic-borrowed-write"]
+                assert driver(connection) is physical
                 async with asyncio.timeout(2):
                     with pytest.raises(service.IdentityWriterUnavailable):
                         async with service.mutation(factory, client, request=req):
@@ -305,8 +313,10 @@ def test_early_owner_close_cannot_leak_a_locked_pool_connection(migrated: None) 
         "pending_before",
         "pending_after",
         "pending_false",
+        "pending_truthy_invalid",
         "stable_before",
         "stable_after",
+        "stable_truthy_invalid",
         "changed_token",
     ],
 )
@@ -322,7 +332,13 @@ def test_pending_and_stable_acknowledgement_outcomes(migrated: None, mode: str) 
             entered = False
             error = (
                 service.IdentityWriterUnavailable
-                if mode in {"pending_false", "changed_token"}
+                if mode
+                in {
+                    "pending_false",
+                    "pending_truthy_invalid",
+                    "stable_truthy_invalid",
+                    "changed_token",
+                }
                 else AckLost
             )
             with pytest.raises(error):
@@ -339,7 +355,12 @@ def test_pending_and_stable_acknowledgement_outcomes(migrated: None, mode: str) 
             ]
             if mode == "pending_before":
                 assert value == b"stable:synthetic-before" and wrapped.sent == []
-            elif mode in {"pending_after", "pending_false", "stable_before"}:
+            elif mode in {
+                "pending_after",
+                "pending_false",
+                "pending_truthy_invalid",
+                "stable_before",
+            }:
                 assert value.startswith(b"pending:")
             elif mode == "changed_token":
                 assert value == b"stable:synthetic-successor"
@@ -443,7 +464,7 @@ def test_cleanup_failure_preserves_primary_exception_without_payload_log(
     run(body)
 
 
-@pytest.mark.parametrize("phase", ["settlement", "unlock"])
+@pytest.mark.parametrize("phase", ["settlement", "publication", "unlock"])
 def test_cleanup_deadline_discards_instead_of_returning_an_uncertain_lease(
     migrated: None, monkeypatch: pytest.MonkeyPatch, phase: str
 ) -> None:
@@ -454,17 +475,39 @@ def test_cleanup_deadline_discards_instead_of_returning_an_uncertain_lease(
         """@spec IDENTITY-WRITER-LIFETIME-V1-6."""
         async with backend() as (engine, factory, client):
             ids = await agents(factory)
-            stalled = asyncio.Event()
+            stalled, reached = asyncio.Event(), asyncio.Event()
             actual_session, actual_connection = None, None
-            original_close = AsyncSession.close
+            original_close, original_rollback = AsyncSession.close, AsyncSession.rollback
             original_execute = AsyncConnection.execute
             original_scalar = AsyncConnection.scalar
 
-            async def settle(session: AsyncSession, *args: Any, **kwargs: Any) -> Any:
-                """@spec IDENTITY-WRITER-LIFETIME-V1-6. Pause the actual owned cleanup call."""
+            async def settle(
+                session: AsyncSession, operation: Any, *args: Any, **kwargs: Any
+            ) -> Any:
+                """@spec IDENTITY-WRITER-LIFETIME-V1-6. Pause either allowed settlement seam."""
                 if session is actual_session and phase == "settlement":
+                    reached.set()
                     await stalled.wait()
-                return await original_close(session, *args, **kwargs)
+                return await operation(session, *args, **kwargs)
+
+            async def close(session: AsyncSession, *args: Any, **kwargs: Any) -> Any:
+                """@spec IDENTITY-WRITER-LIFETIME-V1-6."""
+                return await settle(session, original_close, *args, **kwargs)
+
+            async def rollback(session: AsyncSession, *args: Any, **kwargs: Any) -> Any:
+                """@spec IDENTITY-WRITER-LIFETIME-V1-6."""
+                return await settle(session, original_rollback, *args, **kwargs)
+
+            class DelayedPublication(AckClient):
+                """@spec IDENTITY-WRITER-LIFETIME-V1-5/6. Delay only the actual EVAL ACK."""
+
+                async def eval(self, *args: Any, **kwargs: Any) -> Any:
+                    """@spec IDENTITY-WRITER-LIFETIME-V1-5/6. Server effect precedes ACK stall."""
+                    result = await super().eval(*args, **kwargs)
+                    if phase == "publication":
+                        reached.set()
+                        await stalled.wait()
+                    return result
 
             async def execute(
                 connection: AsyncConnection, statement: Any, *args: Any, **kwargs: Any
@@ -475,6 +518,7 @@ def test_cleanup_deadline_discards_instead_of_returning_an_uncertain_lease(
                     and phase == "unlock"
                     and "pg_advisory_unlock(" in str(statement)
                 ):
+                    reached.set()
                     await stalled.wait()
                 return await original_execute(connection, statement, *args, **kwargs)
 
@@ -487,24 +531,29 @@ def test_cleanup_deadline_discards_instead_of_returning_an_uncertain_lease(
                     and phase == "unlock"
                     and "pg_advisory_unlock(" in str(statement)
                 ):
+                    reached.set()
                     await stalled.wait()
                 return await original_scalar(connection, statement, *args, **kwargs)
 
             with monkeypatch.context() as fault:
-                fault.setattr(AsyncSession, "close", settle)
+                fault.setattr(AsyncSession, "close", close)
+                fault.setattr(AsyncSession, "rollback", rollback)
                 fault.setattr(AsyncConnection, "execute", execute)
                 fault.setattr(AsyncConnection, "scalar", scalar)
                 started = asyncio.get_running_loop().time()
                 try:
                     with pytest.raises(service.IdentityWriterUnavailable):
-                        async with service.mutation(factory, client) as session:
+                        async with service.mutation(
+                            factory, DelayedPublication(client, "normal")
+                        ) as session:
                             actual_session = session
                             actual_connection = await session.connection()
                             original = driver(actual_connection)
                             await session.execute(update_model(ids[0], "synthetic-committed"))
                             await session.commit()
                             await session.execute(update_model(ids[1], "synthetic-unfinished"))
-                    assert asyncio.get_running_loop().time() - started < 12
+                    assert reached.is_set(), "the selected cleanup fault seam was not reached"
+                    assert 4.5 <= asyncio.get_running_loop().time() - started < 12
                 finally:
                     stalled.set()
             assert original.is_closed()
