@@ -47,6 +47,8 @@ from .github_app import credentials_for, log_credential_path
 from .github_checks import GitHubStatusReporter
 from .github_review_store import GitHubReviewReconciler
 from .graveyardwatcher import GraveyardWatcher
+from .identity.http_invocation import HttpInvocationRuntime
+from .identity.http_transport import HttpIdentityClient
 from .identity_fence import IdentityFenceMiddleware
 from .k8s import build_lazy_pod_lister, build_lazy_pod_log_reader
 from .killswitch import KillSwitch
@@ -507,7 +509,38 @@ def _metric_http_method(method: str) -> str:
     return normalized if normalized in _HTTP_METHOD_DOMAIN else "OTHER"
 
 
-def create_app() -> FastAPI:
+# @spec HTTP-INVOCATION-EXECUTION-15
+def create_app(
+    *, http_identity_runtime: HttpInvocationRuntime | None = None,
+    http_identity_client: HttpIdentityClient | None = None,
+) -> FastAPI:
+    if (
+        (
+            http_identity_runtime is not None
+            and type(http_identity_runtime) is not HttpInvocationRuntime
+        )
+        or (
+            http_identity_client is not None
+            and type(http_identity_client) is not HttpIdentityClient
+        )
+        or (http_identity_client is not None and http_identity_runtime is None)
+    ):
+        raise ValueError("invalid_http_invocation_runtime") from None
+
+    @asynccontextmanager
+    async def initialized_lifespan(app: FastAPI) -> AsyncIterator[None]:
+        """@spec HTTP-INVOCATION-EXECUTION-15."""
+        client = http_identity_client
+        if http_identity_runtime is not None and client is None:
+            client = HttpIdentityClient()
+        app.state.http_identity_runtime = http_identity_runtime
+        app.state.http_identity_client = client
+        async with AsyncExitStack() as resources:
+            if client is not None:
+                await resources.enter_async_context(client)
+            async with lifespan(app):
+                yield
+
     configure_logging()
     # Which credential the platform will clone with (ADR-0092, #1262). One
     # line, no secret, and a warning when the App is set up only halfway.
@@ -520,7 +553,7 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title="Curie API",
         version="0.1.0",
-        lifespan=lifespan,
+        lifespan=initialized_lifespan,
         telemetry={
             "tracing": False,
             "metrics": False,
