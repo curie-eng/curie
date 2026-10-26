@@ -26,7 +26,6 @@ from curie_telemetry import (
 )
 from fastapi import FastAPI, HTTPException, Request
 from opentelemetry.trace import SpanKind, StatusCode
-from starlette.responses import JSONResponse
 from starlette.routing import Match
 
 from curie_api.crud import agents as crud_agents
@@ -48,6 +47,7 @@ from .github_app import credentials_for, log_credential_path
 from .github_checks import GitHubStatusReporter
 from .github_review_store import GitHubReviewReconciler
 from .graveyardwatcher import GraveyardWatcher
+from .identity_fence import IdentityFenceMiddleware
 from .k8s import build_lazy_pod_lister, build_lazy_pod_log_reader
 from .killswitch import KillSwitch
 from .langfuse import LangfuseClient
@@ -611,6 +611,9 @@ def create_app() -> FastAPI:
     app.include_router(agent_access.router)
     app.include_router(hooks.router)
 
+    # @spec IDENTITY-WRITER-LIFETIME-V1-8. Telemetry stays outside preparation.
+    app.add_middleware(IdentityFenceMiddleware)
+
     @app.middleware("http")
     async def observe_http(request: Request, call_next):  # type: ignore[no-untyped-def]
         operation = _route_template(app, request)
@@ -646,37 +649,7 @@ def create_app() -> FastAPI:
             ) as span:
                 if diagnostic is not None:
                     span.add_event(diagnostic)
-                from . import identity_fence
-
-                fenced = False
-                if identity_fence.protects(request.method, request.url.path):
-                    try:
-                        fenced = await identity_fence.prepare(request)
-                    except TimeoutError:
-                        status_code = 408
-                        return JSONResponse(
-                            {"detail": "request body timeout"},
-                            status_code=408,
-                            headers={
-                                "Cache-Control": "private, no-store",
-                                "Referrer-Policy": "no-referrer",
-                            },
-                        )
-                    except HTTPException as error:
-                        status_code = error.status_code
-                        return JSONResponse(
-                            {"detail": error.detail},
-                            status_code=error.status_code,
-                            headers={
-                                "Cache-Control": "private, no-store",
-                                "Referrer-Policy": "no-referrer",
-                            },
-                        )
-                if fenced:
-                    async with identity_fence.mutation(app.state.sessionmaker, app.state.valkey):
-                        response = await call_next(request)
-                else:
-                    response = await call_next(request)
+                response = await call_next(request)
                 status_code = response.status_code
                 if status_code >= 500 and hasattr(span, "set_status"):
                     span.set_status(StatusCode.ERROR)
