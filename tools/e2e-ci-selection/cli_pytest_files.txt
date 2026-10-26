@@ -70,6 +70,7 @@ runner/tests/test_repository_verification.py
 runner/tests/test_route_callers.py
 runner/tests/test_tool_policy_enforcement.py
 runner/tests/test_workspace_preamble.py
+tests/http_identity/test_role_filter_artifact.py
 tests/test_approval_resume_ownership_probe.py
 tests/test_repository_facts.py
 tests/test_scripts_pipefail_grep.py
