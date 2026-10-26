@@ -158,6 +158,8 @@ floating-point timestamp or narrow the domain. Facts validation and pure role
 calculation reuse this public owner rather than importing a private helper.
 This exposes the existing conversion without changing freshness or error order.
 
+The facts schema owner exposes the pure internal helper `utc_instant(value: str) -> Fraction` over its existing exact timestamp parser. Accept actual strings in the unchanged calendar, UTC suffix and fractional grammar below, preserving all decimal precision and the complete year 0001 through 9999 domain. Reject nonstrings and invalid instants with fixed ValueError text `invalid_utc_instant` and no sensitive input or chained exception. This helper reads no clock, performs no I/O and grants no authority. Existing T1 parser call paths and wire acceptance remain unchanged.
+
 An observation's as_of is the backing-source observation instant, not the
 HTTP response creation time. Timestamps are valid RFC3339 calendar instants
 with uppercase T, seconds 00–59, optional decimal fractional seconds and UTC
