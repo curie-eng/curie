@@ -799,3 +799,24 @@ def test_existing_enqueue_surface_adds_only_an_optional_guard() -> None:
     assert parameter is not None, "enqueue_owned has no optional delivery guard"
     assert parameter.default is None
     assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+
+
+@pytest.fixture(scope="module", autouse=True)
+def required_guarded_delivery_valkey() -> None:
+    """@spec GUARDED-DELIVERY-V1-8: unavailable prerequisites are setup errors."""
+    from redis.backoff import NoBackoff
+    from redis.retry import Retry
+
+    async def check() -> None:
+        """@spec GUARDED-DELIVERY-V1-8: no keys, fallback, or command retries."""
+        client = redis.from_url(
+            get_settings().valkey_dsn(), socket_connect_timeout=2, socket_timeout=2,
+            retry=Retry(NoBackoff(), 0),
+        )
+        try:
+            if await client.ping() is not True:
+                raise RuntimeError("guarded delivery Valkey prerequisite unavailable")
+        finally:
+            await client.aclose()
+
+    asyncio.run(check())
