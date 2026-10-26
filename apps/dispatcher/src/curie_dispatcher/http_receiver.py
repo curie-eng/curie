@@ -74,7 +74,7 @@ class HttpReceiverBindingV1(_Frozen):
     schema_version: codec.Version
     native_channel_id: codec.Identifier
     binding_id: codec.CanonicalUUID
-    binding_generation: codec.Generation
+    binding_generation: codec.ChannelGeneration
     channel_credential: Annotated[str, BeforeValidator(_credential)] = Field(repr=False)
 
 

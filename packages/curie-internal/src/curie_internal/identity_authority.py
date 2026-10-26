@@ -6,7 +6,13 @@ from typing import Annotated, Literal, Never, Self
 
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
 
-from curie_internal.identity_context import CanonicalUUID, Digest, Generation, Identifier, Version
+from curie_internal.identity_context import (
+    CanonicalUUID,
+    ChannelGeneration,
+    Digest,
+    Identifier,
+    Version,
+)
 
 Stage = Literal["prepare", "claim_or_resume", "start", "steer"]
 
@@ -37,7 +43,7 @@ class TurnAuthorityScopeV1(_Observation):
     tenant_id: CanonicalUUID
     agent_id: CanonicalUUID
     binding_id: CanonicalUUID
-    binding_generation: Generation
+    binding_generation: ChannelGeneration
 
 
 class TurnAuthorityRequestV1(_Observation):

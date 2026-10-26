@@ -459,7 +459,7 @@ class HttpIdentityBinding(BaseModel):
     tenant_id: uuid.UUID
     agent_id: uuid.UUID
     binding_id: uuid.UUID
-    binding_generation: int = Field(strict=True, ge=1, le=2**63 - 1)
+    binding_generation: int = Field(strict=True, ge=0, le=2**63 - 1)
     http_identity_required: bool
 
 

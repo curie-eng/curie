@@ -76,6 +76,8 @@ CanonicalUUID = Annotated[Text, AfterValidator(_uuid)]
 KeyId = Annotated[Text, AfterValidator(_key_id)]
 Digest = Annotated[Text, AfterValidator(_digest)]
 Generation = Annotated[int, Field(strict=True, ge=1, le=_MAX_GENERATION)]
+# agent_channels.generation is 0 until first rebound. @spec HTTP-INVOCATION-EXECUTION-13.
+ChannelGeneration = Annotated[int, Field(strict=True, ge=0, le=_MAX_GENERATION)]
 Version = Annotated[Literal[1], BeforeValidator(_version)]
 
 
@@ -112,7 +114,7 @@ class ReceiverProofV1(_Wire):
     channel_identity_id: CanonicalUUID
     provider_installation_id: CanonicalUUID
     binding_id: CanonicalUUID
-    binding_generation: Generation
+    binding_generation: ChannelGeneration
     delivery_id: Identifier
     native_channel_id: Identifier
     conversation_id: Conversation
@@ -135,7 +137,7 @@ class InvocationScopeV1(_Wire):
     tenant_id: CanonicalUUID
     agent_id: CanonicalUUID
     binding_id: CanonicalUUID
-    binding_generation: Generation
+    binding_generation: ChannelGeneration
     channel_identity_id: CanonicalUUID
     provider_installation_id: CanonicalUUID
     provider: Identifier
