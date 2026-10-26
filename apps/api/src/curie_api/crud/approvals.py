@@ -49,14 +49,14 @@ def _no_wake_resumed_at() -> Any:
     )
 
 
-async def create_approval(
+async def insert_approval(
     session: AsyncSession,
     data: "ApprovalRequest",
     *,
     traceparent: str | None = None,
+    approval_id: uuid.UUID | None = None,
 ) -> Approval:
-    """Insert a pending approval. Raises IntegrityError on a dedupe_key replay;
-    the router maps that to the existing record (idempotent creation)."""
+    """Borrowed insert/flush only. @spec HTTP-APPROVAL-CONTINUITY-5/9."""
 
     expires_at = None
     if data.expires_in_seconds is not None:
@@ -91,7 +91,21 @@ async def create_approval(
         granted_arguments=data.granted_arguments,
         expires_at=expires_at,
     )
+    if approval_id is not None:
+        approval.id = approval_id
     session.add(approval)
+    await session.flush()
+    return approval
+
+
+async def create_approval(
+    session: AsyncSession,
+    data: "ApprovalRequest",
+    *,
+    traceparent: str | None = None,
+) -> Approval:
+    """Preserve legacy commit ownership. @spec HTTP-APPROVAL-CONTINUITY-5/9."""
+    approval = await insert_approval(session, data, traceparent=traceparent)
     await session.commit()
     await session.refresh(approval)
     return approval

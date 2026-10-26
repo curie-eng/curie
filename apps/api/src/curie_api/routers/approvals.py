@@ -63,6 +63,7 @@ from ..auth import require_api_key, require_platform_key
 from ..authorizer import AuthzDecision, authorize_approval
 from ..config import get_settings
 from ..deps import ApproverSetSelectorDep, ResumeQueueDep, SessionDep, get_store
+from ..identity.http_approval import require_legacy_approval_creation
 from ..identity_fence import lock_identity_reader
 from ..models import Approval, ApprovalStatus
 from ..remediation_approvals import (
@@ -280,6 +281,7 @@ async def create_approval(
     runner, so a sandbox cannot talk its way past it.
     """
 
+    await require_legacy_approval_creation(session, data)
     traceparent = canonicalize_traceparent(
         request.headers.get(TRACEPARENT_STREAM_FIELD)
     )

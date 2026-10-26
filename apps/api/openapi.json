@@ -2261,6 +2261,121 @@
         "title": "ApprovalCreateOut",
         "type": "object"
       },
+      "ApprovalCreationIdentityV1": {
+        "additionalProperties": false,
+        "description": "@spec HTTP-APPROVAL-CONTINUITY-3/4.",
+        "properties": {
+          "context": {
+            "title": "Context",
+            "type": "string"
+          },
+          "payload": {
+            "title": "Payload",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/TurnAuthorityScopeV1"
+          }
+        },
+        "required": [
+          "schema_version",
+          "context",
+          "payload",
+          "scope"
+        ],
+        "title": "ApprovalCreationIdentityV1",
+        "type": "object"
+      },
+      "ApprovalCreationRequestV1": {
+        "additionalProperties": false,
+        "description": "@spec HTTP-APPROVAL-CONTINUITY-3.",
+        "properties": {
+          "approval": {
+            "$ref": "#/components/schemas/ApprovalRequest"
+          },
+          "identity": {
+            "$ref": "#/components/schemas/ApprovalCreationIdentityV1"
+          },
+          "request_id": {
+            "title": "Request Id",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "schema_version",
+          "request_id",
+          "approval",
+          "identity"
+        ],
+        "title": "ApprovalCreationRequestV1",
+        "type": "object"
+      },
+      "ApprovalCreationResponseV1": {
+        "additionalProperties": false,
+        "description": "@spec HTTP-APPROVAL-CONTINUITY-3.",
+        "properties": {
+          "duplicate": {
+            "title": "Duplicate",
+            "type": "boolean"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "request_id": {
+            "title": "Request Id",
+            "type": "string"
+          },
+          "requested_by": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Requested By"
+          },
+          "schema_version": {
+            "const": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "status": {
+            "enum": [
+              "pending",
+              "approved",
+              "rejected",
+              "expired"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "schema_version",
+          "request_id",
+          "id",
+          "status",
+          "duplicate",
+          "requested_by"
+        ],
+        "title": "ApprovalCreationResponseV1",
+        "type": "object"
+      },
       "ApprovalIdentityFactsOut": {
         "description": "Per-row FACTS about one pending approval (#2753).\n\nFacts, never verdicts: nothing here says a row cannot be resolved. A route\nwhose approver set is the card channel's membership is a HEALTHY route that\nany attested chat click resolves, and it is reported like any other row.",
         "properties": {
@@ -28183,6 +28298,66 @@
         "summary": "Verify Review",
         "tags": [
           "internal-github-reviews"
+        ]
+      }
+    },
+    "/v1/internal/identity/approvals": {
+      "post": {
+        "description": "@spec HTTP-APPROVAL-CONTINUITY-3.",
+        "operationId": "create_identity_approval_v1_internal_identity_approvals_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApprovalCreationRequestV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApprovalCreationResponseV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Identity Approval",
+        "tags": [
+          "internal-identity-authority"
         ]
       }
     },

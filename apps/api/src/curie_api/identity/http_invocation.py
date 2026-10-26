@@ -471,6 +471,12 @@ class CurrentHttpInvocation:
     _application: principal_authority.PrincipalApplication = field(repr=False)
     _stable: str = field(repr=False)
     _validity: DeliveryValidityWindow = field(repr=False)
+    _response_bytes: bytes = field(repr=False)
+    _lookup: LookupRequestV1 = field(repr=False)
+    _credential: ResolvedProviderCredential = field(repr=False)
+    _source: _AuthenticatedSource = field(repr=False)
+    _client: HttpIdentityClient = field(repr=False)
+    _original: codec.InvocationContextV1 | None = field(repr=False)
     _sealable: bool = field(default=True, repr=False)
     _open: bool = field(default=True, repr=False)
 
@@ -651,6 +657,7 @@ async def _current_source_authority(
             live = CurrentHttpInvocation(
                 binding, session, intent_digest,
                 principal_ref, runtime, registration, current, facts, application, stable, validity,
+                observation.response_bytes, lookup, credential, source, client, original,
                 _sealable=original is None,
             )
         except HTTPException:
@@ -680,6 +687,33 @@ def _check_response(
     )
 
 
+def invocation_source(
+    runtime: HttpInvocationRuntime, context: codec.InvocationContextV1,
+) -> tuple[ReceiverRegistrationV1, _AuthenticatedSource]:
+    """Authenticated source scope only. @spec HTTP-APPROVAL-CONTINUITY-4/9."""
+    scope = context.scope
+    registration = runtime._receivers.get((context.receiver_id, context.receiver_generation))
+    if (
+        registration is None or registration.tenant_id != scope.tenant_id
+        or scope.binding_id not in registration.binding_ids or scope.provider != "slack"
+        or registration.channel_identity_id != scope.channel_identity_id
+        or registration.provider_installation_id != scope.provider_installation_id
+        or registration.namespace.model_dump() != scope.namespace.model_dump()
+        or context.independent_human != (scope.native_id in registration.human_native_ids)
+    ):
+        _invalid_receiver()
+    source = _AuthenticatedSource(
+        scope.binding_id, scope.binding_generation,
+        SenderV1(
+            provider=scope.provider, channel_identity_id=scope.channel_identity_id,
+            provider_installation_id=scope.provider_installation_id,
+            namespace=registration.namespace, native_id=scope.native_id,
+        ),
+        agent_id=scope.agent_id,
+    )
+    return registration, source
+
+
 async def check_http_turn_authority(
     request: Request, check: TurnAuthorityRequestV1,
 ) -> TurnAuthorityResponseV1:
@@ -699,27 +733,12 @@ async def check_http_turn_authority(
         or check.scope.binding_generation != scope.binding_generation
     ):
         return _check_response(check, "refuse", "invalid_context")
-    registration = runtime._receivers.get((context.receiver_id, context.receiver_generation))
-    if (
-        registration is None or registration.tenant_id != scope.tenant_id
-        or scope.binding_id not in registration.binding_ids or scope.provider != "slack"
-        or registration.channel_identity_id != scope.channel_identity_id
-        or registration.provider_installation_id != scope.provider_installation_id
-        or registration.namespace.model_dump() != scope.namespace.model_dump()
-        or context.independent_human != (scope.native_id in registration.human_native_ids)
-    ):
+    try:
+        registration, source = invocation_source(runtime, context)
+    except HTTPException:
         return _check_response(check, "refuse", "invalid_context")
     if check.approval_id is not None:
         return _check_response(check, "refuse", "unsupported_resume")
-    source = _AuthenticatedSource(
-        scope.binding_id, scope.binding_generation,
-        SenderV1(
-            provider=scope.provider, channel_identity_id=scope.channel_identity_id,
-            provider_installation_id=scope.provider_installation_id,
-            namespace=registration.namespace, native_id=scope.native_id,
-        ),
-        agent_id=scope.agent_id,
-    )
     try:
         async with _current_source_authority(
             request, runtime=runtime, client=client, registration=registration,
@@ -735,3 +754,56 @@ async def check_http_turn_authority(
         return _check_response(check, "unavailable", "authority_unavailable")
     except (SQLAlchemyError, RedisError, identity_fence.IdentityWriterUnavailable):
         return _check_response(check, "unavailable", "authority_unavailable")
+
+
+@asynccontextmanager
+async def current_http_approval_caller(
+    request: Request, context: codec.InvocationContextV1,
+) -> AsyncIterator[CurrentHttpInvocation]:
+    """Read-only preparation for the separate insert owner. @spec HTTP-APPROVAL-CONTINUITY-9."""
+    runtime = getattr(request.app.state, "http_identity_runtime", None)
+    client = getattr(request.app.state, "http_identity_client", None)
+    if type(runtime) is not HttpInvocationRuntime or not isinstance(client, HttpIdentityClient):
+        _unavailable()
+    registration, source = invocation_source(runtime, context)
+    async with _current_source_authority(
+        request, runtime=runtime, client=client, registration=registration,
+        source=source, original=context,
+    ) as caller:
+        yield caller
+
+
+async def revalidate_http_approval_caller(
+    request: Request, writer: AsyncSession, caller: CurrentHttpInvocation,
+) -> None:
+    """No external I/O; only the separate borrowed writer. @spec HTTP-APPROVAL-CONTINUITY-9."""
+    if caller._open or not writer.in_transaction():
+        _unavailable()
+    if (
+        request.app.state.http_identity_runtime is not caller._runtime
+        or request.app.state.http_identity_client is not caller._client
+    ):
+        _unavailable()
+    current, binding = await _capture(
+        writer, caller._registration, caller._source, writer_agent=caller._capture.agent_id,
+    )
+    if current != caller._capture:
+        _unavailable()
+    facts = _facts(caller._response_bytes, caller._lookup, caller._credential)
+    if caller._application.principal_id is not None:
+        principal = await writer.get(
+            Principal, caller._application.principal_id, populate_existing=True,
+        )
+        if (
+            principal is None or facts.identity is None or principal.type != "human"
+            or principal.tenant_id != uuid.UUID(caller._registration.tenant_id)
+            or principal.idp_issuer != facts.identity.issuer
+            or principal.idp_subject != facts.identity.subject
+            or principal.status != facts.identity.account_status
+            or principal.authorization_version != caller._application.authorization_version
+        ):
+            _unavailable()
+    _permission(
+        current, binding, facts,
+        current.sender.native_id in caller._registration.human_native_ids, caller._original,
+    )

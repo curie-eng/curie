@@ -573,6 +573,11 @@ class Approval(Base):
 
     __tablename__ = "approvals"
     __table_args__ = (
+        # @spec HTTP-APPROVAL-CONTINUITY-5. Private, bounded provenance.
+        CheckConstraint(
+            "identity_context IS NULL OR octet_length(identity_context) <= 16384",
+            name="approvals_identity_context_length_ck",
+        ),
         CheckConstraint(
             "(policy_identity IS NULL AND policy_version IS NULL) OR "
             "(policy_identity = 'publication:auto' AND policy_version >= 1)",
@@ -633,6 +638,8 @@ class Approval(Base):
     # ingress route derives it from the HTTP header, and terminal/recovery paths
     # use it only to reconnect telemetry after the human pause.
     traceparent: Mapped[str | None] = mapped_column(String(55), default=None)
+    # @spec HTTP-APPROVAL-CONTINUITY-5. Never part of a public approval DTO.
+    identity_context: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
     status: Mapped[str] = mapped_column(server_default=ApprovalStatus.pending, index=True)
     # Optional SLA: past this instant the record can no longer be approved or
     # rejected; a resolve attempt flips it to expired instead.

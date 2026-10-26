@@ -389,6 +389,8 @@ _HTTP_OPERATIONS = [
     "/v1/internal/attachment-access/complete",
     # @spec HTTP-INVOCATION-EXECUTION-16
     "/v1/internal/identity/turn-authority/check",
+    # @spec HTTP-APPROVAL-CONTINUITY-3
+    "/v1/internal/identity/approvals",
     "/channel-read",
     "/channels/admission",
     "/channels/token",
