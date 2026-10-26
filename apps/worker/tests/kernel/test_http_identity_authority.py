@@ -667,3 +667,53 @@ def test_normal_worker_factory_supplies_the_current_authority_client(built):
     assert isinstance(kwargs.get("identity_authority"), HttpTurnAuthorityClient), (
         "normal worker build leaves HTTP current authority unwired"
     )
+
+
+def test_retained_attachment_rechecks_authority_after_fetch_before_handoff(make_harness):
+    """@spec HTTP-INVOCATION-EXECUTION-18: a completed fetch cannot retain an earlier grant."""
+    require_execution_interface()
+
+    class AuthenticatedBinding(Binding):
+        """@spec HTTP-INVOCATION-EXECUTION-18: qualify this retained-runner handoff."""
+
+        def boot_env(self, resolved: Any, thread_key: str, **kwargs: Any) -> dict[str, str]:
+            """@spec HTTP-INVOCATION-EXECUTION-18."""
+            return {
+                **super().boot_env(resolved, thread_key, **kwargs),
+                "CURIE_RUNNER_TOKEN": "synthetic-http-attachment-runner-token",
+            }
+
+    async def run() -> None:
+        """@spec HTTP-INVOCATION-EXECUTION-18."""
+        binding, core = AuthenticatedBinding(), Core()
+        binding.resolved.deployment_id = uuid.uuid4()
+        entered, release = threading.Event(), threading.Event()
+        lane = _FakeAttachmentLane(resolve_entered=entered, resolve_gate=release)
+        async with make_harness(
+            binding=binding, identity_authority=core, per_sandbox_runners=2,
+        ) as h:
+            h.kernel._attachments = lane
+            h.kernel._workspace = _WorkspaceProbe(h.substrate, selected_repo=None)
+            await process(h, qevent("retained opener", thread="post-fetch-handoff"))
+            original = h.substrate.lookup("slack:C1:post-fetch-handoff")
+            assert original is not None and original.token
+            assert len(h.fake_k8s.claim_envs) == 1
+            minted = len(binding.mints)
+            task = asyncio.create_task(process(h, qevent(
+                "revoked while fetching", thread="post-fetch-handoff",
+                attachments=[Attachment(id="F3", name="file.txt")],
+            )))
+            try:
+                assert await asyncio.to_thread(entered.wait, 3), "retained fetch did not start"
+                core.refuse = "claim_or_resume"
+            finally:
+                release.set()
+                await task
+            assert len(h.fake_k8s.claim_envs) == 1, "revoked fetch created a replacement claim"
+            assert h.substrate.lookup("slack:C1:post-fetch-handoff") == original
+            assert [text for runner in h.runners.values() for text in runner.opened] == [
+                "retained opener",
+            ]
+            assert len(binding.mints) == minted
+            assert core.requests[-1].stage == "claim_or_resume"
+    asyncio.run(run())
