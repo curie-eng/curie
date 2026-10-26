@@ -221,3 +221,52 @@ def test_coherent_but_unusable_python_intervals_fail_closed(case: str) -> None:
             "identity_observation": observation, "identity_expires_at": Fraction(-1, 1000),
         })
     rejected(facts, limits)
+
+
+def utc_converter() -> Any:
+    """@spec HTTP-IDENTITY-V1-4 GUARDED-DELIVERY-V1-3."""
+    function = getattr(facts_api, "utc_instant", None)
+    assert callable(function), "public exact UTC instant helper is not implemented"
+    return function
+
+
+@pytest.mark.parametrize(("value", "expected"), [
+    ("1970-01-01T00:00:00Z", Fraction(0)),
+    ("1970-01-01T00:00:00+00:00", Fraction(0)),
+    ("1970-01-01T00:00:00.123456789Z", Fraction(123456789, 10**9)),
+    ("1970-01-01T00:00:00.000000000000000001+00:00", Fraction(1, 10**18)),
+    ("1969-12-31T23:59:59.9999999Z", Fraction(-1, 10**7)),
+    ("0001-01-01T00:00:00Z", Fraction(-62135596800)),
+    ("9999-12-31T23:59:59.999999999999999999Z",
+     Fraction(253402300799) + Fraction(10**18 - 1, 10**18)),
+    ("2000-02-29T00:00:00Z", Fraction(951782400)),
+])
+def test_public_utc_instant_preserves_calendar_and_all_decimal_precision(
+    value: str, expected: Fraction,
+) -> None:
+    """@spec HTTP-IDENTITY-V1-4 GUARDED-DELIVERY-V1-3."""
+    actual = utc_converter()(value)
+    assert isinstance(actual, Fraction)
+    assert actual == expected
+
+
+class TimestampText(str):
+    """@spec HTTP-IDENTITY-V1-4: actual strings, without coercion/subclasses."""
+
+
+@pytest.mark.parametrize("value", [
+    None, False, 0, b"1970-01-01T00:00:00Z", TimestampText("1970-01-01T00:00:00Z"), "",
+    "2023-02-29T00:00:00Z", "1900-02-29T00:00:00Z",
+    "0000-01-01T00:00:00Z", "10000-01-01T00:00:00Z",
+    "1970-01-01T24:00:00Z", "1970-01-01T00:00:60Z",
+    "1970-01-01T00:00:00+01:00", "1970-01-01T00:00:00-00:00",
+    "1970-01-01t00:00:00z", "1970-01-01T00:00:00.Z", "1970-01-01T00:00:00Z\n",
+])
+def test_public_utc_instant_refuses_invalid_input_with_one_bounded_error(value: Any) -> None:
+    """@spec HTTP-IDENTITY-V1-4 GUARDED-DELIVERY-V1-3."""
+    function = utc_converter()
+    with pytest.raises(ValueError) as caught:
+        function(value)
+    assert str(caught.value) == "invalid_utc_instant"
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None or caught.value.__suppress_context__
