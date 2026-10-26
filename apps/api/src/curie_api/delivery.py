@@ -97,34 +97,90 @@ local function delivery_window_contains(bounds, seconds, micros)
 end
 """
 
-_ENQUEUE_SCRIPT = _DELIVERY_WINDOW_LUA + """
+_IDENTITY_RECEIPT_LUA = """
+-- @spec HTTP-INVOCATION-EXECUTION-7, HTTP-INVOCATION-EXECUTION-14.
+local function identity_receipt(cur, metadata, intent)
+  if not cur then
+    if metadata then return -6, '' end
+    return 0, ''
+  end
+  if #cur == 40 and string.match(cur, '^pending:[0-9a-f]+$') then
+    if metadata then return -6, '' end
+    return 0, cur
+  end
+  if not string.match(cur, '^[0-9]+%-[0-9]+$')
+     or not metadata or #metadata > 512 then return -6, '' end
+  local context, saved_intent, stream = string.match(metadata,
+    '^{"context_digest":"([0-9a-f]+)","intent_digest":"([0-9a-f]+)","schema_version":1,"stream_id":"([0-9]+%-[0-9]+)"}$')
+  if not context or #context ~= 64 or #saved_intent ~= 64
+     or saved_intent ~= intent or stream ~= cur then return -6, '' end
+  return 1, cur
+end
+"""
+
+_IDENTITY_RECEIPT_READ = _IDENTITY_RECEIPT_LUA + """
+local status, value = identity_receipt(
+  redis.call('GET', KEYS[1]), redis.call('GET', KEYS[2]), ARGV[1])
+return {status, value}
+"""
+
+_ENQUEUE_SCRIPT = _DELIVERY_WINDOW_LUA + _IDENTITY_RECEIPT_LUA + """
 -- @spec GUARDED-DELIVERY-V1-4, GUARDED-DELIVERY-V1-5.
 local mode = ARGV[8] or ''
-local guarded = mode == 'identity_guard_v1'
+local identity = mode == 'identity_guard_v2'
+local guarded = mode == 'identity_guard_v1' or identity
+local function invalid_protocol()
+  if identity then return {-7, ''} end
+  return redis.error_reply('invalid guarded delivery protocol')
+end
 local bounds = nil
 if guarded then
-  if #KEYS ~= 4 or #ARGV ~= 14 or ARGV[7] ~= '' then
-    return redis.error_reply('invalid guarded delivery protocol')
+  local key_count = identity and 5 or 4
+  local arg_count = identity and 17 or 14
+  if #KEYS ~= key_count or #ARGV ~= arg_count or ARGV[7] ~= '' then
+    return invalid_protocol()
   end
-  for i = 1, 4 do
-    if KEYS[i] == '' then return redis.error_reply('invalid guarded delivery protocol') end
-    for j = i + 1, 4 do
+  for i = 1, key_count do
+    if KEYS[i] == '' then return invalid_protocol() end
+    for j = i + 1, key_count do
       if KEYS[i] == KEYS[j] then
-        return redis.error_reply('invalid guarded delivery protocol')
+        return invalid_protocol()
       end
     end
   end
   if not string.match(ARGV[1], '^pending:[0-9a-f]+$') or #ARGV[1] ~= 40
      or string.sub(ARGV[9], 1, 7) ~= 'stable:' or #ARGV[9] <= 7
      or not string.match(ARGV[10], '^[0-9a-f]+$') or #ARGV[10] ~= 32 then
-    return redis.error_reply('invalid guarded delivery protocol')
+    return invalid_protocol()
   end
   bounds = delivery_window_bounds(ARGV[11], ARGV[12], ARGV[13], ARGV[14])
-  if not bounds then return redis.error_reply('invalid guarded delivery protocol') end
-elseif mode ~= '' or #KEYS == 4 then
+  if not bounds then return invalid_protocol() end
+  if identity then
+    if #ARGV[15] > 16384 then return invalid_protocol() end
+    local body, signature = string.match(ARGV[15],
+      '^curie%-context%-v1%.([%w_-]+)%.([%w_-]+)$')
+    if not body or #signature ~= 43
+       or #ARGV[16] ~= 64 or not string.match(ARGV[16], '^[0-9a-f]+$')
+       or #ARGV[17] ~= 64 or not string.match(ARGV[17], '^[0-9a-f]+$')
+       or (ARGV[5] ~= '' and ARGV[5] ~= 'traceparent')
+       or (ARGV[5] == '') ~= (ARGV[6] == '')
+       or ARGV[3] == '' or ARGV[3] == 'curie_identity_context_v1'
+       or ARGV[3] == ARGV[5] then
+      return invalid_protocol()
+    end
+  end
+elseif mode ~= '' or #KEYS >= 4 then
   return redis.error_reply('invalid guarded delivery protocol')
 end
 local function append()
+  if identity then
+    if ARGV[5] ~= '' then
+      return redis.call('XADD', KEYS[2], '*', ARGV[3], ARGV[2],
+        ARGV[5], ARGV[6], 'curie_identity_context_v1', ARGV[15])
+    end
+    return redis.call('XADD', KEYS[2], '*', ARGV[3], ARGV[2],
+      'curie_identity_context_v1', ARGV[15])
+  end
   if ARGV[5] ~= '' then
     return redis.call('XADD', KEYS[2], '*', ARGV[3], ARGV[2], ARGV[5], ARGV[6])
   end
@@ -140,6 +196,14 @@ if with_receipt then
   end
 end
 local cur = redis.call('GET', KEYS[1])
+if identity then
+  local metadata = redis.call('GET', KEYS[5])
+  if cur ~= ARGV[1] or metadata then
+    local status, value = identity_receipt(cur, metadata, ARGV[16])
+    if status == -6 then return {-6, ''} end
+    if cur then return {0, value} end
+  end
+end
 if cur == ARGV[1] or not cur then
   if guarded then
     if redis.call('GET', KEYS[3]) ~= ARGV[9] then return {-2, ''} end
@@ -152,7 +216,12 @@ if cur == ARGV[1] or not cur then
   if with_receipt and redis.call('EXISTS', KEYS[3]) == 1 then return {-1, ''} end
   if not cur then redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[4]) end
   local id = append()
-  if with_receipt then
+  if identity then
+    local metadata = '{"context_digest":"' .. ARGV[17]
+      .. '","intent_digest":"' .. ARGV[16]
+      .. '","schema_version":1,"stream_id":"' .. id .. '"}'
+    redis.call('MSET', KEYS[1], id, KEYS[5], metadata)
+  elseif with_receipt then
     -- All validation precedes XADD. MSET publishes both retained keys together;
     -- there is no post-append JSON parser or second independent metadata write.
     redis.call('MSET', KEYS[1], id, KEYS[3], ARGV[7] .. id .. '"}')
@@ -323,10 +392,80 @@ class DeliveryGuardRefusal(RuntimeError):
         """@spec GUARDED-DELIVERY-V1-6."""
         if type(code) is not str or code not in {
             "fence_changed", "outside_validity", "reservation_lost", "clock_unavailable",
+            "intent_conflict",
         }:
             raise ValueError("invalid_delivery_guard_refusal")
         self.code = code
         super().__init__(code)
+
+
+@dataclass(frozen=True)
+class DeliveryIdentityContext:
+    """@spec HTTP-INVOCATION-EXECUTION-7 HTTP-INVOCATION-EXECUTION-14."""
+
+    capsule: str = field(repr=False)
+    intent_digest: str = field(repr=False)
+    receipt_key: str = field(repr=False)
+
+    def __post_init__(self) -> None:
+        """@spec HTTP-INVOCATION-EXECUTION-14."""
+        try:
+            if (
+                type(self.capsule) is not str or len(self.capsule) > 16_384
+                or re.fullmatch(
+                    r"curie-context-v1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{43}", self.capsule,
+                ) is None
+                or type(self.intent_digest) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", self.intent_digest) is None
+                or type(self.receipt_key) is not str or not self.receipt_key
+            ):
+                raise ValueError
+            self.capsule.encode("ascii")
+            self.receipt_key.encode("utf-8")
+        except (ValueError, TypeError, AttributeError):
+            raise ValueError("invalid_delivery_context") from None
+
+    @property
+    def context_digest(self) -> str:
+        """@spec HTTP-INVOCATION-EXECUTION-14."""
+        self.__post_init__()
+        return hashlib.sha256(self.capsule.encode("ascii")).hexdigest()
+
+
+async def read_identity_delivery_receipt(
+    client: redis.Redis, *, key: str, receipt_key: str, intent_digest: str,
+) -> str | None:
+    """@spec HTTP-INVOCATION-EXECUTION-14."""
+    try:
+        if (
+            any(type(value) is not str or not value for value in (key, receipt_key))
+            or key == receipt_key or type(intent_digest) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", intent_digest) is None
+        ):
+            raise ValueError
+        key.encode("utf-8")
+        receipt_key.encode("utf-8")
+    except (ValueError, TypeError, AttributeError):
+        raise ValueError("invalid_delivery_context") from None
+    result = await client.eval_ro(_IDENTITY_RECEIPT_READ, 2, key, receipt_key, intent_digest)
+    if type(result) not in (list, tuple) or len(result) != 2 or type(result[0]) is not int:
+        raise RuntimeError("invalid_identity_receipt_result")
+    if result[0] == -6:
+        raise DeliveryGuardRefusal("intent_conflict")
+    if not isinstance(result[1], (str, bytes, bytearray)):
+        raise RuntimeError("invalid_identity_receipt_result")
+    try:
+        current = text(result[1])
+    except UnicodeError:
+        raise RuntimeError("invalid_identity_receipt_result") from None
+    if result[0] == 0 and not current:
+        return None
+    if (
+        result[0] == 0 and re.fullmatch(r"pending:[0-9a-f]{32}", current)
+        or result[0] == 1 and re.fullmatch(r"[0-9]+-[0-9]+", current)
+    ):
+        return current
+    raise RuntimeError("invalid_identity_receipt_result")
 
 
 def _guarded_enqueue_result(result: Any) -> tuple[bool, str]:
@@ -460,6 +599,7 @@ async def enqueue_owned(
     receipt_key: str | None = None,
     receipt_prefix: str | None = None,
     guard: DeliveryEnqueueGuard | None = None,
+    identity_context: DeliveryIdentityContext | None = None,
 ) -> tuple[bool, str]:
     """Enqueue the payload if this request still owns the claim.
 
@@ -483,6 +623,19 @@ async def enqueue_owned(
 
     # @spec GUARDED-DELIVERY-V1-2, GUARDED-DELIVERY-V1-4.
     guarded_arguments: list[str] = []
+    if identity_context is not None:
+        if (
+            type(identity_context) is not DeliveryIdentityContext or guard is None
+            or receipt_key is not None or receipt_prefix is not None
+        ):
+            raise ValueError("invalid_delivery_context")
+        DeliveryIdentityContext.__post_init__(identity_context)
+        if (
+            transport_field not in (None, "traceparent")
+            or (transport_field is None) != (transport_value is None)
+            or payload_field in ("curie_identity_context_v1", transport_field, "")
+        ):
+            raise ValueError("invalid_delivery_context")
     if guard is not None:
         keys, guarded_arguments = _guard_arguments(
             guard, key=key, stream=stream, owner=owner,
@@ -490,6 +643,16 @@ async def enqueue_owned(
         )
     else:
         keys = [key, stream] if receipt_key is None else [key, stream, receipt_key]
+    if identity_context is not None:
+        assert guard is not None
+        if identity_context.receipt_key in (*keys, guard.reservation.counter_key):
+            raise ValueError("invalid_delivery_context")
+        keys.append(identity_context.receipt_key)
+        guarded_arguments[0] = "identity_guard_v2"
+        guarded_arguments.extend([
+            identity_context.capsule, identity_context.intent_digest,
+            identity_context.context_digest,
+        ])
     # @spec HOOK-RECEIPT-1, HOOK-RECEIPT-5. The hook codec validates and bounds this prefix
     # before claiming. Lua only appends the server's canonical stream ID.
     if (receipt_key is None) != (receipt_prefix is None):
@@ -510,6 +673,11 @@ async def enqueue_owned(
         *guarded_arguments,
     )
     if guard is not None:
+        if (
+            identity_context is not None and type(result) in (list, tuple) and len(result) == 2
+            and type(result[0]) is int and result[0] == -6
+        ):
+            raise DeliveryGuardRefusal("intent_conflict")
         return _guarded_enqueue_result(result)
     enqueued, current = result
     if enqueued == -1:
