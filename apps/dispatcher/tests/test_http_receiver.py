@@ -291,7 +291,7 @@ def test_exact_native_turn_bytes_and_receiver_proof_are_bound_without_core_keys(
         "address": CHANNEL,
         "adapter": NAME,
         "delivery_id": "EvNativeSynthetic",
-        "conversation_id": CHANNEL + ":1700.0001",
+        "conversation_id": "1700.0001",
         "author": SENDER,
         "text": "Hello synthetic receiver",
         "reply_ref": "",
@@ -312,7 +312,7 @@ def test_exact_native_turn_bytes_and_receiver_proof_are_bound_without_core_keys(
         "binding_generation": 7,
         "delivery_id": "EvNativeSynthetic",
         "native_channel_id": CHANNEL,
-        "conversation_id": CHANNEL + ":1700.0001",
+        "conversation_id": "1700.0001",
         "body_sha256": hashlib.sha256(request.content).hexdigest(),
         "slack": {
             "delivery": "app_mention",
