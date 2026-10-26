@@ -19,7 +19,11 @@ from pydantic import (
 )
 
 from curie_api.schemas.directory import DirectoryConfigIn
-from curie_api.schemas.http_identity import CanonicalUUID, Text, _issuer, _text
+from curie_api.schemas.http_identity import CanonicalUUID, Issuer, Text
+
+# Reuse public facts annotations without importing their private validators.
+_FACTS_ISSUER = TypeAdapter(Issuer)
+_FACTS_TEXT = TypeAdapter(Text)
 
 # Reuse the configuration owner's constraints without its update/CAS surface.
 _DIRECTORY_ISSUER = TypeAdapter[Any](
@@ -37,7 +41,12 @@ _DIRECTORY_MANAGER = TypeAdapter[Any](
 def _configuration_issuer(value: str) -> str:
     """@spec HTTP-AUTHORITY-CONFIG-V1-1."""
     _DIRECTORY_ISSUER.validate_python(value)
-    return _issuer(value)
+    return _FACTS_ISSUER.validate_python(value)
+
+
+def _mode(value: Any) -> str:
+    """@spec HTTP-AUTHORITY-CONFIG-V1-1."""
+    return _FACTS_TEXT.validate_python(value)
 
 
 def _domains(value: Any) -> list[str]:
@@ -115,13 +124,13 @@ class CredentialReferenceV1(AuthorityModel):
 class DisabledSelectionV1(AuthorityModel):
     """@spec HTTP-AUTHORITY-CONFIG-V1-1."""
 
-    mode: Annotated[Literal["disabled"], BeforeValidator(_text)]
+    mode: Annotated[Literal["disabled"], BeforeValidator(_mode)]
 
 
 class LocalProjectionSelectionV1(AuthorityModel):
     """@spec HTTP-AUTHORITY-CONFIG-V1-1."""
 
-    mode: Annotated[Literal["local_projection"], BeforeValidator(_text)]
+    mode: Annotated[Literal["local_projection"], BeforeValidator(_mode)]
     issuer: ConfigurationIssuer
     governed_domains: Annotated[list[str], BeforeValidator(_domains)]
     managed_by: Annotated[Text, AfterValidator(_manager)]
@@ -133,7 +142,7 @@ class HttpSelectionV1(AuthorityModel):
     @spec HTTP-AUTHORITY-CONFIG-V1-3 to HTTP-AUTHORITY-CONFIG-V1-5.
     """
 
-    mode: Annotated[Literal["http"], BeforeValidator(_text)]
+    mode: Annotated[Literal["http"], BeforeValidator(_mode)]
     issuer: ConfigurationIssuer
     lookup_url: Annotated[Text, AfterValidator(_lookup_url)]
     credential_ref: CredentialReferenceV1
