@@ -11,12 +11,12 @@ The current protected production writers are:
 
 | Route owner | Mutations |
 | --- | --- |
-| `routers/agents.py` | Agent POST/PATCH/DELETE; channel POST/PATCH/DELETE; channel caller-list PUT. |
-| `routers/agent_access.py` | Existing whole-policy PUT. |
-| `routers/directory.py` | Configuration PUT; team, credential, namespace, attempt and account-status POST; snapshot PUT; invalid-snapshot failure recording. |
-| `routers/identity.py` | Slack-report POST. |
-| `routers/identity_connect.py` | Connection-confirm POST. |
-| `routers/channel_identities.py`, `routers/provider_installations.py` | POST/PATCH/DELETE. |
+| `apps/api/src/curie_api/routers/agents.py` | Agent POST/PATCH/DELETE; channel POST/PATCH/DELETE; channel caller-list PUT. |
+| `apps/api/src/curie_api/routers/agent_access.py` | Existing whole-policy PUT. |
+| `apps/api/src/curie_api/routers/directory.py` | Configuration PUT; team, credential, namespace, attempt and account-status POST; snapshot PUT; invalid-snapshot failure recording. |
+| `apps/api/src/curie_api/routers/identity.py` | Slack-report POST. |
+| `apps/api/src/curie_api/routers/identity_connect.py` | Connection-confirm POST. |
+| `apps/api/src/curie_api/routers/channel_identities.py`, `apps/api/src/curie_api/routers/provider_installations.py` | POST/PATCH/DELETE. |
 
 Ordinary writers use SessionDep and pass that session to services/CRUD. The known independent write-session bypass is DirectoryRoute's validation-failure recorder. Repair it under criterion 7. Teams/identity-admin currently provide reads only. Static Slack bootstrap/retry, `/identity/resolve`, `/channels/token`, console/OIDC and unrelated control subresources are outside the existing protected set; do not declare this change their fence or silently change that set.
 
