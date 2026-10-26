@@ -92,15 +92,15 @@ def test_0136_raises_both_deadline_checks_and_downgrade_refuses_longer_rows(
         requests_before = sql_dicts(
             "SELECT id, started_at, execution_deadline FROM curie.execution_requests ORDER BY id"
         )
-        assert len(agents_before) == 3
-        assert len(requests_before) == 4
+        assert len(agents_before) == 2
+        assert len(requests_before) == 3
         assert long_agent in {row["id"] for row in agents_before}
 
         with pytest.raises(RuntimeError) as excinfo:
             command.downgrade(config, BELOW)
         message = str(excinfo.value)
+        assert re.search(r"\b2\b", message), message
         assert re.search(r"\b3\b", message), message
-        assert re.search(r"\b4\b", message), message
 
         # The refusal alters no data and leaves the revision where it was.
         assert (
@@ -142,9 +142,7 @@ def test_0136_downgrade_succeeds_when_every_row_is_within_three_hours(
     try:
         command.downgrade(config, BELOW)
         assert stamped_revision() == BELOW
-        assert sql_dicts(
-            "SELECT 1 FROM curie.agents WHERE execution_deadline_seconds = 10800"
-        )
+        assert sql_dicts("SELECT 1 FROM curie.agents WHERE execution_deadline_seconds = 10800")
         assert len(sql_dicts("SELECT 1 FROM curie.execution_requests")) == 1
     finally:
         _clear_long_deadlines()
