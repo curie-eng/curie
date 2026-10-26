@@ -41,7 +41,11 @@ The GitLab entries are driven by the gitlab driver with `--forge-target`.
 node's address and removes it, and its teardown check reads the fixture's
 state directory as gone; it also asserts that a Reporter's label admits
 nothing. `@saas` reads its gitlab.com test project and token files from the
-environment, and its live run fails before any step when one is unset.
+environment, and its live run fails before any step when one is unset. Both
+GitLab entries also assert that the issue shows the in-progress label
+(`curie-factory:running`) within one tracker poll interval of the labeler's
+label, and that exactly one factory status note on the issue links the merge
+request (#4867).
 """
 
 from __future__ import annotations
@@ -93,6 +97,14 @@ NAMESPACE_GONE = (
     "the run's namespace is gone: kubectl --context <context> get namespace <namespace> "
     "--ignore-not-found -o name exits 0 and prints nothing"
 )
+# The classified expiry labels `curie cluster status --json` reports per forge
+# credential (cli/src/forge_expiry.rs `classify(...).label()`).
+CREDENTIALS_EXPIRY_LABELS = ("known", "unknown", "none")
+# The expected value of the `scenario.cluster_status.credentials` persisted
+# assertion (#4866): a plain string, so the dry run prints it verbatim and the
+# judge dispatches on it to check every recorded row's expiry against the
+# labels instead of one expected value.
+CREDENTIALS_EXPIRY_VALID = "every credential's expiry is one of known, unknown or none"
 
 Runner = Callable[[list[str], float], int]
 Kubectl = Callable[[list[str]], "subprocess.CompletedProcess[str]"]
@@ -266,6 +278,11 @@ def _persisted(
         ("scenario.forge_merged", True),
         ("scenario.work_item_pr_status", "merged"),
         ("scenario.cli_pr_status", "merged"),
+        # The reads the loop records before teardown (#4866): the per-run
+        # cost is complete, and every recorded credential row carries one of
+        # the classified expiry labels.
+        ("scenario.usage.cost_complete", True),
+        ("scenario.cluster_status.credentials", CREDENTIALS_EXPIRY_VALID),
         *tracker,
         ("teardown_clean", True),
         *((f"teardown_ok.{name}", True) for name in teardown_steps),
@@ -328,6 +345,8 @@ def _gitlab_step(target: str) -> Step:
     tracker: tuple[tuple[str, Any], ...] = (
         ("scenario.tracker.closes_issue", True),
         ("scenario.tracker.thread_replies", 1),
+        # #4867 decision 2: exactly one factory note on the issue links the MR.
+        ("scenario.tracker.status_note_links_mr", True),
     )
     teardown_steps: tuple[str, ...] = (
         "reset fixture repository",
@@ -344,9 +363,14 @@ def _gitlab_step(target: str) -> Step:
         )
         remote = (
             "GitLab shows one new issue opened and labelled by developer through Sudo",
+            "the issue shows the in-progress label (curie-factory:running) within one "
+            "tracker poll interval of the developer's label "
+            "(scenario.tracker.in_progress_label_seconds)",
             "a second issue labelled by reporter admits no WorkItem and gets no state label",
             "GitLab shows exactly one merge request opened by the factory whose description "
             "carries Closes #<iid>",
+            "the issue gets exactly one factory status note that links the merge request "
+            "(scenario.tracker.status_note_links_mr)",
             "the merge request's first head carries a failing external commit status from "
             "developer (CI red)",
             "a later head pushed by the factory has passing checks (CI green)",
@@ -371,8 +395,13 @@ def _gitlab_step(target: str) -> Step:
         )
         remote = (
             "gitlab.com shows one new issue opened and labelled by the human Owner",
+            "the issue shows the in-progress label (curie-factory:running) within one "
+            "tracker poll interval of the Owner's label "
+            "(scenario.tracker.in_progress_label_seconds)",
             "gitlab.com shows exactly one merge request opened by the factory whose "
             "description carries Closes #<iid>",
+            "the issue gets exactly one factory status note that links the merge request "
+            "(scenario.tracker.status_note_links_mr)",
             "the merge request's first head carries a failing external commit status from "
             "the human Owner (CI red)",
             "a later head pushed by the factory has passing checks (CI green)",
@@ -553,6 +582,28 @@ def _get_path(evidence: Any, dotted: str) -> Any:
     return node
 
 
+def _credential_expiry_failures(field: str, got: Any) -> list[str]:
+    """Every way the recorded credential rows fall short of the expiry labels.
+
+    Pure. A release may record no forge credential, so an empty list passes;
+    each recorded row must be an object whose ``expiry`` is one of
+    ``CREDENTIALS_EXPIRY_LABELS`` (#4866).
+    """
+
+    if got is _MISSING:
+        return [f"evidence {field} is missing, expected the cluster status credential rows"]
+    if not isinstance(got, list):
+        return [f"evidence {field} is {got!r}, expected the cluster status credential rows"]
+    failures: list[str] = []
+    for index, row in enumerate(got):
+        if not isinstance(row, dict) or row.get("expiry") not in CREDENTIALS_EXPIRY_LABELS:
+            failures.append(
+                f"evidence {field}[{index}] is {row!r}, "
+                f"expected expiry one of {', '.join(CREDENTIALS_EXPIRY_LABELS)}"
+            )
+    return failures
+
+
 def _namespace_gone(args: Any, evidence: Mapping[str, Any], kubectl: Kubectl) -> str | None:
     """None when the namespace is gone, else why not.
 
@@ -610,7 +661,9 @@ def _judge_step(
     else:
         for field, expected in step.persisted_assertions:
             got = _get_path(evidence, field)
-            if got is _MISSING:
+            if expected == CREDENTIALS_EXPIRY_VALID:
+                failures.extend(_credential_expiry_failures(field, got))
+            elif got is _MISSING:
                 failures.append(f"evidence {field} is missing, expected {expected!r}")
             elif got != expected:
                 failures.append(f"evidence {field} is {got!r}, expected {expected!r}")

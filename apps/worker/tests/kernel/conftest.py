@@ -21,7 +21,7 @@ import uuid
 from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any, NoReturn
 
 import aiohttp
 import pytest
@@ -40,6 +40,7 @@ from channel_protocol.reply import (
     TurnCompleted,
     TurnStatus,
 )
+from curie_test_support.postgres import pg_connect_or_skip
 from curie_test_support.valkey import (
     VALKEY_HOST as _VALKEY_HOST,
 )
@@ -70,6 +71,9 @@ from redis.backoff import NoBackoff
 from redis.maint_notifications import MaintNotificationsConfig
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+
+if TYPE_CHECKING:
+    from curie_worker.sandbox.types import ToolDaemonMount
 
 # ``sync_redis`` and ``names`` (the per-test-unique stream / group / key
 # prefixes on the shared Valkey) live in ``tests/conftest.py``: they are used
@@ -137,6 +141,11 @@ def make_hook_run() -> Callable[..., contextlib.AbstractAsyncContextManager[Hook
     @contextlib.asynccontextmanager
     async def seed(*, outcome: str | None = None) -> AsyncIterator[HookRunSeed]:
         engine = create_async_engine(_DB_URL)
+        try:
+            await pg_connect_or_skip(engine)
+        except BaseException:
+            await engine.dispose()
+            raise
         token = uuid.uuid4().hex
         agent_id = uuid.uuid4()
         version_id = uuid.uuid4()
@@ -527,9 +536,12 @@ class FakeK8s:
         pool: str,
         env: dict[str, str] | None = None,
         labels: dict[str, str] | None = None,
+        deadline: float,
         runner_resources: dict[str, object] | None = None,
         agent_name: str | None = None,
+        tool_daemon: ToolDaemonMount | None = None,
     ) -> None:
+        assert deadline > 0 and tool_daemon is None
         self.claim_envs.append(env)
         sandbox_name = f"sbx-{name}"
         quota_rejection = self.quota_rejection
@@ -636,6 +648,23 @@ class FakeK8s:
         self.termination_queries.append(name)
         return self.termination
 
+    # No Docker repository pool is configured in this suite, so the substrate
+    # never reaches the tool-daemon seam (ADR 0217); any call is a test bug.
+    def create_daemon_object(self, *args: object, **kwargs: object) -> NoReturn:
+        raise AssertionError("no tool daemon is provisioned in this suite")
+
+    def list_daemon_objects(self, *args: object, **kwargs: object) -> NoReturn:
+        raise AssertionError("no tool daemon is listed in this suite")
+
+    def delete_daemon_object(self, *args: object, **kwargs: object) -> NoReturn:
+        raise AssertionError("no tool daemon is retired in this suite")
+
+    def get_daemon_pod(self, *args: object, **kwargs: object) -> NoReturn:
+        raise AssertionError("no tool daemon pod is read in this suite")
+
+    def open_daemon_stream(self, *args: object, **kwargs: object) -> NoReturn:
+        raise AssertionError("no tool daemon is pinged in this suite")
+
     def set_sandbox_mode(self, name: str, mode: str) -> None:
         self.sandboxes[name].operating_mode = mode
 
@@ -692,6 +721,7 @@ class FakeRunner:
         # None omits the key, as a runner that predates it does; anything else
         # is sent as is, so a test can advertise ``False`` or ``"true"``.
         self.channel_read_enforced: object = None
+        self.attachment_access_enforced: object = None
         # When set, /status answers 200 with no ``turn_active`` field.
         self.status_malformed = False
         self.status_delay_seconds = 0.0
@@ -747,6 +777,8 @@ class FakeRunner:
         }
         if self.tool_access_enforced is not None:
             body["tool_access"] = list(self.tool_access_enforced)
+        if self.attachment_access_enforced is not None:
+            body["attachment_access"] = self.attachment_access_enforced
         if self.channel_read_enforced is not None:
             body["channel_read"] = self.channel_read_enforced
         if request.path == "/v1/status":
@@ -1066,6 +1098,7 @@ async def kernel_harness(
     sibling_limit_factory: Callable[[AsyncRedis, WorkerConfig], object] | None = None,
     progress_factory: Callable[[AsyncRedis, WorkerConfig], object] | None = None,
     sweep_factory: Callable[[AsyncRedis, WorkerConfig], object] | None = None,
+    pod_termination_wait_s: float = 0.0,
     **config_overrides: object,
 ) -> AsyncIterator[Harness]:
     """Assemble a live kernel wired to a fake runner and real Valkey."""
@@ -1194,6 +1227,12 @@ async def kernel_harness(
 
         killswitch = KillSwitch(async_redis, on_kill=kernel.interrupt_agent)
         kernel.attach_killswitch(killswitch)
+    from curie_worker.kernel import constants as kernel_constants
+
+    _wait_existed = hasattr(kernel_constants, "POD_TERMINATION_WAIT_S")
+    _wait_previous = getattr(kernel_constants, "POD_TERMINATION_WAIT_S", None)
+    # raising=False equivalent: the attribute need not exist on a reverted source.
+    kernel_constants.POD_TERMINATION_WAIT_S = pod_termination_wait_s
     try:
         yield Harness(
             substrate,
@@ -1208,6 +1247,10 @@ async def kernel_harness(
             runners,
         )
     finally:
+        if _wait_existed:
+            kernel_constants.POD_TERMINATION_WAIT_S = _wait_previous
+        else:
+            delattr(kernel_constants, "POD_TERMINATION_WAIT_S")
         with contextlib.suppress(Exception):
             await runner_client.close()
         with contextlib.suppress(Exception):

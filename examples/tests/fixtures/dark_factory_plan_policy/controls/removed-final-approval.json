@@ -1,0 +1,71 @@
+{
+  "description": "Removes the diff review from the whole workflow: the review_diff phase and step, the diff reviewer, and every sentence that requires the diff reviewer's approval before publishing, so the control is a coherent skill with no final diff approval. Each find string must occur exactly once in the candidate prompt after the section removal.",
+  "remove_sections": [
+    {
+      "start": "## 7. Diff review",
+      "end": "## Loop cap"
+    }
+  ],
+  "deletions": [
+    {
+      "find": "Every run walks nine phases, named in each step heading below: `read_issue`,\n`pin_criteria`, `plan` (which starts by exploring the repository),\n`plan_review`, `failing_test`, `implement` (which also runs the checks),\n`review_diff`, `publish` and `wait_ci`. The plan gets exactly one review,\n`plan_review` round 1. Two pairs loop: `implement` and `review_diff`, then\n`wait_ci` back to `implement` when the pull request's checks fail. Each of\nthose loops runs at most 3 rounds.",
+      "replace": "Every run walks eight phases, named in each step heading below: `read_issue`,\n`pin_criteria`, `plan` (which starts by exploring the repository),\n`plan_review`, `failing_test`, `implement` (which also runs the checks),\n`publish` and `wait_ci`. The plan gets exactly one review,\n`plan_review` round 1. One pair loops: `wait_ci` back to `implement` when the\npull request's checks fail. That loop runs at most 3 rounds."
+    },
+    {
+      "find": "`round` for `plan`, `plan_review`, `implement` and\n`review_diff`, and an optional",
+      "replace": "`round` for `plan`, `plan_review` and `implement`, and an optional"
+    },
+    {
+      "find": "refuses a review out of order or a second plan review, and\nrefuses publication until the diff reviewer approves. Follow",
+      "replace": "refuses a review out of order or a second plan review. Follow"
+    },
+    {
+      "find": "Two independent reviewers check your work, and\nthey are the only sub-agents you may start: `dark-factory:plan-reviewer` in\nphase `plan_review` and `dark-factory:diff-reviewer` in phase `review_diff`.",
+      "replace": "One independent reviewer checks your work, and\nit is the only sub-agent you may start: `dark-factory:plan-reviewer` in\nphase `plan_review`."
+    },
+    {
+      "find": "Publish only if\n   the diff reviewer approved and every criterion is met and verified;",
+      "replace": "Publish only if\n   every criterion is met and verified;"
+    },
+    {
+      "find": "and ignore the rest. Never apply\ndiff-review notes to the code after the diff reviewer approved; that approval\ncovers the diff it read. List diff-review notes in the pull request body as\nnotes you did not address.\n",
+      "replace": "and ignore the rest.\n"
+    },
+    {
+      "find": "to every plan review and diff review call.",
+      "replace": "to every plan review call."
+    },
+    {
+      "find": "give each finding with its resolution to the diff\n  reviewer in step 7.",
+      "replace": "give each finding with its resolution in the pull\n  request body in step 8."
+    },
+    {
+      "find": "On round 2 or 3,\nfix every finding from the previous diff review.",
+      "replace": "On round 2 or 3,\nfix what the failing checks show."
+    },
+    {
+      "find": "a mock presented as real, or a fixed result.\n",
+      "replace": "a mock presented as real, or a fixed result. When the checks are done, go to\nstep 8.\n"
+    },
+    {
+      "find": "The diff loop and the `wait_ci` loop each run at most 3 rounds. The plan\nreview is a single pass and never repeats. A diff review rejection returns to\nstep 6 (implement), never to the plan. When the diff reviewer still answers\n`VERDICT: CHANGES` on round 3, or a review fails, do not publish:",
+      "replace": "The `wait_ci` loop runs at most 3 rounds. The plan review is a single pass\nand never repeats. When the checks still fail on `wait_ci` round 3, or a\nreview fails, do not publish:"
+    },
+    {
+      "find": ", every available product check passes, and the\ndiff reviewer's latest verdict is `VERDICT: APPROVE`.",
+      "replace": ", and every available product check passes."
+    },
+    {
+      "find": "findings was resolved, then the diff review rounds it took, then anything",
+      "replace": "findings was resolved, then anything"
+    },
+    {
+      "find": "The platform opens the pull request after\nthe approval, and its checks run there.",
+      "replace": "The platform opens the pull request, and its\nchecks run there."
+    },
+    {
+      "find": "Then run step 7 (`review_diff`) again and\npublish per step 8;",
+      "replace": "Then publish per step 8;"
+    }
+  ]
+}

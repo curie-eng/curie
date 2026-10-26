@@ -1,4 +1,4 @@
-"""ADR 0238 review r1 F4: approval resumes of agent schedule firings, driven
+"""ADR 0248 review r1 F4: approval resumes of agent schedule firings, driven
 through the kernel's real ``process_event``.
 
 An approved continuation of a firing on ``hook:<agent>:agent-schedule:<id>``

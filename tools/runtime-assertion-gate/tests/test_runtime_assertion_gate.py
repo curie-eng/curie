@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import importlib.util
 import json
 import os
@@ -327,7 +328,8 @@ def test_self_test_refuses_an_unregistered_anchor() -> None:
 CHART_JOB = "e2e-cluster-chart-regressions"
 CHART_JOB_IF = "${{ needs.changes.outputs.chart_scenarios != '[]' }}"
 CHART_STEP_IF = (
-    "${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'example-runtime') }}"
+    "${{ matrix.leg == 'chart' && "
+    "contains(fromJSON(needs.changes.outputs.chart_scenarios), 'example-runtime') }}"
 )
 CHART_RUNTIME_SCRIPTS = [
     "charts/curie/ci/runtime/upgrade-drain-installation-runtime.sh",
@@ -337,6 +339,7 @@ CHART_RUNTIME_SCRIPTS = [
     "charts/curie/ci/runtime/connector-readiness-runtime.sh",
     "charts/curie/ci/runtime/workspace-dependency-diagnostic-runtime.sh",
     "charts/curie/ci/runtime/idle-capacity-reclamation-runtime.sh",
+    "charts/curie/ci/runtime/factory-resource-profile-runtime.sh",
 ]
 
 
@@ -348,7 +351,7 @@ def _chart_workflow(tmp_path: Path) -> tuple[Path, Path]:
     document["chart_scenarios"] = {
         "job": CHART_JOB,
         "shared_inputs": ["charts/curie/templates"],
-        "scenarios": {"example-runtime": {"step": "Run it", "inputs": [SCRIPT]}},
+        "scenarios": {"example-runtime": {"step": "Run it", "inputs": [SCRIPT], "leg": "chart"}},
     }
     registry.write_text(yaml.safe_dump(document, sort_keys=False))
     workflow.write_text(yaml.safe_dump({
@@ -376,7 +379,8 @@ def test_chart_assertion_registers_with_its_own_scenario_condition(tmp_path: Pat
     ["old-job-if", "wrong-job-if", "wrong-step-if", "wrong-scenario-id", "missing-step-if",
      "missing-entry", "wrong-step-name", "script-only-shared", "script-only-other-scenario",
      "no-calico", "late-calico", "conditional-calico", "step-continue", "job-continue",
-     "other-command", "not-required", "different-job"],
+     "other-command", "not-required", "different-job", "missing-leg-clause", "wrong-leg",
+     "missing-registry-leg"],
 )
 def test_chart_scenario_registration_preserves_all_gate_requirements(
     tmp_path: Path, mutation: str,
@@ -407,7 +411,11 @@ def test_chart_scenario_registration_preserves_all_gate_requirements(
         if mutation == "script-only-shared":
             section["shared_inputs"].append(SCRIPT)
         else:
-            section["scenarios"]["other-runtime"] = {"step": "Other step", "inputs": [SCRIPT]}
+            section["scenarios"]["other-runtime"] = {
+                "step": "Other step",
+                "inputs": [SCRIPT],
+                "leg": "chart",
+            }
     elif mutation == "no-calico":
         del job["steps"][0]
     elif mutation == "late-calico":
@@ -422,6 +430,15 @@ def test_chart_scenario_registration_preserves_all_gate_requirements(
         step["run"] += "\necho unrelated command"
     elif mutation == "not-required":
         document["jobs"]["e2e-required"]["needs"] = ["changes"]
+    elif mutation == "missing-leg-clause":
+        # The pre-#4722 condition runs the step in every leg.
+        step["if"] = (
+            "${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'example-runtime') }}"
+        )
+    elif mutation == "wrong-leg":
+        step["if"] = CHART_STEP_IF.replace("'chart'", "'workload'")
+    elif mutation == "missing-registry-leg":
+        del entry["leg"]
     else:
         document["jobs"]["other-chart-job"] = document["jobs"].pop(CHART_JOB)
         document["jobs"]["e2e-required"]["needs"] = ["changes", "other-chart-job"]
@@ -432,10 +449,36 @@ def test_chart_scenario_registration_preserves_all_gate_requirements(
 
 
 def test_real_ci_registers_every_enabled_chart_runtime_script() -> None:
-    disabled = "charts/curie/ci/runtime/idle-capacity-reclamation-runtime.sh"
-    gate.check_registration(CI, [s for s in CHART_RUNTIME_SCRIPTS if s != disabled])
-    with pytest.raises(gate.GateError, match="idle-capacity-reclamation-runtime"):
-        gate.check_registration(CI, [disabled])
+    gate.check_registration(CI, list(CHART_RUNTIME_SCRIPTS))
+
+
+def test_chart_legs_upload_distinct_receipts_the_required_verdict_merges() -> None:
+    jobs = yaml.safe_load(CI.read_text())["jobs"]
+    uploads = [
+        step
+        for step in jobs[CHART_JOB]["steps"]
+        if step.get("name") == "Upload runtime assertion receipts"
+    ]
+    assert len(uploads) == 1
+    name = uploads[0]["with"]["name"]
+    assert name == "runtime-assertion-receipts-${{ github.job }}-${{ matrix.leg }}"
+    downloads = [
+        step
+        for step in jobs["e2e-required"]["steps"]
+        if step.get("name") == "Download runtime assertion receipts"
+    ]
+    assert len(downloads) == 1
+    download = downloads[0]["with"]
+    assert download["merge-multiple"] is True
+    names = {
+        name.replace("${{ github.job }}", CHART_JOB).replace("${{ matrix.leg }}", leg)
+        for leg in ("chart", "workload")
+    }
+    # Two legs uploading one name would collide; each leg needs its own artifact.
+    assert len(names) == 2
+    for artifact in names:
+        assert "${{" not in artifact
+        assert fnmatch.fnmatchcase(artifact, download["pattern"]), artifact
 
 
 def test_self_test_exercises_the_registry_omission_negative_control(

@@ -23,7 +23,7 @@ pub(crate) use dev::*;
 pub(crate) use local::*;
 pub(crate) use skill::*;
 
-/// The agent-schedule verbs and policy setters (ADR 0238) flattened into each
+/// The agent-schedule verbs and policy setters (ADR 0248) flattened into each
 /// tier's `schedules`. They all need `--agent`, conflict with each other and
 /// with `--pause`/`--resume` through the `schedule_verb` group (`--pause` and
 /// `--resume` join it where they are declared).
@@ -559,7 +559,7 @@ impl<C: clap::Args> ActionsCommand<C> {
     }
 }
 
-/// `<tier> skills <agent> <verb>`: an agent's learned skills (ADR 0237),
+/// `<tier> skills <agent> <verb>`: an agent's learned skills (ADR 0247),
 /// shared by `local` and `cluster`. `C` is the tier's connection flags; they
 /// are global, so they parse after the verb's own arguments too.
 #[derive(Args, Debug, Clone)]
@@ -662,7 +662,9 @@ impl From<RemediationPolicyWriteArgs> for commands::PolicyWriteArgs {
 /// The `remediation-policy` verbs, shared by `local` and `cluster` so the two
 /// tiers cannot drift. `C` is the tier's connection flags, carried on each
 /// leaf so they parse after the verb's own arguments. Writes authenticate
-/// their operator with CURIE_APPROVAL_PRINCIPAL_TOKEN.
+/// their operator with CURIE_APPROVAL_PRINCIPAL_TOKEN; `apply` and `arm` also
+/// present the remediation authority from CURIE_REMEDIATION_AUTHORITY_KEY
+/// (ADR 0231).
 #[derive(Subcommand, Debug, Clone)]
 pub(crate) enum RemediationPolicyCommand<C: clap::Args> {
     /// Read a hook's current remediation policy generation
@@ -677,6 +679,7 @@ pub(crate) enum RemediationPolicyCommand<C: clap::Args> {
     },
     /// Bind or replace a hook's policy from a JSON document (`PUT`). The
     /// document is validated with the platform's rules before any request.
+    /// Needs the remediation authority in CURIE_REMEDIATION_AUTHORITY_KEY.
     Apply {
         /// Agent name or id.
         agent: String,
@@ -691,6 +694,7 @@ pub(crate) enum RemediationPolicyCommand<C: clap::Args> {
         conn: C,
     },
     /// Arm the current policy so its automatic actions may run (`POST .../arm`).
+    /// Needs the remediation authority in CURIE_REMEDIATION_AUTHORITY_KEY.
     Arm {
         /// Agent name or id.
         agent: String,
@@ -1622,6 +1626,10 @@ pub(crate) enum FactoryAction {
         /// Daily USD budget for the deployed agent.
         #[arg(long, default_value_t = curie::factory_quickstart::DEFAULT_BUDGET_USD)]
         budget: f64,
+        /// Output token allowance for each run of the deployed agent
+        /// (max_output_tokens_per_run). Must be > 0.
+        #[arg(long, value_name = "N", default_value_t = curie::factory_quickstart::DEFAULT_OUTPUT_TOKENS_PER_RUN, value_parser = clap::value_parser!(u64).range(1..))]
+        output_tokens: u64,
         /// Agent to deploy. On a release that already records factory intake
         /// and with no App flags, the agent is added to that install: no
         /// cluster up, App registration, or intake.
@@ -1894,7 +1902,7 @@ impl EvalSamplingArgs {
 }
 
 /// The reversible memory lifecycle flags shared by `local memory` and
-/// `cluster memory` (ADR 0239). Each acts on one canonical entry, in agent
+/// `cluster memory` (ADR 0249). Each acts on one canonical entry, in agent
 /// memory or the `--channel` selected binding, and none combines with add,
 /// delete, a guidance flag, or another lifecycle flag. None takes an expected
 /// version from argv: every mutation reads the current one first.

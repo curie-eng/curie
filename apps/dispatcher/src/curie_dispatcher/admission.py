@@ -26,8 +26,11 @@ Answers live in two layers: a bounded in-process LRU in front of Valkey, which
 the dispatcher already holds for dedupe. Valkey is what lets a dispatcher that
 restarts during an API blip keep answering from what the previous process
 learned; every key there expires with the stale window, so a restart can never
-serve an answer older than the ADR's bound. A Valkey that cannot answer only
-costs the second layer.
+serve an answer older than the ADR's bound. Every lookup also checks the
+current identity fence in Valkey; pending, missing-uninitializable, malformed
+or unavailable fencing forces a fresh API decision. A newer stable generation
+partitions both layers, so old identity decisions cannot survive a directory,
+account status, identity link or agent policy change.
 
 An API that predates ADR 0175 answers FastAPI's route-miss 404 for the
 endpoint. Such an API has no caller lists, so none can refuse anyone: the
@@ -51,10 +54,12 @@ import json
 import logging
 import threading
 import time
+import uuid
 from collections import OrderedDict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Final, Literal
+from urllib.parse import urlsplit
 
 import httpx
 import redis
@@ -73,6 +78,7 @@ logger = logging.getLogger(__name__)
 #: the same reason ``handlers._mint_turn`` states it: a Slack dispatcher that
 #: could ask about another kind's bindings is a misrouting vector.
 SLACK_KIND = "slack"
+IDENTITY_FENCE_KEY = "curie:identity:admission-fence"
 
 # Every phase named, because httpx timeouts are per phase and a phase left at
 # its default silently joins the sum. The call runs after Bolt has acked the
@@ -128,6 +134,7 @@ class AdmissionAnswer:
     allowed: bool
     restricted: bool
     install_restricted: bool = True
+    connect_url: str | None = None
 
 
 class AdmissionClient:
@@ -154,7 +161,12 @@ class AdmissionClient:
         self._skew_logged = False
 
     def ask(
-        self, *, address: str, adapter: str | None, callers: tuple[str, ...]
+        self,
+        *,
+        address: str,
+        adapter: str | None,
+        callers: tuple[str, ...],
+        slack: dict[str, Any] | None = None,
     ) -> AdmissionAnswer | None:
         """Ask whether ``callers`` may start a turn on the Slack route.
 
@@ -174,6 +186,8 @@ class AdmissionClient:
         }
         if adapter is not None:
             body["adapter"] = adapter
+        if slack is not None:
+            body["slack"] = slack
         headers = dict(self._headers)
         inject_trace_context(headers)
         try:
@@ -221,7 +235,24 @@ def _answer_from(parsed: Any) -> AdmissionAnswer | None:
         isinstance(allowed, bool) and isinstance(restricted, bool) and isinstance(install, bool)
     ):
         return None
-    return AdmissionAnswer(allowed=allowed, restricted=restricted, install_restricted=install)
+    connect_url = parsed.get("connect_url")
+    if connect_url is not None:
+        if not isinstance(connect_url, str) or len(connect_url) > 4096:
+            return None
+        try:
+            url = urlsplit(connect_url)
+            if (
+                url.scheme not in {"http", "https"}
+                or not url.hostname
+                or url.username
+                or url.password
+            ):
+                return None
+        except ValueError:
+            return None
+    return AdmissionAnswer(
+        allowed=allowed, restricted=restricted, install_restricted=install, connect_url=connect_url
+    )
 
 
 @dataclass
@@ -268,67 +299,134 @@ class AdmissionGate:
         # When the last fetch failed, on this gate's clock; None when the last
         # fetch answered. Inside `_FAILURE_BACKOFF_S` of it nobody asks.
         self._failed_at: float | None = None
+        self._failed_generation: str | None = None
 
     def refusal(
-        self, *, address: str, adapter: str | None, callers: Iterable[str]
+        self,
+        *,
+        address: str,
+        adapter: str | None,
+        callers: Iterable[str],
+        slack: dict[str, Any] | None = None,
+        on_connect: Callable[[str], None] | None = None,
     ) -> DropReason | None:
-        """The reason this caller must not start a turn, or None to admit.
+        """Use cached authority only under a currently verified stable fence.
 
-        Args:
-            address: the Slack conversation id the delivery arrived in.
-            adapter: the identity half of the route, None for the default app.
-            callers: every id Slack reports for the caller; blanks are dropped.
-
-        Returns:
-            None to admit, ``CALLER_NOT_ALLOWED`` when the list refuses the
-            caller, or ``ADMISSION_UNAVAILABLE`` when the API could not answer
-            and nothing usable was cached.
+        A connect URL is delivered only to the requesting handler from its own
+        fresh HTTP answer. Neither cache layer nor a single-flight follower
+        can recover or share that single-use channel-account credential.
         """
-
         route: RouteKey = (SLACK_KIND, adapter, address)
         ids = tuple(sorted({caller for caller in callers if caller}))
-        keys = self._keys(route, ids)
-
+        generation = self._generation()
+        if generation is None:
+            return self._fresh_refusal(address, adapter, ids, slack, on_connect)
+        keys = self._keys(route, ids, generation, slack)
         cached = self._verdict_from_cache(keys, self._ttl_s)
         if cached is not None:
-            return _final(cached)
+            if self._generation() == generation:
+                return _final(cached)
+            return self._fresh_refusal(address, adapter, ids, slack, on_connect)
+        if self._backing_off(generation):
+            if self._generation() == generation:
+                return self._stale_verdict(keys)
+            return self._fresh_refusal(address, adapter, ids, slack, on_connect)
 
-        if self._backing_off():
-            return self._stale_verdict(keys)
-
-        flight, leader = self._join_flight(route)
+        # A follower shares only a decision for the same generation, caller
+        # and canonical signed-transport evidence, never a connect URL.
+        flight_key: RouteKey = (SLACK_KIND, adapter, keys["caller"])
+        flight, leader = self._join_flight(flight_key)
         if not leader:
             flight.done.wait(_FOLLOW_TIMEOUT_S)
             cached = self._verdict_from_cache(keys, self._ttl_s)
-            if cached is not None:
+            if cached is not None and self._generation() == generation:
                 return _final(cached)
             if flight.failed:
-                # The API just failed for this route: asking it again from
-                # every waiting worker would hold them all for another timeout.
-                return self._stale_verdict(keys)
+                return (
+                    self._stale_verdict(keys)
+                    if self._generation() == generation
+                    else DropReason.ADMISSION_UNAVAILABLE
+                )
         try:
-            answer = self._client.ask(address=address, adapter=adapter, callers=ids)
+            answer = self._client.ask(address=address, adapter=adapter, callers=ids, slack=slack)
         except BaseException:
             if leader:
-                self._land_flight(route, flight, failed=True)
+                self._land_flight(flight_key, flight, failed=True)
             raise
         with self._lock:
             self._failed_at = None if answer is not None else self._clock()
-        if answer is not None:
-            # Stored BEFORE the followers wake, so they find it in the cache.
+            self._failed_generation = generation
+        # A writer can commit while the HTTP request is in flight. Its new
+        # generation must never receive a decision made against older state.
+        unchanged = self._generation() == generation
+        if answer is not None and unchanged:
             self._store(keys, answer)
         if leader:
-            self._land_flight(route, flight, failed=answer is None)
+            self._land_flight(flight_key, flight, failed=answer is None)
         if answer is None:
-            return self._stale_verdict(keys)
+            return self._stale_verdict(keys) if unchanged else DropReason.ADMISSION_UNAVAILABLE
+        return self._answer_refusal(answer, on_connect)
+
+    def _fresh_refusal(
+        self,
+        address: str,
+        adapter: str | None,
+        ids: tuple[str, ...],
+        slack: dict[str, Any] | None,
+        on_connect: Callable[[str], None] | None,
+    ) -> DropReason | None:
+        answer = self._client.ask(address=address, adapter=adapter, callers=ids, slack=slack)
+        if answer is None:
+            return DropReason.ADMISSION_UNAVAILABLE
+        return self._answer_refusal(answer, on_connect)
+
+    @staticmethod
+    def _answer_refusal(
+        answer: AdmissionAnswer,
+        on_connect: Callable[[str], None] | None,
+    ) -> DropReason | None:
+        if not answer.allowed and answer.connect_url is not None and on_connect is not None:
+            on_connect(answer.connect_url)
         return None if answer.allowed else DropReason.CALLER_NOT_ALLOWED
+
+    def _generation(self) -> str | None:
+        """None means pending, malformed or unavailable: fresh API only.
+
+        A missing key is initialized with SET NX and reread. The unique
+        generation preserves legacy caching without resurrecting old L1 allows
+        after a Valkey flush or lost fence key.
+        """
+        if self._redis is None:
+            return None
+        try:
+            raw = self._redis.get(IDENTITY_FENCE_KEY)
+        except redis.RedisError:
+            return None
+        if raw is None:
+            try:
+                self._redis.set(IDENTITY_FENCE_KEY, "stable:" + uuid.uuid4().hex, nx=True)
+                raw = self._redis.get(IDENTITY_FENCE_KEY)
+            except redis.RedisError:
+                return None
+        try:
+            value = raw.decode("ascii") if isinstance(raw, bytes) else raw
+            if not isinstance(value, str) or not value.startswith("stable:"):
+                return None
+            uuid.UUID(value.removeprefix("stable:"))
+            return value
+        except (ValueError, UnicodeError, AttributeError):
+            return None
 
     # --- single-flight and backoff ---------------------------------------------
 
-    def _backing_off(self) -> bool:
+    def _backing_off(self, generation: str) -> bool:
         with self._lock:
             failed_at = self._failed_at
-        return failed_at is not None and self._clock() - failed_at < _FAILURE_BACKOFF_S
+        return (
+            self._failed_generation == generation
+            and failed_at is not None
+            and self._clock() - failed_at < _FAILURE_BACKOFF_S
+        )
 
     def _join_flight(self, route: RouteKey) -> tuple[_Flight, bool]:
         with self._lock:
@@ -348,14 +446,20 @@ class AdmissionGate:
 
     # --- the cache -------------------------------------------------------------
 
-    def _keys(self, route: RouteKey, ids: tuple[str, ...]) -> dict[str, str]:
+    def _keys(
+        self, route: RouteKey, ids: tuple[str, ...], generation: str, slack: dict[str, Any] | None
+    ) -> dict[str, str]:
         kind, adapter, address = route
-        route_part = f"{kind}:{adapter or ''}:{address}"
+        evidence = hashlib.sha256(
+            json.dumps(slack, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()[:32]
+        partition = f"{generation}:{evidence}"
+        route_part = f"{partition}:{kind}:{adapter or ''}:{address}"
         digest = hashlib.sha256("\n".join(ids).encode()).hexdigest()[:32]
         return {
             "open": f"{self._prefix}open:{route_part}",
             "caller": f"{self._prefix}caller:{route_part}:{digest}",
-            "install": f"{self._prefix}install",
+            "install": f"{self._prefix}install:{partition}",
         }
 
     def _verdict_from_cache(self, keys: dict[str, str], max_age_s: float) -> Verdict | None:

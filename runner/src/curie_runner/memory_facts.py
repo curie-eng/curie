@@ -1,4 +1,4 @@
-"""Agent and channel memory (#1461, ADR-0167, ADR 0239).
+"""Agent and channel memory (#1461, ADR-0167, ADR 0249).
 
 Two memories, each a namespace on the durable state API:
 
@@ -10,7 +10,7 @@ Two memories, each a namespace on the durable state API:
 
 An entry is one key ``fact-<32 hex>`` whose value is the canonical record
 ``{"kind", "title", "statement", "author", "stated_at", "session_id",
-"conversation", "archived"}`` (ADR 0239). ``kind`` is ``fact`` (data) or
+"conversation", "archived"}`` (ADR 0249). ``kind`` is ``fact`` (data) or
 ``instruction`` (a standing instruction, followed only when the operator turned
 on agent-wide learning). Agent memory also holds two reserved keys that are
 never entries: ``log`` (the legacy record list ``memory.py`` still loads) and
@@ -84,7 +84,7 @@ Memory
 
 Saving memory is turned off for this agent. What is said here will not be kept for later conversations. Never say that you saved, noted or will remember something."""  # noqa: E501
 
-# The opted-in default guidance (ADR 0239), injected instead of
+# The opted-in default guidance (ADR 0249), injected instead of
 # ``DEFAULT_GUIDANCE`` when the operator turned on agent-wide learning and stored
 # no guidance of their own. The API holds a byte-identical copy
 # (``curie_api.memory_guidance.LEARNING_MEMORY_GUIDANCE``);
@@ -108,11 +108,11 @@ Use remember with a kind and a short title (one line, at most 80 characters) to 
 
 Nothing is kept for later unless a memory call succeeds. Never say you saved, noted, changed or will remember something unless that call succeeded. If it was refused or failed, say so."""  # noqa: E501
 
-# The longest title and statement the tools accept (ADR 0239; the statement
+# The longest title and statement the tools accept (ADR 0249; the statement
 # limit dates from #1461 review F4). The API enforces the same limits.
 MAX_TITLE_CHARS = 80
 MAX_STATEMENT_CHARS = 500
-# What one boot context may carry, across both memories (ADR 0239). The API
+# What one boot context may carry, across both memories (ADR 0249). The API
 # selects; the runner only refuses to render more than this.
 MAX_BOOT_INSTRUCTIONS = 20
 MAX_BOOT_INDEX = 50
@@ -121,7 +121,7 @@ MAX_SEARCH_CHARS = 200
 # The ADR-0167 per-memory fact count. ``RunnerConfig.memory_max_facts`` still
 # parses the frozen boot env key ``CURIE_MEMORY_MAX_FACTS`` with this default,
 # but nothing in the runner admits or truncates by it any more: the API owns
-# the retained-entry limit and the boot selection (ADR 0239).
+# the retained-entry limit and the boot selection (ADR 0249).
 MAX_FACTS_PER_MEMORY = 200
 
 MEMORY_SCOPES = ("agent", "channel")
@@ -153,7 +153,7 @@ class MemoryRefused(MemoryFactsError):
     """The state API refused the request (403): the credential may not do it.
 
     ADR-0188: the API holds a sandbox credential to its own channel's memory,
-    to fact keys, and to writes only with the turn's write credential. ADR 0239
+    to fact keys, and to writes only with the turn's write credential. ADR 0249
     adds the current memory-writes switch and, for instructions, agent-wide
     learning. A refusal is not an outage, so the tools say so rather than
     "could not be reached"."""
@@ -189,7 +189,7 @@ class MemoryFull(MemoryFactsError):
 
     ``limit`` says which: ``"value"`` when this one entry is over the state
     API's per-value cap, ``"entries"`` when the memory already holds as many
-    entries as the API retains per scope (ADR 0239), and ``"namespace"`` when
+    entries as the API retains per scope (ADR 0249), and ``"namespace"`` when
     the memory as a whole is at the state API's byte cap.
     """
 
@@ -408,7 +408,7 @@ def _is_record(value: object, scope: str, fact_id: str | None = None) -> bool:
 
 def _is_snapshot(value: object) -> bool:
     """A revision's snapshot: null (a deletion) or a canonical value. A value
-    from before ADR 0239 may lack the provenance fields, never their types."""
+    from before ADR 0249 may lack the provenance fields, never their types."""
 
     if value is None:
         return True
@@ -499,7 +499,7 @@ class MemoryFactsStore:
     refused for writes by a newer one.
 
     ``scope`` (``agent`` or ``channel``) and ``typed_url`` (``.../state/_memory``)
-    address the typed memory routes (ADR 0239). A sandbox never names its
+    address the typed memory routes (ADR 0249). A sandbox never names its
     channel: ``channel`` means the binding its credential is signed for.
     """
 
@@ -576,7 +576,7 @@ class MemoryFactsStore:
 
         Never replaces an entry: every call mints its own ``fact-<uuid4>`` key and
         asks for a create (``expected_version`` 0). The API alone decides whether
-        the memory has room (ADR 0239); there is no runner-side count.
+        the memory has room (ADR 0249); there is no runner-side count.
         """
 
         fact_id = f"{FACT_KEY_PREFIX}{uuid.uuid4().hex}"
@@ -748,7 +748,7 @@ def resolve_facts_store(
     return MemoryFactsStore(ref, token, turn_token=turn_token, scope=scope, typed_url=typed_url)
 
 
-# --- The boot context (ADR 0239) ----------------------------------------------
+# --- The boot context (ADR 0249) ----------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -901,7 +901,7 @@ async def fetch_memory_context(typed_url: str, token: str | None) -> MemoryConte
 # --- Boot composition --------------------------------------------------------
 
 _INSTRUCTIONS_HEADING = "# Standing instructions"
-# Instructions are executed only with agent-wide learning on (ADR 0239), and
+# Instructions are executed only with agent-wide learning on (ADR 0249), and
 # never above the bundle: the block says so, and it sits above the bundle prompt
 # so the bundle's own instructions have the last word.
 _INSTRUCTIONS_PREAMBLE = (
@@ -1002,7 +1002,7 @@ def format_facts_preamble(
     """Render agent then channel facts in full, newest first, or None when both are empty.
 
     The ADR-0167 full-statement rendering. Boot no longer uses it: since ADR
-    0239 boot shows fact titles only (``render_memory_context``).
+    0249 boot shows fact titles only (``render_memory_context``).
     """
 
     if not agent_facts and not channel_facts:
@@ -1099,7 +1099,7 @@ def log_boot_injection(
     guidance_source: str,
     degraded: str | None,
 ) -> None:
-    """The one ``memory boot injection`` record per boot (ADR 0239).
+    """The one ``memory boot injection`` record per boot (ADR 0249).
 
     Counts, ids, versions, the guidance source and a digest of the exact
     injected memory text: never a statement, an author or guidance text.

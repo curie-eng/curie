@@ -38,6 +38,7 @@ import time
 import uuid
 from datetime import UTC, datetime
 from typing import Annotated, Any
+from urllib.parse import urlsplit
 
 import redis.asyncio as redis
 from aci_protocol import (
@@ -76,8 +77,15 @@ from curie_api.crud import channels as crud_channels
 from curie_api.graveyardwatcher import text
 from curie_api.schemas.channels import ChannelBinding
 
-from .. import adapter_principal, channel_token
-from ..admission import AdmissionDecision, admit
+from .. import (
+    adapter_principal,
+    admission,
+    channel_token,
+    identity_audit,
+    identity_fence,
+    team_authorization,
+)
+from ..admission import AdmissionDecision
 from ..approval_auth import platform_key_or_adapter
 from ..auth import require_api_key, verify_platform_key
 from ..channel_token import CHANNEL_ENQUEUE_SCOPE
@@ -92,8 +100,11 @@ from ..delivery import (
     take_backlog_slot,
 )
 from ..deps import SessionDep
+from ..identity import connect
+from ..identity.slack import SlackEvidence
 from ..models import AgentChannel
 from ..wirebody import read_bounded_body
+from .identity_connect import public_api_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -218,6 +229,7 @@ class AdmissionIn(ChannelBinding):
     callers: list[Annotated[str, Field(max_length=256)]] = Field(
         default_factory=list, max_length=_MAX_ADMISSION_CALLERS
     )
+    slack: SlackEvidence | None = None
 
 
 class AdmissionOut(BaseModel):
@@ -235,6 +247,7 @@ class AdmissionOut(BaseModel):
     # miss during an outage on an install with no list anywhere is admitted:
     # a list that does not exist cannot refuse anyone.
     install_restricted: bool
+    connect_url: str | None = None
 
 
 class TurnAccepted(BaseModel):
@@ -472,9 +485,7 @@ def _verify_credential(x_api_key: str | None) -> channel_token.ChannelClaims | N
     raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail=_AUTH_DETAIL)
 
 
-def _authorize(
-    claims: channel_token.ChannelClaims | None, row: AgentChannel | None
-) -> None:
+def _authorize(claims: channel_token.ChannelClaims | None, row: AgentChannel | None) -> None:
     """The STATEFUL half: bind already-verified claims to the loaded row.
 
     A token names one binding ROW at one GENERATION, so a token for another
@@ -487,11 +498,7 @@ def _authorize(
 
     if claims is None:
         return
-    if (
-        row is None
-        or str(row.id) != claims.channel_id
-        or row.generation != claims.generation
-    ):
+    if row is None or str(row.id) != claims.channel_id or row.generation != claims.generation:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail=_AUTH_DETAIL)
 
 
@@ -599,6 +606,9 @@ def _duplicate(event_id: str, current: str, response: Response) -> TurnAccepted:
     return TurnAccepted(event_id=event_id, stream_id=stream_id, duplicate=True)
 
 
+# @spec COMMON-ADMISSION-EXTRACTION-1
+# @spec COMMON-ADMISSION-EXTRACTION-3
+# @spec COMMON-ADMISSION-EXTRACTION-4
 @router.post("/turns", response_model=TurnAccepted)
 async def ingest_turn(
     request: Request,
@@ -636,6 +646,7 @@ async def ingest_turn(
     )
     body = _parse_turn(raw)
     claims = _verify_credential(x_api_key)
+    await identity_fence.lock_identity_reader(session)
     # `TurnIn` deliberately does not model `adapter` (plan D4.1, `TurnIn`'s own
     # docstring): the credential -- not the body -- names the binding. A `chn`
     # token's claim names its ROW, so that row is loaded by id and must be the
@@ -651,8 +662,7 @@ async def ingest_turn(
     if row is None:
         raise HTTPException(
             status.HTTP_404_NOT_FOUND,
-            f"no agent is bound to channel kind {body.kind!r} at address "
-            f"{body.address!r}",
+            f"no agent is bound to channel kind {body.kind!r} at address {body.address!r}",
         )
     if not _route_is_configured(row):
         # The mint's refusal, on the ingress. Enqueuing here would hand the
@@ -664,13 +674,23 @@ async def ingest_turn(
     # trusted to send the sender it authenticated, as it always was; `author`
     # is that sender. The platform key is not exempt: the list is about who
     # wrote the message, not who carried it.
-    decision = admit(row, [body.author])
-    if not decision.allowed:
+    def on_list_refusal(decision: AdmissionDecision) -> None:
+        """@spec COMMON-ADMISSION-EXTRACTION-3"""
         _record_refusal(row, decision, surface="channel-port")
         record_metric(
             "curie.turn.refused",
             attributes={"service.name": "curie-api", "reason": decision.reason.value},
         )
+
+    decision = await admission.evaluate_invocation(
+        session,
+        row,
+        [body.author],
+        surface="channel-port",
+        email=body.author if row.kind == "email" else None,
+        on_list_refusal=on_list_refusal,
+    )
+    if not decision.allowed:
         raise HTTPException(status.HTTP_403_FORBIDDEN, CALLER_NOT_ALLOWED_DETAIL)
 
     # One hash of the `delivery_id`, shared by the two names derived from it.
@@ -707,9 +727,7 @@ async def ingest_turn(
     # have named its owner. If that repeats, the honest answer is "someone is
     # mid-flight" -- never a second XADD.
     for _attempt in range(2):
-        if await claim_delivery(
-            client, key, owner, settings.channel_delivery_lease_s
-        ):
+        if await claim_delivery(client, key, owner, settings.channel_delivery_lease_s):
             try:
                 if not await take_backlog_slot(
                     client,
@@ -732,9 +750,7 @@ async def ingest_turn(
                     raise HTTPException(
                         status.HTTP_429_TOO_MANY_REQUESTS,
                         "too many new deliveries for this binding; retry later",
-                        headers={
-                            "Retry-After": str(settings.channel_binding_backlog_window_s)
-                        },
+                        headers={"Retry-After": str(settings.channel_binding_backlog_window_s)},
                     )
                 # Minted and serialized only once this request holds both the claim
                 # and a quota slot: an adapter retrying an already-enqueued delivery
@@ -812,9 +828,7 @@ async def ingest_turn(
                         current,
                         row.kind,
                     )
-                    return TurnAccepted(
-                        event_id=event_id, stream_id=current, duplicate=False
-                    )
+                    return TurnAccepted(event_id=event_id, stream_id=current, duplicate=False)
                 # Branch (c): our lease was re-claimed while we were slow. The other
                 # claimant owns the delivery; we do not enqueue on top of it.
                 return _duplicate(event_id, current, response)
@@ -838,12 +852,18 @@ async def ingest_turn(
 # --- POST /channels/admission ---------------------------------------------------
 
 
+# @spec COMMON-ADMISSION-EXTRACTION-1
+# @spec COMMON-ADMISSION-EXTRACTION-3
+# @spec COMMON-ADMISSION-EXTRACTION-4
 @router.post(
     "/admission",
     response_model=AdmissionOut,
+    response_model_exclude_none=True,
     dependencies=[Depends(require_api_key)],
 )
-async def check_admission(data: AdmissionIn, session: SessionDep) -> AdmissionOut:
+async def check_admission(
+    data: AdmissionIn, session: SessionDep, response: Response
+) -> AdmissionOut:
     """Answer whether a caller may start a turn on a route (platform key only).
 
     The Slack dispatcher's half of ADR 0175 decision 2: it has no database, so
@@ -861,16 +881,71 @@ async def check_admission(data: AdmissionIn, session: SessionDep) -> AdmissionOu
     call, unchanged by this ADR.
     """
 
+    response.headers["Cache-Control"] = "private, no-store"
+    await identity_fence.lock_identity_reader(session)
     row = await crud_channels.binding_for_route(session, data.kind, data.adapter, data.address)
-    decision = admit(row, data.callers)
-    if not decision.allowed and row is not None:
+
+    def on_list_refusal(decision: AdmissionDecision) -> None:
+        """@spec COMMON-ADMISSION-EXTRACTION-3"""
         # The dispatcher counts its own refusal (`curie.turn.refused` with
         # service curie-dispatcher); counting it here too would double every
         # Slack refusal, so this side only logs the binding and reason.
-        _record_refusal(row, decision, surface="admission", level=logging.DEBUG)
-    install_restricted = decision.restricted or await crud_channels.any_binding_restricted(session)
+        if row is not None:
+            _record_refusal(row, decision, surface="admission", level=logging.DEBUG)
+
+    decision = await admission.evaluate_invocation(
+        session,
+        row,
+        data.callers,
+        surface="admission",
+        slack=data.slack,
+        on_list_refusal=on_list_refusal,
+    )
+    connect_url = None
+    allowed, restricted = decision.allowed, decision.restricted
+    human = decision.team_decision
+    if row is not None and human is not None:
+        if not allowed and human.restricted:
+            identity_audit.record(
+                session,
+                tenant_id=row.tenant_id,
+                event_type="invocation.refused",
+                actor="channel-admission",
+                principal_id=human.principal_id,
+                team_id=human.team_id,
+                details={"reason": human.reason, "epoch": human.epoch, "digest": human.digest},
+            )
+            origin = urlsplit(get_settings().oidc_redirect_uri)
+            if (
+                human.unlinked
+                and decision.list_decision.allowed
+                and data.slack is not None
+                and data.slack.user_id in data.callers
+                and get_settings().oidc_enabled
+                and origin.scheme == "https"
+                and origin.netloc
+            ):
+                token = await connect.issue_for_sender(
+                    session,
+                    tenant_id=row.tenant_id,
+                    provider="slack",
+                    channel_identity=row.adapter or "default",
+                    slack=data.slack,
+                )
+                if token is not None:
+                    connect_url = (
+                        f"{origin.scheme}://{origin.netloc}{public_api_prefix()}"
+                        f"/identity/connect/{token}"
+                    )
+            await session.commit()
+    install_restricted = (
+        restricted
+        or await crud_channels.any_binding_restricted(session)
+        or await team_authorization.any_invocation_team(session)
+    )
     return AdmissionOut(
-        allowed=decision.allowed,
-        restricted=decision.restricted,
+        allowed=allowed,
+        restricted=restricted,
         install_restricted=install_restricted,
+        connect_url=connect_url,
     )

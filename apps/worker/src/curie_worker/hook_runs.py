@@ -49,7 +49,7 @@ logger = logging.getLogger(__name__)
 _RETRY_MARK = "retry"
 
 # An agent-created schedule's hook name is this prefix and the schedule id
-# (ADR 0238). Its runs share the hook_runs ledger with bundle triggers.
+# (ADR 0248). Its runs share the hook_runs ledger with bundle triggers.
 AGENT_SCHEDULE_PREFIX = "agent-schedule:"
 
 
@@ -189,7 +189,7 @@ class HookRunRecorder:
     async def start_guard(self, ref: HookRunRef) -> AsyncIterator[bool]:
         """Serialize runner admission with an operator pause of this hook.
 
-        For an agent schedule (ADR 0238) the run must also still be what was
+        For an agent schedule (ADR 0248) the run must also still be what was
         admitted: the schedule exists and is not cancelled, the agent's toggle
         is on, its exact destination binding exists, and its revision is the
         run snapshot's. Otherwise the row is closed ``skipped`` with reason

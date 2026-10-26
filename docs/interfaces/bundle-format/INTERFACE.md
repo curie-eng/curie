@@ -112,6 +112,23 @@ files**, each absent from a bundle that needs none, all three invisible to Claud
   connector cannot declare it (`connectors.remote_has_resources`). Neither field touches the caller
   proxy container's probe or resources, and with both omitted the rendered Deployment is unchanged.
   A consumer built before these fields refuses a bundle that sets either one as an unknown key.
+  A hosted connector may declare `routes`, the non-MCP HTTP routes its bundle's own stdio
+  servers call through the caller proxy (ADR 0240). Each entry has a `path`, matched exactly, that
+  starts with `/`, holds only letters, digits, `.`, `_`, `~`, `-` and `/`, has no empty, `.` or `..`
+  segment, and is neither `/mcp` nor under it (`connectors.bad_route_path`); it may not be the
+  connector's `readiness_path` (`connectors.route_is_readiness_path`) or repeat
+  (`connectors.duplicate_route`). `methods` is a non-empty subset of `POST` and `PUT`, defaulting to
+  `[POST]` (`connectors.bad_route_methods`). `max_body_bytes` is a required integer from 1 to
+  268435456, 256 MiB (`connectors.bad_route_max_body_bytes`). `callers` names at least one server
+  (`connectors.route_without_callers`), and bundle validation requires each to be a stdio server the
+  bundle's `.mcp.json` or manifest `mcpServers` declares (`connectors.route_caller_undeclared`,
+  `connectors.route_caller_not_stdio`). A `url` connector cannot declare `routes`
+  (`connectors.remote_has_routes`). A declared caller reads its routes once at start from the
+  descriptor `CURIE_CONNECTOR_ROUTES_FD` names, a JSON object from connector name to `{url, token}`,
+  and sends the token as `X-Curie-Caller` on the route; started without the name set, it has no
+  routes. Declare a caller as the program itself rather than a wrapper that forks (`sh -c`), since
+  the runner observes the lock only on the process it starts, and have it load what it needs at
+  start. A consumer built before the field refuses a bundle that sets it as an unknown key.
   Intake refuses any `sealed_secrets` declaration with
   `connectors.sealed_secrets_unsupported` until a decrypt path exists (see
   [sealed-credential](../sealed-credential/INTERFACE.md)). For a hosted (`image`/`build`) connector

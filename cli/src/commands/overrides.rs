@@ -253,8 +253,8 @@ fn patch_body_json(body: &AgentUpdate) -> Result<serde_json::Value> {
 ///   execution_deadline_seconds: the stored deadline override, same convention.
 ///   runner_resources: the stored runner resources override, same convention.
 ///   memory_writes: whether the agent's memory tools are on (#1461).
-///   agent_wide_learning: whether the agent opted in to agent-wide learning (ADR 0239).
-///   learned_skills: whether the agent's learned skills are on (ADR 0237).
+///   agent_wide_learning: whether the agent opted in to agent-wide learning (ADR 0249).
+///   learned_skills: whether the agent's learned skills are on (ADR 0247).
 ///   changed: whether this invocation wrote, as opposed to inspecting.
 ///
 /// Returns:
@@ -304,8 +304,8 @@ pub fn overrides_summary(
 /// is what it is" from "this is what it now is" without diffing.
 /// `memory_writes` is the agent's NOT NULL memory-tools switch (#1461), so it
 /// is always a boolean, never null. `agent_wide_learning` is the independent
-/// NOT NULL learning opt-in (ADR 0239), reported the same way, and
-/// `learned_skills` is the agent's NOT NULL learned-skills switch (ADR 0237),
+/// NOT NULL learning opt-in (ADR 0249), reported the same way, and
+/// `learned_skills` is the agent's NOT NULL learned-skills switch (ADR 0247),
 /// likewise always a boolean.
 #[derive(Debug)]
 pub enum OverridesOutput {
@@ -389,7 +389,7 @@ impl crate::ui::CliOutput for OverridesOutput {
 }
 
 /// Output of `<tier> overrides <agent>` at the CLI: [`OverridesOutput`] plus
-/// the agent's ADR 0238 schedule settings as the API stored them. The settings
+/// the agent's ADR 0248 schedule settings as the API stored them. The settings
 /// are `None` only on a dry run, which has no stored row to read.
 #[derive(Debug)]
 pub struct AgentOverridesOutput {
@@ -513,12 +513,12 @@ pub fn on_off_flag(value: Option<&str>) -> Option<bool> {
 pub struct AgentSwitches {
     /// `--memory-writes on|off` (#1461): whether the memory tools mount.
     pub memory_writes: Option<bool>,
-    /// `--agent-wide-learning on|off` (ADR 0239): the learning opt-in.
+    /// `--agent-wide-learning on|off` (ADR 0249): the learning opt-in.
     pub agent_wide_learning: Option<bool>,
-    /// `--agent-schedules on|off` (ADR 0238): whether the agent may create and
+    /// `--agent-schedules on|off` (ADR 0248): whether the agent may create and
     /// change its own schedules.
     pub agent_schedules: Option<bool>,
-    /// `--learned-skills on|off` (ADR 0237): whether learned skills load.
+    /// `--learned-skills on|off` (ADR 0247): whether learned skills load.
     pub learned_skills: Option<bool>,
 }
 
@@ -539,7 +539,7 @@ fn require_agent_wide_learning(agent: &str, value: Option<bool>) -> Result<bool>
 }
 
 /// [`overrides`] plus the `memory_writes` (#1461), `agent_wide_learning`
-/// (ADR 0239), `agent_schedules` (ADR 0238) and `learned_skills` (ADR 0237)
+/// (ADR 0249), `agent_schedules` (ADR 0248) and `learned_skills` (ADR 0247)
 /// switches.
 ///
 /// Each switch is a NOT NULL boolean rather than a nullable override, so none

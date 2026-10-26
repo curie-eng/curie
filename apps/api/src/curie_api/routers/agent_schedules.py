@@ -1,4 +1,4 @@
-"""Agent-created schedules (ADR 0238): an agent's own recurring and one-shot runs.
+"""Agent-created schedules (ADR 0248): an agent's own recurring and one-shot runs.
 
 The runner reads them with its boot ``state`` credential and changes them with
 the per-turn credential the worker mints (``schedules: "write"``); the operator
@@ -120,7 +120,7 @@ async def _writer(
     if not sender:
         raise _forbidden("this credential names no sender")
     if configures:
-        # ADR 0238 section 11: only an exact false admits a configuring change.
+        # ADR 0248 section 11: only an exact false admits a configuring change.
         if principal.scheduled is None:
             raise _forbidden(NO_WRITE)
         if principal.scheduled or sender == NO_PERSON or sender.startswith("cron:"):

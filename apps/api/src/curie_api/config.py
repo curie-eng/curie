@@ -35,7 +35,7 @@ from curie_internal.driver_declaration import (
     parse_drivers,
     refuse_published_defaults,
 )
-from curie_internal.keyspace import WORKER_KEY_PREFIX_DEFAULT
+from curie_internal.keyspace import SANDBOX_KEY_PREFIX_DEFAULT, WORKER_KEY_PREFIX_DEFAULT
 from curie_upgrade_pause import authoritative_key
 from plugin_format.connector_render import ConnectorProxy
 from pydantic import AliasChoices, Field, field_validator, model_validator
@@ -160,6 +160,12 @@ class Settings(BaseSettings):
         default=(),
         validation_alias=AliasChoices(TEST_INSTALLATION_DRIVERS_ENV, "test_installation_drivers"),
     )
+
+    # Opt-in lazy attachment facade; never infer activation from a URL.
+    attachment_access_enabled: bool = False
+    attachment_broker_url: str = ""
+    attachment_sandbox_key_prefix: str = SANDBOX_KEY_PREFIX_DEFAULT
+    attachment_transfer_timeout_seconds: int = Field(default=300, ge=1, le=3600)
 
     # Separate trust boundary for credential redemption. The operator/CLI API
     # key can administer deployments but cannot redeem the GitHub identity.
@@ -318,7 +324,7 @@ class Settings(BaseSettings):
     # push (#3162). The execution deadline still caps it; at most 10800 s, the
     # longest execution deadline (ADR 0171).
     factory_ci_wait_s: int = Field(
-        default=1200,
+        default=3600,
         gt=0,
         le=10800,
         validation_alias="FACTORY_CI_WAIT_S",
@@ -674,7 +680,7 @@ class Settings(BaseSettings):
     # namespace are both bounded. Sizes are the serialized-JSON byte length.
     state_max_value_bytes: int = 64 * 1024  # 64 KiB per value
     state_max_namespace_bytes: int = 1024 * 1024  # 1 MiB per (agent, namespace)
-    # Canonical memory heads (facts and standing instructions, ADR 0239) one
+    # Canonical memory heads (facts and standing instructions, ADR 0249) one
     # (agent, memory scope) may retain, active and archived alike. A delete
     # frees a slot; an archive does not.
     memory_max_entries_per_scope: int = 1000

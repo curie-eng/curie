@@ -85,6 +85,12 @@
       "omissions": []
     },
     {
+      "struct": "ConnectorRouteDecl",
+      "file": "cli/src/connector_build.rs",
+      "schema": "ConnectorRoute",
+      "omissions": []
+    },
+    {
       "struct": "RunnerSpecDecl",
       "file": "cli/src/connector_build.rs",
       "schema": "RunnerSpec",
@@ -134,6 +140,11 @@
       "struct": "PreflightSetupError",
       "file": "cli/src/commands/dev.rs",
       "reason": "A preflight setup error with recovery instructions, unrelated to plugin_format."
+    },
+    {
+      "struct": "TestEnvOutput",
+      "file": "cli/src/commands/dev.rs",
+      "reason": "The isolated test environment result read from the source-owned test-env helper, unrelated to plugin_format."
     },
     {
       "struct": "CheckReport",

@@ -2,15 +2,24 @@
 
 use super::*;
 
-/// Run one parsed `cluster` subcommand.
-pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Result<()> {
-    let target = curie::kube_context::pin_for_cluster_command(context.as_deref())?;
+fn pin_context(context: Option<&str>) -> Result<Option<curie::kube_context::KubeTarget>> {
+    let target = curie::kube_context::pin_for_cluster_command(context)?;
     if let Some(target) = &target {
         ui::ui().note(&format!(
             "Kubernetes context: {} (cluster {})",
             target.context, target.cluster
         ));
     }
+    Ok(target)
+}
+
+/// Run one parsed `cluster` subcommand.
+pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Result<()> {
+    let target = if matches!(&action, ClusterAction::Message { .. }) {
+        None
+    } else {
+        pin_context(context.as_deref())?
+    };
     match action {
         ClusterAction::LintValues {
             files,
@@ -460,6 +469,7 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                 CliTurnArgs {
                     channel,
                     thread,
+                    context,
                     namespace,
                     release,
                     chart,
@@ -482,6 +492,7 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                     .ok()
                     .filter(|v| !v.is_empty()),
             )?;
+            let target = pin_context(resolved.context.as_deref())?;
             let resolved_chart = artifacts::resolve_chart(
                 resolved.chart.as_deref(),
                 artifacts::Channel::current(),
@@ -500,19 +511,34 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                 message::DEFAULT_API_KEY,
                 || ops::discover_api_key(&resolved.namespace, &resolved.release),
             )
-            .await?;
+            .await
+            .map_err(|error| {
+                ops::cluster_message_context_error(
+                    error,
+                    target.is_some(),
+                    &curie::kube_context::available_contexts(),
+                )
+            })?;
             let valkey_password = message::resolve_cluster_credential(
                 valkey_password,
                 dry_run,
                 message::DEFAULT_VALKEY_PASSWORD,
                 || ops::discover_valkey_password(&resolved.namespace, &resolved.release),
             )
-            .await?;
+            .await
+            .map_err(|error| {
+                ops::cluster_message_context_error(
+                    error,
+                    target.is_some(),
+                    &curie::kube_context::available_contexts(),
+                )
+            })?;
             message::message(MessageOpts {
                 text,
                 channel: resolved.channel,
                 agent: resolved.agent,
                 thread: resolved.thread,
+                context: target.map(|target| target.context),
                 namespace: resolved.namespace,
                 release: resolved.release,
                 chart,
@@ -1233,6 +1259,73 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
             .await?;
             emit(
                 commands::channel_bindings(
+                    AgentActionOpts {
+                        api_url,
+                        api_key,
+                        agent,
+                        dry_run,
+                    },
+                    change,
+                )
+                .await?,
+            )
+        }
+        ClusterAction::Directory {
+            tenant,
+            resource,
+            apply,
+            after,
+            conn,
+            dry_run,
+        } => {
+            let (api_url, api_key, _port_forward) = commands::resolve_cluster_conn(
+                conn.api_url,
+                conn.api_key,
+                &conn.namespace,
+                &conn.release,
+                dry_run,
+            )
+            .await?;
+            emit(
+                commands::directory_admin(
+                    api_url,
+                    api_key,
+                    tenant.to_string(),
+                    resource,
+                    apply,
+                    after,
+                    dry_run,
+                )
+                .await?,
+            )
+        }
+        ClusterAction::AccessPolicy {
+            agent,
+            invocation_team,
+            approver_team,
+            clear_invocation_team,
+            clear_approver_team,
+            conn,
+            dry_run,
+        } => {
+            // Resolved before the connection, like `Callers`: a malformed team
+            // id is a usage error, not a cluster lookup that fails elsewhere.
+            let change = commands::AccessPolicyChange::resolve(
+                invocation_team,
+                approver_team,
+                clear_invocation_team,
+                clear_approver_team,
+            )?;
+            let (api_url, api_key, _port_forward) = commands::resolve_cluster_conn(
+                conn.api_url,
+                conn.api_key,
+                &conn.namespace,
+                &conn.release,
+                dry_run,
+            )
+            .await?;
+            emit(
+                commands::agent_access_policy(
                     AgentActionOpts {
                         api_url,
                         api_key,

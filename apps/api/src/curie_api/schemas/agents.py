@@ -621,17 +621,17 @@ class AgentUpdate(BaseModel):
     # it unchanged; the column is NOT NULL, so like `memory` there is no
     # default for a null to clear back to.
     memory_writes: bool | None = None
-    # Agent-wide learning (ADR 0239). Omitted (None) leaves it unchanged, the
+    # Agent-wide learning (ADR 0249). Omitted (None) leaves it unchanged, the
     # same plain-None rule as ``memory_writes``.
     agent_wide_learning: bool | None = None
-    # Agent-created schedules (ADR 0238): the switch, the default zone and the
+    # Agent-created schedules (ADR 0248): the switch, the default zone and the
     # limits. Same plain-None rule as `memory_writes`; the switch is strict,
     # so "yes" is not a boolean.
     agent_schedules: StrictBool | None = None
     schedule_timezone: str | None = None
     schedule_max_active: Annotated[int, Field(ge=1, le=100)] | None = None
     schedule_min_interval_minutes: Annotated[int, Field(ge=1, le=1440)] | None = None
-    # Whether the agent loads and edits learned skills (ADR 0237). Same
+    # Whether the agent loads and edits learned skills (ADR 0247). Same
     # plain-None rule as `memory_writes`, but strict: "yes" is not a boolean.
     learned_skills: StrictBool | None = None
     # Omitted leaves the current publication policy. Explicit null is refused.
@@ -702,14 +702,14 @@ class AgentOut(BaseModel):
     memory: bool
     # Whether the runner mounts its remember/update/forget tools (#1461).
     memory_writes: bool = False
-    # Whether the agent is opted in to agent-wide learning (ADR 0239).
+    # Whether the agent is opted in to agent-wide learning (ADR 0249).
     agent_wide_learning: bool = False
-    # Agent-created schedules (ADR 0238): the switch, default zone and limits.
+    # Agent-created schedules (ADR 0248): the switch, default zone and limits.
     agent_schedules: bool = False
     schedule_timezone: str = "UTC"
     schedule_max_active: int = 20
     schedule_min_interval_minutes: int = 15
-    # Whether the agent loads and edits learned skills (ADR 0237).
+    # Whether the agent loads and edits learned skills (ADR 0247).
     learned_skills: bool = False
     publication_policy: Literal["approve", "auto"] = "approve"
     publication_policy_version: int = 1

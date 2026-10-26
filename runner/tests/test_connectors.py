@@ -24,6 +24,7 @@ from curie_runner.mcp_tool_capability import McpToolCapabilityProbe
 from curie_runner.plugin import PluginBundleError
 from curie_runner.tool_names import STATE_SERVER_NAME
 from plugin_format.connectors import RESERVED_CONNECTOR_NAMES
+from runner_boot_session import initialized_session_sync
 
 HOSTED = "connectors:\n  grafana:\n    image: grafana/mcp-grafana:0.17.2\n    secrets: [T]\n"
 REMOTE = "connectors:\n  internal:\n    url: https://mcp.internal/mcp\n"
@@ -72,7 +73,7 @@ def _boot_options(
 
     monkeypatch.setattr(boot, "probe_mcp_tool_capability", probe)
     monkeypatch.setattr(boot, "ClaudeAgentSession", _CapturedSession)
-    session = build_runner(config, fake_model=False)._factory()
+    session = initialized_session_sync(build_runner(config, fake_model=False))
     assert isinstance(session, _CapturedSession)
     return session.options
 
@@ -1151,7 +1152,7 @@ def test_build_runner_expands_the_bearer_and_drops_it_from_spawn_env(
 
     monkeypatch.setattr(boot, "probe_mcp_tool_capability", probe)
     monkeypatch.setattr(boot, "ClaudeAgentSession", _CapturedSession)
-    session = build_runner(config, fake_model=False, sdk_env=spawn)._factory()
+    session = initialized_session_sync(build_runner(config, fake_model=False, sdk_env=spawn))
     assert isinstance(session, _CapturedSession)
     assert "GITHUB_PERSONAL_ACCESS_TOKEN" not in spawn
     assert spawn["STDIO_TOKEN"] == "keep-me"
@@ -1187,7 +1188,7 @@ def test_optional_binding_is_projected_before_hosted_secret_cleanup(
     monkeypatch.setattr(boot, "probe_mcp_tool_capability", probe)
     monkeypatch.setattr(boot, "ClaudeAgentSession", _CapturedSession)
     runner = build_runner(config, fake_model=False, sdk_env=spawn)
-    session = runner._factory()
+    session = initialized_session_sync(runner)
     assert isinstance(session, _CapturedSession)
     # Bound is judged at boot, before hosted credential custody removes the
     # process variable. Preserve existing stdio placeholder semantics; this is
@@ -1339,6 +1340,30 @@ def test_the_boot_tells_the_gate_which_connectors_are_proxied(
     assert gate.proxied_connector_servers == frozenset(expected)
 
 
+# @spec ADR-0168 d7
+def test_a_bundle_stdio_server_cannot_ask_for_the_caller_token(tmp_path: Path) -> None:
+    # The starting point ADR 0240 (Draft) records: naming the token in a bundle
+    # stdio server's env gets it nothing. Only the derived hosted entry is
+    # expanded, and the name is gone from every env before the CLI spawns the
+    # server (#3550).
+    from curie_runner.connectors import materialize_connector_caller_headers
+
+    derived = derive_mcp_servers(_bundle(tmp_path, HOSTED), **SCOPE, caller_header=True)
+    stdio = {
+        "type": "stdio",
+        "command": "review-tools",
+        "env": {"CALLER": _CALLER_PLACEHOLDER},
+    }
+    servers = build_mcp_servers({}, {**derived, "plugin:b:review-tools": stdio})
+    process_env = {"CURIE_CONNECTOR_CALLER_TOKEN": "cct.payload.signature"}
+    spawn_env = dict(process_env)
+    materialize_connector_caller_headers(servers, spawn_env, process_env)
+    assert servers["grafana"]["headers"][_CALLER_HEADER] == "cct.payload.signature"
+    assert servers["plugin:b:review-tools"]["env"] == {"CALLER": _CALLER_PLACEHOLDER}
+    assert "CURIE_CONNECTOR_CALLER_TOKEN" not in spawn_env
+    assert "CURIE_CONNECTOR_CALLER_TOKEN" not in process_env
+
+
 def test_a_fallback_url_never_receives_the_caller_token(tmp_path: Path) -> None:
     servers = derive_mcp_servers(
         _bundle(tmp_path, HOSTED_WITH_FALLBACK),
@@ -1375,7 +1400,7 @@ def test_a_minted_token_is_expanded_into_the_header_and_dropped_from_env(
 
     monkeypatch.setattr(boot, "probe_mcp_tool_capability", probe)
     monkeypatch.setattr(boot, "ClaudeAgentSession", _CapturedSession)
-    session = build_runner(config, fake_model=False, sdk_env=spawn)._factory()
+    session = initialized_session_sync(build_runner(config, fake_model=False, sdk_env=spawn))
     assert isinstance(session, _CapturedSession)
     assert session.options.mcp_servers["github"]["headers"] == {
         _CALLER_HEADER: "cct.payload.signature"

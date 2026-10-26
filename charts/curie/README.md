@@ -1297,9 +1297,90 @@ explicit `sizeLimit`:
 |---|---|---|
 | `bundles` (fetched archive + extracted plugin dir) | `agentSandbox.runner.bundleFetch.sizeLimit` | `2Gi` |
 | `aws-config` (init only AWS CLI path addressing config) | `agentSandbox.runner.bundleFetch.awsConfigSizeLimit` | `16Mi` |
-| One per `agentSandbox.runner.hardening.writablePaths` entry (`/tmp`, `/home/runner` by default) | `agentSandbox.runner.hardening.writablePathSizeLimit` | `512Mi` |
-| `workspace` (the managed repository checkout at `/workspace`) | `agentSandbox.runner.workspace.sizeLimit`, or per agent `agentSandbox.workspaceSizeLimits.<agent>` | `1Gi`; per agent: none, the agent inherits the default |
+| One per `agentSandbox.runner.hardening.writablePaths` entry (`/tmp`, `/home/runner` by default) | `agentSandbox.resourceProfiles.<profile>.<field>`, or the generic `agentSandbox.runner.hardening.writablePathSizeLimit` (sets every writable path) | `standard`: `512Mi` each; `factory`: home `15Gi`, tmp `4Gi`, other paths `512Mi` |
+| `workspace` (the managed repository checkout at `/workspace`) | per agent `agentSandbox.workspaceSizeLimits.<agent>`, the generic `agentSandbox.runner.workspace.sizeLimit`, or the profile's workspace field | `standard`: `1Gi`; `factory`: `15Gi`; per agent: none |
 | `attachments` (one turn's inbound attachments) | `agentSandbox.runner.attachments.sizeLimit` | `512Mi` |
+
+### Resource profiles
+
+`agentSandbox.resourceProfiles` defines two named envelopes. The generic keys
+`agentSandbox.runner.resources`, `agentSandbox.runner.workspace.sizeLimit` and
+`agentSandbox.runner.hardening.writablePathSizeLimit` are empty by default, so
+the selected profile supplies the values.
+
+| Field | `standard` | `factory` |
+|---|---|---|
+| Memory request / limit | `192Mi` / `768Mi` | `8Gi` / `8Gi` |
+| CPU request / limit | `50m` / `1` | `50m` / `2` |
+| Ephemeral storage request / limit | `512Mi` / `4Gi` | `10Gi` / `20Gi` |
+| Workspace volume | `1Gi` | `15Gi` |
+| Home volume | `512Mi` | `15Gi` |
+| Tmp volume | `512Mi` | `4Gi` |
+| Other writable paths | `512Mi` | `512Mi` |
+
+An agent with `factory.sandboxEgress.<agent>: true` while `factory.enabled` is
+true uses `factory`. The generic template and every other agent use `standard`.
+`agentSandbox.agentResourceProfiles.<agent>: standard|factory` overrides that
+choice, either to opt a factory agent back to the lightweight envelope or to opt
+another agent in. The dark-factory example values select `factory` for
+`dark-factory` explicitly.
+
+Precedence, highest first:
+
+1. `agentSandbox.workspaceSizeLimits.<agent>`, which sets that agent's workspace
+   only.
+2. An explicitly set generic key. For `agentSandbox.runner.resources` this works
+   per resource pair: setting either the request or the limit of cpu, memory or
+   ephemeral-storage takes that resource's pair from the generic side, with the
+   unset side filled from `standard`. `agentSandbox.runner.workspace.sizeLimit`
+   sets the workspace. `agentSandbox.runner.hardening.writablePathSizeLimit`
+   sets every writable path.
+3. The selected profile's field, which you can change with
+   `agentSandbox.resourceProfiles.<profile>.<field>`.
+
+The worker's per-agent API override, `curie cluster overrides <agent>
+--runner-resources`, still applies on top of the rendered envelope at claim time.
+
+Read the factory envelope as five separate bounds: RAM (the 8Gi memory limit),
+the workspace volume, the home volume, the tmp volume, and aggregate ephemeral
+disk (the 20Gi ephemeral-storage limit). The volume ceilings are independent
+upper bounds, not reservations. Their sum, 15 + 15 + 4 = 34Gi, can exceed the
+shared 20Gi ephemeral-storage limit, which is an additional constraint on their
+combined use. The 10Gi ephemeral-storage request is what the scheduler reserves.
+A pod is evicted when any single volume passes its own ceiling or when the total
+passes 20Gi, and the eviction message names the volume.
+
+Capacity consequences of the factory profile:
+
+1. The 8Gi memory request means a factory sandbox needs a node with 8Gi of
+   unrequested allocatable memory.
+2. The default `resourceQuota.hard.requestsMemory` of `8Gi` admits exactly one
+   factory sandbox at a time. Raise `resourceQuota.hard.*` for concurrency, or
+   opt the agent to `standard` with `agentSandbox.agentResourceProfiles` on a
+   small trial cluster.
+3. Existing sandbox pods keep the volume limits and resources they were created
+   with. Kubernetes cannot resize an `emptyDir` `sizeLimit` in place, so new
+   limits apply to sandboxes created after the upgrade.
+4. `helm upgrade --reuse-values` from a release made by an older chart carries
+   that chart's computed defaults forward as values, so the factory agent keeps
+   the old envelope on that path. `curie cluster upgrade` (or
+   `--reset-then-reuse-values`) picks up the profile, and explicit operator
+   values survive `curie cluster upgrade`.
+
+`helm install` prints every effective envelope together in the NOTES under
+"Sandbox resource envelopes".
+
+The profiles also carry one install-wide field, `apiMemoryLimit`: the API
+container's memory limit, which the schema-migrate Job shares. It is `512Mi` in
+`standard` and `2Gi` in `factory`, and the install uses `factory` when
+`factory.enabled` is true, else `standard`. It applies only while
+`api.resources.limits.memory` is unset, which is the chart default. Any explicit
+`api.resources.limits.memory`, including `512Mi`, wins for every install, and a
+release made by an older chart keeps the `512Mi` it stored when upgraded with
+`--reuse-values`. The API memory request (`256Mi`) and CPU (`100m` / `1`) do
+not change with the profile. The factory `2Gi` is headroom, not a measured
+need: after #4895 the factory publication listing over 231 pages peaked near
+170 MB under both a `512Mi` and a `2Gi` limit.
 
 `agentSandbox.workspaceSizeLimits` maps an agent name to that agent's workspace
 ceiling, for example `dark-factory: 24Gi`, so one build-heavy agent can compile
@@ -1406,8 +1487,16 @@ requests default to `500m` CPU, `1Gi` memory and `10Gi` ephemeral storage; limit
 default to `2`, `4Gi` and `20Gi`. `factory.docker.storageSizeLimit` defaults to
 `20Gi`, `maxClaimLifetimeSeconds` to `86400` and `pingTimeoutSeconds` to `2`.
 Missing new leaves on retained releases receive these defaults. Namespace quota
-and LimitRange remain separate. This handoff configures future worker creation;
-daemon lifecycle and certificate issuance are not implemented here.
+and LimitRange remain separate. The worker
+(`apps/worker/src/curie_worker/sandbox/tool_daemon.py`) creates each Docker
+claim's daemon Pod, headless Service, ingress NetworkPolicy and per-claim mTLS
+Secret before the claim, reuses a retained route only after an authenticated
+ping, and deletes those objects on every retirement path, with an orphan sweep
+for objects older than the claim timeout. With `factory.docker.createNamespace`
+false, removing the last Docker repository also removes the worker's Role here,
+so daemon objects alive at that upgrade are left for the operator: each Pod
+stops at its `activeDeadlineSeconds`, while its Service, Secret and
+NetworkPolicy remain until deleted by hand.
 
 1. A daemon namespace, `factory.docker.namespace` or
    `<release-namespace>-<fullname>-docker` by default. The chart creates it
@@ -1416,7 +1505,7 @@ daemon lifecycle and certificate issuance are not implemented here.
    creates it with that label.
 2. A Role and RoleBinding there for the worker ServiceAccount: create, get,
    list and delete on pods, services and networkpolicies, get on pods/log,
-   create and delete on secrets.
+   create and get on pods/portforward, create and delete on secrets.
 3. A ResourceQuota from `factory.docker.quota.hard` and a Container LimitRange
    from `factory.docker.limitRange` (`max`, `min`, `default`,
    `defaultRequest`). All are required.
@@ -1430,10 +1519,14 @@ daemon lifecycle and certificate issuance are not implemented here.
    egress lists.
 5. With Rail 1 on, `<fullname>-runner-allow-docker-daemon` lets the factory
    agent's runner sandboxes (`curietech.ai/agent` set to the one factory agent
-   repository runners belong to) dial daemon pods on `factory.docker.port`
-   (2376). Other agents' sandboxes get no such allow. Daemon ingress
-   stays default-deny until the worker's per-run policy admits that run's
-   sandbox, so a sandbox reaches only its own daemon.
+   repository runners belong to) dial daemon pods on the full TCP range 1
+   through 65535 (`port: 1`, `endPort: 65535`). Other agents' sandboxes get no
+   such allow. Daemon ingress stays default-deny until the worker's per-run
+   policy admits the sandbox with the same `curietech.ai/sandbox-claim`
+   value, so a sandbox reaches only its own daemon. The runner uses
+   `DOCKER_PUBLISHED_HOST` to reach ports published by containers on its
+   daemon. The Docker API remains on `factory.docker.port` (2376) with
+   unchanged per-claim mTLS.
 6. Three ValidatingAdmissionPolicies with Deny bindings, which need
    Kubernetes 1.30 or newer:
    `<fullname>-docker-daemon-pods` admits only a worker-created pod with one
@@ -1454,13 +1547,18 @@ daemon lifecycle and certificate issuance are not implemented here.
    `activeDeadlineSeconds`.
    `<fullname>-docker-daemon-objects` holds the worker's Services to
    ClusterIP, its Secrets to Opaque or TLS, and its NetworkPolicies to
-   ingress-only policies selecting their own claim, whose every peer is a
-   runner sandbox of this release in the release namespace selected by a
-   label key outside the release selector keys (`name`, `instance`,
-   `component`), with no `ipBlock`, on TCP `factory.docker.port` with no
-   `endPort` range.
+   ingress-only policies selecting their own claim. Every peer must be in
+   the release namespace, with `app.kubernetes.io/component: runner-sandbox`,
+   this release's `app.kubernetes.io/instance`, and
+   `curietech.ai/sandbox-claim` exactly equal to the policy's metadata claim
+   label. Each ingress rule requires nonempty peer and port lists, no
+   `ipBlock`, and TCP `port: 1` with `endPort: 65535`.
    `<fullname>-docker-daemon-cleanup` lets the worker delete only
    NetworkPolicies labelled `curietech.ai/sandbox-claim`, never the chart's.
+
+**Upgrade note.** Existing claims retain their old ingress policies until
+reclaimed. New admission refuses older workers' ingress policies until the
+worker rollout completes.
 
 Opting a repository into Docker widens that repository's egress to what its
 class allows. Runner admission is unchanged.
@@ -2386,3 +2484,42 @@ The existing OTEL overrides and worker `CURIE_API_URL` / `CURIE_API_KEY`
 overrides remain supported: their helpers omit the chart entry, so each name
 appears once. Repeating any name within `extraEnv` itself is refused. Workloads
 without an `extraEnv` surface cannot append entries to their chart-owned env.
+
+### Opting into on-demand attachments
+
+The default `worker.attachments.enabled: false` keeps the lane off. Operators
+may opt in with `worker.attachments.enabled: true` and
+`worker.attachments.mode: lazy` after installing compatible API, worker and
+runner images. Activation is an explicit operator choice. Lazy mode requires
+a real runner (`agentSandbox.runner.fakeModel: false`) and the existing
+attachments cache mount. The chart creates an internal broker Service on
+`worker.attachments.broker.port` (default `8093`) and permits ingress only from
+the API pods. It supplies the API facade settings and worker transfer budgets
+from the same values. There is no new external ingress.
+
+The runner retains a writable attachments `emptyDir` with the finite
+`agentSandbox.runner.attachments.sizeLimit` (default `512Mi`) and existing
+sandbox resource limits. Lazy mode renders no eager `attachments-init`
+container. Listing references does not materialize their bytes. A requested file
+must fit the available cache; storage exhaustion is an explicit fetch failure.
+Legacy `maxFileBytes` and `threadMaxBytes` apply only in `mode: eager`.
+
+For an isolated source-built local stack, export
+`CURIE_ATTACHMENT_ENABLED=true`, `CURIE_ATTACHMENT_MODE=lazy` and
+`CURIE_ATTACHMENT_ACCESS_ENABLED=true` before `curie local up --build`, together
+with the existing real-model settings. Choose a unique
+`CURIE_ATTACHMENT_BROKER_PORT` for each simultaneous local stack (default
+`28093`). The broker binds loopback by default. The API reaches the host-network worker
+through `host.docker.internal` where Docker Desktop forwards that loopback
+listener. Native Linux or other topologies may require
+`CURIE_ATTACHMENT_BROKER_HOST` set to a verified private Docker bridge/gateway
+interface and `CURIE_ATTACHMENT_BROKER_URL` set to the matching API-reachable
+origin. A refused/unreachable broker blocks lazy activation. Do not broaden the
+bind to a LAN-facing interface to hide a networking error. Internal authentication
+is required on every broker request. Keep the
+existing Compose project, override files and endpoints consistent for startup
+and teardown. The local runner receives a claim-owned writable named tmpfs cache volume;
+`CURIE_ATTACHMENT_CACHE_SIZE_BYTES` controls its finite capacity (default
+`536870912`, or `512Mi`). Its contents consume effective memory resources, so
+a file below the volume capacity can still fail when the runner's memory limit
+is exhausted. Claim deletion removes only that claim's volume.

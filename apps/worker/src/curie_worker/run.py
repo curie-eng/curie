@@ -25,6 +25,7 @@ import httpx
 import redis
 from aci_protocol.s3 import build_s3_client
 from aci_protocol.turn import DEFAULT_IDENTITY
+from aiohttp import web
 from curie_protected_hooks.source_policy_sql import SourceGate
 from curie_telemetry import bootstrap_service_telemetry, record_metric
 from redis.asyncio import Redis as AsyncRedis
@@ -38,6 +39,7 @@ from .action_executor_loop import ActionExecutorLoop
 from .actions import ActionClient, ActionRecorder
 from .approval_cards import ApprovalCardStore
 from .approvals import ApprovalClient
+from .attachment_access_client import AttachmentAccessClient
 from .attachments import (
     AttachmentCoordinator,
     AttachmentLimits,
@@ -113,6 +115,7 @@ from .workspace import (
     WorkspaceClaimCoordinator,
     WorkspaceCredentialClient,
     WorkspaceLimits,
+    WorkspaceObjectPort,
     WorkspaceObjectStore,
     WorkspacePreparer,
 )
@@ -171,6 +174,7 @@ class Runtime:
     stream_retention: StreamRetention | None = None
     resources: WorkerResources | None = None
     source_gate: SourceGate | None = None
+    attachment_broker: web.AppRunner | None = None
 
 
 # 365 days, the ceiling shared by all three operator-tunable seconds knobs
@@ -408,6 +412,7 @@ def _sandbox_client(
             # tiers disagreeing on how big a file may be is the kind of skew
             # that only shows up as a refusal in one place and not the other.
             attachment_limits=_attachment_limits(config),
+            attachment_cache_size_bytes=config.attachment_cache_size_bytes,
         )
         # Prewarm the runner image once at startup so the first claim window is
         # not gated on a cold pull. Best-effort inside ensure_image.
@@ -426,6 +431,52 @@ def create_source_gate_engine(config: WorkerConfig) -> AsyncEngine:
 async def _close_sync(close: Callable[[], None]) -> None:
     """@spec PROTECTED-HOOK-SOURCE-2."""
     await asyncio.to_thread(close)
+
+
+def _attachment_coordinator(
+    config: WorkerConfig, objects: WorkspaceObjectPort, slack_tokens: Mapping[str, str]
+) -> AttachmentCoordinator | None:
+    """Keep legacy object retention cleanup active during lazy rollout."""
+    return (
+        AttachmentCoordinator(
+            # The lane is on when any identity holds a token, so `default`'s
+            # may be blank here; `_files_for` refuses that identity before any
+            # fetch rather than this module standing in a broken port for it.
+            files=(
+                SlackFileClient(
+                    token=config.slack_bot_token,
+                    read_chunk_bytes=_attachment_limits(config).read_chunk_bytes,
+                )
+                if config.slack_bot_token
+                else None
+            ),
+            identity_files={
+                name: SlackFileClient(
+                    token=token,
+                    read_chunk_bytes=_attachment_limits(config).read_chunk_bytes,
+                )
+                for name, token in slack_tokens.items()
+                if name != DEFAULT_IDENTITY
+            },
+            channel_files=(
+                ChannelPortFileClient(
+                    credentials=config.adapter_credentials,
+                    read_chunk_bytes=_attachment_limits(config).read_chunk_bytes,
+                )
+                if config.adapter_credentials
+                else None
+            ),
+            objects=objects,
+            limits=_attachment_limits(config),
+        )
+        if config.attachment_enabled
+        and (
+            config.attachment_mode == "lazy"
+            or any(slack_tokens.values())
+            or bool(config.adapter_credentials)
+        )
+        else None
+    )
 
 
 def build(
@@ -519,7 +570,7 @@ def build(
     # v0.8.8 answers it. The chart's ``worker.attachments.enabled`` gates the
     # sandbox half from the same value, so there is one knob and not two.
     #
-    # The credential condition is separate: the lane downloads a referenced
+    # In eager mode the credential condition is separate: the lane downloads a referenced
     # file with a Slack bot token, or with a channel-port adapter's secret
     # (ADR-0153), and the kernel treats a wired lane as authoritative. An
     # install holding neither (compose smoke) keeps running every turn exactly
@@ -527,7 +578,10 @@ def build(
     # An install holding only one gets a lane whose other client is None, and
     # a file on that other kind is refused by name.
     #
-    # It parks bytes in the PRIVATE workspace store, never the public bundle
+    # Lazy mode retains this coordinator only for legacy retention cleanup,
+    # even without provider credentials; all new downloads use the broker.
+    #
+    # It parks eager bytes in the PRIVATE workspace store, never the public bundle
     # bucket -- under its own ``attachments/`` key prefix, with its retention
     # ledger a sibling of ``_ownership/`` -- so an inbound file is reachable only
     # through a short-lived one-object presigned URL redeemed by the sandbox's
@@ -536,46 +590,42 @@ def build(
     # Each Slack identity's bot token, read once from this process's env
     # (ADR-0168 decision 5), so the lane and the sink serve the same set.
     slack_tokens = slack_bot_tokens(config, environ=env)
-    attachments = (
-        AttachmentCoordinator(
-            # The lane is on when any identity holds a token, so `default`'s
-            # may be blank here; `_files_for` refuses that identity before any
-            # fetch rather than this module standing in a broken port for it.
-            files=(
-                SlackFileClient(
-                    token=config.slack_bot_token,
-                    read_chunk_bytes=_attachment_limits(config).read_chunk_bytes,
-                )
-                if config.slack_bot_token
-                else None
-            ),
-            identity_files={
-                name: SlackFileClient(
-                    token=token,
-                    read_chunk_bytes=_attachment_limits(config).read_chunk_bytes,
-                )
-                for name, token in slack_tokens.items()
-                if name != DEFAULT_IDENTITY
-            },
-            channel_files=(
-                ChannelPortFileClient(
-                    credentials=config.adapter_credentials,
-                    read_chunk_bytes=_attachment_limits(config).read_chunk_bytes,
-                )
-                if config.adapter_credentials
-                else None
-            ),
-            objects=workspace_objects,
-            limits=_attachment_limits(config),
-        )
-        if config.attachment_enabled
-        and (any(slack_tokens.values()) or bool(config.adapter_credentials))
-        else None
-    )
+    attachments = _attachment_coordinator(config, workspace_objects, slack_tokens)
     # One API-lane HTTP client shared by the approval writer (#244) and the two
     # eval-lane reporters below; httpx.AsyncClient is task-safe.
     eval_http = httpx.AsyncClient(timeout=30.0)
     owner.register_close("eval-http", eval_http.aclose, order=30)
+    attachment_access_client = None
+    broker_server = None
+    if config.attachment_enabled and config.attachment_mode == "lazy":
+        from .attachment_broker import AttachmentBroker
+
+        broker = AttachmentBroker(
+            internal_token=config.internal_worker_token,
+            routes_for_agent=binding.routes_for_agent,
+            slack_files={
+                name: SlackFileClient(token=token, read_chunk_bytes=64 * 1024)
+                for name, token in slack_tokens.items()
+                if token
+            },
+            channel_files=(
+                ChannelPortFileClient(
+                    credentials=config.adapter_credentials, read_chunk_bytes=64 * 1024
+                )
+                if config.adapter_credentials
+                else None
+            ),
+            api_url=config.api_base_url,
+            max_concurrent=config.attachment_broker_max_concurrent,
+            transfer_timeout_seconds=config.attachment_transfer_timeout_seconds,
+        )
+        broker_server = web.AppRunner(broker.create_app(), handler_cancellation=True)
+        owner.register_close("attachment-broker", broker_server.cleanup, order=25)
+        attachment_access_client = AttachmentAccessClient(
+            api_base_url=config.api_base_url,
+            worker_token=config.internal_worker_token,
+            client=eval_http,
+        )
     approval_client = ApprovalClient(
         api_base_url=config.api_base_url,
         api_key=config.api_key,
@@ -654,6 +704,7 @@ def build(
         binding=binding,
         workspace=workspace,
         attachments=attachments,
+        attachment_access=attachment_access_client,
         # ADR 0205: the thread attachment ledger, behind the internal worker
         # token and nothing else. Without the token (or without the lane) no
         # ledger is wired and every turn's attachments behave as before.
@@ -776,6 +827,7 @@ def build(
         eval_http=eval_http,
         engine=engine,
         resources=owner,
+        attachment_broker=broker_server,
         source_gate=source_gate,
         card_store=card_store,
         orphan_sweeper=(
@@ -1038,15 +1090,16 @@ def _build_action_recorder(
 ) -> ActionRecorder:
     """The ledger client, wrapped to attribute connector digests where it can.
 
-    @spec ACTION-EXECUTOR-12: only on the cluster tier with the connector
-    reconciler (which owns the Deployments read) and the executor (whose chart
-    gate is what grants the worker ``get`` on Deployments) both enabled, and an
-    internal worker token to send attribution under. With either flag off the
+    @spec ACTION-EXECUTOR-12: only on the cluster tier with the executor
+    enabled and its connector reads on (``WorkerConfig.executor_reads_connectors``:
+    the connector reconciler, or the executor's own reads without it, #4800),
+    which is exactly when the chart grants the worker ``get`` on Deployments,
+    and an internal worker token to send attribution under. Otherwise the
     worker Role has no such ``get``, so the wrapper is not composed and every
     action records a null digest, as on the local tier.
     """
 
-    if not (config.connector_reconcile_enabled and config.action_executor_enabled):
+    if not config.executor_reads_connectors:
         return client
     if not config.internal_worker_token:
         # The API takes attribution only under the worker token; without one
@@ -1094,10 +1147,14 @@ def _build_action_executor(
     nothing. The executor routes take only the internal worker token, so a
     worker without one cannot run it.
 
-    Tiers. With the connector reconciler on (the cluster tier) the loop reads
-    the connector Deployment, which the chart lets the worker ``get`` only with
-    the executor enabled, and the in-force digest from the same API render the
-    reconciler applies. Without it (the local tier) there is no Deployment and
+    Tiers. With the executor's connector reads on (the cluster tier, with the
+    connector reconciler or, #4800, the executor's own reads while the
+    reconcile loop stays off) the loop reads the connector Deployment, which
+    the chart lets the worker ``get`` only with the executor enabled, and the
+    in-force digest from the same API render the reconciler applies. An
+    unreadable Deployment or a digest that does not match refuses
+    ``connector_digest_unavailable`` before any sandbox claim. Without either
+    (the local tier) there is no Deployment and
     no caller proxy: every restore refuses ``tool_not_grant_bound`` and every
     probe ``connector_digest_unavailable``, which is what the local tier proves
     (ACTION-EXECUTOR-7). No consumer, stream, thread lock or marker is touched.
@@ -1114,9 +1171,14 @@ def _build_action_executor(
 
     deployments = None
     manifests = None
-    if config.connector_reconcile_enabled:
+    if config.executor_reads_connectors:
         from .connector_k8s import connector_deployments_api
 
+        if not config.connector_reconcile_enabled:
+            logger.info(
+                "action executor reads connector Deployments by name; "
+                "connector reconcile loop off"
+            )
         deployments = connector_deployments_api()
         manifests = HttpManifestSource(
             api_base_url=config.api_base_url,
@@ -1457,6 +1519,12 @@ async def _run(config: WorkerConfig, env: Mapping[str, str]) -> None:
 
 async def _run_runtime(rt: Runtime, config: WorkerConfig, resources: WorkerResources) -> None:
     """@spec PROTECTED-HOOK-SOURCE-2."""
+
+    if rt.attachment_broker is not None:
+        await rt.attachment_broker.setup()
+        await web.TCPSite(
+            rt.attachment_broker, config.attachment_broker_host, config.attachment_broker_port
+        ).start()
 
     loop = asyncio.get_running_loop()
 

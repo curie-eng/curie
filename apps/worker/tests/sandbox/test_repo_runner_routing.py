@@ -14,6 +14,7 @@ in-memory Kubernetes fake and the real Valkey affinity store.
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
@@ -212,7 +213,19 @@ def test_stale_base_is_refused_before_any_kubernetes_write(
     message = str(refusal)
     assert REPO in message
     assert "stale_base" in message
-    assert f"curie cluster factory --repo {REPO}" in message
+    command = f"curie cluster factory --repo-runner {REPO}="
+    assert command in message
+    spec = message.split(command, 1)[1].split()[0].rstrip("`.;")
+    assert spec and not spec.startswith("-")
+    assert "--registry " in message
+    registry = message.split("--registry ", 1)[1].split()[0].rstrip("`.;")
+    assert registry and not registry.startswith("-")
+    assert "rebuild" in message.lower()
+    if platform is None:
+        assert "pin " in message.lower()
+        assert message.lower().index("pin ") < message.lower().index("rebuild")
+    else:
+        assert platform in message
     _assert_nothing_written(probing_k8s, affinity, "T-stale")
 
 
@@ -396,7 +409,7 @@ def _lose_race_to(
         runner_digests=runner_digests,
         runner_docker=False,
     )
-    k8s.create_claim("claim-winner", pool=POOL)
+    k8s.create_claim("claim-winner", pool=POOL, deadline=time.monotonic() + 300)
     original_create = k8s.create_claim
     fired: list[bool] = []
 
@@ -645,7 +658,7 @@ def test_legacy_route_without_runner_fields_is_reused_when_no_entry_applies(
     key_prefix: str,
 ) -> None:
     # A route a pre-upgrade worker wrote: no runner_digests, no runner_docker.
-    probing_k8s.create_claim("legacy-claim", pool=BASE_POOL)
+    probing_k8s.create_claim("legacy-claim", pool=BASE_POOL, deadline=time.monotonic() + 300)
     legacy = {
         "thread_key": "T-legacy",
         "claim_name": "legacy-claim",

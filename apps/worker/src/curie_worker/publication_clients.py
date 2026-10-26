@@ -10,14 +10,23 @@ from urllib.parse import quote, urlsplit
 
 import httpx
 
-from .publication_k8s import HEADER_FORMS, HeaderForm, clean_origin, valid_repository_path
+from .publication_k8s import (
+    HEADER_FORMS,
+    HeaderForm,
+    clean_origin,
+    valid_base_branch,
+    valid_repository_path,
+)
 from .publication_loop import (
+    PublicationBranchHead,
     PublicationCredential,
     PublicationIdentityUnavailable,
     PublicationLineageRefused,
     PublicationPullState,
     PublicationReconcileError,
+    PublicationRecoveryTimeout,
     PublicationRemoteTerminalError,
+    PublicationRevisionCommit,
     PublicationTranscriptPermanentError,
 )
 
@@ -349,21 +358,25 @@ class PublicationCodeHostClient:
             raise PublicationReconcileError("the API returned the wrong stored pull request")
         return pull
 
-    async def read_branch_head(self, publication_id: uuid.UUID) -> str | None:
-        """The deterministic branch head, or None when the branch does not exist."""
+    async def read_branch_head(self, publication_id: uuid.UUID) -> PublicationBranchHead:
+        """Read the publication head and the API-authoritative base branch."""
 
         response = await self._call(
             "GET", self._url(publication_id, "branch-head"), "branch lookup"
         )
         try:
-            head_sha = response.json()["head_sha"]
+            data = response.json()
+            head_sha = data["head_sha"]
+            base_branch = data["base_branch"]
         except (KeyError, TypeError, ValueError) as exc:
             raise PublicationReconcileError("branch lookup response was unusable") from exc
-        if head_sha is None:
-            return None
-        if not isinstance(head_sha, str) or _SHA.fullmatch(head_sha) is None:
+        if not valid_base_branch(base_branch):
+            raise PublicationReconcileError("branch lookup returned an invalid base branch")
+        if head_sha is not None and (
+            not isinstance(head_sha, str) or _SHA.fullmatch(head_sha) is None
+        ):
             raise PublicationReconcileError("branch lookup returned an invalid branch head")
-        return head_sha
+        return PublicationBranchHead(head_sha=head_sha, base_branch=base_branch)
 
     async def verify_revision_commit(
         self,
@@ -372,7 +385,7 @@ class PublicationCodeHostClient:
         *,
         revision_id: uuid.UUID,
         expected_parent: str,
-    ) -> str:
+    ) -> PublicationRevisionCommit:
         response = await self._call(
             "POST",
             self._url(publication_id, "revision-commit"),
@@ -384,12 +397,23 @@ class PublicationCodeHostClient:
             },
         )
         try:
-            observed = response.json()["commit_sha"]
+            data = response.json()
+            observed = data["commit_sha"]
+            parent_sha = data["parent_sha"]
         except (KeyError, TypeError, ValueError) as exc:
             raise PublicationReconcileError("revision verification response was unusable") from exc
         if observed != commit_sha:
             raise PublicationReconcileError("revision verification returned a different commit")
-        return commit_sha
+        if (
+            not isinstance(observed, str)
+            or _SHA.fullmatch(observed) is None
+            or not isinstance(parent_sha, str)
+            or _SHA.fullmatch(parent_sha) is None
+        ):
+            raise PublicationReconcileError(
+                "revision verification returned an invalid commit proof"
+            )
+        return PublicationRevisionCommit(commit_sha=observed, parent_sha=parent_sha)
 
     async def update_pull_request_metadata(self, publication_id: uuid.UUID) -> PublicationPullState:
         """Apply a metadata-only revision to its stored pull request, through the API."""
@@ -402,20 +426,25 @@ class PublicationCodeHostClient:
         return _pull_state(response)
 
     async def recover_pull_request(
-        self, publication_id: uuid.UUID, *, expected_head_sha: str
+        self, publication_id: uuid.UUID, *, expected_head_sha: str, adopt_only: bool
     ) -> PublicationPullState | None:
-        """Adopt the branch's pull request, or open it when the branch exists."""
+        """Adopt the branch's pull request, opening only when adopt_only is false."""
 
         if _SHA.fullmatch(expected_head_sha) is None:
             raise PublicationReconcileError(
                 "deterministic-head recovery expected commit is invalid"
             )
-        response = await self._call(
-            "POST",
-            self._url(publication_id, "pull-request"),
-            "deterministic-head recovery",
-            body={"expected_head_sha": expected_head_sha},
-        )
+        try:
+            response = await self._call(
+                "POST",
+                self._url(publication_id, "pull-request"),
+                "deterministic-head recovery",
+                body={"expected_head_sha": expected_head_sha, "adopt_only": adopt_only},
+            )
+        except PublicationReconcileError as exc:
+            if not adopt_only and isinstance(exc.__cause__, httpx.TimeoutException):
+                raise PublicationRecoveryTimeout(expected_head_sha) from exc.__cause__
+            raise
         if response.status_code == 204:
             return None
         pull = _pull_state(response)

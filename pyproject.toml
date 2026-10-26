@@ -93,6 +93,8 @@ root_packages = [
     "curie_internal",
     "curie_worker",
     "curie_connector_proxy",
+    "curie_commissioning_ingress",
+    "curie_commissioning_worker",
     "curie_dispatcher",
     "curie_discord_adapter",
     "curie_mail_adapter",
@@ -117,6 +119,304 @@ name = "Protected hook primitives stay independent of applications and harnesses
 type = "forbidden"
 source_modules = ["curie_protected_hooks"]
 forbidden_modules = ["curie_api", "curie_worker", "curie_runner", "claude_agent_sdk"]
+
+# @spec PROTECTED-HOOK-SOURCE-11: only provisioner composition imports the
+# runtime directory writer. The HTTP application and every package that
+# composes a process holding the ordinary platform key or ordinary application
+# credentials cannot reach it, and the shared grammar the API reads never
+# imports it. A provisioner entry inside a listed package needs a reviewed
+# ignore_imports exception naming that one module.
+[[tool.importlinter.contracts]]
+name = "The runtime directory writer stays out of ordinary compositions"
+type = "forbidden"
+source_modules = [
+    "curie_api",
+    "curie_worker",
+    "curie_dispatcher",
+    "curie_runner",
+    "curie_internal",
+    "curie_upgrade_pause",
+    "curie_discord_adapter",
+    "curie_mail_adapter",
+    "curie_connector_proxy",
+    "curie_e2e_connector",
+    "curie_commissioning_ingress",
+    "curie_commissioning_worker",
+    "curie_protected_hooks.runtime_directory",
+]
+forbidden_modules = ["curie_protected_hooks.runtime_directory_writer"]
+ignore_imports = [
+    "curie_worker.commissioning_registered_observer -> curie_protected_hooks.commissioning_operator_custody",
+]
+
+# @spec PROTECTED-COMMISSIONING-1/2: production composition reads no commissioning
+# record. The whole API and worker are sources, so a new production module is
+# covered by default; a later commissioning entry needs a reviewed exception.
+# Later commissioning slices add their record modules to the forbidden list.
+[[tool.importlinter.contracts]]
+name = "Production composition never imports commissioning records"
+type = "forbidden"
+source_modules = ["curie_api", "curie_worker"]
+forbidden_modules = [
+    "curie_protected_hooks.commissioning_series_guard",
+    "curie_protected_hooks.commissioning_operator_custody",
+    "curie_protected_hooks.commissioning_operator_records",
+    "curie_protected_hooks.commissioning_run_authority",
+    "curie_protected_hooks.commissioning_run_storage",
+    "curie_protected_hooks.commissioning_run_records",
+    "curie_protected_hooks.commissioning_trial_records",
+    "curie_protected_hooks.commissioning_trial_evidence_records",
+    "curie_protected_hooks.commissioning_evidence_acl",
+    "curie_protected_hooks.commissioning_series_bootstrap",
+    "curie_protected_hooks.commissioning_retained",
+    "curie_protected_hooks.commissioning_evidence_records",
+    "curie_protected_hooks.commissioning_acceptance_writer",
+    "curie_protected_hooks.commissioning_acl",
+    "curie_protected_hooks.commissioning_activation",
+    "curie_protected_hooks.commissioning_admissions",
+    "curie_protected_hooks.commissioning_bootstrap",
+    "curie_protected_hooks.commissioning_campaign_records",
+    "curie_protected_hooks.commissioning_encoding",
+    "curie_protected_hooks.commissioning_gateway_control",
+    "curie_protected_hooks.commissioning_journal",
+    "curie_protected_hooks.commissioning_launch_control",
+    "curie_protected_hooks.commissioning_local_bootstrap",
+    "curie_protected_hooks.commissioning_local_broker",
+    "curie_protected_hooks.commissioning_local_installation",
+    "curie_protected_hooks.commissioning_local_ownership",
+    "curie_protected_hooks.commissioning_local_worker",
+    "curie_protected_hooks.commissioning_local_workloads",
+    "curie_protected_hooks.commissioning_operator_guard",
+    "curie_protected_hooks.commissioning_operator_protocol",
+    "curie_protected_hooks.commissioning_producers",
+    "curie_protected_hooks.commissioning_provisioner",
+    "curie_protected_hooks.commissioning_records",
+    "curie_protected_hooks.commissioning_reservations",
+    "curie_protected_hooks.commissioning_scripts",
+    "curie_protected_hooks.commissioning_verifier",
+    "curie_protected_hooks.commissioning_worker",
+    "curie_protected_hooks.qualification_publication",
+]
+
+# ADR 0236's internal operator and ADR 0241's provisioner-only evidence reader
+# have only these named exceptions. Local installation reads stay provisioner-only.
+ignore_imports = [
+    "curie_worker.commissioning_registered_observer -> curie_protected_hooks.commissioning_operator_custody",
+    "curie_worker.commissioning_registered_observer -> curie_protected_hooks.commissioning_journal",
+    "curie_worker.commissioning_registered_observer -> curie_protected_hooks.commissioning_records",
+    "curie_worker.commissioning_registered_observer -> curie_protected_hooks.commissioning_producers",
+    "curie_worker.commissioning_registered_observer -> curie_protected_hooks.commissioning_evidence_records",
+    "curie_worker.commissioning_registered_observer -> curie_protected_hooks.commissioning_evidence_acl",
+    "curie_worker.commissioning_evidence_observer -> curie_protected_hooks.commissioning_series_guard",
+    "curie_worker.commissioning_evidence_observer -> curie_protected_hooks.commissioning_series_bootstrap",
+    "curie_worker.commissioning_evidence_observer -> curie_protected_hooks.commissioning_records",
+    "curie_worker.commissioning_evidence_observer -> curie_protected_hooks.commissioning_journal",
+    "curie_worker.commissioning_evidence_observer -> curie_protected_hooks.commissioning_evidence_records",
+    "curie_worker.commissioning_control_process -> curie_protected_hooks.commissioning_bootstrap",
+    "curie_worker.commissioning_control_process -> curie_protected_hooks.commissioning_operator_guard",
+    "curie_worker.commissioning_control_process -> curie_protected_hooks.commissioning_producers",
+    "curie_worker.commissioning_control_process -> curie_protected_hooks.commissioning_provisioner",
+    "curie_worker.commissioning_control_process -> curie_protected_hooks.commissioning_records",
+    "curie_worker.commissioning_control_reader -> curie_protected_hooks.commissioning_local_installation",
+    "curie_worker.commissioning_control_reader -> curie_protected_hooks.commissioning_local_ownership",
+]
+
+# @spec PROTECTED-COMMISSIONING-8: the commissioning launch authorizer is the
+# second closed authorizer of the shared launch mechanics. It and its registry
+# live in `curie_worker` beside the mechanics, import no commissioning record,
+# and are reached from production composition only through the mechanics'
+# closed class admission and authorizer-owned registry; those two edges are the
+# reviewed exception.
+[[tool.importlinter.contracts]]
+name = "Production composition reaches the commissioning launch path only through the closed seam"
+type = "forbidden"
+source_modules = [
+    "curie_api",
+    "curie_worker.__main__",
+    "curie_worker.protected_entry",
+    "curie_worker.protected_lane",
+    "curie_worker.protected_launch_client",
+    "curie_worker.protected_launch_server",
+]
+forbidden_modules = [
+    "curie_worker.commissioning_cleanup",
+    "curie_worker.commissioning_launch",
+    "curie_worker.commissioning_probe_registry",
+    "curie_worker.commissioning_probe_runtime",
+    "curie_worker.commissioning_registry",
+    "curie_worker.commissioning_supervisor",
+]
+ignore_imports = [
+    "curie_worker.protected_launch_mechanics -> curie_worker.commissioning_launch",
+    "curie_worker.protected_launch_mechanics -> curie_worker.commissioning_registry",
+]
+
+# @spec PROTECTED-COMMISSIONING-8: before a permit exists, the primitive probes
+# follow the campaign ownership rules in a registry of their own that grants no
+# campaign or production authority. They reuse the campaign registry's
+# termination and never-started facts, but reach no launch authorizer, launch
+# server or client, supervisor, provider gateway or API.
+[[tool.importlinter.contracts]]
+name = "Primitive probes hold no campaign or production launch authority"
+type = "forbidden"
+source_modules = [
+    "curie_worker.commissioning_probe_registry",
+    "curie_worker.commissioning_probe_runtime",
+]
+forbidden_modules = [
+    "curie_api",
+    "curie_worker.commissioning_launch",
+    "curie_worker.commissioning_provider_gateway",
+    "curie_worker.commissioning_supervisor",
+    "curie_worker.protected_entry",
+    "curie_worker.protected_launch_client",
+    "curie_worker.protected_launch_mechanics",
+    "curie_worker.protected_launch_server",
+]
+
+# @spec PROTECTED-COMMISSIONING-8: the provider gateway is a permanent
+# installation component named by the execution configuration's model base URL.
+# It selects its production or commissioning authorizer only from the launch
+# identity a trusted registrar recorded, so it never reaches the launch
+# mechanics, the commissioning launch path or a launch server, and its campaign
+# authority arrives only through the protocol the control implements outside
+# `curie_worker` (covered by the first contract).
+[[tool.importlinter.contracts]]
+name = "The provider gateway reaches no launch mechanics"
+type = "forbidden"
+source_modules = [
+    "curie_worker.commissioning_provider_gateway",
+    "curie_worker.provider_identity",
+]
+forbidden_modules = [
+    "curie_worker.commissioning_launch",
+    "curie_worker.commissioning_registry",
+    "curie_worker.protected_launch_client",
+    "curie_worker.protected_launch_mechanics",
+    "curie_worker.protected_launch_server",
+]
+
+# @spec PROTECTED-COMMISSIONING-8: the guard's control profile, slots and
+# admission policy are installation objects, read by the guard and the
+# commissioning compositions only. No production composition imports them, and
+# they reach no launch authority, so the guard can decide admission but can
+# never itself create, reserve or authorize a launch. The control installation
+# that installs the guard and the control observer that reobserves it are held
+# to the same two contracts. The guard modules live in
+# `curie_worker`, so the first contract names every protected production module
+# explicitly: import-linter does not check a package against its own modules.
+[[tool.importlinter.contracts]]
+name = "Production composition never imports the commissioning guard"
+type = "forbidden"
+source_modules = [
+    "curie_api",
+    "curie_worker.__main__",
+    "curie_worker.protected_binding",
+    "curie_worker.protected_completion",
+    "curie_worker.protected_configuration",
+    "curie_worker.protected_dispatch",
+    "curie_worker.protected_entry",
+    "curie_worker.protected_execution",
+    "curie_worker.protected_history",
+    "curie_worker.protected_kubernetes_projection",
+    "curie_worker.protected_lane",
+    "curie_worker.protected_launch_client",
+    "curie_worker.protected_launch_documents",
+    "curie_worker.protected_launch_kubernetes",
+    "curie_worker.protected_launch_mechanics",
+    "curie_worker.protected_launch_records",
+    "curie_worker.protected_launch_registry",
+    "curie_worker.protected_launch_server",
+    "curie_worker.protected_markers",
+    "curie_worker.protected_nomination",
+    "curie_worker.protected_nomination_filter",
+    "curie_worker.protected_recovery",
+    "curie_worker.protected_retirement",
+    "curie_worker.protected_run",
+    "curie_worker.protected_runner",
+    "curie_worker.protected_substrate",
+    "curie_worker.protected_substrate_facts",
+    "curie_worker.protected_substrate_readers",
+    "curie_worker.protected_worker_bootstrap",
+]
+forbidden_modules = [
+    "curie_worker.commissioning_evidence_observer",
+    "curie_worker.commissioning_registered_observer",
+    "curie_worker.commissioning_control_admission",
+    "curie_worker.commissioning_control_installation",
+    "curie_worker.commissioning_control_observer",
+    "curie_worker.commissioning_control_process",
+    "curie_worker.commissioning_control_reader",
+    "curie_worker.commissioning_control_profile",
+    "curie_worker.commissioning_control_slots",
+]
+
+[[tool.importlinter.contracts]]
+name = "The commissioning guard holds no launch authority"
+type = "forbidden"
+source_modules = [
+    "curie_worker.commissioning_control_admission",
+    "curie_worker.commissioning_control_installation",
+    "curie_worker.commissioning_control_observer",
+    "curie_worker.commissioning_control_profile",
+    "curie_worker.commissioning_control_slots",
+]
+forbidden_modules = [
+    "curie_api",
+    "curie_worker.protected_entry",
+    "curie_worker.protected_launch_mechanics",
+    "curie_worker.protected_launch_server",
+    "curie_worker.protected_launch_client",
+    "curie_worker.protected_launch_kubernetes",
+    "curie_worker.protected_launch_registry",
+]
+
+# The in-cluster control process cannot acquire the provisioner's local cluster
+# configuration or signing key, acceptance writer, or publication credentials.
+[[tool.importlinter.contracts]]
+name = "The control process never owns provisioner or publication authority"
+type = "forbidden"
+source_modules = ["curie_worker.commissioning_control_process"]
+forbidden_modules = [
+    "curie_worker.commissioning_evidence_observer",
+    "curie_worker.commissioning_registered_observer",
+    "curie_worker.commissioning_control_reader",
+    "curie_worker.commissioning_control_installation",
+    "curie_protected_hooks.commissioning_local_installation",
+    "curie_protected_hooks.commissioning_local_ownership",
+    "curie_protected_hooks.commissioning_local_bootstrap",
+    "curie_protected_hooks.commissioning_acceptance_writer",
+    "curie_protected_hooks.commissioning_activation",
+    "curie_protected_hooks.qualification_publication",
+]
+
+# @spec PROTECTED-COMMISSIONING-2/4: the commissioning ingress and worker are
+# separate standalone process compositions, top-level packages beside
+# `curie_api` and `curie_worker` rather than modules of them, so the contract
+# above holds for the whole API and worker with no exception. No ordinary
+# composition imports either. The ingress may import the API's shared signing
+# and file-reading helpers and the worker the worker's stream transport, never
+# the reverse.
+[[tool.importlinter.contracts]]
+name = "Ordinary compositions never import the commissioning compositions"
+type = "forbidden"
+source_modules = [
+    "curie_api",
+    "curie_worker",
+    "curie_dispatcher",
+    "curie_runner",
+    "curie_internal",
+    "curie_protected_hooks",
+    "curie_connector_proxy",
+]
+forbidden_modules = ["curie_commissioning_ingress", "curie_commissioning_worker"]
+
+# The commissioning worker has no path into the API: no worker to API import.
+[[tool.importlinter.contracts]]
+name = "The commissioning worker imports nothing of the API"
+type = "forbidden"
+source_modules = ["curie_commissioning_worker"]
+forbidden_modules = ["curie_api", "curie_commissioning_ingress"]
 
 [[tool.importlinter.contracts]]
 # Telemetry attribute names are shared schema, not an application or harness
@@ -264,6 +564,7 @@ testpaths = [
     # fixture the e2e ladder builds into a bundle; its tests ship beside it.
     "cli/scripts/fixtures/reversible-reference",
     "tools/preflight/tests",
+    "tools/test-env",
     "tools/doclint/tests",
     # @spec PROTECTED-HOOK-LANE-2
     "packages/protected-hooks/tests",

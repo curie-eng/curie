@@ -2530,15 +2530,16 @@ no {{ .key }} in this container's env: nothing to stage. This is expected for a 
 {{/*
 Agents that get a per-agent runner SandboxTemplate and warm pool, as a JSON
 array: every connectorSecrets agent, every registryEgress agent (#3083), and
-every runnerImages agent (ADR-0173), every runnerEnv agent, and every workspaceSizeLimits agent (#3523),
-every true factory.sandboxEgress, and every string in agentSandbox.poolAgents.
+every runnerImages agent (ADR-0173), every runnerEnv agent, every workspaceSizeLimits agent (#3523),
+every agentResourceProfiles agent (#4889), every true factory.sandboxEgress, and every string in
+agentSandbox.poolAgents.
 */}}
 {{- define "curie.agentSandboxPoolAgents" -}}
 {{- $extra := list -}}
 {{- if kindIs "slice" .Values.agentSandbox.poolAgents -}}
 {{- $extra = .Values.agentSandbox.poolAgents -}}
 {{- end -}}
-{{- $agents := concat (keys (.Values.agentSandbox.connectorSecrets | default dict)) (keys (.Values.agentSandbox.registryEgress | default dict)) (keys (.Values.agentSandbox.runnerImages | default dict)) (keys (include "curie.agentSandboxRunnerEnv" . | fromJson)) (keys (.Values.agentSandbox.workspaceSizeLimits | default dict)) (include "curie.factory.sandboxAgents" . | fromJsonArray) $extra -}}
+{{- $agents := concat (keys (.Values.agentSandbox.connectorSecrets | default dict)) (keys (.Values.agentSandbox.registryEgress | default dict)) (keys (.Values.agentSandbox.runnerImages | default dict)) (keys (include "curie.agentSandboxRunnerEnv" . | fromJson)) (keys (.Values.agentSandbox.workspaceSizeLimits | default dict)) (keys (get .Values.agentSandbox "agentResourceProfiles" | default dict)) (include "curie.factory.sandboxAgents" . | fromJsonArray) $extra -}}
 {{- $agents | uniq | sortAlpha | toJson -}}
 {{- end -}}
 
@@ -2551,6 +2552,28 @@ predates it does not carry under --reuse-values (#3505, #3544).
 */}}
 {{- define "curie.actionExecutorEnabled" -}}
 {{- if (get (.Values.actionExecutor | default dict) "enabled") -}}true{{- else -}}false{{- end -}}
+{{- end -}}
+
+{{/*
+The executor's own connector reads without the reconcile loop (#4800,
+ACTION-EXECUTOR-12 as amended): "true" or "false". On, the worker Role gains a
+single-object `get` on Deployments (and nothing else) and the worker reads the
+acting connector's Deployment and the in-force digest itself, while
+worker.connectorReconciler stays off. It requires the executor, and is refused
+with the reconciler on, where the executor already reads through the
+reconciler's rules. Read through `default dict` for --reuse-values from a
+release that predates the key.
+*/}}
+{{- define "curie.actionExecutorConnectorReads" -}}
+{{- if (get (.Values.actionExecutor | default dict) "connectorReadsWithoutReconciler") -}}
+{{- if ne (include "curie.actionExecutorEnabled" .) "true" -}}
+{{- fail "actionExecutor.connectorReadsWithoutReconciler=true requires actionExecutor.enabled=true: only the executor reads connector Deployments" -}}
+{{- end -}}
+{{- if .Values.worker.connectorReconciler.enabled -}}
+{{- fail "actionExecutor.connectorReadsWithoutReconciler=true is for worker.connectorReconciler.enabled=false: with the reconciler on the executor already reads connector Deployments, so leave it unset" -}}
+{{- end -}}
+true
+{{- else -}}false{{- end -}}
 {{- end -}}
 
 {{/*

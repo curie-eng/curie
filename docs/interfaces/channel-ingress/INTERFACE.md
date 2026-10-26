@@ -187,6 +187,17 @@ satisfying the egress Protocol, or out of process over the HTTP wire.
   services count `curie.turn.refused`. The list is set with
   `PUT /agents/{agent_id}/channels/callers`, which leaves the binding generation,
   and so the adapter's token, alone.
+  The [common API admission extraction contract](../../superpowers/specs/2026-10-23-common-admission-extraction.md)
+  specifies behavior-preserving delegation of the existing list and invocation-team
+  composition by both API entry points; it preserves their different evidence,
+  refusal, cache and enqueue boundaries.
+- **Delivery canary**: a Slack mention in a channel listed in
+  `CURIE_SLACK_DELIVERY_CANARY_CHANNELS` proves that Slack still delivers to that
+  identity, and nothing more. The dispatcher counts it on
+  `curie.slack.delivery_canary` and refuses it as `delivery_canary` in
+  `process_event` (`apps/dispatcher/src/curie_dispatcher/handlers.py::process_event`),
+  after envelope validation and before relevance, admission and `claim_event`. It
+  never asks the API, posts a placeholder or enqueues a turn (#4960).
 - **Binding** — a channel resolves to a deployment by exact `(kind, address)` equality in
   `BindingResolver.resolve` (`apps/worker/src/curie_worker/binding.py::BindingResolver.resolve`).
   Both halves are required, with no address-only fallback, and uniqueness is on the same
@@ -446,12 +457,15 @@ attachments from Discord or mail).
 
 Email sender authentication remains adapter-owned. A channel token authenticates the
 adapter and binding, not the sender named in a turn. The platform trusts that adapter's
-sender assertion before applying caller authorization. The AgentMail provider exposes
-labels and arbitrary headers without a trusted aligned authentication verdict or header
-provenance guarantee, so `MailAdapter._listing_rejection`
+sender assertion before applying caller authorization. Since ADR 0228 the mail service
+sits behind the [mail provider seam](../mail-provider/INTERFACE.md), and the gate opens
+only for a provider that verifies senders. The AgentMail provider exposes labels and
+arbitrary headers without a trusted aligned authentication verdict or header
+provenance guarantee, so it declares that it cannot verify senders, and
+`MailAdapter._listing_rejection`
 (`apps/mail-adapter/src/curie_mail_adapter/adapter.py::MailAdapter._listing_rejection`)
-refuses all inbound messages, including approval replies. An allowed sender list cannot
-replace that authentication evidence. Outbound reply and approval-card rendering remain
+refuses all of its inbound messages, including approval replies, before any fetch. An
+allowed sender list cannot replace that authentication evidence. Outbound reply and approval-card rendering remain
 implemented through `apps/mail-adapter/src/curie_mail_adapter/egress.py::EgressHandler`.
 
 1. **Fixed (#7).** The ingress field names were Slack's (`slack_event_id`, `thread_ts`,

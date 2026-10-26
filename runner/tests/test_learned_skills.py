@@ -1,4 +1,4 @@
-"""Learned skills on the runner (epic #4780, ADR 0237).
+"""Learned skills on the runner (epic #4780, ADR 0247).
 
 The runner reads an agent's active learned skills at boot from the dedicated
 learned-skills API, materializes them as a generated local plugin named
@@ -53,6 +53,7 @@ from curie_runner import __main__ as boot
 from curie_runner.__main__ import build_runner
 from curie_runner.mcp_tool_capability import McpToolCapabilityProbe
 from curie_runner.memory_facts import NO_PERSON, MemoryTurn
+from runner_boot_session import initialized_session
 
 READ_TOKEN = "boot-read-token-SECRET-1111"
 WRITE_TOKEN = "turn-write-token-SECRET-2222"
@@ -1126,7 +1127,7 @@ def _boot(
         kwargs["mcp_capability"] = _PROBE
         runner = build_runner(config, fake_model=False, **kwargs)
         captured["runner"] = runner
-        captured["options"] = runner._factory().options  # noqa: SLF001
+        captured["options"] = (await initialized_session(runner)).options
         captured["learned"] = fetches.learned_skills
 
     _run(go, api)

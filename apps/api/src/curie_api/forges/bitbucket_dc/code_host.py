@@ -70,6 +70,7 @@ CAPABILITIES: Mapping[Operation, Support] = {
     Operation.CI_DIAGNOSTICS: Support.UNSUPPORTED,
     Operation.RERUN_FAILED: Support.UNSUPPORTED,
     Operation.USER_CAN_WRITE: Support.UNSUPPORTED,
+    Operation.REQUIRED_CHECKS: Support.UNSUPPORTED,
 }
 # A feedback listing re-reads this far behind its cursor and drops what it
 # already returned, so a comment stamped late is still listed once (decision 10.5).
@@ -471,10 +472,10 @@ class BitbucketDcCodeHost:
         repository. One counts when both ``fromRef`` and ``toRef`` name this
         repository's id and, when `own_user_id` is known, ``author.user.id`` is
         it (``owner_verified=True``). Without the ``X-AUSERID`` header every
-        such pull request is listed with ``owner_verified=False``, the
-        Bitbucket Cloud semantics: rediscovery ignores unverified publications,
-        so nothing is suppressed there and a reinstall can still open one
-        duplicate pull request. An item, author, branch, state, description or URL
+        such pull request is listed with ``owner_verified=False``, and
+        rediscovery ignores unverified publications on Data Center, so nothing
+        is suppressed there and a reinstall can still open one duplicate pull
+        request. An item, author, branch, state, description or URL
         that cannot be read fails the listing; a null or absent description
         is an empty body, and the ``links.self`` URL must be on the configured server
         (`types.publication_url`). ``closed_at`` is ``closedDate``, else
@@ -627,6 +628,10 @@ class BitbucketDcCodeHost:
                 continue
             checks.append(_build_check(key, build, head_sha))
         return CiRollup.on_head(head_sha, tuple(checks))
+
+    async def required_checks(self, repository: RepositoryRef, branch: str) -> frozenset[str]:
+        await self.ensure_version(Operation.REQUIRED_CHECKS)
+        raise Unsupported(Operation.REQUIRED_CHECKS)
 
     async def ci_diagnostics(
         self, repository: RepositoryRef, head_sha: str, *, base_ref: str | None

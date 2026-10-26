@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "case": "unfetched-size-unknown",
+      "file": {
+        "id": "00000000-0000-4000-8000-000000000001",
+        "name": "report.csv",
+        "mime_type": "text/csv",
+        "size_bytes": null,
+        "sha256": null,
+        "current": true
+      }
+    },
+    {
+      "case": "empty-verified-earlier-file",
+      "file": {
+        "id": "00000000-0000-4000-8000-000000000002",
+        "name": "empty.txt",
+        "mime_type": null,
+        "size_bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "current": false
+      }
+    },
+    {
+      "case": "metadata-above-old-file-and-thread-ceilings",
+      "file": {
+        "id": "00000000-0000-4000-8000-000000000003",
+        "name": "large-dataset.bin",
+        "mime_type": "application/octet-stream",
+        "size_bytes": 1099511627776,
+        "sha256": null,
+        "current": false
+      }
+    },
+    {
+      "case": "maximum-legacy-basename",
+      "file": {
+        "id": "00000000-0000-4000-8000-000000000004",
+        "name": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.txt",
+        "mime_type": "text/plain",
+        "size_bytes": 17,
+        "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "current": true
+      }
+    }
+  ]
+}

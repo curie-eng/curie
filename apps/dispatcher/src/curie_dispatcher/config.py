@@ -129,6 +129,11 @@ class DispatcherConfig(BaseSettings):
     slack_threaded_bot_allowlist: Annotated[tuple[ThreadedBotAdmission, ...], NoDecode] = Field(
         default=(), validation_alias="CURIE_SLACK_THREADED_BOT_ALLOWLIST"
     )
+    # Channels whose mentions only prove delivery (#4960): counted and refused
+    # before admission, so a scheduled poster can probe every identity.
+    slack_delivery_canary_channels: Annotated[
+        tuple[Annotated[str, Field(strict=True, pattern=r"^[CG][A-Z0-9]+$")], ...], NoDecode
+    ] = Field(default=(), validation_alias="CURIE_SLACK_DELIVERY_CANARY_CHANNELS")
 
     # The test installation declaration (ADR 0202 decision 1), rendered only
     # by the chart. On, the boot refuses a published default secret, and the
@@ -274,6 +279,16 @@ class DispatcherConfig(BaseSettings):
         # Decode here so JSON null is rejected instead of being discarded by
         # the settings env source and silently replaced by the empty default.
         return json.loads(value) if isinstance(value, str) else value
+
+    @field_validator("slack_delivery_canary_channels", mode="before")
+    @classmethod
+    def _decode_delivery_canary_channels(cls, value: object) -> object:
+        # As above: decode here so JSON null and a bare string are refused,
+        # not replaced by the empty default or split into characters.
+        decoded = json.loads(value) if isinstance(value, str) else value
+        if not isinstance(decoded, list | tuple):
+            raise ValueError("CURIE_SLACK_DELIVERY_CANARY_CHANNELS must be a JSON list")
+        return decoded
 
     @field_validator("test_installation_thread_turn_limit", mode="before")
     @classmethod

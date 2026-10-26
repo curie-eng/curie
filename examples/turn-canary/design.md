@@ -43,6 +43,25 @@ adapter is connected.
   `delivered` and a reply update whose entire text equals the nonce. A reply
   alone, an approval pause, dropped or escalated completion, a mismatched
   nonce, malformed event, or a timeout fails. No reply is posted to a channel.
+  Independently, delivery is observed only when the production `ReplyEvent`
+  parser accepts every observed event, every target matches the enqueued
+  turn's kind, address, conversation ID and reply reference, exactly one
+  completion matches its event ID and has outcome `delivered`, and the latest
+  text update is nonblank. Text may be streamed before completion; a later
+  status clear is allowed. Placeholder, status and progress events alone are
+  insufficient. Duplicate completions and malformed or unrelated events fail
+  both observations closed. Cursors must be nonnegative integers excluding
+  booleans and advance by the page event count; terminal flags must be booleans
+  consistent with the observed completion. The checker assesses only events
+  observed before return, without sealing the relay against later writes.
+  Delivery is lifecycle evidence, not proof of model execution, useful task
+  completion, policy compliance or final-text provenance. Exact nonce success,
+  last-success timestamps, cycle success and exit status keep their existing
+  meaning: exact success uses the last `reply.update` literally, including a
+  progress edit, and accepts only `reply.update`, `turn.status` and
+  `turn.completed` event types. A valid `reply.post` therefore cannot broaden
+  exact success. An `awaiting-approval` completion uses the relay's nonterminal
+  page shape and fails the probe as `not_delivered`.
 
 - **TURN-CANARY-4: owned cleanup.** After every enqueued probe, including
   timeout and error paths, the checker computes the worker thread key with
@@ -121,7 +140,16 @@ adapter is connected.
 
 - **TURN-CANARY-6: diagnostics.** Export a portable Prometheus target success
   gauge, last run and last success timestamps, cleanup degraded gauge, capacity
-  skip counter, cycle success gauge, and last cycle timestamp. The target
+  skip counter, cycle success gauge, and last cycle timestamp. An independent
+  `target_delivery_success` gauge records delivery observation per attempted
+  route. A delivered nonblank mismatch sets delivery to 1 and exact nonce
+  success to 0. An error or timeout sets delivery to 0. Capacity skips and
+  cleanup holds create no delivery sample; the standing exporter retains a
+  previous observation until a successful inventory read removes its route.
+  Restart does not restore delivery observations from persistent state and
+  missing samples never imply healthy delivery. Logs expose only bounded
+  assessment reason codes, without adding content or identity labels.
+  The target
   success gauge is published only for a route whose turn was attempted: a
   capacity-skipped route publishes no target success sample in that cycle, and
   the exporter keeps the route's previous value. A per-route capacity skipped

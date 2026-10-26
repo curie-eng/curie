@@ -123,6 +123,8 @@ pub(crate) fn cluster_action_target(action: &ClusterAction) -> (Option<&str>, Op
         | ClusterAction::PublicationPolicy { conn, .. }
         | ClusterAction::Surfaces { conn, .. }
         | ClusterAction::Callers { conn, .. }
+        | ClusterAction::AccessPolicy { conn, .. }
+        | ClusterAction::Directory { conn, .. }
         | ClusterAction::ChannelToken { conn, .. }
         | ClusterAction::Budget { conn, .. }
         | ClusterAction::ResetThread { conn, .. }
@@ -275,6 +277,8 @@ pub(crate) fn retarget_cluster_action(
         | ClusterAction::PublicationPolicy { conn, .. }
         | ClusterAction::Surfaces { conn, .. }
         | ClusterAction::Callers { conn, .. }
+        | ClusterAction::AccessPolicy { conn, .. }
+        | ClusterAction::Directory { conn, .. }
         | ClusterAction::ChannelToken { conn, .. }
         | ClusterAction::Budget { conn, .. }
         | ClusterAction::ResetThread { conn, .. }

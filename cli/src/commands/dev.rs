@@ -504,6 +504,166 @@ pub async fn dev_preflight(
     Ok(report)
 }
 
+#[derive(Default, Deserialize, Serialize)]
+pub struct TestEnvOutput {
+    pub profile: String,
+    pub project: String,
+    pub ports: BTreeMap<String, u16>,
+    pub networks: Vec<String>,
+    pub child_exit_code: Option<i32>,
+    pub cleanup_verified: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signal: Option<i32>,
+}
+
+impl crate::ui::CliOutput for TestEnvOutput {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::to_value(self).expect("test environment report contains serializable fields")
+    }
+
+    fn render(&self, ui: &crate::ui::Ui) {
+        ui.payload_plain(&format!(
+            "{} test environment {}: child exit {}, cleanup verified: {}",
+            self.profile,
+            self.project,
+            self.child_exit_code
+                .map_or_else(|| "not started".into(), |code| code.to_string()),
+            self.cleanup_verified,
+        ));
+    }
+}
+
+pub async fn dev_test_env(profile: &str, arguments: &[String]) -> Result<TestEnvOutput> {
+    let report = TestEnvOutput {
+        profile: profile.to_string(),
+        cleanup_verified: true,
+        ..TestEnvOutput::default()
+    };
+    let fail = |mut report: TestEnvOutput, error: crate::exit::CliError| {
+        report.error = Some(error.message.clone());
+        crate::ui::ui().failed_report(&report, error.into())
+    };
+    if !matches!(profile, "core" | "full") {
+        return Err(fail(
+            report,
+            crate::exit::CliError::usage("Profile must be core or full."),
+        ));
+    }
+    if arguments
+        .first()
+        .is_none_or(|value| value.is_empty() || value.starts_with('-'))
+    {
+        return Err(fail(
+            report,
+            crate::exit::CliError::usage("A command after -- is required."),
+        ));
+    }
+    let Some(root) = find_repo_root() else {
+        return Err(fail(
+            report,
+            crate::exit::CliError::usage("Test environments require a Curie source checkout."),
+        ));
+    };
+    let helper = root.join("tools/test-env/test_env.py");
+    if !helper.is_file() {
+        return Err(fail(
+            report,
+            crate::exit::CliError::usage("The source checkout has no test environment tool."),
+        ));
+    }
+    #[cfg(unix)]
+    let mut signals =
+        signal_hook::iterator::Signals::new([libc::SIGINT, libc::SIGTERM]).map_err(|_| {
+            fail(
+                TestEnvOutput {
+                    profile: profile.to_string(),
+                    cleanup_verified: true,
+                    ..TestEnvOutput::default()
+                },
+                crate::exit::CliError::transient("Could not supervise test environment signals."),
+            )
+        })?;
+    let child = tokio::process::Command::new("python3")
+        .arg(helper)
+        .args(["--profile", profile, "--"])
+        .args(arguments)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .map_err(|_| {
+            fail(
+                TestEnvOutput {
+                    profile: profile.to_string(),
+                    cleanup_verified: true,
+                    ..TestEnvOutput::default()
+                },
+                crate::exit::CliError::transient(
+                    "Could not start the test environment tool. Install python3 and retry.",
+                ),
+            )
+        })?;
+    #[cfg(unix)]
+    let forwarding = {
+        let handle = signals.handle();
+        let pid = child.id().expect("a spawned helper has a process ID") as libc::pid_t;
+        let worker = std::thread::spawn(move || {
+            let mut forwarded = false;
+            for number in signals.forever() {
+                if !forwarded {
+                    // The helper owns child groups and must finish cleanup before the CLI exits.
+                    unsafe {
+                        libc::kill(pid, number);
+                    }
+                    forwarded = true;
+                }
+            }
+        });
+        (handle, worker)
+    };
+    let output = child.wait_with_output().await;
+    #[cfg(unix)]
+    {
+        forwarding.0.close();
+        let _ = forwarding.1.join();
+    }
+    let output = output.map_err(|_| {
+        fail(
+            TestEnvOutput {
+                profile: profile.to_string(),
+                ..TestEnvOutput::default()
+            },
+            crate::exit::CliError::transient("Could not read the test environment result."),
+        )
+    })?;
+    let report: TestEnvOutput = serde_json::from_slice(&output.stdout).map_err(|_| {
+        fail(
+            TestEnvOutput {
+                profile: profile.to_string(),
+                ..TestEnvOutput::default()
+            },
+            crate::exit::CliError::transient(
+                "The test environment tool did not return one valid report.",
+            ),
+        )
+    })?;
+    if !output.status.success() || !report.cleanup_verified {
+        let message = report
+            .error
+            .as_deref()
+            .unwrap_or("The test environment run failed.");
+        let error = match output.status.code() {
+            Some(2) if report.cleanup_verified => crate::exit::CliError::usage(message),
+            Some(1) if report.cleanup_verified => crate::exit::CliError::failure(message),
+            _ => crate::exit::CliError::transient(message),
+        };
+        return Err(fail(report, error));
+    }
+    Ok(report)
+}
+
 /// `curie dev <script>`: run a repo dev script by relative path. Thin wrapper
 /// -- finds the repo root, confirms the script exists, shells `bash <script> [args]`
 /// from the root, streams its output, and propagates its exit code. A release

@@ -60,8 +60,9 @@ def test_identity_link_model_shape() -> None:
     assert table.c["principal_id"].nullable is True
     assert table.c["bot_id"].nullable is True
     assert table.c["revoked_at"].nullable is True
-    # Link provenance is mandatory (plan r4.1 item 7).
-    assert table.c["created_by_principal_id"].nullable is False
+    # Directory links record their manager; other links require their principal creator.
+    assert table.c["created_by_principal_id"].nullable is True
+    assert table.c["created_by_directory"].nullable is True
     fks = {c.name: c for c in table.constraints if isinstance(c, ForeignKeyConstraint)}
     assert fks["identity_links_namespace_fkey"].column_keys == [
         "tenant_id",
@@ -475,11 +476,11 @@ def test_link_unknown_bot_rejected(migrated: None) -> None:
 def test_link_creator_is_required(migrated: None) -> None:
     async def body(conn: AsyncConnection) -> None:
         tenant_id, principal_id, namespace_id = await _base(conn)
-        await _expect_not_null(
+        await _expect_integrity_error(
             conn,
             _LINK_INSERT,
             _link_row(tenant_id, namespace_id, principal_id, creator=None),
-            column="created_by_principal_id",
+            constraint="identity_links_creator_ck",
         )
 
     _rolled_back(body)

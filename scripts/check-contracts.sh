@@ -14,6 +14,9 @@ aci_wire_lock="packages/aci-protocol/schema/wire.lock"
 channel_schema="packages/channel-protocol/schema/channel-protocol.schema.json"
 plugin_schema="packages/plugin-format/schema/plugin-format.schema.json"
 eval_schema="apps/worker/schema/eval-cases.schema.json"
+identity_openapi="docs/interfaces/http-identity/http-identity-v1.openapi.json"
+identity_schema="docs/interfaces/http-identity/http-identity-v1.schema.json"
+role_filter_schema="docs/interfaces/agent-access/agent-role-filter-v1.schema.json"
 env_example=".env.example"
 ts_out="packages/aci-protocol/generated/ts/aci-protocol.ts"
 rust_crate="packages/aci-protocol/generated/rust"
@@ -23,6 +26,10 @@ uv run python -m aci_protocol.schema_export
 uv run python -m channel_protocol.schema_export
 uv run python -m plugin_format.schema_export
 uv run python -m curie_worker.eval.schema_export
+# @spec HTTP-IDENTITY-V1-5: standalone provider artifacts, without app startup.
+uv run python -m curie_api.http_identity_export
+# @spec AGENT-ROLE-FILTER-V1-7: pure role configuration artifact, without app startup.
+uv run python -m curie_api.agent_role_filter_export
 
 echo "== regenerating the boot-env block in .env.example =="
 uv run python -m aci_protocol.env_example_export
@@ -47,6 +54,7 @@ pnpm --dir tools/contract-codegen exec tsc --noEmit \
 echo "== checking for drift =="
 if ! git diff --exit-code -- \
   "$aci_schema" "$aci_wire_lock" "$channel_schema" "$plugin_schema" "$eval_schema" \
+  "$identity_openapi" "$identity_schema" "$role_filter_schema" \
   "$env_example" "$ts_out" "$rust_crate/src/lib.rs"; then
   echo "ERROR: committed contract artifacts drifted from the models." >&2
   echo "The files above were regenerated and differ. Review, then commit them." >&2

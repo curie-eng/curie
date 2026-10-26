@@ -1,4 +1,4 @@
-"""Migration selfimp_skills_0001 adds learned skills (ADR 0237, epic #4780).
+"""Migration selfimp_skills_0001 adds learned skills (ADR 0247, epic #4780).
 
 Expand-only: `agents.learned_skills BOOLEAN NOT NULL DEFAULT false`, so every
 existing agent comes out of the upgrade with learned skills off, plus the

@@ -30,6 +30,48 @@ use serde::Serialize;
 
 use crate::api::{ApprovalRouteBindingWrite, HookPartitionInput, SourceBindingInput};
 
+/// `PUT /directory/config/{tenant_id}` (`DirectoryConfigIn`).
+#[derive(Clone, serde::Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DirectoryConfigIn {
+    pub expected_version: u64,
+    pub governed_domains: Vec<String>,
+    pub issuer: String,
+    pub managed_by: String,
+}
+
+/// `POST /directory/namespaces` (`DirectoryNamespaceIn`).
+#[derive(Clone, serde::Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DirectoryNamespaceIn {
+    #[serde(
+        default,
+        deserialize_with = "directory_authority",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub authority: Option<String>,
+    pub key: String,
+    pub kind: String,
+    pub provider: String,
+    pub tenant_id: String,
+}
+
+fn directory_authority<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    // Omission asks the server to derive authority; explicit null is invalid.
+    <String as serde::Deserialize>::deserialize(deserializer).map(Some)
+}
+
+/// `POST /directory/teams` (`DirectoryTeamIn`).
+#[derive(Clone, serde::Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DirectoryTeamIn {
+    pub external_id: String,
+    pub name: String,
+    pub tenant_id: String,
+}
+
 /// `POST /agents` (`AgentCreate`). Deploy creates an agent with its one
 /// channel and, when asked, its repository binding; every other setting is
 /// written afterwards by its own verb.
@@ -117,6 +159,16 @@ pub struct ChannelCallersWrite {
     pub allowed_callers: Option<Vec<String>>,
 }
 
+/// `PUT /agents/{id}/access-policy` (`AgentAccessPolicyWrite`, ADR 0220).
+/// Both team keys are required; `null` clears that role. `expected_version`
+/// is the version last read, 0 when the agent has no policy yet.
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentAccessPolicyWrite {
+    pub invocation_team_id: Option<String>,
+    pub approver_team_id: Option<String>,
+    pub expected_version: u64,
+}
+
 /// `POST /channels/token` (`ChannelTokenRequest`).
 #[derive(Debug, Clone, Serialize)]
 pub struct ChannelTokenRequest {
@@ -177,7 +229,7 @@ pub struct MemoryGuidanceIn {
 }
 
 /// `POST /agents/{id}/state/_memory/archive` and `.../restore`
-/// (`MemoryLifecycleIn`, ADR 0239). `expected_version` is the version the CLI
+/// (`MemoryLifecycleIn`, ADR 0249). `expected_version` is the version the CLI
 /// just read; the channel pair is sent only for channel scope.
 #[derive(Debug, Clone, Serialize)]
 pub struct MemoryLifecycleIn {
@@ -190,7 +242,7 @@ pub struct MemoryLifecycleIn {
     pub scope: String,
 }
 
-/// `POST /agents/{id}/state/_memory/revert` (`MemoryRevertIn`, ADR 0239).
+/// `POST /agents/{id}/state/_memory/revert` (`MemoryRevertIn`, ADR 0249).
 /// `to_version` 0 means the entry's absence before it was created.
 #[derive(Debug, Clone, Serialize)]
 pub struct MemoryRevertIn {
@@ -242,7 +294,7 @@ pub struct EvalTriggerRequest {
     pub suite: Option<String>,
 }
 
-/// `PATCH /agents/{id}/schedules/{schedule_id}` (`AgentScheduleUpdate`, ADR 0238).
+/// `PATCH /agents/{id}/schedules/{schedule_id}` (`AgentScheduleUpdate`, ADR 0248).
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentScheduleUpdate {
     pub expected_revision: u32,
@@ -273,7 +325,7 @@ pub struct AgentScheduleRevert {
 }
 
 /// `POST /agents/{id}/learned-skills/{ref}/revert` (`LearnedSkillRevert`,
-/// ADR 0237). No `to_revision` undoes the last change.
+/// ADR 0247). No `to_revision` undoes the last change.
 #[derive(Debug, Clone, Serialize)]
 pub struct LearnedSkillRevert {
     pub expected_revision: u32,

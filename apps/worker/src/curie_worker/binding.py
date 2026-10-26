@@ -115,6 +115,9 @@ PLUGIN_DIR_ENV = BootEnv.env_key("plugin_dir")
 BUDGET_ENV = BootEnv.env_key("budget")
 MAX_TURNS_ENV = BootEnv.env_key("max_turns")
 CONNECTOR_CALLER_TOKEN_ENV = BootEnv.env_key("connector_caller_token")
+# ADR 0240 decision 2. Not a BootEnv field: the worker writes it beside the
+# render, like CURIE_CONNECTOR_TOOL_GRANT. A JSON object, connector -> ccr.
+CONNECTOR_ROUTE_TOKENS_ENV = "CURIE_CONNECTOR_ROUTE_TOKENS"
 SESSION_ID_ENV = BootEnv.env_key("session_id")
 FAKE_MODEL_ENV = BootEnv.env_key("fake_model")
 CREDENTIALS_ENV = BootEnv.env_key("credentials_ref")
@@ -308,7 +311,7 @@ def _parse_resume_event_id(event_id: str) -> uuid.UUID | None:
 
 # An approval raised inside an approval-resumed continuation carries that
 # resume's event id as its dedupe key, so approvals chain back to the event
-# that started the work (ADR 0238). The walk reads at most this many links.
+# that started the work (ADR 0248). The walk reads at most this many links.
 APPROVAL_CHAIN_MAX_LINKS = 16
 
 
@@ -553,12 +556,12 @@ class ResolvedDeployment(BaseModel):
     # 0068 and resolution runs against older schemas, so the kernel reads it
     # with ``memory_writes_for`` and copies it on, as with runner_resources.
     memory_writes: bool = False
-    # Whether the operator turned agent-created schedules on (ADR 0238): with
+    # Whether the operator turned agent-created schedules on (ADR 0248): with
     # it on the per-turn credential carries ``schedules: "write"``. Read apart
     # from the resolver statements for the same schema reason
     # (``agent_schedules_for``) and copied on by the kernel, degrading to off.
     agent_schedules: bool = False
-    # Whether the operator turned learned skills on (ADR 0237): with it on the
+    # Whether the operator turned learned skills on (ADR 0247): with it on the
     # per-turn credential carries ``skills: "write"``. Read apart from the
     # resolver statements for the same schema reason (``learned_skills_for``),
     # but copied on here by every resolve path, degrading to off.
@@ -884,11 +887,13 @@ class BindingResolver:
         A re-fetch of an earlier attachment resolves its route from these and
         never from anything recorded with the file, so a removed binding makes
         the file unavailable and a moved adapter endpoint is followed. Read
-        only; the address is not returned because no re-fetch needs it.
+        only. The private lazy broker also matches the exact binding identity,
+        generation and address authorized by the API.
         """
 
         sql = text(
-            f"SELECT kind, adapter, endpoint FROM {self._config.db_schema}.agent_channels "
+            f"SELECT id, generation, address, kind, adapter, endpoint "
+            f"FROM {self._config.db_schema}.agent_channels "
             "WHERE agent_id = :id AND tenant_id = :tenant_id "
             "ORDER BY kind, adapter NULLS FIRST, endpoint NULLS FIRST"
         )
@@ -896,7 +901,10 @@ class BindingResolver:
             result = await conn.execute(sql, {"id": agent_id, "tenant_id": self._tenant_id})
             rows = result.all()
         return [
-            AgentRoute(kind=str(row.kind), adapter=row.adapter, endpoint=row.endpoint)
+            AgentRoute(
+                kind=str(row.kind), adapter=row.adapter, endpoint=row.endpoint,
+                binding_id=row.id, generation=row.generation, address=row.address,
+            )
             for row in rows
         ]
 
@@ -1125,6 +1133,30 @@ class BindingResolver:
             value = json.loads(value)
         return value if isinstance(value, dict) else None
 
+    async def eval_connector_settings_for(
+        self, agent_id: uuid.UUID
+    ) -> tuple[str, list[str]] | None:
+        """Read the eval caller identity and operator gates in one tenant-scoped snapshot."""
+        sql = text(
+            f"SELECT name, approval_required_tools FROM {self._config.db_schema}.agents "
+            "WHERE id = :id AND tenant_id = :tenant_id"
+        )
+        async with self._engine.connect() as conn:
+            result = await conn.execute(sql, {"id": agent_id, "tenant_id": self._tenant_id})
+            row = result.first()
+        if row is None:
+            return None
+        policy = row[1]
+        if isinstance(policy, str):
+            policy = json.loads(policy)
+        if policy is None:
+            policy = []
+        if not isinstance(policy, list) or any(
+            not isinstance(tool, str) or not tool.strip() or "," in tool for tool in policy
+        ):
+            raise ValueError("invalid stored approval policy for eval")
+        return row[0], policy
+
     async def name_for(self, agent_id: uuid.UUID) -> str | None:
         """The agent's NAME for eval pool routing (#1488). None if unknown."""
         sql = text(
@@ -1177,7 +1209,7 @@ class BindingResolver:
         return bool(row is not None and row[0])
 
     async def agent_schedules_for(self, agent_id: uuid.UUID) -> bool:
-        """Whether the operator turned agent-created schedules on (ADR 0238).
+        """Whether the operator turned agent-created schedules on (ADR 0248).
 
         The same separate read as ``memory_writes_for`` (migration
         selfimp_sched_0001 adds the column). A missing agent row or a null
@@ -1193,7 +1225,7 @@ class BindingResolver:
         return bool(row is not None and row[0])
 
     async def learned_skills_for(self, agent_id: uuid.UUID) -> bool:
-        """Whether the operator turned learned skills on for the agent (ADR 0237).
+        """Whether the operator turned learned skills on for the agent (ADR 0247).
 
         The same separate read as ``memory_writes_for`` (migration selfimp_skills_0001 adds
         the column). A missing agent row or a null value reads as off.
@@ -1208,7 +1240,7 @@ class BindingResolver:
         return bool(row is not None and row[0])
 
     async def approval_from_cron(self, event_id: str, agent_id: uuid.UUID) -> bool:
-        """Whether an approval resume continues a scheduled firing (ADR 0238).
+        """Whether an approval resume continues a scheduled firing (ADR 0248).
 
         True when the resumed approval's chain (``approval_chain_origin``)
         starts at a cron event id of this agent (``cron:<agent>:...``), the
@@ -1339,6 +1371,7 @@ class BindingResolver:
         caller_work_item: str | None = None,
         caller_exp_ceiling: int | None = None,
         token_ttl_s: float | None = None,
+        route_connectors: frozenset[str] = frozenset(),
     ) -> dict[str, str]:
         """The env injected into the sandbox claim for a bound run.
 
@@ -1473,6 +1506,9 @@ class BindingResolver:
         # which is the stock install. render_worker emits it only with the
         # connector scope.
         connector_caller_token: str | None = None
+        # ADR 0240 decision 2: one ccr per hosted connector that declares
+        # routes, with the caller token's own claims and expiry.
+        route_tokens: dict[str, str] = {}
         if self._config.connector_caller_signing_key.strip():
             caller_exp = int(time.time()) + SANDBOX_TOKEN_TTL_SECONDS
             if caller_exp_ceiling is not None:
@@ -1484,6 +1520,15 @@ class BindingResolver:
                 run=caller_run,
                 work_item=caller_work_item,
             )
+            for connector in sorted(route_connectors):
+                route_tokens[connector] = caller_token.mint_route(
+                    self._config.connector_caller_signing_key,
+                    agent=resolved.agent_name,
+                    connector=connector,
+                    exp=caller_exp,
+                    run=caller_run,
+                    work_item=caller_work_item,
+                )
         env = BootEnv.render_worker(
             plugin_dir=self._config.bundle_plugin_dir,
             session_id=f"agent-{resolved.agent_id}-thread-{thread_key}",
@@ -1520,6 +1565,11 @@ class BindingResolver:
             or None,
             deployment_environment=resolved.deployment_environment or None,
             fake_model=self._config.fake_model,
+            attachment_access_enabled=(
+                True
+                if self._config.attachment_enabled and self._config.attachment_mode == "lazy"
+                else None
+            ),
             credentials_ref=self._config.credentials,
             base_url=self._config.model_base_url,
             # The endpoint's declared wire protocol and credential key(s) (#514).
@@ -1564,6 +1614,13 @@ class BindingResolver:
         # keys, and stays the marker's sole writer -- see the
         # inject_connector_secrets docstring for the #457/#429 rationale.
         inject_connector_secrets(env, resolved.secrets, agent_label=resolved.agent_id)
+        # ADR 0240 decision 2. Only beside a rendered caller token, which
+        # render_worker emits with the connector scope or not at all, so a
+        # route token never reaches a sandbox that has no Service to call.
+        if route_tokens and CONNECTOR_CALLER_TOKEN_ENV in env:
+            env[CONNECTOR_ROUTE_TOKENS_ENV] = json.dumps(
+                route_tokens, sort_keys=True, separators=(",", ":")
+            )
         # #1909: default local/cluster eval is a static bundle-plus-cases gate.
         # Ambient durable memory is per-agent, so a fresh thread still loaded
         # it and could change a committed case. The CLI marks those turns with
@@ -1589,7 +1646,7 @@ class BindingResolver:
         ttl_s: float,
         scheduled: bool = False,
     ) -> str | None:
-        """The per-turn state write credential (ADR-0188, ADR 0237, ADR 0238), or None.
+        """The per-turn state write credential (ADR-0188, ADR 0247, ADR 0248), or None.
 
         Sent as the turn's ``Event.memory_token`` (MEMORY-TOKEN-2), never in the
         boot env: the boot-env token outlives the turn and so cannot name its
@@ -1599,11 +1656,11 @@ class BindingResolver:
         writes); the API writes only fact keys with it, only on the channel
         ``binding`` names, and stamps ``sender`` as the fact's author and
         ``conversation`` (this turn's ``thread_key``) as its source
-        conversation (ADR 0239). ``schedules`` is ``"write"`` only with agent
+        conversation (ADR 0249). ``schedules`` is ``"write"`` only with agent
         schedules on, and ``scheduled`` marks a scheduled run or its approval
-        continuation, which may not create or change schedules (ADR 0238).
+        continuation, which may not create or change schedules (ADR 0248).
         ``skills`` is ``"write"`` only with learned skills on, and the API
-        stamps ``sender`` and ``conversation`` on each skill change (ADR 0237).
+        stamps ``sender`` and ``conversation`` on each skill change (ADR 0247).
 
         None unless there is a key to sign with, the agent has memory writes,
         agent schedules or learned skills on, the turn names a binding, and the

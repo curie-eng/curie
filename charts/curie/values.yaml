@@ -792,6 +792,17 @@ connectorCaller:
 # (ACTION-EXECUTOR-12, -14); with the executor off that grant is absent and
 # actions record no digest, so they are not undoable.
 #
+# connectorReadsWithoutReconciler (#4800, default false) is for an installation
+# that keeps worker.connectorReconciler off, for example because its hosted
+# connectors are pinned and managed outside Curie. On, the worker Role gains
+# only that single-object `get` on Deployments, none of the reconciler's rules,
+# and the worker reads the acting connector's Deployment and the in-force digest
+# itself; the reconcile loop stays off. An execution whose Deployment cannot be
+# read, or does not serve the in-force digest, is refused
+# `connector_digest_unavailable` before dispatch. Capability probes are still
+# requested only by a reconcile pass, so restores need a recorded capability.
+# Requires enabled: true; a render with the reconciler on fails.
+#
 # maxConcurrentSandboxes (AUTOMATED-REMEDIATION-12, executor amendment E9) is the
 # most executions live (claimed or dispatched) across the installation at once,
 # rendered as CURIE_ACTION_EXECUTOR_MAX_CONCURRENT_SANDBOXES into both the API,
@@ -801,6 +812,7 @@ connectorCaller:
 # write. It leaves sandbox quota to ordinary turns; an integer of at least 1.
 actionExecutor:
   enabled: false
+  connectorReadsWithoutReconciler: false
   maxConcurrentSandboxes: 2
 
 # Automated remediation (AUTOMATED-REMEDIATION-1). One switch, rendered as
@@ -1285,7 +1297,7 @@ factory:
   enabled: false
   intake: poll  # or webhook
   cardBaseUrl: ""
-  ciWaitSeconds: 1200
+  ciWaitSeconds: 3600
   codeHosts: []
   trackers: []
   bindings: []
@@ -1307,8 +1319,8 @@ factory:
     # when the operator creates it; it must then carry
     # pod-security.kubernetes.io/enforce: privileged.
     createNamespace: true
-    # The daemon's mutual TLS port. The Rail 1 sandbox allow opens only this
-    # port toward the daemon namespace.
+    # The daemon's mutual TLS API port. Rail 1 opens TCP 1 through 65535 to
+    # this release's daemons; each daemon admits only its own claim's runner.
     port: 2376
     # Individual daemon Pod sizing, separate from namespace quota and limits.
     resources:
@@ -1659,9 +1671,13 @@ api:
     enabled: true
     intervalSeconds: 30
     batchLimit: 100
+  # limits.memory is unset on purpose: the selected resource profile supplies
+  # it (agentSandbox.resourceProfiles.<profile>.apiMemoryLimit, 512Mi for
+  # `standard`, 2Gi for `factory`). Any explicit limits.memory, including
+  # 512Mi, wins for every install. The schema-migrate Job uses these too.
   resources:
     requests: { cpu: 100m, memory: 256Mi }
-    limits: { cpu: "1", memory: 512Mi }
+    limits: { cpu: "1" }
   # Container securityContext (issue #67). Restricted-PSS baseline: the image runs
   # as non-root uid 1000 (see apps/api/Dockerfile) and needs no Linux
   # capabilities. readOnlyRootFilesystem stays false -- the app writes to its
@@ -2131,7 +2147,16 @@ worker:
     # not refuse). Gates agentSandbox.runner.attachments too; that key is only a
     # sandbox-side sub-gate and cannot turn the lane on by itself.
     enabled: false
-    # Per-file ceiling, enforced while streaming in the worker (nothing is
+    # Explicit opt-in. Lazy mode requires compatible API/worker/runner images.
+    mode: eager
+    broker:
+      port: 8093
+      maxConcurrent: 8
+      transferTimeoutSeconds: 300
+
+    # Legacy eager-only per-file ceiling. Lazy catalog entries and selected
+    # transfers ignore this policy; finite cache/resource capacity still applies.
+    # Enforced while streaming in the eager worker (nothing is
     # buffered past the crossing chunk) and again in the init container. A zero
     # is refused rather than read as "unlimited".
     maxFileBytes: 33554432
@@ -2141,7 +2166,8 @@ worker:
     # How long the parked bytes are retained so a redelivery of the same turn can
     # still fetch them. Swept by the worker's existing reap_orphans tick.
     retentionTtlSeconds: 3600
-    # ADR 0205 decision 7: every boot of a thread rebuilds the thread's whole
+    # Legacy eager-only budgets (ADR 0205 decision 7). Lazy catalogs do not
+    # filter by these byte budgets. In eager mode every boot rebuilds the thread's whole
     # file set, so it is bounded per thread, separately from the per-message
     # cap. Over either bound the newest files are kept and the omitted ones are
     # named to the agent. threadMaxBytes must fit
@@ -2677,18 +2703,75 @@ agentSandbox:
   #       CLAUDE_CODE_MAX_OUTPUT_TOKENS: "16000"
   runnerEnv: {}
   # Per-agent workspace ceiling (#3523): agent name -> the sizeLimit of that
-  # agent's `workspace` emptyDir, replacing agentSandbox.runner.workspace.sizeLimit
-  # (default 1Gi) for that agent only. Each listed agent gets its own
-  # SandboxTemplate and warm pool; every other agent keeps the runner default.
-  # A build-heavy agent needs this: a checkout of curie-eng/curie plus the cargo
-  # target directory of `cargo test` for cli/ outgrew a 10Gi workspace and the
-  # pod was evicted. emptyDir usage also counts against the pod's
-  # ephemeral-storage limit, so raise that agent's runner resources
-  # `ephemeral-storage` limit (runner.resources, or the agent's runner
-  # resources) to at least this value plus the home scratch.
+  # agent's `workspace` emptyDir. It beats both agentSandbox.runner.workspace.sizeLimit
+  # and the agent's resource profile workspaceSizeLimit, for that agent only.
+  # Each listed agent gets its own SandboxTemplate and warm pool. emptyDir usage
+  # also counts against the pod's ephemeral-storage limit, so keep the agent's
+  # profile (or explicit runner.resources) ephemeral-storage limit at least
+  # this value plus the home and tmp scratch it actually fills.
   #   workspaceSizeLimits:
   #     dark-factory: 24Gi
   workspaceSizeLimits: {}
+  # Sandbox resource profiles (#4889; ADR-0059: every ceiling is an
+  # operator-overridable value). Agent name -> profile name (a key of
+  # resourceProfiles below). Overrides the derived selection: an agent with
+  # factory.sandboxEgress.<agent>: true while factory.enabled is true uses
+  # `factory`; every other agent, and the generic template, uses `standard`.
+  # Each listed agent gets its own SandboxTemplate and warm pool.
+  #   agentResourceProfiles:
+  #     dark-factory: standard   # opt a factory agent out
+  #     big-builder: factory     # opt any agent in
+  agentResourceProfiles: {}
+  # Complete sandbox envelopes. A profile field applies only where no explicit
+  # value supplies it:
+  #   resources, per pair (cpu, memory, ephemeral-storage): setting either
+  #     agentSandbox.runner.resources.requests.<r> or .limits.<r> takes that pair
+  #     from the generic keys for EVERY template (the unset side from
+  #     `standard`); otherwise the selected profile supplies both sides.
+  #   workspace: workspaceSizeLimits.<agent> > runner.workspace.sizeLimit >
+  #     the profile workspaceSizeLimit.
+  #   writable paths: runner.hardening.writablePathSizeLimit (every path) >
+  #     homeSizeLimit for runner.hardening.home, tmpSizeLimit for /tmp,
+  #     writablePathSizeLimit for any other writablePaths entry.
+  # The render refuses a needed field that resolves to nothing, and a memory or
+  # ephemeral-storage request above its limit (bare integer or Ki/Mi/Gi/Ti
+  # quantities only; other forms are left to the API server).
+  #
+  # factory sizing: the 15Gi workspace, 15Gi home and 4Gi tmp are independent
+  # volume ceilings (15 + 15 + 4 = 34Gi of upper bounds, not reservations); the
+  # 20Gi ephemeral-storage limit is an additional shared bound on all of them,
+  # and the scheduler reserves only the 10Gi request. The 8Gi memory request
+  # equals resourceQuota.hard.requestsMemory, so the default quota admits one
+  # factory sandbox at a time and a node needs 8Gi of unrequested memory to
+  # schedule it. Raise resourceQuota.hard.requestsMemory / limitsMemory per
+  # extra concurrent factory sandbox. Existing pods keep their envelope; a new
+  # sandbox picks up a change.
+  #
+  # apiMemoryLimit is install-wide, not per agent: it is the API container's
+  # memory limit (and the schema-migrate Job's) when api.resources.limits.memory
+  # is unset. The profile is `factory` when factory.enabled is true, else
+  # `standard`. The factory 2Gi is a headroom choice, not a measured need:
+  # after #4895 the factory publication listing over 231 pages peaked near
+  # 170 MB under both 512Mi and 2Gi limits.
+  resourceProfiles:
+    standard:
+      resources:
+        requests: { cpu: 50m, memory: 192Mi, ephemeral-storage: 512Mi }
+        limits: { cpu: "1", memory: 768Mi, ephemeral-storage: 4Gi }
+      workspaceSizeLimit: 1Gi
+      homeSizeLimit: 512Mi
+      tmpSizeLimit: 512Mi
+      writablePathSizeLimit: 512Mi
+      apiMemoryLimit: 512Mi
+    factory:
+      resources:
+        requests: { cpu: 50m, memory: 8Gi, ephemeral-storage: 10Gi }
+        limits: { cpu: "2", memory: 8Gi, ephemeral-storage: 20Gi }
+      workspaceSizeLimit: 15Gi
+      homeSizeLimit: 15Gi
+      tmpSizeLimit: 4Gi
+      writablePathSizeLimit: 512Mi
+      apiMemoryLimit: 2Gi
   # Agents that get a labeled sandbox template and warm pool so connector
   # ingress can select curietech.ai/agent=<name>. A list of agent name strings.
   # Empty by default. Agents already covered by connectorSecrets, registryEgress,
@@ -2816,7 +2899,10 @@ agentSandbox:
     workspace:
       enabled: true
       mountPath: /workspace
-      sizeLimit: 1Gi
+      # Unset: the agent's resource profile workspaceSizeLimit (standard 1Gi,
+      # factory 15Gi). A value here applies to every agent;
+      # agentSandbox.workspaceSizeLimits.<agent> still wins for that agent.
+      sizeLimit:
       fetchTimeoutSeconds: 45
       extractTimeoutSeconds: 45
     # Inbound attachments arrive the same way a workspace does: a claim-scoped,
@@ -2907,9 +2993,14 @@ agentSandbox:
     # keeps a node from being overcommitted) and the limit (the periodic-
     # measurement backstop) are required and do different jobs (decision 2);
     # raise either per agent/workload via a values override.
+    #
+    # #4889: the numbers live in agentSandbox.resourceProfiles (standard for
+    # the generic template). Leave a pair unset to take the selected profile's
+    # values; set either side of a pair (e.g. limits.memory) and that pair
+    # applies to EVERY template, its unset side taken from `standard`.
     resources:
-      requests: { cpu: 50m, memory: 192Mi, ephemeral-storage: 512Mi }
-      limits: { cpu: "1", memory: 768Mi, ephemeral-storage: 4Gi }
+      requests: {}
+      limits: {}
     # --- security rails on the runner surface ---
     # Rail 3: container hardening. non-root + read-only rootfs + dropped caps +
     # no privilege escalation + RuntimeDefault seccomp. readOnlyRootFilesystem
@@ -2939,7 +3030,12 @@ agentSandbox:
       # bundleFetch.sizeLimit above: the kubelet samples usage rather than
       # capping writes inline, so this is a fast, attributable backstop (the
       # offending pod is evicted, not the node degraded), not a hard quota.
-      writablePathSizeLimit: 512Mi
+      #
+      # #4889: unset takes the agent's resource profile per path: the `home`
+      # path gets homeSizeLimit, `/tmp` gets tmpSizeLimit, and any other path
+      # gets writablePathSizeLimit. A value here is one ceiling for every path
+      # on every template (the pre-profile semantics).
+      writablePathSizeLimit:
     # Rail 4 (gVisor kernel isolation) is controlled by security.gvisor.mode
     # below -- the effective pod runtimeClassName is computed from that tri-state,
     # not set here.
@@ -3212,10 +3308,13 @@ resourceQuota:
   # that then sit Pending until the claim times out.
   #
   #   quota ceiling = min(sandboxPodCount,
-  #                       requestsCpu    / agentSandbox.runner.resources.requests.cpu,
-  #                       requestsMemory / agentSandbox.runner.resources.requests.memory,
-  #                       limitsCpu      / agentSandbox.runner.resources.limits.cpu,
-  #                       limitsMemory   / agentSandbox.runner.resources.limits.memory)
+  #                       requestsCpu    / per-sandbox requests.cpu,
+  #                       requestsMemory / per-sandbox requests.memory,
+  #                       limitsCpu      / per-sandbox limits.cpu,
+  #                       limitsMemory   / per-sandbox limits.memory)
+  #   where per-sandbox is the generic (standard) envelope: agentSandbox.resourceProfiles.standard
+  #   unless agentSandbox.runner.resources sets the pair. NOTES also reports
+  #   each agent whose profile differs (a factory sandbox requests 8Gi).
   #   (a term whose per-sandbox value is unset or 0 is skipped). With the
   #   shipped defaults: min(50, 4/50m=80, 8Gi/192Mi=42, 8/1=8, 16Gi/768Mi=21)
   #   = 8, so limitsCpu is the binding term.

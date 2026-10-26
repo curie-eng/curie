@@ -140,7 +140,7 @@ banned in this contract, so all three tiers are written out in full:
 - local tier: `curie local status --json` then `curie local eval --json`
 - cluster tier: `curie cluster status --json` then `curie cluster eval --json`
 
-**After changing an agent's memory (ADR 0239).** `curie local overrides
+**After changing an agent's memory (ADR 0249).** `curie local overrides
 acme-bot --agent-wide-learning on --json` exits 0 only when
 `agent_wide_learning` is `true` in the payload, and `memory_writes` still holds
 its earlier value: the two switches are independent. `curie local memory

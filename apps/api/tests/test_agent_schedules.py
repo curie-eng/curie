@@ -1,4 +1,4 @@
-"""Agent-created schedules through the API (ADR 0238).
+"""Agent-created schedules through the API (ADR 0248).
 
 The router `/agents/{agent_id}/schedules` is the only write path for an agent's
 own schedules. The sandbox writes with the per-turn STATE credential the worker

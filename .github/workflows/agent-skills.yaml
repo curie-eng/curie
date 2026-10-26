@@ -34,7 +34,7 @@ permissions:
 jobs:
   agent-skills:
     name: Skills conform to the Agent Skills spec
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
         with:

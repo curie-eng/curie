@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import os
 import socket
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from aci_protocol.service_config import (
     API_KEY_ENV,
@@ -560,6 +560,62 @@ class WorkerConfig(BaseSettings):
                 "the reconciler would manage a parallel set under wrong names"
             )
         return self
+
+    @model_validator(mode="after")
+    def _executor_connector_reads_stand_alone(self) -> WorkerConfig:
+        """Refuse the executor's own connector reads where they cannot apply.
+
+        @spec ACTION-EXECUTOR-12 (as amended, #4800). Without the executor
+        nothing would read; with the reconciler on its reads already apply, so
+        the setting would claim a mode the worker is not in; and the
+        Deployment the executor reads is named from the namespace, release and
+        app name, so with any of them unset every read would miss and every
+        execution would refuse for a reason the operator cannot see.
+        """
+
+        if not self.action_executor_connector_reads:
+            return self
+        if not self.action_executor_enabled:
+            raise ValueError(
+                "CURIE_ACTION_EXECUTOR_CONNECTOR_READS=true requires "
+                "CURIE_ACTION_EXECUTOR_ENABLED=true"
+            )
+        if self.connector_reconcile_enabled:
+            raise ValueError(
+                "CURIE_ACTION_EXECUTOR_CONNECTOR_READS=true is for a worker with the "
+                "connector reconciler off; with CURIE_CONNECTOR_RECONCILE on the "
+                "executor already reads through it, so leave it unset"
+            )
+        missing = [
+            env
+            for env, value in (
+                ("CURIE_NAMESPACE", self.connector_namespace),
+                ("CURIE_RELEASE", self.connector_release),
+                ("CURIE_CONNECTOR_APP_NAME", self.connector_app_name),
+            )
+            if not value.strip()
+        ]
+        if missing:
+            raise ValueError(
+                f"CURIE_ACTION_EXECUTOR_CONNECTOR_READS is on but {', '.join(missing)} "
+                "is unset; the connector Deployment the executor reads is named "
+                "from these, so every read would miss"
+            )
+        return self
+
+    @property
+    def executor_reads_connectors(self) -> bool:
+        """Whether the executor and the digest recorder read connector Deployments.
+
+        @spec ACTION-EXECUTOR-12: with the executor on and either the connector
+        reconciler or the executor's own connector reads on. These are exactly
+        the configurations in which the chart grants the worker ``get`` on
+        Deployments.
+        """
+
+        return self.action_executor_enabled and (
+            self.connector_reconcile_enabled or self.action_executor_connector_reads
+        )
 
     @model_validator(mode="after")
     def _caller_signing_key_is_a_seed(self) -> WorkerConfig:
@@ -1114,6 +1170,25 @@ class WorkerConfig(BaseSettings):
     # charts/curie/values.yaml worker.attachments.enabled, which also gates the
     # sandbox half, and pinned by test_config.py.
     attachment_enabled: bool = Field(default=False, validation_alias="CURIE_ATTACHMENT_ENABLED")
+    attachment_mode: Literal["eager", "lazy"] = Field(
+        default="eager", validation_alias="CURIE_ATTACHMENT_MODE"
+    )
+    attachment_cache_size_bytes: int = Field(
+        default=512 * 1024 * 1024, gt=0, validation_alias="CURIE_ATTACHMENT_CACHE_SIZE_BYTES"
+    )
+    attachment_broker_host: str = Field(
+        default="127.0.0.1", validation_alias="CURIE_ATTACHMENT_BROKER_HOST"
+    )
+    attachment_broker_port: int = Field(
+        default=8093, gt=0, le=65535, validation_alias="CURIE_ATTACHMENT_BROKER_PORT"
+    )
+    attachment_broker_max_concurrent: int = Field(
+        default=8, gt=0, validation_alias="CURIE_ATTACHMENT_BROKER_MAX_CONCURRENT"
+    )
+    attachment_transfer_timeout_seconds: int = Field(
+        default=300, gt=0, validation_alias="CURIE_ATTACHMENT_TRANSFER_TIMEOUT_SECONDS"
+    )
+
     attachment_max_file_bytes: int = Field(
         default=32 * 1024 * 1024,
         gt=0,
@@ -1143,6 +1218,18 @@ class WorkerConfig(BaseSettings):
     attachment_thread_prepare_timeout_seconds: float = Field(
         default=15.0, gt=0, validation_alias="CURIE_ATTACHMENT_THREAD_PREPARE_TIMEOUT_SECONDS"
     )
+
+    @model_validator(mode="after")
+    def validate_lazy_attachment_activation(self) -> WorkerConfig:
+        if self.attachment_enabled and self.attachment_mode == "lazy":
+            if self.fake_model:
+                raise ValueError(
+                    "lazy attachments require a real runner; fake-model runs stay offline"
+                )
+            if not self.internal_worker_token:
+                raise ValueError("lazy attachments require CURIE_INTERNAL_WORKER_TOKEN")
+        return self
+
     # Approval-gated publication runs only on the Kubernetes substrate. These
     # values shape the worker-owned Job; none are bundle inputs.
     publication_enabled: bool = Field(default=True, validation_alias="CURIE_PUBLICATION_ENABLED")
@@ -1321,6 +1408,15 @@ class WorkerConfig(BaseSettings):
     # executor amendment E9), rendered from the same chart or compose value as
     # the API's. The executor loop runs up to this many executions at once; the
     # API's claim route, not this loop, is the authority over the count.
+    # The executor's own connector reads without the reconcile loop (#4800,
+    # ACTION-EXECUTOR-12 as amended). On, the worker reads the acting
+    # connector's Deployment by name and the in-force digest for the executor
+    # and the digest recorder exactly as it does with the reconciler on, while
+    # the reconcile loop stays off. The chart grants only `get` on Deployments
+    # for it. Off (the default), those reads follow CURIE_CONNECTOR_RECONCILE.
+    action_executor_connector_reads: bool = Field(
+        default=False, validation_alias="CURIE_ACTION_EXECUTOR_CONNECTOR_READS"
+    )
     action_executor_max_concurrent_sandboxes: int = Field(
         default=2, ge=1, validation_alias="CURIE_ACTION_EXECUTOR_MAX_CONCURRENT_SANDBOXES"
     )
@@ -1530,6 +1626,9 @@ class WorkerConfig(BaseSettings):
         # can open before this one's owner has drained, and this owner must
         # not close the steers that joined the next turn.
         return f"{self.key_prefix}:memory-steer-turns:{agent_id}:{live_turn}"
+
+    def attachment_access_turn_key(self, thread_key: str) -> str:
+        return f"{self.key_prefix}:attachment-access:turn:{thread_key}"
 
     def channel_read_turn_key(self, thread_key: str) -> str:
         # The live channel read logical turn on one thread (ADR 0100, #2877):

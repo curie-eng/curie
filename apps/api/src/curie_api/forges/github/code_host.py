@@ -20,7 +20,7 @@ import binascii
 import json
 import logging
 import re
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import AsyncIterator, Collection, Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
@@ -97,6 +97,67 @@ _PERMANENT_CI_REASONS = {
     "github_forbidden": Unauthorized,
     "github_not_found": NotFound,
 }
+
+
+def _ruleset_contexts(rules: Any) -> set[str]:
+    """Contexts from required status check rules. Other rule types add none."""
+
+    if not isinstance(rules, list):
+        raise Unavailable("malformed_response")
+    names: set[str] = set()
+    for rule in rules:
+        if not isinstance(rule, dict):
+            raise Unavailable("malformed_response")
+        if rule.get("type") != "required_status_checks":
+            continue
+        parameters = rule.get("parameters")
+        if parameters is None:
+            continue
+        if not isinstance(parameters, dict):
+            raise Unavailable("malformed_response")
+        checks = parameters.get("required_status_checks")
+        if checks is None:
+            continue
+        if not isinstance(checks, list):
+            raise Unavailable("malformed_response")
+        for item in checks:
+            if not isinstance(item, dict):
+                raise Unavailable("malformed_response")
+            context = item.get("context")
+            if not isinstance(context, str):
+                raise Unavailable("malformed_response")
+            if context:
+                names.add(context)
+    return names
+
+
+def _protection_contexts(payload: Any) -> set[str]:
+    """Branch protection contexts. A missing protection object adds none."""
+
+    if not isinstance(payload, dict):
+        raise Unavailable("malformed_response")
+    protection = payload.get("protection")
+    if protection is None:
+        return set()
+    if not isinstance(protection, dict):
+        raise Unavailable("malformed_response")
+    required = protection.get("required_status_checks")
+    if required is None:
+        return set()
+    if not isinstance(required, dict):
+        raise Unavailable("malformed_response")
+    contexts = required.get("contexts")
+    if contexts is None:
+        return set()
+    if not isinstance(contexts, list):
+        raise Unavailable("malformed_response")
+    names: set[str] = set()
+    for context in contexts:
+        if not isinstance(context, str):
+            raise Unavailable("malformed_response")
+        if context:
+            names.add(context)
+    return names
 
 
 def _ci_error(reason: str) -> ForgeError:
@@ -664,15 +725,14 @@ class GitHubCodeHost:
             raise Unavailable("own_identity_unreadable")
         return login, kind
 
-    async def _every_pull(self, repository: RepositoryRef, token: str) -> list[Any]:
-        """Every pull request of ``repository`` in any state, following the
-        ``Link`` header's ``next`` to the end. A failed page, a ``next`` off
-        this API, or a listing longer than `_MAX_PUBLICATION_PAGES` raises
-        `Unavailable`.
+    async def _pull_pages(self, repository: RepositoryRef, token: str) -> AsyncIterator[list[Any]]:
+        """Every pull request of ``repository`` in any state, one parsed page
+        at a time, following the ``Link`` header's ``next`` to the end (#4892).
+        A failed page, a ``next`` off this API, or a listing longer than
+        `_MAX_PUBLICATION_PAGES` raises `Unavailable`.
         https://docs.github.com/en/rest/using-the-rest-api/using-pagination-in-the-rest-api
         """
 
-        items: list[Any] = []
         path: str = f"{self._repo(repository.path)}/pulls"
         params: Mapping[str, Any] | None = {"state": "all", "per_page": self._page_size}
         for _ in range(_MAX_PUBLICATION_PAGES):
@@ -683,13 +743,22 @@ class GitHubCodeHost:
                 raise Unavailable("malformed_response") from None
             if not isinstance(payload, list):
                 raise Unavailable("malformed_response")
-            items.extend(payload)
             following = response.links.get("next", {}).get("url")
-            if not following:
-                return items
-            if not following.startswith(f"{self._api}/"):
+            # Hold at most this one page of raw payloads: drop the response
+            # before the yield and the payload after it. httpx binds each
+            # response's stream back to the response, so without replacing it
+            # the body bytes of every page stay in a reference cycle until a
+            # full garbage collection; with it, reference counting frees the
+            # page as soon as it is dropped (#4892).
+            response.stream = httpx.ByteStream(b"")
+            del response
+            if following and not following.startswith(f"{self._api}/"):
                 # Never send the token to another origin.
                 raise Unavailable("pagination")
+            yield payload
+            del payload
+            if not following:
+                return
             # The ``next`` link carries the whole query.
             path, params = following[len(self._api) :], None
         raise Unavailable("listing_incomplete")
@@ -702,7 +771,8 @@ class GitHubCodeHost:
 
         ``GET /repos/{owner}/{repo}/pulls?state=all``
         (https://docs.github.com/en/rest/pulls/pulls#list-pull-requests) read
-        to its last page. A pull request counts when its ``user`` is the own
+        to its last page, one page at a time so only the matching rows are
+        kept (#4892). A pull request counts when its ``user`` is the own
         identity (`_own_login`, login compared case-insensitively, type
         equal) and both its head and base repository are ``repository``. Any
         item whose author, branch, state or body cannot be read fails the
@@ -713,53 +783,56 @@ class GitHubCodeHost:
         own_login, own_type = await self._own_login(repository)
         token = await self._token(repository.path)
         found: list[FactoryPublication] = []
-        for item in await self._every_pull(repository, token):
-            if not isinstance(item, dict):
-                raise Unavailable("malformed_response")
-            user, head, base = item.get("user"), item.get("head"), item.get("base")
-            if (
-                not isinstance(user, dict)
-                or not isinstance(head, dict)
-                or not isinstance(base, dict)
-            ):
-                raise Unavailable("malformed_response")
-            login, kind, head_ref = user.get("login"), user.get("type"), head.get("ref")
-            if (
-                not isinstance(login, str)
-                or not isinstance(kind, str)
-                or not isinstance(head_ref, str)
-                or not head_ref
-                or item.get("state") not in {"open", "closed"}
-            ):
-                raise Unavailable("malformed_response")
-            if (
-                login.casefold() != own_login.casefold()
-                or kind != own_type
-                or not is_publication_branch(head_ref)
-            ):
-                continue
-            sides = [side.get("repo") for side in (head, base)]
-            if not all(
-                isinstance(repo, dict)
-                and isinstance(repo.get("full_name"), str)
-                and repo["full_name"].casefold() == repository.path.casefold()
-                for repo in sides
-            ):
-                # A fork's branch (or a deleted fork, ``repo: null``) is never ours.
-                continue
-            pull = self._pull_request(repository, item, require_sides=True)
-            found.append(
-                FactoryPublication(
-                    ref=pull.ref,
-                    url=pull.url,
-                    head_ref=pull.head_ref,
-                    state=pull.state,
-                    body=publication_body(item, "body"),
-                    closed_at=_timestamp(item.get("merged_at"))
-                    or _timestamp(item.get("closed_at")),
-                    owner_verified=True,
+        async for page in self._pull_pages(repository, token):
+            for item in page:
+                if not isinstance(item, dict):
+                    raise Unavailable("malformed_response")
+                user, head, base = item.get("user"), item.get("head"), item.get("base")
+                if (
+                    not isinstance(user, dict)
+                    or not isinstance(head, dict)
+                    or not isinstance(base, dict)
+                ):
+                    raise Unavailable("malformed_response")
+                login, kind, head_ref = user.get("login"), user.get("type"), head.get("ref")
+                if (
+                    not isinstance(login, str)
+                    or not isinstance(kind, str)
+                    or not isinstance(head_ref, str)
+                    or not head_ref
+                    or item.get("state") not in {"open", "closed"}
+                ):
+                    raise Unavailable("malformed_response")
+                if (
+                    login.casefold() != own_login.casefold()
+                    or kind != own_type
+                    or not is_publication_branch(head_ref)
+                ):
+                    continue
+                sides = [side.get("repo") for side in (head, base)]
+                if not all(
+                    isinstance(repo, dict)
+                    and isinstance(repo.get("full_name"), str)
+                    and repo["full_name"].casefold() == repository.path.casefold()
+                    for repo in sides
+                ):
+                    # A fork's branch (or a deleted fork, ``repo: null``) is never ours.
+                    continue
+                pull = self._pull_request(repository, item, require_sides=True)
+                found.append(
+                    FactoryPublication(
+                        ref=pull.ref,
+                        url=pull.url,
+                        head_ref=pull.head_ref,
+                        state=pull.state,
+                        body=publication_body(item, "body"),
+                        closed_at=_timestamp(item.get("merged_at"))
+                        or _timestamp(item.get("closed_at")),
+                        owner_verified=True,
+                    )
                 )
-            )
+            # Keep no raw page alive while the next one is fetched.
+            del page
         return tuple(found)
 
     async def find_pull_request(
@@ -872,6 +945,32 @@ class GitHubCodeHost:
         if detail.state != "observed" or detail.reason is not None:
             raise _ci_error(detail.reason or "github_error")
         return detail
+
+    async def required_checks(self, repository: RepositoryRef, branch: str) -> frozenset[str]:
+        """Names required on ``branch`` before GitHub will merge.
+
+        The union of ruleset contexts from
+        ``GET /repos/{owner}/{repo}/rules/branches/{branch}`` and branch
+        protection contexts from ``GET /repos/{owner}/{repo}/branches/{branch}``.
+        HTTP 404 on the rules endpoint, an empty rules list, a rules list with
+        no required status checks rule, a missing protection object, and a
+        protection object with no required status checks all contribute no
+        names from that source. HTTP 404 on the branch endpoint is
+        ``github_not_found``. Every other failure uses the same reason
+        ``observe_ci`` raises for that failure.
+        """
+
+        token = await self._token(repository.path)
+        repo = self._repo(repository.path)
+        encoded = quote(branch, safe="")
+        try:
+            rules = await self._json("GET", f"{repo}/rules/branches/{encoded}", token=token)
+        except NotFound:
+            rules = []
+        names = _ruleset_contexts(rules)
+        payload = await self._json("GET", f"{repo}/branches/{encoded}", token=token)
+        names.update(_protection_contexts(payload))
+        return frozenset(names)
 
     async def observe_ci(self, repository: RepositoryRef, head_sha: str) -> CiRollup:
         """Check runs and commit statuses on exactly ``head_sha``."""

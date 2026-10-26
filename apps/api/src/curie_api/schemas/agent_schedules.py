@@ -1,4 +1,4 @@
-"""Agent-created schedules (ADR 0238): request bodies and list wrappers.
+"""Agent-created schedules (ADR 0248): request bodies and list wrappers.
 
 The schedule itself (``AgentScheduleOut``) lives in ``schemas.schedules`` beside
 the hook-run reason set it reports, because ``GET /schedules`` lists it too.

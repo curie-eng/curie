@@ -153,6 +153,7 @@ async def _recover(
         repository,
         _contract(base=resolved, draft=draft),
         expected_head_sha=REVISION_HEAD,
+        adopt_only=False,
         before_open=_open_clear,
     )
 
@@ -1144,3 +1145,76 @@ def test_write_access_is_read_for_the_immutable_account(
     )
 
     assert allowed is expected
+
+
+def _required_handler(
+    rules_status: int,
+    rules_body: Any,
+    branch_status: int = 200,
+    branch_body: Any | None = None,
+) -> Handler:
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/rules/branches/main"):
+            return httpx.Response(rules_status, json=rules_body)
+        if path.endswith("/branches/main"):
+            payload = {"name": "main"} if branch_body is None else branch_body
+            return httpx.Response(branch_status, json=payload)
+        return httpx.Response(404, json={"message": "missing"})
+
+    return handler
+
+
+def test_required_checks_unions_ruleset_and_protection_contexts() -> None:
+    rules = [
+        {"type": "pull_request", "parameters": {}},
+        {
+            "type": "required_status_checks",
+            "parameters": {
+                "required_status_checks": [
+                    {"context": "unit"},
+                    {"context": "label-gate"},
+                ]
+            },
+        },
+    ]
+    branch = {
+        "name": "main",
+        "protection": {"required_status_checks": {"contexts": ["label-gate", "lint"]}},
+    }
+
+    async def body(host: GitHubCodeHost) -> frozenset[str]:
+        return await host.required_checks(_repository(), "main")
+
+    assert _with_host(_required_handler(200, rules, branch_body=branch), body) == frozenset(
+        {"unit", "label-gate", "lint"}
+    )
+
+
+def test_required_checks_rules_not_found_keeps_protection_only() -> None:
+    branch = {"name": "main", "protection": {"required_status_checks": {"contexts": ["lint"]}}}
+
+    async def body(host: GitHubCodeHost) -> frozenset[str]:
+        return await host.required_checks(_repository(), "main")
+
+    found = _with_host(_required_handler(404, {"message": "Not Found"}, branch_body=branch), body)
+    assert found == frozenset({"lint"})
+
+
+def test_required_checks_empty_rules_and_missing_protection_add_no_names() -> None:
+    async def body(host: GitHubCodeHost) -> frozenset[str]:
+        return await host.required_checks(_repository(), "main")
+
+    assert _with_host(_required_handler(200, [], branch_body={"name": "main"}), body) == frozenset()
+
+
+def test_required_checks_branch_not_found_is_unreadable() -> None:
+    async def body(host: GitHubCodeHost) -> frozenset[str]:
+        return await host.required_checks(_repository(), "main")
+
+    with pytest.raises(NotFound) as refused:
+        _with_host(
+            _required_handler(200, [], branch_status=404, branch_body={"message": "Not Found"}),
+            body,
+        )
+    assert str(refused.value) == "github_not_found"

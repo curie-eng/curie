@@ -92,6 +92,7 @@ from curie_runner.session import SessionRunner
 from curie_runner.side_effects import SideEffectClassifier
 from curie_runner.translate import TurnState, translate_message
 from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
+from runner_boot_session import initialized_session_sync
 
 _BUDGET = '{"max_output_tokens_per_run": 10000, "max_usd_per_day": 1.0}'
 _CAPABILITY_SERVER = Path(__file__).parent / "fixtures" / "mcp_tool_capability_server.py"
@@ -843,7 +844,7 @@ def _options_from_boot(
     monkeypatch.setenv("CURIE_TURN_PROGRESS_ENABLED", "1")
     monkeypatch.setattr(boot, "ClaudeAgentSession", _CapturedSession)
     runner = build_runner(config, workspace_path=workspace_path)
-    session = runner._factory()
+    session = initialized_session_sync(runner)
     assert isinstance(session, _CapturedSession)
     return session.options
 
@@ -1083,7 +1084,7 @@ def test_explicit_gate_keeps_pager_and_annotations_classify_receipt_actions(
         runner = build_runner(_config(plugin_dir))
         if mode == "read-only":
             read_only_runner = runner
-        session = runner._factory()
+        session = initialized_session_sync(runner)
         assert isinstance(session, _CapturedSession)
 
         # An explicit non-grantable permission gate is already the pager.
@@ -1141,7 +1142,7 @@ def test_explicit_tool_gate_overrides_its_read_only_annotation(
         plugin_dir = _bundle(tmp_path / directory)
         _add_capability_server(plugin_dir, "read-only")
         runner = build_runner(_config(plugin_dir, CURIE_APPROVAL_REQUIRED_TOOLS=gated_tool))
-        session = runner._factory()
+        session = initialized_session_sync(runner)
         assert isinstance(session, _CapturedSession)
         names = anyio.run(
             _mcp_tool_names,

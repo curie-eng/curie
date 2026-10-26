@@ -433,10 +433,11 @@ def test_any_other_sub_agent_is_denied(session: Session) -> None:
 
 
 def test_hook_reports_review_phase_and_round(session: Session) -> None:
+    # The plan gets one review (#4929); only the diff loop counts rounds.
     session.review(PLAN, reply(PLAN, "CHANGES"))
-    session.review(PLAN, reply(PLAN, "APPROVE"))
+    session.review(DIFF, reply(DIFF, "CHANGES"))
     session.review(DIFF, reply(DIFF, "APPROVE"))
-    assert session.phases() == [("plan_review", 1), ("plan_review", 2), ("review_diff", 1)]
+    assert session.phases() == [("plan_review", 1), ("review_diff", 1), ("review_diff", 2)]
 
 
 # --- Loop order and the round cap ----------------------------------------------
@@ -459,29 +460,36 @@ def test_diff_rejection_returns_to_implement_not_plan(session: Session) -> None:
     assert session.phases()[-1] == ("review_diff", 2)
 
 
-@pytest.mark.parametrize("kind", [PLAN, DIFF])
-def test_third_rejection_caps_the_loop(session: Session, kind: str) -> None:
-    if kind == DIFF:
-        session.review(PLAN, reply(PLAN, "APPROVE"))
+@pytest.mark.parametrize("plan_verdict", ["APPROVE", "CHANGES"])
+def test_third_rejection_caps_the_loop(session: Session, plan_verdict: str) -> None:
+    # Only the diff loop has rounds to cap; the plan review is one pass (#4929)
+    # and either of its verdicts leads into the same capped diff loop.
+    session.review(PLAN, reply(PLAN, plan_verdict))
     for round_ in (1, 2):
-        _, context = session.review(kind, reply(kind, "CHANGES"))
+        _, context = session.review(DIFF, reply(DIFF, "CHANGES"))
         assert f"round {round_ + 1} of 3" in context
-    _, context = session.review(kind, reply(kind, "CHANGES"))
+    _, context = session.review(DIFF, reply(DIFF, "CHANGES"))
     assert context.startswith("STOP.")
     assert "3 round cap" in context and "Could not complete:" in context
-    # A fourth round is refused, and nothing is published.
-    fourth = session.pre("Agent", {"subagent_type": kind, "description": "r", "prompt": "p"})
-    assert fourth["permissionDecision"] == "deny"
+    # A fourth round is refused, as is a plan review, and nothing is published.
+    for kind in (DIFF, PLAN):
+        again = session.pre("Agent", {"subagent_type": kind, "description": "r", "prompt": "p"})
+        assert again["permissionDecision"] == "deny"
     assert session.pre(PUBLISH)["permissionDecision"] == "deny"
-    loop = "plan_review" if kind == PLAN else "review_diff"
-    assert [p for p in session.phases() if p[0] == loop] == [(loop, 1), (loop, 2), (loop, 3)]
+    assert [p for p in session.phases() if p[0] == "review_diff"] == [
+        ("review_diff", 1),
+        ("review_diff", 2),
+        ("review_diff", 3),
+    ]
+    assert [p for p in session.phases() if p[0] == "plan_review"] == [("plan_review", 1)]
 
 
 def test_a_capped_run_states_its_findings_in_its_reply(session: Session) -> None:
     # ADR 0187: the bundle has no GitHub write tool. The platform posts the
     # final reply on the issue, so the stop text asks for the findings there.
+    session.review(PLAN, reply(PLAN, "CHANGES"))
     for _ in range(3):
-        _, context = session.review(PLAN, reply(PLAN, "CHANGES"))
+        _, context = session.review(DIFF, reply(DIFF, "CHANGES"))
     assert "Could not complete:" in context
     assert "add_issue_comment" not in context
     assert "platform posts that reply on the issue" in context
@@ -545,6 +553,67 @@ def test_a_new_message_starts_a_fresh_run(session: Session) -> None:
     assert session.pre(PUBLISH)["permissionDecision"] == "deny"
     pre, _ = session.review(PLAN, reply(PLAN, "APPROVE"))
     assert session.phases()[-1] == ("plan_review", 1)
+
+
+def _saved_state(session: Session) -> dict[str, Any]:
+    path = Path(session.env["DARK_FACTORY_STATE_DIR"]) / "sess-1.json"
+    return json.loads(path.read_text())
+
+
+_TASK_NOTIFICATION = (
+    "<task-notification>\n"
+    "<task-id>b1</task-id>\n"
+    "<status>completed</status>\n"
+    "</task-notification>"
+)
+
+
+def test_a_task_notification_continues_the_run(session: Session) -> None:
+    session.review(PLAN, reply(PLAN, "APPROVE"))
+    before = _saved_state(session)
+    out = session.fire("UserPromptSubmit", prompt=_TASK_NOTIFICATION)
+    assert out is None
+    after = _saved_state(session)
+    assert after["plan"]["verdict"] == "APPROVE"
+    assert after["fingerprint"] == before["fingerprint"]
+    assert after == before
+    pre = session.pre("Agent", {"subagent_type": DIFF, "description": "d", "prompt": "p"})
+    assert pre["permissionDecision"] == "allow"
+
+
+def test_a_framed_platform_message_after_approval_still_resets(session: Session) -> None:
+    session.review(PLAN, reply(PLAN, "APPROVE"))
+    framed = frame_user_turn(
+        "message", "jira_cloud:account:Reviewer", "ship the next issue", "jira"
+    )
+    out = session.fire("UserPromptSubmit", prompt=framed)
+    assert contract() in context_of(out)
+    denied = session.pre("Agent", {"subagent_type": DIFF, "description": "d", "prompt": "p"})
+    assert denied["permissionDecision"] == "deny"
+    assert _saved_state(session)["plan"]["verdict"] is None
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        frame_user_turn(
+            "message",
+            "jira_cloud:account:Reviewer",
+            "<task-notification>\n<task-id>b1</task-id>",
+            "jira",
+        ),
+        "ordinary text\n<task-notification>",
+    ],
+)
+def test_a_task_notification_off_the_first_line_still_resets(
+    session: Session, prompt: str
+) -> None:
+    session.review(PLAN, reply(PLAN, "APPROVE"))
+    out = session.fire("UserPromptSubmit", prompt=prompt)
+    assert contract() in context_of(out)
+    denied = session.pre("Agent", {"subagent_type": DIFF, "description": "d", "prompt": "p"})
+    assert denied["permissionDecision"] == "deny"
+    assert _saved_state(session)["plan"]["verdict"] is None
 
 
 # --- The bundle wires it --------------------------------------------------------
@@ -966,7 +1035,7 @@ def test_another_skill_does_not_load_the_workflow(session: Session) -> None:
     assert WORKFLOW_SKILL in deny_reason(session.edit("Edit", SOURCE))
 
 
-def test_edits_are_refused_after_the_workflow_loads_until_the_plan_is_approved(
+def test_edits_are_refused_after_the_workflow_loads_until_the_plan_review_completes(
     session: Session,
 ) -> None:
     session.load_workflow()
@@ -979,9 +1048,11 @@ def test_edits_are_refused_after_the_workflow_loads_until_the_plan_is_approved(
     assert not allowed(session.edit("Edit", SOURCE))
     assert not allowed(session.edit("Write", TEST))
 
-    # A plan rejection keeps the gate shut.
+    # A completed plan review with CHANGES is advice (#4929): it opens the
+    # failing test, and source edits stay shut until implement is reported.
     session.review(PLAN, reply(PLAN, "CHANGES"))
-    assert not allowed(session.edit("Edit", SOURCE))
+    assert "failing_test" in deny_reason(session.edit("Edit", SOURCE))
+    assert allowed(session.edit("Write", TEST))
     refused = [e for e in session.gate_events() if e["curie_gate"] == "edit_refused"]
     assert len(refused) == 4
 
@@ -1442,12 +1513,17 @@ def test_an_ignored_file_written_before_approval_does_not_refuse_it(session: Ses
     assert not any(e["curie_gate"] == "approval_refused" for e in session.gate_events())
 
 
-def test_an_unverifiable_checkout_refuses_the_approval(tmp_path: Path) -> None:
+def test_an_unverifiable_checkout_refuses_plan_review(tmp_path: Path) -> None:
     s = Session(tmp_path)
     s.cwd = tmp_path / "not-a-repo"
     s.cwd.mkdir()
-    assert contract() in context_of(s.fire("UserPromptSubmit", prompt=ISSUE))
-    _assert_approval_refused(s, "checkout_unverifiable")
+    context = context_of(s.fire("UserPromptSubmit", prompt=ISSUE))
+    assert context.startswith("STOP.")
+    assert "checkout_unverifiable" in context
+    pre = s.pre("Agent", {"subagent_type": PLAN, "description": "p", "prompt": "p"})
+    assert pre["permissionDecision"] == "deny"
+    assert _saved_state(s)["plan"] == {"round": 0, "verdict": None}
+    assert s.phases() == []
 
 
 def _load_hook(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, name: str) -> Any:
@@ -1506,11 +1582,11 @@ def test_the_fingerprint_deadline_covers_hashing_untracked_files(
     module = _load_hook(monkeypatch, tmp_path, "dark_factory_review_gate_deadline")
     repo = _repo_with_untracked_files(tmp_path)
     # Control: in budget, the same checkout fingerprints.
-    assert module.fingerprint(str(repo)) is not None
+    assert module.fingerprint(str(repo), module.time.monotonic() + 7.0) is not None
 
     _expire_after_listing_untracked(monkeypatch, module)
 
-    assert module.fingerprint(str(repo)) is None
+    assert module.fingerprint(str(repo), module.time.monotonic() + 7.0) is None
 
 
 def test_an_unchanged_checkout_whose_prompt_fingerprint_timed_out_is_unverifiable(
@@ -1527,10 +1603,11 @@ def test_an_unchanged_checkout_whose_prompt_fingerprint_timed_out_is_unverifiabl
 
     with monkeypatch.context() as slow:
         _expire_after_listing_untracked(slow, module)
-        assert contract() in context_of(fire("UserPromptSubmit", prompt=ISSUE))
+        context = context_of(fire("UserPromptSubmit", prompt=ISSUE))
+        assert context.startswith("STOP.")
+        assert "checkout_unverifiable" in context
 
-    # The checkout never changed, and the approval-time fingerprint is in
-    # budget; the prompt-time one was not, so nothing proves it unchanged.
+    # Git is readable again, but that cannot supply the missing prompt baseline.
     fire("PostToolUse", tool_name="Skill", tool_input={"skill": WORKFLOW_SKILL})
     pre = fire(
         "PreToolUse",
@@ -1538,17 +1615,10 @@ def test_an_unchanged_checkout_whose_prompt_fingerprint_timed_out_is_unverifiabl
         tool_input={"subagent_type": PLAN, "description": "plan-reviewer", "prompt": "p"},
     )
     assert pre is not None
-    assert pre["hookSpecificOutput"]["permissionDecision"] == "allow"
-    post = fire(
-        "PostToolUse",
-        tool_name="Agent",
-        tool_input=pre["hookSpecificOutput"]["updatedInput"],
-        tool_response={"content": [{"type": "text", "text": reply(PLAN, "APPROVE")}]},
-    )
-    assert post is not None
-    context = post["hookSpecificOutput"]["additionalContext"]
-    assert context.startswith("STOP."), context
-    assert "checkout_unverifiable" in context
+    assert pre["hookSpecificOutput"]["permissionDecision"] == "deny"
+    state = module.load(module.state_path("sess-t"))
+    assert state["plan"] == {"round": 0, "verdict": None}
+    assert state["fingerprint"] is None
 
 
 def test_a_new_prompt_resets_the_state_before_fingerprinting(
@@ -1569,7 +1639,7 @@ def test_a_new_prompt_resets_the_state_before_fingerprinting(
     )
     module.save(path, approved)
 
-    def killed(workspace: str) -> str | None:
+    def killed(workspace: str, deadline: float) -> str | None:
         raise SystemExit(1)
 
     monkeypatch.setattr(module, "fingerprint", killed)
@@ -2400,18 +2470,17 @@ def test_an_incorrect_test_or_missing_ci_route_is_refused_at_both_reviews(
     queue = {"file_path": s.abspath("pkg/queue.py"), "content": _queue_source(s)}
 
     _start(run)
-    _, context = run.review_with(PLAN, verified_reply(PLAN, "CHANGES", refused, finding))
-    assert "Go back to phase plan, round 2 of 3" in context
-    assert "plan review" in deny_reason(run.edit("Write", queue)).lower()
+    # The one plan review refuses AC1 and accepts the plan's delegated AC2 row.
+    # The hook records what it was told and never overrides a verdict.
+    plan_rows = [*refused, "- AC2: delegated integration-tests"]
+    _, context = run.review_with(PLAN, verified_reply(PLAN, "CHANGES", plan_rows, finding))
+    # Plan CHANGES is advice (#4929): on to the failing test, never a plan round 2.
+    assert not context.startswith("STOP.") and "failing_test" in context
+    assert "failing_test" in deny_reason(run.edit("Write", queue))
     assert "return 0" in (s.cwd / "pkg" / "queue.py").read_text()
     assert run.decision(PUBLISH, {"title": "t", "body": "b"}) == "deny"
-
-    # The plan reviewer accepts the revised plan's delegated row. The hook
-    # records what it was told and never overrides a verdict.
-    _, context = run.review_with(
-        PLAN, verified_reply(PLAN, "APPROVE", ["- AC1: delegated integration-tests"])
-    )
-    assert "APPROVED" in context
+    plan_again = run.pre("Agent", {"subagent_type": PLAN, "description": "p", "prompt": "p"})
+    assert "returns to implement" in deny_reason(plan_again)
     if case == "invalid_test":
         # The test replaces the function it claims to verify: green on the base code.
         content = MOCKED_QUEUE_TEST
@@ -2437,27 +2506,26 @@ def test_an_incorrect_test_or_missing_ci_route_is_refused_at_both_reviews(
 
     assert stages(s) == [
         ("plan_review", 1, "CHANGES"),
-        ("plan_review", 2, "APPROVE"),
         ("review_diff", 1, "CHANGES"),
     ]
     records = classified(s)
     expected = [{"ac": 1, "route": "refused", "reason": reason}]
-    assert records[0]["classifications"] == expected
-    assert records[2]["classifications"] == expected
+    assert records[1]["classifications"] == expected
     # Only the resolved declaration makes a label a route: the plan's row is
     # recorded as declared in the declared case alone, its label nowhere else.
     declared = case == "invalid_test"
-    assert records[1]["classifications"] == [
+    assert records[0]["classifications"] == [
+        *expected,
         {
-            "ac": 1,
+            "ac": 2,
             "route": "delegated",
             "declared": declared,
             "check_id": "queue" if declared else None,
-        }
+        },
     ]
+    assert "integration-tests" not in s.log.read_text()
     assert s.phases() == [
         ("plan_review", 1),
-        ("plan_review", 2),
         ("failing_test", 1),
         ("implement", 1),
         ("review_diff", 1),
@@ -2554,39 +2622,42 @@ def test_a_reply_without_a_verification_block_still_approves(session: Session) -
 
 
 def test_the_verification_block_never_changes_the_verdict(session: Session) -> None:
-    # A CHANGES whose block holds no refusal still returns to plan.
+    # A CHANGES whose block holds no refusal is still a CHANGES verdict.
     _, context = session.review(
         PLAN, verified_reply(PLAN, "CHANGES", ["- AC1: sandbox x"], ("AC1: no",))
     )
-    assert "Go back to phase plan, round 2 of 3" in context
-    # An APPROVE carrying a refused row is still an approval: nothing is overridden.
-    refused = ["- AC1: refused invalid_test"]
-    _, context = session.review(PLAN, verified_reply(PLAN, "APPROVE", refused))
-    assert "APPROVED" in context
-    # Only the first run of criterion lines is the block; prose ends it.
+    assert "CHANGES" in context and "APPROVED" not in context
+    assert _state(session)["plan"]["verdict"] == "CHANGES"
+    # Only the first run of criterion lines is the block; prose ends it. A diff
+    # CHANGES returns to implement whatever its block says.
     lines = [
         "- AC1: refused made_up_reason",
         "- AC2: delegated bad`name",
         "The rest of the diff is fine.",
         "- AC9: sandbox late",
     ]
-    _, context = session.review(DIFF, verified_reply(DIFF, "APPROVE", lines))
+    _, context = session.review(DIFF, verified_reply(DIFF, "CHANGES", lines, ("AC1: no",)))
+    assert "phase implement, round 2 of 3" in context
+    assert session.pre(PUBLISH, {"title": "t", "body": "b"})["permissionDecision"] == "deny"
+    # An APPROVE carrying a refused row is still an approval: nothing is overridden.
+    refused = ["- AC1: refused invalid_test"]
+    _, context = session.review(DIFF, verified_reply(DIFF, "APPROVE", refused))
     assert "APPROVED" in context
     assert session.pre(PUBLISH, {"title": "t", "body": "b"})["permissionDecision"] == "allow"
 
     records = classified(session)
     assert stages(session) == [
         ("plan_review", 1, "CHANGES"),
-        ("plan_review", 2, "APPROVE"),
-        ("review_diff", 1, "APPROVE"),
+        ("review_diff", 1, "CHANGES"),
+        ("review_diff", 2, "APPROVE"),
     ]
     assert records[0]["classifications"] == [{"ac": 1, "route": "sandbox"}]
     assert records[1]["classifications"] == [
-        {"ac": 1, "route": "refused", "reason": "invalid_test"}
-    ]
-    assert records[2]["classifications"] == [
         {"ac": 1, "route": "refused", "reason": "unrecognized"},
         {"ac": 2, "route": "delegated", "declared": False, "check_id": None},
+    ]
+    assert records[2]["classifications"] == [
+        {"ac": 1, "route": "refused", "reason": "invalid_test"}
     ]
 
 
@@ -3016,3 +3087,248 @@ def test_an_unreadable_git_status_does_not_stop_diff_review(
     assert "--porcelain=v1" in argv
     assert "-z" in argv
     assert "--untracked-files=all" in argv
+
+
+# --- Advisory plan review (#4929) ----------------------------------------------
+#
+# One completed plan review per run. Either verdict from the real plan reviewer
+# opens phase failing_test; CHANGES is advice the implementer carries to the
+# diff reviewer. Only a diff APPROVE opens publication.
+
+PLAN_VERDICTS = ("APPROVE", "CHANGES")
+ADVISORY_LINE = 'ADVISORY_PLAN_VERDICTS = ("APPROVE", "CHANGES")'
+STRICT_LINE = 'ADVISORY_PLAN_VERDICTS = ("APPROVE",)'
+
+
+def _state(s: Session) -> dict[str, Any]:
+    """The hook's saved state for the session, read from DARK_FACTORY_STATE_DIR."""
+    path = Path(s.env["DARK_FACTORY_STATE_DIR"]) / "sess-1.json"
+    assert path.is_file(), path
+    state: dict[str, Any] = json.loads(path.read_text())
+    return state
+
+
+def _call(s: Session, kind: str) -> dict[str, Any]:
+    """The PreToolUse decision for a reviewer call that is never answered."""
+    return s.pre("Agent", {"subagent_type": kind, "description": kind.split(":")[1], "prompt": "p"})
+
+
+def _plan_reply(verdict: str) -> str:
+    return verified_reply(
+        PLAN, verdict, ["- AC1: sandbox python -m pytest tests/test_calc.py"], ("AC2: no test row",)
+    )
+
+
+def _started(s: Session) -> Session:
+    out = s.fire("UserPromptSubmit", prompt="https://github.com/Acme/bot/issues/7")
+    assert contract() in context_of(out)
+    s.load_workflow()
+    return s
+
+
+def _advisory_outcome(s: Session, verdict: str) -> dict[str, Any]:
+    """What one completed plan review with ``verdict`` leads to, observed in order.
+
+    The same observations run against the production hook and the strict-plan
+    control, so the control can show each expectation is falsifiable.
+    """
+    _, context = s.review(PLAN, _plan_reply(verdict))
+    observed: dict[str, Any] = {"context": context, "state": _state(s)}
+    observed["test_edit"] = s.edit("Write", TEST)
+    observed["source_edit"] = s.edit("Edit", SOURCE)
+    observed["publish"] = s.pre(PUBLISH)
+    observed["second_plan"] = _call(s, PLAN)
+    return observed
+
+
+@pytest.mark.parametrize("verdict", PLAN_VERDICTS)
+def test_one_completed_plan_review_opens_the_failing_test(tmp_path: Path, verdict: str) -> None:
+    s = _started(Session(tmp_path))
+    seen = _advisory_outcome(s, verdict)
+
+    assert not seen["context"].startswith("STOP."), seen["context"]
+    assert seen["state"]["plan"] == {"round": 1, "verdict": verdict}
+    assert seen["state"]["stage"] == "failing_test"
+    assert seen["state"]["stopped"] is None
+    # The first edit may be the test; source waits for the implement report.
+    assert allowed(seen["test_edit"])
+    assert "failing_test" in deny_reason(seen["source_edit"])
+    # Neither plan verdict authorizes publication.
+    assert seen["publish"]["permissionDecision"] == "deny"
+    # The one plan review is spent: a second one is refused, not numbered.
+    assert seen["second_plan"]["permissionDecision"] == "deny"
+    assert "returns to implement" in seen["second_plan"]["permissionDecisionReason"]
+    assert _state(s)["plan"] == {"round": 1, "verdict": verdict}
+    assert [p for p in s.phases() if p[0] == "plan_review"] == [("plan_review", 1)]
+    # The reviewer's verdict is recorded as it came back.
+    (record,) = classified(s)
+    assert (record["stage"], record["kind"], record["round"]) == ("plan_review", "plan", 1)
+    assert record["verdict"] == verdict
+
+    s.apply_edit("Write", TEST)
+    s.run_bash("uv run pytest tests/test_calc.py", failed=True)
+    s.report("implement", 1)
+    assert allowed(s.edit("Edit", SOURCE))
+    assert s.phases() == [("plan_review", 1), ("failing_test", 1), ("implement", 1)]
+
+
+def test_a_pending_plan_review_keeps_edits_and_publication_shut(session: Session) -> None:
+    session.load_workflow()
+    # The call was allowed and routed, but no reply has come back yet.
+    assert _call(session, PLAN)["permissionDecision"] == "allow"
+    assert _state(session)["plan"] == {"round": 1, "verdict": None}
+
+    assert "plan review" in deny_reason(session.edit("Write", TEST)).lower()
+    assert not allowed(session.edit("Edit", SOURCE))
+    assert session.pre(PUBLISH)["permissionDecision"] == "deny"
+    assert _call(session, DIFF)["permissionDecision"] == "deny"
+    assert _state(session)["stage"] is None
+
+
+PLAN_FAILURES = {
+    "no_verdict": "REVIEWER: plan-reviewer\nI could not decide.\n",
+    "wrong_reviewer": "REVIEWER: diff-reviewer\nVERDICT: CHANGES\n- AC2 has no test\n",
+    "errored": None,
+}
+
+
+@pytest.mark.parametrize("failure", list(PLAN_FAILURES))
+def test_a_plan_review_without_a_real_verdict_stops_the_run(session: Session, failure: str) -> None:
+    session.load_workflow()
+    pre = _call(session, PLAN)
+    assert pre["permissionDecision"] == "allow"
+    text = PLAN_FAILURES[failure]
+    if text is None:
+        out = session.fire(
+            "PostToolUseFailure",
+            tool_name="Agent",
+            tool_input=pre["updatedInput"],
+            error="model is not available",
+        )
+    else:
+        out = session.fire(
+            "PostToolUse",
+            tool_name="Agent",
+            tool_input=pre["updatedInput"],
+            tool_response={"content": [{"type": "text", "text": text}]},
+        )
+    assert out is not None
+    context = out["hookSpecificOutput"]["additionalContext"]
+    assert context.startswith("STOP.") and "Could not complete:" in context
+
+    state = _state(session)
+    assert state["stopped"]
+    assert state["plan"]["verdict"] is None
+    assert state["stage"] is None
+    assert not allowed(session.edit("Write", TEST))
+    assert not allowed(session.edit("Edit", SOURCE))
+    assert session.pre(PUBLISH)["permissionDecision"] == "deny"
+    assert _call(session, PLAN)["permissionDecision"] == "deny"
+    assert _call(session, DIFF)["permissionDecision"] == "deny"
+    assert classified(session) == []
+
+
+def _through_implement(s: Session) -> None:
+    """Plan CHANGES, the failing test, then the implement report and a source edit."""
+    _, context = s.review(PLAN, _plan_reply("CHANGES"))
+    assert "failing_test" in context
+    s.apply_edit("Write", TEST)
+    s.run_bash("uv run pytest tests/test_calc.py", failed=True)
+    s.report("implement", 1)
+    s.apply_edit("Edit", SOURCE)
+    assert s.pre(PUBLISH)["permissionDecision"] == "deny"
+
+
+def test_after_plan_changes_the_third_diff_changes_caps_the_run(session: Session) -> None:
+    session.load_workflow()
+    _through_implement(session)
+    for round_ in (1, 2):
+        _, context = session.review(DIFF, reply(DIFF, "CHANGES"))
+        assert f"phase implement, round {round_ + 1} of 3" in context
+        assert session.pre(PUBLISH)["permissionDecision"] == "deny"
+        # A diff rejection never reopens the plan review.
+        plan_again = _call(session, PLAN)
+        assert plan_again["permissionDecision"] == "deny"
+        assert "returns to implement" in plan_again["permissionDecisionReason"]
+    _, context = session.review(DIFF, reply(DIFF, "CHANGES"))
+    assert context.startswith("STOP.") and "3 round cap" in context
+
+    state = _state(session)
+    assert state["diff"] == {"round": 3, "verdict": "CHANGES"}
+    assert state["plan"] == {"round": 1, "verdict": "CHANGES"}
+    assert state["stopped"]
+    assert session.pre(PUBLISH)["permissionDecision"] == "deny"
+    assert _call(session, DIFF)["permissionDecision"] == "deny"
+    assert stages(session) == [
+        ("plan_review", 1, "CHANGES"),
+        ("review_diff", 1, "CHANGES"),
+        ("review_diff", 2, "CHANGES"),
+        ("review_diff", 3, "CHANGES"),
+    ]
+
+
+@pytest.mark.parametrize("diff_rounds", [1, 3])
+def test_after_plan_changes_only_a_diff_approval_opens_publication(
+    session: Session, diff_rounds: int
+) -> None:
+    session.load_workflow()
+    _through_implement(session)
+    for _ in range(diff_rounds - 1):
+        session.review(DIFF, reply(DIFF, "CHANGES"))
+        assert session.pre(PUBLISH)["permissionDecision"] == "deny"
+    _, context = session.review(DIFF, reply(DIFF, "APPROVE"))
+    assert "APPROVED" in context
+    assert session.pre(PUBLISH)["permissionDecision"] == "allow"
+    assert _state(session)["diff"] == {"round": diff_rounds, "verdict": "APPROVE"}
+
+
+@pytest.mark.parametrize("verdict", PLAN_VERDICTS)
+def test_a_checkout_changed_before_either_plan_verdict_refuses_it(
+    session: Session, verdict: str
+) -> None:
+    (session.cwd / "pkg" / "fix.py").write_text("PATCHED = True\n")
+    session.load_workflow()
+    _, context = session.review(PLAN, _plan_reply(verdict))
+
+    assert context.startswith("STOP.") and "checkout_changed_before_plan_approval" in context
+    refusals = [e for e in session.gate_events() if e["curie_gate"] == "approval_refused"]
+    assert [e["cause"] for e in refusals] == ["checkout_changed_before_plan_approval"]
+    state = _state(session)
+    assert state["stopped"] and state["stage"] is None
+    assert state["plan"]["verdict"] is None
+    assert not allowed(session.edit("Write", TEST))
+    assert not allowed(session.edit("Edit", SOURCE))
+    assert session.pre(PUBLISH)["permissionDecision"] == "deny"
+    assert _call(session, DIFF)["permissionDecision"] == "deny"
+
+
+def _strict_plan_hook(tmp_path: Path) -> Path:
+    """The production hook with the old strict plan loop restored, in a bundle copy.
+
+    The copy keeps ``verification/`` beside ``hooks/`` so CONTRACT_PATH resolves.
+    """
+    hook = _bundle_copy(tmp_path) / "hooks" / "review_gate.py"
+    text = hook.read_text()
+    assert text.count(ADVISORY_LINE) == 1
+    assert text.count("PLAN: 1") == 1
+    text = text.replace(ADVISORY_LINE, STRICT_LINE).replace("PLAN: 1", "PLAN: MAX_ROUNDS")
+    hook.write_text(text)
+    return hook
+
+
+def test_the_strict_plan_control_fails_the_advisory_expectations(tmp_path: Path) -> None:
+    # Falsifiable control: the same CHANGES scenario against a hook that keeps
+    # the strict plan loop must not meet the advisory expectations above.
+    control = _started(Session(tmp_path, hook=_strict_plan_hook(tmp_path)))
+    seen = _advisory_outcome(control, "CHANGES")
+
+    assert "Go back to phase plan, round 2 of 3" in seen["context"]
+    assert seen["state"]["stage"] is None
+    assert not allowed(seen["test_edit"])
+    assert seen["second_plan"]["permissionDecision"] == "allow"
+    assert _state(control)["plan"] == {"round": 2, "verdict": None}
+    # The production hook, driven the same way, does the opposite.
+    production = _started(Session(tmp_path / "production"))
+    expected = _advisory_outcome(production, "CHANGES")
+    assert allowed(expected["test_edit"])
+    assert expected["second_plan"]["permissionDecision"] == "deny"

@@ -58,9 +58,10 @@ CONTRACT = "0041"
 # WorkItems are keyed by their tracker issue (0103 contract, #3831), and
 # channel and WorkItem reads carry the trigger label of 0105 (#4361).
 # The 0108 join requires both stable reply selectors (0106) and identity links (0107).
-# The Agent ORM reads agents.learned_skills (selfimp_skills_0001, ADR 0237), the
-# agent schedule columns (selfimp_sched_0001, ADR 0238) and the twin memory toggle
-# of selfimp_memory_0001 (ADR 0239), so twin memory is the floor.
+# The join requires both start diagnostics (0123) and attachment catalogs (0130),
+# and above it the Agent ORM reads agents.learned_skills (selfimp_skills_0001,
+# ADR 0247), the agent schedule columns (selfimp_sched_0001, ADR 0248) and the
+# twin memory toggle of selfimp_memory_0001 (ADR 0249), so twin memory is the floor.
 APP_SCHEMA_MIN = "selfimp_memory_0001"
 REVIEW_SCHEMA_MIN = "0063"
 PREV = "0040"
@@ -148,6 +149,12 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0106",
             "0107",
             "0108",
+            "0120",
+            "0121",
+            "0122",
+            "0123",
+            "0130",
+            "0131",
             "selfimp_safety_0001",
             "selfimp_skills_0001",
             "selfimp_sched_0001",
@@ -168,6 +175,12 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0106",
             "0107",
             "0108",
+            "0120",
+            "0121",
+            "0122",
+            "0123",
+            "0130",
+            "0131",
             "selfimp_safety_0001",
             "selfimp_skills_0001",
             "selfimp_sched_0001",
@@ -257,8 +270,11 @@ def test_agent_reads_refuse_the_schema_before_deploy_notification_expand() -> No
     # factory status replies read 0102's typed reply target and 0103 keys
     # WorkItems by their tracker issue (#3831), and 0105 adds the trigger
     # label (#4361). The 0108 join also requires stable reply selectors and
-    # identity links, and learned skills adds the agents column the Agent ORM
-    # reads, so every earlier schema is refused.
+    # identity links, the directory and connect ORM requires the identity
+    # tables and columns of 0120 through 0131, and learned skills, agent
+    # schedules and twin memory add the agents columns the Agent ORM reads.
+    # Migration expand compatibility for older images does not mean this image
+    # can serve an older database, so every earlier schema is refused.
     served = {window.schema_min, window.schema_head}
     for below_tenant_scope in sorted(known - served):
         assert can_serve(below_tenant_scope, window, known) is False

@@ -1,4 +1,4 @@
-"""ADR 0239 twin memory: the API half of Contract r4.
+"""ADR 0249 twin memory: the API half of Contract r4.
 
 Every case drives the real state and agent routers over HTTP against the
 disposable Postgres and the compose Valkey the conftest provisions. Nothing is

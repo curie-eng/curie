@@ -350,11 +350,11 @@ def test_0103_keeps_ids_backfills_the_tracker_identity_and_a_replay_dedupes(
             }
         ]
 
-        # The ORM reads the head's columns (0105's trigger label, #4361, and
-        # selfimp_skills_0001's agents.learned_skills, selfimp_sched_0001's agent
-        # schedule columns and selfimp_memory_0001's
-        # agents.agent_wide_learning), so the typed reads and the replay below run on
-        # the head schema.
+        # The ORM reads the head's columns (0105's trigger label, #4361,
+        # 0123's last_start_failure_detail, #4930, selfimp_skills_0001's
+        # agents.learned_skills, selfimp_sched_0001's agent schedule columns and
+        # selfimp_memory_0001's agents.agent_wide_learning), so the typed reads and
+        # the replay below run on the head schema.
         command.upgrade(config, "selfimp_memory_0001")
 
         # The typed derivations over the migrated row are the legacy values.

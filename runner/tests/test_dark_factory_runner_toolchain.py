@@ -364,6 +364,7 @@ def test_factory_runner_pod_resolves_repository_lockfiles() -> None:
         assert re.match(r"^Python 3\.13\.", _exec("python3 --version"))
         for command in ("uv --version", "cargo --version", "pnpm --version"):
             assert _exec(command), command
+        assert re.match(r"^cargo-nextest 0\.9\.146\b", _exec("cargo nextest --version"))
 
         _exec(
             "cd /workspace && "

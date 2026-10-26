@@ -418,13 +418,14 @@ class GithubStub:
             "clone_url": self.clone_url,
         }
 
-    def _checks(self) -> list[dict[str, Any]]:
+    def _checks(self, sha: str) -> list[dict[str, Any]]:
+        """The recorded check runs as of the stub clock, on ``sha`` like GitHub's rows."""
         now = _date(self.recording["epoch"]) + timedelta(seconds=self._seconds())
         rows = []
         for recorded in self.recording["check_runs"]:
             if _date(recorded["started_at"]) > now:
                 continue
-            row = dict(recorded)
+            row = dict(recorded) | {"head_sha": sha}
             if not row.get("completed_at") or _date(row["completed_at"]) > now:
                 row.update(status="in_progress", conclusion=None, completed_at=None)
             rows.append(row)
@@ -548,6 +549,10 @@ class GithubStub:
             }
         if method == "GET" and tail == "collaborators/octocat/permission":
             return 200, {"permission": "write", "user": HUMAN}
+        if method == "GET" and tail.startswith("rules/branches/"):
+            # No ruleset on this fixture. HTTP 404 contributes no required names.
+            # https://docs.github.com/en/rest/repos/rules#get-rules-for-a-branch
+            return 404, {"message": "Not Found"}
         if method == "GET" and tail.startswith("branches/"):
             branch = tail.removeprefix("branches/")
             sha = self._find_ref(branch)
@@ -570,7 +575,7 @@ class GithubStub:
             return 200, commit
         if method == "GET" and tail.startswith("commits/"):
             if tail.endswith("/check-runs"):
-                runs = self._checks()
+                runs = self._checks(tail.removeprefix("commits/").removesuffix("/check-runs"))
                 return 200, {"total_count": len(runs), "check_runs": self._page(runs, query)}
             if tail.endswith("/status") or tail.endswith("/statuses"):
                 now = _date(self.recording["epoch"]) + timedelta(seconds=self._seconds())

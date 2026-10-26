@@ -33,6 +33,7 @@ from _support import (
     wait_until,
 )
 from curie_mail_adapter.adapter import MailAdapter
+from curie_mail_adapter.provider import MessageSummary
 
 
 @pytest.mark.parametrize(
@@ -106,7 +107,13 @@ def test_each_inbound_surface_applies_the_same_authentication_gate(
             adapter.prime()
         else:
             assert adapter.state.admit(summary) == "admitted"
-            assert adapter.handle_inbound(summary)
+            listed = MessageSummary(
+                message_id=summary["message_id"],
+                thread_id=summary["thread_id"],
+                sent_by_inbox=False,
+                senders=(summary["from"],),
+            )
+            assert adapter.handle_inbound(listed)
 
     assert ingress.requests == []
     assert mail.body_calls == {}

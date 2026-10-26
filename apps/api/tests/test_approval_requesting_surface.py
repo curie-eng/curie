@@ -619,6 +619,9 @@ def test_a_listed_verified_sender_answers_and_the_session_resumes(
         "kind": "email_list",
         "emails": [APPROVER],
         "actor_listed": True,
+        "authenticated_actor": {
+            "kind": "adapter", "adapter_bindings": [agent["binding_id"]],
+        },
     }
     # The answer wakes the paused session; it is never a new turn of its own.
     entries = valkey.xrange(runs_stream)

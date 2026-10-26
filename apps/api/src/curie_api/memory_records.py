@@ -1,4 +1,4 @@
-"""Canonical memory records: the one transaction boundary (ADR 0239).
+"""Canonical memory records: the one transaction boundary (ADR 0249).
 
 A canonical memory entry is a ``memory`` / ``fact-<32 lowercase hex>`` head in
 ``workflow_state_entries``, agent-wide (``binding_scope`` null) or in one
@@ -787,7 +787,7 @@ async def _guidance_value(session: AsyncSession, agent_id: uuid.UUID) -> Any:
 
 
 async def guidance_for(session: AsyncSession, agent: Agent) -> MemoryGuidanceOut:
-    """The agent's effective guidance and its source (ADR 0239 selection)."""
+    """The agent's effective guidance and its source (ADR 0249 selection)."""
 
     text_, source = effective_guidance(
         await _guidance_value(session, agent.id), agent.agent_wide_learning

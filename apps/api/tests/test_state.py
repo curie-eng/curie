@@ -224,7 +224,7 @@ def test_app_scoped_token_is_refused_on_reserved_namespaces(
         assert client.delete(f"/agents/{aid}/state/{ns}/k", headers=headers).status_code == 403
 
 
-# ADR 0239: a canonical fact value is typed, and a sandbox write needs the
+# ADR 0249: a canonical fact value is typed, and a sandbox write needs the
 # agent's stored memory_writes on and a signed conversation claim.
 _TYPED_FACT = {
     "kind": "fact",

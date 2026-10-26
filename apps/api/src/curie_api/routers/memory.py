@@ -107,7 +107,7 @@ async def _locked_log(
 ) -> tuple[WorkflowStateEntry, list[dict[str, Any]]]:
     """Load and lock the memory log, then validate its expected parent version."""
     await _require_agent(session, agent_id)
-    # The log shares the agent-wide memory byte budget (ADR 0239): take the
+    # The log shares the agent-wide memory byte budget (ADR 0249): take the
     # memory scope lock before the row lock, like every memory writer.
     await memory_records.lock_scope(session, agent_id, None)
     entry: WorkflowStateEntry | None = await session.scalar(
@@ -234,7 +234,7 @@ async def _get_guidance_entry(
 
 
 def _guidance_out(entry: WorkflowStateEntry | None, agent: Agent) -> MemoryGuidanceOut:
-    """The effective guidance (ADR 0239): the stored text, else the learning
+    """The effective guidance (ADR 0249): the stored text, else the learning
     default when the agent is opted in to agent-wide learning, else the
     platform default.
 
@@ -252,7 +252,7 @@ def _guidance_out(entry: WorkflowStateEntry | None, agent: Agent) -> MemoryGuida
 async def get_memory_guidance(
     agent_id: uuid.UUID, session: SessionDep
 ) -> MemoryGuidanceOut:
-    """The agent's effective memory guidance and its source (#1461, ADR 0239)."""
+    """The agent's effective memory guidance and its source (#1461, ADR 0249)."""
     agent = await _require_agent(session, agent_id)
     return await memory_records.guidance_for(session, agent)
 

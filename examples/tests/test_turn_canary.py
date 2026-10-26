@@ -12,6 +12,8 @@ from pathlib import Path
 
 import pytest
 from aci_protocol.turn import QueuedTurn
+from channel_protocol import ReplyEvent, ReplyTarget, ReplyUpdate, TurnCompleted
+from pydantic import TypeAdapter
 
 CANARY = Path(__file__).resolve().parents[1] / "turn-canary" / "turn_canary.py"
 REPLY_REF = "3f2504e0-4f89-41d3-9a0c-0305e82c3301"
@@ -37,6 +39,35 @@ def _binding(adapter: str = "blue") -> dict[str, str]:
         "address": "C-EXAMPLE-1",
         "adapter": adapter,
     }
+
+
+def target_for(turn):
+    """Public reply target from the queued request. @spec TURN-CANARY-3"""
+    return ReplyTarget(
+        kind=turn.reply_handle.kind, address=turn.reply_handle.channel,
+        conversation_id=turn.conversation_id, reply_ref=turn.reply_handle.placeholder,
+    )
+
+
+def reply_events(turn, text="nonce-1", outcome="delivered"):
+    """Serialize production reply models for synthetic traffic. @spec TURN-CANARY-3"""
+    target = target_for(turn)
+    return [
+        ReplyUpdate(
+            version="1.0", event="reply.update", target=target, text=text
+        ).model_dump(mode="json"),
+        TurnCompleted(version="1.0", event="turn.completed", target=target,
+                      event_id=turn.event_id, outcome=outcome).model_dump(mode="json"),
+    ]
+
+
+def _wire_events(events, turn):
+    parser = TypeAdapter(ReplyEvent)
+    return [parser.validate_python({
+        "version": "1.0", "target": target_for(turn),
+        **({"event_id": turn.event_id} if event["event"] == "turn.completed" else {}),
+        **event,
+    }).model_dump(mode="json") for event in events]
 
 
 def test_selection_requires_exact_live_active_binding() -> None:
@@ -125,7 +156,12 @@ def test_named_binding_turn_is_read_only_and_relayed_internally() -> None:
 )
 def test_success_requires_delivered_completion_and_exact_nonce(events, expected) -> None:
     """@spec TURN-CANARY-3"""
-    assert _canary().relay_outcome(events, nonce="nonce-1") is expected
+    canary = _canary()
+    turn = canary.build_turn(
+        _binding(), nonce="nonce-1", conversation_id="eval:sample", reply_ref=REPLY_REF,
+        event_id="EvCANARY-sample", received_at="2026-01-01T00:00:00Z",
+    )
+    assert canary.relay_outcome(_wire_events(events, turn), nonce="nonce-1") is expected
 
 
 def test_owned_reset_key_matches_named_worker_route() -> None:
@@ -184,6 +220,7 @@ class CyclePlatform:
         return self.headroom
 
     async def enqueue(self, turn):
+        self.turn = turn
         assert (
             QueuedTurn.model_validate_json(turn.model_dump_json()).tool_access.value == "read-only"
         )
@@ -196,7 +233,7 @@ class CyclePlatform:
         if self.reply_events is None:
             return {"events": [], "next_cursor": after, "terminal": False}
         return {
-            "events": self.reply_events,
+            "events": _wire_events(self.reply_events, self.turn),
             "next_cursor": after + len(self.reply_events),
             "terminal": True,
         }
@@ -492,6 +529,7 @@ class RoutePlatform:
         self.headroom = list(headroom or [])
         self.calls: list[tuple[str, str]] = []
         self.nonces: dict[str, str] = {}
+        self.turns = {}
         self.cleanup_blocked = False
 
     async def inventory(self):
@@ -508,12 +546,10 @@ class RoutePlatform:
         self.calls.append(("conversation", turn.conversation_id))
         nonce = turn.text.split("no other text: ", 1)[1].split(". Do not", 1)[0]
         self.nonces[turn.reply_handle.placeholder] = nonce
+        self.turns[turn.reply_handle.placeholder] = turn
 
     async def replies(self, reply_ref, after):
-        events = [
-            {"event": "reply.update", "text": self.nonces[reply_ref]},
-            {"event": "turn.completed", "outcome": "delivered"},
-        ]
+        events = reply_events(self.turns[reply_ref], self.nonces[reply_ref])
         return {"events": events, "next_cursor": after + len(events), "terminal": True}
 
     def _address(self, thread_key):

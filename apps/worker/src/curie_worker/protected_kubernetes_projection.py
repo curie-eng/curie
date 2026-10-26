@@ -528,6 +528,10 @@ def _defaults(spec: dict[str, Any]) -> None:
     for field_name in _EMPTY_SPEC:
         if field_name in spec:
             _require(type(spec[field_name]) is list and spec.pop(field_name) == [])
+    # The Priority admission plugin adds these when no priorityClassName is set.
+    for field_name, content in (("priority", 0), ("preemptionPolicy", "PreemptLowerPriority")):
+        if field_name in spec:
+            _require(type(spec[field_name]) is type(content) and spec.pop(field_name) == content)
     for field_name, content in (
         ("hostNetwork", False),
         ("hostPID", False),
@@ -542,6 +546,7 @@ def _defaults(spec: dict[str, Any]) -> None:
     for field_name in _EMPTY_CONTAINER:
         if field_name in container:
             _require(type(container[field_name]) is list and container.pop(field_name) == [])
+    container.setdefault("args", [])
     for field_name, content in (
         ("terminationMessagePath", "/dev/termination-log"),
         ("terminationMessagePolicy", "File"),

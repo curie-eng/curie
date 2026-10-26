@@ -1138,15 +1138,14 @@ def test_principal_endpoint_rejects_the_pre_host_prefix_cookie_name(
     ).status_code == 200
 
 
-def test_oidc_session_cannot_resolve_an_approval(
+def test_oidc_principal_is_authenticated_but_cannot_bypass_legacy_approver_list(
     oidc_client: TestClient, idp: TestIdP, auth_headers: dict[str, str]
 ) -> None:
-    """ADR-0106 / plan: OIDC sessions leave ``subject`` NULL, so no approval authority.
+    """An authenticated OIDC person cannot impersonate a legacy provider id.
 
-    Modeled on test_approval_authenticated_principals.py's
-    ``test_null_subject_console_session_cannot_be_an_approval_principal``. The
-    approver list deliberately names the IdP ``sub``: an IdP-controlled subject
-    that happens to equal a provider id must NOT gain approval authority.
+    With no IdP approver team, the explicit list remains authoritative. Even
+    when the IdP subject collides with a listed Slack user, the console actor
+    is its principal UUID and gains no membership from that collision.
     """
 
     # A Slack-shaped ``sub``: agent creation validates approver ids as Slack
@@ -1191,16 +1190,22 @@ def test_oidc_session_cannot_resolve_an_approval(
     assert approval.status_code == 201, approval.text
     approval_id = approval.json()["id"]
 
-    # A matching Origin passes the cookie-only origin check, so the refusal
-    # below is the NULL subject's and not the origin's.
+    # A matching Origin passes browser CSRF checks; the list denies membership.
     denied = oidc_client.post(
         f"/approvals/{approval_id}/resolve",
         json={"decision": "approved"},
         headers={**_cookie(SESSION_COOKIE, token), "Origin": "http://testserver"},
     )
-    assert denied.status_code == 401, denied.text
+    assert denied.status_code == 403, denied.text
     status = oidc_client.get(f"/approvals/{approval_id}", headers=auth_headers).json()["status"]
     assert status == "pending"
+    assert (
+        _sql(
+            "SELECT id FROM curie.action_executions WHERE agent_id=:id",
+            {"id": uuid.UUID(agent.json()["id"])},
+        )
+        == []
+    )
 
 
 # --- configuration -------------------------------------------------------------

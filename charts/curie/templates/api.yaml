@@ -224,6 +224,12 @@ spec:
                 secretKeyRef:
                   name: {{ include "curie.secretName" . }}
                   key: remediationAuthorityKey
+            - name: ATTACHMENT_TRANSFER_TIMEOUT_SECONDS
+              value: {{ dig "broker" "transferTimeoutSeconds" 300 .Values.worker.attachments | quote }}
+            - name: ATTACHMENT_ACCESS_ENABLED
+              value: {{ and .Values.worker.attachments.enabled (eq (.Values.worker.attachments.mode | default "eager") "lazy") | quote }}
+            - name: ATTACHMENT_BROKER_URL
+              value: {{ printf "http://%s-attachment-broker:%v" (include "curie.fullname" .) (dig "broker" "port" 8093 .Values.worker.attachments) | quote }}
             - name: CURIE_INTERNAL_WORKER_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -354,7 +360,7 @@ spec:
             - name: FACTORY_INTAKE
               value: {{ get (.Values.factory | default dict) "intake" | default "poll" | quote }}
             - name: FACTORY_CI_WAIT_S
-              value: {{ include "curie.factory.str" (get (.Values.factory | default dict) "ciWaitSeconds" | default 1200) | quote }}
+              value: {{ include "curie.factory.str" (get (.Values.factory | default dict) "ciWaitSeconds" | default 3600) | quote }}
             - name: CURIE_FORGES
               value: {{ include "curie.factory.forgesJson" . | quote }}
             - name: GITHUB_API_URL
@@ -498,7 +504,7 @@ spec:
               port: 8000
             {{- toYaml .Values.api.livenessProbe | nindent 12 }}
           resources:
-            {{- toYaml .Values.api.resources | nindent 12 }}
+            {{- include "curie.api.resources" . | nindent 12 }}
           {{- $codeHostTrust := include "curie.codeHostTrust.name" . }}
           {{- $forgeCredentials := include "curie.factory.hasCredentials" . }}
           {{- if or $codeHostTrust $forgeCredentials }}

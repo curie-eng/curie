@@ -1,5 +1,5 @@
 //! `curie <local|cluster> skills <agent> <verb>`: the operator surface over an
-//! agent's learned skills (ADR 0237). A skill ref (id or slug) goes to the API
+//! agent's learned skills (ADR 0247). A skill ref (id or slug) goes to the API
 //! verbatim; the API resolves it, deleted skills included, so `revert` also
 //! undoes a `delete`. Every write is a compare-and-swap on the head revision
 //! this command reads first.

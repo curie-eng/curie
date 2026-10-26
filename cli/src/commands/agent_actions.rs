@@ -766,7 +766,7 @@ impl MemoryChannel {
 }
 
 /// An individual canonical memory entry with the attribution stored by its
-/// producer (ADR 0239): its kind (`fact` or `instruction`), title, the
+/// producer (ADR 0249): its kind (`fact` or `instruction`), title, the
 /// conversation it was set in (null when unknown), whether it is archived, and
 /// the head version every lifecycle write is checked against.
 #[derive(Debug, Clone, Serialize)]
@@ -1251,7 +1251,7 @@ pub async fn memory_delete(
 }
 
 /// Which reversible lifecycle operation `<tier> memory <agent>` was asked for
-/// (ADR 0239). Each names one canonical entry by its immutable id.
+/// (ADR 0249). Each names one canonical entry by its immutable id.
 #[derive(Debug, Clone)]
 pub enum MemoryLifecycleAction {
     /// `--archive FACT_ID`: stop boot loading the entry, keeping it readable.

@@ -283,7 +283,7 @@ _APPROVAL_SERVER_TOOL_NAMES: frozenset[str] = frozenset(
     }
 )
 
-# The memory tools (#1461, ADR-0167, ADR 0239), on the same ``curie`` server.
+# The memory tools (#1461, ADR-0167, ADR 0249), on the same ``curie`` server.
 # Rendered from the one tuple ``harness.claude.approval.build_memory_tools``
 # registers. This is the universe of names a session could mount; the exemption
 # itself is ONLY the exact set the session did mount (``memory_tool_names``,
@@ -660,14 +660,14 @@ class ApprovalGate:
     # rather than a silent bypass nobody can.
     state_server_mounted: bool = False
     # The exact live names of the memory tools THIS session mounted on the
-    # ``curie`` server (#1461, ADR 0239). Same fact-not-default reasoning as
+    # ``curie`` server (#1461, ADR 0249). Same fact-not-default reasoning as
     # ``state_server_mounted``: ``__main__`` sets it from the tools it mounted,
     # and the empty default exempts nothing.
     memory_tool_names: frozenset[str] = frozenset()
-    # Whether THIS session mounted the ``agent_schedules`` server (ADR 0238), on
+    # Whether THIS session mounted the ``agent_schedules`` server (ADR 0248), on
     # the same reasoning.
     agent_schedules_mounted: bool = False
-    # Whether THIS session mounted the ``learned_skills`` server (ADR 0237), on
+    # Whether THIS session mounted the ``learned_skills`` server (ADR 0247), on
     # the same reasoning.
     learned_skills_mounted: bool = False
     _boot_turn_seen: bool = False
@@ -960,10 +960,10 @@ def platform_tool_names(
     tool cannot be published without being exempted (#2286).
 
     ``memory_tool_names`` is the exact set of memory tool live names the runner
-    mounted (#1461, ADR 0239). Only those join, and only when they are memory
+    mounted (#1461, ADR 0249). Only those join, and only when they are memory
     tool names at all: a name outside ``MEMORY_TOOL_LIVE_NAMES`` gains nothing
-    from appearing here. The five agent-schedule tools (ADR 0238) and the six
-    learned-skills tools (ADR 0237) join only when the runner mounted their
+    from appearing here. The five agent-schedule tools (ADR 0248) and the six
+    learned-skills tools (ADR 0247) join only when the runner mounted their
     server, on the same reasoning as the state tools.
     """
 

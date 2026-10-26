@@ -21,9 +21,9 @@ Gating rules (see the plan's Edge cases):
   is worse than no proof.
 
 The Python job still does not build ``curie-runner``, so its collection of this
-module skips every container leg. Merge gating lives in the dedicated
-``repo-toolchain-proof`` CI job, which builds the runner image and runs this
-module with ``CURIE_REPO_TOOLCHAIN_PROOF=required``. An absent image or an
+module skips every container leg. Merge gating lives in the Toolchain group
+of ``image-proofs``, which loads the runner image built by ``ci-images`` and runs
+this module with ``CURIE_REPO_TOOLCHAIN_PROOF=required``. An absent image or an
 absent Docker daemon then fails that job instead of skipping.
 
 Evidence JSON is written to ``CURIE_PROOF_EVIDENCE_DIR`` when that is set, and

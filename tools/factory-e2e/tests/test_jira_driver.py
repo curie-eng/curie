@@ -1272,6 +1272,9 @@ def _loop(
     p.cli_not_found_check = lambda *_a, **_k: None  # type: ignore[method-assign]
     cli_body = json.dumps({"item": {"state": "published", "pr": {"number": 7, "status": "merged"}}})
     p.cli_work_items_raw = lambda _id: (0, cli_body)  # type: ignore[method-assign]
+    # The pre-teardown reads (#4866) are not what these tests observe.
+    p.work_item_usage = lambda _id: {"cost_complete": True}  # type: ignore[method-assign]
+    p.cli_cluster_status = lambda: (0, json.dumps({"credentials": []}))  # type: ignore[method-assign]
     return p, driver
 
 
@@ -1303,6 +1306,7 @@ def test_run_loop_without_a_pull_request_still_records_tracker_evidence(
 ) -> None:
     evidence = {"key": "FAC-42", "status_comments": 0}
     p, driver = _loop(tmp_path, monkeypatch, lambda p: _LoopDriver(p, evidence, change=False))
+    p.sql = lambda _query: []  # type: ignore[method-assign]
     with pytest.raises(fe.PreflightFailed):
         fe.run_loop(p, driver)
     scenario = p.evidence["scenario"]
@@ -1311,6 +1315,45 @@ def test_run_loop_without_a_pull_request_still_records_tracker_evidence(
     assert scenario["pairing"] == "fakejira+github"
     assert "the run opened no pull request" in scenario["failures"]
     assert any("0 status comments" in f for f in scenario["failures"])
+    assert scenario["no_change"]["detail"] is None
+
+
+def test_run_loop_no_change_records_terminal_notice_cause_and_detail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    evidence = {"key": "FAC-42", "status_comments": 0}
+    p, driver = _loop(tmp_path, monkeypatch, lambda p: _LoopDriver(p, evidence, change=False))
+    queries: list[str] = []
+
+    def sql(query: str) -> list[list[str]]:
+        queries.append(query)
+        return [["no_pull_request", "implement still running after plan review"]]
+
+    p.sql = sql  # type: ignore[method-assign]
+    p.work_item_detail = lambda _id: {  # type: ignore[method-assign]
+        "state": "failed",
+        "requests": [
+            {
+                "sequence": 2,
+                "status": "failed",
+                "started_at": "2026-10-11T00:00:00Z",
+                "terminal_cause": "from_the_operator_payload",
+            }
+        ],
+    }
+    with pytest.raises(fe.PreflightFailed):
+        fe.run_loop(p, driver)
+    scenario = p.evidence["scenario"]
+    assert scenario["no_change"] == {
+        "state": "failed",
+        "statuses": ["failed"],
+        "terminal_cause": "no_pull_request",
+        "detail": "implement still running after plan review",
+    }
+    (query,) = queries
+    assert "factory_terminal_notices" in query
+    assert "work_item_id = 'wi-1'" in query
+    assert "execution_request_id =" not in query
 
 
 # --- install_jira: the quickstart in AddAgent mode -------------------------------------

@@ -37,6 +37,7 @@ from types import MappingProxyType
 from typing import TypedDict, cast
 
 from aci_protocol import (
+    ATTACHMENT_ACCESS_STATUS_FIELD,
     CHANNEL_READ_STATUS_FIELD,
     TOOL_ACCESS_STATUS_FIELD,
     Event,
@@ -157,7 +158,12 @@ def create_app(
     token: str | None = None,
     snapshotter: Snapshotter | None = None,
 ) -> web.Application:
-    """Build the aiohttp application bound to a started SessionRunner.
+    """Build the aiohttp application that starts ``runner`` in the background.
+
+    Startup schedules the runner's initialization without awaiting it, so the
+    listener binds and ``/healthz`` answers while a declared verification
+    preflight runs (#4777); a turn waits for that initialization itself.
+    Cleanup closes the runner, cancelling an initialization still in flight.
 
     When ``token`` is set, the runner control routes require a matching bearer
     token. A ``None`` token builds an unauthenticated app, which exists only for
@@ -194,6 +200,7 @@ def create_app(
             web.post("/v1/snapshot", _snapshot),
         ]
     )
+    app.on_startup.append(_on_startup)
     app.on_cleanup.append(_on_cleanup)
     return app
 
@@ -281,6 +288,11 @@ async def _execute(request: web.Request) -> web.Response:
     return web.json_response(answer)
 
 
+async def _on_startup(app: web.Application) -> None:
+    # Scheduled, not awaited: binding must not wait for the preflight (#4777).
+    app[RUNNER].begin_start()
+
+
 async def _on_cleanup(app: web.Application) -> None:
     await app[RUNNER].close()
 
@@ -299,6 +311,8 @@ async def _status(request: web.Request) -> web.Response:
         # @spec RUNNER-TOOL-ACCESS-5: credential-free, so on both status routes.
         TOOL_ACCESS_STATUS_FIELD: list(runner.enforced_tool_access),
     }
+    if runner.enforces_attachment_access:
+        body[ATTACHMENT_ACCESS_STATUS_FIELD] = True
     if runner.enforces_channel_read:
         # Literal true only when curie-slack is mounted and the holder is live
         # (ADR 0100); credential free, so on both status routes. An absent key

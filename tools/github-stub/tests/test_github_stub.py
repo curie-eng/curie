@@ -289,7 +289,7 @@ def test_captured_lifecycle_replays_pending_shards_before_the_required_aggregate
     final = _ok(github.get(f"{path}/check-runs", params={"per_page": 100, "filter": "latest"}))
     assert final["total_count"] == len(recording["check_runs"])
     assert {run["id"]: run for run in final["check_runs"]} == {
-        run["id"]: run for run in recording["check_runs"]
+        run["id"]: run | {"head_sha": source["head_sha"]} for run in recording["check_runs"]
     }
     assert stub.unknown_requests == []
 

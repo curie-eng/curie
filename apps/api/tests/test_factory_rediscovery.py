@@ -9,15 +9,20 @@
    at all, when one of the tracker's references occurs in it, not preceded by
    ``[\\w/.-]`` and not followed by ``[\\w-]``.
    A publication with ``owner_verified=False`` (Bitbucket Cloud always;
-   Bitbucket Data Center without its ``X-AUSERID`` header) is never evidence:
-   it is ignored before matching, because a read-only user can open a pull
-   request from a factory publication branch carrying another issue's marker.
+   Bitbucket Data Center without its ``X-AUSERID`` header) is never evidence
+   of the factory's own work, because a read-only user can open a pull request
+   from a factory publication branch carrying another issue's marker.
 2. The verdict, in order: more than one verified open match is ``ambiguous``;
-   one is ``open``; a completed match whose completion is unknown, or not
-   strictly before ``event_at`` (unknown included), is ``completed``; else
-   ``clear``. There is no ``unverified`` verdict.
+   one is ``open``; on a Bitbucket Cloud repository only, an unverified open
+   match is ``unconfirmed`` (#4747, pinned against the real adapter in
+   `test_factory_rediscovery_bitbucket_cloud`); a verified completed match
+   whose completion is unknown, or not strictly before ``event_at`` (unknown
+   included), is ``completed``; else ``clear``. Every other code host ignores
+   unverified publications, so the ``_Listing`` stub here (a memory host)
+   never yields ``unconfirmed``.
 3. `report` keeps one marked status comment on the issue naming every
-   matching link for ``open`` and ``ambiguous``, and writes nothing otherwise.
+   matching link for ``open``, ``ambiguous`` and ``unconfirmed``, and writes
+   nothing otherwise.
 
 `publication_pulls.adopt_or_open` takes a required ``before_open`` check that
 runs only right before a new pull request would be opened. The tracker and
@@ -654,15 +659,16 @@ async def test_dc_with_its_user_header_verifies_its_own_open_pull_request() -> N
     assert [p.ref.number for p in found.publications] == [str(pid)]
 
 
-# --- Bitbucket Cloud: a reader's pull request is not evidence ------------------------
+# --- Bitbucket Cloud: a reader's pull request is not proof, only a question --------
 
 
 @pytest.mark.anyio
-async def test_a_reader_created_pull_request_from_a_publication_branch_suppresses_nothing() -> None:
+async def test_a_readers_pull_request_from_a_publication_branch_is_only_unconfirmed() -> None:
     """Bitbucket Cloud cannot say who opened a pull request, so a read-only user
     can open one from an existing factory publication branch with another
-    issue's marker in its body. That listing entry must neither suppress nor
-    refuse the issue it names."""
+    issue's marker in its body. That listing entry is never proof of the
+    factory's publication (never ``open``); it refuses the issue it names as
+    ``unconfirmed`` with one comment asking the operator to confirm (#4747)."""
 
     cloud = BitbucketCloudFake()
     cloud.add_user(CLOUD_REVIEWER)
@@ -682,8 +688,11 @@ async def test_a_reader_created_pull_request_from_a_publication_branch_suppresse
 
     assert [p.owner_verified for p in listed] == [False]
     assert issue_marker(issue) in listed[0].body
-    assert found == Rediscovery(verdict="clear", publications=())
-    assert _status(tracker, issue) == []
+    assert found.verdict == "unconfirmed"
+    assert [p.url for p in found.publications] == [listed[0].url]
+    (body,) = _status(tracker, issue)
+    assert "confirm whether it is the factory's pull request" in body
+    assert f"1. <{listed[0].url}>" in body.splitlines()
 
 
 # --- publishing_code_host ------------------------------------------------------------
@@ -792,7 +801,7 @@ async def test_before_open_runs_once_right_before_a_new_pull_request_opens() -> 
     check = _Check(code_host, repository)
 
     opened = await adopt_or_open(
-        code_host, repository, contract, expected_head_sha=head, before_open=check
+        code_host, repository, contract, expected_head_sha=head, adopt_only=False, before_open=check
     )
 
     assert opened is not None and opened.head_ref == BRANCH
@@ -810,7 +819,7 @@ async def test_before_open_is_never_asked_when_the_branch_already_has_its_pull_r
     check.refuse = True
 
     adopted = await adopt_or_open(
-        code_host, repository, contract, expected_head_sha=head, before_open=check
+        code_host, repository, contract, expected_head_sha=head, adopt_only=False, before_open=check
     )
 
     assert adopted is not None and adopted.ref == existing.ref
@@ -831,14 +840,24 @@ async def test_before_open_is_never_asked_for_a_missing_or_moved_branch() -> Non
 
     assert (
         await adopt_or_open(
-            code_host, repository, missing, expected_head_sha=head, before_open=check
+            code_host,
+            repository,
+            missing,
+            expected_head_sha=head,
+            adopt_only=False,
+            before_open=check,
         )
         is None
     )
     code_host.push(repository, BRANCH, "someone else's commit")
     with pytest.raises(PullRequestRefused) as moved:
         await adopt_or_open(
-            code_host, repository, contract, expected_head_sha=head, before_open=check
+            code_host,
+            repository,
+            contract,
+            expected_head_sha=head,
+            adopt_only=False,
+            before_open=check,
         )
 
     assert moved.value.code == "branch_moved"
@@ -854,7 +873,12 @@ async def test_a_refusing_before_open_opens_nothing() -> None:
 
     with pytest.raises(PullRequestRefused) as refused:
         await adopt_or_open(
-            code_host, repository, contract, expected_head_sha=head, before_open=check
+            code_host,
+            repository,
+            contract,
+            expected_head_sha=head,
+            adopt_only=False,
+            before_open=check,
         )
 
     assert refused.value.code == "publication_exists"
@@ -867,6 +891,8 @@ async def test_a_refusing_before_open_opens_nothing() -> None:
 async def test_before_open_is_a_required_keyword() -> None:
     code_host, repository, head, contract = _publishing()
 
-    with pytest.raises(TypeError):
-        await adopt_or_open(code_host, repository, contract, expected_head_sha=head)  # type: ignore[call-arg]
+    with pytest.raises(TypeError, match="before_open"):
+        await adopt_or_open(  # type: ignore[call-arg]
+            code_host, repository, contract, expected_head_sha=head, adopt_only=False
+        )
     assert await code_host.find_pull_request(repository, head_ref=BRANCH) is None

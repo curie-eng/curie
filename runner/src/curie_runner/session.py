@@ -19,6 +19,7 @@ Responsibilities layered on the translation:
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import hmac
 import logging
@@ -39,7 +40,14 @@ from aci_protocol import (
     parse_ndjson_line,
     to_ndjson_line,
 )
-from claude_agent_sdk import AssistantMessage, ResultMessage, SystemMessage
+from claude_agent_sdk import (
+    TERMINAL_TASK_STATUSES,
+    AssistantMessage,
+    ResultMessage,
+    SystemMessage,
+    TaskNotificationMessage,
+    TaskUpdatedMessage,
+)
 from curie_telemetry import record_metric
 from opentelemetry.context import Context
 from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
@@ -52,6 +60,7 @@ from .adapter import (
     model_message_to_conversation,
 )
 from .approval import ApprovalGate, is_mcp_tool, platform_tool_names
+from .attachment_access import LAZY_ATTACHMENT_NOTICE, AttachmentAccessTurn
 from .budget import BUDGET_CLASSIFICATION, BudgetTracker
 from .final_answer import (
     FINAL_ANSWER_CLASSIFICATION,
@@ -95,7 +104,13 @@ from .tool_access import (
     TurnToolAccess,
 )
 from .tool_names import PLATFORM_SLACK_TOOL_NAMES
-from .translate import TurnState, is_credit_refusal, is_usage_refusal, translate_message
+from .translate import (
+    TurnState,
+    is_credit_refusal,
+    is_usage_refusal,
+    map_error_classification,
+    translate_message,
+)
 from .turn_progress import ProgressCapability, TurnProgress
 from .usage_report import UsageSink
 
@@ -298,6 +313,40 @@ def _history_capacity_lines(detail: str | None = None) -> tuple[str, str]:
     )
 
 
+def _track_live_background_tasks(live: set[str], message: object) -> None:
+    """Update the turn's live background task ids from one SDK message.
+
+    ``background_tasks_changed`` replaces the set (ambient housekeeping is
+    omitted). A ``task_updated`` with ``is_backgrounded`` adds its id, and a
+    ``task_notification`` or a terminal ``task_updated`` removes it.
+    ``task_started`` does not count: foreground work also starts as a task.
+    """
+
+    if isinstance(message, SystemMessage) and message.subtype == "background_tasks_changed":
+        tasks = message.data.get("tasks") if isinstance(message.data, dict) else None
+        replacement: set[str] = set()
+        if isinstance(tasks, list):
+            for entry in tasks:
+                if not isinstance(entry, dict) or entry.get("ambient") is True:
+                    continue
+                task_id = entry.get("task_id")
+                if isinstance(task_id, str) and task_id:
+                    replacement.add(task_id)
+        live.clear()
+        live.update(replacement)
+        return
+    if isinstance(message, TaskNotificationMessage):
+        live.discard(message.task_id)
+        return
+    if isinstance(message, TaskUpdatedMessage):
+        patch = message.patch if isinstance(message.patch, dict) else {}
+        if patch.get("is_backgrounded") is True and message.task_id:
+            live.add(message.task_id)
+        status = patch.get("status")
+        if status in TERMINAL_TASK_STATUSES:
+            live.discard(message.task_id)
+
+
 class SessionRunner:
     """Drives one model session, streaming ACI NDJSON for each inbound frame."""
 
@@ -330,13 +379,21 @@ class SessionRunner:
         turn_progress: TurnProgress | None = None,
         memory_turn: MemoryTurn | None = None,
         channel_read: ChannelReadTurn | None = None,
+        attachment_access: AttachmentAccessTurn | None = None,
         tool_access: TurnToolAccess | None = None,
         attachment_notice: str | None = None,
         channel_kind: str | None = None,
         final_answer: FinalAnswerPolicy | None = None,
+        initializer: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self._final_answer = final_answer
         self._factory = session_factory
+        # Boot work that must finish before the first session exists, such as
+        # the declared verification preflight. It runs inside the shared start
+        # task, which is scheduled at application startup and does not block
+        # the listener from binding (#4777).
+        self._initializer = initializer
+        self._start_task: asyncio.Task[None] | None = None
         # The attachments this boot found, named on the first prompt sent
         # (#3691): the worker boots a sandbox for every turn that carries a
         # file, so that prompt is the message that carried them. Cleared once
@@ -370,6 +427,7 @@ class SessionRunner:
         # at turn start, renewed or cleared at each steer, cleared on every
         # terminal path before any await.
         self._channel_read = channel_read
+        self._attachment_access = attachment_access
         # Session-wide activity counters for report_progress (#3077); None when
         # no progress tool is mounted.
         self._progress_activity = progress_activity
@@ -550,6 +608,11 @@ class SessionRunner:
         """Whether every completed logical turn is present in durable replay."""
 
         return self._history_durable
+
+    @property
+    def enforces_attachment_access(self) -> bool:
+        """The tools and active-turn enforcement were mounted together at boot."""
+        return self._attachment_access is not None
 
     @property
     def enforces_channel_read(self) -> bool:
@@ -796,15 +859,56 @@ class SessionRunner:
             )
         return result
 
-    async def start(self) -> None:
-        """Create and connect the model session (rehydrating if configured)."""
+    def begin_start(self) -> asyncio.Task[None]:
+        """Schedule the one shared initialization, once, and return its task.
 
+        The server calls this at startup without awaiting it, so the listener
+        answers while a slow preflight runs (#4777). A failure is logged here
+        and re-raised to every caller of ``start``.
+        """
+
+        if self._start_task is None:
+            task = asyncio.create_task(self._initialize())
+            task.add_done_callback(self._log_start_failure)
+            self._start_task = task
+        return self._start_task
+
+    @staticmethod
+    def _log_start_failure(task: asyncio.Task[None]) -> None:
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error("session start failed error_class=%s: %s", type(exc).__name__, exc)
+
+    async def _initialize(self) -> None:
+        if self._initializer is not None:
+            await self._initializer()
         self._advertised_tools = None
         self._session = self._factory()
         await self._session.connect()
         self._started = True
+        logger.info("session started session=%s", self._session_id)
+
+    async def start(self) -> None:
+        """Wait for the shared initialization, scheduling it if needed.
+
+        Runs the initializer, then creates and connects the model session
+        (rehydrating if configured). Every caller awaits the same task, and a
+        cancelled caller (a client disconnect) leaves it running for the rest.
+        """
+
+        await asyncio.shield(self.begin_start())
 
     async def close(self) -> None:
+        if self._attachment_access is not None:
+            self._attachment_access.end()
+        task = self._start_task
+        if task is not None and not task.done():
+            # Shutdown during a held preflight: cancelling kills the check's
+            # process group instead of waiting it out (#4777).
+            task.cancel()
+            await asyncio.wait({task})
         if self._session is not None:
             await self._session.close()
         self._tracer.shutdown()
@@ -830,9 +934,13 @@ class SessionRunner:
         lock is free the moment this runs.
         """
 
+        if self._attachment_access is not None:
+            self._attachment_access.end()
         if self._channel_read is not None:
             self._channel_read.end()
         async with self._turn_lock:
+            # Never race the boot initialization for the session slot.
+            await self.start()
             if self._session is not None:
                 await self._session.close()
             self._advertised_tools = None
@@ -919,6 +1027,8 @@ class SessionRunner:
         self._unrestricted_prompt_sent = True
         if event is not None and self._memory_turn is not None:
             self._memory_turn.begin(event)
+        if self._attachment_access is not None:
+            self._attachment_access.steer(event)
         if self._channel_read is not None:
             # Replace or clear before the steered text reaches the model, so it
             # never reads under an earlier generation (ADR 0100).
@@ -944,13 +1054,18 @@ class SessionRunner:
         if self._persistence_owned:
             return
         self._interrupt_requested = True
+        if self._attachment_access is not None:
+            self._attachment_access.end()
         if self._channel_read is not None:
             self._channel_read.end()
         if self._turn_open and not self._turn_ready:
             # Accepted turn still in connector recovery: no query has been
             # sent, and run_turn checks the flag before sending one.
             return
-        if self._session is not None:
+        # The session object exists before connect() finishes; interrupting the
+        # unconnected SDK client raises and turns POST /v1/interrupt into a 500
+        # (#4777). `_started` is set right after connect in `_initialize`.
+        if self._session is not None and self._started:
             await self._session.interrupt()
 
     async def timeout(self, turn_epoch: str) -> bool:
@@ -963,8 +1078,7 @@ class SessionRunner:
 
         current_epoch = self._turn_epoch
         if (
-            self._session is None
-            or not self._turn_open
+            not self._turn_open
             or self._timeout_requested
             or current_epoch is None
             or not hmac.compare_digest(turn_epoch.encode("utf-8"), current_epoch.encode("utf-8"))
@@ -972,6 +1086,8 @@ class SessionRunner:
             return False
         # Only after the epoch guard: a stale timeout never touches the
         # current turn's channel read credential.
+        if self._attachment_access is not None:
+            self._attachment_access.end()
         if self._channel_read is not None:
             self._channel_read.end()
         timeout_interrupt_settled = anyio.Event()
@@ -988,6 +1104,8 @@ class SessionRunner:
             # checks the flag after recovery and emits the timeout terminal.
             timeout_interrupt_settled.set()
             return True
+        # A ready turn always has a session: it is set before the turn's query.
+        assert self._session is not None
         try:
             await self._session.interrupt()
             # A delayed SDK acknowledgement can return after this turn has
@@ -1047,6 +1165,20 @@ class SessionRunner:
             )
         ) as stream:
             async for line in stream:
+                # The terminal can remain suspended at yield while its client
+                # drains. Retire access before exposing that final, while this
+                # generator still owns the logical turn lock.
+                if self._attachment_access is not None and not self._turn_open:
+                    self._attachment_access.end()
+                # #4940: hand the root span the closed classification, never the text.
+                # Only an error frame can carry one, so other lines skip the parse.
+                if '"type":"error"' in line:
+                    frame = parse_ndjson_line(line)
+                    if isinstance(frame, ErrorEvent) and frame.classification:
+                        self._tracer.observe_error_classification(
+                            map_error_classification(frame.classification),
+                            output_ceiling=self._ceiling,
+                        )
                 for scrubbed in redactor.push(line):
                     yield scrubbed
             pending = redactor.finish()
@@ -1062,9 +1194,6 @@ class SessionRunner:
         admission_required: bool,
         progress: ProgressCapability | None,
     ) -> AsyncGenerator[str]:
-        if self._session is None:
-            raise RuntimeError("session not started")
-
         async with self._turn_lock:
             start = time.monotonic()
             self._interrupt_requested = False
@@ -1096,6 +1225,10 @@ class SessionRunner:
                 ),
             )
             self._active_state = state
+            attachment_opener = (
+                self._attachment_access.begin(event)
+                if self._attachment_access is not None else None
+            )
             if self._memory_turn is not None:
                 self._memory_turn.begin(event)
             if self._channel_read is not None:
@@ -1174,6 +1307,11 @@ class SessionRunner:
                                 )
                                 return
                             self._admission_gate = None
+                        # A turn that arrives while boot initialization runs
+                        # waits here, after admission so its epoch stays visible
+                        # (#4777). An initialization failure ends it through the
+                        # runner-error path below, before any model call.
+                        await self.start()
                         access_refusal = self._tool_access_refusal(event)
                         if access_refusal is not None:
                             # @spec RUNNER-TOOL-ACCESS-4 RUNNER-TOOL-ACCESS-5
@@ -1414,6 +1552,8 @@ class SessionRunner:
                             self._turn_epoch = None
                             # An abandoned turn loses its channel read credential
                             # before the interrupt below can await.
+                            if self._attachment_access is not None:
+                                self._attachment_access.end(attachment_opener)
                             if self._turn_open and self._channel_read is not None:
                                 self._channel_read.end()
                             # If the turn never reached a terminal final (_turn_open
@@ -1457,6 +1597,8 @@ class SessionRunner:
                         int((time.monotonic() - start) * 1000),
                     )
                 self._active_state = None
+                if self._attachment_access is not None:
+                    self._attachment_access.end(attachment_opener)
                 if self._memory_turn is not None:
                     # However the turn ended, its write credential ends with it.
                     self._memory_turn.end()
@@ -1589,6 +1731,8 @@ class SessionRunner:
             self._read_only_prompt_sent = True
         self._result_pending = True
         prompt = frame_user_turn(event.type, event.user, event.text, self._channel_kind)
+        if self._attachment_access is not None:
+            prompt = f"{prompt}\n\n{LAZY_ATTACHMENT_NOTICE}"
         if self._attachment_notice is not None:
             prompt = f"{prompt}\n\n{self._attachment_notice}"
             self._attachment_notice = None
@@ -1599,254 +1743,283 @@ class SessionRunner:
             gen.remember_echo(prompt)
         state.prompt_text = prompt
         await self._session.query(prompt)
-        async for message in self._session.receive_turn():
-            if isinstance(message, ResultMessage):
-                self._result_pending = False
-            if isinstance(message, StreamedToolUseBoundary):
-                gen.record_first_response_boundary()
-                gen.streamed_tool_use(
-                    message.call_id,
-                    message.tool_name,
-                    observed_time_ns=message.observed_time_ns,
-                )
-                continue
-            if isinstance(message, PartialMessageBoundary):
-                gen.record_first_response_boundary()
-                if message.event_type == "message_start":
-                    state.assistant_group = message.assistant_group
-                continue
-            if _is_auth_rejection(message):
-                # A rejected model credential is terminal: stop the live session
-                # so the SDK/CLI does not keep retrying with backoff to the wall,
-                # then surface a distinct, immediate classified failure. Suppress
-                # a failing interrupt (a wedged transport -- the very state a bad
-                # credential can cause) so it cannot propagate to the generic
-                # retryable ``runner-error`` handler and defeat the fast-fail; the
-                # terminal ``model-credential-rejected`` error is emitted regardless.
-                with contextlib.suppress(Exception):
-                    await self._session.interrupt()
-                self._set_failed(gen)
-                for line in self._auth_halt_lines():
-                    yield line
-                return
-            if isinstance(message, SystemMessage) and message.subtype == "init":
-                tools = message.data.get("tools")
-                self._advertised_tools = (
-                    set(tools)
-                    if isinstance(tools, list) and all(isinstance(name, str) for name in tools)
-                    else None
-                )
-            history_message = model_message_to_conversation(message)
-            if history_message is not None and self._channel_read is not None:
-                history_message = self._retain_no_channel_bodies(history_message, state)
-            if history_message is not None:
-                if history_message.role == "assistant":
-                    history_message = replace(
-                        history_message, assistant_group=state.assistant_group
-                    )
-                elif not is_tool_result_message(history_message):
-                    state.assistant_group = None
-                # Some harness streams echo the submitted user prompt before
-                # assistant output. The durable turn already prepends the exact
-                # inbound event, so drop only that leading duplicate.
-                if not (
-                    not state.history_messages
-                    and history_message.role == "user"
-                    and history_message.content == prompt
-                ):
-                    state.history_messages.append(history_message)
-            usage = getattr(message, "usage", None)
-            # The terminal result carries the authoritative turn total; streaming
-            # assistant messages carry per-message output. Fold them differently
-            # so the same tokens are not counted twice (see BudgetTracker).
-            if isinstance(message, ResultMessage):
-                tracker.set_total(usage)
-                if self._history_resumed and not self._resume_cache_metric_recorded:
-                    cache_read = (
-                        int(usage.get("cache_read_input_tokens") or 0)
-                        if isinstance(usage, dict)
-                        else 0
-                    )
-                    record_metric(
-                        "curie.history.resume.cache_read",
-                        cache_read,
-                        attributes={
-                            "service.name": "curie-runner",
-                            "source": "runner",
-                            "cache_hit": "true" if cache_read > 0 else "false",
-                        },
-                    )
-                    logger.info(
-                        "history resume cache observed session=%s cache_read_input_tokens=%d",
-                        self._session_id,
-                        cache_read,
-                    )
-                    self._resume_cache_metric_recorded = True
-            else:
-                tracker.add_increment(usage, message_id=getattr(message, "message_id", None))
-            budget_hit = tracker.exceeded
-            events = translate_message(
-                message, state, self._classifier, gen, activity=self._progress_activity
-            )
-            # Synchronous, on the very iteration that delivered the block and
-            # strictly before any ResultMessage iteration classifies the turn
-            # (#2294). Never a task, and nothing is awaited between observing a
-            # publication call and classifying the turn that made it.
-            await self._observe_publication_calls(state)
-            # The tool result counter (#3486), on the same iteration: a held
-            # call's gate record is standing when its deny result arrives.
-            self._observe_tool_results(state)
-            decided_result_final: Final | None = None
-            if isinstance(message, AssistantMessage):
-                if self._primary_model is None:
-                    self._primary_model = getattr(message, "model", None) or None
-                if self._usage_reporter is not None:
-                    self._usage_reporter.observe(message)
-            if state.usage_limited and not isinstance(message, ResultMessage):
-                # Stop on the refusal's own iteration, before the SDK retries
-                # or the parent continues after a failed reviewer. Interrupt
-                # failure cannot turn a terminal usage refusal into runner-error.
-                with contextlib.suppress(Exception):
-                    await self._session.interrupt()
-                self._set_failed(gen)
-                self._turn_open = False
-                self._turn_ready = False
-                self._status = SessionStatus.CLASSIFIED_FAILURE
-                for outbound in events:
-                    yield to_ndjson_line(outbound)
-                yield to_ndjson_line(
-                    Final(
-                        text="run failed: model provider usage limit reached",
-                        status=SessionStatus.CLASSIFIED_FAILURE,
-                    )
-                )
-                return
-            if isinstance(message, ResultMessage):
-                terminal_reason = getattr(message, "terminal_reason", None)
-                cancelled = self._interrupt_requested and not self._timeout_requested
-                subtype = message.subtype or ""
-                result_failed = (
-                    self._timeout_requested
-                    or budget_hit
-                    or (not cancelled and (message.is_error or subtype.startswith("error")))
-                )
-                if not budget_hit:
-                    self._merge_gate_block(state)
-                    sdk_final = next(
-                        (outbound for outbound in events if isinstance(outbound, Final)),
-                        None,
-                    )
-                    if sdk_final is not None:
-                        decided_result_final = _apply_approval_override(
-                            self._reclassify(sdk_final), state
-                        )
-                gen.record_result_usage(getattr(message, "usage", None))
-                if self._usage_reporter is not None:
-                    # Awaited before the Final event is yielded; never raises.
-                    await self._usage_reporter.report(message, self._primary_model)
-                gen.result_boundary_observed(
-                    failed=result_failed,
-                    terminal_reason=terminal_reason,
-                    approval_paused=decided_result_final is not None
-                    and decided_result_final.status is SessionStatus.AWAITING_APPROVAL,
-                )
-
-            for outbound in events:
-                if (
+        live_background: set[str] = set()
+        while True:
+            held_for_background = False
+            async for message in self._session.receive_turn():
+                _track_live_background_tasks(live_background, message)
+                # A result while a background task is still live is the CLI
+                # pausing, not the end of the factory turn (#4902). Accounting
+                # still runs; the next receive_turn on this same session
+                # continues the turn. A timeout keeps the existing terminal.
+                background_hold = (
                     isinstance(message, ResultMessage)
-                    and message.subtype == "error_max_budget_usd"
-                    and not budget_hit
-                    and isinstance(outbound, ErrorEvent)
-                    and outbound.classification == BUDGET_CLASSIFICATION
-                ):
-                    outbound = outbound.model_copy(
-                        update={
-                            "message": (
-                                f"USD budget exceeded (max_usd_per_day={self._max_usd_per_day})"
-                            )
-                        }
+                    and bool(live_background)
+                    and not self._timeout_requested
+                    and message.subtype != "error_max_budget_usd"
+                )
+                if isinstance(message, ResultMessage) and not background_hold:
+                    self._result_pending = False
+                if isinstance(message, StreamedToolUseBoundary):
+                    gen.record_first_response_boundary()
+                    gen.streamed_tool_use(
+                        message.call_id,
+                        message.tool_name,
+                        observed_time_ns=message.observed_time_ns,
                     )
-                if isinstance(outbound, ToolNote):
-                    logger.info("tool call session=%s tool=%s", self._session_id, outbound.tool)
-                if isinstance(outbound, ErrorEvent):
-                    logger.error(
-                        "model error session=%s classification=%s",
-                        self._session_id,
-                        outbound.classification,
-                    )
-                if isinstance(outbound, Final):
-                    if budget_hit:
-                        self._set_failed(gen)
-                        for line in self._budget_halt_lines():
-                            yield line
-                        return
-                    if decided_result_final is None:
-                        self._merge_gate_block(state)
-                        final = _apply_approval_override(self._reclassify(outbound), state)
-                    else:
-                        final = decided_result_final
-                    unrecorded = self._publication_unrecorded_lines(state, final)
-                    if unrecorded:
-                        self._set_failed(gen)
-                        for line in unrecorded:
-                            yield line
-                        return
-                    self._log_publication_fallback_alone(state)
-                    self._log_publication_not_carried(state, final)
-                    for line in self._approval_not_acted_lines(state, final):
+                    continue
+                if isinstance(message, PartialMessageBoundary):
+                    gen.record_first_response_boundary()
+                    if message.event_type == "message_start":
+                        state.assistant_group = message.assistant_group
+                    continue
+                if _is_auth_rejection(message):
+                    # A rejected model credential is terminal: stop the live session
+                    # so the SDK/CLI does not keep retrying with backoff to the wall,
+                    # then surface a distinct, immediate classified failure. Suppress
+                    # a failing interrupt (a wedged transport -- the very state a bad
+                    # credential can cause) so it cannot propagate to the generic
+                    # retryable ``runner-error`` handler and defeat the fast-fail; the
+                    # terminal ``model-credential-rejected`` error is emitted regardless.
+                    with contextlib.suppress(Exception):
+                        await self._session.interrupt()
+                    self._set_failed(gen)
+                    for line in self._auth_halt_lines():
                         yield line
-                    for line in self._false_completion_lines(state, final):
-                        yield line
-                    # A timeout can land while one of the warning lines above is
-                    # suspended at its yield. Re-apply its precedence immediately
-                    # before publishing the terminal final.
-                    final = self._reclassify(final)
-                    final, validation_failed = self._validate_publication(state, final)
-                    capacity_failure = False
-                    if final.status in {
-                        SessionStatus.DONE,
-                        SessionStatus.AWAITING_APPROVAL,
-                    }:
-                        final, capacity_failure = await self._persist_terminal(
-                            event,
-                            state,
-                            final,
-                            final_text=final.text,
-                        )
-                    else:
-                        self._status = final.status
-                        self._turn_open = False
-                        self._turn_ready = False
-                    gen.finish_turn(
-                        timeout_requested=self._timeout_requested,
-                        interrupt_requested=self._interrupt_requested,
-                        classified_failure=final.status is SessionStatus.CLASSIFIED_FAILURE,
-                        approval_paused=final.status is SessionStatus.AWAITING_APPROVAL,
-                        completed_without_result=final.status is SessionStatus.AWAITING_APPROVAL,
-                    )
-                    if validation_failed:
-                        yield to_ndjson_line(
-                            ErrorEvent(
-                                message=FINAL_ANSWER_DIAGNOSTIC,
-                                classification=FINAL_ANSWER_CLASSIFICATION,
-                            )
-                        )
-                    if capacity_failure:
-                        for line in _history_capacity_lines(self._capacity_detail):
-                            yield line
-                    else:
-                        yield to_ndjson_line(self._with_connector_notice(final))
                     return
-                yield to_ndjson_line(outbound)
+                if isinstance(message, SystemMessage) and message.subtype == "init":
+                    tools = message.data.get("tools")
+                    self._advertised_tools = (
+                        set(tools)
+                        if isinstance(tools, list) and all(isinstance(name, str) for name in tools)
+                        else None
+                    )
+                history_message = model_message_to_conversation(message)
+                if history_message is not None and self._channel_read is not None:
+                    history_message = self._retain_no_channel_bodies(history_message, state)
+                if history_message is not None:
+                    if history_message.role == "assistant":
+                        history_message = replace(
+                            history_message, assistant_group=state.assistant_group
+                        )
+                    elif not is_tool_result_message(history_message):
+                        state.assistant_group = None
+                    # Some harness streams echo the submitted user prompt before
+                    # assistant output. The durable turn already prepends the exact
+                    # inbound event, so drop only that leading duplicate.
+                    if not (
+                        not state.history_messages
+                        and history_message.role == "user"
+                        and history_message.content == prompt
+                    ):
+                        state.history_messages.append(history_message)
+                usage = getattr(message, "usage", None)
+                # The terminal result carries the authoritative turn total; streaming
+                # assistant messages carry per-message output. Fold them differently
+                # so the same tokens are not counted twice (see BudgetTracker).
+                if isinstance(message, ResultMessage):
+                    tracker.set_total(usage)
+                    if self._history_resumed and not self._resume_cache_metric_recorded:
+                        cache_read = (
+                            int(usage.get("cache_read_input_tokens") or 0)
+                            if isinstance(usage, dict)
+                            else 0
+                        )
+                        record_metric(
+                            "curie.history.resume.cache_read",
+                            cache_read,
+                            attributes={
+                                "service.name": "curie-runner",
+                                "source": "runner",
+                                "cache_hit": "true" if cache_read > 0 else "false",
+                            },
+                        )
+                        logger.info(
+                            "history resume cache observed session=%s cache_read_input_tokens=%d",
+                            self._session_id,
+                            cache_read,
+                        )
+                        self._resume_cache_metric_recorded = True
+                else:
+                    tracker.add_increment(usage, message_id=getattr(message, "message_id", None))
+                if background_hold and not tracker.exceeded:
+                    # Keep the turn open. Generation usage stays on the
+                    # terminal result: record_result_usage keeps the first
+                    # positive total and would hide the later one.
+                    held_for_background = True
+                    if self._usage_reporter is not None:
+                        await self._usage_reporter.report(message, self._primary_model)
+                    continue
+                budget_hit = tracker.exceeded
+                events = translate_message(
+                    message, state, self._classifier, gen, activity=self._progress_activity
+                )
+                # Synchronous, on the very iteration that delivered the block and
+                # strictly before any ResultMessage iteration classifies the turn
+                # (#2294). Never a task, and nothing is awaited between observing a
+                # publication call and classifying the turn that made it.
+                await self._observe_publication_calls(state)
+                # The tool result counter (#3486), on the same iteration: a held
+                # call's gate record is standing when its deny result arrives.
+                self._observe_tool_results(state)
+                decided_result_final: Final | None = None
+                if isinstance(message, AssistantMessage):
+                    if self._primary_model is None:
+                        self._primary_model = getattr(message, "model", None) or None
+                    if self._usage_reporter is not None:
+                        self._usage_reporter.observe(message)
+                if state.usage_limited and not isinstance(message, ResultMessage):
+                    # Stop on the refusal's own iteration, before the SDK retries
+                    # or the parent continues after a failed reviewer. Interrupt
+                    # failure cannot turn a terminal usage refusal into runner-error.
+                    with contextlib.suppress(Exception):
+                        await self._session.interrupt()
+                    self._set_failed(gen)
+                    self._turn_open = False
+                    self._turn_ready = False
+                    self._status = SessionStatus.CLASSIFIED_FAILURE
+                    for outbound in events:
+                        yield to_ndjson_line(outbound)
+                    yield to_ndjson_line(
+                        Final(
+                            text="run failed: model provider usage limit reached",
+                            status=SessionStatus.CLASSIFIED_FAILURE,
+                        )
+                    )
+                    return
+                if isinstance(message, ResultMessage):
+                    terminal_reason = getattr(message, "terminal_reason", None)
+                    cancelled = self._interrupt_requested and not self._timeout_requested
+                    subtype = message.subtype or ""
+                    result_failed = (
+                        self._timeout_requested
+                        or budget_hit
+                        or (not cancelled and (message.is_error or subtype.startswith("error")))
+                    )
+                    if not budget_hit:
+                        self._merge_gate_block(state)
+                        sdk_final = next(
+                            (outbound for outbound in events if isinstance(outbound, Final)),
+                            None,
+                        )
+                        if sdk_final is not None:
+                            decided_result_final = _apply_approval_override(
+                                self._reclassify(sdk_final), state
+                            )
+                    gen.record_result_usage(getattr(message, "usage", None))
+                    if self._usage_reporter is not None:
+                        # Awaited before the Final event is yielded; never raises.
+                        await self._usage_reporter.report(message, self._primary_model)
+                    gen.result_boundary_observed(
+                        failed=result_failed,
+                        terminal_reason=terminal_reason,
+                        approval_paused=decided_result_final is not None
+                        and decided_result_final.status is SessionStatus.AWAITING_APPROVAL,
+                    )
 
-            if budget_hit:
-                # Budget crossed on a non-terminal message: stop the live run,
-                # then emit the same error+final pair.
-                await self._session.interrupt()
-                self._set_failed(gen)
-                for line in self._budget_halt_lines():
-                    yield line
-                return
+                for outbound in events:
+                    if (
+                        isinstance(message, ResultMessage)
+                        and message.subtype == "error_max_budget_usd"
+                        and not budget_hit
+                        and isinstance(outbound, ErrorEvent)
+                        and outbound.classification == BUDGET_CLASSIFICATION
+                    ):
+                        outbound = outbound.model_copy(
+                            update={
+                                "message": (
+                                    f"USD budget exceeded (max_usd_per_day={self._max_usd_per_day})"
+                                )
+                            }
+                        )
+                    if isinstance(outbound, ToolNote):
+                        logger.info("tool call session=%s tool=%s", self._session_id, outbound.tool)
+                    if isinstance(outbound, ErrorEvent):
+                        logger.error(
+                            "model error session=%s classification=%s",
+                            self._session_id,
+                            outbound.classification,
+                        )
+                    if isinstance(outbound, Final):
+                        if budget_hit:
+                            if live_background:
+                                await self._session.interrupt()
+                            self._set_failed(gen)
+                            for line in self._budget_halt_lines():
+                                yield line
+                            return
+                        if decided_result_final is None:
+                            self._merge_gate_block(state)
+                            final = _apply_approval_override(self._reclassify(outbound), state)
+                        else:
+                            final = decided_result_final
+                        unrecorded = self._publication_unrecorded_lines(state, final)
+                        if unrecorded:
+                            self._set_failed(gen)
+                            for line in unrecorded:
+                                yield line
+                            return
+                        self._log_publication_fallback_alone(state)
+                        self._log_publication_not_carried(state, final)
+                        for line in self._approval_not_acted_lines(state, final):
+                            yield line
+                        for line in self._false_completion_lines(state, final):
+                            yield line
+                        # A timeout can land while one of the warning lines above is
+                        # suspended at its yield. Re-apply its precedence immediately
+                        # before publishing the terminal final.
+                        final = self._reclassify(final)
+                        final, validation_failed = self._validate_publication(state, final)
+                        capacity_failure = False
+                        if final.status in {
+                            SessionStatus.DONE,
+                            SessionStatus.AWAITING_APPROVAL,
+                        }:
+                            final, capacity_failure = await self._persist_terminal(
+                                event,
+                                state,
+                                final,
+                                final_text=final.text,
+                            )
+                        else:
+                            self._status = final.status
+                            self._turn_open = False
+                            self._turn_ready = False
+                        gen.finish_turn(
+                            timeout_requested=self._timeout_requested,
+                            interrupt_requested=self._interrupt_requested,
+                            classified_failure=final.status is SessionStatus.CLASSIFIED_FAILURE,
+                            approval_paused=final.status is SessionStatus.AWAITING_APPROVAL,
+                            completed_without_result=final.status
+                            is SessionStatus.AWAITING_APPROVAL,
+                        )
+                        if validation_failed:
+                            yield to_ndjson_line(
+                                ErrorEvent(
+                                    message=FINAL_ANSWER_DIAGNOSTIC,
+                                    classification=FINAL_ANSWER_CLASSIFICATION,
+                                )
+                            )
+                        if capacity_failure:
+                            for line in _history_capacity_lines(self._capacity_detail):
+                                yield line
+                        else:
+                            yield to_ndjson_line(self._with_connector_notice(final))
+                        return
+                    yield to_ndjson_line(outbound)
+
+                if budget_hit:
+                    # Budget crossed on a non-terminal message: stop the live run,
+                    # then emit the same error+final pair.
+                    await self._session.interrupt()
+                    self._set_failed(gen)
+                    for line in self._budget_halt_lines():
+                        yield line
+                    return
+
+            if held_for_background:
+                continue
+            break
 
         # The turn iterator ended without a terminal result (e.g. an interrupt
         # aborted before the model produced one). Emit a final so the stream

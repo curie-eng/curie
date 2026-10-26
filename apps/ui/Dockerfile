@@ -11,7 +11,7 @@
 # apps/ui/Dockerfile.dockerignore (BuildKit honors <dockerfile>.dockerignore over
 # the context-root one) trims the root context to the UI plus that vector. The
 # API types (src/api/generated.ts) are committed; nothing is generated here.
-FROM node:22.23.2-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5 AS build
+FROM node:22.23.4-slim@sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d AS build
 WORKDIR /app
 # Pin pnpm explicitly: package.json has no packageManager field, so corepack
 # would otherwise pull whatever pnpm is latest. pnpm 10+ turns a dependency with
@@ -60,6 +60,34 @@ server {
     }
     location ^~ /api/v1/internal/ {
         return 404;
+    }
+
+    # These URLs carry account capabilities or OIDC codes/state. Both access
+    # and upstream-error logs otherwise include the raw request URI, including
+    # when the API is unavailable and cannot set its own privacy headers.
+    location ^~ /api/identity/connect/ {
+        access_log off;
+        error_log /dev/null;
+        add_header Cache-Control "private, no-store" always;
+        add_header Referrer-Policy "no-referrer" always;
+        gzip off;
+        proxy_pass ${CURIE_API_TARGET}/identity/connect/;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+    location = /api/console/oidc/callback {
+        access_log off;
+        error_log /dev/null;
+        add_header Cache-Control "private, no-store" always;
+        add_header Referrer-Policy "no-referrer" always;
+        gzip off;
+        proxy_pass ${CURIE_API_TARGET}/console/oidc/callback;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
     }
 
     # Reverse-proxy operator API calls, stripping the /api prefix.

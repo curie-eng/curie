@@ -396,6 +396,23 @@ def _open_file(root_fd: int, name: str) -> int:
         raise
 
 
+def _require_no_probe_storage(root_fd: int) -> None:
+    """A launch root never holds primitive-probe storage, in either open order.
+
+    Check lock and SQLite sidecars too: an interrupted probe open still owns
+    its root. A symlink, including a dangling one, is present and refuses.
+    @spec PROTECTED-COMMISSIONING-8.
+    """
+    for name in (
+        "probe.lock", "probe.sqlite", "probe.sqlite-wal", "probe.sqlite-shm", "probe.sqlite-journal"
+    ):
+        try:
+            os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        raise RegistryInvalid()
+
+
 class ProtectedLaunchRegistry:
     """Actual single-host lock + SQLite, no failover or portable issuer claim.
 
@@ -436,6 +453,7 @@ class ProtectedLaunchRegistry:
         instance._boot_id = boot_id
         try:
             instance._root_fd = _open_root(root)
+            _require_no_probe_storage(instance._root_fd)
             instance._lock_fd = _open_file(instance._root_fd, "registry.lock")
             try:
                 fcntl.flock(instance._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -494,6 +512,7 @@ class ProtectedLaunchRegistry:
 
     def _check_root(self) -> None:
         _require(self._root_fd >= 0)
+        _require_no_probe_storage(self._root_fd)
         actual = os.stat(self._root, follow_symlinks=False)
         pinned = os.fstat(self._root_fd)
         _require(

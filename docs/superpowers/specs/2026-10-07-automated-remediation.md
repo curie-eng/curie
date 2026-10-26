@@ -375,7 +375,10 @@ with a hook key and no platform credential is refused `401`. Validation is
 mirrored in a new `remediation-policy` verb group under `curie local` and
 `curie cluster` (`show`, `apply`, `arm`, `disarm`, `close-breaker`), with
 `--json`, ADR-0021 exit codes and `{"error","fix"}` errors, following the CLI
-and API validation convention.
+and API validation convention. The CLI `apply` and `arm` read the remediation
+authority from `CURIE_REMEDIATION_AUTHORITY_KEY` in their own environment (never
+a flag, never printed), send it in `X-Curie-Remediation-Authority`, and refuse
+without it before any request; the other verbs never send it.
 
 Acceptance: a `PUT` or arm with the platform key, a `remediation.administer`
 operator principal and the remediation authority header creates a generation
