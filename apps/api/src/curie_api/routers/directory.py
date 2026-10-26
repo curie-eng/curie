@@ -15,7 +15,7 @@ from sqlalchemy import select
 from .. import directory_credential, directory_service, directory_sync, identity_audit
 from ..auth import require_platform_key, verify_platform_key
 from ..config import get_settings
-from ..deps import SessionDep
+from ..deps import SessionDep, request_session
 from ..directory_credential import DirectoryClaims
 from ..identity_fence import lock_identity_reader
 from ..models import IdentityNamespace, Principal, Team
@@ -62,7 +62,10 @@ class DirectoryRoute(APIRoute):
                             epoch = body.get("expected_epoch") if isinstance(body, dict) else None
                             team_id = uuid.UUID(request.path_params["team_id"])
                             if type(epoch) is int and epoch >= 0:
-                                async with request.app.state.sessionmaker() as session:
+                                async with request_session(request) as session:
+                                    # @spec IDENTITY-WRITER-LIFETIME-V1-7. Discard the
+                                    # incomplete dependency work before recording failure.
+                                    await session.rollback()
                                     await directory_service.authenticate(session, claims)
                                     await directory_sync.record_failure(
                                         session,

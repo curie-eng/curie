@@ -52,6 +52,24 @@ from _migration_support import (  # noqa: E402
     alembic_config,
     render_url,
 )
+from identity_fence_support import (  # noqa: E402
+    fence_key_for_worker,
+    installed_fence_key,
+)
+
+
+@pytest.fixture(scope="session")
+def identity_fence_key(testrun_uid: str, worker_id: str) -> str:
+    """@spec IDENTITY-WRITER-LIFETIME-V1-10."""
+    return fence_key_for_worker(testrun_uid, worker_id)
+
+
+@pytest.fixture(autouse=True)
+def identity_fence_backend(identity_fence_key: str) -> Iterator[str]:
+    """@spec IDENTITY-WRITER-LIFETIME-V1-10."""
+    with installed_fence_key(identity_fence_key):
+        yield identity_fence_key
+
 
 # The object-store credential the suite talks to compose's RustFS with. The code
 # default in `curie_api.config` is deliberately empty so that omitting these

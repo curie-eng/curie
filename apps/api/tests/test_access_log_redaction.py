@@ -20,6 +20,8 @@ import pytest
 from curie_api.config import get_settings
 from opentelemetry.proto.collector.logs.v1.logs_service_pb2 import ExportLogsServiceRequest
 
+from .identity_fence_support import fence_child_env
+
 CANARY = "synthetic-access-log-canary-2536"
 REDACTION_MARKER = "[REDACTED:url_secret_param]"
 
@@ -45,7 +47,14 @@ class ApiProcess:
         return self.output
 
 
-def _start_api(request: pytest.FixtureRequest, cwd: Path, extra_env: dict[str, str]) -> ApiProcess:
+def _start_api(
+    request: pytest.FixtureRequest,
+    cwd: Path,
+    extra_env: dict[str, str],
+    *,
+    factory: str | None = None,
+) -> ApiProcess:
+    """@spec IDENTITY-WRITER-LIFETIME-V1-10."""
     settings = get_settings()
     # Only the driver's actual backing-service settings cross into the child.
     # The empty working directory also prevents Settings from reading a .env.
@@ -74,8 +83,11 @@ def _start_api(request: pytest.FixtureRequest, cwd: Path, extra_env: dict[str, s
     with socket.socket() as reservation:
         reservation.bind(("127.0.0.1", 0))
         port = int(reservation.getsockname()[1])
+    command = [sys.executable, "-m", "curie_api"]
+    if factory is not None:
+        command = [sys.executable, "-m", "uvicorn", factory, "--factory"]
     process = subprocess.Popen(
-        [sys.executable, "-m", "curie_api", "--host", "127.0.0.1", "--port", str(port)],
+        [*command, "--host", "127.0.0.1", "--port", str(port)],
         cwd=cwd,
         env=env,
         stdout=subprocess.PIPE,
@@ -113,6 +125,22 @@ def _start_api(request: pytest.FixtureRequest, cwd: Path, extra_env: dict[str, s
 @pytest.fixture
 def plain_api(migrated: None, request: pytest.FixtureRequest, tmp_path: Path) -> ApiProcess:
     return _start_api(request, tmp_path, {})
+
+
+@pytest.fixture
+def namespaced_identity_api(
+    migrated: None,
+    identity_fence_key: str,
+    request: pytest.FixtureRequest,
+    tmp_path: Path,
+) -> ApiProcess:
+    """@spec IDENTITY-WRITER-LIFETIME-V1-10."""
+    return _start_api(
+        request,
+        tmp_path,
+        fence_child_env({}, identity_fence_key),
+        factory="identity_fence_support:create_namespaced_app",
+    )
 
 
 class OtlpReceiver:

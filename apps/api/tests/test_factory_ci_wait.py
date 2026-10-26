@@ -22,6 +22,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 import re
 import socket
 import ssl
@@ -75,6 +76,7 @@ from forge_fakes.github_comments import (  # noqa: F401  (fixtures)
     ci_pending,
     comments,
 )
+from identity_fence_support import fence_child_env
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from test_factory_terminus import (  # noqa: F401  (fixtures)
@@ -2638,9 +2640,11 @@ def test_recorded_github_timeline_waits_for_python_aggregate_through_the_factory
 
 @pytest.fixture
 def workspace_api(
-    recorded_github: tuple[Any, Any, dict[str, Any]], monkeypatch: pytest.MonkeyPatch
+    recorded_github: tuple[Any, Any, dict[str, Any]],
+    monkeypatch: pytest.MonkeyPatch,
+    identity_fence_key: str,
 ) -> Iterator[str]:
-    """Run the production API on an owned socket for the worker's HTTP client."""
+    """@spec IDENTITY-WRITER-LIFETIME-V1-10."""
 
     _client, stub, _recording = recorded_github
     monkeypatch.setenv("GITHUB_CLONE_BASE", stub.base_url)
@@ -2658,11 +2662,13 @@ def workspace_api(
                 "-c",
                 "import asyncio,socket,sys,uvicorn; "
                 "listener=socket.socket(fileno=int(sys.argv[1])); "
-                "server=uvicorn.Server(uvicorn.Config('curie_api.main:create_app', "
+                "server=uvicorn.Server(uvicorn.Config("
+                "'identity_fence_support:create_namespaced_app', "
                 "factory=True,log_level='critical',access_log=False)); "
                 "asyncio.run(server.serve(sockets=[listener]))",
                 str(listener.fileno()),
             ],
+            env=fence_child_env(dict(os.environ), identity_fence_key),
             pass_fds=(listener.fileno(),),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
