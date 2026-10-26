@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import ast
+import json
+import sys
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -27,12 +29,8 @@ def checker(get: Callable[..., Any], clock: Callable[[], float]) -> Callable[[],
         node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name == "counts_against_quota"
     )
-    burst = next(
-        node for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name == "burst_sixteen"
-    )
     quota_pods = next(
-        node for node in burst.body
+        node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name == "quota_pods"
     )
     # Compile the original nodes without running the driver's setup, launches,
@@ -42,6 +40,8 @@ def checker(get: Callable[..., Any], clock: Callable[[], float]) -> Callable[[],
         "get": get,
         "time": SimpleNamespace(time=clock),
         "datetime": datetime,
+        "json": json,
+        "sys": sys,
         "fullname": "clock-check",
     }
     exec(compile(module, str(SCRIPT), "exec"), namespace)
@@ -131,7 +131,8 @@ def test_list_read_crossing_deletion_grace_does_not_invent_a_quota_overage(creat
     # Pods are chargeable. The newly admitted variant did not exist at 100.
     observation.check()
     assert_single_list_read(observation)
-    assert observation.clock_observations == [110]
+    # 100 is the diagnostic read-start stamp; only 110 classifies the list.
+    assert observation.clock_observations == [100, 110]
 
 
 def test_three_genuine_active_pods_still_fail_the_chargeable_count_assertion() -> None:

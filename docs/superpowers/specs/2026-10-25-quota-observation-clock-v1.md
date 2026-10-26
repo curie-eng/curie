@@ -5,7 +5,7 @@ The existing idle-capacity scenario checks two chargeable sandbox Pods. Its ordi
 ## Fresh observation time
 
 <!-- @spec QUOTA-OBSERVATION-CLOCK-1 -->
-In the existing nested quota_pods function inside burst_sixteen, finish the existing single Pod-list read before sampling time.time. Apply the existing counts_against_quota predicate to that observed list and this fresh time, consistent with observe. Do not sample a clock before list I/O and reuse it to classify returned Pods. This is observation-completion classification, not a continuous quota guarantee.
+In the quota_pods function shared by observe and burst_sixteen, finish the existing single Pod-list read before sampling time.time. Apply the existing counts_against_quota predicate to that observed list and this fresh time, consistent with observe. Do not sample a clock before list I/O and reuse it to classify returned Pods. This is observation-completion classification, not a continuous quota guarantee.
 
 The existing predicate mirrors the pinned [Kubernetes v1.31.0 QuotaV1Pod implementation](https://github.com/kubernetes/kubernetes/blob/v1.31.0/pkg/quota/v1/evaluator/core/pods.go#L417-L436): terminal Pods and deleting Pods strictly past their deletion grace do not consume Pod quota. Keep that predicate unchanged, including equality at the grace boundary.
 
