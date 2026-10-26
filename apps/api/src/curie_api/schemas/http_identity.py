@@ -462,7 +462,7 @@ def decode_json_bytes(data: bytes, *, max_bytes: int) -> Any:
     return value
 
 
-def _clock(now: datetime) -> Fraction:
+def utc_clock_instant(now: datetime) -> Fraction:
     """@spec HTTP-IDENTITY-V1-4."""
     if not isinstance(now, datetime) or now.utcoffset() != timedelta(0):
         raise ValueError("expected UTC caller clock")
@@ -497,7 +497,7 @@ def validate_lookup(
         raise ValueError("invalid caller context")
     request = LookupRequestV1.model_validate(request)
     limits = FreshnessLimits.model_validate(limits)
-    current = _clock(now)
+    current = utc_clock_instant(now)
     invalid = FactsRefusal(code="invalid_response")
     try:
         value = decode_json_bytes(response_bytes, max_bytes=MAX_RESPONSE_BYTES)

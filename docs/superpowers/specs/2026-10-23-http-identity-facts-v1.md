@@ -148,6 +148,16 @@ max_membership_age_ms, nonnegative integer max_clock_skew_ms and a valid UTC
 clock instant. There are no product TTL defaults. These are internal
 validation inputs, not an authority administration resource.
 
+The facts schema module owns public `utc_clock_instant(now: datetime) -> Fraction`
+for this existing caller-clock contract. Accept the existing datetime instances
+with a defined zero UTC offset; reject non-datetime, naive and nonzero-offset
+inputs with ValueError. Return exact signed epoch seconds including the full
+microsecond component across datetime's year 0001 through 9999 domain, using
+Fraction arithmetic. Do not read a clock, normalize a supplied offset, use a
+floating-point timestamp or narrow the domain. Facts validation and pure role
+calculation reuse this public owner rather than importing a private helper.
+This exposes the existing conversion without changing freshness or error order.
+
 An observation's as_of is the backing-source observation instant, not the
 HTTP response creation time. Timestamps are valid RFC3339 calendar instants
 with uppercase T, seconds 00–59, optional decimal fractional seconds and UTC
