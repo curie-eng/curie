@@ -128,6 +128,10 @@ def test_agent_schedules_for_reads_the_agent_column() -> None:
         on, off, missing = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
         try:
             await pg_connect_or_skip(engine)
+        except BaseException:
+            await engine.dispose()
+            raise
+        try:
             async with engine.begin() as conn:
                 for agent, value in ((on, True), (off, False)):
                     await conn.execute(
@@ -172,6 +176,10 @@ def _approval_chain_case(origin_key: str, links: int) -> bool:
         agent = uuid.uuid4()
         try:
             await pg_connect_or_skip(engine)
+        except BaseException:
+            await engine.dispose()
+            raise
+        try:
             async with engine.begin() as conn:
                 await conn.execute(
                     text(
@@ -270,6 +278,10 @@ def _approval_rows_case(build: Any) -> bool:
         agent, other = uuid.uuid4(), uuid.uuid4()
         try:
             await pg_connect_or_skip(engine)
+        except BaseException:
+            await engine.dispose()
+            raise
+        try:
             async with engine.begin() as conn:
                 for agent_id in (agent, other):
                     await conn.execute(
