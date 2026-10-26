@@ -345,9 +345,20 @@ def test_idle_409_fallback_rechecks_start_before_new_capabilities(make_harness):
 def test_attachment_handoff_reaches_the_same_start_refusal_gate(make_harness):
     """@spec HTTP-INVOCATION-EXECUTION-18: a replacement sandbox cannot skip the common gate."""
     require_execution_interface()
+
+    class AuthenticatedBinding(Binding):
+        """@spec HTTP-INVOCATION-EXECUTION-18: satisfy retained-runner handoff authentication."""
+
+        def boot_env(self, resolved: Any, thread_key: str, **kwargs: Any) -> dict[str, str]:
+            """@spec HTTP-INVOCATION-EXECUTION-18."""
+            return {
+                **super().boot_env(resolved, thread_key, **kwargs),
+                "CURIE_RUNNER_TOKEN": "synthetic-http-attachment-runner-token",
+            }
+
     async def run() -> None:
         """@spec HTTP-INVOCATION-EXECUTION-18."""
-        binding, core = Binding(), Core()
+        binding, core = AuthenticatedBinding(), Core()
         binding.resolved.deployment_id = uuid.uuid4()
         async with make_harness(
             binding=binding, identity_authority=core, per_sandbox_runners=2,
