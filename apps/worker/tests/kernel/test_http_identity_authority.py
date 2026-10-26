@@ -717,3 +717,192 @@ def test_retained_attachment_rechecks_authority_after_fetch_before_handoff(make_
             assert len(binding.mints) == minted
             assert core.requests[-1].stage == "claim_or_resume"
     asyncio.run(run())
+
+
+def test_cancelled_owner_cannot_claim_while_its_async_cleanup_is_blocked(
+    make_harness, tmp_path, monkeypatch: pytest.MonkeyPatch,
+):
+    """@spec HTTP-INVOCATION-EXECUTION-18: cancellation ends the copied thread's authority now."""
+    async def run() -> None:
+        """@spec HTTP-INVOCATION-EXECUTION-18."""
+        binding, core = Binding(), Core()
+        binding.resolved.deployment_id = uuid.uuid4()
+        prepared, resume_prepare, thread_finished = (
+            threading.Event(), threading.Event(), threading.Event(),
+        )
+        cleanup_entered, resume_cleanup = asyncio.Event(), asyncio.Event()
+        async with make_harness(binding=binding, identity_authority=core) as h:
+            preparer, _commands, objects = workspace_tests._preparer(workspace_module, tmp_path)
+            original_prepare, original_redeem = preparer.prepare, preparer.credentials.redeem
+
+            def redeem(deployment: Any, _thread: str) -> Any:
+                """@spec HTTP-INVOCATION-EXECUTION-18."""
+                return original_redeem(deployment, "1700000000.000100")
+
+            def select(*_args: Any) -> str:
+                """@spec HTTP-INVOCATION-EXECUTION-18: synthetic external repository selection."""
+                return "acme-corp/acme-bot"
+
+            def blocked_prepare(**kwargs: Any) -> Any:
+                """@spec HTTP-INVOCATION-EXECUTION-18."""
+                archive = original_prepare(**kwargs)
+                prepared.set()
+                assert resume_prepare.wait(5), "preparation barrier was not released"
+                return archive
+
+            class ObservedCoordinator(workspace_module.WorkspaceClaimCoordinator):
+                """@spec HTTP-INVOCATION-EXECUTION-18."""
+
+                def claim_or_resume_with_handle(self, **kwargs: Any) -> Any:
+                    """@spec HTTP-INVOCATION-EXECUTION-18."""
+                    try:
+                        return super().claim_or_resume_with_handle(**kwargs)
+                    finally:
+                        thread_finished.set()
+
+            preparer.credentials.redeem, preparer.credentials.select = redeem, select
+            preparer.prepare = blocked_prepare
+            coordinator = ObservedCoordinator(preparer=preparer, substrate=h.substrate)
+            h.kernel._workspace = coordinator
+            actual_cleanup = h.kernel._close_hook_run_after_error
+
+            async def blocked_cleanup(*args: Any, **kwargs: Any) -> None:
+                """@spec HTTP-INVOCATION-EXECUTION-18."""
+                cleanup_entered.set()
+                await resume_cleanup.wait()
+                await actual_cleanup(*args, **kwargs)
+
+            monkeypatch.setattr(h.kernel, "_close_hook_run_after_error", blocked_cleanup)
+            event = qevent("Use https://github.com/acme-corp/acme-bot", thread="cancel-preparation")
+            owner = asyncio.create_task(process(h, event))
+            try:
+                assert await asyncio.to_thread(prepared.wait, 3), "archive preparation not reached"
+                owner.cancel()
+                await asyncio.wait_for(cleanup_entered.wait(), 3)
+                assert not owner.done(), "the cancellation cleanup was not held"
+                resume_prepare.set()
+                assert await asyncio.to_thread(
+                    thread_finished.wait, 4,
+                ), "coordinator did not settle"
+                assert not owner.done(), "the async cleanup barrier was bypassed"
+                assert h.fake_k8s.claim_envs == [], "cancelled owner allocated a late sandbox"
+                assert objects.objects == {}, "cancelled preparation orphaned its staged archive"
+                assert h.runner.opened == [] and binding.mints == []
+            finally:
+                resume_prepare.set()
+                resume_cleanup.set()
+                await asyncio.gather(owner, return_exceptions=True)
+                assert await asyncio.to_thread(thread_finished.wait, 4)
+                await asyncio.to_thread(coordinator.release, "slack:C1:cancel-preparation")
+                await asyncio.to_thread(h.substrate.release, "slack:C1:cancel-preparation")
+    asyncio.run(run())
+
+
+async def park_notice_record(
+    h: Any, consumer: Consumer, leases: DeliveryLeaseStore, event: Any, *, recognized: bool,
+) -> tuple[dict[str, str], Any]:
+    """@spec HTTP-INVOCATION-EXECUTION-18."""
+    fields = {"payload": event.model_dump_json(), "synthetic-extra": "original-fields"}
+    if recognized:
+        fields["curie_identity_context_v1"] = "synthetic-invalid-context"
+    entry_id, observed = await pending_entry(h, consumer, fields)
+    lease = await leases.acquire(
+        h.config.stream, h.config.consumer_group, entry_id, consumer=h.config.consumer_name,
+    )
+    assert lease is not None
+    try:
+        record = await consumer._waits.park(entry_id, observed, event.event_id, lease)
+    finally:
+        await leases.release(
+            h.config.stream, h.config.consumer_group, entry_id,
+            owner=lease.owner, resume_event_id=None,
+        )
+    assert await leases.is_live(h.config.stream, h.config.consumer_group, entry_id) is False
+    assert record.fields == fields
+    return fields, record
+
+
+def test_capacity_queued_notice_suppresses_unverified_http_without_faking_delivery(make_harness):
+    """@spec HTTP-INVOCATION-EXECUTION-18."""
+    async def run() -> None:
+        """@spec HTTP-INVOCATION-EXECUTION-18."""
+        async with make_harness() as h:
+            leases = DeliveryLeaseStore(h.async_redis, h.config)
+            consumer = Consumer(
+                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=leases,
+            )
+            legacy = qevent("legacy courtesy", thread="legacy-courtesy")
+            _, legacy_record = await park_notice_record(
+                h, consumer, leases, legacy, recognized=False,
+            )
+            await consumer._send_wait_notice(legacy_record)
+            assert h.sink.events, "the unselected legacy courtesy control did not emit"
+            before = list(h.sink.events)
+            event = qevent("unverified queued message", thread="http-courtesy")
+            fields, record = await park_notice_record(h, consumer, leases, event, recognized=True)
+            await consumer._send_wait_notice(record)
+            assert h.sink.events == before, "unverified HTTP queue courtesy wrote to the reply sink"
+            retained = await consumer._waits.get(event.event_id)
+            assert retained.fields == fields and retained.state == "waiting"
+            assert retained.notice_pending and retained.reply_ref is None
+            assert (
+                await h.async_redis.xpending(h.config.stream, h.config.consumer_group)
+            )["pending"] == 0
+    asyncio.run(run())
+
+
+def test_capacity_expiry_repair_suppresses_unverified_http_and_keeps_original_fields(make_harness):
+    """@spec HTTP-INVOCATION-EXECUTION-18."""
+    async def run() -> None:
+        """@spec HTTP-INVOCATION-EXECUTION-18."""
+        async with make_harness(capacity_wait_budget_s=1) as h:
+            leases = DeliveryLeaseStore(h.async_redis, h.config)
+            consumer = Consumer(
+                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=leases,
+            )
+            event = qevent("unverified repaired expiry", thread="http-expiry-repair")
+            fields, _ = await park_notice_record(h, consumer, leases, event, recognized=True)
+            await asyncio.sleep(1.1)
+            assert await consumer._waits.wake_due() == 1
+            record = await consumer._waits.get(event.event_id)
+            assert await consumer._waits.flag_expiry(event.event_id, record.generation)
+            await h.kernel._markers.mark_done(event.event_id, marker_value="1")
+            assert await consumer._waits.mark_terminal(event.event_id, record.generation)
+            await consumer._repair_expiry_notices()
+            assert h.sink.events == [], "unverified HTTP expiry repair wrote to the reply sink"
+            retained = await consumer._waits.get(event.event_id)
+            assert retained.fields == fields and retained.state == "expired"
+            assert retained.expiry_notice_pending and retained.reply_ref is None
+            assert h.runner.opened == [] and h.fake_k8s.claim_envs == []
+    asyncio.run(run())
+
+
+def test_expired_http_wait_delivery_settles_without_an_unverified_reply(make_harness):
+    """@spec HTTP-INVOCATION-EXECUTION-18: actual expired-WAIT handler cannot bypass provenance."""
+    async def run() -> None:
+        """@spec HTTP-INVOCATION-EXECUTION-18."""
+        async with make_harness(capacity_wait_budget_s=1) as h:
+            leases = DeliveryLeaseStore(h.async_redis, h.config)
+            consumer = Consumer(
+                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=leases,
+            )
+            event = qevent("unverified expired delivery", thread="http-expired-wait")
+            fields, _ = await park_notice_record(h, consumer, leases, event, recognized=True)
+            await asyncio.sleep(1.1)
+            assert await consumer._waits.wake_due() == 1
+            rows = await h.async_redis.xreadgroup(
+                h.config.consumer_group, h.config.consumer_name, {h.config.stream: ">"}, count=1,
+            )
+            entry_id, awakened = rows[0][1][0]
+            assert all(awakened[key] == value for key, value in fields.items())
+            await consumer._handle(entry_id, dict(awakened))
+            assert h.sink.events == [], "unverified expired HTTP delivery wrote to the reply sink"
+            assert (
+                await h.async_redis.xpending(h.config.stream, h.config.consumer_group)
+            )["pending"] == 0
+            assert await h.async_redis.exists(h.config.done_key(event.event_id))
+            retained = await consumer._waits.get(event.event_id)
+            assert retained.fields == fields and retained.state == "expired"
+            assert retained.expiry_notice_pending and retained.reply_ref is None
+            assert h.runner.opened == [] and h.fake_k8s.claim_envs == []
+    asyncio.run(run())
