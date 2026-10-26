@@ -183,14 +183,15 @@ fn stable_v0100_sorts_after_its_release_candidate_for_fail_forward() {
 /// catalog 0130, so the upgrade is forward-only.
 #[test]
 fn v091_source_upgrades_through_the_packaged_chart_graph() {
+    // @spec HTTP-PRINCIPAL-ADOPTION-V1-13: candidate graph keeps published windows unchanged.
     let source = window_for("0.9.1").expect("0.9.1 is catalogued");
     let target: TargetMetadata =
         serde_json::from_str(include_str!("../../charts/curie/files/schema-compat.json"))
             .expect("packaged chart schema compatibility metadata parses");
 
     assert_eq!(source.schema_head, "0044");
-    assert_eq!(target.schema_min, "0131");
-    assert_eq!(target.schema_head, "0131");
+    assert_eq!(target.schema_min, "0132");
+    assert_eq!(target.schema_head, "0132");
 
     let pending =
         pending_revisions(Some("0044"), &target).expect("0044 reaches the packaged chart head");
@@ -212,7 +213,7 @@ fn v091_source_upgrades_through_the_packaged_chart_graph() {
             "0081", "0082", "0083", "0084", "0085", "0086", "0087", "0088", "0089", "0090",
             "0091a", "0092a", "0093a", "0094", "0095", "0096", "0097", "0098", "0091", "0092",
             "0093", "0099", "0100", "0101", "0102", "0103", "0105", "0107", "0106", "0108", "0120",
-            "0121", "0122", "0123", "0130", "0131"
+            "0121", "0122", "0123", "0130", "0131", "0132"
         ]
     );
     let contracts: Vec<&str> = pending
@@ -243,12 +244,13 @@ fn v091_source_upgrades_through_the_packaged_chart_graph() {
     );
     assert_eq!(decision.action, "apply");
     assert_eq!(decision.source_head.as_deref(), Some("0044"));
-    assert_eq!(decision.target_min, "0131");
+    assert_eq!(decision.target_min, "0132");
 }
 
 // @spec PROTECTED-HOOK-SOURCE-10
 #[test]
 fn released_v0101_upgrades_through_the_new_feature_train_revision() {
+    // @spec HTTP-PRINCIPAL-ADOPTION-V1-13: candidate graph keeps published windows unchanged.
     // @spec DEPLOY-NOTICE-RELEASE-1.
     let source = window_for("0.10.1").expect("released 0.10.1 is catalogued");
     let target: TargetMetadata =
@@ -256,7 +258,7 @@ fn released_v0101_upgrades_through_the_new_feature_train_revision() {
             .expect("packaged chart schema compatibility metadata parses");
 
     assert_eq!(source.schema_head, "0058");
-    assert_eq!(target.schema_head, "0131");
+    assert_eq!(target.schema_head, "0132");
     let pending = pending_revisions(Some(&source.schema_head), &target)
         .expect("released 0.10.1 reaches the new head");
     assert_eq!(
@@ -276,7 +278,7 @@ fn released_v0101_upgrades_through_the_new_feature_train_revision() {
             "0084", "0085", "0086", "0087", "0088", "0089", "0090", "0091a", "0092a", "0093a",
             "0094", "0095", "0096", "0097", "0098", "0091", "0092", "0093", "0099", "0100", "0101",
             "0102", "0103", "0105", "0107", "0106", "0108", "0120", "0121", "0122", "0123", "0130",
-            "0131"
+            "0131", "0132"
         ]
     );
 
@@ -297,7 +299,7 @@ fn released_v0101_upgrades_through_the_new_feature_train_revision() {
         Some(&source.schema_head),
     );
     assert_eq!(decision.action, "apply");
-    assert_eq!(decision.target_min, "0131");
+    assert_eq!(decision.target_min, "0132");
 }
 
 /// @spec PROTECTED-HOOK-SOURCE-1
@@ -314,6 +316,7 @@ fn released_v0101_upgrades_through_the_new_feature_train_revision() {
 /// access policies 0121, directory identity 0122 and the attachment catalog 0130.
 #[test]
 fn released_v0102_upgrades_through_the_feature_train_revisions() {
+    // @spec HTTP-PRINCIPAL-ADOPTION-V1-13: candidate graph keeps published windows unchanged.
     // @spec DEPLOY-NOTICE-RELEASE-1.
     let source = window_for("0.10.2").expect("released 0.10.2 is catalogued");
     let target: TargetMetadata =
@@ -321,7 +324,7 @@ fn released_v0102_upgrades_through_the_feature_train_revisions() {
             .expect("packaged chart schema compatibility metadata parses");
 
     assert_eq!(source.schema_head, "0062");
-    assert_eq!(target.schema_head, "0131");
+    assert_eq!(target.schema_head, "0132");
     let pending = pending_revisions(Some(&source.schema_head), &target)
         .expect("released 0.10.2 reaches the new head");
     assert_eq!(
@@ -340,7 +343,7 @@ fn released_v0102_upgrades_through_the_feature_train_revisions() {
             "0075", "0076", "0079", "0080", "0081", "0082", "0083", "0084", "0085", "0086", "0087",
             "0088", "0089", "0090", "0091a", "0092a", "0093a", "0094", "0095", "0096", "0097",
             "0098", "0091", "0092", "0093", "0099", "0100", "0101", "0102", "0103", "0105", "0107",
-            "0106", "0108", "0120", "0121", "0122", "0123", "0130", "0131"
+            "0106", "0108", "0120", "0121", "0122", "0123", "0130", "0131", "0132"
         ]
     );
     let contracts: Vec<&str> = pending
@@ -380,6 +383,7 @@ fn released_v0102_upgrades_through_the_feature_train_revisions() {
 /// attachment catalog 0130.
 #[test]
 fn released_v0103_upgrades_through_the_renumbered_feature_train() {
+    // @spec HTTP-PRINCIPAL-ADOPTION-V1-13: candidate graph keeps published windows unchanged.
     // @spec DEPLOY-NOTICE-RELEASE-1.
     let source = window_for("0.10.3").expect("released 0.10.3 is catalogued");
     let target: TargetMetadata =
@@ -387,7 +391,7 @@ fn released_v0103_upgrades_through_the_renumbered_feature_train() {
             .expect("packaged chart schema compatibility metadata parses");
 
     assert_eq!(source.schema_head, "0063");
-    assert_eq!(target.schema_head, "0131");
+    assert_eq!(target.schema_head, "0132");
     let pending = pending_revisions(Some(&source.schema_head), &target)
         .expect("released 0.10.3 reaches the new head");
     assert_eq!(
@@ -406,7 +410,7 @@ fn released_v0103_upgrades_through_the_renumbered_feature_train() {
             "0076", "0079", "0080", "0081", "0082", "0083", "0084", "0085", "0086", "0087", "0088",
             "0089", "0090", "0091a", "0092a", "0093a", "0094", "0095", "0096", "0097", "0098",
             "0091", "0092", "0093", "0099", "0100", "0101", "0102", "0103", "0105", "0107", "0106",
-            "0108", "0120", "0121", "0122", "0123", "0130", "0131"
+            "0108", "0120", "0121", "0122", "0123", "0130", "0131", "0132"
         ]
     );
     let contracts: Vec<&str> = pending
