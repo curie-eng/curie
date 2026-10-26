@@ -332,20 +332,33 @@ pub(super) async fn run(action: LocalAction) -> Result<()> {
             agent,
             pause,
             resume,
+            agent_schedule,
             api_url,
             api_key,
             dry_run,
-        } => emit(
-            commands::schedules(commands::SchedulesOpts {
-                api_url,
-                api_key,
-                agent,
-                pause,
-                resume,
-                dry_run,
-            })
-            .await?,
-        ),
+        } => match agent_schedule.into_verb()? {
+            Some(verb) => emit_boxed(
+                commands::agent_schedule(commands::AgentScheduleOpts {
+                    api_url,
+                    api_key,
+                    agent,
+                    verb,
+                    dry_run,
+                })
+                .await?,
+            ),
+            None => emit(
+                commands::schedules(commands::SchedulesOpts {
+                    api_url,
+                    api_key,
+                    agent,
+                    pause,
+                    resume,
+                    dry_run,
+                })
+                .await?,
+            ),
+        },
         LocalAction::Hook { action } => match action {
             LocalHookAction::Fire {
                 agent,
@@ -391,13 +404,17 @@ pub(super) async fn run(action: LocalAction) -> Result<()> {
             delete,
             channel,
             guidance,
-        } => match (guidance.action(), add, delete) {
-            (Some(action), _, _) => emit_memory_guidance(target.into(), action).await,
-            (None, None, Some(id)) => {
+            lifecycle,
+        } => match (guidance.action(), add, delete, lifecycle.action()) {
+            (Some(action), _, _, _) => emit_memory_guidance(target.into(), action).await,
+            (None, None, None, Some(action)) => {
+                emit(commands::memory_lifecycle(target.into(), action, channel).await?)
+            }
+            (None, None, Some(id), _) => {
                 emit(commands::memory_delete(target.into(), id, channel).await?)
             }
-            (None, None, None) => emit(commands::memory(target.into(), channel).await?),
-            (None, Some(content), _) => {
+            (None, None, None, None) => emit(commands::memory(target.into(), channel).await?),
+            (None, Some(content), _, _) => {
                 emit(commands::memory_add(target.into(), content, "local").await?)
             }
         },
@@ -468,6 +485,18 @@ pub(super) async fn run(action: LocalAction) -> Result<()> {
                 .await?,
             )
         }
+        LocalAction::Skills(args) => emit_boxed(
+            commands::learned_skills(
+                commands::SkillsOpts {
+                    api_url: args.conn.api_url,
+                    api_key: args.conn.api_key,
+                    tier: "local",
+                    agent: args.agent,
+                },
+                args.verb.into(),
+            )
+            .await?,
+        ),
         // @spec AUTOMATED-REMEDIATION-3
         LocalAction::RemediationPolicy { verb } => {
             let (verb, conn) = verb.into_parts();
@@ -538,11 +567,14 @@ pub(super) async fn run(action: LocalAction) -> Result<()> {
             runner_resources,
             clear_runner_resources,
             memory_writes,
+            agent_wide_learning,
+            agent_schedules,
+            learned_skills,
             api_url,
             api_key,
             dry_run,
         } => emit(
-            commands::overrides_with_memory_writes(
+            commands::overrides_with_switches(
                 AgentActionOpts {
                     api_url,
                     api_key,
@@ -564,7 +596,12 @@ pub(super) async fn run(action: LocalAction) -> Result<()> {
                     runner_resources,
                     clear_runner_resources,
                 )?,
-                commands::memory_writes_flag(memory_writes.as_deref()),
+                commands::AgentSwitches {
+                    memory_writes: commands::on_off_flag(memory_writes.as_deref()),
+                    agent_wide_learning: commands::on_off_flag(agent_wide_learning.as_deref()),
+                    agent_schedules: commands::on_off_flag(agent_schedules.as_deref()),
+                    learned_skills: commands::on_off_flag(learned_skills.as_deref()),
+                },
             )
             .await?,
         ),

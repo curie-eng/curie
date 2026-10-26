@@ -4,6 +4,8 @@ Date: 2026-10-01
 
 Status: Accepted
 
+Amended by [ADR 0247](0247-learned-skills-are-a-mutable-markdown-skill-source.md) for learned skills, a second, generated skill source.
+
 Accepted by Brian on 2026-10-02 for v0.12.0. The implementation was
 already present in `runner/src/curie_runner/adapter.py`.
 

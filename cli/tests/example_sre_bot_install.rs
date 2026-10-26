@@ -650,6 +650,7 @@ exit 64
                         "channels": [{"kind": "slack", "address": "#local-dev"}],
                         "created_at": "2026-08-21T00:00:00Z",
                         "memory": false,
+                        "agent_wide_learning": false,
                     });
                     *agent_state = Some(agent.clone());
                     Response::json(201, &agent.to_string())
@@ -699,6 +700,7 @@ exit 64
                             "channels": [{"kind": "slack", "address": "#local-dev"}],
                             "created_at": "2026-08-21T00:00:00Z",
                             "memory": false,
+                            "agent_wide_learning": false,
                         })
                     });
                     if let Ok(body) = serde_json::from_slice::<Value>(&request.body) {
@@ -730,6 +732,7 @@ exit 64
                             "channels": [{"kind": "slack", "address": "#local-dev"}],
                             "created_at": "2026-08-21T00:00:00Z",
                             "memory": false,
+                            "agent_wide_learning": false,
                         })
                     });
                     if let Some(routes) = body.get("approval_routes") {
@@ -821,6 +824,7 @@ exit 64
             "channels": [{"kind": "slack", "address": "#local-dev"}],
             "created_at": "2026-08-21T00:00:00Z",
             "memory": false,
+            "agent_wide_learning": false,
             "approval_routes": routes,
         }));
         self

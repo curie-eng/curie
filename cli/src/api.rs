@@ -9,10 +9,11 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::api_requests::{
-    ActionUndo, AgentAccessPolicyWrite, AgentCreate, AgentUpdate, ApprovalPrincipalMint,
-    ApprovalRecover, ApprovalResolve, ChannelBindingWrite, ChannelCallersWrite,
-    ChannelTokenRequest, ConsoleLoginCodeMint, DeploymentCreate, DirectoryConfigIn,
-    DirectoryNamespaceIn, DirectoryTeamIn, EvalTriggerRequest, MemoryEntryCreate, MemoryGuidanceIn,
+    ActionUndo, AgentAccessPolicyWrite, AgentCreate, AgentScheduleCancel, AgentScheduleRevert,
+    AgentScheduleUpdate, AgentUpdate, ApprovalPrincipalMint, ApprovalRecover, ApprovalResolve,
+    ChannelBindingWrite, ChannelCallersWrite, ChannelTokenRequest, ConsoleLoginCodeMint,
+    DeploymentCreate, DirectoryConfigIn, DirectoryNamespaceIn, DirectoryTeamIn, EvalTriggerRequest,
+    LearnedSkillRevert, MemoryEntryCreate, MemoryGuidanceIn, MemoryLifecycleIn, MemoryRevertIn,
     RemediationBreakerClose, RemediationPolicyMutation, RemediationPolicyWrite,
     RemediationQualificationWrite, RemediationVerifierRunStart, ResolveTargetRequest,
     RoutingCheckRequest, VersionCreate,
@@ -361,6 +362,29 @@ pub struct Agent {
     /// as off, which is what it does.
     #[serde(default)]
     pub memory_writes: bool,
+    /// Whether this agent opted in to agent-wide learning (ADR 0249): the
+    /// learning default guidance and standing instructions. Independent of
+    /// `memory_writes`. Absent deserializes as `None`: the platform did not
+    /// report it, and consumers refuse rather than assume it is off.
+    #[serde(default)]
+    pub agent_wide_learning: Option<bool>,
+    /// Whether the agent may create and change its own schedules (ADR 0248).
+    /// Defaulted to off, the `AgentOut` default.
+    #[serde(default)]
+    pub agent_schedules: bool,
+    /// The zone a schedule without its own timezone runs in (ADR 0248).
+    #[serde(default = "default_schedule_timezone")]
+    pub schedule_timezone: String,
+    /// How many active schedules the agent may hold (ADR 0248).
+    #[serde(default = "default_schedule_max_active")]
+    pub schedule_max_active: u32,
+    /// The shortest cron interval the agent may schedule, in minutes (ADR 0248).
+    #[serde(default = "default_schedule_min_interval_minutes")]
+    pub schedule_min_interval_minutes: u32,
+    /// Whether the runner loads and may edit this agent's learned skills
+    /// (ADR 0247). Defaulted so an older platform reads as off.
+    #[serde(default)]
+    pub learned_skills: bool,
     /// Who resolves publication approval. Missing responses stay on human approval.
     #[serde(default = "default_publication_policy")]
     pub publication_policy: String,
@@ -429,6 +453,41 @@ fn default_publication_policy() -> String {
 
 fn default_publication_policy_version() -> i64 {
     1
+}
+
+// The `AgentOut` defaults for the ADR 0248 schedule settings.
+fn default_schedule_timezone() -> String {
+    "UTC".to_string()
+}
+
+fn default_schedule_max_active() -> u32 {
+    20
+}
+
+fn default_schedule_min_interval_minutes() -> u32 {
+    15
+}
+
+/// An agent's stored ADR 0248 schedule settings, as `<tier> overrides` and the
+/// `<tier> schedules` policy setters print them.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AgentSchedulePolicy {
+    pub agent_schedules: bool,
+    pub schedule_timezone: String,
+    pub schedule_max_active: u32,
+    pub schedule_min_interval_minutes: u32,
+}
+
+impl Agent {
+    /// The schedule settings this agent row carries.
+    pub fn schedule_policy(&self) -> AgentSchedulePolicy {
+        AgentSchedulePolicy {
+            agent_schedules: self.agent_schedules,
+            schedule_timezone: self.schedule_timezone.clone(),
+            schedule_max_active: self.schedule_max_active,
+            schedule_min_interval_minutes: self.schedule_min_interval_minutes,
+        }
+    }
 }
 
 /// One route's display-only binding, mirroring `ApprovalRouteBindingOut`.
@@ -800,6 +859,17 @@ pub struct ForgeCredentialHealthReport {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ScheduleList {
     pub schedules: Vec<AgentSchedules>,
+    /// Agent-created and operator-created schedules (ADR 0248), kept as the
+    /// API sent them. Required: a list without it is refused, not read as none.
+    pub agent_schedules: Vec<serde_json::Value>,
+}
+
+/// `GET /agents/{id}/schedules/{id}/revisions` (`AgentScheduleRevisions`,
+/// ADR 0248). Only the object form is accepted; each revision is kept as the
+/// API sent it.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AgentScheduleRevisions {
+    pub revisions: Vec<serde_json::Value>,
 }
 
 /// One durable hook run record (`HookFireOut`, #2932).
@@ -842,6 +912,56 @@ pub struct MemoryEntry {
     pub provenance: MemoryProvenance,
 }
 
+/// One learned skill (`LearnedSkillOut`, ADR 0247). `author` and
+/// `conversation` come from the head's latest revision.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LearnedSkill {
+    pub id: String,
+    pub slug: String,
+    pub description: String,
+    pub body: String,
+    pub revision: u32,
+    pub author: String,
+    pub conversation: Option<String>,
+    pub updated_at: String,
+    pub created_at: String,
+    pub deleted: bool,
+}
+
+/// `GET /agents/{id}/learned-skills` (`LearnedSkillList`): active skills
+/// ordered by slug, plus whether the agent's toggle is on.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LearnedSkillList {
+    pub enabled: bool,
+    pub skills: Vec<LearnedSkill>,
+}
+
+/// One immutable learned-skill revision (`LearnedSkillRevisionOut`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LearnedSkillRevision {
+    pub revision: u32,
+    pub action: String,
+    pub slug: String,
+    pub description: String,
+    pub body: String,
+    pub digest: String,
+    pub author: String,
+    pub conversation: Option<String>,
+    pub turn: Option<String>,
+    pub source: String,
+    pub reverted_to: Option<u32>,
+    pub created_at: String,
+    /// The skill's state after this revision: true for a tombstone.
+    pub deleted: bool,
+}
+
+/// `GET .../learned-skills/{ref}/revisions` (`LearnedSkillRevisions`),
+/// ascending.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LearnedSkillRevisions {
+    pub revisions: Vec<LearnedSkillRevision>,
+}
+
 /// A row from the existing state routes (`StateEntryOut`). The memory command
 /// validates the open value only after selecting a canonical fact key.
 #[derive(Debug, Clone, Deserialize)]
@@ -853,9 +973,90 @@ pub struct StateEntry {
     pub updated_at: String,
 }
 
+/// One canonical memory head as the typed memory routes return it
+/// (`MemoryRecordOut`, ADR 0249). Serialized back verbatim as the archive and
+/// restore result, so the CLI cannot drop a field by hand-picking one.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MemoryRecord {
+    pub id: String,
+    pub scope: String,
+    pub kind: String,
+    pub title: String,
+    pub statement: String,
+    /// Null only for an entry with no stored attribution (a historical head
+    /// the migration could not attribute).
+    pub author: Option<String>,
+    pub stated_at: Option<String>,
+    pub conversation: Option<String>,
+    pub archived: bool,
+    pub version: u64,
+    pub updated_at: String,
+}
+
+/// One immutable revision of a canonical memory entry (`MemoryRevisionOut`).
+/// `snapshot` is the resulting canonical value, null for a deletion.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MemoryRevision {
+    pub version: u64,
+    pub operation: String,
+    pub actor: String,
+    pub source: String,
+    pub conversation: Option<String>,
+    pub created_at: String,
+    pub reverted_to_version: Option<u64>,
+    pub snapshot: Option<serde_json::Value>,
+}
+
+/// A canonical memory entry with its newest revisions (`MemoryDetailOut`).
+/// `entry` is null and `deleted` true when the head was forgotten or reverted
+/// to absence; `version` is then the latest revision's version.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MemoryDetail {
+    pub entry: Option<MemoryRecord>,
+    pub deleted: bool,
+    pub version: u64,
+    pub history: Vec<MemoryRevision>,
+    pub history_before: Option<u64>,
+}
+
+/// The scope a typed memory route acts on: agent-wide memory, or one exact
+/// bound channel pair.
+#[derive(Debug, Clone, Copy)]
+pub enum MemoryScope<'a> {
+    Agent,
+    Channel { kind: &'a str, address: &'a str },
+}
+
+impl<'a> MemoryScope<'a> {
+    /// The scope for an optional selected channel pair.
+    pub fn of(channel: Option<(&'a str, &'a str)>) -> Self {
+        match channel {
+            Some((kind, address)) => MemoryScope::Channel { kind, address },
+            None => MemoryScope::Agent,
+        }
+    }
+
+    /// The `scope` value the typed routes take.
+    pub fn name(&self) -> &'static str {
+        match self {
+            MemoryScope::Agent => "agent",
+            MemoryScope::Channel { .. } => "channel",
+        }
+    }
+
+    /// The `channel_kind` and `channel_address` pair, for channel scope only.
+    pub fn channel(&self) -> Option<(&'a str, &'a str)> {
+        match *self {
+            MemoryScope::Agent => None,
+            MemoryScope::Channel { kind, address } => Some((kind, address)),
+        }
+    }
+}
+
 /// An agent's effective memory guidance (`MemoryGuidanceOut`, #1461): the
 /// text the runner shows beside its memory tools, and whether it is the
-/// platform `default` or `operator`-set.
+/// platform `default`, the `learning_default` for an agent that opted in to
+/// agent-wide learning (ADR 0249), or `operator`-set.
 #[derive(Debug, Clone, Deserialize)]
 pub struct MemoryGuidance {
     pub text: String,
@@ -2218,6 +2419,22 @@ pub(crate) fn hook_run_path(agent: &str, name: &str, run_id: &str) -> String {
     hook_agent_path(agent, name, &["runs", run_id])
 }
 
+/// The percent-encoded path `/agents/{agent}/{tail..}` for the agent-schedule
+/// routes, pushed segment by segment like [`hook_fire_path`].
+pub(crate) fn agent_schedule_path(agent: &str, tail: &[&str]) -> String {
+    let mut url = reqwest::Url::parse("http://schedule.invalid").expect("static URL base parses");
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .expect("static URL base accepts path segments");
+        segments.push("agents").push(agent);
+        for segment in tail {
+            segments.push(segment);
+        }
+    }
+    url.path().to_string()
+}
+
 /// Percent-encode an agent hook path by pushing each segment through a
 /// throwaway URL, mirroring how `control_schedule` builds its request URL.
 fn hook_agent_path(agent: &str, name: &str, tail: &[&str]) -> String {
@@ -2257,6 +2474,41 @@ pub(crate) fn memory_state_url(
         path.push("memory");
         if let Some(key) = key {
             path.push(key);
+        }
+    }
+    Ok(url)
+}
+
+/// Build the typed memory detail route (ADR 0249):
+/// `/agents/{id}/state/_memory/entries/{fact_id}?scope=agent|channel` plus the
+/// exact `channel_kind` and `channel_address` for channel scope. Identities
+/// travel as path segments and query values, never interpolated.
+pub(crate) fn memory_entry_url(
+    base_url: &str,
+    agent_id: &str,
+    scope: MemoryScope<'_>,
+    fact_id: &str,
+) -> Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse(base_url)?;
+    {
+        let mut path = url
+            .path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("api URL cannot hold path segments"))?;
+        path.pop_if_empty()
+            .push("agents")
+            .push(agent_id)
+            .push("state")
+            .push("_memory")
+            .push("entries")
+            .push(fact_id);
+    }
+    {
+        let mut query = url.query_pairs_mut();
+        query.append_pair("scope", scope.name());
+        if let Some((kind, address)) = scope.channel() {
+            query
+                .append_pair("channel_kind", kind)
+                .append_pair("channel_address", address);
         }
     }
     Ok(url)
@@ -3805,6 +4057,132 @@ impl ApiClient {
             .context("decoding schedule list")
     }
 
+    /// `GET /agents/{agent_id}/schedules/{schedule_id}` (ADR 0248), as sent.
+    pub async fn get_agent_schedule(
+        &self,
+        agent_id: &str,
+        schedule_id: &str,
+    ) -> Result<serde_json::Value> {
+        let resp = self
+            .send_request(
+                self.http
+                    .get(format!(
+                        "{}/agents/{agent_id}/schedules/{schedule_id}",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key),
+                "GET /agents/{id}/schedules/{id}",
+            )
+            .await?;
+        Self::expect_ok(resp, "reading the agent schedule")
+            .await?
+            .json()
+            .await
+            .context("decoding agent schedule")
+    }
+
+    /// `GET /agents/{agent_id}/schedules/{schedule_id}/revisions`, as sent.
+    pub async fn get_agent_schedule_revisions(
+        &self,
+        agent_id: &str,
+        schedule_id: &str,
+    ) -> Result<AgentScheduleRevisions> {
+        let resp = self
+            .send_request(
+                self.http
+                    .get(format!(
+                        "{}/agents/{agent_id}/schedules/{schedule_id}/revisions",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key),
+                "GET /agents/{id}/schedules/{id}/revisions",
+            )
+            .await?;
+        Self::expect_ok(resp, "reading agent schedule revisions")
+            .await?
+            .json()
+            .await
+            .context("decoding agent schedule revisions")
+    }
+
+    /// `PATCH /agents/{agent_id}/schedules/{schedule_id}`.
+    pub async fn update_agent_schedule(
+        &self,
+        agent_id: &str,
+        schedule_id: &str,
+        body: &AgentScheduleUpdate,
+    ) -> Result<serde_json::Value> {
+        let resp = self
+            .send_request(
+                self.http
+                    .patch(format!(
+                        "{}/agents/{agent_id}/schedules/{schedule_id}",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key)
+                    .json::<AgentScheduleUpdate>(body),
+                "PATCH /agents/{id}/schedules/{id}",
+            )
+            .await?;
+        Self::expect_ok(resp, "updating the agent schedule")
+            .await?
+            .json()
+            .await
+            .context("decoding agent schedule")
+    }
+
+    /// `POST /agents/{agent_id}/schedules/{schedule_id}/cancel`.
+    pub async fn cancel_agent_schedule(
+        &self,
+        agent_id: &str,
+        schedule_id: &str,
+        body: &AgentScheduleCancel,
+    ) -> Result<serde_json::Value> {
+        let resp = self
+            .send_request(
+                self.http
+                    .post(format!(
+                        "{}/agents/{agent_id}/schedules/{schedule_id}/cancel",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key)
+                    .json::<AgentScheduleCancel>(body),
+                "POST /agents/{id}/schedules/{id}/cancel",
+            )
+            .await?;
+        Self::expect_ok(resp, "cancelling the agent schedule")
+            .await?
+            .json()
+            .await
+            .context("decoding agent schedule")
+    }
+
+    /// `POST /agents/{agent_id}/schedules/{schedule_id}/revert`.
+    pub async fn revert_agent_schedule(
+        &self,
+        agent_id: &str,
+        schedule_id: &str,
+        body: &AgentScheduleRevert,
+    ) -> Result<serde_json::Value> {
+        let resp = self
+            .send_request(
+                self.http
+                    .post(format!(
+                        "{}/agents/{agent_id}/schedules/{schedule_id}/revert",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key)
+                    .json::<AgentScheduleRevert>(body),
+                "POST /agents/{id}/schedules/{id}/revert",
+            )
+            .await?;
+        Self::expect_ok(resp, "reverting the agent schedule")
+            .await?
+            .json()
+            .await
+            .context("decoding agent schedule")
+    }
+
     pub async fn control_schedule(
         &self,
         agent: &str,
@@ -3933,6 +4311,245 @@ impl ApiClient {
             .await?;
         Self::expect_ok(response, "deleting memory fact").await?;
         Ok(())
+    }
+
+    /// A typed memory route's refusal (ADR 0249). A 409 means the head moved
+    /// after the CLI read it: that is reported as a stale version and never
+    /// retried, because a retry would overwrite a change nobody reviewed.
+    async fn expect_memory_ok(resp: reqwest::Response, what: &str) -> Result<reqwest::Response> {
+        if resp.status() != reqwest::StatusCode::CONFLICT {
+            return Self::expect_ok(resp, what).await;
+        }
+        let body = resp.text().await.unwrap_or_default();
+        let reason = api_detail_reason(&body).unwrap_or_else(|| "version conflict".to_string());
+        Err(crate::exit::CliError::failure(format!(
+            "{what} refused with 409: stale version, the entry changed after it was read ({reason})"
+        ))
+        .with_fix(
+            "read the current entry with --history, then run the command again if it still applies",
+        )
+        .into())
+    }
+
+    /// Read one canonical memory entry with its newest revisions:
+    /// `GET /agents/{id}/state/_memory/entries/{fact_id}`.
+    pub async fn get_memory_entry(
+        &self,
+        agent_id: &str,
+        scope: MemoryScope<'_>,
+        fact_id: &str,
+    ) -> Result<MemoryDetail> {
+        let url = memory_entry_url(&self.base_url, agent_id, scope, fact_id)?;
+        let response = self
+            .send_request(
+                self.http.get(url).header("X-API-Key", &self.api_key),
+                "GET memory entry",
+            )
+            .await?;
+        Self::expect_ok(response, "reading memory entry")
+            .await?
+            .json()
+            .await
+            .context("decoding memory entry detail")
+    }
+
+    /// Archive one canonical entry at its read version:
+    /// `POST /agents/{id}/state/_memory/archive`.
+    pub async fn archive_memory_entry(
+        &self,
+        agent_id: &str,
+        body: &MemoryLifecycleIn,
+    ) -> Result<MemoryRecord> {
+        let resp = self
+            .send_request(
+                self.http
+                    .post(format!(
+                        "{}/agents/{agent_id}/state/_memory/archive",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key)
+                    .json::<MemoryLifecycleIn>(body),
+                "POST /agents/{id}/state/_memory/archive",
+            )
+            .await?;
+        Self::expect_memory_ok(resp, "archiving memory entry")
+            .await?
+            .json()
+            .await
+            .context("decoding archived memory entry")
+    }
+
+    /// Restore one archived canonical entry at its read version:
+    /// `POST /agents/{id}/state/_memory/restore`.
+    pub async fn restore_memory_entry(
+        &self,
+        agent_id: &str,
+        body: &MemoryLifecycleIn,
+    ) -> Result<MemoryRecord> {
+        let resp = self
+            .send_request(
+                self.http
+                    .post(format!(
+                        "{}/agents/{agent_id}/state/_memory/restore",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key)
+                    .json::<MemoryLifecycleIn>(body),
+                "POST /agents/{id}/state/_memory/restore",
+            )
+            .await?;
+        Self::expect_memory_ok(resp, "restoring memory entry")
+            .await?
+            .json()
+            .await
+            .context("decoding restored memory entry")
+    }
+
+    /// Revert one canonical entry to an earlier revision, or to absence with
+    /// revision 0: `POST /agents/{id}/state/_memory/revert`.
+    pub async fn revert_memory_entry(
+        &self,
+        agent_id: &str,
+        body: &MemoryRevertIn,
+    ) -> Result<MemoryDetail> {
+        let resp = self
+            .send_request(
+                self.http
+                    .post(format!(
+                        "{}/agents/{agent_id}/state/_memory/revert",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key)
+                    .json::<MemoryRevertIn>(body),
+                "POST /agents/{id}/state/_memory/revert",
+            )
+            .await?;
+        Self::expect_memory_ok(resp, "reverting memory entry")
+            .await?
+            .json()
+            .await
+            .context("decoding reverted memory entry")
+    }
+
+    /// An agent's active learned skills: `GET /agents/{id}/learned-skills`.
+    pub async fn list_learned_skills(&self, agent_id: &str) -> Result<LearnedSkillList> {
+        let resp = self
+            .send_request(
+                self.http
+                    .get(format!(
+                        "{}/agents/{agent_id}/learned-skills",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key),
+                "GET /agents/{id}/learned-skills",
+            )
+            .await?;
+        Self::expect_ok(resp, "listing learned skills")
+            .await?
+            .json()
+            .await
+            .context("decoding learned skills")
+    }
+
+    /// One learned skill by id or slug, deleted ones included for the
+    /// operator: `GET /agents/{id}/learned-skills/{ref}`.
+    pub async fn get_learned_skill(&self, agent_id: &str, skill: &str) -> Result<LearnedSkill> {
+        let resp = self
+            .send_request(
+                self.http
+                    .get(format!(
+                        "{}/agents/{agent_id}/learned-skills/{skill}",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key),
+                "GET /agents/{id}/learned-skills/{ref}",
+            )
+            .await?;
+        Self::expect_ok(resp, "reading learned skill")
+            .await?
+            .json()
+            .await
+            .context("decoding learned skill")
+    }
+
+    /// A learned skill's revisions, ascending:
+    /// `GET /agents/{id}/learned-skills/{ref}/revisions`.
+    pub async fn learned_skill_revisions(
+        &self,
+        agent_id: &str,
+        skill: &str,
+    ) -> Result<Vec<LearnedSkillRevision>> {
+        let resp = self
+            .send_request(
+                self.http
+                    .get(format!(
+                        "{}/agents/{agent_id}/learned-skills/{skill}/revisions",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key),
+                "GET /agents/{id}/learned-skills/{ref}/revisions",
+            )
+            .await?;
+        let list: LearnedSkillRevisions = Self::expect_ok(resp, "reading learned skill history")
+            .await?
+            .json()
+            .await
+            .context("decoding learned skill revisions")?;
+        Ok(list.revisions)
+    }
+
+    /// Revert a learned skill, compare-and-swap on its head revision:
+    /// `POST /agents/{id}/learned-skills/{ref}/revert`.
+    pub async fn revert_learned_skill(
+        &self,
+        agent_id: &str,
+        skill: &str,
+        body: &LearnedSkillRevert,
+    ) -> Result<LearnedSkill> {
+        let resp = self
+            .send_request(
+                self.http
+                    .post(format!(
+                        "{}/agents/{agent_id}/learned-skills/{skill}/revert",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key)
+                    .json::<LearnedSkillRevert>(body),
+                "POST /agents/{id}/learned-skills/{ref}/revert",
+            )
+            .await?;
+        Self::expect_ok(resp, "reverting learned skill")
+            .await?
+            .json()
+            .await
+            .context("decoding reverted learned skill")
+    }
+
+    /// Delete a learned skill at exactly `expected_revision`:
+    /// `DELETE /agents/{id}/learned-skills/{ref}?expected_revision=N`.
+    pub async fn delete_learned_skill(
+        &self,
+        agent_id: &str,
+        skill: &str,
+        expected_revision: u32,
+    ) -> Result<LearnedSkill> {
+        let resp = self
+            .send_request(
+                self.http
+                    .delete(format!(
+                        "{}/agents/{agent_id}/learned-skills/{skill}",
+                        self.base_url
+                    ))
+                    .query(&[("expected_revision", expected_revision)])
+                    .header("X-API-Key", &self.api_key),
+                "DELETE /agents/{id}/learned-skills/{ref}",
+            )
+            .await?;
+        Self::expect_ok(resp, "deleting learned skill")
+            .await?
+            .json()
+            .await
+            .context("decoding deleted learned skill")
     }
 
     /// List an agent's learned memory, oldest first: `GET /agents/{id}/memory`.

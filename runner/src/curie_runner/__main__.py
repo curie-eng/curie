@@ -15,7 +15,7 @@ import contextlib
 import json
 import logging
 import os
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -23,7 +23,7 @@ from typing import Any
 import anyio
 from aci_protocol import BootEnv
 from aiohttp import web
-from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
+from claude_agent_sdk import ClaudeAgentOptions, HookMatcher, SdkPluginConfig
 from curie_telemetry import bootstrap_service_telemetry
 from plugin_format import CHANNEL_READ_SERVER_NAME
 
@@ -34,6 +34,15 @@ from .adapter import (
     build_options,
     build_structured_resume,
     hidden_restore_tools,
+)
+from .agent_schedules import (
+    AgentSchedulesClient,
+    AgentSchedulesConfig,
+    agent_schedules_url,
+    schedules_guidance,
+)
+from .agent_schedules import (
+    load_for_session as load_schedules_for_session,
 )
 from .approval import (
     APPROVAL_SERVER_NAME,
@@ -78,13 +87,16 @@ from .connectors import (
 )
 from .executor import EXECUTOR_MODE, RUNNER_MODE_ENV
 from .fake import FakeModelSession
+from .harness.claude.agent_schedule_tools import build_agent_schedules_server
 from .harness.claude.approval import (
     build_approval_hook,
     build_approval_server,
     build_can_use_tool,
     build_memory_tools,
+    memory_tool_live_names,
 )
 from .harness.claude.attachment_access import build_attachment_tools
+from .harness.claude.learned_skill_tools import build_learned_skills_server
 from .harness.claude.platform_slack import build_channel_read_server
 from .harness.claude.preflight_blocked import PreflightBlockedSession
 from .harness.contribution import HarnessContribution
@@ -107,6 +119,15 @@ from .history import (
 )
 from .hooks import build_factory_foreground_hooks, build_gated_pre_tool_use_hooks, load_bundle_hooks
 from .issue_read import build_issue_tool, resolve_issue_read
+from .learned_skills import (
+    LEARNED_SKILLS_GUIDANCE,
+    LearnedSkillsClient,
+    MaterializedPlugin,
+    learned_skills_url,
+)
+from .learned_skills import (
+    load_for_session as load_learned_skills_for_session,
+)
 from .mcp_tool_capability import (
     ConnectorAvailability,
     ConnectorCapabilityFailure,
@@ -119,10 +140,17 @@ from .memory import MEMORY_TOKEN_ENV, MemoryStore, format_memory_preamble, resol
 from .memory_facts import (
     DEFAULT_GUIDANCE,
     WRITES_OFF_NOTICE,
-    Fact,
+    MemoryContext,
+    MemoryFactsError,
+    MemoryMalformedResponse,
+    MemoryRefused,
     MemoryTurn,
-    format_facts_preamble,
+    RenderedMemory,
+    fetch_memory_context,
+    log_boot_injection,
+    render_memory_context,
     resolve_facts_store,
+    typed_memory_url,
 )
 from .otel import RunTracer, build_tracer_provider
 from .platform_slack.capability import ChannelReadTurn, url_origin
@@ -156,6 +184,7 @@ from .sdk_auth import (
     MODEL_ENV_KEY_ENV,
     InvalidEnvKeyError,
     UnsupportedCredentialError,
+    model_endpoint_host,
     parse_env_keys,
 )
 from .server import bind_status_attestation, create_app, create_executor_app
@@ -167,7 +196,14 @@ from .state import (
 )
 from .subprocess_env import lock_process_environ
 from .tool_access import TurnToolAccess, front_can_use_tool, front_pre_tool_use_hooks
-from .tool_names import STATE_SERVER_NAME, platform_slack_tool_names
+from .tool_names import (
+    AGENT_SCHEDULE_READ_ONLY_TOOL_NAMES,
+    AGENT_SCHEDULES_SERVER_NAME,
+    LEARNED_SKILL_READ_ONLY_TOOL_NAMES,
+    LEARNED_SKILLS_SERVER_NAME,
+    STATE_SERVER_NAME,
+    platform_slack_tool_names,
+)
 from .turn_progress import (
     PROGRESS_PREAMBLE,
     TurnProgress,
@@ -656,6 +692,8 @@ def _compose_system_prompt(
     progress_preamble: str | None = None,
     facts_preamble: str | None = None,
     guidance_preamble: str | None = None,
+    schedules_preamble: str | None = None,
+    learned_skills_preamble: str | None = None,
 ) -> str | None:
     """Compose durable memory, mounted-workspace facts, bundle instructions, and model identity.
 
@@ -676,6 +714,9 @@ def _compose_system_prompt(
 
     Image tools (ADR 0216) and the remote Docker contract (ADR 0217) sit beside
     the workspace verification block, before bundle instructions.
+
+    The learned-skills guidance (ADR 0247) follows the memory guidance it is
+    contrasted with, present only when learned skills loaded.
     """
 
     model_preamble = f"Configured model: {model}" if model else None
@@ -685,6 +726,8 @@ def _compose_system_prompt(
             memory_preamble,
             facts_preamble,
             guidance_preamble,
+            schedules_preamble,
+            learned_skills_preamble,
             workspace_preamble,
             tool_manifest_preamble,
             remote_docker_preamble,
@@ -773,6 +816,8 @@ def build_runner(
     history_capacity_exceeded: bool = False,
     memory_facts_preamble: str | None = None,
     memory_guidance: str | None = None,
+    agent_schedules: AgentSchedulesConfig | None = None,
+    learned_skills: MaterializedPlugin | None = None,
 ) -> SessionRunner:
     """Wire a SessionRunner backed by the active harness's model session.
 
@@ -785,9 +830,13 @@ def build_runner(
     drive the read-only tool set and bundle compile; it defaults to the built-in
     Claude harness so existing callers are unaffected.
 
-    ``memory_facts_preamble`` is the rendered remembered-facts block and
-    ``memory_guidance`` the operator's stored guidance text (None falls back to
-    ``DEFAULT_GUIDANCE``), both loaded at boot (#1461).
+    ``memory_facts_preamble`` is the rendered standing-instruction and fact
+    index blocks and ``memory_guidance`` the selected guidance text (None falls
+    back to ``DEFAULT_GUIDANCE``), both from the boot memory context (#1461,
+    ADR 0249).
+
+    ``learned_skills`` is the session's materialized ``curie-learned`` plugin
+    (ADR 0247), None when the toggle is off or the store was unreachable.
     """
 
     # Resolve the active harness's contribution (ADR-0060): its manifest is the
@@ -862,47 +911,98 @@ def build_runner(
         )
         else None
     )
-    # The memory tools (#1461, ADR-0167) mount iff memory writes are on (the
-    # worker's explicit flag, or a bare channel ref from an older worker; see
-    # RunnerConfig.memory_writes_on, #3621), the worker set a channel memory
-    # ref AND a memory token to write with, and only on the real-model path,
-    # which is the only path that mounts platform MCP servers at all. The
-    # toolPolicy exemption below reads this same flag, so the claim matches
-    # the mount. The guidance block rides with the tools and only with them;
-    # the facts block does not, because reading memory needs no switch. With
-    # writes off, a short notice takes the guidance's place so the agent never
-    # claims to have saved anything.
+    # The memory tools (#1461, ADR-0167, ADR 0249) mount only on the real-model
+    # path, which is the only path that mounts platform MCP servers at all, and
+    # only with a memory token and the typed memory routes the worker's refs
+    # locate. ``read_memory`` mounts whenever memory is readable, writes on or
+    # off. The six mutators additionally need memory writes on (the worker's
+    # explicit flag, or a bare channel ref from an older worker; see
+    # RunnerConfig.memory_writes_on, #3621) and a channel memory ref. The
+    # toolPolicy exemption below is the exact set of names built here, so the
+    # claim matches the mount. The guidance block rides with the mutators and
+    # only with them; the memory blocks do not, because reading memory needs no
+    # switch. With writes off, a short notice takes the guidance's place so the
+    # agent never claims to have saved anything.
     memory_token = os.environ.get(MEMORY_TOKEN_ENV) or None
+    typed_memory = typed_memory_url(config.session.memory_ref, config.channel_memory_ref)
     channel_facts_store = resolve_facts_store(config.channel_memory_ref, memory_token)
     channel_memory_readable = channel_facts_store is not None and memory_token is not None
     if config.channel_memory_ref and config.memory_writes_on:
         # These point at a broken config, so they fire only when the tools
         # would otherwise have mounted.
-        if channel_facts_store is None:
-            logger.warning("memory tools not mounted: unsupported channel memory ref scheme")
+        if channel_facts_store is None or typed_memory is None:
+            logger.warning("memory tools not mounted: unsupported channel memory ref")
         if memory_token is None:
             logger.warning("memory tools not mounted: no memory token")
     elif config.channel_memory_ref and not channel_memory_readable:
         logger.info("channel facts not loaded: no memory token or unsupported ref scheme")
-    memory_tools_mounted = (
-        config.memory_writes_on
-        and channel_facts_store is not None
-        and memory_token is not None
-        and not fake_model
+    memory_readable = typed_memory is not None and memory_token is not None and not fake_model
+    memory_mutators_mounted = (
+        memory_readable and config.memory_writes_on and channel_facts_store is not None
     )
-    memory_turn = MemoryTurn() if memory_tools_mounted else None
+    # Agent schedules (ADR 0248) and learned skills (ADR 0247) mount on the
+    # real-model path only. Their tools read the author and the write
+    # credential from the same per-turn holder, so it exists whenever memory is
+    # readable or either of these sets of tools is mounted.
+    schedules_url = agent_schedules_url(os.environ.get(BootEnv.env_key("state_url"), ""))
+    schedules = (
+        agent_schedules
+        if agent_schedules is not None and not fake_model and schedules_url is not None
+        else None
+    )
+    if schedules is not None:
+        logger.info("agent schedules tools mounted session=%s", config.session.session_id)
+    learned_url = learned_skills_url(os.environ.get(BootEnv.env_key("state_url"), ""))
+    learned = (
+        learned_skills
+        if learned_skills is not None and not fake_model and learned_url is not None
+        else None
+    )
+    if learned is not None:
+        logger.info(
+            "learned skills loaded session=%s revisions=%s",
+            config.session.session_id,
+            ",".join(learned.loaded),
+        )
+    memory_turn = (
+        MemoryTurn()
+        if memory_readable or schedules is not None or learned is not None
+        else None
+    )
 
     def turn_write_token() -> str | None:
         # ADR-0188: the tools write with the turn's own credential, carried on
         # Event.memory_token into MemoryTurn and never into the env.
         return memory_turn.write_token if memory_turn is not None else None
 
+    agent_tool_store = resolve_facts_store(
+        config.session.memory_ref,
+        memory_token,
+        turn_token=turn_write_token,
+        scope="agent",
+        typed_url=typed_memory,
+    )
     channel_tool_store = resolve_facts_store(
         config.channel_memory_ref,
         memory_token,
         turn_token=turn_write_token,
-        max_facts=config.memory_max_facts,
+        scope="channel",
+        typed_url=typed_memory,
     )
+    memory_tools = (
+        build_memory_tools(
+            agent_store=agent_tool_store,
+            channel_store=channel_tool_store,
+            turn=memory_turn,
+            session_id=config.session.session_id,
+            mutators=memory_mutators_mounted,
+        )
+        if memory_readable
+        and memory_turn is not None
+        and (agent_tool_store is not None or channel_tool_store is not None)
+        else []
+    )
+    memory_tool_names = memory_tool_live_names(memory_tools)
 
     # Image tools and the remote Docker contract are boot facts, read here as
     # before #4777; only the workspace block waits for the preflight.
@@ -929,11 +1029,15 @@ def build_runner(
             facts_preamble=memory_facts_preamble,
             guidance_preamble=(
                 (memory_guidance or DEFAULT_GUIDANCE)
-                if memory_tools_mounted
+                if memory_mutators_mounted
                 else WRITES_OFF_NOTICE
                 if channel_memory_readable and not config.memory_writes_on
                 else None
             ),
+            schedules_preamble=(
+                schedules_guidance(schedules.timezone) if schedules is not None else None
+            ),
+            learned_skills_preamble=LEARNED_SKILLS_GUIDANCE if learned is not None else None,
         )
 
     # In-bundle PreToolUse guardrails declared in the manifest hooks field (#272),
@@ -1020,6 +1124,8 @@ def build_runner(
         # here rather than in build_approval_gate because only this scope holds
         # both the assembled gate and the bundle directory.
         assert_gates_not_shadowed(config.session.plugin_dir, approval_gate, resolution)
+        if learned is not None:
+            assert_gates_not_shadowed(learned.root, approval_gate)
     except ApprovalPolicyError as exc:
         # Log then re-raise, matching the module's other two fatal boot paths
         # (credential resolution, session start): a bare traceback is the one
@@ -1085,7 +1191,9 @@ def build_runner(
             repo_origin=config.repo_origin,
             repo_path=config.repo_path,
         )
-        approval_gate.memory_tools_mounted = memory_tools_mounted
+        approval_gate.memory_tool_names = memory_tool_names
+        approval_gate.agent_schedules_mounted = schedules is not None
+        approval_gate.learned_skills_mounted = learned is not None
     workspace_cwd = str(mounted_workspace) if mounted_workspace is not None else None
     derived_mcp_servers = derive_mcp_servers(
         config.session.plugin_dir,
@@ -1160,13 +1268,16 @@ def build_runner(
 
     def session_tool_access(observed: frozenset[str]) -> TurnToolAccess:
         # @spec RUNNER-TOOL-ACCESS-1: the classifier's set, built once per boot.
+        # The learned list/read tools are in the classifier's platform set.
         return TurnToolAccess(
             _readonly_tools(
                 harness,
                 observed | (frozenset({"mcp__curie__list_attachments"})
                             if attachment_turn is not None else frozenset()),
                 approval_gate,
-            ),
+            )
+            | (AGENT_SCHEDULE_READ_ONLY_TOOL_NAMES if schedules is not None else frozenset())
+            | (LEARNED_SKILL_READ_ONLY_TOOL_NAMES if learned is not None else frozenset()),
             requires_approval=(
                 approval_gate.requires_approval if approval_gate is not None else None
             ),
@@ -1278,28 +1389,26 @@ def build_runner(
                 turn_progress_tool=(
                     build_turn_progress_tool(turn_progress) if turn_progress is not None else None
                 ),
-                memory_tools=(
-                    build_memory_tools(
-                        agent_store=resolve_facts_store(
-                            config.session.memory_ref,
-                            os.environ.get(MEMORY_TOKEN_ENV),
-                            turn_token=turn_write_token,
-                            max_facts=config.memory_max_facts,
-                        ),
-                        channel_store=channel_tool_store,
-                        turn=memory_turn,
-                        session_id=config.session.session_id,
-                    )
-                    if memory_tools_mounted
-                    and channel_tool_store is not None
-                    and memory_turn is not None
-                    else ()
-                ),
+                memory_tools=memory_tools,
                 issue_tool=(build_issue_tool(*issue_read) if issue_read is not None else None),
                 attachment_tools=(
                     build_attachment_tools(attachment_access)
                     if attachment_access is not None else ()
                 ),
+            ),
+            **(
+                {
+                    AGENT_SCHEDULES_SERVER_NAME: build_agent_schedules_server(
+                        client=AgentSchedulesClient(
+                            schedules_url,
+                            os.environ.get(MEMORY_TOKEN_ENV),
+                            turn_write_token,
+                        ),
+                        turn=memory_turn,
+                    )
+                }
+                if schedules is not None and schedules_url is not None and memory_turn is not None
+                else {}
             ),
             **(
                 {STATE_SERVER_NAME: build_state_server(state_client)}
@@ -1315,6 +1424,20 @@ def build_runner(
                 if channel_read_turn is not None
                 else {}
             ),
+            **(
+                {
+                    LEARNED_SKILLS_SERVER_NAME: build_learned_skills_server(
+                        client=LearnedSkillsClient(
+                            learned_url,
+                            os.environ.get(MEMORY_TOKEN_ENV),
+                            turn_write_token,
+                        ),
+                        turn=memory_turn,
+                    )
+                }
+                if learned is not None and learned_url is not None and memory_turn is not None
+                else {}
+            ),
         }
 
         def options_for(system_prompt: str | None) -> ClaudeAgentOptions:
@@ -1327,7 +1450,10 @@ def build_runner(
                 system_prompt=system_prompt,
             )
             return build_options(
-                plugins=compiled.plugins,
+                plugins=[
+                    *compiled.plugins,
+                    *([SdkPluginConfig(type="local", path=learned.root)] if learned else []),
+                ],
                 model=config.model,
                 reviewer_model=config.reviewer_model,
                 system_prompt=system_prompt,
@@ -1353,7 +1479,11 @@ def build_runner(
                 hooks=session_hooks,
                 # Only the bundle's own skills are listed to the model (#3766,
                 # ADR-0189); the CLI's built-in skills stay hidden.
-                skills=bundle_skill_names(config.session.plugin_dir),
+                # Learned skills (ADR 0247) are the one generated plugin admitted beside it.
+                skills=[
+                    *bundle_skill_names(config.session.plugin_dir),
+                    *(learned.qualified_names if learned else []),
+                ],
                 # Platform tools and connectors share the SDK MCP channel. The
                 # generic policy pager is present only on an actionable surface;
                 # state and publication remain independent platform capabilities.
@@ -1559,76 +1689,77 @@ async def _load_memory(config: RunnerConfig) -> tuple[MemoryStore, str | None]:
     return store, format_memory_preamble(records)
 
 
-async def _load_memory_facts(config: RunnerConfig) -> tuple[str | None, str | None]:
-    """Load agent and channel facts and the operator guidance at boot (#1461).
+def _memory_context_failure(exc: Exception) -> str:
+    """A short classified reason for a degraded boot context (no bodies, no URL)."""
 
-    Returns the rendered facts block and the operator's guidance text. Each read
-    degrades on its own to nothing, like ``_load_memory``: an unreachable store
-    boots the agent without that part of its memory, never not at all.
+    if isinstance(exc, MemoryMalformedResponse):
+        return "malformed"
+    if isinstance(exc, MemoryRefused):
+        return "refused"
+    if isinstance(exc, MemoryFactsError):
+        return "unavailable"
+    return f"error:{type(exc).__name__}"
+
+
+async def _load_memory_facts(config: RunnerConfig) -> tuple[str | None, str | None]:
+    """Load the typed memory context at boot (#1461, ADR 0249).
+
+    One ``GET .../state/_memory/context`` with the session's read token returns
+    the agent-wide learning switch, the selected guidance, the standing
+    instructions and the fact title index across agent and channel memory.
+    Returns the rendered memory blocks and the guidance text to inject.
+
+    Stateless boot: any failure (unreachable, refused, malformed) degrades to no
+    memory blocks, learning off and the runner's own ``DEFAULT_GUIDANCE`` (a None
+    guidance here), never to a failed boot and never to an older broad read.
+    Either way exactly one ``memory boot injection`` record describes what this
+    returns.
     """
 
-    token = os.environ.get(MEMORY_TOKEN_ENV)
-    agent_store = resolve_facts_store(config.session.memory_ref, token)
-    channel_store = resolve_facts_store(config.channel_memory_ref, token)
-    agent_facts: list[Fact] = []
-    channel_facts: list[Fact] = []
-    guidance: str | None = None
-
-    async def read(label: str, call: Callable[[], Awaitable[Any]]) -> Any:
-        try:
-            return await call()
-        except Exception as exc:  # noqa: BLE001 - degrade to nothing, never fail boot
-            logger.warning(
-                "memory %s load failed session=%s error_class=%s: %s",
-                label,
-                config.session.session_id,
-                type(exc).__name__,
-                exc,
-            )
-            return None
-
-    async def load_agent() -> None:
-        nonlocal agent_facts
-        if agent_store is not None:
-            agent_facts = await read("agent facts", agent_store.list) or []
-
-    async def load_channel() -> None:
-        nonlocal channel_facts
-        if channel_store is not None:
-            channel_facts = await read("channel facts", channel_store.list) or []
-
-    # Channel facts load whenever there is a channel store; the guidance is
-    # about the writing tools, so it is read only when writes are on (#3621).
-    writes_on = config.memory_writes_on
-
-    async def load_guidance() -> None:
-        nonlocal guidance
-        if writes_on and agent_store is not None and channel_store is not None:
-            guidance = await read("guidance", agent_store.guidance)
-
-    async with anyio.create_task_group() as tg:
-        tg.start_soon(load_agent)
-        tg.start_soon(load_channel)
-        tg.start_soon(load_guidance)
-    # Counts and the guidance source only: never statements, authors or the
-    # guidance text. Counts are what the prompt shows, after the per-memory cap.
-    # "none" mirrors build_runner's mount rule as far as boot can see it
-    # (writes on, a channel store and a memory token).
-    if not writes_on or channel_store is None or not token:
-        guidance_source = "none"
+    session_id = config.session.session_id
+    token = os.environ.get(MEMORY_TOKEN_ENV) or None
+    typed = typed_memory_url(config.session.memory_ref, config.channel_memory_ref)
+    # The guidance is about the writing tools, so it is injected only when they
+    # can mount: writes on, a channel ref and a memory token (#3621). "none"
+    # mirrors build_runner's mount rule as far as boot can see it.
+    guidance_wanted = bool(config.memory_writes_on and config.channel_memory_ref and token)
+    context: MemoryContext | None = None
+    degraded: str | None = None
+    if typed is None:
+        degraded = "no-memory-ref"
     else:
-        guidance_source = "operator" if guidance is not None else "default"
-    logger.info(
-        "memory facts loaded session=%s agent=%d channel=%d guidance=%s",
-        config.session.session_id,
-        min(len(agent_facts), config.memory_max_facts),
-        min(len(channel_facts), config.memory_max_facts),
-        guidance_source,
+        try:
+            context = await fetch_memory_context(typed, token)
+        except Exception as exc:  # noqa: BLE001 - degrade to no memory, never fail boot
+            degraded = _memory_context_failure(exc)
+            logger.warning(
+                "memory context load failed session=%s reason=%s error_class=%s",
+                session_id,
+                degraded,
+                type(exc).__name__,
+            )
+    rendered: RenderedMemory | None = None
+    guidance: str | None = None
+    if context is not None:
+        rendered = render_memory_context(context)
+        if guidance_wanted:
+            guidance = context.guidance_text
+    if not guidance_wanted:
+        guidance_source = "none"
+    elif context is None:
+        guidance_source = "default"
+    else:
+        guidance_source = context.guidance_source
+    log_boot_injection(
+        session_id=session_id,
+        agent_wide_learning=context.agent_wide_learning if context is not None else False,
+        rendered=rendered,
+        omitted_instructions=context.omitted_instructions if context is not None else 0,
+        omitted_facts=context.omitted_facts if context is not None else 0,
+        guidance_source=guidance_source,
+        degraded=degraded,
     )
-    return (
-        format_facts_preamble(agent_facts, channel_facts, max_facts=config.memory_max_facts),
-        guidance,
-    )
+    return (rendered.text or None) if rendered is not None else None, guidance
 
 
 # Boot compaction passes (#2927): each is a compare-and-set rewrite of the value
@@ -1756,10 +1887,12 @@ class _BootFetches:
     mcp_capability: McpToolCapabilityProbe | None
     connector_failures: tuple[ConnectorCapabilityFailure, ...] = ()
     history_capacity_exceeded: bool = False
-    # Remembered facts and operator guidance (#1461); field names match the
+    # Memory blocks and guidance from the boot context (#1461, ADR 0249); field names match the
     # build_runner parameters they feed.
     memory_facts_preamble: str | None = None
     memory_guidance: str | None = None
+    agent_schedules: AgentSchedulesConfig | None = None
+    learned_skills: MaterializedPlugin | None = None
 
 
 async def _load_boot_fetches(
@@ -1775,6 +1908,8 @@ async def _load_boot_fetches(
     memory: tuple[MemoryStore, str | None] | None = None
     history: tuple[TranscriptStore, ConversationReplay, bool] | None = None
     facts: tuple[str | None, str | None] = (None, None)
+    schedules: AgentSchedulesConfig | None = None
+    learned: MaterializedPlugin | None = None
     capability: McpToolCapabilityProbe | None = None
     derived = derive_mcp_servers(
         config.session.plugin_dir,
@@ -1802,6 +1937,16 @@ async def _load_boot_fetches(
         nonlocal facts
         facts = await _load_memory_facts(config)
 
+    async def load_schedules() -> None:
+        nonlocal schedules
+        schedules = await load_schedules_for_session(os.environ, fake_model)
+
+    async def load_learned() -> None:
+        nonlocal learned
+        learned = await load_learned_skills_for_session(
+            os.environ, bundle_plugin_dir=config.session.plugin_dir, fake_model=fake_model
+        )
+
     async def probe() -> None:
         nonlocal capability
         capability = await probe_mcp_tool_capability(
@@ -1814,6 +1959,8 @@ async def _load_boot_fetches(
         tg.start_soon(load_memory)
         tg.start_soon(load_history)
         tg.start_soon(load_facts)
+        tg.start_soon(load_schedules)
+        tg.start_soon(load_learned)
         if not fake_model:
             tg.start_soon(probe)
 
@@ -1832,6 +1979,8 @@ async def _load_boot_fetches(
         history_capacity_exceeded=history[2],
         memory_facts_preamble=facts[0],
         memory_guidance=facts[1],
+        agent_schedules=schedules,
+        learned_skills=learned,
     )
 
 
@@ -1969,6 +2118,18 @@ def _serve() -> None:
         except UnsupportedCredentialError as exc:
             logger.error("credential resolution failed: %s", exc)
             raise
+    # Boot evidence of which model endpoint this session dials: the host only
+    # (never the credential, path or query) and the model id. Read from the env
+    # the harness just resolved; the fake model dials nothing.
+    endpoint_host = "none" if fake_model else model_endpoint_host(os.environ, override)
+    model_id = config.model or "default"
+    logger.info(
+        "model endpoint host=%s model=%s fake_model=%s",
+        endpoint_host,
+        model_id,
+        fake_model,
+        extra={"model_endpoint_host": endpoint_host, "model": model_id},
+    )
     fetches = anyio.run(_load_boot_fetches, config, fake_model, override)
     memory_store, memory_preamble = fetches.memory_store, fetches.memory_preamble
     history_store, conversation_replay = fetches.history_store, fetches.conversation_replay
@@ -1998,6 +2159,8 @@ def _serve() -> None:
         history_capacity_exceeded=fetches.history_capacity_exceeded,
         memory_facts_preamble=fetches.memory_facts_preamble,
         memory_guidance=fetches.memory_guidance,
+        agent_schedules=fetches.agent_schedules,
+        learned_skills=fetches.learned_skills,
     )
 
     def capture_mounted_workspace() -> WorkspaceSnapshot:

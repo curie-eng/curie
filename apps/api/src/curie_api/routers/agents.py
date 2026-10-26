@@ -400,6 +400,29 @@ async def update_agent(
     if data.memory_writes is not None:
         # Same plain-None rule as `memory`: omitted (or null) is unchanged.
         agent = await crud_agents.update_agent_memory_writes(session, agent, data.memory_writes)
+    if data.agent_wide_learning is not None:
+        # Same plain-None rule: omitted (or null) is unchanged (ADR 0249).
+        agent = await crud_agents.update_agent_wide_learning(
+            session, agent, data.agent_wide_learning
+        )
+    schedule_settings = (
+        data.agent_schedules,
+        data.schedule_timezone,
+        data.schedule_max_active,
+        data.schedule_min_interval_minutes,
+    )
+    if any(value is not None for value in schedule_settings):
+        # Same plain-None rule as `memory_writes`: omitted (or null) is unchanged.
+        agent = await crud_agents.update_agent_schedule_settings(
+            session,
+            agent,
+            enabled=data.agent_schedules,
+            timezone=data.schedule_timezone,
+            max_active=data.schedule_max_active,
+            min_interval_minutes=data.schedule_min_interval_minutes,
+        )
+    if data.learned_skills is not None:
+        agent = await crud_agents.update_agent_learned_skills(session, agent, data.learned_skills)
     if data.approval_required_tools is not None:
         # Omitted leaves the gates unchanged; an explicit [] clears them (#245).
         agent = await crud_agents.update_agent_approval_tools(

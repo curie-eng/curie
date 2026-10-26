@@ -23,6 +23,111 @@ pub(crate) use dev::*;
 pub(crate) use local::*;
 pub(crate) use skill::*;
 
+/// The agent-schedule verbs and policy setters (ADR 0248) flattened into each
+/// tier's `schedules`. They all need `--agent`, conflict with each other and
+/// with `--pause`/`--resume` through the `schedule_verb` group (`--pause` and
+/// `--resume` join it where they are declared).
+#[derive(Args, Debug, Clone, Default)]
+#[command(group = clap::ArgGroup::new("schedule_verb").multiple(false).requires("agent"))]
+pub(crate) struct AgentScheduleArgs {
+    /// Show one agent schedule (`GET /agents/{id}/schedules/{id}`).
+    #[arg(long, value_name = "ID", group = "schedule_verb")]
+    show: Option<String>,
+    /// Cancel one agent schedule.
+    #[arg(long, value_name = "ID", group = "schedule_verb")]
+    cancel: Option<String>,
+    /// List one agent schedule's revisions.
+    #[arg(long, value_name = "ID", group = "schedule_verb")]
+    history: Option<String>,
+    /// Change one agent schedule; pass at least one of --prompt, --cron,
+    /// --run-at, --timezone, and --expected-revision.
+    #[arg(
+        long,
+        value_name = "ID",
+        group = "schedule_verb",
+        requires = "expected_revision"
+    )]
+    update: Option<String>,
+    /// Restore an earlier revision of one agent schedule (omit --to-revision
+    /// to undo the last change); needs --expected-revision.
+    #[arg(
+        long,
+        value_name = "ID",
+        group = "schedule_verb",
+        requires = "expected_revision"
+    )]
+    revert: Option<String>,
+    /// New prompt for --update.
+    #[arg(long, requires = "update")]
+    prompt: Option<String>,
+    /// New cron expression for --update.
+    #[arg(long, requires = "update")]
+    cron: Option<String>,
+    /// New one-shot time (RFC 3339, or local time in the schedule zone) for --update.
+    #[arg(long, requires = "update")]
+    run_at: Option<String>,
+    /// New IANA time zone for --update.
+    #[arg(long, requires = "update")]
+    timezone: Option<String>,
+    /// Revision to restore with --revert.
+    #[arg(long, requires = "revert")]
+    to_revision: Option<u32>,
+    /// The revision the caller last saw; the change is refused if it moved.
+    #[arg(long)]
+    expected_revision: Option<u32>,
+    /// Set the agent's default schedule time zone (IANA name).
+    #[arg(long, value_name = "ZONE", group = "schedule_verb")]
+    set_timezone: Option<String>,
+    /// Set the most active schedules the agent may hold (1-100).
+    #[arg(long, value_name = "N", group = "schedule_verb", value_parser = clap::value_parser!(u32).range(1..=100))]
+    set_max_active: Option<u32>,
+    /// Set the shortest gap between fires of one schedule (1-1440 minutes).
+    #[arg(long, value_name = "MINUTES", group = "schedule_verb", value_parser = clap::value_parser!(u32).range(1..=1440))]
+    set_min_interval_minutes: Option<u32>,
+}
+
+impl AgentScheduleArgs {
+    /// The verb asked for, if any. Clap has already ensured at most one.
+    pub(crate) fn into_verb(self) -> Result<Option<commands::AgentScheduleVerb>> {
+        use commands::AgentScheduleVerb as V;
+        let verb = if let Some(id) = self.show {
+            V::Show(id)
+        } else if let Some(id) = self.cancel {
+            V::Cancel(id)
+        } else if let Some(id) = self.history {
+            V::History(id)
+        } else if let Some(id) = self.update {
+            V::Update {
+                id,
+                prompt: self.prompt,
+                cron: self.cron,
+                run_at: self.run_at,
+                timezone: self.timezone,
+                expected_revision: self.expected_revision.unwrap_or_default(),
+            }
+        } else if let Some(id) = self.revert {
+            V::Revert {
+                id,
+                to_revision: self.to_revision,
+                expected_revision: self.expected_revision.unwrap_or_default(),
+            }
+        } else if let Some(zone) = self.set_timezone {
+            V::SetTimezone(zone)
+        } else if let Some(max) = self.set_max_active {
+            V::SetMaxActive(max)
+        } else if let Some(minutes) = self.set_min_interval_minutes {
+            V::SetMinIntervalMinutes(minutes)
+        } else if self.expected_revision.is_some() {
+            return Err(curie::exit::usage(
+                "--expected-revision only applies to --update and --revert",
+            ));
+        } else {
+            return Ok(None);
+        };
+        Ok(Some(verb))
+    }
+}
+
 /// Per-tier defaults for the flags shared by the agent-target verbs. The only
 /// thing that differs between `local` and `cluster` is where the platform API
 /// listens, so that is the single const each tier supplies.
@@ -112,7 +217,8 @@ pub(crate) struct ClusterConn {
 }
 
 /// Same connection as [`ClusterConn`], but the flags are global so they parse
-/// after `cluster hook fire` or `cluster hook record` as well as on `cluster hook`.
+/// after a nested verb (`cluster hook fire`, `cluster skills <agent> list`) as
+/// well as on its group.
 #[derive(Args, Debug, Clone)]
 pub(crate) struct ClusterHookConn {
     /// Platform API base URL. Omit to self-plumb a loopback tunnel to the release API.
@@ -449,6 +555,83 @@ impl<C: clap::Args> ActionsCommand<C> {
             | ActionsCommand::Show { conn, .. }
             | ActionsCommand::Undo { conn, .. }
             | ActionsCommand::Execution { conn, .. } => conn,
+        }
+    }
+}
+
+/// `<tier> skills <agent> <verb>`: an agent's learned skills (ADR 0247),
+/// shared by `local` and `cluster`. `C` is the tier's connection flags; they
+/// are global, so they parse after the verb's own arguments too.
+#[derive(Args, Debug, Clone)]
+pub(crate) struct SkillsArgs<C: clap::Args> {
+    /// Agent name or id.
+    pub(crate) agent: String,
+    #[command(flatten)]
+    pub(crate) conn: C,
+    #[command(subcommand)]
+    pub(crate) verb: SkillsCommand,
+}
+
+/// [`LocalObservabilityConn`] with global flags, for the `local skills` verbs.
+#[derive(Args, Debug, Clone)]
+pub(crate) struct LocalGlobalConn {
+    /// Platform API base URL.
+    #[arg(
+        long,
+        default_value = message::DEFAULT_LOCAL_API_URL,
+        env = "CURIE_API_URL",
+        global = true
+    )]
+    pub(crate) api_url: String,
+    /// Platform API key.
+    #[arg(long, default_value = message::DEFAULT_API_KEY, env = "CURIE_API_KEY", hide_env_values = true, value_parser = message::api_key_or_default, global = true)]
+    pub(crate) api_key: String,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum SkillsCommand {
+    /// List the agent's active learned skills.
+    List,
+    /// Print one skill (id or slug), deleted ones included.
+    Show { skill: String },
+    /// Unified diff of a skill's SKILL.md between two revisions
+    /// (default: the head against the revision before it).
+    Diff {
+        skill: String,
+        #[arg(long, value_name = "N")]
+        from: Option<u32>,
+        #[arg(long, value_name = "M")]
+        to: Option<u32>,
+    },
+    /// List every revision of a skill, oldest first.
+    History { skill: String },
+    /// Undo a skill's last change, or restore revision N with --to. Works on
+    /// a deleted skill, so it also undoes a delete.
+    Revert {
+        skill: String,
+        #[arg(long, value_name = "N")]
+        to: Option<u32>,
+    },
+    /// Delete a skill. Its history stays, and `revert` brings it back.
+    Delete { skill: String },
+    /// Write every active skill to <DIR>/skills/<slug>/SKILL.md.
+    Export {
+        #[arg(long, value_name = "DIR", default_value = ".")]
+        out: std::path::PathBuf,
+    },
+}
+
+impl From<SkillsCommand> for commands::SkillsVerb {
+    fn from(verb: SkillsCommand) -> Self {
+        use commands::SkillsVerb as V;
+        match verb {
+            SkillsCommand::List => V::List,
+            SkillsCommand::Show { skill } => V::Show { skill },
+            SkillsCommand::Diff { skill, from, to } => V::Diff { skill, from, to },
+            SkillsCommand::History { skill } => V::History { skill },
+            SkillsCommand::Revert { skill, to } => V::Revert { skill, to },
+            SkillsCommand::Delete { skill } => V::Delete { skill },
+            SkillsCommand::Export { out } => V::Export { out },
         }
     }
 }
@@ -1715,6 +1898,79 @@ pub(crate) struct EvalSamplingArgs {
 impl EvalSamplingArgs {
     pub(crate) fn config(self) -> anyhow::Result<curie::eval_sampling::SampleConfig> {
         curie::eval_sampling::SampleConfig::new(self.samples, self.aggregation, self.pass_at_k)
+    }
+}
+
+/// The reversible memory lifecycle flags shared by `local memory` and
+/// `cluster memory` (ADR 0249). Each acts on one canonical entry, in agent
+/// memory or the `--channel` selected binding, and none combines with add,
+/// delete, a guidance flag, or another lifecycle flag. None takes an expected
+/// version from argv: every mutation reads the current one first.
+#[derive(clap::Args, Debug, Default, Clone)]
+pub(crate) struct MemoryLifecycleArgs {
+    /// Archive this entry so boot no longer loads it; it stays readable and
+    /// restorable (`POST /agents/{id}/state/_memory/archive`).
+    #[arg(
+        long,
+        value_name = "FACT_ID",
+        conflicts_with_all = ["add", "delete", "guidance", "guidance_from", "reset_guidance", "restore", "revert", "history"]
+    )]
+    pub(crate) archive: Option<String>,
+    /// Restore this archived entry (`POST /agents/{id}/state/_memory/restore`).
+    #[arg(
+        long,
+        value_name = "FACT_ID",
+        conflicts_with_all = ["add", "delete", "guidance", "guidance_from", "reset_guidance", "archive", "revert", "history"]
+    )]
+    pub(crate) restore: Option<String>,
+    /// Revert this entry to the revision named by --to-version as a new
+    /// version (`POST /agents/{id}/state/_memory/revert`).
+    #[arg(
+        long,
+        value_name = "FACT_ID",
+        requires = "to_version",
+        conflicts_with_all = ["add", "delete", "guidance", "guidance_from", "reset_guidance", "archive", "restore", "history"]
+    )]
+    pub(crate) revert: Option<String>,
+    /// The revision --revert restores; 0 removes the entry, as before it was
+    /// created. Clap treats a requirement as met when a conflicting flag is
+    /// present, so the conflicts are listed here too: `--archive X
+    /// --to-version 1` is refused rather than silently ignoring the version.
+    #[arg(
+        long,
+        value_name = "N",
+        requires = "revert",
+        conflicts_with_all = ["add", "delete", "guidance", "guidance_from", "reset_guidance", "archive", "restore", "history"]
+    )]
+    pub(crate) to_version: Option<u64>,
+    /// Show this entry with its newest revisions
+    /// (`GET /agents/{id}/state/_memory/entries/{fact_id}`).
+    #[arg(
+        long,
+        value_name = "FACT_ID",
+        conflicts_with_all = ["add", "delete", "guidance", "guidance_from", "reset_guidance", "archive", "restore", "revert"]
+    )]
+    pub(crate) history: Option<String>,
+}
+
+impl MemoryLifecycleArgs {
+    /// The one lifecycle operation asked for, or `None` for the other memory
+    /// operations. Clap has already refused a combination.
+    pub(crate) fn action(&self) -> Option<commands::MemoryLifecycleAction> {
+        if let Some(id) = &self.archive {
+            Some(commands::MemoryLifecycleAction::Archive(id.clone()))
+        } else if let Some(id) = &self.restore {
+            Some(commands::MemoryLifecycleAction::Restore(id.clone()))
+        } else if let (Some(id), Some(to_version)) = (&self.revert, self.to_version) {
+            Some(commands::MemoryLifecycleAction::Revert {
+                id: id.clone(),
+                to_version,
+            })
+        } else {
+            self.history
+                .as_ref()
+                .map(|id| commands::MemoryLifecycleAction::History(id.clone()))
+        }
     }
 }
 

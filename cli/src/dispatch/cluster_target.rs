@@ -146,6 +146,10 @@ pub(crate) fn cluster_action_target(action: &ClusterAction) -> (Option<&str>, Op
             let conn = verb.conn();
             (Some(conn.namespace.as_str()), Some(conn.release.as_str()))
         }
+        ClusterAction::Skills(args) => (
+            Some(args.conn.namespace.as_str()),
+            Some(args.conn.release.as_str()),
+        ),
         ClusterAction::RemediationPolicy { verb } => {
             let conn = verb.conn();
             (Some(conn.namespace.as_str()), Some(conn.release.as_str()))
@@ -298,6 +302,10 @@ pub(crate) fn retarget_cluster_action(
             let conn = verb.conn_mut();
             replace(&mut conn.namespace, &namespace);
             replace(&mut conn.release, &release);
+        }
+        ClusterAction::Skills(args) => {
+            replace(&mut args.conn.namespace, &namespace);
+            replace(&mut args.conn.release, &release);
         }
         ClusterAction::RemediationPolicy { verb } => {
             let conn = verb.conn_mut();

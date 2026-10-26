@@ -904,8 +904,40 @@
       ],
       "revision": "0131",
       "sha256": "7aac1845a091e64c072dcd249f79d0619fa444ca4181ffcd320e9cd4523dd159"
+    },
+    {
+      "kind": "expand",
+      "parents": [
+        "selfimp_sched_0001"
+      ],
+      "revision": "selfimp_memory_0001",
+      "sha256": "7bb16633878d44de9510649dbc0d805a6f5dbe5434a3500011ce38175ceeaa4a"
+    },
+    {
+      "kind": "expand",
+      "parents": [
+        "0131"
+      ],
+      "revision": "selfimp_safety_0001",
+      "sha256": "54a8d9f04872d269f53c7f8bf64283d4c1469440510354285a87cd3271bf3c86"
+    },
+    {
+      "kind": "expand",
+      "parents": [
+        "selfimp_skills_0001"
+      ],
+      "revision": "selfimp_sched_0001",
+      "sha256": "817e178ee8f8fe94bfe77a2000876dcc1eed40d10f373c37e8176e631eca86ec"
+    },
+    {
+      "kind": "expand",
+      "parents": [
+        "selfimp_safety_0001"
+      ],
+      "revision": "selfimp_skills_0001",
+      "sha256": "e7d62c25a418c914e22ba3da288edf8b4a35e0113fa01eb53f5ed7c1b60966d6"
     }
   ],
-  "schema_head": "0131",
-  "schema_min": "0131"
+  "schema_head": "selfimp_memory_0001",
+  "schema_min": "selfimp_memory_0001"
 }

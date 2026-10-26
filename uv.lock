@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.13"
 resolution-markers = [
     "python_full_version >= '3.15'",
@@ -764,6 +764,7 @@ dependencies = [
     { name = "asyncpg" },
     { name = "boto3" },
     { name = "boto3-stubs", extra = ["s3"] },
+    { name = "cronsim" },
     { name = "curie-channel-protocol" },
     { name = "curie-internal" },
     { name = "curie-protected-hooks" },
@@ -790,6 +791,7 @@ requires-dist = [
     { name = "asyncpg", specifier = ">=0.30" },
     { name = "boto3", specifier = ">=1.43.55" },
     { name = "boto3-stubs", extras = ["s3"], specifier = ">=1.43.57" },
+    { name = "cronsim", specifier = "==2.7" },
     { name = "curie-channel-protocol", editable = "packages/channel-protocol" },
     { name = "curie-internal", editable = "packages/curie-internal" },
     { name = "curie-protected-hooks", editable = "packages/protected-hooks" },

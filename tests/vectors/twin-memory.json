@@ -1,0 +1,132 @@
+{
+  "description": "ADR 0249 twin memory wire shapes (Contract r4). Example payloads for the typed memory routes under /agents/{agent_id}/state/_memory: GET /context returns memory_context_out, GET /entries/{fact_id} and POST /revert return memory_detail_out, GET /search returns memory_search_out, POST /archive and POST /restore return memory_record_out. apps/api/tests/test_twin_memory.py pins the key sets of each object here, recursively, to what the real API produces. Every identifier and value is a synthetic placeholder.",
+  "memory_record_out": {
+    "id": "fact-00000000000000000000000000000002",
+    "scope": "channel",
+    "kind": "fact",
+    "title": "Deploy window",
+    "statement": "The deploy window is Tuesday afternoon.",
+    "author": "U0EXAMPLE02",
+    "stated_at": "2026-10-20T12:05:00Z",
+    "conversation": "slack:C0EXAMPLE1:1700000000.000002",
+    "archived": true,
+    "version": 3,
+    "updated_at": "2026-10-20T12:06:00Z"
+  },
+  "memory_context_out": {
+    "agent_wide_learning": true,
+    "memory_writes": true,
+    "guidance": {
+      "text": "Example memory guidance text.",
+      "source": "learning_default"
+    },
+    "instructions": [
+      {
+        "id": "fact-00000000000000000000000000000001",
+        "scope": "agent",
+        "kind": "instruction",
+        "title": "Sign replies",
+        "statement": "End every reply with the signature: Example Team.",
+        "author": "U0EXAMPLE01",
+        "stated_at": "2026-10-20T12:00:00Z",
+        "conversation": "slack:C0EXAMPLE1:1700000000.000001",
+        "archived": false,
+        "version": 1,
+        "updated_at": "2026-10-20T12:00:00Z"
+      }
+    ],
+    "index": [
+      {
+        "id": "fact-00000000000000000000000000000003",
+        "scope": "agent",
+        "title": "Vendor contract approver",
+        "version": 2
+      }
+    ],
+    "totals": {
+      "instructions": 1,
+      "facts": 1,
+      "archived": 1
+    },
+    "omitted": {
+      "instructions": 0,
+      "facts": 0
+    }
+  },
+  "memory_detail_out": {
+    "entry": {
+      "id": "fact-00000000000000000000000000000003",
+      "scope": "agent",
+      "kind": "fact",
+      "title": "Vendor contract approver",
+      "statement": "Sam approves vendor contracts.",
+      "author": "U0EXAMPLE02",
+      "stated_at": "2026-10-20T12:10:00Z",
+      "conversation": "slack:C0EXAMPLE1:1700000000.000003",
+      "archived": false,
+      "version": 2,
+      "updated_at": "2026-10-20T12:10:00Z"
+    },
+    "deleted": false,
+    "version": 2,
+    "history": [
+      {
+        "version": 2,
+        "operation": "update",
+        "actor": "U0EXAMPLE02",
+        "source": "sandbox",
+        "conversation": "slack:C0EXAMPLE1:1700000000.000003",
+        "created_at": "2026-10-20T12:10:00Z",
+        "reverted_to_version": null,
+        "snapshot": {
+          "kind": "fact",
+          "title": "Vendor contract approver",
+          "statement": "Sam approves vendor contracts.",
+          "author": "U0EXAMPLE02",
+          "stated_at": "2026-10-20T12:10:00Z",
+          "session_id": "sess-example-2",
+          "conversation": "slack:C0EXAMPLE1:1700000000.000003",
+          "archived": false
+        }
+      },
+      {
+        "version": 1,
+        "operation": "create",
+        "actor": "U0EXAMPLE01",
+        "source": "sandbox",
+        "conversation": "slack:C0EXAMPLE1:1700000000.000001",
+        "created_at": "2026-10-20T12:01:00Z",
+        "reverted_to_version": null,
+        "snapshot": {
+          "kind": "fact",
+          "title": "Vendor contract approver",
+          "statement": "Alex approves vendor contracts.",
+          "author": "U0EXAMPLE01",
+          "stated_at": "2026-10-20T12:01:00Z",
+          "session_id": "sess-example-1",
+          "conversation": "slack:C0EXAMPLE1:1700000000.000001",
+          "archived": false
+        }
+      }
+    ],
+    "history_before": null
+  },
+  "memory_search_out": {
+    "entries": [
+      {
+        "id": "fact-00000000000000000000000000000003",
+        "scope": "agent",
+        "kind": "fact",
+        "title": "Vendor contract approver",
+        "statement": "Sam approves vendor contracts.",
+        "author": "U0EXAMPLE02",
+        "stated_at": "2026-10-20T12:10:00Z",
+        "conversation": "slack:C0EXAMPLE1:1700000000.000003",
+        "archived": false,
+        "version": 2,
+        "updated_at": "2026-10-20T12:10:00Z"
+      }
+    ],
+    "next_cursor": null
+  }
+}

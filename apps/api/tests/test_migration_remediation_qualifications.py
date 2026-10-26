@@ -73,7 +73,9 @@ def test_one_hand_written_revision_on_the_assumed_parent() -> None:
     """@spec AUTOMATED-REMEDIATION-22: one revision, ``HEAD`` on ``BELOW``; task 12's
     ``0095`` (remediation escalations) and task 16's ``0096`` (the tune
     refusal) are above it; ``0097`` (receipts) and ``0098`` (driver audit) follow it.
-    Agent access policies (``0121``), above the train merge, are the single head.
+    The twin memory expand (``selfimp_memory_0001``), after next's revisions
+    through the ``0131`` merge, schedule safety, learned skills
+    (``selfimp_skills_0001``) and agent schedules, is the single head.
     """
 
     revision, down = _revision()

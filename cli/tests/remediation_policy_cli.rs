@@ -97,7 +97,7 @@ fn base_document() -> Value {
 
 fn agent_json() -> String {
     format!(
-        r#"{{"id":"{AGENT_ID}","name":"{AGENT_NAME}","channels":[],"created_at":"2026-10-01T00:00:00Z","memory":false}}"#
+        r#"{{"id":"{AGENT_ID}","name":"{AGENT_NAME}","channels":[],"created_at":"2026-10-01T00:00:00Z","memory":false,"agent_wide_learning":false}}"#
     )
 }
 

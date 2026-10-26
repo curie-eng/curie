@@ -29,6 +29,8 @@ dependencies = [
     "curie-telemetry",
     "curie-telemetry-schema",
     "curie-upgrade-pause",
+    # Agent-created schedules read cron like the worker cron loop (ADR 0248).
+    "cronsim==2.7",
 ]
 
 [build-system]

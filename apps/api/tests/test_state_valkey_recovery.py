@@ -371,8 +371,16 @@ class _Recovery:
         self.path = ""
         self.primary: _Credential
         self.facts = {
-            "fact-" + "a" * 32: {"statement": "the release window is Tuesday"},
-            "fact-" + "b" * 32: {"statement": "retain the audit record"},
+            "fact-" + "a" * 32: {
+                "kind": "fact",
+                "title": "Release window",
+                "statement": "the release window is Tuesday",
+            },
+            "fact-" + "b" * 32: {
+                "kind": "fact",
+                "title": "Audit record",
+                "statement": "retain the audit record",
+            },
         }
         self.secrets: list[str] = []
         self.control_tasks: set[asyncio.Task[httpx.Response]] = set()
@@ -585,7 +593,12 @@ def _facts(response: httpx.Response, harness: _Recovery) -> None:
     assert response.status_code == 200, response.text
     entries = response.json()
     assert len(entries) == len(harness.facts)
-    assert {entry["key"]: entry["value"] for entry in entries} == harness.facts
+    # Memory facts are canonical typed records (ADR 0249): the server adds
+    # author, stated_at and the like, so compare only the fields the seed wrote.
+    assert {
+        entry["key"]: {name: entry["value"].get(name) for name in harness.facts[entry["key"]]}
+        for entry in entries
+    } == harness.facts
     assert all(entry["namespace"] == "memory" and entry["version"] == 1 for entry in entries)
 
 

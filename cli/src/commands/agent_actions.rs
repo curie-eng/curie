@@ -765,19 +765,32 @@ impl MemoryChannel {
     }
 }
 
-/// An individual fact with the attribution stored by its producer.
+/// An individual canonical memory entry with the attribution stored by its
+/// producer (ADR 0249): its kind (`fact` or `instruction`), title, the
+/// conversation it was set in (null when unknown), whether it is archived, and
+/// the head version every lifecycle write is checked against.
 #[derive(Debug, Clone, Serialize)]
 pub struct MemoryFact {
     pub id: String,
     pub scope: String,
     pub channel: Option<MemoryChannel>,
+    pub kind: String,
+    pub title: String,
     pub statement: String,
-    pub author: String,
-    pub stated_at: String,
+    /// Null when the stored fact never recorded who stated it.
+    pub author: Option<String>,
+    /// Null when the stored fact never recorded when it was stated.
+    pub stated_at: Option<String>,
+    pub conversation: Option<String>,
+    pub archived: bool,
+    pub version: u64,
 }
 
 /// Output of `<tier> memory <agent>`: a plan, log and fact listing, deletion,
-/// or an operator seeded add. Owns its data so it outlives the `ApiClient`.
+/// an operator seeded add, an archived or restored entry (`Record`, shaped as
+/// `MemoryRecordOut`), or an entry with its revisions after `--history` or
+/// `--revert` (`Detail`, shaped as `MemoryDetailOut`). Owns its data so it
+/// outlives the `ApiClient`.
 #[derive(Debug)]
 pub enum MemoryOutput {
     DryRun(crate::ui::DryRunPlan),
@@ -800,6 +813,8 @@ pub enum MemoryOutput {
         fresh_session_required: bool,
         message_verb: String,
     },
+    Record(crate::api::MemoryRecord),
+    Detail(crate::api::MemoryDetail),
 }
 
 impl crate::ui::CliOutput for MemoryOutput {
@@ -844,6 +859,14 @@ impl crate::ui::CliOutput for MemoryOutput {
                 "fresh_session_required": fresh_session_required,
                 "next_command": memory_add_next_command(message_verb),
             }),
+            // Delegated wholesale to the API mirror's Serialize, so no field
+            // can be dropped by hand-picking keys.
+            MemoryOutput::Record(head) => {
+                serde_json::to_value(head).expect("a memory record always serializes")
+            }
+            MemoryOutput::Detail(entry) => {
+                serde_json::to_value(entry).expect("a memory detail always serializes")
+            }
         }
     }
 
@@ -869,10 +892,22 @@ impl crate::ui::CliOutput for MemoryOutput {
                 }
                 for fact in facts {
                     let scope = memory_scope_label(fact.channel.as_ref());
-                    let date = fact.stated_at.split('T').next().unwrap_or(&fact.stated_at);
+                    let author = fact.author.as_deref().unwrap_or("author unknown");
+                    let date = fact
+                        .stated_at
+                        .as_deref()
+                        .map(|at| at.split('T').next().unwrap_or(at))
+                        .unwrap_or("an unrecorded date");
+                    let marker = if fact.archived { ", archived" } else { "" };
                     ui.payload(&format!(
-                        "{} ({scope}): {} on {date} stated: {}",
-                        fact.id, fact.author, fact.statement
+                        "{} ({scope}) {}{marker} v{} {:?}: {} on {date} in {} stated: {}",
+                        fact.id,
+                        fact.kind,
+                        fact.version,
+                        fact.title,
+                        author,
+                        memory_conversation_label(fact.conversation.as_deref()),
+                        fact.statement
                     ));
                 }
             }
@@ -899,7 +934,77 @@ impl crate::ui::CliOutput for MemoryOutput {
                     ui.payload(&memory_add_fresh_session_line(message_verb));
                 }
             }
+            MemoryOutput::Record(record) => {
+                let state = if record.archived {
+                    "archived"
+                } else {
+                    "active"
+                };
+                ui.payload(&format!(
+                    "{} ({}) {} is {state} at version {}",
+                    record.id, record.scope, record.kind, record.version
+                ));
+                ui.payload(memory_change_fresh_session_line());
+            }
+            MemoryOutput::Detail(detail) => {
+                match &detail.entry {
+                    Some(entry) => {
+                        let state = if entry.archived { ", archived" } else { "" };
+                        ui.payload(&format!(
+                            "{} ({}) {}{state} at version {} {:?}: {} on {} in {} stated: {}",
+                            entry.id,
+                            entry.scope,
+                            entry.kind,
+                            entry.version,
+                            entry.title,
+                            entry.author.as_deref().unwrap_or("an unrecorded author"),
+                            entry.stated_at.as_deref().unwrap_or("an unrecorded time"),
+                            memory_conversation_label(entry.conversation.as_deref()),
+                            entry.statement
+                        ));
+                    }
+                    None => ui.payload(&format!(
+                        "the entry is deleted; its latest revision is version {}",
+                        detail.version
+                    )),
+                }
+                for revision in &detail.history {
+                    let reverted = revision
+                        .reverted_to_version
+                        .map(|to| format!(" to version {to}"))
+                        .unwrap_or_default();
+                    ui.kv(
+                        &format!("v{}", revision.version),
+                        &format!(
+                            "{}{reverted} by {} ({}) at {} in {}",
+                            revision.operation,
+                            revision.actor,
+                            revision.source,
+                            revision.created_at,
+                            memory_conversation_label(revision.conversation.as_deref())
+                        ),
+                    );
+                }
+                if let Some(before) = detail.history_before {
+                    ui.payload(&format!("older revisions exist before version {before}"));
+                }
+            }
         }
+    }
+}
+
+/// A lifecycle change reaches the model only through a new session's boot
+/// memory: a warm thread already holds the earlier context.
+fn memory_change_fresh_session_line() -> &'static str {
+    "A fresh session is required before boot memory reflects this change."
+}
+
+/// The conversation an entry or revision was set in, or that it is unknown
+/// (an operator write, or an entry that predates recorded conversations).
+fn memory_conversation_label(conversation: Option<&str>) -> String {
+    match conversation {
+        Some(conversation) => format!("conversation {conversation}"),
+        None => "an unrecorded conversation".to_string(),
     }
 }
 
@@ -987,13 +1092,51 @@ async fn read_memory_facts(
                         )
                     })
             };
+            let malformed = |name: &str, expected: &str| {
+                anyhow::anyhow!(
+                    "memory fact {} in {} memory has malformed {name}: expected {expected}",
+                    row.key,
+                    memory_scope_label(channel)
+                )
+            };
+            let kind = field("kind")?;
+            if kind != "fact" && kind != "instruction" {
+                return Err(malformed("kind", "fact or instruction"));
+            }
+            let archived = row
+                .value
+                .get("archived")
+                .and_then(serde_json::Value::as_bool)
+                .ok_or_else(|| malformed("archived", "a stored boolean"))?;
+            // Provenance a historical fact never recorded stays explicitly
+            // unknown (null); the migration does not invent it. A value that is
+            // present must still be a nonempty string.
+            let provenance = |name: &str| -> Result<Option<String>> {
+                match row.value.get(name) {
+                    None | Some(serde_json::Value::Null) => Ok(None),
+                    Some(serde_json::Value::String(value)) if !value.trim().is_empty() => {
+                        Ok(Some(value.clone()))
+                    }
+                    _ => Err(malformed(name, "a nonempty stored string or null")),
+                }
+            };
+            let conversation = match row.value.get("conversation") {
+                Some(serde_json::Value::Null) => None,
+                Some(serde_json::Value::String(conversation)) => Some(conversation.clone()),
+                _ => return Err(malformed("conversation", "a stored string or null")),
+            };
             Ok(MemoryFact {
                 id: row.key.clone(),
                 scope: if channel.is_some() { "channel" } else { "agent" }.to_string(),
                 channel: channel.cloned(),
+                kind,
+                title: field("title")?,
                 statement: field("statement")?,
-                author: field("author")?,
-                stated_at: field("stated_at")?,
+                author: provenance("author")?,
+                stated_at: provenance("stated_at")?,
+                conversation,
+                archived,
+                version: row.version,
             })
         })
         .collect()
@@ -1105,6 +1248,149 @@ pub async fn memory_delete(
         .to_string(),
         channel,
     })
+}
+
+/// Which reversible lifecycle operation `<tier> memory <agent>` was asked for
+/// (ADR 0249). Each names one canonical entry by its immutable id.
+#[derive(Debug, Clone)]
+pub enum MemoryLifecycleAction {
+    /// `--archive FACT_ID`: stop boot loading the entry, keeping it readable.
+    Archive(String),
+    /// `--restore FACT_ID`: make an archived entry eligible for boot again.
+    Restore(String),
+    /// `--revert FACT_ID --to-version N`: restore revision N as a new version,
+    /// or remove the head when N is 0.
+    Revert { id: String, to_version: u64 },
+    /// `--history FACT_ID`: read the entry and its newest revisions.
+    History(String),
+}
+
+impl MemoryLifecycleAction {
+    fn id(&self) -> &str {
+        match self {
+            MemoryLifecycleAction::Archive(id)
+            | MemoryLifecycleAction::Restore(id)
+            | MemoryLifecycleAction::Revert { id, .. }
+            | MemoryLifecycleAction::History(id) => id,
+        }
+    }
+
+    /// The typed route a mutation posts to; `None` for the read-only history.
+    fn route(&self) -> Option<&'static str> {
+        match self {
+            MemoryLifecycleAction::Archive(_) => Some("archive"),
+            MemoryLifecycleAction::Restore(_) => Some("restore"),
+            MemoryLifecycleAction::Revert { .. } => Some("revert"),
+            MemoryLifecycleAction::History(_) => None,
+        }
+    }
+}
+
+fn require_memory_fact_id(id: &str) -> Result<()> {
+    if is_memory_fact_id(id) {
+        return Ok(());
+    }
+    Err(crate::exit::usage(
+        "fact id must be fact- followed by exactly 32 lowercase hexadecimal characters",
+    ))
+}
+
+/// The typed detail route for the dry-run plan, with the agent id left as a
+/// placeholder.
+fn memory_entry_plan_url(
+    api_url: &str,
+    scope: crate::api::MemoryScope<'_>,
+    id: &str,
+) -> Result<String> {
+    let url = crate::api::memory_entry_url(api_url, "<id>", scope, id)?;
+    Ok(url
+        .as_str()
+        .replacen("/agents/%3Cid%3E/state", "/agents/<id>/state", 1))
+}
+
+/// `<tier> memory <agent> --archive|--restore|--revert|--history FACT_ID`.
+///
+/// The id and channel are validated before any request. A mutation first reads
+/// the entry through the typed detail route and sends that version as
+/// `expected_version`; the CLI never takes a version from argv. A 409 means the
+/// entry moved after that read: it is reported as a stale version and never
+/// retried. `--dry-run` plans the read and the write and sends nothing.
+pub async fn memory_lifecycle(
+    opts: AgentActionOpts,
+    action: MemoryLifecycleAction,
+    channel: Option<String>,
+) -> Result<MemoryOutput> {
+    require_memory_fact_id(action.id())?;
+    let channel = memory_channel(channel)?;
+    let scope = crate::api::MemoryScope::of(channel.as_ref().map(MemoryChannel::pair));
+    let id = action.id().to_string();
+    if opts.dry_run {
+        let read = memory_entry_plan_url(&opts.api_url, scope, &id)?;
+        let mut lines = vec![format!(
+            "GET {read}  (would resolve agent {:?} and verify any selected bound channel first)",
+            opts.agent
+        )];
+        if let Some(route) = action.route() {
+            let mut fields = vec![format!("scope={}", scope.name()), format!("id={id}")];
+            if let Some((kind, address)) = scope.channel() {
+                fields.push(format!("channel_kind={kind:?}"));
+                fields.push(format!("channel_address={address:?}"));
+            }
+            if let MemoryLifecycleAction::Revert { to_version, .. } = &action {
+                fields.push(format!("to_version={to_version}"));
+            }
+            fields.push("expected_version=<current-version>".to_string());
+            let body = fields.join(" ");
+            lines.push(format!(
+                "POST {}/agents/<id>/state/_memory/{route}  body {body}  (using the version from that GET)",
+                opts.api_url.trim_end_matches('/')
+            ));
+        }
+        return Ok(MemoryOutput::DryRun(crate::ui::DryRunPlan { lines }));
+    }
+    let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
+    let agent = client.find_agent(&opts.agent).await?;
+    if let Some(channel) = &channel {
+        require_memory_channel(&agent, channel)?;
+    }
+    let detail = client.get_memory_entry(&agent.id, scope, &id).await?;
+    let (channel_kind, channel_address) = match scope.channel() {
+        Some((kind, address)) => (Some(kind.to_string()), Some(address.to_string())),
+        None => (None, None),
+    };
+    let lifecycle = |id: String| crate::api_requests::MemoryLifecycleIn {
+        channel_address: channel_address.clone(),
+        channel_kind: channel_kind.clone(),
+        expected_version: detail.version,
+        id,
+        scope: scope.name().to_string(),
+    };
+    match action {
+        MemoryLifecycleAction::History(_) => Ok(MemoryOutput::Detail(detail)),
+        MemoryLifecycleAction::Archive(id) => Ok(MemoryOutput::Record(
+            client
+                .archive_memory_entry(&agent.id, &lifecycle(id))
+                .await?,
+        )),
+        MemoryLifecycleAction::Restore(id) => Ok(MemoryOutput::Record(
+            client
+                .restore_memory_entry(&agent.id, &lifecycle(id))
+                .await?,
+        )),
+        MemoryLifecycleAction::Revert { id, to_version } => {
+            let body = crate::api_requests::MemoryRevertIn {
+                channel_address: channel_address.clone(),
+                channel_kind: channel_kind.clone(),
+                expected_version: detail.version,
+                id,
+                scope: scope.name().to_string(),
+                to_version,
+            };
+            Ok(MemoryOutput::Detail(
+                client.revert_memory_entry(&agent.id, &body).await?,
+            ))
+        }
+    }
 }
 
 /// `<tier> memory <agent> --add <content>`: append an operator-authored record.

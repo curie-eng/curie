@@ -2641,6 +2641,7 @@ mod tests {
             "id": "agent-1",
             "name": "acme-second",
             "memory": false,
+            "agent_wide_learning": false,
             "channels": [{"kind": kind, "address": address, "trigger_label": label}],
         }))
         .unwrap()

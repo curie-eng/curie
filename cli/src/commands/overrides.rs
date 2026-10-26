@@ -253,6 +253,8 @@ fn patch_body_json(body: &AgentUpdate) -> Result<serde_json::Value> {
 ///   execution_deadline_seconds: the stored deadline override, same convention.
 ///   runner_resources: the stored runner resources override, same convention.
 ///   memory_writes: whether the agent's memory tools are on (#1461).
+///   agent_wide_learning: whether the agent opted in to agent-wide learning (ADR 0249).
+///   learned_skills: whether the agent's learned skills are on (ADR 0247).
 ///   changed: whether this invocation wrote, as opposed to inspecting.
 ///
 /// Returns:
@@ -266,6 +268,8 @@ pub fn overrides_summary(
     execution_deadline_seconds: &Option<u32>,
     runner_resources: &Option<serde_json::Value>,
     memory_writes: bool,
+    agent_wide_learning: bool,
+    learned_skills: bool,
     changed: bool,
 ) -> String {
     let show = |v: &Option<String>| v.clone().unwrap_or_else(|| "platform default".to_string());
@@ -281,8 +285,10 @@ pub fn overrides_summary(
     // onto the colon instead of leaving a gap where a word used to be.
     let verb = if changed { " now" } else { "" };
     let writes = if memory_writes { "on" } else { "off" };
+    let learning = if agent_wide_learning { "on" } else { "off" };
+    let skills = if learned_skills { "on" } else { "off" };
     format!(
-        "overrides for {agent}{verb}: model {}, reviewer model {reviewer}, thinking {}, execution deadline {deadline}, runner resources {resources}, memory writes {writes}",
+        "overrides for {agent}{verb}: model {}, reviewer model {reviewer}, thinking {}, execution deadline {deadline}, runner resources {resources}, memory writes {writes}, agent-wide learning {learning}, learned skills {skills}",
         show(model),
         show(thinking)
     )
@@ -297,7 +303,10 @@ pub fn overrides_summary(
 /// distinguishes an inspect from a write, so an agent consumer can tell "this
 /// is what it is" from "this is what it now is" without diffing.
 /// `memory_writes` is the agent's NOT NULL memory-tools switch (#1461), so it
-/// is always a boolean, never null.
+/// is always a boolean, never null. `agent_wide_learning` is the independent
+/// NOT NULL learning opt-in (ADR 0249), reported the same way, and
+/// `learned_skills` is the agent's NOT NULL learned-skills switch (ADR 0247),
+/// likewise always a boolean.
 #[derive(Debug)]
 pub enum OverridesOutput {
     DryRun(crate::ui::DryRunPlan),
@@ -309,6 +318,8 @@ pub enum OverridesOutput {
         execution_deadline_seconds: Option<u32>,
         runner_resources: Option<serde_json::Value>,
         memory_writes: bool,
+        agent_wide_learning: bool,
+        learned_skills: bool,
         changed: bool,
     },
 }
@@ -325,6 +336,10 @@ impl crate::ui::CliOutput for OverridesOutput {
                 execution_deadline_seconds,
                 runner_resources,
                 memory_writes,
+                agent_wide_learning,
+                // Not shorthand: emit parity follows a bare `learned_skills`
+                // into the same-named skills verb, whose keys are not these.
+                learned_skills: skills_on,
                 changed,
             } => serde_json::json!({
                 "agent": agent,
@@ -334,6 +349,8 @@ impl crate::ui::CliOutput for OverridesOutput {
                 "execution_deadline_seconds": execution_deadline_seconds,
                 "runner_resources": runner_resources,
                 "memory_writes": memory_writes,
+                "agent_wide_learning": agent_wide_learning,
+                "learned_skills": skills_on,
                 "changed": changed,
             }),
         }
@@ -350,6 +367,8 @@ impl crate::ui::CliOutput for OverridesOutput {
                 execution_deadline_seconds,
                 runner_resources,
                 memory_writes,
+                agent_wide_learning,
+                learned_skills,
                 changed,
             } => {
                 ui.payload(&overrides_summary(
@@ -360,9 +379,79 @@ impl crate::ui::CliOutput for OverridesOutput {
                     execution_deadline_seconds,
                     runner_resources,
                     *memory_writes,
+                    *agent_wide_learning,
+                    *learned_skills,
                     *changed,
                 ));
             }
+        }
+    }
+}
+
+/// Output of `<tier> overrides <agent>` at the CLI: [`OverridesOutput`] plus
+/// the agent's ADR 0248 schedule settings as the API stored them. The settings
+/// are `None` only on a dry run, which has no stored row to read.
+#[derive(Debug)]
+pub struct AgentOverridesOutput {
+    pub overrides: OverridesOutput,
+    pub schedule_policy: Option<crate::api::AgentSchedulePolicy>,
+}
+
+/// The schedule settings clause of the `<tier> overrides` summary line.
+pub fn schedule_policy_summary(policy: &crate::api::AgentSchedulePolicy) -> String {
+    format!(
+        "agent schedules {}, schedule timezone {}, schedule max active {}, schedule min interval {} min",
+        if policy.agent_schedules { "on" } else { "off" },
+        policy.schedule_timezone,
+        policy.schedule_max_active,
+        policy.schedule_min_interval_minutes
+    )
+}
+
+impl crate::ui::CliOutput for AgentOverridesOutput {
+    fn to_json(&self) -> serde_json::Value {
+        let mut value = self.overrides.to_json();
+        if let (Some(policy), Some(object)) = (&self.schedule_policy, value.as_object_mut()) {
+            if let Ok(serde_json::Value::Object(fields)) = serde_json::to_value(policy) {
+                object.extend(fields);
+            }
+        }
+        value
+    }
+
+    fn render(&self, ui: &crate::ui::Ui) {
+        match (&self.overrides, &self.schedule_policy) {
+            (
+                OverridesOutput::Done {
+                    agent,
+                    model,
+                    reviewer_model,
+                    thinking,
+                    execution_deadline_seconds,
+                    runner_resources,
+                    memory_writes,
+                    agent_wide_learning,
+                    learned_skills,
+                    changed,
+                },
+                Some(policy),
+            ) => ui.payload(&format!(
+                "{}, {}",
+                overrides_summary(
+                    agent,
+                    model,
+                    reviewer_model,
+                    thinking,
+                    execution_deadline_seconds,
+                    runner_resources,
+                    *memory_writes,
+                    *agent_wide_learning,
+                    *learned_skills,
+                    *changed,
+                ),
+                schedule_policy_summary(policy)
+            )),
+            (overrides, _) => overrides.render(ui),
         }
     }
 }
@@ -397,30 +486,67 @@ pub async fn overrides(
     execution_deadline: OverrideChange,
     runner_resources: OverrideChange,
 ) -> Result<OverridesOutput> {
-    overrides_with_memory_writes(
+    overrides_with_switches(
         opts,
         model,
         reviewer_model,
         thinking,
         execution_deadline,
         runner_resources,
-        None,
+        AgentSwitches::default(),
     )
     .await
+    .map(|output| output.overrides)
 }
 
-/// The `--memory-writes on|off` value as the boolean the API stores, or `None`
-/// when the flag was not passed. Clap has already refused any other value.
-pub fn memory_writes_flag(value: Option<&str>) -> Option<bool> {
+/// An `on|off` switch flag (`--memory-writes`, `--agent-wide-learning`,
+/// `--agent-schedules`, `--learned-skills`) as the
+/// boolean the API stores, or `None` when the flag was not passed. Clap has
+/// already refused any other value.
+pub fn on_off_flag(value: Option<&str>) -> Option<bool> {
     value.map(|v| v == "on")
 }
 
-/// [`overrides`] plus the `memory_writes` switch (#1461).
+/// The agent's NOT NULL switches an `overrides` invocation may set. `None`
+/// leaves that switch's key out of the PATCH body.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AgentSwitches {
+    /// `--memory-writes on|off` (#1461): whether the memory tools mount.
+    pub memory_writes: Option<bool>,
+    /// `--agent-wide-learning on|off` (ADR 0249): the learning opt-in.
+    pub agent_wide_learning: Option<bool>,
+    /// `--agent-schedules on|off` (ADR 0248): whether the agent may create and
+    /// change its own schedules.
+    pub agent_schedules: Option<bool>,
+    /// `--learned-skills on|off` (ADR 0247): whether learned skills load.
+    pub learned_skills: Option<bool>,
+}
+
+/// Refuses an agent whose response lacks `agent_wide_learning`.
 ///
-/// `memory_writes` is a NOT NULL boolean rather than a nullable override, so it
-/// has no clear: `Some(b)` sends a JSON boolean under its own key, `None`
-/// leaves the key out of the body. The result reports the switch as the API
-/// stored it, like every other field.
+/// Args:
+///   agent: the agent name, for the message.
+///   value: the field as the platform reported it.
+///
+/// Returns:
+///   The reported value, or an error when the platform omitted it.
+fn require_agent_wide_learning(agent: &str, value: Option<bool>) -> Result<bool> {
+    value.ok_or_else(|| {
+        anyhow::anyhow!(
+            "the platform's response for agent {agent:?} lacks agent_wide_learning; refusing to report or change overrides without knowing its state (upgrade the platform)"
+        )
+    })
+}
+
+/// [`overrides`] plus the `memory_writes` (#1461), `agent_wide_learning`
+/// (ADR 0249), `agent_schedules` (ADR 0248) and `learned_skills` (ADR 0247)
+/// switches.
+///
+/// Each switch is a NOT NULL boolean rather than a nullable override, so none
+/// has a clear: `Some(b)` sends a JSON boolean under its own key, `None` leaves
+/// the key out of the body. They are independent: setting one never sends
+/// another. The result reports every switch as the API stored it, like every
+/// other field.
 ///
 /// Args:
 ///   opts: api url/key, the agent name or id, and the dry-run flag.
@@ -429,19 +555,20 @@ pub fn memory_writes_flag(value: Option<&str>) -> Option<bool> {
 ///   thinking: the intent for the thinking override.
 ///   execution_deadline: the intent for the execution deadline.
 ///   runner_resources: the intent for the runner resources override.
-///   memory_writes: the new memory-writes switch, if one was asked for.
+///   switches: the new memory-writes, agent-wide learning, agent-schedules
+///     and learned-skills values, if asked for.
 ///
 /// Returns:
-///   The stored overrides, or the dry-run plan.
-pub async fn overrides_with_memory_writes(
+///   The stored overrides, switches and schedule settings, or the dry-run plan.
+pub async fn overrides_with_switches(
     opts: AgentActionOpts,
     model: OverrideChange,
     reviewer_model: OverrideChange,
     thinking: OverrideChange,
     execution_deadline: OverrideChange,
     runner_resources: OverrideChange,
-    memory_writes: Option<bool>,
-) -> Result<OverridesOutput> {
+    switches: AgentSwitches,
+) -> Result<AgentOverridesOutput> {
     let ui = crate::ui::ui();
     let mut body = overrides_patch_body(
         &model,
@@ -450,8 +577,19 @@ pub async fn overrides_with_memory_writes(
         &execution_deadline,
         &runner_resources,
     );
-    if let Some(on) = memory_writes {
+    if let Some(on) = switches.memory_writes {
         body.get_or_insert_with(AgentUpdate::default).memory_writes = Some(on);
+    }
+    if let Some(on) = switches.agent_wide_learning {
+        body.get_or_insert_with(AgentUpdate::default)
+            .agent_wide_learning = Some(on);
+    }
+    if let Some(on) = switches.agent_schedules {
+        body.get_or_insert_with(AgentUpdate::default)
+            .agent_schedules = Some(on);
+    }
+    if let Some(on) = switches.learned_skills {
+        body.get_or_insert_with(AgentUpdate::default).learned_skills = Some(on);
     }
     if opts.dry_run {
         let plan = match &body {
@@ -466,24 +604,31 @@ pub async fn overrides_with_memory_writes(
                 opts.api_url, opts.agent
             ),
         };
-        return Ok(OverridesOutput::DryRun(crate::ui::DryRunPlan {
-            lines: vec![plan],
-        }));
+        return Ok(AgentOverridesOutput {
+            overrides: OverridesOutput::DryRun(crate::ui::DryRunPlan { lines: vec![plan] }),
+            schedule_policy: None,
+        });
     }
     let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
     let agent = client.find_agent(&opts.agent).await?;
+    let fetched_learning = require_agent_wide_learning(&agent.name, agent.agent_wide_learning)?;
     let Some(body) = body else {
         // Inspect: find_agent already carries every override, so there is nothing
         // further to fetch and nothing to write.
-        return Ok(OverridesOutput::Done {
-            agent: agent.name,
-            model: agent.model,
-            reviewer_model: agent.reviewer_model,
-            thinking: agent.thinking,
-            execution_deadline_seconds: agent.execution_deadline_seconds,
-            runner_resources: agent.runner_resources,
-            memory_writes: agent.memory_writes,
-            changed: false,
+        return Ok(AgentOverridesOutput {
+            schedule_policy: Some(agent.schedule_policy()),
+            overrides: OverridesOutput::Done {
+                agent: agent.name,
+                model: agent.model,
+                reviewer_model: agent.reviewer_model,
+                thinking: agent.thinking,
+                execution_deadline_seconds: agent.execution_deadline_seconds,
+                runner_resources: agent.runner_resources,
+                memory_writes: agent.memory_writes,
+                agent_wide_learning: fetched_learning,
+                learned_skills: agent.learned_skills,
+                changed: false,
+            },
         });
     };
     let cl = ui.checklist();
@@ -498,15 +643,21 @@ pub async fn overrides_with_memory_writes(
             return Err(err);
         }
     };
-    Ok(OverridesOutput::Done {
-        agent: saved.name,
-        model: saved.model,
-        reviewer_model: saved.reviewer_model,
-        thinking: saved.thinking,
-        execution_deadline_seconds: saved.execution_deadline_seconds,
-        runner_resources: saved.runner_resources,
-        memory_writes: saved.memory_writes,
-        changed: true,
+    let saved_learning = require_agent_wide_learning(&saved.name, saved.agent_wide_learning)?;
+    Ok(AgentOverridesOutput {
+        schedule_policy: Some(saved.schedule_policy()),
+        overrides: OverridesOutput::Done {
+            agent: saved.name,
+            model: saved.model,
+            reviewer_model: saved.reviewer_model,
+            thinking: saved.thinking,
+            execution_deadline_seconds: saved.execution_deadline_seconds,
+            runner_resources: saved.runner_resources,
+            memory_writes: saved.memory_writes,
+            agent_wide_learning: saved_learning,
+            learned_skills: saved.learned_skills,
+            changed: true,
+        },
     })
 }
 
@@ -796,10 +947,12 @@ mod overrides_tests {
             &None,
             false,
             false,
+            false,
+            false,
         );
         assert_eq!(
             line,
-            "overrides for a: model kimi-k2, reviewer model credential default, thinking platform default, execution deadline platform default, runner resources platform default, memory writes off"
+            "overrides for a: model kimi-k2, reviewer model credential default, thinking platform default, execution deadline platform default, runner resources platform default, memory writes off, agent-wide learning off, learned skills off"
         );
         assert!(!line.contains("  "), "no double space anywhere: {line}");
     }
@@ -815,9 +968,11 @@ mod overrides_tests {
                 &Some(90),
                 &None,
                 true,
+                true,
+                true,
                 true
             ),
-            "overrides for a now: model platform default, reviewer model credential default, thinking adaptive, execution deadline 90 s, runner resources platform default, memory writes on"
+            "overrides for a now: model platform default, reviewer model credential default, thinking adaptive, execution deadline 90 s, runner resources platform default, memory writes on, agent-wide learning on, learned skills on"
         );
     }
 

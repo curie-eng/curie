@@ -61,8 +61,9 @@ The credential value (and its length) is never logged or echoed.
 from __future__ import annotations
 
 import json
-from collections.abc import MutableMapping
+from collections.abc import Mapping, MutableMapping
 from enum import StrEnum
+from urllib.parse import urlsplit
 
 from aci_protocol import BootEnv
 
@@ -355,6 +356,30 @@ def resolve_model_credential(env: MutableMapping[str, str]) -> None:
         )
     else:
         env[OAUTH_TOKEN_ENV] = credential
+
+
+def model_endpoint_host(env: Mapping[str, str], override: Mapping[str, str] | None = None) -> str:
+    """The host of the model endpoint this boot resolved, as boot evidence.
+
+    Host only (``openrouter.ai``), or ``default`` when no base URL is set and
+    the SDK dials its own Anthropic endpoint. Never the credential, the path or
+    the query. ``override`` is ``resolve_sdk_env``'s answer, which wins over
+    ``env`` the way it does for the spawned SDK.
+    """
+
+    raw = (
+        (override or {}).get(BASE_URL_ENV)
+        or env.get(BASE_URL_ENV)
+        or env.get(MODEL_BASE_URL_ENV)
+        or ""
+    ).strip()
+    if not raw:
+        return "default"
+    try:
+        host = urlsplit(raw).hostname
+    except ValueError:
+        host = None
+    return host or "unparseable"
 
 
 def resolve_sdk_env(env: MutableMapping[str, str]) -> dict[str, str] | None:

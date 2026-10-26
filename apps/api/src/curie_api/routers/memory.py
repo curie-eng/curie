@@ -31,12 +31,12 @@ from curie_api.schemas.state import (
     SourceTraceOut,
 )
 
-from .. import state_mutation
+from .. import memory_records, state_mutation
 from ..auth import require_api_key
 from ..config import get_settings
 from ..deps import SessionDep
-from ..memory_guidance import DEFAULT_MEMORY_GUIDANCE
-from ..models import WorkflowStateEntry
+from ..memory_guidance import effective_guidance
+from ..models import Agent, WorkflowStateEntry
 
 router = APIRouter(
     prefix="/agents", tags=["memory"], dependencies=[Depends(require_api_key)]
@@ -54,9 +54,11 @@ MEMORY_GUIDANCE_KEY = "guidance"
 OPERATOR_MEMORY_SOURCE = "operator"
 
 
-async def _require_agent(session: SessionDep, agent_id: uuid.UUID) -> None:
-    if await crud_agents.get_agent(session, agent_id) is None:
+async def _require_agent(session: SessionDep, agent_id: uuid.UUID) -> Agent:
+    agent = await crud_agents.get_agent(session, agent_id)
+    if agent is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
+    return agent
 
 
 async def _get_log_entry(
@@ -66,6 +68,7 @@ async def _get_log_entry(
         select(WorkflowStateEntry).where(
             WorkflowStateEntry.agent_id == agent_id,
             WorkflowStateEntry.namespace == MEMORY_NAMESPACE,
+            WorkflowStateEntry.binding_scope.is_(None),
             WorkflowStateEntry.key == MEMORY_LOG_KEY,
         )
     )
@@ -104,11 +107,15 @@ async def _locked_log(
 ) -> tuple[WorkflowStateEntry, list[dict[str, Any]]]:
     """Load and lock the memory log, then validate its expected parent version."""
     await _require_agent(session, agent_id)
+    # The log shares the agent-wide memory byte budget (ADR 0249): take the
+    # memory scope lock before the row lock, like every memory writer.
+    await memory_records.lock_scope(session, agent_id, None)
     entry: WorkflowStateEntry | None = await session.scalar(
         select(WorkflowStateEntry)
         .where(
             WorkflowStateEntry.agent_id == agent_id,
             WorkflowStateEntry.namespace == MEMORY_NAMESPACE,
+            WorkflowStateEntry.binding_scope.is_(None),
             WorkflowStateEntry.key == MEMORY_LOG_KEY,
         )
         .with_for_update()
@@ -171,11 +178,13 @@ async def create_memory(
     """
     await _require_agent(session, agent_id)
     record = _operator_record(data.content)
+    await memory_records.lock_scope(session, agent_id, None)
     entry: WorkflowStateEntry | None = await session.scalar(
         select(WorkflowStateEntry)
         .where(
             WorkflowStateEntry.agent_id == agent_id,
             WorkflowStateEntry.namespace == MEMORY_NAMESPACE,
+            WorkflowStateEntry.binding_scope.is_(None),
             WorkflowStateEntry.key == MEMORY_LOG_KEY,
         )
         .with_for_update()
@@ -224,18 +233,17 @@ async def _get_guidance_entry(
     return entry
 
 
-def _guidance_out(entry: WorkflowStateEntry | None) -> MemoryGuidanceOut:
-    """The effective guidance: the stored text, else the platform default.
+def _guidance_out(entry: WorkflowStateEntry | None, agent: Agent) -> MemoryGuidanceOut:
+    """The effective guidance (ADR 0249): the stored text, else the learning
+    default when the agent is opted in to agent-wide learning, else the
+    platform default.
 
-    A stored value that is not ``{"text": <non-blank str>}`` reads as the
-    default, which is also what the runner does with it.
+    A stored value that is not ``{"text": <non-blank str>}`` reads as absent,
+    which is also what the runner does with it.
     """
     value = entry.value if entry is not None else None
-    if isinstance(value, dict):
-        text = value.get("text")
-        if isinstance(text, str) and text.strip():
-            return MemoryGuidanceOut(text=text, source="operator")
-    return MemoryGuidanceOut(text=DEFAULT_MEMORY_GUIDANCE, source="default")
+    text, source = effective_guidance(value, agent.agent_wide_learning)
+    return MemoryGuidanceOut(text=text, source=source)
 
 
 # The guidance routes are registered before ``/memory/{index}`` so the literal
@@ -244,9 +252,9 @@ def _guidance_out(entry: WorkflowStateEntry | None) -> MemoryGuidanceOut:
 async def get_memory_guidance(
     agent_id: uuid.UUID, session: SessionDep
 ) -> MemoryGuidanceOut:
-    """The agent's effective memory guidance and its source (#1461)."""
-    await _require_agent(session, agent_id)
-    return _guidance_out(await _get_guidance_entry(session, agent_id))
+    """The agent's effective memory guidance and its source (#1461, ADR 0249)."""
+    agent = await _require_agent(session, agent_id)
+    return await memory_records.guidance_for(session, agent)
 
 
 @router.put("/{agent_id}/memory/guidance", response_model=MemoryGuidanceOut)
@@ -258,8 +266,9 @@ async def put_memory_guidance(
     The runner reads it at the next session boot; a live thread keeps the
     guidance it booted with.
     """
-    await _require_agent(session, agent_id)
+    agent = await _require_agent(session, agent_id)
     value = {"text": data.text}
+    await memory_records.lock_scope(session, agent_id, None)
     await enforce_caps(
         session, agent_id, None, MEMORY_NAMESPACE, MEMORY_GUIDANCE_KEY, value
     )
@@ -286,7 +295,7 @@ async def put_memory_guidance(
         entry.version += 1
     await session.commit()
     await session.refresh(entry)
-    return _guidance_out(entry)
+    return _guidance_out(entry, agent)
 
 
 @router.delete(

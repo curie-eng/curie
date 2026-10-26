@@ -480,6 +480,9 @@ pub(crate) enum LocalAction {
     },
     /// List an agent's individual facts and memory log. `--channel KIND=ADDRESS`
     /// selects one bound channel; `--delete FACT_ID` removes one fact.
+    /// `--archive`, `--restore`, `--revert FACT_ID --to-version N` and
+    /// `--history` act on one entry under its current version (ADR 0249); a
+    /// fresh session is required before a change reaches boot memory.
     /// `--add <content>` seeds an operator-authored record; a fresh session is
     /// required before it is injected at boot. `--guidance` shows the guidance
     /// the agent gets beside its memory tools, `--guidance-from <file>` replaces
@@ -498,6 +501,8 @@ pub(crate) enum LocalAction {
         channel: Option<String>,
         #[command(flatten)]
         guidance: MemoryGuidanceArgs,
+        #[command(flatten)]
+        lifecycle: MemoryLifecycleArgs,
     },
     /// The action ledger and its undo: list and read an agent's recorded
     /// actions, ask for an undo, and read an execution's receipt.
@@ -505,6 +510,9 @@ pub(crate) enum LocalAction {
         #[command(subcommand)]
         verb: ActionsCommand<LocalObservabilityConn>,
     },
+    /// An agent's learned skills (ADR 0247): list, show, diff, history,
+    /// revert, delete and export.
+    Skills(SkillsArgs<LocalGlobalConn>),
     /// A protected hook's remediation policy: show it, apply a document, arm,
     /// disarm or remove it, or close an open circuit breaker. Writes run as the
     /// operator principal in CURIE_APPROVAL_PRINCIPAL_TOKEN; apply and arm also
@@ -650,6 +658,22 @@ pub(crate) enum LocalAction {
         /// channel memory stays readable. Takes effect at the next sandbox boot.
         #[arg(long, value_name = "on|off", value_parser = ["on", "off"])]
         memory_writes: Option<String>,
+        /// Opt the agent in to agent-wide learning, or out (`agent_wide_learning`,
+        /// ADR 0249). On selects the learning default guidance and lets standing
+        /// instructions load and be saved; it never turns memory writes on.
+        /// Off keeps the existing default guidance byte for byte. Takes effect
+        /// at the next sandbox boot.
+        #[arg(long, value_name = "on|off", value_parser = ["on", "off"])]
+        agent_wide_learning: Option<String>,
+        /// Let the agent create and manage its own schedules on or off
+        /// (`agent_schedules`, ADR 0248). Off stops creating and changing them;
+        /// stored schedules and history stay.
+        #[arg(long, value_name = "on|off", value_parser = ["on", "off"])]
+        agent_schedules: Option<String>,
+        /// Turn the agent's learned skills on or off (ADR 0247). Off stops
+        /// loading and editing them; stored skills and history stay.
+        #[arg(long, value_name = "on|off", value_parser = ["on", "off"])]
+        learned_skills: Option<String>,
         #[arg(long, default_value = "http://localhost:28000", env = "CURIE_API_URL")]
         api_url: String,
         #[arg(long, default_value = "curie-dev-key", env = "CURIE_API_KEY", hide_env_values = true, value_parser = message::api_key_or_default)]
@@ -846,7 +870,8 @@ pub(crate) enum LocalAction {
             long,
             value_name = "HOOK",
             conflicts_with = "resume",
-            requires = "agent"
+            requires = "agent",
+            group = "schedule_verb"
         )]
         pause: Option<String>,
         /// Resume one named cron hook on the selected agent.
@@ -854,9 +879,12 @@ pub(crate) enum LocalAction {
             long,
             value_name = "HOOK",
             conflicts_with = "pause",
-            requires = "agent"
+            requires = "agent",
+            group = "schedule_verb"
         )]
         resume: Option<String>,
+        #[command(flatten)]
+        agent_schedule: AgentScheduleArgs,
         #[arg(
             long,
             default_value = message::DEFAULT_LOCAL_API_URL,

@@ -14,6 +14,11 @@
       "omissions": []
     },
     {
+      "struct": "AgentScheduleRevisions",
+      "schema": "AgentScheduleRevisions",
+      "omissions": []
+    },
+    {
       "struct": "ForgeCredentialHealthReport",
       "schema": "ForgeCredentialHealthReport",
       "omissions": []
@@ -258,6 +263,26 @@
       "omissions": []
     },
     {
+      "struct": "LearnedSkill",
+      "schema": "LearnedSkillOut",
+      "omissions": []
+    },
+    {
+      "struct": "LearnedSkillList",
+      "schema": "LearnedSkillList",
+      "omissions": []
+    },
+    {
+      "struct": "LearnedSkillRevision",
+      "schema": "LearnedSkillRevisionOut",
+      "omissions": []
+    },
+    {
+      "struct": "LearnedSkillRevisions",
+      "schema": "LearnedSkillRevisions",
+      "omissions": []
+    },
+    {
       "struct": "MemoryProvenance",
       "schema": "MemoryProvenanceOut",
       "omissions": []
@@ -265,6 +290,21 @@
     {
       "struct": "MemoryGuidance",
       "schema": "MemoryGuidanceOut",
+      "omissions": []
+    },
+    {
+      "struct": "MemoryRecord",
+      "schema": "MemoryRecordOut",
+      "omissions": []
+    },
+    {
+      "struct": "MemoryRevision",
+      "schema": "MemoryRevisionOut",
+      "omissions": []
+    },
+    {
+      "struct": "MemoryDetail",
+      "schema": "MemoryDetailOut",
       "omissions": []
     },
     {
@@ -547,6 +587,26 @@
   "_requests_comment": "Typed request bodies (#3834). Every platform JSON send in cli/src/api.rs is a .json::<T>(..) call on self.http.<method>(format!(\"{}<path>\", self.base_url, ..)). request_mirrors maps each body struct (cli/src/api_requests.rs, or a shared Serialize DTO in cli/src/api.rs) to its OpenAPI request schema, with justified omissions just like mirrors. requests binds each sending fn to the struct, method and OpenAPI path it sends; the gate checks the method and path against the source and the operation's requestBody schema against the mirror. Check with: curie dev field-parity",
   "request_mirrors": [
     {
+      "struct": "AgentScheduleUpdate",
+      "schema": "AgentScheduleUpdate",
+      "omissions": [
+        {
+          "field": "paused",
+          "why": "Pausing goes through `schedules --pause/--resume` on the existing schedule control route, so the update verb never sends it."
+        }
+      ]
+    },
+    {
+      "struct": "AgentScheduleCancel",
+      "schema": "AgentScheduleCancel",
+      "omissions": []
+    },
+    {
+      "struct": "AgentScheduleRevert",
+      "schema": "AgentScheduleRevert",
+      "omissions": []
+    },
+    {
       "struct": "AgentCreate",
       "schema": "AgentCreate",
       "omissions": [
@@ -688,6 +748,16 @@
       "omissions": []
     },
     {
+      "struct": "MemoryLifecycleIn",
+      "schema": "MemoryLifecycleIn",
+      "omissions": []
+    },
+    {
+      "struct": "MemoryRevertIn",
+      "schema": "MemoryRevertIn",
+      "omissions": []
+    },
+    {
       "struct": "ApprovalResolve",
       "schema": "ApprovalResolve",
       "omissions": []
@@ -720,6 +790,11 @@
           "why": "The CLI triggers the agent's active dev deployment and scopes results by the returned sha; it never pins a version id."
         }
       ]
+    },
+    {
+      "struct": "LearnedSkillRevert",
+      "schema": "LearnedSkillRevert",
+      "omissions": []
     },
     {
       "struct": "ActionUndo",
@@ -773,6 +848,24 @@
     }
   ],
   "requests": [
+    {
+      "function": "update_agent_schedule",
+      "struct": "AgentScheduleUpdate",
+      "method": "patch",
+      "path": "/agents/{agent_id}/schedules/{schedule_id}"
+    },
+    {
+      "function": "cancel_agent_schedule",
+      "struct": "AgentScheduleCancel",
+      "method": "post",
+      "path": "/agents/{agent_id}/schedules/{schedule_id}/cancel"
+    },
+    {
+      "function": "revert_agent_schedule",
+      "struct": "AgentScheduleRevert",
+      "method": "post",
+      "path": "/agents/{agent_id}/schedules/{schedule_id}/revert"
+    },
     {
       "function": "create_agent",
       "struct": "AgentCreate",
@@ -864,6 +957,24 @@
       "path": "/agents/{agent_id}/memory/guidance"
     },
     {
+      "function": "archive_memory_entry",
+      "struct": "MemoryLifecycleIn",
+      "method": "post",
+      "path": "/agents/{agent_id}/state/_memory/archive"
+    },
+    {
+      "function": "restore_memory_entry",
+      "struct": "MemoryLifecycleIn",
+      "method": "post",
+      "path": "/agents/{agent_id}/state/_memory/restore"
+    },
+    {
+      "function": "revert_memory_entry",
+      "struct": "MemoryRevertIn",
+      "method": "post",
+      "path": "/agents/{agent_id}/state/_memory/revert"
+    },
+    {
       "function": "resolve_approval",
       "struct": "ApprovalResolve",
       "method": "post",
@@ -910,6 +1021,12 @@
       "struct": "EvalTriggerRequest",
       "method": "post",
       "path": "/evals/trigger"
+    },
+    {
+      "function": "revert_learned_skill",
+      "struct": "LearnedSkillRevert",
+      "method": "post",
+      "path": "/agents/{agent_id}/learned-skills/{ref}/revert"
     },
     {
       "function": "undo_action",
@@ -995,10 +1112,16 @@
         {"field": "runner_resources", "why": "Runner resources belong to the overrides command."},
         {"field": "memory", "why": "The shared memory setting is unrelated to hook configuration."},
         {"field": "memory_writes", "why": "The memory tools switch belongs to the overrides command."},
+        {"field": "agent_wide_learning", "why": "The agent-wide learning opt-in belongs to the overrides command."},
+        {"field": "learned_skills", "why": "The learned skills switch belongs to the overrides command."},
         {"field": "publication_policy", "why": "Publication policy has its own operator command."},
         {"field": "publication_policy_version", "why": "Publication policy has its own operator command."},
         {"field": "publication_draft", "why": "Publication policy has its own operator command."},
-        {"field": "publication_branch_prefix", "why": "Publication policy has its own operator command."}
+        {"field": "publication_branch_prefix", "why": "Publication policy has its own operator command."},
+        {"field": "agent_schedules", "why": "Agent schedule settings belong to the overrides command."},
+        {"field": "schedule_timezone", "why": "Agent schedule settings belong to the overrides command."},
+        {"field": "schedule_max_active", "why": "Agent schedule settings belong to the overrides command."},
+        {"field": "schedule_min_interval_minutes", "why": "Agent schedule settings belong to the overrides command."}
       ]
     },
     {
@@ -1110,6 +1233,22 @@
         {
           "field": "source_bindings",
           "why": "Hook configuration has its own operator command. The overrides command changes model behavior only."
+        },
+        {
+          "field": "agent_schedules",
+          "why": "AgentOverridesOutput wraps this result and emits the stored agent schedule settings."
+        },
+        {
+          "field": "schedule_timezone",
+          "why": "AgentOverridesOutput wraps this result and emits the stored agent schedule settings."
+        },
+        {
+          "field": "schedule_max_active",
+          "why": "AgentOverridesOutput wraps this result and emits the stored agent schedule settings."
+        },
+        {
+          "field": "schedule_min_interval_minutes",
+          "why": "AgentOverridesOutput wraps this result and emits the stored agent schedule settings."
         }
       ]
     },

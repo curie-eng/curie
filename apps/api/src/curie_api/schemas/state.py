@@ -9,7 +9,11 @@ class StateEntryPut(BaseModel):
     """Write a durable state entry (#23). ``expected_version`` opts into
     compare-and-set: the write is rejected with 409 unless it matches the stored
     version (omit it for a blind upsert). ``value`` is any JSON value (object,
-    array, or scalar); an array value is what ``append`` grows."""
+    array, or scalar); an array value is what ``append`` grows.
+
+    On a canonical memory key (``memory`` / ``fact-<32 hex>``, ADR 0249) the
+    value must be the typed entry shape, a create sends no ``expected_version``
+    (or 0), and an update must send the head's version (428 when omitted)."""
 
     value: Any
     expected_version: int | None = None
@@ -171,9 +175,11 @@ class MemoryGuidanceIn(BaseModel):
 class MemoryGuidanceOut(BaseModel):
     """The agent's effective memory guidance and where it comes from (#1461).
 
-    ``source`` is ``operator`` when guidance is stored for the agent, else
-    ``default`` and ``text`` is the platform default.
+    ``source`` is ``operator`` when guidance is stored for the agent; else
+    ``learning_default`` when the agent is opted in to agent-wide learning and
+    ``text`` is the learning default (ADR 0249); else ``default`` and ``text``
+    is the platform default.
     """
 
     text: str
-    source: Literal["default", "operator"]
+    source: Literal["default", "operator", "learning_default"]

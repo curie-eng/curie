@@ -192,7 +192,8 @@ class Campaign:
 @pytest.fixture
 def campaign(worker_db: Any) -> Iterator[Campaign]:
     """@spec PROTECTED-HOOK-SOURCE-2/10."""
-    support, _, url = worker_db
+    support, clone, url = worker_db
+    clone.at("selfimp_memory_0001")
     actual = Campaign(support, url)
     try:
         yield actual

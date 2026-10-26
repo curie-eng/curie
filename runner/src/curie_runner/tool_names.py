@@ -67,3 +67,30 @@ CANVAS_READ_ONLY_TOOL_NAMES: Final[frozenset[str]] = _full_names(
     (CANVAS_LIST_TOOL_SHORT_NAME, CANVAS_READ_TOOL_SHORT_NAME)
 )
 PLATFORM_SLACK_TOOL_NAMES: Final[frozenset[str]] = CHANNEL_READ_TOOL_NAMES | CANVAS_TOOL_NAMES
+# The agent-schedule tools (ADR 0248) on their own in-process server, mounted only
+# when the agent's schedules toggle is on. Only list_schedules reads.
+AGENT_SCHEDULES_SERVER_NAME: Final = "agent_schedules"
+AGENT_SCHEDULE_TOOL_SHORT_NAMES: Final = (
+    "create_schedule",
+    "list_schedules",
+    "update_schedule",
+    "cancel_schedule",
+    "revert_schedule",
+)
+AGENT_SCHEDULE_TOOL_NAMES: Final[frozenset[str]] = frozenset(
+    f"mcp__{AGENT_SCHEDULES_SERVER_NAME}__{name}" for name in AGENT_SCHEDULE_TOOL_SHORT_NAMES
+)
+AGENT_SCHEDULE_READ_ONLY_TOOL_NAMES: Final[frozenset[str]] = frozenset(
+    {f"mcp__{AGENT_SCHEDULES_SERVER_NAME}__list_schedules"}
+)
+
+# The learned-skills tools (ADR 0247) on their own in-process server, mounted
+# only when the agent's learned skills toggle is on. Only list and read read.
+LEARNED_SKILLS_SERVER_NAME: Final = "learned_skills"
+LEARNED_SKILL_TOOL_SHORT_NAMES: Final = ("list", "read", "create", "patch", "delete", "revert")
+LEARNED_SKILL_TOOL_NAMES: Final[frozenset[str]] = frozenset(
+    f"mcp__{LEARNED_SKILLS_SERVER_NAME}__{name}" for name in LEARNED_SKILL_TOOL_SHORT_NAMES
+)
+LEARNED_SKILL_READ_ONLY_TOOL_NAMES: Final[frozenset[str]] = frozenset(
+    f"mcp__{LEARNED_SKILLS_SERVER_NAME}__{name}" for name in ("list", "read")
+)

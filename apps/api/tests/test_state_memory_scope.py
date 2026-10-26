@@ -8,8 +8,13 @@ minted with the shared ``sandbox_token`` module used by the worker and API.
 The two credential shapes (plan section 2):
 
 - long-lived: ``{binding, memory: "read"}``, handed to the sandbox at boot;
-- per-turn: ``{binding, memory: "write", sender, turn}``, carried on the turn's
-  ACI ``Event``.
+- per-turn: ``{binding, memory: "write", sender, turn, conversation}``,
+  carried on the turn's ACI ``Event``; ``conversation`` is the thread key the
+  API stamps as a fact's source conversation (ADR 0249).
+
+Sandbox writes also need the agent's stored ``memory_writes`` on, so every agent
+here turns it on. Canonical fact values carry the typed shape (``kind``,
+``title``) for every principal.
 
 A token with no ``memory`` claim is a legacy (pre-ADR-0188) token and fails
 closed: read-only, agent memory only.
@@ -29,6 +34,7 @@ CHANNEL_B = "C000000S02"
 BINDING_A = f"slack:{CHANNEL_A}"
 BINDING_B = f"slack:{CHANNEL_B}"
 SENDER = "U0000SENDER"
+CONVERSATION = f"slack:{CHANNEL_A}:1700000000.000001"
 FACT = "fact-" + "0123456789abcdef" * 2
 OTHER_FACT = "fact-" + "fedcba9876543210" * 2
 
@@ -51,6 +57,8 @@ def _agent_with_two_channels(client: Any, auth_headers: dict[str, str]) -> str:
         headers=auth_headers,
     )
     assert second.status_code == 201, second.text
+    writes = client.patch(f"/agents/{aid}", json={"memory_writes": True}, headers=auth_headers)
+    assert writes.status_code == 200, writes.text
     return aid
 
 
@@ -66,7 +74,16 @@ def _reader(aid: str, binding: str | None = BINDING_A) -> dict[str, str]:
 def _writer(
     aid: str, binding: str | None = BINDING_A, *, sender: str = SENDER, turn: str = "evt-1"
 ) -> dict[str, str]:
-    return _token(aid, {"binding": binding, "memory": "write", "sender": sender, "turn": turn})
+    return _token(
+        aid,
+        {
+            "binding": binding,
+            "memory": "write",
+            "sender": sender,
+            "turn": turn,
+            "conversation": CONVERSATION,
+        },
+    )
 
 
 def _legacy(aid: str) -> dict[str, str]:
@@ -85,12 +102,16 @@ def _agent_memory(aid: str) -> str:
 
 def _fact_value(
     statement: str = "the deploy window is Tuesday", author: str = SENDER
-) -> dict[str, str]:
+) -> dict[str, Any]:
     return {
+        "kind": "fact",
+        "title": "Deploy window",
         "statement": statement,
         "author": author,
         "stated_at": "2026-10-01T00:00:00+00:00",
         "session_id": "sess-1",
+        "conversation": None,
+        "archived": False,
     }
 
 
@@ -141,7 +162,10 @@ def test_channel_a_credential_is_refused_channel_b_memory(
     own_list = client.get(_channel(aid, CHANNEL_A), headers=_reader(aid))
     assert own_list.status_code == 200, own_list.text
     assert [e["key"] for e in own_list.json()] == [FACT]
-    assert client.delete(a_fact, headers=_writer(aid)).status_code == 204
+    assert (
+        client.delete(a_fact, params={"expected_version": 1}, headers=_writer(aid)).status_code
+        == 204
+    )
 
 
 def test_cross_binding_refusal_precedes_binding_lookup(
@@ -282,13 +306,15 @@ def test_append_on_memory_refused_for_sandbox(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
     # Facts are written with PUT; POST append on memory is always refused for a
-    # sandbox credential, whatever the key and whichever credential.
+    # sandbox credential, whatever the key and whichever credential. On a
+    # canonical fact key it is a 422 for every principal (ADR 0249); on the
+    # legacy log it stays the sandbox's 403.
     aid = _agent_with_two_channels(client, auth_headers)
     for headers in (_writer(aid), _reader(aid), _legacy(aid)):
         for base in (_agent_memory(aid), _channel(aid, CHANNEL_A)):
-            for key in ("log", FACT):
+            for key, refused in (("log", 403), (FACT, 422)):
                 resp = client.post(f"{base}/{key}/append", json={"item": {"n": 1}}, headers=headers)
-                assert resp.status_code == 403, f"{base}/{key}: {resp.text}"
+                assert resp.status_code == refused, f"{base}/{key}: {resp.text}"
     assert client.get(f"{_agent_memory(aid)}/log", headers=auth_headers).status_code == 404
     # Append on general state is unaffected.
     ok = client.post(
@@ -316,7 +342,7 @@ def test_write_stamps_author_from_sender_claim(
 
         updated = client.put(
             url,
-            json={"value": _fact_value("v2", author="U0FORGED02")},
+            json={"value": _fact_value("v2", author="U0FORGED02"), "expected_version": 1},
             headers=_writer(aid, sender="U0SECOND01", turn="evt-2"),
         )
         assert updated.status_code == 200, updated.text
@@ -327,7 +353,9 @@ def test_write_stamps_author_from_sender_claim(
 
         # A body with no author at all is stamped too.
         no_author = {k: v for k, v in _fact_value("v3").items() if k != "author"}
-        third = client.put(url, json={"value": no_author}, headers=_writer(aid))
+        third = client.put(
+            url, json={"value": no_author, "expected_version": 2}, headers=_writer(aid)
+        )
         assert third.status_code == 200, third.text
         assert client.get(url, headers=auth_headers).json()["value"]["author"] == SENDER
 
@@ -344,15 +372,17 @@ def test_write_stamps_author_from_sender_claim(
 def test_platform_key_keeps_body_author(
     client: Any, auth_headers: dict[str, str], clean_db: None
 ) -> None:
-    # The operator is trusted to say who they are.
+    # The operator is trusted to say who they are; the conversation is the
+    # server's, and a platform-key write names none (ADR 0249).
     aid = _agent_with_two_channels(client, auth_headers)
     for base in (_agent_memory(aid), _channel(aid, CHANNEL_A)):
         url = f"{base}/{FACT}"
-        put = client.put(
-            url, json={"value": _fact_value(author="operator-alex")}, headers=auth_headers
-        )
+        value = {**_fact_value(author="operator-alex"), "conversation": "forged"}
+        put = client.put(url, json={"value": value}, headers=auth_headers)
         assert put.status_code == 200, put.text
-        assert client.get(url, headers=auth_headers).json()["value"]["author"] == "operator-alex"
+        stored = client.get(url, headers=auth_headers).json()["value"]
+        assert stored["author"] == "operator-alex"
+        assert stored["conversation"] is None
 
 
 def test_non_object_fact_value_is_422(
@@ -366,10 +396,15 @@ def test_non_object_fact_value_is_422(
         resp = client.put(url, json={"value": value}, headers=_writer(aid))
         assert resp.status_code == 422, f"{value!r}: {resp.status_code} {resp.text}"
     assert client.get(url, headers=auth_headers).status_code == 404
-    # The platform key is not held to the fact shape.
+    # The platform key is held to the typed fact shape too (ADR 0249).
     assert (
-        client.put(url, json={"value": "operator string"}, headers=auth_headers).status_code == 200
+        client.put(url, json={"value": "operator string"}, headers=auth_headers).status_code == 422
     )
+    assert client.get(url, headers=auth_headers).status_code == 404
+    # Liveness: a typed value writes with either credential.
+    assert client.put(url, json={"value": _fact_value()}, headers=auth_headers).status_code == 200
+    other = f"{_agent_memory(aid)}/{OTHER_FACT}"
+    assert client.put(other, json={"value": _fact_value()}, headers=_writer(aid)).status_code == 200
 
 
 def test_write_token_without_sender_refused(
@@ -379,7 +414,10 @@ def test_write_token_without_sender_refused(
     # write. The worker never mints one; a 403 keeps a bug from storing
     # unattributed facts.
     aid = _agent_with_two_channels(client, auth_headers)
-    headers = _token(aid, {"binding": BINDING_A, "memory": "write", "turn": "evt-1"})
+    headers = _token(
+        aid,
+        {"binding": BINDING_A, "memory": "write", "turn": "evt-1", "conversation": CONVERSATION},
+    )
     for base in (_agent_memory(aid), _channel(aid, CHANNEL_A)):
         resp = client.put(f"{base}/{FACT}", json={"value": _fact_value()}, headers=headers)
         assert resp.status_code == 403, resp.text
@@ -564,3 +602,4 @@ def test_platform_key_keeps_body_stated_at(
     stored = client.get(url, headers=auth_headers).json()["value"]
     assert stored["stated_at"] == "1999-01-01T00:00:00+00:00"
     assert stored["session_id"] == "s-op"
+    assert stored["conversation"] is None

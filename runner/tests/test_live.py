@@ -1624,38 +1624,115 @@ def test_live_publish_without_gate_layers_still_pauses_via_the_stream(
 
 
 class _InProcessFactsStore:
-    """A fake memory namespace with the ``MemoryFactsStore`` surface the tools use.
+    """A fake memory with the ``MemoryFactsStore`` surface the tools use (ADR 0249).
 
-    Only the memory tools call ``add``/``update``, so ``writes`` is the record of
-    every successful ``remember``/``update`` call this turn.
+    Only the memory tools call ``create``/``update``, so ``writes`` is the record
+    of every successful ``remember``/``update`` call this turn. Versions are
+    compare-and-set exactly as the state API keeps them.
     """
 
-    def __init__(self) -> None:
-        self.facts: dict[str, dict[str, str]] = {}
+    def __init__(self, scope: str) -> None:
+        self.scope = scope
+        self.facts: dict[str, dict[str, Any]] = {}
         self.writes: list[tuple[str, str]] = []
 
     async def list(self) -> list[Any]:
         return []
 
-    async def add(self, *, statement: str, author: str, session_id: str) -> str:
-        fact_id = f"fact-{uuid4().hex}"
-        self.facts[fact_id] = {"statement": statement, "author": author}
-        self.writes.append(("remember", statement))
-        return fact_id
+    def _record(self, fact_id: str) -> dict[str, Any]:
+        return {"id": fact_id, "scope": self.scope, **self.facts[fact_id]}
 
-    async def update(self, fact_id: str, *, statement: str, author: str, session_id: str) -> None:
+    def _head(self, fact_id: str, expected_version: int) -> dict[str, Any]:
+        from curie_runner.memory_facts import FactNotFound, MemoryConflict
+
+        head = self.facts.get(fact_id)
+        if head is None:
+            raise FactNotFound(fact_id)
+        if head["version"] != expected_version:
+            raise MemoryConflict(
+                f"version mismatch: current version is {head['version']}",
+                current_version=head["version"],
+            )
+        return head
+
+    async def create(
+        self, *, kind: str, title: str, statement: str, author: str, session_id: str
+    ) -> tuple[str, int]:
+        fact_id = f"fact-{uuid4().hex}"
+        self.facts[fact_id] = {
+            "kind": kind,
+            "title": title,
+            "statement": statement,
+            "author": author,
+            "archived": False,
+            "version": 1,
+        }
+        self.writes.append(("remember", statement))
+        return fact_id, 1
+
+    async def update(
+        self,
+        fact_id: str,
+        *,
+        expected_version: int,
+        title: str,
+        statement: str,
+        author: str,
+        session_id: str,
+    ) -> int:
+        head = self._head(fact_id, expected_version)
+        head.update(title=title, statement=statement, author=author)
+        head["version"] += 1
+        self.writes.append(("update", statement))
+        return int(head["version"])
+
+    async def forget(self, fact_id: str, *, expected_version: int) -> None:
+        self._head(fact_id, expected_version)
+        del self.facts[fact_id]
+
+    async def read(self, fact_id: str, *, before_version: int | None = None) -> dict[str, Any]:
         from curie_runner.memory_facts import FactNotFound
 
         if fact_id not in self.facts:
             raise FactNotFound(fact_id)
-        self.facts[fact_id] = {"statement": statement, "author": author}
-        self.writes.append(("update", statement))
+        record = self._record(fact_id)
+        return {
+            "entry": record,
+            "deleted": False,
+            "version": record["version"],
+            "history": [],
+            "history_before": None,
+        }
 
-    async def forget(self, fact_id: str) -> None:
-        from curie_runner.memory_facts import FactNotFound
+    async def search(self, text: str, *, cursor: str | None = None) -> dict[str, Any]:
+        needle = text.lower()
+        hits = [
+            self._record(fact_id)
+            for fact_id, value in self.facts.items()
+            if needle in value["title"].lower() or needle in value["statement"].lower()
+        ]
+        return {"entries": hits, "next_cursor": None}
 
-        if self.facts.pop(fact_id, None) is None:
-            raise FactNotFound(fact_id)
+    async def change(
+        self,
+        operation: str,
+        fact_id: str,
+        *,
+        expected_version: int,
+        to_version: int | None = None,
+    ) -> dict[str, Any]:
+        # Archive and restore only flip the flag; revert is not part of this
+        # scenario and is refused rather than faked.
+        from curie_runner.memory_facts import MemoryFactsError
+
+        head = self._head(fact_id, expected_version)
+        if operation not in ("archive", "restore"):
+            raise MemoryFactsError(f"{operation} is not available in this test store")
+        wanted = operation == "archive"
+        if head["archived"] != wanted:
+            head["archived"] = wanted
+            head["version"] += 1
+        return self._record(fact_id)
 
 
 _COMPOUND_MEMORY_REQUEST = (
@@ -1742,15 +1819,17 @@ def test_live_compound_request_saves_or_does_not_claim_to() -> None:
     from curie_runner.harness.claude.approval import build_memory_tools
     from curie_runner.memory_facts import DEFAULT_GUIDANCE, MemoryTurn
 
-    channel_store = _InProcessFactsStore()
-    agent_store = _InProcessFactsStore()
+    channel_store = _InProcessFactsStore("channel")
+    agent_store = _InProcessFactsStore("agent")
     turn = MemoryTurn()
     session_id = "live-memory-compound"
+    # Writes on and a credential present: all seven memory tools mount.
     memory_tools = build_memory_tools(
         agent_store=agent_store,  # type: ignore[arg-type]
         channel_store=channel_store,  # type: ignore[arg-type]
         turn=turn,
         session_id=session_id,
+        mutators=True,
     )
     # The production composition: the default memory guidance ahead of the
     # bundle's own prompt, as a boot with the tools mounted and no operator

@@ -1143,6 +1143,9 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
             runner_resources,
             clear_runner_resources,
             memory_writes,
+            agent_wide_learning,
+            agent_schedules,
+            learned_skills,
             conn,
             dry_run,
         } => {
@@ -1174,7 +1177,7 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
             )
             .await?;
             emit(
-                commands::overrides_with_memory_writes(
+                commands::overrides_with_switches(
                     AgentActionOpts {
                         api_url,
                         api_key,
@@ -1186,7 +1189,12 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                     thinking,
                     execution_deadline,
                     runner_resources,
-                    commands::memory_writes_flag(memory_writes.as_deref()),
+                    commands::AgentSwitches {
+                        memory_writes: commands::on_off_flag(memory_writes.as_deref()),
+                        agent_wide_learning: commands::on_off_flag(agent_wide_learning.as_deref()),
+                        agent_schedules: commands::on_off_flag(agent_schedules.as_deref()),
+                        learned_skills: commands::on_off_flag(learned_skills.as_deref()),
+                    },
                 )
                 .await?,
             )
@@ -1495,9 +1503,11 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
             agent,
             pause,
             resume,
+            agent_schedule,
             conn,
             dry_run,
         } => {
+            let verb = agent_schedule.into_verb()?;
             let (api_url, api_key, _cluster_api_pf) = commands::resolve_cluster_conn(
                 conn.api_url,
                 conn.api_key,
@@ -1506,17 +1516,29 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                 dry_run,
             )
             .await?;
-            emit(
-                commands::schedules(commands::SchedulesOpts {
-                    api_url,
-                    api_key,
-                    agent,
-                    pause,
-                    resume,
-                    dry_run,
-                })
-                .await?,
-            )
+            match verb {
+                Some(verb) => emit_boxed(
+                    commands::agent_schedule(commands::AgentScheduleOpts {
+                        api_url,
+                        api_key,
+                        agent,
+                        verb,
+                        dry_run,
+                    })
+                    .await?,
+                ),
+                None => emit(
+                    commands::schedules(commands::SchedulesOpts {
+                        api_url,
+                        api_key,
+                        agent,
+                        pause,
+                        resume,
+                        dry_run,
+                    })
+                    .await?,
+                ),
+            }
         }
         ClusterAction::Hook { action, conn } => {
             let dry_run = match &action {
@@ -1659,6 +1681,7 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
             delete,
             channel,
             guidance,
+            lifecycle,
         } => {
             let ClusterAgentTarget {
                 agent,
@@ -1679,11 +1702,16 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                 agent,
                 dry_run,
             };
-            match (guidance.action(), add, delete) {
-                (Some(action), _, _) => emit_memory_guidance(opts, action).await,
-                (None, None, Some(id)) => emit(commands::memory_delete(opts, id, channel).await?),
-                (None, None, None) => emit(commands::memory(opts, channel).await?),
-                (None, Some(content), _) => {
+            match (guidance.action(), add, delete, lifecycle.action()) {
+                (Some(action), _, _, _) => emit_memory_guidance(opts, action).await,
+                (None, None, None, Some(action)) => {
+                    emit(commands::memory_lifecycle(opts, action, channel).await?)
+                }
+                (None, None, Some(id), _) => {
+                    emit(commands::memory_delete(opts, id, channel).await?)
+                }
+                (None, None, None, None) => emit(commands::memory(opts, channel).await?),
+                (None, Some(content), _, _) => {
                     emit(commands::memory_add(opts, content, "cluster").await?)
                 }
             }
@@ -1710,6 +1738,33 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                         api_url,
                         api_key,
                         tier: "cluster",
+                    },
+                    verb,
+                )
+                .await?,
+            )
+        }
+        ClusterAction::Skills(args) => {
+            let verb: commands::SkillsVerb = args.verb.into();
+            let conn = args.conn;
+            // Validated before the connection is resolved, so a malformed ref
+            // never reaches discovery or the API.
+            verb.validate()?;
+            let (api_url, api_key, _cluster_api_pf) = commands::resolve_cluster_conn(
+                conn.api_url,
+                conn.api_key,
+                &conn.namespace,
+                &conn.release,
+                false,
+            )
+            .await?;
+            emit_boxed(
+                commands::learned_skills(
+                    commands::SkillsOpts {
+                        api_url,
+                        api_key,
+                        tier: "cluster",
+                        agent: args.agent,
                     },
                     verb,
                 )

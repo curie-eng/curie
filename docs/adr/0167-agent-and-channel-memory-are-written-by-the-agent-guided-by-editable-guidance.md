@@ -4,6 +4,8 @@ Date: 2026-09-21
 
 Status: Accepted
 
+Partially superseded by [ADR 0249](0249-twin-memory-standing-instructions-and-a-bounded-index.md): agent memory for agents that opt in to agent-wide learning, standing instructions as a followed memory kind, and boot loading every fact body.
+
 Accepted by Brian on 2026-09-30. This is the design for
 [#1461](https://github.com/curie-eng/curie/issues/1461), shipping in v0.12.0
 from `next`. Memory implementation merged on `next` in

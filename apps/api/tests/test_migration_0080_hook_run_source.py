@@ -92,8 +92,11 @@ def test_0080_is_expand_after_0079_and_precedes_the_single_candidate_head() -> N
     assert revision.down_revision == BELOW
     # #2911 appends tenant scope (0101) after the OIDC login revision, and #3831
     # the reply target (0102), tracker identity (0103), trigger label (0105),
-    # identity links (0107), stable history join (0108) and team sync state
-    # (0120) and agent access policies (0121) follow that.
+    # identity links (0107), stable history join (0108), team sync state
+    # (0120), agent access policies (0121), directory identity (0122), start
+    # failure detail (0123), attachment catalogs (0130) and their merge (0131),
+    # then schedule safety, learned skills, agent schedules and twin memory
+    # follow that.
     assert script.get_heads() == [load_window().schema_head]
     candidate = script.get_revision("0081")
     assert candidate is not None

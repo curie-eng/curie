@@ -36,8 +36,11 @@ def test_candidate_requires_deploy_notices_after_ledger_schema(resource: str) ->
     )
     # The next-only migrations follow the immutable published 0.12.2 chain.
     # The minimum tracks the newest schema the app reads (#2911's tenant scope);
-    # The join requires both start diagnostics (0123) and attachment catalogs (0130).
-    assert window == {"schema_min": "0131", "schema_head": "0131"}
+    # the join requires both start diagnostics (0123) and attachment catalogs
+    # (0130), and above it the Agent ORM reads agents.learned_skills (ADR 0247),
+    # the agent schedule columns (ADR 0248), then agents.agent_wide_learning
+    # (ADR 0249).
+    assert window == {"schema_min": "selfimp_memory_0001", "schema_head": "selfimp_memory_0001"}
 
 
 @pytest.mark.parametrize("field", ["cargo", "chart", "app"])
@@ -65,7 +68,7 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     assert data["windows"].get("0.13.2") == {"schema_min": "0108", "schema_head": "0108"}
     assert data["windows"].get("0.14.0") == {"schema_min": "0122", "schema_head": "0122"}
     assert data["windows"].get("0.14.1") == {"schema_min": "0123", "schema_head": "0123"}
-    assert data["revisions"][-18:] == [
+    assert data["revisions"][-22:] == [
         "0095",
         "0096",
         "0097",
@@ -84,6 +87,10 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
         "0123",
         "0130",
         "0131",
+        "selfimp_safety_0001",
+        "selfimp_skills_0001",
+        "selfimp_sched_0001",
+        "selfimp_memory_0001",
     ]
     kinds = json.loads((ROOT / "apps/api/src/curie_api/revision_kinds.json").read_text())
     assert kinds["0102"] == "expand"
@@ -98,6 +105,10 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     assert kinds["0130"] == "expand"
     assert kinds["0123"] == "expand"
     assert kinds["0131"] == "expand"
+    assert kinds["selfimp_safety_0001"] == "expand"
+    assert kinds["selfimp_skills_0001"] == "expand"
+    assert kinds["selfimp_sched_0001"] == "expand"
+    assert kinds["selfimp_memory_0001"] == "expand"
 
 
 def test_every_prior_registered_window_is_exactly_preserved() -> None:
@@ -144,6 +155,14 @@ def test_released_0076_startup_refuses_without_migrating_then_0101_starts(
             with TestClient(create_app()):
                 pass
         assert current_revision() == "0100"
+        # The Agent ORM reads the twin memory toggle, so the agent schedules
+        # head, the revision right below twin memory, is below the min too.
+        command.upgrade(alembic_config(), "selfimp_sched_0001")
+        get_settings.cache_clear()
+        with pytest.raises(RuntimeError, match="below application min"):
+            with TestClient(create_app()):
+                pass
+        assert current_revision() == "selfimp_sched_0001"
         command.upgrade(alembic_config(), load_window().schema_head)
         assert current_revision() == load_window().schema_head
         with TestClient(create_app()) as client:
@@ -172,7 +191,7 @@ def test_both_train_heads_upgrade_without_losing_existing_rows(
 
     command.upgrade(alembic_config(), "head")
 
-    assert current_revision() == "0131"
+    assert current_revision() == load_window().schema_head
     assert sql_dicts("SELECT name FROM curie.agents WHERE id = :id", {"id": agent_id}) == [
         {"name": "acme-retained"}
     ]

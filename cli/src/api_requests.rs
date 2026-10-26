@@ -109,6 +109,10 @@ pub struct ChannelBindingWrite {
 #[derive(Clone, Default, Serialize)]
 pub struct AgentUpdate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_schedules: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_wide_learning: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_required_tools: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_routes: Option<BTreeMap<String, ApprovalRouteBindingWrite>>,
@@ -116,6 +120,8 @@ pub struct AgentUpdate {
     pub execution_deadline_seconds: Option<Option<u32>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hook_partitions: Option<BTreeMap<String, HookPartitionInput>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub learned_skills: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_writes: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -132,6 +138,12 @@ pub struct AgentUpdate {
     pub repo_full_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runner_resources: Option<Option<serde_json::Map<String, serde_json::Value>>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule_max_active: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule_min_interval_minutes: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule_timezone: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secrets: Option<BTreeMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -216,6 +228,34 @@ pub struct MemoryGuidanceIn {
     pub text: String,
 }
 
+/// `POST /agents/{id}/state/_memory/archive` and `.../restore`
+/// (`MemoryLifecycleIn`, ADR 0249). `expected_version` is the version the CLI
+/// just read; the channel pair is sent only for channel scope.
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryLifecycleIn {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_kind: Option<String>,
+    pub expected_version: u64,
+    pub id: String,
+    pub scope: String,
+}
+
+/// `POST /agents/{id}/state/_memory/revert` (`MemoryRevertIn`, ADR 0249).
+/// `to_version` 0 means the entry's absence before it was created.
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryRevertIn {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_kind: Option<String>,
+    pub expected_version: u64,
+    pub id: String,
+    pub scope: String,
+    pub to_version: u64,
+}
+
 /// `POST /approvals/{id}/resolve` (`ApprovalResolve`).
 #[derive(Debug, Clone, Serialize)]
 pub struct ApprovalResolve {
@@ -252,6 +292,45 @@ pub struct EvalTriggerRequest {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suite: Option<String>,
+}
+
+/// `PATCH /agents/{id}/schedules/{schedule_id}` (`AgentScheduleUpdate`, ADR 0248).
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentScheduleUpdate {
+    pub expected_revision: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cron: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+}
+
+/// `POST /agents/{id}/schedules/{schedule_id}/cancel` (`AgentScheduleCancel`).
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentScheduleCancel {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<u32>,
+}
+
+/// `POST /agents/{id}/schedules/{schedule_id}/revert` (`AgentScheduleRevert`).
+/// No `to_revision` undoes the last change.
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentScheduleRevert {
+    pub expected_revision: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_revision: Option<u32>,
+}
+
+/// `POST /agents/{id}/learned-skills/{ref}/revert` (`LearnedSkillRevert`,
+/// ADR 0247). No `to_revision` undoes the last change.
+#[derive(Debug, Clone, Serialize)]
+pub struct LearnedSkillRevert {
+    pub expected_revision: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_revision: Option<u32>,
 }
 
 // @spec ACTION-EXECUTOR-23 @spec ACTION-EXECUTOR-3

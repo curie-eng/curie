@@ -73,7 +73,13 @@ from .approval_wording import describe_approval, presentation_text
 from .caller_feedback import action_label
 from .memory_facts import MEMORY_TOOL_NAMES
 from .publication_precheck import PublicationPrecheck
-from .tool_names import PROGRESS_TOOL, STATE_TOOL_NAMES, TURN_PROGRESS_TOOL
+from .tool_names import (
+    AGENT_SCHEDULE_TOOL_NAMES,
+    LEARNED_SKILL_TOOL_NAMES,
+    PROGRESS_TOOL,
+    STATE_TOOL_NAMES,
+    TURN_PROGRESS_TOOL,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -277,12 +283,14 @@ _APPROVAL_SERVER_TOOL_NAMES: frozenset[str] = frozenset(
     }
 )
 
-# The memory tools (#1461, ADR-0167), on the same ``curie`` server but mounted
-# only when the worker set a channel memory ref. Rendered from the one tuple
-# ``harness.claude.approval.build_memory_tools`` registers, so a fourth tool cannot
-# be published without being exempted. Unlike ``report_progress`` these are
-# exempt ONLY when mounted: they write, so a name the platform did not publish
-# this session must fall to the fail-closed default.
+# The memory tools (#1461, ADR-0167, ADR 0249), on the same ``curie`` server.
+# Rendered from the one tuple ``harness.claude.approval.build_memory_tools``
+# registers. This is the universe of names a session could mount; the exemption
+# itself is ONLY the exact set the session did mount (``memory_tool_names``,
+# taken from the tools ``build_memory_tools`` returned). ``read_memory`` mounts
+# whenever memory is readable and the six mutators only with writes on, so a
+# mutator name the platform did not publish this session must fall to the
+# fail-closed default.
 MEMORY_TOOL_LIVE_NAMES: frozenset[str] = frozenset(
     f"mcp__{APPROVAL_SERVER_NAME}__{name}" for name in MEMORY_TOOL_NAMES
 )
@@ -651,10 +659,17 @@ class ApprovalGate:
     # state server, so a forgotten wiring costs an over-refusal a human can see
     # rather than a silent bypass nobody can.
     state_server_mounted: bool = False
-    # Whether THIS session mounted the memory tools on the ``curie`` server
-    # (#1461). Same fact-not-default reasoning as ``state_server_mounted``:
-    # ``__main__`` sets it from the expression that decides the mount.
-    memory_tools_mounted: bool = False
+    # The exact live names of the memory tools THIS session mounted on the
+    # ``curie`` server (#1461, ADR 0249). Same fact-not-default reasoning as
+    # ``state_server_mounted``: ``__main__`` sets it from the tools it mounted,
+    # and the empty default exempts nothing.
+    memory_tool_names: frozenset[str] = frozenset()
+    # Whether THIS session mounted the ``agent_schedules`` server (ADR 0248), on
+    # the same reasoning.
+    agent_schedules_mounted: bool = False
+    # Whether THIS session mounted the ``learned_skills`` server (ADR 0247), on
+    # the same reasoning.
+    learned_skills_mounted: bool = False
     _boot_turn_seen: bool = False
 
     def grantable_tool_for_route(self, route: str | None) -> str | None:
@@ -924,7 +939,11 @@ def canonical_tool_name(
 
 
 def platform_tool_names(
-    *, state_server_mounted: bool, memory_tools_mounted: bool = False
+    *,
+    state_server_mounted: bool,
+    memory_tool_names: frozenset[str] = frozenset(),
+    agent_schedules_mounted: bool = False,
+    learned_skills_mounted: bool = False,
 ) -> frozenset[str]:
     """The live tool names Curie's own in-process servers mounted THIS session.
 
@@ -940,20 +959,32 @@ def platform_tool_names(
     the same ordered names ``build_state_server`` registers, so a sixth state
     tool cannot be published without being exempted (#2286).
 
-    The three memory tools (#1461) join the set only when the runner mounted
-    them, on the same reasoning as the state tools.
+    ``memory_tool_names`` is the exact set of memory tool live names the runner
+    mounted (#1461, ADR 0249). Only those join, and only when they are memory
+    tool names at all: a name outside ``MEMORY_TOOL_LIVE_NAMES`` gains nothing
+    from appearing here. The five agent-schedule tools (ADR 0248) and the six
+    learned-skills tools (ADR 0247) join only when the runner mounted their
+    server, on the same reasoning as the state tools.
     """
 
     names = _APPROVAL_SERVER_TOOL_NAMES
     if state_server_mounted:
         names = names | STATE_TOOL_NAMES
-    if memory_tools_mounted:
-        names = names | MEMORY_TOOL_LIVE_NAMES
+    names = names | (memory_tool_names & MEMORY_TOOL_LIVE_NAMES)
+    if agent_schedules_mounted:
+        names = names | AGENT_SCHEDULE_TOOL_NAMES
+    if learned_skills_mounted:
+        names = names | LEARNED_SKILL_TOOL_NAMES
     return names
 
 
 def is_platform_owned_tool(
-    live_tool_name: str, *, state_server_mounted: bool, memory_tools_mounted: bool = False
+    live_tool_name: str,
+    *,
+    state_server_mounted: bool,
+    memory_tool_names: frozenset[str] = frozenset(),
+    agent_schedules_mounted: bool = False,
+    learned_skills_mounted: bool = False,
 ) -> bool:
     """Whether a live SDK name is one Curie's own servers published (#2286).
 
@@ -986,7 +1017,10 @@ def is_platform_owned_tool(
     """
 
     return live_tool_name in platform_tool_names(
-        state_server_mounted=state_server_mounted, memory_tools_mounted=memory_tools_mounted
+        state_server_mounted=state_server_mounted,
+        memory_tool_names=memory_tool_names,
+        agent_schedules_mounted=agent_schedules_mounted,
+        learned_skills_mounted=learned_skills_mounted,
     )
 
 
@@ -1018,7 +1052,9 @@ def _tool_policy_outcome(gate: ApprovalGate, tool_name: str) -> ToolPolicyDecisi
     if is_platform_owned_tool(
         tool_name,
         state_server_mounted=gate.state_server_mounted,
-        memory_tools_mounted=gate.memory_tools_mounted,
+        memory_tool_names=gate.memory_tool_names,
+        agent_schedules_mounted=gate.agent_schedules_mounted,
+        learned_skills_mounted=gate.learned_skills_mounted,
     ):
         return None
     canonical = canonical_tool_name(

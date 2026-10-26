@@ -326,7 +326,7 @@ sys.exit(64)
 "#;
 
 fn agent() -> Value {
-    json!({"id":"agent-fixture","name":"dark-factory","channels":[],"created_at":"2026-10-04T00:00:00Z","memory":false,"memory_writes":true,"publication_policy":"auto","execution_deadline_seconds":3600})
+    json!({"id":"agent-fixture","name":"dark-factory","channels":[],"created_at":"2026-10-04T00:00:00Z","memory":false,"agent_wide_learning":false,"memory_writes":true,"publication_policy":"auto","execution_deadline_seconds":3600})
 }
 
 fn platform(req: &Request, state: &std::sync::Mutex<Value>) -> Response {

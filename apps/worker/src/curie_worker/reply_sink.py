@@ -706,7 +706,7 @@ def build_reply_sink(
     resolves it once and hands the same map to the attachment lane.
     """
     tokens = slack_bot_tokens(config) if slack_tokens is None else slack_tokens
-    return ReplySinkRouter(
+    sink = ReplySinkRouter(
         adapters={
             SLACK_KIND: SlackReplyAdapter(
                 config.slack_bot_token,
@@ -722,3 +722,7 @@ def build_reply_sink(
             config.internal_worker_token,
         ),
     )
+    from .schedule_safety import bind_notice_sink
+
+    bind_notice_sink(sink)
+    return sink

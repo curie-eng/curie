@@ -733,9 +733,14 @@ fn memory_output_json_shape_is_pinned() {
                     id: "fact-0123456789abcdef0123456789abcdef".to_string(),
                     scope: "agent".to_string(),
                     channel: None,
+                    kind: "fact".to_string(),
+                    title: "Timestamps".to_string(),
                     statement: "prefer complete timestamps".to_string(),
-                    author: "operator@example.com".to_string(),
-                    stated_at: "2026-10-01T03:04:05.123456+00:00".to_string(),
+                    author: Some("operator@example.com".to_string()),
+                    stated_at: Some("2026-10-01T03:04:05.123456+00:00".to_string()),
+                    conversation: None,
+                    archived: false,
+                    version: 1,
                 },
                 MemoryFact {
                     id: "fact-11111111111111111111111111111111".to_string(),
@@ -744,9 +749,14 @@ fn memory_output_json_shape_is_pinned() {
                         kind: "slack".to_string(),
                         address: "C0EXAMPLE1".to_string(),
                     }),
+                    kind: "instruction".to_string(),
+                    title: "Morning updates".to_string(),
                     statement: "prefer morning updates".to_string(),
-                    author: "U0EXAMPLE1".to_string(),
-                    stated_at: "2026-10-02T03:04:05Z".to_string(),
+                    author: Some("U0EXAMPLE1".to_string()),
+                    stated_at: Some("2026-10-02T03:04:05Z".to_string()),
+                    conversation: Some("slack:C0EXAMPLE1:1700000000.000100".to_string()),
+                    archived: true,
+                    version: 4,
                 },
             ],
         }
@@ -762,17 +772,27 @@ fn memory_output_json_shape_is_pinned() {
                     "id": "fact-0123456789abcdef0123456789abcdef",
                     "scope": "agent",
                     "channel": null,
+                    "kind": "fact",
+                    "title": "Timestamps",
                     "statement": "prefer complete timestamps",
                     "author": "operator@example.com",
                     "stated_at": "2026-10-01T03:04:05.123456+00:00",
+                    "conversation": null,
+                    "archived": false,
+                    "version": 1,
                 },
                 {
                     "id": "fact-11111111111111111111111111111111",
                     "scope": "channel",
                     "channel": {"kind": "slack", "address": "C0EXAMPLE1"},
+                    "kind": "instruction",
+                    "title": "Morning updates",
                     "statement": "prefer morning updates",
                     "author": "U0EXAMPLE1",
                     "stated_at": "2026-10-02T03:04:05Z",
+                    "conversation": "slack:C0EXAMPLE1:1700000000.000100",
+                    "archived": true,
+                    "version": 4,
                 },
             ],
         })
@@ -1670,7 +1690,8 @@ fn deploy_api_response(
                     "id": format!("agent-{target}"),
                     "name": name,
                     "channels": [{"kind": "slack", "address": channel}],
-                    "memory": false
+                    "memory": false,
+                    "agent_wide_learning": false
                 }),
             )
         }
@@ -1723,7 +1744,8 @@ fn deploy_api_response(
                     "id": id,
                     "name": id,
                     "channels": [],
-                    "memory": false
+                    "memory": false,
+                    "agent_wide_learning": false
                 }),
             )
         }

@@ -36,6 +36,7 @@ from ..binding import (
     AmbiguousRoute,
     FactoryBindingRefused,
     FactoryWake,
+    _parse_resume_event_id,
     binding_adapter_for_handle,
 )
 from ..capacity_wait import (
@@ -813,6 +814,89 @@ async def _process_event(
                     )
             if memory_writes:
                 resolved = resolved.model_copy(update={"memory_writes": True})
+            # Agent schedules (ADR 0248) are read beside memory writes, for
+            # the same schema reason, and degrade to off the same way. This
+            # read is the one every resolve path converges on.
+            agent_schedules = False
+            if hasattr(self._binding, "agent_schedules_for"):
+                try:
+                    agent_schedules = await self._binding.agent_schedules_for(agent_id)
+                except Exception as exc:  # noqa: BLE001 - degrade to off
+                    logger.warning(
+                        "agent schedules read failed agent=%s error_class=%s;"
+                        " running with agent schedules off",
+                        agent_id,
+                        type(exc).__name__,
+                    )
+            if agent_schedules != getattr(resolved, "agent_schedules", False):
+                resolved = resolved.model_copy(update={"agent_schedules": agent_schedules})
+            # A scheduled run, or the approval continuation of one (its
+            # approval chain starts at a cron event id), may not create or
+            # change schedules. The chain origin, not the conversation,
+            # decides: a person's approval in a schedule conversation is not
+            # a scheduled continuation. The origin is read when the toggle is
+            # on or the conversation is a schedule's, so a cron origin is
+            # still guarded with the toggle off. An unreadable origin, or a
+            # binding that cannot read it, counts as cron: the restrictive
+            # direction, for both the claim and the schedule guard.
+            scheduled = qevent.source is TurnSource.CRON
+            is_resume = self._is_approval_resume(event_id)
+            schedule_id = (
+                hooks._agent_schedule_of_conversation(qevent.conversation_id, agent_id)
+                if is_resume
+                else None
+            )
+            from_cron = False
+            # Learned skills read the same claim (ADR 0247 refuses scheduled
+            # writes), so the origin is read when they are on too.
+            learned_skills = bool(getattr(resolved, "learned_skills", False))
+            if is_resume and (agent_schedules or learned_skills or schedule_id is not None):
+                origin_reader = getattr(self._binding, "approval_from_cron", None)
+                if origin_reader is None:
+                    from_cron = True
+                else:
+                    try:
+                        from_cron = await origin_reader(event_id, agent_id)
+                    except Exception as exc:  # noqa: BLE001 - fail toward scheduled
+                        logger.warning(
+                            "approval origin read failed agent=%s error_class=%s;"
+                            " treating the continuation as scheduled",
+                            agent_id,
+                            type(exc).__name__,
+                        )
+                        from_cron = True
+            scheduled = scheduled or from_cron
+            if schedule_id is not None and from_cron:
+                # ADR 0248: an approved continuation of an agent schedule
+                # firing runs only while that schedule still allows it;
+                # checked here and again under its lock at start or steer.
+                # Start and steer guard only the schedule_resume set below,
+                # so a human-origin resume is never re-checked there either.
+                approval_id = _parse_resume_event_id(event_id)
+                allowed = False
+                if approval_id is not None and self._hook_runs is not None:
+                    async with self._hook_runs.resume_guard(
+                        agent_id, schedule_id, approval_id
+                    ) as allowed:
+                        pass
+                if not allowed or approval_id is None:
+                    logger.info(
+                        "approval resume %s for agent schedule %s refused: the "
+                        "schedule changed, was cancelled or paused, or is off; dropping",
+                        event_id,
+                        schedule_id,
+                    )
+                    await self._complete(
+                        qevent,
+                        route,
+                        "dropped",
+                        telemetry_outcome="interrupted",
+                        lease=lease,
+                    )
+                    return
+                resume_carry = constants._HOOK_RUN_CARRY.get()
+                assert resume_carry is not None
+                resume_carry.schedule_resume = (agent_id, schedule_id, approval_id)
             # The scoped key, not the bare conversation id: this mints the
             # sandbox's history ref and session id, so two channels sharing
             # a conversation id must not rehydrate one another's transcript.
@@ -835,6 +919,7 @@ async def _process_event(
                     kind=handle.kind,
                     address=handle.channel,
                     thread_key=thread_key,
+                    scheduled=scheduled,
                 )
                 deployment_id = getattr(resolved, "deployment_id", None)
                 if isinstance(deployment_id, uuid.UUID):
@@ -1164,6 +1249,18 @@ async def _process_event(
                     channel_read_grant=channel_read_grant,
                 )
             except failures._WorkItemDeferred:
+                return
+            except hooks.ScheduleResumeRefused as exc:
+                # ADR 0248: the schedule changed under its lock between intake
+                # and the start or steer. Dropped with a log line, no reply.
+                logger.info("approval resume %s refused at start: %s; dropping", event_id, exc)
+                await self._complete(
+                    qevent,
+                    route,
+                    "dropped",
+                    telemetry_outcome="interrupted",
+                    lease=lease,
+                )
                 return
             except failures.SweepClaimGone as exc:
                 # ADR-0160: a continuation never claims, resumes or hands off

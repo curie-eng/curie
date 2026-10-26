@@ -73,7 +73,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use proc_macro2::{Delimiter, TokenStream, TokenTree};
+use proc_macro2::{Delimiter, Spacing, TokenStream, TokenTree};
 use quote::ToTokens;
 use serde_json::Value;
 use syn::visit::Visit;
@@ -166,7 +166,10 @@ impl<'ast> Visit<'ast> for OutputCollector {
 /// by value (`.map(approval_record_json)`) or by call
 /// (`approval_record_json(r)`) -- a name that happens not to resolve to a
 /// known `fn` (a local variable, a type, a keyword-shaped ident) is simply
-/// never looked up, so over-collecting here is harmless.
+/// never looked up, so over-collecting here is harmless. The one exception is
+/// an ident followed by a lone `:` (not `::`): that is a field name in a
+/// pattern or struct literal (`learned_skills: on`), never a fn reference, and
+/// following it would pull in the keys of an unrelated same-named fn.
 fn bare_idents(tokens: TokenStream) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     collect_idents(tokens, &mut out);
@@ -174,10 +177,17 @@ fn bare_idents(tokens: TokenStream) -> BTreeSet<String> {
 }
 
 fn collect_idents(tokens: TokenStream, out: &mut BTreeSet<String>) {
-    for tt in tokens {
+    let mut iter = tokens.into_iter().peekable();
+    while let Some(tt) = iter.next() {
         match tt {
             TokenTree::Ident(id) => {
-                out.insert(id.to_string());
+                let is_field_name = matches!(
+                    iter.peek(),
+                    Some(TokenTree::Punct(p)) if p.as_char() == ':' && p.spacing() == Spacing::Alone
+                );
+                if !is_field_name {
+                    out.insert(id.to_string());
+                }
             }
             TokenTree::Group(g) => collect_idents(g.stream(), out),
             _ => {}

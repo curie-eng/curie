@@ -33,6 +33,9 @@ class TurnMemoryGrant:
     kind: str
     address: str
     thread_key: str
+    # A scheduled run, or the approval continuation of one (ADR 0248): the
+    # credential then says so, and the API refuses schedule changes with it.
+    scheduled: bool = False
 
 
 class ReclaimPreflightUnsafe(RuntimeError):
@@ -190,6 +193,7 @@ def _with_memory_token(
         sender=qevent.author or "",
         turn=turn,
         ttl_s=ttl_s,
+        scheduled=grant.scheduled,
     )
     if not token:
         return unminted

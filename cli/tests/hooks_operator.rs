@@ -26,6 +26,7 @@ fn agent() -> Value {
         "name": AGENT_NAME,
         "channels": [{"kind": "slack", "address": "C0EXAMPLE1"}],
         "memory": false,
+        "agent_wide_learning": false,
         "created_at": "2026-09-27T00:00:00Z",
         "hook_partitions": {"alertmanager": {"pointer": "/old_partition"}},
         "source_bindings": {

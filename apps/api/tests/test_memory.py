@@ -109,7 +109,12 @@ async def _wait_for_blocked_memory_requests(
                 FROM pg_stat_activity
                 WHERE datname = current_database()
                   AND wait_event_type = 'Lock'
-                  AND query LIKE '%workflow_state_entries%'
+                  AND (
+                    query LIKE '%workflow_state_entries%'
+                    -- ADR 0249: memory writes first take the per-scope
+                    -- advisory lock, so a second writer waits there.
+                    OR query LIKE '%pg_advisory_xact_lock%'
+                  )
                 """
             )
             if int(count) >= minimum:

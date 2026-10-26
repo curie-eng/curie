@@ -6,6 +6,7 @@ mod support;
 
 mod access_policy_verb;
 mod actions_cli;
+mod agent_schedules_cli;
 mod agent_update_body;
 mod api_deploy;
 mod api_emit_parity;
@@ -126,6 +127,7 @@ mod installation_plan_parity;
 mod json_contract;
 mod json_emit_contract;
 mod kube_spawn_inventory;
+mod learned_skills_cli;
 mod lease_expiry_cluster_proof;
 mod local_connectedness_probe;
 mod local_resources;

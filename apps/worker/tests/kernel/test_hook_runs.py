@@ -24,6 +24,7 @@ from aci_protocol import (
     TurnSource,
 )
 from curie_telemetry import record_metric
+from curie_test_support.postgres import pg_connect_or_skip
 from curie_worker import hook_runs as hook_runs_module
 from curie_worker.approvals import ApprovalRequest, CreatedApproval
 from curie_worker.binding import BindingResolver
@@ -1115,6 +1116,11 @@ def test_recorder_reads_and_writes_the_configured_schema() -> None:
                 ),
             )
         )
+        try:
+            await pg_connect_or_skip(engine)
+        except BaseException:
+            await engine.dispose()
+            raise
         schema = f"hook_runs_{uuid.uuid4().hex[:12]}"
         agent_id = uuid.uuid4()
         run_id = uuid.uuid4()
@@ -1133,6 +1139,27 @@ def test_recorder_reads_and_writes_the_configured_schema() -> None:
                             f"(LIKE curie.{table} INCLUDING ALL)"
                         )
                     )
+                await conn.execute(
+                    text(
+                        f"CREATE TABLE {schema}.agents ("
+                        "id uuid PRIMARY KEY, model text)"
+                    )
+                )
+                await conn.execute(
+                    text(
+                        f"CREATE TABLE {schema}.schedule_failure_streaks ("
+                        "agent_id uuid NOT NULL, name text NOT NULL, "
+                        "consecutive integer NOT NULL, "
+                        "PRIMARY KEY (agent_id, name))"
+                    )
+                )
+                await conn.execute(
+                    text(
+                        f"INSERT INTO {schema}.agents (id, model) "
+                        "VALUES (:id, :model)"
+                    ),
+                    {"id": agent_id, "model": "anthropic/claude-haiku-5.5"},
+                )
                 await conn.execute(
                     text(
                         f"INSERT INTO {schema}.hook_runs "

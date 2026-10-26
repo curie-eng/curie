@@ -224,6 +224,57 @@ async def update_agent_memory_writes(
     return agent
 
 
+async def update_agent_wide_learning(
+    session: AsyncSession, agent: Agent, agent_wide_learning: bool
+) -> Agent:
+    """Set whether the agent is opted in to agent-wide learning (ADR 0249).
+    Takes effect at the next sandbox boot for guidance and instructions, and at
+    once for sandbox instruction writes; memory writes are untouched."""
+
+    agent.agent_wide_learning = agent_wide_learning
+    await session.commit()
+    await session.refresh(agent)
+    return agent
+
+
+async def update_agent_schedule_settings(
+    session: AsyncSession,
+    agent: Agent,
+    *,
+    enabled: bool | None,
+    timezone: str | None,
+    max_active: int | None,
+    min_interval_minutes: int | None,
+) -> Agent:
+    """Set the agent-created schedule switch, default zone and limits (ADR 0248);
+    None leaves a field unchanged. Stored schedules are untouched: turning the
+    switch off stops them firing, and a lower limit refuses only new ones."""
+
+    if enabled is not None:
+        agent.agent_schedules = enabled
+    if timezone is not None:
+        agent.schedule_timezone = timezone
+    if max_active is not None:
+        agent.schedule_max_active = max_active
+    if min_interval_minutes is not None:
+        agent.schedule_min_interval_minutes = min_interval_minutes
+    await session.commit()
+    await session.refresh(agent)
+    return agent
+
+
+async def update_agent_learned_skills(
+    session: AsyncSession, agent: Agent, learned_skills: bool
+) -> Agent:
+    """Set whether the agent loads and edits learned skills (ADR 0247).
+    Takes effect at the next sandbox boot; stored skills are untouched."""
+
+    agent.learned_skills = learned_skills
+    await session.commit()
+    await session.refresh(agent)
+    return agent
+
+
 async def update_agent_approval_tools(
     session: AsyncSession, agent: Agent, tools: list[str]
 ) -> Agent:

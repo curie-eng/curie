@@ -323,6 +323,20 @@ class Agent(Base):
     # agent (#1461, ADR-0167). Operator-owned; off by default. When on, the
     # worker hands the runner the binding-scoped channel memory URL.
     memory_writes: Mapped[bool] = mapped_column(default=False, server_default="false")
+    # Whether this agent is opted in to agent-wide learning (ADR 0249). Operator
+    # owned and off by default, independent of ``memory_writes``: it authorizes
+    # standing instructions (kind ``instruction``) and selects the learning
+    # default guidance. It never turns memory writes on.
+    agent_wide_learning: Mapped[bool] = mapped_column(default=False, server_default="false")
+    # Whether the agent may create and change its own schedules (ADR 0248), and
+    # the limits it is held to. Operator-owned; off by default.
+    agent_schedules: Mapped[bool] = mapped_column(default=False, server_default="false")
+    schedule_timezone: Mapped[str] = mapped_column(Text, default="UTC", server_default="UTC")
+    schedule_max_active: Mapped[int] = mapped_column(default=20, server_default="20")
+    schedule_min_interval_minutes: Mapped[int] = mapped_column(default=15, server_default="15")
+    # Whether the agent loads and may edit its learned skills (ADR 0247).
+    # Operator-owned; off by default, like ``memory_writes``.
+    learned_skills: Mapped[bool] = mapped_column(default=False, server_default="false")
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
     versions: Mapped[list[AgentVersion]] = relationship(
@@ -2317,6 +2331,42 @@ class WorkflowStateEntry(Base):
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
 
 
+class MemoryRevision(Base):
+    """One immutable revision of a canonical memory entry (ADR 0249).
+
+    Every successful create, update, delete, archive, restore and revert of a
+    ``memory`` / ``fact-<hex>`` head appends exactly one row here in the same
+    transaction as the head mutation; the migration seeds one ``baseline`` row
+    per valid pre-existing fact. ``snapshot`` is the resulting canonical value,
+    null for a deletion. ``scope`` is the head's ``binding_scope`` with the
+    agent-wide scope stored as ``memory_records.AGENT_SCOPE`` (never null), so
+    the unique key below holds for agent-wide rows too. Rows are never updated;
+    deleting the agent removes them.
+    """
+
+    __tablename__ = "memory_revisions"
+    __table_args__ = (
+        UniqueConstraint(
+            "agent_id", "scope", "fact_id", "version", name="uq_memory_revisions_version"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE")
+    )
+    scope: Mapped[str] = mapped_column(Text)
+    fact_id: Mapped[str] = mapped_column(Text)
+    version: Mapped[int]
+    operation: Mapped[str] = mapped_column(Text)
+    # none_as_null: a deletion tombstone is SQL NULL, not the JSON null literal.
+    snapshot: Mapped[Any | None] = mapped_column(JSONB(none_as_null=True), default=None)
+    actor: Mapped[str] = mapped_column(Text)
+    source: Mapped[str] = mapped_column(Text)
+    conversation: Mapped[str | None] = mapped_column(Text, default=None)
+    reverted_to_version: Mapped[int | None] = mapped_column(default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
 
 class ThreadTranscript(Base):
     """One thread's conversation transcript (ADR-0170, #3070).
@@ -3893,3 +3943,187 @@ class IdentityConnectToken(Base):
     )
     verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class AgentSchedule(Base):
+    """One schedule an agent (or its operator) created (ADR 0248).
+
+    Exactly one of ``cron`` (recurring) and ``run_at`` (one-shot) is set.
+    ``revision`` is the configuration revision: it moves only when the prompt,
+    cron, run_at or timezone change, or on revert. Stored ``state`` is active,
+    cancelled or done; paused is read from ``schedule_controls``."""
+
+    __tablename__ = "agent_schedules"
+    __table_args__ = (
+        CheckConstraint("(cron IS NULL) <> (run_at IS NULL)", name="agent_schedules_one_kind_ck"),
+        CheckConstraint(
+            "state IN ('active', 'cancelled', 'done')", name="agent_schedules_state_ck"
+        ),
+        CheckConstraint(
+            "created_source IN ('agent', 'operator')", name="agent_schedules_source_ck"
+        ),
+        CheckConstraint("revision >= 1", name="agent_schedules_revision_ck"),
+        UniqueConstraint("agent_id", "idempotency_key", name="uq_agent_schedules_idempotency_key"),
+        Index("ix_agent_schedules_agent_state", "agent_id", "state"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE")
+    )
+    revision: Mapped[int]
+    state: Mapped[str] = mapped_column(Text)
+    prompt: Mapped[str] = mapped_column(Text)
+    cron: Mapped[str | None] = mapped_column(Text, default=None)
+    run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    timezone: Mapped[str] = mapped_column(Text)
+    destination_kind: Mapped[str] = mapped_column(Text)
+    destination_address: Mapped[str] = mapped_column(Text)
+    destination_adapter: Mapped[str | None] = mapped_column(Text, default=None)
+    created_by: Mapped[str] = mapped_column(Text)
+    created_source: Mapped[str] = mapped_column(Text)
+    created_conversation: Mapped[str | None] = mapped_column(Text, default=None)
+    created_turn: Mapped[str | None] = mapped_column(Text, default=None)
+    idempotency_key: Mapped[str] = mapped_column(Text)
+    effective_from: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_by: Mapped[str | None] = mapped_column(Text, default=None)
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    cancelled_by: Mapped[str | None] = mapped_column(Text, default=None)
+    fired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+
+
+class AgentScheduleRevision(Base):
+    """One insert-only entry in a schedule's change log (ADR 0248). Several
+    entries share a ``revision``: pause, resume, cancel and completion are
+    logged without moving it. ``state`` is the read-back state after it."""
+
+    __tablename__ = "agent_schedule_revisions"
+    __table_args__ = (
+        CheckConstraint(
+            "action IN ('create', 'update', 'pause', 'resume', 'cancel', 'revert', 'complete')",
+            name="agent_schedule_revisions_action_ck",
+        ),
+        CheckConstraint(
+            "state IN ('active', 'paused', 'cancelled', 'done')",
+            name="agent_schedule_revisions_state_ck",
+        ),
+        CheckConstraint(
+            "source IN ('agent', 'operator', 'scheduler')",
+            name="agent_schedule_revisions_source_ck",
+        ),
+    )
+
+    schedule_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agent_schedules.id", ondelete="CASCADE"), primary_key=True
+    )
+    seq: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
+    revision: Mapped[int]
+    action: Mapped[str] = mapped_column(Text)
+    state: Mapped[str] = mapped_column(Text)
+    prompt: Mapped[str] = mapped_column(Text)
+    cron: Mapped[str | None] = mapped_column(Text, default=None)
+    run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    timezone: Mapped[str] = mapped_column(Text)
+    author: Mapped[str] = mapped_column(Text)
+    source: Mapped[str] = mapped_column(Text)
+    conversation: Mapped[str | None] = mapped_column(Text, default=None)
+    turn: Mapped[str | None] = mapped_column(Text, default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class AgentScheduleRun(Base):
+    """What one hook run of an agent schedule fired (ADR 0248): an immutable
+    snapshot keyed by its ``hook_runs`` row, read by the start guard."""
+
+    __tablename__ = "agent_schedule_runs"
+    __table_args__ = (Index("ix_agent_schedule_runs_schedule", "schedule_id", "revision"),)
+
+    hook_run_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.hook_runs.id", ondelete="CASCADE"), primary_key=True
+    )
+    schedule_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agent_schedules.id", ondelete="CASCADE")
+    )
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE")
+    )
+    revision: Mapped[int]
+    prompt: Mapped[str] = mapped_column(Text)
+    cron: Mapped[str | None] = mapped_column(Text, default=None)
+    run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    timezone: Mapped[str] = mapped_column(Text)
+    destination_kind: Mapped[str] = mapped_column(Text)
+    destination_address: Mapped[str] = mapped_column(Text)
+    destination_adapter: Mapped[str | None] = mapped_column(Text, default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class LearnedSkill(Base):
+    """One learned skill's head (ADR 0247): its current content and the revision
+    number every change compare-and-sets. History is ``LearnedSkillRevision``."""
+
+    __tablename__ = "learned_skills"
+    __table_args__ = (
+        Index(
+            "uq_learned_skills_active_slug",
+            "agent_id",
+            "slug",
+            unique=True,
+            postgresql_where=text("deleted_at IS NULL"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE")
+    )
+    slug: Mapped[str] = mapped_column(Text)
+    description: Mapped[str] = mapped_column(Text)
+    body: Mapped[str] = mapped_column(Text)
+    revision: Mapped[int]
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class LearnedSkillRevision(Base):
+    """One immutable, insert-only change to a learned skill (ADR 0247). ``deleted``
+    is the skill's state after this revision, so a revert restores it too."""
+
+    __tablename__ = "learned_skill_revisions"
+    __table_args__ = (
+        CheckConstraint(
+            "action IN ('create', 'patch', 'revert', 'delete')",
+            name="learned_skill_revisions_action_ck",
+        ),
+        CheckConstraint(
+            "source IN ('agent', 'operator')", name="learned_skill_revisions_source_ck"
+        ),
+        UniqueConstraint("skill_id", "revision", name="uq_learned_skill_revisions_revision"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    skill_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.learned_skills.id", ondelete="CASCADE")
+    )
+    revision: Mapped[int]
+    action: Mapped[str] = mapped_column(Text)
+    slug: Mapped[str] = mapped_column(Text)
+    description: Mapped[str] = mapped_column(Text)
+    body: Mapped[str] = mapped_column(Text)
+    digest: Mapped[str] = mapped_column(Text)
+    deleted: Mapped[bool]
+    reverted_to: Mapped[int | None] = mapped_column(default=None)
+    author: Mapped[str] = mapped_column(Text)
+    conversation: Mapped[str | None] = mapped_column(Text, default=None)
+    turn: Mapped[str | None] = mapped_column(Text, default=None)
+    source: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )

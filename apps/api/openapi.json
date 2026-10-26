@@ -1285,6 +1285,16 @@
       },
       "AgentOut": {
         "properties": {
+          "agent_schedules": {
+            "default": false,
+            "title": "Agent Schedules",
+            "type": "boolean"
+          },
+          "agent_wide_learning": {
+            "default": false,
+            "title": "Agent Wide Learning",
+            "type": "boolean"
+          },
           "approval_required_tools": {
             "anyOf": [
               {
@@ -1370,6 +1380,11 @@
             "format": "uuid",
             "title": "Id",
             "type": "string"
+          },
+          "learned_skills": {
+            "default": false,
+            "title": "Learned Skills",
+            "type": "boolean"
           },
           "memory": {
             "title": "Memory",
@@ -1459,6 +1474,21 @@
             ],
             "title": "Runner Resources"
           },
+          "schedule_max_active": {
+            "default": 20,
+            "title": "Schedule Max Active",
+            "type": "integer"
+          },
+          "schedule_min_interval_minutes": {
+            "default": 15,
+            "title": "Schedule Min Interval Minutes",
+            "type": "integer"
+          },
+          "schedule_timezone": {
+            "default": "UTC",
+            "title": "Schedule Timezone",
+            "type": "string"
+          },
           "secrets": {
             "anyOf": [
               {
@@ -1520,6 +1550,667 @@
         "title": "AgentOut",
         "type": "object"
       },
+      "AgentScheduleCancel": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_revision": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Revision"
+          }
+        },
+        "title": "AgentScheduleCancel",
+        "type": "object"
+      },
+      "AgentScheduleCreate": {
+        "additionalProperties": false,
+        "description": "Exactly one of ``cron`` and ``run_at``. ``run_at`` with an offset is that\ninstant; without one it is wall time in ``timezone`` (the agent's zone when\nomitted). ``destination`` and ``idempotency_key`` are for the operator: a\nsandbox schedule replies on its turn's binding and is keyed by its turn.",
+        "properties": {
+          "cron": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cron"
+          },
+          "destination": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AgentScheduleDestination"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "idempotency_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Idempotency Key"
+          },
+          "prompt": {
+            "title": "Prompt",
+            "type": "string"
+          },
+          "run_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run At"
+          },
+          "timezone": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Timezone"
+          }
+        },
+        "required": [
+          "prompt"
+        ],
+        "title": "AgentScheduleCreate",
+        "type": "object"
+      },
+      "AgentScheduleDestination": {
+        "additionalProperties": false,
+        "description": "The binding an operator-created schedule replies on. ``adapter`` omitted\nresolves like a turn's binding: the one row, or the default Slack identity.",
+        "properties": {
+          "adapter": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Adapter"
+          },
+          "address": {
+            "title": "Address",
+            "type": "string"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "address"
+        ],
+        "title": "AgentScheduleDestination",
+        "type": "object"
+      },
+      "AgentScheduleDestinationOut": {
+        "description": "The binding an agent schedule replies on, stored at create.",
+        "properties": {
+          "adapter": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Adapter"
+          },
+          "address": {
+            "title": "Address",
+            "type": "string"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "address",
+          "adapter"
+        ],
+        "title": "AgentScheduleDestinationOut",
+        "type": "object"
+      },
+      "AgentScheduleList": {
+        "description": "The agent's schedule switch and limits, and its schedules.",
+        "properties": {
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "max_active": {
+            "title": "Max Active",
+            "type": "integer"
+          },
+          "min_interval_minutes": {
+            "title": "Min Interval Minutes",
+            "type": "integer"
+          },
+          "schedules": {
+            "items": {
+              "$ref": "#/components/schemas/AgentScheduleOut"
+            },
+            "title": "Schedules",
+            "type": "array"
+          },
+          "timezone": {
+            "title": "Timezone",
+            "type": "string"
+          }
+        },
+        "required": [
+          "enabled",
+          "timezone",
+          "max_active",
+          "min_interval_minutes",
+          "schedules"
+        ],
+        "title": "AgentScheduleList",
+        "type": "object"
+      },
+      "AgentScheduleOut": {
+        "description": "One agent-created schedule (ADR 0248). ``conversation`` and ``turn`` are\nshown to the platform caller only; a sandbox response leaves them unset.",
+        "properties": {
+          "agent": {
+            "title": "Agent",
+            "type": "string"
+          },
+          "agent_id": {
+            "format": "uuid",
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "consecutive_failures": {
+            "title": "Consecutive Failures",
+            "type": "integer"
+          },
+          "conversation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Conversation"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "created_by": {
+            "title": "Created By",
+            "type": "string"
+          },
+          "created_source": {
+            "enum": [
+              "agent",
+              "operator"
+            ],
+            "title": "Created Source",
+            "type": "string"
+          },
+          "cron": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cron"
+          },
+          "destination": {
+            "$ref": "#/components/schemas/AgentScheduleDestinationOut"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "last_fire_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Fire At"
+          },
+          "last_outcome": {
+            "anyOf": [
+              {
+                "enum": [
+                  "ran",
+                  "deferred",
+                  "skipped",
+                  "blocked",
+                  "reclaimed",
+                  "failed"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Outcome"
+          },
+          "last_reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "turn_error",
+                  "target_unbound",
+                  "approval_gate_targetless",
+                  "agent_killed",
+                  "budget_exhausted",
+                  "run_in_flight",
+                  "catch_up_expired",
+                  "deferred_expired",
+                  "reply_undeliverable",
+                  "prior_side_effect",
+                  "deployment_missing",
+                  "hook_paused",
+                  "live_session",
+                  "enqueue_failed",
+                  "claim_expired",
+                  "daily_budget",
+                  "schedule_changed"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Reason"
+          },
+          "next_run_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Run At"
+          },
+          "next_run_local": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Run Local"
+          },
+          "paused": {
+            "title": "Paused",
+            "type": "boolean"
+          },
+          "prompt": {
+            "title": "Prompt",
+            "type": "string"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "integer"
+          },
+          "run_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run At"
+          },
+          "state": {
+            "enum": [
+              "active",
+              "paused",
+              "cancelled",
+              "done"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "timezone": {
+            "title": "Timezone",
+            "type": "string"
+          },
+          "turn": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Turn"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          },
+          "updated_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated By"
+          }
+        },
+        "required": [
+          "id",
+          "agent",
+          "agent_id",
+          "revision",
+          "state",
+          "cron",
+          "run_at",
+          "timezone",
+          "prompt",
+          "created_by",
+          "created_source",
+          "destination",
+          "next_run_at",
+          "next_run_local",
+          "paused",
+          "consecutive_failures",
+          "last_fire_at",
+          "last_outcome",
+          "last_reason",
+          "created_at",
+          "updated_at",
+          "updated_by"
+        ],
+        "title": "AgentScheduleOut",
+        "type": "object"
+      },
+      "AgentScheduleRevert": {
+        "additionalProperties": false,
+        "description": "Restore revision ``to_revision``'s configuration as a new revision;\nomitted is the revision before the current one.",
+        "properties": {
+          "expected_revision": {
+            "title": "Expected Revision",
+            "type": "integer"
+          },
+          "to_revision": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "To Revision"
+          }
+        },
+        "required": [
+          "expected_revision"
+        ],
+        "title": "AgentScheduleRevert",
+        "type": "object"
+      },
+      "AgentScheduleRevisionOut": {
+        "properties": {
+          "action": {
+            "enum": [
+              "create",
+              "update",
+              "pause",
+              "resume",
+              "cancel",
+              "revert",
+              "complete"
+            ],
+            "title": "Action",
+            "type": "string"
+          },
+          "author": {
+            "title": "Author",
+            "type": "string"
+          },
+          "conversation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Conversation"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "cron": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cron"
+          },
+          "prompt": {
+            "title": "Prompt",
+            "type": "string"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "integer"
+          },
+          "run_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run At"
+          },
+          "seq": {
+            "title": "Seq",
+            "type": "integer"
+          },
+          "source": {
+            "enum": [
+              "agent",
+              "operator",
+              "scheduler"
+            ],
+            "title": "Source",
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "active",
+              "paused",
+              "cancelled",
+              "done"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "timezone": {
+            "title": "Timezone",
+            "type": "string"
+          },
+          "turn": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Turn"
+          }
+        },
+        "required": [
+          "seq",
+          "revision",
+          "action",
+          "state",
+          "prompt",
+          "cron",
+          "run_at",
+          "timezone",
+          "author",
+          "source",
+          "conversation",
+          "turn",
+          "created_at"
+        ],
+        "title": "AgentScheduleRevisionOut",
+        "type": "object"
+      },
+      "AgentScheduleRevisions": {
+        "properties": {
+          "revisions": {
+            "items": {
+              "$ref": "#/components/schemas/AgentScheduleRevisionOut"
+            },
+            "title": "Revisions",
+            "type": "array"
+          }
+        },
+        "required": [
+          "revisions"
+        ],
+        "title": "AgentScheduleRevisions",
+        "type": "object"
+      },
+      "AgentScheduleUpdate": {
+        "additionalProperties": false,
+        "description": "A compare-and-set change. A prompt, cron, run_at or timezone change moves\nthe revision; ``paused`` is logged without moving it. ``cron`` and\n``run_at`` are exclusive: giving one replaces the other.",
+        "properties": {
+          "cron": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cron"
+          },
+          "expected_revision": {
+            "title": "Expected Revision",
+            "type": "integer"
+          },
+          "paused": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Paused"
+          },
+          "prompt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prompt"
+          },
+          "run_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run At"
+          },
+          "timezone": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Timezone"
+          }
+        },
+        "required": [
+          "expected_revision"
+        ],
+        "title": "AgentScheduleUpdate",
+        "type": "object"
+      },
       "AgentSchedulesOut": {
         "description": "The scheduled hooks of one agent's in-force deployment.",
         "properties": {
@@ -1563,6 +2254,28 @@
       "AgentUpdate": {
         "description": "Partial update of mutable agent fields. An omitted field is unchanged.\n\nFor the two nullable operator overrides -- `model` and `thinking` -- omitted\nand explicit JSON null are DIFFERENT requests, and the router tells them\napart with `model_fields_set` (#1310). Omitted leaves the current value;\nexplicit null clears the override back to the platform default. Reading\n`None` alone cannot distinguish the two, which is why setting one of these\nused to be a one-way door.\n\nThe repo binding stopped being identity in ADR-0091: one repository builds\nmany agents now, so binding is a routing fact, not a name.",
         "properties": {
+          "agent_schedules": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Schedules"
+          },
+          "agent_wide_learning": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Wide Learning"
+          },
           "approval_required_tools": {
             "anyOf": [
               {
@@ -1628,6 +2341,17 @@
               }
             ],
             "title": "Hook Partitions"
+          },
+          "learned_skills": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Learned Skills"
           },
           "memory": {
             "anyOf": [
@@ -1735,6 +2459,43 @@
               }
             ],
             "title": "Runner Resources"
+          },
+          "schedule_max_active": {
+            "anyOf": [
+              {
+                "maximum": 100.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Schedule Max Active"
+          },
+          "schedule_min_interval_minutes": {
+            "anyOf": [
+              {
+                "maximum": 1440.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Schedule Min Interval Minutes"
+          },
+          "schedule_timezone": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Schedule Timezone"
           },
           "secrets": {
             "anyOf": [
@@ -7334,7 +8095,9 @@
                   "hook_paused",
                   "live_session",
                   "enqueue_failed",
-                  "claim_expired"
+                  "claim_expired",
+                  "daily_budget",
+                  "schedule_changed"
                 ],
                 "type": "string"
               },
@@ -7882,6 +8645,311 @@
         "title": "KillState",
         "type": "object"
       },
+      "LearnedSkillCreate": {
+        "additionalProperties": false,
+        "properties": {
+          "body": {
+            "title": "Body",
+            "type": "string"
+          },
+          "description": {
+            "title": "Description",
+            "type": "string"
+          },
+          "slug": {
+            "title": "Slug",
+            "type": "string"
+          }
+        },
+        "required": [
+          "slug",
+          "description",
+          "body"
+        ],
+        "title": "LearnedSkillCreate",
+        "type": "object"
+      },
+      "LearnedSkillList": {
+        "properties": {
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "skills": {
+            "items": {
+              "$ref": "#/components/schemas/LearnedSkillOut"
+            },
+            "title": "Skills",
+            "type": "array"
+          }
+        },
+        "required": [
+          "enabled",
+          "skills"
+        ],
+        "title": "LearnedSkillList",
+        "type": "object"
+      },
+      "LearnedSkillOut": {
+        "properties": {
+          "author": {
+            "title": "Author",
+            "type": "string"
+          },
+          "body": {
+            "title": "Body",
+            "type": "string"
+          },
+          "conversation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Conversation"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "deleted": {
+            "title": "Deleted",
+            "type": "boolean"
+          },
+          "description": {
+            "title": "Description",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "integer"
+          },
+          "slug": {
+            "title": "Slug",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "slug",
+          "description",
+          "body",
+          "revision",
+          "author",
+          "created_at",
+          "updated_at",
+          "deleted"
+        ],
+        "title": "LearnedSkillOut",
+        "type": "object"
+      },
+      "LearnedSkillPatch": {
+        "additionalProperties": false,
+        "description": "A targeted edit: ``old_string`` must occur exactly once in the body and\nis replaced by ``new_string``; ``description`` replaces the description.\nThere is deliberately no wholesale ``body`` field.",
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "expected_revision": {
+            "title": "Expected Revision",
+            "type": "integer"
+          },
+          "new_string": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "New String"
+          },
+          "old_string": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Old String"
+          }
+        },
+        "required": [
+          "expected_revision"
+        ],
+        "title": "LearnedSkillPatch",
+        "type": "object"
+      },
+      "LearnedSkillRevert": {
+        "additionalProperties": false,
+        "description": "Restore revision ``to_revision``'s content and state; omitted is undo.",
+        "properties": {
+          "expected_revision": {
+            "title": "Expected Revision",
+            "type": "integer"
+          },
+          "to_revision": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "To Revision"
+          }
+        },
+        "required": [
+          "expected_revision"
+        ],
+        "title": "LearnedSkillRevert",
+        "type": "object"
+      },
+      "LearnedSkillRevisionOut": {
+        "properties": {
+          "action": {
+            "enum": [
+              "create",
+              "patch",
+              "revert",
+              "delete"
+            ],
+            "title": "Action",
+            "type": "string"
+          },
+          "author": {
+            "title": "Author",
+            "type": "string"
+          },
+          "body": {
+            "title": "Body",
+            "type": "string"
+          },
+          "conversation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Conversation"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "deleted": {
+            "title": "Deleted",
+            "type": "boolean"
+          },
+          "description": {
+            "title": "Description",
+            "type": "string"
+          },
+          "digest": {
+            "title": "Digest",
+            "type": "string"
+          },
+          "reverted_to": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reverted To"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "integer"
+          },
+          "slug": {
+            "title": "Slug",
+            "type": "string"
+          },
+          "source": {
+            "enum": [
+              "agent",
+              "operator"
+            ],
+            "title": "Source",
+            "type": "string"
+          },
+          "turn": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Turn"
+          }
+        },
+        "required": [
+          "revision",
+          "action",
+          "slug",
+          "description",
+          "body",
+          "digest",
+          "deleted",
+          "author",
+          "source",
+          "reverted_to",
+          "created_at"
+        ],
+        "title": "LearnedSkillRevisionOut",
+        "type": "object"
+      },
+      "LearnedSkillRevisions": {
+        "properties": {
+          "revisions": {
+            "items": {
+              "$ref": "#/components/schemas/LearnedSkillRevisionOut"
+            },
+            "title": "Revisions",
+            "type": "array"
+          }
+        },
+        "required": [
+          "revisions"
+        ],
+        "title": "LearnedSkillRevisions",
+        "type": "object"
+      },
       "ListedTargets": {
         "description": "Every target a ``deploy.yaml`` declares, dev before prod.\n\nOrdered so a caller onboarding a repository deploys dev first. A run that\nfails part-way then leaves prod BEHIND rather than ahead of a dev that\nnever landed -- recoverable in one direction, not the other.",
         "properties": {
@@ -7971,6 +9039,103 @@
         "title": "LoopDeclaration",
         "type": "object"
       },
+      "MemoryContextOut": {
+        "description": "The bounded boot context (``GET .../_memory/context``).\n\nAt most 20 active instructions (full records, empty unless agent-wide\nlearning is on) and at most 50 active fact titles, newest updated first,\nfrom agent memory plus the caller's own channel. No fact statement appears\nanywhere in it.",
+        "properties": {
+          "agent_wide_learning": {
+            "title": "Agent Wide Learning",
+            "type": "boolean"
+          },
+          "guidance": {
+            "$ref": "#/components/schemas/MemoryGuidanceOut"
+          },
+          "index": {
+            "items": {
+              "$ref": "#/components/schemas/MemoryIndexItemOut"
+            },
+            "title": "Index",
+            "type": "array"
+          },
+          "instructions": {
+            "items": {
+              "$ref": "#/components/schemas/MemoryRecordOut"
+            },
+            "title": "Instructions",
+            "type": "array"
+          },
+          "memory_writes": {
+            "title": "Memory Writes",
+            "type": "boolean"
+          },
+          "omitted": {
+            "$ref": "#/components/schemas/MemoryOmittedOut"
+          },
+          "totals": {
+            "$ref": "#/components/schemas/MemoryTotalsOut"
+          }
+        },
+        "required": [
+          "agent_wide_learning",
+          "memory_writes",
+          "guidance",
+          "instructions",
+          "index",
+          "totals",
+          "omitted"
+        ],
+        "title": "MemoryContextOut",
+        "type": "object"
+      },
+      "MemoryDetailOut": {
+        "description": "An entry with a page of its history (``GET .../_memory/entries/{id}``,\n``POST .../_memory/revert``).\n\n``entry`` is null and ``deleted`` true when the head was forgotten or\nreverted to absence; ``version`` is then the deletion's version, the one a\nrevert must name as ``expected_version``. ``history`` is at most the 10\nnewest revisions older than the requested ``before_version``;\n``history_before`` is the value to pass back for the next older page, null\nwhen there is none.",
+        "properties": {
+          "deleted": {
+            "title": "Deleted",
+            "type": "boolean"
+          },
+          "entry": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MemoryRecordOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "history": {
+            "items": {
+              "$ref": "#/components/schemas/MemoryRevisionOut"
+            },
+            "title": "History",
+            "type": "array"
+          },
+          "history_before": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "History Before"
+          },
+          "version": {
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "entry",
+          "deleted",
+          "version",
+          "history",
+          "history_before"
+        ],
+        "title": "MemoryDetailOut",
+        "type": "object"
+      },
       "MemoryEntryCreate": {
         "description": "Append one operator-authored memory record (#1904).\n\nProvenance is stamped by the server. Extra body fields, including a\ncaller-supplied provenance object, are ignored rather than trusted.",
         "properties": {
@@ -8047,12 +9212,13 @@
         "type": "object"
       },
       "MemoryGuidanceOut": {
-        "description": "The agent's effective memory guidance and where it comes from (#1461).\n\n``source`` is ``operator`` when guidance is stored for the agent, else\n``default`` and ``text`` is the platform default.",
+        "description": "The agent's effective memory guidance and where it comes from (#1461).\n\n``source`` is ``operator`` when guidance is stored for the agent; else\n``learning_default`` when the agent is opted in to agent-wide learning and\n``text`` is the learning default (ADR 0249); else ``default`` and ``text``\nis the platform default.",
         "properties": {
           "source": {
             "enum": [
               "default",
-              "operator"
+              "operator",
+              "learning_default"
             ],
             "title": "Source",
             "type": "string"
@@ -8067,6 +9233,110 @@
           "source"
         ],
         "title": "MemoryGuidanceOut",
+        "type": "object"
+      },
+      "MemoryIndexItemOut": {
+        "description": "One active fact in the boot index: its title, never its statement.",
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "scope": {
+            "enum": [
+              "agent",
+              "channel"
+            ],
+            "title": "Scope",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "scope",
+          "title",
+          "version"
+        ],
+        "title": "MemoryIndexItemOut",
+        "type": "object"
+      },
+      "MemoryLifecycleIn": {
+        "description": "Archive or restore one entry under compare-and-set.\n\n``channel_kind``/``channel_address`` name the binding for a platform-key\ncaller with ``scope=\"channel\"``. A sandbox caller's channel is the binding\nits credential is signed for, and naming one is refused.",
+        "properties": {
+          "channel_address": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Channel Address"
+          },
+          "channel_kind": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Channel Kind"
+          },
+          "expected_version": {
+            "minimum": 0.0,
+            "title": "Expected Version",
+            "type": "integer"
+          },
+          "id": {
+            "pattern": "^fact-[0-9a-f]{32}$",
+            "title": "Id",
+            "type": "string"
+          },
+          "scope": {
+            "enum": [
+              "agent",
+              "channel"
+            ],
+            "title": "Scope",
+            "type": "string"
+          }
+        },
+        "required": [
+          "scope",
+          "id",
+          "expected_version"
+        ],
+        "title": "MemoryLifecycleIn",
+        "type": "object"
+      },
+      "MemoryOmittedOut": {
+        "description": "Active entries the bounded context left out.",
+        "properties": {
+          "facts": {
+            "title": "Facts",
+            "type": "integer"
+          },
+          "instructions": {
+            "title": "Instructions",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "instructions",
+          "facts"
+        ],
+        "title": "MemoryOmittedOut",
         "type": "object"
       },
       "MemoryProvenanceOut": {
@@ -8108,6 +9378,289 @@
           }
         },
         "title": "MemoryProvenanceOut",
+        "type": "object"
+      },
+      "MemoryRecordOut": {
+        "description": "One canonical memory entry (a fact or a standing instruction).\n\n``author`` and ``stated_at`` are null only for an entry stored before ADR\n0249 that never named them; the migration does not invent provenance.\n``conversation`` is the signed source conversation of the last sandbox\nwrite, null for operator writes and migrated entries.",
+        "properties": {
+          "archived": {
+            "title": "Archived",
+            "type": "boolean"
+          },
+          "author": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Author"
+          },
+          "conversation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Conversation"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "fact",
+              "instruction"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "scope": {
+            "enum": [
+              "agent",
+              "channel"
+            ],
+            "title": "Scope",
+            "type": "string"
+          },
+          "stated_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stated At"
+          },
+          "statement": {
+            "title": "Statement",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "scope",
+          "kind",
+          "title",
+          "statement",
+          "author",
+          "stated_at",
+          "conversation",
+          "archived",
+          "version",
+          "updated_at"
+        ],
+        "title": "MemoryRecordOut",
+        "type": "object"
+      },
+      "MemoryRevertIn": {
+        "description": "Revert one entry to an earlier version; ``to_version`` 0 is absence.",
+        "properties": {
+          "channel_address": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Channel Address"
+          },
+          "channel_kind": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Channel Kind"
+          },
+          "expected_version": {
+            "minimum": 0.0,
+            "title": "Expected Version",
+            "type": "integer"
+          },
+          "id": {
+            "pattern": "^fact-[0-9a-f]{32}$",
+            "title": "Id",
+            "type": "string"
+          },
+          "scope": {
+            "enum": [
+              "agent",
+              "channel"
+            ],
+            "title": "Scope",
+            "type": "string"
+          },
+          "to_version": {
+            "minimum": 0.0,
+            "title": "To Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "scope",
+          "id",
+          "expected_version",
+          "to_version"
+        ],
+        "title": "MemoryRevertIn",
+        "type": "object"
+      },
+      "MemoryRevisionOut": {
+        "description": "One immutable revision. ``snapshot`` is the resulting canonical value,\nnull for a deletion (a forget, or a revert to absence).",
+        "properties": {
+          "actor": {
+            "title": "Actor",
+            "type": "string"
+          },
+          "conversation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Conversation"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "operation": {
+            "enum": [
+              "baseline",
+              "create",
+              "update",
+              "delete",
+              "archive",
+              "restore",
+              "revert"
+            ],
+            "title": "Operation",
+            "type": "string"
+          },
+          "reverted_to_version": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reverted To Version"
+          },
+          "snapshot": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Snapshot"
+          },
+          "source": {
+            "title": "Source",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "version",
+          "operation",
+          "actor",
+          "source",
+          "conversation",
+          "created_at",
+          "reverted_to_version",
+          "snapshot"
+        ],
+        "title": "MemoryRevisionOut",
+        "type": "object"
+      },
+      "MemorySearchOut": {
+        "description": "A page of literal search results over active and archived entries.",
+        "properties": {
+          "entries": {
+            "items": {
+              "$ref": "#/components/schemas/MemoryRecordOut"
+            },
+            "title": "Entries",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          }
+        },
+        "required": [
+          "entries",
+          "next_cursor"
+        ],
+        "title": "MemorySearchOut",
+        "type": "object"
+      },
+      "MemoryTotalsOut": {
+        "description": "Counts over both visible scopes: active instructions, active facts, and\narchived entries of either kind.",
+        "properties": {
+          "archived": {
+            "title": "Archived",
+            "type": "integer"
+          },
+          "facts": {
+            "title": "Facts",
+            "type": "integer"
+          },
+          "instructions": {
+            "title": "Instructions",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "instructions",
+          "facts",
+          "archived"
+        ],
+        "title": "MemoryTotalsOut",
         "type": "object"
       },
       "MemoryTraceBackOut": {
@@ -12187,7 +13740,9 @@
                   "hook_paused",
                   "live_session",
                   "enqueue_failed",
-                  "claim_expired"
+                  "claim_expired",
+                  "daily_budget",
+                  "schedule_changed"
                 ],
                 "type": "string"
               },
@@ -12234,7 +13789,9 @@
                   "hook_paused",
                   "live_session",
                   "enqueue_failed",
-                  "claim_expired"
+                  "claim_expired",
+                  "daily_budget",
+                  "schedule_changed"
                 ],
                 "type": "string"
               },
@@ -12281,8 +13838,15 @@
         "type": "object"
       },
       "ScheduleListOut": {
-        "description": "Every in-force cron hook the platform can see.",
+        "description": "Every in-force cron hook the platform can see, and every active agent\nschedule (ADR 0248).",
         "properties": {
+          "agent_schedules": {
+            "items": {
+              "$ref": "#/components/schemas/AgentScheduleOut"
+            },
+            "title": "Agent Schedules",
+            "type": "array"
+          },
           "schedules": {
             "items": {
               "$ref": "#/components/schemas/AgentSchedulesOut"
@@ -12292,7 +13856,8 @@
           }
         },
         "required": [
-          "schedules"
+          "schedules",
+          "agent_schedules"
         ],
         "title": "ScheduleListOut",
         "type": "object"
@@ -12749,7 +14314,7 @@
         "type": "object"
       },
       "StateEntryPut": {
-        "description": "Write a durable state entry (#23). ``expected_version`` opts into\ncompare-and-set: the write is rejected with 409 unless it matches the stored\nversion (omit it for a blind upsert). ``value`` is any JSON value (object,\narray, or scalar); an array value is what ``append`` grows.",
+        "description": "Write a durable state entry (#23). ``expected_version`` opts into\ncompare-and-set: the write is rejected with 409 unless it matches the stored\nversion (omit it for a blind upsert). ``value`` is any JSON value (object,\narray, or scalar); an array value is what ``append`` grows.\n\nOn a canonical memory key (``memory`` / ``fact-<32 hex>``, ADR 0249) the\nvalue must be the typed entry shape, a create sends no ``expected_version``\n(or 0), and an update must send the head's version (428 when omitted).",
         "properties": {
           "expected_version": {
             "anyOf": [
@@ -18695,6 +20260,502 @@
         ]
       }
     },
+    "/agents/{agent_id}/learned-skills": {
+      "get": {
+        "description": "Active skills by slug. A sandbox credential sees none while the toggle is off.",
+        "operationId": "list_learned_skills_agents__agent_id__learned_skills_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LearnedSkillList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Learned Skills",
+        "tags": [
+          "learned-skills"
+        ]
+      },
+      "post": {
+        "operationId": "create_learned_skill_agents__agent_id__learned_skills_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LearnedSkillCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LearnedSkillOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Learned Skill",
+        "tags": [
+          "learned-skills"
+        ]
+      }
+    },
+    "/agents/{agent_id}/learned-skills/{ref}": {
+      "delete": {
+        "operationId": "delete_learned_skill_agents__agent_id__learned_skills__ref__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "ref",
+            "required": true,
+            "schema": {
+              "title": "Ref",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "expected_revision",
+            "required": true,
+            "schema": {
+              "title": "Expected Revision",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LearnedSkillOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Learned Skill",
+        "tags": [
+          "learned-skills"
+        ]
+      },
+      "get": {
+        "operationId": "get_learned_skill_agents__agent_id__learned_skills__ref__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "ref",
+            "required": true,
+            "schema": {
+              "title": "Ref",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LearnedSkillOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Learned Skill",
+        "tags": [
+          "learned-skills"
+        ]
+      }
+    },
+    "/agents/{agent_id}/learned-skills/{ref}/patch": {
+      "post": {
+        "description": "A targeted edit: ``old_string`` must occur exactly once in the body.",
+        "operationId": "patch_learned_skill_agents__agent_id__learned_skills__ref__patch_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "ref",
+            "required": true,
+            "schema": {
+              "title": "Ref",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LearnedSkillPatch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LearnedSkillOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Patch Learned Skill",
+        "tags": [
+          "learned-skills"
+        ]
+      }
+    },
+    "/agents/{agent_id}/learned-skills/{ref}/revert": {
+      "post": {
+        "description": "Restore a revision's content and state. Without ``to_revision`` this is\nundo: back to the revision before the head, or a delete when the head is\nthe create. Undo of an undo is a redo. Any caller reaches a deleted skill.",
+        "operationId": "revert_learned_skill_agents__agent_id__learned_skills__ref__revert_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "ref",
+            "required": true,
+            "schema": {
+              "title": "Ref",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LearnedSkillRevert"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LearnedSkillOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Revert Learned Skill",
+        "tags": [
+          "learned-skills"
+        ]
+      }
+    },
+    "/agents/{agent_id}/learned-skills/{ref}/revisions": {
+      "get": {
+        "operationId": "list_learned_skill_revisions_agents__agent_id__learned_skills__ref__revisions_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "ref",
+            "required": true,
+            "schema": {
+              "title": "Ref",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LearnedSkillRevisions"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Learned Skill Revisions",
+        "tags": [
+          "learned-skills"
+        ]
+      }
+    },
     "/agents/{agent_id}/memory": {
       "get": {
         "description": "List an agent's learned memory entries, oldest first, with provenance.",
@@ -18880,7 +20941,7 @@
         ]
       },
       "get": {
-        "description": "The agent's effective memory guidance and its source (#1461).",
+        "description": "The agent's effective memory guidance and its source (#1461, ADR 0249).",
         "operationId": "get_memory_guidance_agents__agent_id__memory_guidance_get",
         "parameters": [
           {
@@ -19610,6 +21671,529 @@
         ]
       }
     },
+    "/agents/{agent_id}/schedules": {
+      "get": {
+        "description": "The agent's schedule switch, limits and schedules (active and paused;\n``all`` adds cancelled and done). A sandbox credential sees none while\nthe toggle is off.",
+        "operationId": "list_agent_schedules_agents__agent_id__schedules_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "all",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "All",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentScheduleList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Agent Schedules",
+        "tags": [
+          "agent-schedules"
+        ]
+      },
+      "post": {
+        "operationId": "create_agent_schedule_agents__agent_id__schedules_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AgentScheduleCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentScheduleOut"
+                }
+              }
+            },
+            "description": "Idempotent replay"
+          },
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentScheduleOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Agent Schedule",
+        "tags": [
+          "agent-schedules"
+        ]
+      }
+    },
+    "/agents/{agent_id}/schedules/{schedule_id}": {
+      "get": {
+        "operationId": "get_agent_schedule_agents__agent_id__schedules__schedule_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "schedule_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Schedule Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentScheduleOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Agent Schedule",
+        "tags": [
+          "agent-schedules"
+        ]
+      },
+      "patch": {
+        "operationId": "update_agent_schedule_agents__agent_id__schedules__schedule_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "schedule_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Schedule Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AgentScheduleUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentScheduleOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Agent Schedule",
+        "tags": [
+          "agent-schedules"
+        ]
+      }
+    },
+    "/agents/{agent_id}/schedules/{schedule_id}/cancel": {
+      "post": {
+        "description": "Tombstone the schedule and settle its deferred runs. A scheduled run\nmay cancel. An active, paused or done schedule cancels the same way;\ncancelling a done one-shot revokes its run's pending approval\ncontinuation, which the worker resumes for a done schedule but never for\na cancelled one. Cancelling a cancelled schedule is a no-op.",
+        "operationId": "cancel_agent_schedule_agents__agent_id__schedules__schedule_id__cancel_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "schedule_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Schedule Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AgentScheduleCancel"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentScheduleOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Cancel Agent Schedule",
+        "tags": [
+          "agent-schedules"
+        ]
+      }
+    },
+    "/agents/{agent_id}/schedules/{schedule_id}/revert": {
+      "post": {
+        "description": "Restore an earlier revision's configuration as a new revision. The\noperator, or a person through the agent; never a scheduled run.",
+        "operationId": "revert_agent_schedule_agents__agent_id__schedules__schedule_id__revert_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "schedule_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Schedule Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AgentScheduleRevert"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentScheduleOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Revert Agent Schedule",
+        "tags": [
+          "agent-schedules"
+        ]
+      }
+    },
+    "/agents/{agent_id}/schedules/{schedule_id}/revisions": {
+      "get": {
+        "description": "The schedule's change log, oldest first. Platform key only.",
+        "operationId": "list_agent_schedule_revisions_agents__agent_id__schedules__schedule_id__revisions_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "schedule_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Schedule Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentScheduleRevisions"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Agent Schedule Revisions",
+        "tags": [
+          "agent-schedules"
+        ]
+      }
+    },
     "/agents/{agent_id}/state": {
       "get": {
         "operationId": "list_namespaces_agents__agent_id__state_get",
@@ -19668,6 +22252,584 @@
           }
         },
         "summary": "List Namespaces",
+        "tags": [
+          "state"
+        ]
+      }
+    },
+    "/agents/{agent_id}/state/_memory/archive": {
+      "post": {
+        "description": "Archive one entry under compare-and-set: it leaves the boot context but\nstays readable, searchable and counted. Already archived at the current\nversion: unchanged, with no new revision.",
+        "operationId": "archive_memory_agents__agent_id__state__memory_archive_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MemoryLifecycleIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryRecordOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Archive Memory",
+        "tags": [
+          "state"
+        ]
+      }
+    },
+    "/agents/{agent_id}/state/_memory/context": {
+      "get": {
+        "description": "The bounded boot memory (ADR 0249): the learning toggle, the effective\nguidance, at most 20 active standing instructions and the titles of at most\n50 active facts from agent memory plus the caller's own channel, with\ntotals and omitted counts. No fact statement is ever in it.\n\nA sandbox credential sees its own binding (none when it names none). The\nplatform key sees agent memory, plus one binding when it names both\n``channel_kind`` and ``channel_address``.",
+        "operationId": "memory_context_agents__agent_id__state__memory_context_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "channel_kind",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Channel Kind"
+            }
+          },
+          {
+            "in": "query",
+            "name": "channel_address",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Channel Address"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryContextOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Memory Context",
+        "tags": [
+          "state"
+        ]
+      }
+    },
+    "/agents/{agent_id}/state/_memory/entries/{fact_id}": {
+      "get": {
+        "description": "One entry, live or deleted, with its newest 10 revisions older than\n``before_version`` (each with its snapshot). A deleted head answers with\n``deleted`` true and the deletion's version, so it can be reverted; an\nidentity never created is 404.",
+        "operationId": "memory_entry_agents__agent_id__state__memory_entries__fact_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "fact_id",
+            "required": true,
+            "schema": {
+              "pattern": "^fact-[0-9a-f]{32}$",
+              "title": "Fact Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "scope",
+            "required": true,
+            "schema": {
+              "enum": [
+                "agent",
+                "channel"
+              ],
+              "title": "Scope",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "before_version",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Before Version"
+            }
+          },
+          {
+            "in": "query",
+            "name": "channel_kind",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Channel Kind"
+            }
+          },
+          {
+            "in": "query",
+            "name": "channel_address",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Channel Address"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryDetailOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Memory Entry",
+        "tags": [
+          "state"
+        ]
+      }
+    },
+    "/agents/{agent_id}/state/_memory/restore": {
+      "post": {
+        "description": "Restore an archived entry under compare-and-set.",
+        "operationId": "restore_memory_agents__agent_id__state__memory_restore_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MemoryLifecycleIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryRecordOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Restore Memory",
+        "tags": [
+          "state"
+        ]
+      }
+    },
+    "/agents/{agent_id}/state/_memory/revert": {
+      "post": {
+        "description": "Revert one entry to an earlier version as a new version (``to_version``\n0 removes the head). Works on a deleted entry, which it restores under the\nsame id. A stale ``expected_version`` is 409 and changes nothing.",
+        "operationId": "revert_memory_agents__agent_id__state__memory_revert_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MemoryRevertIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryDetailOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Revert Memory",
+        "tags": [
+          "state"
+        ]
+      }
+    },
+    "/agents/{agent_id}/state/_memory/search": {
+      "get": {
+        "description": "Literal, case-insensitive search of one scope's titles and statements,\nactive and archived entries alike, with full records. A miss is an empty\npage; ``next_cursor`` continues a longer result.",
+        "operationId": "memory_search_agents__agent_id__state__memory_search_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "scope",
+            "required": true,
+            "schema": {
+              "enum": [
+                "agent",
+                "channel"
+              ],
+              "title": "Scope",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "q",
+            "required": true,
+            "schema": {
+              "maxLength": 500,
+              "minLength": 1,
+              "title": "Q",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "maximum": 50,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "channel_kind",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Channel Kind"
+            }
+          },
+          {
+            "in": "query",
+            "name": "channel_address",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Channel Address"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemorySearchOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Memory Search",
         "tags": [
           "state"
         ]

@@ -1,7 +1,7 @@
 {
   "candidate": {
-    "schema_head": "0131",
-    "schema_min": "0131"
+    "schema_head": "selfimp_memory_0001",
+    "schema_min": "selfimp_memory_0001"
   },
   "revisions": [
     "0001",
@@ -116,7 +116,11 @@
     "0122",
     "0123",
     "0130",
-    "0131"
+    "0131",
+    "selfimp_safety_0001",
+    "selfimp_skills_0001",
+    "selfimp_sched_0001",
+    "selfimp_memory_0001"
   ],
   "windows": {
     "0.10.0": {

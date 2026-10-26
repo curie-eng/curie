@@ -342,7 +342,7 @@ run_self_test() {
         log "self-test: published v0.8.9 checksum pins are malformed"
         failed=1
     fi
-    if [[ "$PUBLISHED_HEAD" =~ ^[0-9]{4}$ && "$TARGET_HEAD" =~ ^[0-9]{4}$ && "$SUPPORTED_ROLLBACK_HEAD" =~ ^[0-9]{4}$ ]]; then
+    if [[ "$PUBLISHED_HEAD" =~ ^[0-9]{4}$ && "$TARGET_HEAD" =~ ^([0-9]{4}|selfimp_[a-z]+_[0-9]{4})$ && "$SUPPORTED_ROLLBACK_HEAD" =~ ^[0-9]{4}$ ]]; then
         log "schema heads published=$PUBLISHED_HEAD candidate=$TARGET_HEAD supported-rollback=$SUPPORTED_ROLLBACK_HEAD"
     else
         log "self-test: schema heads are malformed published='$PUBLISHED_HEAD' target='$TARGET_HEAD' supported-rollback='$SUPPORTED_ROLLBACK_HEAD'"
@@ -3282,12 +3282,39 @@ if previous["status"] != "superseded" or previous["app_version"] != uncatalogued
     grep -qF "refusing rollback to application $U: no declared schema range for that version" \
         "$EVIDENCE_DIR/rollback-uncatalogued.err" \
         || die "rollback-uncatalogued rollback did not refuse the uncatalogued target"
-    grep -qF "fail forward to application $V" "$EVIDENCE_DIR/rollback-uncatalogued.err" \
-        || die "rollback-uncatalogued rollback did not name fail forward to application $V"
+    # The fail-forward hint reads only the embedded catalog. A checkout that
+    # carries migrations past its own released version's window has no
+    # catalogued version that can start against the live revision, so the
+    # correct hint there is to stay on the current revision.
+    local live expected
+    live="$(python3 -c '
+import json, sys
+print(json.load(open(sys.argv[1]))["compatibility"]["current_revision"])
+' "$EVIDENCE_DIR/rollback-uncatalogued-setup.json")" \
+        || die "rollback-uncatalogued could not read the live schema revision"
+    if python3 -c '
+import json, sys
+catalog = json.load(open(sys.argv[1]))
+window = catalog["windows"].get(sys.argv[2])
+order = catalog["revisions"]
+live = sys.argv[3]
+inside = (
+    window is not None
+    and live in order
+    and order.index(window["schema_min"]) <= order.index(live) <= order.index(window["schema_head"])
+)
+raise SystemExit(0 if inside else 1)
+' "$REPO_ROOT/cli/src/application_schema_windows.json" "$V" "$live"; then
+        expected="fail forward to application $V"
+    else
+        expected="no catalogued application version in this release history can start against revision $live; stay on the current revision"
+    fi
+    grep -qF "$expected" "$EVIDENCE_DIR/rollback-uncatalogued.err" \
+        || die "rollback-uncatalogued rollback did not name the expected next step: $expected"
     helm_ns history "$RELEASE" -o json >"$EVIDENCE_DIR/rollback-uncatalogued-after.json"
     assert_helm_history_unchanged "$before" "$EVIDENCE_DIR/rollback-uncatalogued-after.json" \
         "rollback-uncatalogued rollback"
-    log "rollback-uncatalogued refused rollback to $U as dry run and real run, named fail forward to $V, and left Helm history unchanged"
+    log "rollback-uncatalogued refused rollback to $U as dry run and real run, named the next step ($expected), and left Helm history unchanged"
 }
 
 # These observations come from the real claim and its bound Pod. A replacement

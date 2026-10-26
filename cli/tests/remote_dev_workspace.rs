@@ -31,7 +31,8 @@ fn agent_json(name: &str, repo: Option<&str>) -> Value {
         "name": name,
         "channels": [{"kind": "slack", "address": "C0EXAMPLE1"}],
         "created_at": "2026-08-23T00:00:00Z",
-        "memory": false
+        "memory": false,
+        "agent_wide_learning": false
     });
     if let Some(repo) = repo {
         agent["repo_full_name"] = json!(repo);
@@ -352,7 +353,8 @@ fn fanout_response(
                     "id": id,
                     "name": id,
                     "channels": [],
-                    "memory": false
+                    "memory": false,
+                    "agent_wide_learning": false
                 })
                 .to_string(),
             )

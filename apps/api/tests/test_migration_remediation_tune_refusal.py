@@ -31,7 +31,8 @@ from sqlalchemy.exc import IntegrityError
 
 BELOW = "0095"
 REVISION = "0096"
-# The application contract names the single compatible candidate head.
+# The application contract names the single compatible candidate head
+# (twin memory, selfimp_memory_0001, after next's revisions through 0131).
 HEAD = load_window().schema_head
 TUNE_REFUSAL = "tune_execution_not_automated"
 REFUSAL_CHECK = "remediation_nominations_refusal_ck"

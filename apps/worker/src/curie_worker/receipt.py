@@ -63,12 +63,22 @@ _READ_ONLY_COMMANDS = (
     r"git diff(?: --stat)?",
 )
 
-# The platform memory tools (#1461, ADR-0167). Saving, changing or forgetting a
-# remembered fact is not a change to the world the person asked about, so the
-# action is still recorded but never announced: a receipt line per save would
-# be noise under every answer. Live names, as the runner's ``curie`` server
-# publishes them.
-_UNANNOUNCED_TOOLS = frozenset({"mcp__curie__remember", "mcp__curie__update", "mcp__curie__forget"})
+# The platform memory tools (#1461, ADR-0167, ADR-0249). Reading, saving,
+# changing, archiving, reverting or forgetting a remembered entry is not a change
+# to the world the person asked about, so the action is still recorded but never
+# announced: a receipt line per save would be noise under every answer. Live
+# names, as the runner's ``curie`` server publishes them.
+_UNANNOUNCED_TOOLS = frozenset(
+    {
+        "mcp__curie__read_memory",
+        "mcp__curie__remember",
+        "mcp__curie__update",
+        "mcp__curie__forget",
+        "mcp__curie__archive_memory",
+        "mcp__curie__restore_memory",
+        "mcp__curie__revert_memory",
+    }
+)
 
 
 def _clamp(text: str) -> str:

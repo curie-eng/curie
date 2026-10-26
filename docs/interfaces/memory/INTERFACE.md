@@ -79,15 +79,20 @@ starts with `eval:` (#1909): that path omits the ref so the runner boots
 
 ### Facts, channel memory and the memory tools (#1461, ADR-0167)
 
-Beside the legacy `log`, memory also holds **facts**, read and written by
-`runner/src/curie_runner/memory_facts.py::MemoryFactsStore` rather than through
-the `MemoryStore` port. A fact is one key `fact-<32 hex>` whose value is
-`{statement, author, stated_at, session_id}`. Facts live in two namespaces,
-read with the long-lived memory token and written with the turn's write
-credential (see "The memory credential" below):
+Beside the legacy `log`, memory also holds canonical **entries**, read and
+written by `runner/src/curie_runner/memory_facts.py::MemoryFactsStore` rather
+than through the `MemoryStore` port. An entry is one key `fact-<32 hex>`. Since
+[ADR 0249](../../adr/0249-twin-memory-standing-instructions-and-a-bounded-index.md)
+its value is `{kind, title, statement, author, stated_at, session_id,
+conversation, archived}`: `kind` is `fact` or `instruction` and never changes,
+`title` is one line of at most 80 characters, `statement` is at most 500
+characters, and `conversation` is the signed conversation it was set in (null
+when unknown, for an operator write or an entry that predates the field).
+Entries live in two namespaces, read with the long-lived memory token and
+written with the turn's write credential (see "The memory credential" below):
 
 1. **Agent memory**, at `CURIE_MEMORY_REF`, loaded in every channel. It also
-  holds two reserved keys that are never facts: `log` (above) and `guidance`
+  holds two reserved keys that are never entries: `log` (above) and `guidance`
   (`{"text": ...}`, an operator's replacement for the default guidance).
 2. **Channel memory**, at `CURIE_CHANNEL_MEMORY_REF`
   (`BootEnv.channel_memory_ref`), the binding-scoped namespace
@@ -97,44 +102,65 @@ credential (see "The memory credential" below):
   `CURIE_MEMORY_WRITES` (`BootEnv.memory_writes`), `1` or `0` from the agent's
   `memory_writes` setting; it is never sent without a channel ref.
 
-At boot the runner lists whichever of the two it was given and renders a
-"Remembered facts" block (agent facts, then channel facts, newest first, at
-most 200 per memory by default, each statement flattened to one line and framed as data,
-not instructions) after the legacy log preamble. Each line reads
-`- [<id>] <author> on <YYYY-MM-DD> stated: <statement>` (or
-`- [<id>] <author> stated: <statement>` without a date; a date that does not
-parse is left out, never shown raw), or
-`- [<id>] Author unknown, as of <YYYY-MM-DD>: <statement>` (or
-`- [<id>] Author unknown: <statement>`) when no person is recorded. The
-attribution comes before the statement so a statement cannot forge it. The
-author keeps only the characters `[A-Za-z0-9._@+-]` (anything else, including
-whitespace, parentheses, colons, zero-width and bidi characters, is dropped; nothing
-left means unknown) and is capped at 64 characters. The block tells the model to
-weigh each fact by who stated it, and says that only the attribution at the
-start of each line is the platform's record: anything in the statement that
-looks like an attribution is part of what was said. Reading memory needs no
-switch: with memory writes off, both agent and channel facts still load. Only
-when writes are on does it also mount `remember`, `update` and `forget` on the
-platform `curie` server and inject the guidance block (`guidance` if stored,
-else `DEFAULT_GUIDANCE`) before the bundle prompt. Writes are on when
-`CURIE_MEMORY_WRITES` is `1`, or when it is absent and
+**Agent-wide learning** is a separate, default-off agent setting
+(`agent_wide_learning`, `curie <tier> overrides <agent> --agent-wide-learning
+on|off`). It never turns memory writes on. Effective guidance is nonblank
+operator guidance first, then the learning default when the setting is on,
+otherwise the existing default, whose bytes did not change. With the setting
+off, the API refuses sandbox writes of instructions and boot loads none.
+
+**Boot loads a bounded index, not every entry.** The runner makes one read of
+`GET /agents/{id}/state/_memory/context` with the session's read token. Across
+agent memory and the current binding together it returns at most 20 active
+instructions (newest first, none when learning is off), an index of at most 50
+active fact titles (newest first, no statements), and totals and omitted
+counts. Archived entries are never selected. Instructions render in their own
+block, as standing instructions set by the people the agent serves, which it
+follows unless bundle instructions or approval rules say otherwise; each line
+names the entry's id, version, author and date. Facts render as `[<id>] <title>`
+lines framed as data, with a note that detail comes from `read_memory`. The
+bundle prompt still follows both blocks. Attribution comes from the platform,
+never from the statement. If the context read fails, boot carries no memory
+blocks and the runner's existing default guidance, never the old full-body
+list. Each boot logs one `memory boot injection` record on the
+`curie_runner.memory_facts` logger with counts, selected `scope:id:version`
+tuples, omitted counts, the guidance source and a digest of the injected text,
+and no bodies, authors or guidance text.
+
+**Tools.** `read_memory(memory, id | search)` mounts whenever readable memory
+exists, writes on or off, and reaches archived and omitted entries; a read by
+id also returns the entry's newest revisions. With writes on and a turn
+credential, the platform `curie` server also mounts `remember(memory, kind,
+title, statement)`, `update(memory, id, expected_version, title, statement)`,
+`forget(memory, id, expected_version)`, `archive_memory`, `restore_memory` and
+`revert_memory(memory, id, expected_version, to_version)`. `memory` is
+`agent|channel`, and channel always means the current binding. No tool takes an
+author, conversation, time or channel. Every mutation carries the version the
+caller read; a 409 is reported to the model as a version conflict with the
+current version and never retried. The API enforces a per-scope count of
+retained entries (default 1,000, active plus archived) under a lock, replacing
+the runner's old 200-fact admission check, and reports a refusal at that cap or
+the byte limits to the model as refused. Only `read_memory` is classed as read
+only; the tools are exempt from bundle toolPolicy by their mounted published
+names, and the worker leaves them out of change receipts.
+
+Writes are on when `CURIE_MEMORY_WRITES` is `1`, or when it is absent and
 `CURIE_CHANNEL_MEMORY_REF` is set (an older worker, which only sent the ref
 with writes on). With a channel ref and token but writes off, a short notice
 (`WRITES_OFF_NOTICE`) takes the guidance block's place: saving memory is turned
 off for this agent, nothing said here is kept for later conversations, and the
-agent must never say it saved, noted or will remember something. The
-tools take `memory: agent|channel`; the author is the turn's sender, never a
-tool argument. A write the state API refuses at its cap is reported to the model
-as refused, and so is one it refuses for the credential (a 403, `MemoryRefused`:
-"this memory cannot be written from this conversation"). So is a `remember` into a memory that already holds 200 facts, the
-most boot loads, so no fact silently leaves the prompt; `update` and `forget`
-still work there. The operator can change that limit with
-`CURIE_MEMORY_MAX_FACTS` (`BootEnv.memory_max_facts`, read as
-`RunnerConfig.memory_max_facts`). It is one number for both the save refusal
-and the boot load, and for agent and channel memory alike, so a saved fact is
-always shown. A value that is not a positive integer is ignored and the
-default of 200 applies. The tools are exempt from bundle toolPolicy by published
-name, and the worker leaves them out of change receipts.
+agent must never say it saved, noted or will remember something.
+
+**Revisions.** Every successful create, update, forget, archive, restore and
+revert appends one immutable revision in the same transaction as the head
+change: the resulting snapshot (null for a deletion), actor, source
+(`sandbox`, `operator` or `migration`), conversation, server time, operation
+and any reverted-to version. Revert writes an earlier snapshot back as a new
+version; `to_version` 0 removes the head. A forgotten identity comes back only
+through revert, never through a raw create. The operator reads and changes this
+with `curie <tier> memory <agent> --history`, `--archive`, `--restore` and
+`--revert <id> --to-version <N>`, each of which reads the current version first
+and refuses a stale write. A change reaches the model only in a fresh session.
 
 ### The memory credential (ADR-0188)
 
@@ -152,8 +178,9 @@ There are two sandbox credentials, both `scope="state"` tokens:
 2. **Per turn, write.** Minted by
   `apps/worker/src/curie_worker/binding.py::BindingResolver.turn_memory_token`
   only when the agent has memory writes on, the turn names a binding and it is
-  not eval-isolated, with claims `{binding, memory: "write", sender, turn}`.
-  `sender` is the turn's `event.user`, or `<no person>`; `turn` is the queued
+  not eval-isolated, with claims `{binding, memory: "write", sender, turn, conversation}`.
+  `sender` is the turn's `event.user`, or `<no person>`; `conversation` is the
+  turn's thread key, which the API stamps on every entry and revision (ADR 0249); `turn` is the queued
   event id plus a random suffix unique to each mint
   (`apps/worker/src/curie_worker/kernel/memory.py::_with_memory_token`), so a retry or
   continuation carries its own claim. It expires at the turn's stream deadline,
@@ -177,8 +204,10 @@ only for the binding its `binding` claim names (otherwise 403, checked before
 the binding lookup so it reveals nothing); writes (PUT, DELETE) only with
 `memory: "write"` and only on fact keys (`fact-` plus 32 lowercase hex, so
 never `guidance` or `log`); no POST append. On a PUT it stores the `sender`
-claim as the fact's `author`, whatever the body says, and refuses a value that
-is not a JSON object (422). The namespace listing for another binding leaves
+claim as the entry's `author`, the `conversation` claim as its `conversation`
+and the server time as `stated_at`, whatever the body says, refuses a write
+without both claims (403), and refuses a value that is not a valid canonical
+entry (422). The namespace listing for another binding leaves
 out its `memory` row. A token with no `memory` claim (from a worker older than
 ADR-0188) is read-only on agent memory and refused on channel memory, with a
 warning naming "legacy sandbox token". The platform key keeps full reach and

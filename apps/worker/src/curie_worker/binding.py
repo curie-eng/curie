@@ -88,7 +88,7 @@ from curie_internal.sealing_key import is_sealing_key_name
 from plugin_format import is_reserved_boot_env_name
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from . import caller_token
 from .attachments import AgentRoute
@@ -309,6 +309,46 @@ def _parse_resume_event_id(event_id: str) -> uuid.UUID | None:
         return None
 
 
+# An approval raised inside an approval-resumed continuation carries that
+# resume's event id as its dedupe key, so approvals chain back to the event
+# that started the work (ADR 0248). The walk reads at most this many links.
+APPROVAL_CHAIN_MAX_LINKS = 16
+
+
+class ApprovalChainTooLong(Exception):
+    """An approval chain did not reach its origin within ``APPROVAL_CHAIN_MAX_LINKS``."""
+
+
+async def approval_chain_origin(
+    conn: AsyncConnection, db_schema: str, approval_id: uuid.UUID, agent_id: uuid.UUID
+) -> str | None:
+    """The dedupe key of the event an approval chain started from.
+
+    Follows each ``approval-<id>-resolved`` dedupe key to that approval of the
+    same agent. A missing approval, a link to another agent's, a null key, or
+    a cycle ends the walk with None. A chain longer than the bound raises
+    ``ApprovalChainTooLong``, so each caller picks its fail-closed direction.
+    """
+
+    sql = text(
+        f"SELECT dedupe_key FROM {db_schema}.approvals WHERE id = :id AND agent_id = :agent_id"
+    )
+    seen: set[uuid.UUID] = set()
+    current = approval_id
+    for _ in range(APPROVAL_CHAIN_MAX_LINKS):
+        if current in seen:
+            return None
+        seen.add(current)
+        key = (await conn.execute(sql, {"id": current, "agent_id": agent_id})).scalar_one_or_none()
+        if not isinstance(key, str):
+            return None
+        prior = _parse_resume_event_id(key)
+        if prior is None:
+            return key
+        current = prior
+    raise ApprovalChainTooLong(f"approval {approval_id} chains past {APPROVAL_CHAIN_MAX_LINKS}")
+
+
 # Migration 0051's auto-provisioned tenant, the one every row belongs to until
 # a second tenant exists. A frozen copy: this package does not import the API's.
 DEFAULT_TENANT_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
@@ -516,6 +556,16 @@ class ResolvedDeployment(BaseModel):
     # 0068 and resolution runs against older schemas, so the kernel reads it
     # with ``memory_writes_for`` and copies it on, as with runner_resources.
     memory_writes: bool = False
+    # Whether the operator turned agent-created schedules on (ADR 0248): with
+    # it on the per-turn credential carries ``schedules: "write"``. Read apart
+    # from the resolver statements for the same schema reason
+    # (``agent_schedules_for``) and copied on by the kernel, degrading to off.
+    agent_schedules: bool = False
+    # Whether the operator turned learned skills on (ADR 0247): with it on the
+    # per-turn credential carries ``skills: "write"``. Read apart from the
+    # resolver statements for the same schema reason (``learned_skills_for``),
+    # but copied on here by every resolve path, degrading to off.
+    learned_skills: bool = False
 
 
 class FactoryWake(BaseModel):
@@ -750,7 +800,7 @@ class BindingResolver:
             return None
         mapped = [dict(row._mapping) for row in matches]
         warn_if_multiple_agents_bound(kind, address, mapped)
-        return _deployment_from_row(mapped[0])
+        return await self._with_learned_skills(_deployment_from_row(mapped[0]))
 
     async def resolve_factory(self, context: FactoryContext) -> ResolvedDeployment | None:
         """Resolve only the authenticated delivery's current agent and binding."""
@@ -771,7 +821,9 @@ class BindingResolver:
             ):
                 raise FactoryBindingRefused("factory_binding_changed")
             row = (await conn.execute(self._resolve_factory_sql, params)).mappings().first()
-        return None if row is None else _deployment_from_row(dict(row))
+        if row is None:
+            return None
+        return await self._with_learned_skills(_deployment_from_row(dict(row)))
 
     async def resolve_agent(self, agent_id: uuid.UUID) -> ResolvedDeployment | None:
         """Resolve an explicit agent to its active deployment, with no binding.
@@ -784,7 +836,9 @@ class BindingResolver:
                 self._resolve_agent_sql, {"agent_id": agent_id, "tenant_id": self._tenant_id}
             )
             row = result.mappings().first()
-        return None if row is None else _deployment_from_row(dict(row))
+        if row is None:
+            return None
+        return await self._with_learned_skills(_deployment_from_row(dict(row)))
 
     async def undeployed_binding(
         self, kind: str, adapter: str | None, address: str
@@ -1154,6 +1208,84 @@ class BindingResolver:
             row = result.first()
         return bool(row is not None and row[0])
 
+    async def agent_schedules_for(self, agent_id: uuid.UUID) -> bool:
+        """Whether the operator turned agent-created schedules on (ADR 0248).
+
+        The same separate read as ``memory_writes_for`` (migration
+        selfimp_sched_0001 adds the column). A missing agent row or a null
+        value reads as off.
+        """
+        sql = text(
+            f"SELECT agent_schedules FROM {self._config.db_schema}.agents "
+            "WHERE id = :id AND tenant_id = :tenant_id"
+        )
+        async with self._engine.connect() as conn:
+            result = await conn.execute(sql, {"id": agent_id, "tenant_id": self._tenant_id})
+            row = result.first()
+        return bool(row is not None and row[0])
+
+    async def learned_skills_for(self, agent_id: uuid.UUID) -> bool:
+        """Whether the operator turned learned skills on for the agent (ADR 0247).
+
+        The same separate read as ``memory_writes_for`` (migration selfimp_skills_0001 adds
+        the column). A missing agent row or a null value reads as off.
+        """
+        sql = text(
+            f"SELECT learned_skills FROM {self._config.db_schema}.agents "
+            "WHERE id = :id AND tenant_id = :tenant_id"
+        )
+        async with self._engine.connect() as conn:
+            result = await conn.execute(sql, {"id": agent_id, "tenant_id": self._tenant_id})
+            row = result.first()
+        return bool(row is not None and row[0])
+
+    async def approval_from_cron(self, event_id: str, agent_id: uuid.UUID) -> bool:
+        """Whether an approval resume continues a scheduled firing (ADR 0248).
+
+        True when the resumed approval's chain (``approval_chain_origin``)
+        starts at a cron event id of this agent (``cron:<agent>:...``), the
+        trusted mark of a scheduled continuation. Unresolved provenance is
+        also True, the restrictive direction: an unparseable resume id, a
+        missing link, a cross-agent link, a cycle, or a chain longer than its
+        bound. False only for a resolved origin that is not this agent's cron
+        event.
+        """
+
+        approval_id = _parse_resume_event_id(event_id)
+        if approval_id is None:
+            return True
+        try:
+            async with self._engine.connect() as conn:
+                key = await approval_chain_origin(
+                    conn, self._config.db_schema, approval_id, agent_id
+                )
+        except ApprovalChainTooLong:
+            logger.warning(
+                "approval chain too long agent=%s approval=%s; treating the continuation"
+                " as scheduled",
+                agent_id,
+                approval_id,
+            )
+            return True
+        return key is None or key.startswith(f"cron:{agent_id}:")
+
+    async def _with_learned_skills(self, resolved: ResolvedDeployment) -> ResolvedDeployment:
+        """``resolved`` with its learned skills setting. A failed read (a DB
+        error, or a schema from before selfimp_skills_0001) never fails the turn: it runs
+        with learned skills off and a warning, the safe direction."""
+
+        try:
+            on = await self.learned_skills_for(resolved.agent_id)
+        except Exception as exc:  # noqa: BLE001 - degrade to off
+            logger.warning(
+                "learned skills read failed agent=%s error_class=%s;"
+                " running with learned skills off",
+                resolved.agent_id,
+                type(exc).__name__,
+            )
+            return resolved
+        return resolved.model_copy(update={"learned_skills": on}) if on else resolved
+
     async def execution_deadline_seconds_for(self, agent_id: uuid.UUID) -> int:
         """The agent's work item execution span, or the platform default.
 
@@ -1512,39 +1644,58 @@ class BindingResolver:
         sender: str,
         turn: str,
         ttl_s: float,
+        scheduled: bool = False,
     ) -> str | None:
-        """The per-turn memory write credential (ADR-0188), or None.
+        """The per-turn state write credential (ADR-0188, ADR 0247, ADR 0248), or None.
 
         Sent as the turn's ``Event.memory_token`` (MEMORY-TOKEN-2), never in the
         boot env: the boot-env token outlives the turn and so cannot name its
-        sender. A ``scope="state"`` token with ``{binding, memory: "write",
-        sender, turn}``; the API writes only fact keys with it, only on the
-        channel ``binding`` names, and stamps ``sender`` as the fact's author.
+        sender. A ``scope="state"`` token with ``{binding, memory, sender, turn,
+        conversation, schedules, scheduled, skills}``. ``memory`` is ``"write"``
+        only with memory writes on (else ``"read"``, so the API refuses fact
+        writes); the API writes only fact keys with it, only on the channel
+        ``binding`` names, and stamps ``sender`` as the fact's author and
+        ``conversation`` (this turn's ``thread_key``) as its source
+        conversation (ADR 0249). ``schedules`` is ``"write"`` only with agent
+        schedules on, and ``scheduled`` marks a scheduled run or its approval
+        continuation, which may not create or change schedules (ADR 0248).
+        ``skills`` is ``"write"`` only with learned skills on, and the API
+        stamps ``sender`` and ``conversation`` on each skill change (ADR 0247).
 
-        None unless there is a key to sign with, the agent has memory writes on,
-        the turn names a binding, and the thread is not eval-isolated (#1909).
+        None unless there is a key to sign with, the agent has memory writes,
+        agent schedules or learned skills on, the turn names a binding, and the
+        thread is not
+        eval-isolated (#1909).
         The expiry is ``ttl_s``, the turn's own deadline, capped at the boot
         token's lifetime, with no grace: the credential ends with the turn.
         """
 
-        if not self._config.api_key or not resolved.memory_writes:
+        if not self._config.api_key or not (
+            resolved.memory_writes or resolved.agent_schedules or resolved.learned_skills
+        ):
             return None
         binding = _binding_claim(kind, address)
         if binding is None or is_eval_isolate_thread(thread_key):
             return None
         lifetime = min(math.ceil(max(0.0, ttl_s)), SANDBOX_TOKEN_TTL_SECONDS)
         exp = int(time.time()) + lifetime
+        # ``scheduled`` is a JSON boolean the API matches exactly (``true``).
+        claims: dict[str, Any] = {
+            "binding": binding,
+            "memory": "write" if resolved.memory_writes else "read",
+            "sender": sender.strip() or NO_PERSON,
+            "turn": turn,
+            "conversation": thread_key,
+            "schedules": "write" if resolved.agent_schedules else None,
+            "scheduled": bool(scheduled),
+            "skills": "write" if resolved.learned_skills else None,
+        }
         return sandbox_token.mint(
             self._config.api_key,
             agent=str(resolved.agent_id),
             scope="state",
             exp=exp,
-            claims={
-                "binding": binding,
-                "memory": "write",
-                "sender": sender.strip() or NO_PERSON,
-                "turn": turn,
-            },
+            claims=claims,
         )
 
     async def close_turn_memory(self, agent_id: uuid.UUID, turn: str) -> None:

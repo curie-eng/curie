@@ -105,6 +105,7 @@ fn assert_schema(value: &Value) {
 
 fn schedules_body() -> Value {
     json!({
+        "agent_schedules": [],
         "schedules": [
             {
                 "agent": "acme-bot",

@@ -210,3 +210,22 @@ def test_memory_writes_for_is_called_on_the_turn_path() -> None:
 
     sources = inspect.getsource(binding) + inspect.getsource(kernel)
     assert sources.count("memory_writes_for(") >= 2
+
+
+@pytest.mark.parametrize(
+    ("row", "expected"),
+    [((True,), True), ((False,), False), ((None,), False), (None, False)],
+    ids=["on", "off", "null", "no-agent-row"],
+)
+def test_learned_skills_for_reads_the_agent_setting(
+    row: tuple[object, ...] | None, expected: bool
+) -> None:
+    # ADR 0247: the same tenant-scoped, separate read as memory_writes_for.
+    resolver, engine = _reader(row)
+    assert asyncio.run(resolver.learned_skills_for(_AGENT)) is expected
+    [(sql, params)] = engine.statements
+    assert "learned_skills" in sql
+    assert f"{WorkerConfig().db_schema}.agents" in sql
+    assert _AGENT in params.values()
+    assert "tenant_id = :tenant_id" in sql
+    assert params["tenant_id"] == binding.DEFAULT_TENANT_ID

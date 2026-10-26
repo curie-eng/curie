@@ -56,11 +56,20 @@ def graph_payload() -> dict[str, Any]:
         ("0101", False),
         ("0102", False),
         ("0103", False),
+        # The Agent ORM reads the learned skills toggle (selfimp_skills_0001), the
+        # agent schedule columns (selfimp_sched_0001) and the twin memory toggle
+        # (selfimp_memory_0001), so the train join, next's revisions through the
+        # 0131 merge, the schedule safety head, the learned skills head and the
+        # agent schedules head are below the minimum.
         ("0108", False),
         ("0122", False),
         ("0123", False),
         ("0130", False),
-        ("0131", True),
+        ("0131", False),
+        ("selfimp_safety_0001", False),
+        ("selfimp_skills_0001", False),
+        ("selfimp_sched_0001", False),
+        ("selfimp_memory_0001", True),
         ("0000", True),
         ("future-expand", True),
     ],

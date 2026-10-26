@@ -182,7 +182,12 @@ PUBLICATION_UNRECORDED_CLASSIFICATION = "publication-unrecorded"
 # counts as platform whether or not this session mounted that server.
 # The curie-slack tools (ADR 0100, ADR 0200) join this label set only: they
 # are governed by toolPolicy and never exempt, and this label grants nothing.
-_PLATFORM_TOOL_NAMES = platform_tool_names(state_server_mounted=True) | PLATFORM_SLACK_TOOL_NAMES
+_PLATFORM_TOOL_NAMES = (
+    platform_tool_names(
+        state_server_mounted=True, agent_schedules_mounted=True, learned_skills_mounted=True
+    )
+    | PLATFORM_SLACK_TOOL_NAMES
+)
 
 
 def _tool_result_origin(tool_name: str) -> str:

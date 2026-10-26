@@ -21,11 +21,13 @@ order: 14
 
 The durable workflow-state store is built. It shipped (#248, under epic #23) as the API
 state router: a scoped KV/document store on Postgres JSONB. The router exposes
-twelve state routes: six operations, covering the verbs this doc once said did not exist
+eighteen state routes. Twelve cover six operations, the verbs this doc once said did not exist
 (get / put-with-CAS / list / delete / append) plus the namespace listing added by #250,
 each doubled by `agents.memory` (#1525 follow-up) into its original path plus a
 binding-scoped `.../state/bindings/{kind}/{address}/...` sibling, both implemented by
-the same shared function. The swap
+the same shared function. The other six are the typed memory routes under
+`/state/_memory` (context, entries, search, archive, restore, revert; ADR 0249).
+The swap
 axis here is the state backend, and it is a SOFT seam: the store is reached over the HTTP
 state API, not a typed in-process port, so a second backend is a persistence change behind
 that API rather than a `Protocol` swap. A separate concrete route store, `AffinityStore`,

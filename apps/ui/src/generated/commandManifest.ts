@@ -1960,7 +1960,7 @@ export const commandManifest = {
           ]
         },
         {
-          "about": "List an agent's individual facts and memory log. `--channel KIND=ADDRESS` selects one bound channel; `--delete FACT_ID` removes one fact. `--add <content>` seeds an operator-authored record; a fresh session is required before it is injected at boot. `--guidance` shows the guidance the agent gets beside its memory tools, `--guidance-from <file>` replaces it and `--reset-guidance` restores the platform default",
+          "about": "List an agent's individual facts and memory log. `--channel KIND=ADDRESS` selects one bound channel; `--delete FACT_ID` removes one fact. `--archive`, `--restore`, `--revert FACT_ID --to-version N` and `--history` act on one entry under its current version (ADR 0249); a fresh session is required before a change reaches boot memory. `--add <content>` seeds an operator-authored record; a fresh session is required before it is injected at boot. `--guidance` shows the guidance the agent gets beside its memory tools, `--guidance-from <file>` replaces it and `--reset-guidance` restores the platform default",
           "args": [
             {
               "global": false,
@@ -2053,6 +2053,46 @@ export const commandManifest = {
                 "true",
                 "false"
               ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Archive this entry so boot no longer loads it; it stays readable and restorable (`POST /agents/{id}/state/_memory/archive`)",
+              "id": "archive",
+              "long": "archive",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Restore this archived entry (`POST /agents/{id}/state/_memory/restore`)",
+              "id": "restore",
+              "long": "restore",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Revert this entry to the revision named by --to-version as a new version (`POST /agents/{id}/state/_memory/revert`)",
+              "id": "revert",
+              "long": "revert",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "The revision --revert restores; 0 removes the entry, as before it was created. Clap treats a requirement as met when a conflicting flag is present, so the conflicts are listed here too: `--archive X --to-version 1` is refused rather than silently ignoring the version",
+              "id": "to_version",
+              "long": "to-version",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Show this entry with its newest revisions (`GET /agents/{id}/state/_memory/entries/{fact_id}`)",
+              "id": "history",
+              "long": "history",
+              "positional": false,
               "required": false
             }
           ],
@@ -2212,6 +2252,151 @@ export const commandManifest = {
               ],
               "hidden": false,
               "name": "execution"
+            }
+          ]
+        },
+        {
+          "about": "An agent's learned skills (ADR 0247): list, show, diff, history, revert, delete and export",
+          "args": [
+            {
+              "global": false,
+              "help": "Agent name or id",
+              "id": "agent",
+              "positional": true,
+              "required": true
+            },
+            {
+              "default_values": [
+                "http://localhost:28000"
+              ],
+              "env": "CURIE_API_URL",
+              "global": true,
+              "help": "Platform API base URL",
+              "id": "api_url",
+              "long": "api-url",
+              "positional": false,
+              "required": false
+            },
+            {
+              "env": "CURIE_API_KEY",
+              "global": true,
+              "help": "Platform API key",
+              "id": "api_key",
+              "long": "api-key",
+              "positional": false,
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "skills",
+          "subcommands": [
+            {
+              "about": "List the agent's active learned skills",
+              "hidden": false,
+              "name": "list"
+            },
+            {
+              "about": "Print one skill (id or slug), deleted ones included",
+              "args": [
+                {
+                  "global": false,
+                  "id": "skill",
+                  "positional": true,
+                  "required": true
+                }
+              ],
+              "hidden": false,
+              "name": "show"
+            },
+            {
+              "about": "Unified diff of a skill's SKILL.md between two revisions (default: the head against the revision before it)",
+              "args": [
+                {
+                  "global": false,
+                  "id": "skill",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "id": "from",
+                  "long": "from",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "id": "to",
+                  "long": "to",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "diff"
+            },
+            {
+              "about": "List every revision of a skill, oldest first",
+              "args": [
+                {
+                  "global": false,
+                  "id": "skill",
+                  "positional": true,
+                  "required": true
+                }
+              ],
+              "hidden": false,
+              "name": "history"
+            },
+            {
+              "about": "Undo a skill's last change, or restore revision N with --to. Works on a deleted skill, so it also undoes a delete",
+              "args": [
+                {
+                  "global": false,
+                  "id": "skill",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "id": "to",
+                  "long": "to",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "revert"
+            },
+            {
+              "about": "Delete a skill. Its history stays, and `revert` brings it back",
+              "args": [
+                {
+                  "global": false,
+                  "id": "skill",
+                  "positional": true,
+                  "required": true
+                }
+              ],
+              "hidden": false,
+              "name": "delete"
+            },
+            {
+              "about": "Write every active skill to <DIR>/skills/<slug>/SKILL.md",
+              "args": [
+                {
+                  "default_values": [
+                    "."
+                  ],
+                  "global": false,
+                  "id": "out",
+                  "long": "out",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "export"
             }
           ]
         },
@@ -3434,6 +3619,42 @@ export const commandManifest = {
               "required": false
             },
             {
+              "global": false,
+              "help": "Opt the agent in to agent-wide learning, or out (`agent_wide_learning`, ADR 0249). On selects the learning default guidance and lets standing instructions load and be saved; it never turns memory writes on. Off keeps the existing default guidance byte for byte. Takes effect at the next sandbox boot",
+              "id": "agent_wide_learning",
+              "long": "agent-wide-learning",
+              "positional": false,
+              "possible_values": [
+                "on",
+                "off"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Let the agent create and manage its own schedules on or off (`agent_schedules`, ADR 0248). Off stops creating and changing them; stored schedules and history stay",
+              "id": "agent_schedules",
+              "long": "agent-schedules",
+              "positional": false,
+              "possible_values": [
+                "on",
+                "off"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Turn the agent's learned skills on or off (ADR 0247). Off stops loading and editing them; stored skills and history stay",
+              "id": "learned_skills",
+              "long": "learned-skills",
+              "positional": false,
+              "possible_values": [
+                "on",
+                "off"
+              ],
+              "required": false
+            },
+            {
               "default_values": [
                 "http://localhost:28000"
               ],
@@ -4036,6 +4257,118 @@ export const commandManifest = {
               "help": "Resume one named cron hook on the selected agent",
               "id": "resume",
               "long": "resume",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Show one agent schedule (`GET /agents/{id}/schedules/{id}`)",
+              "id": "show",
+              "long": "show",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Cancel one agent schedule",
+              "id": "cancel",
+              "long": "cancel",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "List one agent schedule's revisions",
+              "id": "history",
+              "long": "history",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Change one agent schedule; pass at least one of --prompt, --cron, --run-at, --timezone, and --expected-revision",
+              "id": "update",
+              "long": "update",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Restore an earlier revision of one agent schedule (omit --to-revision to undo the last change); needs --expected-revision",
+              "id": "revert",
+              "long": "revert",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "New prompt for --update",
+              "id": "prompt",
+              "long": "prompt",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "New cron expression for --update",
+              "id": "cron",
+              "long": "cron",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "New one-shot time (RFC 3339, or local time in the schedule zone) for --update",
+              "id": "run_at",
+              "long": "run-at",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "New IANA time zone for --update",
+              "id": "timezone",
+              "long": "timezone",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Revision to restore with --revert",
+              "id": "to_revision",
+              "long": "to-revision",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "The revision the caller last saw; the change is refused if it moved",
+              "id": "expected_revision",
+              "long": "expected-revision",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Set the agent's default schedule time zone (IANA name)",
+              "id": "set_timezone",
+              "long": "set-timezone",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Set the most active schedules the agent may hold (1-100)",
+              "id": "set_max_active",
+              "long": "set-max-active",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Set the shortest gap between fires of one schedule (1-1440 minutes)",
+              "id": "set_min_interval_minutes",
+              "long": "set-min-interval-minutes",
               "positional": false,
               "required": false
             },
@@ -6430,6 +6763,42 @@ export const commandManifest = {
               "required": false
             },
             {
+              "global": false,
+              "help": "Opt the agent in to agent-wide learning, or out (`agent_wide_learning`, ADR 0249). On selects the learning default guidance and lets standing instructions load and be saved; it never turns memory writes on. Off keeps the existing default guidance byte for byte. Takes effect at the next sandbox boot",
+              "id": "agent_wide_learning",
+              "long": "agent-wide-learning",
+              "positional": false,
+              "possible_values": [
+                "on",
+                "off"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Let the agent create and manage its own schedules on or off (`agent_schedules`, ADR 0248). Off stops creating and changing them; stored schedules and history stay",
+              "id": "agent_schedules",
+              "long": "agent-schedules",
+              "positional": false,
+              "possible_values": [
+                "on",
+                "off"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Turn the agent's learned skills on or off (ADR 0247). Off stops loading and editing them; stored skills and history stay",
+              "id": "learned_skills",
+              "long": "learned-skills",
+              "positional": false,
+              "possible_values": [
+                "on",
+                "off"
+              ],
+              "required": false
+            },
+            {
               "env": "CURIE_API_URL",
               "global": false,
               "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
@@ -7486,6 +7855,118 @@ export const commandManifest = {
               "required": false
             },
             {
+              "global": false,
+              "help": "Show one agent schedule (`GET /agents/{id}/schedules/{id}`)",
+              "id": "show",
+              "long": "show",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Cancel one agent schedule",
+              "id": "cancel",
+              "long": "cancel",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "List one agent schedule's revisions",
+              "id": "history",
+              "long": "history",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Change one agent schedule; pass at least one of --prompt, --cron, --run-at, --timezone, and --expected-revision",
+              "id": "update",
+              "long": "update",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Restore an earlier revision of one agent schedule (omit --to-revision to undo the last change); needs --expected-revision",
+              "id": "revert",
+              "long": "revert",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "New prompt for --update",
+              "id": "prompt",
+              "long": "prompt",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "New cron expression for --update",
+              "id": "cron",
+              "long": "cron",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "New one-shot time (RFC 3339, or local time in the schedule zone) for --update",
+              "id": "run_at",
+              "long": "run-at",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "New IANA time zone for --update",
+              "id": "timezone",
+              "long": "timezone",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Revision to restore with --revert",
+              "id": "to_revision",
+              "long": "to-revision",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "The revision the caller last saw; the change is refused if it moved",
+              "id": "expected_revision",
+              "long": "expected-revision",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Set the agent's default schedule time zone (IANA name)",
+              "id": "set_timezone",
+              "long": "set-timezone",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Set the most active schedules the agent may hold (1-100)",
+              "id": "set_max_active",
+              "long": "set-max-active",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Set the shortest gap between fires of one schedule (1-1440 minutes)",
+              "id": "set_min_interval_minutes",
+              "long": "set-min-interval-minutes",
+              "positional": false,
+              "required": false
+            },
+            {
               "env": "CURIE_API_URL",
               "global": false,
               "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
@@ -7955,7 +8436,7 @@ export const commandManifest = {
           ]
         },
         {
-          "about": "List an agent's individual facts and memory log. `--channel KIND=ADDRESS` selects one bound channel; `--delete FACT_ID` removes one fact. `--add <content>` seeds an operator-authored record; a fresh session is required before it is injected at boot. `--guidance` shows the guidance the agent gets beside its memory tools, `--guidance-from <file>` replaces it and `--reset-guidance` restores the platform default",
+          "about": "List an agent's individual facts and memory log. `--channel KIND=ADDRESS` selects one bound channel; `--delete FACT_ID` removes one fact. `--archive`, `--restore`, `--revert FACT_ID --to-version N` and `--history` act on one entry under its current version (ADR 0249); a fresh session is required before a change reaches boot memory. `--add <content>` seeds an operator-authored record; a fresh session is required before it is injected at boot. `--guidance` shows the guidance the agent gets beside its memory tools, `--guidance-from <file>` replaces it and `--reset-guidance` restores the platform default",
           "args": [
             {
               "global": false,
@@ -8070,6 +8551,46 @@ export const commandManifest = {
                 "true",
                 "false"
               ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Archive this entry so boot no longer loads it; it stays readable and restorable (`POST /agents/{id}/state/_memory/archive`)",
+              "id": "archive",
+              "long": "archive",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Restore this archived entry (`POST /agents/{id}/state/_memory/restore`)",
+              "id": "restore",
+              "long": "restore",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Revert this entry to the revision named by --to-version as a new version (`POST /agents/{id}/state/_memory/revert`)",
+              "id": "revert",
+              "long": "revert",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "The revision --revert restores; 0 removes the entry, as before it was created. Clap treats a requirement as met when a conflicting flag is present, so the conflicts are listed here too: `--archive X --to-version 1` is refused rather than silently ignoring the version",
+              "id": "to_version",
+              "long": "to-version",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Show this entry with its newest revisions (`GET /agents/{id}/state/_memory/entries/{fact_id}`)",
+              "id": "history",
+              "long": "history",
+              "positional": false,
               "required": false
             }
           ],
@@ -8309,6 +8830,171 @@ export const commandManifest = {
               ],
               "hidden": false,
               "name": "execution"
+            }
+          ]
+        },
+        {
+          "about": "An agent's learned skills (ADR 0247): list, show, diff, history, revert, delete and export",
+          "args": [
+            {
+              "global": false,
+              "help": "Agent name or id",
+              "id": "agent",
+              "positional": true,
+              "required": true
+            },
+            {
+              "env": "CURIE_API_URL",
+              "global": true,
+              "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
+              "id": "api_url",
+              "long": "api-url",
+              "positional": false,
+              "required": false
+            },
+            {
+              "env": "CURIE_API_KEY",
+              "global": true,
+              "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+              "id": "api_key",
+              "long": "api-key",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "env": "CURIE_NAMESPACE",
+              "global": true,
+              "help": "Kubernetes namespace of the release. Default: curie",
+              "id": "namespace",
+              "long": "namespace",
+              "positional": false,
+              "required": false
+            },
+            {
+              "default_values": [
+                "curie"
+              ],
+              "global": true,
+              "help": "Helm release name. Default: curie",
+              "id": "release",
+              "long": "release",
+              "positional": false,
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "skills",
+          "subcommands": [
+            {
+              "about": "List the agent's active learned skills",
+              "hidden": false,
+              "name": "list"
+            },
+            {
+              "about": "Print one skill (id or slug), deleted ones included",
+              "args": [
+                {
+                  "global": false,
+                  "id": "skill",
+                  "positional": true,
+                  "required": true
+                }
+              ],
+              "hidden": false,
+              "name": "show"
+            },
+            {
+              "about": "Unified diff of a skill's SKILL.md between two revisions (default: the head against the revision before it)",
+              "args": [
+                {
+                  "global": false,
+                  "id": "skill",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "id": "from",
+                  "long": "from",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "id": "to",
+                  "long": "to",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "diff"
+            },
+            {
+              "about": "List every revision of a skill, oldest first",
+              "args": [
+                {
+                  "global": false,
+                  "id": "skill",
+                  "positional": true,
+                  "required": true
+                }
+              ],
+              "hidden": false,
+              "name": "history"
+            },
+            {
+              "about": "Undo a skill's last change, or restore revision N with --to. Works on a deleted skill, so it also undoes a delete",
+              "args": [
+                {
+                  "global": false,
+                  "id": "skill",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "id": "to",
+                  "long": "to",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "revert"
+            },
+            {
+              "about": "Delete a skill. Its history stays, and `revert` brings it back",
+              "args": [
+                {
+                  "global": false,
+                  "id": "skill",
+                  "positional": true,
+                  "required": true
+                }
+              ],
+              "hidden": false,
+              "name": "delete"
+            },
+            {
+              "about": "Write every active skill to <DIR>/skills/<slug>/SKILL.md",
+              "args": [
+                {
+                  "default_values": [
+                    "."
+                  ],
+                  "global": false,
+                  "id": "out",
+                  "long": "out",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "export"
             }
           ]
         },

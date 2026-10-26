@@ -64,6 +64,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
@@ -84,10 +85,14 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from .bundle_store import BundleReader, extract_bundle
-from .hook_runs import retry_event_id
+from .hook_runs import AGENT_SCHEDULE_PREFIX, retry_event_id
 from .hook_source_guard import CronHookSourceGuard, CronSourceContext
 
 logger = logging.getLogger(__name__)
+
+# How long after its slot an agent one-shot may still fire, on first sight or
+# on a deferred retry (ADR 0248). Past it the slot is recorded skipped.
+ONE_SHOT_CATCH_UP = timedelta(hours=1)
 
 
 def _record_fire(outcome: str) -> None:
@@ -388,6 +393,125 @@ RETURNING id
 """
 
 
+# Agent-created schedules (ADR 0248): the active ones of agents whose toggle is
+# on. Cancelled and done schedules never fire, and a toggled-off agent's
+# schedules are not read at all.
+_AGENT_SCHEDULES_SQL = """
+SELECT s.id, s.agent_id, s.revision, s.prompt, s.cron, s.run_at, s.timezone,
+       s.destination_kind, s.destination_address, s.destination_adapter, s.effective_from
+FROM {schema}.agent_schedules s
+JOIN {schema}.agents a ON a.id = s.agent_id
+WHERE s.state = 'active' AND a.agent_schedules
+"""
+
+_AGENT_SCHEDULE_DESTINATION_SQL = """
+SELECT kind, address, endpoint, adapter
+FROM {schema}.agent_channels
+WHERE agent_id = :agent_id AND kind = :kind AND address = :address
+  AND adapter IS NOT DISTINCT FROM CAST(:adapter AS text)
+"""
+
+# The admission compare-and-set, taken after the per (agent, name) advisory
+# lock, the same lock order every API mutation of a schedule uses.
+_AGENT_SCHEDULE_CAS_SQL = """
+SELECT s.revision, s.state, a.agent_schedules
+FROM {schema}.agent_schedules s
+JOIN {schema}.agents a ON a.id = s.agent_id
+WHERE s.id = :id
+FOR UPDATE OF s
+"""
+
+_AGENT_SCHEDULE_SNAPSHOT_SQL = """
+INSERT INTO {schema}.agent_schedule_runs
+       (hook_run_id, schedule_id, agent_id, revision, prompt, cron, run_at, timezone,
+        destination_kind, destination_address, destination_adapter)
+SELECT :run_id, id, agent_id, revision, prompt, cron, run_at, timezone,
+       destination_kind, destination_address, destination_adapter
+FROM {schema}.agent_schedules WHERE id = :id
+ON CONFLICT (hook_run_id) DO NOTHING
+"""
+
+_AGENT_SCHEDULE_SNAPSHOT_REVISION_SQL = """
+SELECT s.revision FROM {schema}.hook_runs r
+JOIN {schema}.agent_schedule_runs s ON s.hook_run_id = r.id
+WHERE r.agent_id = :agent_id AND r.name = :name AND r.slot_utc = :slot
+"""
+
+# A one-shot's scheduled rows. Manual test fires (source 'manual') never
+# consume or complete it.
+_ONE_SHOT_RUNS_SQL = """
+SELECT slot_utc, outcome, reason FROM {schema}.hook_runs
+WHERE agent_id = :agent_id AND name = :name AND source = 'schedule'
+"""
+
+# ``_RECLAIM_SQL`` keyed on the one-shot's own slot: its claim lapsed with the
+# worker that held it, and the firing is lost visibly rather than republished.
+_ONE_SHOT_RECLAIM_SQL = """
+UPDATE {schema}.hook_runs
+SET outcome = 'reclaimed', reason = 'claim_expired', ended_at = now()
+WHERE agent_id = :agent_id AND name = :name AND slot_utc = :slot AND outcome IS NULL
+  AND source = 'schedule'
+  AND COALESCE(lease_expires_at, started_at + make_interval(secs => :lease_s)) < now()
+RETURNING id
+"""
+
+_ONE_SHOT_DONE_SQL = """
+UPDATE {schema}.agent_schedules
+SET state = 'done', fired_at = COALESCE(fired_at, now()), updated_at = now()
+WHERE id = :id AND state = 'active' AND revision = :revision
+RETURNING id
+"""
+
+_SCHEDULE_COMPLETE_LOG_SQL = """
+INSERT INTO {schema}.agent_schedule_revisions
+       (schedule_id, seq, revision, action, state, prompt, cron, run_at, timezone,
+        author, source, conversation, turn, created_at)
+SELECT s.id,
+       COALESCE((SELECT max(seq) FROM {schema}.agent_schedule_revisions
+                 WHERE schedule_id = s.id), 0) + 1,
+       s.revision, 'complete', s.state, s.prompt, s.cron, s.run_at, s.timezone,
+       'cron:' || :name, 'scheduler', NULL, NULL, now()
+FROM {schema}.agent_schedules s WHERE s.id = :id
+"""
+
+
+@dataclass(frozen=True)
+class _AgentSchedule:
+    """One active agent-created schedule as a pass read it (ADR 0248)."""
+
+    id: uuid.UUID
+    agent_id: uuid.UUID
+    revision: int
+    prompt: str
+    cron: str | None
+    run_at: datetime | None
+    timezone: str
+    destination_kind: str
+    destination_address: str
+    destination_adapter: str | None
+    effective_from: datetime
+
+    @property
+    def name(self) -> str:
+        return f"{AGENT_SCHEDULE_PREFIX}{self.id}"
+
+    @property
+    def one_shot_slot(self) -> datetime:
+        """``run_at`` plus one microsecond per revision past the first, so a
+        revision that follows a ``schedule_changed`` skip gets a fresh slot."""
+
+        assert self.run_at is not None
+        return self.run_at.astimezone(UTC) + timedelta(microseconds=self.revision - 1)
+
+    def trigger(self) -> dict[str, Any]:
+        """The bundle-trigger shape the shared admission path reads."""
+
+        trigger: dict[str, Any] = {"name": self.name, "prompt": self.prompt}
+        if self.cron is not None:
+            trigger["schedule"] = self.cron
+        return trigger
+
+
 class _UnboundTarget(Exception):
     """A hook's target matches no single binding of its agent."""
 
@@ -465,6 +589,7 @@ class CronSchedulerLoop:
         # A version's declared triggers are immutable, so one fetch per version.
         self._triggers: dict[tuple[uuid.UUID, str], list[dict[str, Any]]] = {}
         # Table identifiers are not user input; the schema comes from config.
+        self._db_schema = db_schema
         self._targets_sql = text(_TARGETS_SQL.format(schema=db_schema))
         self._target_sql = text(
             _TARGETS_SQL.replace("ORDER BY a.id", "WHERE a.id=:agent_id\nORDER BY a.id").format(
@@ -484,6 +609,20 @@ class CronSchedulerLoop:
         self._deferred_sql = text(_DEFERRED_SQL.format(schema=db_schema))
         self._settle_deferred_sql = text(_SETTLE_DEFERRED_SQL.format(schema=db_schema))
         self._reopen_sql = text(_REOPEN_SQL.format(schema=db_schema))
+        self._agent_schedules_sql = text(_AGENT_SCHEDULES_SQL.format(schema=db_schema))
+        self._agent_schedule_sql = text(
+            _AGENT_SCHEDULES_SQL.format(schema=db_schema) + "  AND s.id = :id\n"
+        )
+        self._destination_sql = text(_AGENT_SCHEDULE_DESTINATION_SQL.format(schema=db_schema))
+        self._schedule_cas_sql = text(_AGENT_SCHEDULE_CAS_SQL.format(schema=db_schema))
+        self._snapshot_sql = text(_AGENT_SCHEDULE_SNAPSHOT_SQL.format(schema=db_schema))
+        self._snapshot_revision_sql = text(
+            _AGENT_SCHEDULE_SNAPSHOT_REVISION_SQL.format(schema=db_schema)
+        )
+        self._one_shot_runs_sql = text(_ONE_SHOT_RUNS_SQL.format(schema=db_schema))
+        self._one_shot_reclaim_sql = text(_ONE_SHOT_RECLAIM_SQL.format(schema=db_schema))
+        self._one_shot_done_sql = text(_ONE_SHOT_DONE_SQL.format(schema=db_schema))
+        self._complete_log_sql = text(_SCHEDULE_COMPLETE_LOG_SQL.format(schema=db_schema))
 
     def _validate_source_context(
         self, context: CronSourceContext | None, target: _Target, name: str
@@ -558,16 +697,30 @@ class CronSchedulerLoop:
             self._triggers[cache_key] = cached
         return cached
 
-    def _budget_spent(self, target: _Target) -> bool:
-        # No daily-spend ledger exists in the worker, so the only spent budget
-        # knowable here is one configured to nothing.
+    async def _budget_block(self, target: _Target, slot: datetime) -> str | None:
+        """Why this slot cannot run, or None when the daily ledger still has room.
+
+        A cap configured to nothing stays ``budget_exhausted``. A positive cap
+        that today's scheduled spend has reached is ``daily_budget``.
+        """
+
+        from .schedule_safety import spent_usd
+
         usd = target.max_usd_per_day if target.max_usd_per_day is not None else self._default_usd
         tokens = (
             target.max_output_tokens_per_run
             if target.max_output_tokens_per_run is not None
             else self._default_tokens
         )
-        return usd <= 0 or tokens <= 0
+        if usd <= 0 or tokens <= 0:
+            return "budget_exhausted"
+        async with self._engine.connect() as conn:
+            spent = await spent_usd(
+                conn, self._db_schema, target.agent_id, slot.astimezone(UTC).date()
+            )
+        if spent >= Decimal(str(usd)):
+            return "daily_budget"
+        return None
 
     async def _insert(
         self,
@@ -696,45 +849,58 @@ class CronSchedulerLoop:
         defer_if_busy: bool,
         *,
         source_context: CronSourceContext | None = None,
+        agent_schedule: _AgentSchedule | None = None,
     ) -> None:
         """@spec PROTECTED-HOOK-SOURCE-2."""
         name = str(trigger["name"])
         context = self._validate_source_context(source_context, target, name)
         block_reason: str | None = None
+        skip_reason: str | None = None
         if await self._is_killed(target.agent_id):
             block_reason = "agent_killed"
-        elif self._budget_spent(target):
-            block_reason = "budget_exhausted"
-        if block_reason is not None:
+        else:
+            budget_reason = await self._budget_block(target, slot)
+            if budget_reason == "budget_exhausted":
+                block_reason = budget_reason
+            elif budget_reason == "daily_budget":
+                skip_reason = budget_reason
+        if block_reason is not None or skip_reason is not None:
             async with self._engine.begin() as conn:
                 reclaimed = await self._lock_and_reclaim(
                     conn, target, name, slot, summary, source_context=context
                 )
-                run_id = await self._insert(
+                terminal = "skipped" if skip_reason is not None else "blocked"
+                run_id, changed = await self._record_slot(
                     conn,
                     target,
                     name,
                     slot,
-                    "blocked",
-                    reason=block_reason,
+                    terminal,
+                    reason=skip_reason or block_reason,
                     source_context=context,
+                    agent_schedule=agent_schedule,
                 )
             self._record_reclaimed(target, name, reclaimed, summary)
+            if changed:
+                return
             if run_id is not None:
-                _record_fire("blocked")
-                summary.blocked += 1
+                _record_fire(terminal)
+                if terminal == "skipped":
+                    summary.skipped += 1
+                else:
+                    summary.blocked += 1
             else:
                 summary.lost += 1
             return
 
         try:
-            handle = await self._reply_handle(target, trigger)
+            handle = await self._reply_handle(target, trigger, agent_schedule)
         except _UnboundTarget:
             async with self._engine.begin() as conn:
                 reclaimed = await self._lock_and_reclaim(
                     conn, target, name, slot, summary, source_context=context
                 )
-                run_id = await self._insert(
+                run_id, changed = await self._record_slot(
                     conn,
                     target,
                     name,
@@ -742,8 +908,11 @@ class CronSchedulerLoop:
                     "failed",
                     reason="target_unbound",
                     source_context=context,
+                    agent_schedule=agent_schedule,
                 )
             self._record_reclaimed(target, name, reclaimed, summary)
+            if changed:
+                return
             if run_id is not None:
                 _record_fire("failed")
                 summary.failed += 1
@@ -767,10 +936,19 @@ class CronSchedulerLoop:
             else:
                 outcome = None
                 reason = None
-            run_id = await self._insert(
-                conn, target, name, slot, outcome, reason=reason, source_context=context
+            run_id, changed = await self._record_slot(
+                conn,
+                target,
+                name,
+                slot,
+                outcome,
+                reason=reason,
+                source_context=context,
+                agent_schedule=agent_schedule,
             )
         self._record_reclaimed(target, name, reclaimed, summary)
+        if changed:
+            return
         if run_id is None:
             # Another replica recorded this slot first.
             summary.lost += 1
@@ -787,6 +965,53 @@ class CronSchedulerLoop:
             summary.failed += 1
             raise
         summary.admitted += 1
+
+    async def _record_slot(
+        self,
+        conn: AsyncConnection,
+        target: _Target,
+        name: str,
+        slot: datetime,
+        outcome: str | None,
+        *,
+        reason: str | None = None,
+        source_context: CronSourceContext | None = None,
+        agent_schedule: _AgentSchedule | None = None,
+    ) -> tuple[uuid.UUID | None, bool]:
+        """``_insert``, plus for an agent schedule the revision compare-and-set
+        and the run snapshot, in the caller's admission transaction.
+
+        Returns the new row id (None when another replica recorded the slot)
+        and whether the schedule changed since the pass read it, in which case
+        nothing is recorded.
+        """
+
+        if agent_schedule is not None and not await self._schedule_unchanged(conn, agent_schedule):
+            logger.info(
+                "agent schedule %s for agent=%s changed during admission; recording nothing",
+                name,
+                target.agent_name,
+            )
+            return None, True
+        run_id = await self._insert(
+            conn, target, name, slot, outcome, reason=reason, source_context=source_context
+        )
+        if run_id is not None and agent_schedule is not None:
+            await conn.execute(self._snapshot_sql, {"run_id": run_id, "id": agent_schedule.id})
+        return run_id, False
+
+    async def _schedule_unchanged(self, conn: AsyncConnection, schedule: _AgentSchedule) -> bool:
+        """Under the advisory lock: the schedule is still active, at the
+        revision the pass read, and its agent's toggle is still on. Locks the
+        schedule row for the rest of the transaction."""
+
+        row = (await conn.execute(self._schedule_cas_sql, {"id": schedule.id})).first()
+        return (
+            row is not None
+            and row.revision == schedule.revision
+            and row.state == "active"
+            and row.agent_schedules is True
+        )
 
     async def _lock_and_reclaim(
         self,
@@ -845,13 +1070,54 @@ class CronSchedulerLoop:
         ).first()
         return in_flight is not None
 
-    async def _reply_handle(self, target: _Target, trigger: dict[str, Any]) -> ReplyHandle | None:
+    async def _reply_handle(
+        self,
+        target: _Target,
+        trigger: dict[str, Any],
+        agent_schedule: _AgentSchedule | None = None,
+    ) -> ReplyHandle | None:
         """The bound route a targeted hook replies on; None for a targetless one.
+
+        An agent schedule replies on the binding with its stored kind, address
+        and adapter exactly, never on another binding of the address.
 
         Raises ``_UnboundTarget`` when the target matches no single binding.
         """
 
         name = str(trigger["name"])
+        if agent_schedule is not None:
+            async with self._engine.connect() as conn:
+                exact = (
+                    (
+                        await conn.execute(
+                            self._destination_sql,
+                            {
+                                "agent_id": target.agent_id,
+                                "kind": agent_schedule.destination_kind,
+                                "address": agent_schedule.destination_address,
+                                "adapter": agent_schedule.destination_adapter,
+                            },
+                        )
+                    )
+                    .mappings()
+                    .all()
+                )
+            if len(exact) != 1:
+                logger.warning(
+                    "agent schedule %s for agent=%s has no binding %s:%s; recording failed",
+                    name,
+                    target.agent_name,
+                    agent_schedule.destination_kind,
+                    agent_schedule.destination_address,
+                )
+                raise _UnboundTarget
+            return ReplyHandle(
+                kind=exact[0]["kind"],
+                channel=exact[0]["address"],
+                placeholder=None,
+                endpoint=exact[0]["endpoint"],
+                adapter=exact[0]["adapter"],
+            )
         handle: ReplyHandle | None = None
         address = trigger.get("target")
         if address is not None:
@@ -977,12 +1243,24 @@ class CronSchedulerLoop:
         summary: CronPassSummary,
         *,
         source_context: CronSourceContext | None = None,
+        agent_schedule: _AgentSchedule | None = None,
     ) -> None:
-        """@spec PROTECTED-HOOK-SOURCE-2."""
+        """@spec PROTECTED-HOOK-SOURCE-2.
+
+        An agent one-shot's deferred slot is bounded by ``ONE_SHOT_CATCH_UP``,
+        and an agent schedule's deferred row whose snapshot revision is no
+        longer current settles ``skipped``/``schedule_changed``.
+        """
 
         name = str(trigger["name"])
         context = self._validate_source_context(source_context, target, name)
-        schedule = str(trigger["schedule"])
+        schedule = trigger.get("schedule")
+
+        def bound(slot: datetime) -> timedelta:
+            if schedule is None:
+                return ONE_SHOT_CATCH_UP
+            return catch_up_bound(str(schedule), zone, slot)
+
         async with self._engine.connect() as conn:
             slots = [
                 row[0]
@@ -994,8 +1272,8 @@ class CronSchedulerLoop:
             ]
         for slot in slots:
             key = {"agent_id": target.agent_id, "name": name, "slot": slot}
-            expires_at = slot + catch_up_bound(schedule, zone, slot)
-            if slot_is_stale(schedule, zone, slot, now):
+            expires_at = slot + bound(slot)
+            if now - slot > bound(slot):
                 async with self._engine.begin() as conn:
                     await context.ensure_before_effect(target.agent_id, name)
                     settled = (
@@ -1011,27 +1289,36 @@ class CronSchedulerLoop:
                     summary.lost += 1
                 continue
             retry_block: str | None = None
+            retry_outcome = "blocked"
             if await self._is_killed(target.agent_id):
                 retry_block = "agent_killed"
-            elif self._budget_spent(target):
-                retry_block = "budget_exhausted"
+            else:
+                budget_reason = await self._budget_block(target, slot)
+                if budget_reason == "daily_budget":
+                    retry_block = budget_reason
+                    retry_outcome = "skipped"
+                elif budget_reason == "budget_exhausted":
+                    retry_block = budget_reason
             if retry_block is not None:
                 async with self._engine.begin() as conn:
                     await context.ensure_before_effect(target.agent_id, name)
                     settled = (
                         await conn.execute(
                             self._settle_deferred_sql,
-                            {**key, "outcome": "blocked", "reason": retry_block},
+                            {**key, "outcome": retry_outcome, "reason": retry_block},
                         )
                     ).first()
                 if settled is not None:
-                    _record_fire("blocked")
-                    summary.blocked += 1
+                    _record_fire(retry_outcome)
+                    if retry_outcome == "skipped":
+                        summary.skipped += 1
+                    else:
+                        summary.blocked += 1
                 else:
                     summary.lost += 1
                 continue
             try:
-                handle = await self._reply_handle(target, trigger)
+                handle = await self._reply_handle(target, trigger, agent_schedule)
             except _UnboundTarget:
                 async with self._engine.begin() as conn:
                     await context.ensure_before_effect(target.agent_id, name)
@@ -1047,6 +1334,7 @@ class CronSchedulerLoop:
                 else:
                     summary.lost += 1
                 continue
+            changed = False
             async with self._engine.begin() as conn:
                 reclaimed = await self._lock_and_reclaim(
                     conn, target, name, slot, summary, source_context=context
@@ -1055,6 +1343,21 @@ class CronSchedulerLoop:
                 blocked = paused_at is not None or await self._blocked_by_in_flight(
                     conn, target, name, slot
                 )
+                if not blocked and agent_schedule is not None:
+                    if not await self._schedule_unchanged(conn, agent_schedule):
+                        # Changed since this pass read it; the next pass decides.
+                        blocked = True
+                    elif (
+                        await conn.execute(self._snapshot_revision_sql, key)
+                    ).scalar_one_or_none() != agent_schedule.revision:
+                        await context.ensure_before_effect(target.agent_id, name)
+                        changed = (
+                            await conn.execute(
+                                self._settle_deferred_sql,
+                                {**key, "outcome": "skipped", "reason": "schedule_changed"},
+                            )
+                        ).first() is not None
+                        blocked = True
                 await context.ensure_before_effect(target.agent_id, name)
                 row = (
                     None
@@ -1066,6 +1369,9 @@ class CronSchedulerLoop:
                     ).first()
                 )
             self._record_reclaimed(target, name, reclaimed, summary)
+            if changed:
+                _record_fire("skipped")
+                summary.skipped += 1
             if paused_at is not None:
                 return
             if blocked:
@@ -1112,11 +1418,251 @@ class CronSchedulerLoop:
                 },
             )
 
+    async def _agent_schedules(
+        self, agent_id: uuid.UUID | None = None, schedule_id: uuid.UUID | None = None
+    ) -> dict[uuid.UUID, list[_AgentSchedule]]:
+        """Active agent schedules of toggled-on agents, by agent (ADR 0248)."""
+
+        async with self._engine.connect() as conn:
+            rows = (
+                (
+                    await conn.execute(
+                        self._agent_schedules_sql
+                        if schedule_id is None
+                        else self._agent_schedule_sql,
+                        {} if schedule_id is None else {"id": schedule_id},
+                    )
+                )
+                .mappings()
+                .all()
+            )
+        found: dict[uuid.UUID, list[_AgentSchedule]] = {}
+        for row in rows:
+            schedule = _AgentSchedule(
+                id=uuid.UUID(str(row["id"])),
+                agent_id=uuid.UUID(str(row["agent_id"])),
+                revision=int(row["revision"]),
+                prompt=str(row["prompt"]),
+                cron=row["cron"],
+                run_at=row["run_at"],
+                timezone=str(row["timezone"] or "UTC"),
+                destination_kind=str(row["destination_kind"]),
+                destination_address=str(row["destination_address"]),
+                destination_adapter=row["destination_adapter"],
+                effective_from=row["effective_from"],
+            )
+            if agent_id is not None and schedule.agent_id != agent_id:
+                continue
+            found.setdefault(schedule.agent_id, []).append(schedule)
+        return found
+
+    async def _agent_schedule_pass(
+        self,
+        hint: _Target,
+        hinted: _AgentSchedule,
+        window_start: datetime,
+        now: datetime,
+        summary: CronPassSummary,
+    ) -> None:
+        """One agent schedule through the guarded admission path (ADR 0248).
+
+        Recurring schedules take the bundle trigger path (deferred retry,
+        bounded catch-up, admission) with the window floored at the
+        schedule's ``effective_from``; one-shots are reconciled by
+        ``_one_shot``. The schedule is re-read under the source guard, and
+        admission compares its revision again under the row lock.
+        """
+
+        name = hinted.name
+        if self._source_guard is None:
+            raise SourceSnapshotUnavailable("source_guard_unavailable")
+        async with self._source_guard.locked_snapshot(hint.agent_id, name) as context:
+            target = await self._target(hint.agent_id)
+            if target is None:
+                return
+            fresh = (await self._agent_schedules(hint.agent_id, hinted.id)).get(hint.agent_id)
+            if not fresh:
+                return
+            schedule = fresh[0]
+            async with self._engine.connect() as conn:
+                paused_at, resume_from, generation = await self._control(conn, target, name)
+            if paused_at is not None:
+                return
+            if schedule.cron is None:
+                await self._one_shot(target, schedule, now, summary, source_context=context)
+            else:
+                trigger = schedule.trigger()
+                zone = schedule.timezone
+                await self._retry_deferred(
+                    target,
+                    trigger,
+                    zone,
+                    now,
+                    summary,
+                    source_context=context,
+                    agent_schedule=schedule,
+                )
+                start = await self._window_start(target, name, window_start, now, resume_from)
+                start = max(start, schedule.effective_from)
+                due = resolve_slots(schedule.cron, zone, start, now)
+                fire, skipped = plan_catch_up(schedule.cron, zone, due, now)
+                await self._skip(target, name, skipped, summary, source_context=context)
+                if fire is not None:
+                    await self._admit(
+                        target,
+                        trigger,
+                        fire,
+                        summary,
+                        resume_from is not None,
+                        source_context=context,
+                        agent_schedule=schedule,
+                    )
+            if resume_from is not None:
+                await self._clear_resume(
+                    target, name, resume_from, generation, source_context=context
+                )
+
+    async def _one_shot(
+        self,
+        target: _Target,
+        schedule: _AgentSchedule,
+        now: datetime,
+        summary: CronPassSummary,
+        *,
+        source_context: CronSourceContext | None = None,
+    ) -> None:
+        """Reconcile, then admit, one agent one-shot (ADR 0248).
+
+        Exactly once rests on the hook_runs unique key at the revision's slot,
+        not on the stored state. Only ``source = 'schedule'`` rows count. A
+        lapsed open claim at the slot is reclaimed, never republished
+        (delivery is at most once). Any terminal row other than a
+        ``schedule_changed`` skip of an earlier revision completes the
+        schedule, a ``schedule_changed`` skip at the current slot included; a
+        deferred row retries within ``ONE_SHOT_CATCH_UP``; an open row is in
+        flight. With no row, a due slot fires, or past the bound is recorded
+        skipped and completes.
+        """
+
+        name = schedule.name
+        context = self._validate_source_context(source_context, target, name)
+        slot = schedule.one_shot_slot
+        key = {"agent_id": target.agent_id, "name": name, "slot": slot}
+        async with self._engine.begin() as conn:
+            reclaimed = await self._lock_and_reclaim(
+                conn, target, name, slot, summary, source_context=context
+            )
+            await context.ensure_before_effect(target.agent_id, name)
+            reclaimed += (
+                await conn.execute(
+                    self._one_shot_reclaim_sql, {**key, "lease_s": self._claim_lease_s}
+                )
+            ).rowcount
+        self._record_reclaimed(target, name, reclaimed, summary)
+        async with self._engine.connect() as conn:
+            rows = (
+                await conn.execute(
+                    self._one_shot_runs_sql, {"agent_id": target.agent_id, "name": name}
+                )
+            ).all()
+        if any(row.outcome == "deferred" for row in rows):
+            await self._retry_deferred(
+                target,
+                schedule.trigger(),
+                schedule.timezone,
+                now,
+                summary,
+                source_context=context,
+                agent_schedule=schedule,
+            )
+            return
+        if any(row.outcome is None for row in rows):
+            return
+        if any(
+            row.slot_utc == slot or (row.outcome, row.reason) != ("skipped", "schedule_changed")
+            for row in rows
+        ):
+            await self._complete_one_shot(target, schedule, source_context=context)
+            return
+        if slot > now:
+            return
+        if now - slot > ONE_SHOT_CATCH_UP:
+            async with self._engine.begin() as conn:
+                await conn.execute(self._lock_sql, {"agent_id": str(target.agent_id), "name": name})
+                run_id, changed = await self._record_slot(
+                    conn,
+                    target,
+                    name,
+                    slot,
+                    "skipped",
+                    reason="catch_up_expired",
+                    source_context=context,
+                    agent_schedule=schedule,
+                )
+                if run_id is not None:
+                    await self._mark_done(conn, schedule)
+            if changed:
+                return
+            if run_id is None:
+                summary.lost += 1
+                return
+            _record_fire("skipped")
+            summary.skipped += 1
+            return
+        await self._admit(
+            target,
+            schedule.trigger(),
+            slot,
+            summary,
+            True,
+            source_context=context,
+            agent_schedule=schedule,
+        )
+
+    async def _complete_one_shot(
+        self,
+        target: _Target,
+        schedule: _AgentSchedule,
+        *,
+        source_context: CronSourceContext | None = None,
+    ) -> None:
+        """Mark a fired one-shot done under the per (agent, name) lock."""
+
+        name = schedule.name
+        context = self._validate_source_context(source_context, target, name)
+        async with self._engine.begin() as conn:
+            await conn.execute(self._lock_sql, {"agent_id": str(target.agent_id), "name": name})
+            await context.ensure_before_effect(target.agent_id, name)
+            done = await self._mark_done(conn, schedule)
+        if done:
+            logger.info("agent one-shot %s for agent=%s completed", name, target.agent_name)
+
+    async def _mark_done(self, conn: AsyncConnection, schedule: _AgentSchedule) -> bool:
+        """Set an active one-shot ``done`` at the revision the pass read and log
+        the completion. The revision does not move."""
+
+        done = (
+            await conn.execute(
+                self._one_shot_done_sql, {"id": schedule.id, "revision": schedule.revision}
+            )
+        ).first()
+        if done is None:
+            return False
+        await conn.execute(self._complete_log_sql, {"id": schedule.id, "name": schedule.name})
+        return True
+
     async def one_pass(self, now: datetime | None = None) -> CronPassSummary:
         """@spec PROTECTED-HOOK-SOURCE-2/10."""
         now = now or self._clock()
         window_start, self._watermark = self._watermark, now
         summary = CronPassSummary()
+        try:
+            schedules = await self._agent_schedules()
+        except Exception:
+            # Agent schedules end here for this pass; bundle triggers still run.
+            summary.failed += 1
+            logger.exception("agent schedule read raised; continuing with bundle triggers")
+            schedules = {}
         for hint in await self._targets():
             try:
                 triggers = await self._cron_triggers(hint)
@@ -1126,7 +1672,7 @@ class CronSchedulerLoop:
                     "cron trigger read raised for agent=%s; continuing with the rest",
                     hint.agent_name,
                 )
-                continue
+                triggers = []
             for hinted_trigger in triggers:
                 name, schedule, prompt = (
                     hinted_trigger.get("name"),
@@ -1201,6 +1747,18 @@ class CronSchedulerLoop:
                     logger.exception(
                         "cron hook %s raised for agent=%s; continuing with the rest",
                         name,
+                        hint.agent_name,
+                    )
+            for hinted_schedule in schedules.get(hint.agent_id, []):
+                try:
+                    await self._agent_schedule_pass(
+                        hint, hinted_schedule, window_start, now, summary
+                    )
+                except Exception:
+                    summary.failed += 1
+                    logger.exception(
+                        "agent schedule %s raised for agent=%s; continuing with the rest",
+                        hinted_schedule.name,
                         hint.agent_name,
                     )
 

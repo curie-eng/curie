@@ -1,0 +1,207 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/skills/v1.0.json",
+  "title": "curie <tier> skills --json",
+  "description": "The agent-facing payload of `curie <tier> skills <agent> <verb>` (ADR 0247): `list` prints an array of skills; `show`, `revert` and `delete` print the skill as the API now holds it (`deleted` true after a delete); `history` prints every revision oldest first; `diff` prints the unified diff of two revisions' generated SKILL.md; `export` prints the files it wrote.",
+  "$defs": {
+    "skill": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "slug": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "body": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "author": {
+          "type": "string"
+        },
+        "conversation": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "updated_at": {
+          "type": "string"
+        },
+        "created_at": {
+          "type": "string"
+        },
+        "deleted": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id",
+        "slug",
+        "description",
+        "body",
+        "revision",
+        "author",
+        "conversation",
+        "updated_at",
+        "created_at",
+        "deleted"
+      ]
+    },
+    "revision": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "action": {
+          "enum": [
+            "create",
+            "patch",
+            "revert",
+            "delete"
+          ]
+        },
+        "slug": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "body": {
+          "type": "string"
+        },
+        "digest": {
+          "type": "string"
+        },
+        "author": {
+          "type": "string"
+        },
+        "conversation": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "turn": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "type": "string"
+        },
+        "reverted_to": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "created_at": {
+          "type": "string"
+        },
+        "deleted": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "revision",
+        "action",
+        "slug",
+        "description",
+        "body",
+        "digest",
+        "author",
+        "conversation",
+        "turn",
+        "source",
+        "reverted_to",
+        "created_at",
+        "deleted"
+      ]
+    }
+  },
+  "oneOf": [
+    {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/skill"
+      }
+    },
+    {
+      "$ref": "#/$defs/skill"
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "skill": {
+          "type": "string"
+        },
+        "revisions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/revision"
+          }
+        }
+      },
+      "required": [
+        "skill",
+        "revisions"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "skill": {
+          "type": "string"
+        },
+        "from": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "to": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "diff": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "skill",
+        "from",
+        "to",
+        "diff"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "files": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "files"
+      ]
+    }
+  ]
+}

@@ -73,7 +73,7 @@ from ..workspace import (
 if TYPE_CHECKING:
     from .core import Kernel
 
-from . import clock, constants, failures, memory, routing, workspace
+from . import clock, constants, failures, hooks, memory, routing, workspace
 from .log import logger
 
 
@@ -861,24 +861,46 @@ async def _route_and_start(
         )
         from .attachment_access import AttachmentTurnEnded, steer_attachment_access
 
-        try:
-            steer_event = await steer_attachment_access(
-                self,
-                steer_event,
-                handle,
-                thread_key,
-                active=retained_live_route and active_before_steer,
+        async def _attach_and_steer() -> bool:
+            try:
+                attached_event = await steer_attachment_access(
+                    self,
+                    steer_event,
+                    handle,
+                    thread_key,
+                    active=retained_live_route and active_before_steer,
+                    remaining_s=remaining_s,
+                )
+            except AttachmentTurnEnded:
+                # The authority ended after the pre-steer snapshot, and a locked
+                # liveness recheck proved the runner idle. Use the same fresh-turn
+                # fallback as a 409; never send a null-authority steer to a live turn.
+                return False
+            return await self._runner.steer(
+                handle.base_url,
+                attached_event,
+                token=handle.token or None,
                 remaining_s=remaining_s,
             )
-        except AttachmentTurnEnded:
-            # The authority ended after the pre-steer snapshot, and a locked
-            # liveness recheck proved the runner idle. Use the same fresh-turn
-            # fallback as a 409; never send a null-authority steer to a live turn.
-            steered = False
+
+        schedule_resume = hooks._schedule_resume()
+        if schedule_resume is not None:
+            # ADR 0248: an approval continuation of an agent schedule firing
+            # steers only while the schedule still allows it, under the
+            # schedule's lock held across the steer, as a start would.
+            recorder = self._hook_runs
+            if recorder is None:
+                raise hooks.ScheduleResumeRefused(
+                    "no hook run recorder to check the agent schedule"
+                )
+            async with recorder.resume_guard(*schedule_resume) as allowed:
+                if not allowed:
+                    raise hooks.ScheduleResumeRefused(
+                        "agent schedule changed before the resume steered"
+                    )
+                steered = await _attach_and_steer()
         else:
-            steered = await self._runner.steer(
-                handle.base_url, steer_event, token=handle.token or None, remaining_s=remaining_s
-            )
+            steered = await _attach_and_steer()
         if steered:
             memory_turns = constants._MEMORY_TURNS.get()
             if memory_turns is not None:

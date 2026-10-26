@@ -339,8 +339,20 @@
     "0131": [
       "0123",
       "0130"
+    ],
+    "selfimp_memory_0001": [
+      "selfimp_sched_0001"
+    ],
+    "selfimp_safety_0001": [
+      "0131"
+    ],
+    "selfimp_sched_0001": [
+      "selfimp_skills_0001"
+    ],
+    "selfimp_skills_0001": [
+      "selfimp_safety_0001"
     ]
   },
-  "schema_head": "0131",
-  "schema_min": "0131"
+  "schema_head": "selfimp_memory_0001",
+  "schema_min": "selfimp_memory_0001"
 }

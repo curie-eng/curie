@@ -262,7 +262,7 @@ pub fn parse_alembic_current_output(stdout: &str) -> Option<String> {
             continue;
         }
         let token = line.split_whitespace().next()?;
-        if !token.is_empty() && token.chars().all(|c| c.is_ascii_alphanumeric()) {
+        if !token.is_empty() && token.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             return Some(token.to_string());
         }
     }
@@ -464,6 +464,10 @@ print(json.dumps(graph))
             Some("0038")
         );
         assert_eq!(parse_alembic_current_output("INFO only\n"), None);
+        assert_eq!(
+            parse_alembic_current_output("selfimp_safety_0001 (head)\n").as_deref(),
+            Some("selfimp_safety_0001")
+        );
     }
 
     #[test]
@@ -564,8 +568,8 @@ print(json.dumps(graph))
     fn candidate_window_tracks_the_catalog_without_changing_released_windows() {
         // @spec DEPLOY-NOTICE-RELEASE-1.
         let candidate = source_candidate_window();
-        assert_eq!(candidate.schema_min, "0131");
-        assert_eq!(candidate.schema_head, "0131");
+        assert_eq!(candidate.schema_min, "selfimp_memory_0001");
+        assert_eq!(candidate.schema_head, "selfimp_memory_0001");
         assert_eq!(
             candidate.schema_head.as_str(),
             catalog().revisions.last().unwrap()
@@ -577,17 +581,25 @@ print(json.dumps(graph))
         for below in [
             "0082", "0083", "0084", "0085", "0086", "0087", "0088", "0089", "0090", "0091a",
             "0092a", "0093a", "0094", "0095", "0096", "0097", "0098", "0099", "0100", "0093",
-            "0101", "0102", "0103",
+            "0101", "0102", "0103", "0105", "0106", "0107", "0108",
         ] {
             assert!(!live_in_window(below, &current), "{below}");
         }
+        // learned skills adds agents.learned_skills, which the Agent ORM reads (ADR 0247),
+        // agent schedules add agents columns it reads (ADR 0248), and twin memory adds
+        // the learning toggle it also reads (ADR 0249). Agent access policies (0121, #4585)
+        // and the later next revisions chain below them.
         assert!(!live_in_window("0108", &current));
         assert!(!live_in_window("0120", &current));
         assert!(!live_in_window("0121", &current));
         assert!(!live_in_window("0122", &current));
         assert!(!live_in_window("0123", &current));
         assert!(!live_in_window("0130", &current));
-        assert!(live_in_window("0131", &current));
+        assert!(!live_in_window("0131", &current));
+        assert!(!live_in_window("selfimp_safety_0001", &current));
+        assert!(!live_in_window("selfimp_skills_0001", &current));
+        assert!(!live_in_window("selfimp_sched_0001", &current));
+        assert!(live_in_window("selfimp_memory_0001", &current));
         assert!(!live_in_window("0075", &current));
         assert!(!live_in_window("0076", &current));
         let retained = window_for("0.12.0").expect("published foundation remains catalogued");

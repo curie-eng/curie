@@ -13,7 +13,13 @@ from aci_protocol import (
 )
 
 from ..delivery_lease import DeliveryLease
-from ..hook_runs import HookRunOutcome, HookRunRecorder, HookRunState
+from ..hook_runs import (
+    AGENT_SCHEDULE_PREFIX,
+    HookRunOutcome,
+    HookRunRecorder,
+    HookRunState,
+    agent_schedule_id,
+)
 from ..runner_client import (
     TurnStream,
 )
@@ -53,6 +59,30 @@ class _HookRunCarry:
     successor_maybe_published: bool = False
     # A coverage notice owed by a close that took effect, until it is posted (#2878).
     notice_pending: str | None = None
+    # An approval continuation of an agent schedule firing (ADR 0248), as
+    # (agent, schedule, approval), checked at intake: its runner start and
+    # steer are guarded again under the schedule's lock.
+    schedule_resume: tuple[uuid.UUID, uuid.UUID, uuid.UUID] | None = None
+
+
+class ScheduleResumeRefused(RuntimeError):
+    """An approved continuation of an agent schedule firing may no longer run
+    (ADR 0248): the schedule changed, was cancelled or paused, the toggle went
+    off, or its destination is gone. The delivery completes dropped."""
+
+
+def _agent_schedule_of_conversation(conversation_id: str, agent_id: uuid.UUID) -> uuid.UUID | None:
+    """The schedule a ``hook:<agent>:agent-schedule:<id>`` conversation belongs to."""
+
+    prefix = f"hook:{agent_id}:"
+    if not conversation_id.startswith(prefix + AGENT_SCHEDULE_PREFIX):
+        return None
+    return agent_schedule_id(conversation_id[len(prefix) :])
+
+
+def _schedule_resume() -> tuple[uuid.UUID, uuid.UUID, uuid.UUID] | None:
+    carry = constants._HOOK_RUN_CARRY.get()
+    return None if carry is None else carry.schedule_resume
 
 
 def _hook_success_outcome() -> HookRunOutcome | None:
@@ -209,6 +239,33 @@ async def _start_turn_under_hook_control(
         async with carry.recorder.start_guard(carry.ref) as allowed:
             if not allowed:
                 raise failures.HookPaused("cron hook paused before runner start")
+            try:
+                turn = await self._runner.start_turn(
+                    handle.base_url,
+                    event,
+                    token=handle.token or None,
+                    remaining_s=remaining_s,
+                    **extra,
+                )
+            except BaseException:  # noqa: BLE001 - broad catch kept at a failure boundary
+                if plan is not None and self._progress is not None:
+                    await deactivate_turn_progress(self._progress, plan)
+                raise
+            if mint is not None:
+                self._record_turn_deadline(mint.grant, remaining_s)
+            memory._note_live_memory_turn(turn)
+            return turn
+    resume = carry.schedule_resume if carry is not None else None
+    if resume is not None:
+        # ADR 0248: the schedule's lock is held across the start, so a change
+        # to the schedule, its toggle or its destination lands before or after
+        # this continuation starts, never between the check and the start.
+        recorder = self._hook_runs
+        if recorder is None:
+            raise ScheduleResumeRefused("no hook run recorder to check the agent schedule")
+        async with recorder.resume_guard(*resume) as allowed:
+            if not allowed:
+                raise ScheduleResumeRefused("agent schedule changed before the resume started")
             try:
                 turn = await self._runner.start_turn(
                     handle.base_url,

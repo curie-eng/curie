@@ -240,7 +240,9 @@ def test_source_policy_additive_upgrade_preserves_existing_agent(
     after = sql_dicts("SELECT * FROM curie.agents WHERE id = :id", {"id": agent_id})
     assert len(before) == len(after) == 1
     # Deploy notifications and the reviewer model, then tenant scope and bot
-    # identity (#2911).
+    # identity (#2911), then the learned skills switch (selfimp_skills_0001, ADR 0247),
+    # then the agent schedule settings (selfimp_sched_0001, ADR 0248) and the
+    # agent-wide learning toggle (selfimp_memory_0001, ADR 0249).
     added = {
         "deploy_notifications": False,
         "reviewer_model": None,
@@ -250,6 +252,12 @@ def test_source_policy_additive_upgrade_preserves_existing_agent(
         "topic_policy_ref": None,
         "data_classification_ref": None,
         "retention_policy_ref": None,
+        "learned_skills": False,
+        "agent_schedules": False,
+        "schedule_timezone": "UTC",
+        "schedule_max_active": 20,
+        "schedule_min_interval_minutes": 15,
+        "agent_wide_learning": False,
     }
     assert not set(added) & set(before[0])
     assert set(after[0]) == set(before[0]) | set(added)
