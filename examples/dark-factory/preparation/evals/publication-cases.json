@@ -458,35 +458,6 @@
       ]
     },
     {
-      "id": "pilot-observations-stay-local",
-      "given": {
-        "pilot_request_id": "synthetic-request-01",
-        "comparison_arm": "prepared, assigned by coordinator before preparation",
-        "behavioral_questions": 5,
-        "question_batches": 2,
-        "human_preparation_minutes": "not measured",
-        "tracker_tools": "none",
-        "source": "new local intent"
-      },
-      "user_turn": "Keep drafts local and record the pilot observations.",
-      "expected": {
-        "local_effects": [
-          "record supplied request ID and arm",
-          "record five behavioral questions and two batches separately from review choices",
-          "record human preparation time as unknown",
-          "preserve unresolved choices and existing local files"
-        ],
-        "tracker_effects": []
-      },
-      "forbidden": [
-        "infer zero minutes",
-        "treat agent elapsed time as human attention time",
-        "change arm or enroll extra successes after splitting",
-        "upload reports or conversations",
-        "claim improved factory completion"
-      ]
-    },
-    {
       "id": "feasibility-host-is-not-sandbox",
       "phase": "verification-feasibility",
       "given": {

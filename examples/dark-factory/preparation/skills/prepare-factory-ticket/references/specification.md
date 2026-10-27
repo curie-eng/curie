@@ -357,24 +357,3 @@ remains ambiguous. Resume only missing operations whose authorization still
 applies. On partial split publication, preserve created issues and local mappings;
 create no duplicates, delete nothing and start no child whose dependency links
 are incomplete. Report exact completed actions and what needs intervention.
-
-## Optional pilot record
-
-If the developer supplies a pilot request ID and comparison arm, include those
-in the local report alongside the preparation question and batch counts. The
-coordinator assigns the arm before preparation; do not assign or change it based
-on the apparent difficulty or outcome. The skill does not enroll or select tasks
-on its own. Pilot participation does not gate drafting, publication or selection.
-
-Record human preparation minutes only when observed or supplied by the developer,
-with their source. Elapsed agent session duration is not human attention time.
-Unknown time remains unknown, never zero. Keep review and publication choices
-separate from behavioral question counts. After submission, the coordinator records
-human intervention episodes, human minutes including review and rework, accepted
-outcomes at the fixed cutoff and existing factory usage observations. Include
-failed and unsubmitted requests; splitting does not create extra successes.
-
-Keep these observations local unless the developer explicitly requests a transfer.
-Do not upload reports or conversations, install a monitor, create an analytics
-service, invent completed runs or claim the preparation improved completion from
-these preparation observations alone.

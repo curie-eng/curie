@@ -86,17 +86,14 @@ question count, or improved factory completion.
 The simplified intake workflow was replayed in a fresh host context with no CLI,
 repository pin or compatibility endpoint. A synthetic existing issue received the
 exact reviewed canonical body; the fake tracker log showed read, update, read,
-one configured label add and final readback. No input prefix was added. The
-separate local report retained a coordinator supplied pilot ID and arm, five
-behavioral questions in two rounds and unknown human preparation minutes. No
-real tracker or factory run was performed. This tests publication behavior and
-honest measurement recording, not the impact on accepted factory outcomes.
+one configured label add and final readback. No input prefix was added. No real
+tracker or factory run was performed. This tests publication behavior, not the
+impact on accepted factory outcomes.
 
 The install-only revision was replayed again in a fresh context after removing
 managed update and repository resolution instructions. The fake tracker received
 one update and one label addition with readbacks, the complete reviewed body was
-preserved, and unknown human time remained unknown in the local pilot record.
-No managed version command or real external operation ran in that replay.
+preserved. No managed version command or real external operation ran in that replay.
 
 The earlier verification-feasibility revision was exercised in fresh contexts using raw
 synthetic repository files, trusted sandbox configuration and local fake tracker

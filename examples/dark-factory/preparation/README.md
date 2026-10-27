@@ -43,8 +43,3 @@ outside the client's skill discovery paths, install the reviewed replacement and
 reapply customizations deliberately. Automatic update checks, managed upgrades,
 rollback and repository version resolution are deferred to follow-up work. See
 the [preparation guide](../../../docs/guides/factory-preparation.md#manual-upgrades).
-
-The optional [pilot protocol](pilot/README.md) and blank [ledger](pilot/outcomes.csv)
-compare usual intake with prepared intake. They measure accepted outcomes,
-postsubmission interventions and total human effort using existing factory
-observations, without a new runtime service.

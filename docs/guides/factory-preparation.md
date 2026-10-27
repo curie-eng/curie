@@ -297,8 +297,8 @@ evaluator result is invented.
 ## Scope of the first release
 
 The local authoring skill can ship before migration of existing factory prompts,
-CI repair policy and labels. The release contains the portable instructions,
-offline installer and optional impact pilot. Format, coverage and dependency
+CI repair policy and labels. The release contains the portable instructions and
+offline installer. Format, coverage and dependency
 review is performed by the coding agent and developer; no Python parser or
 runtime admission validator is included.
 [ADR 0222](../adr/0222-coworker-bundles-own-workflow-policy-and-curie-enforces-execution.md)
@@ -333,18 +333,3 @@ This workflow does not interpret `.curie-factory.json` or promise compatibility
 with an installed factory version. Follow the current repository's guidance and
 resolve any conflicting format requirement during review. Reviewed publication
 uses existing tracker tools and the confirmed configured factory label.
-
-## Measure whether preparation helps
-
-Use the [preparation pilot protocol](../../examples/dark-factory/preparation/pilot/README.md)
-and its blank ledger to compare ordinary intake with prepared intake. Enroll
-original requests before preparing them, keep the factory setup comparable, and
-measure accepted outcomes and postsubmission interventions at the same cutoff.
-Include preparation time as well as supervision, review and rework so that moving
-questions earlier is not mistaken for eliminating human effort.
-
-The pilot uses a private local ledger and existing
-[outcome and usage evidence](measuring-factory-outcomes.md). It installs no
-analytics service and uploads nothing. Participation is optional and does not
-block publication or factory selection. A small exploratory trial can guide the
-next change; it does not establish a universal productivity improvement.
