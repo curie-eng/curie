@@ -2,11 +2,14 @@
 
 Date: 2026-10-27
 
-Status: Draft
+Status: Accepted
 
 Tracked in [#5092](https://github.com/curie-eng/curie/issues/5092), which is
-the design and delivery umbrella for this decision. This Draft authorizes no
-implementation.
+the design and delivery umbrella for this decision.
+
+Accepted with explicit maintainer approval on 2026-10-27: "Accept ADR 0251 as
+written". Acceptance records the approved direction; the delivery slices below
+remain unimplemented.
 
 ## Context
 
@@ -133,10 +136,9 @@ concurrency; and the 60-second aggregate capture deadline end to end.
 4. **Acceptance prerequisite.** Under
    [ADR 0085](0085-acceptance-not-implementation-authorizes-an-adr.md) as
    amended by [ADR 0102](0102-accepted-alongside-implementation-with-explicit-approval.md),
-   this Draft authorizes nothing. Its policies are proposals for review, and
-   recovery implementation stays gated on acceptance. Implementation starts only after this ADR is
-   published `Accepted` with explicit maintainer approval. It does not claim
-   the ADR 0102 coordinated exception. At acceptance, add exactly one
+   explicit maintainer approval authorizes this decision. Implementation starts
+   only after this acceptance is merged into the target branch. It does not
+   claim the ADR 0102 coordinated exception. Acceptance adds exactly one
    back-link under
    [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md),
    immediately after the `Status:` line of ADR 0186. ADR 0045 permits a
@@ -151,7 +153,8 @@ concurrency; and the 60-second aggregate capture deadline end to end.
    > checkpoint's original trusted base commit and recorded PR target branch
    > instead of resolving the base anew. Everything else in this ADR stands.
 
-   This Draft PR leaves the body and status of every Accepted ADR unchanged.
+   This acceptance leaves the body and status of every existing Accepted ADR
+   unchanged; only the specified back-link is added to ADR 0186.
 
 The related Drafts [ADR 0211](0211-a-factory-run-that-loses-its-sandbox-is-re-admitted-like-one-that-loses-its-worker.md)
 (sandbox-loss successors) and [ADR 0233](0233-factory-publication-recovery-requires-explicit-operator-adoption.md)
@@ -164,7 +167,7 @@ neither and feeds neither a checkpoint.
 ordinary terminal failure of a factory request captures a private checkpoint
 of its files against the trusted base before the sandbox is released. Only an
 explicit, authorized restoration reads it, and it does so by admitting a new
-request.** The numeric limits below are proposed for ADR review.
+request.** The numeric limits below are accepted with this decision.
 
 ### 1. Recovery is opt-in and capped installation wide
 
