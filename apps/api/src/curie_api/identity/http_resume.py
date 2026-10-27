@@ -16,13 +16,13 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from curie_api import identity_fence
-from curie_api.identity.http_approval import _canonical, _verified_capsule
+from curie_api.identity.http_approval import canonical_json, verified_capsule
 from curie_api.identity.http_invocation import (
     HttpInvocationRuntime,
-    _check_response,
-    _current_source_authority,
     check_http_turn_authority,
+    current_source_authority,
     invocation_source,
+    turn_authority_response,
 )
 from curie_api.identity.http_transport import HttpIdentityClient
 from curie_api.models import Approval
@@ -56,7 +56,7 @@ def _grant_matches(row: Approval, grant: wire.ApprovalGrantExpectationV1) -> boo
     """Every effect field against the committed row. @spec HTTP-APPROVAL-CONTINUITY-12."""
     arguments = row.granted_arguments
     try:
-        stored = None if arguments is None else _canonical(arguments)
+        stored = None if arguments is None else canonical_json(arguments)
     except (ValueError, TypeError, RecursionError):
         return False
     if row.gate_kind == "permission" and (not row.granted_tool or arguments is None):
@@ -80,7 +80,7 @@ def _row_matches(
     """
     if row is None:
         return False
-    saved = _verified_capsule(runtime, row)
+    saved = verified_capsule(runtime, row)
     if saved is None or (
         row.status != resume.status or row.agent_id is None
         or str(row.agent_id) != resume.scope.agent_id
@@ -112,10 +112,10 @@ async def _check_resume(
     runtime = getattr(request.app.state, "http_identity_runtime", None)
     client = getattr(request.app.state, "http_identity_client", None)
     if type(runtime) is not HttpInvocationRuntime or not isinstance(client, HttpIdentityClient):
-        return _check_response(check, "unavailable", "authority_unavailable")
+        return turn_authority_response(check, "unavailable", "authority_unavailable")
     resume = wire.open_resume_context(check.context, runtime._context_keys)
     if not isinstance(resume, wire.ResumeContextV1):
-        return _check_response(check, "refuse", "invalid_context")
+        return turn_authority_response(check, "refuse", "invalid_context")
     scope = resume.scope
     if (
         check.approval_id != resume.approval_id or check.event_id != resume.event_id
@@ -124,28 +124,28 @@ async def _check_resume(
         or check.scope.binding_id != scope.binding_id
         or check.scope.binding_generation != scope.binding_generation
     ):
-        return _check_response(check, "refuse", "invalid_context")
+        return turn_authority_response(check, "refuse", "invalid_context")
     try:
         original = _original_invocation(resume)
         registration, source = invocation_source(runtime, original)
     except (ValueError, TypeError, HTTPException):
-        return _check_response(check, "refuse", "invalid_context")
+        return turn_authority_response(check, "refuse", "invalid_context")
     factory = request.app.state.sessionmaker
     try:
         async with factory() as session, session.begin():
             await identity_fence.lock_identity_reader(session)
             row = await _read_row(session, resume.approval_id)
             if not _row_matches(runtime, row, resume, grant):
-                return _check_response(check, "refuse", "invalid_context")
+                return turn_authority_response(check, "refuse", "invalid_context")
     except (SQLAlchemyError, RedisError, identity_fence.IdentityWriterUnavailable):
-        return _check_response(check, "unavailable", "authority_unavailable")
+        return turn_authority_response(check, "unavailable", "authority_unavailable")
     if resume.status == "approved":
         # Criterion 8's independent approver composition is not realized, so a
         # preserved actor cannot be freshly reauthorized: approval never continues.
-        return _check_response(check, "refuse", "unsupported_resume")
+        return turn_authority_response(check, "refuse", "unsupported_resume")
     reason: Literal["current_authority", "invalid_context"] = "invalid_context"
     try:
-        async with _current_source_authority(
+        async with current_source_authority(
             request, runtime=runtime, client=client, registration=registration,
             source=source, original=original,
         ) as current:
@@ -155,15 +155,15 @@ async def _check_resume(
                 reason = "current_authority"
     except HTTPException as error:
         if error.status_code == 401:
-            return _check_response(check, "refuse", "invalid_context")
+            return turn_authority_response(check, "refuse", "invalid_context")
         if error.status_code == 403:
-            return _check_response(check, "refuse", "caller_not_allowed")
-        return _check_response(check, "unavailable", "authority_unavailable")
+            return turn_authority_response(check, "refuse", "caller_not_allowed")
+        return turn_authority_response(check, "unavailable", "authority_unavailable")
     except (SQLAlchemyError, RedisError, identity_fence.IdentityWriterUnavailable):
-        return _check_response(check, "unavailable", "authority_unavailable")
+        return turn_authority_response(check, "unavailable", "authority_unavailable")
     if reason == "current_authority":
-        return _check_response(check, "continue", "current_authority")
-    return _check_response(check, "refuse", "invalid_context")
+        return turn_authority_response(check, "continue", "current_authority")
+    return turn_authority_response(check, "refuse", "invalid_context")
 
 
 async def check_current_turn_authority(
@@ -201,6 +201,6 @@ async def check_http_approval_grant(
     return wire.ApprovalGrantAuthorityResponseV1(
         schema_version=1, check=result,
         grant_sha256=hashlib.sha256(
-            _canonical(body.grant.model_dump(mode="json")).encode("utf-8"),
+            canonical_json(body.grant.model_dump(mode="json")).encode("utf-8"),
         ).hexdigest(),
     )

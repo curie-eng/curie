@@ -608,7 +608,7 @@ async def current_http_invocation(
     if registration is None or proof.body_sha256 != hashlib.sha256(submitted_bytes).hexdigest():
         _invalid_receiver()
     source = _receiver_source(registration, proof, claims, body)
-    async with _current_source_authority(
+    async with current_source_authority(
         request, runtime=runtime, client=client, registration=registration, source=source,
         intent_digest=hashlib.sha256(receiver_proof.encode("ascii")).hexdigest(),
     ) as current:
@@ -616,7 +616,7 @@ async def current_http_invocation(
 
 
 @asynccontextmanager
-async def _current_source_authority(
+async def current_source_authority(
     request: Request, *, runtime: HttpInvocationRuntime, client: HttpIdentityClient,
     registration: ReceiverRegistrationV1, source: AuthenticatedSource,
     intent_digest: str = "", original: codec.InvocationContextV1 | None = None,
@@ -716,7 +716,7 @@ async def _current_source_authority(
             object.__setattr__(live, "_open", False)
 
 
-def _check_response(
+def turn_authority_response(
     check: TurnAuthorityRequestV1,
     decision: Literal["continue", "refuse", "unavailable"],
     reason: Literal[
@@ -767,10 +767,10 @@ async def check_http_turn_authority(
     runtime = getattr(request.app.state, "http_identity_runtime", None)
     client = getattr(request.app.state, "http_identity_client", None)
     if type(runtime) is not HttpInvocationRuntime or not isinstance(client, HttpIdentityClient):
-        return _check_response(check, "unavailable", "authority_unavailable")
+        return turn_authority_response(check, "unavailable", "authority_unavailable")
     context = codec.open_invocation_context(check.context, runtime._context_keys)
     if not isinstance(context, codec.InvocationContextV1):
-        return _check_response(check, "refuse", "invalid_context")
+        return turn_authority_response(check, "refuse", "invalid_context")
     scope = context.scope
     if (
         check.payload_sha256 != context.payload_sha256 or check.event_id != context.event_id
@@ -778,28 +778,28 @@ async def check_http_turn_authority(
         or check.scope.binding_id != scope.binding_id
         or check.scope.binding_generation != scope.binding_generation
     ):
-        return _check_response(check, "refuse", "invalid_context")
+        return turn_authority_response(check, "refuse", "invalid_context")
     try:
         registration, source = invocation_source(runtime, context)
     except HTTPException:
-        return _check_response(check, "refuse", "invalid_context")
+        return turn_authority_response(check, "refuse", "invalid_context")
     if check.approval_id is not None:
-        return _check_response(check, "refuse", "unsupported_resume")
+        return turn_authority_response(check, "refuse", "unsupported_resume")
     try:
-        async with _current_source_authority(
+        async with current_source_authority(
             request, runtime=runtime, client=client, registration=registration,
             source=source, original=context,
         ):
-            result = _check_response(check, "continue", "current_authority")
+            result = turn_authority_response(check, "continue", "current_authority")
         return result
     except HTTPException as error:
         if error.status_code == 401:
-            return _check_response(check, "refuse", "invalid_context")
+            return turn_authority_response(check, "refuse", "invalid_context")
         if error.status_code == 403:
-            return _check_response(check, "refuse", "caller_not_allowed")
-        return _check_response(check, "unavailable", "authority_unavailable")
+            return turn_authority_response(check, "refuse", "caller_not_allowed")
+        return turn_authority_response(check, "unavailable", "authority_unavailable")
     except (SQLAlchemyError, RedisError, identity_fence.IdentityWriterUnavailable):
-        return _check_response(check, "unavailable", "authority_unavailable")
+        return turn_authority_response(check, "unavailable", "authority_unavailable")
 
 
 @asynccontextmanager
@@ -812,7 +812,7 @@ async def current_http_approval_caller(
     if type(runtime) is not HttpInvocationRuntime or not isinstance(client, HttpIdentityClient):
         _unavailable()
     registration, source = invocation_source(runtime, context)
-    async with _current_source_authority(
+    async with current_source_authority(
         request, runtime=runtime, client=client, registration=registration,
         source=source, original=context,
     ) as caller:
