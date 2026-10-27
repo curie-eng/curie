@@ -797,6 +797,19 @@ def test_install_docker_values_raise_the_daemon_limits_for_a_skill_rung() -> Non
     assert daemon["namespace"] == DAEMON_NAMESPACE
 
 
+def test_install_docker_values_size_factory_sandboxes_at_4gi() -> None:
+    source = _lifecycle_values(docker=True)
+    snapshot = copy.deepcopy(source)
+    values = docker_driver.docker_values(source, _images(), SCHEMA_VERSION)
+    assert source == snapshot, "docker_values mutated its input"
+    factory = values["agentSandbox"]["resourceProfiles"]["factory"]
+    assert factory == {"resources": {"requests": {"memory": "4Gi"}, "limits": {"memory": "4Gi"}}}
+    daemon_resources = values["factory"]["docker"]["resources"]
+    assert daemon_resources["limits"] == {"memory": "4Gi", "ephemeral-storage": "32Gi", "cpu": "2"}
+    assert daemon_resources["requests"]["ephemeral-storage"] == "8Gi"
+    assert values["agentSandbox"]["runner"] == source["agentSandbox"]["runner"]
+
+
 def test_install_values_method_is_docker_values_over_the_lifecycle_values(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
