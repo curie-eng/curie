@@ -97,6 +97,56 @@ def worker_env(docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return container["env"]
 
 
+def role_permissions(roles: list[dict[str, Any]]) -> dict[tuple[str, str], set[str]]:
+    permissions: dict[tuple[str, str], set[str]] = {}
+    for role in roles:
+        for rule in role["rules"]:
+            for group in rule["apiGroups"]:
+                for resource in rule["resources"]:
+                    permissions.setdefault((group, resource), set()).update(rule["verbs"])
+    return permissions
+
+
+def bound_worker_roles(docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    worker = next(
+        doc
+        for doc in docs
+        if doc.get("kind") == "Deployment"
+        and doc["metadata"]["labels"].get("app.kubernetes.io/component") == "worker"
+    )
+    account = worker["spec"]["template"]["spec"]["serviceAccountName"]
+    namespace = "acme-admission"
+    roles: list[dict[str, Any]] = []
+    for binding in docs:
+        if (
+            binding.get("kind") != "RoleBinding"
+            or binding["metadata"].get("namespace", namespace) != namespace
+            or not any(
+                subject.get("kind") == "ServiceAccount"
+                and subject.get("name") == account
+                and subject.get("namespace") == namespace
+                for subject in binding.get("subjects", [])
+            )
+        ):
+            continue
+        reference = binding["roleRef"]
+        assert reference["apiGroup"] == "rbac.authorization.k8s.io"
+        assert reference["kind"] in {"Role", "ClusterRole"}
+        referenced = [
+            doc
+            for doc in docs
+            if doc.get("kind") == reference["kind"]
+            and doc["metadata"]["name"] == reference["name"]
+            and (
+                reference["kind"] == "ClusterRole"
+                or doc["metadata"].get("namespace", namespace) == namespace
+            )
+        ]
+        assert len(referenced) == 1, "worker RoleBinding must resolve to one rendered role"
+        roles.extend(referenced)
+    return roles
+
+
 @pytest.mark.parametrize(
     ("hard", "ceiling"),
     [
@@ -169,19 +219,14 @@ def test_extra_env_cannot_replace_or_duplicate_admission(tmp_path: Path) -> None
 
 def test_worker_admission_adds_only_namespaced_inventory_reads(tmp_path: Path) -> None:
     docs = render(tmp_path, security={"gvisor": {"mode": "off"}})
-    role = next(
+    baseline_role = next(
         doc
         for doc in docs
         if doc.get("kind") == "Role" and doc["metadata"]["name"] == "acme-admission-worker"
     )
-    permissions: dict[tuple[str, str], set[str]] = {}
-    for rule in role["rules"]:
-        for group in rule["apiGroups"]:
-            for resource in rule["resources"]:
-                permissions.setdefault((group, resource), set()).update(rule["verbs"])
-    assert permissions == {
+    baseline_permissions = {
         ("extensions.agents.x-k8s.io", "sandboxclaims"): {"create", "get", "list", "delete"},
-        ("agents.x-k8s.io", "sandboxes"): {"get", "patch", "list"},
+        ("agents.x-k8s.io", "sandboxes"): {"get", "patch"},
         ("", "resourcequotas"): {"get"},
         ("extensions.agents.x-k8s.io", "sandboxtemplates"): {
             "get",
@@ -192,10 +237,98 @@ def test_worker_admission_adds_only_namespaced_inventory_reads(tmp_path: Path) -
         },
         ("extensions.agents.x-k8s.io", "sandboxwarmpools"): {"get", "create", "patch"},
         ("", "secrets"): {"create"},
-        ("", "pods"): {"get", "list"},
+        ("", "pods"): {"get"},
         ("", "pods/log"): {"get"},
         ("", "events"): {"list"},
     }
+    assert role_permissions([baseline_role]) == baseline_permissions
+    inventory_name = "acme-admission-worker-admission"
+    inventory_roles = [
+        doc
+        for doc in docs
+        if doc.get("kind") == "Role" and doc["metadata"]["name"] == inventory_name
+    ]
+    assert len(inventory_roles) == 1
+    inventory_role = inventory_roles[0]
+    assert inventory_role["metadata"].get("namespace", "acme-admission") == "acme-admission"
+    assert inventory_role["metadata"]["labels"]["app.kubernetes.io/component"] == (
+        "sandbox-admission"
+    )
+    assert inventory_role["rules"] == [
+        {"apiGroups": [""], "resources": ["pods"], "verbs": ["list"]},
+        {"apiGroups": ["agents.x-k8s.io"], "resources": ["sandboxes"], "verbs": ["list"]},
+    ]
+    inventory_bindings = [
+        doc
+        for doc in docs
+        if doc.get("kind") == "RoleBinding" and doc["metadata"]["name"] == inventory_name
+    ]
+    assert len(inventory_bindings) == 1
+    inventory_binding = inventory_bindings[0]
+    assert inventory_binding["metadata"].get("namespace", "acme-admission") == "acme-admission"
+    assert inventory_binding["metadata"]["labels"]["app.kubernetes.io/component"] == (
+        "sandbox-admission"
+    )
+    assert inventory_binding["roleRef"] == {
+        "apiGroup": "rbac.authorization.k8s.io",
+        "kind": "Role",
+        "name": inventory_name,
+    }
+    assert inventory_binding["subjects"] == [
+        {
+            "kind": "ServiceAccount",
+            "name": "acme-admission-worker",
+            "namespace": "acme-admission",
+        }
+    ]
+    assert role_permissions(bound_worker_roles(docs)) == baseline_permissions | {
+        ("", "pods"): {"get", "list"},
+        ("agents.x-k8s.io", "sandboxes"): {"get", "patch", "list"},
+    }
+    assert not any(
+        doc.get("kind") == "ClusterRoleBinding"
+        and any(
+            subject.get("name") == "acme-admission-worker" for subject in doc.get("subjects", [])
+        )
+        for doc in docs
+    )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"resourceQuota": {"enabled": False}},
+        {"agentSandbox": {"deploy": False}},
+    ],
+    ids=["quota-disabled", "substrate-disabled"],
+)
+def test_disabled_admission_omits_inventory_grants(
+    tmp_path: Path, overrides: dict[str, dict[str, bool]]
+) -> None:
+    docs = render(tmp_path, security={"gvisor": {"mode": "off"}}, **overrides)
+    assert not any(entry["name"] == ENV for entry in worker_env(docs))
+    environment = {entry["name"]: entry["value"] for entry in worker_env(docs) if "value" in entry}
+    assert _substrate_config(environment).admission is None
+    assert not any(
+        doc.get("kind") in {"Role", "RoleBinding", "ClusterRole", "ClusterRoleBinding"}
+        and (
+            doc["metadata"]["name"] == "acme-admission-worker-admission"
+            or doc["metadata"].get("labels", {}).get("app.kubernetes.io/component")
+            == "sandbox-admission"
+        )
+        for doc in docs
+    )
+    baseline_role = next(
+        doc
+        for doc in docs
+        if doc.get("kind") == "Role" and doc["metadata"]["name"] == "acme-admission-worker"
+    )
+    for permissions in [
+        role_permissions([baseline_role]),
+        role_permissions(bound_worker_roles(docs)),
+    ]:
+        assert permissions[("", "pods")] == {"get"}
+        assert permissions[("agents.x-k8s.io", "sandboxes")] == {"get", "patch"}
     assert not any(
         doc.get("kind") == "ClusterRoleBinding"
         and any(
