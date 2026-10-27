@@ -21,36 +21,12 @@ from curie_worker.upgrade_drain import UpgradeDrainGate
 from kubernetes.utils.quantity import parse_quantity
 
 _STATUS_HELPER = """
-import resource
 import runpy
 import sys
 
 sys.argv = ["curie_worker.upgrade_drain", "--mode", "status", "--json", "--with-ttl"]
-try:
-    runpy.run_module("curie_worker.upgrade_drain", run_name="__main__", alter_sys=True)
-finally:
-    if sys.platform == "linux":
-        # VmHWM measures this exec's address space, without inherited ru_maxrss.
-        # https://man7.org/linux/man-pages/man5/proc_pid_status.5.html
-        with open("/proc/self/status") as status_file:
-            for line in status_file:
-                if line.startswith("VmHWM:"):
-                    _, amount, unit = line.split()
-                    if unit != "kB":
-                        raise RuntimeError("unexpected process peak RSS unit")
-                    peak = int(amount) * 1024
-                    break
-            else:
-                raise RuntimeError("missing process peak RSS")
-    elif sys.platform == "darwin":
-        # Darwin getrusage(2) reports ru_maxrss in bytes.
-        # https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/getrusage.2.html
-        peak = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
-    else:
-        raise RuntimeError("process peak RSS measurement requires Linux or macOS")
-    sys.stderr.write(f"CURIE_HELPER_PEAK_RSS_BYTES={int(peak)}\\n")
+runpy.run_module("curie_worker.upgrade_drain", run_name="__main__", alter_sys=True)
 """
-_RSS_PREFIX = "CURIE_HELPER_PEAK_RSS_BYTES="
 _QUIESCE_TTL_S = 120
 
 
@@ -96,69 +72,12 @@ async def _quiesce(config: WorkerConfig) -> dict[str, object]:
         await client.aclose()
 
 
-def _read_status(process: subprocess.Popen[str]) -> tuple[dict[str, object], int]:
-    stdout, stderr = process.communicate(timeout=10)
+def _read_status(process: subprocess.Popen[str]) -> dict[str, object]:
+    stdout, _ = process.communicate(timeout=10)
     assert process.returncode == 0, f"status helper exited {process.returncode}"
     assert len(stdout.splitlines()) == 1
     status: dict[str, object] = json.loads(stdout)
-    metrics = [
-        line.removeprefix(_RSS_PREFIX)
-        for line in stderr.splitlines()
-        if line.startswith(_RSS_PREFIX)
-    ]
-    assert len(metrics) == 1, "status helper must report one peak RSS measurement"
-    peak = int(metrics[0])
-    assert peak > 0
-    return status, peak
-
-
-@pytest.mark.parametrize("quiescing", [False, True], ids=["claims-enabled", "quiescing"])
-def test_six_status_helpers_fit_the_worker_memory_reserve(
-    status_config: WorkerConfig, quiescing: bool,
-) -> None:
-    expected: dict[str, object] = {"state": "claims_enabled", "since": None, "revision": None}
-    if quiescing:
-        expected = asyncio.run(_quiesce(status_config))
-        assert expected["state"] == "quiescing"
-        assert expected["revision"] == status_config.upgrade_revision
-
-    children: list[subprocess.Popen[str]] = []
-    try:
-        for _ in range(6):
-            children.append(
-                subprocess.Popen(
-                    [sys.executable, "-c", _STATUS_HELPER],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                )
-            )
-        with ThreadPoolExecutor(max_workers=6) as pool:
-            results = list(pool.map(_read_status, children))
-    finally:
-        for child in children:
-            if child.poll() is None:
-                child.kill()
-        for child in children:
-            child.communicate(timeout=10)
-
-    for status, _ in results:
-        if quiescing:
-            ttl = status.pop("ttl_seconds")
-            assert isinstance(ttl, int) and not isinstance(ttl, bool)
-            assert 0 < ttl <= _QUIESCE_TTL_S
-        assert status == expected
-
-    chart = Path(__file__).resolve().parents[3] / "charts/curie/values.yaml"
-    resources = yaml.safe_load(chart.read_text())["worker"]["resources"]
-    # The request reserves memory for the main worker; helpers share the remainder.
-    budget = int(
-        parse_quantity(resources["limits"]["memory"])
-        - parse_quantity(resources["requests"]["memory"])
-    )
-    assert budget > 0
-    peaks = [peak for _, peak in results]
-    assert sum(peaks) <= budget, f"helper peaks {peaks} exceed worker reserve {budget} bytes"
+    return status
 
 
 def _live_helper_rss(children: list[subprocess.Popen[str]]) -> int:
@@ -196,9 +115,10 @@ def _live_helper_rss(children: list[subprocess.Popen[str]]) -> int:
     return total
 
 
+@pytest.mark.parametrize("helper_count", [6, 16])
 @pytest.mark.parametrize("quiescing", [False, True], ids=["claims-enabled", "quiescing"])
-def test_sixteen_status_helpers_fit_the_live_worker_memory_reserve(
-    status_config: WorkerConfig, quiescing: bool,
+def test_status_helpers_fit_the_live_worker_memory_reserve(
+    status_config: WorkerConfig, helper_count: int, quiescing: bool,
 ) -> None:
     expected: dict[str, object] = {"state": "claims_enabled", "since": None, "revision": None}
     if quiescing:
@@ -215,11 +135,11 @@ def test_sixteen_status_helpers_fit_the_live_worker_memory_reserve(
         + _STATUS_HELPER
     )
     children: list[subprocess.Popen[str]] = []
-    pool = ThreadPoolExecutor(max_workers=16)
+    pool = ThreadPoolExecutor(max_workers=helper_count)
     peak = 0
     try:
         with selectors.DefaultSelector() as ready:
-            for _ in range(16):
+            for _ in range(helper_count):
                 child = subprocess.Popen(
                     [sys.executable, "-c", program],
                     stdin=subprocess.PIPE,
@@ -248,7 +168,7 @@ def test_sixteen_status_helpers_fit_the_live_worker_memory_reserve(
             child.stdin.write("1")
             child.stdin.flush()
 
-        def observe(child: subprocess.Popen[str]) -> tuple[dict[str, object], int]:
+        def observe(child: subprocess.Popen[str]) -> dict[str, object]:
             result = _read_status(child)
             assert time.monotonic() <= deadline, (
                 "status command exceeded its 10s observation budget"
@@ -268,7 +188,7 @@ def test_sixteen_status_helpers_fit_the_live_worker_memory_reserve(
         for child in children:
             child.communicate(timeout=10)
 
-    for status, _ in results:
+    for status in results:
         if quiescing:
             ttl = status.pop("ttl_seconds")
             assert isinstance(ttl, int) and not isinstance(ttl, bool)
@@ -277,6 +197,7 @@ def test_sixteen_status_helpers_fit_the_live_worker_memory_reserve(
 
     chart = Path(__file__).resolve().parents[3] / "charts/curie/values.yaml"
     resources = yaml.safe_load(chart.read_text())["worker"]["resources"]
+    # The request reserves memory for the main worker; helpers share the remainder.
     budget = int(
         parse_quantity(resources["limits"]["memory"])
         - parse_quantity(resources["requests"]["memory"])
