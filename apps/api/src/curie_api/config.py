@@ -794,6 +794,11 @@ class Settings(BaseSettings):
     protected_runtime_dir: str | None = Field(
         default=None, validation_alias="CURIE_PROTECTED_RUNTIME_DIR"
     )
+    # The operator directory holding api-runtime.json (HTTP-INVOCATION-EXECUTION-20).
+    # Unset is the unconfigured install; any value must initialize completely.
+    http_identity_dir: str | None = Field(
+        default=None, validation_alias="CURIE_HTTP_IDENTITY_DIR"
+    )
     channel_binding_backlog_limit: int = 64
     channel_binding_backlog_window_s: int = Field(default=60, gt=0)
     # Sandbox ResourceQuota hard limits (#3209). The chart sets all four when

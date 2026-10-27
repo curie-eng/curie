@@ -26,6 +26,11 @@ from .app import SocketModeConnection, build_app, build_redis, build_web_client
 from .config import DispatcherConfig
 from .heartbeat import start_heartbeat
 from .http_receiver import HttpReceiverRuntime
+from .http_receiver_initializer import (
+    HttpReceiverInitializationError,
+    build_selected_receivers,
+    load_http_receiver_registrations,
+)
 from .identities import (
     SlackBotIds,
     SlackIdentityCredentials,
@@ -269,8 +274,26 @@ def main() -> None:
             logger.error("%s", exc)
             raise SystemExit(1) from exc
 
+        # @spec HTTP-INVOCATION-EXECUTION-20: only a configured selection passes receivers,
+        # and a failed selection stops startup before any Socket Mode connection.
+        receiver_kwargs: dict[str, Any] = {}
+        if config.http_receiver_dir is not None:
+            try:
+                receiver_kwargs["http_receivers"] = build_selected_receivers(
+                    config,
+                    admitted,
+                    load_http_receiver_registrations(config.http_receiver_dir),
+                    web_client_factory=build_web_client,
+                )
+            except HttpReceiverInitializationError as exc:
+                logger.error("%s", exc)
+                raise SystemExit(1) from None
         supervisor = build_supervisor(
-            config, logger=logger, identities=admitted, declared_count=len(identities)
+            config,
+            logger=logger,
+            identities=admitted,
+            declared_count=len(identities),
+            **receiver_kwargs,
         )
         # Looked up as a module global so tests can keep the reports offline.
         reports_stop = threading.Event()

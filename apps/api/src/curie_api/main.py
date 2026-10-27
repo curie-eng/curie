@@ -48,6 +48,10 @@ from .github_checks import GitHubStatusReporter
 from .github_review_store import GitHubReviewReconciler
 from .graveyardwatcher import GraveyardWatcher
 from .identity.http_approval import http_expiry_owner
+from .identity.http_initializer import (
+    configured_http_identity_runtime,
+    load_provider_tls_context,
+)
 from .identity.http_invocation import HttpInvocationRuntime
 from .identity.http_transport import HttpIdentityClient
 from .identity_fence import IdentityFenceMiddleware
@@ -718,4 +722,23 @@ def create_app(
     return app
 
 
-app = create_app()
+def create_configured_app() -> FastAPI:
+    """The served app; operator HTTP identity only when configured.
+
+    @spec HTTP-INVOCATION-EXECUTION-20: unconfigured startup calls create_app() exactly as
+    before, and a configured directory either initializes completely or stops startup.
+    """
+    settings = get_settings()
+    runtime = configured_http_identity_runtime(settings)
+    if runtime is None or settings.http_identity_dir is None:
+        return create_app()
+    # The optional private trust anchor is the only one for provider lookups.
+    tls = load_provider_tls_context(settings.http_identity_dir)
+    if tls is None:
+        return create_app(http_identity_runtime=runtime)
+    return create_app(
+        http_identity_runtime=runtime, http_identity_client=HttpIdentityClient(tls_context=tls),
+    )
+
+
+app = create_configured_app()

@@ -2470,6 +2470,60 @@ still running, and that pod can take turns until it is replaced. Upgrading
 first with no key and generating one later does not remove this: the second
 upgrade rolls workers that do not yet hold the key in the same way.
 
+### HTTP identity operator files
+
+HTTP identity (ADR 0246,
+[criterion 20](../../docs/superpowers/specs/2026-10-26-http-invocation-execution-v1.md), section 20)
+is off by default and the default render is unchanged. Two values select it,
+each naming a Secret the operator creates; the chart never creates, reads or
+checksums either one.
+
+| Value | Secret key | Mounted into | Environment |
+| --- | --- | --- | --- |
+| `api.httpIdentity.existingSecret` | `api-runtime.json` | the `api` container only, at `/var/run/curie/http-identity` | `CURIE_HTTP_IDENTITY_DIR` |
+| `api.httpIdentity.providerCaBundle: true` (with the Secret above) | `provider-ca.pem` (optional) | the same `api` volume, beside `api-runtime.json` | `CURIE_HTTP_IDENTITY_DIR` |
+| `dispatcher.httpIdentity.existingSecret` | `receivers.json` | the `dispatcher` container only, at `/var/run/curie/http-receiver` | `CURIE_HTTP_RECEIVER_DIR` |
+
+Each file is mounted read-only with mode 0440 and the pod's `fsGroup` set to
+the image's group, and the process refuses a file that is group-writable or
+grants any permission to other users. Selecting the dispatcher without the API
+fails the render, because the API holds the receiver registrations it verifies.
+Both environment names are reserved even while unselected. The worker, runner,
+bundles and agent Secrets never receive either file; the worker uses its
+existing internal worker token and API URL for current-authority checks.
+
+`api-runtime.json` holds, as strict JSON with no unknown or missing members:
+`schema_version` 1; `providers`, each the tenant's complete HTTP authority
+configuration and its lookup bearer; `receivers`, each an exact receiver
+registration and that receiver's key; `context_keys`, each a core sealing key
+with its key ID and generation; and `signing_key`, the key ID and generation
+used to seal. `receivers.json` holds `schema_version` 1 and `receivers`, each a
+receiver scope, its bindings with their pinned channel credentials, and the same
+receiver key. Every key is an independently generated 32 bytes in unpadded
+base64url, never derived from or reused as another credential.
+
+`provider-ca.pem` is for a provider whose TLS certificate comes from a private
+CA, such as a cluster issuer. When it is mounted, its certificates are the only
+trust anchors for every provider lookup of that API: no system or environment
+CAs are mixed in, hostname verification stays on and TLS 1.2 is the minimum.
+Providers that need different anchors in one installation are not supported.
+The file holds one through 16 PEM `CERTIFICATE` blocks, each a CA certificate
+(basicConstraints CA true), separated only by newlines, at most 262,144 ASCII
+bytes. An empty, malformed or non-CA bundle stops the API. Leaving
+`providerCaBundle` false keeps the default verified trust store.
+
+All of these files are read once at startup. A missing, unsafe or invalid file stops
+the process with a fixed message naming only the failing stage, and a selected
+dispatcher identity that did not pass Slack preflight or whose `auth.test` does
+not match its registration stops the dispatcher rather than starting that
+identity on the legacy path. Changing a Secret takes effect only when the
+workload is rolled. No chart NetworkPolicy selects the API pods, so selecting
+HTTP identity needs no egress value: the API reaches an in-cluster provider
+Service or an external HTTPS host on 443 as it does today. `api.egress` is the
+runner's route to an external API and does not apply here; an egress control
+outside the chart must allow the lookup itself. Rendering these mounts is wiring; key custody, the effective
+mounts on a real cluster and activation remain separate qualification.
+
 ### Reserved environment variables
 
 Every workload accepting `extraEnv` uses the reserved names and replacement

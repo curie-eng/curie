@@ -3009,3 +3009,37 @@ github code host together. */ -}}
 {{- end -}}
 {{- toJson $out -}}
 {{- end -}}
+
+{{/* HTTP identity operator files (@spec HTTP-INVOCATION-EXECUTION-20). Each names an
+     operator-created Secret, or renders empty. Read through dig so a retained
+     release whose values predate httpIdentity renders unchanged. */}}
+{{- define "curie.httpIdentity.apiSecret" -}}
+{{- dig "httpIdentity" "existingSecret" "" (.Values.api | default dict) -}}
+{{- end -}}
+{{- define "curie.httpIdentity.providerCaBundle" -}}
+{{- if dig "httpIdentity" "providerCaBundle" false (.Values.api | default dict) -}}
+{{- if not (include "curie.httpIdentity.apiSecret" .) -}}
+{{- fail "api.httpIdentity.providerCaBundle requires api.httpIdentity.existingSecret: the CA bundle is a key of that Secret" -}}
+{{- end -}}
+true
+{{- end -}}
+{{- end -}}
+{{- define "curie.httpIdentity.receiverSecret" -}}
+{{- $name := dig "httpIdentity" "existingSecret" "" (.Values.dispatcher | default dict) -}}
+{{- if and $name (not (include "curie.httpIdentity.apiSecret" .)) -}}
+{{- fail "dispatcher.httpIdentity.existingSecret requires api.httpIdentity.existingSecret: the API must hold the receiver registrations it verifies" -}}
+{{- end -}}
+{{- $name -}}
+{{- end -}}
+{{/* Named operator Secret keys as 0440 files; only the named workload mounts them. */}}
+{{- define "curie.httpIdentity.volume" -}}
+- name: {{ .name }}
+  secret:
+    secretName: {{ .secret | quote }}
+    defaultMode: 0440
+    items:
+      {{- range .files }}
+      - key: {{ . }}
+        path: {{ . }}
+      {{- end }}
+{{- end -}}
