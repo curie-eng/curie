@@ -65,6 +65,7 @@ from .test_channel_read import (
     _tool_results,
     _url,
 )
+from .test_channel_read import advancing_mint_clock as advancing_mint_clock
 from .test_connectors import _boot_env, _published_live_tool_names
 from .test_tool_policy_enforcement import _interception_reason
 
@@ -769,17 +770,20 @@ def test_persisted_records_keep_canvas_ids_not_canvas_text_or_the_token(
     assert all(SENTINEL not in repr(record.args) for record in caplog.records)
 
 
+@pytest.mark.usefixtures("advancing_mint_clock")
 def test_a_canvas_capability_header_is_the_minted_token(drive: _Drive) -> None:
     async def scenario(rig: _Rig) -> None:
-        turn = await rig.open(rig.capability(turn="evt-1"))
+        capability = rig.capability(turn="evt-1")
+        turn = await rig.open(capability)
         rig.api.payload = READ_RESULT
         assert (await rig.sdk.call("read_canvas", {"canvas_id": CANVAS}))["is_error"] is False
         await rig.close_turn(turn)
         # After the turn the capability is gone: refused with no request.
         _assert_refused(await rig.sdk.call("read_canvas", {"canvas_id": CANVAS}), NO_CAP)
-        assert rig.headers == [_token(turn="evt-1")]
+        assert rig.capability(turn="evt-1")["token"] != capability["token"]
+        assert rig.headers == [capability["token"]]
         assert [(path, header) for path, header, _ in rig.api.received] == [
-            ("/channel-canvas", _token(turn="evt-1"))
+            ("/channel-canvas", capability["token"])
         ]
 
     drive(scenario)
