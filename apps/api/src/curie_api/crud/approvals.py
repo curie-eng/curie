@@ -530,7 +530,12 @@ async def claim_approval_resolution(
 
 
 async def list_expired_pending_approvals(
-    session: AsyncSession, *, now: datetime, limit: int = 100
+    session: AsyncSession,
+    *,
+    now: datetime,
+    limit: int = 100,
+    sealed: bool | None = None,
+    after: tuple[datetime, uuid.UUID] | None = None,
 ) -> list[Approval]:
     """The pending approvals whose SLA has lapsed (#412), oldest-lapse-first.
 
@@ -539,18 +544,29 @@ async def list_expired_pending_approvals(
     lapses first, so a backlog larger than ``limit`` clears across successive
     sweep passes rather than starving the earliest-expired records. Records
     with a NULL ``expires_at`` (no SLA) are never selected.
+
+    ``sealed`` selects only rows with (True) or without (False) stored identity
+    provenance, and ``after`` continues past an ``(expires_at, id)`` key, so a
+    writer that must leave some rows untouched pages past them instead of
+    re-reading the same full batch. @spec HTTP-APPROVAL-CONTINUITY-10.
     """
 
-    result = await session.scalars(
-        select(Approval)
-        .where(
-            Approval.status == ApprovalStatus.pending,
-            Approval.expires_at.is_not(None),
-            Approval.expires_at <= now,
-        )
-        .order_by(Approval.expires_at)
-        .limit(limit)
+    stmt = select(Approval).where(
+        Approval.status == ApprovalStatus.pending,
+        Approval.expires_at.is_not(None),
+        Approval.expires_at <= now,
     )
+    if sealed is not None:
+        provenance = Approval.identity_context
+        stmt = stmt.where(provenance.is_not(None) if sealed else provenance.is_(None))
+    if after is not None:
+        stmt = stmt.where(
+            tuple_(Approval.expires_at, Approval.id)
+            > tuple_(
+                literal(after[0], Approval.expires_at.type), literal(after[1], Approval.id.type)
+            )
+        )
+    result = await session.scalars(stmt.order_by(Approval.expires_at, Approval.id).limit(limit))
     return list(result)
 
 
@@ -707,19 +723,44 @@ async def list_resolved_unresumed(
     the Valkey enqueue of the batch and never needs the full row here.
     """
 
-    result = await session.scalars(
-        select(Approval.id)
-        .where(
-            Approval.purpose.not_in(NO_WAKE_PURPOSES),
-            Approval.status.in_(_RESUMABLE_STATUSES),
-            Approval.resolved_at.is_not(None),
-            Approval.resumed_at.is_(None),
-            Approval.resolved_at <= resolved_before,
+    return [
+        approval_id
+        for approval_id, _ in await list_resolved_unresumed_page(
+            session, resolved_before=resolved_before, limit=limit
         )
-        .order_by(Approval.resolved_at)
-        .limit(limit)
+    ]
+
+
+async def list_resolved_unresumed_page(
+    session: AsyncSession,
+    *,
+    resolved_before: datetime,
+    limit: int,
+    after: tuple[datetime, uuid.UUID] | None = None,
+) -> list[tuple[uuid.UUID, datetime]]:
+    """One keyed page of owed legacy wakes, never sealed rows.
+
+    A sealed row's wake is owed to its own publisher, so it never occupies this
+    batch. @spec HTTP-APPROVAL-CONTINUITY-10.
+    """
+
+    stmt = select(Approval.id, Approval.resolved_at).where(
+        Approval.purpose.not_in(NO_WAKE_PURPOSES),
+        Approval.status.in_(_RESUMABLE_STATUSES),
+        Approval.resolved_at.is_not(None),
+        Approval.resumed_at.is_(None),
+        Approval.resolved_at <= resolved_before,
+        Approval.identity_context.is_(None),
     )
-    return list(result)
+    if after is not None:
+        stmt = stmt.where(
+            tuple_(Approval.resolved_at, Approval.id)
+            > tuple_(
+                literal(after[0], Approval.resolved_at.type), literal(after[1], Approval.id.type)
+            )
+        )
+    result = await session.execute(stmt.order_by(Approval.resolved_at, Approval.id).limit(limit))
+    return [(row[0], row[1]) for row in result.all()]
 
 
 async def append_approval_audit(

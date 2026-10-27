@@ -896,6 +896,10 @@ async def _pause_for_approval(
         await self._reply_for(qevent, route, exc.public_detail)
         return _ApprovalPause.refused(exc.public_detail)
     except (ApprovalBackendError, ValidationError) as exc:
+        # @spec HTTP-APPROVAL-CONTINUITY-3: a selected turn never takes the legacy
+        # escalation, which can publish an unverified reply.
+        if selected:
+            raise identity.HttpIdentityRefused() from None
         # ValidationError: the shared model rejected the payload at
         # construction (#492) -- an unknown gate_kind, or an empty
         # conversation_id/author/dedupe_key, which the wire's QueuedTurn does
@@ -923,6 +927,12 @@ async def _pause_for_approval(
             failure_class="approval-create-failed",
         )
         return _ApprovalPause.refused(refusal)
+    except ValueError:
+        # @spec HTTP-APPROVAL-CONTINUITY-3: a local validation error of a selected
+        # request is the terminal refusal; any other propagates as before.
+        if selected:
+            raise identity.HttpIdentityRefused() from None
+        raise
     if self._approval_run_abandoned(qevent):
         # #4331: the thread route may now name a successor's claim, so this
         # worker neither touches the workspace nor suspends.

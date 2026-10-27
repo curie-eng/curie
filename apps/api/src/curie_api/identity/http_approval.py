@@ -227,6 +227,19 @@ async def expire_http_approval(
     if type(runtime) is not HttpInvocationRuntime:
         return None
     now = datetime.now(UTC).replace(tzinfo=None)
+
+    def expirable(row: Approval | None) -> bool:
+        """@spec HTTP-APPROVAL-CONTINUITY-10."""
+        return (
+            row is not None and row.status == ApprovalStatus.pending
+            and row.expires_at is not None and row.expires_at <= now
+            and _verified_capsule(runtime, row) is not None
+        )
+
+    # A plain read first: the global identity writer is taken only for real work.
+    async with factory() as session:
+        if not expirable(await session.get(Approval, approval_id)):
+            return None
     async with identity_fence.mutation(factory, valkey) as writer:
         async with writer.begin():
             row = (
@@ -237,14 +250,10 @@ async def expire_http_approval(
                     .execution_options(populate_existing=True)
                 )
             ).scalar_one_or_none()
-            if (
-                row is None or row.status != ApprovalStatus.pending
-                or row.expires_at is None or row.expires_at > now
-            ):
+            if row is None or not expirable(row):
                 return None
             saved = _verified_capsule(runtime, row)
-            if saved is None:
-                return None
+            assert saved is not None
             row.status = ApprovalStatus.expired
             row.resolved_at = now
             await writer.flush()

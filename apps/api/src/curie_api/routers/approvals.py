@@ -533,14 +533,27 @@ async def resolve_approval(
     # through the sealing owner; its wake stays owed rather than context-free.
     if await approval_is_selected(session, approval):
         await session.commit()
+        gone: Approval | None = approval if approval.status == ApprovalStatus.expired else None
         if approval.status == ApprovalStatus.pending and _expired(approval):
-            expired = await request.app.state.http_approval_expiry(approval_id)
-            if expired is not None:
+            try:
+                gone = await request.app.state.http_approval_expiry(approval_id)
+                if gone is None:
+                    # A concurrent expiry may have won; it is still the 410 answer.
+                    current = await crud_approvals.reread_approval(session, approval_id)
+                    if current is not None and current.status == ApprovalStatus.expired:
+                        gone = current
+            except Exception:  # noqa: BLE001 - bounded answer, never a raw 500.
                 raise HTTPException(
-                    status.HTTP_410_GONE,
-                    f"approval expired at {expired.expires_at} and can no longer be resolved",
-                )
-        raise HTTPException(status.HTTP_409_CONFLICT, "unsupported_approval")
+                    status.HTTP_503_SERVICE_UNAVAILABLE, "authority_unavailable"
+                ) from None
+        if gone is not None:
+            raise HTTPException(
+                status.HTTP_410_GONE,
+                f"approval expired at {gone.expires_at} and can no longer be resolved",
+            )
+        # 403, not 409: a 409 reads as settled and would retire a card whose row
+        # is still pending.
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "unsupported_approval")
 
     # The route binding is read fresh at resolve time (#420), so revoking an
     # approver takes effect on the next click rather than at the next restart.
