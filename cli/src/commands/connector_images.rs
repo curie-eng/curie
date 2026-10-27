@@ -259,6 +259,7 @@ pub async fn build_connectors(opts: ConnectorBuildOpts) -> Result<ConnectorBuild
         return Err(err);
     }
 
+    let runner_image = runner_entry.as_ref().map(|entry| entry.image.clone());
     cb::write_lock(
         &plugin_dir,
         &cb::ConnectorLockFileDecl {
@@ -268,6 +269,20 @@ pub async fn build_connectors(opts: ConnectorBuildOpts) -> Result<ConnectorBuild
         },
         opts.force,
     )?;
+    if let Some(image) = runner_image {
+        let input = plugin_dir.join(crate::factory_capabilities::INPUT_PATH);
+        if input.is_file() {
+            crate::factory_capabilities::generate(&plugin_dir, &image).await?;
+        } else if plugin_dir
+            .join(crate::factory_capabilities::MANIFEST_PATH)
+            .exists()
+        {
+            bail!(
+                "runner capability inputs are missing: {}; refusing a stale capability manifest",
+                input.display()
+            );
+        }
+    }
     Ok(ConnectorBuildOutput {
         connectors: records,
     })

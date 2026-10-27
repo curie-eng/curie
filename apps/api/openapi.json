@@ -3545,6 +3545,104 @@
         "title": "Capability",
         "type": "object"
       },
+      "CapabilityManifest": {
+        "additionalProperties": false,
+        "properties": {
+          "bundle_input_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Bundle Input Sha256",
+            "type": "string"
+          },
+          "connectors": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Connectors",
+            "type": "array"
+          },
+          "egress_class": {
+            "minLength": 1,
+            "title": "Egress Class",
+            "type": "string"
+          },
+          "executables": {
+            "items": {
+              "$ref": "#/components/schemas/Executable"
+            },
+            "title": "Executables",
+            "type": "array"
+          },
+          "publication": {
+            "$ref": "#/components/schemas/Publication"
+          },
+          "registry_hosts": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Registry Hosts",
+            "type": "array"
+          },
+          "runner_image": {
+            "pattern": "^(?:[^@\\s]+@)?sha256:[0-9a-f]{64}$",
+            "title": "Runner Image",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "services": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Services",
+            "type": "array"
+          },
+          "verification": {
+            "$ref": "#/components/schemas/Verification"
+          }
+        },
+        "required": [
+          "schema_version",
+          "runner_image",
+          "bundle_input_sha256",
+          "executables",
+          "registry_hosts",
+          "services",
+          "connectors",
+          "verification",
+          "egress_class",
+          "publication"
+        ],
+        "title": "CapabilityManifest",
+        "type": "object"
+      },
+      "CapabilityRead": {
+        "additionalProperties": false,
+        "properties": {
+          "bundle_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Bundle Sha256",
+            "type": "string"
+          },
+          "manifest": {
+            "$ref": "#/components/schemas/CapabilityManifest"
+          },
+          "manifest_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Manifest Sha256",
+            "type": "string"
+          }
+        },
+        "required": [
+          "manifest",
+          "manifest_sha256",
+          "bundle_sha256"
+        ],
+        "title": "CapabilityRead",
+        "type": "object"
+      },
       "ChannelAddress": {
         "additionalProperties": false,
         "properties": {
@@ -4618,6 +4716,64 @@
           "address"
         ],
         "title": "ChannelTokenRequest",
+        "type": "object"
+      },
+      "Check": {
+        "additionalProperties": false,
+        "properties": {
+          "command": {
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1,
+            "title": "Command",
+            "type": "array"
+          },
+          "delegated_to": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Delegated To"
+          },
+          "id": {
+            "minLength": 1,
+            "title": "Id",
+            "type": "string"
+          },
+          "install": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Install"
+          },
+          "paths": {
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1,
+            "title": "Paths",
+            "type": "array"
+          }
+        },
+        "required": [
+          "id",
+          "paths",
+          "command"
+        ],
+        "title": "Check",
         "type": "object"
       },
       "ClusterMessageReplyAck": {
@@ -6382,6 +6538,42 @@
           "bundle_ref"
         ],
         "title": "EvalTriggerResult",
+        "type": "object"
+      },
+      "Executable": {
+        "additionalProperties": false,
+        "properties": {
+          "command": {
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1,
+            "title": "Command",
+            "type": "array"
+          },
+          "name": {
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "path": {
+            "minLength": 1,
+            "title": "Path",
+            "type": "string"
+          },
+          "version": {
+            "minLength": 1,
+            "title": "Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "version",
+          "path",
+          "command"
+        ],
+        "title": "Executable",
         "type": "object"
       },
       "ExecutionArguments": {
@@ -9171,6 +9363,27 @@
           }
         },
         "title": "ProviderInstallationUpdate",
+        "type": "object"
+      },
+      "Publication": {
+        "additionalProperties": false,
+        "properties": {
+          "code_host_credential_in_sandbox": {
+            "const": false,
+            "title": "Code Host Credential In Sandbox",
+            "type": "boolean"
+          },
+          "github_directory_writable": {
+            "const": false,
+            "title": "Github Directory Writable",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "github_directory_writable",
+          "code_host_credential_in_sandbox"
+        ],
+        "title": "Publication",
         "type": "object"
       },
       "PublicationBranchHeadOut": {
@@ -13597,6 +13810,37 @@
           "type"
         ],
         "title": "ValidationError",
+        "type": "object"
+      },
+      "Verification": {
+        "additionalProperties": false,
+        "properties": {
+          "checks": {
+            "items": {
+              "$ref": "#/components/schemas/Check"
+            },
+            "title": "Checks",
+            "type": "array"
+          },
+          "lockfile_installs": {
+            "title": "Lockfile Installs",
+            "type": "boolean"
+          },
+          "source": {
+            "enum": [
+              "bundle",
+              "repository"
+            ],
+            "title": "Source",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "checks",
+          "lockfile_installs"
+        ],
+        "title": "Verification",
         "type": "object"
       },
       "VerificationObservation": {
@@ -23859,6 +24103,65 @@
           }
         },
         "summary": "Get Deployment",
+        "tags": [
+          "deployments"
+        ]
+      }
+    },
+    "/deployments/{deployment_id}/capabilities": {
+      "get": {
+        "operationId": "read_deployment_capabilities_deployments__deployment_id__capabilities_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "deployment_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Deployment Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CapabilityRead"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Read Deployment Capabilities",
         "tags": [
           "deployments"
         ]

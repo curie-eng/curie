@@ -1197,7 +1197,7 @@ async fn render_published_bundle(
     }
     let rendered = match published {
         Some(published) => {
-            crate::examples::render_dark_factory_with_published_runner(dir, published)?
+            crate::examples::render_dark_factory_with_published_runner(dir, published).await?
         }
         None => {
             crate::examples::render_dark_factory(crate::examples::DarkFactoryRenderOpts {

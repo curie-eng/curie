@@ -103,6 +103,7 @@ mod example_builtin_coding_tools;
 mod example_dark_factory_render;
 mod example_sre_bot_install;
 mod exit_codes;
+mod factory_capability_manifest;
 mod factory_github_app;
 mod factory_quickstart_context;
 mod factory_quickstart_forges;

@@ -57,7 +57,7 @@ class Check(_Claim):
 
 
 class Verification(_Claim):
-    source: Literal["bundle", "repository", "none"]
+    source: Literal["bundle", "repository"]
     checks: tuple[Check, ...]
     lockfile_installs: StrictBool
 
@@ -192,7 +192,9 @@ def read_manifest(
                 if manifest.verification.lockfile_installs != checks_raw.get(
                     "lockfile_installs", False
                 ):
-                    raise CapabilityUnknown("capability manifest install policy differs from bundle")
+                    raise CapabilityUnknown(
+                        "capability manifest install policy differs from bundle"
+                    )
                 if checks and (
                     manifest.verification.source != "bundle"
                     or manifest.verification.checks != expected

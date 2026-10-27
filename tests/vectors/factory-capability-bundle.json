@@ -1,0 +1,7 @@
+{
+  "files": {
+    "a.txt": "alpha",
+    "verification/checks.json": "{\"checks\":[]}"
+  },
+  "expected_sha256": "0f6883c268615ceafb65b67034c4c65d83381411972eb95ed827110ca2630059"
+}

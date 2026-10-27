@@ -19,6 +19,10 @@ path = "tests/integration.rs"
 name = "dev_test_env"
 path = "tests/dev_test_env.rs"
 
+[[test]]
+name = "factory_capability_manifest"
+path = "tests/factory_capability_manifest.rs"
+
 [dependencies]
 curie-aci-protocol = { path = "../packages/aci-protocol/generated/rust" }
 anstream = "1"

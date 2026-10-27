@@ -285,6 +285,17 @@ gate requires.
 A kind cluster works for a single operator. It pulls the published runner
 layer from GHCR, so it needs no local registry.
 
+The bundle's `verification/capability-inputs.json` lists version commands that
+must run in its locked runner image, plus the registry hosts and services the
+factory expects to use. `curie build --plugin-dir` probes those commands in the
+image and writes `verification/capabilities.json`. A missing command fails the
+build by name. `curie example dark-factory render` does the same for a published
+runner layer and therefore needs Docker to pull and probe that layer. The
+manifest names registry hosts as inputs for the later
+sandbox check; it does not attest that those hosts are reachable. When bundle
+verification checks are absent, the manifest leaves repository checks
+unresolved until the repository checkout is available.
+
 Polling needs no inbound GitHub connection. If you choose webhook mode,
 GitHub must reach the API. Start a port forward and a cloudflared quick tunnel
 to it:

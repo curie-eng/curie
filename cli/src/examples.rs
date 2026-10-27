@@ -890,6 +890,10 @@ pub const DARK_FACTORY_BUNDLE_FILES: &[(&str, &[u8])] = &[
         "verification/contract.md",
         include_bytes!("../../examples/dark-factory/verification/contract.md"),
     ),
+    (
+        "verification/capability-inputs.json",
+        include_bytes!("../../examples/dark-factory/verification/capability-inputs.json"),
+    ),
 ];
 
 /// Files rendered with the executable bit, matching their tracked mode.
@@ -1017,6 +1021,7 @@ pub async fn render_dark_factory(opts: DarkFactoryRenderOpts) -> Result<DarkFact
     match published {
         Ok(published) => {
             lock_published_runner(&out, &published.layer_image, &published.base_image)?;
+            crate::factory_capabilities::generate(&out, &published.layer_image).await?;
             Ok(DarkFactoryRenderOutput {
                 path: out,
                 runner_image: Some(published.layer_image),
@@ -1037,12 +1042,13 @@ pub async fn render_dark_factory(opts: DarkFactoryRenderOpts) -> Result<DarkFact
 
 /// Quickstart has already resolved every candidate image before any cluster
 /// call. Record those exact runner digests without resolving a release tag.
-pub(crate) fn render_dark_factory_with_published_runner(
+pub(crate) async fn render_dark_factory_with_published_runner(
     out: PathBuf,
     published: &PublishedStockRunner,
 ) -> Result<DarkFactoryRenderOutput> {
     write_dark_factory_bundle(&out)?;
     lock_published_runner(&out, &published.layer_image, &published.base_image)?;
+    crate::factory_capabilities::generate(&out, &published.layer_image).await?;
     Ok(DarkFactoryRenderOutput {
         path: out,
         runner_image: Some(published.layer_image.clone()),

@@ -1,0 +1,27 @@
+{
+  "required_executables": [
+    {"name": "python3", "command": ["python3", "--version"]},
+    {"name": "node", "command": ["node", "--version"]},
+    {"name": "npm", "command": ["npm", "--version"]},
+    {"name": "git", "command": ["git", "--version"]},
+    {"name": "uv", "command": ["uv", "--version"]},
+    {"name": "cargo", "command": ["cargo", "--version"]},
+    {"name": "cargo fmt", "command": ["cargo", "fmt", "--version"]},
+    {"name": "cargo clippy", "command": ["cargo", "clippy", "--version"]},
+    {"name": "cargo nextest", "command": ["cargo", "nextest", "--version"]},
+    {"name": "rustc", "command": ["rustc", "--version"]},
+    {"name": "pnpm", "command": ["pnpm", "--version"]},
+    {"name": "cc", "command": ["cc", "--version"]},
+    {"name": "cmake", "command": ["cmake", "--version"]},
+    {"name": "pkg-config", "command": ["pkg-config", "--version"]}
+  ],
+  "registry_hosts": [
+    "index.crates.io",
+    "static.crates.io",
+    "pypi.org",
+    "files.pythonhosted.org",
+    "registry.npmjs.org"
+  ],
+  "services": [],
+  "egress_class": "restricted"
+}

@@ -511,6 +511,7 @@
           "/deploy-targets/resolve",
           "/deployments",
           "/deployments/{deployment_id}",
+          "/deployments/{deployment_id}/capabilities",
           "/evals/matrix",
           "/evals/report",
           "/evals/trigger",
@@ -627,7 +628,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 1504,
+      "cardinality_bound": 1512,
       "description": "Active HTTP server requests.",
       "monotonic": false,
       "type": "up_down_counter",
@@ -726,6 +727,7 @@
           "/deploy-targets/resolve",
           "/deployments",
           "/deployments/{deployment_id}",
+          "/deployments/{deployment_id}/capabilities",
           "/evals/matrix",
           "/evals/report",
           "/evals/trigger",
@@ -849,7 +851,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 7520,
+      "cardinality_bound": 7560,
       "description": "HTTP server requests.",
       "monotonic": true,
       "type": "counter",
@@ -948,6 +950,7 @@
           "/deploy-targets/resolve",
           "/deployments",
           "/deployments/{deployment_id}",
+          "/deployments/{deployment_id}/capabilities",
           "/evals/matrix",
           "/evals/report",
           "/evals/trigger",
@@ -1071,7 +1074,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 7520,
+      "cardinality_bound": 7560,
       "description": "HTTP server request duration.",
       "monotonic": false,
       "type": "histogram",

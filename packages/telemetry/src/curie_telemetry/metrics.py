@@ -405,6 +405,7 @@ _HTTP_OPERATIONS = [
     "/deploy-targets/resolve",
     "/deployments",
     "/deployments/{deployment_id}",
+    "/deployments/{deployment_id}/capabilities",
     "/evals/matrix",
     "/evals/report",
     "/evals/trigger",

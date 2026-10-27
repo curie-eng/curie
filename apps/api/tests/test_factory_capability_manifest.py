@@ -17,6 +17,17 @@ IMAGE = "ghcr.io/acme-corp/acme-bot@sha256:" + "1" * 64
 BASE = "ghcr.io/acme-corp/acme-base@sha256:" + "2" * 64
 
 
+def test_bundle_digest_matches_shared_cross_language_vector(tmp_path: Path) -> None:
+    vector = json.loads(
+        (Path(__file__).parents[3] / "tests/vectors/factory-capability-bundle.json").read_text()
+    )
+    for name, content in vector["files"].items():
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    assert factory_capabilities.bundle_input_digest(tmp_path) == vector["expected_sha256"]
+
+
 def _archive(root: Path) -> bytes:
     out = io.BytesIO()
     with tarfile.open(fileobj=out, mode="w:gz") as archive:
@@ -110,7 +121,37 @@ def test_manifest_matches_inputs_and_runner_lock(tmp_path: Path) -> None:
     assert result.manifest == expected
 
 
-@pytest.mark.parametrize("change", ["bundle", "runner", "tool", "registry", "connector"])
+def test_bundle_verification_checks_take_precedence(tmp_path: Path) -> None:
+    root, manifest = _bundle(tmp_path)
+    checks = [
+        {
+            "id": "fmt",
+            "paths": ["**/*.rs"],
+            "command": ["cargo", "fmt", "--check"],
+            "delegated_to": "rust-tests",
+        }
+    ]
+    (root / "verification/checks.json").write_text(
+        json.dumps({"checks": checks, "lockfile_installs": True}), encoding="utf-8"
+    )
+    manifest["verification"] = {
+        "source": "bundle",
+        "checks": checks,
+        "lockfile_installs": True,
+    }
+    manifest["bundle_input_sha256"] = factory_capabilities.bundle_input_digest(root)
+    (root / "verification/capabilities.json").write_text(
+        json.dumps(manifest), encoding="utf-8"
+    )
+    read = factory_capabilities.read_manifest(_archive(root), get_settings())
+    assert read is not None
+    assert read.manifest.verification.source == "bundle"
+    assert read.manifest.verification.checks[0].id == "fmt"
+
+
+@pytest.mark.parametrize(
+    "change", ["bundle", "runner", "tool", "registry", "connector", "verification"]
+)
 def test_manifest_refuses_false_claims(tmp_path: Path, change: str) -> None:
     root, manifest = _bundle(tmp_path)
     if change == "bundle":
@@ -123,6 +164,14 @@ def test_manifest_refuses_false_claims(tmp_path: Path, change: str) -> None:
         manifest["registry_hosts"] = ["example.com"]
     elif change == "connector":
         manifest["connectors"] = ["undeclared"]
+    elif change == "verification":
+        manifest["verification"] = {
+            "source": "bundle",
+            "checks": [
+                {"id": "fmt", "paths": ["**/*.rs"], "command": ["cargo", "fmt", "--check"]}
+            ],
+            "lockfile_installs": False,
+        }
     (root / "verification/capabilities.json").write_text(json.dumps(manifest), encoding="utf-8")
     with pytest.raises(factory_capabilities.CapabilityUnknown):
         factory_capabilities.read_manifest(_archive(root), get_settings())
