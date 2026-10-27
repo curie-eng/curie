@@ -98,9 +98,11 @@ from .types import (
     BUNDLE_REF_LABEL,
     MANAGED_BY_LABEL,
     MANAGED_BY_VALUE,
+    CapacityInventory,
     ClaimView,
     OperatingMode,
     QuotaRejection,
+    QuotaStatus,
     SandboxError,
     SandboxTermination,
     SandboxView,
@@ -885,6 +887,26 @@ class DockerSandboxClient:
     ) -> bool:
         del rejection, request_timeout_seconds
         return False
+
+    def claim_resources(
+        self,
+        *,
+        pool: str,
+        runner_resources: dict[str, object] | None,
+        agent_name: str | None,
+        executor_secret_names: frozenset[str] | None,
+    ) -> dict[str, str]:
+        raise ValueError("Docker substrate does not support Kubernetes quota admission")
+
+    def capacity_inventory(
+        self, *, priority_class: str, request_timeout_seconds: float
+    ) -> CapacityInventory:
+        raise ValueError("Docker substrate does not support Kubernetes quota admission")
+
+    def read_quota(
+        self, quota_name: str, *, request_timeout_seconds: float
+    ) -> QuotaStatus:
+        raise ValueError("Docker substrate does not support Kubernetes quota admission")
 
     def pod_unschedulable(self, name: str, *, request_timeout_seconds: float) -> str | None:
         # A Docker runner has no scheduler; it starts or fails.

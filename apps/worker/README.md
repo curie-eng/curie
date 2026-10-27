@@ -1093,9 +1093,29 @@ substrate.reap_orphans()              # periodic tick: claims with no live route
 
 Contract notes the kernel must know:
 
-Quota pressure reclamation runs only after a real ResourceQuota refusal and
-only when the remaining delivery budget is at least 70 seconds plus
-`claim_timeout_seconds`. A lower budget skips the scan. An interactive Slack
+With sandbox quotas enabled, the chart supplies `CURIE_SANDBOX_ADMISSION` with
+the quota name, sandbox PriorityClass, computed ceiling and complete resource
+hard map. Before a fresh claim can mint credentials or create a SandboxClaim,
+the substrate atomically reserves its selected Pod footprint in a shared
+Valkey ledger for its namespace and quota. Every admission accounts for occupied
+claims, unmatched chargeable Pods and outstanding reservations across Pod count,
+CPU and memory requests and limits, including init containers and RuntimeClass
+overhead. The nominal ceiling uses the chart's existing capacity calculation;
+the actual resource vector determines admission. An enabled zero ceiling refuses
+claims. Disabling the quota omits the admission contract.
+
+Reservations survive worker restart and remain charged through uncertain
+creation or deletion. Route expiry and reservation age do not free capacity.
+Reconciliation releases a reservation only after fresh inventory confirms its
+claim, all owned Sandboxes and all owned chargeable Pods are absent. A suspended
+Sandbox occupies zero only after its Pods are confirmed gone. Inventory or
+configured quota read failures fail closed, and an underreported quota usage
+cannot authorize a reservation beyond the shared budget.
+
+Capacity pressure reclamation runs after a real ResourceQuota refusal or a
+typed refusal from shared admission, and only when the remaining delivery budget
+is at least 70 seconds plus `claim_timeout_seconds`. A lower budget skips the
+scan. An interactive Slack
 turn waits durably for capacity under its original event identity, with a
 fixed deadline set by `CURIE_CAPACITY_WAIT_BUDGET_S` (24 hours by default).
 The worker acknowledges a parked stream delivery, then wakes the turn through
@@ -1107,7 +1127,7 @@ grant outcome is not unknown. A failed notice stays queued for another try.
 A confirmed or unknown grant keeps the existing notice retry. Waiting does not use a runner attempt or
 hold a conversation lock. Its placeholder says queued while waiting and
 receives an expiry message if the deadline passes. An approval resume does not
-wait. It runs the same reclamation pass after its own quota refusal, and when
+wait. It runs the same reclamation pass after its own capacity refusal, and when
 the pass frees nothing, or the one retry after it is refused again, the attempt
 fails under `sandbox-capacity` instead (#3693, #3700). The failure retries, and
 each retry that is refused again may run the pass once more, so a resume that
@@ -1118,21 +1138,26 @@ earlier attempt's confirmed pod termination is carried onto that notice. Other t
 retain their capacity response. Operators can inspect the persisted wait state and
 `curie.capacity.wait` metrics for waiting, active, and expired turns.
 
-The rejection retains every exceeded resource and its requested, used, and
-hard quantity. Before scanning, the worker validates the complete map with
+Quota rejection evidence retains every exceeded resource and its requested,
+used, and hard quantity. Admission evidence identifies the shared resource
+budget and refused footprint without presenting computed usage as a Kubernetes
+quota rejection. Before scanning, the worker validates the complete map with
 Kubernetes quantity semantics, including CPU DecimalSI, memory BinarySI, pod
 counts, and combined rejections. Invalid or incomplete evidence skips
 pressure reclamation with `outcome=refused-invalid-quota` and performs no
 pressure Redis call or deletion.
 
-After one exact idle route is detached and deleted, the worker polls the exact
-named ResourceQuota in its configured namespace within the existing 20 second
-cleanup window. It retries only when live spec and status hard limits agree and
-every rejected resource has enough current headroom. A transient claim or
-sandbox disappearance read supplies no observation and is polled again within
-that same window. Both resources must be confirmed absent before quota
-headroom can authorize the retry. The worker Role grants
-only namespaced `get` on core `resourcequotas`. A missing permission, malformed
+After one exact idle route is detached and deleted, the worker polls within the
+existing 20 second cleanup window until the victim's claim, all owned Sandboxes
+and all owned chargeable Pods are absent and its reservation is released. It
+then verifies shared admission headroom and the exact named ResourceQuota in
+its configured namespace. It retries only when live spec and status hard limits
+agree and every refused resource has enough current headroom. A transient
+inventory read supplies no observation and is polled again within that same
+window. The worker Role adds only namespaced inventory reads on Sandboxes and
+Pods and retains `get` on core `resourcequotas`. A separate cluster grant permits
+only `get` on the selected RuntimeClass when required for overhead. A missing
+permission, malformed
 quantity, mismatched spec and status limits, or timeout fails closed. The
 rejected claim or another quota can consume the freed capacity before the full
 retry. That bounded race records `reclaimed-retry-refused`; it does not delete

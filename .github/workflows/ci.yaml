@@ -3811,6 +3811,7 @@ jobs:
           CURIE_SCENARIO_API_IMAGE: curie-api:wsdiag-${{ github.sha }}
           CURIE_SCENARIO_WORKER_IMAGE: curie-worker:wsdiag-${{ github.sha }}
           CURIE_SCENARIO_RUNNER_IMAGE: curie-runner:wsdiag-${{ github.sha }}
+        shell: uv run python tools/sandbox-admission-observer/run.py -- bash {0}
         run: |
           set -euo pipefail
           bash tools/runtime-assertion-gate/run.sh \

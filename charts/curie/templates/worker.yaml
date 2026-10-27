@@ -43,8 +43,9 @@
 The worker drives the Kubernetes API to claim and manage agent-sandbox custom
 resources (the substrate's SandboxClient). It gets a namespaced Role scoped to
 exactly the CRD verbs KubernetesSandboxClient uses -- SandboxClaims it
-creates/reads/deletes/lists, Sandboxes it reads and patches (suspend/resume) --
-and nothing else. RBAC does not require the CRDs to be installed for the Role to
+creates/reads/deletes/lists, Sandboxes it reads, lists and patches (suspend/resume).
+Admission also reads the selected RuntimeClass to account for Pod overhead.
+RBAC does not require the CRDs to be installed for the Role to
 apply, so this is valid even when agentSandbox.deploy is false.
 */}}
 apiVersion: v1
@@ -75,7 +76,7 @@ rules:
     verbs: ["create", "get", "list", "delete"]
   - apiGroups: ["agents.x-k8s.io"]
     resources: ["sandboxes"]
-    verbs: ["get", "patch"]
+    verbs: ["get", "patch", "list"]
   # Pressure recovery reads only the exact quota named by the rejected claim.
   # The worker never lists, watches, or changes ResourceQuota objects.
   - apiGroups: [""]
@@ -109,11 +110,11 @@ rules:
     resources: ["secrets"]
     verbs: ["create"]
   {{- end }}
-  # The worker reads the exact sandbox pod for capacity and stream failure
-  # diagnosis. It lists only events for that named pod after a stream drop.
+  # Admission lists Pods to charge occupied capacity, including surviving children.
+  # Stream failure diagnosis reads the exact sandbox Pod and its events.
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["get"]
+    verbs: ["get", "list"]
   # A claim that never became Ready logs the runner's last 8 KB before cleanup.
   - apiGroups: [""]
     resources: ["pods/log"]
@@ -194,6 +195,41 @@ subjects:
     name: {{ include "curie.fullname" . }}-worker
     namespace: {{ .Release.Namespace }}
 ---
+{{- if and .Values.agentSandbox.deploy .Values.resourceQuota.enabled }}
+{{- $runtimeClass := include "curie.gvisor.runtimeClassName" . | trim }}
+{{- if $runtimeClass }}
+{{- $runtimeClassRole := printf "%s-worker-runtimeclass-%s" (include "curie.fullname" .) .Release.Namespace }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $runtimeClassRole }}
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+rules:
+  - apiGroups: ["node.k8s.io"]
+    resources: ["runtimeclasses"]
+    resourceNames: [{{ $runtimeClass | quote }}]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $runtimeClassRole }}
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $runtimeClassRole }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "curie.fullname" . }}-worker
+    namespace: {{ .Release.Namespace }}
+---
+{{- end }}
+{{- end }}
 {{- end }}
 apiVersion: apps/v1
 kind: Deployment
@@ -541,6 +577,10 @@ spec:
                   key: langfuseInitProjectSecretKey
             - name: CURIE_WARM_POOL
               value: {{ $warmPool | quote }}
+            {{- if and .Values.agentSandbox.deploy .Values.resourceQuota.enabled }}
+            - name: CURIE_SANDBOX_ADMISSION
+              value: {{ include "curie.sandboxAdmission" . | quote }}
+            {{- end }}
             # Every agent agent-sandbox.yaml renders a per-agent pool for
             # (connectorSecrets, registryEgress, #3083, and runnerImages,
             # ADR-0173), or none when worker.warmPool is overridden and the
