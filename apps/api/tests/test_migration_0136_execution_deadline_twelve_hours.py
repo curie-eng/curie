@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -53,19 +54,13 @@ def _insert_running(deadline_seconds: int) -> uuid.UUID:
     return request_id
 
 
-def _agent_rejected(deadline_seconds: int) -> None:
+def _rejected(insert: Callable[[int], uuid.UUID], deadline_seconds: int) -> None:
     with pytest.raises(DBAPIError) as excinfo:
-        _insert_agent(deadline_seconds)
+        insert(deadline_seconds)
     assert getattr(excinfo.value.orig, "sqlstate", None) == "23514"
 
 
-def _request_rejected(deadline_seconds: int) -> None:
-    with pytest.raises(DBAPIError) as excinfo:
-        _insert_running(deadline_seconds)
-    assert getattr(excinfo.value.orig, "sqlstate", None) == "23514"
-
-
-def _clear_long_deadlines() -> None:
+def _clear_deadline_rows() -> None:
     sql_dicts("DELETE FROM curie.execution_requests")
     sql_dicts("UPDATE curie.agents SET execution_deadline_seconds = NULL")
 
@@ -77,8 +72,8 @@ def test_0136_raises_both_deadline_checks_and_downgrade_refuses_longer_rows(
     isolated_migration_db.at("0136")
     _insert_agent(43200)
     _insert_running(43200)
-    _agent_rejected(43201)
-    _request_rejected(43201)
+    _rejected(_insert_agent, 43201)
+    _rejected(_insert_running, 43201)
     # Distinct counts so the error text can be checked for each: 2 agents and
     # 3 requests are past the old three-hour bound.
     long_agent = _insert_agent(20000)
@@ -119,16 +114,16 @@ def test_0136_raises_both_deadline_checks_and_downgrade_refuses_longer_rows(
         )
         assert stamped_revision() == "0136"
 
-        _clear_long_deadlines()
+        _clear_deadline_rows()
         command.downgrade(config, BELOW)
         assert stamped_revision() == BELOW
         _insert_agent(10800)
         _insert_running(10800)
-        _agent_rejected(10801)
-        _request_rejected(10801)
+        _rejected(_insert_agent, 10801)
+        _rejected(_insert_running, 10801)
     finally:
         # A failed assertion must not leave this private database below head.
-        _clear_long_deadlines()
+        _clear_deadline_rows()
         command.upgrade(config, "head")
 
 
@@ -145,5 +140,5 @@ def test_0136_downgrade_succeeds_when_every_row_is_within_three_hours(
         assert sql_dicts("SELECT 1 FROM curie.agents WHERE execution_deadline_seconds = 10800")
         assert len(sql_dicts("SELECT 1 FROM curie.execution_requests")) == 1
     finally:
-        _clear_long_deadlines()
+        _clear_deadline_rows()
         command.upgrade(config, "head")

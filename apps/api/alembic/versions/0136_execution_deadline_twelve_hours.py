@@ -68,8 +68,8 @@ def downgrade() -> None:
     ).scalar_one()
     if agents or requests:
         raise RuntimeError(
-            f"cannot downgrade below 0136: {int(agents)} agents have "
-            f"execution_deadline_seconds above {OLD_MAX} and {int(requests)} "
+            f"cannot downgrade below 0136: {agents} agents have "
+            f"execution_deadline_seconds above {OLD_MAX} and {requests} "
             f"execution requests have a deadline more than {OLD_MAX} seconds "
             "after started_at; clear those values first"
         )
