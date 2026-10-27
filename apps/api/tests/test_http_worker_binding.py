@@ -442,6 +442,62 @@ def test_database_failure_propagates_instead_of_becoming_absent_or_legacy(clean_
     run(check)
 
 
+def test_labelled_tracker_route_without_http_selection_is_not_an_http_binding(
+    clean_db: None,
+) -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-17: shared tracker addresses are not ambiguity errors."""
+
+    async def check(factory: async_sessionmaker[AsyncSession]) -> None:
+        scope = await _seed_scope(factory, "absent")
+        address = "synthetic-org/synthetic-repo-" + uuid.uuid4().hex
+        async with factory() as session, session.begin():
+            second = Agent(tenant_id=scope["tenant"], name="synthetic-second-" + uuid.uuid4().hex)
+            session.add(second)
+            await session.flush()
+            for agent, label in ((scope["agent"], "first"), (second.id, "second")):
+                session.add(
+                    AgentChannel(
+                        tenant_id=scope["tenant"], agent_id=agent, kind="github",
+                        address=address, adapter=None, endpoint=None, trigger_label=label,
+                    )
+                )
+        resolver = await _resolver(factory, scope)
+        assert await resolver.identity_binding("github", None, address) is None
+
+    run(check)
+
+
+def test_kernel_refuses_an_ambiguous_route_with_an_http_candidate() -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-17/18: definitive, never an unavailable pending turn."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from curie_worker.binding import AmbiguousRoute
+    from curie_worker.kernel import identity
+
+    from apps.worker.tests.queue_fixtures import qevent
+
+    class AmbiguousBinding:
+        """@spec HTTP-INVOCATION-EXECUTION-17: the production owner's ambiguity answer."""
+
+        async def identity_binding(self, kind: str, *_args: Any) -> None:
+            """@spec HTTP-INVOCATION-EXECUTION-17."""
+            raise AmbiguousRoute(kind, "synthetic-address", [uuid.uuid4(), uuid.uuid4()])
+
+    async def go() -> None:
+        carry = identity.HttpTurnCarry(qevent("synthetic ambiguous turn"), None, None)
+        token = identity.CURRENT.set(carry)
+        try:
+            with pytest.raises(identity.HttpIdentityRefused):
+                await identity.prepare(
+                    SimpleNamespace(_binding=AmbiguousBinding(), _identity_authority=None)
+                )
+        finally:
+            identity.CURRENT.reset(token)
+
+    asyncio.run(go())
+
+
 @pytest.mark.parametrize("generation", [0, 1, 2**63 - 1])
 @pytest.mark.parametrize("required", [True, False])
 def test_binding_value_is_frozen_with_actual_integer_and_boolean(
