@@ -86,6 +86,7 @@ RECEIPT_CODES: Final = frozenset(
         "arguments_schema_mismatch",
         "agent_stopped",
         "reply_surface_unavailable",
+        "http_identity_selected",
         "tune_execution_not_automated",
         # approval_reasons
         "generation_not_current",
