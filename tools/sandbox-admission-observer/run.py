@@ -321,7 +321,12 @@ class _Collector:
                 for obj in crds.get("items", [])
             ]
             if len(established) == 2 and all(established):
-                self._start_objects()
+                preflight = self._get("job", f"{self.fullname}-preflight-controller")
+                if any(
+                    row.get("type") == "Complete" and row.get("status") == "True"
+                    for row in preflight.get("status", {}).get("conditions", [])
+                ):
+                    self._start_objects()
         if self._versions and not self._worker_started:
             worker = self._get("deployment", f"{self.fullname}-worker")
             if worker.get("status", {}).get("availableReplicas", 0) > 0:
