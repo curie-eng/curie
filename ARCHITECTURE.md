@@ -1037,8 +1037,9 @@ snapshot is `next` commit `bac88c6ea`, read on 2026-10-02.
 | 0162 | Transitions compare and advance a row version | ENFORCED | Lifecycle operations in [`apps/api/src/curie_api/workitems.py`](apps/api/src/curie_api/workitems.py) return `WorkItemConflict` on a version mismatch. |
 | 0162 | One publication lineage per WorkItem, linked once | ENFORCED | `work_items_publication_lineage_key`; bound only while unset and the request is running. |
 | 0162 | Execution deadline is exactly 1800 seconds | AMENDED | By ADR 0171. |
-| 0171 | Deadline is per agent, 60 to 10800 seconds, default 1800 | ENFORCED | `agents_execution_deadline_seconds_ck`, `execution_requests_deadline_ck`. |
+| 0171 | Deadline is per agent, 60 to 10800 seconds, default 1800 | AMENDED | By ADR 0249. |
 | 0171 | Time, not turns, bounds a run | ENFORCED | `WorkerConfig.work_item_max_turns` (default 1000) sets the turn budget; `max-turns` is not retried. |
+| 0249 | Deadline is per agent, 60 to 43200 seconds, default 1800 | ENFORCED | `agents_execution_deadline_seconds_ck`, `execution_requests_deadline_ck` (migration 0136). |
 | 0174 | `ppc` authorizes only the metadata comparison | ENFORCED | `require_publication_precheck`; no other route accepts it. |
 | 0174 | Precheck limits: 10 s and 5 per turn; 20 per lineage per 5 minutes | ENFORCED | [`runner/src/curie_runner/publication_precheck.py`](runner/src/curie_runner/publication_precheck.py) and [`apps/api/src/curie_api/routers/publication_precheck.py`](apps/api/src/curie_api/routers/publication_precheck.py). |
 | 0174 | An empty snapshot is refused without pending approval | ENFORCED | Runner refusals `body_required`, `stale_context`, `rate_limited`, `no_change`. |
