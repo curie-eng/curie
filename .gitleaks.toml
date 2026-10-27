@@ -90,6 +90,25 @@ tags = ["identifier", "slack"]
     '''^apps/api/tests/test_http_approval_creation\.py$''',
   ]
 
+  # 526a02e9 and ecbf8115 are the same fixture files after that unmerged branch
+  # was rewritten. The bytes match the earlier pins. The new commits are not on
+  # main or next, and the branch cannot be rewritten from a release line.
+  [[rules.allowlists]]
+  description = "Synthetic unbound channel prefix C0UNBOUND in 526a02e9a0c949022c3f46000d7e9b477068abcd. The file bytes match the earlier pin. The commit is only on an unmerged branch. AND pins the excuse to that commit and this path, so the same text in any other commit or file still matches."
+  condition = "AND"
+  commits = ["526a02e9a0c949022c3f46000d7e9b477068abcd"]
+  paths = [
+    '''^apps/api/tests/test_http_approval_legacy_writers\.py$''',
+  ]
+
+  [[rules.allowlists]]
+  description = "Synthetic unbound reply channel C0UNBOUND in ecbf8115d60ff9188826637e4c52995d6204bf25. The file bytes match the earlier pin. The commit is only on an unmerged branch. AND pins the excuse to that commit and this path, so the same text in any other commit or file still matches."
+  condition = "AND"
+  commits = ["ecbf8115d60ff9188826637e4c52995d6204bf25"]
+  paths = [
+    '''^apps/api/tests/test_http_approval_creation\.py$''',
+  ]
+
 [[rules]]
 id = "aws-account-id"
 description = "AWS account id -- use 000000000000 in docs and tests"
