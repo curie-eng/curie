@@ -115,6 +115,18 @@ class SlackUserGroupClient:
             group=group_id, users=users, fetched_at=fetched_at, cache_age_s=0.0
         )
 
+    async def fresh_members(self, group_id: str) -> UserGroupMembership:
+        """A fetch started by this caller, never a cached or shared answer.
+
+        HTTP-selected approval answers take no positive cached membership; the
+        cache is neither read nor written. @spec HTTP-APPROVAL-CONTINUITY-8.
+        """
+
+        users = await self._fetch(group_id)
+        return UserGroupMembership(
+            group=group_id, users=users, fetched_at=self._clock(), cache_age_s=0.0
+        )
+
     async def _fetch_shared(self, group_id: str) -> tuple[datetime, frozenset[str]]:
         """The single fetch every concurrent caller for this group awaits."""
 
