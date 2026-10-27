@@ -497,3 +497,167 @@ def test_creation_external_lookup_holds_no_sql_transaction_or_writer_fence(
     monkeypatch.setattr(HttpIdentityClient, "lookup", lookup)
     accepted(post(case), case.request)
     assert checks == [(0, 0)]
+
+
+def resolve_and_resume(
+    case: SimpleNamespace, *, status: str = "approved",
+) -> tuple[dict[str, Any], dict[str, Any], str]:
+    """@spec HTTP-APPROVAL-CONTINUITY-4/6: a resolved first approval and its sealed resume.
+
+    The owned SQL fixture models the committed, correctly resealed answer and the
+    core-built resume (criteria 10/11 own those writers). Returns the resolved row,
+    the resume capsule fields and the exact resume payload the worker would carry.
+    """
+    accepted(post(case), case.request)
+    row = rows(case.request["approval"]["dedupe_key"])[0]
+    module, ring, capsule = opened(case, row)
+    approver = "U0EXAMPLEAPPROVER"
+    row.update(status=status, resolved_by=approver, resolved_at=datetime.now(UTC))
+    scope = capsule.scope
+    data = capsule.model_dump(mode="json")
+    data.update(
+        status=status,
+        approval_record_sha256=digest(canonical({key: row[key] for key in RECORD_FIELDS})),
+        actor_scope={
+            "tenant_id": scope.tenant_id, "channel_identity_id": scope.channel_identity_id,
+            "provider_installation_id": scope.provider_installation_id,
+            "provider": scope.provider, "native_id": approver,
+            "actor_channel": row["card_channel"], "namespace": scope.namespace.model_dump(),
+        },
+        actor_receiver_id=capsule.receiver_id,
+        actor_receiver_generation=capsule.receiver_generation,
+        actor_independent_human=True, actor_provider_issuer=capsule.provider_issuer,
+        actor_provider_version=capsule.provider_version,
+        actor_provider_credential_id=capsule.provider_credential_id,
+        actor_provider_credential_generation=capsule.provider_credential_generation,
+        actor_lifecycle_generation=capsule.lifecycle_generation,
+        actor_role_policy_version=capsule.role_policy_version,
+        actor_outcome=capsule.outcome,
+        actor_canonical=None if capsule.canonical is None else capsule.canonical.model_dump(),
+        actor_principal=None if capsule.principal is None else capsule.principal.model_dump(),
+    )
+    resealed = module.seal_approval_context(module.ApprovalContextV1.model_validate(data), ring)
+    built: list[str] = []
+
+    async def resolve(factory: async_sessionmaker[AsyncSession]) -> None:
+        """@spec HTTP-APPROVAL-CONTINUITY-10/11: install the answer, then build its resume."""
+        from curie_api.models import Approval
+        from curie_api.resumequeue import resume_turn_for
+
+        async with factory() as session:
+            await session.execute(
+                text(f'UPDATE "{SCHEMA}".approvals SET status=:status, resolved_by=:by, '
+                     'resolved_at=:at, identity_context=:context WHERE id=:id'),
+                {"status": status, "by": approver, "at": row["resolved_at"].replace(tzinfo=None),
+                 "context": resealed, "id": row["id"]},
+            )
+            await session.commit()
+            stored = await session.get(Approval, row["id"])
+            assert stored is not None
+            built.append(resume_turn_for(stored).model_dump_json())
+
+    run(resolve)
+    payload = built[0]
+    resume = dict(data)
+    resume.update(
+        purpose="resume", event_id=f"approval-{row['id']}-resolved",
+        payload_sha256=digest(payload),
+    )
+    return row, resume, payload
+
+
+def seal_resume(case: SimpleNamespace, resume: dict[str, Any]) -> str:
+    """@spec HTTP-APPROVAL-CONTINUITY-6: the purpose-specific resume seal core publishes."""
+    module = importlib.import_module("curie_internal.identity_approval")
+    ring = identity_context.build_identity_keyring(
+        "context", (("synthetic-context", 1, case.scope["context_key"]),),
+    )
+    return module.seal_resume_context(module.ResumeContextV1.model_validate(resume), ring)
+
+
+def resumed_request(case: SimpleNamespace, token: str, payload: str) -> dict[str, Any]:
+    """@spec HTTP-APPROVAL-CONTINUITY-4: the second gate as the resumed worker sends it."""
+    request = request_for(SimpleNamespace(
+        payload=payload, capsule=token, scope=case.scope, context=case.context,
+    ))
+    request["approval"]["summary"] = "Approve the second synthetic bounded operation"
+    request["approval"]["granted_tool"] = "synthetic_write"
+    return request
+
+
+def test_resumed_turn_suspends_again_under_its_original_invoker(
+    creation_case: SimpleNamespace,
+) -> None:
+    """@spec HTTP-APPROVAL-CONTINUITY-4/5/6/13: recursive suspension without invoker retagging."""
+    case = creation_case
+    first, resume, payload = resolve_and_resume(case)
+    token = seal_resume(case, resume)
+    request = resumed_request(case, token, payload)
+    assert request["approval"]["author"] == "U0EXAMPLEAPPROVER"
+    calls = len(case.provider.requests)
+    created = accepted(post(case, request), request)
+    assert created["status"] == "pending" and created["id"] != str(first["id"])
+    # Fresh current authority is the original invoker's, not the answering actor's.
+    assert len(case.provider.requests) == calls + 1
+    lookup, invoked = (
+        {key: value for key, value in item.items() if key != "request_id"}
+        for item in (case.provider.requests[-1], case.provider.requests[0])
+    )
+    assert lookup == invoked
+    stored = rows(request["approval"]["dedupe_key"])
+    assert len(stored) == 1
+    _, _, capsule = opened(case, stored[0])
+    assert capsule.approval_id == created["id"]
+    assert capsule.source_event_id == resume["event_id"] == request["approval"]["dedupe_key"]
+    assert capsule.source_context_sha256 == digest(token)
+    assert capsule.source_payload_sha256 == digest(payload)
+    assert capsule.original_event_id == case.context.event_id
+    assert capsule.original_payload_sha256 == digest(case.payload)
+    assert capsule.scope == case.context.scope
+    assert capsule.receiver_id == case.context.receiver_id
+    assert capsule.canonical == case.context.canonical
+    assert capsule.principal == case.context.principal
+    assert capsule.actor_scope is None and capsule.status == "pending"
+    # An identical retry is historical and asks the provider nothing.
+    retry = copy.deepcopy(request)
+    retry["request_id"] = str(uuid.uuid4())
+    assert accepted(post(case, retry), retry, duplicate=True)["id"] == created["id"]
+    assert len(case.provider.requests) == calls + 1
+
+
+@pytest.mark.parametrize(
+    "variant", ["forged", "stale", "other_approval", "retagged", "altered_payload"],
+)
+def test_forged_stale_or_foreign_resume_cannot_suspend_again(
+    creation_case: SimpleNamespace, variant: str,
+) -> None:
+    """@spec HTTP-APPROVAL-CONTINUITY-4/6: the resume must match the approval it names."""
+    case = creation_case
+    first, resume, payload = resolve_and_resume(case)
+    if variant == "forged":
+        ring = identity_context.build_identity_keyring(
+            "context", (("synthetic-context", 1, b"f" * 32),),
+        )
+        module = importlib.import_module("curie_internal.identity_approval")
+        token = module.seal_resume_context(module.ResumeContextV1.model_validate(resume), ring)
+    elif variant == "stale":
+        token = seal_resume(case, {**resume, "status": "rejected"})
+    elif variant == "other_approval":
+        # A consistent resume of an approval this turn never suspended on.
+        other = str(uuid.uuid4())
+        payload = payload.replace(resume["event_id"], f"approval-{other}-resolved")
+        token = seal_resume(case, {
+            **resume, "approval_id": other, "event_id": f"approval-{other}-resolved",
+            "payload_sha256": digest(payload),
+        })
+    elif variant == "retagged":
+        token = seal_resume(case, {**resume, "original_payload_sha256": digest("synthetic")})
+    else:
+        token = seal_resume(case, resume)
+        payload += " "
+    request = resumed_request(case, token, payload)
+    calls = len(case.provider.requests)
+    refused(post(case, request), 422, "invalid_approval_context")
+    assert rows(request["approval"]["dedupe_key"]) == []
+    assert len(case.provider.requests) == calls
+    assert rows(case.request["approval"]["dedupe_key"])[0]["id"] == first["id"]
