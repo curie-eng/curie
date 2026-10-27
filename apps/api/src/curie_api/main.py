@@ -47,6 +47,7 @@ from .github_app import credentials_for, log_credential_path
 from .github_checks import GitHubStatusReporter
 from .github_review_store import GitHubReviewReconciler
 from .graveyardwatcher import GraveyardWatcher
+from .identity.http_approval import http_expiry_owner
 from .identity.http_invocation import HttpInvocationRuntime
 from .identity.http_transport import HttpIdentityClient
 from .identity_fence import IdentityFenceMiddleware
@@ -182,6 +183,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         stream=settings.runs_stream,
         dead_letter_stream=settings.resume_dead_letter_stream or settings.dead_letter_stream_name(),
     )
+    # @spec HTTP-APPROVAL-CONTINUITY-10: the only writer that may expire a selected row.
+    app.state.http_approval_expiry = http_expiry_owner(app.state)
     app.state.github_review_reconciler = GitHubReviewReconciler(
         app.state.sessionmaker,
         valkey,
@@ -270,6 +273,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 settings.approval_sweep_interval_s,
                 sweeper_stop,
                 publication_patch_retention_seconds=(settings.publication_patch_retention_seconds),
+                http_expiry=app.state.http_approval_expiry,
                 remediation_admissions=(
                     partial(
                         reconcile_admissions,

@@ -56,6 +56,7 @@ from ..approval_auth import ApprovalPrincipalDep
 from ..auth import require_platform_key
 from ..config import get_settings
 from ..deps import ResumeQueueDep, SessionDep
+from ..identity.http_approval import approval_is_selected
 from ..models import AgentChannel, Approval, ApprovalAuditEntry, ApprovalStatus
 from ..remediation_approvals import REMEDIATION_PURPOSE, settle_remediation_approval
 from ..resumequeue import approval_trace_context, build_resume_turn
@@ -272,6 +273,10 @@ async def recover_approval(
     approval = await crud_approvals.get_approval(session, approval_id)
     if approval is None:
         raise _not_found()
+    # @spec HTTP-APPROVAL-CONTINUITY-10: platform-key recovery has no qualified
+    # actor proof for a selected row, so it refuses before any mutation.
+    if await approval_is_selected(session, approval):
+        raise HTTPException(status.HTTP_409_CONFLICT, "unsupported_approval")
     recorded = await crud_approvals.find_recovery_audit(session, data.recovery_key)
     if recorded is not None:
         return _replayed_recovery(approval, recorded, data.recovery_key)

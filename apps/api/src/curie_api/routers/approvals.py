@@ -63,7 +63,7 @@ from ..auth import require_api_key, require_platform_key
 from ..authorizer import AuthzDecision, authorize_approval
 from ..config import get_settings
 from ..deps import ApproverSetSelectorDep, ResumeQueueDep, SessionDep, get_store
-from ..identity.http_approval import require_legacy_approval_creation
+from ..identity.http_approval import approval_is_selected, require_legacy_approval_creation
 from ..identity_fence import lock_identity_reader
 from ..models import Approval, ApprovalStatus
 from ..remediation_approvals import (
@@ -497,6 +497,7 @@ async def _admit_adapter_answer(session: AsyncSession, approval: Approval, sende
 async def resolve_approval(
     approval_id: uuid.UUID,
     data: ApprovalResolve,
+    request: Request,
     session: SessionDep,
     resume_queue: ResumeQueueDep,
     approver_sets: ApproverSetSelectorDep,
@@ -527,6 +528,19 @@ async def resolve_approval(
     ):
         raise _approval_not_found()
     stored_parent = approval_trace_context(approval)
+    # @spec HTTP-APPROVAL-CONTINUITY-10: a selected row never reaches legacy
+    # admission, team lookup or CAS. Only its deadline expiry is supported here,
+    # through the sealing owner; its wake stays owed rather than context-free.
+    if await approval_is_selected(session, approval):
+        await session.commit()
+        if approval.status == ApprovalStatus.pending and _expired(approval):
+            expired = await request.app.state.http_approval_expiry(approval_id)
+            if expired is not None:
+                raise HTTPException(
+                    status.HTTP_410_GONE,
+                    f"approval expired at {expired.expires_at} and can no longer be resolved",
+                )
+        raise HTTPException(status.HTTP_409_CONFLICT, "unsupported_approval")
 
     # The route binding is read fresh at resolve time (#420), so revoking an
     # approver takes effect on the next click rather than at the next restart.

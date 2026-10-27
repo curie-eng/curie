@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any, NoReturn
 
@@ -20,7 +21,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from curie_api import identity_fence, principal_authority
 from curie_api.crud import approvals as approvals_crud
 from curie_api.crud import channels as channels_crud
-from curie_api.models import Agent, Approval, TenantIdentityProvider
+from curie_api.models import (
+    Agent,
+    Approval,
+    ApprovalAuditEntry,
+    ApprovalStatus,
+    TenantIdentityProvider,
+)
 from curie_api.schemas.approvals import ApprovalResolutionTarget, ApprovalRouteBinding
 from curie_api.schemas.channels import BUILTIN_CLUSTER_MESSAGE_ADAPTER
 from curie_api.schemas.http_authority import HttpSelectionV1
@@ -143,40 +150,137 @@ async def _http_tenant(session: AsyncSession, tenant_id: uuid.UUID) -> bool:
     return isinstance(configuration.selection, HttpSelectionV1)
 
 
+async def _selected(session: AsyncSession, source: ApprovalRequest | Approval) -> bool:
+    """Stored provenance, the agent and every route candidate. @spec HTTP-APPROVAL-CONTINUITY-1."""
+    if isinstance(source, Approval) and source.identity_context is not None:
+        return True
+    agent = None if source.agent_id is None else await session.get(Agent, source.agent_id)
+    if agent is not None and await _http_tenant(session, agent.tenant_id):
+        return True
+    adapter = (
+        source.reply_identity
+        if source.reply_kind == "slack" and source.reply_adapter == BUILTIN_CLUSTER_MESSAGE_ADAPTER
+        else source.reply_adapter
+    )
+    # Every candidate, so an ambiguous route cannot hide an adopted one. A tenant
+    # without HTTP selection keeps agent/route disagreement and ambiguity.
+    for binding in await channels_crud.bindings_for_route(
+        session, source.reply_kind, adapter, source.reply_channel,
+    ):
+        if await _http_tenant(session, binding.tenant_id):
+            return True
+    return False
+
+
+async def approval_is_selected(session: AsyncSession, approval: Approval) -> bool:
+    """Classify a stored row before any legacy mutation or wake.
+
+    Null provenance is not legacy authority; unavailable classification raises
+    the fixed 503 rather than selecting legacy. @spec HTTP-APPROVAL-CONTINUITY-1/10.
+    """
+    try:
+        return await _selected(session, approval)
+    except HTTPException:
+        raise
+    except Exception:  # noqa: BLE001 - classification failure cannot select legacy.
+        _refuse(503, "authority_unavailable")
+
+
 async def require_legacy_approval_creation(session: AsyncSession, data: ApprovalRequest) -> None:
     """No provenance-free adopted creation. @spec HTTP-APPROVAL-CONTINUITY-1/5."""
     try:
         await identity_fence.lock_identity_reader(session)
         existing = await approvals_crud.get_approval_by_dedupe_key(session, data.dedupe_key)
-        if existing is not None and existing.identity_context is not None:
-            _refuse(409, "unsupported_approval")
-        inputs: list[ApprovalRequest | Approval] = [data]
-        if existing is not None:
-            inputs.append(existing)
-        for source in inputs:
-            agent = None if source.agent_id is None else await session.get(Agent, source.agent_id)
-            if agent is not None and await _http_tenant(session, agent.tenant_id):
+        for source in (data,) if existing is None else (data, existing):
+            if await _selected(session, source):
                 _refuse(409, "unsupported_approval")
-            adapter = (
-                source.reply_identity
-                if source.reply_kind == "slack"
-                and source.reply_adapter == BUILTIN_CLUSTER_MESSAGE_ADAPTER
-                else source.reply_adapter
-            )
-            # Every candidate, so an ambiguous route cannot hide an adopted one. A tenant
-            # without HTTP selection keeps agent/route disagreement and ambiguity.
-            for binding in await channels_crud.bindings_for_route(
-                session,
-                source.reply_kind,
-                adapter,
-                source.reply_channel,
-            ):
-                if await _http_tenant(session, binding.tenant_id):
-                    _refuse(409, "unsupported_approval")
     except HTTPException:
         raise
     except Exception:  # noqa: BLE001 - classification failure cannot select legacy.
         _refuse(503, "authority_unavailable")
+
+
+def _verified_capsule(
+    runtime: HttpInvocationRuntime, row: Approval,
+) -> wire.ApprovalContextV1 | None:
+    """The stored seal names exactly this row as it is. @spec HTTP-APPROVAL-CONTINUITY-5/10."""
+    if row.identity_context is None:
+        return None
+    saved = wire.open_approval_context(row.identity_context, runtime._context_keys)
+    if not isinstance(saved, wire.ApprovalContextV1) or (
+        saved.approval_id != str(row.id)
+        or saved.status != row.status
+        or saved.approval_record_sha256 != approval_record_digest(row)
+    ):
+        return None
+    return saved
+
+
+async def expire_http_approval(
+    factory: Any, valkey: Any, runtime: Any, approval_id: uuid.UUID,
+) -> Approval | None:
+    """Expire a lapsed selected row; status, seal and audit commit together.
+
+    Expiry invents no actor and needs no caller lookup. A row whose stored seal
+    does not name it exactly is left pending. @spec HTTP-APPROVAL-CONTINUITY-9/10.
+    """
+    if type(runtime) is not HttpInvocationRuntime:
+        return None
+    now = datetime.now(UTC).replace(tzinfo=None)
+    async with identity_fence.mutation(factory, valkey) as writer:
+        async with writer.begin():
+            row = (
+                await writer.execute(
+                    select(Approval)
+                    .where(Approval.id == approval_id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+            if (
+                row is None or row.status != ApprovalStatus.pending
+                or row.expires_at is None or row.expires_at > now
+            ):
+                return None
+            saved = _verified_capsule(runtime, row)
+            if saved is None:
+                return None
+            row.status = ApprovalStatus.expired
+            row.resolved_at = now
+            await writer.flush()
+            await writer.refresh(row)
+            resealed = saved.model_dump()
+            resealed.update(
+                status="expired",
+                key_id=runtime._signing_key[0],
+                key_generation=runtime._signing_key[1],
+                approval_record_sha256=approval_record_digest(row),
+            )
+            row.identity_context = wire.seal_approval_context(
+                wire.ApprovalContextV1.model_validate(resealed), runtime._context_keys,
+            )
+            writer.add(ApprovalAuditEntry(
+                approval_id=row.id, action="expired", actor="system", actor_channel=None,
+                principal_kind=None, authenticated=False, principal_subject=None, decision="",
+                authorizer="HttpApprovalExpiry", authorized=True,
+                reason=f"approval expired at {row.expires_at}", evidence=None,
+            ))
+            await writer.flush()
+            await writer.commit()
+    return row
+
+
+def http_expiry_owner(state: Any) -> Callable[[uuid.UUID], Awaitable[Approval | None]]:
+    """The sealing expiry owner, bound to the app's stores. @spec HTTP-APPROVAL-CONTINUITY-10."""
+
+    async def expire(approval_id: uuid.UUID) -> Approval | None:
+        """@spec HTTP-APPROVAL-CONTINUITY-10."""
+        return await expire_http_approval(
+            state.sessionmaker, state.valkey,
+            getattr(state, "http_identity_runtime", None), approval_id,
+        )
+
+    return expire
 
 
 def _original(

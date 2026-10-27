@@ -100,6 +100,7 @@ from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from curie_api.crud import approvals as crud_approvals
+from curie_api.identity.http_approval import approval_is_selected
 
 from .resumequeue import (
     ResumeQueue,
@@ -299,6 +300,10 @@ class ResumeReconciler:
                     if approval is None:
                         # Another replica holds it, or it is already resumed;
                         # exit the txn block cleanly, releasing any lock.
+                        return _Outcome.NOT_CLAIMED
+                    # @spec HTTP-APPROVAL-CONTINUITY-1/10: a selected row's wake
+                    # stays owed; this queue cannot publish its sealed context.
+                    if await approval_is_selected(session, approval):
                         return _Outcome.NOT_CLAIMED
                     turn = resume_turn_for(approval)
                     await self._resume_queue.enqueue(
