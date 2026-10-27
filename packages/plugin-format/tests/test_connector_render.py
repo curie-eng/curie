@@ -933,6 +933,58 @@ def test_a_referenced_secret_points_at_the_secret_the_author_named() -> None:
     assert "value" not in entry
 
 
+def _referenced_secret_name(from_secret: str, agent: str) -> str:
+    spec = ConnectorSpec(image="x:1", secrets=[SecretRef(name="T", from_secret=from_secret)])
+    dep = next(
+        o
+        for o in r.render(
+            release="rel",
+            agent=agent,
+            namespace="ns",
+            app_name="app",
+            connector="g",
+            spec=spec,
+            secret_name="curie-owned",
+            proxy=_caller_proxy(),
+        )
+        if o["kind"] == "Deployment"
+    )
+    entry = next(
+        e for e in dep["spec"]["template"]["spec"]["containers"][0]["env"] if e["name"] == "T"
+    )
+    name = entry["valueFrom"]["secretKeyRef"]["name"]
+    assert isinstance(name, str)
+    return name
+
+
+def test_a_referenced_secret_can_be_scoped_to_the_deploying_agent() -> None:
+    # One bundle deployed as two agents in one namespace: each agent's
+    # connector reads its own out-of-band Secret, not a shared one.
+    template = "example-read-${CURIE_AGENT}"
+    assert _referenced_secret_name(template, "foo") == "example-read-foo"
+    assert _referenced_secret_name(template, "foo-dev") == "example-read-foo-dev"
+
+
+def test_a_literal_referenced_secret_does_not_depend_on_the_agent() -> None:
+    assert _referenced_secret_name("example-read", "foo") == "example-read"
+    assert _referenced_secret_name("example-read", "foo-dev") == "example-read"
+
+
+@pytest.mark.parametrize("agent", ["Foo", "foo_dev", "a" * 250])
+def test_an_agent_that_cannot_complete_a_secret_name_refuses_to_render(agent: str) -> None:
+    # The validator proves the template fits every valid agent name, but the
+    # agent arrives separately at render. A name the API server would refuse
+    # at apply is refused here instead, naming both halves.
+    with pytest.raises(ValueError, match="example-read-"):
+        _referenced_secret_name("example-read-${CURIE_AGENT}", agent)
+
+
+def test_secret_ref_placeholders_are_disjoint_from_args_and_env_placeholders() -> None:
+    # `${CURIE_AGENT}` is substituted only in `from_secret`; an args/env value
+    # carrying it is still refused as unknown, and vice versa.
+    assert not set(r.SECRET_REF_PLACEHOLDERS) & set(r.PLACEHOLDERS)
+
+
 def test_owned_and_referenced_secrets_are_indistinguishable_to_the_container() -> None:
     # Both render a secretKeyRef and never a literal. The container cannot tell
     # which is which, so nothing downstream needs to care.

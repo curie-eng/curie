@@ -2479,6 +2479,35 @@ connectors:
     }
 
     #[test]
+    fn an_agent_scoped_secret_reference_is_refused_not_resolved_locally() {
+        // `${CURIE_AGENT}` is expanded by the cluster render only. Locally
+        // there is no out-of-band Secret to point at, so the templated form is
+        // refused like any other reference and its placeholder text never
+        // stands in for a Secret name or a bound env var.
+        let decl = decl(
+            r#"
+connectors:
+  reader:
+    image: ghcr.io/example/reader:1
+    secrets:
+      - name: EXAMPLE_TOKEN
+        from_secret: example-read-${CURIE_AGENT}
+"#,
+        );
+        assert!(hosted_env_secret_names(&decl).is_empty());
+        let spec = &decl.connectors["reader"];
+        let text = format!(
+            "{:#}",
+            refuse_out_of_band_secrets("reader", spec)
+                .expect_err("an agent-scoped reference has no local equivalent")
+        );
+        assert!(
+            text.contains("`example-read-${CURIE_AGENT}`") && text.contains("EXAMPLE_TOKEN"),
+            "the refusal names the reference as written: {text}"
+        );
+    }
+
+    #[test]
     fn remote_url_connector_is_excluded() {
         // A pure `url:` remote is the MCP client's own config; Curie resolves
         // and delivers no credential for it, so binding its name would put an

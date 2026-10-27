@@ -88,7 +88,15 @@ files**, each absent from a bundle that needs none, all three invisible to Claud
   `secrets` is `list[str | SecretRef]`
   (`packages/plugin-format/src/plugin_format/connectors.py::SecretRef`, with
   `name` / `from_secret` / `key`) and `secret_files` is by NAME only; neither form
-  carries a value. A hosted connector may also list `config`, env-var names for per-agent
+  carries a value. A `from_secret` without a placeholder is used as written. One that carries
+  `${CURIE_AGENT}` names a Secret per deploying agent: the renderer expands it to the agent's
+  name (`example-read-${CURIE_AGENT}` becomes `example-read-foo` for agent `foo` and
+  `example-read-foo-dev` for `foo-dev`), so agents deployed from one bundle into one namespace
+  read different out-of-band Secrets. It is the only placeholder a `from_secret` accepts
+  (`connectors.secret_ref_unknown_placeholder`), and the template must expand to a Kubernetes
+  Secret name for every valid agent name (`connectors.secret_ref_bad_name`); the render checks
+  the expanded name again. The local tiers have no out-of-band Secrets and refuse every
+  `from_secret` reference, templated or not. A hosted connector may also list `config`, env-var names for per-agent
   NON-secret settings (a folder path, a channel id) the operator stores beside the connector's
   credentials. Each `config` name resolves from the same per-agent store as a plain `secrets`
   name and renders the same `secretKeyRef` env var on the connector pod, but it is never a
