@@ -536,6 +536,8 @@ FACTORY_FIXTURE_COMMIT = "5f98d1bce852a94c4545c27a599d24a314a23f59"
 SYNTHETIC_CHANNEL_COMMIT = "f0c43984edaf749321d5aa0bbc0854160ba15fbf"
 UNBOUND_LEGACY_COMMIT = "b0dc00db025319d7e5dd38a62c4d9c5b3f246484"
 UNBOUND_CREATION_COMMIT = "340c09720fd79c2229a64d3d7702fc8882f7c7c9"
+UNBOUND_LEGACY_REWRITE_COMMIT = "526a02e9a0c949022c3f46000d7e9b477068abcd"
+UNBOUND_CREATION_REWRITE_COMMIT = "ecbf8115d60ff9188826637e4c52995d6204bf25"
 FACTORY_FIXTURE_PATHS = (
     r"^tools/factory-e2e/tests/test_acceptance\.py$",
     r"^tools/factory-e2e/tests/test_factory_e2e_loop\.py$",
@@ -595,6 +597,8 @@ def test_historical_fixture_allowlist_stays_pinned_to_commit_and_path() -> None:
     unbound_pins = {
         UNBOUND_LEGACY_COMMIT: (UNBOUND_LEGACY_PATH,),
         UNBOUND_CREATION_COMMIT: (UNBOUND_CREATION_PATH,),
+        UNBOUND_LEGACY_REWRITE_COMMIT: (UNBOUND_LEGACY_PATH,),
+        UNBOUND_CREATION_REWRITE_COMMIT: (UNBOUND_CREATION_PATH,),
     }
     for commit, paths in unbound_pins.items():
         pinned = [
@@ -614,6 +618,8 @@ def test_historical_fixture_allowlist_stays_pinned_to_commit_and_path() -> None:
     assert SYNTHETIC_CHANNEL_COMMIT not in global_commits
     assert UNBOUND_LEGACY_COMMIT not in global_commits
     assert UNBOUND_CREATION_COMMIT not in global_commits
+    assert UNBOUND_LEGACY_REWRITE_COMMIT not in global_commits
+    assert UNBOUND_CREATION_REWRITE_COMMIT not in global_commits
 
 
 def test_new_commits_of_the_fixture_shapes_still_match(tmp_path: Path) -> None:
