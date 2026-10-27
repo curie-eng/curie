@@ -274,8 +274,14 @@ Capture reuses the existing release fence. It runs inside
 reclaim the sandbox during capture. Because a capture may take up to 60
 seconds, the capture slice holds the lock through the renewable
 `ThreadLock.hold` lease rather than the plain acquire, and confirms ownership
-with `LockLease.ensure_owned` before `release_if_claim` runs. A lost lease
-abandons the capture, never the release. `release_if_claim` and the
+with `LockLease.ensure_owned` before `release_if_claim` runs.
+`release_if_claim` relies on its caller holding that lock, and a lost lease
+is not reacquired, so a lost lease never proceeds to release. It discards the
+capture, which retains nothing new and records that outcome, and the release
+path then acquires the lock again and calls `release_if_claim` with the
+claim name the run recorded, so it deletes only that claim. If the lock cannot
+be acquired again, cleanup stays deferred, exactly as today's release path
+leaves the claim when its lock acquire fails. `release_if_claim` and the
 conditional `workspace.release` are otherwise unchanged. This ADR does not
 invent a predecessor generation fence. A late release from a
 predecessor still goes through the guarded path and touches only its own claim
@@ -355,7 +361,12 @@ stays gated on this ADR being Accepted.
    2. A late predecessor cleanup, driven through the guarded
       `_release_work_item_sandbox` path after a successor has started, leaves
       the successor's claim, workspace and recovery objects intact.
-   3. A capture that misses the 60-second deadline leaves no visible pointer,
+   3. The thread lock lease is lost during a capture while a successor takes
+      the thread. The capture is discarded and its outcome recorded, the
+      predecessor's release reacquires the lock and releases only its own
+      recorded claim, or stays deferred when it cannot reacquire, and the
+      successor's claim and workspace are intact.
+   4. A capture that misses the 60-second deadline leaves no visible pointer,
       and its staging is collected after 600 seconds.
 3. **Authenticated artifact access.** Seams: `WorkspaceObjectPort.presign_get`
    and `workspace_reference_ttl_seconds`. Tests: a list or status read returns
