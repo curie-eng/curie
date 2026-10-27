@@ -260,6 +260,9 @@ async def _process_event(
             # Completion emit stays at-least-once; turn side effects stay
             # at-most-once for the whole outbox retention period.
             logger.info("event %s already done; skipping", event_id)
+            # @spec HTTP-INVOCATION-EXECUTION-18: the terminal caption clear below
+            # stays a legacy courtesy, so classify before skipping.
+            await identity.classify_skip(self)
             # The skip holds no resolved route of its own and must not
             # invent one, so it makes no sink call -- except to hand off a
             # completion an earlier delivery durably owed and never

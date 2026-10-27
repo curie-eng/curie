@@ -112,6 +112,21 @@ async def prepare(self: Kernel) -> None:
     await check(self, "prepare")
 
 
+async def classify_skip(self: Kernel) -> None:
+    """A context-free skip keeps legacy courtesy only once classified.
+
+    Recognized contexts are not checked again for a delivery that is already done.
+    @spec HTTP-INVOCATION-EXECUTION-18.
+    """
+    carry = CURRENT.get()
+    if carry is None or carry.context is not None:
+        return
+    try:
+        await prepare(self)
+    except (TurnAuthorityUnavailable, HttpIdentityRefused):
+        carry.legacy = False
+
+
 async def check(self: Kernel, stage: Stage) -> None:
     """@spec HTTP-INVOCATION-EXECUTION-8/18."""
     carry = CURRENT.get()
