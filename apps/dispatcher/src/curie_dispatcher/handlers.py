@@ -39,7 +39,9 @@ whether the caller may talk to the bot through this binding (ADR 0175,
 ``admission.AdmissionGate``). A refused caller gets no placeholder and no
 reply; the refusal is logged as ``CALLER_NOT_ALLOWED`` or, when the API could
 not answer and nothing was cached, ``ADMISSION_UNAVAILABLE``, and counted on
-``curie.turn.refused``. Approval-card clicks never start a turn (ADR-0106) and
+``curie.turn.refused``. A selected HTTP receiver's mention lane instead tells a
+refused or unavailable human sender once (HTTP-INVOCATION-EXECUTION-19).
+Approval-card clicks never start a turn (ADR-0106) and
 are not asked. Refusals made *above*
 these listeners by Bolt's own middleware (self events, authorization, listener
 matching) are documented in ``docs/interfaces/channel-ingress/INTERFACE.md``
@@ -57,6 +59,7 @@ import logging
 import re
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from queue import Full, Queue
@@ -106,7 +109,14 @@ from .inbound_text import derive_text
 from .inbound_text import strip_self_mention as _strip_self_mention
 from .marked_actions import MARK, REFUSAL, declared_driver, reserve_turn
 from .queue import claim_event, enqueue
-from .relevance import DropReason, Lane, classify, drop, missing_envelope_fields
+from .relevance import (
+    NON_CONTENT_SUBTYPES,
+    DropReason,
+    Lane,
+    classify,
+    drop,
+    missing_envelope_fields,
+)
 from .thread_context import SlackThreadContext
 
 if TYPE_CHECKING:
@@ -307,6 +317,71 @@ def _refused_caller(
     )
     return True
 
+
+
+# @spec HTTP-INVOCATION-EXECUTION-19: the same words for every refusal reason,
+# and separate retry words when access could not be checked at all.
+SELECTED_REFUSED_TEXT = "Sorry, I can't help with this request."
+SELECTED_UNAVAILABLE_TEXT = (
+    "I couldn't verify your access right now. Please try again in a few minutes."
+)
+
+
+class _SelectedNotices:
+    """Tell a person once why a selected mention was not taken.
+
+    Bounded per listener: a Slack redelivery reuses its native event_id, so a
+    remembered id posts no second notice. @spec HTTP-INVOCATION-EXECUTION-19.
+    """
+
+    _LIMIT = 1024
+
+    def __init__(self, web_client: WebClient, log: logging.Logger) -> None:
+        self._web = web_client
+        self._log = log
+        self._lock = threading.Lock()
+        self._seen: OrderedDict[str, None] = OrderedDict()
+
+    def _first(self, event_id: str) -> bool:
+        with self._lock:
+            if event_id in self._seen:
+                return False
+            self._seen[event_id] = None
+            while len(self._seen) > self._LIMIT:
+                self._seen.popitem(last=False)
+            return True
+
+    def send(
+        self, *, status: str, body: dict[str, Any], event: dict[str, Any], bot_user_id: Any,
+    ) -> None:
+        """Post the fixed notice to a human sender only; never raises."""
+        if status not in {"refused", "unavailable"}:
+            return
+        user, channel = event.get("user"), event.get("channel")
+        event_id, ts, thread_ts = body.get("event_id"), event.get("ts"), event.get("thread_ts")
+        if (
+            event.get("bot_id") or event.get("subtype") in NON_CONTENT_SUBTYPES
+            or type(user) is not str or not user or user == bot_user_id
+            or type(channel) is not str or not channel
+            or type(event_id) is not str or not event_id
+            or type(ts) is not str or not ts
+            or (thread_ts is not None and (type(thread_ts) is not str or not thread_ts))
+            or not self._first(event_id)
+        ):
+            return
+        text = SELECTED_REFUSED_TEXT if status == "refused" else SELECTED_UNAVAILABLE_TEXT
+        try:
+            if channel.startswith("D"):
+                # A direct message has no audience to hide the notice from.
+                self._web.chat_postMessage(channel=channel, thread_ts=thread_ts or ts, text=text)
+            elif thread_ts:
+                self._web.chat_postEphemeral(
+                    channel=channel, user=user, thread_ts=thread_ts, text=text,
+                )
+            else:
+                self._web.chat_postEphemeral(channel=channel, user=user, text=text)
+        except Exception as error:  # noqa: BLE001 - a lost notice changes no outcome
+            self._log.warning("selected mention notice failed error=%s", type(error).__name__)
 
 def _mint_turn(
     *,
@@ -940,6 +1015,8 @@ def register_handlers(
     log = logger or logging.getLogger(__name__)
 
     driver_approval_probe = _DriverApprovalProbe()
+    # @spec HTTP-INVOCATION-EXECUTION-19: only the selected mention lane notifies.
+    selected_notices = None if http_receiver is None else _SelectedNotices(web_client, log)
 
     def _driver_approval_owner(
         body: dict[str, Any],
@@ -1025,6 +1102,11 @@ def register_handlers(
                     log, DropReason.CALLER_NOT_ALLOWED if result.status == "refused"
                     else DropReason.ADMISSION_UNAVAILABLE, lane="mention",
                     event_id=str(body.get("event_id") or ""),
+                )
+                assert selected_notices is not None
+                selected_notices.send(
+                    status=result.status, body=body, event=event,
+                    bot_user_id=context.get("bot_user_id"),
                 )
             return
         process_event(
