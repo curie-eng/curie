@@ -27,7 +27,8 @@ _MAX_TOKEN = 16_384
 _KEY_ID = re.compile(r"[A-Za-z0-9_-]{1,64}\Z", re.ASCII)
 _UUID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\Z", re.ASCII)
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
-_BASE64 = re.compile(r"[A-Za-z0-9_-]+\Z", re.ASCII)
+# A set test, not a regex: linear on any input. @spec HTTP-INVOCATION-EXECUTION-13.
+_BASE64 = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
 _PREFIXES = {"receiver": "curie-receiver-v1", "context": "curie-context-v1"}
 
 
@@ -326,7 +327,7 @@ def _constant(value: str) -> Never:
 
 def _decode(segment: str) -> bytes:
     """@spec HTTP-INVOCATION-EXECUTION-13."""
-    if not _BASE64.fullmatch(segment):
+    if not segment or not _BASE64.issuperset(segment):
         raise ValueError
     result = b64url_decode(segment)
     if b64url(result) != segment:
