@@ -2,7 +2,7 @@
 
 @spec HTTP-PRINCIPAL-ADOPTION-V1-2.
 Revision ID: 0132
-Revises: 0131
+Revises: 0136
 """
 
 from collections.abc import Sequence
@@ -12,7 +12,7 @@ from alembic import op
 from sqlalchemy.dialects import postgresql
 
 revision: str = "0132"
-down_revision: str = "0131"
+down_revision: str = "0136"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

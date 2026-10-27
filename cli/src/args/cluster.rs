@@ -902,7 +902,7 @@ pub(crate) enum ClusterAction {
         /// Clear the thinking override back to the platform default.
         #[arg(long)]
         clear_thinking: bool,
-        /// Pin this agent's run deadline in seconds (60-10800; platform
+        /// Pin this agent's run deadline in seconds (60-43200; platform
         /// default is 1800s).
         #[arg(long)]
         execution_deadline: Option<String>,

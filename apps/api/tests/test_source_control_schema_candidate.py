@@ -67,7 +67,7 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     assert data["windows"].get("0.14.0") == {"schema_min": "0122", "schema_head": "0122"}
     assert data["windows"].get("0.14.1") == {"schema_min": "0123", "schema_head": "0123"}
     assert data["windows"].get("0.14.2") == {"schema_min": "0123", "schema_head": "0123"}
-    assert data["revisions"][-20:] == [
+    assert data["revisions"][-21:] == [
         "0095",
         "0096",
         "0097",
@@ -86,6 +86,7 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
         "0123",
         "0130",
         "0131",
+        "0136",
         "0132",
         "0133",
     ]
@@ -102,6 +103,7 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     assert kinds["0130"] == "expand"
     assert kinds["0123"] == "expand"
     assert kinds["0131"] == "expand"
+    assert kinds["0136"] == "expand"
     assert kinds["0132"] == "expand"
     assert kinds["0133"] == "expand"
 
