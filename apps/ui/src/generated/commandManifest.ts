@@ -3383,7 +3383,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Pin this agent's run deadline in seconds (60-10800; platform default is 1800s)",
+              "help": "Pin this agent's run deadline in seconds (60-43200; platform default is 1800s)",
               "id": "execution_deadline",
               "long": "execution-deadline",
               "positional": false,
@@ -6379,7 +6379,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Pin this agent's run deadline in seconds (60-10800; platform default is 1800s)",
+              "help": "Pin this agent's run deadline in seconds (60-43200; platform default is 1800s)",
               "id": "execution_deadline",
               "long": "execution-deadline",
               "positional": false,

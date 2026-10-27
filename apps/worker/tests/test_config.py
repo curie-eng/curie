@@ -1046,17 +1046,17 @@ def test_runner_total_timeout_accepts_short_programmatic_values_and_maximum(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The chart and Python config accept positive timeout values, including
-    sub-minute values; only positivity and the 10800s ceiling (#3071) apply."""
+    sub-minute values; only positivity and the 43200s ceiling (#5067) apply."""
     _clear_all_config_env(monkeypatch)
 
     short = _lease_config(runner_total_timeout_s=0.5)
     maximum = _lease_config(
-        delivery_budget_s=10800.0,
-        runner_total_timeout_s=10800.0,
+        delivery_budget_s=43200.0,
+        runner_total_timeout_s=43200.0,
     )
 
     assert short.runner_total_timeout_s == 0.5
-    assert maximum.runner_total_timeout_s == 10800.0
+    assert maximum.runner_total_timeout_s == 43200.0
 
 
 @pytest.mark.parametrize(
@@ -1064,8 +1064,8 @@ def test_runner_total_timeout_accepts_short_programmatic_values_and_maximum(
     [
         (0.0, "greater_than"),
         (-0.1, "greater_than"),
-        (10800.1, "less_than_equal"),
-        (10801.0, "less_than_equal"),
+        (43200.1, "less_than_equal"),
+        (43201.0, "less_than_equal"),
     ],
 )
 def test_runner_total_timeout_rejects_programmatic_values_outside_its_bounds(
@@ -1076,7 +1076,7 @@ def test_runner_total_timeout_rejects_programmatic_values_outside_its_bounds(
     _clear_all_config_env(monkeypatch)
 
     with pytest.raises(ValidationError) as exc_info:
-        _lease_config(delivery_budget_s=10800.0, runner_total_timeout_s=value)
+        _lease_config(delivery_budget_s=43200.0, runner_total_timeout_s=value)
 
     assert any(
         error["loc"] == ("runner_total_timeout_s",) and error["type"] == error_type
@@ -1102,29 +1102,29 @@ def test_runner_total_timeout_rejects_zero_from_the_canonical_env(
 def test_delivery_budget_accepts_the_adr_maximum_and_rejects_above_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """#3071 raised the maximum to 10800s (three hours) so a long factory run
+    """#5067 raised the maximum to 43200s (twelve hours) so a long factory run
     fits one delivery. Anything above it is refused at boot."""
     _clear_all_config_env(monkeypatch)
 
-    assert _lease_config(delivery_budget_s=10800.0).delivery_budget_s == 10800.0
+    assert _lease_config(delivery_budget_s=43200.0).delivery_budget_s == 43200.0
 
     with pytest.raises(ValueError):
-        _lease_config(delivery_budget_s=10801.0)
+        _lease_config(delivery_budget_s=43201.0)
 
 
 def test_delivery_budget_maximum_is_read_from_the_canonical_env(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _clear_all_config_env(monkeypatch)
-    monkeypatch.setenv("CURIE_DELIVERY_BUDGET_S", "10800")
-    monkeypatch.setenv("CURIE_RUNNER_TOTAL_TIMEOUT_S", "10800")
+    monkeypatch.setenv("CURIE_DELIVERY_BUDGET_S", "43200")
+    monkeypatch.setenv("CURIE_RUNNER_TOTAL_TIMEOUT_S", "43200")
 
     config = WorkerConfig()
 
-    assert config.delivery_budget_s == 10800.0
-    assert config.runner_total_timeout_s == 10800.0
+    assert config.delivery_budget_s == 43200.0
+    assert config.runner_total_timeout_s == 43200.0
 
-    monkeypatch.setenv("CURIE_DELIVERY_BUDGET_S", "10801")
+    monkeypatch.setenv("CURIE_DELIVERY_BUDGET_S", "43201")
     with pytest.raises(ValidationError) as exc_info:
         WorkerConfig()
     assert any(
@@ -1140,7 +1140,7 @@ def test_runner_ceiling_still_bounded_by_budget_at_the_raised_maximum(
     _clear_all_config_env(monkeypatch)
 
     with pytest.raises(ValueError) as exc_info:
-        _lease_config(delivery_budget_s=600.0, runner_total_timeout_s=10800.0)
+        _lease_config(delivery_budget_s=600.0, runner_total_timeout_s=43200.0)
 
     assert "CURIE_RUNNER_TOTAL_TIMEOUT_S" in str(exc_info.value)
     assert "CURIE_DELIVERY_BUDGET_S" in str(exc_info.value)
@@ -1149,14 +1149,14 @@ def test_runner_ceiling_still_bounded_by_budget_at_the_raised_maximum(
 def test_termination_grace_must_cover_the_raised_maximum_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A declared grace still has to cover budget + reserve at 10800s."""
+    """A declared grace still has to cover budget + reserve at 43200s."""
     _clear_all_config_env(monkeypatch)
 
-    ok = _lease_config(delivery_budget_s=10800.0, termination_grace_period_s=10860.0)
-    assert ok.termination_grace_period_s == 10860.0
+    ok = _lease_config(delivery_budget_s=43200.0, termination_grace_period_s=43260.0)
+    assert ok.termination_grace_period_s == 43260.0
 
     with pytest.raises(ValueError) as exc_info:
-        _lease_config(delivery_budget_s=10800.0, termination_grace_period_s=10859.0)
+        _lease_config(delivery_budget_s=43200.0, termination_grace_period_s=43259.0)
     assert "CURIE_TERMINATION_GRACE_PERIOD_S" in str(exc_info.value)
 
 
