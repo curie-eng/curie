@@ -565,8 +565,9 @@ print(json.dumps(graph))
         // @spec DEPLOY-NOTICE-RELEASE-1.
         // @spec AGENT-ROLE-PERSISTENCE-V1-9: current policy reads require 0133.
         let candidate = source_candidate_window();
-        assert_eq!(candidate.schema_min, "0133");
-        assert_eq!(candidate.schema_head, "0133");
+        // @spec HTTP-APPROVAL-CONTINUITY-5: approval ORM reads require 0137.
+        assert_eq!(candidate.schema_min, "0137");
+        assert_eq!(candidate.schema_head, "0137");
         assert_eq!(
             candidate.schema_head.as_str(),
             catalog().revisions.last().unwrap()
@@ -592,7 +593,9 @@ print(json.dumps(graph))
         assert!(!live_in_window("0136", &current));
         // @spec AGENT-ROLE-PERSISTENCE-V1-9: policy ORM requires 0133.
         assert!(!live_in_window("0132", &current));
-        assert!(live_in_window("0133", &current));
+        // @spec HTTP-APPROVAL-CONTINUITY-5: approval ORM requires 0137.
+        assert!(!live_in_window("0133", &current));
+        assert!(live_in_window("0137", &current));
         assert!(!live_in_window("0075", &current));
         assert!(!live_in_window("0076", &current));
         let retained = window_for("0.12.0").expect("published foundation remains catalogued");

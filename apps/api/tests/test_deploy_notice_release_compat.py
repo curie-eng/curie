@@ -48,7 +48,8 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
     # policies (0121), directory authority (0122), and attachment catalogs (0130).
     released_0130 = {"schema_min": "0108", "schema_head": "0108"}
     # @spec AGENT-ROLE-PERSISTENCE-V1-9: policy ORM reads require 0133.
-    candidate = {"schema_min": "0133", "schema_head": "0133"}
+    # @spec HTTP-APPROVAL-CONTINUITY-5: approval ORM reads require the 0137 column.
+    candidate = {"schema_min": "0137", "schema_head": "0137"}
     assert catalog["windows"]["0.12.0"] == released
     assert catalog["windows"]["0.12.0-rc.1"] == released
     assert catalog["windows"]["0.12.1"] == stable
@@ -56,10 +57,10 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
     assert catalog["windows"]["0.12.3"] == {"schema_min": "0076", "schema_head": "0093"}
     assert catalog["candidate"] == candidate
     assert catalog["windows"]["0.13.0"] == released_0130
-    assert catalog["revisions"][-21:] == [
+    assert catalog["revisions"][-22:] == [
         "0095", "0096", "0097", "0098", "0099", "0100", "0101", "0102", "0103",
         "0105", "0107", "0108", "0120", "0121", "0122", "0123", "0130", "0131",
-        "0136", "0132", "0133",
+        "0136", "0132", "0133", "0137",
     ]
     assert "0074" not in catalog["revisions"]
     prior_windows = json.loads(

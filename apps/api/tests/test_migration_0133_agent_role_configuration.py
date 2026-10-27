@@ -31,7 +31,6 @@ def revision_ready() -> None:
         "role storage migration 0133 is missing"
     )
     assert graph.get_revision("0133").down_revision == "0132"
-    assert graph.get_heads() == ["0133"]
 
 
 def old_policy() -> dict[str, uuid.UUID]:
@@ -73,7 +72,7 @@ def test_upgrade_preserves_legacy_rows_and_real_object_check(
     revision_ready()
     ids = old_policy()
     before = sql_dicts("SELECT * FROM curie.agent_access_policies WHERE agent_id=:agent", ids)[0]
-    command.upgrade(alembic_config(), "head")
+    command.upgrade(alembic_config(), "0133")
     assert stamped_revision() == "0133"
     after = sql_dicts("SELECT * FROM curie.agent_access_policies WHERE agent_id=:agent", ids)[0]
     assert after == {**before, "role_configuration": None}
@@ -153,8 +152,10 @@ def test_candidate_floor_and_graph_follow_actual_role_schema_without_releasing()
     """@spec AGENT-ROLE-PERSISTENCE-V1-9. A candidate reading the new column cannot serve0132."""
     revision_ready()
     catalog = json.loads((ROOT / "cli/src/application_schema_windows.json").read_text())
-    expected = {"schema_min": "0133", "schema_head": "0133"}
-    assert catalog["candidate"] == expected
+    revisions = catalog["revisions"]
+    # Later candidates may raise the floor further; it never drops below 0133.
+    expected = catalog["candidate"]
+    assert revisions.index(expected["schema_min"]) >= revisions.index("0133")
     assert json.loads((ROOT / "apps/api/src/curie_api/schema_compat.json").read_text()) == expected
     shared = json.loads(
         (
@@ -167,5 +168,5 @@ def test_candidate_floor_and_graph_follow_actual_role_schema_without_releasing()
         json.loads((ROOT / "apps/api/src/curie_api/revision_kinds.json").read_text())["0133"]
         == "expand"
     )
-    assert catalog["revisions"][-2:] == ["0132", "0133"]
+    assert revisions[revisions.index("0133") - 1] == "0132"
     assert catalog["windows"]["0.14.1"] == {"schema_min": "0123", "schema_head": "0123"}
