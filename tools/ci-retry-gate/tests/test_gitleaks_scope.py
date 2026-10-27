@@ -532,6 +532,108 @@ def test_repository_identifier_rules_preserve_case_and_clone_verdicts(
     assert {finding["RuleID"] for finding in findings} == expected_rules
 
 
+FACTORY_FIXTURE_COMMIT = "5f98d1bce852a94c4545c27a599d24a314a23f59"
+SYNTHETIC_CHANNEL_COMMIT = "f0c43984edaf749321d5aa0bbc0854160ba15fbf"
+FACTORY_FIXTURE_PATHS = (
+    r"^tools/factory-e2e/tests/test_acceptance\.py$",
+    r"^tools/factory-e2e/tests/test_factory_e2e_loop\.py$",
+    r"^tools/factory-e2e/tests/test_gitlab_acceptance\.py$",
+)
+SYNTHETIC_CHANNEL_PATH = r"^apps/worker/src/curie_worker/eval/learning\.py$"
+
+
+def _rule(rule_id: str) -> dict[str, Any]:
+    rules = _gitleaks_config()["rules"]
+    assert isinstance(rules, list)
+    matches = [rule for rule in rules if isinstance(rule, dict) and rule.get("id") == rule_id]
+    assert len(matches) == 1, rule_id
+    rule = matches[0]
+    assert isinstance(rule, dict)
+    return rule
+
+
+def test_historical_fixture_allowlist_stays_pinned_to_commit_and_path() -> None:
+    """History-only fixture hits are excused by commit and path together.
+
+    A path-wide or pattern-wide excuse would hide the same text if it came back.
+    The global commit list would hide every other finding in those commits.
+    """
+    factory_lists = _rule("cross-repo-issue-ref").get("allowlists")
+    assert isinstance(factory_lists, list)
+    factory_pinned = [
+        item
+        for item in factory_lists
+        if isinstance(item, dict)
+        and item.get("condition") == "AND"
+        and item.get("commits") == [FACTORY_FIXTURE_COMMIT]
+    ]
+    assert len(factory_pinned) == 1
+    assert tuple(factory_pinned[0].get("paths")) == FACTORY_FIXTURE_PATHS
+    assert not factory_pinned[0].get("regexes")
+    assert not factory_pinned[0].get("stopwords")
+    own_repo = [item for item in factory_lists if isinstance(item, dict) and item.get("regexes")]
+    assert own_repo
+    assert all(item.get("condition") in (None, "", "OR") for item in own_repo)
+
+    slack_lists = _rule("slack-conversation-id").get("allowlists")
+    assert isinstance(slack_lists, list)
+    slack_pinned = [
+        item
+        for item in slack_lists
+        if isinstance(item, dict)
+        and item.get("condition") == "AND"
+        and item.get("commits") == [SYNTHETIC_CHANNEL_COMMIT]
+    ]
+    assert len(slack_pinned) == 1
+    assert tuple(slack_pinned[0].get("paths")) == (SYNTHETIC_CHANNEL_PATH,)
+    assert not slack_pinned[0].get("regexes")
+    assert not slack_pinned[0].get("stopwords")
+
+    global_commits = set(_gitleaks_config()["allowlist"].get("commits") or [])
+    assert FACTORY_FIXTURE_COMMIT not in global_commits
+    assert SYNTHETIC_CHANNEL_COMMIT not in global_commits
+
+
+def test_new_commits_of_the_fixture_shapes_still_match(tmp_path: Path) -> None:
+    """The pinned commits do not excuse the same fixture text anywhere else."""
+    repo, base_sha = _new_repo(tmp_path / "repo")
+    (repo / ".gitleaks.toml").write_bytes(GITLEAKS_CONFIG_PATH.read_bytes())
+    display_key = "".join(("acme", "/fixture#", "7"))
+    channel = "".join(("C0", "SYNTHETIC"))
+    factory_paths = (
+        "tools/factory-e2e/tests/test_acceptance.py",
+        "tools/factory-e2e/tests/test_factory_e2e_loop.py",
+        "tools/factory-e2e/tests/test_gitlab_acceptance.py",
+        "tools/factory-e2e/tests/other_probe.py",
+    )
+    for relative in factory_paths:
+        path = repo / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f'display_key = "{display_key}"\n', encoding="utf-8")
+    learning = repo / "apps/worker/src/curie_worker/eval/learning.py"
+    learning.parent.mkdir(parents=True, exist_ok=True)
+    learning.write_text(f'SYNTHETIC_CHANNEL = "{channel}"\n', encoding="utf-8")
+    other = repo / "apps/worker/src/curie_worker/eval/other.py"
+    other.write_text(f'SYNTHETIC_CHANNEL = "{channel}"\n', encoding="utf-8")
+    head_sha = _commit(repo, "reintroduce fixture shapes")
+
+    scan = _scan(repo, f"{base_sha}..{head_sha}", report_path="/repo/findings.json")
+
+    assert scan.returncode == 1, _scan_diagnostics(scan)
+    findings = json.loads((repo / "findings.json").read_text(encoding="utf-8"))
+    by_file: dict[str, set[str]] = {}
+    for finding in findings:
+        by_file.setdefault(str(finding["File"]), set()).add(str(finding["RuleID"]))
+    for relative in factory_paths:
+        assert "cross-repo-issue-ref" in by_file.get(relative, set()), by_file
+    assert "slack-conversation-id" in by_file.get(
+        "apps/worker/src/curie_worker/eval/learning.py", set()
+    ), by_file
+    assert "slack-conversation-id" in by_file.get(
+        "apps/worker/src/curie_worker/eval/other.py", set()
+    ), by_file
+
+
 def _path_allowlist() -> list[re.Pattern[str]]:
     paths = _gitleaks_config()["allowlist"]["paths"]
     assert isinstance(paths, list)
