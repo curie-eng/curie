@@ -255,11 +255,15 @@ class SandboxSubstrate:
             or any(pod.claim_name == name for pod in inventory.pods.values())
         )
 
-    def _admission_inventory(self, *, timeout: float = 1.0) -> CapacityInventory:
+    def _admission_inventory(
+        self, *, known_claim_resources: Mapping[str, Mapping[str, str]], timeout: float = 1.0
+    ) -> CapacityInventory:
         config = self._config.admission
         assert config is not None
         return self._k8s.capacity_inventory(
-            priority_class=config.priority_class, request_timeout_seconds=min(1.0, timeout)
+            priority_class=config.priority_class,
+            known_claim_resources=known_claim_resources,
+            request_timeout_seconds=min(1.0, timeout),
         )
 
     def _reconcile_admission(self, *, deadline: float | None = None) -> CapacityInventory:
@@ -272,7 +276,10 @@ class SandboxSubstrate:
             remaining = 1.0 if deadline is None else deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("sandbox admission reconciliation deadline expired")
-            return self._admission_inventory(timeout=remaining)
+            return self._admission_inventory(
+                known_claim_resources={name: row.resources for name, row in entries.items()},
+                timeout=remaining,
+            )
 
         inventory = read()
         grace = self._config.claim_timeout_seconds + REAP_GRACE_MARGIN_SECONDS

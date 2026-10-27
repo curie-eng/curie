@@ -15,6 +15,7 @@ import copy
 import logging
 import re
 import time
+from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -636,16 +637,24 @@ class KubernetesSandboxClient:
         return spec
 
     def _capacity_pod_spec(
-        self, spec: dict[str, Any], *, request_timeout_seconds: float
+        self,
+        spec: dict[str, Any],
+        *,
+        runtime_class_overheads: dict[str, dict[str, str]],
+        request_timeout_seconds: float,
     ) -> dict[str, Any]:
         pod = copy.deepcopy(spec)
         runtime_class = pod.get("runtimeClassName")
         if runtime_class and not pod.get("overhead"):
-            runtime = self._node_api.read_runtime_class(
-                runtime_class, _request_timeout=request_timeout_seconds
-            )
-            overhead = getattr(runtime, "overhead", None)
-            pod["overhead"] = getattr(overhead, "pod_fixed", None) or {}
+            if runtime_class not in runtime_class_overheads:
+                runtime = self._node_api.read_runtime_class(
+                    runtime_class, _request_timeout=request_timeout_seconds
+                )
+                overhead = getattr(runtime, "overhead", None)
+                runtime_class_overheads[runtime_class] = (
+                    getattr(overhead, "pod_fixed", None) or {}
+                )
+            pod["overhead"] = runtime_class_overheads[runtime_class]
         return pod
 
     def claim_resources(
@@ -667,11 +676,16 @@ class KubernetesSandboxClient:
                 raise ValueError("runner resources require an agent name")
             source = claim_resources_spec(source, runner_resources)
         return pod_resources(self._capacity_pod_spec(
-            source["podTemplate"]["spec"], request_timeout_seconds=timeout
+            source["podTemplate"]["spec"], runtime_class_overheads={},
+            request_timeout_seconds=timeout,
         ))
 
     def capacity_inventory(
-        self, *, priority_class: str, request_timeout_seconds: float
+        self,
+        *,
+        priority_class: str,
+        known_claim_resources: Mapping[str, Mapping[str, str]],
+        request_timeout_seconds: float,
     ) -> CapacityInventory:
         observed_at = time.time()
         deadline = time.monotonic() + request_timeout_seconds
@@ -695,22 +709,15 @@ class KubernetesSandboxClient:
         ).items
         footprints: dict[str, dict[str, str]] = {}
         claim_names: set[str] = set()
-        pool_specs: dict[str, dict[str, Any]] = {}
-        for claim in claims:
-            name = claim["metadata"]["name"]
-            pool = claim["spec"]["warmPoolRef"]["name"]
-            if pool not in pool_specs:
-                pool_specs[pool] = self._source_template_spec(
-                    self._pool_template_name(pool, request_timeout_seconds=budget()),
-                    request_timeout_seconds=budget(),
-                )["podTemplate"]["spec"]
-            spec = pool_specs[pool]
-            if spec.get("priorityClassName", priority_class) != priority_class:
-                continue
-            claim_names.add(name)
-            footprints[name] = pod_resources(self._capacity_pod_spec(
-                spec, request_timeout_seconds=budget()
-            ))
+        runtime_class_overheads: dict[str, dict[str, str]] = {}
+
+        def record_footprint(identity: str, footprint: dict[str, str]) -> None:
+            previous = footprints.get(identity, {})
+            footprints[identity] = {
+                key: format(max(Decimal(value), Decimal(previous.get(key, "0"))), "f")
+                for key, value in footprint.items()
+            }
+
         owners: dict[str, str | None] = {}
         owners_by_uid: dict[str, str | None] = {}
         owner_modes: dict[str, list[str | None]] = {}
@@ -730,14 +737,11 @@ class KubernetesSandboxClient:
             owners_by_uid[metadata["uid"]] = owner
             if pod_spec:
                 footprint = pod_resources(self._capacity_pod_spec(
-                    pod_spec, request_timeout_seconds=budget()
+                    pod_spec, runtime_class_overheads=runtime_class_overheads,
+                    request_timeout_seconds=budget(),
                 ))
                 identity = owner or f"sandbox:{metadata['name']}"
-                previous = footprints.get(identity, {})
-                footprints[identity] = {
-                    key: format(max(Decimal(value), Decimal(previous.get(key, "0"))), "f")
-                    for key, value in footprint.items()
-                }
+                record_footprint(identity, footprint)
             if owner:
                 owner_modes.setdefault(owner, []).append(spec.get("operatingMode"))
         chargeable: dict[str, CapacityPod] = {}
@@ -766,10 +770,39 @@ class KubernetesSandboxClient:
                 owner = (metadata.labels or {}).get(ADMISSION_CLAIM_LABEL)
             if not metadata.uid:
                 raise ValueError("sandbox capacity Pod has no UID")
+            footprint = pod_resources(pod.spec.to_dict())
             chargeable[metadata.uid] = CapacityPod(
                 claim_name=owner,
-                resources=pod_resources(pod.spec.to_dict()),
+                resources=footprint,
             )
+            if owner is not None:
+                record_footprint(owner, footprint)
+        pool_templates: dict[str, str] = {}
+        template_specs: dict[str, dict[str, Any]] = {}
+        for claim in claims:
+            name = claim["metadata"]["name"]
+            if name not in footprints:
+                if name in known_claim_resources:
+                    footprints[name] = dict(known_claim_resources[name])
+                else:
+                    pool = claim["spec"]["warmPoolRef"]["name"]
+                    if pool not in pool_templates:
+                        pool_templates[pool] = self._pool_template_name(
+                            pool, request_timeout_seconds=budget()
+                        )
+                    template = pool_templates[pool]
+                    if template not in template_specs:
+                        template_specs[template] = self._source_template_spec(
+                            template, request_timeout_seconds=budget()
+                        )["podTemplate"]["spec"]
+                    spec = template_specs[template]
+                    if spec.get("priorityClassName", priority_class) != priority_class:
+                        continue
+                    footprints[name] = pod_resources(self._capacity_pod_spec(
+                        spec, runtime_class_overheads=runtime_class_overheads,
+                        request_timeout_seconds=budget(),
+                    ))
+            claim_names.add(name)
         budget()
         return CapacityInventory(
             claims=frozenset(claim_names), sandboxes=owners, pods=chargeable,

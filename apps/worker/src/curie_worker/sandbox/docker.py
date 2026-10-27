@@ -899,7 +899,11 @@ class DockerSandboxClient:
         raise ValueError("Docker substrate does not support Kubernetes quota admission")
 
     def capacity_inventory(
-        self, *, priority_class: str, request_timeout_seconds: float
+        self,
+        *,
+        priority_class: str,
+        known_claim_resources: Mapping[str, Mapping[str, str]],
+        request_timeout_seconds: float,
     ) -> CapacityInventory:
         raise ValueError("Docker substrate does not support Kubernetes quota admission")
 

@@ -560,7 +560,11 @@ class SandboxClient(Protocol):
     ) -> dict[str, str]: ...
 
     def capacity_inventory(
-        self, *, priority_class: str, request_timeout_seconds: float
+        self,
+        *,
+        priority_class: str,
+        known_claim_resources: Mapping[str, Mapping[str, str]],
+        request_timeout_seconds: float,
     ) -> CapacityInventory: ...
 
     def read_quota(
