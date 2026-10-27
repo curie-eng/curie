@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 from typing import Any
+from urllib.parse import urlencode
 
 
 class ObservationError(RuntimeError):
@@ -231,22 +232,17 @@ class _Collector:
         self._readers.append(reader)
         reader.start()
 
+    def _resource_path(self, source: str) -> str:
+        resource, group = _KINDS[source].split(".", 1)
+        return f"/apis/{group}/v1beta1/namespaces/{self.namespace}/{resource}"
+
     def _watch(self, source: str) -> None:
-        self._stream(
-            source,
-            [
-                "get", _KINDS[source], "--watch-only", "--output-watch-events", "-o", "json",
-                "--resource-version", self._versions[source],
-            ],
-        )
+        query = urlencode({"watch": "true", "resourceVersion": self._versions[source]})
+        self._stream(source, ["get", "--raw", f"{self._resource_path(source)}?{query}"])
 
     def _start_objects(self) -> None:
-        for source, kind in _KINDS.items():
-            resource, group = kind.split(".", 1)
-            initial = self._request_json(
-                "get", "--raw",
-                f"/apis/{group}/v1beta1/namespaces/{self.namespace}/{resource}",
-            )
+        for source in _KINDS:
+            initial = self._request_json("get", "--raw", self._resource_path(source))
             items = initial.get("items")
             metadata = initial.get("metadata")
             version = metadata.get("resourceVersion") if isinstance(metadata, dict) else None
