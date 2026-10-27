@@ -4572,6 +4572,40 @@ class _Campaign:
                 return False
         return True
 
+    def retire_runners(self, scope: Mapping[str, Any]) -> None:
+        """Thread runners stay running between turns, so a finished scenario's idle runners
+        would pile up across the campaign and saturate the Docker engine. The substrate
+        evicts a missing runner's route and re-claims, so a later scheduled fire still gets one."""
+        assert self.stack is not None
+        action: dict[str, Any] = {
+            "repetition": scope["repetition"],
+            "case_id": scope["case_id"],
+            "agent_id": scope["agent_id"],
+            "action": "retire-runners",
+            "containers": 0,
+        }
+        try:
+            ids = _docker_lines(
+                "container",
+                "ls",
+                "--no-trunc",
+                "--filter",
+                f"label=curietech.ai/stack={self.stack.project}_runner",
+                "--filter",
+                f"label=curietech.ai/agent={scope['agent_id']}",
+                "--filter",
+                "status=running",
+                "--format",
+                "{{.ID}}",
+            )
+            if ids:
+                _docker_lines("container", "rm", "--force", *ids)
+            action["containers"] = len(ids)
+        except (_Invalid, OSError, subprocess.SubprocessError) as exc:
+            action["containers"] = 0
+            action["error"] = (str(exc) or type(exc).__name__)[:200]
+        self.quiesce_actions.append(action)
+
     def sweep_schedules(self, scope: Mapping[str, Any]) -> None:
         """After every actor turn, no active schedule may stay unreserved: bind it to a
         pending reservation, else reserve it if that fits, else cancel it at once
@@ -4992,6 +5026,7 @@ class _Campaign:
         if control is not None:
             control(scope, fixture, agent_id, thread, after, values)
         self.reconcile_fires(scope)
+        self.retire_runners(scope)
         self.lower_fire_cap(scope)
 
     def record_control(
