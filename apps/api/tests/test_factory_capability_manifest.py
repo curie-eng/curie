@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 from curie_api import bundles, factory_capabilities
 from curie_api.config import get_settings
+from curie_api.storage import build_s3_client
 from plugin_format import connector_lock
 from plugin_format.connectors import ConnectorBuild
 
@@ -225,3 +226,12 @@ def test_deployment_read_round_trip(
     assert read.json()["bundle_sha256"] == hashlib.sha256(archive).hexdigest()
     assert "credentials" not in read.text
     assert client.get(f"/deployments/{deployment.json()['id']}/capabilities").status_code == 401
+    settings = get_settings()
+    build_s3_client(settings).delete_object(
+        Bucket=settings.bundle_bucket, Key=upload.json()["bundle_ref"]
+    )
+    missing = client.get(
+        f"/deployments/{deployment.json()['id']}/capabilities", headers=auth_headers
+    )
+    assert missing.status_code == 409
+    assert missing.json()["detail"] == "environment_unknown"

@@ -110,7 +110,13 @@ async def read_deployment_capabilities(
     version = await crud_versions.get_version(session, deployment.version_id)
     if version is None or version.bundle_ref is None or version.bundle_sha256 is None:
         raise HTTPException(status.HTTP_409_CONFLICT, "environment_unknown")
-    bundle_data = await store.get(version.bundle_ref)
+    try:
+        bundle_data = await store.get(version.bundle_ref)
+    except Exception as exc:
+        # The object-store port permits different backends and does not fix an
+        # exception type for absent/unreadable bytes. No readable bundle means
+        # admission cannot establish this deployment's environment.
+        raise HTTPException(status.HTTP_409_CONFLICT, "environment_unknown") from exc
     try:
         claim = await run_in_threadpool(
             factory_capabilities.read_manifest,
