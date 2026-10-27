@@ -514,6 +514,7 @@ spec:
           {{- $codeHostTrust := include "curie.codeHostTrust.name" . }}
           {{- $forgeCredentials := include "curie.factory.hasCredentials" . }}
           {{- $httpIdentity := include "curie.httpIdentity.apiSecret" . }}
+          {{- $providerCa := include "curie.httpIdentity.providerCaBundle" . }}
           {{- if or $codeHostTrust $forgeCredentials $httpIdentity }}
           volumeMounts:
             {{- include "curie.codeHostTrust.volumeMount" . | nindent 12 }}
@@ -529,7 +530,7 @@ spec:
         {{- include "curie.codeHostTrust.volume" . | nindent 8 }}
         {{- include "curie.factory.credentialVolume" . | nindent 8 }}
         {{- if $httpIdentity }}
-        {{- include "curie.httpIdentity.volume" (dict "name" "http-identity" "secret" $httpIdentity "file" "api-runtime.json") | nindent 8 }}
+        {{- include "curie.httpIdentity.volume" (dict "name" "http-identity" "secret" $httpIdentity "files" (compact (list "api-runtime.json" (ternary "provider-ca.pem" "" (eq $providerCa "true"))))) | nindent 8 }}
         {{- end }}
       {{- end }}
 {{- end }}

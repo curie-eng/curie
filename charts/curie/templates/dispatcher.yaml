@@ -168,6 +168,6 @@ spec:
           {{- end }}
       {{- if $httpReceiver }}
       volumes:
-        {{- include "curie.httpIdentity.volume" (dict "name" "http-receiver" "secret" $httpReceiver "file" "receivers.json") | nindent 8 }}
+        {{- include "curie.httpIdentity.volume" (dict "name" "http-receiver" "secret" $httpReceiver "files" (list "receivers.json")) | nindent 8 }}
       {{- end }}
 {{- end }}

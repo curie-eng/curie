@@ -11,6 +11,10 @@
           "maxLength": 253,
           "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$",
           "description": "Operator-created Secret holding this workload's HTTP identity operator file (HTTP-INVOCATION-EXECUTION-20). Empty renders nothing."
+        },
+        "providerCaBundle": {
+          "type": "boolean",
+          "description": "API only: also mount the Secret's provider-ca.pem key as the only trust anchor for provider lookups."
         }
       }
     },

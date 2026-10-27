@@ -3016,6 +3016,14 @@ github code host together. */ -}}
 {{- define "curie.httpIdentity.apiSecret" -}}
 {{- dig "httpIdentity" "existingSecret" "" (.Values.api | default dict) -}}
 {{- end -}}
+{{- define "curie.httpIdentity.providerCaBundle" -}}
+{{- if dig "httpIdentity" "providerCaBundle" false (.Values.api | default dict) -}}
+{{- if not (include "curie.httpIdentity.apiSecret" .) -}}
+{{- fail "api.httpIdentity.providerCaBundle requires api.httpIdentity.existingSecret: the CA bundle is a key of that Secret" -}}
+{{- end -}}
+true
+{{- end -}}
+{{- end -}}
 {{- define "curie.httpIdentity.receiverSecret" -}}
 {{- $name := dig "httpIdentity" "existingSecret" "" (.Values.dispatcher | default dict) -}}
 {{- if and $name (not (include "curie.httpIdentity.apiSecret" .)) -}}
@@ -3023,13 +3031,15 @@ github code host together. */ -}}
 {{- end -}}
 {{- $name -}}
 {{- end -}}
-{{/* One operator Secret key as a 0440 file; only the named workload mounts it. */}}
+{{/* Named operator Secret keys as 0440 files; only the named workload mounts them. */}}
 {{- define "curie.httpIdentity.volume" -}}
 - name: {{ .name }}
   secret:
     secretName: {{ .secret | quote }}
     defaultMode: 0440
     items:
-      - key: {{ .file }}
-        path: {{ .file }}
+      {{- range .files }}
+      - key: {{ . }}
+        path: {{ . }}
+      {{- end }}
 {{- end -}}

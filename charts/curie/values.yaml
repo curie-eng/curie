@@ -1446,9 +1446,12 @@ api:
   # container alone and read once at startup; the chart never creates, reads or
   # checksums it, so roll the API after changing it. The provider's lookup host
   # must also be allowed by api.egress. Rendering this is wiring, not
-  # activation: see charts/curie/README.md.
+  # activation: see charts/curie/README.md. providerCaBundle: true also mounts
+  # that Secret's provider-ca.pem key, the private CA bundle that then becomes
+  # the only trust anchor for provider lookups (hostnames are still verified).
   httpIdentity:
     existingSecret: ""
+    providerCaBundle: false
   # Probe cadences. Database aware /ready keeps the API out of the Service until
   # Postgres responds, while process local /health keeps the process alive.
   # Liveness must outlast readiness. Cutoffs: readiness 120s, liveness 195s.

@@ -2481,6 +2481,7 @@ checksums either one.
 | Value | Secret key | Mounted into | Environment |
 | --- | --- | --- | --- |
 | `api.httpIdentity.existingSecret` | `api-runtime.json` | the `api` container only, at `/var/run/curie/http-identity` | `CURIE_HTTP_IDENTITY_DIR` |
+| `api.httpIdentity.providerCaBundle: true` (with the Secret above) | `provider-ca.pem` (optional) | the same `api` volume, beside `api-runtime.json` | `CURIE_HTTP_IDENTITY_DIR` |
 | `dispatcher.httpIdentity.existingSecret` | `receivers.json` | the `dispatcher` container only, at `/var/run/curie/http-receiver` | `CURIE_HTTP_RECEIVER_DIR` |
 
 Each file is mounted read-only with mode 0440 and the pod's `fsGroup` set to
@@ -2501,7 +2502,17 @@ receiver scope, its bindings with their pinned channel credentials, and the same
 receiver key. Every key is an independently generated 32 bytes in unpadded
 base64url, never derived from or reused as another credential.
 
-Both files are read once at startup. A missing, unsafe or invalid file stops
+`provider-ca.pem` is for a provider whose TLS certificate comes from a private
+CA, such as a cluster issuer. When it is mounted, its certificates are the only
+trust anchors for every provider lookup of that API: no system or environment
+CAs are mixed in, hostname verification stays on and TLS 1.2 is the minimum.
+Providers that need different anchors in one installation are not supported.
+The file holds one through 16 PEM `CERTIFICATE` blocks, each a CA certificate
+(basicConstraints CA true), separated only by newlines, at most 262,144 ASCII
+bytes. An empty, malformed or non-CA bundle stops the API. Leaving
+`providerCaBundle` false keeps the default verified trust store.
+
+All of these files are read once at startup. A missing, unsafe or invalid file stops
 the process with a fixed message naming only the failing stage, and a selected
 dispatcher identity that did not pass Slack preflight or whose `auth.test` does
 not match its registration stops the dispatcher rather than starting that
