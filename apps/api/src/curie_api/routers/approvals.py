@@ -49,6 +49,7 @@ from .. import adapter_principal, approval_principal
 from ..action_forward import ForwardRefused
 from ..admission import admit
 from ..approval_auth import (
+    APPROVAL_PRINCIPAL_HEADER,
     ApprovalPrincipalDep,
     platform_key_or_adapter,
     require_adapter_principal,
@@ -64,6 +65,12 @@ from ..authorizer import AuthzDecision, authorize_approval
 from ..config import get_settings
 from ..deps import ApproverSetSelectorDep, ResumeQueueDep, SessionDep, get_store
 from ..identity.http_approval import approval_is_selected, require_legacy_approval_creation
+from ..identity.http_approval_answer import (
+    PROOF_HEADER,
+    ApprovalAnswer,
+    ApprovalSettled,
+    answer_http_approval,
+)
 from ..identity_fence import lock_identity_reader
 from ..models import Approval, ApprovalStatus
 from ..remediation_approvals import (
@@ -528,9 +535,10 @@ async def resolve_approval(
     ):
         raise _approval_not_found()
     stored_parent = approval_trace_context(approval)
-    # @spec HTTP-APPROVAL-CONTINUITY-10: a selected row never reaches legacy
-    # admission, team lookup or CAS. Only its deadline expiry is supported here,
-    # through the sealing owner; its wake stays owed rather than context-free.
+    # @spec HTTP-APPROVAL-CONTINUITY-7/10: a selected row never reaches legacy
+    # admission, team lookup or CAS. Its deadline expiry goes through the sealing
+    # owner, and an authenticated Slack answer through the approval commit owner;
+    # either way its wake stays owed rather than context-free.
     if await approval_is_selected(session, approval):
         await session.commit()
         gone: Approval | None = approval if approval.status == ApprovalStatus.expired else None
@@ -551,9 +559,35 @@ async def resolve_approval(
                 status.HTTP_410_GONE,
                 f"approval expired at {gone.expires_at} and can no longer be resolved",
             )
-        # 403, not 409: a 409 reads as settled and would retire a card whose row
-        # is still pending.
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "unsupported_approval")
+        proof = request.headers.get(PROOF_HEADER)
+        attestation = request.headers.get(APPROVAL_PRINCIPAL_HEADER)
+        if proof is None or attestation is None or principal.kind != "chat":
+            # 403, not 409: a 409 reads as settled and would retire a card whose
+            # row is still pending. Only a receiver-proved Slack answer qualifies.
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "unsupported_approval")
+        try:
+            resolved = await answer_http_approval(
+                request, approval_id, principal=principal, approver_sets=approver_sets,
+                answer=ApprovalAnswer(
+                    operation="resolve", decision=data.decision, note=data.note,
+                    body=await request.body(), attestation=attestation, proof=proof,
+                ),
+            )
+        except ApprovalSettled as settled:
+            if settled.status in (ApprovalStatus.expired, "expired"):
+                raise HTTPException(
+                    status.HTTP_410_GONE, "approval expired and can no longer be resolved",
+                ) from None
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"already resolved by {settled.resolved_by} ({settled.status})",
+            ) from None
+        record_metric(
+            "curie.approval.lifecycle",
+            attributes={"service.name": "curie-api", "operation": "resolve",
+                        "outcome": "resolved"},
+        )
+        return ApprovalOut.model_validate(resolved)
 
     # The route binding is read fresh at resolve time (#420), so revoking an
     # approver takes effect on the next click rather than at the next restart.

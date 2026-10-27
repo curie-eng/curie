@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from types import MappingProxyType
-from typing import Annotated, Any, Literal, Never, Self, SupportsIndex
+from typing import Annotated, Any, Literal, Never, Protocol, Self, SupportsIndex
 
 from aci_protocol import PrincipalRef
 from curie_internal import identity_context as codec
@@ -214,6 +214,21 @@ def _deny() -> Never:
     raise HTTPException(403, "caller_not_allowed")
 
 
+class OriginalAssociation(Protocol):
+    """Preserved invoker provenance a later phase checks. @spec HTTP-APPROVAL-CONTINUITY-8."""
+
+    @property
+    def scope(self) -> codec.InvocationScopeV1: ...
+    @property
+    def receiver_id(self) -> str: ...
+    @property
+    def receiver_generation(self) -> int: ...
+    @property
+    def independent_human(self) -> bool: ...
+    @property
+    def canonical(self) -> codec.ContextCanonicalV1 | None: ...
+
+
 @dataclass(frozen=True)
 class _Capture:
     """@spec HTTP-INVOCATION-EXECUTION-4/15."""
@@ -278,14 +293,25 @@ def _receiver_source(
     )
 
 
+Role = Literal["invocation", "approver"]
+
+
 async def _capture(
     session: AsyncSession,
     registration: ReceiverRegistrationV1,
     source: _AuthenticatedSource,
     *,
     writer_agent: uuid.UUID | None = None,
+    role: Role = "invocation",
+    binding_identity: bool = True,
 ) -> tuple[_Capture, AgentChannel]:
-    """@spec HTTP-INVOCATION-EXECUTION-2/4/5/15."""
+    """One source's current scope for one role.
+
+    An answering actor's receiver may differ from the binding's identity: its
+    required identity comes from the server-resolved approval target, checked by
+    the answer owner, so ``binding_identity`` is false there.
+    @spec HTTP-INVOCATION-EXECUTION-2/4/5/15 HTTP-APPROVAL-CONTINUITY-8.
+    """
     tenant_id = uuid.UUID(registration.tenant_id)
     if writer_agent is not None:
         await principal_authority.lock_scope(session, tenant_id)
@@ -314,7 +340,8 @@ async def _capture(
         or binding.kind != "slack"
         or (source.address is not None and source.address != binding.address)
         or (source.agent_id is not None and source.agent_id != str(binding.agent_id))
-        or (binding.adapter or "default") != registration.channel_identity_name
+        or (binding_identity and (binding.adapter or "default")
+            != registration.channel_identity_name)
         or binding.endpoint is not None
         or source.sender.provider != "slack"
         or source.sender.channel_identity_id != registration.channel_identity_id
@@ -357,11 +384,13 @@ async def _capture(
         or namespace.key != registration.namespace.key
     ):
         _invalid_receiver()
-    role = None if policy is None else policy.roles.invocation
-    team_id = None if policy_row is None else policy_row.invocation_team_id
+    role_config = None if policy is None else getattr(policy.roles, role)
+    team_id = None if policy_row is None else (
+        policy_row.invocation_team_id if role == "invocation" else policy_row.approver_team_id
+    )
     group = None
     team_state = None
-    if team_id is not None and (role is None or role.legacy_state != "migrated"):
+    if team_id is not None and (role_config is None or role_config.legacy_state != "migrated"):
         team = await session.get(Team, team_id, populate_existing=True)
         if (
             team is None or team.tenant_id != tenant_id or team.source != "idp_group"
@@ -373,6 +402,7 @@ async def _capture(
         team_state = (str(team.id), team.managed_by, team.external_id, team.epoch, team.digest,
                       team.last_synced_at.isoformat())
     fingerprint = json.dumps({
+        "role": role,
         "configuration": config.model_dump(mode="json"),
         "managed_by": idp.managed_by, "governed_domains": idp.governed_domains,
         "agent": str(agent.id), "binding": str(binding.id), "generation": binding.generation,
@@ -393,6 +423,24 @@ async def _capture(
     ), binding
 
 
+def lookup_request(
+    registration: ReceiverRegistrationV1, captured: _Capture,
+    credential: ResolvedProviderCredential, *, purpose: Literal["invocation", "approval"],
+) -> LookupRequestV1:
+    """A fresh bounded lookup for one source and provider purpose.
+
+    @spec HTTP-INVOCATION-EXECUTION-4 HTTP-APPROVAL-CONTINUITY-8.
+    """
+    return LookupRequestV1(
+        schema_version=1, request_id=str(uuid.uuid4()), purpose=purpose,
+        authority_version=captured.authority.configuration.version,
+        scope=ScopeV1(
+            tenant_id=registration.tenant_id, expected_issuer=credential.target.expected_issuer,
+            sender=captured.sender,
+        ),
+    )
+
+
 def _facts(
     response_bytes: bytes, lookup: LookupRequestV1, credential: ResolvedProviderCredential,
 ) -> ValidatedFacts:
@@ -411,12 +459,13 @@ def _facts(
 
 def _permission(
     capture: _Capture, binding: AgentChannel, facts: ValidatedFacts, independent_human: bool,
-    original: codec.InvocationContextV1 | None = None,
+    original: codec.InvocationContextV1 | OriginalAssociation | None = None,
+    *, role_name: Role = "invocation",
 ) -> None:
-    """@spec HTTP-INVOCATION-EXECUTION-5/15."""
+    """@spec HTTP-INVOCATION-EXECUTION-5/15 HTTP-APPROVAL-CONTINUITY-8."""
     if not admission.admit(binding, [capture.sender.native_id]).allowed:
         _deny()
-    role = None if capture.policy is None else capture.policy.roles.invocation
+    role = None if capture.policy is None else getattr(capture.policy.roles, role_name)
     raw = role is not None and role.legacy_state == "migrated" and role.filter is not None and any(
         isinstance(entry, SurfaceAccountSelectorV1)
         and entry.provider == capture.sender.provider
@@ -431,7 +480,7 @@ def _permission(
             capture.policy, facts,
             context=RoleFilterContext(
                 tenant_id=capture.authority.configuration.tenant_id, agent_id=str(capture.agent_id),
-                role="invocation", request=facts.request,
+                role=role_name, request=facts.request,
             ),
             now=datetime.now(UTC),
         )
@@ -572,7 +621,11 @@ async def _current_source_authority(
     registration: ReceiverRegistrationV1, source: _AuthenticatedSource,
     intent_digest: str = "", original: codec.InvocationContextV1 | None = None,
 ) -> AsyncIterator[CurrentHttpInvocation]:
-    """One lookup/application/reader owner. @spec HTTP-INVOCATION-EXECUTION-4/5/8."""
+    """One caller's lookup/application/reader owner, purpose and role invocation.
+
+    Two-subject approval operations compose the same phases in
+    ``http_approval_answer``. @spec HTTP-INVOCATION-EXECUTION-4/5/8 HTTP-APPROVAL-CONTINUITY-8.
+    """
     factory = request.app.state.sessionmaker
     valkey = request.app.state.valkey
     try:
@@ -582,14 +635,7 @@ async def _current_source_authority(
             credential = runtime._providers.resolve(captured.authority.configuration)
             if not isinstance(credential, ResolvedProviderCredential):
                 _unavailable()
-        lookup = LookupRequestV1(
-            schema_version=1, request_id=str(uuid.uuid4()), purpose="invocation",
-            authority_version=captured.authority.configuration.version,
-            scope=ScopeV1(
-                tenant_id=registration.tenant_id, expected_issuer=credential.target.expected_issuer,
-                sender=captured.sender,
-            ),
-        )
+        lookup = lookup_request(registration, captured, credential, purpose="invocation")
         observation = await client.lookup(
             target=credential.target, bearer=credential.bearer, request=lookup,
             limits=credential.limits,
@@ -688,7 +734,7 @@ def _check_response(
 
 
 def invocation_source(
-    runtime: HttpInvocationRuntime, context: codec.InvocationContextV1,
+    runtime: HttpInvocationRuntime, context: codec.InvocationContextV1 | OriginalAssociation,
 ) -> tuple[ReceiverRegistrationV1, _AuthenticatedSource]:
     """Authenticated source scope only. @spec HTTP-APPROVAL-CONTINUITY-4/9."""
     scope = context.scope
