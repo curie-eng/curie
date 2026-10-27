@@ -374,17 +374,21 @@ class Rig:
                         await asyncio.sleep(0.01)
         finally:
             # A product shutdown defect must not skip fixture listener cleanup.
+            # Stop accepting, then end the connections this rig owns before
+            # waiting: wait_closed() waits for every open connection to close.
             for listener in self.listeners:
                 if listener.server is not None:
                     listener.server.close()
-                    await listener.server.wait_closed()
-                    assert not listener.server.is_serving()
             for writer in tuple(self.writers):
                 writer.close()
             for task in tuple(self.handlers):
                 task.cancel()
             if self.handlers:
                 await asyncio.gather(*tuple(self.handlers), return_exceptions=True)
+            for listener in self.listeners:
+                if listener.server is not None:
+                    await listener.server.wait_closed()
+                    assert not listener.server.is_serving()
         assert not self.handlers and not self.writers
         assert not self.errors, "owned listener handler failed"
         # A closed report must correspond to actual thread and async-task drain.
