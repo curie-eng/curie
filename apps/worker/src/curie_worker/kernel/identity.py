@@ -18,7 +18,7 @@ from curie_internal.identity_authority import (
     TurnAuthorityScopeV1,
 )
 
-from ..binding import HttpIdentityBinding, binding_adapter_for_handle
+from ..binding import AmbiguousRoute, HttpIdentityBinding, binding_adapter_for_handle
 from ..identity_authority import TurnAuthorityUnavailable
 from .approval import _approval_id_from_resume_event
 
@@ -90,6 +90,10 @@ async def prepare(self: Kernel) -> None:
             if type(classification) is not HttpIdentityBinding:
                 raise ValueError
             classification = HttpIdentityBinding.model_validate(classification.model_dump())
+    except AmbiguousRoute:
+        # @spec HTTP-INVOCATION-EXECUTION-17: an HTTP-selected candidate on a shared
+        # route is a definitive refusal, never a pending unavailable turn.
+        raise HttpIdentityRefused() from None
     except Exception:  # noqa: BLE001 - fixed unavailable boundary, cancellation propagates.
         raise TurnAuthorityUnavailable() from None
     if not is_live(carry):

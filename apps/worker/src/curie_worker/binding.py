@@ -751,7 +751,12 @@ class BindingResolver:
         if not matches:
             return None
         mapped = [dict(row._mapping) for row in matches]
-        refuse_several_agents(kind, address, mapped)
+        if len({row["agent_id"] for row in mapped}) > 1:
+            # Every candidate is classified: an HTTP-selected one is a definitive
+            # refusal; otherwise, as for trigger-labelled trackers, no HTTP binding.
+            if any(row["http_identity_required"] for row in mapped):
+                refuse_several_agents(kind, address, mapped)
+            return None
         current = mapped[0]
         return HttpIdentityBinding(
             tenant_id=current["tenant_id"], agent_id=current["agent_id"],
