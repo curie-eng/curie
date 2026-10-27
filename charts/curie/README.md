@@ -2517,8 +2517,11 @@ the process with a fixed message naming only the failing stage, and a selected
 dispatcher identity that did not pass Slack preflight or whose `auth.test` does
 not match its registration stops the dispatcher rather than starting that
 identity on the legacy path. Changing a Secret takes effect only when the
-workload is rolled. The provider's lookup host must also be allowed by
-`api.egress`. Rendering these mounts is wiring; key custody, the effective
+workload is rolled. No chart NetworkPolicy selects the API pods, so selecting
+HTTP identity needs no egress value: the API reaches an in-cluster provider
+Service or an external HTTPS host on 443 as it does today. `api.egress` is the
+runner's route to an external API and does not apply here; an egress control
+outside the chart must allow the lookup itself. Rendering these mounts is wiring; key custody, the effective
 mounts on a real cluster and activation remain separate qualification.
 
 ### Reserved environment variables

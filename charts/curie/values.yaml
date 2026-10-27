@@ -1444,8 +1444,9 @@ api:
   # holds the provider bearers, receiver registrations and keys, and the core
   # context sealing keys. It is mounted read-only at 0440 into the API
   # container alone and read once at startup; the chart never creates, reads or
-  # checksums it, so roll the API after changing it. The provider's lookup host
-  # must also be allowed by api.egress. Rendering this is wiring, not
+  # checksums it, so roll the API after changing it. No chart NetworkPolicy
+  # restricts API egress, so the provider lookup needs no extra rule (api.egress
+  # is the runner's route and does not apply). Rendering this is wiring, not
   # activation: see charts/curie/README.md. providerCaBundle: true also mounts
   # that Secret's provider-ca.pem key, the private CA bundle that then becomes
   # the only trust anchor for provider lookups (hostnames are still verified).
