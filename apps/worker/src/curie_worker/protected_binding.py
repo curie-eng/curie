@@ -26,7 +26,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from .behaviorpacks import BehaviorPacks
-from .binding import ResolvedDeployment, binding_adapter_for_handle
+from .binding import HttpIdentityBinding, ResolvedDeployment, binding_adapter_for_handle
 from .kernel.routing import _thread_key_for
 from .protected_configuration import ProtectedExecutionConfig
 from .protected_history import protected_history_key
@@ -143,6 +143,15 @@ WHERE a.id = :agent_id AND c.kind = :kind AND c.address = :address
         ):
             raise ValueError("protected delivery does not match its execution profile")
         return delivery
+
+    async def identity_binding(
+        self, kind: str, adapter: str | None, address: str,
+    ) -> HttpIdentityBinding | None:
+        """Explicitly local: protected deliveries never come from HTTP invocation ingress.
+
+        @spec HTTP-INVOCATION-EXECUTION-18.
+        """
+        return None
 
     async def resolve(
         self, kind: str, adapter: str | None, address: str
