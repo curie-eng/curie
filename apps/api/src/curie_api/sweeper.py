@@ -169,9 +169,23 @@ async def sweep_expired_approvals(
     for approval_id in sealed_ids:
         assert http_expiry is not None
         try:
-            await http_expiry(approval_id)
+            sealed = await http_expiry(approval_id)
         except Exception:  # noqa: BLE001 - one row never blocks the pass.
             logger.warning("selected approval %s expiry unavailable; left pending", approval_id)
+            continue
+        if sealed is None:
+            continue
+        # @spec HTTP-APPROVAL-CONTINUITY-11: the wake converges on the core-owned
+        # publisher; confirmed append precedes the mark, and a refusal or unknown
+        # append leaves it owed for the reconciler.
+        try:
+            await resume_queue.enqueue_approval(
+                approval_id, parent=approval_trace_context(sealed),
+            )
+            await crud_approvals.mark_approval_resumed(session, approval_id)
+        except Exception:  # noqa: BLE001 - the wake stays owed, never context-free.
+            await session.rollback()
+            logger.warning("selected approval %s expired; resume left owed", approval_id)
 
     flipped = 0
     for approval_id, stored_parent in approval_work:

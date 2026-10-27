@@ -53,6 +53,7 @@ from .identity.http_initializer import (
     load_provider_tls_context,
 )
 from .identity.http_invocation import HttpInvocationRuntime
+from .identity.http_resume import http_resume_owner
 from .identity.http_transport import HttpIdentityClient
 from .identity_fence import IdentityFenceMiddleware
 from .k8s import build_lazy_pod_lister, build_lazy_pod_log_reader
@@ -186,6 +187,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         valkey,
         stream=settings.runs_stream,
         dead_letter_stream=settings.resume_dead_letter_stream or settings.dead_letter_stream_name(),
+        # @spec HTTP-APPROVAL-CONTINUITY-11: selected resumes are built and
+        # authorized by the API owner. No approver observation is wired yet, so
+        # an approved selected row is refused and its wake stays owed.
+        approvals=http_resume_owner(app.state),
     )
     # @spec HTTP-APPROVAL-CONTINUITY-10: the only writer that may expire a selected row.
     app.state.http_approval_expiry = http_expiry_owner(app.state)

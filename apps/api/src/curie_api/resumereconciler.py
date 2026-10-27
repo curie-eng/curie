@@ -103,6 +103,7 @@ from curie_api.crud import approvals as crud_approvals
 from curie_api.identity.http_approval import approval_is_selected
 
 from .resumequeue import (
+    ApprovalResumeRefused,
     ResumeQueue,
     approval_trace_context,
     parse_resume_event_id,
@@ -183,6 +184,9 @@ class ResumeReconciler:
         self._batch_limit = batch_limit
         self._dead_letter_scan_limit = dead_letter_scan_limit
         self._last_success_monotonic: float | None = None
+        # Round-robin keyset cursor over sealed owed wakes, so rows whose current
+        # authority keeps refusing cannot starve the rest. @spec HTTP-APPROVAL-CONTINUITY-11.
+        self._sealed_after: tuple[datetime, uuid.UUID] | None = None
 
     async def reconcile_once(self) -> int:
         """Run one measured pass without changing the reconciler's result shape."""
@@ -275,6 +279,10 @@ class ResumeReconciler:
                     still_owed = True
                 if not still_owed:
                     self._resume_queue.forget_undelivered(approval_id)
+            elif outcome is _Outcome.SELECTED:
+                # A refused selected wake stays owed to the grace backstop rather
+                # than repeating its authority lookups every pass.
+                self._resume_queue.forget_undelivered(approval_id)
             # _Outcome.FAILED: enqueue re-recorded the id; it stays owed.
 
         resolved_before = datetime.now(UTC).replace(tzinfo=None) - timedelta(
@@ -303,6 +311,39 @@ class ResumeReconciler:
                     skipped = True
             if not skipped or len(page) < self._batch_limit:
                 break
+        return count + await self._reconcile_sealed(resolved_before, handled)
+
+    async def _reconcile_sealed(
+        self, resolved_before: datetime, handled: set[uuid.UUID]
+    ) -> int:
+        """Publish sealed owed wakes through their own bounded selection.
+
+        One page per pass from a round-robin cursor, each row through
+        ``_reenqueue_one``'s claim-release-publish path. @spec HTTP-APPROVAL-CONTINUITY-11.
+        """
+
+        async def page_after(
+            after: tuple[datetime, uuid.UUID] | None,
+        ) -> list[tuple[uuid.UUID, datetime]]:
+            async with self._sessionmaker() as session:
+                return await crud_approvals.list_resolved_unresumed_page(
+                    session, resolved_before=resolved_before, limit=self._batch_limit,
+                    after=after, sealed=True,
+                )
+
+        page = await page_after(self._sealed_after)
+        if not page and self._sealed_after is not None:
+            page = await page_after(None)
+        self._sealed_after = (
+            (page[-1][1], page[-1][0]) if len(page) >= self._batch_limit else None
+        )
+        count = 0
+        for approval_id, _resolved_at in page:
+            if approval_id in handled:
+                continue
+            handled.add(approval_id)
+            if await self._reenqueue_one(approval_id) is _Outcome.ENQUEUED:
+                count += 1
         return count
 
     async def _reenqueue_one(self, approval_id: uuid.UUID) -> _Outcome:
@@ -312,6 +353,7 @@ class ResumeReconciler:
         mark rolls back, leaving ``resumed_at`` NULL for a later pass.
         """
 
+        selected = False
         async with self._sessionmaker() as session:
             try:
                 async with session.begin():
@@ -320,15 +362,16 @@ class ResumeReconciler:
                         # Another replica holds it, or it is already resumed;
                         # exit the txn block cleanly, releasing any lock.
                         return _Outcome.NOT_CLAIMED
-                    # @spec HTTP-APPROVAL-CONTINUITY-1/10: a selected row's wake
-                    # stays owed; this queue cannot publish its sealed context.
-                    if await approval_is_selected(session, approval):
-                        return _Outcome.SELECTED
-                    turn = resume_turn_for(approval)
-                    await self._resume_queue.enqueue(
-                        turn, parent=approval_trace_context(approval)
-                    )
-                    approval.resumed_at = datetime.now(UTC).replace(tzinfo=None)
+                    # @spec HTTP-APPROVAL-CONTINUITY-1/11: a selected row is
+                    # published by the core owner, whose lookups never run under
+                    # this claim, so the claim transaction ends first.
+                    selected = await approval_is_selected(session, approval)
+                    if not selected:
+                        turn = resume_turn_for(approval)
+                        await self._resume_queue.enqueue(
+                            turn, parent=approval_trace_context(approval), delegate=False
+                        )
+                        approval.resumed_at = datetime.now(UTC).replace(tzinfo=None)
                 # session.begin() committed here, releasing the row lock.
             except Exception:  # noqa: BLE001
                 logger.warning(
@@ -337,7 +380,44 @@ class ResumeReconciler:
                     exc_info=True,
                 )
                 return _Outcome.FAILED
+        if selected:
+            return await self._publish_selected(approval_id)
         logger.info("approval %s resume turn re-enqueued", approval_id)
+        return _Outcome.ENQUEUED
+
+    async def _publish_selected(self, approval_id: uuid.UUID) -> _Outcome:
+        """Publish a selected wake after the row claim is released, then mark it.
+
+        The owner rereads and revalidates the committed row inside its own final
+        reader. Confirmed append precedes ``mark_approval_resumed``; a refusal
+        leaves the obligation unmarked, and an unknown append stays recorded as
+        undelivered by the queue. A racing replica's redundant wake is absorbed
+        by the worker's deterministic claim. @spec HTTP-APPROVAL-CONTINUITY-11.
+        """
+
+        try:
+            async with self._sessionmaker() as session:
+                if not await crud_approvals.approval_owes_resume(session, approval_id):
+                    return _Outcome.NOT_CLAIMED
+            await self._resume_queue.enqueue_approval(approval_id)
+        except ApprovalResumeRefused as refused:
+            logger.warning(
+                "selected approval %s resume refused (%s); left owed", approval_id, refused.code,
+            )
+            return _Outcome.SELECTED
+        except Exception:  # noqa: BLE001 - provider and SQL details stay out of logs.
+            logger.warning("selected approval %s resume append unknown; left owed", approval_id)
+            return _Outcome.FAILED
+        try:
+            async with self._sessionmaker() as session:
+                await crud_approvals.mark_approval_resumed(session, approval_id)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "selected approval %s resumed but not marked; a later pass republishes",
+                approval_id,
+            )
+            return _Outcome.FAILED
+        logger.info("selected approval %s resume turn published", approval_id)
         return _Outcome.ENQUEUED
 
     async def reopen_dead_lettered_resumes(self) -> int:
