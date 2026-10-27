@@ -1303,7 +1303,11 @@ def test_connector_secrets_are_never_written_to_the_claim() -> None:
     # Non-secret boot env is still written.
     assert {"name": "CURIE_BUDGET", "value": "{}"} in entries
     body = _claim_body(api)
-    assert "additionalPodMetadata" not in body["spec"]
+    # The pinned controller permits additional labels in the sandbox.users.io domain.
+    # https://github.com/kubernetes-sigs/agent-sandbox/blob/v0.5.0/extensions/controllers/sandboxclaim_controller.go
+    assert body["spec"]["additionalPodMetadata"] == {
+        "labels": {"sandbox.users.io/curie-admission-claim": "claim-1"}
+    }
     assert body["spec"]["warmPoolRef"]["name"] == "pool"
 
 
@@ -1320,7 +1324,9 @@ def test_claim_metadata_agent_label_is_not_additional_pod_metadata() -> None:
     )
     body = _claim_body(api)
     assert body["metadata"]["labels"]["curietech.ai/agent"] == "acme-a"
-    assert "additionalPodMetadata" not in body["spec"]
+    assert body["spec"]["additionalPodMetadata"] == {
+        "labels": {"sandbox.users.io/curie-admission-claim": "claim-1"}
+    }
     assert body["spec"]["warmPoolRef"]["name"] == "curie-agent-acme-a-runner-pool"
 
 

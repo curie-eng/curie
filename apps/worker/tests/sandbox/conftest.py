@@ -10,13 +10,16 @@ client is exercised by the env-gated k8scratch e2e in ``test_e2e_k8scratch.py``.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import os
+import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 import redis
@@ -413,6 +416,8 @@ class FakeClaim:
     ready_message: str | None = None
     # The executor claim's header set (ACTION-EXECUTOR-5); None is an ordinary claim.
     executor_secret_names: frozenset[str] | None = None
+    runner_resources: dict[str, object] | None = None
+    agent_name: str | None = None
 
 
 @dataclass
@@ -479,12 +484,97 @@ class FakeSandboxClient:
             ready_reason=self.ready_reason,
             ready_message=self.ready_message,
             executor_secret_names=executor_secret_names,
+            runner_resources=copy.deepcopy(runner_resources),
+            agent_name=agent_name,
         )
         self.sandboxes[sandbox_name] = FakeSandbox(
             name=sandbox_name,
             service_fqdn=f"{sandbox_name}.{self.namespace}.svc.cluster.local",
         )
         self.created.append(name)
+
+    def claim_resources(
+        self,
+        *,
+        pool: str,
+        runner_resources: dict[str, object] | None,
+        agent_name: str | None,
+        executor_secret_names: frozenset[str] | None,
+    ) -> dict[str, str]:
+        if runner_resources is None:
+            return {
+                "pods": "1",
+                "requests.cpu": "250m",
+                "requests.memory": "256Mi",
+                "limits.cpu": "1",
+                "limits.memory": "1Gi",
+            }
+        result = {"pods": "1"}
+        for side in ("requests", "limits"):
+            values = runner_resources[side]
+            assert isinstance(values, dict)
+            for resource in ("cpu", "memory"):
+                result[f"{side}.{resource}"] = str(values[resource])
+        return result
+
+    def capacity_inventory(
+        self, *, priority_class: str, request_timeout_seconds: float
+    ) -> Any:
+        from curie_worker.sandbox.types import CapacityInventory, CapacityPod
+
+        assert 0 < request_timeout_seconds <= 1.0
+        observed_at = time.time()
+        owners = {claim.sandbox_name: claim.name for claim in self.claims.values()}
+        resources = {
+            claim.name: self.claim_resources(
+                pool=claim.pool,
+                runner_resources=claim.runner_resources,
+                agent_name=claim.agent_name,
+                executor_secret_names=claim.executor_secret_names,
+            )
+            for claim in self.claims.values()
+        }
+        default = self.claim_resources(
+            pool="", runner_resources=None, agent_name=None, executor_secret_names=None
+        )
+        return CapacityInventory(
+            claims=frozenset(self.claims),
+            sandboxes={name: owners.get(name) for name in self.sandboxes},
+            pods={
+                name: CapacityPod(
+                    claim_name=owners.get(name),
+                    resources=resources.get(owners.get(name, ""), default),
+                )
+                for name, sandbox in self.sandboxes.items()
+                if sandbox.operating_mode != "Suspended"
+            },
+            claim_resources=resources,
+            suspended_claims=frozenset(
+                owners[name]
+                for name, sandbox in self.sandboxes.items()
+                if sandbox.operating_mode == "Suspended" and name in owners
+            ),
+            observed_at=observed_at,
+        )
+
+    def read_quota(self, quota_name: str, *, request_timeout_seconds: float) -> Any:
+        from curie_worker.sandbox.types import QuotaStatus
+
+        assert 0 < request_timeout_seconds <= 1.0
+        hard = {
+            "pods": "2",
+            "requests.cpu": "500m",
+            "requests.memory": "512Mi",
+            "limits.cpu": "2",
+            "limits.memory": "2Gi",
+        }
+        return QuotaStatus(
+            name=quota_name,
+            namespace=self.namespace,
+            spec_hard=hard,
+            status_hard=hard,
+            status_used=dict.fromkeys(hard, "0"),
+        )
 
     def get_claim(self, name: str, *, request_timeout_seconds: float) -> ClaimView | None:
         assert request_timeout_seconds > 0

@@ -4313,10 +4313,12 @@ def test_quota_progress_runs_on_the_workload_leg() -> None:
         "CURIE_SCENARIO_WORKER_IMAGE": "curie-worker:wsdiag-${{ github.sha }}",
         "CURIE_SCENARIO_RUNNER_IMAGE": "curie-runner:wsdiag-${{ github.sha }}",
     }
+    assert quota["shell"] == (
+        "uv run python tools/sandbox-admission-observer/run.py -- bash {0}"
+    )
     commands = quota["run"].replace("\\\n", " ")
     assert [" ".join(line.split()) for line in commands.splitlines() if line.strip()] == [
         "set -euo pipefail",
-        "uv run python tools/sandbox-admission-observer/run.py -- "
         "bash tools/runtime-assertion-gate/run.sh "
         "charts/curie/ci/runtime/idle-capacity-reclamation-runtime.sh",
     ]

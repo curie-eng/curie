@@ -138,3 +138,64 @@ def test_failure_reports_never_echo_objects_or_worker_log_contents(
         observer.verify()
     captured = capsys.readouterr()
     assert marker not in str(error.value) + captured.out + captured.err
+
+
+@pytest.fixture
+def collector(helper, snapshot, monkeypatch) -> tuple[Any, dict[str, Any]]:
+    objects = {
+        kind: {"metadata": {"name": "acme-owned"}}
+        for kind in ("namespace", "deployment", "statefulset")
+    }
+    subject = helper._Collector("acme-context", "acme-run", [])
+    monkeypatch.setattr(subject, "_get", lambda kind, *_args: objects.get(kind, {"items": []}))
+    subject._poll_startup()
+    for source in ("claims", "sandboxes"):
+        for obj in snapshot[source]:
+            subject._event("data", source, {"type": "ADDED", "object": obj})
+    subject._event("data", "ledger", {"ledger": snapshot["ledger"]})
+    return subject, objects
+
+
+@pytest.fixture(params=[("data", {"error": "ledger observation failed"}), ("end", 1)])
+def ledger_event(request) -> tuple[str, str, Any]:
+    return request.param[0], "ledger", request.param[1]
+
+
+def test_ledger_failure_while_owned_objects_are_healthy_fails(
+    helper, collector, snapshot, ledger_event
+) -> None:
+    subject, _ = collector
+    subject._event("data", "logs", snapshot["worker_logs"][0])
+    with pytest.raises(helper.ObservationError):
+        subject._event(*ledger_event)
+
+
+@pytest.mark.parametrize("owned", ["namespace", "deployment", "statefulset"])
+@pytest.mark.parametrize(
+    "teardown", [{}, {"metadata": {"deletionTimestamp": "2026-01-01T00:00:00Z"}}]
+)
+def test_expected_ledger_closure_after_live_proof_and_owned_teardown(
+    collector, snapshot, ledger_event, owned, teardown
+) -> None:
+    subject, objects = collector
+    subject._event("data", "logs", snapshot["worker_logs"][0])
+    objects[owned] = teardown
+    subject._event(*ledger_event)
+    subject.observer.verify()
+
+
+@pytest.mark.parametrize("owned", ["namespace", "deployment", "statefulset"])
+def test_owned_absence_does_not_replace_affirmative_live_proof(
+    helper, collector, ledger_event, owned
+) -> None:
+    subject, objects = collector
+    objects[owned] = {}
+    with pytest.raises(helper.ObservationError):
+        subject._event(*ledger_event)
+
+
+def test_main_propagates_real_child_exit_without_observed_proof(helper, monkeypatch) -> None:
+    monkeypatch.setenv("CURIE_SCENARIO_CONTEXT", "acme-context")
+    monkeypatch.setenv("CURIE_SCENARIO_RUN_ID", "acme-run")
+    monkeypatch.setattr(helper._Collector, "_get", lambda _self, *_args: {})
+    assert helper.main(["--", sys.executable, "-c", "raise SystemExit(17)"]) == 17
