@@ -1211,9 +1211,10 @@ def test_skill_body_missing_a_step_fails():
     assert _body_score(body) is False
 
 
-def test_skill_body_with_steps_out_of_order_fails():
+def test_skill_body_reordering_steps_without_nonces_is_left_to_the_judge():
+    # Steps one and two carry no nonce, so their order imposes no deterministic constraint.
     first, second, third = REAL_SKILL_BODY.splitlines()
-    assert _body_score("\n".join([second, first, third])) is False
+    assert _body_score("\n".join([second, first, third])) is True
 
 
 def test_skill_body_with_wrong_marker_fails():
@@ -1312,9 +1313,10 @@ def test_f1_p2_body_with_a_wrong_route_marker_fails():
     assert _body_score(body, F1_P2_STEPS) is False
 
 
-def test_f1_p2_body_missing_the_leave_quantity_unchanged_content_fails():
+def test_f1_p2_body_missing_plain_wording_but_keeping_nonces_is_left_to_the_judge():
+    # Plain (non-nonce) wording is the judge's call, not a token-coverage threshold.
     body = "\n".join(F1_P2_LINES).replace(" Leave the quantity unchanged.", "")
-    assert _body_score(body, F1_P2_STEPS) is False
+    assert _body_score(body, F1_P2_STEPS) is True
 
 
 def test_f1_p2_body_with_nonce_bearing_steps_reversed_fails():
@@ -1322,9 +1324,10 @@ def test_f1_p2_body_with_nonce_bearing_steps_reversed_fails():
     assert _body_score("\n".join([first, third, second]), F1_P2_STEPS) is False
 
 
-def test_f8_p2_body_omitting_the_third_word_fails():
+def test_f8_p2_body_without_nonces_imposes_no_deterministic_step_constraint():
+    # F8-P2 steps carry no nonce, so no unique-token anchor can fail the body.
     body = "Place the second word before the first word last."
-    assert _body_score(body, F8_P2_STEPS) is False
+    assert _body_score(body, F8_P2_STEPS) is True
 
 
 def test_f3_p3_statement_with_a_different_value_fails():
@@ -1373,3 +1376,100 @@ def test_correction_gate_is_not_available_when_only_seed_rows_were_evaluated():
     )
     gate = _summary(rows)["gates"]["correction_duplicates"]
     assert gate == {"status": "NOT_AVAILABLE", "value": None}
+
+
+# Paraphrase tolerance (review R1-2): nonces are the only deterministic anchor ------------
+
+NONCE_STEPS = [
+    "Look up route-1ecd41 for every kg load.",
+    "Send each cm load through route-d0d301 instead.",
+    "Finish the reply with rt-c5cab1.",
+]
+NONCE_PARAPHRASE = (
+    "Kilogram shipments use route-1ecd41. Centimetre shipments go via route-d0d301. "
+    "Append rt-c5cab1 at the very end."
+)
+
+
+def test_contains_in_order_accepts_a_paraphrase_that_keeps_every_nonce_in_order():
+    from curie_worker.eval.learning_metrics import _contains_in_order
+
+    assert _contains_in_order(NONCE_PARAPHRASE, NONCE_STEPS) is True
+    assert _body_score(NONCE_PARAPHRASE, NONCE_STEPS) is True
+
+
+def test_contains_in_order_rejects_a_body_missing_one_nonce():
+    from curie_worker.eval.learning_metrics import _contains_in_order
+
+    body = NONCE_PARAPHRASE.replace(" Centimetre shipments go via route-d0d301.", "")
+    assert _contains_in_order(body, NONCE_STEPS) is False
+
+
+def test_contains_in_order_rejects_nonces_out_of_step_order():
+    from curie_worker.eval.learning_metrics import _contains_in_order
+
+    body = (
+        "Centimetre shipments go via route-d0d301. Kilogram shipments use route-1ecd41. "
+        "Append rt-c5cab1 at the very end."
+    )
+    assert _contains_in_order(body, NONCE_STEPS) is False
+
+
+def test_contains_in_order_step_without_a_nonce_imposes_no_constraint():
+    from curie_worker.eval.learning_metrics import _contains_in_order
+
+    steps = ["Read the three input words in their given order.", "Return rm-db6ac1 first."]
+    assert _contains_in_order("Lead the output with rm-db6ac1.", steps) is True
+    assert _contains_in_order("Something unrelated entirely.", ["Read the words."]) is True
+
+
+def test_contains_in_order_still_requires_a_text_body():
+    from curie_worker.eval.learning_metrics import _contains_in_order
+
+    with pytest.raises(EvidenceError):
+        _contains_in_order(None, NONCE_STEPS)
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "The value of cabinet-abc123 is violet-def456",
+        "violet-def456 is what cabinet-abc123 holds now.",
+        "For cabinet-abc123, use violet-def456.",
+    ],
+)
+def test_statement_agrees_with_any_wording_that_holds_every_expected_nonce(statement):
+    from curie_worker.eval.learning_metrics import _statement_agrees
+
+    assert _statement_agrees(statement, "cabinet-abc123 is violet-def456") is True
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "cabinet-abc123 is violet-def456, formerly amber-123abc.",
+        "cabinet-abc123 is amber-123abc",
+        "cabinet-abc123 is set",
+        "cabinet-abc1234 is violet-def456",
+    ],
+    ids=["competing-nonce", "wrong-nonce", "missing-nonce", "nonce-not-a-word"],
+)
+def test_statement_disagrees_on_a_missing_or_competing_nonce(statement):
+    from curie_worker.eval.learning_metrics import _statement_agrees
+
+    assert _statement_agrees(statement, "cabinet-abc123 is violet-def456") is False
+
+
+@pytest.mark.parametrize(
+    "statement,agrees",
+    [
+        ("Note: the deploy window is Friday.", True),
+        ("The **deploy window** is friday", True),
+        ("the deploy window is fridays", False),
+        ("deploy window friday", False),
+    ],
+)
+def test_statement_without_expected_nonces_keeps_word_bounded_containment(statement, agrees):
+    from curie_worker.eval.learning_metrics import _statement_agrees
+
+    assert _statement_agrees(statement, "the deploy window is friday") is agrees

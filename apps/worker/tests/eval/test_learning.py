@@ -4760,3 +4760,347 @@ def test_f4_reservation_peak_fits_the_campaign_budget(
     assert reserve == learning.AGENT_DAILY_USD + _PEAK_OVERSHOOT
     peak = _PEAK_CHARGED + _PEAK_FIRES * reserve + reserve + learning.SHUTDOWN_RESERVE
     assert peak <= _PEAK_LIMIT, f"F4 reservation peak {peak} exceeds {_PEAK_LIMIT}"
+
+
+# Review R1-1: parsed child evidence is redacted before it is stored ---------------------
+
+_CAMPAIGN_KEY = "sk-or-v1-" + "campaign-secret-" * 2
+_PLATFORM_KEY = "plat-key-SECRET-abcdef"
+
+
+def _keyed_campaign(tmp_path: Path) -> Any:
+    campaign = _bare_campaign(tmp_path)
+    campaign.key = _CAMPAIGN_KEY
+    campaign.platform_keys = [_PLATFORM_KEY]
+    return campaign
+
+
+def _strings(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [s for item in value.values() for s in _strings(item)]
+    if isinstance(value, list | tuple):
+        return [s for item in value for s in _strings(item)]
+    return []
+
+
+def _assert_redacted(value: Any) -> None:
+    for text in _strings(value):
+        assert _CAMPAIGN_KEY not in text
+        assert _PLATFORM_KEY not in text
+
+
+def test_add_redacts_every_nested_evidence_string_without_truncating(tmp_path: Path) -> None:
+    campaign = _keyed_campaign(tmp_path)
+    long_text = "\n".join(f"line {n} {_CAMPAIGN_KEY}" for n in range(200)) + " " + "x" * 9000
+    value = {
+        "case_id": "F3-P1-R1",
+        "result": {
+            "error": {"detail": f"bad key {_CAMPAIGN_KEY}", "hint": [f"try {_PLATFORM_KEY}"]},
+            "rows": [{"statement": f"{_PLATFORM_KEY} and {_CAMPAIGN_KEY}"}, 3, None, True],
+        },
+        "long": long_text,
+    }
+    ref = campaign.add("cli-result", copy.deepcopy(value))
+    stored = campaign.evidence[ref]["value"]
+    _assert_redacted(stored)
+    assert stored["result"]["error"]["detail"] == "bad key [redacted]"
+    assert stored["result"]["error"]["hint"] == ["try [redacted]"]
+    assert stored["result"]["rows"] == [{"statement": "[redacted] and [redacted]"}, 3, None, True]
+    assert stored["case_id"] == "F3-P1-R1"
+    # Redaction only replaces: the long text keeps every line and every character.
+    assert stored["long"] == long_text.replace(_CAMPAIGN_KEY, "[redacted]")
+
+
+def test_cli_redacts_the_parsed_result_it_stores_and_returns(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from curie_worker.eval import learning
+
+    campaign = _keyed_campaign(tmp_path)
+    payload = {
+        "error": {"detail": f"bad key {_CAMPAIGN_KEY}", "cause": {"token": _PLATFORM_KEY}},
+        "items": [f"echo {_CAMPAIGN_KEY}"],
+    }
+
+    def run(argv: Any, **_kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess(argv, 1, json.dumps(payload).encode(), b"")
+
+    monkeypatch.setattr(learning.subprocess, "run", run)
+    scope = {"repetition": 1, "case_id": "F3-P1-R1", "agent_id": "agent-F3-P1-R1"}
+    code, parsed, _invocation, result_ref, _error = campaign.cli(["memory", "list"], scope)
+    assert code == 1
+    _assert_redacted(parsed)
+    assert parsed["error"]["detail"] == "bad key [redacted]"
+    assert parsed["error"]["cause"] == {"token": "[redacted]"}
+    assert parsed["items"] == ["echo [redacted]"]
+    stored = campaign.evidence[result_ref]["value"]["result"]
+    assert stored == parsed
+    _assert_redacted(campaign.evidence)
+    _assert_redacted(campaign.invocations)
+
+
+# Review R1-3: a reused output directory is refused before any spend ---------------------
+
+
+def _executable(tmp_path: Path) -> Path:
+    binary = tmp_path / "bin" / "curie"
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    binary.write_text("#!/bin/sh\nexit 0\n")
+    binary.chmod(0o755)
+    return binary
+
+
+def _drive_run(
+    monkeypatch: pytest.MonkeyPatch, binary: Path, output: Path
+) -> tuple[int, list[str]]:
+    """Run ``main(["run", ...])`` with every live step stubbed. ``started`` records
+    whether the campaign began its live sequence (identity is its first step)."""
+    from curie_worker.eval import learning
+
+    for name in learning.STRIPPED_AUTH:
+        monkeypatch.delenv(name, raising=False)
+    started: list[str] = []
+
+    def identity(self: Any) -> None:
+        started.append("identity")
+        raise learning._Stop("stubbed: no live campaign in unit tests")
+
+    monkeypatch.setattr(learning._Campaign, "identity", identity)
+    monkeypatch.setattr(learning._Campaign, "teardown", lambda self: {"verified": False})
+    monkeypatch.setattr(
+        learning._Campaign,
+        "report",
+        lambda self, commit, cleanup: {
+            "implementation_verification": "FAIL",
+            "acceptance": "FAIL",
+            "failure_reasons": ["stubbed"],
+        },
+    )
+    code = _module_exit(
+        ["run", "--curie-bin", str(binary), "--output-dir", str(output), "--budget-usd", "1"]
+    )
+    return code, started
+
+
+@pytest.mark.parametrize("artifact", ["ledger.sqlite", "report.json"])
+def test_run_refuses_an_output_dir_that_already_holds_a_campaign(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    artifact: str,
+) -> None:
+    import sqlite3
+
+    output = tmp_path / "out"
+    output.mkdir()
+    path = output / artifact
+    if artifact == "ledger.sqlite":
+        with sqlite3.connect(path) as db:
+            db.execute("CREATE TABLE operations (identity TEXT PRIMARY KEY)")
+            db.execute("INSERT INTO operations VALUES ('calibration-operation-1')")
+        db.close()
+    else:
+        path.write_text('{"previous": true}')
+    before = path.read_bytes()
+    code, started = _drive_run(monkeypatch, _executable(tmp_path), output)
+    assert started == [], "a reused output dir must be refused before the campaign starts"
+    assert code != 0
+    err = capsys.readouterr().err
+    assert "output" in err.lower()
+    assert "IntegrityError" not in err
+    assert path.read_bytes() == before
+    assert sorted(p.name for p in output.iterdir()) == [artifact]
+
+
+@pytest.mark.parametrize("state", ["missing", "empty"])
+def test_run_accepts_a_fresh_output_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, state: str
+) -> None:
+    output = tmp_path / "out"
+    if state == "empty":
+        output.mkdir()
+    _code, started = _drive_run(monkeypatch, _executable(tmp_path), output)
+    assert started == ["identity"]
+
+
+# Review R1-4: follow-ups run in fresh threads ---------------------------------------------
+
+
+def _reply(text: str, channel: str, thread: str, reply: str = "ok") -> dict[str, Any]:
+    return {
+        "invocation_id": "invocation-1",
+        "result_ref": "cli-result-1",
+        "exit_code": 0,
+        "reply": reply,
+        "thread": thread,
+        "channel": channel,
+        "finalized": True,
+        "generation": "operation-1",
+    }
+
+
+def _tracked_threads(monkeypatch: pytest.MonkeyPatch, campaign: Any) -> list[str]:
+    made: list[str] = []
+    original = campaign.new_thread
+
+    def new_thread() -> str:
+        thread = original()
+        made.append(thread)
+        return thread
+
+    monkeypatch.setattr(campaign, "new_thread", new_thread)
+    return made
+
+
+def test_f5_revise_and_cancel_each_run_in_a_distinct_fresh_thread(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from curie_worker.eval import learning
+
+    campaign = _bare_campaign(tmp_path)
+    empty = {"skills": [], "facts": [], "schedules": []}
+    monkeypatch.setattr(campaign, "snapshot", lambda _scope: (copy.deepcopy(empty), None))
+    monkeypatch.setattr(campaign, "schedule_row", lambda *_a, **_k: (None, "absent"))
+    sent: list[tuple[str, str]] = []
+
+    def message(scope: Any, text: str, channel: str, thread: str) -> dict[str, Any]:
+        sent.append((text, thread))
+        return _reply(text, channel, thread)
+
+    monkeypatch.setattr(campaign, "message", message)
+    made = _tracked_threads(monkeypatch, campaign)
+    values = learning._scenario_values(datetime.now(UTC))
+    raw = next(row for row in campaign.corpus if row["id"] == "F5-P1")
+    fixture = learning._substitute(copy.deepcopy(dict(raw)), values)
+    teaching = "1800000000.000001"
+    campaign.threads.add(teaching)
+    scope = {"repetition": 1, "case_id": "F5-P1-R1", "agent_id": "agent-F5-P1-R1"}
+    campaign.control_recurring(scope, fixture, scope["agent_id"], teaching, (empty, None), values)
+    control = next(c for c in fixture["controls"] if c["id"] == "revise-and-cancel")
+    threads = {text: thread for text, thread in sent}
+    revise, cancel = (threads[str(text)] for text in control["messages"])
+    assert teaching not in (revise, cancel)
+    assert revise != cancel
+    assert revise in made and cancel in made
+
+
+_F67 = [f"F{family}-P{phrase}" for family in (6, 7) for phrase in range(1, 4)]
+_PLACEHOLDER = re.compile(r"^\{([a-z_]+)\}$")
+
+
+@pytest.mark.parametrize("fixture_id", _F67)
+def test_f6_f7_scenarios_carry_one_fresh_thread_no_reuse_probe(fixture_id: str) -> None:
+    from curie_worker.eval import learning
+
+    family = next(
+        f
+        for f in json.loads((FIXTURES / "learning-cases.json").read_text())["families"]
+        if f["id"] == fixture_id[:2]
+    )
+    scenario = next(s for s in family["scenarios"] if s["id"] == fixture_id)
+    probes = scenario["probes"]
+    assert [p["id"] for p in probes] == ["fresh-thread-no-reuse"]
+    probe = probes[0]
+    assert isinstance(probe["channel"], str) and probe["channel"]
+    assert isinstance(probe["input"], str) and probe["input"]
+    forbidden = probe["forbidden_values"]
+    assert isinstance(forbidden, list) and forbidden
+    teaching = " ".join(scenario["messages"])
+    values = learning._scenario_values(datetime.now(UTC))
+    for placeholder in forbidden:
+        match = _PLACEHOLDER.match(placeholder)
+        assert match, f"{placeholder!r} is not a placeholder"
+        assert placeholder in teaching, f"{placeholder} is not in the teaching message"
+        assert re.match(r"^[a-z]+-[0-9a-f]{6}$", values[match.group(1)]), placeholder
+
+
+@pytest.mark.parametrize(
+    "reply,passed",
+    [
+        ("I do not have anything saved about that.", True),
+        ("The label was amber-abc123.", False),
+        ("The label was AMBER-ABC123.", False),
+        ("Either Violet-DEF456 or something else.", False),
+    ],
+)
+def test_absent_control_check_passes_only_when_no_forbidden_value_appears(
+    reply: str, passed: bool
+) -> None:
+    from curie_worker.eval import learning
+
+    check = {
+        "kind": "absent",
+        "reply": reply,
+        "forbidden_values": ["amber-abc123", "violet-def456"],
+    }
+    assert learning._control_check(check) is passed
+
+
+@pytest.mark.parametrize("fixture_id", ["F6-P1", "F7-P1"])
+@pytest.mark.parametrize("leaked", [False, True])
+def test_f6_f7_scenario_sends_the_no_reuse_probe_in_a_fresh_thread(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fixture_id: str, leaked: bool
+) -> None:
+    from curie_worker.eval import learning
+
+    campaign = _bare_campaign(tmp_path)
+    empty = {"skills": [], "facts": [], "schedules": []}
+    monkeypatch.setattr(campaign, "provision", lambda scope: str(scope["agent_id"]))
+    monkeypatch.setattr(campaign, "snapshot", lambda _scope: (copy.deepcopy(empty), None))
+    monkeypatch.setattr(campaign, "consent", lambda *_a, **_k: None)
+    monkeypatch.setattr(campaign, "reconcile_fires", lambda *_a, **_k: None)
+    monkeypatch.setattr(campaign, "lower_fire_cap", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        campaign, "transcript", lambda *_a, **_k: ({"binding_key": "slack:C:T", "messages": []}, [])
+    )
+    monkeypatch.setattr(
+        campaign, "cli", lambda *_a, **_k: (0, {}, "invocation-m", "cli-result-m", "")
+    )
+    taught: list[tuple[str, str]] = []
+
+    def teach(scope: Any, fixture: Any, agent_id: str, thread: str, index: int) -> Any:
+        taught.append((str(fixture["messages"][index]), thread))
+        return _reply("", campaign.channels[0], thread), (copy.deepcopy(empty), None)
+
+    monkeypatch.setattr(campaign, "teach", teach)
+    sent: list[tuple[str, str, str]] = []
+    substituted: dict[str, Any] = {}
+
+    def message(scope: Any, text: str, channel: str, thread: str) -> dict[str, Any]:
+        sent.append((text, channel, thread))
+        values = campaign.substitutions["values"]
+        substituted.update(values)
+        reply = "Nothing is saved about that."
+        if leaked:
+            reply = f"Earlier you mentioned {next(iter(forbidden_values(values))).upper()}."
+        return _reply(text, channel, thread, reply)
+
+    raw = next(row for row in campaign.corpus if row["id"] == fixture_id)
+    probe = raw["probes"][0]
+
+    def forbidden_values(values: dict[str, str]) -> list[str]:
+        return [learning._substitute(v, values) for v in probe["forbidden_values"]]
+
+    monkeypatch.setattr(campaign, "message", message)
+    made = _tracked_threads(monkeypatch, campaign)
+    campaign.scenario(1, raw)
+
+    teaching_threads = {thread for _text, thread in taught}
+    assert len(teaching_threads) == 1
+    probe_input = learning._substitute(probe["input"], substituted)
+    probes = [(c, t) for text, c, t in sent if text == probe_input]
+    assert len(probes) == 1
+    _channel, probe_thread = probes[0]
+    assert probe_thread in made
+    assert probe_thread not in teaching_threads
+    controls = [c for c in campaign.controls if c["control_id"] == "fresh-thread-no-reuse"]
+    assert len(controls) == 1
+    assert controls[0]["status"] == ("FAIL" if leaked else "PASS")
+    observation = campaign.evidence[controls[0]["evidence_ref"]]["value"]
+    absent = [c for c in observation["checks"] if c.get("kind") == "absent"]
+    assert len(absent) == 1
+    assert absent[0]["forbidden_values"] == forbidden_values(substituted)
+    assert all(re.match(r"^[a-z]+-[0-9a-f]{6}$", v) for v in absent[0]["forbidden_values"])
+    assert learning._control_check(absent[0]) is (not leaked)
