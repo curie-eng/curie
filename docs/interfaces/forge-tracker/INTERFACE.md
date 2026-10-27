@@ -75,9 +75,9 @@ marked and described:
 `CodeHost` (`apps/api/src/curie_api/forges/ports.py::CodeHost`) is where code,
 pull requests, CI and review live: `resolve_repository` from an immutable id;
 `credential` for clone or push scope; `branch_head` and `read_commit`;
-`is_ancestor`, one forge request that says whether a commit is reachable
-through any parent of another; `find_pull_request`, `open_pull_request`,
-`update_pull_request` and `read_pull_request`; `list_factory_publications`; `observe_ci` on an exact
+`is_ancestor`, whether one commit is reachable from another through any
+parent; `find_pull_request`, `open_pull_request`, `update_pull_request` and
+`read_pull_request`; `list_factory_publications`; `observe_ci` on an exact
 head; `list_review_feedback` since a cursor and `verify_feedback`. Optional:
 `ci_diagnostics`, `rerun_failed`, `user_can_write` and `required_checks`
 (GitHub only among the shipped code hosts; GitLab and both Bitbucket adapters
