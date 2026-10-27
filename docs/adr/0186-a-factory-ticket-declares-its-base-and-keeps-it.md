@@ -4,6 +4,12 @@ Date: 2026-10-01
 
 Status: Accepted
 
+**Partially amended by [ADR 0251](0251-a-failed-factory-run-keeps-a-private-recovery-checkpoint-that-only-explicit-restoration-reads.md)**
+(back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+in section 5, for explicit restoration only, a new request pins the
+checkpoint's original trusted base commit and recorded PR target branch
+instead of resolving the base anew. Everything else in this ADR stands.
+
 Accepted by Brian on 2026-10-02 for v0.12.0. The implementation was
 already present in `apps/api/src/curie_api/factory_base.py`.
 
