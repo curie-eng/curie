@@ -16,6 +16,7 @@ apps/api/tests/test_workitem_outcomes.py
 apps/dispatcher/tests/test_approval_actions.py
 apps/worker/tests/binding/test_eval_memory_isolation.py
 apps/worker/tests/binding/test_reserved_boot_env_pin.py
+apps/worker/tests/eval/test_learning.py
 apps/worker/tests/eval/test_schema_compat.py
 apps/worker/tests/sandbox/test_e2e_tool_daemon.py
 apps/worker/tests/test_blocks_progress.py

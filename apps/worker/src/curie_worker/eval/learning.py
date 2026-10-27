@@ -41,6 +41,8 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
+from aci_protocol import BootEnv
+
 from .scorer import ScoreResult
 
 # Fixed identities ---------------------------------------------------------------
@@ -2535,12 +2537,17 @@ SCHEDULE_LEAD_MINUTES = 12
 F4_LEAD_MINUTES = 72
 F4_STAGGER_MINUTES = 2
 AUTHOR = "U-curie-message"
+# The boot-contract names the campaign sets or strips, read from the declaration.
+CREDENTIALS_ENV = BootEnv.env_key("credentials_ref")
+MODEL_ENV = BootEnv.env_key("model")
+FAKE_MODEL_ENV = BootEnv.env_key("fake_model")
+OTEL_ENDPOINT_ENV = BootEnv.env_key("otel_endpoint")
 STRIPPED_AUTH = (
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
-    "ANTHROPIC_BASE_URL",
+    BootEnv.env_key("base_url"),
     "CLAUDE_CODE_OAUTH_TOKEN",
-    "CURIE_CREDENTIALS",
+    CREDENTIALS_ENV,
     "CURIE_MODEL_CREDENTIALS",
     "CURIE_OPENROUTER_API_URL",
 )
@@ -3136,7 +3143,7 @@ class _Stack:
             "CURIE_API_URL": self.api_url,
             "SLACK_API_BASE_URL": f"http://{self.stub_host}:{self.stub_port}/api/",
             "CURIE_DOCKER_NETWORK": f"{self.project}_runner",
-            "OTEL_EXPORTER_OTLP_ENDPOINT": f"http://127.0.0.1:{self.ports['otel-collector'][4318]}",
+            OTEL_ENDPOINT_ENV: f"http://127.0.0.1:{self.ports['otel-collector'][4318]}",
             # One attempt per ordinary turn: a reservation covers one session, and
             # the kernel would otherwise retry a failed turn up to three times.
             "CURIE_MAX_ATTEMPTS": "1",
@@ -3588,10 +3595,10 @@ class _Campaign:
         if self.stack is not None:
             env.update(self.stack.env(self.base_compose))
             env["CURIE_API_KEY"] = self.stack.api_key
-        env["CURIE_MODEL"] = ACTOR_MODEL
+        env[MODEL_ENV] = ACTOR_MODEL
         if credentials and self.key:
-            env["CURIE_CREDENTIALS"] = self.key
-            env["CURIE_FAKE_MODEL"] = "0"
+            env[CREDENTIALS_ENV] = self.key
+            env[FAKE_MODEL_ENV] = "0"
         return env
 
     def scrub(self, text: str) -> str:
@@ -4193,7 +4200,7 @@ class _Campaign:
             "'api_key':bool(env.get('ANTHROPIC_API_KEY'))}))\n"
         )
         env = _docker_env()
-        env["CURIE_CREDENTIALS"] = self.key or ""
+        env[CREDENTIALS_ENV] = self.key or ""
         docker = shutil.which("docker") or "docker"
         created = subprocess.run(
             [
@@ -4204,11 +4211,11 @@ class _Campaign:
                 "--entrypoint",
                 "python",
                 "-e",
-                "CURIE_CREDENTIALS",
+                CREDENTIALS_ENV,
                 "-e",
-                f"CURIE_MODEL={ACTOR_MODEL}",
+                f"{MODEL_ENV}={ACTOR_MODEL}",
                 "-e",
-                "CURIE_FAKE_MODEL=0",
+                f"{FAKE_MODEL_ENV}=0",
                 image,
                 "-c",
                 script,
@@ -6387,7 +6394,7 @@ def _run_command(args: argparse.Namespace) -> int:
                 f"--output-dir {options.output_dir} already holds {', '.join(reused)} "
                 "from an earlier campaign; use a fresh output directory"
             )
-    key = os.environ.get("CURIE_CREDENTIALS") or None
+    key = os.environ.get(CREDENTIALS_ENV) or None
     for name in STRIPPED_AUTH:
         os.environ.pop(name, None)
     campaign = _Campaign(options, key)
