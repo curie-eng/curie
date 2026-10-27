@@ -200,3 +200,62 @@ def test_selected_click_without_interaction_team_refuses_before_http(
     assert sock.acked_envelope_ids == ["env-noteam"]
     assert rig.requests == [] and rig.clients == []
     _no_queue_or_legacy(redis_client, config, legacy)
+
+
+_REFUSAL_TEXTS = (
+    (403, "caller_not_allowed", "You are not allowed to answer this approval."),
+    (403, "unsupported_approval", "This approval can't be answered here."),
+    (403, "some_new_internal_code", "This click was refused and the platform gave no reason."),
+    (
+        503, "authority_unavailable",
+        "Couldn't confirm your permission right now. Try again in a moment.",
+    ),
+    (410, "approval expired and can no longer be resolved",
+     "This approval expired and can no longer be resolved."),
+)
+
+
+def _ephemeral_texts(rig: HttpRig) -> list[str]:
+    """@spec HTTP-APPROVAL-CONTINUITY-7: every ephemeral text the user was shown."""
+    return [call.kwargs["text"] for call in rig.web.chat_postEphemeral.call_args_list]
+
+
+def test_selected_click_refusal_shows_plain_text_never_the_api_code(
+    config: DispatcherConfig, redis_client: redis.Redis,
+) -> None:
+    """@spec HTTP-APPROVAL-CONTINUITY-7: each fixed refusal code maps to one plain sentence."""
+    api()
+    for index, (status_code, code, expected) in enumerate(_REFUSAL_TEXTS):
+
+        async def handler(
+            _request: httpx.Request, status_code: int = status_code, code: str = code,
+        ) -> httpx.Response:
+            return httpx.Response(status_code, json={"detail": code})
+
+        rig = HttpRig(handler)
+        app, _legacy = _selected(config, redis_client, rig)
+        _handle(app, _click(f"env-refused-{index}"))
+        assert _ephemeral_texts(rig) == [expected]
+        assert code not in expected or status_code == 410
+        rig.closed()
+
+
+def test_selected_submission_refusal_shows_plain_text_never_the_api_code(
+    config: DispatcherConfig, redis_client: redis.Redis,
+) -> None:
+    """@spec HTTP-APPROVAL-CONTINUITY-7: the closed dialog's refusal is plain text too."""
+    api()
+    for index, (status_code, code, expected) in enumerate(_REFUSAL_TEXTS):
+
+        async def handler(
+            _request: httpx.Request, status_code: int = status_code, code: str = code,
+        ) -> httpx.Response:
+            return httpx.Response(status_code, json={"detail": code})
+
+        rig = HttpRig(handler)
+        app, _legacy = _selected(config, redis_client, rig)
+        _handle(app, _submission(f"env-refused-note-{index}"))
+        shown = _ephemeral_texts(rig)
+        assert expected in shown
+        assert all(code not in text for text in shown if status_code != 410)
+        rig.closed()
