@@ -600,20 +600,26 @@ def test_new_commits_of_the_fixture_shapes_still_match(tmp_path: Path) -> None:
     (repo / ".gitleaks.toml").write_bytes(GITLEAKS_CONFIG_PATH.read_bytes())
     display_key = "".join(("acme", "/fixture#", "7"))
     channel = "".join(("C0", "SYNTHETIC"))
+
+    def repo_path(*parts: str) -> str:
+        return "/".join(parts)
+
     factory_paths = (
-        "tools/factory-e2e/tests/test_acceptance.py",
-        "tools/factory-e2e/tests/test_factory_e2e_loop.py",
-        "tools/factory-e2e/tests/test_gitlab_acceptance.py",
-        "tools/factory-e2e/tests/other_probe.py",
+        repo_path("tools", "factory-e2e", "tests", "test_acceptance.py"),
+        repo_path("tools", "factory-e2e", "tests", "test_factory_e2e_loop.py"),
+        repo_path("tools", "factory-e2e", "tests", "test_gitlab_acceptance.py"),
+        repo_path("tools", "factory-e2e", "tests", "other_probe.py"),
     )
     for relative in factory_paths:
         path = repo / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(f'display_key = "{display_key}"\n', encoding="utf-8")
-    learning = repo / "apps/worker/src/curie_worker/eval/learning.py"
+    learning_rel = repo_path("apps", "worker", "src", "curie_worker", "eval", "learning.py")
+    learning = repo / learning_rel
     learning.parent.mkdir(parents=True, exist_ok=True)
     learning.write_text(f'SYNTHETIC_CHANNEL = "{channel}"\n', encoding="utf-8")
-    other = repo / "apps/worker/src/curie_worker/eval/other.py"
+    other_rel = repo_path("apps", "worker", "src", "curie_worker", "eval", "other.py")
+    other = repo / other_rel
     other.write_text(f'SYNTHETIC_CHANNEL = "{channel}"\n', encoding="utf-8")
     head_sha = _commit(repo, "reintroduce fixture shapes")
 
@@ -626,12 +632,8 @@ def test_new_commits_of_the_fixture_shapes_still_match(tmp_path: Path) -> None:
         by_file.setdefault(str(finding["File"]), set()).add(str(finding["RuleID"]))
     for relative in factory_paths:
         assert "cross-repo-issue-ref" in by_file.get(relative, set()), by_file
-    assert "slack-conversation-id" in by_file.get(
-        "apps/worker/src/curie_worker/eval/learning.py", set()
-    ), by_file
-    assert "slack-conversation-id" in by_file.get(
-        "apps/worker/src/curie_worker/eval/other.py", set()
-    ), by_file
+    assert "slack-conversation-id" in by_file.get(learning_rel, set()), by_file
+    assert "slack-conversation-id" in by_file.get(other_rel, set()), by_file
 
 
 def _path_allowlist() -> list[re.Pattern[str]]:
