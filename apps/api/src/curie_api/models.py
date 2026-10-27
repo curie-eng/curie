@@ -3124,6 +3124,8 @@ class PrincipalTeam(Base):
 class AgentAccessPolicy(Base):
     """Which teams may invoke an agent and approve for it (#4585, ADR 0220 s.8).
 
+    @spec AGENT-ROLE-PERSISTENCE-V1-2.
+
     One row per agent, absent until an operator sets one; a missing row and a
     NULL role both mean today's behavior for that role. Each team reference
     carries ``tenant_id``, so a policy cannot name another tenant's team, and a
@@ -3135,6 +3137,11 @@ class AgentAccessPolicy(Base):
     __tablename__ = "agent_access_policies"
     __table_args__ = (
         CheckConstraint("version >= 1", name="agent_access_policies_version_ck"),
+        # @spec AGENT-ROLE-PERSISTENCE-V1-2.
+        CheckConstraint(
+            "role_configuration IS NULL OR jsonb_typeof(role_configuration) = 'object'",
+            name="agent_access_policies_role_object_ck",
+        ),
         ForeignKeyConstraint(
             ["tenant_id", "agent_id"],
             [f"{SCHEMA}.agents.tenant_id", f"{SCHEMA}.agents.id"],
@@ -3160,6 +3167,10 @@ class AgentAccessPolicy(Base):
     )
     approver_team_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), default=None
+    )
+    # @spec AGENT-ROLE-PERSISTENCE-V1-2: absence is SQL NULL, never JSON null.
+    role_configuration: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB(none_as_null=True), nullable=True, default=None
     )
     version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
     updated_at: Mapped[datetime] = mapped_column(
@@ -3824,13 +3835,26 @@ class TenantIdentityProvider(Base):
     __table_args__ = (
         CheckConstraint("version >= 1", name="tenant_identity_providers_version_ck"),
         CheckConstraint("identity_epoch >= 0", name="tenant_identity_providers_identity_epoch_ck"),
+        CheckConstraint("lifecycle_generation >= 0", name="tenant_identity_providers_lifecycle_ck"),
+        CheckConstraint(
+            "http_selection IS NULL OR jsonb_typeof(http_selection) = 'object'",
+            name="tenant_identity_providers_http_object_ck",
+        ),
+        CheckConstraint(
+            "(http_selection IS NULL AND governed_domains IS NOT NULL AND managed_by IS NOT NULL) "
+            "OR (http_selection IS NOT NULL AND lifecycle_generation >= 1)",
+            name="tenant_identity_providers_owner_ck",
+        ),
     )
     tenant_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey(f"{SCHEMA}.tenants.id"), primary_key=True
     )
     issuer: Mapped[str] = mapped_column(String)
-    governed_domains: Mapped[list[str]] = mapped_column(JSONB)
-    managed_by: Mapped[str] = mapped_column(String)
+    governed_domains: Mapped[list[str] | None] = mapped_column(JSONB(none_as_null=True))
+    managed_by: Mapped[str | None] = mapped_column(String)
+    # @spec HTTP-PRINCIPAL-ADOPTION-V1-2.
+    http_selection: Mapped[dict[str, Any] | None] = mapped_column(JSONB(none_as_null=True))
+    lifecycle_generation: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0")
     version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
 
     # Shared channel-account ownership spans teams, so team epochs cannot fence it.

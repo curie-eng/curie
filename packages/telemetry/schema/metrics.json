@@ -494,6 +494,7 @@
           "/v1/internal/attachment-access/revoke",
           "/v1/internal/attachment-access/redeem",
           "/v1/internal/attachment-access/complete",
+          "/v1/internal/identity/turn-authority/check",
           "/channel-read",
           "/channels/admission",
           "/channels/token",
@@ -627,7 +628,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 1504,
+      "cardinality_bound": 1512,
       "description": "Active HTTP server requests.",
       "monotonic": false,
       "type": "up_down_counter",
@@ -709,6 +710,7 @@
           "/v1/internal/attachment-access/revoke",
           "/v1/internal/attachment-access/redeem",
           "/v1/internal/attachment-access/complete",
+          "/v1/internal/identity/turn-authority/check",
           "/channel-read",
           "/channels/admission",
           "/channels/token",
@@ -849,7 +851,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 7520,
+      "cardinality_bound": 7560,
       "description": "HTTP server requests.",
       "monotonic": true,
       "type": "counter",
@@ -931,6 +933,7 @@
           "/v1/internal/attachment-access/revoke",
           "/v1/internal/attachment-access/redeem",
           "/v1/internal/attachment-access/complete",
+          "/v1/internal/identity/turn-authority/check",
           "/channel-read",
           "/channels/admission",
           "/channels/token",
@@ -1071,7 +1074,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 7520,
+      "cardinality_bound": 7560,
       "description": "HTTP server request duration.",
       "monotonic": false,
       "type": "histogram",

@@ -195,6 +195,7 @@ async def read_directory_binding(
         # Reuse ingestion's active/tenant and governed-email/issuer checks.
         # Its row locks are released on session close without any mutation.
         await directory_service.scoped_namespaces(session, claims, config)
+        assert config.managed_by is not None
         return DirectoryBindingOut(
             tenant_id=claims.scope.tenant_id,
             issuer=config.issuer,
@@ -315,6 +316,7 @@ async def issue_directory_credential(
         )
         if len(teams) != len(body.team_ids):
             raise directory_sync.DirectorySyncError("team_out_of_scope")
+        assert config.managed_by is not None
         scope = directory_sync.DirectoryScope(
             body.tenant_id, config.issuer, config.managed_by, frozenset(body.team_ids)
         )
@@ -495,6 +497,7 @@ async def provision_directory_namespace(
 ) -> DirectoryNamespaceOut:
     try:
         config = await directory_service.configuration(session, body.tenant_id, write=True)
+        assert config.governed_domains is not None
         valid = (
             body.kind == "slack_workspace"
             and body.provider == "slack"

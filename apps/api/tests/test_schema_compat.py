@@ -58,9 +58,10 @@ CONTRACT = "0041"
 # WorkItems are keyed by their tracker issue (0103 contract, #3831), and
 # channel and WorkItem reads carry the trigger label of 0105 (#4361).
 # The 0108 join requires both stable reply selectors (0106) and identity links (0107).
-# The join requires both start diagnostics (0123) and attachment catalogs (0130),
-# and the API writes the twelve-hour execution deadlines only 0136 admits (#5067).
-APP_SCHEMA_MIN = "0136"
+# The join requires both start diagnostics (0123) and attachment catalogs (0130).
+# The API writes the twelve-hour execution deadlines only 0136 admits (#5067).
+# @spec AGENT-ROLE-PERSISTENCE-V1-9: policy ORM reads require the 0133 column.
+APP_SCHEMA_MIN = "0133"
 REVIEW_SCHEMA_MIN = "0063"
 PREV = "0040"
 
@@ -154,6 +155,8 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0130",
             "0131",
             "0136",
+            "0132",
+            "0133",
         } <= pending
         assert not pending & {"0091", "0092", "0093"}
     else:
@@ -177,8 +180,10 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0130",
             "0131",
             "0136",
+            "0132",
+            "0133",
         }
-    assert current_revision() == "0136"
+    assert current_revision() == "0133"
     assert sql_rows("SELECT name FROM curie.agents WHERE id=:id", {"id": agent_id}) == [
         ("merge-example",)
     ]
@@ -261,9 +266,9 @@ def test_agent_reads_refuse_the_schema_before_deploy_notification_expand() -> No
     # The directory and connect ORM requires the new identity tables/columns.
     # Migration expand compatibility for older images does not mean this image
     # can serve an older database.
-    for revision in sorted(known - {"0136"}):
+    for revision in sorted(known - {"0133"}):
         assert can_serve(revision, window, known) is False
-    assert can_serve("0136", window, known) is True
+    assert can_serve("0133", window, known) is True
 
 
 def test_planner_refuses_irreversible_before_mutation() -> None:

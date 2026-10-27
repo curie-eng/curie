@@ -24,7 +24,7 @@ from urllib.parse import urlsplit
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from . import identity_audit
+from . import identity_audit, principal_authority
 from .models import Principal, PrincipalTeam, Team
 
 MAX_MEMBERS = 10_000
@@ -87,6 +87,8 @@ async def locked_team(
     team_id: uuid.UUID,
     expected_epoch: int,
 ) -> Team:
+    # @spec HTTP-PRINCIPAL-ADOPTION-V1-9. Guard direct callers before team locks.
+    await principal_authority.require_local_scope(session, scope.tenant_id)
     require_version(expected_epoch)
     if team_id not in scope.team_ids:
         raise DirectorySyncError("team_out_of_scope")
@@ -214,6 +216,8 @@ async def set_account_status(
     if status not in {"active", "disabled", "revoked"}:
         raise DirectorySyncError("invalid_status")
     async with session.begin_nested():
+        # @spec HTTP-PRINCIPAL-ADOPTION-V1-9.
+        config = await principal_authority.require_local_scope(session, scope.tenant_id)
         principal = await session.scalar(
             select(Principal)
             .where(
@@ -231,6 +235,8 @@ async def set_account_status(
             raise DirectoryConflict("stale_authorization_version")
         principal.status = status
         principal.authorization_version += 1
+        if config is not None:
+            config.lifecycle_generation += 1
         version = principal.authorization_version
         identity_audit.record(
             session,

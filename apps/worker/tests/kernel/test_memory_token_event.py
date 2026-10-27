@@ -28,7 +28,12 @@ from aci_protocol import Final, OutboundEvent, QueuedTurn, SessionStatus, TextDe
 from curie_internal.sandbox_token import verify
 from curie_worker import binding as binding_module
 from curie_worker.behaviorpacks import BehaviorPacks
-from curie_worker.binding import BindingResolver, FactoryContext, ResolvedDeployment
+from curie_worker.binding import (
+    BindingResolver,
+    FactoryContext,
+    HttpIdentityBinding,
+    ResolvedDeployment,
+)
 from curie_worker.config import WorkerConfig
 
 # importlib import mode does not add the test root to sys.path.
@@ -53,6 +58,19 @@ _qevent = functools.partial(qevent, channel=CHANNEL, received_at="2026-10-01T00:
 
 class _MemoryBinding:
     """Resolves one agent with memory writes on; real boot env and real mints."""
+
+    async def identity_binding(
+        self, kind: str, adapter: str | None, address: str,
+    ) -> HttpIdentityBinding | None:
+        """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+        agent_id = AGENT_ID
+        return HttpIdentityBinding(
+            tenant_id=uuid.UUID("00000000-0000-4000-8000-000000000001"),
+            agent_id=agent_id,
+            binding_id=uuid.uuid5(uuid.NAMESPACE_URL, repr((kind, adapter, address))),
+            binding_generation=1, http_identity_required=False,
+        )
+
 
     def __init__(self, *, memory_writes: bool = True) -> None:
         self.memory_writes = memory_writes

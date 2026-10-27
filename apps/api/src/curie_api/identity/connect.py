@@ -17,7 +17,7 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .. import identity_audit
+from .. import identity_audit, principal_authority
 from ..crud.console import principal_is_active
 from ..models import (
     IdentityConnectToken,
@@ -25,7 +25,6 @@ from ..models import (
     IdentityNamespace,
     Principal,
     Team,
-    Tenant,
     TenantIdentityProvider,
 )
 from ..oidc import OidcClaims
@@ -49,20 +48,16 @@ def hash_token(token: str) -> str:
 async def configured_provider(
     session: AsyncSession, tenant_id: uuid.UUID
 ) -> TenantIdentityProvider | None:
-    tenant_status = await session.scalar(
-        select(Tenant.status)
-        .where(Tenant.id == tenant_id)
-        .with_for_update(read=True, key_share=True)
-    )
-    if tenant_status != "active":
+    # @spec HTTP-PRINCIPAL-ADOPTION-V1-10. Retained metadata is not authority.
+    try:
+        _, config = await principal_authority.lock_scope(session, tenant_id)
+        if config is None:
+            return None
+        if config.http_selection is not None:
+            principal_authority.stored_configuration(config)
+    except principal_authority.PrincipalAuthorityRefusal:
         return None
-    config = await session.scalar(
-        select(TenantIdentityProvider)
-        .where(TenantIdentityProvider.tenant_id == tenant_id)
-        .with_for_update(read=True)
-        .execution_options(populate_existing=True)
-    )
-    if config is None:
+    if config.governed_domains is None or config.managed_by is None:
         return None
     # A configured issuer alone must not turn an empty projection into an
     # identity authority. A successful full snapshot is required once.
@@ -161,13 +156,19 @@ async def live_token(
 ) -> IdentityConnectToken:
     if not TOKEN_PATTERN.fullmatch(token):
         raise ConnectRefused("invalid_connect")
+    # @spec HTTP-PRINCIPAL-ADOPTION-V1-4. Discover only the tenant before locking.
+    tenant_id = await session.scalar(select(IdentityConnectToken.tenant_id).where(
+        IdentityConnectToken.token_hash == hash_token(token)
+    ))
+    if tenant_id is None:
+        raise ConnectRefused("invalid_connect")
+    config = await configured_provider(session, tenant_id)
     query = select(IdentityConnectToken).where(IdentityConnectToken.token_hash == hash_token(token))
     if lock:
         query = query.with_for_update()
     row = await session.scalar(query.execution_options(populate_existing=True))
     if row is None or row.consumed_at is not None or row.expires_at <= datetime.now(UTC):
         raise ConnectRefused("invalid_connect")
-    config = await configured_provider(session, row.tenant_id)
     namespace = await session.get(
         IdentityNamespace, row.identity_namespace_id, populate_existing=True
     )
@@ -182,6 +183,21 @@ async def live_token(
     return row
 
 
+async def _connection_principal(
+    session: AsyncSession, *, tenant_id: uuid.UUID, principal_id: uuid.UUID,
+) -> Principal:
+    """@spec HTTP-PRINCIPAL-ADOPTION-V1-10."""
+    try:
+        person = await principal_authority.guarded_principal(
+            session, tenant_id=tenant_id, principal_id=principal_id,
+        )
+    except principal_authority.PrincipalAuthorityRefusal:
+        raise ConnectRefused("invalid_connect") from None
+    if person is None:
+        raise ConnectRefused("invalid_connect")
+    return person
+
+
 async def preserve_verified_claims(
     session: AsyncSession,
     *,
@@ -190,6 +206,9 @@ async def preserve_verified_claims(
     claims: OidcClaims,
 ) -> None:
     row = await live_token(session, token, lock=True)
+    principal = await _connection_principal(
+        session, tenant_id=row.tenant_id, principal_id=principal.id,
+    )
     if (
         principal.tenant_id != row.tenant_id
         or principal.idp_issuer != row.idp_issuer
@@ -202,7 +221,7 @@ async def preserve_verified_claims(
     # Principal.email is a display attribute and cannot substitute for proof.
     config = await configured_provider(session, row.tenant_id)
     parsed = (
-        governed_email(claims.email, list(config.governed_domains))
+        governed_email(claims.email, list(config.governed_domains or []))
         if claims.raw.get("email_verified") is True and claims.email and config
         else None
     )
@@ -284,7 +303,7 @@ async def link_verified_email(
     config = await configured_provider(session, tenant_id)
     if config is None or issuer != config.issuer:
         return
-    parsed = governed_email(email, list(config.governed_domains))
+    parsed = governed_email(email, list(config.governed_domains or []))
     if parsed is None:
         return
     address, domain = parsed
@@ -304,6 +323,10 @@ async def link_verified_email(
     )
     if namespace is None or namespace.status != "active":
         return
+    # @spec HTTP-PRINCIPAL-ADOPTION-V1-10.
+    principal = await _connection_principal(
+        session, tenant_id=tenant_id, principal_id=principal.id,
+    )
     existing = await session.scalar(
         select(IdentityLink).where(
             IdentityLink.identity_namespace_id == namespace.id,
@@ -334,7 +357,8 @@ async def confirm(session: AsyncSession, *, token: str, principal: Principal) ->
     if row.verified_principal_id == principal.id and row.verified_at and row.verified_email:
         config = await configured_provider(session, row.tenant_id)
         parsed = (
-            governed_email(row.verified_email, list(config.governed_domains)) if config else None
+            governed_email(row.verified_email, list(config.governed_domains or []))
+            if config else None
         )
         if parsed is not None:
             email_namespace = await find_or_create_namespace(
@@ -360,11 +384,8 @@ async def confirm(session: AsyncSession, *, token: str, principal: Principal) ->
     namespace = next((ns for ns in namespaces if ns.id == row.identity_namespace_id), None)
     # Re-read the principal while holding a lock: concurrent deactivation and
     # connection serialize rather than admitting a stale in-memory principal.
-    person = await session.scalar(
-        select(Principal)
-        .where(Principal.id == principal.id)
-        .with_for_update()
-        .execution_options(populate_existing=True)
+    person = await _connection_principal(
+        session, tenant_id=row.tenant_id, principal_id=principal.id,
     )
     if (
         person is None

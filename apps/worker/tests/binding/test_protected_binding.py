@@ -315,3 +315,50 @@ def test_resolver_rejects_profile_from_a_different_manifest() -> None:
             await engine.dispose()
 
     asyncio.run(go())
+
+
+def _classifying_resolver(engine) -> ProtectedBindingResolver:
+    """@spec HTTP-INVOCATION-EXECUTION-18: the production protected owner, no delivery."""
+    profile = execution_profile()
+    return ProtectedBindingResolver(
+        engine,
+        db_schema=_SCHEMA,
+        execution=parse_execution_config(canonical(profile), manifest=manifest_for(profile)),
+        trusted_manifest=manifest_for(profile),
+        credentials=_Credentials(),
+    )
+
+
+@pytest.mark.parametrize("recognized", [False, True], ids=["context-free", "recognized"])
+def test_protected_owner_is_an_explicitly_local_classifier(recognized: bool) -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-18: protected turns are not HTTP invocations."""
+    from types import SimpleNamespace
+
+    from curie_worker.kernel import identity
+    from queue_fixtures import qevent
+
+    async def go() -> None:
+        engine = create_async_engine(_DB_URL)
+        try:
+            resolver = _classifying_resolver(engine)
+            assert await resolver.identity_binding("slack", "default", "CEXAMPLE1") is None
+            turn = qevent("protected synthetic turn", channel="CEXAMPLE1")
+            carry = identity.HttpTurnCarry(
+                turn, "synthetic-context" if recognized else None,
+                hashlib.sha256(b"synthetic").hexdigest() if recognized else None,
+            )
+            token = identity.CURRENT.set(carry)
+            try:
+                kernel = SimpleNamespace(_binding=resolver, _identity_authority=None)
+                if recognized:
+                    with pytest.raises(identity.HttpIdentityRefused):
+                        await identity.prepare(kernel)
+                else:
+                    await identity.prepare(kernel)
+                    assert carry.legacy is True and carry.scope is None
+            finally:
+                identity.CURRENT.reset(token)
+        finally:
+            await engine.dispose()
+
+    asyncio.run(go())

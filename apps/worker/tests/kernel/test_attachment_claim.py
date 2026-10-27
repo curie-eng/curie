@@ -52,6 +52,7 @@ from aci_protocol import (
 )
 from curie_worker.attachments import AttachmentResolutionError
 from curie_worker.behaviorpacks import BehaviorPacks
+from curie_worker.binding import HttpIdentityBinding
 from curie_worker.kernel.core import Kernel
 from curie_worker.sandbox import SuspendedThreadError
 from curie_worker.workspace import WORKSPACE_REF_ENV, WORKSPACE_SHA256_ENV
@@ -222,6 +223,18 @@ class _WorkspaceBinding:
         self.resolved = _WorkspaceResolved(
             deployment_id,
             workspace_enabled=workspace_enabled,
+        )
+        self._local_tenant_id = uuid.uuid4()
+        self._local_binding_id = uuid.uuid4()
+
+    async def identity_binding(
+        self, _kind: str, _adapter: str | None, _channel: str,
+    ) -> HttpIdentityBinding:
+        """@spec HTTP-INVOCATION-EXECUTION-18: this workspace fixture is explicitly local."""
+        return HttpIdentityBinding(
+            tenant_id=self._local_tenant_id, agent_id=self.resolved.agent_id,
+            binding_id=self._local_binding_id, binding_generation=1,
+            http_identity_required=False,
         )
 
     async def resolve(self, _kind: str, _adapter: str | None, _channel: str) -> _WorkspaceResolved:

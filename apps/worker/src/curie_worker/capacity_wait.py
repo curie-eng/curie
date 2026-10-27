@@ -300,6 +300,15 @@ return {1, generation, cause, terminal_entry}
 """
 
 
+# @spec HTTP-INVOCATION-EXECUTION-18
+_SUPPRESS_HTTP_NOTICES_LUA = """
+if redis.call('HGET', KEYS[1], 'generation') ~= ARGV[1] then return 0 end
+redis.call('ZREM', KEYS[2], ARGV[2])
+redis.call('ZREM', KEYS[3], ARGV[2])
+return 1
+"""
+
+
 _NOTICE_CLAIM_LUA = """
 if redis.call('HGET', KEYS[1], 'state') ~= 'waiting' then return 0 end
 if redis.call('HGET', KEYS[1], 'generation') ~= ARGV[1] then return 0 end
@@ -511,6 +520,13 @@ class CapacityWaitStore:
         if _NOTICE_LOCK_MS < 2 * _NOTICE_SEND_TIMEOUT_S * 1000:
             raise ValueError("capacity notice lock must outlast its send bound")
         return _NOTICE_LOCK_MS
+
+    async def suppress_http_notices(self, event_id: str, generation: int) -> None:
+        """Unschedule courtesies without delivery flags. @spec HTTP-INVOCATION-EXECUTION-18."""
+        await self._redis.eval(
+            _SUPPRESS_HTTP_NOTICES_LUA, 3, self._record(event_id), self._notices,
+            self._expiry_notices, str(generation), event_id,
+        )
 
     async def get(self, event_id: str) -> CapacityWaitRecord | None:
         stored = await self._redis.hgetall(self._record(event_id))

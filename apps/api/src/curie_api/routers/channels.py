@@ -37,7 +37,7 @@ import secrets
 import time
 import uuid
 from datetime import UTC, datetime
-from typing import Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any
 from urllib.parse import urlsplit
 
 import redis.asyncio as redis
@@ -68,6 +68,7 @@ from fastapi.exceptions import RequestValidationError
 from opentelemetry.trace import SpanKind, StatusCode
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from curie_api.crud import channels as crud_channels
 
@@ -91,20 +92,26 @@ from ..auth import require_api_key, verify_platform_key
 from ..channel_token import CHANNEL_ENQUEUE_SCOPE
 from ..config import get_settings
 from ..delivery import (
+    DeliveryGuardRefusal,
     backlog_reservation,
     claim_delivery,
     duplicate_stream_id,
     enqueue_owned,
+    read_identity_delivery_receipt,
     settle_failed_delivery,
     sha16,
     take_backlog_slot,
 )
 from ..deps import SessionDep
 from ..identity import connect
+from ..identity.http_invocation import current_http_invocation
 from ..identity.slack import SlackEvidence
-from ..models import AgentChannel
+from ..models import AgentChannel, TenantIdentityProvider
 from ..wirebody import read_bounded_body
 from .identity_connect import public_api_prefix
+
+if TYPE_CHECKING:
+    from ..identity.http_invocation import CurrentHttpInvocation
 
 logger = logging.getLogger(__name__)
 
@@ -615,6 +622,7 @@ async def ingest_turn(
     response: Response,
     session: SessionDep,
     x_api_key: Annotated[str | None, Header()] = None,
+    x_curie_receiver_proof: Annotated[str | None, Header()] = None,
 ) -> TurnAccepted:
     """Enqueue one inbound delivery for the binding the body names.
 
@@ -645,6 +653,8 @@ async def ingest_turn(
         subject="channel turn body",
     )
     body = _parse_turn(raw)
+    if x_curie_receiver_proof is not None and not x_api_key:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid_http_receiver")
     claims = _verify_credential(x_api_key)
     await identity_fence.lock_identity_reader(session)
     # `TurnIn` deliberately does not model `adapter` (plan D4.1, `TurnIn`'s own
@@ -668,6 +678,33 @@ async def ingest_turn(
         # The mint's refusal, on the ingress. Enqueuing here would hand the
         # worker a turn with nowhere to reply and no credential to reply with.
         raise _unroutable(body.kind, body.address)
+
+    # @spec HTTP-INVOCATION-EXECUTION-2 HTTP-INVOCATION-EXECUTION-3
+    # SQL presence keeps corrupt JSON null out of the legacy authorization path.
+    http_mode = await session.scalar(
+        select(TenantIdentityProvider.http_selection.is_not(None)).where(
+            TenantIdentityProvider.tenant_id == row.tenant_id,
+        )
+    )
+    if http_mode is True or x_curie_receiver_proof is not None:
+        if claims is None or not x_curie_receiver_proof:
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid_http_receiver")
+        # @spec HTTP-INVOCATION-EXECUTION-4/15: external lookup holds no reader.
+        await session.rollback()
+        assert x_api_key is not None
+        try:
+            async with current_http_invocation(
+                request, body=body, submitted_bytes=raw,
+                channel_credential=x_api_key, receiver_proof=x_curie_receiver_proof,
+            ) as current:
+                return await _enqueue_turn(
+                    request, response, current.session, current.row, body, claims,
+                    http_invocation=current,
+                )
+        except DeliveryGuardRefusal as exc:
+            if exc.code == "intent_conflict":
+                raise HTTPException(409, "delivery_intent_conflict") from None
+            raise HTTPException(503, "identity_authority_unavailable") from None
 
     # ADR 0175: the one admission check, after the credential proved it speaks
     # for this binding and before anything is claimed or queued. The adapter is
@@ -693,6 +730,17 @@ async def ingest_turn(
     if not decision.allowed:
         raise HTTPException(status.HTTP_403_FORBIDDEN, CALLER_NOT_ALLOWED_DETAIL)
 
+    return await _enqueue_turn(request, response, session, row, body, claims)
+
+
+# @spec HTTP-INVOCATION-EXECUTION-7 HTTP-INVOCATION-EXECUTION-15
+async def _enqueue_turn(
+    request: Request, response: Response, session: AsyncSession, row: AgentChannel,
+    body: TurnIn, claims: channel_token.ChannelClaims | None,
+    *, http_invocation: CurrentHttpInvocation | None = None,
+) -> TurnAccepted:
+    """Use the existing delivery owner inside the caller's live boundary."""
+    settings = get_settings()
     # One hash of the `delivery_id`, shared by the two names derived from it.
     digest = sha16(body.delivery_id)
     event_id = _event_id(row.id, digest)
@@ -758,6 +806,21 @@ async def ingest_turn(
                 # those requests answers from `event_id` alone and would have thrown
                 # the payload away.
                 turn = _mint_turn(row, body, event_id)
+                identity_arguments: dict[str, Any] = {}
+                if http_invocation is not None:
+                    assert turn.reply_handle is not None
+                    turn = turn.model_copy(update={
+                        "author_principal": http_invocation.principal_ref,
+                        "reply_handle": turn.reply_handle.model_copy(update={"placeholder": None}),
+                    })
+                payload = turn.model_dump_json()
+                if http_invocation is not None:
+                    context, guard = http_invocation.seal_payload(
+                        payload=payload, event_id=event_id,
+                        original_invocation_id=event_id, reservation=reservation,
+                        receipt_key=f"{key}:identity",
+                    )
+                    identity_arguments = {"identity_context": context, "guard": guard}
                 carrier: dict[str, str] = {}
                 enqueue_error: Exception | None = None
                 enqueue_result: tuple[bool, str] | None = None
@@ -773,7 +836,7 @@ async def ingest_turn(
                             key=key,
                             stream=settings.runs_stream,
                             owner=owner,
-                            payload=turn.model_dump_json(),
+                            payload=payload,
                             payload_field=STREAM_PAYLOAD_FIELD,
                             lease_s=settings.channel_delivery_lease_s,
                             transport_field=(
@@ -782,6 +845,7 @@ async def ingest_turn(
                                 else None
                             ),
                             transport_value=carrier.get(TRACEPARENT_STREAM_FIELD),
+                            **identity_arguments,
                         )
                     except Exception as exc:  # noqa: BLE001 - existing broad catch retained
                         enqueue_error = exc
@@ -841,7 +905,15 @@ async def ingest_turn(
                     preserve_quota=preserve_quota,
                 )
                 raise
-        held = await client.get(key)
+        held: bytes | str | None
+        if http_invocation is not None:
+            # @spec HTTP-INVOCATION-EXECUTION-14: historical claims require metadata.
+            held = await read_identity_delivery_receipt(
+                client, key=key, receipt_key=f"{key}:identity",
+                intent_digest=http_invocation.intent_digest,
+            )
+        else:
+            held = await client.get(key)
         if held is not None:
             return _duplicate(event_id, text(held), response)
 

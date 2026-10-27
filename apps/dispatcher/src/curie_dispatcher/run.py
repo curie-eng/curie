@@ -13,6 +13,7 @@ import signal
 import threading
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from typing import Any
 
 import redis
 from curie_telemetry import bootstrap_service_telemetry
@@ -24,6 +25,7 @@ from .admission import build_admission
 from .app import SocketModeConnection, build_app, build_redis, build_web_client
 from .config import DispatcherConfig
 from .heartbeat import start_heartbeat
+from .http_receiver import HttpReceiverRuntime
 from .identities import (
     SlackBotIds,
     SlackIdentityCredentials,
@@ -89,6 +91,7 @@ def build_identity_connections(
     redis_client: redis.Redis,
     logger: logging.Logger,
     declared_count: int | None = None,
+    http_receivers: tuple[HttpReceiverRuntime, ...] = (),
 ) -> tuple[IdentityConnection, ...]:
     """One connection per identity, all feeding the one stream ``redis_client`` writes.
 
@@ -102,6 +105,18 @@ def build_identity_connections(
     preflight leaves one survivor of a larger count, that survivor still names
     itself.
     """
+    # @spec HTTP-INVOCATION-EXECUTION-19: invalid selection never starts legacy sockets.
+    if type(http_receivers) is not tuple:
+        raise ValueError("invalid_http_receiver_runtime")
+    selected: dict[str, HttpReceiverRuntime] = {}
+    names = {item.credentials.name for item in identities}
+    for receiver in http_receivers:
+        if (
+            type(receiver) is not HttpReceiverRuntime or receiver.identity_name not in names
+            or receiver.identity_name in selected
+        ):
+            raise ValueError("invalid_http_receiver_runtime")
+        selected[receiver.identity_name] = receiver
     configured = declared_count if declared_count is not None else len(identities)
     several = configured > 1
     presence = SocketPresence(configured=configured)
@@ -126,6 +141,9 @@ def build_identity_connections(
     for preflighted in identities:
         credentials = preflighted.credentials
         web_client = build_web_client(config, credentials)
+        receiver_kwargs: dict[str, Any] = {}
+        if credentials.name in selected:
+            receiver_kwargs["http_receiver"] = selected[credentials.name]
         app = build_app(
             config,
             identity=credentials,
@@ -134,6 +152,7 @@ def build_identity_connections(
             logger=logger,
             identity_bots=identity_bots,
             admission=admission,
+            **receiver_kwargs,
         )
         connect = _socket_mode_connector(
             app,
@@ -167,6 +186,7 @@ def build_supervisor(
     logger: logging.Logger,
     identities: Sequence[PreflightedIdentity] | None = None,
     declared_count: int | None = None,
+    http_receivers: tuple[HttpReceiverRuntime, ...] = (),
 ) -> SupervisorGroup:
     """Assemble one supervisor per admitted identity, run together.
 
@@ -176,6 +196,8 @@ def build_supervisor(
     the number of identities resolved before preflight. It defaults to the
     number of ``identities`` (1, for the stock default).
     """
+    if type(http_receivers) is not tuple:
+        raise ValueError("invalid_http_receiver_runtime")
     admitted = (
         tuple(identities)
         if identities is not None
@@ -192,6 +214,7 @@ def build_supervisor(
         redis_client=build_redis(config),
         logger=logger,
         declared_count=declared_count if declared_count is not None else len(admitted),
+        **({"http_receivers": http_receivers} if http_receivers else {}),
     )
     group = SupervisorGroup(
         {c.name: c.supervisor for c in connections},

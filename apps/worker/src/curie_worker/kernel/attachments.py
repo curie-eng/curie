@@ -235,6 +235,10 @@ async def _route_attachment_and_start(
                         BaseException | None,
                     ]:
                         try:
+                            # @spec HTTP-INVOCATION-EXECUTION-18: fetch/readiness precede authority.
+                            from .identity import check
+
+                            await check(self, "claim_or_resume")
                             return (
                                 await asyncio.to_thread(
                                     self._substrate.handoff,

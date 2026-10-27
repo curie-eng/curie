@@ -174,6 +174,9 @@ async def _start_turn_under_hook_control(
 ) -> TurnStream:
     """Serialize runner admission with the operator pause action."""
 
+    from .identity import check
+
+    await check(self, "start")
     if event.tool_access is not None:
         # @spec WORKER-TOOL-ACCESS-2: every path that opens a turn comes
         # through here, the attachment handoff included.

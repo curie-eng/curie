@@ -387,6 +387,8 @@ _HTTP_OPERATIONS = [
     "/v1/internal/attachment-access/revoke",
     "/v1/internal/attachment-access/redeem",
     "/v1/internal/attachment-access/complete",
+    # @spec HTTP-INVOCATION-EXECUTION-16
+    "/v1/internal/identity/turn-authority/check",
     "/channel-read",
     "/channels/admission",
     "/channels/token",

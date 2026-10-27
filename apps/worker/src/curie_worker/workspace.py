@@ -1787,6 +1787,7 @@ class WorkspaceClaimCoordinator:
         repo_full_name: str | None = None,
         replace_handle: Any | None = None,
         revalidate_before_handoff: Callable[[], None] | None = None,
+        revalidate_before_claim: Callable[[], None] | None = None,
         validate_candidate: Callable[[Any], None] | None = None,
         lineage_branch: str | None = None,
         lineage_head: str | None = None,
@@ -1864,6 +1865,9 @@ class WorkspaceClaimCoordinator:
                     if validate_candidate is not None
                     else {}
                 )
+                # @spec HTTP-INVOCATION-EXECUTION-18: sample after all preparation/fences.
+                if revalidate_before_claim is not None:
+                    revalidate_before_claim()
                 handle = self.substrate.handoff(
                     thread_key,
                     expected=replace_handle,
@@ -1878,6 +1882,8 @@ class WorkspaceClaimCoordinator:
                 )
             else:
                 try:
+                    if revalidate_before_claim is not None:
+                        revalidate_before_claim()
                     handle = self.substrate.claim(
                         thread_key,
                         env=claim_env,
@@ -1894,6 +1900,8 @@ class WorkspaceClaimCoordinator:
                     # port independent of the concrete Docker/Kubernetes package.
                     if not isinstance(exc, self._suspended_errors):
                         raise
+                    if revalidate_before_claim is not None:
+                        revalidate_before_claim()
                     handle = self.substrate.resume(
                         thread_key,
                         env=claim_env,

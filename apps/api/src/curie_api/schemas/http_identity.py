@@ -155,6 +155,16 @@ def _timestamp(value: str) -> str:
     return value
 
 
+def utc_instant(value: str) -> Fraction:
+    """Exact timestamp conversion owned by T1. @spec HTTP-IDENTITY-V1-4."""
+    try:
+        if type(value) is not str:
+            raise ValueError
+        return _instant(value)
+    except (ValueError, TypeError):
+        raise ValueError("invalid_utc_instant") from None
+
+
 Text = Annotated[str, BeforeValidator(_text)]
 Opaque = Annotated[Text, Field(min_length=1)]
 # @spec HTTP-IDENTITY-V1-5: validation-chain schemas can omit the later UUID pattern.

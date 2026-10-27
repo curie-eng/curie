@@ -92,6 +92,7 @@ from .approval_actions import (
     this_release_owns_action,
 )
 from .config import DispatcherConfig, release_identity
+from .http_receiver import HttpReceiverRuntime
 from .identities import delivery_key, minted_adapter
 from .identity import (
     IdentityResolver,
@@ -101,6 +102,7 @@ from .identity import (
 )
 from .inbound_attachments import derive_attachments
 from .inbound_text import derive_text
+from .inbound_text import strip_self_mention as _strip_self_mention
 from .marked_actions import MARK, REFUSAL, declared_driver, reserve_turn
 from .queue import claim_event, enqueue
 from .relevance import DropReason, Lane, classify, drop, missing_envelope_fields
@@ -117,27 +119,6 @@ CONNECT_ACCOUNT_ACTION_ID = "curie_connect_account"
 
 def _utc_now_iso() -> str:
     return datetime.now(UTC).isoformat()
-
-
-def _strip_self_mention(text: str, bot_user_id: str | None) -> str:
-    """Remove every mention of THIS bot from an event's raw ``text``.
-
-    Slack delivers ``app_mention``/``message`` events with the mention token
-    still embedded verbatim -- ``<@BOT_USER_ID>``, optionally followed by a
-    ``|display name`` label, and (since the composer always inserts one after
-    an inline mention) trailing whitespace. Left unstripped, a mention-only
-    message -- ``@Squawk`` and nothing else -- reaches the worker as a
-    NON-empty string, the mention markup itself, rather than the empty text
-    the sender actually meant. A model-backed agent shrugs this off as prompt
-    noise, which is exactly why it went unnoticed; an agent whose behavior
-    branches on emptiness (a stack's push-vs-pop, #1525) pushes the literal
-    markup instead of popping. ``bot_user_id`` comes from Bolt's own
-    ``context["bot_user_id"]`` (resolved from the ``authorize`` result per
-    request), never re-derived here.
-    """
-    if not bot_user_id:
-        return text
-    return re.sub(rf"<@{re.escape(bot_user_id)}(?:\|[^>]*)?>\s*", "", text).strip()
 
 
 def _is_unambiguous_rejection(error: SlackApiError) -> bool:
@@ -430,6 +411,31 @@ def _mint_turn(
     return stream_id
 
 
+def _delivery_canary(
+    *, lane: Lane, channel: str, slack_event_id: str, config: DispatcherConfig,
+    slack_identity: str, log: logging.Logger,
+) -> bool:
+    """Shared read-only short circuit. @spec HTTP-INVOCATION-EXECUTION-19."""
+    # A delivery canary proves Slack still delivers to this identity and
+    # nothing more (#4960): count it and stop before relevance and admission,
+    # so it never asks the API, posts a placeholder or mints a turn.
+    if lane == "mention" and channel in config.slack_delivery_canary_channels:
+        record_metric(
+            "curie.slack.delivery_canary",
+            attributes={"service.name": "curie-dispatcher", "slack_identity": slack_identity},
+        )
+        drop(
+            log,
+            DropReason.DELIVERY_CANARY,
+            event_id=slack_event_id,
+            level=logging.DEBUG,
+            channel=channel,
+        )
+        return True
+
+    return False
+
+
 def process_event(
     *,
     body: dict[str, Any],
@@ -504,21 +510,10 @@ def process_event(
         )
         return None
 
-    # A delivery canary proves Slack still delivers to this identity and
-    # nothing more (#4960): count it and stop before relevance and admission,
-    # so it never asks the API, posts a placeholder or mints a turn.
-    if lane == "mention" and channel in config.slack_delivery_canary_channels:
-        record_metric(
-            "curie.slack.delivery_canary",
-            attributes={"service.name": "curie-dispatcher", "slack_identity": slack_identity},
-        )
-        drop(
-            log,
-            DropReason.DELIVERY_CANARY,
-            event_id=slack_event_id,
-            level=logging.DEBUG,
-            channel=channel,
-        )
+    if _delivery_canary(
+        lane=lane, channel=channel, slack_event_id=slack_event_id, config=config,
+        slack_identity=slack_identity, log=log,
+    ):
         return None
 
     bots = identity_bots or {}
@@ -875,6 +870,7 @@ def register_handlers(
     identity_bots: Mapping[str, str] | None = None,
     admission: AdmissionGate | None = None,
     identity_client: IdentityResolver | None = None,
+    http_receiver: HttpReceiverRuntime | None = None,
 ) -> None:
     """Wire the app_mention, (direct-message) message, block-action, and
     approval-card listeners. ``resolver`` (the approvals API client) is
@@ -887,11 +883,19 @@ def register_handlers(
     lookup (#2910); None builds the production one from config, and a build
     that yields None registers no lookup at all."""
 
+    # @spec HTTP-INVOCATION-EXECUTION-19: selection is explicit and cannot fall back.
+    if http_receiver is not None and (
+        type(http_receiver) is not HttpReceiverRuntime
+        or http_receiver.identity_name != slack_identity
+    ):
+        raise ValueError("invalid_http_receiver_runtime")
     approval_resolver = resolver if resolver is not None else build_resolver(config)
     admission_gate = admission if admission is not None else build_admission(config, redis_client)
     # Looked up as a module global so tests can keep the lookup offline.
     lookup: IdentityResolver | None = (
-        identity_client if identity_client is not None else build_identity_client(config)
+        None if http_receiver is not None else (
+            identity_client if identity_client is not None else build_identity_client(config)
+        )
     )
     if lookup is not None:
         # Registered first among this app's own middleware: it only submits to a
@@ -934,6 +938,9 @@ def register_handlers(
         decline with 503 for retry; exact row misses retain 404. Never call
         Slack here, and ask caller admission before dedupe and ownership.
         """
+        # @spec HTTP-INVOCATION-EXECUTION-19: selected intake precedes every legacy probe.
+        if http_receiver is not None:
+            return next()
         if str(event.get("channel") or "") in config.slack_delivery_canary_channels:
             return next()
         text = _strip_self_mention(derive_text(event), context.get("bot_user_id"))
@@ -983,6 +990,25 @@ def register_handlers(
     def _on_app_mention(
         body: dict[str, Any], event: dict[str, Any], context: dict[str, Any]
     ) -> None:
+        # @spec HTTP-INVOCATION-EXECUTION-19: Bolt has already acknowledged this event.
+        if http_receiver is not None:
+            if _delivery_canary(
+                lane="mention", channel=str(event.get("channel") or ""),
+                slack_event_id=str(body.get("event_id") or ""), config=config,
+                slack_identity=slack_identity, log=log,
+            ):
+                return
+            result = http_receiver.submit(
+                body=body, event=event, slack_identity=slack_identity,
+                bot_user_id=context.get("bot_user_id"),
+            )
+            if result.status in {"refused", "unavailable"}:
+                drop(
+                    log, DropReason.CALLER_NOT_ALLOWED if result.status == "refused"
+                    else DropReason.ADMISSION_UNAVAILABLE, lane="mention",
+                    event_id=str(body.get("event_id") or ""),
+                )
+            return
         process_event(
             body=body,
             event=event,
@@ -1002,6 +1028,10 @@ def register_handlers(
 
     @app.event("message")
     def _on_message(body: dict[str, Any], event: dict[str, Any], context: dict[str, Any]) -> None:
+        # @spec HTTP-INVOCATION-EXECUTION-19.
+        if http_receiver is not None:
+            drop(log, DropReason.UNSUBSCRIBED_LANE, event_id="", lane="im")
+            return
         # ENVELOPE VALIDATION, not a relevance decision (#2006). The manifest at
         # `apps/dispatcher/slack-app-manifest.yaml` subscribes bot_events to
         # exactly `app_mention` and `message.im`, so a message on any other
@@ -1053,6 +1083,11 @@ def register_handlers(
     # checked per install, not assumed after some interval.
     @app.action(APPROVE_ACTION_ID)
     def _on_approve(ack: Callable[..., Any], body: dict[str, Any]) -> None:
+        # @spec HTTP-INVOCATION-EXECUTION-19: these selected lanes are not qualified.
+        if http_receiver is not None:
+            ack()
+            drop(log, DropReason.UNSUBSCRIBED_LANE, event_id="")
+            return
         click = resolve_approval_action(
             body=body,
             decision="approved",
@@ -1077,6 +1112,11 @@ def register_handlers(
 
     @app.action(REJECT_ACTION_ID)
     def _on_reject(ack: Callable[..., Any], body: dict[str, Any]) -> None:
+        # @spec HTTP-INVOCATION-EXECUTION-19: these selected lanes are not qualified.
+        if http_receiver is not None:
+            ack()
+            drop(log, DropReason.UNSUBSCRIBED_LANE, event_id="")
+            return
         click = resolve_approval_action(
             body=body,
             decision="rejected",
@@ -1107,6 +1147,11 @@ def register_handlers(
     # a second live behavior; the earlier wording claimed otherwise.
     @app.action(APPROVE_NOTE_ACTION_ID)
     def _on_approve_with_note(ack: Callable[..., Any], body: dict[str, Any]) -> None:
+        # @spec HTTP-INVOCATION-EXECUTION-19: these selected lanes are not qualified.
+        if http_receiver is not None:
+            ack()
+            drop(log, DropReason.UNSUBSCRIBED_LANE, event_id="")
+            return
         if this_release_owns_action(body, approval_resolver) is False:
             decline_unowned_envelope(
                 ack,
@@ -1128,6 +1173,11 @@ def register_handlers(
 
     @app.action(REJECT_NOTE_ACTION_ID)
     def _on_reject_with_note(ack: Callable[..., Any], body: dict[str, Any]) -> None:
+        # @spec HTTP-INVOCATION-EXECUTION-19: these selected lanes are not qualified.
+        if http_receiver is not None:
+            ack()
+            drop(log, DropReason.UNSUBSCRIBED_LANE, event_id="")
+            return
         if this_release_owns_action(body, approval_resolver) is False:
             decline_unowned_envelope(
                 ack,
@@ -1154,6 +1204,11 @@ def register_handlers(
     # the open modal.
     @app.view(NOTE_MODAL_CALLBACK_ID)
     def _on_note_submitted(ack: Callable[..., Any], body: dict[str, Any]) -> None:
+        # @spec HTTP-INVOCATION-EXECUTION-19: these selected lanes are not qualified.
+        if http_receiver is not None:
+            ack()
+            drop(log, DropReason.UNSUBSCRIBED_LANE, event_id="")
+            return
         # Decide first, with no Slack round trip in the way: Slack allows three
         # seconds for the ack and the resolve POST is the only network hop the
         # decision needs (#1077).
@@ -1195,6 +1250,11 @@ def register_handlers(
     # non-owning release can leave the envelope for Slack to retry (#2248).
     @app.action(re.compile(r".+"))
     def _on_action(ack: Callable[..., None], body: dict[str, Any]) -> None:
+        # @spec HTTP-INVOCATION-EXECUTION-19.
+        if http_receiver is not None:
+            ack()
+            drop(log, DropReason.UNSUBSCRIBED_LANE, event_id="")
+            return
         actions = body.get("actions") or []
         action_id = str(actions[0].get("action_id", "")) if actions else ""
         if is_approval_action(action_id):

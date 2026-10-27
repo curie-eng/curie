@@ -760,6 +760,12 @@ async def _emit_status(self: Kernel, target: ReplyTarget, route: TargetRoute, st
     assistant feature must all cost one debug line and nothing else. An
     EMPTY status is the clear.
     """
+    # @spec HTTP-INVOCATION-EXECUTION-18: no premature or unverified courtesy mutation.
+    from .identity import CURRENT
+
+    carry = CURRENT.get()
+    if carry is not None and not carry.legacy:
+        return
     try:
         await self._sink.emit(
             TurnStatus(
