@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import copy
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from curie_worker.sandbox import k8s as k8s_module
+from curie_worker.sandbox.types import CapacityInventory
 from kubernetes import client as kube
 from kubernetes.utils.quantity import parse_quantity
 
@@ -196,7 +197,7 @@ def test_inventory_follows_real_owner_chain_and_counts_unmatched_chargeable_pods
         _pod("unrelated", priority="another-priority"),
     ]
     inventory = _client(api).capacity_inventory(
-        priority_class="acme-sandbox", request_timeout_seconds=1
+        priority_class="acme-sandbox", known_claim_resources={}, request_timeout_seconds=1
     )
     assert inventory.claims == frozenset({"pending-claim"})
     assert inventory.sandboxes["owned-sandbox"] == "pending-claim"
@@ -205,11 +206,48 @@ def test_inventory_follows_real_owner_chain_and_counts_unmatched_chargeable_pods
     assert inventory.pods["uid-warm"].claim_name is None
     del api.objects[("sandboxclaims", "pending-claim")]
     after = _client(api).capacity_inventory(
-        priority_class="acme-sandbox", request_timeout_seconds=1
+        priority_class="acme-sandbox", known_claim_resources={}, request_timeout_seconds=1
     )
     assert after.claims == frozenset()
     assert after.sandboxes["owned-sandbox"] == "pending-claim"
     assert after.pods["uid-owned"].claim_name == "pending-claim"
+
+
+def _inventory_with_latency(
+    api: InventoryAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    known_claim_resources: Mapping[str, Mapping[str, str]],
+) -> tuple[CapacityInventory, list[str], float]:
+    elapsed = 0.0
+    reads: list[str] = []
+
+    def with_latency(method: Callable[..., Any]) -> Callable[..., Any]:
+        def read(*args: Any, **kwargs: Any) -> Any:
+            nonlocal elapsed
+            assert 0 < kwargs["_request_timeout"] <= 1.0
+            elapsed += 0.015
+            reads.append(method.__name__)
+            return method(*args, **kwargs)
+
+        return read
+
+    for name in (
+        "list_namespaced_custom_object",
+        "get_namespaced_custom_object",
+        "list_namespaced_pod",
+        "read_runtime_class",
+    ):
+        monkeypatch.setattr(api, name, with_latency(getattr(api, name)))
+    monkeypatch.setattr(k8s_module.time, "monotonic", lambda: elapsed)
+    client = _client(api)
+    client._node_api = api
+    inventory = client.capacity_inventory(
+        priority_class="acme-sandbox",
+        known_claim_resources=known_claim_resources,
+        request_timeout_seconds=1,
+    )
+    return inventory, reads, elapsed
 
 
 def test_inventory_of_fifty_bound_claims_fits_one_second_with_constant_api_reads(
@@ -269,32 +307,8 @@ def test_inventory_of_fifty_bound_claims_fits_one_second_with_constant_api_reads
         expected_owners[sandbox_name] = claim_name
         expected_pod_owners[f"uid-pod-{index}"] = claim_name
 
-    elapsed = 0.0
-    reads: list[str] = []
-
-    def with_latency(method: Callable[..., Any]) -> Callable[..., Any]:
-        def read(*args: Any, **kwargs: Any) -> Any:
-            nonlocal elapsed
-            assert 0 < kwargs["_request_timeout"] <= 1.0
-            elapsed += 0.015
-            reads.append(method.__name__)
-            return method(*args, **kwargs)
-
-        return read
-
-    for name in (
-        "list_namespaced_custom_object",
-        "get_namespaced_custom_object",
-        "list_namespaced_pod",
-        "read_runtime_class",
-    ):
-        monkeypatch.setattr(api, name, with_latency(getattr(api, name)))
-    monkeypatch.setattr(k8s_module.time, "monotonic", lambda: elapsed)
-    client = _client(api)
-    client._node_api = api
-
-    inventory = client.capacity_inventory(
-        priority_class="acme-sandbox", request_timeout_seconds=1
+    inventory, reads, elapsed = _inventory_with_latency(
+        api, monkeypatch, known_claim_resources={}
     )
 
     assert inventory.claims == frozenset(expected_resources)
@@ -320,6 +334,78 @@ def test_inventory_of_fifty_bound_claims_fits_one_second_with_constant_api_reads
     assert elapsed < 1.0
 
 
+def test_inventory_of_fifty_pending_claims_uses_known_resources_with_three_lists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api = InventoryAPI()
+    known_resources = {
+        f"pending-{index}": {
+            "pods": "1",
+            "requests.cpu": "0.5",
+            "requests.memory": str((256 + index) * 1024**2),
+            "limits.cpu": "1",
+            "limits.memory": str(1024**3),
+        }
+        for index in range(50)
+    }
+    for name in known_resources:
+        api.seed(
+            "sandboxclaims", name, {"warmPoolRef": {"name": f"{name}-resources-pool"}}
+        )
+
+    inventory, reads, elapsed = _inventory_with_latency(
+        api, monkeypatch, known_claim_resources=known_resources
+    )
+
+    assert inventory.claims == frozenset(known_resources)
+    assert inventory.claim_resources == known_resources
+    assert inventory.sandboxes == inventory.pods == {}
+    assert inventory.suspended_claims == frozenset()
+    assert reads.count("list_namespaced_custom_object") == 2
+    assert reads.count("list_namespaced_pod") == 1
+    assert len(reads) == 3
+    assert api.runtime_reads == []
+    assert elapsed < 1.0
+
+
+def test_inventory_uses_owned_sandbox_spec_when_old_pool_is_missing() -> None:
+    # https://github.com/kubernetes-sigs/agent-sandbox/blob/v0.5.0/extensions/controllers/sandboxclaim_controller.go#L1232
+    api = InventoryAPI()
+    client = _footprint_client(api, runtime_class=True)
+    pool_name = "curie-agent-acme-a-runner-pool"
+    spec = api.objects[("sandboxtemplates", "curie-agent-acme-a-runner")]["spec"]
+    del api.objects[("sandboxwarmpools", pool_name)]
+    claim = api.seed("sandboxclaims", "bound-claim", {"warmPoolRef": {"name": pool_name}})
+    claim["status"] = {"sandbox": {"name": "owned-sandbox"}}
+    sandbox = api.seed("sandboxes", "owned-sandbox", {**spec, "operatingMode": "Running"})
+    sandbox["metadata"]["ownerReferences"] = [
+        {"kind": "SandboxClaim", "name": "bound-claim", "uid": claim["metadata"]["uid"]}
+    ]
+
+    inventory = client.capacity_inventory(
+        priority_class="acme-sandbox", known_claim_resources={}, request_timeout_seconds=1
+    )
+
+    assert inventory.claims == frozenset({"bound-claim"})
+    assert inventory.sandboxes == {"owned-sandbox": "bound-claim"}
+    assert inventory.pods == {}
+    assert inventory.suspended_claims == frozenset()
+    expected = {
+        "pods": "1",
+        "requests.cpu": "900m",
+        "requests.memory": "576Mi",
+        "limits.cpu": "2100m",
+        "limits.memory": "1088Mi",
+    }
+    assert set(inventory.claim_resources) == {"bound-claim"}
+    assert {
+        key: parse_quantity(value)
+        for key, value in inventory.claim_resources["bound-claim"].items()
+    } == {key: parse_quantity(value) for key, value in expected.items()}
+    assert api.calls == []
+    assert api.runtime_reads == ["gvisor"]
+
+
 @pytest.mark.parametrize("resource", ["sandboxclaims", "sandboxes", "pods"])
 def test_incomplete_inventory_raises_instead_of_reporting_empty_capacity(resource: str) -> None:
     api = InventoryAPI()
@@ -328,4 +414,6 @@ def test_incomplete_inventory_raises_instead_of_reporting_empty_capacity(resourc
     else:
         api.failures[("list", resource)] = kube.ApiException(status=403)
     with pytest.raises(kube.ApiException):
-        _client(api).capacity_inventory(priority_class="acme-sandbox", request_timeout_seconds=1)
+        _client(api).capacity_inventory(
+            priority_class="acme-sandbox", known_claim_resources={}, request_timeout_seconds=1
+        )

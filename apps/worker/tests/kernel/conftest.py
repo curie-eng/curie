@@ -571,10 +571,15 @@ class FakeK8s:
         }
 
     def capacity_inventory(
-        self, *, priority_class: str, request_timeout_seconds: float
+        self,
+        *,
+        priority_class: str,
+        known_claim_resources: Mapping[str, Mapping[str, str]],
+        request_timeout_seconds: float,
     ) -> Any:
         from curie_worker.sandbox.types import CapacityInventory, CapacityPod
 
+        del known_claim_resources
         assert 0 < request_timeout_seconds <= 1.0
         resources = self.claim_resources(
             pool="test-pool", runner_resources=None, agent_name=None, executor_secret_names=None

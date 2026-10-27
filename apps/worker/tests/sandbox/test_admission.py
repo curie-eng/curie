@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from typing import Any
@@ -83,9 +84,16 @@ class AdmissionClient(FakeSandboxClient):
         del pool, runner_resources, executor_secret_names
         return dict(self.selected.get(agent_name or "", SMALL))
 
-    def capacity_inventory(self, *, priority_class: str, request_timeout_seconds: float) -> Any:
+    def capacity_inventory(
+        self,
+        *,
+        priority_class: str,
+        known_claim_resources: Mapping[str, Mapping[str, str]],
+        request_timeout_seconds: float,
+    ) -> Any:
         from curie_worker.sandbox.types import CapacityInventory, CapacityPod
 
+        del known_claim_resources
         assert priority_class == "acme-sandbox"
         assert 0 < request_timeout_seconds <= 1.0
         if self.inventory_error is not None:

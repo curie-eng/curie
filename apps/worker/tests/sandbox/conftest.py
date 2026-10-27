@@ -15,7 +15,7 @@ import json
 import os
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -518,10 +518,15 @@ class FakeSandboxClient:
         return result
 
     def capacity_inventory(
-        self, *, priority_class: str, request_timeout_seconds: float
+        self,
+        *,
+        priority_class: str,
+        known_claim_resources: Mapping[str, Mapping[str, str]],
+        request_timeout_seconds: float,
     ) -> Any:
         from curie_worker.sandbox.types import CapacityInventory, CapacityPod
 
+        del known_claim_resources
         assert 0 < request_timeout_seconds <= 1.0
         observed_at = time.time()
         owners = {claim.sandbox_name: claim.name for claim in self.claims.values()}
