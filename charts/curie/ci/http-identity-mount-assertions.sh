@@ -110,6 +110,21 @@ assert mentions(documents, API_SECRET) == ["Deployment/acme-curie-api"], mention
 dispatcher = container(workload(documents, "dispatcher"), "dispatcher")
 assert not env_value(dispatcher, "CURIE_HTTP_RECEIVER_DIR")
 
+# 2b. The optional provider trust anchor joins the same API-only volume.
+anchored = docs(render("--set-string", f"api.httpIdentity.existingSecret={API_SECRET}",
+                       "--set", "api.httpIdentity.providerCaBundle=true"))
+volumes = [v for v in workload(anchored, "api")["volumes"] if v["name"] == "http-identity"]
+assert volumes[0]["secret"]["items"] == [
+    {"key": "api-runtime.json", "path": "api-runtime.json"},
+    {"key": "provider-ca.pem", "path": "provider-ca.pem"},
+], volumes
+assert mentions(anchored, "provider-ca.pem") == ["Deployment/acme-curie-api"]
+assert "provider-ca.pem" not in selected.stdout, "the anchor mounted without being selected"
+orphan = render("--set", "api.httpIdentity.providerCaBundle=true", ok=False)
+assert orphan.returncode != 0 and "api.httpIdentity.existingSecret" in orphan.stderr, orphan.stderr
+assert render("--set-string", f"api.httpIdentity.existingSecret={API_SECRET}",
+              "--set-string", "api.httpIdentity.providerCaBundle=true", ok=False).returncode != 0
+
 # 3. Dispatcher selection: its own file, never the API's, never worker or runner.
 both = render(
     "--set-string", f"api.httpIdentity.existingSecret={API_SECRET}",

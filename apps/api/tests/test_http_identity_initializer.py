@@ -321,3 +321,214 @@ def test_initialized_api_serves_a_selected_turn_through_the_provider_client(
         keys = membership._keys(valkey, scope["binding"])
         if keys:
             valkey.delete(*keys)
+
+
+CA_FILE = "provider-ca.pem"
+
+
+def certificate_pem(*, ca: bool = True, name: str = "Synthetic initializer CA") -> str:
+    """@spec HTTP-INVOCATION-EXECUTION-20: an independently generated synthetic certificate."""
+    from datetime import UTC, datetime, timedelta
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    now = datetime.now(UTC)
+    signer = ec.generate_private_key(ec.SECP256R1())
+    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, name)])
+    cert = (
+        x509.CertificateBuilder().subject_name(subject).issuer_name(subject)
+        .public_key(signer.public_key()).serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(minutes=1)).not_valid_after(now + timedelta(days=1))
+        .add_extension(x509.BasicConstraints(ca=ca, path_length=None), critical=True)
+        .sign(signer, hashes.SHA256())
+    )
+    return cert.public_bytes(serialization.Encoding.PEM).decode("ascii")
+
+
+def write_ca(directory: Path, value: str | bytes, *, mode: int = 0o440) -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-20: the optional trust anchor beside the runtime file."""
+    path = directory / CA_FILE
+    if path.exists():
+        path.chmod(0o600)
+    path.write_bytes(value.encode() if isinstance(value, str) else value)
+    path.chmod(mode)
+
+
+def tls_api() -> Any:
+    """@spec HTTP-INVOCATION-EXECUTION-20: fail during execution, never collection."""
+    module = api()
+    assert hasattr(module, "load_provider_tls_context"), "provider trust anchor is not loaded"
+    return module
+
+
+def test_absent_trust_anchor_keeps_default_trust(tmp_path: Path) -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-20: no provider-ca.pem means the default client."""
+    module = tls_api()
+    write(tmp_path, document())
+    assert module.load_provider_tls_context(str(tmp_path)) is None
+
+
+def test_trust_anchor_is_the_only_store_with_hostname_verification(tmp_path: Path) -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-20: only the supplied CAs, verified hostnames."""
+    import ssl
+
+    module = tls_api()
+    write_ca(tmp_path, certificate_pem() + certificate_pem(name="Synthetic second CA"))
+    context = module.load_provider_tls_context(str(tmp_path))
+    assert isinstance(context, ssl.SSLContext)
+    assert context.verify_mode == ssl.CERT_REQUIRED and context.check_hostname is True
+    assert context.minimum_version >= ssl.TLSVersion.TLSv1_2
+    assert context.cert_store_stats() == {"x509": 2, "crl": 0, "x509_ca": 2}
+
+
+@pytest.mark.parametrize(
+    "bundle",
+    [
+        "",
+        "\n",
+        "not a certificate\n",
+        "TRAILING",
+        "LEAF",
+        "KEY",
+        "BADBASE64",
+        "TOO_MANY",
+        "NON_ASCII",
+    ],
+)
+def test_malformed_trust_anchor_stops_startup(tmp_path: Path, bundle: str) -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-20: empty, malformed or non-CA bundles refuse."""
+    module = tls_api()
+    good = certificate_pem()
+    value: str | bytes = {
+        "TRAILING": good + "trailing text\n",
+        "LEAF": certificate_pem(ca=False),
+        "KEY": "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n",
+        "BADBASE64": good.replace(good.splitlines()[1], "!" + good.splitlines()[1][1:], 1),
+        "TOO_MANY": good * 17,
+        "NON_ASCII": good.encode() + "é".encode(),
+    }.get(bundle, bundle)
+    write_ca(tmp_path, value)
+    with pytest.raises(module.HttpIdentityInitializationError) as caught:
+        module.load_provider_tls_context(str(tmp_path))
+    assert caught.value.stage == "invalid_document" and caught.value.__cause__ is None
+    assert good.splitlines()[1] not in str(caught.value) + repr(caught.value)
+
+
+def test_unsafe_trust_anchor_file_refuses(tmp_path: Path) -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-20: the same custody checks as the runtime file."""
+    module = tls_api()
+    write_ca(tmp_path, certificate_pem(), mode=0o644)
+    with pytest.raises(module.HttpIdentityInitializationError) as caught:
+        module.load_provider_tls_context(str(tmp_path))
+    assert caught.value.stage == "unsafe_file"
+    (tmp_path / CA_FILE).chmod(0o600)
+    (tmp_path / CA_FILE).unlink()
+    (tmp_path / CA_FILE).mkdir()
+    with pytest.raises(module.HttpIdentityInitializationError) as caught:
+        module.load_provider_tls_context(str(tmp_path))
+    assert caught.value.stage == "unsafe_file"
+
+
+def test_configured_app_supplies_a_client_only_for_a_trust_anchor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-15/20: the anchor reaches create_app as its client."""
+    module = tls_api()
+    from curie_api import main
+
+    calls: list[dict[str, Any]] = []
+
+    def record(**kwargs: Any) -> str:
+        """@spec HTTP-INVOCATION-EXECUTION-20."""
+        calls.append(kwargs)
+        return "app"
+
+    monkeypatch.setattr(main, "create_app", record)
+    write(tmp_path, document())
+    write_ca(tmp_path, certificate_pem())
+    monkeypatch.setenv("CURIE_HTTP_IDENTITY_DIR", str(tmp_path))
+    get_settings.cache_clear()
+    try:
+        main.create_configured_app()
+        assert sorted(calls[0]) == ["http_identity_client", "http_identity_runtime"]
+        assert type(calls[0]["http_identity_client"]) is HttpIdentityClient
+        assert type(calls[0]["http_identity_runtime"]) is HttpInvocationRuntime
+        write_ca(tmp_path, "")
+        with pytest.raises(module.HttpIdentityInitializationError):
+            main.create_configured_app()
+        assert len(calls) == 1
+    finally:
+        get_settings.cache_clear()
+
+
+@pytest.mark.parametrize("anchor", ["own", "absent", "other"])
+def test_private_ca_provider_is_reached_only_through_its_configured_anchor(
+    clean_db: None,
+    valkey: redis.Redis,
+    runs_stream: str,
+    synthetic_provider: SimpleNamespace,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    anchor: str,
+) -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-15/20: the served app trusts only the mounted CA."""
+    tls_api()
+    from curie_api.main import create_configured_app
+
+    scope = membership._scope(synthetic_provider.url)
+    operator = tmp_path / "operator"
+    operator.mkdir()
+    write(operator, {
+        "schema_version": 1,
+        "providers": [{
+            "configuration": scope["configuration"].model_dump(mode="json"),
+            "bearer": membership.BEARER,
+        }],
+        "receivers": [{
+            "registration": {
+                "schema_version": 1, "receiver_id": scope["receiver_id"], "generation": 1,
+                "tenant_id": scope["tenant"], "channel_identity_id": scope["identity"],
+                "channel_identity_name": scope["adapter"],
+                "provider_installation_id": scope["installation"],
+                "namespace": scope["namespace"].model_dump(mode="json"),
+                "installation_account": membership.ACCOUNT, "bot_user_id": "U0EXAMPLEBOT",
+                "binding_ids": [scope["binding"]], "human_native_ids": [membership.SENDER],
+            },
+            "key": key(scope["receiver_key"]),
+        }],
+        "context_keys": [
+            {"key_id": "synthetic-context", "generation": 1, "key": key(scope["context_key"])},
+        ],
+        "signing_key": {"key_id": "synthetic-context", "generation": 1},
+    })
+    if anchor == "own":
+        # The owned synthetic provider's private CA, written by its TLS rig.
+        write_ca(operator, (tmp_path / "ca.pem").read_text())
+    elif anchor == "other":
+        write_ca(operator, certificate_pem(name="Synthetic unrelated CA"))
+    monkeypatch.setenv("CURIE_HTTP_IDENTITY_DIR", str(operator))
+    get_settings.cache_clear()
+    try:
+        app = create_configured_app()
+        with TestClient(app) as client:
+            assert type(app.state.http_identity_runtime) is HttpInvocationRuntime
+            token = membership._credential(client, scope)
+            body, proof = membership._submission(scope)
+            response = membership._post(client, token, body, proof)
+            entries = valkey.xrange(runs_stream)
+            if anchor == "own":
+                assert response.status_code == 200, response.text
+                assert len(synthetic_provider.requests) == 1
+                assert len(entries) == 1 and "curie_identity_context_v1" in entries[0][1]
+            else:
+                assert response.status_code == 503, response.text
+                assert response.json() == {"detail": "identity_authority_unavailable"}
+                assert synthetic_provider.requests == [] and entries == []
+    finally:
+        get_settings.cache_clear()
+        keys = membership._keys(valkey, scope["binding"])
+        if keys:
+            valkey.delete(*keys)
