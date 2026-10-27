@@ -70,6 +70,26 @@ tags = ["identifier", "slack"]
     '''^apps/worker/src/curie_worker/eval/learning\.py$''',
   ]
 
+  # b0dc00db and 340c0972 are only on an unmerged task branch. The value is
+  # C0UNBOUND, used as a synthetic prefix and as a reply channel whose adapter
+  # is synthetic-unbound. That branch cannot be rewritten from a release line.
+  # Each AND excuse is one commit and one test path.
+  [[rules.allowlists]]
+  description = "Synthetic unbound channel prefix C0UNBOUND in b0dc00db025319d7e5dd38a62c4d9c5b3f246484. The test concatenates it with a generated suffix. The commit is only on an unmerged branch. AND pins the excuse to that commit and this path, so the same text in any other commit or file still matches."
+  condition = "AND"
+  commits = ["b0dc00db025319d7e5dd38a62c4d9c5b3f246484"]
+  paths = [
+    '''^apps/api/tests/test_http_approval_legacy_writers\.py$''',
+  ]
+
+  [[rules.allowlists]]
+  description = "Synthetic unbound reply channel C0UNBOUND in 340c09720fd79c2229a64d3d7702fc8882f7c7c9. The tests set reply_adapter to synthetic-unbound. The commit is only on an unmerged branch. AND pins the excuse to that commit and this path, so the same text in any other commit or file still matches."
+  condition = "AND"
+  commits = ["340c09720fd79c2229a64d3d7702fc8882f7c7c9"]
+  paths = [
+    '''^apps/api/tests/test_http_approval_creation\.py$''',
+  ]
+
 [[rules]]
 id = "aws-account-id"
 description = "AWS account id -- use 000000000000 in docs and tests"
