@@ -599,7 +599,11 @@ def test_resumed_turn_suspends_again_under_its_original_invoker(
     assert created["status"] == "pending" and created["id"] != str(first["id"])
     # Fresh current authority is the original invoker's, not the answering actor's.
     assert len(case.provider.requests) == calls + 1
-    assert case.provider.requests[-1] == case.provider.requests[0]
+    lookup, invoked = (
+        {key: value for key, value in item.items() if key != "request_id"}
+        for item in (case.provider.requests[-1], case.provider.requests[0])
+    )
+    assert lookup == invoked
     stored = rows(request["approval"]["dedupe_key"])
     assert len(stored) == 1
     _, _, capsule = opened(case, stored[0])
@@ -639,18 +643,19 @@ def test_forged_stale_or_foreign_resume_cannot_suspend_again(
     elif variant == "stale":
         token = seal_resume(case, {**resume, "status": "rejected"})
     elif variant == "other_approval":
+        # A consistent resume of an approval this turn never suspended on.
         other = str(uuid.uuid4())
-        token = seal_resume(
-            case, {**resume, "approval_id": other, "event_id": f"approval-{other}-resolved"},
-        )
+        payload = payload.replace(resume["event_id"], f"approval-{other}-resolved")
+        token = seal_resume(case, {
+            **resume, "approval_id": other, "event_id": f"approval-{other}-resolved",
+            "payload_sha256": digest(payload),
+        })
     elif variant == "retagged":
         token = seal_resume(case, {**resume, "original_payload_sha256": digest("synthetic")})
     else:
         token = seal_resume(case, resume)
         payload += " "
     request = resumed_request(case, token, payload)
-    if variant == "other_approval":
-        request["approval"]["dedupe_key"] = f"approval-{resume['approval_id']}-resolved"
     calls = len(case.provider.requests)
     refused(post(case, request), 422, "invalid_approval_context")
     assert rows(request["approval"]["dedupe_key"]) == []
