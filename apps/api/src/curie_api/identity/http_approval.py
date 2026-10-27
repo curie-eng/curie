@@ -1,4 +1,4 @@
-"""Creation continuity in existing approval owners. @spec HTTP-APPROVAL-CONTINUITY-1/3/4/5/9."""
+"""Creation continuity in existing approval owners. @spec HTTP-APPROVAL-CONTINUITY-1/3/4/5/6/9."""
 
 from __future__ import annotations
 
@@ -292,17 +292,98 @@ def http_expiry_owner(state: Any) -> Callable[[uuid.UUID], Awaitable[Approval | 
     return expire
 
 
+def original_invocation(resume: wire.ResumeContextV1) -> codec.InvocationContextV1:
+    """The verified original invoker a resume carries, never resealed or published.
+
+    @spec HTTP-APPROVAL-CONTINUITY-4/6/8.
+    """
+    return codec.InvocationContextV1(
+        schema_version=1, purpose="invocation", key_id=resume.key_id,
+        key_generation=resume.key_generation, event_id=resume.original_event_id,
+        original_event_id=resume.original_event_id, scope=resume.scope,
+        receiver_id=resume.receiver_id, receiver_generation=resume.receiver_generation,
+        independent_human=resume.independent_human, provider_issuer=resume.provider_issuer,
+        provider_version=resume.provider_version,
+        provider_credential_id=resume.provider_credential_id,
+        provider_credential_generation=resume.provider_credential_generation,
+        lifecycle_generation=resume.lifecycle_generation,
+        role_policy_version=resume.role_policy_version, outcome=resume.outcome,
+        canonical=resume.canonical, principal=resume.principal,
+        payload_sha256=resume.original_payload_sha256,
+    )
+
+
+# Each capsule carries its own sealing key; every other continuity field must match.
+_KEY_FIELDS = frozenset({"purpose", "key_id", "key_generation"})
+
+
+def resume_row_matches(
+    runtime: HttpInvocationRuntime, row: Approval | None, resume: wire.ResumeContextV1,
+) -> bool:
+    """The named row, its stored seal and the resume capsule agree exactly.
+
+    @spec HTTP-APPROVAL-CONTINUITY-4/5/6.
+    """
+    if row is None:
+        return False
+    saved = verified_capsule(runtime, row)
+    if saved is None or (
+        row.status != resume.status or row.agent_id is None
+        or str(row.agent_id) != resume.scope.agent_id
+        or row.conversation_id != resume.conversation_id
+        or row.dedupe_key != resume.source_event_id
+    ):
+        return False
+    return all(
+        getattr(saved, name) == getattr(resume, name)
+        for name in wire.ApprovalContinuityV1.model_fields
+        if name not in _KEY_FIELDS
+    )
+
+
+async def _require_resume_row(
+    session: AsyncSession, runtime: HttpInvocationRuntime, resume: wire.ResumeContextV1 | None,
+) -> None:
+    """A fresh read of the approval a resume names. @spec HTTP-APPROVAL-CONTINUITY-4."""
+    if resume is None:
+        return
+    row = (
+        await session.execute(
+            select(Approval).where(Approval.id == uuid.UUID(resume.approval_id))
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if not resume_row_matches(runtime, row, resume):
+        _refuse(422, "invalid_approval_context")
+
+
 def _original(
     request: Request,
     body: wire.ApprovalCreationRequestV1,
-) -> tuple[HttpInvocationRuntime, codec.InvocationContextV1]:
-    """Authenticate the exact queue bytes before lookup. @spec HTTP-APPROVAL-CONTINUITY-4."""
+) -> tuple[HttpInvocationRuntime, codec.InvocationContextV1, wire.ResumeContextV1 | None]:
+    """Authenticate the exact queue bytes before lookup.
+
+    A resumed turn suspends again with its resume context; the original invoker
+    comes from that verified continuity, never from the answering actor.
+    @spec HTTP-APPROVAL-CONTINUITY-4.
+    """
     runtime = getattr(request.app.state, "http_identity_runtime", None)
     if type(runtime) is not HttpInvocationRuntime:
         _refuse(503, "authority_unavailable")
-    context = codec.open_invocation_context(body.identity.context, runtime._context_keys)
-    if not isinstance(context, codec.InvocationContextV1):
-        _refuse(422, "invalid_approval_context")
+    token = body.identity.context
+    resume: wire.ResumeContextV1 | None = None
+    opened = codec.open_invocation_context(token, runtime._context_keys)
+    if isinstance(opened, codec.InvocationContextV1):
+        context, event_id, payload_sha256 = opened, opened.event_id, opened.payload_sha256
+    else:
+        candidate = wire.open_resume_context(token, runtime._context_keys)
+        if not isinstance(candidate, wire.ResumeContextV1):
+            _refuse(422, "invalid_approval_context")
+        try:
+            context = original_invocation(candidate)
+        except (ValueError, TypeError):
+            _refuse(422, "invalid_approval_context")
+        resume, event_id, payload_sha256 = candidate, candidate.event_id, candidate.payload_sha256
     data, scope, expected = body.approval, context.scope, body.identity.scope
     if (
         body.approval.agent_id is None
@@ -311,8 +392,8 @@ def _original(
         or expected.agent_id != scope.agent_id
         or expected.binding_id != scope.binding_id
         or expected.binding_generation != scope.binding_generation
-        or _digest(body.identity.payload) != context.payload_sha256
-        or data.dedupe_key != context.event_id
+        or _digest(body.identity.payload) != payload_sha256
+        or data.dedupe_key != event_id
     ):
         _refuse(422, "invalid_approval_context")
     try:
@@ -323,7 +404,7 @@ def _original(
         handle = turn.reply_handle
         if (
             handle is None
-            or turn.event_id != context.event_id
+            or turn.event_id != event_id
             or turn.conversation_id != data.conversation_id
             or turn.author != data.author
             or handle.kind != data.reply_kind
@@ -336,7 +417,7 @@ def _original(
             raise ValueError
     except (ValueError, TypeError, HTTPException):
         _refuse(422, "invalid_approval_context")
-    return runtime, context
+    return runtime, context, resume
 
 
 def _effect(data: ApprovalRequest) -> None:
@@ -444,7 +525,8 @@ def _seal(
         key_id=runtime._signing_key[0],
         key_generation=runtime._signing_key[1],
         approval_id=str(row.id),
-        source_event_id=original.event_id,
+        # The incoming invocation or resume event; original fields stay the root's.
+        source_event_id=body.approval.dedupe_key,
         conversation_id=body.approval.conversation_id,
         status="pending",
         creation_request_sha256=_digest(_canonical(body.approval.model_dump(mode="json"))),
@@ -463,7 +545,7 @@ async def create_http_approval(
     body: wire.ApprovalCreationRequestV1,
 ) -> wire.ApprovalCreationResponseV1:
     """Separate acknowledged lifecycle and creation commits. @spec HTTP-APPROVAL-CONTINUITY-9."""
-    runtime, original = _original(request, body)
+    runtime, original, resume = _original(request, body)
     factory, valkey = request.app.state.sessionmaker, request.app.state.valkey
     try:
         async with factory() as session, session.begin():
@@ -473,6 +555,7 @@ async def create_http_approval(
             )
             if existing is not None:
                 return _historical(runtime, body, original, existing)
+            await _require_resume_row(session, runtime, resume)
             _effect(body.approval)
             route_snapshot = await _route_snapshot(session, body.approval)
             if await approvals_crud.find_rejected_reraise(session, body.approval) is not None:
@@ -496,6 +579,7 @@ async def create_http_approval(
                 if existing is not None:
                     result = _historical(runtime, body, original, existing)
                 else:
+                    await _require_resume_row(writer, runtime, resume)
                     if (
                         await approvals_crud.find_rejected_reraise(writer, body.approval)
                         is not None
