@@ -169,6 +169,16 @@ async def _receipt(response: httpx.Response) -> ReceiverSubmission:
 _ANSWER_REFUSED = ResolveOutcome(status_code=401)
 _ANSWER_UNKNOWN = ResolveOutcome(status_code=0)
 _INTERACTIONS = frozenset({"block_actions", "view_submission"})
+# The API's fixed refusal codes, worded for the person who clicked. A code
+# outside this table renders the legacy class-neutral refusal, never itself.
+# @spec HTTP-APPROVAL-CONTINUITY-7.
+_REFUSAL_WORDING = {
+    (403, "caller_not_allowed"): "You are not allowed to answer this approval.",
+    (403, "unsupported_approval"): "This approval can't be answered here.",
+    (503, "authority_unavailable"): (
+        "Couldn't confirm your permission right now. Try again in a moment."
+    ),
+}
 
 
 async def _answer_outcome(response: httpx.Response) -> ResolveOutcome:
@@ -190,6 +200,8 @@ async def _answer_outcome(response: httpx.Response) -> ResolveOutcome:
             status_code=response.status_code,
         )
     detail, resolved_by, status = value.get("detail"), value.get("resolved_by"), value.get("status")
+    if response.status_code in {403, 503}:
+        detail = _REFUSAL_WORDING.get((response.status_code, str(detail)), "")
     if response.status_code == 200 and status not in {"approved", "rejected"}:
         return _ANSWER_UNKNOWN
     return ResolveOutcome(

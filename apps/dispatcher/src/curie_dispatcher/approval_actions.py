@@ -962,6 +962,8 @@ def _refusal_text(outcome: ResolveOutcome) -> str:
         )
     if outcome.status_code == 410:
         return "This approval expired and can no longer be resolved."
+    if outcome.status_code == 503 and outcome.detail:
+        return outcome.detail
     if outcome.status_code == 404:
         if outcome.detail.strip().casefold() == _APPROVAL_NOT_FOUND_DETAIL:
             return (
