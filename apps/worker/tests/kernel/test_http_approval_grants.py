@@ -132,12 +132,20 @@ class GrantCore(Core):
         )
 
 
-async def resume(h: Any, approval: str) -> Any:
-    """@spec HTTP-APPROVAL-CONTINUITY-12: the existing parser derives the approval ID."""
+async def resume(h: Any, approval: str, *, unavailable: bool = False) -> Any:
+    """@spec HTTP-APPROVAL-CONTINUITY-12: the existing parser derives the approval ID.
+
+    Unavailable authority surfaces to the consumer, which keeps the entry pending.
+    """
     event = qevent("approved system message", event_id=f"approval-{approval}-resolved")
-    await h.kernel.process_event(
-        event, http_identity_context=CAPSULE, original_payload_sha256=ORIGINAL_HASH,
-    )
+    try:
+        await h.kernel.process_event(
+            event, http_identity_context=CAPSULE, original_payload_sha256=ORIGINAL_HASH,
+        )
+    except TurnAuthorityUnavailable:
+        assert unavailable, "grant check was unexpectedly unavailable"
+    else:
+        assert not unavailable, "unavailable grant authority did not surface"
     return event
 
 
@@ -222,7 +230,7 @@ def test_grant_without_a_continue_for_that_snapshot_boots_nothing(
         binding.value = snapshot(binding, approval)
         core = GrantCore(binding, grant=outcome)
         async with make_harness(binding=binding, identity_authority=core) as h:
-            event = await resume(h, approval)
+            event = await resume(h, approval, unavailable=outcome != "refuse")
             assert len(core.grants) == 1
             assert binding.boots == [] and h.fake_k8s.claim_envs == []
             assert h.runner.opened == [] and binding.legacy == []
@@ -278,7 +286,7 @@ def test_snapshot_read_faults_never_fall_back_to_legacy_grants(
         binding = GrantBinding(fault=error)
         core = GrantCore(binding)
         async with make_harness(binding=binding, identity_authority=core) as h:
-            event = await resume(h, approval)
+            event = await resume(h, approval, unavailable=fault == "read-failure")
             assert core.grants == [] and binding.legacy == []
             assert binding.boots == [] and h.fake_k8s.claim_envs == []
             done = await h.async_redis.exists(h.config.done_key(event.event_id))
