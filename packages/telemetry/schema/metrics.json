@@ -1472,7 +1472,7 @@
           "escalated"
         ]
       },
-      "cardinality_bound": 3069,
+      "cardinality_bound": 3168,
       "description": "Remediation lifecycle receipts posted, by stage, kind, authority and code.",
       "monotonic": true,
       "type": "counter",

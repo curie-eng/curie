@@ -118,8 +118,9 @@ def test_the_refusal_check_accepts_every_frozen_refusal_and_nothing_else(
     refusal included, is accepted; an unknown code violates the check.
     """
 
-    revision, _ = _revision()
-    isolated_migration_db.at(revision)
+    # The frozen set grows by later widening revisions (0138 added
+    # ``http_identity_selected``), so the whole set is checked at the head.
+    isolated_migration_db.at("head")
     nomination_id = _nomination()
     for code in _CODES["nomination_refusals"]:
         _refuse(nomination_id, code)
