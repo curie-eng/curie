@@ -2361,6 +2361,10 @@ def test_publication_turn_is_done_before_card_delivery_and_never_replays_model(
                 )
 
     class WorkspaceBinding:
+        async def identity_binding(self, *_args: Any) -> None:
+            """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+            return None
+
         async def resolve(self, kind: str, adapter: str | None, channel: str) -> ResolvedDeployment:
             return ResolvedDeployment(
                 agent_id=uuid.UUID(deployment["agent_id"]),
@@ -2668,6 +2672,10 @@ def test_coder_path_reaches_the_publication_boundary_through_real_runner_and_api
     repo, base_sha, base_archive = _local_publication_repository(tmp_path, REPO)
 
     class WorkspaceBinding:
+        async def identity_binding(self, *_args: Any) -> None:
+            """@spec HTTP-INVOCATION-EXECUTION-18: explicit local fixture classification."""
+            return None
+
         async def resolve(self, kind: str, adapter: str | None, address: str) -> ResolvedDeployment:
             assert (kind, address) == ("slack", "C0EXAMPLE1")
             return ResolvedDeployment(
@@ -3081,6 +3089,10 @@ def test_kernel_publications_isolate_same_timestamp_across_slack_channels(
 
     class RecordingBinding:
         """Observe the production resolver's canonical history identity."""
+
+        async def identity_binding(self, *args: Any) -> Any:
+            """@spec HTTP-INVOCATION-EXECUTION-18: the wrapped production classification."""
+            return await self._resolver.identity_binding(*args)
 
         def __init__(self, resolver: BindingResolver) -> None:
             self._resolver = resolver
