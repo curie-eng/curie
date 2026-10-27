@@ -47,6 +47,76 @@ def test_substrate_config_claim_timeout_defaults_to_90s() -> None:
     assert _substrate_config({}).claim_timeout_seconds == 90.0
 
 
+def _admission_contract() -> dict[str, Any]:
+    return {
+        "quota_name": "acme-sandbox-quota",
+        "priority_class": "acme-sandbox",
+        "ceiling": 2,
+        "hard": {
+            "pods": "2",
+            "requests.cpu": "500m",
+            "requests.memory": "512Mi",
+            "limits.cpu": "2",
+            "limits.memory": "2Gi",
+        },
+    }
+
+
+@pytest.mark.parametrize("ceiling", [0, 2])
+def test_substrate_config_reads_complete_admission_contract(ceiling: int) -> None:
+    contract = {**_admission_contract(), "ceiling": ceiling}
+    config = _substrate_config({"CURIE_SANDBOX_ADMISSION": json.dumps(contract)})
+    assert config.admission is not None
+    assert config.admission.quota_name == "acme-sandbox-quota"
+    assert config.admission.priority_class == "acme-sandbox"
+    assert config.admission.ceiling == ceiling
+    assert dict(config.admission.hard) == contract["hard"]
+
+
+@pytest.mark.parametrize("raw", ["", "{", "null", "[]", '"contract"', "{}"])
+def test_substrate_config_refuses_malformed_admission_json_or_shape(raw: str) -> None:
+    with pytest.raises(ValueError):
+        _substrate_config({"CURIE_SANDBOX_ADMISSION": raw})
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"quota_name": "bad/name"},
+        {"priority_class": ""},
+        {"ceiling": -1},
+        {"ceiling": True},
+        {"ceiling": 2.0},
+        {"ceiling": "2"},
+        {"unexpected": "field"},
+        {"hard": {"pods": "2"}},
+        {"hard": {**_admission_contract()["hard"], "pods": "-1"}},
+        {"hard": {**_admission_contract()["hard"], "limits.cpu": "NaN"}},
+        {"hard": {**_admission_contract()["hard"], "limits.memory": 2}},
+        {"hard": {**_admission_contract()["hard"], "unsupported": "1"}},
+    ],
+)
+def test_substrate_config_refuses_invalid_admission_schema(changes: dict[str, Any]) -> None:
+    contract = {**_admission_contract(), **changes}
+    with pytest.raises(ValueError):
+        _substrate_config({"CURIE_SANDBOX_ADMISSION": json.dumps(contract)})
+
+
+def test_substrate_config_refuses_kubernetes_admission_for_docker() -> None:
+    with pytest.raises(ValueError):
+        _substrate_config(
+            {
+                "CURIE_SANDBOX_SUBSTRATE": "docker",
+                "CURIE_SANDBOX_ADMISSION": json.dumps(_admission_contract()),
+            }
+        )
+
+
+@pytest.mark.parametrize("backend", ["kubernetes", "docker"])
+def test_substrate_config_without_admission_contract_remains_disabled(backend: str) -> None:
+    assert _substrate_config({"CURIE_SANDBOX_SUBSTRATE": backend}).admission is None
+
+
 def test_substrate_config_claim_timeout_reads_env() -> None:
     cfg = _substrate_config({"CURIE_CLAIM_TIMEOUT_SECONDS": "45"})
     assert cfg.claim_timeout_seconds == 45.0

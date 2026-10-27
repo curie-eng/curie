@@ -312,6 +312,7 @@ class SubstrateConfig:
 
     namespace: str
     warm_pool: str
+    admission: AdmissionConfig | None = None
     # Agents the chart renders a per-agent pool for (agentSandbox.connectorSecrets,
     # agentSandbox.registryEgress, #3083, #2943, or agentSandbox.runnerImages,
     # ADR-0173), from CURIE_AGENT_SANDBOX_POOLS.
@@ -393,6 +394,64 @@ class QuotaRejection:
     requested: Mapping[str, str]
     used: Mapping[str, str]
     hard: Mapping[str, str]
+
+
+@dataclass(frozen=True)
+class AdmissionConfig:
+    """The namespace quota envelope published by the deployment."""
+
+    quota_name: str
+    priority_class: str
+    ceiling: int
+    hard: Mapping[str, str]
+
+
+@dataclass(frozen=True)
+class AdmissionRejection:
+    """Computed admission evidence, independent of observed quota rejection."""
+
+    quota_name: str
+    requested: Mapping[str, str]
+    used: Mapping[str, str]
+    hard: Mapping[str, str]
+    evidence_type: Literal["admission"] = "admission"
+
+
+CapacityRejection = QuotaRejection | AdmissionRejection
+
+
+@dataclass(frozen=True)
+class QuotaStatus:
+    name: str
+    namespace: str
+    spec_hard: Mapping[str, str]
+    status_hard: Mapping[str, str]
+    status_used: Mapping[str, str]
+
+
+@dataclass(frozen=True)
+class CapacityPod:
+    claim_name: str | None
+    resources: Mapping[str, str]
+
+
+@dataclass(frozen=True)
+class CapacityInventory:
+    claims: frozenset[str]
+    sandboxes: Mapping[str, str | None]
+    pods: Mapping[str, CapacityPod]
+    claim_resources: Mapping[str, Mapping[str, str]]
+    suspended_claims: frozenset[str]
+    observed_at: float
+
+
+@dataclass(frozen=True)
+class AdmissionReservation:
+    state: Literal["preparing", "submitted", "bound", "retiring"]
+    resources: Mapping[str, str]
+    owner_token: str
+    created_at: float
+    updated_at: float
 
 
 @dataclass(frozen=True)
@@ -490,6 +549,27 @@ class SandboxClient(Protocol):
         ...
 
     def get_claim(self, name: str, *, request_timeout_seconds: float) -> ClaimView | None: ...
+
+    def claim_resources(
+        self,
+        *,
+        pool: str,
+        runner_resources: dict[str, object] | None,
+        agent_name: str | None,
+        executor_secret_names: frozenset[str] | None,
+    ) -> dict[str, str]: ...
+
+    def capacity_inventory(
+        self,
+        *,
+        priority_class: str,
+        known_claim_resources: Mapping[str, Mapping[str, str]],
+        request_timeout_seconds: float,
+    ) -> CapacityInventory: ...
+
+    def read_quota(
+        self, quota_name: str, *, request_timeout_seconds: float
+    ) -> QuotaStatus: ...
 
     def delete_claim(self, name: str, *, request_timeout_seconds: float) -> None: ...
 
@@ -620,12 +700,15 @@ class RepoRunnerPoolRefused(MissingAgentPoolError):
 
 
 class CapacityExhaustedError(SandboxError):
-    """A sandbox claim was rejected by an observed ResourceQuota limit."""
+    """A sandbox claim was refused by admission or an observed quota limit."""
 
-    def __init__(self, rejection: QuotaRejection) -> None:
+    def __init__(self, rejection: CapacityRejection) -> None:
         self.rejection = rejection
+        source = (
+            "sandbox admission" if isinstance(rejection, AdmissionRejection) else "ResourceQuota"
+        )
         super().__init__(
-            f"ResourceQuota {rejection.quota_name} rejected "
+            f"{source} {rejection.quota_name} rejected "
             f"requested={rejection.requested}; used={rejection.used}; "
             f"hard={rejection.hard}"
         )

@@ -15,8 +15,8 @@ from channel_protocol.reply import (
 
 from ..delivery_lease import DeliveryLease
 from ..sandbox.types import (
+    CapacityRejection,
     PressureCandidate,
-    QuotaRejection,
     RouteRecord,
     RouteState,
 )
@@ -182,7 +182,7 @@ def _pressure_status_is_safe(status: dict[str, object]) -> bool:
 async def _reclaim_idle_route(
     self: Kernel,
     requesting_thread_key: str,
-    rejection: QuotaRejection,
+    rejection: CapacityRejection,
     *,
     remaining_s: float,
 ) -> _PressureResult:
@@ -203,7 +203,7 @@ async def _reclaim_idle_route(
 async def _reclaim_idle_route_before_deadline(
     self: Kernel,
     requesting_thread_key: str,
-    rejection: QuotaRejection,
+    rejection: CapacityRejection,
     *,
     pressure_deadline: float,
 ) -> _PressureResult:
