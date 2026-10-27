@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import importlib.util
+import io
+import json
 import sys
 from copy import deepcopy
 from pathlib import Path
@@ -199,3 +201,121 @@ def test_main_propagates_real_child_exit_without_observed_proof(helper, monkeypa
     monkeypatch.setenv("CURIE_SCENARIO_RUN_ID", "acme-run")
     monkeypatch.setattr(helper._Collector, "_get", lambda _self, *_args: {})
     assert helper.main(["--", sys.executable, "-c", "raise SystemExit(17)"]) == 17
+
+
+@pytest.fixture
+def kubectl_inventory(helper, snapshot, monkeypatch):
+    subject = helper._Collector("acme-context", "acme-run", [])
+    resources = {
+        "claims": ("sandboxclaims.extensions.agents.x-k8s.io", "extensions.agents.x-k8s.io",
+                   "SandboxClaimList", "110"),
+        "sandboxes": ("sandboxes.agents.x-k8s.io", "agents.x-k8s.io", "SandboxList", "220"),
+    }
+    inventories = {}
+    endpoints = {}
+    for source, (resource, group, kind, version) in resources.items():
+        items = deepcopy(snapshot[source])
+        for index, obj in enumerate(items):
+            obj["metadata"]["resourceVersion"] = str(int(version) - 10 + index)
+        items[1]["metadata"]["deletionTimestamp"] = "2026-01-01T00:00:00Z"
+        inventories[source] = {
+            "apiVersion": f"{group}/v1beta1", "kind": kind,
+            "metadata": {"resourceVersion": version}, "items": items,
+        }
+        plural = resource.split(".", 1)[0]
+        endpoints[f"/apis/{group}/v1beta1/namespaces/{subject.namespace}/{plural}"] = source
+    calls = []
+    watch_events = {source: [] for source in resources}
+
+    def arguments(command):
+        assert command[:5] == [
+            "kubectl", "--context", "acme-context", "--namespace", subject.namespace,
+        ]
+        calls.append(command)
+        assert command[5] == "get"
+        return command[6:]
+
+    def run(command, **_kwargs):
+        args = arguments(command)
+        if "--raw" in args:
+            source = endpoints[args[args.index("--raw") + 1]]
+            document = inventories[source]
+        else:
+            source = next(key for key, value in resources.items() if value[0] == args[0])
+            # Observed with kubectl: ordinary JSON get synthesizes List with RV "";
+            # raw namespaced LIST preserves the server's typed list and nonempty RV.
+            document = {
+                "apiVersion": "v1", "kind": "List", "metadata": {"resourceVersion": ""},
+                "items": inventories[source]["items"],
+            }
+        return helper.subprocess.CompletedProcess(command, 0, json.dumps(document), "")
+
+    class Watch:
+        def __init__(self, events):
+            self.stdout = io.StringIO("".join(json.dumps(event) + "\n" for event in events))
+
+        def poll(self):
+            return 0
+
+        def wait(self, **_kwargs):
+            return 0
+
+    def popen(command, **_kwargs):
+        args = arguments(command)
+        assert "--watch-only" in args
+        source = next(key for key, value in resources.items() if value[0] == args[0])
+        return Watch(watch_events[source])
+
+    monkeypatch.setattr(helper.subprocess, "run", run)
+    monkeypatch.setattr(helper.subprocess, "Popen", popen)
+    try:
+        yield subject, inventories, watch_events, calls
+    finally:
+        subject.close()
+
+
+def test_raw_inventory_preserves_server_list_versions_for_both_watches(
+    kubectl_inventory,
+) -> None:
+    subject, _, _, calls = kubectl_inventory
+    subject._start_objects()
+    assert subject.observer.max_claims == 2
+    assert subject.observer.max_sandboxes == 2
+    watches = [command for command in calls if "--watch-only" in command]
+    assert [
+        (command[6], command[command.index("--resource-version") + 1])
+        for command in watches
+    ] == [
+        ("sandboxclaims.extensions.agents.x-k8s.io", "110"),
+        ("sandboxes.agents.x-k8s.io", "220"),
+    ]
+
+
+@pytest.mark.parametrize("source", ["claims", "sandboxes"])
+@pytest.mark.parametrize("metadata", [{}, {"resourceVersion": ""}, {"resourceVersion": 110}])
+def test_raw_inventory_rejects_missing_or_invalid_server_version(
+    helper, kubectl_inventory, source, metadata,
+) -> None:
+    subject, inventories, _, _ = kubectl_inventory
+    inventories[source]["metadata"] = metadata
+    with pytest.raises(helper.ObservationError, match="invalid initial admission inventory"):
+        subject._start_objects()
+
+
+def test_watch_third_claim_counts_initial_deleting_claim(helper, kubectl_inventory) -> None:
+    subject, _, watch_events, _ = kubectl_inventory
+    watch_events["claims"].append({
+        "type": "ADDED",
+        "object": {"metadata": {"name": "acme-c", "resourceVersion": "111"}},
+    })
+    subject._start_objects()
+    assert subject.observer.max_claims == 2
+    for reader in subject._readers:
+        reader.join()
+    while not subject._events.empty():
+        event = subject._events.get_nowait()
+        if event[:2] == ("data", "claims"):
+            with pytest.raises(helper.ObservationError, match="more than two claims or Sandboxes"):
+                subject._event(*event)
+            return
+    pytest.fail("kubectl watch did not deliver its third claim")
