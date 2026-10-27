@@ -176,5 +176,68 @@ for workload_name, name, key in (
 invalid = render("--set-string", "api.httpIdentity.existingSecret=Not_A_Name", ok=False)
 assert invalid.returncode != 0, "accepted an invalid Secret name"
 
-print(f"OK: {count} Helm renders; default render unchanged; API and dispatcher files mount only into their own containers")
+# 7. With the network rails on, a selected API can still reach a provider on 443.
+def selects(selector, labels):
+    """Kubernetes label-selector semantics for matchLabels and matchExpressions."""
+    if any(labels.get(k) != v for k, v in (selector.get("matchLabels") or {}).items()):
+        return False
+    for expr in selector.get("matchExpressions") or []:
+        present, value = expr["key"] in labels, labels.get(expr["key"])
+        op, values = expr["operator"], expr.get("values") or []
+        if (op == "In" and value not in values) or (op == "NotIn" and value in values) or (
+            op == "Exists" and not present) or (op == "DoesNotExist" and present):
+            return False
+    return True
+
+
+def provider_443_allowed(documents):
+    """True when Kubernetes would admit API egress to an arbitrary host on TCP 443."""
+    api_pod = next(
+        doc for doc in documents if doc.get("kind") == "Deployment"
+        and doc["metadata"].get("labels", {}).get("app.kubernetes.io/component") == "api"
+    )
+    labels = api_pod["spec"]["template"]["metadata"]["labels"]
+    namespace = api_pod["metadata"].get("namespace")
+    governing = [
+        doc for doc in documents if doc.get("kind") == "NetworkPolicy"
+        and doc["metadata"].get("namespace") == namespace
+        and "Egress" in (doc["spec"].get("policyTypes") or [])
+        and selects(doc["spec"].get("podSelector") or {}, labels)
+    ]
+    if not governing:
+        return True  # An unselected pod's egress is not isolated.
+    for doc in governing:
+        for rule in doc["spec"].get("egress") or []:
+            ports = rule.get("ports")
+            port_ok = not ports or any(
+                p.get("protocol", "TCP") == "TCP" and p.get("port") in (None, 443) for p in ports
+            )
+            if port_ok and not rule.get("to"):
+                return True
+    return False
+
+
+for overlay in ([], ["-f", str(chart / "values-external.yaml")]):
+    rails = docs(render(
+        *overlay, "--set", "security.networkPolicy.enabled=true",
+        "--set-string", f"api.httpIdentity.existingSecret={API_SECRET}",
+        "--set", "api.httpIdentity.providerCaBundle=true",
+        "--set-string", f"dispatcher.httpIdentity.existingSecret={RECEIVER_SECRET}",
+    ))
+    assert any(doc.get("kind") == "NetworkPolicy" for doc in rails), "network rails did not render"
+    assert provider_443_allowed(rails), "a selected API cannot reach its provider on 443"
+    # Negative control: a policy that isolates API egress must be detected as blocking.
+    deny = {
+        "kind": "NetworkPolicy", "metadata": {"name": "control-deny"},
+        "spec": {
+            "podSelector": {"matchLabels": next(
+                doc for doc in rails if doc.get("kind") == "Deployment"
+                and doc["metadata"]["labels"].get("app.kubernetes.io/component") == "api"
+            )["spec"]["selector"]["matchLabels"]},
+            "policyTypes": ["Egress"], "egress": [{"ports": [{"protocol": "UDP", "port": 53}]}],
+        },
+    }
+    assert not provider_443_allowed([*rails, deny]), "the egress check missed a deny control"
+
+print(f"OK: {count} Helm renders; default render unchanged; API and dispatcher files mount only into their own containers; a selected API reaches a provider on 443 with the network rails on")
 PY
