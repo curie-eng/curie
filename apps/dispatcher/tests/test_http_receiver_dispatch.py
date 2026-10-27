@@ -34,10 +34,26 @@ from .test_dispatch import (
     _events_api_request,
     _mention_event,
 )
-from .test_http_receiver import CHANNEL, NAME, HttpRig, api, native, receipt, scope_body
+from .test_http_receiver import (
+    BOT,
+    CHANNEL,
+    NAME,
+    SENDER,
+    HttpRig,
+    api,
+    binding_body,
+    native,
+    receipt,
+    scope_body,
+)
 from .test_test_actions import DRIVER
 
 APPROVAL = "55555555-5555-4555-8555-555555555555"
+# @spec HTTP-INVOCATION-EXECUTION-19: the two fixed person-facing notices.
+REFUSED_TEXT = "Sorry, I can't help with this request."
+UNAVAILABLE_TEXT = "I couldn't verify your access right now. Please try again in a few minutes."
+DM_CHANNEL = "D0EXAMPLEDIRECT"
+DM_BINDING = "66666666-6666-4666-8666-666666666666"
 
 
 class ForbiddenBoundary:
@@ -59,10 +75,12 @@ def _identity() -> SlackIdentityCredentials:
     return SlackIdentityCredentials(name=NAME, app_token="xapp-test", bot_token="xoxb-test")
 
 
-def _selected(config: DispatcherConfig, redis_client: redis.Redis, rig: HttpRig) -> tuple[Any, Any]:
+def _selected(
+    config: DispatcherConfig, redis_client: redis.Redis, rig: HttpRig, *, bindings: Any = None
+) -> tuple[Any, Any]:
     """@spec HTTP-INVOCATION-EXECUTION-19: actual constructor and listener registration."""
     module = api()
-    runtime = rig.runtime(module)
+    runtime = rig.runtime(module, bindings=bindings)
     legacy = ForbiddenBoundary()
     for method in (
         "chat_postMessage",
@@ -185,8 +203,249 @@ def test_selected_complete_denial_or_route_miss_never_enters_legacy_fallback(
     finally:
         _finish_owned_listeners(app)
     assert sock.acked_envelope_ids == ["env-http"] and len(rig.requests) == 1
+    # @spec HTTP-INVOCATION-EXECUTION-19: the one notice is the only Slack effect.
+    rig.web.chat_postEphemeral.assert_called_once_with(
+        channel=CHANNEL, user=SENDER, thread_ts="1700.0001",
+        text=REFUSED_TEXT if status == 403 else UNAVAILABLE_TEXT,
+    )
+    rig.web.chat_postEphemeral.reset_mock()
     _no_legacy_effects(redis_client, config, rig, legacy)
     rig.closed()
+
+
+def _deliver_selected(
+    config: DispatcherConfig,
+    redis_client: redis.Redis,
+    rig: HttpRig,
+    *events: dict[str, Any],
+    bindings: Any = None,
+) -> Any:
+    """@spec HTTP-INVOCATION-EXECUTION-19: deliver native mentions through the actual Bolt owner."""
+    app, legacy = _selected(config, redis_client, rig, bindings=bindings)
+    sock = FakeSocketClient()
+    try:
+        for index, body in enumerate(events):
+            request = SocketModeRequest(
+                type="events_api", envelope_id=f"env-notice-{index}", payload=body,
+            )
+            SocketModeHandler(app, app_token="xapp-test").handle(sock, request)
+    finally:
+        _finish_owned_listeners(app)
+    assert sock.acked_envelope_ids == [f"env-notice-{index}" for index in range(len(events))]
+    assert legacy.calls == [] and redis_client.xlen(config.stream) == 0
+    return rig.web
+
+
+def _answering(status: int, detail: str = "caller_not_allowed") -> Any:
+    """@spec HTTP-INVOCATION-EXECUTION-19: a complete API answer carrying revealing detail."""
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, json={
+            "detail": detail, "policy": "synthetic-finance-policy",
+            "group": "synthetic-approvers-group", "provider": "okta",
+        })
+
+    return handler
+
+
+_LEAKS = ("caller_not_allowed", "policy", "group", "okta", "provider", "403", "503", "allowed")
+
+
+def _posted_texts(web: Any) -> list[str]:
+    """@spec HTTP-INVOCATION-EXECUTION-19: every text this identity tried to show anyone."""
+    return [
+        str(call.kwargs.get("text"))
+        for method in ("chat_postEphemeral", "chat_postMessage", "chat_update")
+        for call in getattr(web, method).call_args_list
+    ]
+
+
+@pytest.mark.parametrize(
+    ("status", "text"),
+    [
+        (401, REFUSED_TEXT),
+        (403, REFUSED_TEXT),
+        (409, REFUSED_TEXT),
+        (413, REFUSED_TEXT),
+        (422, REFUSED_TEXT),
+        (404, UNAVAILABLE_TEXT),
+        (429, UNAVAILABLE_TEXT),
+        (500, UNAVAILABLE_TEXT),
+        (503, UNAVAILABLE_TEXT),
+    ],
+)
+def test_selected_refused_or_unavailable_mention_tells_only_the_sender_in_a_channel(
+    config: DispatcherConfig, redis_client: redis.Redis, status: int, text: str
+) -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-19: one fixed ephemeral per outcome class, no reason."""
+    api()
+    rig = HttpRig(_answering(status))
+    body, _event = native()
+    web = _deliver_selected(config, redis_client, rig, body)
+    web.chat_postEphemeral.assert_called_once_with(
+        channel=CHANNEL, user=SENDER, thread_ts="1700.0001", text=text,
+    )
+    web.chat_postMessage.assert_not_called()
+    web.chat_update.assert_not_called()
+    for posted in _posted_texts(web):
+        assert not any(leak in posted.lower() for leak in _LEAKS), posted
+    rig.closed()
+
+
+def test_selected_mention_whose_api_is_unreachable_gets_the_retry_notice(
+    config: DispatcherConfig, redis_client: redis.Redis
+) -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-19: a transport failure is unavailable, not refused."""
+    api()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("synthetic refused connection", request=request)
+
+    rig = HttpRig(handler)
+    body, _event = native()
+    web = _deliver_selected(config, redis_client, rig, body)
+    web.chat_postEphemeral.assert_called_once_with(
+        channel=CHANNEL, user=SENDER, thread_ts="1700.0001", text=UNAVAILABLE_TEXT,
+    )
+    web.chat_postMessage.assert_not_called()
+
+
+def test_selected_top_level_mention_notice_is_not_threaded(
+    config: DispatcherConfig, redis_client: redis.Redis
+) -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-19: a channel-level mention gets a channel ephemeral."""
+    api()
+    rig = HttpRig(_answering(403))
+    body, event = native()
+    event.pop("thread_ts")
+    web = _deliver_selected(config, redis_client, rig, body)
+    web.chat_postEphemeral.assert_called_once_with(
+        channel=CHANNEL, user=SENDER, text=REFUSED_TEXT,
+    )
+
+
+@pytest.mark.parametrize(("status", "text"), [(403, REFUSED_TEXT), (503, UNAVAILABLE_TEXT)])
+def test_selected_direct_message_notice_is_an_ordinary_thread_reply(
+    config: DispatcherConfig, redis_client: redis.Redis, status: int, text: str
+) -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-19: a DM has no audience to hide the notice from."""
+    module = api()
+    rig = HttpRig(_answering(status))
+    bindings = (
+        module.HttpReceiverBindingV1.model_validate(binding_body()),
+        module.HttpReceiverBindingV1.model_validate(
+            binding_body(native_channel_id=DM_CHANNEL, binding_id=DM_BINDING),
+        ),
+    )
+    body, event = native()
+    event["channel"] = DM_CHANNEL
+    web = _deliver_selected(config, redis_client, rig, body, bindings=bindings)
+    assert len(rig.requests) == 1
+    web.chat_postMessage.assert_called_once_with(
+        channel=DM_CHANNEL, thread_ts="1700.0001", text=text,
+    )
+    web.chat_postEphemeral.assert_not_called()
+
+
+def test_selected_mention_in_an_unbound_channel_gets_the_same_refusal(
+    config: DispatcherConfig, redis_client: redis.Redis
+) -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-19: a local refusal reads exactly like an API one."""
+    api()
+    rig = HttpRig()
+    body, event = native()
+    event["channel"] = "C0EXAMPLEUNBOUND"
+    web = _deliver_selected(config, redis_client, rig, body)
+    assert rig.requests == []
+    web.chat_postEphemeral.assert_called_once_with(
+        channel="C0EXAMPLEUNBOUND", user=SENDER, thread_ts="1700.0001", text=REFUSED_TEXT,
+    )
+
+
+@pytest.mark.parametrize("sender", ["bot", "self", "subtype", "no_user"])
+def test_selected_bot_self_or_senderless_mention_never_gets_a_notice(
+    config: DispatcherConfig, redis_client: redis.Redis, sender: str
+) -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-19: no notice can answer a bot or start a loop."""
+    api()
+    rig = HttpRig(_answering(403))
+    body, event = native()
+    if sender == "bot":
+        event["bot_id"] = "B0EXAMPLEOTHER"
+    elif sender == "self":
+        event["user"] = BOT
+    elif sender == "subtype":
+        event["subtype"] = "message_changed"
+    else:
+        event.pop("user")
+    web = _deliver_selected(config, redis_client, rig, body)
+    assert rig.requests == []
+    assert _posted_texts(web) == []
+    web.chat_postEphemeral.assert_not_called()
+    web.chat_postMessage.assert_not_called()
+
+
+def test_selected_repeated_refused_delivery_posts_one_notice(
+    config: DispatcherConfig, redis_client: redis.Redis
+) -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-19: a Slack redelivery of one event never re-notifies."""
+    api()
+    rig = HttpRig(_answering(403))
+    first, _event = native()
+    again, _event = native()
+    web = _deliver_selected(config, redis_client, rig, first, again)
+    assert len(rig.requests) == 2
+    web.chat_postEphemeral.assert_called_once_with(
+        channel=CHANNEL, user=SENDER, thread_ts="1700.0001", text=REFUSED_TEXT,
+    )
+
+
+def test_selected_pending_or_accepted_mention_posts_no_notice(
+    config: DispatcherConfig, redis_client: redis.Redis
+) -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-19: an admitted turn is answered by the worker alone."""
+    api()
+    answers = iter([receipt(), receipt(pending=True)])
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        value = next(answers)
+        return httpx.Response(202 if value["duplicate"] else 200, json=value)
+
+    rig = HttpRig(handler)
+    first, _event = native()
+    again, _event = native()
+    web = _deliver_selected(config, redis_client, rig, first, again)
+    assert len(rig.requests) == 2
+    assert _posted_texts(web) == []
+
+
+def test_selected_failed_notice_is_logged_by_class_and_never_raises(
+    config: DispatcherConfig, redis_client: redis.Redis, caplog: pytest.LogCaptureFixture
+) -> None:
+    """@spec HTTP-INVOCATION-EXECUTION-19: a lost notice changes no outcome and leaks nothing."""
+    api()
+    rig = HttpRig(_answering(403))
+    body, _event = native()
+    app, _legacy = _selected(config, redis_client, rig)
+    rig.web.chat_postEphemeral.side_effect = RuntimeError("synthetic " + SENDER + " failure")
+    errors: list[BaseException] = []
+
+    @app.error
+    def _collect(error: BaseException) -> None:
+        errors.append(error)
+
+    sock = FakeSocketClient()
+    with caplog.at_level(logging.DEBUG):
+        try:
+            SocketModeHandler(app, app_token="xapp-test").handle(
+                sock, SocketModeRequest(type="events_api", envelope_id="env-fail", payload=body),
+            )
+        finally:
+            _finish_owned_listeners(app)
+    assert errors == [] and sock.acked_envelope_ids == ["env-fail"]
+    rig.web.chat_postEphemeral.assert_called_once()
+    assert "RuntimeError" in caplog.text
+    assert "synthetic " + SENDER + " failure" not in caplog.text
 
 
 # Approval clicks, note dialogs and their submissions are the qualified answer
