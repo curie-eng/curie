@@ -167,9 +167,9 @@ class _Collector:
         self.deletion_count = 0
         self.max_deletion_seconds = 0.0
 
-    def _get(self, *args: str) -> dict[str, Any]:
+    def _request_json(self, *args: str) -> dict[str, Any]:
         result = subprocess.run(
-            [*self.kube, "get", *args, "--ignore-not-found", "-o", "json", "--request-timeout=5s"],
+            [*self.kube, *args, "--request-timeout=5s"],
             capture_output=True,
             text=True,
             check=False,
@@ -181,6 +181,9 @@ class _Collector:
         if not isinstance(document, dict):
             raise ObservationError("invalid admission control plane response")
         return document
+
+    def _get(self, *args: str) -> dict[str, Any]:
+        return self._request_json("get", *args, "--ignore-not-found", "-o", "json")
 
     def _stream(self, source: str, arguments: list[str]) -> None:
         process = subprocess.Popen(
@@ -239,14 +242,19 @@ class _Collector:
 
     def _start_objects(self) -> None:
         for source, kind in _KINDS.items():
-            initial = self._get(kind)
+            resource, group = kind.split(".", 1)
+            initial = self._request_json(
+                "get", "--raw",
+                f"/apis/{group}/v1beta1/namespaces/{self.namespace}/{resource}",
+            )
             items = initial.get("items")
-            version = initial.get("metadata", {}).get("resourceVersion")
+            metadata = initial.get("metadata")
+            version = metadata.get("resourceVersion") if isinstance(metadata, dict) else None
             if not isinstance(items, list) or not isinstance(version, str) or not version:
                 raise ObservationError("invalid initial admission inventory")
-            self._versions[source] = version
             for obj in items:
                 self._object(source, "ADDED", obj)
+            self._versions[source] = version
             self._watch(source)
         self._observe([])
 

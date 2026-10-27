@@ -2586,6 +2586,8 @@ const RESERVED_WITHOUT_MIGRATION: &[&str] = &[
     "CURIE_PUBLICATION_SERVICE_ACCOUNT_NAME",
     "CURIE_RUNNER_IMAGE",
     "CURIE_RUNNER_PORT",
+    // Sandbox admission is generated chart policy from introduction, never an extraEnv input.
+    "CURIE_SANDBOX_ADMISSION",
     "CURIE_SANDBOX_QUOTA_LIMITS_CPU",
     "CURIE_SANDBOX_QUOTA_LIMITS_MEMORY",
     "CURIE_SANDBOX_QUOTA_REQUESTS_CPU",
