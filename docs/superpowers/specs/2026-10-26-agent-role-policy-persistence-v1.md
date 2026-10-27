@@ -142,6 +142,8 @@ Because existing ORM AgentAccessPolicy reads will include the new column, the ca
 
 Before source begins or after a rebase, re-resolve the actual graph. If 0133 is occupied or the parent changed, stop the affected migration/pin work and amend this specification before tests/source; do not manufacture an empty bridge, duplicate history, dangling parent or automatic graph merge. Public source publication must exclude any temporary dependency-combination commit and wait for the prerequisite contracts' converged public ancestry. This is a development compatibility update, not release preparation.
 
+Re-resolved graph: `next` has since added 0136 (execution deadlines) as a child of 0131. The unreleased 0132 is re-parented onto 0136, giving one linear chain 0131, 0136, 0132, 0133 with no bridge or merge revision. 0133 remains the candidate floor and head, and the CLI catalog keeps `next`'s revision order as its prefix: 0136, then 0132 and 0133.
+
 ## 10. Evidence and remaining activation gates
 
 <!-- @spec AGENT-ROLE-PERSISTENCE-V1-10 -->
