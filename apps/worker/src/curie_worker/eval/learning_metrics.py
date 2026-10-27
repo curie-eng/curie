@@ -455,7 +455,7 @@ def _predicate(raw: object) -> _Predicate:
             learning_class is LearningClass.SKILL
             and isinstance(value, list)
             and bool(value)
-            and all(isinstance(step, str) and _required_tokens(step) for step in value)
+            and all(isinstance(step, str) and _tokens(step) for step in value)
         )
     elif name == "schedule_matches":
         valid = (
@@ -532,14 +532,8 @@ def _norm(text: str) -> str:
         text = trimmed
 
 
-# Section A3: share of a step's distinct non-nonce tokens the body must contain.
-_STEP_TOKEN_COVERAGE = 0.85
 _TOKEN_SPLIT = re.compile(r"[^a-z0-9-]+")
 _NONCE = re.compile(r"^[a-z]+-[0-9a-f]{6}$")
-_STOPWORDS = frozenset(
-    "a an the and or of to in on for by as is it its this that then with from each their"
-    " those these be".split()
-)
 
 
 def _tokens(text: str) -> list[str]:
@@ -547,66 +541,46 @@ def _tokens(text: str) -> list[str]:
     return [token for token in stripped if token]
 
 
-def _required_tokens(step: str) -> list[str]:
-    return [token for token in _tokens(step) if token not in _STOPWORDS]
+def _nonces(text: str) -> list[str]:
+    return [token for token in _tokens(text) if _NONCE.match(token)]
 
 
 def _contains_in_order(body: object, steps: Sequence[object]) -> bool:
-    """Token anchors (decision after live run 7).
+    """Nonce anchors (decision after review round 1).
 
-    Every nonce of every step and at least 85 percent of each step's other distinct
-    non-stopword tokens must be words of the body, nonce
-    tokens must first occur in the body in the same relative order as in the steps,
-    and each step's unique-token anchor must appear in step order.
+    Every nonce of every step must be a word of the body, and the nonces must first
+    occur in the body in the same relative order as in the steps. Plain wording is
+    left to the judge, so a paraphrase that keeps the nonces passes and a step with
+    no nonce imposes no deterministic constraint.
     """
     if not isinstance(body, str):
         raise EvidenceError("stored skill body must be text")
-    words = _tokens(body)
     first: dict[str, int] = {}
-    for index, word in enumerate(words):
+    for index, word in enumerate(_tokens(body)):
         first.setdefault(word, index)
-    required = [_required_tokens(str(step)) for step in steps]
     nonces: list[str] = []
-    for tokens in required:
-        plain = {token for token in tokens if not _NONCE.match(token)}
-        if plain and len(plain & first.keys()) < _STEP_TOKEN_COVERAGE * len(plain):
-            return False
-        for token in tokens:
-            if _NONCE.match(token):
-                if token not in first:
-                    return False
-                if token not in nonces:
-                    nonces.append(token)
+    for step in steps:
+        for token in _nonces(str(step)):
+            if token not in first:
+                return False
+            if token not in nonces:
+                nonces.append(token)
     positions = [first[token] for token in nonces]
-    if positions != sorted(positions):
-        return False
-    # Section A2: each step's anchor is its first token found in no other step; anchors
-    # must occur in step order under a greedy forward cursor.
-    cursor = 0
-    for index, tokens in enumerate(required):
-        others = {token for other, rest in enumerate(required) if other != index for token in rest}
-        anchor = next((token for token in tokens if token not in others), None)
-        if anchor is None:
-            continue
-        found = next((at for at in range(cursor, len(words)) if words[at] == anchor), None)
-        if found is None:
-            return False
-        cursor = found
-    return True
+    return positions == sorted(positions)
 
 
 def _statement_agrees(statement: object, expected: str) -> bool:
-    """Word-bounded normalized containment with no competing value of the nonce shape."""
+    """With nonces expected: every expected nonce is a word of the statement and no
+    other nonce-shaped token appears. Without: word-bounded normalized containment."""
     if not isinstance(statement, str):
         return False
+    allowed = set(_nonces(expected))
+    if allowed:
+        found = set(_nonces(statement))
+        return allowed <= found and found <= allowed
     needle, haystack = _norm(expected), _norm(statement)
     bounded = rf"(?<![a-z0-9-]){re.escape(needle)}(?![a-z0-9-])"
-    if not needle or re.search(bounded, haystack) is None:
-        return False
-    allowed = {token for token in _tokens(expected) if _NONCE.match(token)}
-    if not allowed:
-        return True
-    return all(token in allowed for token in _tokens(statement) if _NONCE.match(token))
+    return bool(needle) and re.search(bounded, haystack) is not None
 
 
 def _schedule_agrees(observed: Mapping[str, object], expected: Mapping[str, object]) -> bool:

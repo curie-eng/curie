@@ -330,6 +330,16 @@ def _load_corpus(path: Path) -> tuple[dict[str, Any], tuple[dict[str, object], .
                 _require(bool(predicates), f"{identity} needs predicates")
                 for raw_predicate in predicates:
                     _check_predicate(raw_predicate, f"{identity} predicate")
+            for raw_probe in _lst(scenario.get("probes", []), f"{identity} probes"):
+                probe = _obj(raw_probe, f"{identity} probe")
+                if "forbidden_values" in probe:
+                    for field in ("id", "channel", "input"):
+                        _text(probe.get(field), f"{identity} no-reuse probe {field}")
+                    forbidden = _lst(probe["forbidden_values"], f"{identity} forbidden values")
+                    _require(
+                        bool(forbidden) and all(_is_str(v) for v in forbidden),
+                        f"{identity} forbidden values",
+                    )
             rows.append(copy.deepcopy(scenario))
     return copy.deepcopy(guidance), tuple(rows)
 
@@ -1291,6 +1301,11 @@ def _control_check(check: Mapping[str, Any]) -> bool:
         return str(check["reply"]).rstrip().endswith(_text(check["expected_suffix"], "suffix"))
     if kind == "contains":
         return _text(check["expected"], "expected") in str(check["reply"])
+    if kind == "absent":
+        forbidden = _lst(check["forbidden_values"], "forbidden values")
+        _require(bool(forbidden), "absent check needs forbidden values")
+        reply = str(check["reply"]).casefold()
+        return not any(_text(v, "forbidden value").casefold() in reply for v in forbidden)
     if kind == "unchanged":
         return not _state_diff(check["before"], check["after"])
     if kind == "instruction-step":
@@ -1360,8 +1375,10 @@ def _control_check(check: Mapping[str, Any]) -> bool:
 def _required_controls(
     report: _Report, capabilities: Mapping[str, bool]
 ) -> set[tuple[int, str, str]]:
-    """Every fixture control of every executed case whose capabilities are available."""
+    """Every fixture control of every executed case whose capabilities are available.
+    A live campaign also owes one record per no-reuse probe (one with forbidden values)."""
 
+    live = report.data.get("data_origin") == "live-campaign"
     required: set[tuple[int, str, str]] = set()
     for (repetition, case_id), case in report.cases.items():
         fixture = report.corpus[case["fixture_id"]]
@@ -1371,6 +1388,10 @@ def _required_controls(
             control_id = str(control["id"])
             if control_id not in AUX_CONTROLS | UNINVENTORIED_CONTROLS:
                 required.add((repetition, case_id, control_id))
+        if live:
+            for probe in fixture.get("probes", []):
+                if "forbidden_values" in probe:
+                    required.add((repetition, case_id, str(probe["id"])))
     return required
 
 
@@ -1406,6 +1427,15 @@ def _check_controls(report: _Report, capabilities: Mapping[str, bool]) -> None:
             continue
         if live or "checks" in observation:
             checks = _lst(observation.get("checks"), f"{control_id} checks")
+            no_reuse = any(
+                str(p["id"]) == control_id and "forbidden_values" in p
+                for p in fixture.get("probes", [])
+            )
+            if no_reuse and status in ("PASS", "FAIL"):
+                _require(
+                    len(checks) == 1 and _obj(checks[0], "check").get("kind") == "absent",
+                    f"{control_id} must carry exactly one absent check",
+                )
             if status in ("PASS", "FAIL"):
                 # Evaluate every check so a malformed one after a FAIL still raises.
                 results = [_control_check(_obj(c, "check")) for c in checks]
@@ -3419,6 +3449,15 @@ def _scenario_values(due: datetime) -> dict[str, str]:
         "schedule_token": token("tok"),
         "cancel_token": token("tok"),
         "revised_token": token("tok"),
+        # F6 and F7 content the agent must not persist; its no-reuse probe forbids it.
+        "amber_candidate": token("amber"),
+        "violet_candidate": token("violet"),
+        "setup_marker": token("setup"),
+        "reference_value": token("ref"),
+        "sequence_marker": token("seq"),
+        "quoted_label": token("amber"),
+        "hypothetical_label": token("coral"),
+        "one_turn_marker": token("ready"),
     }
     due = due.replace(second=0, microsecond=0)
     cancel = due + timedelta(minutes=3)
@@ -3495,8 +3534,35 @@ class _Campaign:
 
     def add(self, kind: str, value: dict[str, Any]) -> str:
         identity = f"{kind}-{len(self.evidence) + 1}"
-        self.evidence[identity] = {"kind": kind, "sha256": "", "value": value}
+        self.evidence[identity] = {"kind": kind, "sha256": "", "value": self.redact(value)}
         return identity
+
+    def redact(self, value: Any) -> Any:
+        """Replace every secret in every nested string, in place for dicts and lists
+        so references to them stay valid. Only replaces; never truncates."""
+
+        keys = [k for k in [self.key, *self.platform_keys] if k]
+        if not keys:
+            return value
+
+        def walk(item: Any) -> Any:
+            if isinstance(item, str):
+                for secret in keys:
+                    item = item.replace(secret, "[redacted]")
+                return item
+            if isinstance(item, dict):
+                pairs = [(walk(k), walk(v)) for k, v in item.items()]
+                item.clear()
+                item.update(pairs)
+                return item
+            if isinstance(item, list):
+                item[:] = [walk(v) for v in item]
+                return item
+            if isinstance(item, tuple):
+                return tuple(walk(v) for v in item)
+            return item
+
+        return walk(value)
 
     def identity(self) -> None:
         path = self.o.curie_bin
@@ -3562,6 +3628,7 @@ class _Campaign:
         parsed: Any = None
         with contextlib.suppress(_Invalid, ValueError, UnicodeError):
             parsed = _strict_loads(stdout) if stdout.strip() else None
+        parsed = self.redact(parsed)
         result_ref = self.add(
             "cli-result", {**scope, "result": parsed, "stdout_sha256": _sha(stdout)}
         )
@@ -4919,6 +4986,8 @@ class _Campaign:
             5: self.control_recurring,
             8: self.control_correction,
             2: self.control_instruction,
+            6: self.control_no_reuse,
+            7: self.control_no_reuse,
         }.get(family)
         if control is not None:
             control(scope, fixture, agent_id, thread, after, values)
@@ -5019,6 +5088,41 @@ class _Campaign:
                 None,
                 f"durable changes {json.dumps(changed)}; reply: {_excerpt(sent['reply'])}",
                 [{"kind": "unchanged", "before": before, "after": after_state}],
+            )
+
+    def control_no_reuse(
+        self,
+        scope: dict[str, Any],
+        fixture: Mapping[str, Any],
+        agent_id: str,
+        thread: str,
+        after: Any,
+        values: Mapping[str, str],
+    ) -> None:
+        """Ask in a fresh thread for content that must not have been persisted; the
+        reply must not carry any of the teaching message's nonces."""
+
+        for probe in fixture.get("probes", []):
+            if "forbidden_values" not in probe:
+                continue
+            sent = self.message(
+                scope, str(probe["input"]), str(probe["channel"]), self.new_thread()
+            )
+            forbidden = [str(v) for v in probe["forbidden_values"]]
+            self.record_control(
+                scope,
+                str(probe["id"]),
+                None,
+                f"fresh-thread no-reuse probe; reply: {_excerpt(sent['reply'])}",
+                [
+                    {
+                        "kind": "absent",
+                        "probe_id": str(probe["id"]),
+                        "reply": sent["reply"],
+                        "forbidden_values": forbidden,
+                        "invocation_id": sent["invocation_id"],
+                    }
+                ],
             )
 
     def suffix_probe(self, scope: Mapping[str, Any], probe: Mapping[str, Any]) -> dict[str, Any]:
@@ -5407,7 +5511,9 @@ class _Campaign:
         original = self.find(after[0], "schedules", "prompt", values["schedule_token"])
         if len(original) == 1:
             self.bind_fire(scope, str(original[0]["id"]))
-        self.message(scope, str(control["messages"][0]), self.channels[0], thread)
+        # Revise and cancel each arrive in a fresh thread, so the agent must find the
+        # schedule from durable state rather than the teaching conversation.
+        self.message(scope, str(control["messages"][0]), self.channels[0], self.new_thread())
         revised_state = self.snapshot(scope)[0]
         revised = [
             r
@@ -5420,7 +5526,7 @@ class _Campaign:
             and revised[0]["id"] == original[0]["id"]
             and revised[0].get("cron") == control["revised_cron"]
         )
-        sent = self.message(scope, str(control["messages"][1]), self.channels[0], thread)
+        sent = self.message(scope, str(control["messages"][1]), self.channels[0], self.new_thread())
         final, source = (None, "absent")
         if original:
             final, source = self.schedule_row(scope, str(original[0]["id"]))
@@ -6094,6 +6200,10 @@ class _Usage(ValueError):
     """A rejected argument; reported on stderr with no stdout."""
 
 
+# Files a run writes into its output directory; either one marks it as used.
+CAMPAIGN_ARTIFACTS = ("ledger.sqlite", "report.json")
+
+
 def _number(text: str, label: str) -> int | float:
     try:
         value: int | float = int(text)
@@ -6234,6 +6344,14 @@ def _validate_command(args: argparse.Namespace) -> int:
 
 def _run_command(args: argparse.Namespace) -> int:
     options = _run_options(args)
+    if not options.dry_run:
+        # A reused directory would mix ledgers and reports across campaigns.
+        reused = [n for n in CAMPAIGN_ARTIFACTS if (options.output_dir / n).exists()]
+        if reused:
+            raise _Usage(
+                f"--output-dir {options.output_dir} already holds {', '.join(reused)} "
+                "from an earlier campaign; use a fresh output directory"
+            )
     key = os.environ.get("CURIE_CREDENTIALS") or None
     for name in STRIPPED_AUTH:
         os.environ.pop(name, None)
