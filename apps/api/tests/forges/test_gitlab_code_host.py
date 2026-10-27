@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import httpx
 import pytest
 from curie_api.forges import types
 from curie_api.forges.errors import Ambiguous, NotFound, Unauthorized, Unavailable
@@ -24,6 +25,7 @@ from curie_api.forges.types import (
 )
 from forge_fakes.contract_harness import OUTSIDER, WRITER
 from forge_fakes.gitlab import (
+    API,
     BOT,
     HOST,
     PROJECT_ID,
@@ -178,6 +180,120 @@ async def test_read_commit(fake: GitLabAPI) -> None:
     commit = await gitlab_code_host(fake).read_commit(fake.repository(), sha)
 
     assert commit == Commit(sha=sha, parents=(parent,), message="Fix the widget\n\nLonger text.")
+
+
+# Ancestry (#5094): one merge base request answers it ---
+
+
+def _ancestry_graph(fake: GitLabAPI) -> dict[str, str]:
+    """A side branch merged back into the mainline, and a fork off the root."""
+
+    root = fake.branches["main"]
+    side = fake.add_commit((root,), "side")
+    mainline = fake.add_commit((root,), "mainline")
+    merge = fake.add_commit((mainline, side), "merge")
+    fork = fake.add_commit((root,), "fork")
+    return {"root": root, "side": side, "mainline": mainline, "merge": merge, "fork": fork}
+
+
+def _merge_base_calls(fake: GitLabAPI) -> list[Any]:
+    return fake.calls("GET", f"{PROJECT}/repository/merge_base")
+
+
+def test_is_ancestor_fake_merge_base_replays_gitlab_answers(fake: GitLabAPI) -> None:
+    graph = _ancestry_graph(fake)
+    orphan = fake.add_commit((), "orphan")
+
+    def merge_base(*refs: str) -> httpx.Response:
+        query = "&".join(f"refs[]={ref}" for ref in refs)
+        return fake.handle(
+            httpx.Request(
+                "GET",
+                f"{API}{PROJECT}/repository/merge_base?{query}",
+                headers={"PRIVATE-TOKEN": TOKEN},
+            )
+        )
+
+    found = merge_base(graph["side"], graph["merge"])
+    assert found.status_code == 200
+    assert found.json()["id"] == graph["side"]
+    assert found.json()["parent_ids"] == [fake.branches["main"]]
+    assert merge_base(graph["fork"], graph["merge"]).json()["id"] == graph["root"]
+    assert merge_base(orphan, graph["merge"]).status_code == 404
+    unknown = merge_base("f" * 40, graph["merge"])
+    assert (unknown.status_code, unknown.json()) == (400, {"message": f"ref not found: {'f' * 40}"})
+    assert merge_base(graph["merge"]).status_code == 400
+
+
+@pytest.mark.anyio
+async def test_is_ancestor_of_identical_shas_is_true(fake: GitLabAPI) -> None:
+    graph = _ancestry_graph(fake)
+
+    assert await gitlab_code_host(fake).is_ancestor(
+        fake.repository(), graph["merge"], graph["merge"]
+    )
+    assert len(_merge_base_calls(fake)) <= 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("ancestor", "descendant", "expected"),
+    [
+        ("root", "mainline", True),
+        ("side", "merge", True),
+        ("root", "merge", True),
+        ("merge", "root", False),
+        ("fork", "merge", False),
+    ],
+    ids=("ahead", "merge-parent", "through-merge", "behind", "diverged"),
+)
+async def test_is_ancestor_compares_the_merge_base_with_the_ancestor(
+    fake: GitLabAPI, ancestor: str, descendant: str, expected: bool
+) -> None:
+    graph = _ancestry_graph(fake)
+
+    answer = await gitlab_code_host(fake).is_ancestor(
+        fake.repository(), graph[ancestor], graph[descendant]
+    )
+
+    assert answer is expected
+    [request] = _merge_base_calls(fake)
+    assert request.url.params.get_list("refs[]") == [graph[ancestor], graph[descendant]]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "body",
+    [{}, {"id": None}, {"short_id": "abc"}, ["not", "an", "object"]],
+    ids=("empty", "null-id", "no-id", "not-an-object"),
+)
+async def test_is_ancestor_on_a_malformed_merge_base_is_unavailable_not_false(
+    fake: GitLabAPI, body: Any
+) -> None:
+    graph = _ancestry_graph(fake)
+    fake.script(200, path=f"{PROJECT}/repository/merge_base", method="GET", body=body)
+
+    with pytest.raises(Unavailable):
+        await gitlab_code_host(fake).is_ancestor(fake.repository(), graph["root"], graph["merge"])
+
+
+@pytest.mark.anyio
+async def test_is_ancestor_without_a_common_ancestor_404_is_unavailable(fake: GitLabAPI) -> None:
+    # GitLab's 404 does not say which ref was missing, so it cannot prove "not an ancestor".
+    graph = _ancestry_graph(fake)
+    orphan = fake.add_commit((), "orphan")
+
+    with pytest.raises(Unavailable):
+        await gitlab_code_host(fake).is_ancestor(fake.repository(), orphan, graph["merge"])
+    assert len(_merge_base_calls(fake)) == 1
+
+
+@pytest.mark.anyio
+async def test_is_ancestor_of_an_unknown_ref_is_unavailable(fake: GitLabAPI) -> None:
+    graph = _ancestry_graph(fake)
+
+    with pytest.raises(Unavailable):
+        await gitlab_code_host(fake).is_ancestor(fake.repository(), "f" * 40, graph["merge"])
 
 
 # Decision 17: merge requests ---

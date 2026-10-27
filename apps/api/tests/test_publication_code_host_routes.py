@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import time
+import re
 import uuid
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -65,6 +65,7 @@ ROUTES = (
     ("POST", "pull-request/metadata", None),
 )
 UPDATED_AT = datetime(2026, 10, 5, 12, 0, tzinfo=UTC)
+_COMMIT_SHA = re.compile(r"[0-9a-f]{40,64}")
 
 
 class _CodeHost:
@@ -81,6 +82,8 @@ class _CodeHost:
         self.base_head: str | None = BASE_SHA
         self.default_branch = "main"
         self.reads: list[str] = []
+        self.ancestry_calls: list[tuple[str, str]] = []
+        self.ancestry_fail: Exception | None = None
         self.branch_reads: list[str] = []
         self.read_delay = 0.0
         self.on_read: Any = None
@@ -138,6 +141,32 @@ class _CodeHost:
         if sha not in self.commits:
             raise NotFound("commit_not_found")
         return self.commits[sha]
+
+    async def is_ancestor(self, repository: RepositoryRef, ancestor: str, descendant: str) -> bool:
+        # One forge call, like a compare or merge-base request, answered from the whole graph.
+        self.ancestry_calls.append((ancestor, descendant))
+        self._maybe_fail()
+        if self.ancestry_fail is not None:
+            raise self.ancestry_fail
+        if ancestor == descendant:
+            return True
+        pending = [descendant]
+        visited: set[str] = set()
+        while pending:
+            sha = pending.pop()
+            if sha in visited:
+                continue
+            visited.add(sha)
+            commit = self.commits.get(sha)
+            if commit is None or commit.sha != sha:
+                raise Unavailable("commit_unreadable")
+            for parent in commit.parents:
+                if not _COMMIT_SHA.fullmatch(parent):
+                    raise Unavailable("commit_unreadable")
+                if parent == ancestor:
+                    return True
+                pending.append(parent)
+        return False
 
     async def resolve_repository(self, project_id: str) -> RepositoryRef:
         assert project_id == f"path:{REPO}"
@@ -1302,14 +1331,17 @@ def test_ancestry_read_budget_is_shared_by_both_proofs(approved: Seeded) -> None
         cursor = _graph_commit(code_host, _sha(10000 + index), cursor)
         if index == 599:
             _published_parent(publication, code_host, cursor)
+            parent = cursor
     code_host.base_head = cursor
     before = _stored_state(publication)
 
     response = _verify(client, publication)
 
-    assert response.status_code == 503, response.text
-    assert "publication_ancestry_unproved" in response.json()["detail"]["message"]
-    assert len(code_host.reads) - code_host.reads.count(HEAD_SHA) <= 1024
+    # Depth costs nothing: both relations are one forge question each (#5094).
+    assert response.status_code == 200, response.text
+    assert response.json() == {"commit_sha": HEAD_SHA, "parent_sha": parent}
+    assert code_host.reads == [HEAD_SHA]
+    assert code_host.ancestry_calls == [(BASE_SHA, parent), (parent, cursor)]
     assert _stored_state(publication) == before
     assert code_host.opened == []
     code_host.base_head = BASE_SHA
@@ -1323,17 +1355,18 @@ def test_ancestry_has_a_whole_operation_deadline_and_can_retry(approved: Seeded)
     parent = _graph_commit(code_host, _sha(60), intermediate)
     code_host.base_head = parent
     _published_parent(publication, code_host, parent)
-    code_host.read_delay = 6.0
+    # The HTTP client timeout is the bound; it surfaces from the forge as Unavailable.
+    code_host.ancestry_fail = Unavailable("github_timeout")
     before = _stored_state(publication)
-    started = time.monotonic()
 
     response = _verify(client, publication)
 
     assert response.status_code == 503, response.text
-    assert time.monotonic() - started < 11.5
+    assert response.json()["detail"]["code"] == "publication.code_host_unavailable"
     assert "publication_ancestry_unproved" in response.json()["detail"]["message"]
     assert _stored_state(publication) == before
-    code_host.read_delay = 0
+    assert code_host.opened == []
+    code_host.ancestry_fail = None
     assert _verify(client, publication).status_code == 200
 
 
@@ -1343,15 +1376,14 @@ def test_paced_ancestry_obeys_wallclock_limit_below_read_cap_and_same_graph_retr
 ) -> None:
     client, publication, code_host = approved
     cursor = BASE_SHA
-    graph: set[str] = set()
     parent = BASE_SHA
     for index in range(120):
         cursor = _graph_commit(code_host, _sha(20000 + index), cursor)
-        graph.add(cursor)
         if index == 59:
             parent = cursor
     code_host.base_head = cursor
     _published_parent(publication, code_host, parent)
+    # Slow commit reads no longer matter: only the publication commit is read.
     code_host.read_delay = 0.1
     before = _stored_state(publication)
     body = (
@@ -1359,26 +1391,29 @@ def test_paced_ancestry_obeys_wallclock_limit_below_read_cap_and_same_graph_retr
         if operation == "revision-commit"
         else {"expected_head_sha": HEAD_SHA, "adopt_only": False}
     )
-    started = time.monotonic()
 
     response = client.post(_url(publication["id"], operation), json=body, headers=WORKER_HEADERS)
 
-    elapsed = time.monotonic() - started
-    assert response.status_code == 503, response.text
-    assert elapsed <= 11.5, elapsed
-    assert response.json()["detail"]["code"] == "publication.code_host_unavailable"
-    assert "publication_ancestry_unproved" in response.json()["detail"]["message"]
-    assert len(code_host.reads) - code_host.reads.count(HEAD_SHA) <= 1024
-    assert code_host.opened == []
+    assert response.status_code == 200, response.text
+    assert code_host.reads == [HEAD_SHA]
+    assert len(code_host.ancestry_calls) == 2
+    if operation == "revision-commit":
+        assert response.json() == {"commit_sha": HEAD_SHA, "parent_sha": parent}
+        assert code_host.opened == []
+    else:
+        assert len(code_host.opened) == 1
     assert _stored_state(publication) == before
 
     code_host.base_head = _graph_commit(code_host, _sha(21000), BASE_SHA)
     _published_parent(publication, code_host, code_host.base_head)
     code_host.reads.clear()
+    code_host.ancestry_calls.clear()
+    code_host.opened.clear()
     paced = client.post(_url(publication["id"], operation), json=body, headers=WORKER_HEADERS)
 
     assert paced.status_code == 200, paced.text
-    assert code_host.reads == [HEAD_SHA, code_host.base_head]
+    assert code_host.reads == [HEAD_SHA]
+    assert len(code_host.ancestry_calls) == 2
     if operation == "revision-commit":
         assert paced.json() == {"commit_sha": HEAD_SHA, "parent_sha": code_host.base_head}
     else:
@@ -1389,17 +1424,59 @@ def test_paced_ancestry_obeys_wallclock_limit_below_read_cap_and_same_graph_retr
     _published_parent(publication, code_host, parent)
     code_host.read_delay = 0
     code_host.reads.clear()
+    code_host.ancestry_calls.clear()
     code_host.opened.clear()
     healthy = client.post(_url(publication["id"], operation), json=body, headers=WORKER_HEADERS)
 
     assert healthy.status_code == 200, healthy.text
-    assert set(code_host.reads) == graph | {HEAD_SHA}
+    assert code_host.reads == [HEAD_SHA]
+    assert len(code_host.ancestry_calls) == 2
     if operation == "revision-commit":
         assert healthy.json() == {"commit_sha": HEAD_SHA, "parent_sha": parent}
         assert code_host.opened == []
     else:
         assert len(code_host.opened) == 1
         assert code_host.opened[0]["base_ref"] == "main"
+    assert _stored_state(publication) == before
+
+
+def test_first_publication_ancestry_is_constant_forge_calls_when_the_base_is_100_commits_ahead(
+    approved: Seeded,
+) -> None:
+    # Fix pin for #5094: a base that moved while the agent worked cost one commit read per
+    # commit, ran past the deadline on a healthy forge, and answered 503.
+    client, publication, code_host = approved
+    parent = _graph_commit(code_host, _sha(30000), BASE_SHA)
+    tip = parent
+    for index in range(1, 121):
+        side = _graph_commit(code_host, _sha(31000 + index), tip)
+        tip = _graph_commit(code_host, _sha(30000 + index), tip, side) if index % 10 == 0 else side
+    code_host.base_head = tip
+    _published_parent(publication, code_host, parent)
+    before = _stored_state(publication)
+
+    for operation in ("revision-commit", "pull-request"):
+        code_host.reads.clear()
+        code_host.ancestry_calls.clear()
+        body = (
+            {"commit_sha": HEAD_SHA, "revision_id": publication["id"], "expected_parent": BASE_SHA}
+            if operation == "revision-commit"
+            else {"expected_head_sha": HEAD_SHA, "adopt_only": False}
+        )
+
+        response = client.post(
+            _url(publication["id"], operation), json=body, headers=WORKER_HEADERS
+        )
+
+        assert response.status_code == 200, (operation, response.text)
+        assert code_host.reads == [HEAD_SHA], operation
+        assert code_host.ancestry_calls == [(BASE_SHA, parent), (parent, tip)], operation
+        if operation == "revision-commit":
+            assert response.json() == {"commit_sha": HEAD_SHA, "parent_sha": parent}
+            assert code_host.opened == []
+        else:
+            assert len(code_host.opened) == 1
+            assert code_host.opened[0]["base_ref"] == "main"
     assert _stored_state(publication) == before
 
 
