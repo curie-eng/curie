@@ -87,6 +87,23 @@ _LANES = (
 # itself under a name the SDK owns.
 _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
     {
+        # The curie CLI's own credential and OpenRouter credit-endpoint env
+        # (cli/src/ops/providers.rs, cli/src/openrouter_credit.rs). The learning
+        # eval harness strips them from the host env before driving the CLI;
+        # neither is injected into a sandbox claim.
+        "CURIE_MODEL_CREDENTIALS",
+        "CURIE_OPENROUTER_API_URL",
+        # The curie CLI's API target and local-stack settings (cli/src/local.rs,
+        # cli/src/message.rs, compose.dev.yaml), which the learning eval harness
+        # sets on the host env of the `curie local` and `docker compose`
+        # processes it drives. None reaches a sandbox claim.
+        "CURIE_API_KEY",
+        "CURIE_API_URL",
+        "CURIE_LOCAL_IMAGE_TAG",
+        "CURIE_LOCAL_POSTGRES_HOST",
+        "CURIE_LOCAL_POSTGRES_PORT",
+        "CURIE_LOCAL_STUB_HOST",
+        "CURIE_LOCAL_STUB_PORT",
         # The worker service's own settings (WorkerConfig validation_alias), read
         # from the WORKER's env at worker startup. Never a sandbox boot key.
         # The inbound-attachment lane's operator envelope (#2567): the lane's own

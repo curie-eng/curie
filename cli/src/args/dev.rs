@@ -154,6 +154,51 @@ pub(crate) enum DevAction {
     },
     /// Check the OpenRouter credit on CURIE_CREDENTIALS before a graded ladder spends a build.
     ModelCredit,
+    /// Evaluate conversational learning on a private local stack (#4780).
+    ///
+    /// Owns the whole lifecycle: a private compose project, the pinned actor
+    /// and judge models, one campaign budget, report.json and report.md in
+    /// the output directory, and teardown of everything it created.
+    LearningEval {
+        /// Number of fresh repetitions of the 24-scenario corpus.
+        #[arg(long, default_value_t = 1)]
+        repetitions: u32,
+        /// Campaign budget in USD for every paid call, at most 7.50.
+        #[arg(long, default_value = "7.50")]
+        budget_usd: String,
+        /// Minimum per-class precision with complete six-class coverage.
+        #[arg(long, default_value_t = 0.9)]
+        precision_threshold: f64,
+        /// Minimum per-class recall with complete six-class coverage.
+        #[arg(long, default_value_t = 0.8)]
+        recall_threshold: f64,
+        /// Maximum distractor false-write rate.
+        #[arg(long, default_value_t = 0.05)]
+        falsewrite_threshold: f64,
+        /// Maximum correction duplicates.
+        #[arg(long, default_value_t = 0)]
+        duplicate_threshold: u32,
+        /// Learned-minus-removed held-out success difference must exceed this.
+        #[arg(long, default_value_t = 0.0)]
+        heldout_control_improvement_threshold: f64,
+        /// Exact final deliveries required per due positive schedule.
+        #[arg(long, default_value_t = 1)]
+        scheduled_delivery_threshold: u32,
+        /// Directory for report.json, report.md and turn context.
+        #[arg(long)]
+        output_dir: PathBuf,
+        /// Validate inputs and print the plan without services or paid calls.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Validate recorded learning-eval evidence without paid calls.
+    LearningEvalVerify {
+        /// Which validator to run.
+        #[arg(value_parser = ["report", "calibration", "negative", "cleanup"])]
+        validator: String,
+        /// Path to the recorded report.json.
+        report: PathBuf,
+    },
     /// Drive generic OIDC console login end to end against a real Dex IdP
     /// (#2908, #3800, `python3 tools/oidc-e2e/oidc_e2e.py`). Boots this
     /// checkout's API and console UI as an isolated compose project beside Dex,

@@ -25,6 +25,78 @@ pub(super) async fn run(action: DevAction) -> Result<()> {
             commands::dev_script("cli/scripts/model-script.sh", &args).await
         }
         DevAction::ModelCredit => curie::openrouter_credit::model_credit().await,
+        DevAction::LearningEval {
+            repetitions,
+            budget_usd,
+            precision_threshold,
+            recall_threshold,
+            falsewrite_threshold,
+            duplicate_threshold,
+            heldout_control_improvement_threshold,
+            scheduled_delivery_threshold,
+            output_dir,
+            dry_run,
+        } => {
+            let curie_bin = std::env::current_exe()?;
+            let curie_bin = curie_bin
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("candidate executable path is not UTF-8"))?;
+            let output_dir = output_dir
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("output directory path is not UTF-8"))?;
+            let repetitions = repetitions.to_string();
+            let precision = precision_threshold.to_string();
+            let recall = recall_threshold.to_string();
+            let falsewrite = falsewrite_threshold.to_string();
+            let duplicates = duplicate_threshold.to_string();
+            let improvement = heldout_control_improvement_threshold.to_string();
+            let deliveries = scheduled_delivery_threshold.to_string();
+            let budget = format!("--budget-usd={budget_usd}");
+            let mut args = vec![
+                "run",
+                "--curie-bin",
+                curie_bin,
+                "--repetitions",
+                repetitions.as_str(),
+                budget.as_str(),
+                "--precision-threshold",
+                precision.as_str(),
+                "--recall-threshold",
+                recall.as_str(),
+                "--falsewrite-threshold",
+                falsewrite.as_str(),
+                "--duplicate-threshold",
+                duplicates.as_str(),
+                "--heldout-control-improvement-threshold",
+                improvement.as_str(),
+                "--scheduled-delivery-threshold",
+                deliveries.as_str(),
+                "--output-dir",
+                output_dir,
+            ];
+            if dry_run {
+                args.push("--dry-run");
+            }
+            if ui::ui().json() {
+                args.push("--json");
+            }
+            commands::dev_script("cli/scripts/learning-eval.sh", &args).await
+        }
+        DevAction::LearningEvalVerify { validator, report } => {
+            let curie_bin = std::env::current_exe()?;
+            let curie_bin = curie_bin
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("candidate executable path is not UTF-8"))?;
+            let report = report
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("report path is not UTF-8"))?;
+            let command = format!("verify-{validator}");
+            let mut args = vec![command.as_str(), "--curie-bin", curie_bin, report];
+            if ui::ui().json() {
+                args.push("--json");
+            }
+            commands::dev_script("cli/scripts/learning-eval.sh", &args).await
+        }
         DevAction::Hooks { action } => match action {
             HooksAction::Install => commands::dev_hooks_install(),
         },
