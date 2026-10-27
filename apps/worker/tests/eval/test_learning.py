@@ -5052,6 +5052,7 @@ def test_f6_f7_scenario_sends_the_no_reuse_probe_in_a_fresh_thread(
     monkeypatch.setattr(campaign, "consent", lambda *_a, **_k: None)
     monkeypatch.setattr(campaign, "reconcile_fires", lambda *_a, **_k: None)
     monkeypatch.setattr(campaign, "lower_fire_cap", lambda *_a, **_k: None)
+    monkeypatch.setattr(campaign, "retire_runners", lambda *_a, **_k: None, raising=False)
     monkeypatch.setattr(
         campaign, "transcript", lambda *_a, **_k: ({"binding_key": "slack:C:T", "messages": []}, [])
     )
@@ -5104,3 +5105,110 @@ def test_f6_f7_scenario_sends_the_no_reuse_probe_in_a_fresh_thread(
     assert absent[0]["forbidden_values"] == forbidden_values(substituted)
     assert all(re.match(r"^[a-z]+-[0-9a-f]{6}$", v) for v in absent[0]["forbidden_values"])
     assert learning._control_check(absent[0]) is (not leaked)
+
+
+_RETIRE_SCOPE = {"repetition": 2, "case_id": "F1-P1-R2", "agent_id": _RUNNER_AGENT}
+
+
+def test_retire_runners_removes_exactly_the_listed_runners_of_this_agent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    ids = ["a" * 64, "b" * 64]
+    campaign, calls = _runner_campaign(monkeypatch, tmp_path, [ids, []])
+    campaign.retire_runners(_RETIRE_SCOPE)
+    listing = [c for c in calls if c[:2] == ("container", "ls")]
+    assert len(listing) == 1
+    assert f"label=curietech.ai/stack={_RUNNER_PROJECT}_runner" in listing[0]
+    assert f"label=curietech.ai/agent={_RUNNER_AGENT}" in listing[0]
+    assert "status=running" in listing[0]
+    assert "{{.ID}}" in listing[0]
+    removals = [c for c in calls if c[:2] == ("container", "rm")]
+    assert removals == [("container", "rm", "--force", *ids)]
+    assert campaign.quiesce_actions[-1] == {
+        "repetition": 2,
+        "case_id": "F1-P1-R2",
+        "agent_id": _RUNNER_AGENT,
+        "action": "retire-runners",
+        "containers": 2,
+    }
+
+
+def test_retire_runners_makes_no_rm_call_when_nothing_is_running(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    campaign, calls = _runner_campaign(monkeypatch, tmp_path, [[]])
+    campaign.retire_runners(_RETIRE_SCOPE)
+    assert calls
+    assert not [c for c in calls if "rm" in c[:2]]
+    assert campaign.quiesce_actions[-1]["action"] == "retire-runners"
+    assert campaign.quiesce_actions[-1]["containers"] == 0
+    assert "error" not in campaign.quiesce_actions[-1]
+
+
+@pytest.mark.parametrize("failing", ["ls", "rm"])
+def test_retire_runners_records_and_swallows_a_docker_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failing: str
+) -> None:
+    from curie_worker.eval import learning
+
+    campaign, _calls = _runner_campaign(monkeypatch, tmp_path, [[]])
+    seen: list[tuple[str, ...]] = []
+
+    def docker_lines(*args: str) -> list[str]:
+        seen.append(args)
+        if args[1] == failing:
+            raise learning._Invalid("the caller's Docker daemon could not be observed")
+        return ["c" * 64]
+
+    monkeypatch.setattr(learning, "_docker_lines", docker_lines)
+    campaign.retire_runners(_RETIRE_SCOPE)
+    action = campaign.quiesce_actions[-1]
+    assert action["action"] == "retire-runners"
+    assert action["agent_id"] == _RUNNER_AGENT
+    assert action["containers"] == 0
+    assert isinstance(action["error"], str)
+    assert action["error"]
+
+
+def test_retire_runners_swallows_os_errors(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    campaign, _calls = _runner_campaign(monkeypatch, tmp_path, [OSError("docker missing")])
+    campaign.retire_runners(_RETIRE_SCOPE)
+    action = campaign.quiesce_actions[-1]
+    assert action["containers"] == 0
+    assert action["error"]
+
+
+def test_scenario_retires_runners_once_after_its_controls(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    campaign = _bare_campaign(tmp_path)
+    order: list[str] = []
+    retired: list[dict[str, Any]] = []
+    empty = {"skills": [], "facts": [], "schedules": []}
+    monkeypatch.setattr(campaign, "provision", lambda scope: str(scope["agent_id"]))
+    monkeypatch.setattr(campaign, "consent", lambda *_a, **_k: None)
+    monkeypatch.setattr(campaign, "new_thread", lambda: "thread-1")
+    monkeypatch.setattr(
+        campaign,
+        "teach",
+        lambda *_a, **_k: (
+            _reply("", campaign.channels[0], "thread-1"),
+            (copy.deepcopy(empty), None),
+        ),
+    )
+    monkeypatch.setattr(campaign, "control_procedure", lambda *_a, **_k: order.append("control"))
+    monkeypatch.setattr(campaign, "reconcile_fires", lambda *_a, **_k: order.append("reconcile"))
+    monkeypatch.setattr(campaign, "lower_fire_cap", lambda *_a, **_k: order.append("cap"))
+
+    def retire(scope: Any) -> None:
+        order.append("retire")
+        retired.append(dict(scope))
+
+    monkeypatch.setattr(campaign, "retire_runners", retire)
+    raw = next(row for row in campaign.corpus if str(row["id"]).startswith("F1"))
+    campaign.scenario(3, raw)
+    assert order.count("retire") == 1
+    assert order.index("control") < order.index("reconcile") < order.index("retire")
+    assert retired[0]["repetition"] == 3
+    assert retired[0]["case_id"] == f"{raw['id']}-R3"
+    assert retired[0]["agent_id"].startswith("le-")
