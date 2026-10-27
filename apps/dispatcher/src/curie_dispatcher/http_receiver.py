@@ -6,16 +6,20 @@ import asyncio
 import hashlib
 import json
 import re
+import uuid
 from collections.abc import Callable, Mapping
 from types import MappingProxyType
 from typing import Annotated, Any, Literal, Never, Self, SupportsIndex
 from urllib.parse import urlsplit
 
 import httpx
+from curie_internal import identity_approval as approval_wire
 from curie_internal import identity_context as codec
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
 from slack_sdk.web import WebClient
 
+from .approval_actions import ResolveOutcome, parse_decision_time
+from .approval_principal import mint_chat_principal
 from .identities import bot_ids_from_auth_test
 from .identity import slack_evidence
 from .inbound_attachments import derive_attachments
@@ -160,14 +164,52 @@ async def _receipt(response: httpx.Response) -> ReceiverSubmission:
         return _UNAVAILABLE
 
 
+# A refused answer sends nothing; an unknown one is never retried or resolved
+# another way. Both render as the existing generic failure.
+_ANSWER_REFUSED = ResolveOutcome(status_code=401)
+_ANSWER_UNKNOWN = ResolveOutcome(status_code=0)
+_INTERACTIONS = frozenset({"block_actions", "view_submission"})
+
+
+async def _answer_outcome(response: httpx.Response) -> ResolveOutcome:
+    """The bounded resolve verdict, strictly decoded. @spec HTTP-APPROVAL-CONTINUITY-7."""
+    chunks, length = [], 0
+    async for chunk in response.aiter_bytes():
+        length += len(chunk)
+        if length > 65_536:
+            return _ANSWER_UNKNOWN
+        chunks.append(chunk)
+    try:
+        value = json.loads(
+            b"".join(chunks).decode("utf-8"), object_pairs_hook=_pairs, parse_constant=_constant,
+        )
+    except (ValueError, TypeError, RecursionError):
+        value = None
+    if type(value) is not dict:
+        return _ANSWER_UNKNOWN if response.status_code == 200 else ResolveOutcome(
+            status_code=response.status_code,
+        )
+    detail, resolved_by, status = value.get("detail"), value.get("resolved_by"), value.get("status")
+    if response.status_code == 200 and status not in {"approved", "rejected"}:
+        return _ANSWER_UNKNOWN
+    return ResolveOutcome(
+        status_code=response.status_code,
+        detail=detail if type(detail) is str else "",
+        resolved_by=resolved_by if type(resolved_by) is str and resolved_by else None,
+        decision=status if type(status) is str else None,
+        resolved_at=parse_decision_time(value.get("resolved_at")),
+    )
+
+
 class HttpReceiverRuntime:
     """Opaque operator initialization. @spec HTTP-INVOCATION-EXECUTION-1/19."""
 
-    __slots__ = ("_scope", "_bindings", "_keys", "_url", "_client_factory")
+    __slots__ = ("_scope", "_bindings", "_keys", "_url", "_api_base", "_client_factory")
     _scope: HttpReceiverScopeV1
     _bindings: Mapping[str, HttpReceiverBindingV1]
     _keys: codec.IdentityKeyring
     _url: str
+    _api_base: str
     _client_factory: Callable[[], httpx.AsyncClient]
 
     def __new__(cls, *args: object, **kwargs: object) -> Self:
@@ -270,6 +312,82 @@ class HttpReceiverRuntime:
             return _REFUSED
         return asyncio.run(self._submit(payload, token, binding.channel_credential))
 
+    def submit_answer(
+        self, *, approval_id: str, decision: str, note: str | None, user: str, channel: str,
+        slack: dict[str, Any] | None, attester_secret: str,
+    ) -> ResolveOutcome:
+        """One bounded, proved answer from the authenticated Bolt listener.
+
+        The decision and note are serialized once; the existing chat attestation
+        and a receiver-signed proof bind those exact bytes. Called only after the
+        listener acked. @spec HTTP-APPROVAL-CONTINUITY-7.
+        """
+        scope = self._scope
+        try:
+            if (
+                type(approval_id) is not str or str(uuid.UUID(approval_id)) != approval_id
+                or decision not in {"approved", "rejected"} or type(slack) is not dict
+                or slack.get("delivery") not in _INTERACTIONS or slack.get("user_id") != user
+                or type(slack.get("interaction_user_team_id")) is not str
+                or not slack["interaction_user_team_id"]
+                or type(channel) is not str or not channel
+                or (note is not None and type(note) is not str)
+            ):
+                return _ANSWER_REFUSED
+            content: dict[str, str] = {"decision": decision}
+            if note:
+                content["note"] = note
+            body = json.dumps(content, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            attestation = mint_chat_principal(
+                attester_secret, subject=user, actor_channel=channel, approval_id=approval_id,
+                slack=slack,
+            )
+            evidence = {
+                "delivery": None, "user_id": None, "event_user_team": None, "event_team": None,
+                "interaction_user_team_id": None, "is_ext_shared_channel": None,
+                **slack,
+            }
+            evidence["enterprise_ids"] = tuple(evidence.get("enterprise_ids", ()))
+            proof = approval_wire.ApprovalAnswerProofV1(
+                schema_version=1, purpose="approval_answer", operation="resolve",
+                receiver_id=scope.receiver_id, receiver_generation=scope.receiver_generation,
+                channel_identity_id=scope.channel_identity_id,
+                provider_installation_id=scope.provider_installation_id,
+                approval_id=approval_id, body_sha256=hashlib.sha256(body).hexdigest(),
+                attestation_sha256=hashlib.sha256(attestation.encode("ascii")).hexdigest(),
+                native_channel_id=channel,
+                slack=codec.ReceiverSlackEvidenceV1.model_validate(evidence),
+            )
+            token = approval_wire.sign_approval_answer_proof(proof, self._keys)
+        except (ValueError, TypeError, AttributeError, RecursionError):
+            return _ANSWER_REFUSED
+        return asyncio.run(self._answer(approval_id, body, attestation, token))
+
+    async def _answer(
+        self, approval_id: str, body: bytes, attestation: str, proof: str,
+    ) -> ResolveOutcome:
+        """Fresh owned client, five seconds total, one attempt. @spec HTTP-APPROVAL-CONTINUITY-7."""
+        try:
+            async with asyncio.timeout(5):
+                async with self._client_factory() as client:
+                    request = httpx.Request(
+                        "POST", f"{self._api_base}/approvals/{approval_id}/resolve",
+                        content=body, headers={
+                            "Content-Type": "application/json",
+                            "X-Curie-Approval-Principal": attestation,
+                            "X-Curie-Approval-Receiver-Proof": proof,
+                        },
+                    )
+                    response = await client.send(
+                        request, stream=True, auth=None, follow_redirects=False,
+                    )
+                    try:
+                        return await _answer_outcome(response)
+                    finally:
+                        await response.aclose()
+        except Exception:  # noqa: BLE001 - an unknown outcome is never a decision.
+            return _ANSWER_UNKNOWN
+
     async def _submit(self, payload: bytes, proof: str, credential: str) -> ReceiverSubmission:
         """@spec HTTP-INVOCATION-EXECUTION-3/19."""
         try:
@@ -297,6 +415,32 @@ class HttpReceiverRuntime:
                     return _UNAVAILABLE
         except Exception:  # noqa: BLE001 - ordinary transport/cleanup errors expose no inputs.
             return _UNAVAILABLE
+
+
+class SelectedApprovalAnswers:
+    """The resolver the approval listeners use on a selected receiver.
+
+    It never reaches the legacy client: every answer is the runtime's bounded,
+    proved submission. Declared test drivers are not a supported answer source.
+    @spec HTTP-APPROVAL-CONTINUITY-7.
+    """
+
+    def __init__(self, runtime: HttpReceiverRuntime, attester_secret: str) -> None:
+        """@spec HTTP-APPROVAL-CONTINUITY-7."""
+        self._runtime = runtime
+        self._attester_secret = attester_secret
+
+    def resolve(
+        self, approval_id: str, *, decision: str, attested_user: str, attested_channel: str,
+        note: str | None = None, test_driver: bool = False, slack: dict[str, Any] | None = None,
+    ) -> ResolveOutcome:
+        """@spec HTTP-APPROVAL-CONTINUITY-7."""
+        if test_driver:
+            return _ANSWER_REFUSED
+        return self._runtime.submit_answer(
+            approval_id=approval_id, decision=decision, note=note, user=attested_user,
+            channel=attested_channel, slack=slack, attester_secret=self._attester_secret,
+        )
 
 
 def build_http_receiver_runtime(
@@ -341,6 +485,7 @@ def build_http_receiver_runtime(
         object.__setattr__(runtime, "_bindings", MappingProxyType(by_channel))
         object.__setattr__(runtime, "_keys", keys)
         object.__setattr__(runtime, "_url", api_base_url.rstrip("/") + "/channels/turns")
+        object.__setattr__(runtime, "_api_base", api_base_url.rstrip("/"))
         object.__setattr__(runtime, "_client_factory", http_client_factory or httpx.AsyncClient)
         return runtime
     except Exception:  # noqa: BLE001 - initializer failures never expose supplied material.

@@ -24,7 +24,7 @@ import json
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Protocol
 
 import httpx
 from curie_telemetry import inject_trace_context
@@ -285,6 +285,26 @@ def approval_slack_evidence(body: dict[str, Any]) -> dict[str, Any] | None:
 
 def evidence_kwargs(evidence: dict[str, Any] | None) -> dict[str, Any]:
     return {"slack": evidence} if evidence is not None else {}
+
+
+class ApprovalResolver(Protocol):
+    """What the click, dialog and submission flows need from a resolver.
+
+    The legacy client below and the selected receiver's bounded answer
+    submission both satisfy it. @spec HTTP-APPROVAL-CONTINUITY-7.
+    """
+
+    def resolve(
+        self,
+        approval_id: str,
+        *,
+        decision: str,
+        attested_user: str,
+        attested_channel: str,
+        note: str | None = None,
+        test_driver: bool = False,
+        slack: dict[str, Any] | None = None,
+    ) -> ResolveOutcome: ...
 
 
 class ApprovalResolveClient:
@@ -676,7 +696,7 @@ def open_note_dialog(
     body: dict[str, Any],
     decision: str,
     web_client: WebClient,
-    resolver: ApprovalResolveClient,
+    resolver: ApprovalResolver,
     logger: logging.Logger | None = None,
 ) -> ResolveOutcome | None:
     """Open the note dialog for a click, or fall forward and resolve without one.
@@ -756,7 +776,7 @@ def open_note_dialog(
 def resolve_note_submission(
     *,
     body: dict[str, Any],
-    resolver: ApprovalResolveClient,
+    resolver: ApprovalResolver,
     logger: logging.Logger | None = None,
 ) -> NoteSubmission | None:
     """Decide a submitted note dialog, making no Slack call at all (#1053, #1077).
@@ -953,6 +973,18 @@ def _refusal_text(outcome: ResolveOutcome) -> str:
     return "Resolving failed; try again shortly."
 
 
+def notify_refusal(
+    web_client: WebClient, *, outcome: ResolveOutcome, channel: str, user: str,
+    log: logging.Logger,
+) -> None:
+    """The refusal ephemeral for a submission whose dialog already closed.
+
+    @spec HTTP-APPROVAL-CONTINUITY-7.
+    """
+
+    _ephemeral(web_client, channel=channel, user=user, text=_refusal_text(outcome), log=log)
+
+
 def _ephemeral(
     web_client: WebClient, *, channel: str, user: str, text: str, log: logging.Logger
 ) -> None:
@@ -972,7 +1004,7 @@ def _resolve_and_render(
     message: dict[str, Any],
     note: str | None,
     web_client: WebClient,
-    resolver: ApprovalResolveClient,
+    resolver: ApprovalResolver,
     log: logging.Logger,
     slack: dict[str, Any] | None = None,
 ) -> ResolveOutcome:
@@ -1112,7 +1144,7 @@ def resolve_approval_action(
     *,
     body: dict[str, Any],
     decision: str,
-    resolver: ApprovalResolveClient,
+    resolver: ApprovalResolver,
     logger: logging.Logger | None = None,
 ) -> ImmediateClick | None:
     """Parse one immediate card click and POST resolve. No Slack I/O."""
