@@ -647,6 +647,7 @@ def create_app(
     app.include_router(channel_identities.router)
     app.include_router(identity_admin.router)
     app.include_router(identity_authority.router)
+    app.include_router(identity_authority.grant_router)
     app.include_router(identity_approvals.router)
     app.include_router(directory.router)
     app.include_router(identity_connect.router)

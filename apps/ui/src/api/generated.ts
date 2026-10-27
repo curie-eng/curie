@@ -3164,6 +3164,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/internal/identity/approval-grant/check": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Check Approval Grant
+         * @description @spec HTTP-APPROVAL-CONTINUITY-12.
+         */
+        post: operations["check_approval_grant_v1_internal_identity_approval_grant_check_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/internal/identity/approvals": {
         parameters: {
             query?: never;
@@ -4778,6 +4798,54 @@ export interface components {
              * @enum {string}
              */
             status: "pending" | "approved" | "rejected" | "expired";
+        };
+        /**
+         * ApprovalGrantAuthorityRequestV1
+         * @description @spec HTTP-APPROVAL-CONTINUITY-12.
+         */
+        ApprovalGrantAuthorityRequestV1: {
+            check: components["schemas"]["TurnAuthorityRequestV1"];
+            grant: components["schemas"]["ApprovalGrantExpectationV1"];
+            /**
+             * Schema Version
+             * @constant
+             */
+            schema_version: 1;
+        };
+        /**
+         * ApprovalGrantAuthorityResponseV1
+         * @description @spec HTTP-APPROVAL-CONTINUITY-12.
+         */
+        ApprovalGrantAuthorityResponseV1: {
+            check: components["schemas"]["TurnAuthorityResponseV1"];
+            /** Grant Sha256 */
+            grant_sha256: string;
+            /**
+             * Schema Version
+             * @constant
+             */
+            schema_version: 1;
+        };
+        /**
+         * ApprovalGrantExpectationV1
+         * @description @spec HTTP-APPROVAL-CONTINUITY-12.
+         */
+        ApprovalGrantExpectationV1: {
+            /** Agent Id */
+            agent_id: string;
+            /** Approval Id */
+            approval_id: string;
+            /** Conversation Id */
+            conversation_id: string;
+            /**
+             * Gate Kind
+             * @enum {string}
+             */
+            gate_kind: "permission" | "policy";
+            /** Granted Arguments Json */
+            granted_arguments_json: string | null;
+            /** Granted Tool */
+            granted_tool: string | null;
         };
         /**
          * ApprovalIdentityFactsOut
@@ -16995,6 +17063,41 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ReviewVerificationOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    check_approval_grant_v1_internal_identity_approval_grant_check_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ApprovalGrantAuthorityRequestV1"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApprovalGrantAuthorityResponseV1"];
                 };
             };
             /** @description Validation Error */
