@@ -75,6 +75,7 @@ marked and described:
 `CodeHost` (`apps/api/src/curie_api/forges/ports.py::CodeHost`) is where code,
 pull requests, CI and review live: `resolve_repository` from an immutable id;
 `credential` for clone or push scope; `branch_head` and `read_commit`;
+`is_ancestor`, one forge request asking whether a commit is another's ancestor;
 `find_pull_request`, `open_pull_request`, `update_pull_request` and
 `read_pull_request`; `list_factory_publications`; `observe_ci` on an exact
 head; `list_review_feedback` since a cursor and `verify_feedback`. Optional:

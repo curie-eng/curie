@@ -626,6 +626,25 @@ class GitHubCodeHost:
         except (KeyError, TypeError):
             raise Unavailable("malformed_response") from None
 
+    async def is_ancestor(self, repository: RepositoryRef, ancestor: str, descendant: str) -> bool:
+        if ancestor == descendant:
+            return True
+        # One three-dot compare; only its status answers, never the commit list.
+        path = (
+            f"{self._repo(repository.path)}/compare/"
+            f"{quote(ancestor, safe='')}...{quote(descendant, safe='')}"
+        )
+        try:
+            payload = await self._json("GET", path, token=await self._token(repository.path))
+        except NotFound:
+            raise Unavailable("ancestry_unknown") from None
+        status = payload.get("status") if isinstance(payload, dict) else None
+        if status in ("identical", "ahead"):
+            return True
+        if status in ("behind", "diverged"):
+            return False
+        raise Unavailable("malformed_response")
+
     # Pull requests ---------------------------------------------------------
 
     def _pull_request(

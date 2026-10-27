@@ -315,6 +315,13 @@ class BitbucketCloudFake:
         self.branches[branch] = sha
         return sha
 
+    def add_commit(self, parents: tuple[str, ...], message: str) -> str:
+        """One commit with exactly ``parents`` and on no branch: a merge, a fork, a root."""
+
+        sha = hashlib.sha1(f"commit-{next(self._commit_ids)}".encode()).hexdigest()
+        self.commits[sha] = _Commit(sha, message, parents, self.now())
+        return sha
+
     def post_status(
         self, sha: str, key: str, state: str, *, name: str | None = None, url: str | None = None
     ) -> None:
@@ -794,6 +801,7 @@ class BitbucketCloudFake:
             Route(repo + "/commit/{sha}/statuses", self._list_statuses, methods=["GET"]),
             Route(repo + "/commit/{sha}/statuses/build", self._post_status, methods=["POST"]),
             Route(repo + "/commit/{sha}", self._get_commit, methods=["GET"]),
+            Route(repo + "/merge-base/{revspec}", self._merge_base, methods=["GET"]),
             Route(repo + "/pullrequests", self._pulls, methods=["GET", "POST"]),
             Route(repo + "/pullrequests/{id:int}", self._one_pull, methods=["GET", "PUT"]),
             Route(repo + "/pullrequests/{id:int}/decline", self._decline, methods=["POST"]),
@@ -937,6 +945,39 @@ class BitbucketCloudFake:
         if not self._repo_matches(request) or sha is None:
             return _error(404, "Commit not found")
         return JSONResponse(self._commit(self.commits[sha]))
+
+    def _history(self, sha: str) -> set[str]:
+        seen: set[str] = set()
+        pending = [sha]
+        while pending:
+            current = pending.pop()
+            if current not in seen and current in self.commits:
+                seen.add(current)
+                pending.extend(self.commits[current].parents)
+        return seen
+
+    async def _merge_base(self, request: Request) -> Response:
+        # "Get the common ancestor between two commits":
+        # https://developer.atlassian.com/cloud/bitbucket/rest/api-group-commits/#api-repositories-workspace-repo-slug-merge-base-revspec-get
+        # ``{revspec}`` is ``a..b``; the answer is the best common ancestor as a commit
+        # object, computed here from the fake's own graph.
+        _, refused = await self._enter(request)
+        if refused is not None:
+            return refused
+        left, sep, right = request.path_params["revspec"].partition("..")
+        shas = (self._resolve_sha(left), self._resolve_sha(right))
+        if not self._repo_matches(request) or not sep or None in shas:
+            return _error(404, "Commit not found")
+        histories = [self._history(sha) for sha in shas if sha is not None]
+        common = histories[0] & histories[1]
+        best = sorted(
+            sha
+            for sha in common
+            if not any(other != sha and sha in self._history(other) for other in common)
+        )
+        if not best:
+            return _error(404, "No common ancestor")
+        return JSONResponse(self._commit(self.commits[best[0]]))
 
     async def _list_statuses(self, request: Request) -> Response:
         _, refused = await self._enter(request)

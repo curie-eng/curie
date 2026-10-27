@@ -11,6 +11,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import re
 import uuid
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
@@ -194,6 +195,9 @@ def review_lineage_app(
         if request.url.path.startswith(f"/repos/{REPO}/git/commits/"):
             commit = truth["commits"].get(request.url.path.rsplit("/", 1)[-1])
             return httpx.Response(200, json=commit) if commit else httpx.Response(404)
+        compared = _COMPARE.fullmatch(request.url.path)
+        if compared:
+            return _compare(truth["commits"], compared[1], compared[2])
         # https://docs.github.com/en/rest/pulls/pulls
         if request.method == "POST" and request.url.path == f"/repos/{REPO}/pulls":
             fields = json.loads(request.content)
@@ -239,6 +243,45 @@ def review_lineage_app(
         asyncio.run(injected.aclose())
         _RESOLVERS.clear()
         get_settings.cache_clear()
+
+
+def _compare(commits: Mapping[str, Any], base: str, head: str) -> httpx.Response:
+    """GitHub's compare of ``base...head`` over ``commits``, following every parent."""
+
+    # https://docs.github.com/en/rest/commits/commits#compare-two-commits
+    if base not in commits or head not in commits:
+        return httpx.Response(404)
+
+    def history(sha: str) -> list[str]:
+        seen, queue = [sha], [sha]
+        while queue:
+            for parent in (commits.get(queue.pop(0)) or {}).get("parents", []):
+                if parent["sha"] not in seen:
+                    seen.append(parent["sha"])
+                    queue.append(parent["sha"])
+        return seen
+
+    base_side, head_side = history(base), history(head)
+    merge_base = next((sha for sha in head_side if sha in base_side), None)
+    status = "diverged"
+    if base == head:
+        status = "identical"
+    elif base in head_side:
+        status = "ahead"
+    elif head in base_side:
+        status = "behind"
+    return httpx.Response(
+        200,
+        json={
+            "status": status,
+            "ahead_by": len([sha for sha in head_side if sha not in base_side]),
+            "behind_by": len([sha for sha in base_side if sha not in head_side]),
+            "merge_base_commit": {"sha": merge_base} if merge_base else None,
+        },
+    )
+
+
+_COMPARE = re.compile(rf"/repos/{REPO}/compare/([0-9a-f]+)\.\.\.([0-9a-f]+)")
 
 
 @contextmanager
@@ -1050,6 +1093,9 @@ def _moved_base_graph(
                     await engine.dispose()
             payload = graph["commits"].get(sha)
             return httpx.Response(200, json=payload) if payload else httpx.Response(404)
+        compared = _COMPARE.fullmatch(path)
+        if compared:
+            return _compare(graph["commits"], compared[1], compared[2])
         if path.startswith(f"/repos/{REPO}/git/ref/heads/"):
             return httpx.Response(
                 200,
@@ -1311,8 +1357,9 @@ def test_label_readmission_of_headless_all_null_base_uses_moved_repository_defau
             _lineage_row(publication["lineage_id"]),
         ) == before
         assert _rows("SELECT * FROM curie.work_items WHERE id = :id", {"id": item_id}) == [item]
-        for sha in (FIRST_REVISION_SHA, MOVED_PARENT_SHA, LATER_BASE_SHA):
-            assert ("GET", f"/repos/{REPO}/git/commits/{sha}") in calls
+        assert ("GET", f"/repos/{REPO}/git/commits/{FIRST_REVISION_SHA}") in calls
+        for relation in ((BASE_SHA, MOVED_PARENT_SHA), (MOVED_PARENT_SHA, LATER_BASE_SHA)):
+            assert ("GET", f"/repos/{REPO}/compare/{relation[0]}...{relation[1]}") in calls
         assert ("GET", f"/repos/{REPO}/git/ref/heads/release/stable") in calls
         assert ("GET", f"/repos/{REPO}/git/ref/heads/next") not in calls
         stale = _settle_moved(
