@@ -180,6 +180,11 @@ class DispatcherConfig(BaseSettings):
     approval_chat_attester_secret: str = Field(
         validation_alias="CURIE_APPROVAL_CHAT_ATTESTER_SECRET"
     )
+    # The operator directory holding receivers.json (HTTP-INVOCATION-EXECUTION-20).
+    # Unset selects no HTTP receiver; any value must initialize completely.
+    http_receiver_dir: str | None = Field(
+        default=None, validation_alias="CURIE_HTTP_RECEIVER_DIR"
+    )
     # Deadline for the boot-time gate on that wiring (see preflight.py). Long
     # enough to absorb the API's own startup. Must be positive: the gate is the
     # AC2 requirement, so a non-positive value is a config error at boot rather
