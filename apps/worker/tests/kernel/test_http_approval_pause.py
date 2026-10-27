@@ -89,6 +89,8 @@ class Creator:
                 raise ApprovalContinuityRefused()
             if self.outcome == "unavailable":
                 raise TurnAuthorityUnavailable()
+            if self.outcome == "invalid":
+                raise ValueError("invalid_approval_creation_request")
         return CreatedApproval(id=str(uuid.uuid4()), status="pending")
 
 
@@ -355,7 +357,7 @@ def test_selected_publication_gate_cannot_create_or_escalate_through_legacy_paus
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("outcome", ["refuse", "unavailable"])
+@pytest.mark.parametrize("outcome", ["refuse", "unavailable", "invalid"])
 def test_identity_creation_outcome_never_uses_legacy_escalation_or_unverified_reply(
     make_harness: Any, outcome: str,
 ) -> None:
@@ -382,7 +384,7 @@ def test_identity_creation_outcome_never_uses_legacy_escalation_or_unverified_re
             pending = await h.async_redis.xpending(h.config.stream, h.config.consumer_group)
             assert pending["pending"] == (1 if outcome == "unavailable" else 0)
             assert bool(await h.async_redis.exists(h.config.done_key(event.event_id))) is (
-                outcome == "refuse"
+                outcome in {"refuse", "invalid"}
             )
             assert await h.async_redis.xlen(h.config.dead_letter_stream_name()) == 0
     asyncio.run(run())
