@@ -16,6 +16,18 @@
       "version": "1.0"
     },
     {
+      "result": "AgentSkillInstallOutput",
+      "kind": "CliOutput",
+      "schema": "agent-skill-install.schema.json",
+      "version": "1.0"
+    },
+    {
+      "result": "AgentSkillsInstallOutput",
+      "kind": "CliOutput",
+      "schema": "agent-skills-install.schema.json",
+      "version": "1.0"
+    },
+    {
       "result": "AllTargetsDeployOutput",
       "kind": "CliOutput",
       "schema": "deploy.schema.json",

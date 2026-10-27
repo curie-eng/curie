@@ -9482,6 +9482,67 @@ export const commandManifest = {
       ]
     },
     {
+      "about": "Install Curie workflows in your existing coding agent",
+      "hidden": false,
+      "name": "skills",
+      "subcommands": [
+        {
+          "about": "Install all bundled Curie skills offline, without a running Curie service",
+          "args": [
+            {
+              "global": false,
+              "help": "Coding agent that will discover the skill",
+              "id": "agent",
+              "long": "agent",
+              "positional": false,
+              "possible_values": [
+                "codex",
+                "claude-code",
+                "copilot",
+                "gemini",
+                "cursor"
+              ],
+              "required": true
+            },
+            {
+              "global": false,
+              "help": "Install in your personal skill directory for use across repositories",
+              "id": "global",
+              "long": "global",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Install in exactly this existing directory. Default: current repository root or cwd",
+              "id": "dir",
+              "long": "dir",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Show the destination and client instructions without writing files",
+              "id": "dry_run",
+              "long": "dry-run",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "install"
+        }
+      ]
+    },
+    {
       "about": "Bring up Curie and the dark factory without a webhook or a tunnel",
       "hidden": false,
       "name": "factory",

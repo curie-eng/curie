@@ -22,12 +22,54 @@ extend the platform's own code.
     - [Bundle packing exclusions](#bundle-packing-exclusions)
     - [Artifact resolution](#artifact-resolution)
   - [Managing secrets](#managing-secrets)
+  - [Installing Curie skills](#installing-curie-skills)
 - [For contributors](#for-contributors)
   - [`curie install`](#curie-install)
   - [`curie dev`](#curie-dev)
   - [Building the runner image from source](#building-the-runner-image-from-source)
   - [Prototyping agents in a source checkout](#prototyping-agents-in-a-source-checkout)
   - [Verify](#verify)
+
+## Installing Curie skills
+
+Install all bundled Curie workflows into your coding agent with one command:
+
+```bash
+curie skills install --agent codex
+```
+
+Choose `codex`, `claude-code`, `copilot`, `gemini` (Gemini CLI), or `cursor`.
+By default the skills are installed in the current repository root; outside Git,
+the current directory is used. `--dir DIR` selects exactly an existing directory.
+`--global` installs in your personal skill directory and conflicts with `--dir`.
+`--dry-run` checks and reports the destination without writing; `--json` emits one
+result object containing one receipt per skill. This installs `prepare-factory-ticket`,
+`review-pr`, `factory-environment-setup`, and `factory-environment-maintenance`.
+All destinations are checked before any writes; a conflict
+in any skill refuses the operation. Identical copies are retained and unrelated
+skills are preserved. Review and move a conflicting copy aside before upgrading.
+
+Installation uses the CLI's embedded files and needs no network, Python, Docker
+or Curie deployment. The result prints invocation and refresh instructions;
+client settings and activation consent still apply. See the
+[preparation guide](../docs/guides/factory-preparation.md) for client paths,
+manual installation, specification review, publication and factory selection.
+
+To upgrade, install the desired Curie CLI release, review your existing skill
+for local edits, and move its folder to a backup location outside the client's
+skill directories. Run the install command again and reapply any customizations
+after reviewing the new instructions. Keep the backup until you have verified
+the new skill in your coding agent. Automatic updates and repository version
+pins are deferred.
+
+The skills remain separate workflows after installation: use
+`$prepare-factory-ticket <issue-url>`, `$review-pr <pr-url>`,
+`$factory-environment-setup <binding>`, or
+`$factory-environment-maintenance <factory>` in Codex. Claude Code uses the
+same names with `/`. The
+[PR review guide](../docs/guides/factory-pr-review.md) covers walkthroughs,
+local tests, approved factory feedback and merging. No second installation
+command is needed. Installation grants no tracker or factory authority.
 
 ## Interactive mode
 

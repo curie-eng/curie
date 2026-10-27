@@ -1051,6 +1051,11 @@ pub(crate) enum Command {
         #[arg(long, global = true, value_name = "NAME")]
         context: Option<String>,
     },
+    /// Install Curie workflows in your existing coding agent.
+    Skills {
+        #[command(subcommand)]
+        action: AgentSkillsAction,
+    },
     /// Bring up Curie and the dark factory without a webhook or a tunnel.
     Factory {
         #[command(subcommand)]
@@ -1385,6 +1390,25 @@ pub(crate) enum Command {
         /// it at the same chart `curie apply --chart` would use.
         #[arg(long)]
         chart: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum AgentSkillsAction {
+    /// Install all bundled Curie skills offline, without a running Curie service.
+    Install {
+        /// Coding agent that will discover the skill.
+        #[arg(long, value_enum, value_name = "CLIENT")]
+        agent: curie::agent_skills::AgentClient,
+        /// Install in your personal skill directory for use across repositories.
+        #[arg(long, conflicts_with = "dir")]
+        global: bool,
+        /// Install in exactly this existing directory. Default: current repository root or cwd.
+        #[arg(long, value_name = "DIR")]
+        dir: Option<PathBuf>,
+        /// Show the destination and client instructions without writing files.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
