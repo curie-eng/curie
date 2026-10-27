@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import math
 import re
 import uuid
 from collections.abc import Sequence
@@ -28,15 +29,29 @@ import httpx
 from aci_protocol import READER_CONTEXT, ApprovalRequest, PublicationContext, QueuedTurn
 from channel_protocol import MessageField, OutboundMessage
 from curie_dispatcher.approval_actions import parse_decision_time
+from curie_internal.identity_approval import (
+    ApprovalCreationIdentityV1,
+    ApprovalCreationRequestV1,
+    ApprovalCreationResponseV1,
+)
 from curie_telemetry import inject_trace_context
 
 from .api_retry import DEFAULT_BUDGET_S, post_with_retry
+from .identity_authority import TurnAuthorityUnavailable, exchange_identity_json
 from .workspace import WorkspaceSelectionRefused
 
 # Re-exported so this module stays the kernel-facing seam for the approval
 # payload: ``ApprovalRequest`` is now the shared wire model (#492), not a
 # lane-local mirror of the API's schema.
 logger = logging.getLogger(__name__)
+
+
+class ApprovalContinuityRefused(RuntimeError):
+    """@spec HTTP-APPROVAL-CONTINUITY-3."""
+
+    def __init__(self) -> None:
+        """@spec HTTP-APPROVAL-CONTINUITY-3."""
+        super().__init__("identity_approval_refused")
 
 _PUBLICATION_REFUSAL_CODES = {
     "publication.github_unavailable",
@@ -377,7 +392,8 @@ class ApprovalCreator(Protocol):
     """The kernel-facing seam; tests supply a recording fake."""
 
     async def create(
-        self, request: ApprovalRequest, *, budget_s: float = DEFAULT_BUDGET_S
+        self, request: ApprovalRequest, *, budget_s: float = DEFAULT_BUDGET_S,
+        identity: ApprovalCreationIdentityV1 | None = None,
     ) -> CreatedApproval: ...
 
 
@@ -454,6 +470,7 @@ class ApprovalClient:
         review_timeout_s: float = 30.0,
     ) -> None:
         self._url = f"{api_base_url.rstrip('/')}/approvals"
+        self._identity_url = f"{api_base_url.rstrip('/')}/v1/internal/identity/approvals"
         self._publication_url = f"{api_base_url.rstrip('/')}/v1/internal/publications"
         self._review_url = f"{api_base_url.rstrip('/')}/v1/internal/github/reviews"
         self._headers = {"X-API-Key": api_key} if api_key else {}
@@ -585,8 +602,12 @@ class ApprovalClient:
             raise WorkspaceSelectionRefused(refusal) from None
 
     async def create(
-        self, request: ApprovalRequest, *, budget_s: float = DEFAULT_BUDGET_S
+        self, request: ApprovalRequest, *, budget_s: float = DEFAULT_BUDGET_S,
+        identity: ApprovalCreationIdentityV1 | None = None,
     ) -> CreatedApproval:
+        # @spec HTTP-APPROVAL-CONTINUITY-3: never retry selected transport via legacy.
+        if identity is not None:
+            return await self._create_with_identity(request, identity, budget_s=budget_s)
         headers = {**self._headers, "Content-Type": "application/json"}
         inject_trace_context(headers)
         try:
@@ -616,6 +637,66 @@ class ApprovalClient:
             requested_by=body.get("requested_by"),
             requester_known="requested_by" in body,
         )
+
+    async def _create_with_identity(
+        self, request: ApprovalRequest, identity: ApprovalCreationIdentityV1, *, budget_s: float,
+    ) -> CreatedApproval:
+        """@spec HTTP-APPROVAL-CONTINUITY-3."""
+        try:
+            if (
+                type(request) is not ApprovalRequest
+                or type(identity) is not ApprovalCreationIdentityV1
+                or type(budget_s) not in {int, float}
+                or not math.isfinite(budget_s) or budget_s <= 0
+            ):
+                raise ValueError
+            captured = ApprovalCreationRequestV1(
+                schema_version=1, request_id=str(uuid.uuid4()),
+                approval=ApprovalRequest.model_validate_json(
+                    request.model_dump_json(), context=READER_CONTEXT,
+                ),
+                identity=ApprovalCreationIdentityV1.model_validate(identity),
+            )
+            payload = captured.model_dump_json().encode("utf-8")
+            if len(payload) > 2_097_152:
+                raise ValueError
+            budget = min(5.0, budget_s)
+        except (ValueError, TypeError, AttributeError, RecursionError, OverflowError):
+            raise ValueError("invalid_approval_creation_request") from None
+        try:
+            if not self._worker_headers:
+                raise ValueError
+            headers = {**self._worker_headers, "Content-Type": "application/json"}
+            inject_trace_context(headers)
+            outgoing = httpx.Request(
+                "POST", self._identity_url, content=payload, headers=headers,
+                extensions={"timeout": httpx.Timeout(budget).as_dict()},
+            )
+            status, body = await exchange_identity_json(self._client, outgoing, budget_s=budget)
+            denials = {
+                403: {"caller_not_allowed"},
+                409: {"approval_provenance_conflict", "unsupported_approval"},
+                413: {"body_too_large"}, 422: {"invalid_approval_context"},
+            }
+            if status in denials and set(body) == {"detail"} and body["detail"] in denials[status]:
+                raise ApprovalContinuityRefused()
+            if status not in {200, 201}:
+                raise ValueError
+            receipt = ApprovalCreationResponseV1.model_validate(body)
+            if (
+                receipt.request_id != captured.request_id
+                or receipt.duplicate is not (status == 200)
+                or status == 201 and receipt.status != "pending"
+            ):
+                raise ValueError
+            return CreatedApproval(
+                id=receipt.id, status=receipt.status, requested_by=receipt.requested_by,
+                requester_known=True,
+            )
+        except ApprovalContinuityRefused:
+            raise
+        except Exception:  # noqa: BLE001 - source, effect and credential data stay private.
+            raise TurnAuthorityUnavailable() from None
 
     async def get(self, approval_id: str) -> SettledApproval | None:
         """The record's settled outcome, or None when it cannot be read (#1084).

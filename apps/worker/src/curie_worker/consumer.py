@@ -551,6 +551,8 @@ class Consumer(StreamConsumer):
                                 "original_payload_sha256": hashlib.sha256(
                                     raw_payload.encode("utf-8"),
                                 ).hexdigest(),
+                                # @spec HTTP-APPROVAL-CONTINUITY-4: exact bytes for creation.
+                                "original_payload": raw_payload,
                             }
                         qevent = from_stream_fields(fields)
                     except Exception as exc:

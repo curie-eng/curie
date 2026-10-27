@@ -8,7 +8,7 @@ import json
 import re
 from collections.abc import Mapping
 from types import MappingProxyType
-from typing import Annotated, Any, Literal, Never, Self, SupportsIndex
+from typing import TYPE_CHECKING, Annotated, Any, Literal, Never, Self, SupportsIndex, cast
 from uuid import UUID
 
 from pydantic import (
@@ -21,6 +21,13 @@ from pydantic import (
 )
 
 from curie_internal.sandbox_token import b64url, b64url_decode
+
+if TYPE_CHECKING:
+    from curie_internal.identity_approval import (
+        ApprovalAnswerProofV1,
+        ApprovalContextV1,
+        ResumeContextV1,
+    )
 
 _MAX_GENERATION = 2**63 - 1
 _MAX_TOKEN = 16_384
@@ -269,8 +276,8 @@ def build_identity_keyring(
         raise ValueError("invalid_identity_keyring") from None
 
 
-def _canonical(value: _Wire) -> bytes:
-    """@spec HTTP-INVOCATION-EXECUTION-13."""
+def _canonical(value: BaseModel) -> bytes:
+    """@spec HTTP-INVOCATION-EXECUTION-13 HTTP-APPROVAL-CONTINUITY-6/7."""
     return json.dumps(
         value.model_dump(mode="json"), sort_keys=True, separators=(",", ":"), ensure_ascii=False,
     ).encode("utf-8")
@@ -398,3 +405,125 @@ def open_invocation_context(
         return result
     except Exception:  # noqa: BLE001 - verification has one bounded refusal
         return ContextRefusal(code="invalid_identity_context")
+
+
+def _additional_protocol(kind: str) -> tuple[type[BaseModel], str, str]:
+    """Closed protocol dispatch keeps keys here. @spec HTTP-APPROVAL-CONTINUITY-6/7."""
+    from curie_internal.identity_approval import (
+        ApprovalAnswerProofV1,
+        ApprovalContextV1,
+        ResumeContextV1,
+    )
+
+    if kind == "approval":
+        return ApprovalContextV1, "curie-approval-context-v1", "context"
+    if kind == "resume":
+        return ResumeContextV1, "curie-resume-context-v1", "context"
+    if kind == "answer":
+        return ApprovalAnswerProofV1, "curie-approval-receiver-v1", "receiver"
+    raise ValueError
+
+
+def _additional_reference(value: BaseModel, purpose: str) -> tuple[str, int]:
+    """@spec HTTP-APPROVAL-CONTINUITY-6/7."""
+    from curie_internal.identity_approval import (
+        ApprovalAnswerProofV1,
+        ApprovalContextV1,
+        ResumeContextV1,
+    )
+
+    if purpose == "receiver" and isinstance(value, ApprovalAnswerProofV1):
+        return value.receiver_id, value.receiver_generation
+    if purpose == "context" and isinstance(value, (ApprovalContextV1, ResumeContextV1)):
+        return value.key_id, value.key_generation
+    raise ValueError
+
+
+def _seal_additional(value: BaseModel, keyring: IdentityKeyring, kind: str) -> str:
+    """@spec HTTP-APPROVAL-CONTINUITY-6/7."""
+    model, prefix, purpose = _additional_protocol(kind)
+    if not isinstance(value, model):
+        raise ValueError
+    value = model.model_validate(value)
+    message = prefix + "." + b64url(_canonical(value))
+    token = message + "." + _mac(
+        _key(keyring, purpose, _additional_reference(value, purpose)), message,
+    )
+    if len(token) > _MAX_TOKEN:
+        raise ValueError
+    return token
+
+
+def _open_additional(token: str, keyring: IdentityKeyring, kind: str) -> BaseModel:
+    """@spec HTTP-APPROVAL-CONTINUITY-6/7."""
+    if type(token) is not str or len(token) > _MAX_TOKEN:
+        raise ValueError
+    token.encode("ascii")
+    prefix, segment, signature = token.split(".")
+    model, expected, purpose = _additional_protocol(kind)
+    if prefix != expected:
+        raise ValueError
+    raw = _decode(segment)
+    _decode(signature)
+    json.loads(raw.decode("utf-8"), object_pairs_hook=_pairs, parse_constant=_constant)
+    value = model.model_validate_json(raw)
+    if _canonical(value) != raw:
+        raise ValueError
+    material = _key(keyring, purpose, _additional_reference(value, purpose))
+    if not hmac.compare_digest(signature, _mac(material, prefix + "." + segment)):
+        raise ValueError
+    return value
+
+
+def seal_approval_context(value: ApprovalContextV1, keyring: IdentityKeyring) -> str:
+    """@spec HTTP-APPROVAL-CONTINUITY-6."""
+    try:
+        return _seal_additional(value, keyring, "approval")
+    except Exception:  # noqa: BLE001 - private protocol failures have a fixed outcome.
+        raise ValueError("invalid_identity_context") from None
+
+
+def open_approval_context(
+    token: str, keyring: IdentityKeyring,
+) -> ApprovalContextV1 | ContextRefusal:
+    """@spec HTTP-APPROVAL-CONTINUITY-6."""
+    try:
+        return cast("ApprovalContextV1", _open_additional(token, keyring, "approval"))
+    except Exception:  # noqa: BLE001 - no supplied token, key or parser text escapes.
+        return ContextRefusal(code="invalid_identity_context")
+
+
+def seal_resume_context(value: ResumeContextV1, keyring: IdentityKeyring) -> str:
+    """@spec HTTP-APPROVAL-CONTINUITY-6."""
+    try:
+        return _seal_additional(value, keyring, "resume")
+    except Exception:  # noqa: BLE001 - private protocol failures have a fixed outcome.
+        raise ValueError("invalid_identity_context") from None
+
+
+def open_resume_context(
+    token: str, keyring: IdentityKeyring,
+) -> ResumeContextV1 | ContextRefusal:
+    """@spec HTTP-APPROVAL-CONTINUITY-6."""
+    try:
+        return cast("ResumeContextV1", _open_additional(token, keyring, "resume"))
+    except Exception:  # noqa: BLE001 - no supplied token, key or parser text escapes.
+        return ContextRefusal(code="invalid_identity_context")
+
+
+def sign_approval_answer_proof(value: ApprovalAnswerProofV1, keyring: IdentityKeyring) -> str:
+    """@spec HTTP-APPROVAL-CONTINUITY-7."""
+    try:
+        return _seal_additional(value, keyring, "answer")
+    except Exception:  # noqa: BLE001 - private protocol failures have a fixed outcome.
+        raise ValueError("invalid_receiver_proof") from None
+
+
+def verify_approval_answer_proof(
+    token: str, keyring: IdentityKeyring,
+) -> ApprovalAnswerProofV1 | ContextRefusal:
+    """@spec HTTP-APPROVAL-CONTINUITY-7."""
+    try:
+        return cast("ApprovalAnswerProofV1", _open_additional(token, keyring, "answer"))
+    except Exception:  # noqa: BLE001 - no supplied token, key or parser text escapes.
+        return ContextRefusal(code="invalid_receiver_proof")

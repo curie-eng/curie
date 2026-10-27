@@ -65,7 +65,9 @@ def graph_payload() -> dict[str, Any]:
         ("0136", False),
         # @spec AGENT-ROLE-PERSISTENCE-V1-9: policy ORM requires 0133.
         ("0132", False),
-        ("0133", True),
+        # @spec HTTP-APPROVAL-CONTINUITY-5: approval ORM requires 0137.
+        ("0133", False),
+        ("0137", True),
         ("0000", True),
         ("future-expand", True),
     ],

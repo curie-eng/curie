@@ -100,6 +100,7 @@ from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from curie_api.crud import approvals as crud_approvals
+from curie_api.identity.http_approval import approval_is_selected
 
 from .resumequeue import (
     ResumeQueue,
@@ -148,12 +149,18 @@ def _parse_dead_lettered_resume(
     return approval_id, dt_naive
 
 
+# Pages a pass may read past selected rows before it stops for this interval.
+_LEGACY_PAGES = 10
+
+
 class _Outcome(enum.Enum):
     """What one per-row re-enqueue attempt did."""
 
     ENQUEUED = "enqueued"
     NOT_CLAIMED = "not_claimed"
     FAILED = "failed"
+    # The row's wake is owed to its sealed publisher. @spec HTTP-APPROVAL-CONTINUITY-10.
+    SELECTED = "selected"
 
 
 class ResumeReconciler:
@@ -273,16 +280,29 @@ class ResumeReconciler:
         resolved_before = datetime.now(UTC).replace(tzinfo=None) - timedelta(
             seconds=self._grace_seconds
         )
-        async with self._sessionmaker() as session:
-            candidate_ids = await crud_approvals.list_resolved_unresumed(
-                session, resolved_before=resolved_before, limit=self._batch_limit
-            )
-
-        for approval_id in candidate_ids:
-            if approval_id in handled:
-                continue
-            if await self._reenqueue_one(approval_id) is _Outcome.ENQUEUED:
-                count += 1
+        # @spec HTTP-APPROVAL-CONTINUITY-10: page past rows classified as
+        # selected, so their owed wakes never fill the legacy batch.
+        after: tuple[datetime, uuid.UUID] | None = None
+        for _ in range(_LEGACY_PAGES):
+            async with self._sessionmaker() as session:
+                page = await crud_approvals.list_resolved_unresumed_page(
+                    session, resolved_before=resolved_before, limit=self._batch_limit,
+                    after=after,
+                )
+            if not page:
+                break
+            after = (page[-1][1], page[-1][0])
+            skipped = False
+            for approval_id, _resolved_at in page:
+                if approval_id in handled:
+                    continue
+                outcome = await self._reenqueue_one(approval_id)
+                if outcome is _Outcome.ENQUEUED:
+                    count += 1
+                elif outcome is _Outcome.SELECTED:
+                    skipped = True
+            if not skipped or len(page) < self._batch_limit:
+                break
         return count
 
     async def _reenqueue_one(self, approval_id: uuid.UUID) -> _Outcome:
@@ -300,6 +320,10 @@ class ResumeReconciler:
                         # Another replica holds it, or it is already resumed;
                         # exit the txn block cleanly, releasing any lock.
                         return _Outcome.NOT_CLAIMED
+                    # @spec HTTP-APPROVAL-CONTINUITY-1/10: a selected row's wake
+                    # stays owed; this queue cannot publish its sealed context.
+                    if await approval_is_selected(session, approval):
+                        return _Outcome.SELECTED
                     turn = resume_turn_for(approval)
                     await self._resume_queue.enqueue(
                         turn, parent=approval_trace_context(approval)

@@ -45,10 +45,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import uuid
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
+from typing import Any, cast
 
 from curie_telemetry import operation_span, record_metric
+from fastapi import HTTPException
 from opentelemetry.trace import SpanKind, StatusCode
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -56,7 +59,8 @@ from curie_api.crud import approvals as crud_approvals
 from curie_api.crud import publications as crud_publications
 
 from .config import get_settings
-from .models import ApprovalStatus
+from .identity.http_approval import approval_is_selected
+from .models import Approval, ApprovalStatus
 from .remediation_approvals import (
     REMEDIATION_PURPOSE,
     reconcile_remediation_approvals,
@@ -70,6 +74,9 @@ from .resumequeue import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Pages a pass may read past selected rows before it stops for this interval.
+_LEGACY_PAGES = 10
 _monotonic = time.monotonic
 
 
@@ -100,6 +107,7 @@ async def sweep_expired_approvals(
     *,
     now: datetime | None = None,
     limit: int = 100,
+    http_expiry: Callable[[uuid.UUID], Awaitable[Approval | None]] | None = None,
 ) -> int:
     """One sweep pass: expire every lapsed pending approval and wake its session.
 
@@ -119,14 +127,51 @@ async def sweep_expired_approvals(
     """
 
     now = now or datetime.now(UTC).replace(tzinfo=None)
-    lapsed = await crud_approvals.list_expired_pending_approvals(session, now=now, limit=limit)
     # Read ids and private parents into plain values up front: the per-record
     # rollback below expires every ORM instance in this shared session, so
     # reading record fields lazily in a later iteration would trigger an
     # implicit reload (MissingGreenlet under the async session).
-    approval_work = [
-        (record.id, approval_trace_context(record)) for record in lapsed
-    ]
+    #
+    # @spec HTTP-APPROVAL-CONTINUITY-10: only rows without stored provenance are
+    # legacy candidates, and the pass pages past any it classifies as selected,
+    # so rows this writer must leave pending never fill its batch.
+    approval_work: list[tuple[uuid.UUID, Any]] = []
+    after: tuple[datetime, uuid.UUID] | None = None
+    for _ in range(_LEGACY_PAGES):
+        page = await crud_approvals.list_expired_pending_approvals(
+            session, now=now, limit=limit, sealed=False, after=after
+        )
+        if not page:
+            break
+        after = (cast(datetime, page[-1].expires_at), page[-1].id)
+        for record in page:
+            try:
+                selected = await approval_is_selected(session, record)
+            except HTTPException:
+                logger.warning(
+                    "approval %s identity classification unavailable; left pending",
+                    record.id,
+                )
+                continue
+            if not selected and len(approval_work) < limit:
+                approval_work.append((record.id, approval_trace_context(record)))
+        if len(approval_work) >= limit or len(page) < limit:
+            break
+    sealed_ids: list[uuid.UUID] = []
+    if http_expiry is not None:
+        sealed_ids = [
+            record.id
+            for record in await crud_approvals.list_expired_pending_approvals(
+                session, now=now, limit=limit, sealed=True
+            )
+        ]
+    await session.commit()
+    for approval_id in sealed_ids:
+        assert http_expiry is not None
+        try:
+            await http_expiry(approval_id)
+        except Exception:  # noqa: BLE001 - one row never blocks the pass.
+            logger.warning("selected approval %s expiry unavailable; left pending", approval_id)
 
     flipped = 0
     for approval_id, stored_parent in approval_work:
@@ -238,6 +283,7 @@ async def run_expiry_sweeper(
     *,
     publication_patch_retention_seconds: int = 3600,
     remediation_admissions: Callable[[AsyncSession], Awaitable[int]] | None = None,
+    http_expiry: Callable[[uuid.UUID], Awaitable[Approval | None]] | None = None,
 ) -> None:
     """Periodic loop driving ``sweep_expired_approvals`` until ``stop`` is set.
 
@@ -280,7 +326,13 @@ async def run_expiry_sweeper(
         ) as span:
             try:
                 async with sessionmaker() as session:
-                    await sweep_expired_approvals(session, resume_queue)
+                    # Without an owner the pass keeps its exact call shape.
+                    if http_expiry is None:
+                        await sweep_expired_approvals(session, resume_queue)
+                    else:
+                        await sweep_expired_approvals(
+                            session, resume_queue, http_expiry=http_expiry,
+                        )
                     await crud_publications.reap_terminal_publication_patches(
                         session,
                         terminal_before=datetime.now(UTC).replace(tzinfo=None)

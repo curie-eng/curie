@@ -3164,6 +3164,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/internal/identity/approvals": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Create Identity Approval
+         * @description @spec HTTP-APPROVAL-CONTINUITY-3.
+         */
+        post: operations["create_identity_approval_v1_internal_identity_approvals_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/internal/identity/turn-authority/check": {
         parameters: {
             query?: never;
@@ -4703,6 +4723,61 @@ export interface components {
             status: string;
             /** Summary */
             summary: string;
+        };
+        /**
+         * ApprovalCreationIdentityV1
+         * @description @spec HTTP-APPROVAL-CONTINUITY-3/4.
+         */
+        ApprovalCreationIdentityV1: {
+            /** Context */
+            context: string;
+            /** Payload */
+            payload: string;
+            /**
+             * Schema Version
+             * @constant
+             */
+            schema_version: 1;
+            scope: components["schemas"]["TurnAuthorityScopeV1"];
+        };
+        /**
+         * ApprovalCreationRequestV1
+         * @description @spec HTTP-APPROVAL-CONTINUITY-3.
+         */
+        ApprovalCreationRequestV1: {
+            approval: components["schemas"]["ApprovalRequest"];
+            identity: components["schemas"]["ApprovalCreationIdentityV1"];
+            /** Request Id */
+            request_id: string;
+            /**
+             * Schema Version
+             * @constant
+             */
+            schema_version: 1;
+        };
+        /**
+         * ApprovalCreationResponseV1
+         * @description @spec HTTP-APPROVAL-CONTINUITY-3.
+         */
+        ApprovalCreationResponseV1: {
+            /** Duplicate */
+            duplicate: boolean;
+            /** Id */
+            id: string;
+            /** Request Id */
+            request_id: string;
+            /** Requested By */
+            requested_by: string | null;
+            /**
+             * Schema Version
+             * @constant
+             */
+            schema_version: 1;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "pending" | "approved" | "rejected" | "expired";
         };
         /**
          * ApprovalIdentityFactsOut
@@ -16920,6 +16995,41 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ReviewVerificationOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    create_identity_approval_v1_internal_identity_approvals_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ApprovalCreationRequestV1"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApprovalCreationResponseV1"];
                 };
             };
             /** @description Validation Error */

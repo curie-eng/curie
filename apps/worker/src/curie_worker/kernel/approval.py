@@ -34,6 +34,7 @@ from pydantic import ValidationError
 from ..approval_wording import approval_display
 from ..approvals import (
     ApprovalBackendError,
+    ApprovalContinuityRefused,
     ApprovalRefused,
     ApprovalRequest,
     CreatedApproval,
@@ -608,6 +609,14 @@ async def _pause_for_approval(
         outcome.approval_gate_kind,
         outcome.approval_granted_tool,
     )
+    # Imported here: the identity owner imports this module's resume parser.
+    from . import identity
+
+    # @spec HTTP-APPROVAL-CONTINUITY-1: selected HTTP publication is terminal and
+    # silent, before any escalation could publish an unverified reply.
+    selected = identity.selected()
+    if selected and is_publication:
+        raise identity.HttpIdentityRefused()
     # The card's destination is a (kind, address) PAIR, never an address on
     # its own: the schema permits the same address string under two kinds,
     # so an address-only comparison misreads an email turn whose address
@@ -804,6 +813,11 @@ async def _pause_for_approval(
             )
         else:
             assert self._approvals is not None
+            # @spec HTTP-APPROVAL-CONTINUITY-3/4: only the live owner supplies identity.
+            # A legacy creator keeps its exact call shape.
+            creation = (
+                {"identity": identity.creation_identity()} if selected else {}
+            )
             created = await self._approvals.create(
                 ApprovalRequest(
                     agent_id=agent_id,
@@ -850,7 +864,15 @@ async def _pause_for_approval(
                     expires_in_seconds=constants._SESSION_APPROVAL_EXPIRES_IN_SECONDS,
                 ),
                 budget_s=routing._api_write_budget_s(),
+                **creation,
             )
+            if selected:
+                # The owner may have been lost while the create was in flight.
+                identity.creation_identity()
+    except ApprovalContinuityRefused:
+        # @spec HTTP-APPROVAL-CONTINUITY-3: definitive refusal is the HTTP terminal
+        # refusal, never the legacy escalation below.
+        raise identity.HttpIdentityRefused() from None
     except WorkspaceSelectionRefused as exc:
         logger.info(
             "publication refused for agent=%s deployment=%s thread=%s: %s",
@@ -874,6 +896,10 @@ async def _pause_for_approval(
         await self._reply_for(qevent, route, exc.public_detail)
         return _ApprovalPause.refused(exc.public_detail)
     except (ApprovalBackendError, ValidationError) as exc:
+        # @spec HTTP-APPROVAL-CONTINUITY-3: a selected turn never takes the legacy
+        # escalation, which can publish an unverified reply.
+        if selected:
+            raise identity.HttpIdentityRefused() from None
         # ValidationError: the shared model rejected the payload at
         # construction (#492) -- an unknown gate_kind, or an empty
         # conversation_id/author/dedupe_key, which the wire's QueuedTurn does
@@ -901,6 +927,12 @@ async def _pause_for_approval(
             failure_class="approval-create-failed",
         )
         return _ApprovalPause.refused(refusal)
+    except ValueError:
+        # @spec HTTP-APPROVAL-CONTINUITY-3: a local validation error of a selected
+        # request is the terminal refusal; any other propagates as before.
+        if selected:
+            raise identity.HttpIdentityRefused() from None
+        raise
     if self._approval_run_abandoned(qevent):
         # #4331: the thread route may now name a successor's claim, so this
         # worker neither touches the workspace nor suspends.

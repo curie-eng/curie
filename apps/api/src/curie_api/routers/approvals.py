@@ -63,6 +63,7 @@ from ..auth import require_api_key, require_platform_key
 from ..authorizer import AuthzDecision, authorize_approval
 from ..config import get_settings
 from ..deps import ApproverSetSelectorDep, ResumeQueueDep, SessionDep, get_store
+from ..identity.http_approval import approval_is_selected, require_legacy_approval_creation
 from ..identity_fence import lock_identity_reader
 from ..models import Approval, ApprovalStatus
 from ..remediation_approvals import (
@@ -280,6 +281,7 @@ async def create_approval(
     runner, so a sandbox cannot talk its way past it.
     """
 
+    await require_legacy_approval_creation(session, data)
     traceparent = canonicalize_traceparent(
         request.headers.get(TRACEPARENT_STREAM_FIELD)
     )
@@ -495,6 +497,7 @@ async def _admit_adapter_answer(session: AsyncSession, approval: Approval, sende
 async def resolve_approval(
     approval_id: uuid.UUID,
     data: ApprovalResolve,
+    request: Request,
     session: SessionDep,
     resume_queue: ResumeQueueDep,
     approver_sets: ApproverSetSelectorDep,
@@ -525,6 +528,32 @@ async def resolve_approval(
     ):
         raise _approval_not_found()
     stored_parent = approval_trace_context(approval)
+    # @spec HTTP-APPROVAL-CONTINUITY-10: a selected row never reaches legacy
+    # admission, team lookup or CAS. Only its deadline expiry is supported here,
+    # through the sealing owner; its wake stays owed rather than context-free.
+    if await approval_is_selected(session, approval):
+        await session.commit()
+        gone: Approval | None = approval if approval.status == ApprovalStatus.expired else None
+        if approval.status == ApprovalStatus.pending and _expired(approval):
+            try:
+                gone = await request.app.state.http_approval_expiry(approval_id)
+                if gone is None:
+                    # A concurrent expiry may have won; it is still the 410 answer.
+                    current = await crud_approvals.reread_approval(session, approval_id)
+                    if current is not None and current.status == ApprovalStatus.expired:
+                        gone = current
+            except Exception:  # noqa: BLE001 - bounded answer, never a raw 500.
+                raise HTTPException(
+                    status.HTTP_503_SERVICE_UNAVAILABLE, "authority_unavailable"
+                ) from None
+        if gone is not None:
+            raise HTTPException(
+                status.HTTP_410_GONE,
+                f"approval expired at {gone.expires_at} and can no longer be resolved",
+            )
+        # 403, not 409: a 409 reads as settled and would retire a card whose row
+        # is still pending.
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "unsupported_approval")
 
     # The route binding is read fresh at resolve time (#420), so revoking an
     # approver takes effect on the next click rather than at the next restart.

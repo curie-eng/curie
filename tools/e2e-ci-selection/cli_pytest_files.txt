@@ -1,6 +1,7 @@
 apps/api/tests/forges/test_tool_catalog_v1.py
 apps/api/tests/test_alembic_revision_gate.py
 apps/api/tests/test_alembic_train_lineage.py
+apps/api/tests/test_approval_identity_schema_candidate.py
 apps/api/tests/test_commitpoller.py
 apps/api/tests/test_deploy_notice_release_compat.py
 apps/api/tests/test_factory_progress.py
