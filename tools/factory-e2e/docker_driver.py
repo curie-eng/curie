@@ -252,6 +252,14 @@ def docker_values(values: Obj, images: dict[str, dict[str, str]], schema_version
         {"memory": "4Gi", "ephemeral-storage": "32Gi", "cpu": "2"}
     )
     resources.setdefault("requests", {})["ephemeral-storage"] = "8Gi"
+    # The docker scenario runs two factory sandboxes at once, so this install asks for
+    # 4Gi of process memory only.
+    sandbox = out.setdefault("agentSandbox", {})
+    profiles = sandbox.setdefault("resourceProfiles", {})
+    factory_profile = profiles.setdefault("factory", {})
+    factory_resources = factory_profile.setdefault("resources", {})
+    factory_resources.setdefault("requests", {})["memory"] = "4Gi"
+    factory_resources.setdefault("limits", {})["memory"] = "4Gi"
     return out
 
 
