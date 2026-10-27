@@ -44,6 +44,13 @@ have no owned keys at all, so they reconcile with no exception. That is the
 path ADR-0090 calls the prerequisite, and it is why this restriction shrinks as
 bundles adopt it rather than being permanent.
 
+A connector replaced by a shared reference under the same name (ADR 0239
+Restore 6) is retained: until the shared application is observed ready, the
+old dedicated holder's objects, and every owned Secret a retained Deployment
+may mount, are hidden from the prune exactly as the protected Secret is.
+Everything else converges as usual, and the first pass after the application
+is ready prunes them.
+
 `prune_agent` is the same reasoning reached from the other direction (#1216).
 When the in-force version has no stored bundle there is no render at all -- not
 an empty one, an absent one -- so nothing this agent owns can be declared, and
@@ -65,6 +72,21 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
+class SharedReach:
+    """One shared entry of the render (ADR 0239): its alias, application and member reach.
+
+    ``reach`` is the frozen ``render_member_reach`` output for this agent,
+    applied by the shared reconciler and never by this module: shared objects
+    carry no ``curie.dev/connector-owner`` label, so no dedicated plan ever
+    sees them.
+    """
+
+    name: str
+    application: str
+    reach: tuple[dict[str, Any], ...] = ()
+
+
+@dataclass(frozen=True)
 class RenderedConnectors:
     """What the API returns for one version's `connectors.yaml`."""
 
@@ -73,6 +95,12 @@ class RenderedConnectors:
     # must supply. Non-empty means the CLI owns that Secret's lifecycle.
     owned_secret_name: str = ""
     owned_secret_keys: list[str] = field(default_factory=list)
+    shared: tuple[SharedReach, ...] = ()
+    # The ``app.kubernetes.io/name`` values and direct Service names of
+    # dedicated connectors this pass retains: each replaced by a shared entry
+    # whose application is not yet observed ready. Set by the loop from the
+    # shared reconciler's readiness, never by the API.
+    retained: frozenset[str] = frozenset()
 
     @property
     def needs_operator_credentials(self) -> bool:
@@ -100,6 +128,9 @@ class AgentOutcome:
     skipped: str | None = None
     plan: ReconcilePlan | None = None
     report: ApplyReport | None = None
+    # The render this outcome reconciled; None on the prune-only path, which
+    # has none. The loop reads its shared entries.
+    rendered: RenderedConnectors | None = None
 
     @property
     def ok(self) -> bool:
@@ -129,6 +160,7 @@ def _execute_and_report(
     agent: str,
     namespace: str,
     skipped: str | None = None,
+    rendered: RenderedConnectors | None = None,
 ) -> AgentOutcome:
     """Run a decided plan and turn it into an outcome.
 
@@ -148,7 +180,9 @@ def _execute_and_report(
             len(report.failures),
             "; ".join(f"{kind}/{name}: {err}" for kind, name, err in report.failures),
         )
-    return AgentOutcome(agent=agent, skipped=skipped, plan=carried, report=report)
+    return AgentOutcome(
+        agent=agent, skipped=skipped, plan=carried, report=report, rendered=rendered
+    )
 
 
 def reconcile_agent(
@@ -180,6 +214,18 @@ def reconcile_agent(
     # is "own it and no longer declare it -> delete it", and that judgement is
     # correct. What is wrong is calling this object ours to begin with.
     manageable = [obj for obj in live if identity(obj) not in protected]
+
+    held = [obj for obj in manageable if _retained(obj, rendered.retained)]
+    if held:
+        # A retained holder still serves its connector until the shared
+        # application is ready, so it, and any owned Secret its Deployment may
+        # mount, is not this pass's to prune.
+        logger.debug(
+            "connector reconcile agent=%s retaining %d object(s) until shared readiness",
+            agent,
+            len(held),
+        )
+        manageable = [obj for obj in manageable if obj not in held and identity(obj)[0] != "Secret"]
 
     if unprovisioned:
         # Widened past `protected` (only THIS render's Secret name) for the
@@ -230,13 +276,19 @@ def reconcile_agent(
         # describe a pass that did not happen.
         carried = ReconcilePlan(delete=computed.delete)
     elif computed.is_noop:
-        return AgentOutcome(agent=agent, plan=computed, report=ApplyReport())
+        return AgentOutcome(agent=agent, plan=computed, report=ApplyReport(), rendered=rendered)
     else:
         carried = computed
 
     return _execute_and_report(
-        client, carried, agent=agent, namespace=namespace, skipped=skipped
+        client, carried, agent=agent, namespace=namespace, skipped=skipped, rendered=rendered
     )
+
+
+def _retained(obj: dict[str, Any], retained: frozenset[str]) -> bool:
+    metadata = obj.get("metadata") or {}
+    labels = metadata.get("labels") or {}
+    return labels.get("app.kubernetes.io/name") in retained or metadata.get("name") in retained
 
 
 def prune_agent(

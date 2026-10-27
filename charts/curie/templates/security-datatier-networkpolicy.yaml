@@ -3,6 +3,7 @@
 {{- if hasKey .Values.security.dataTierNetworkPolicy "allowMcpConnectorValkeyIngress" }}
 {{- $allowMcpConnectorValkeyIngress = .Values.security.dataTierNetworkPolicy.allowMcpConnectorValkeyIngress }}
 {{- end }}
+{{- $sharedConnectors := eq (include "curie.sharedConnectors.enabled" .) "true" }}
 {{/*
 Rail: default-deny ingress + scoped-allow around the data tier (Postgres, RustFS,
 ClickHouse, Valkey).
@@ -79,6 +80,24 @@ spec:
         {{- range $p := $s.ports }}
         - { protocol: TCP, port: {{ $p }} }
         {{- end }}
+    {{- if and $sharedConnectors (or (eq $s.component "postgres") (eq $s.component "valkey")) }}
+    # Shared connector application Pods (ADR 0239) resolve credentials from
+    # Postgres and spend grants in Valkey. They are not chart app pods: this
+    # peer is the frozen render's shared labels (part-of this release, the
+    # shared-connector-application component, and an application id), same
+    # namespace only, on this store's port only. sharedConnectors.enabled.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: {{ $.Release.Name }}
+              app.kubernetes.io/component: shared-connector-application
+            matchExpressions:
+              - { key: curietech.ai/shared-application, operator: Exists }
+      ports:
+        {{- range $p := $s.ports }}
+        - { protocol: TCP, port: {{ $p }} }
+        {{- end }}
+    {{- end }}
     {{/* @spec docs/superpowers/specs/2026-10-08-mcp-connector-valkey-ingress-optout.md */}}
     {{ if and (eq $s.component "valkey") $allowMcpConnectorValkeyIngress }}
     # Connector proxies spend one-shot grants in Valkey. Their pods are not

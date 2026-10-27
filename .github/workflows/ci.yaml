@@ -3731,6 +3731,22 @@ jobs:
           set -euo pipefail
           bash tools/runtime-assertion-gate/run.sh \
             charts/curie/ci/runtime/connector-readiness-runtime.sh
+      # Shared connector applications (ADR 0239, cp5). Runs after the uv
+      # install above (its driver is the host-side API and reconcile loop).
+      # Owns a kind cluster of its own (Calico, same pin as above) rather
+      # than curie-e2e: it proves
+      # the worker Secret admission shapes, the production reconcile loop as
+      # the worker identity, member reach and ownership, and the root network
+      # policies, then deletes the cluster and its containers and verifies
+      # they are gone.
+      - name: Shared connector applications admit, reach and own only what they should (own kind cluster)
+        if: ${{ matrix.leg == 'chart' && contains(fromJSON(needs.changes.outputs.chart_scenarios), 'shared-connector-kind') }}
+        env:
+          RUN_ID: ${{ github.run_id }}${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          bash tools/runtime-assertion-gate/run.sh \
+            charts/curie/ci/runtime/shared-connector-kind-runtime.sh
       # Runner BYO egress (#2369). Render assertions prove the CIDRs land in
       # NetworkPolicy YAML; this proves a runner-labelled pod can actually
       # reach each declared peer (rustfs, sts, otel, api) and that an

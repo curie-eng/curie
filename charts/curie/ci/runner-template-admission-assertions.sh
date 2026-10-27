@@ -345,7 +345,13 @@ def assert_side_policies(root):
             die(f"{name}: resourceRules are {got}, want {want['rules']}")
         if name.endswith("-worker-secrets") and rules[0].get("apiVersions") != ["v1"]:
             die(f"{name}: apiVersions is {rules[0].get('apiVersions')!r}, want ['v1']")
-        exprs = " ".join(v.get("expression") or "" for v in validations(policy))
+        # The worker-secrets predicates may live in spec.variables, which the
+        # validation then ORs (cp5: tokens || sharedKey || sharedDsn), so the
+        # needles are looked up across both.
+        exprs = " ".join(
+            [v.get("expression") or "" for v in validations(policy)]
+            + [v.get("expression") or "" for v in spec.get("variables") or []]
+        )
         if not validations(policy):
             die(f"{name}: no validations")
         missing = [n for n in want["needles"] if n not in exprs]

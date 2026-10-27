@@ -71,6 +71,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, Final
 
+from curie_internal.shared_declarations import Declarations
 from plugin_format.connectors import ConnectorSpec
 from sqlalchemy import cast, literal, or_, select, update
 from sqlalchemy.dialects.postgresql import JSONB, insert
@@ -100,6 +101,7 @@ from .remediation_forward import (
 from .remediation_limits import outcome_written, release_reservation
 from .remediation_predicate import SATISFIED, SUCCESSFUL_SAMPLES, evaluate_sample
 from .remediation_reads import OBSERVE_TOOL, ReadRefused, scheduled_read
+from .shared_connectors.declarations import read_declarations
 from .storage import BundleStore, ObjectStore
 
 logger = logging.getLogger(__name__)
@@ -202,7 +204,7 @@ def header_secret_names(spec: ConnectorSpec) -> frozenset[str]:
     return frozenset(names)
 
 
-def _connectors_of(data: bytes) -> dict[str, ConnectorSpec]:
+def _connectors_of(data: bytes) -> Declarations:
     settings = get_settings()
     with TemporaryDirectory() as tmp:
         bundles.extract_stored_bundle(
@@ -212,7 +214,7 @@ def _connectors_of(data: bytes) -> dict[str, ConnectorSpec]:
             max_compression_ratio=settings.bundle_max_compression_ratio,
             max_members=settings.bundle_max_members,
         )
-        return dict(bundles.read_connectors(Path(tmp)).connectors)
+        return read_declarations(Path(tmp))
 
 
 class _Unreadable(Exception):
@@ -221,7 +223,7 @@ class _Unreadable(Exception):
 
 async def _in_force_connectors(
     session: AsyncSession, store: ObjectStore, agent_id: uuid.UUID
-) -> dict[str, ConnectorSpec] | None:
+) -> Declarations | None:
     """The in-force version's connectors; None when no version is in force."""
 
     bundle_ref = (await in_force_bundle_refs(session, [agent_id])).get(agent_id)
@@ -265,7 +267,13 @@ async def independence_refusal(
         return NOT_INDEPENDENT
     if connectors is None:
         return None
-    acting_spec, reading_spec = connectors.get(acting), connectors.get(reading)
+    # A shared connector's headers are the application's, not this version's,
+    # so independence cannot be shown: never routed into the header check.
+    shared = {entry.name for entry in connectors.shared}
+    if acting in shared or reading in shared:
+        return NOT_INDEPENDENT
+    dedicated = connectors.dedicated.connectors
+    acting_spec, reading_spec = dedicated.get(acting), dedicated.get(reading)
     if acting_spec is None or reading_spec is None:
         return None
     if header_secret_names(acting_spec) & header_secret_names(reading_spec):

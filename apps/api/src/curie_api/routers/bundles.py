@@ -116,7 +116,9 @@ async def upload_bundle(
         )
 
     try:
-        extension, content_type = await run_in_threadpool(deploy.validate_archive, data)
+        extension, content_type, shared = await run_in_threadpool(
+            deploy.validate_archive, data, allow_shared=True
+        )
     except bundles.UnsupportedArchive as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
     except deploy.BundleInvalid as exc:
@@ -124,6 +126,16 @@ async def upload_bundle(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             {"detail": "bundle failed validation", "errors": exc.errors},
         ) from exc
+
+    # Shared connectors (ADR 0239): every shared entry this agent's target runs
+    # must resolve to an enabled application of this installation the agent is
+    # a member of under that name, before anything is stored. A refusal answers
+    # its code and the applications the bundle declares, never cached.
+    if shared:
+        agent = await crud_agents.get_agent(session, agent_id)
+        if agent is None:  # pragma: no cover -- the version lookup above proves it
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
+        await deploy.check_shared_declarations(session, agent_id, agent.name, data, get_settings())
 
     # The declared/bound approval-route join, CONDITIONAL on this version already
     # being live (#2436). `DeploymentCreate` carries no bundle and

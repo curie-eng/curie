@@ -1,0 +1,160 @@
+{{/*
+"true" when sharedConnectors.enabled is set, else "false". Read through
+`default dict` because sharedConnectors is a top level key that a release
+predating it does not carry under --reuse-values. A present non-boolean value
+is refused, so a quoted "false" cannot turn shared connector policies on.
+*/}}
+{{- define "curie.sharedConnectors.enabled" -}}
+{{- $shared := .Values.sharedConnectors | default dict -}}
+{{- $enabled := get $shared "enabled" -}}
+{{- if and (hasKey $shared "enabled") (not (kindIs "invalid" $enabled)) (not (kindIs "bool" $enabled)) -}}
+{{- fail (printf "sharedConnectors.enabled must be a boolean, got %q" (toString $enabled)) -}}
+{{- end -}}
+{{- if and (kindIs "bool" $enabled) $enabled -}}true{{- else -}}false{{- end -}}
+{{- end -}}
+{{- if eq (include "curie.sharedConnectors.enabled" .) "true" }}
+{{- $shared := .Values.sharedConnectors | default dict }}
+{{- $np := .Values.security.networkPolicy | default dict }}
+{{- $grantStoreEgress := get $shared "grantStoreEgress" | default list }}
+{{- $applicationEgress := get $shared "applicationEgress" | default dict }}
+{{- if not (kindIs "slice" $grantStoreEgress) }}
+{{- fail "sharedConnectors.grantStoreEgress must be a list of egress entries" }}
+{{- end }}
+{{- if not (kindIs "map" $applicationEgress) }}
+{{- fail "sharedConnectors.applicationEgress must be a map of application id to egress entries" }}
+{{- end }}
+{{/*
+Root network policies for shared connector applications (ADR 0239).
+
+A shared application Pod carries app.kubernetes.io/part-of=<release>,
+app.kubernetes.io/component=shared-connector-application and
+curietech.ai/shared-application=<uuid>, all from the frozen render. That
+render ships its own default-deny ingress and its database egress policy, so
+the Pod's egress is closed except what some policy allows. These policies,
+owned by this chart, deny every shared application Pod's ingress at the root
+and allow the rest of its egress: DNS, the grant store, and per application
+provider egress. Nothing here selects a runner sandbox or a dedicated
+connector. Membership reach (which runners may call the application) is
+rendered per member by the worker, not here.
+
+The metadata component is shared-connector-root, deliberately not the
+application component, so the worker's shared reach and application object
+selectors never match a chart-owned policy.
+*/}}
+---
+# Ingress isolation of every shared application Pod, owned by the chart. The
+# render's own default-deny ingress is a per application object the worker
+# garbage collects, and worker replicas overlap with no leader election: one
+# can delete an application's policies after another recreated its
+# Deployment. This root deny never depends on that ordering. Ingress only,
+# with no rule, so only the members' reach policies admit a caller.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "curie.fullname" . }}-shared-app-deny-ingress
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: shared-connector-root
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: {{ .Release.Name }}
+      app.kubernetes.io/component: shared-connector-application
+    matchExpressions:
+      - { key: curietech.ai/shared-application, operator: Exists }
+  policyTypes: [Ingress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "curie.fullname" . }}-shared-app-allow-dns
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: shared-connector-root
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: {{ .Release.Name }}
+      app.kubernetes.io/component: shared-connector-application
+    matchExpressions:
+      - { key: curietech.ai/shared-application, operator: Exists }
+  policyTypes: [Egress]
+  # The runner's DNS egress (security-networkpolicy.yaml), for the same
+  # dnsNamespace.
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ get $np "dnsNamespace" | default "kube-system" }}
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "curie.fullname" . }}-shared-app-allow-grant-store
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: shared-connector-root
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: {{ .Release.Name }}
+      app.kubernetes.io/component: shared-connector-application
+    matchExpressions:
+      - { key: curietech.ai/shared-application, operator: Exists }
+  policyTypes: [Egress]
+  egress:
+{{- if .Values.valkey.deploy }}
+{{- if $grantStoreEgress }}
+{{- fail "sharedConnectors.grantStoreEgress is set while valkey.deploy is true: shared applications spend grants in this release's in-chart Valkey, so the entries would be ignored. Clear sharedConnectors.grantStoreEgress, or set valkey.deploy=false for an external grant store." }}
+{{- end }}
+    # This release's in-chart Valkey, on its container port only.
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "curie.selectorLabels" (dict "root" . "component" "valkey") | nindent 14 }}
+      ports:
+        - { protocol: TCP, port: 6379 }
+{{- else }}
+{{- if not $grantStoreEgress }}
+{{- fail "sharedConnectors.grantStoreEgress is required with sharedConnectors.enabled and valkey.deploy=false: list the external grant store's CIDR and port, or shared applications cannot spend grants" }}
+{{- end }}
+{{- range $grantStoreEgress }}
+{{- include "curie.objectStore.egressEntry" (dict "key" "sharedConnectors.grantStoreEgress" "entry" .) }}
+{{- end }}
+    {{- include "curie.egress.ipBlockRules" (dict "entries" $grantStoreEgress "root" $) | trim | nindent 4 }}
+{{- end }}
+{{- range $app := keys $applicationEgress | sortAlpha }}
+{{- if not (regexMatch "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$" $app) }}
+{{- fail (printf "sharedConnectors.applicationEgress key %q is not a canonical lowercase application UUID" $app) }}
+{{- end }}
+{{- $entries := index $applicationEgress $app | default list }}
+{{- if not (kindIs "slice" $entries) }}
+{{- fail (printf "sharedConnectors.applicationEgress.%s must be a list of egress entries" $app) }}
+{{- end }}
+{{- range $entries }}
+{{- include "curie.objectStore.egressEntry" (dict "key" (printf "sharedConnectors.applicationEgress.%s" $app) "entry" .) }}
+{{- end }}
+{{- if $entries }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "curie.fullname" $ }}-shared-{{ $app }}-allow-egress
+  labels:
+    {{- include "curie.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: shared-connector-root
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: {{ $.Release.Name }}
+      app.kubernetes.io/component: shared-connector-application
+      curietech.ai/shared-application: {{ $app | quote }}
+  policyTypes: [Egress]
+  egress:
+    {{- include "curie.egress.ipBlockRules" (dict "entries" $entries "root" $) | trim | nindent 4 }}
+{{- end }}
+{{- end }}
+{{- end }}

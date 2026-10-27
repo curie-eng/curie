@@ -1116,6 +1116,7 @@ def _build_action_executor(
     from .action_digest import agent_deployment_resolver
     from .action_executor_binding import ExecutorBindings
     from .action_executor_loop import ExecutionApi
+    from .shared_declarations_client import SharedResolveClient
 
     deployments = None
     manifests = None
@@ -1139,6 +1140,12 @@ def _build_action_executor(
         binding=binding,
         bundles=bundles,
         manifests=manifests,
+        # ADR 0239: the shared entries an acting agent's target runs resolve
+        # through the API on the worker token checked above.
+        shared=SharedResolveClient(
+            base_url=config.api_base_url,
+            internal_worker_token=config.internal_worker_token,
+        ),
         release=config.connector_release,
         namespace=config.connector_namespace,
         max_uncompressed_bytes=config.bundle_max_uncompressed_bytes,
@@ -1187,12 +1194,38 @@ def _build_connector_loop(
     Constructed here rather than inside the loop so a bad kubeconfig fails at
     boot, next to the flag that asked for it, instead of once per interval in a
     background task nobody is watching.
+
+    The shared application reconciler (ADR 0239) rides the same loop and the
+    same cluster credential. Its worker routes need the internal worker token;
+    without one it still prunes reach, and every agent with shared entries is
+    refused ``shared_worker_token_missing`` as undecidable.
     """
 
     if not config.connector_reconcile_enabled:
         return None
     from .connector_k8s import KubernetesConnectorClient
+    from .shared_k8s import KubernetesSharedClient
+    from .shared_reconcile import HttpSharedApplicationApi, SharedReconciler
 
+    connectors = KubernetesConnectorClient()
+    if not config.internal_worker_token:
+        logger.warning(
+            "connector reconcile without an internal worker token: "
+            "shared connector applications are not reconciled (shared_worker_token_missing)"
+        )
+    shared = SharedReconciler(
+        KubernetesSharedClient(),
+        (
+            HttpSharedApplicationApi(
+                api_base_url=config.api_base_url,
+                internal_worker_token=config.internal_worker_token,
+            )
+            if config.internal_worker_token
+            else None
+        ),
+        namespace=config.connector_namespace,
+        release=config.connector_release,
+    )
     return ConnectorReconcileLoop(
         engine=engine,
         source=HttpManifestSource(
@@ -1202,11 +1235,12 @@ def _build_connector_loop(
             namespace=config.connector_namespace,
             app_name=config.connector_app_name,
         ),
-        client=KubernetesConnectorClient(),
+        client=connectors,
         namespace=config.connector_namespace,
         db_schema=config.db_schema,
         interval_seconds=config.connector_reconcile_interval_s,
         probe_trigger=_build_probe_trigger(config, engine, client=client),
+        shared=shared,
     )
 
 

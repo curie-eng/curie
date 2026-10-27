@@ -20,6 +20,7 @@ import pytest
 from curie_api import bundles
 from curie_api.config import get_settings
 from curie_api.models import Agent, AgentChannel
+from curie_api.shared_connectors.declarations import read_declarations
 from plugin_format.connector_render import CALLER_PROXY_PORT, ConnectorProxy
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -91,7 +92,7 @@ def _render(root: Path, agent: str = AGENT, proxy: object = _DEFAULT_PROXY) -> l
     # Success paths pass a caller proxy. `proxy=None` is the empty-key refusal.
     resolved = _api_proxy() if proxy is _DEFAULT_PROXY else proxy
     return bundles.render_connector_manifests(
-        bundles.read_connectors(root),
+        read_declarations(root).dedicated,
         release=RELEASE,
         agent=agent,
         namespace=NAMESPACE,
@@ -191,7 +192,7 @@ def test_mcp_entry_url_matches_the_rendered_service(tmp_path: Path) -> None:
     root = _bundle(tmp_path, HOSTED)
     svc = next(o for o in _render(root) if o["kind"] == "Service")
     entries = bundles.connector_mcp_entries(
-        bundles.read_connectors(root), release=RELEASE, agent=AGENT, namespace=NAMESPACE
+        read_declarations(root).dedicated, release=RELEASE, agent=AGENT, namespace=NAMESPACE
     )
     assert svc["metadata"]["name"] in entries["grafana"]["url"]
 
@@ -248,7 +249,7 @@ def test_each_of_the_four_names_lands_where_it_belongs(tmp_path: Path) -> None:
     env = dep["spec"]["template"]["spec"]["containers"][0]["env"]
     assert {"name": "SELF_URL", "value": f"http://{dns}:8000"} in env
     entries = bundles.connector_mcp_entries(
-        bundles.read_connectors(root), release=RELEASE, agent=AGENT, namespace=NAMESPACE
+        read_declarations(root).dedicated, release=RELEASE, agent=AGENT, namespace=NAMESPACE
     )
     assert entries["grafana"] == {"type": "http", "url": f"http://{dns}:8000/mcp"}
 
@@ -257,7 +258,7 @@ def test_remote_connector_contributes_an_entry_but_no_objects(tmp_path: Path) ->
     root = _bundle(tmp_path, "connectors:\n  x:\n    url: https://mcp.internal/mcp\n")
     assert _render(root) == []
     entries = bundles.connector_mcp_entries(
-        bundles.read_connectors(root), release=RELEASE, agent=AGENT, namespace=NAMESPACE
+        read_declarations(root).dedicated, release=RELEASE, agent=AGENT, namespace=NAMESPACE
     )
     assert entries["x"]["url"] == "https://mcp.internal/mcp"
 
@@ -286,12 +287,12 @@ def test_a_referenced_secret_is_not_something_the_caller_must_resolve(tmp_path: 
     # The property ADR-0090 depends on: with every credential referenced, the
     # deploy path handles none, so a reconciler holding no secrets can apply
     # this connector.
-    declared = bundles.read_connectors(_bundle(tmp_path, REFERENCED))
+    declared = read_declarations(_bundle(tmp_path, REFERENCED)).dedicated
     assert bundles.owned_secret_keys(declared) == []
 
 
 def test_a_literal_secret_still_must_be_resolved(tmp_path: Path) -> None:
-    declared = bundles.read_connectors(_bundle(tmp_path, HOSTED))
+    declared = read_declarations(_bundle(tmp_path, HOSTED)).dedicated
     assert bundles.owned_secret_keys(declared) == ["GRAFANA_TOKEN"]
 
 
@@ -307,7 +308,7 @@ def test_a_secret_file_is_something_the_caller_must_resolve(tmp_path: Path) -> N
     # #1424: with no `secrets:` entry at all this came back empty, so the CLI
     # skipped creating the Secret and the pod hung on FailedMount against the
     # volume the renderer had already emitted `optional: false`.
-    declared = bundles.read_connectors(_bundle(tmp_path, FILE_ONLY))
+    declared = read_declarations(_bundle(tmp_path, FILE_ONLY)).dedicated
     assert bundles.owned_secret_keys(declared) == ["K8S_KUBECONFIG"]
 
 
@@ -400,7 +401,7 @@ def test_a_built_connector_renders_the_locked_digest_and_no_build(tmp_path: Path
     root = _built(tmp_path)
     _write_lock(root)
     declared = connector_lock.apply_lock(
-        bundles.read_connectors(root), bundles.read_connector_lock(root), portable=False
+        read_declarations(root).dedicated, bundles.read_connector_lock(root), portable=False
     )
     dep = next(
         o
@@ -427,7 +428,7 @@ def test_render_connector_manifests_stays_a_pure_function_of_its_arguments(tmp_p
     _write_lock(root)
     with pytest.raises(ValueError, match="connectors.lock.yaml"):
         bundles.render_connector_manifests(
-            bundles.read_connectors(root),
+            read_declarations(root).dedicated,
             release=RELEASE,
             agent=AGENT,
             namespace=NAMESPACE,
@@ -449,7 +450,7 @@ def test_the_mcp_entry_is_the_same_before_and_after_the_lock_is_applied(tmp_path
     root = _built(tmp_path)
     _write_lock(root)
     resolved = connector_lock.apply_lock(
-        bundles.read_connectors(root), bundles.read_connector_lock(root), portable=False
+        read_declarations(root).dedicated, bundles.read_connector_lock(root), portable=False
     )
     authored, errors = validate_connectors(
         {
@@ -473,7 +474,7 @@ def test_the_mcp_entry_is_the_same_before_and_after_the_lock_is_applied(tmp_path
 #
 # Real Postgres + real RustFS from the compose stack, matching the round-trip
 # tests in test_bundles.py: nothing here is mocked. Asserting on the helper
-# alone would leave the router free to keep calling `read_connectors` directly,
+# alone would leave the router free to keep reading connectors directly,
 # which is exactly the wiring gap review finding 8 named -- the resolution was
 # claimed and never wired. Deleting the `apply_lock` call in the router must
 # make this fail, and it fails as `image: None`, not as an import error.
@@ -761,7 +762,7 @@ def test_the_returned_entry_carries_the_connector_credential(tmp_path: Path) -> 
     # and nothing errors (#2503).
     root = _bundle(tmp_path, GITHUB)
     entries = bundles.connector_mcp_entries(
-        bundles.read_connectors(root), release=RELEASE, agent=AGENT, namespace=NAMESPACE
+        read_declarations(root).dedicated, release=RELEASE, agent=AGENT, namespace=NAMESPACE
     )
     assert entries["github"]["headers"] == {
         "Authorization": "Bearer ${GITHUB_PERSONAL_ACCESS_TOKEN}"
@@ -866,7 +867,7 @@ def _proxy_admits(manifests: list[dict[str, Any]]) -> list[str]:
 def test_the_manifests_carry_the_proxy_the_caller_passes(tmp_path: Path) -> None:
     root = _bundle(tmp_path, HOSTED)
     manifests = bundles.render_connector_manifests(
-        bundles.read_connectors(root),
+        read_declarations(root).dedicated,
         release=RELEASE,
         agent=AGENT,
         namespace=NAMESPACE,

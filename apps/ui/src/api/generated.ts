@@ -3499,6 +3499,46 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/internal/shared-connectors/applications/{application_id}/render": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Render Shared Application
+         * @description The frozen application render and its Secret plan, at the worker's root.
+         */
+        get: operations["render_shared_application_v1_internal_shared_connectors_applications__application_id__render_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/shared-connectors/resolve": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Resolve Shared Declarations
+         * @description Resolve shared entries for one agent; the first refusal answers in its dict form.
+         */
+        post: operations["resolve_shared_declarations_v1_internal_shared_connectors_resolve_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/internal/state/released-credentials": {
         parameters: {
             query?: never;
@@ -5798,6 +5838,8 @@ export interface components {
              * @default
              */
             owned_secret_name?: string;
+            /** Shared */
+            shared?: components["schemas"]["SharedConnectorReach"][];
             /** Triggers */
             triggers?: {
                 [key: string]: unknown;
@@ -9113,6 +9155,28 @@ export interface components {
             };
             policy: components["schemas"]["SharedPolicy"];
         };
+        /**
+         * SharedApplicationRenderOut
+         * @description The frozen ``render_application`` output and the Secret plan beside it.
+         */
+        SharedApplicationRenderOut: {
+            /**
+             * Application Id
+             * Format: uuid
+             */
+            application_id: string;
+            /** Enabled */
+            enabled: boolean;
+            /** Installation Label */
+            installation_label: string;
+            /** Objects */
+            objects: {
+                [key: string]: unknown;
+            }[];
+            /** Recipients */
+            recipients: string[];
+            secrets: components["schemas"]["SharedSecretPlanOut"];
+        };
         /** SharedBindingCheck */
         SharedBindingCheck: {
             source: components["schemas"]["SharedSourceVersion"];
@@ -9235,6 +9299,28 @@ export interface components {
             status: "provisioned";
         };
         /**
+         * SharedConnectorReach
+         * @description One shared connector this agent runs: its alias, application and member reach.
+         *
+         *     ``reach`` is the frozen ``render_member_reach`` output for this agent,
+         *     unmodified: the NetworkPolicies that let this agent's runner reach the
+         *     shared application (ADR 0239). The application's own objects are the
+         *     worker's to apply, from its own route.
+         */
+        SharedConnectorReach: {
+            /**
+             * Application
+             * Format: uuid
+             */
+            application: string;
+            /** Name */
+            name: string;
+            /** Reach */
+            reach: {
+                [key: string]: unknown;
+            }[];
+        };
+        /**
          * SharedCredentialEnvelope
          * @description A credential the CLI sealed to one of the application's recipients.
          */
@@ -9265,6 +9351,28 @@ export interface components {
             status: "provisioned" | "pending" | "ready" | "failed";
             /** Status Reason */
             status_reason: string | null;
+        };
+        /**
+         * SharedDatabasePlanOut
+         * @description The application's database Secret, as the worker reconciles it.
+         *
+         *     Bundled: the worker-managed DSN Secret, and once provisioned the DSN sealed
+         *     to the application's recipient with its revision, which the worker writes
+         *     unopened. Managed: the operator's own Secret reference only.
+         */
+        SharedDatabasePlanOut: {
+            /** Dsn Revision */
+            dsn_revision: number | null;
+            /**
+             * Mode
+             * @enum {string}
+             */
+            mode: "bundled" | "managed";
+            /** Sealed Dsn */
+            sealed_dsn: string | null;
+            secret: components["schemas"]["SharedSecretRefOut"];
+            /** Status */
+            status: ("provisioned" | "pending" | "ready" | "failed") | null;
         };
         /**
          * SharedDatabaseProvision
@@ -9317,6 +9425,19 @@ export interface components {
              * @enum {string}
              */
             status: "ready" | "failed";
+        };
+        /**
+         * SharedDeclarationEntryIn
+         * @description One shared entry of a bundle: its connector name and the application it references.
+         */
+        SharedDeclarationEntryIn: {
+            /**
+             * Application
+             * Format: uuid
+             */
+            application: string;
+            /** Name */
+            name: string;
         };
         /** SharedManagedDatabaseOut */
         SharedManagedDatabaseOut: {
@@ -9486,6 +9607,48 @@ export interface components {
              * @enum {string}
              */
             state: "ready" | "refreshing" | "recovery_required";
+        };
+        /** SharedResolveOut */
+        SharedResolveOut: {
+            /**
+             * Agent Id
+             * Format: uuid
+             */
+            agent_id: string;
+            /** Entries */
+            entries: components["schemas"]["SharedResolvedEntryOut"][];
+        };
+        /**
+         * SharedResolveRequest
+         * @description The worker's own readers resolve the shared entries an agent's target runs.
+         */
+        SharedResolveRequest: {
+            /**
+             * Agent Id
+             * Format: uuid
+             */
+            agent_id: string;
+            /** Entries */
+            entries: components["schemas"]["SharedDeclarationEntryIn"][];
+        };
+        /** SharedResolvedEntryOut */
+        SharedResolvedEntryOut: {
+            /**
+             * Application
+             * Format: uuid
+             */
+            application: string;
+            /** Enabled */
+            enabled: boolean;
+            /** Name */
+            name: string;
+        };
+        /** SharedSecretPlanOut */
+        SharedSecretPlanOut: {
+            database: components["schemas"]["SharedDatabasePlanOut"];
+            encryption_key: components["schemas"]["SharedSecretRefOut"];
+            grant_store: components["schemas"]["SharedSecretRefOut"];
+            snapshot_seal: components["schemas"]["SharedSecretRefOut"] | null;
         };
         /** SharedSecretRefOut */
         SharedSecretRefOut: {
@@ -17877,6 +18040,77 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["SharedRecipientRegistered"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    render_shared_application_v1_internal_shared_connectors_applications__application_id__render_get: {
+        parameters: {
+            query: {
+                namespace: string;
+                release: string;
+            };
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path: {
+                application_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SharedApplicationRenderOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    resolve_shared_declarations_v1_internal_shared_connectors_resolve_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SharedResolveRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SharedResolveOut"];
                 };
             };
             /** @description Validation Error */

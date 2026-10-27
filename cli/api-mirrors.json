@@ -370,7 +370,12 @@
     {
       "struct": "ConnectorManifests",
       "schema": "ConnectorManifests",
-      "omissions": []
+      "omissions": [
+        {
+          "field": "shared",
+          "why": "Shared application reach is applied by the worker reconciler; the CLI's cluster deploy apply of shared reach is checkpoint cp6, so the CLI reads no shared field yet."
+        }
+      ]
     },
     {
       "struct": "NamedTarget",
