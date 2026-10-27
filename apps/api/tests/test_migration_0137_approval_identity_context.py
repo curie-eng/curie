@@ -28,8 +28,6 @@ def revision_ready() -> None:
         "approval provenance migration 0137 is missing"
     )
     assert graph.get_revision("0137").down_revision == "0133"
-    # Later revisions append after it; 0138 is the head (AUTOMATED-REMEDIATION-15).
-    assert graph.get_heads() == ["0138"]
 
 
 def seed_approval(status: str = "pending") -> uuid.UUID:

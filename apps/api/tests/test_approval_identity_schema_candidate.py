@@ -29,10 +29,9 @@ def script() -> ScriptDirectory:
     return ScriptDirectory.from_config(config)
 
 
-def test_migration_0137_is_the_single_head_with_parent_0133() -> None:
+def test_migration_0137_follows_role_configuration_0133() -> None:
     """@spec HTTP-APPROVAL-CONTINUITY-5: additive revision after role configuration."""
     graph = script()
-    assert graph.get_heads() == ["0138"]
     revision = graph.get_revision("0137")
     assert revision is not None and revision.down_revision == "0133"
     assert Path(revision.path).resolve() == MIGRATION.resolve()
@@ -57,13 +56,18 @@ def test_migration_0137_is_the_single_head_with_parent_0133() -> None:
 )
 def test_every_coupled_candidate_consumer_requires_0137(relative: str, extract: Any) -> None:
     """@spec HTTP-APPROVAL-CONTINUITY-5: the ORM reads identity_context."""
-    assert extract(load(relative)) == CANDIDATE
+    # Later candidates may raise the floor further; it never drops below 0137.
+    revisions = load("cli/src/application_schema_windows.json")["revisions"]
+    window = extract(load(relative))
+    assert set(window) == set(CANDIDATE)
+    for key in CANDIDATE:
+        assert revisions.index(window[key]) >= revisions.index(CANDIDATE[key])
 
 
 def test_catalog_kind_parent_and_chart_digest_name_the_exact_migration() -> None:
     """@spec HTTP-APPROVAL-CONTINUITY-5: exact graph parent and file digest."""
     revisions = load("cli/src/application_schema_windows.json")["revisions"]
-    assert revisions[-3:] == ["0133", "0137", "0138"]
+    assert revisions[revisions.index("0137") - 1] == "0133"
     assert load("apps/api/src/curie_api/revision_kinds.json")["0137"] == "expand"
     serving = load("packages/protected-hooks/src/curie_protected_hooks/schema_serving.json")
     assert serving["revision_parents"]["0137"] == ["0133"]

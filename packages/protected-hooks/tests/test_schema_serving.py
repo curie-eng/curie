@@ -67,7 +67,11 @@ def graph_payload() -> dict[str, Any]:
         ("0132", False),
         # @spec HTTP-APPROVAL-CONTINUITY-5: approval ORM requires 0137.
         ("0133", False),
-        ("0137", True),
+        # @spec HTTP-INVOCATION-EXECUTION-21: Grid reports write the 0139 namespace kind.
+        ("0137", False),
+        # @spec AUTOMATED-REMEDIATION-15: 0138 only widens a CHECK below the floor.
+        ("0138", False),
+        ("0139", True),
         ("0000", True),
         ("future-expand", True),
     ],

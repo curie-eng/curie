@@ -12,6 +12,7 @@ apps/api/tests/test_migration_0133_agent_role_configuration.py
 apps/api/tests/test_publications.py
 apps/api/tests/test_schema_window_gate.py
 apps/api/tests/test_slack_channel_default.py
+apps/api/tests/test_slack_enterprise_schema_candidate.py
 apps/api/tests/test_source_control_schema_candidate.py
 apps/api/tests/test_upgrade_schema_metadata.py
 apps/api/tests/test_workitem_outcomes.py
