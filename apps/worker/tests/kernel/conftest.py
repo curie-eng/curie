@@ -1093,6 +1093,7 @@ async def kernel_harness(
     progress_factory: Callable[[AsyncRedis, WorkerConfig], object] | None = None,
     sweep_factory: Callable[[AsyncRedis, WorkerConfig], object] | None = None,
     pod_termination_wait_s: float = 0.0,
+    attachment_access: object | None = None,
     **config_overrides: object,
 ) -> AsyncIterator[Harness]:
     """Assemble a live kernel wired to a fake runner and real Valkey."""
@@ -1194,6 +1195,7 @@ async def kernel_harness(
         markers=Markers(async_redis, config),
         config=config,
         binding=binding,  # type: ignore[arg-type]
+        attachment_access=attachment_access,  # type: ignore[arg-type]
         approvals=approvals,  # type: ignore[arg-type]
         approval_reader=approval_reader,  # type: ignore[arg-type]
         actions=actions,  # type: ignore[arg-type]
