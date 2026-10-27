@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import copy
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from curie_worker.sandbox import k8s as k8s_module
 from kubernetes import client as kube
 from kubernetes.utils.quantity import parse_quantity
 
@@ -208,6 +210,114 @@ def test_inventory_follows_real_owner_chain_and_counts_unmatched_chargeable_pods
     assert after.claims == frozenset()
     assert after.sandboxes["owned-sandbox"] == "pending-claim"
     assert after.pods["uid-owned"].claim_name == "pending-claim"
+
+
+def test_inventory_of_fifty_bound_claims_fits_one_second_with_constant_api_reads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # https://github.com/kubernetes-sigs/agent-sandbox/blob/v0.5.0/extensions/controllers/sandboxclaim_controller.go#L1232
+    # https://github.com/kubernetes-sigs/agent-sandbox/blob/v0.5.0/controllers/sandbox_controller.go#L915
+    # https://kubernetes.io/docs/concepts/scheduling-eviction/pod-overhead/
+    api = InventoryAPI()
+    expected_resources: dict[str, dict[str, str]] = {}
+    expected_owners: dict[str, str] = {}
+    expected_pod_owners: dict[str, str] = {}
+    for index in range(50):
+        claim_name = f"claim-{index}"
+        sandbox_name = f"sandbox-{index}"
+        pool_name = f"{claim_name}-resources-pool"
+        template_name = f"{claim_name}-resources"
+        spec = _chart_template_spec()
+        pod_spec = spec["podTemplate"]["spec"]
+        pod_spec["priorityClassName"] = "acme-sandbox"
+        resources = _resources(f"{250 + index}m", f"{256 + index}Mi", "1", "1Gi")
+        pod_spec["containers"][0]["resources"] = resources
+        api.seed("sandboxtemplates", template_name, spec)
+        api.seed(
+            "sandboxwarmpools",
+            pool_name,
+            {"replicas": 0, "sandboxTemplateRef": {"name": template_name}},
+        )
+        claim = api.seed("sandboxclaims", claim_name, {"warmPoolRef": {"name": pool_name}})
+        claim["status"] = {"sandbox": {"name": sandbox_name}}
+        sandbox = api.seed("sandboxes", sandbox_name, {**spec, "operatingMode": "Running"})
+        sandbox["metadata"]["ownerReferences"] = [
+            {
+                "apiVersion": "extensions.agents.x-k8s.io/v1beta1",
+                "kind": "SandboxClaim",
+                "name": claim_name,
+                "uid": claim["metadata"]["uid"],
+            }
+        ]
+        pod = _pod(
+            f"pod-{index}",
+            owner_uid=sandbox["metadata"]["uid"],
+            owner_name=sandbox_name,
+            phase="Running",
+        )
+        pod.spec.containers[0].resources = kube.V1ResourceRequirements(**resources)
+        pod.spec.runtime_class_name = "gvisor"
+        pod.spec.overhead = dict(api.overhead)
+        api.pods.append(pod)
+        expected_resources[claim_name] = {
+            "pods": "1",
+            "requests.cpu": f"{350 + index}m",
+            "requests.memory": f"{320 + index}Mi",
+            "limits.cpu": "1100m",
+            "limits.memory": "1088Mi",
+        }
+        expected_owners[sandbox_name] = claim_name
+        expected_pod_owners[f"uid-pod-{index}"] = claim_name
+
+    elapsed = 0.0
+    reads: list[str] = []
+
+    def with_latency(method: Callable[..., Any]) -> Callable[..., Any]:
+        def read(*args: Any, **kwargs: Any) -> Any:
+            nonlocal elapsed
+            assert 0 < kwargs["_request_timeout"] <= 1.0
+            elapsed += 0.015
+            reads.append(method.__name__)
+            return method(*args, **kwargs)
+
+        return read
+
+    for name in (
+        "list_namespaced_custom_object",
+        "get_namespaced_custom_object",
+        "list_namespaced_pod",
+        "read_runtime_class",
+    ):
+        monkeypatch.setattr(api, name, with_latency(getattr(api, name)))
+    monkeypatch.setattr(k8s_module.time, "monotonic", lambda: elapsed)
+    client = _client(api)
+    client._node_api = api
+
+    inventory = client.capacity_inventory(
+        priority_class="acme-sandbox", request_timeout_seconds=1
+    )
+
+    assert inventory.claims == frozenset(expected_resources)
+    assert inventory.sandboxes == expected_owners
+    assert {
+        uid: pod.claim_name for uid, pod in inventory.pods.items()
+    } == expected_pod_owners
+    assert {
+        name: {key: parse_quantity(value) for key, value in values.items()}
+        for name, values in inventory.claim_resources.items()
+    } == {
+        name: {key: parse_quantity(value) for key, value in values.items()}
+        for name, values in expected_resources.items()
+    }
+    for uid, pod in inventory.pods.items():
+        assert {key: parse_quantity(value) for key, value in pod.resources.items()} == {
+            key: parse_quantity(value)
+            for key, value in expected_resources[expected_pod_owners[uid]].items()
+        }
+    assert inventory.suspended_claims == frozenset()
+    assert len(reads) <= 4
+    assert len(api.runtime_reads) <= 1
+    assert elapsed < 1.0
 
 
 @pytest.mark.parametrize("resource", ["sandboxclaims", "sandboxes", "pods"])
