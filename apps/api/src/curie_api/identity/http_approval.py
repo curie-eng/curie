@@ -9,7 +9,7 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any, NoReturn
 
-from aci_protocol import ApprovalRequest, QueuedTurn
+from aci_protocol import READER_CONTEXT, ApprovalRequest, QueuedTurn
 from curie_internal import identity_approval as wire
 from curie_internal import identity_context as codec
 from curie_telemetry import TRACEPARENT_STREAM_FIELD, canonicalize_traceparent
@@ -319,7 +319,7 @@ def _original(
         # The receiver registration is current permission, checked by the caller phase;
         # an identical historical retry never reasserts it.
         decoded = decode_creation_json(body.identity.payload.encode("utf-8"), max_bytes=262_144)
-        turn = QueuedTurn.model_validate(decoded)
+        turn = QueuedTurn.model_validate(decoded, context=READER_CONTEXT)
         handle = turn.reply_handle
         if (
             handle is None

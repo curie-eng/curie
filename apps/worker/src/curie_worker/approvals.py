@@ -652,7 +652,9 @@ class ApprovalClient:
                 raise ValueError
             captured = ApprovalCreationRequestV1(
                 schema_version=1, request_id=str(uuid.uuid4()),
-                approval=ApprovalRequest.model_validate_json(request.model_dump_json()),
+                approval=ApprovalRequest.model_validate_json(
+                    request.model_dump_json(), context=READER_CONTEXT,
+                ),
                 identity=ApprovalCreationIdentityV1.model_validate(identity),
             )
             payload = captured.model_dump_json().encode("utf-8")
