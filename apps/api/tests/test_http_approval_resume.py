@@ -53,7 +53,7 @@ CONTEXT_FIELD = "curie_identity_context_v1"
 
 def resume_module() -> Any:
     """@spec HTTP-APPROVAL-CONTINUITY-11: the owner under test, imported at use."""
-    from curie_api.identity import http_resume
+    from curie_api.identity import http_resume_publication as http_resume
 
     return http_resume
 

@@ -40,7 +40,7 @@ from curie_api.resumequeue import (
     resume_turn_for,
 )
 
-from .http_approval import _verified_capsule, approval_is_selected, approval_record_digest
+from .http_approval import approval_is_selected, approval_record_digest, verified_capsule
 from .http_invocation import HttpInvocationRuntime, current_http_approval_caller
 
 Role = Literal["invocation", "approver"]
@@ -183,7 +183,7 @@ class HttpResumeOwner:
             or row.status not in _RESUMABLE or row.resolved_at is None
         ):
             raise ApprovalResumeRefused("unsupported_resume")
-        saved = _verified_capsule(runtime, row)
+        saved = verified_capsule(runtime, row)
         if saved is None or saved.status == "pending":
             raise ApprovalResumeRefused("unsupported_resume")
         return saved

@@ -53,7 +53,7 @@ from .identity.http_initializer import (
     load_provider_tls_context,
 )
 from .identity.http_invocation import HttpInvocationRuntime
-from .identity.http_resume import http_resume_owner
+from .identity.http_resume_publication import http_resume_owner
 from .identity.http_transport import HttpIdentityClient
 from .identity_fence import IdentityFenceMiddleware
 from .k8s import build_lazy_pod_lister, build_lazy_pod_log_reader
