@@ -383,7 +383,7 @@ def test_exact_grant_snapshot_reaches_the_approver_boundary_and_fails_closed(
         ("granted_arguments_json", None),
         ("granted_arguments_json", '{"path":"other"}'),
         ("gate_kind", "policy"),
-        ("agent_id", str(uuid.uuid4())),
+        ("agent_id", "00000000-0000-4000-8000-0000000000a1"),
         ("conversation_id", "1760000000.999999"),
     ],
 )
