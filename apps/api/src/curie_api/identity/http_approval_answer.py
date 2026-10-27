@@ -12,9 +12,12 @@ import asyncio
 import hashlib
 import hmac
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any, Literal, NoReturn
+from types import SimpleNamespace
+from typing import Any, Literal, NoReturn, cast
 
 from curie_internal import identity_approval as wire
 from curie_internal import identity_context as codec
@@ -32,6 +35,7 @@ from curie_api.schemas.http_authority import HttpSelectionV1
 from curie_api.schemas.http_identity import LookupRequestV1, SenderV1, ValidatedFacts
 from curie_api.slack_approvers import SlackUserGroupMembers, approval_token_identity
 
+from .delivery_validity import identity_delivery_window
 from .http_approval import approval_record_digest, verified_capsule
 from .http_credential_registry import ResolvedProviderCredential
 from .http_invocation import (
@@ -44,6 +48,11 @@ from .http_invocation import (
     lookup_request,
     source_facts,
     source_permission,
+)
+from .http_resume_publication import (
+    ApprovedResumeAuthority,
+    CurrentResumeAuthority,
+    ResumeWindow,
 )
 from .http_transport import HttpIdentityClient, HttpIdentityObservation
 from .slack import AUTH_TEST_KEY, INTERACTION_DELIVERIES, SlackEvidence, derive
@@ -711,3 +720,81 @@ async def check_http_approval_actor(
         raise
     except Exception:  # noqa: BLE001 - provider, credential and SQL details never cross.
         _unavailable()
+
+
+def approved_resume_authority(state: Any) -> ApprovedResumeAuthority:
+    """The two-subject current check an approved selected resume publishes under.
+
+    Fresh original-invoker (purpose=invocation) and preserved answering-actor
+    (purpose=approval, role=approver) authority, each against its sealed
+    association, through the same read-only phases 1 to 4 as
+    ``check_http_approval_actor``. Every lookup and route-membership decision
+    finishes before the final read-only reader opens; that reader is yielded
+    with the stable fence read under it and one T1 window per role, and it
+    writes nothing. Phase 5 is absent. @spec HTTP-APPROVAL-CONTINUITY-8/9/11.
+    """
+
+    @asynccontextmanager
+    async def authority(saved: wire.ApprovalContextV1) -> AsyncIterator[CurrentResumeAuthority]:
+        """@spec HTTP-APPROVAL-CONTINUITY-8/9/11."""
+        runtime = getattr(state, "http_identity_runtime", None)
+        client = getattr(state, "http_identity_client", None)
+        if type(runtime) is not HttpInvocationRuntime or not isinstance(
+            client, HttpIdentityClient,
+        ):
+            _unavailable()
+        request = cast(Request, SimpleNamespace(app=SimpleNamespace(state=state)))
+        factory, valkey = state.sessionmaker, state.valkey
+        approval_id = uuid.UUID(saved.approval_id)
+        # Phase 1: a short reader capture of both subjects; released before lookups.
+        async with factory() as session, session.begin():
+            await identity_fence.lock_identity_reader(session)
+            row = await session.get(Approval, approval_id, populate_existing=True)
+            if (
+                row is None or row.status != ApprovalStatus.approved or row.purpose != "session"
+                or verified_capsule(runtime, row) != saved or saved.status != "approved"
+            ):
+                _refuse(403, "unsupported_approval")
+            actor, association = _preserved_actor(runtime, row, saved)
+            try:
+                caller_registration, caller_source = invocation_source(runtime, saved)
+            except HTTPException:
+                _deny()
+            caller = await _prepare(
+                session, runtime, "invocation", caller_registration, caller_source,
+            )
+            approver = await _prepare(
+                session, runtime, "approver", actor.registration, actor.source,
+            )
+            route_binding = await approvals_crud.get_approval_route_binding(session, row)
+            snapshot = approval_record_digest(row)
+        composition = _Composition(
+            request, runtime, client, factory, valkey, approval_id, snapshot, row,
+            route_binding, state.approver_sets, actor.source.sender.native_id, actor.channel,
+            [caller, approver], {"invocation": saved, "approver": association},
+        )
+        # Phases 2 and 3: lookups and route membership outside SQL, then lifecycle.
+        await composition.observe_and_apply()
+        # Phase 4: the final clean reader, held open across the guarded append.
+        async with factory() as session, session.begin():
+            await identity_fence.lock_identity_reader(session)
+            facts = await composition.verify(session, writer=False)
+            _pending(
+                await session.get(Approval, approval_id, populate_existing=True),
+                snapshot, status=row.status,
+            )
+            stable = await valkey.get(identity_fence.FENCE_KEY)
+            if isinstance(stable, bytes):
+                stable = stable.decode("ascii")
+            if type(stable) is not str or not stable.startswith("stable:"):
+                _unavailable()
+            windows: dict[Literal["invocation", "approver"], ResumeWindow] = {}
+            for subject in composition.subjects:
+                validity = identity_delivery_window(facts[subject.role], subject.credential.limits)
+                windows[subject.role] = ResumeWindow(
+                    validity.lower_seconds * 1_000_000 + validity.lower_microseconds,
+                    validity.upper_seconds * 1_000_000 + validity.upper_microseconds,
+                )
+            yield CurrentResumeAuthority(session=session, stable_fence=stable, windows=windows)
+
+    return authority
