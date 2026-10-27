@@ -52,8 +52,8 @@ def _constant(value: str) -> Never:
     raise ValueError
 
 
-def _read(directory: str, name: str) -> bytes:
-    """@spec HTTP-INVOCATION-EXECUTION-20."""
+def _read(directory: str, name: str, *, optional: bool = False) -> bytes | None:
+    """@spec HTTP-INVOCATION-EXECUTION-20: an optional file may be absent, nothing else."""
     if type(directory) is not str or not directory or type(name) is not str:
         _refuse("unconfigured_directory")
     try:
@@ -63,6 +63,10 @@ def _read(directory: str, name: str) -> bytes:
     try:
         try:
             descriptor = os.open(name, _FILE_FLAGS, dir_fd=directory_fd)
+        except FileNotFoundError:
+            if optional:
+                return None
+            _refuse("unsafe_file")
         except OSError:
             _refuse("unsafe_file")
         try:
@@ -89,9 +93,19 @@ def _read(directory: str, name: str) -> bytes:
         os.close(directory_fd)
 
 
+def read_optional_operator_bytes(directory: str, name: str) -> bytes | None:
+    """One protected file's bytes, or None when it does not exist.
+
+    @spec HTTP-INVOCATION-EXECUTION-20.
+    """
+    return _read(directory, name, optional=True)
+
+
 def read_operator_json(directory: str, name: str) -> Any:
     """Strict JSON from one protected file. @spec HTTP-INVOCATION-EXECUTION-20."""
     raw = _read(directory, name)
+    if raw is None:  # only an optional read returns None
+        _refuse("unsafe_file")
     try:
         text = raw.decode("utf-8")
         # Reject lone surrogates that JSON escapes would otherwise smuggle in.

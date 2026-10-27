@@ -7,7 +7,10 @@ replacement (HTTP-INVOCATION-EXECUTION-1).
 
 from __future__ import annotations
 
+import base64
 import json
+import re
+import ssl
 from collections.abc import Mapping
 from typing import Any, Literal, Never
 
@@ -16,6 +19,7 @@ from curie_internal.operator_file import (
     OperatorFileRefusal,
     decode_key_material,
     read_operator_json,
+    read_optional_operator_bytes,
 )
 from pydantic import BaseModel, ConfigDict
 
@@ -37,7 +41,13 @@ from curie_api.schemas.http_authority import (
 )
 
 RUNTIME_FILE = "api-runtime.json"
+PROVIDER_CA_FILE = "provider-ca.pem"
 _MAX_ENTRIES = 256
+_MAX_CA_BYTES = 262_144
+_MAX_CA_CERTIFICATES = 16
+_CERTIFICATE = re.compile(
+    r"-----BEGIN CERTIFICATE-----\n((?:[A-Za-z0-9+/=]{1,76}\n)+)-----END CERTIFICATE-----\n",
+)
 
 Stage = Literal["unconfigured_directory", "unsafe_file", "invalid_document", "invalid_runtime"]
 
@@ -152,3 +162,54 @@ def configured_http_identity_runtime(settings: Settings) -> HttpInvocationRuntim
     if directory is None:
         return None
     return load_http_identity_runtime(directory)
+
+
+def _certificate_blocks(raw: bytes) -> int:
+    """Count canonical PEM certificate blocks, or refuse. @spec HTTP-INVOCATION-EXECUTION-20."""
+    if not 0 < len(raw) <= _MAX_CA_BYTES:
+        raise ValueError
+    text = raw.decode("ascii")
+    position, blocks = 0, 0
+    while position < len(text):
+        if text[position] == "\n":
+            position += 1
+            continue
+        match = _CERTIFICATE.match(text, position)
+        if match is None:
+            raise ValueError
+        body = match.group(1).replace("\n", "")
+        if base64.b64encode(base64.b64decode(body, validate=True)).decode("ascii") != body:
+            raise ValueError
+        blocks += 1
+        position = match.end()
+    if not 1 <= blocks <= _MAX_CA_CERTIFICATES:
+        raise ValueError
+    return blocks
+
+
+def load_provider_tls_context(directory: str) -> ssl.SSLContext | None:
+    """The optional private trust anchor for provider lookups.
+
+    @spec HTTP-INVOCATION-EXECUTION-20: None keeps the default verified trust; otherwise
+    the supplied CA certificates are the only anchors and hostnames are still verified.
+    """
+    try:
+        raw = read_optional_operator_bytes(directory, PROVIDER_CA_FILE)
+    except OperatorFileRefusal as refusal:
+        _refuse(refusal.stage)
+    if raw is None:
+        return None
+    try:
+        blocks = _certificate_blocks(raw)
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        context.load_verify_locations(cadata=raw.decode("ascii"))
+        stats = context.cert_store_stats()
+        if (
+            stats.get("x509") != blocks or stats.get("x509_ca") != blocks
+            or context.verify_mode != ssl.CERT_REQUIRED or not context.check_hostname
+        ):
+            raise ValueError
+        return context
+    except Exception:  # noqa: BLE001 - bundle defects never expose supplied bytes.
+        _refuse("invalid_document")
