@@ -314,3 +314,30 @@ def test_selected_recovery_without_actor_proof_still_refuses(
     assert response.status_code == 409, response.text
     assert response.json() == {"detail": "unsupported_approval"}
     unchanged(case, 2)
+
+
+def test_original_invoker_losing_invocation_authority_blocks_an_approver_answer(
+    answer_case: SimpleNamespace,
+) -> None:
+    """@spec HTTP-APPROVAL-CONTINUITY-8: the original invoker is checked independently."""
+    case = answer_case
+
+    async def narrow(factory: async_sessionmaker[AsyncSession]) -> None:
+        """@spec HTTP-APPROVAL-CONTINUITY-8: only the invocation role changes."""
+        async with factory() as session, session.begin():
+            result = await agent_role_policy.apply_role_change(session, change=change(
+                uuid.UUID(case.scope["tenant"]), uuid.UUID(case.scope["agent"]),
+                version=case.scope["role_version"], target="invocation",
+                filter={"entries": [
+                    {"kind": "issuer_group",
+                     "group": {"issuer": ISSUER, "id": "SyntheticInvokerOnlyGroup"}},
+                ]},
+            ))
+            case.scope["role_version"] = result.version
+
+    run(narrow)
+    before = len(case.provider.requests)
+    response = resolve(case, *answer(case))
+    assert response.status_code == 403, response.text
+    assert response.json() == {"detail": "caller_not_allowed"}
+    unchanged(case, before + 2)
