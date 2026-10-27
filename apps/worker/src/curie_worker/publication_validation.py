@@ -12,20 +12,18 @@ import tarfile
 import tempfile
 import tomllib
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, cast
+from typing import cast
 
 import yaml
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 
+from .runner_client import RunnerWorkspaceSnapshot
 from .workspace import (
     WorkspaceClaimCoordinator,
     WorkspacePreparationError,
     scrubbed_git_environment,
 )
-
-if TYPE_CHECKING:
-    from .runner_client import RunnerWorkspaceSnapshot
 
 MAX_PATCH_BYTES = 900_000
 _SAFE_GIT_MODES = {"000000", "100644", "100755"}

@@ -9,7 +9,7 @@ third time in a worker test fixture), a seam the blob-storage INTERFACE flagged 
 alignment cannot drift.
 
 It takes primitives, not either app's config object, so it couples to neither
-`curie_api.Settings` nor `curie_worker.config.WorkerConfig`. `boto3` is imported
+`curie_api.Settings` nor `curie_worker.WorkerConfig`. `boto3` is imported
 lazily inside the function so importing this module (and the rest of
 ``aci_protocol``) never requires boto3 for consumers that do not touch S3.
 
