@@ -203,6 +203,14 @@ class CodeHost(Protocol):
 
     async def read_commit(self, repository: RepositoryRef, sha: str) -> Commit: ...
 
+    async def is_ancestor(self, repository: RepositoryRef, ancestor: str, descendant: str) -> bool:
+        """Whether ``ancestor`` is reachable from ``descendant`` through any parent.
+
+        Equal shas are true. False only when the forge answers that it is not;
+        `Unavailable` when the forge cannot answer, including a missing commit.
+        """
+        ...
+
     async def find_pull_request(
         self, repository: RepositoryRef, *, head_ref: str
     ) -> PullRequest | None:

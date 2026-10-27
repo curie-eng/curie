@@ -16,6 +16,7 @@ import logging
 import re
 from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from typing import Any
+from urllib.parse import urlencode
 
 from curie_api.forges import types
 from curie_api.forges.capabilities import CODE_HOST_OPERATIONS, Operation, Support
@@ -72,6 +73,7 @@ _STATES = {
     "locked": PullRequestState.CLOSED,
 }
 # The title prefixes GitLab reads as a draft; the factory writes ``Draft: ``.
+_COMMIT_SHA = re.compile(r"[0-9a-f]{40,64}")
 _DRAFT_PREFIX = re.compile(r"^\s*(?:draft:|\[draft\]|\(draft\))\s*", re.IGNORECASE)
 DRAFT_PREFIX = "Draft: "
 # GitLab can refuse a merge request for a branch pushed a moment ago with a 400
@@ -213,6 +215,23 @@ class GitLabCodeHost:
             parents=tuple(p for p in (parents if isinstance(parents, list) else []) if p),
             message=_text(commit.get("message")),
         )
+
+    async def is_ancestor(self, repository: RepositoryRef, ancestor: str, descendant: str) -> bool:
+        if ancestor == descendant:
+            return True
+        # Compare carries no ahead/behind status, so ask for the merge base. A 404
+        # does not say whether a ref is missing or the commits share no ancestor.
+        query = urlencode([("refs[]", ancestor), ("refs[]", descendant)])
+        try:
+            base = await self._transport.get_object(
+                f"{self._project(repository)}/repository/merge_base?{query}"
+            )
+        except NotFound:
+            raise Unavailable("ancestry_unknown") from None
+        found = base.get("id")
+        if not isinstance(found, str) or _COMMIT_SHA.fullmatch(found) is None:
+            raise Unavailable("malformed")
+        return found == ancestor
 
     # Merge requests ----------------------------------------------------------------
 
