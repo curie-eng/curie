@@ -3,14 +3,16 @@
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from starlette.concurrency import run_in_threadpool
 
 from curie_api.crud import agents as crud_agents
 from curie_api.crud import deployments as crud_deployments
 from curie_api.crud import versions as crud_versions
 from curie_api.schemas.deployments import DeploymentCreate, DeploymentOut
 
-from .. import deploy
+from .. import deploy, factory_capabilities
 from ..auth import require_api_key
+from ..config import get_settings
 from ..deps import SessionDep, StoreDep
 
 router = APIRouter(
@@ -45,6 +47,19 @@ async def create_deployment(
         await deploy.revalidate_stored_bundle(store, version)
     except deploy.BundleTooLarge as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+    if version.bundle_ref is not None:
+        bundle_data = await store.get(version.bundle_ref)
+        try:
+            await run_in_threadpool(
+                factory_capabilities.read_manifest,
+                bundle_data,
+                get_settings(),
+                expected_bundle_sha256=version.bundle_sha256,
+                required=False,
+                require_registry_image=True,
+            )
+        except factory_capabilities.CapabilityUnknown as exc:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
     # @spec ACTION-EXECUTOR-16: a bundle stored before intake refused a
     # non-SecretRef sealing key declaration is refused here too, before any row.
     try:
@@ -81,6 +96,33 @@ async def get_deployment(
     if deployment is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "deployment not found")
     return DeploymentOut.model_validate(deployment)
+
+
+@router.get(
+    "/{deployment_id}/capabilities", response_model=factory_capabilities.CapabilityRead
+)
+async def read_deployment_capabilities(
+    deployment_id: uuid.UUID, session: SessionDep, store: StoreDep
+) -> factory_capabilities.CapabilityRead:
+    deployment = await crud_deployments.get_deployment(session, deployment_id)
+    if deployment is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "deployment not found")
+    version = await crud_versions.get_version(session, deployment.version_id)
+    if version is None or version.bundle_ref is None or version.bundle_sha256 is None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "environment_unknown")
+    bundle_data = await store.get(version.bundle_ref)
+    try:
+        claim = await run_in_threadpool(
+            factory_capabilities.read_manifest,
+            bundle_data,
+            get_settings(),
+            expected_bundle_sha256=version.bundle_sha256,
+            require_registry_image=True,
+        )
+    except factory_capabilities.CapabilityUnknown as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, "environment_unknown") from exc
+    assert claim is not None
+    return claim
 
 
 @router.delete("/{deployment_id}", status_code=status.HTTP_204_NO_CONTENT)

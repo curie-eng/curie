@@ -404,6 +404,15 @@ async def store_bundle(
 ) -> BundleOut:
     """Store validated bytes under the immutable key and record them."""
 
+    # Both direct upload and git-flow attachment use this write seam. A
+    # malformed present claim must never become an immutable stored artifact;
+    # legacy bundles without a claim retain their current deployment path.
+    from curie_api import factory_capabilities
+
+    await run_in_threadpool(
+        factory_capabilities.read_manifest, data, get_settings(), required=False
+    )
+
     key = f"bundles/{agent_id}/{version.id}{extension}"
     digest = hashlib.sha256(data).hexdigest()
     await store.put(key, data, content_type)

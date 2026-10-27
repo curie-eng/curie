@@ -15,7 +15,7 @@ from curie_api.crud import deployments as crud_deployments
 from curie_api.crud import versions as crud_versions
 from curie_api.schemas.versions import BundleOut
 
-from .. import bundles, deploy
+from .. import bundles, deploy, factory_capabilities
 from ..auth import require_api_key
 from ..config import get_settings
 from ..deps import SessionDep, StoreDep
@@ -155,9 +155,12 @@ async def upload_bundle(
         except deploy.ApprovalRoutesUnbound as exc:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
 
-    return await deploy.store_bundle(
-        store, session, agent_id, version, data, extension, content_type
-    )
+    try:
+        return await deploy.store_bundle(
+            store, session, agent_id, version, data, extension, content_type
+        )
+    except factory_capabilities.CapabilityUnknown as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
 
 
 @router.get("")
