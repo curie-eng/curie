@@ -42,12 +42,14 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any, Final
 
+from fastapi import HTTPException
 from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .action_undoable import undo_refusal
 from .config import get_settings
+from .identity.writer_selection import http_selected_scope
 from .models import (
     Agent,
     AgentAction,
@@ -233,6 +235,26 @@ async def _offer_undo(
     if surface is None:
         logger.warning(
             "remediation undo not offered: no reply surface nomination=%s", nomination.id
+        )
+        return None
+    # The outcome's own transaction must commit, so a refusal only declines the
+    # offer. Unavailable classification never selects legacy.
+    # @spec HTTP-APPROVAL-CONTINUITY-1.
+    try:
+        selected = await http_selected_scope(
+            session,
+            Approval(
+                agent_id=action.agent_id,
+                reply_kind=surface.kind,
+                reply_channel=surface.channel,
+                reply_adapter=surface.adapter,
+            ),
+        )
+    except HTTPException:
+        selected = True
+    if selected:
+        logger.warning(
+            "remediation undo not offered: scope not supported nomination=%s", nomination.id
         )
         return None
     document: Mapping[str, Any] = generation.document if generation is not None else {}

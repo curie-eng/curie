@@ -44,12 +44,14 @@ from datetime import timedelta
 from typing import Any, Final
 
 from aci_protocol.turn import QueuedTurn
+from fastapi import HTTPException
 from sqlalchemy import func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .action_forward import ForwardCreated, ForwardRefused, arguments_sha256
 from .config import get_settings
+from .identity.writer_selection import http_selected_scope
 from .models import (
     Agent,
     Approval,
@@ -296,6 +298,25 @@ async def request_remediation_approval(
         nomination.approval_id = approval_id
         await session.commit()
         return RemediationApprovalRequested(approval_id=approval_id, created=False)
+
+    # Before the card's reads or any insert. @spec HTTP-APPROVAL-CONTINUITY-1.
+    try:
+        selected = await http_selected_scope(
+            session,
+            Approval(
+                agent_id=nomination.agent_id,
+                reply_kind=handle.kind,
+                reply_channel=handle.channel,
+                reply_adapter=handle.adapter,
+            ),
+        )
+    except HTTPException:
+        # Unavailable classification never selects the legacy writer.
+        await session.rollback()
+        raise RemediationApprovalUnavailable("the approval scope cannot be classified") from None
+    if selected:
+        await session.rollback()
+        raise RemediationApprovalUnavailable("the approval scope is selected for HTTP identity")
 
     tune_reads = (
         await tune_read_rows(

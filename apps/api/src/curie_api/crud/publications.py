@@ -14,6 +14,7 @@ from curie_api.schemas.channels import BUILTIN_CLUSTER_MESSAGE_ADAPTER
 from curie_api.schemas.publications import PublicationCreate
 
 from ..config import get_settings
+from ..identity.writer_selection import http_selected_scope
 from ..models import (
     Approval,
     ApprovalAuditEntry,
@@ -340,6 +341,23 @@ async def create_publication(
     if agent is None:
         raise LookupError("agent not found")
     auto = agent.publication_policy == POLICY_AUTO
+    # Before any lineage or reservation change. @spec HTTP-APPROVAL-CONTINUITY-1.
+    if await http_selected_scope(
+        session,
+        Approval(
+            agent_id=deployment.agent_id,
+            reply_kind=data.reply_kind,
+            reply_channel=data.reply_channel,
+            reply_adapter=data.reply_adapter,
+            reply_identity=normalized_reply_identity(
+                data.reply_kind, data.reply_adapter, data.reply_identity
+            ),
+        ),
+    ):
+        raise PublicationLineageConflict(
+            "publication.unsupported_approval",
+            "publication approvals are not supported for an HTTP-selected scope",
+        )
 
     owned_request = await _refuse_fenced_work_item(
         session,
