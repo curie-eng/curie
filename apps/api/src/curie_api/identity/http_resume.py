@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from curie_api import identity_fence
 from curie_api.identity.http_approval import canonical_json, verified_capsule
+from curie_api.identity.http_approval_answer import check_http_approval_actor
 from curie_api.identity.http_invocation import (
     HttpInvocationRuntime,
     check_http_turn_authority,
@@ -140,9 +141,19 @@ async def _check_resume(
     except (SQLAlchemyError, RedisError, identity_fence.IdentityWriterUnavailable):
         return turn_authority_response(check, "unavailable", "authority_unavailable")
     if resume.status == "approved":
-        # Criterion 8's independent approver composition is not realized, so a
-        # preserved actor cannot be freshly reauthorized: approval never continues.
-        return turn_authority_response(check, "refuse", "unsupported_resume")
+        # The preserved answering actor needs fresh approver authority of its own,
+        # independently of the original invoker checked below. @spec HTTP-APPROVAL-CONTINUITY-8/12.
+        try:
+            await check_http_approval_actor(
+                request, uuid.UUID(resume.approval_id),
+                approver_sets=request.app.state.approver_sets,
+            )
+        except HTTPException as error:
+            if error.status_code == 403 and error.detail == "caller_not_allowed":
+                return turn_authority_response(check, "refuse", "caller_not_allowed")
+            if error.status_code == 403:
+                return turn_authority_response(check, "refuse", "unsupported_resume")
+            return turn_authority_response(check, "unavailable", "authority_unavailable")
     reason: Literal["current_authority", "invalid_context"] = "invalid_context"
     try:
         async with current_source_authority(
