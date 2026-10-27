@@ -319,7 +319,7 @@ def test_approved_resume_without_fresh_approver_authority_fails_closed(
 ) -> None:
     """@spec HTTP-APPROVAL-CONTINUITY-12: preserved actor still needs fresh approver authority.
 
-    Approver composition (criterion 8) is not realized, so approval never continues.
+    This fixture actor was never an answering approver, so approval never continues.
     """
     case = resolved_case
     token, payload = resume_token(case, resolve(case, "approved"))
@@ -327,7 +327,7 @@ def test_approved_resume_without_fresh_approver_authority_fails_closed(
         request = resume_check(case, token, payload, stage=stage)
         assert_response(
             post_check(case.client, request), request,
-            decision="refuse", reason="unsupported_resume",
+            decision="refuse", reason="caller_not_allowed",
         )
     assert len(case.provider.requests) == 2
 
@@ -370,7 +370,7 @@ def test_exact_grant_snapshot_reaches_the_approver_boundary_and_fails_closed(
     body = grant_request(case, token, payload)
     assert body["grant"]["granted_arguments_json"] == "{}"
     assert_grant(
-        post_grant(case.client, body), body, decision="refuse", reason="unsupported_resume",
+        post_grant(case.client, body), body, decision="refuse", reason="caller_not_allowed",
     )
     assert len(case.provider.requests) == 2
 
