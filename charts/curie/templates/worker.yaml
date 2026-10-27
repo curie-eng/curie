@@ -43,8 +43,7 @@
 The worker drives the Kubernetes API to claim and manage agent-sandbox custom
 resources (the substrate's SandboxClient). It gets a namespaced Role scoped to
 exactly the CRD verbs KubernetesSandboxClient uses -- SandboxClaims it
-creates/reads/deletes/lists, Sandboxes it reads, lists and patches (suspend/resume).
-Admission also reads the selected RuntimeClass to account for Pod overhead.
+creates/reads/deletes/lists, Sandboxes it reads and patches (suspend/resume).
 RBAC does not require the CRDs to be installed for the Role to
 apply, so this is valid even when agentSandbox.deploy is false.
 */}}
@@ -76,7 +75,7 @@ rules:
     verbs: ["create", "get", "list", "delete"]
   - apiGroups: ["agents.x-k8s.io"]
     resources: ["sandboxes"]
-    verbs: ["get", "patch", "list"]
+    verbs: ["get", "patch"]
   # Pressure recovery reads only the exact quota named by the rejected claim.
   # The worker never lists, watches, or changes ResourceQuota objects.
   - apiGroups: [""]
@@ -110,11 +109,10 @@ rules:
     resources: ["secrets"]
     verbs: ["create"]
   {{- end }}
-  # Admission lists Pods to charge occupied capacity, including surviving children.
   # Stream failure diagnosis reads the exact sandbox Pod and its events.
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["get", "list"]
+    verbs: ["get"]
   # A claim that never became Ready logs the runner's last 8 KB before cleanup.
   - apiGroups: [""]
     resources: ["pods/log"]
@@ -196,6 +194,39 @@ subjects:
     namespace: {{ .Release.Namespace }}
 ---
 {{- if and .Values.agentSandbox.deploy .Values.resourceQuota.enabled }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "curie.fullname" . }}-worker-admission
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: sandbox-admission
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list"]
+  - apiGroups: ["agents.x-k8s.io"]
+    resources: ["sandboxes"]
+    verbs: ["list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "curie.fullname" . }}-worker-admission
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+    app.kubernetes.io/component: sandbox-admission
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "curie.fullname" . }}-worker-admission
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "curie.fullname" . }}-worker
+    namespace: {{ .Release.Namespace }}
+---
 {{- $runtimeClass := include "curie.gvisor.runtimeClassName" . | trim }}
 {{- if $runtimeClass }}
 {{- $runtimeClassRole := printf "%s-worker-runtimeclass-%s" (include "curie.fullname" .) .Release.Namespace }}

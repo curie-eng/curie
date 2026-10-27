@@ -1154,12 +1154,12 @@ then verifies shared admission headroom and the exact named ResourceQuota in
 its configured namespace. It retries only when live spec and status hard limits
 agree and every refused resource has enough current headroom. A transient
 inventory read supplies no observation and is polled again within that same
-window. The worker Role adds only namespaced inventory reads on Sandboxes and
-Pods and retains `get` on core `resourcequotas`. A separate cluster grant permits
-only `get` on the selected RuntimeClass when required for overhead. A missing
-permission, malformed
-quantity, mismatched spec and status limits, or timeout fails closed. The
-rejected claim or another quota can consume the freed capacity before the full
+window. With sandbox quotas enabled, a dedicated namespaced `worker-admission`
+Role grants only `list` on Sandboxes and Pods. The main worker Role retains
+`get` on core `resourcequotas`. A separate cluster grant permits only `get` on
+the selected RuntimeClass when required for overhead. A missing permission,
+malformed quantity, mismatched spec and status limits, or timeout fails closed.
+The rejected claim or another quota can consume the freed capacity before the full
 retry. That bounded race records `reclaimed-retry-refused`; it does not delete
 another victim or schedule work.
 
