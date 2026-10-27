@@ -9,6 +9,7 @@ import sys
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -238,7 +239,9 @@ def kubectl_inventory(helper, snapshot, monkeypatch):
     def run(command, **_kwargs):
         args = arguments(command)
         if "--raw" in args:
-            source = endpoints[args[args.index("--raw") + 1]]
+            url = urlsplit(args[args.index("--raw") + 1])
+            assert not url.query
+            source = endpoints[url.path]
             document = inventories[source]
         else:
             source = next(key for key, value in resources.items() if value[0] == args[0])
@@ -251,19 +254,26 @@ def kubectl_inventory(helper, snapshot, monkeypatch):
         return helper.subprocess.CompletedProcess(command, 0, json.dumps(document), "")
 
     class Watch:
-        def __init__(self, events):
+        def __init__(self, events, returncode=0):
             self.stdout = io.StringIO("".join(json.dumps(event) + "\n" for event in events))
+            self.returncode = returncode
 
         def poll(self):
-            return 0
+            return self.returncode
 
         def wait(self, **_kwargs):
-            return 0
+            return self.returncode
 
     def popen(command, **_kwargs):
         args = arguments(command)
-        assert "--watch-only" in args
-        source = next(key for key, value in resources.items() if value[0] == args[0])
+        # Observed kubectl get exits 1 for the unsupported --resource-version flag.
+        if "--resource-version" in args:
+            return Watch([], returncode=1)
+        assert "--raw" in args
+        url = urlsplit(args[args.index("--raw") + 1])
+        query = parse_qs(url.query)
+        assert query["watch"] == ["true"]
+        source = endpoints[url.path]
         return Watch(watch_events[source])
 
     monkeypatch.setattr(helper.subprocess, "run", run)
@@ -281,13 +291,18 @@ def test_raw_inventory_preserves_server_list_versions_for_both_watches(
     subject._start_objects()
     assert subject.observer.max_claims == 2
     assert subject.observer.max_sandboxes == 2
-    watches = [command for command in calls if "--watch-only" in command]
-    assert [
-        (command[6], command[command.index("--resource-version") + 1])
-        for command in watches
-    ] == [
-        ("sandboxclaims.extensions.agents.x-k8s.io", "110"),
-        ("sandboxes.agents.x-k8s.io", "220"),
+    watches = []
+    for command in calls:
+        if "--raw" in command:
+            url = urlsplit(command[command.index("--raw") + 1])
+            query = parse_qs(url.query)
+            if query:
+                watches.append((
+                    url.path.rsplit("/", 1)[1], query["watch"], query["resourceVersion"],
+                ))
+    assert watches == [
+        ("sandboxclaims", ["true"], ["110"]),
+        ("sandboxes", ["true"], ["220"]),
     ]
 
 
@@ -302,11 +317,18 @@ def test_raw_inventory_rejects_missing_or_invalid_server_version(
         subject._start_objects()
 
 
-def test_watch_third_claim_counts_initial_deleting_claim(helper, kubectl_inventory) -> None:
+@pytest.mark.parametrize("event_type", ["ADDED", "DELETED", "ERROR"])
+def test_watch_third_claim_and_api_errors_fail(helper, kubectl_inventory, event_type) -> None:
     subject, _, watch_events, _ = kubectl_inventory
+    obj = {"metadata": {"name": "acme-c", "resourceVersion": "111"}}
+    failure = "more than two claims or Sandboxes"
+    if event_type == "ERROR":
+        obj = {"apiVersion": "v1", "kind": "Status", "status": "Failure",
+               "reason": "Expired", "code": 410}
+        failure = "invalid admission inventory watch event"
     watch_events["claims"].append({
-        "type": "ADDED",
-        "object": {"metadata": {"name": "acme-c", "resourceVersion": "111"}},
+        "type": event_type,
+        "object": obj,
     })
     subject._start_objects()
     assert subject.observer.max_claims == 2
@@ -315,7 +337,7 @@ def test_watch_third_claim_counts_initial_deleting_claim(helper, kubectl_invento
     while not subject._events.empty():
         event = subject._events.get_nowait()
         if event[:2] == ("data", "claims"):
-            with pytest.raises(helper.ObservationError, match="more than two claims or Sandboxes"):
+            with pytest.raises(helper.ObservationError, match=failure):
                 subject._event(*event)
             return
-    pytest.fail("kubectl watch did not deliver its third claim")
+    pytest.fail("kubectl watch did not deliver its event")
