@@ -65,7 +65,7 @@ from .blocks import (
     resolved_approval_card,
     to_blocks,
 )
-from .slack_text import split_answer, split_verbatim_answer
+from .slack_text import split_answer, split_verbatim_answer, verbatim_rich_text
 from .slack_tokens import token_identity
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle: reply_sink builds this adapter
@@ -685,22 +685,9 @@ class SlackReplyAdapter:
         for index, part in enumerate(parts):
             payload = (part.text, blocks if len(parts) == 1 else None)
             if verbatim:
-                # A plain_text section shows line breaks as spaces in the client;
-                # preformatted rich text shows every character and line break.
-                payload = (
-                    part.content,
-                    [
-                        {
-                            "type": "rich_text",
-                            "elements": [
-                                {
-                                    "type": "rich_text_preformatted",
-                                    "elements": [{"type": "text", "text": part.content}],
-                                }
-                            ],
-                        }
-                    ],
-                )
+                # ADR 0250: an ordinary rich text section keeps every character
+                # and line break without drawing the answer as a code box.
+                payload = (part.content, [verbatim_rich_text(part.content)])
             if structured is not None and len(parts) > 1:
                 last = index == len(parts) - 1
                 payload = (
