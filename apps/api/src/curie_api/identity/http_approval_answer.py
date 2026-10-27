@@ -46,7 +46,7 @@ from .http_invocation import (
     source_permission,
 )
 from .http_transport import HttpIdentityClient, HttpIdentityObservation
-from .slack import AUTH_TEST_KEY, INTERACTION_DELIVERIES, SlackEvidence, derive
+from .slack import INTERACTION_DELIVERIES, SlackEvidence, derive_registered_sender
 
 PROOF_HEADER = "X-Curie-Approval-Receiver-Proof"
 _INVALID_PRINCIPAL = "missing or invalid approval principal"
@@ -158,13 +158,14 @@ def _authenticate_actor(
         or saved.scope.binding_id not in registration.binding_ids
     ):
         _invalid()
-    sender = derive(
+    # The registered-sender owner: an ordinary workspace keeps the existing
+    # derivation; a Grid workspace resolves in its organisation and only from
+    # its own workspace (@spec HTTP-INVOCATION-EXECUTION-21).
+    sender = derive_registered_sender(
         signed,
-        identity_attributes={AUTH_TEST_KEY: {
-            "team_id": registration.installation_account, "user_id": registration.bot_user_id,
-            "enterprise_id": None, "is_enterprise_install": False,
-        }},
-        installation_authority=registration.namespace.authority,
+        namespace_kind=registration.namespace.kind,
+        namespace_authority=registration.namespace.authority,
+        namespace_key=registration.namespace.key,
         installation_account=registration.installation_account,
     )
     if (
