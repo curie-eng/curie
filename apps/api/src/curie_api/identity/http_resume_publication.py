@@ -196,11 +196,8 @@ class HttpResumeOwner:
         """
         request = cast(Request, _StateRequest(_StateApp(self._state)))
         async with current_http_approval_caller(request, _original(saved)) as live:
-            # The live reader's own stable fence and T1 window. The caller module
-            # is owned by the authority phases and exposes no public accessor yet.
-            if not live.session.in_transaction():
-                raise ApprovalResumeRefused("authority_unavailable")
-            stable, validity = live._stable, live._validity
+            # The live reader's own stable fence and T1 window.
+            stable, validity = live.publication_window()
             yield CurrentResumeAuthority(
                 session=live.session, stable_fence=stable,
                 windows={"invocation": _window(validity)},

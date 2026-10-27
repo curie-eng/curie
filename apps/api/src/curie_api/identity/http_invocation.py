@@ -529,6 +529,16 @@ class CurrentHttpInvocation:
     _sealable: bool = field(default=True, repr=False)
     _open: bool = field(default=True, repr=False)
 
+    def publication_window(self) -> tuple[str, DeliveryValidityWindow]:
+        """The stable fence read under this open reader and its T1 window.
+
+        Valid only while the boundary that yielded it is open; a closed or
+        released reader is unavailable. @spec HTTP-APPROVAL-CONTINUITY-11.
+        """
+        if not self._open or not self.session.in_transaction():
+            _unavailable()
+        return self._stable, self._validity
+
     def seal_payload(
         self, *, payload: str, event_id: str, original_invocation_id: str,
         reservation: BacklogReservation, receipt_key: str,
