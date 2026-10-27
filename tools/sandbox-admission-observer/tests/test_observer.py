@@ -341,3 +341,91 @@ def test_watch_third_claim_and_api_errors_fail(helper, kubectl_inventory, event_
                 subject._event(*event)
             return
     pytest.fail("kubectl watch did not deliver its event")
+
+
+@pytest.fixture
+def preflight_bootstrap(helper, snapshot, kubectl_inventory, monkeypatch):
+    subject, _, _, calls = kubectl_inventory
+    objects = {
+        "namespace": {"metadata": {"name": subject.namespace}},
+        "crd": {"items": [
+            {"status": {"conditions": [{"type": "Established", "status": "True"}]}}
+            for _ in range(2)
+        ]},
+        "job": {},
+        "deployment": {"status": {"availableReplicas": 1}},
+    }
+    original_get = subject._get
+
+    def get(kind, *args):
+        if kind == "job":
+            assert args == (f"{subject.fullname}-preflight-controller",)
+        return objects[kind] if kind in objects else original_get(kind, *args)
+
+    worker_calls = []
+    original_popen = helper.subprocess.Popen
+
+    class WorkerStream:
+        def __init__(self, document):
+            self.stdout = io.StringIO(json.dumps(document) + "\n")
+
+        def poll(self):
+            return 0
+
+        def wait(self, **_kwargs):
+            return 0
+
+    def popen(command, **kwargs):
+        assert command[:5] == subject.kube
+        operation = command[5]
+        if operation == "get":
+            return original_popen(command, **kwargs)
+        assert operation in {"logs", "exec"}
+        worker_calls.append(operation)
+        document = (
+            snapshot["worker_logs"][0] if operation == "logs" else {"ledger": snapshot["ledger"]}
+        )
+        return WorkerStream(document)
+
+    monkeypatch.setattr(subject, "_get", get)
+    monkeypatch.setattr(helper.subprocess, "Popen", popen)
+    return subject, objects, calls, worker_calls
+
+
+@pytest.mark.parametrize(
+    "job",
+    [
+        {},
+        {"status": {"active": 1}},
+        {"status": {"conditions": [{"type": "Complete", "status": "False"}]}},
+        {"status": {"failed": 1, "conditions": [{"type": "Failed", "status": "True"}]}},
+    ],
+    ids=["absent", "incomplete", "complete-false", "failed"],
+)
+def test_established_crds_do_not_start_inventory_before_preflight_completion(
+    preflight_bootstrap, job,
+) -> None:
+    subject, objects, calls, worker_calls = preflight_bootstrap
+    objects["job"] = job
+    subject._poll_startup()
+    assert not calls
+    assert not worker_calls
+
+
+def test_completed_preflight_starts_inventory_and_worker_observation(preflight_bootstrap) -> None:
+    subject, objects, calls, worker_calls = preflight_bootstrap
+    # The chart hook completes only after the controller's informer cache sync:
+    # charts/curie/templates/preflight-controller.yaml:107,404-462.
+    objects["job"] = {"status": {"conditions": [{"type": "Complete", "status": "True"}]}}
+    subject._poll_startup()
+    for reader in subject._readers:
+        reader.join()
+    while not subject._events.empty():
+        event = subject._events.get_nowait()
+        if event[0] == "data":
+            subject._event(*event)
+    subject.observer.verify()
+    assert subject.observer.max_claims == 2
+    assert subject.observer.max_sandboxes == 2
+    assert calls
+    assert worker_calls == ["logs", "exec"]
