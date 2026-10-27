@@ -21,11 +21,12 @@ import pytest
 import redis
 from curie_api.config import get_settings
 from curie_api.db import SCHEMA
+from curie_api.identity.http_transport import HttpIdentityClient
 from curie_internal import identity_approval as wire
 from curie_internal import identity_context
 from role_policy_support import run
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from apps.api.tests.test_http_approval_creation import (
     RECORD_FIELDS,
@@ -228,6 +229,36 @@ def test_non_grant_resume_repeats_fresh_original_invoker_authority(
         post_check(case.client, second), second, decision="refuse", reason="caller_not_allowed",
     )
     assert len(case.provider.requests) == 4
+
+
+def test_row_change_during_the_fresh_lookup_is_never_salvaged(
+    resolved_case: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """@spec HTTP-APPROVAL-CONTINUITY-12: the final reader rechecks the unchanged row."""
+    case = resolved_case
+    token, payload = resume_token(case, resolve(case, "expired"))
+    original = HttpIdentityClient.lookup
+
+    async def lookup(client: HttpIdentityClient, **kwargs: Any) -> Any:
+        """@spec HTTP-APPROVAL-CONTINUITY-12: actual verified TLS, then a committed change."""
+        result = await original(client, **kwargs)
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(f'UPDATE "{SCHEMA}".approvals SET granted_tool = :tool WHERE id = :id'),
+                    {"tool": "synthetic_other", "id": uuid.UUID(case.approval_id)},
+                )
+        finally:
+            await engine.dispose()
+        return result
+
+    monkeypatch.setattr(HttpIdentityClient, "lookup", lookup)
+    request = resume_check(case, token, payload)
+    assert_response(
+        post_check(case.client, request), request, decision="refuse", reason="invalid_context",
+    )
+    assert len(case.provider.requests) == 3
 
 
 @pytest.mark.parametrize(
