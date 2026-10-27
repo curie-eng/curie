@@ -83,6 +83,7 @@ from .approval_actions import (
     decline_unowned_envelope,
     is_approval_action,
     is_release_ownership_miss,
+    notify_refusal,
     open_note_dialog,
     render_approval_action,
     render_note_submission,
@@ -92,7 +93,7 @@ from .approval_actions import (
     this_release_owns_action,
 )
 from .config import DispatcherConfig, release_identity
-from .http_receiver import HttpReceiverRuntime
+from .http_receiver import HttpReceiverRuntime, SelectedApprovalAnswers
 from .identities import delivery_key, minted_adapter
 from .identity import (
     IdentityResolver,
@@ -890,6 +891,23 @@ def register_handlers(
     ):
         raise ValueError("invalid_http_receiver_runtime")
     approval_resolver = resolver if resolver is not None else build_resolver(config)
+    # @spec HTTP-APPROVAL-CONTINUITY-7: the only caller of the selected answer path.
+    selected_answers = (
+        None if http_receiver is None
+        else SelectedApprovalAnswers(http_receiver, config.approval_chat_attester_secret)
+    )
+
+    def _answer_selected(body: dict[str, Any], decision: str) -> None:
+        """@spec HTTP-APPROVAL-CONTINUITY-7: post-ack answer and render, never raising."""
+        assert selected_answers is not None
+        try:
+            click = resolve_approval_action(
+                body=body, decision=decision, resolver=selected_answers, logger=logger,
+            )
+            if click is not None:
+                render_approval_action(click, web_client=web_client, logger=logger)
+        except Exception as exc:  # noqa: BLE001 - a raise past the ack eats the ack
+            log.warning("selected approval answer failed: %s", type(exc).__name__)
     admission_gate = admission if admission is not None else build_admission(config, redis_client)
     # Looked up as a module global so tests can keep the lookup offline.
     lookup: IdentityResolver | None = (
@@ -1083,10 +1101,10 @@ def register_handlers(
     # checked per install, not assumed after some interval.
     @app.action(APPROVE_ACTION_ID)
     def _on_approve(ack: Callable[..., Any], body: dict[str, Any]) -> None:
-        # @spec HTTP-INVOCATION-EXECUTION-19: these selected lanes are not qualified.
-        if http_receiver is not None:
+        # @spec HTTP-APPROVAL-CONTINUITY-7: ack, then one proved bounded answer.
+        if selected_answers is not None:
             ack()
-            drop(log, DropReason.UNSUBSCRIBED_LANE, event_id="")
+            _answer_selected(body, "approved")
             return
         click = resolve_approval_action(
             body=body,
@@ -1112,10 +1130,10 @@ def register_handlers(
 
     @app.action(REJECT_ACTION_ID)
     def _on_reject(ack: Callable[..., Any], body: dict[str, Any]) -> None:
-        # @spec HTTP-INVOCATION-EXECUTION-19: these selected lanes are not qualified.
-        if http_receiver is not None:
+        # @spec HTTP-APPROVAL-CONTINUITY-7: ack, then one proved bounded answer.
+        if selected_answers is not None:
             ack()
-            drop(log, DropReason.UNSUBSCRIBED_LANE, event_id="")
+            _answer_selected(body, "rejected")
             return
         click = resolve_approval_action(
             body=body,
@@ -1147,10 +1165,14 @@ def register_handlers(
     # a second live behavior; the earlier wording claimed otherwise.
     @app.action(APPROVE_NOTE_ACTION_ID)
     def _on_approve_with_note(ack: Callable[..., Any], body: dict[str, Any]) -> None:
-        # @spec HTTP-INVOCATION-EXECUTION-19: these selected lanes are not qualified.
-        if http_receiver is not None:
+        # @spec HTTP-APPROVAL-CONTINUITY-7: the dialog's fall-forward answers
+        # through the selected submission too, never the legacy client.
+        if selected_answers is not None:
             ack()
-            drop(log, DropReason.UNSUBSCRIBED_LANE, event_id="")
+            open_note_dialog(
+                body=body, decision="approved", web_client=web_client,
+                resolver=selected_answers, logger=logger,
+            )
             return
         if this_release_owns_action(body, approval_resolver) is False:
             decline_unowned_envelope(
@@ -1173,10 +1195,14 @@ def register_handlers(
 
     @app.action(REJECT_NOTE_ACTION_ID)
     def _on_reject_with_note(ack: Callable[..., Any], body: dict[str, Any]) -> None:
-        # @spec HTTP-INVOCATION-EXECUTION-19: these selected lanes are not qualified.
-        if http_receiver is not None:
+        # @spec HTTP-APPROVAL-CONTINUITY-7: the dialog's fall-forward answers
+        # through the selected submission too, never the legacy client.
+        if selected_answers is not None:
             ack()
-            drop(log, DropReason.UNSUBSCRIBED_LANE, event_id="")
+            open_note_dialog(
+                body=body, decision="rejected", web_client=web_client,
+                resolver=selected_answers, logger=logger,
+            )
             return
         if this_release_owns_action(body, approval_resolver) is False:
             decline_unowned_envelope(
@@ -1204,10 +1230,20 @@ def register_handlers(
     # the open modal.
     @app.view(NOTE_MODAL_CALLBACK_ID)
     def _on_note_submitted(ack: Callable[..., Any], body: dict[str, Any]) -> None:
-        # @spec HTTP-INVOCATION-EXECUTION-19: these selected lanes are not qualified.
-        if http_receiver is not None:
+        # @spec HTTP-APPROVAL-CONTINUITY-7: ACK precedes the bounded HTTP answer,
+        # so a refusal is shown as an ephemeral once the dialog has closed.
+        if selected_answers is not None:
             ack()
-            drop(log, DropReason.UNSUBSCRIBED_LANE, event_id="")
+            selected = resolve_note_submission(
+                body=body, resolver=selected_answers, logger=logger,
+            )
+            if selected is not None:
+                render_note_submission(selected, web_client=web_client, logger=logger)
+                if selected.outcome.status_code != 200:
+                    notify_refusal(
+                        web_client, outcome=selected.outcome, channel=selected.channel,
+                        user=selected.user, log=log,
+                    )
             return
         # Decide first, with no Slack round trip in the way: Slack allows three
         # seconds for the ack and the resolve POST is the only network hop the
@@ -1250,13 +1286,16 @@ def register_handlers(
     # non-owning release can leave the envelope for Slack to retry (#2248).
     @app.action(re.compile(r".+"))
     def _on_action(ack: Callable[..., None], body: dict[str, Any]) -> None:
-        # @spec HTTP-INVOCATION-EXECUTION-19.
+        actions = body.get("actions") or []
+        action_id = str(actions[0].get("action_id", "")) if actions else ""
+        # @spec HTTP-INVOCATION-EXECUTION-19 HTTP-APPROVAL-CONTINUITY-7: the
+        # dedicated approval listeners own their ack on a selected receiver too.
         if http_receiver is not None:
+            if is_approval_action(action_id):
+                return
             ack()
             drop(log, DropReason.UNSUBSCRIBED_LANE, event_id="")
             return
-        actions = body.get("actions") or []
-        action_id = str(actions[0].get("action_id", "")) if actions else ""
         if is_approval_action(action_id):
             # The dedicated approval listeners own ack-or-decline. Acking here
             # would consume an envelope the non-owning release must leave for

@@ -189,7 +189,9 @@ def test_selected_complete_denial_or_route_miss_never_enters_legacy_fallback(
     rig.closed()
 
 
-@pytest.mark.parametrize("lane", ["im", "action", "approve", "approve_note", "modal", "driver"])
+# Approval clicks, note dialogs and their submissions are the qualified answer
+# lanes (HTTP-APPROVAL-CONTINUITY-7), covered in test_http_receiver_answers.py.
+@pytest.mark.parametrize("lane", ["im", "action", "driver"])
 def test_selected_unsupported_turn_and_approval_lanes_refuse_before_legacy_work(
     config: DispatcherConfig,
     redis_client: redis.Redis,
