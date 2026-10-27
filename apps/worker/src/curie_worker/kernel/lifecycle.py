@@ -895,6 +895,15 @@ async def _process_event(
             )
             if route_connectors:
                 boot_env_kwargs["route_connectors"] = route_connectors
+            # @spec HTTP-APPROVAL-CONTINUITY-12: a selected HTTP resume grants only
+            # the one snapshot a fresh core check continued for, checked before
+            # boot_env runs; legacy readers and summary fallbacks never run for it.
+            selected = identity.selected()
+            checked_grant = (
+                await identity.approval_grant(self, resolved.agent_id)
+                if selected and qevent.tool_access is None
+                else None
+            )
             boot_env = self._binding.boot_env(
                 resolved,
                 thread_key,
@@ -913,14 +922,25 @@ async def _process_event(
             # on the next claim. Server-side and tool-name-scoped; never minted by the
             # sandbox. getattr: binding doubles may not carry the method, like the
             # approval_routes probe below. See docs/interfaces/approval/INTERFACE.md.
-            grant_fn = getattr(self._binding, "approval_grant_tool", None)
+            grant_fn = None if selected else getattr(self._binding, "approval_grant_tool", None)
             # @spec WORKER-TOOL-ACCESS-4: never a grant for a restricted turn.
             grant_tool = (
                 await grant_fn(qevent.event_id, resolved.agent_id)
                 if grant_fn is not None and qevent.tool_access is None
                 else None
             )
-            if grant_tool:
+            grant_arguments: dict[str, Any] | None = None
+            if checked_grant is not None and checked_grant.granted_tool is not None:
+                grant_tool = checked_grant.granted_tool
+                boot_env[GRANT_TOOL_ENV] = grant_tool
+                if checked_grant.gate_kind == "permission":
+                    exact = checked_grant.granted_arguments_json
+                    assert exact is not None
+                    # The exact checked string crosses unchanged; the parsed copy
+                    # only names the connector grant and is never written back.
+                    boot_env[GRANT_ARGUMENTS_ENV] = exact
+                    grant_arguments = json.loads(exact)
+            elif grant_tool:
                 boot_env[GRANT_TOOL_ENV] = grant_tool
                 grant_arguments = await self._binding.approval_grant_arguments(
                     qevent.event_id, resolved.agent_id
@@ -929,6 +949,7 @@ async def _process_event(
                     boot_env[GRANT_ARGUMENTS_ENV] = json.dumps(
                         grant_arguments, sort_keys=True, separators=(",", ":")
                     )
+            if grant_tool:
                 # A connector live name is mcp__<server>__<tool>. Plugin
                 # tools and a resume with no arguments mint no connector grant.
                 connector_grant = claim._connector_tool_grant(
@@ -985,11 +1006,15 @@ async def _process_event(
             # ran); a 'permission' marker is inert there. Grants nothing
             # (contrast the grant above); getattr-tolerant of binding doubles
             # that do not carry the method, like the grant.
-            resumed_kind_fn = getattr(self._binding, "approval_resumed_kind", None)
+            # A selected HTTP resume names the checked snapshot's own gate kind
+            # rather than rereading the row. @spec HTTP-APPROVAL-CONTINUITY-12.
+            resumed_kind_fn = (
+                None if selected else getattr(self._binding, "approval_resumed_kind", None)
+            )
             resumed_kind = (
                 await resumed_kind_fn(qevent.event_id, resolved.agent_id)
                 if resumed_kind_fn is not None
-                else None
+                else None if checked_grant is None else checked_grant.gate_kind
             )
             if resumed_kind:
                 boot_env[RESUMED_KIND_ENV] = resumed_kind

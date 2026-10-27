@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import re
 import uuid
 from contextvars import ContextVar
@@ -11,7 +12,12 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from aci_protocol import QueuedTurn
-from curie_internal.identity_approval import ApprovalCreationIdentityV1
+from curie_internal.identity_approval import (
+    ApprovalCreationIdentityV1,
+    ApprovalGrantAuthorityRequestV1,
+    ApprovalGrantAuthorityResponseV1,
+    ApprovalGrantExpectationV1,
+)
 from curie_internal.identity_authority import (
     Stage,
     TurnAuthorityRequestV1,
@@ -198,3 +204,80 @@ async def check(self: Kernel, stage: Stage) -> None:
         raise HttpIdentityRefused()
     if result.decision != "continue":
         raise TurnAuthorityUnavailable()
+
+
+async def approval_grant(self: Kernel, agent_id: uuid.UUID) -> ApprovalGrantExpectationV1 | None:
+    """The one exact snapshot a fresh core check continued for, or no grant.
+
+    Called after prepare and immediately before boot_env; nothing from an earlier
+    observation is reused. @spec HTTP-APPROVAL-CONTINUITY-12.
+    """
+    carry = CURRENT.get()
+    if carry is None or carry.context is None:
+        raise TurnAuthorityUnavailable()
+    approval_id = _approval_id_from_resume_event(carry.event.event_id)
+    if approval_id is None:
+        return None
+    reader = getattr(self._binding, "approval_grant_snapshot", None)
+    if not callable(reader) or carry.scope is None or self._identity_authority is None:
+        raise TurnAuthorityUnavailable()
+    try:
+        value = await reader(carry.event.event_id, agent_id)
+    except ValueError:
+        raise HttpIdentityRefused() from None
+    except Exception:  # noqa: BLE001 - fixed unavailable boundary, cancellation propagates.
+        raise TurnAuthorityUnavailable() from None
+    if value is None:
+        return None
+    try:
+        if type(value) is not ApprovalGrantExpectationV1:
+            raise ValueError
+        grant = ApprovalGrantExpectationV1.model_validate(value)
+        if (
+            grant.approval_id != approval_id or grant.agent_id != str(agent_id)
+            or grant.agent_id != carry.scope.agent_id
+            or (grant.gate_kind == "permission" and (
+                grant.granted_tool is None or grant.granted_arguments_json is None
+            ))
+            or carry.payload_sha256 is None
+        ):
+            raise ValueError
+        request = ApprovalGrantAuthorityRequestV1(
+            schema_version=1,
+            check=TurnAuthorityRequestV1(
+                schema_version=1, request_id=str(uuid.uuid4()), stage="prepare",
+                context=carry.context, payload_sha256=carry.payload_sha256,
+                event_id=carry.event.event_id, scope=carry.scope, approval_id=approval_id,
+            ),
+            grant=grant,
+        )
+    except (ValueError, TypeError):
+        raise HttpIdentityRefused() from None
+    if not is_live(carry):
+        raise TurnAuthorityUnavailable()
+    try:
+        result = await self._identity_authority.check_grant(request)
+        if type(result) is not ApprovalGrantAuthorityResponseV1:
+            raise ValueError
+        result = ApprovalGrantAuthorityResponseV1.model_validate(result)
+        check = result.check
+        encoded = json.dumps(
+            grant.model_dump(mode="json"), sort_keys=True, separators=(",", ":"),
+            ensure_ascii=False, allow_nan=False,
+        )
+        if (
+            check.request_id != request.check.request_id or check.stage != "prepare"
+            or check.event_id != request.check.event_id or check.scope != request.check.scope
+            or check.context_sha256 != hashlib.sha256(carry.context.encode("ascii")).hexdigest()
+            or result.grant_sha256 != hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+        ):
+            raise ValueError
+    except Exception:  # noqa: BLE001 - fixed unavailable boundary, cancellation propagates.
+        raise TurnAuthorityUnavailable() from None
+    if not is_live(carry):
+        raise TurnAuthorityUnavailable()
+    if check.decision == "refuse":
+        raise HttpIdentityRefused()
+    if check.decision != "continue":
+        raise TurnAuthorityUnavailable()
+    return grant

@@ -84,6 +84,7 @@ from aci_protocol.turn import (
     matching_routes,
 )
 from curie_internal import sandbox_token
+from curie_internal.identity_approval import ApprovalGrantExpectationV1
 from curie_internal.sealing_key import is_sealing_key_name
 from plugin_format import is_reserved_boot_env_name
 from pydantic import BaseModel, ConfigDict, Field
@@ -1031,6 +1032,47 @@ class BindingResolver:
             return None
         arguments: Any = row["granted_arguments"]
         return arguments if isinstance(arguments, dict) else None
+
+    async def approval_grant_snapshot(
+        self, event_id: str, agent_id: uuid.UUID
+    ) -> ApprovalGrantExpectationV1 | None:
+        """One coherent detached read of an approved row's effect fields.
+
+        A value to submit to the current core check, never a grant by itself.
+        A malformed approved row raises ``ValueError("invalid_approval_grant")``
+        rather than degrading to no grant. @spec HTTP-APPROVAL-CONTINUITY-12.
+        """
+        approval_id = _parse_resume_event_id(event_id)
+        if approval_id is None:
+            return None
+        sql = text(
+            f"SELECT status, agent_id, conversation_id, gate_kind, granted_tool, "
+            f"granted_arguments FROM {self._config.db_schema}.approvals WHERE id = :id"
+        )
+        async with self._engine.connect() as conn:
+            result = await conn.execute(sql, {"id": approval_id})
+            row = result.mappings().first()
+            if row is None or row["status"] != "approved":
+                return None
+            if row["agent_id"] is None or row["agent_id"] != agent_id:
+                return None
+            try:
+                arguments: Any = row["granted_arguments"]
+                if arguments is not None and type(arguments) is not dict:
+                    raise ValueError
+                return ApprovalGrantExpectationV1(
+                    approval_id=str(approval_id),
+                    agent_id=str(row["agent_id"]),
+                    conversation_id=row["conversation_id"],
+                    gate_kind=row["gate_kind"],
+                    granted_tool=row["granted_tool"],
+                    granted_arguments_json=None if arguments is None else json.dumps(
+                        arguments, sort_keys=True, separators=(",", ":"),
+                        ensure_ascii=False, allow_nan=False,
+                    ),
+                )
+            except (ValueError, TypeError, RecursionError):
+                raise ValueError("invalid_approval_grant") from None
 
     async def approval_resumed_kind(self, event_id: str, agent_id: uuid.UUID) -> str | None:
         """The gate provenance of the approval a resume turn is resuming (#544,
