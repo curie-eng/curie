@@ -43,7 +43,12 @@ from curie_api.identity.http_credential_registry import (
     ResolvedProviderCredential,
 )
 from curie_api.identity.http_transport import HttpIdentityClient, HttpIdentityObservation
-from curie_api.identity.slack import AUTH_TEST_KEY, SlackEvidence, derive
+from curie_api.identity.slack import (
+    SLACK_ENTERPRISE_KIND,
+    SLACK_WORKSPACE_KIND,
+    SlackEvidence,
+    derive_registered_sender,
+)
 from curie_api.models import (
     Agent,
     AgentAccessPolicy,
@@ -89,11 +94,16 @@ class ReceiverRegistrationV1(FactsModel):
 
     @model_validator(mode="after")
     def consistent_scope(self) -> Self:
-        """@spec HTTP-INVOCATION-EXECUTION-15."""
+        """@spec HTTP-INVOCATION-EXECUTION-15/21."""
         namespace = self.namespace
+        ordinary = (
+            namespace.kind == SLACK_WORKSPACE_KIND and namespace.key == self.installation_account
+        )
+        grid = (
+            namespace.kind == SLACK_ENTERPRISE_KIND and namespace.key != self.installation_account
+        )
         if (
-            namespace.authority != "" or namespace.kind != "slack_workspace"
-            or namespace.key != self.installation_account
+            namespace.authority != "" or not (ordinary or grid)
             or len(set(self.binding_ids)) != len(self.binding_ids)
             or len(set(self.human_native_ids)) != len(self.human_native_ids)
         ):
@@ -257,7 +267,7 @@ def _receiver_source(
     registration: ReceiverRegistrationV1, proof: codec.ReceiverProofV1,
     claims: channel_token.ChannelClaims, body: Any,
 ) -> AuthenticatedSource:
-    """@spec HTTP-INVOCATION-EXECUTION-2/15."""
+    """@spec HTTP-INVOCATION-EXECUTION-2/15/21."""
     if (
         proof.binding_id != claims.channel_id or proof.binding_generation != claims.generation
         or proof.channel_identity_id != registration.channel_identity_id
@@ -268,13 +278,11 @@ def _receiver_source(
     ):
         _invalid_receiver()
     evidence = SlackEvidence.model_validate(proof.slack.model_dump(mode="json"))
-    sender = derive(
+    sender = derive_registered_sender(
         evidence,
-        identity_attributes={AUTH_TEST_KEY: {
-            "team_id": registration.installation_account, "user_id": registration.bot_user_id,
-            "enterprise_id": None, "is_enterprise_install": False,
-        }},
-        installation_authority=registration.namespace.authority,
+        namespace_kind=registration.namespace.kind,
+        namespace_authority=registration.namespace.authority,
+        namespace_key=registration.namespace.key,
         installation_account=registration.installation_account,
     )
     if (
