@@ -230,7 +230,7 @@ class OriginalAssociation(Protocol):
 
 
 @dataclass(frozen=True)
-class _Capture:
+class SourceCapture:
     """@spec HTTP-INVOCATION-EXECUTION-4/15."""
 
     authority: principal_authority.AuthorityCapture
@@ -243,7 +243,7 @@ class _Capture:
 
 
 @dataclass(frozen=True)
-class _AuthenticatedSource:
+class AuthenticatedSource:
     """Core-authenticated source, never worker claims. @spec HTTP-INVOCATION-EXECUTION-2/8."""
 
     binding_id: str
@@ -256,7 +256,7 @@ class _AuthenticatedSource:
 def _receiver_source(
     registration: ReceiverRegistrationV1, proof: codec.ReceiverProofV1,
     claims: channel_token.ChannelClaims, body: Any,
-) -> _AuthenticatedSource:
+) -> AuthenticatedSource:
     """@spec HTTP-INVOCATION-EXECUTION-2/15."""
     if (
         proof.binding_id != claims.channel_id or proof.binding_generation != claims.generation
@@ -282,7 +282,7 @@ def _receiver_source(
         or sender[1] != body.author
     ):
         _invalid_receiver()
-    return _AuthenticatedSource(
+    return AuthenticatedSource(
         claims.channel_id, claims.generation,
         SenderV1(
             provider="slack", channel_identity_id=registration.channel_identity_id,
@@ -296,15 +296,15 @@ def _receiver_source(
 Role = Literal["invocation", "approver"]
 
 
-async def _capture(
+async def capture_source(
     session: AsyncSession,
     registration: ReceiverRegistrationV1,
-    source: _AuthenticatedSource,
+    source: AuthenticatedSource,
     *,
     writer_agent: uuid.UUID | None = None,
     role: Role = "invocation",
     binding_identity: bool = True,
-) -> tuple[_Capture, AgentChannel]:
+) -> tuple[SourceCapture, AgentChannel]:
     """One source's current scope for one role.
 
     An answering actor's receiver may differ from the binding's identity: its
@@ -416,7 +416,7 @@ async def _capture(
         "sql_null": sql_null, "team": team_state,
         "registration": registration.model_dump(mode="json"),
     }, sort_keys=True, separators=(",", ":"))
-    return _Capture(
+    return SourceCapture(
         principal_authority.AuthorityCapture(config, idp.lifecycle_generation), agent.id,
         fingerprint, source.sender, policy,
         None if policy_row is None else policy_row.version, group,
@@ -424,7 +424,7 @@ async def _capture(
 
 
 def lookup_request(
-    registration: ReceiverRegistrationV1, captured: _Capture,
+    registration: ReceiverRegistrationV1, captured: SourceCapture,
     credential: ResolvedProviderCredential, *, purpose: Literal["invocation", "approval"],
 ) -> LookupRequestV1:
     """A fresh bounded lookup for one source and provider purpose.
@@ -441,7 +441,7 @@ def lookup_request(
     )
 
 
-def _facts(
+def source_facts(
     response_bytes: bytes, lookup: LookupRequestV1, credential: ResolvedProviderCredential,
 ) -> ValidatedFacts:
     """@spec HTTP-INVOCATION-EXECUTION-4/5."""
@@ -457,8 +457,8 @@ def _facts(
     return facts
 
 
-def _permission(
-    capture: _Capture, binding: AgentChannel, facts: ValidatedFacts, independent_human: bool,
+def source_permission(
+    capture: SourceCapture, binding: AgentChannel, facts: ValidatedFacts, independent_human: bool,
     original: codec.InvocationContextV1 | OriginalAssociation | None = None,
     *, role_name: Role = "invocation",
 ) -> None:
@@ -515,7 +515,7 @@ class CurrentHttpInvocation:
     principal_ref: PrincipalRef | None
     _runtime: HttpInvocationRuntime = field(repr=False)
     _registration: ReceiverRegistrationV1 = field(repr=False)
-    _capture: _Capture = field(repr=False)
+    _capture: SourceCapture = field(repr=False)
     _facts: ValidatedFacts = field(repr=False)
     _application: principal_authority.PrincipalApplication = field(repr=False)
     _stable: str = field(repr=False)
@@ -523,7 +523,7 @@ class CurrentHttpInvocation:
     _response_bytes: bytes = field(repr=False)
     _lookup: LookupRequestV1 = field(repr=False)
     _credential: ResolvedProviderCredential = field(repr=False)
-    _source: _AuthenticatedSource = field(repr=False)
+    _source: AuthenticatedSource = field(repr=False)
     _client: HttpIdentityClient = field(repr=False)
     _original: codec.InvocationContextV1 | None = field(repr=False)
     _sealable: bool = field(default=True, repr=False)
@@ -618,7 +618,7 @@ async def current_http_invocation(
 @asynccontextmanager
 async def _current_source_authority(
     request: Request, *, runtime: HttpInvocationRuntime, client: HttpIdentityClient,
-    registration: ReceiverRegistrationV1, source: _AuthenticatedSource,
+    registration: ReceiverRegistrationV1, source: AuthenticatedSource,
     intent_digest: str = "", original: codec.InvocationContextV1 | None = None,
 ) -> AsyncIterator[CurrentHttpInvocation]:
     """One caller's lookup/application/reader owner, purpose and role invocation.
@@ -631,7 +631,7 @@ async def _current_source_authority(
     try:
         async with factory() as session, session.begin():
             await identity_fence.lock_identity_reader(session)
-            captured, _ = await _capture(session, registration, source)
+            captured, _ = await capture_source(session, registration, source)
             credential = runtime._providers.resolve(captured.authority.configuration)
             if not isinstance(credential, ResolvedProviderCredential):
                 _unavailable()
@@ -644,12 +644,12 @@ async def _current_source_authority(
             _unavailable()
         async with identity_fence.mutation(factory, valkey) as writer:
             async with writer.begin():
-                current, _ = await _capture(
+                current, _ = await capture_source(
                     writer, registration, source, writer_agent=captured.agent_id,
                 )
                 if current != captured:
                     _unavailable()
-                _facts(observation.response_bytes, lookup, credential)
+                source_facts(observation.response_bytes, lookup, credential)
                 application = await principal_authority.apply_http_principal(
                     writer, capture=captured.authority, request=lookup,
                     response_bytes=observation.response_bytes,
@@ -663,7 +663,7 @@ async def _current_source_authority(
     async with factory() as session, session.begin():
         try:
             await identity_fence.lock_identity_reader(session)
-            current, binding = await _capture(session, registration, source)
+            current, binding = await capture_source(session, registration, source)
             if (
                 current.fingerprint != captured.fingerprint
                 or current.authority.lifecycle_generation != application.lifecycle_generation
@@ -671,7 +671,7 @@ async def _current_source_authority(
                 or request.app.state.http_identity_client is not client
             ):
                 _unavailable()
-            facts = _facts(observation.response_bytes, lookup, credential)
+            facts = source_facts(observation.response_bytes, lookup, credential)
             if application.principal_id is not None:
                 principal = await session.get(Principal, application.principal_id)
                 if (
@@ -682,7 +682,7 @@ async def _current_source_authority(
                     or principal.authorization_version != application.authorization_version
                 ):
                     _unavailable()
-            _permission(
+            source_permission(
                 current, binding, facts,
                 current.sender.native_id in registration.human_native_ids, original,
             )
@@ -735,7 +735,7 @@ def _check_response(
 
 def invocation_source(
     runtime: HttpInvocationRuntime, context: codec.InvocationContextV1 | OriginalAssociation,
-) -> tuple[ReceiverRegistrationV1, _AuthenticatedSource]:
+) -> tuple[ReceiverRegistrationV1, AuthenticatedSource]:
     """Authenticated source scope only. @spec HTTP-APPROVAL-CONTINUITY-4/9."""
     scope = context.scope
     registration = runtime._receivers.get((context.receiver_id, context.receiver_generation))
@@ -748,7 +748,7 @@ def invocation_source(
         or context.independent_human != (scope.native_id in registration.human_native_ids)
     ):
         _invalid_receiver()
-    source = _AuthenticatedSource(
+    source = AuthenticatedSource(
         scope.binding_id, scope.binding_generation,
         SenderV1(
             provider=scope.provider, channel_identity_id=scope.channel_identity_id,
@@ -830,12 +830,12 @@ async def revalidate_http_approval_caller(
         or request.app.state.http_identity_client is not caller._client
     ):
         _unavailable()
-    current, binding = await _capture(
+    current, binding = await capture_source(
         writer, caller._registration, caller._source, writer_agent=caller._capture.agent_id,
     )
     if current != caller._capture:
         _unavailable()
-    facts = _facts(caller._response_bytes, caller._lookup, caller._credential)
+    facts = source_facts(caller._response_bytes, caller._lookup, caller._credential)
     if caller._application.principal_id is not None:
         principal = await writer.get(
             Principal, caller._application.principal_id, populate_existing=True,
@@ -849,7 +849,7 @@ async def revalidate_http_approval_caller(
             or principal.authorization_version != caller._application.authorization_version
         ):
             _unavailable()
-    _permission(
+    source_permission(
         current, binding, facts,
         current.sender.native_id in caller._registration.human_native_ids, caller._original,
     )

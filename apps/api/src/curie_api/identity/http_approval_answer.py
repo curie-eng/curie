@@ -32,18 +32,18 @@ from curie_api.schemas.http_authority import HttpSelectionV1
 from curie_api.schemas.http_identity import LookupRequestV1, SenderV1, ValidatedFacts
 from curie_api.slack_approvers import SlackUserGroupMembers, approval_token_identity
 
-from .http_approval import _verified_capsule, approval_record_digest
+from .http_approval import approval_record_digest, verified_capsule
 from .http_credential_registry import ResolvedProviderCredential
 from .http_invocation import (
+    AuthenticatedSource,
     HttpInvocationRuntime,
     ReceiverRegistrationV1,
-    _AuthenticatedSource,
-    _Capture,
-    _capture,
-    _facts,
-    _permission,
+    SourceCapture,
+    capture_source,
     invocation_source,
     lookup_request,
+    source_facts,
+    source_permission,
 )
 from .http_transport import HttpIdentityClient, HttpIdentityObservation
 from .slack import AUTH_TEST_KEY, INTERACTION_DELIVERIES, SlackEvidence, derive
@@ -112,7 +112,7 @@ class _Actor:
     """Receiving scope of an authenticated answering actor. @spec HTTP-APPROVAL-CONTINUITY-7."""
 
     registration: ReceiverRegistrationV1
-    source: _AuthenticatedSource
+    source: AuthenticatedSource
     channel: str
 
 
@@ -174,7 +174,7 @@ def _authenticate_actor(
         _invalid()
     return _Actor(
         registration,
-        _AuthenticatedSource(
+        AuthenticatedSource(
             saved.scope.binding_id, saved.scope.binding_generation,
             SenderV1(
                 provider="slack", channel_identity_id=registration.channel_identity_id,
@@ -193,8 +193,8 @@ class _Subject:
 
     role: Literal["invocation", "approver"]
     registration: ReceiverRegistrationV1
-    source: _AuthenticatedSource
-    capture: _Capture
+    source: AuthenticatedSource
+    capture: SourceCapture
     credential: ResolvedProviderCredential
     lookup: LookupRequestV1
     response_bytes: bytes = b""
@@ -207,13 +207,13 @@ class _Subject:
 async def _prepare(
     session: AsyncSession, runtime: HttpInvocationRuntime,
     role: Literal["invocation", "approver"], registration: ReceiverRegistrationV1,
-    source: _AuthenticatedSource,
+    source: AuthenticatedSource,
 ) -> _Subject:
     """Phase 1 for one subject: capture and a fresh role-purpose lookup request.
 
     @spec HTTP-APPROVAL-CONTINUITY-8/9.
     """
-    captured, _ = await _capture(
+    captured, _ = await capture_source(
         session, registration, source, role=role, binding_identity=role == "invocation",
     )
     credential = runtime._providers.resolve(captured.authority.configuration)
@@ -230,9 +230,9 @@ async def _prepare(
 
 async def _recapture(
     session: AsyncSession, subject: _Subject, *, writer: bool,
-) -> tuple[_Capture, Any]:
+) -> tuple[SourceCapture, Any]:
     """@spec HTTP-APPROVAL-CONTINUITY-8/9."""
-    return await _capture(
+    return await capture_source(
         session, subject.registration, subject.source,
         writer_agent=subject.capture.agent_id if writer else None, role=subject.role,
         binding_identity=subject.role == "invocation",
@@ -440,7 +440,7 @@ class _Composition:
                         _unavailable()
                 observed: dict[tuple[str, str], Any] = {}
                 for subject in self.subjects:
-                    facts = _facts(subject.response_bytes, subject.lookup, subject.credential)
+                    facts = source_facts(subject.response_bytes, subject.lookup, subject.credential)
                     key = (subject.source.sender.native_id, subject.source.sender.namespace.id)
                     # Contradictory canonical observations for one sender refuse.
                     if observed.setdefault(key, facts.identity) != facts.identity:
@@ -480,9 +480,9 @@ class _Composition:
                 or state.http_identity_client is not self.client
             ):
                 _unavailable()
-            observed = _facts(subject.response_bytes, subject.lookup, subject.credential)
+            observed = source_facts(subject.response_bytes, subject.lookup, subject.credential)
             await _check_principal(session, subject, observed, self.applications[subject.role])
-            _permission(
+            source_permission(
                 current, binding, observed, subject.independent_human(),
                 self.associations.get(subject.role), role_name=subject.role,
             )
@@ -527,7 +527,7 @@ def _preserved_actor(
         _deny()
     return _Actor(
         registration,
-        _AuthenticatedSource(
+        AuthenticatedSource(
             saved.scope.binding_id, saved.scope.binding_generation,
             SenderV1(
                 provider="slack", channel_identity_id=registration.channel_identity_id,
@@ -593,7 +593,7 @@ async def _answer(
     async with factory() as session, session.begin():
         await identity_fence.lock_identity_reader(session)
         row = _pending(await session.get(Approval, approval_id, populate_existing=True))
-        saved = _verified_capsule(runtime, row)
+        saved = verified_capsule(runtime, row)
         if saved is None or saved.status != "pending" or row.purpose != "session":
             _refuse(403, "unsupported_approval")
         actor_scope = _authenticate_actor(runtime, row, saved, principal, answer)
@@ -684,7 +684,7 @@ async def check_http_approval_actor(
         async with factory() as session, session.begin():
             await identity_fence.lock_identity_reader(session)
             row = await session.get(Approval, approval_id, populate_existing=True)
-            saved = None if row is None else _verified_capsule(runtime, row)
+            saved = None if row is None else verified_capsule(runtime, row)
             if (
                 row is None or saved is None or row.status != ApprovalStatus.approved
                 or saved.status != "approved" or row.purpose != "session"

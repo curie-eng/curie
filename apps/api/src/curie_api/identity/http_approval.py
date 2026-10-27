@@ -200,7 +200,7 @@ async def require_legacy_approval_creation(session: AsyncSession, data: Approval
         _refuse(503, "authority_unavailable")
 
 
-def _verified_capsule(
+def verified_capsule(
     runtime: HttpInvocationRuntime, row: Approval,
 ) -> wire.ApprovalContextV1 | None:
     """The stored seal names exactly this row as it is. @spec HTTP-APPROVAL-CONTINUITY-5/10."""
@@ -233,7 +233,7 @@ async def expire_http_approval(
         return (
             row is not None and row.status == ApprovalStatus.pending
             and row.expires_at is not None and row.expires_at <= now
-            and _verified_capsule(runtime, row) is not None
+            and verified_capsule(runtime, row) is not None
         )
 
     # A plain read first: the global identity writer is taken only for real work.
@@ -252,7 +252,7 @@ async def expire_http_approval(
             ).scalar_one_or_none()
             if row is None or not expirable(row):
                 return None
-            saved = _verified_capsule(runtime, row)
+            saved = verified_capsule(runtime, row)
             assert saved is not None
             row.status = ApprovalStatus.expired
             row.resolved_at = now
