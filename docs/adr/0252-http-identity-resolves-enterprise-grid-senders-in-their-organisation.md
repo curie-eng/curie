@@ -2,7 +2,11 @@
 
 Date: 2026-10-27
 
-Status: Draft
+Status: Accepted
+
+Accepted 2026-10-27 with maintainer approval from jw3329, recorded as a
+comment on the publishing pull request
+([#5109](https://github.com/curie-eng/curie/pull/5109)).
 
 Tracked in [#4890](https://github.com/curie-eng/curie/issues/4890).
 
@@ -10,7 +14,7 @@ This ADR amends [ADR 0198](0198-identity-links-live-in-provider-identity-namespa
 and [ADR 0201](0201-provider-field-mappings-live-with-their-realization.md)
 for the HTTP identity path of
 [ADR 0246](0246-common-admission-resolves-an-optional-http-identity-before-authorized-enqueue.md)
-only. When Accepted, it supersedes these clauses in that scope:
+only. It supersedes these clauses in that scope:
 
 - **ADR 0198 decision 2, its Slack kinds sentence** ("For Slack, the kind is
   `slack_workspace` and the key is a `T…` id"). Slack gains a second kind,

@@ -270,5 +270,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0247 | [A tree-identical parent or a schema window registration reuses checks](0247-a-tree-identical-parent-or-a-schema-window-registration-reuses-checks.md) | Accepted |
 | 0249 | [A factory run may take twelve hours](0249-a-factory-run-may-take-twelve-hours.md) | Accepted |
 | 0251 | [A failed factory run keeps a private recovery checkpoint that only explicit restoration reads](0251-a-failed-factory-run-keeps-a-private-recovery-checkpoint-that-only-explicit-restoration-reads.md) | Accepted |
-| 0252 | [HTTP identity resolves Enterprise Grid senders in their organisation](0252-http-identity-resolves-enterprise-grid-senders-in-their-organisation.md) | Draft |
+| 0252 | [HTTP identity resolves Enterprise Grid senders in their organisation](0252-http-identity-resolves-enterprise-grid-senders-in-their-organisation.md) | Accepted |
 <!-- END GENERATED: adr-index -->
