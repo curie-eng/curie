@@ -594,11 +594,13 @@ GRID_SENDER = "W0EXAMPLEPERSON"
 
 def grid_scope_body(**changes: Any) -> dict[str, Any]:
     """@spec HTTP-INVOCATION-EXECUTION-21: a synthetic Grid workspace registration."""
-    return scope_body(
-        namespace={"id": NAMESPACE, "authority": "", "kind": "slack_enterprise", "key": GRID_ORG},
-        installation_account=GRID_WORKSPACE,
+    return scope_body(**{
+        "namespace": {
+            "id": NAMESPACE, "authority": "", "kind": "slack_enterprise", "key": GRID_ORG,
+        },
+        "installation_account": GRID_WORKSPACE,
         **changes,
-    )
+    })
 
 
 def grid_auth(**changes: Any) -> dict[str, Any]:
