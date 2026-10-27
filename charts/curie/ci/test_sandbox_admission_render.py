@@ -26,6 +26,7 @@ def render(
     tmp_path: Path,
     *,
     expected_error: str | None = None,
+    show_only: str | None = None,
     **overrides: Any,
 ) -> list[dict[str, Any]]:
     values = {
@@ -45,6 +46,9 @@ def render(
     }
     for key, value in overrides.items():
         values[key].update(value)
+    selection = (
+        ["--output-dir", str(tmp_path)] if show_only is None else ["--show-only", show_only]
+    )
     completed = subprocess.run(
         [
             "helm",
@@ -57,8 +61,7 @@ def render(
             "1.31.0",
             "--api-versions",
             "admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy",
-            "--output-dir",
-            str(tmp_path),
+            *selection,
             "-f",
             "-",
         ],
@@ -74,6 +77,8 @@ def render(
         assert "worker.extraEnv" in completed.stderr
         return []
     assert completed.returncode == 0, completed.stderr
+    if show_only is not None:
+        return [doc for doc in yaml.safe_load_all(completed.stdout) if isinstance(doc, dict)]
     return [
         doc
         for path in sorted(tmp_path.rglob("*.yaml"))
@@ -215,6 +220,52 @@ def test_extra_env_cannot_replace_or_duplicate_admission(tmp_path: Path) -> None
             ]
         },
     )
+
+
+@pytest.mark.parametrize(
+    "connector_reconciler_enabled",
+    [False, True],
+    ids=["reconciler-disabled", "reconciler-enabled"],
+)
+def test_worker_template_preserves_baseline_rbac(
+    tmp_path: Path, connector_reconciler_enabled: bool
+) -> None:
+    docs = render(
+        tmp_path,
+        show_only="templates/worker.yaml",
+        worker={"connectorReconciler": {"enabled": connector_reconciler_enabled}},
+        agentSandbox={"deploy": True},
+        resourceQuota={"enabled": True},
+        security={"gvisor": {"mode": "require", "runtimeClassName": "acme-runtime"}},
+    )
+    assert len([entry for entry in worker_env(docs) if entry["name"] == ENV]) == 1
+    roles = [doc for doc in docs if doc.get("kind") == "Role"]
+    assert [role["metadata"]["name"] for role in roles] == ["acme-admission-worker"]
+    bindings = [doc for doc in docs if doc.get("kind") == "RoleBinding"]
+    assert len(bindings) == 1
+    assert bindings[0]["metadata"]["name"] == "acme-admission-worker"
+    assert bindings[0]["roleRef"] == {
+        "apiGroup": "rbac.authorization.k8s.io",
+        "kind": "Role",
+        "name": "acme-admission-worker",
+    }
+    assert bindings[0]["subjects"] == [
+        {
+            "kind": "ServiceAccount",
+            "name": "acme-admission-worker",
+            "namespace": "acme-admission",
+        }
+    ]
+    assert not any(
+        doc.get("kind") in {"Role", "RoleBinding", "ClusterRole", "ClusterRoleBinding"}
+        and (
+            doc["metadata"]["name"] == "acme-admission-worker-admission"
+            or doc["metadata"].get("labels", {}).get("app.kubernetes.io/component")
+            == "sandbox-admission"
+        )
+        for doc in docs
+    )
+    assert not any(doc.get("kind") in {"ClusterRole", "ClusterRoleBinding"} for doc in docs)
 
 
 def test_worker_admission_adds_only_namespaced_inventory_reads(tmp_path: Path) -> None:
