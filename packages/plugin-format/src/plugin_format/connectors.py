@@ -75,7 +75,9 @@ class SecretRef(BaseModel):
 
     # The env var the connector reads.
     name: str
-    # The Kubernetes Secret holding it, provisioned out of band.
+    # The Kubernetes Secret holding it, provisioned out of band. May carry
+    # `${CURIE_AGENT}`, expanded at render to the deploying agent's name, so
+    # one bundle deployed as several agents can give each its own Secret.
     from_secret: str
     # The key within that Secret. Defaults to the env var name, which is the
     # common case and saves repeating it.
@@ -556,6 +558,50 @@ def _known_placeholders() -> frozenset[str]:
     from .connector_render import PLACEHOLDERS
 
     return frozenset(PLACEHOLDERS)
+
+
+def _validate_secret_ref_template(
+    where: str, declared: SecretRef, errors: list[tuple[str, str]]
+) -> None:
+    """Check a ``from_secret`` that carries a placeholder.
+
+    Only ``${CURIE_AGENT}`` is substituted there, and it must expand to a
+    Kubernetes Secret name for EVERY valid agent name, because the same bundle
+    deploys as agents the author never saw. An agent name is an RFC 1123 label
+    of at most ``_NAME_MAX`` characters, so substituting the longest such label
+    decides both the shape and the length for all of them. A literal value is
+    not checked here: its validation is unchanged.
+    """
+
+    from .connector_render import SECRET_REF_PLACEHOLDERS, is_secret_name
+
+    remainder = declared.from_secret
+    for placeholder in SECRET_REF_PLACEHOLDERS:
+        remainder = remainder.replace(f"${{{placeholder}}}", "")
+    if "${" in remainder:
+        known = ", ".join(f"${{{p}}}" for p in SECRET_REF_PLACEHOLDERS)
+        errors.append(
+            (
+                "connectors.secret_ref_unknown_placeholder",
+                f"{where}: `{declared.name}` sets `from_secret: {declared.from_secret}`, "
+                f"but a Secret name may carry only {known}. Anything else would reach "
+                "the cluster as literal text in the Secret name.",
+            )
+        )
+        return
+    widest = declared.from_secret
+    for placeholder in SECRET_REF_PLACEHOLDERS:
+        widest = widest.replace(f"${{{placeholder}}}", "a" * _NAME_MAX)
+    if not is_secret_name(widest):
+        errors.append(
+            (
+                "connectors.secret_ref_bad_name",
+                f"{where}: `{declared.name}` sets `from_secret: {declared.from_secret}`, "
+                "which does not expand to a Kubernetes Secret name for every agent name "
+                "(lowercase alphanumeric, `-` or `.`, starting and ending alphanumeric, "
+                f"at most 253 characters with a {_NAME_MAX}-character agent name).",
+            )
+        )
 
 
 def _forges_the_render_join(name: str) -> bool:
@@ -1082,6 +1128,8 @@ def validate_connectors(data: Any) -> tuple[ConnectorsFile | None, list[tuple[st
                         "API server rejects at apply -- long after the deploy looked fine.",
                     )
                 )
+            elif "${" in declared.from_secret:
+                _validate_secret_ref_template(where, declared, errors)
         for env_name, blob in spec.sealed_secrets.items():
             if not env_name.strip():
                 errors.append(

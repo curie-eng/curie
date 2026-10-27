@@ -573,6 +573,75 @@ def test_an_empty_from_secret_is_rejected() -> None:
     )
 
 
+def _ref_codes(from_secret: str) -> list[str]:
+    return _codes(
+        {
+            "connectors": {
+                "g": {"image": "x:1", "secrets": [{"name": "T", "from_secret": from_secret}]}
+            }
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "from_secret",
+    [
+        "example-read-${CURIE_AGENT}",
+        "${CURIE_AGENT}",
+        "${CURIE_AGENT}-example.read",
+        "a-${CURIE_AGENT}-b-${CURIE_AGENT}",
+    ],
+)
+def test_from_secret_may_name_the_deploying_agent(from_secret: str) -> None:
+    # Two agents deployed from one bundle into one namespace each need their
+    # own out-of-band Secret. `${CURIE_AGENT}` is the only per-agent value.
+    assert _ref_codes(from_secret) == []
+
+
+@pytest.mark.parametrize(
+    "from_secret",
+    [
+        # A real args/env placeholder, but not one a Secret name can carry.
+        "example-${CURIE_CONNECTOR_HOST}",
+        "example-${CURIE_AGENT_NAME}",
+        "example-${AGENT}",
+        "example-${curie_agent}",
+        # Unterminated: the literal text would reach the Secret name.
+        "example-${CURIE_AGENT",
+        "example-${CURIE_AGENT}-${}",
+    ],
+)
+def test_from_secret_refuses_any_other_placeholder(from_secret: str) -> None:
+    assert "connectors.secret_ref_unknown_placeholder" in _ref_codes(from_secret)
+
+
+@pytest.mark.parametrize(
+    "from_secret",
+    [
+        "Example-${CURIE_AGENT}",
+        "example_${CURIE_AGENT}",
+        "-${CURIE_AGENT}",
+        "${CURIE_AGENT}.",
+        "example..${CURIE_AGENT}",
+        # 213 + a 40 character agent name is 253; one more cannot fit them all.
+        "a" * 214 + "${CURIE_AGENT}",
+    ],
+)
+def test_a_templated_from_secret_must_expand_to_a_secret_name(from_secret: str) -> None:
+    assert "connectors.secret_ref_bad_name" in _ref_codes(from_secret)
+
+
+def test_the_longest_templated_from_secret_that_fits_every_agent_is_accepted() -> None:
+    assert _ref_codes("a" * 213 + "${CURIE_AGENT}") == []
+
+
+@pytest.mark.parametrize("from_secret", ["Example_Secret", "grafana-mcp", "x" * 300])
+def test_a_literal_from_secret_keeps_its_existing_validation(from_secret: str) -> None:
+    # No behaviour change for a value without a placeholder: the Secret name
+    # checks apply only to the templated form.
+    assert _ref_codes(from_secret) == []
+
+
 def test_the_same_env_name_declared_twice_is_rejected() -> None:
     # Two env entries with one name means the container silently gets whichever
     # the renderer emitted last -- possibly pointed at the wrong Secret.

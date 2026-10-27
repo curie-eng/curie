@@ -445,6 +445,44 @@ def substitute(value: str, subs: dict[str, str]) -> str:
     return value
 
 
+# Placeholders a `SecretRef.from_secret` may carry. Deliberately one, and
+# disjoint from `PLACEHOLDERS`: a Secret name is chosen by the operator who
+# provisions it out of band, so the only thing worth varying is which agent
+# reads it. One bundle deployed as `foo` and `foo-dev` in one namespace then
+# references `example-read-foo` and `example-read-foo-dev`. Re-exported for the
+# validator, so the accepted set and the substituted set are one list.
+SECRET_REF_PLACEHOLDERS = ("CURIE_AGENT",)
+
+
+def is_secret_name(name: str) -> bool:
+    """Whether ``name`` is a Kubernetes Secret name (a DNS-1123 subdomain)."""
+
+    return len(name) <= _SECRET_NAME_MAX and bool(_SECRET_NAME.fullmatch(name))
+
+
+def referenced_secret_name(from_secret: str, agent: str) -> str:
+    """The Secret a ``SecretRef`` points at when deployed as ``agent``.
+
+    A literal ``from_secret`` is returned unchanged, exactly as before
+    ``${CURIE_AGENT}`` existed. The validator proves a templated one expands to
+    a Secret name for every valid agent name; the agent arrives separately
+    here, so the expansion is checked again rather than handing the API server
+    a name it refuses at apply.
+    """
+
+    if "${" not in from_secret:
+        return from_secret
+    name = substitute(from_secret, {"CURIE_AGENT": agent})
+    if not is_secret_name(name):
+        raise ValueError(
+            f"`from_secret: {from_secret}` expands to `{name}` for agent `{agent}`, "
+            "which is not a Kubernetes Secret name (lowercase alphanumeric, `-` or "
+            f"`.`, starting and ending alphanumeric, at most {_SECRET_NAME_MAX} "
+            "characters). Rename the agent or the Secret template."
+        )
+    return name
+
+
 def _readiness_probe(port: str = "http") -> dict[str, Any]:
     """``tcpSocket`` on the named container port.
 
@@ -500,7 +538,8 @@ def render_deployment(
     ]
     # Declared secrets arrive by reference, never as literals in the manifest.
     # A declared secret points either at the Secret Curie owns for this agent,
-    # or at one provisioned out of band (#1163). Both render the same shape --
+    # or at one provisioned out of band (#1163), whose name may carry
+    # `${CURIE_AGENT}` so each agent reads its own. Both render the same shape --
     # a secretKeyRef, never a literal -- so the container cannot tell them
     # apart and nothing downstream needs to.
     for declared in spec.secrets:
@@ -523,7 +562,7 @@ def render_deployment(
                     "name": declared.name,
                     "valueFrom": {
                         "secretKeyRef": {
-                            "name": declared.from_secret,
+                            "name": referenced_secret_name(declared.from_secret, agent),
                             "key": declared.secret_key(),
                             # Not optional: a referenced Secret that does not
                             # exist must stop the pod, not start it without the
