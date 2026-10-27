@@ -2,6 +2,18 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "type": "object",
   "definitions": {
+    "httpIdentityFile": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "existingSecret": {
+          "type": "string",
+          "maxLength": 253,
+          "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$",
+          "description": "Operator-created Secret holding this workload's HTTP identity operator file (HTTP-INVOCATION-EXECUTION-20). Empty renders nothing."
+        }
+      }
+    },
     "daemonQuantity": {
       "type": "string", "maxLength": 128,
       "pattern": "^\\+?(?:[0-9]*[1-9][0-9]*(?:\\.[0-9]*)?|[0-9]*\\.[0-9]*[1-9][0-9]*)(?:[eE][+-]?[0-9]{1,3}|[numkMGTPE]|[KMGTPE]i)?$",
@@ -277,6 +289,7 @@
       "type": "object",
       "properties": {
         "podDisruptionBudget": {"$ref": "#/definitions/computePodDisruptionBudget"},
+        "httpIdentity": {"$ref": "#/definitions/httpIdentityFile"},
         "approvalChatAttesterSecret": {
           "type": "string",
           "minLength": 1,
@@ -486,7 +499,8 @@
     "dispatcher": {
       "type": "object",
       "properties": {
-        "podDisruptionBudget": {"$ref": "#/definitions/computePodDisruptionBudget"}
+        "podDisruptionBudget": {"$ref": "#/definitions/computePodDisruptionBudget"},
+        "httpIdentity": {"$ref": "#/definitions/httpIdentityFile"}
       }
     },
     "agentSandbox": {

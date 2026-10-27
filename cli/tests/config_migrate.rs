@@ -2492,6 +2492,9 @@ const RESERVED_WITHOUT_MIGRATION: &[&str] = &[
     "CURIE_ACTION_EXECUTOR_MAX_CONCURRENT_SANDBOXES",
     "CURIE_ATTACHMENT_THREAD_MAX_BYTES",
     "CURIE_ATTACHMENT_THREAD_MAX_FILES",
+    // HTTP-INVOCATION-EXECUTION-20: operator file directories were introduced as Helm values.
+    "CURIE_HTTP_IDENTITY_DIR",
+    "CURIE_HTTP_RECEIVER_DIR",
     // #5005 / ADR 0244: new chart-owned lazy settings have no released extraEnv source.
     // Broker origins are derived from the private Service, not migrated into a values map.
     "ATTACHMENT_BROKER_URL",

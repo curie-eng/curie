@@ -99,8 +99,9 @@ spec:
       # The runner-logs proxy lists pods and reads pod logs via the K8s API, so
       # the API pod runs as its own ServiceAccount (see api-rbac.yaml).
       serviceAccountName: {{ include "curie.fullname" . }}-api
-      {{- if include "curie.factory.hasCredentials" . }}
-      # The api runs as gid 1000: fsGroup reads the 0440 forge credentials.
+      {{- if or (include "curie.factory.hasCredentials" .) (include "curie.httpIdentity.apiSecret" .) }}
+      # The api runs as gid 1000: fsGroup reads the 0440 forge credentials and
+      # HTTP identity operator file.
       securityContext:
         fsGroup: 1000
       {{- end }}
@@ -489,6 +490,11 @@ spec:
             # Per-thread conversation transcript cap in bytes (#3301).
             - name: TRANSCRIPT_MAX_THREAD_BYTES
               value: {{ .Values.api.transcriptMaxThreadBytes | int64 | quote }}
+            {{- if include "curie.httpIdentity.apiSecret" . }}
+            # HTTP identity operator file (HTTP-INVOCATION-EXECUTION-20).
+            - name: CURIE_HTTP_IDENTITY_DIR
+              value: /var/run/curie/http-identity
+            {{- end }}
             {{- $checksumExtraEnv | nindent 12 }}
           ports:
             - name: http
@@ -507,14 +513,23 @@ spec:
             {{- include "curie.api.resources" . | nindent 12 }}
           {{- $codeHostTrust := include "curie.codeHostTrust.name" . }}
           {{- $forgeCredentials := include "curie.factory.hasCredentials" . }}
-          {{- if or $codeHostTrust $forgeCredentials }}
+          {{- $httpIdentity := include "curie.httpIdentity.apiSecret" . }}
+          {{- if or $codeHostTrust $forgeCredentials $httpIdentity }}
           volumeMounts:
             {{- include "curie.codeHostTrust.volumeMount" . | nindent 12 }}
             {{- include "curie.factory.credentialMount" . | nindent 12 }}
+            {{- if $httpIdentity }}
+            - name: http-identity
+              mountPath: /var/run/curie/http-identity
+              readOnly: true
+            {{- end }}
           {{- end }}
-      {{- if or $codeHostTrust $forgeCredentials }}
+      {{- if or $codeHostTrust $forgeCredentials $httpIdentity }}
       volumes:
         {{- include "curie.codeHostTrust.volume" . | nindent 8 }}
         {{- include "curie.factory.credentialVolume" . | nindent 8 }}
+        {{- if $httpIdentity }}
+        {{- include "curie.httpIdentity.volume" (dict "name" "http-identity" "secret" $httpIdentity "file" "api-runtime.json") | nindent 8 }}
+        {{- end }}
       {{- end }}
 {{- end }}

@@ -24,6 +24,7 @@ malformed allowlist still reports its invalid field first. */ -}}
 {{- $threadedBotAllowlist = include "curie.dispatcher.threadedBotAllowlist" $ -}}
 {{- $threadedReserved = dict "CURIE_SLACK_THREADED_BOT_ALLOWLIST" "dispatcher.threadedBotAllowlist" -}}
 {{- end -}}
+{{- $httpReceiver := include "curie.httpIdentity.receiverSecret" . -}}
 {{- $checksumExtraEnv := include "curie.extraEnv" (dict "root" . "workload" "dispatcher" "env" .Values.dispatcher.extraEnv "additionalReserved" (merge $threadedReserved (include "curie.slack.reservedEnv" (dict "root" . "workload" "dispatcher") | fromJson))) -}}
 apiVersion: apps/v1
 kind: Deployment
@@ -77,6 +78,11 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- if $httpReceiver }}
+      # The dispatcher runs as gid 1000: fsGroup reads the 0440 receiver file.
+      securityContext:
+        fsGroup: 1000
+      {{- end }}
       containers:
         - name: dispatcher
           image: {{ include "curie.image" (dict "repository" .Values.dispatcher.image.repository "tag" .Values.dispatcher.image.tag "digest" .Values.dispatcher.image.digest "defaultTag" .Chart.AppVersion) | quote }}
@@ -126,6 +132,11 @@ spec:
             - name: CURIE_SLACK_THREADED_BOT_ALLOWLIST
               value: {{ $threadedBotAllowlist | quote }}
             {{- end }}
+            {{- if $httpReceiver }}
+            # Selected HTTP receivers (HTTP-INVOCATION-EXECUTION-20).
+            - name: CURIE_HTTP_RECEIVER_DIR
+              value: /var/run/curie/http-receiver
+            {{- end }}
             {{- $checksumExtraEnv | nindent 12 }}
           # No HTTP port on the dispatcher (Slack Socket Mode is outbound-only),
           # so an exec probe checks a heartbeat file a background daemon thread
@@ -149,4 +160,14 @@ spec:
           {{- include "curie.heartbeatProbes" . | nindent 10 }}
           resources:
             {{- toYaml .Values.dispatcher.resources | nindent 12 }}
+          {{- if $httpReceiver }}
+          volumeMounts:
+            - name: http-receiver
+              mountPath: /var/run/curie/http-receiver
+              readOnly: true
+          {{- end }}
+      {{- if $httpReceiver }}
+      volumes:
+        {{- include "curie.httpIdentity.volume" (dict "name" "http-receiver" "secret" $httpReceiver "file" "receivers.json") | nindent 8 }}
+      {{- end }}
 {{- end }}

@@ -1439,6 +1439,16 @@ api:
   # values-dev.yaml keeps the published deterministic default. Read it back with
   # kubectl get secret <release>-secrets -o jsonpath='{.data.remediationAuthorityKey}'.
   remediationAuthorityKey: curie-dev-remediation-authority
+  # HTTP identity operator file (HTTP-INVOCATION-EXECUTION-20), off by default.
+  # existingSecret names an operator-created Secret whose api-runtime.json key
+  # holds the provider bearers, receiver registrations and keys, and the core
+  # context sealing keys. It is mounted read-only at 0440 into the API
+  # container alone and read once at startup; the chart never creates, reads or
+  # checksums it, so roll the API after changing it. The provider's lookup host
+  # must also be allowed by api.egress. Rendering this is wiring, not
+  # activation: see charts/curie/README.md.
+  httpIdentity:
+    existingSecret: ""
   # Probe cadences. Database aware /ready keeps the API out of the Service until
   # Postgres responds, while process local /health keeps the process alive.
   # Liveness must outlast readiness. Cutoffs: readiness 120s, liveness 195s.
@@ -1731,6 +1741,14 @@ dispatcher:
   # first deadline; the startup probe below outlasts both phases plus the final
   # bounded two-second Slack call.
   apiPreflightTimeoutSeconds: 120
+  # Selected HTTP receivers (HTTP-INVOCATION-EXECUTION-20), off by default.
+  # existingSecret names an operator-created Secret whose receivers.json key
+  # holds each selected identity's receiver scope, bindings with their pinned
+  # channel credentials, and that receiver's key; never a core context key. It
+  # is mounted read-only at 0440 into the dispatcher container alone. Selecting
+  # a receiver requires api.httpIdentity.existingSecret.
+  httpIdentity:
+    existingSecret: ""
   # Startup uses the same heartbeat freshness check as readiness/liveness. The
   # kubelet can count its first failure at t=0, so 27 samples every 10 seconds
   # make the earliest fast-failure 260s -- strictly after the maximum 242s
