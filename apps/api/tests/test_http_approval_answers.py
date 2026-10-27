@@ -341,3 +341,52 @@ def test_original_invoker_losing_invocation_authority_blocks_an_approver_answer(
     assert response.status_code == 403, response.text
     assert response.json() == {"detail": "caller_not_allowed"}
     unchanged(case, before + 2)
+
+
+def current_actor_check(case: SimpleNamespace) -> int | str:
+    """@spec HTTP-APPROVAL-CONTINUITY-8: the exposed approver check, on this pass's own stores."""
+    from curie_api.identity.http_approval_answer import check_http_approval_actor
+    from curie_api.identity.http_transport import HttpIdentityClient
+    from fastapi import HTTPException
+    from redis import asyncio as redis_async
+
+    result: list[int | str] = []
+
+    async def go(factory: async_sessionmaker[AsyncSession]) -> None:
+        """@spec HTTP-APPROVAL-CONTINUITY-8."""
+        valkey = redis_async.from_url(get_settings().valkey_dsn())
+        state = SimpleNamespace(
+            sessionmaker=factory, valkey=valkey,
+            http_identity_runtime=case.client.app.state.http_identity_runtime,
+            http_identity_client=HttpIdentityClient(tls_context=case.provider.tls),
+        )
+        try:
+            await check_http_approval_actor(
+                SimpleNamespace(app=SimpleNamespace(state=state)),  # type: ignore[arg-type]
+                case.row["id"], approver_sets=case.client.app.state.approver_sets,
+            )
+            result.append(200)
+        except HTTPException as error:
+            result.append(f"{error.status_code} {error.detail}")
+        finally:
+            await valkey.aclose()
+
+    run(go)
+    return result[0]
+
+
+def test_preserved_actor_check_repeats_fresh_approver_authority(
+    answer_case: SimpleNamespace,
+) -> None:
+    """@spec HTTP-APPROVAL-CONTINUITY-8: a later boundary rechecks the sealed actor alone."""
+    case = answer_case
+    assert current_actor_check(case) == "403 unsupported_approval"
+    assert resolve(case, *answer(case)).status_code == 200
+    resolved = rows(case.row["dedupe_key"])
+    before = len(case.provider.requests)
+    assert current_actor_check(case) == 200
+    assert [item["purpose"] for item in case.provider.requests[before:]] == ["approval"]
+    assert [row["status"] for row in rows(case.row["dedupe_key"])] == ["approved"]
+    assert rows(case.row["dedupe_key"]) == resolved
+    case.provider.member = False
+    assert current_actor_check(case) == "403 caller_not_allowed"
