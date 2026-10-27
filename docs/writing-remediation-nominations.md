@@ -179,6 +179,7 @@ person to approve:
 | `arguments_schema_mismatch` | A key outside the schema, a declared key missing, or a wrong type; for `tune`, an undeclared rule or field. |
 | `agent_stopped` | The agent's kill switch is set or unreadable. |
 | `reply_surface_unavailable` | The delivery recorded no place to post a card, so a person cannot be asked. |
+| `http_identity_selected` | The approval's scope is selected for HTTP identity, which the legacy approval writer does not support, so no approval can be raised. |
 | `tune_execution_not_automated` | An approved `tune` request. It executes nothing. |
 
 The submission route itself refuses without writing a row: `remediation_disabled`

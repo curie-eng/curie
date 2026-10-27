@@ -39,7 +39,8 @@ def test_candidate_requires_deploy_notices_after_ledger_schema(resource: str) ->
     # The join requires both start diagnostics (0123) and attachment catalogs (0130).
     # @spec AGENT-ROLE-PERSISTENCE-V1-9: policy ORM reads require 0133.
     # @spec HTTP-APPROVAL-CONTINUITY-5: approval ORM reads require the 0137 column.
-    assert window == {"schema_min": "0137", "schema_head": "0137"}
+    # @spec AUTOMATED-REMEDIATION-15: 0138 widens a CHECK; the floor stays 0137.
+    assert window == {"schema_min": "0137", "schema_head": "0138"}
 
 
 @pytest.mark.parametrize("field", ["cargo", "chart", "app"])
@@ -69,7 +70,6 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     assert data["windows"].get("0.14.1") == {"schema_min": "0123", "schema_head": "0123"}
     assert data["windows"].get("0.14.2") == {"schema_min": "0123", "schema_head": "0123"}
     assert data["revisions"][-22:] == [
-        "0095",
         "0096",
         "0097",
         "0098",
@@ -91,6 +91,7 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
         "0132",
         "0133",
         "0137",
+        "0138",
     ]
     kinds = json.loads((ROOT / "apps/api/src/curie_api/revision_kinds.json").read_text())
     assert kinds["0102"] == "expand"
@@ -109,6 +110,7 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     assert kinds["0132"] == "expand"
     assert kinds["0133"] == "expand"
     assert kinds["0137"] == "expand"
+    assert kinds["0138"] == "expand"
 
 
 def test_every_prior_registered_window_is_exactly_preserved() -> None:
@@ -183,7 +185,7 @@ def test_both_train_heads_upgrade_without_losing_existing_rows(
 
     command.upgrade(alembic_config(), "head")
 
-    assert current_revision() == "0137"
+    assert current_revision() == "0138"
     assert sql_dicts("SELECT name FROM curie.agents WHERE id = :id", {"id": agent_id}) == [
         {"name": "acme-retained"}
     ]

@@ -1423,6 +1423,7 @@
           "arguments_schema_mismatch",
           "agent_stopped",
           "reply_surface_unavailable",
+          "http_identity_selected",
           "tune_execution_not_automated",
           "generation_not_current",
           "policy_disarmed",
@@ -1471,7 +1472,7 @@
           "escalated"
         ]
       },
-      "cardinality_bound": 3069,
+      "cardinality_bound": 3168,
       "description": "Remediation lifecycle receipts posted, by stage, kind, authority and code.",
       "monotonic": true,
       "type": "counter",

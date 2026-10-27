@@ -28,7 +28,8 @@ def revision_ready() -> None:
         "approval provenance migration 0137 is missing"
     )
     assert graph.get_revision("0137").down_revision == "0133"
-    assert graph.get_heads() == ["0137"]
+    # Later revisions append after it; 0138 is the head (AUTOMATED-REMEDIATION-15).
+    assert graph.get_heads() == ["0138"]
 
 
 def seed_approval(status: str = "pending") -> uuid.UUID:
@@ -62,7 +63,7 @@ def test_upgrade_adds_nullable_bounded_column_without_backfill(
     revision_ready()
     rows = {status: seed_approval(status) for status in ("pending", "approved", "rejected")}
     before = {status: approval_row(row) for status, row in rows.items()}
-    command.upgrade(alembic_config(), "head")
+    command.upgrade(alembic_config(), "0137")
     assert stamped_revision() == "0137"
     assert "identity_context" in column_names("approvals")
     assert constraint_exists(CHECK)
@@ -92,7 +93,7 @@ def test_downgrade_restores_0133_only_when_no_context_is_retained(
     """@spec HTTP-APPROVAL-CONTINUITY-5. Downgrade never discards retained authority."""
     isolated_migration_db.at("0133")
     revision_ready()
-    command.upgrade(alembic_config(), "head")
+    command.upgrade(alembic_config(), "0137")
     retained = seed_approval()
     sql_rows(
         "UPDATE curie.approvals SET identity_context='synthetic-sealed-context' WHERE id=:id",
@@ -108,5 +109,5 @@ def test_downgrade_restores_0133_only_when_no_context_is_retained(
     assert "identity_context" not in column_names("approvals")
     assert not constraint_exists(CHECK)
     assert "identity_context" not in approval_row(retained)
-    command.upgrade(alembic_config(), "head")
+    command.upgrade(alembic_config(), "0137")
     assert stamped_revision() == "0137"

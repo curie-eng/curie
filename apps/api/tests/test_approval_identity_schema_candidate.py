@@ -13,7 +13,8 @@ from alembic.script import ScriptDirectory
 
 ROOT = Path(__file__).resolve().parents[3]
 MIGRATION = ROOT / "apps/api/alembic/versions/0137_approval_identity_context.py"
-CANDIDATE = {"schema_min": "0137", "schema_head": "0137"}
+# The floor stays at the column the ORM reads; 0138 only widens a CHECK.
+CANDIDATE = {"schema_min": "0137", "schema_head": "0138"}
 
 
 def load(relative: str) -> Any:
@@ -31,7 +32,7 @@ def script() -> ScriptDirectory:
 def test_migration_0137_is_the_single_head_with_parent_0133() -> None:
     """@spec HTTP-APPROVAL-CONTINUITY-5: additive revision after role configuration."""
     graph = script()
-    assert graph.get_heads() == ["0137"]
+    assert graph.get_heads() == ["0138"]
     revision = graph.get_revision("0137")
     assert revision is not None and revision.down_revision == "0133"
     assert Path(revision.path).resolve() == MIGRATION.resolve()
@@ -62,7 +63,7 @@ def test_every_coupled_candidate_consumer_requires_0137(relative: str, extract: 
 def test_catalog_kind_parent_and_chart_digest_name_the_exact_migration() -> None:
     """@spec HTTP-APPROVAL-CONTINUITY-5: exact graph parent and file digest."""
     revisions = load("cli/src/application_schema_windows.json")["revisions"]
-    assert revisions[-2:] == ["0133", "0137"]
+    assert revisions[-3:] == ["0133", "0137", "0138"]
     assert load("apps/api/src/curie_api/revision_kinds.json")["0137"] == "expand"
     serving = load("packages/protected-hooks/src/curie_protected_hooks/schema_serving.json")
     assert serving["revision_parents"]["0137"] == ["0133"]

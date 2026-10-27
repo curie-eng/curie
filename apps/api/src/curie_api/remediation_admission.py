@@ -92,6 +92,7 @@ from typing import Any, Final
 
 from aci_protocol import QueuedTurn, ReplyHandle, ToolAccess, TurnSource
 from channel_protocol import hook_conversation_id
+from fastapi import HTTPException
 from sqlalchemy import Integer, and_, cast, delete, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import SQLAlchemyError
@@ -99,10 +100,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .action_forward import ForwardRefused
 from .action_undoable import sealing_custody
+from .identity.writer_selection import http_selected_scope
 from .killswitch import KillSwitch
 from .models import (
     ActionExecution,
     AgentAction,
+    Approval,
     ConnectorCapability,
     ExecutionKind,
     ExecutionState,
@@ -169,6 +172,7 @@ ADMISSION_UNREADABLE: Final = "admission_unreadable"
 POLICY_CHANGED: Final = "policy_changed"
 REPLY_SURFACE_UNAVAILABLE: Final = "reply_surface_unavailable"
 UNKNOWN_ACTION: Final = "unknown_action"
+HTTP_IDENTITY_SELECTED: Final = "http_identity_selected"
 
 # The precondition read's idempotency key: ``remediation:<nomination id>:precondition``.
 _PRECONDITION: Final = "precondition"
@@ -1073,6 +1077,90 @@ def _owed_approval() -> Any:
     )
 
 
+async def _end_http_selected(session: AsyncSession) -> None:
+    """End every owed approval whose scope is positively HTTP-selected. Commits nothing.
+
+    @spec AUTOMATED-REMEDIATION-15 @spec HTTP-APPROVAL-CONTINUITY-1. The
+    internal writer refuses a selected scope before insertion, so no pass could
+    raise it. The scope is classified once per distinct agent and recorded reply
+    surface, by the owner ``request_remediation_approval`` classifies with
+    (``identity.writer_selection.http_selected_scope``) holding the shared
+    identity lock until the caller commits, and every row of a selected scope is
+    ended in one statement: the pass limit of ``reconcile_admissions`` never
+    bounds it. A scope that cannot be classified is not selected: its rows stay
+    owed and are retried. Runs after ``_end_unraisable``'s statements, so every
+    owed row it sees has a reply surface.
+    """
+
+    surface = RemediationNominationSubmission
+    scopes = (
+        await session.execute(
+            select(
+                RemediationNomination.agent_id,
+                surface.reply_kind,
+                surface.reply_channel,
+                surface.reply_adapter,
+            )
+            .join(surface, surface.event_id == RemediationNomination.event_id)
+            .where(
+                _owed_approval(),
+                surface.reply_kind.is_not(None),
+                surface.reply_channel.is_not(None),
+            )
+            .distinct()
+        )
+    ).all()
+    for agent_id, kind, channel, adapter in scopes:
+        try:
+            async with session.begin_nested():
+                if not await http_selected_scope(
+                    session,
+                    Approval(
+                        agent_id=agent_id,
+                        reply_kind=kind,
+                        reply_channel=channel,
+                        reply_adapter=adapter,
+                    ),
+                ):
+                    continue
+                ended = (
+                    await session.scalars(
+                        update(RemediationNomination)
+                        .where(
+                            _owed_approval(),
+                            RemediationNomination.agent_id == agent_id,
+                            select(surface.event_id)
+                            .where(
+                                surface.event_id == RemediationNomination.event_id,
+                                surface.reply_kind == kind,
+                                surface.reply_channel == channel,
+                                surface.reply_adapter.is_not_distinct_from(adapter),
+                            )
+                            .exists(),
+                        )
+                        .values(
+                            state=REFUSED,
+                            refusal_code=HTTP_IDENTITY_SELECTED,
+                            decided_at=func.now(),
+                        )
+                        .returning(RemediationNomination.id)
+                        .execution_options(synchronize_session=False)
+                    )
+                ).all()
+                for nomination_id in ended:
+                    await release_reservation(session, nomination_id)
+        except HTTPException:
+            # Unavailable classification never selects; the rows stay owed.
+            logger.warning("remediation approval scope cannot be classified")
+            continue
+        if ended:
+            logger.warning(
+                "remediation nominations refused count=%d code=%s",
+                len(ended),
+                HTTP_IDENTITY_SELECTED,
+            )
+
+
 async def _end_unraisable(session: AsyncSession) -> None:
     """End every owed approval request that no pass could ever raise. Commits nothing."""
 
@@ -1122,6 +1210,7 @@ async def _end_unraisable(session: AsyncSession) -> None:
             await release_reservation(session, nomination_id)
         if ended:
             logger.warning("remediation nominations refused count=%d code=%s", len(ended), code)
+    await _end_http_selected(session)
 
 
 async def reconcile_admissions(
@@ -1140,7 +1229,9 @@ async def reconcile_admissions(
     for every such row, so it is never selected again and cannot starve a
     raisable one: no reply surface recorded is ``reply_surface_unavailable``,
     and an action the generation the approval would bind no longer declares is
-    ``unknown_action`` (AUTOMATED-REMEDIATION-7, -15). A recorded delivery reply
+    ``unknown_action`` (AUTOMATED-REMEDIATION-7, -15), and a scope the internal
+    writer refuses because it is HTTP-selected is ``http_identity_selected``
+    (``_end_http_selected``). A recorded delivery reply
     surface is pruned once its submission copied it.
     """
 
