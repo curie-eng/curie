@@ -67,10 +67,11 @@ from ..identity.http_approval_answer import (
     ApprovalAnswer,
     ApprovalSettled,
     answer_http_approval,
+    publish_answered_resume,
 )
 from ..models import AgentChannel, Approval, ApprovalAuditEntry, ApprovalStatus
 from ..remediation_approvals import REMEDIATION_PURPOSE, settle_remediation_approval
-from ..resumequeue import approval_trace_context, build_resume_turn
+from ..resumequeue import ResumeQueue, approval_trace_context, build_resume_turn
 
 logger = logging.getLogger(__name__)
 
@@ -291,7 +292,7 @@ async def recover_approval(
     # authority; platform-key-only recovery refuses before any mutation.
     if await approval_is_selected(session, approval):
         return await _recover_selected(
-            approval, data, session, principal, request, approver_sets,
+            approval, data, session, principal, request, approver_sets, resume_queue,
         )
     recorded = await crud_approvals.find_recovery_audit(session, data.recovery_key)
     if recorded is not None:
@@ -367,6 +368,7 @@ async def _recover_selected(
     principal: AuthenticatedApprovalPrincipal,
     request: Request,
     approver_sets: ApproverSetSelector,
+    resume_queue: ResumeQueue,
 ) -> ApprovalRecoveryOut:
     """Recovery of a selected row through the approval commit owner.
 
@@ -408,7 +410,10 @@ async def _recover_selected(
         "approval %s administratively recovered as rejected by %s (key %s)",
         approval.id, principal.subject, data.recovery_key,
     )
-    return _recovery_out(recovered, data.recovery_key)
+    # @spec HTTP-APPROVAL-CONTINUITY-10/11: the wake publishes only after the commit.
+    out = _recovery_out(recovered, data.recovery_key)
+    await publish_answered_resume(session, resume_queue, recovered)
+    return out
 
 
 def _recovery_out(approval: Approval, recovery_key: str) -> ApprovalRecoveryOut:

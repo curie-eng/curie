@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import logging
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -31,6 +32,7 @@ from curie_api.approval_teams import authenticated_actor_evidence, team_restrict
 from curie_api.authorizer import authorize_approval
 from curie_api.crud import approvals as approvals_crud
 from curie_api.models import Approval, ApprovalAuditEntry, ApprovalStatus, Principal
+from curie_api.resumequeue import ApprovalResumeRefused, approval_trace_context
 from curie_api.schemas.http_authority import HttpSelectionV1
 from curie_api.schemas.http_identity import LookupRequestV1, SenderV1, ValidatedFacts
 from curie_api.slack_approvers import SlackUserGroupMembers, approval_token_identity
@@ -56,6 +58,8 @@ from .http_resume_publication import (
 )
 from .http_transport import HttpIdentityClient, HttpIdentityObservation
 from .slack import AUTH_TEST_KEY, INTERACTION_DELIVERIES, SlackEvidence, derive
+
+logger = logging.getLogger(__name__)
 
 PROOF_HEADER = "X-Curie-Approval-Receiver-Proof"
 _INVALID_PRINCIPAL = "missing or invalid approval principal"
@@ -798,3 +802,34 @@ def approved_resume_authority(state: Any) -> ApprovedResumeAuthority:
             yield CurrentResumeAuthority(session=session, stable_fence=stable, windows=windows)
 
     return authority
+
+
+async def publish_answered_resume(
+    session: AsyncSession, resume_queue: Any, row: Approval,
+) -> None:
+    """Publish the wake a committed selected answer owes, after its commit.
+
+    Called only once the commit owner has positively acknowledged the
+    resolution: never inside the mutation or under a row lock. A refusal
+    appends nothing and leaves the wake owed for the reconciler; any other
+    failure is not marked either, and the committed resolution still stands.
+    @spec HTTP-APPROVAL-CONTINUITY-10/11.
+    """
+    try:
+        await resume_queue.enqueue_approval(row.id, parent=approval_trace_context(row))
+    except ApprovalResumeRefused as refused:
+        logger.warning(
+            "approval %s resolved; selected resume refused (%s), the wake stays owed",
+            row.id, refused.code,
+        )
+        return
+    except Exception:  # noqa: BLE001 - the resolution committed; the wake stays owed.
+        logger.warning(
+            "approval %s resolved; selected resume enqueue failed, the wake stays owed",
+            row.id,
+        )
+        return
+    try:
+        await approvals_crud.mark_approval_resumed(session, row.id)
+    except Exception:  # noqa: BLE001 - a duplicate wake is absorbed by the done-marker.
+        logger.warning("approval %s resume appended; marking it resumed failed", row.id)
