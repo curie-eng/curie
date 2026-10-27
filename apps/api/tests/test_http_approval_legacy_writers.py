@@ -17,9 +17,11 @@ from typing import Any
 from curie_api import approval_principal
 from curie_api.config import get_settings
 from curie_api.db import SCHEMA
+from curie_api.identity.http_approval import http_expiry_owner
 from curie_api.resumequeue import ResumeQueue
 from curie_api.resumereconciler import ResumeReconciler
 from curie_api.sweeper import sweep_expired_approvals
+from redis import asyncio as redis_async
 from role_policy_support import run
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -123,18 +125,30 @@ def operator_headers() -> dict[str, str]:
     return {"X-API-Key": get_settings().api_key, "X-Curie-Approval-Principal": token}
 
 
-def sweep(case: SimpleNamespace, **kwargs: Any) -> int:
-    """@spec HTTP-APPROVAL-CONTINUITY-10: one real sweeper pass with the app's own stores."""
-    state = case.client.app.state
+def sweep(case: SimpleNamespace, *, owner: bool) -> int:
+    """@spec HTTP-APPROVAL-CONTINUITY-10: one real sweeper pass.
+
+    Its stores and the production owner factory are built on this pass's own event
+    loop; the app's pooled clients belong to the TestClient loop.
+    """
+    runtime = case.client.app.state.http_identity_runtime
     result: list[int] = []
 
     async def go(factory: async_sessionmaker[AsyncSession]) -> None:
         """@spec HTTP-APPROVAL-CONTINUITY-10."""
-        async with factory() as session:
-            result.append(await sweep_expired_approvals(
-                session, state.resume_queue,
-                now=datetime.now(UTC).replace(tzinfo=None) + timedelta(days=1), **kwargs,
-            ))
+        valkey = redis_async.from_url(get_settings().valkey_dsn())
+        try:
+            stores = SimpleNamespace(
+                sessionmaker=factory, valkey=valkey, http_identity_runtime=runtime,
+            )
+            async with factory() as session:
+                result.append(await sweep_expired_approvals(
+                    session, ResumeQueue(valkey),
+                    now=datetime.now(UTC).replace(tzinfo=None) + timedelta(days=1),
+                    http_expiry=http_expiry_owner(stores) if owner else None,
+                ))
+        finally:
+            await valkey.aclose()
 
     run(go)
     return result[0]
@@ -179,7 +193,7 @@ def test_sweeper_expires_a_selected_row_through_the_sealing_owner(
     """@spec HTTP-APPROVAL-CONTINUITY-10: the background writer reseals too."""
     case = creation_case
     row = lapse(case, created(case))
-    sweep(case, http_expiry=case.client.app.state.http_approval_expiry)
+    sweep(case, owner=True)
     expired = assert_expired_and_resealed(case, row["dedupe_key"])
     assert expired["resumed_at"] is None
 
@@ -190,7 +204,7 @@ def test_sweeper_without_the_sealing_owner_leaves_a_selected_row_pending(
     """@spec HTTP-APPROVAL-CONTINUITY-10: the legacy writer never expires an adopted row."""
     case = creation_case
     row = lapse(case, created(case))
-    sweep(case)
+    sweep(case, owner=False)
     assert rows(row["dedupe_key"]) == [row]
     assert audits(row["id"]) == []
 
@@ -219,8 +233,8 @@ def test_adopted_row_without_provenance_is_never_legacy_expired(
             await session.commit()
 
     run(insert)
-    sweep(case, http_expiry=case.client.app.state.http_approval_expiry)
-    sweep(case)
+    sweep(case, owner=True)
+    sweep(case, owner=False)
     response = case.client.post(
         f"/approvals/{forged}/resolve", json={"decision": "approved"},
         headers=chat_headers(uuid.UUID(forged), row["card_channel"]),
@@ -270,18 +284,21 @@ def test_reconciler_keeps_a_selected_wake_owed_instead_of_publishing_it(
     """@spec HTTP-APPROVAL-CONTINUITY-1/10: no context-free resume for a selected row."""
     case = creation_case
     row = lapse(case, created(case))
-    sweep(case, http_expiry=case.client.app.state.http_approval_expiry)
+    sweep(case, owner=True)
     assert_expired_and_resealed(case, row["dedupe_key"])
-    state = case.client.app.state
-    queue: ResumeQueue = state.resume_queue
 
     async def reconcile(factory: async_sessionmaker[AsyncSession]) -> None:
         """@spec HTTP-APPROVAL-CONTINUITY-10: a pass past the grace horizon."""
-        reconciler = ResumeReconciler(
-            factory, queue, interval_seconds=1, grace_seconds=0, batch_limit=10,
-        )
-        await asyncio.sleep(0.01)
-        assert await reconciler.reconcile_once() == 0
+        valkey = redis_async.from_url(get_settings().valkey_dsn())
+        try:
+            reconciler = ResumeReconciler(
+                factory, ResumeQueue(valkey), interval_seconds=1, grace_seconds=0,
+                batch_limit=10,
+            )
+            await asyncio.sleep(0.01)
+            assert await reconciler.reconcile_once() == 0
+        finally:
+            await valkey.aclose()
 
     run(reconcile)
     assert rows(row["dedupe_key"])[0]["resumed_at"] is None
