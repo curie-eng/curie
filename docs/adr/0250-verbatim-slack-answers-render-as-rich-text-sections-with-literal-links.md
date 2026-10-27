@@ -2,7 +2,9 @@
 
 Date: 2026-10-26
 
-Status: Draft
+Status: Accepted
+
+Accepted alongside implementation with explicit maintainer approval from Junwon Jung on 2026-10-26 under ADR 0102. Approval covers the rendering decision below and its realizing paths.
 
 ## Context
 
