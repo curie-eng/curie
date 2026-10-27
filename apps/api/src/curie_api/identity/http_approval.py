@@ -163,16 +163,15 @@ async def require_legacy_approval_creation(session: AsyncSession, data: Approval
                 and source.reply_adapter == BUILTIN_CLUSTER_MESSAGE_ADAPTER
                 else source.reply_adapter
             )
-            binding = await channels_crud.binding_for_route(
+            # Every candidate, so an ambiguous route cannot hide an adopted one. A tenant
+            # without HTTP selection keeps agent/route disagreement and ambiguity.
+            for binding in await channels_crud.bindings_for_route(
                 session,
                 source.reply_kind,
                 adapter,
                 source.reply_channel,
-            )
-            if binding is not None:
+            ):
                 if await _http_tenant(session, binding.tenant_id):
-                    _refuse(409, "unsupported_approval")
-                if source.agent_id is not None and binding.agent_id != source.agent_id:
                     _refuse(409, "unsupported_approval")
     except HTTPException:
         raise
