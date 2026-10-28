@@ -277,3 +277,98 @@ def test_superseding_a_blocked_external_read_cannot_pin_or_start_the_old_request
         {"id": old["id"]},
     )
     assert stale == {"status": "cancelled", "acquire_owner": None}
+
+
+@pytest.mark.parametrize("label", ["base:next", "base:release-1", "base:main"])
+def test_a_base_only_label_observation_fences_a_blocked_first_acquisition(
+    base_app: Any, label: str
+) -> None:
+    client, api = base_app
+    number = 32008
+    assert _label(client, api, number, "base:main").json()["status"] == "factory_admitted"
+    original = _execution(number)
+    payload = _acquire_body(number)
+
+    async def race() -> httpx.Response:
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def forge(request: httpx.Request) -> httpx.Response:
+            if request.url.path == f"/repos/{REPO}/git/ref/heads/main":
+                entered.set()
+                await release.wait()
+            return api.handle(request)
+
+        previous = client.app.state.http_client
+        async with httpx.AsyncClient(transport=httpx.MockTransport(forge)) as external:
+            client.app.state.http_client = external
+            try:
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=client.app), base_url="http://testserver"
+                ) as http:
+                    claiming = asyncio.create_task(
+                        http.post(
+                            f"/v1/internal/work-items/requests/{original['id']}/acquire",
+                            headers=WORKER,
+                            json=payload,
+                        )
+                    )
+                    try:
+                        await asyncio.wait_for(entered.wait(), 5)
+                        api.labels = [LABEL, label]
+                        body = json.dumps(
+                            _issue_event("labeled", number, label={"name": label})
+                        ).encode()
+                        observed = await asyncio.wait_for(
+                            http.post(
+                                "/github/webhook",
+                                content=body,
+                                headers={
+                                    "X-GitHub-Delivery": str(uuid.uuid4()),
+                                    "X-GitHub-Event": "issues",
+                                    "X-Hub-Signature-256": _signature(body),
+                                    "Content-Type": "application/json",
+                                },
+                            ),
+                            5,
+                        )
+                        assert observed.status_code == 200, observed.text
+                    finally:
+                        release.set()
+                    return await asyncio.wait_for(claiming, 5)
+            finally:
+                client.app.state.http_client = previous
+
+    first = client.portal.call(race)
+
+    current = _execution(number)
+    assert current["id"] == original["id"]
+    assert current["status"] == "waiting"
+    if label != "base:main":
+        assert first.status_code == 409, first.text
+    else:
+        assert first.status_code in {200, 409}, first.text
+    if first.status_code == 409:
+        assert current["acquire_owner"] is None
+        item = _work_item(number)
+        assert (item["base_branch"], item["base_source"], item["base_commit"]) == (
+            None,
+            None,
+            None,
+        )
+    _due(number)
+
+    latest = _acquire(client, number)
+
+    if label == "base:release-1":
+        assert latest.status_code == 409, latest.text
+        assert _execution(number)["id"] == original["id"]
+        assert _execution(number)["acquire_owner"] is None
+        assert _work_item(number)["base_commit"] is None
+        api.labels = [LABEL, "base:next"]
+        _due(number)
+        latest = _acquire(client, number)
+    assert latest.status_code == 200, latest.text
+    assert _execution(number)["id"] == original["id"]
+    expected = ("main", MAIN_SHA) if label == "base:main" else ("next", NEXT_SHA)
+    item = _work_item(number)
+    assert (item["base_branch"], item["base_commit"]) == expected
