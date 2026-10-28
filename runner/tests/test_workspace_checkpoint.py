@@ -618,6 +618,14 @@ def test_checkpoint_refusals(tmp_path: Path) -> None:
     (unsafe / "sub").mkdir()
     (unsafe / "README.md").write_text("edited\n")
 
+    # Names containing quote characters, in a separate small repository.
+    quoted = _init(tmp_path / "quoted")
+    (quoted / '"q.txt').write_text("q base\n")
+    quoted_base = _commit_all(quoted, "quoted base")
+    (quoted / '"q.txt').write_text("q edited\n")
+    (quoted / '"note.txt"').write_text("note\n")
+    quoted_runner = _boot(tmp_path, "quoted", quoted)
+
     runner = _boot(tmp_path, "refusals", repo)
     shallow_runner = _boot(tmp_path, "shallow", shallow)
     unsafe_runner = _boot(tmp_path, "unsafe", unsafe)
@@ -629,6 +637,15 @@ def test_checkpoint_refusals(tmp_path: Path) -> None:
             shallow_client = await stack.enter_async_context(_serve(shallow_runner))
             unsafe_client = await stack.enter_async_context(_serve(unsafe_runner))
             turn_client = await stack.enter_async_context(_serve(turn_runner))
+            quoted_client = await stack.enter_async_context(_serve(quoted_runner))
+
+            # Quote characters in path names survive into paths and digests.
+            quoted_body = await _capture(quoted_client, quoted_base)
+            assert quoted_body["changed_paths"] == ['"note.txt"', '"q.txt']
+            _, _, quoted_manifest = _decode(quoted_body)
+            for entry in quoted_manifest["entries"]:
+                digest = hashlib.sha256((quoted / entry["path"]).read_bytes()).hexdigest()
+                assert entry["sha256"] == digest, entry
 
             # Malformed bodies.
             await _capture(client, base)
@@ -658,6 +675,9 @@ def test_checkpoint_refusals(tmp_path: Path) -> None:
             ]
             for body in malformed:
                 await _refused(client, 400, "invalid_request", json_body=body)
+            # A budget too large for a float is still a clean 400.
+            huge = ('{"base_sha": "%s", "budget_seconds": 1%s}' % (base, "0" * 400)).encode()
+            await _refused(client, 400, "invalid_request", data=huge)
             await _capture(client, base)
 
             # An active turn refuses a well-formed request; a malformed one is
