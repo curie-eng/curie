@@ -676,7 +676,7 @@ def test_checkpoint_refusals(tmp_path: Path) -> None:
             for body in malformed:
                 await _refused(client, 400, "invalid_request", json_body=body)
             # A budget too large for a float is still a clean 400.
-            huge = ('{"base_sha": "%s", "budget_seconds": 1%s}' % (base, "0" * 400)).encode()
+            huge = f'{{"base_sha": "{base}", "budget_seconds": 1{"0" * 400}}}'.encode()
             await _refused(client, 400, "invalid_request", data=huge)
             await _capture(client, base)
 

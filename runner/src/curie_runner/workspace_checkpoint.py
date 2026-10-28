@@ -171,8 +171,9 @@ def parse_checkpoint_request(body: object) -> tuple[str, float]:
     if (
         isinstance(budget, bool)
         or not isinstance(budget, int | float)
-        or not math.isfinite(budget)
+        # Compare before any float conversion: a huge integer overflows it.
         or not 0 < budget <= MAX_BUDGET_SECONDS
+        or not math.isfinite(budget)
     ):
         raise CheckpointRefusal(
             "invalid_request",
@@ -280,6 +281,14 @@ def _safe_path(raw: bytes) -> str:
     ):
         raise _unsafe("workspace contains an unsafe path")
     return path
+
+
+def _stdin_path(path: str) -> str:
+    """A path as ``--stdin-paths`` reads it: a leading quote means C quoting."""
+
+    if not path.startswith('"'):
+        return path
+    return '"' + path.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
 def _git_hasher(object_format: str) -> hashlib._Hash:
@@ -553,7 +562,7 @@ def capture_workspace_checkpoint(
                 "--no-filters",
                 "--stdin-paths",
                 env=isolated,
-                input="".join(f"{path}\n" for path in blobs).encode("utf-8"),
+                input="".join(f"{_stdin_path(path)}\n" for path in blobs).encode("utf-8"),
             )
             if printed.decode("ascii", "replace").split() != [desired[p][1] for p in blobs]:
                 raise _changed("a workspace file changed during the checkpoint")
