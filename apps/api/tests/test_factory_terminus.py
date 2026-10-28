@@ -1302,19 +1302,20 @@ def _attach_publication(
                         "result": pr_url,
                     },
                 )
-                changed = await conn.execute(
-                    text(
-                        "UPDATE curie.work_items SET publication_lineage_id = :lineage, "
-                        "version = version + 1 WHERE id = :id AND version = :version"
-                    ),
-                    {
-                        "lineage": lineage_id,
-                        "id": work_item_id,
-                        "version": item["version"],
-                    },
-                )
-                if changed.rowcount != 1:
-                    raise AssertionError(f"work item {work_item_id} was not linked")
+                if pr is not None:
+                    changed = await conn.execute(
+                        text(
+                            "UPDATE curie.work_items SET publication_lineage_id = :lineage, "
+                            "version = version + 1 WHERE id = :id AND version = :version"
+                        ),
+                        {
+                            "lineage": lineage_id,
+                            "id": work_item_id,
+                            "version": item["version"],
+                        },
+                    )
+                    if changed.rowcount != 1:
+                        raise AssertionError(f"work item {work_item_id} was not linked")
                 if request["id"] is None:
                     raise AssertionError("running request is missing")
         finally:

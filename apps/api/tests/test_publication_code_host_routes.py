@@ -1009,7 +1009,7 @@ def test_branch_context_preserves_verified_lineage_base(seeded: Seeded) -> None:
     ("branch", "source", "commit"),
     [
         ("", "default", BASE_SHA),
-        ("refs/heads/main", "default", BASE_SHA),
+        ("refs/heads//main", "default", BASE_SHA),
         ("bad..branch", "default", BASE_SHA),
         ("x" * 1025, "default", BASE_SHA),
         ("main", "default", "not-a-sha"),

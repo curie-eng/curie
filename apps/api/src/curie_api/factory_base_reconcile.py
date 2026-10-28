@@ -363,7 +363,9 @@ async def observe_base_labels(
         .with_for_update()
         .limit(1)
     )
-    if choice.branch == item.base_branch and moving is None:
+    if choice.branch == item.base_branch and (
+        moving is None or (moving.phase == "applied" and choice.branch == moving.target_base_ref)
+    ):
         item.base_requested_branch, item.base_requested_source = None, None
         if item.base_source != choice.source:
             item.base_source = choice.source

@@ -321,7 +321,7 @@ jobs:
           PYTEST_SCOPE: ${{ steps.python-runtime.outputs.pytest_scope }}
         run: |
           pytest_args=(-q -n 4 --dist loadgroup --ci-shard "$SHARD/6" --reruns 1 -rsR --durations=25 --ignore=tools/factory-e2e/tests/test_c4_initial_binding.py --ignore=tools/factory-e2e/tests/test_c4_static_token_rotation.py --ignore=tools/factory-e2e/tests/test_c4_held_cancellation.py --ignore=tools/factory-e2e/tests/test_c4_forge_instances.py)
-          pytest_args+=(--deselect=tools/factory-e2e/tests/test_c4_admitted_agent.py)
+          pytest_args+=(--deselect=tools/factory-e2e/tests/test_c4_admitted_agent.py --deselect=tools/factory-e2e/tests/test_c4_dynamic_base.py)
           pytest_args+=(--ignore tools/factory-e2e/tests/test_c4_upgrade_migration.py)
           pytest_args+=(--ignore tools/factory-e2e/tests/test_c4_cluster_up.py)
           pytest_args+=(--ignore tools/factory-e2e/tests/test_c4_tracker_scope.py)

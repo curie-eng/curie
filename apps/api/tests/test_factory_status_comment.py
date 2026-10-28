@@ -1236,15 +1236,27 @@ def _link_through_jira(
     return linked, issue
 
 
-def _bind_lineage_pr(work_item_id: uuid.UUID, pr: int) -> None:
+def _bind_lineage_pr(
+    work_item_id: uuid.UUID, pr: int, *, publication_request_id: uuid.UUID
+) -> None:
     _execute(
-        "UPDATE curie.thread_publication_lineages SET pr_number = :pr, pr_url = :url, "
-        "head_sha = :head WHERE id = (SELECT publication_lineage_id FROM curie.work_items "
-        "WHERE id = :id)",
+        "WITH bound_lineage AS ("
+        "UPDATE curie.thread_publication_lineages AS l SET pr_number = :pr, pr_url = :url, "
+        "head_sha = :head, code_host_kind = w.code_host_kind, "
+        "code_host_host = w.code_host_host, repository_project_id = w.repository_project_id, "
+        "code_host_installation_id = w.code_host_installation_id, code_host_pr_id = :node_id, "
+        "base_ref = w.base_branch, base_sha = w.base_commit, version = l.version + 1 "
+        "FROM curie.work_items AS w WHERE w.id = :id AND l.id = ("
+        "SELECT lineage_id FROM curie.publications WHERE execution_request_id = :request_id) "
+        "RETURNING l.id) "
+        "UPDATE curie.work_items AS w SET publication_lineage_id = l.id, "
+        "version = w.version + 1 FROM bound_lineage AS l WHERE w.id = :id",
         {
             "pr": pr,
             "url": f"https://github.com/{REPO}/pull/{pr}",
             "head": HEAD_A,
+            "node_id": f"PR_fixture_{work_item_id.hex}",
+            "request_id": publication_request_id,
             "id": work_item_id,
         },
     )
@@ -1278,7 +1290,7 @@ def test_failed_first_publication_then_second_opens_pr_links_once(
     assert linked == []
 
     second = _second_request(client, work_item_id, number, "Fix the parser")
-    _bind_lineage_pr(work_item_id, 81)
+    _bind_lineage_pr(work_item_id, 81, publication_request_id=first)
     _attach_revision_publication(work_item_id, second, head_sha=HEAD_A)
     _reconcile()
     _reconcile()
