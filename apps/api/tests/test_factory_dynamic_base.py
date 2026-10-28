@@ -18,6 +18,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from curie_api.config import Settings, get_settings
 from forge_fakes.github import LABEL, REPO, _issue_event, _post, _signature
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine
 from test_github_factory_base import (  # noqa: F401
     MAIN_SHA,
     NEXT_SHA,
@@ -372,3 +374,132 @@ def test_a_base_only_label_observation_fences_a_blocked_first_acquisition(
     expected = ("main", MAIN_SHA) if label == "base:main" else ("next", NEXT_SHA)
     item = _work_item(number)
     assert (item["base_branch"], item["base_commit"]) == expected
+
+
+def test_a_base_label_waiting_behind_the_first_pin_still_replaces_its_granted_owner(
+    base_app: Any,
+) -> None:
+    client, api = base_app
+    number = 32009
+    assert _label(client, api, number, "base:main").json()["status"] == "factory_admitted"
+    original = _execution(number)
+    item = _work_item(number)
+    payload = _acquire_body(number)
+
+    async def race() -> tuple[httpx.Response, httpx.Response]:
+        branch_read = asyncio.Event()
+
+        async def forge(request: httpx.Request) -> httpx.Response:
+            if request.url.path == f"/repos/{REPO}/git/ref/heads/main":
+                branch_read.set()
+            return api.handle(request)
+
+        engine = create_async_engine(get_settings().database_url)
+        previous = client.app.state.http_client
+        try:
+            async with (
+                engine.connect() as holder,
+                engine.connect() as inspector,
+                httpx.AsyncClient(transport=httpx.MockTransport(forge)) as external,
+                httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=client.app), base_url="http://testserver"
+                ) as http,
+            ):
+                client.app.state.http_client = external
+                holder_pid = await holder.scalar(text("SELECT pg_backend_pid()"))
+                await holder.execute(
+                    text("SELECT id FROM curie.work_items WHERE id = :id FOR UPDATE"),
+                    {"id": item["id"]},
+                )
+
+                async def waiter(blocker: int, request: asyncio.Task[httpx.Response]) -> int:
+                    async with asyncio.timeout(5):
+                        while True:
+                            result = await inspector.execute(
+                                text(
+                                    "SELECT DISTINCT pid FROM pg_locks WHERE NOT granted "
+                                    "AND CAST(:blocker AS integer) = ANY(pg_blocking_pids(pid))"
+                                ),
+                                {"blocker": blocker},
+                            )
+                            waiting = result.scalars().all()
+                            if waiting:
+                                (pid,) = waiting
+                                return int(pid)
+                            assert not request.done(), "request completed before the row lock wait"
+
+                async with asyncio.TaskGroup() as requests:
+                    acquiring = requests.create_task(
+                        http.post(
+                            f"/v1/internal/work-items/requests/{original['id']}/acquire",
+                            headers=WORKER,
+                            json=payload,
+                        )
+                    )
+                    try:
+                        await asyncio.wait_for(branch_read.wait(), 5)
+                        acquiring_pid = await waiter(int(holder_pid), acquiring)
+                        api.labels = [LABEL, "base:next"]
+                        body = json.dumps(
+                            _issue_event("labeled", number, label={"name": "base:next"})
+                        ).encode()
+                        observing = requests.create_task(
+                            http.post(
+                                "/github/webhook",
+                                content=body,
+                                headers={
+                                    "X-GitHub-Delivery": str(uuid.uuid4()),
+                                    "X-GitHub-Event": "issues",
+                                    "X-Hub-Signature-256": _signature(body),
+                                    "Content-Type": "application/json",
+                                },
+                            )
+                        )
+                        observing_pid = await waiter(acquiring_pid, observing)
+                        assert observing_pid != acquiring_pid
+                    finally:
+                        await holder.rollback()
+                    acquired, observed = await asyncio.wait_for(
+                        asyncio.gather(acquiring, observing), 5
+                    )
+                    return acquired, observed
+        finally:
+            client.app.state.http_client = previous
+            await engine.dispose()
+
+    acquired, observed = client.portal.call(race)
+
+    assert acquired.status_code == 200, acquired.text
+    assert observed.status_code == 200, observed.text
+    requests = _rows(
+        "SELECT id, status, acquire_owner FROM curie.execution_requests "
+        "WHERE work_item_id = :id ORDER BY sequence",
+        {"id": item["id"]},
+    )
+    assert [request["status"] for request in requests] == ["cancelled", "waiting"], requests
+    predecessor, successor = requests
+    assert predecessor == {"id": original["id"], "status": "cancelled", "acquire_owner": None}
+    assert successor["id"] != original["id"]
+    assert successor["status"] == "waiting"
+    stale_start = client.post(
+        f"/v1/internal/work-items/requests/{original['id']}/start",
+        headers=WORKER,
+        json={
+            "owner": "factory-base-owner",
+            "generation": acquired.json()["generation"],
+            "claim_name": "claim-factory-base",
+            "sandbox_name": "sandbox-factory-base",
+            "context": acquired.json()["context"],
+        },
+    )
+    assert stale_start.status_code == 409, stale_start.text
+    _due(number)
+
+    healthy = _acquire(client, number)
+
+    assert healthy.status_code == 200, healthy.text
+    assert (_work_item(number)["base_branch"], _work_item(number)["base_commit"]) == (
+        "next",
+        NEXT_SHA,
+    )
+    assert _start(client, number, healthy).status_code == 200
