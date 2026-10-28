@@ -73,7 +73,7 @@ def _refuse(status: int, code: str) -> NoReturn:
     raise HTTPException(status, code, headers={"Cache-Control": "no-store"})
 
 
-def _canonical(value: Any) -> str:
+def canonical_json(value: Any) -> str:
     """@spec HTTP-APPROVAL-CONTINUITY-2/5."""
 
     def scalar(item: Any) -> str:
@@ -128,7 +128,7 @@ def _digest(value: str) -> str:
 
 def approval_record_digest(approval: Approval) -> str:
     """@spec HTTP-APPROVAL-CONTINUITY-5."""
-    return _digest(_canonical({name: getattr(approval, name) for name in _RECORD_FIELDS}))
+    return _digest(canonical_json({name: getattr(approval, name) for name in _RECORD_FIELDS}))
 
 
 async def _http_tenant(session: AsyncSession, tenant_id: uuid.UUID) -> bool:
@@ -431,7 +431,7 @@ def _effect(data: ApprovalRequest) -> None:
             raise ValueError
         if (
             data.granted_arguments is not None
-            and len(_canonical(data.granted_arguments).encode("utf-8")) > 16_384
+            and len(canonical_json(data.granted_arguments).encode("utf-8")) > 16_384
         ):
             raise ValueError
     except (ValueError, TypeError, RecursionError):
@@ -445,7 +445,7 @@ async def _route_snapshot(
     agent = await session.get(Agent, data.agent_id, populate_existing=True)
     if agent is None:
         _refuse(422, "invalid_approval_context")
-    snapshot = _canonical(agent.approval_routes)
+    snapshot = canonical_json(agent.approval_routes)
     if expected is not None and snapshot != expected:
         _refuse(503, "authority_unavailable")
     target = data.reply_channel
@@ -491,7 +491,7 @@ def _historical(
         or saved.status != row.status
         or saved.approval_record_sha256 != approval_record_digest(row)
         or saved.creation_request_sha256
-        != _digest(_canonical(body.approval.model_dump(mode="json")))
+        != _digest(canonical_json(body.approval.model_dump(mode="json")))
         or saved.source_context_sha256 != _digest(body.identity.context)
         or saved.source_payload_sha256 != _digest(body.identity.payload)
         or saved.source_event_id != body.approval.dedupe_key
@@ -529,7 +529,7 @@ def _seal(
         source_event_id=body.approval.dedupe_key,
         conversation_id=body.approval.conversation_id,
         status="pending",
-        creation_request_sha256=_digest(_canonical(body.approval.model_dump(mode="json"))),
+        creation_request_sha256=_digest(canonical_json(body.approval.model_dump(mode="json"))),
         source_context_sha256=_digest(body.identity.context),
         source_payload_sha256=_digest(body.identity.payload),
         original_payload_sha256=original.payload_sha256,

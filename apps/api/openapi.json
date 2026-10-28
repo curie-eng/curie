@@ -2376,6 +2376,117 @@
         "title": "ApprovalCreationResponseV1",
         "type": "object"
       },
+      "ApprovalGrantAuthorityRequestV1": {
+        "additionalProperties": false,
+        "description": "@spec HTTP-APPROVAL-CONTINUITY-12.",
+        "properties": {
+          "check": {
+            "$ref": "#/components/schemas/TurnAuthorityRequestV1"
+          },
+          "grant": {
+            "$ref": "#/components/schemas/ApprovalGrantExpectationV1"
+          },
+          "schema_version": {
+            "const": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "schema_version",
+          "check",
+          "grant"
+        ],
+        "title": "ApprovalGrantAuthorityRequestV1",
+        "type": "object"
+      },
+      "ApprovalGrantAuthorityResponseV1": {
+        "additionalProperties": false,
+        "description": "@spec HTTP-APPROVAL-CONTINUITY-12.",
+        "properties": {
+          "check": {
+            "$ref": "#/components/schemas/TurnAuthorityResponseV1"
+          },
+          "grant_sha256": {
+            "title": "Grant Sha256",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "schema_version",
+          "check",
+          "grant_sha256"
+        ],
+        "title": "ApprovalGrantAuthorityResponseV1",
+        "type": "object"
+      },
+      "ApprovalGrantExpectationV1": {
+        "additionalProperties": false,
+        "description": "@spec HTTP-APPROVAL-CONTINUITY-12.",
+        "properties": {
+          "agent_id": {
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "approval_id": {
+            "title": "Approval Id",
+            "type": "string"
+          },
+          "conversation_id": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "gate_kind": {
+            "enum": [
+              "permission",
+              "policy"
+            ],
+            "title": "Gate Kind",
+            "type": "string"
+          },
+          "granted_arguments_json": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Granted Arguments Json"
+          },
+          "granted_tool": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Granted Tool"
+          }
+        },
+        "required": [
+          "approval_id",
+          "agent_id",
+          "conversation_id",
+          "gate_kind",
+          "granted_tool",
+          "granted_arguments_json"
+        ],
+        "title": "ApprovalGrantExpectationV1",
+        "type": "object"
+      },
       "ApprovalIdentityFactsOut": {
         "description": "Per-row FACTS about one pending approval (#2753).\n\nFacts, never verdicts: nothing here says a row cannot be resolved. A route\nwhose approver set is the card channel's membership is a HEALTHY route that\nany attested chat click resolves, and it is reported like any other row.",
         "properties": {
@@ -28298,6 +28409,66 @@
         "summary": "Verify Review",
         "tags": [
           "internal-github-reviews"
+        ]
+      }
+    },
+    "/v1/internal/identity/approval-grant/check": {
+      "post": {
+        "description": "@spec HTTP-APPROVAL-CONTINUITY-12.",
+        "operationId": "check_approval_grant_v1_internal_identity_approval_grant_check_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApprovalGrantAuthorityRequestV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApprovalGrantAuthorityResponseV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Check Approval Grant",
+        "tags": [
+          "internal-identity-authority"
         ]
       }
     },
