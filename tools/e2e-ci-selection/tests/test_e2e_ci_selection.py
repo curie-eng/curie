@@ -248,6 +248,19 @@ CHART_SCENARIOS: dict[str, _ChartScenario] = {
         ],
         "leg": "chart",
     },
+    "connector-apply-race": {
+        "step": "Connector apply survives a concurrent reconciler create",
+        "inputs": [
+            "charts/curie/ci/runtime/connector-apply-race-runtime.sh",
+            "cli",
+            "apps/api",
+            "apps/worker",
+            "packages",
+            "pyproject.toml",
+            "uv.lock",
+        ],
+        "leg": "workload",
+    },
     "connector-secret-rotation": {
         "step": "Hosted connector credential rotation rolls only that connector",
         "inputs": [
@@ -319,6 +332,7 @@ WORKLOAD_SCENARIOS = frozenset(
         "workspace-diagnostic",
         "quota-progress",
         "connector-secret-rotation",
+        "connector-apply-race",
         "failed-first-install-retry",
         "factory-resource-profile",
     }
@@ -1864,6 +1878,7 @@ def test_mixed_root_documentation_and_runtime_diff_selects_runtime_tiers(
         "cluster",
         pytest_deselect=ALL_CONDITIONAL,
         chart_scenarios=(
+            "connector-apply-race",
             "connector-secret-rotation",
             "factory-resource-profile",
             "quota-progress",
@@ -4169,6 +4184,7 @@ WORKLOAD_STAGING_IF = (
     "(contains(fromJSON(needs.changes.outputs.chart_scenarios), 'workspace-diagnostic') "
     "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') "
     "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-secret-rotation') "
+    "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-apply-race') "
     "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'failed-first-install-retry') "
     "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'factory-resource-profile')) }}"
 )
@@ -5194,6 +5210,7 @@ def test_controller_preflight_upgrade_scenario_runs_on_chart_pull_requests() -> 
             False,
             False,
             (
+                "connector-apply-race",
                 "connector-secret-rotation",
                 "factory-resource-profile",
                 "quota-progress",
@@ -5218,6 +5235,7 @@ def test_controller_preflight_upgrade_scenario_runs_on_chart_pull_requests() -> 
             False,
             False,
             (
+                "connector-apply-race",
                 "connector-readiness",
                 "connector-secret-rotation",
                 "factory-resource-profile",
@@ -5230,6 +5248,7 @@ def test_controller_preflight_upgrade_scenario_runs_on_chart_pull_requests() -> 
             False,
             False,
             (
+                "connector-apply-race",
                 "connector-readiness",
                 "connector-secret-rotation",
                 "factory-resource-profile",
@@ -5298,6 +5317,7 @@ def test_chart_scenarios_follow_changed_inputs_and_final_tiers(
         (
             "apps/worker/src/curie_worker/connector_k8s.py.bak",
             (
+                "connector-apply-race",
                 "connector-secret-rotation",
                 "factory-resource-profile",
                 "quota-progress",
@@ -5348,6 +5368,7 @@ def test_chart_scenario_union_is_sorted_and_deduplicated(tmp_path: Path) -> None
     assert forward.returncode == reverse.returncode == 0, forward.stderr + reverse.stderr
     assert output == reversed_output
     assert json.loads(_outputs_of(output)["chart_scenarios"]) == [
+        "connector-apply-race",
         "connector-readiness",
         "connector-secret-rotation",
         "factory-resource-profile",
@@ -5652,6 +5673,7 @@ def test_unregistered_chart_scenario_fails_closed_in_each_selection_mode(
         CHART_IDS
         if mode in {"push", "revisions"}
         else (
+                "connector-apply-race",
                 "connector-secret-rotation",
                 "factory-resource-profile",
                 "quota-progress",
@@ -5730,6 +5752,23 @@ def test_negative_control_still_covers_the_chart_job_result() -> None:
     mutated = _run_aggregate(script_transform=omit_chart_check, **state)
     assert mutated.returncode != 0, mutated.stdout + mutated.stderr
     assert "Selected and skipped negative control failed" in mutated.stdout + mutated.stderr
+
+
+def test_connector_apply_race_selects_candidate_runtime(tmp_path: Path) -> None:
+    for path in (
+        "charts/curie/ci/runtime/connector-apply-race-runtime.sh",
+        "cli/src/connectors.rs",
+        "apps/worker/src/curie_worker/connector_k8s.py",
+    ):
+        completed, output = _invoke_selector(tmp_path, path)
+        assert completed.returncode == 0, completed.stderr
+        selected = json.loads(_outputs_of(output)["chart_scenarios"])
+        if "connector-apply-race" not in selected:
+            raise AssertionError("changed connector apply race input was not selected")
+    completed, output = _invoke_selector(tmp_path, "docs/agents.md")
+    assert completed.returncode == 0, completed.stderr
+    if "connector-apply-race" in json.loads(_outputs_of(output)["chart_scenarios"]):
+        raise AssertionError("an unrelated path selected the connector apply race")
 
 
 def test_connector_secret_rotation_selects_candidate_runtime(tmp_path: Path) -> None:
