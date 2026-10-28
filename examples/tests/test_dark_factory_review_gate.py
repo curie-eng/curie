@@ -18,6 +18,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -3070,12 +3071,248 @@ def test_an_unreadable_git_status_does_not_stop_diff_review(
     replacement.chmod(0o755)
     s.env["PATH"] = f"{binaries}{os.pathsep}{s.env['PATH']}"
 
-    _, context = s.review(DIFF, reply(DIFF, "APPROVE"))
+    decision = s.pre("Agent", {"subagent_type": DIFF, "description": "d", "prompt": "p"})
 
-    assert "APPROVED" in context
-    assert s.pre(PUBLISH)["permissionDecision"] == "allow"
     assert not [e for e in s.gate_events() if e["curie_gate"] == "github_path_refused"]
+    assert decision["permissionDecision"] == "deny"
+    assert s.pre(PUBLISH)["permissionDecision"] == "deny"
+    assert _saved_state(s)["stopped"] is None
+    assert _saved_state(s)["diff"]["round"] == 0
     argv = json.loads(invocation.read_text())
     assert "--porcelain=v1" in argv
     assert "-z" in argv
     assert "--untracked-files=all" in argv
+
+
+# --- Fresh diff review after the checkout changes (#5122) -------------------
+
+
+_CHECKOUT_CHANGES = (
+    "tracked",
+    "untracked",
+    "deletion",
+    "mode",
+    "head",
+    "staged",
+    "untracked-mode",
+    "untracked-edit",
+    "missing",
+    "moved",
+    "unreadable",
+)
+_UNTRACKED_BYTES = b"print(1)\n"
+_TRACKED_TEXT = "def add(a, b):\n    return a - b\n"
+
+
+def _prepend_git_shim(session: Session, body: str) -> None:
+    binaries = session.cwd.parent / "git-bin"
+    binaries.mkdir()
+    replacement = binaries / "git"
+    replacement.write_text(f"#!{sys.executable}\n{body}")
+    replacement.chmod(0o755)
+    session.env["PATH"] = f"{binaries}{os.pathsep}{session.env['PATH']}"
+
+
+def _plant_untracked(session: Session, change: str) -> None:
+    if change in {"untracked-mode", "untracked-edit"}:
+        (session.cwd / "new.py").write_bytes(_UNTRACKED_BYTES)
+
+
+def _mutate_checkout(session: Session, change: str) -> None:
+    repo = session.cwd
+    target = repo / SOURCE
+    if change == "tracked":
+        target.write_text(_TRACKED_TEXT)
+    elif change == "untracked":
+        (repo / "new.py").write_bytes(_UNTRACKED_BYTES)
+    elif change == "deletion":
+        target.unlink()
+    elif change == "mode":
+        target.chmod(0o755)
+    elif change == "head":
+        _git(repo, "commit", "--allow-empty", "-q", "-m", "empty")
+    elif change == "staged":
+        target.write_text(_TRACKED_TEXT)
+        _git(repo, "add", SOURCE)
+    elif change == "untracked-mode":
+        (repo / "new.py").chmod(0o755)
+    elif change == "untracked-edit":
+        (repo / "new.py").write_bytes(b"print(2)\n")
+    elif change == "missing":
+        shutil.rmtree(repo / ".git")
+    elif change == "moved":
+        repo.rename(repo.with_name(repo.name + "-away"))
+    elif change == "unreadable":
+        _prepend_git_shim(session, "import sys\nsys.exit(1)\n")
+    else:
+        raise AssertionError(change)
+
+
+@pytest.mark.parametrize("change", _CHECKOUT_CHANGES)
+def test_stale_publication_refused(session: Session, change: str) -> None:
+    session.review(PLAN, reply(PLAN, "APPROVE"))
+    _plant_untracked(session, change)
+    session.review(DIFF, reply(DIFF, "APPROVE"))
+    _mutate_checkout(session, change)
+    assert session.pre(PUBLISH)["permissionDecision"] == "deny"
+    assert _saved_state(session)["diff"]["verdict"] is None
+
+
+@pytest.mark.parametrize("change", _CHECKOUT_CHANGES)
+def test_mutation_during_review_refused(session: Session, change: str) -> None:
+    session.review(PLAN, reply(PLAN, "APPROVE"))
+    _plant_untracked(session, change)
+    pre = session.pre("Agent", {"subagent_type": DIFF, "description": "d", "prompt": "p"})
+    assert pre["permissionDecision"] == "allow", pre
+    _mutate_checkout(session, change)
+    post = session.fire(
+        "PostToolUse",
+        tool_name="Agent",
+        tool_input=pre["updatedInput"],
+        tool_response={"content": [{"type": "text", "text": reply(DIFF, "APPROVE")}]},
+    )
+    assert post is not None
+    assert _saved_state(session)["diff"]["verdict"] is None
+    assert session.pre(PUBLISH)["permissionDecision"] == "deny"
+
+
+def test_unchanged_approved_tree_allowed(session: Session) -> None:
+    session.review(PLAN, reply(PLAN, "APPROVE"))
+    session.review(DIFF, reply(DIFF, "APPROVE"))
+    approved = _saved_state(session)["diff"]
+    assert session.pre(PUBLISH)["permissionDecision"] == "allow"
+    assert _saved_state(session)["diff"] == approved
+
+
+def test_ignored_publication_content_does_not_invalidate(session: Session) -> None:
+    session.review(PLAN, reply(PLAN, "APPROVE"))
+    session.review(DIFF, reply(DIFF, "APPROVE"))
+    approved = _saved_state(session)["diff"]
+    (session.cwd / ".venv").mkdir()
+    (session.cwd / ".venv" / "x").write_text("site-packages\n")
+    assert session.pre(PUBLISH)["permissionDecision"] == "allow"
+    assert _saved_state(session)["diff"] == approved
+
+
+def test_stale_then_fresh_review_preserves_round(session: Session) -> None:
+    session.review(PLAN, reply(PLAN, "APPROVE"))
+    session.review(DIFF, reply(DIFF, "APPROVE"))
+    (session.cwd / SOURCE).write_text(_TRACKED_TEXT)
+    assert session.pre(PUBLISH)["permissionDecision"] == "deny"
+    assert _saved_state(session)["diff"]["round"] == 1
+    assert _saved_state(session)["diff"]["verdict"] is None
+    session.review(DIFF, reply(DIFF, "APPROVE"))
+    assert _saved_state(session)["diff"]["round"] == 2
+    assert session.pre(PUBLISH)["permissionDecision"] == "allow"
+
+
+def test_before_review_unreadable_refused_without_spending_round(session: Session) -> None:
+    session.review(PLAN, reply(PLAN, "APPROVE"))
+    _prepend_git_shim(session, "import sys\nsys.exit(1)\n")
+    decision = session.pre("Agent", {"subagent_type": DIFF, "description": "d", "prompt": "p"})
+    assert decision["permissionDecision"] == "deny"
+    assert _saved_state(session)["diff"]["round"] == 0
+    assert _saved_state(session)["stopped"] is None
+
+
+def test_untracked_mode_changes_real_fingerprint(session: Session) -> None:
+    path = session.cwd / "new.py"
+    path.write_bytes(_UNTRACKED_BYTES)
+    session.fire("UserPromptSubmit", prompt="mode-off")
+    first = _saved_state(session)["fingerprint"]
+    path.chmod(0o755)
+    session.fire("UserPromptSubmit", prompt="mode-on")
+    second = _saved_state(session)["fingerprint"]
+    assert first is not None
+    assert second is not None
+    assert first != second
+
+
+def test_unreadable_before_review_can_resume_without_round_reset(session: Session) -> None:
+    session.review(PLAN, reply(PLAN, "APPROVE"))
+    original = session.env["PATH"]
+    _prepend_git_shim(session, "import sys\nsys.exit(1)\n")
+    decision = session.pre("Agent", {"subagent_type": DIFF, "description": "d", "prompt": "p"})
+    assert decision["permissionDecision"] == "deny"
+    assert _saved_state(session)["diff"]["round"] == 0
+    session.env["PATH"] = original
+    session.review(DIFF, reply(DIFF, "APPROVE"))
+    assert _saved_state(session)["diff"]["round"] == 1
+    assert _saved_state(session)["stopped"] is None
+    assert session.pre(PUBLISH)["permissionDecision"] == "allow"
+
+
+def test_stale_at_cap_does_not_get_more_rounds(session: Session) -> None:
+    session.review(PLAN, reply(PLAN, "APPROVE"))
+    session.review(DIFF, reply(DIFF, "CHANGES"))
+    session.review(DIFF, reply(DIFF, "CHANGES"))
+    session.review(DIFF, reply(DIFF, "APPROVE"))
+    (session.cwd / SOURCE).write_text(_TRACKED_TEXT)
+    assert session.pre(PUBLISH)["permissionDecision"] == "deny"
+    assert _saved_state(session)["diff"]["round"] == 3
+    assert _saved_state(session)["diff"]["verdict"] is None
+    denied = session.pre("Agent", {"subagent_type": DIFF, "description": "d", "prompt": "p"})
+    assert denied["permissionDecision"] == "deny"
+    assert _saved_state(session)["diff"]["round"] == 3
+    assert _saved_state(session)["stopped"] is not None
+
+
+def test_missing_workspace_can_restore_and_re_review(session: Session) -> None:
+    session.review(PLAN, reply(PLAN, "APPROVE"))
+    session.review(DIFF, reply(DIFF, "APPROVE"))
+    away = session.cwd.with_name(session.cwd.name + "-away")
+    session.cwd.rename(away)
+    assert session.pre(PUBLISH)["permissionDecision"] == "deny"
+    assert _saved_state(session)["diff"]["verdict"] is None
+    away.rename(session.cwd)
+    session.review(DIFF, reply(DIFF, "APPROVE"))
+    assert _saved_state(session)["diff"]["round"] == 2
+    assert session.pre(PUBLISH)["permissionDecision"] == "allow"
+
+
+def test_review_git_calls_share_hook_budget(session: Session) -> None:
+    session.review(PLAN, reply(PLAN, "APPROVE"))
+    real_git = shutil.which("git")
+    assert real_git is not None
+    _prepend_git_shim(
+        session,
+        "import os\n"
+        "import sys\n"
+        "import time\n"
+        "time.sleep(2.6)\n"
+        f"os.execv({real_git!r}, [{real_git!r}, *sys.argv[1:]])\n",
+    )
+    started = time.monotonic()
+    decision = session.pre("Agent", {"subagent_type": DIFF, "description": "d", "prompt": "p"})
+    elapsed = time.monotonic() - started
+    assert decision["permissionDecision"] == "deny"
+    assert _saved_state(session)["diff"]["round"] == 0
+    assert elapsed < 9
+
+
+def test_publication_gate_is_not_atomic_snapshot_authority(session: Session) -> None:
+    session.review(PLAN, reply(PLAN, "APPROVE"))
+    session.review(DIFF, reply(DIFF, "APPROVE"))
+    assert session.pre(PUBLISH)["permissionDecision"] == "allow"
+    (session.cwd / SOURCE).write_text(_TRACKED_TEXT)
+    diff = subprocess.run(
+        ["git", "diff", "--", SOURCE],
+        cwd=session.cwd,
+        env=_clean_env(),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "return a - b" in diff.stdout
+    assert session.pre(PUBLISH)["permissionDecision"] == "deny"
+
+
+def test_task_notification_preserves_approval_until_a_later_edit(session: Session) -> None:
+    session.review(PLAN, reply(PLAN, "APPROVE"))
+    session.review(DIFF, reply(DIFF, "APPROVE"))
+    before = _saved_state(session)
+    out = session.fire("UserPromptSubmit", prompt=_TASK_NOTIFICATION)
+    assert out is None
+    assert _saved_state(session) == before
+    (session.cwd / SOURCE).write_text(_TRACKED_TEXT)
+    assert session.pre(PUBLISH)["permissionDecision"] == "deny"
