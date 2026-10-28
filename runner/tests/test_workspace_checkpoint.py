@@ -442,6 +442,7 @@ def test_trusted_base_http_restore(tmp_path: Path) -> None:
     (repo / "script.sh").write_text("#!/bin/sh\necho hi\n")
     (repo / "image.bin").write_bytes(b"\x00\x01base\xff\x00")
     (repo / ".gitignore").write_text("ignored.log\n")
+    (repo / "café.txt").write_text("base café\n", encoding="utf-8")
     (repo / "script.sh").chmod(0o644)
     base = _commit_all(repo, "base")
 
@@ -472,6 +473,10 @@ def test_trusted_base_http_restore(tmp_path: Path) -> None:
     (repo / "dir" / "nested" / "new.txt").write_text("untracked text\n")
     (repo / "new.bin").write_bytes(b"\x00untracked\x00binary\xff")
     (repo / "ignored.log").write_text("never captured\n")
+    # UTF-8 names: one tracked file modified, one new untracked file in a new directory.
+    (repo / "café.txt").write_text("edited café\n", encoding="utf-8")
+    (repo / "naïve").mkdir()
+    (repo / "naïve" / "日本.txt").write_text("untracked 日本\n", encoding="utf-8")
 
     expected = _tree(repo, skip=frozenset({"ignored.log"}))
     base_files = _tree(copy)
@@ -479,6 +484,7 @@ def test_trusted_base_http_restore(tmp_path: Path) -> None:
     changed = {path for path in expected if base_files.get(path) != expected[path]} | deleted
     assert deleted == {"delete_me.txt"}
     assert {"script.sh", "image.bin", "new.bin", "added_in_commit.txt", "modify.txt"} <= changed
+    assert {"café.txt", "naïve/日本.txt"} <= changed
     assert "keep.txt" not in changed
 
     runner = _boot(tmp_path, "restore", repo)
