@@ -104,7 +104,8 @@ def dynamic_factory(
         policy is None
         or policy["bases"] != ["*"]
         or policy["default_base"] != "main"
-        or policy["ci"]["required"] != {"key": "dynamic-ci", "paths": [CHANGE]}
+        or policy["ci"]["required"]
+        != {"key": "dynamic-ci", "paths": [CHANGE], "pending_key_prefix": None}
     ):
         raise RuntimeError("the API did not consume the dynamic-base GitHub repository policy")
     run.deadline = None

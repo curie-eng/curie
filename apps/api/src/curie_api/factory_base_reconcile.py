@@ -158,6 +158,7 @@ async def resolve_for_acquire(
     )
     policy = work_item_policy(registry, issue, repository)
     item_id, item_version, request_version = item.id, item.version, request.version
+    trigger_label, publication_lineage_id = item.trigger_label, item.publication_lineage_id
     await session.commit()
     try:
         async with asyncio.timeout(_READ_SECONDS):
@@ -174,7 +175,7 @@ async def resolve_for_acquire(
             current_repository = await host.resolve_repository(repository.project_id)
             if current_repository != repository or current_repository.path != repository.path:
                 raise Unavailable("repository_identity_changed")
-            if item.trigger_label is not None and item.trigger_label not in ticket.labels:
+            if trigger_label is not None and trigger_label not in ticket.labels:
                 raise Unavailable("factory_label_absent")
             resolved = await factory_base.resolve_base(
                 policy=policy,
@@ -185,9 +186,12 @@ async def resolve_for_acquire(
             )
             remote_lineage_head = None
             lineage = (
-                await session.get(ThreadPublicationLineage, item.publication_lineage_id)
-                if item.publication_lineage_id
+                await session.get(ThreadPublicationLineage, publication_lineage_id)
+                if publication_lineage_id
                 else None
+            )
+            lineage_branch = (
+                lineage.branch if lineage is not None and lineage.head_sha is None else None
             )
             if (
                 lineage is not None
@@ -195,10 +199,9 @@ async def resolve_for_acquire(
                 and lineage.base_ref != resolved.branch
             ):
                 await _supersede_pending_authority(session, lineage.id)
-            if lineage is not None and lineage.head_sha is None:
-                branch = lineage.branch
+            if lineage_branch is not None:
                 await session.commit()
-                remote_lineage_head = await host.branch_head(repository, branch)
+                remote_lineage_head = await host.branch_head(repository, lineage_branch)
     except (ForgeError, FeedbackUnavailable, TimeoutError):
         item = await lifecycle.lock_work_item(session, item_id)
         request = await lifecycle.lock_request(session, work_item_id=item_id, request_id=request_id)
@@ -313,11 +316,16 @@ async def observe_base_labels(
     policy = work_item_policy(registry, item.tracker_issue, item.repository)
     choice = factory_base.choose_base(labels, factory_base.bases_for(policy), default_branch)
     if isinstance(choice, factory_base.BaseRefusal):
+        issue, repository, installation = (
+            item.tracker_issue,
+            item.repository,
+            item.code_host_installation_id,
+        )
         await session.commit()
         tracker = tracker_for_work_item(
-            registry, client, item.tracker_issue, item.repository, item.code_host_installation_id
+            registry, client, issue, repository, installation
         )
-        await factory_base.comment_refusal(tracker.marked_comments, item.tracker_issue, choice)
+        await factory_base.comment_refusal(tracker.marked_comments, issue, choice)
         return
     if item.cancelled_at is not None or (
         item.trigger_label is not None and item.trigger_label not in labels
