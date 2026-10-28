@@ -36,6 +36,7 @@ from curie_api.forges.capabilities import CODE_HOST_OPERATIONS, Operation, Suppo
 from curie_api.forges.credential_providers import StaticTokenProvider, TokenSnapshot
 from curie_api.forges.errors import Ambiguous, NotFound, Unavailable, Unsupported
 from curie_api.forges.paths import valid_repository_path
+from curie_api.forges.retarget import retarget_checked
 from curie_api.forges.types import (
     Actor,
     CheckSource,
@@ -589,6 +590,56 @@ class BitbucketDcCodeHost:
             self.pull_path(pull_request), what="pull_request", json=change
         )
         return await self._pull(pull_request.repository, updated)
+
+    async def retarget_pull_request(
+        self,
+        pull_request: PullRequestRef,
+        *,
+        base_ref: str,
+        expected_head_sha: str,
+    ) -> PullRequest:
+        await self.ensure_version(Operation.RETARGET_PULL_REQUEST)
+        repository = pull_request.repository
+        path = self.pull_path(pull_request)
+        version: int | None = None
+
+        async def parse(payload: dict[str, Any]) -> PullRequest:
+            if type(payload.get("id")) is not int or str(payload["id"]) != pull_request.number:
+                raise Unavailable("pull_request_mismatch")
+            for side in ("fromRef", "toRef"):
+                branch = _dict(payload.get(side))
+                if (
+                    str(_dict(branch.get("repository")).get("id")) != repository.project_id
+                    or not isinstance(branch.get("displayId"), str)
+                    or branch.get("id") != f"refs/heads/{branch['displayId']}"
+                ):
+                    raise Unavailable("pull_request_mismatch")
+            return await self._pull(repository, payload)
+
+        async def read() -> PullRequest:
+            nonlocal version
+            current = await self.read_pull(pull_request)
+            reported = current.payload.get("version")
+            if type(reported) is not int or reported < 0:
+                raise Unavailable("pull_request_version")
+            version = reported
+            return await parse(current.payload)
+
+        async def update() -> PullRequest:
+            updated = await self._http.put_versioned(
+                path,
+                what="pull_request",
+                json={"version": version, "toRef": {"id": f"refs/heads/{base_ref}"}},
+            )
+            return await parse(updated)
+
+        return await retarget_checked(
+            pull_request,
+            base_ref=base_ref,
+            expected_head_sha=expected_head_sha,
+            read=read,
+            update=update,
+        )
 
     async def read_pull_request(self, pull_request: PullRequestRef) -> PullRequest:
         await self.ensure_version(Operation.READ_PULL_REQUEST)

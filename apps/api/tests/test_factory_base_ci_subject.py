@@ -11,7 +11,6 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
-import httpx
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -45,7 +44,14 @@ from test_factory_ci_wait import (
     _terminal,
 )
 from test_factory_progress import verification
-from test_factory_terminus import _label, _published_issue, _reconcile, _request, _start_running
+from test_factory_terminus import (
+    _acknowledge_publication_history,
+    _label,
+    _published_issue,
+    _reconcile,
+    _request,
+    _start_running,
+)
 from test_github_factory_base import MAIN_SHA, NEXT_SHA, _open_lineage
 
 pytestmark = pytest.mark.usefixtures("clean_db")
@@ -168,53 +174,6 @@ def _request_state(row: dict[str, Any]) -> tuple[str, str | None]:
         {"id": row["id"]},
     )[0]
     return current["status"], current["terminal_cause"]
-
-
-def _acknowledge_publication_history(client: Any, published: dict[str, Any]) -> None:
-    from curie_worker.publication_clients import PublicationTranscriptClient
-    from curie_worker.publication_store import PostgresPublicationStore
-
-    publication = _rows(
-        "SELECT id FROM curie.publications WHERE execution_request_id = :id",
-        {"id": published["id"]},
-    )[0]
-
-    async def acknowledge() -> None:
-        engine = create_async_engine(get_settings().database_url)
-        store = PostgresPublicationStore(
-            engine, schema="curie", lease_owner="factory-ci-history"
-        )
-        try:
-            cleanup = await store.claim_pending_cleanup()
-            assert cleanup is not None and cleanup.publication_id == publication["id"]
-            await store.mark_cleanup_completed(cleanup.publication_id)
-            result = await store.pending_result(publication["id"])
-            assert result is not None
-            async with httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=client.app), base_url="http://api.example.com"
-            ) as state_client:
-                transcript = PublicationTranscriptClient(
-                    api_base_url="http://api.example.com",
-                    api_key=get_settings().api_key,
-                    client=state_client,
-                )
-                await transcript.record_result(
-                    result.agent_id,
-                    result.workspace_conversation_id,
-                    result.publication_id,
-                    f"Published the approved changes: {result.pr_url}",
-                )
-            await store.mark_outcome_history_ready(result.publication_id)
-        finally:
-            await engine.dispose()
-
-    client.portal.call(acknowledge)
-    acknowledged = _rows(
-        "SELECT status, outcome_history_ready_at FROM curie.publications WHERE id = :id",
-        {"id": publication["id"]},
-    )[0]
-    assert acknowledged["status"] == "succeeded"
-    assert acknowledged["outcome_history_ready_at"] is not None
 
 
 def _queued_same_base_move(
@@ -842,8 +801,12 @@ def test_a_stale_final_head_observation_cannot_settle_over_current_authority(
 def test_ready_transition_ci_blocks_both_owner_loss_prechecks_until_readiness_is_cleared(
     moved: Any, boundary: str
 ) -> None:
-    from curie_api import workitems
     from curie_api.workitem_dispatch import DispatchConflict, OwnerLostResult, declare_owner_lost
+    from curie_api.workitems.lifecycle import (
+        WorkItemConflict,
+        WorkItemOutcome,
+        request_owner_lost_cancellation,
+    )
 
     client, _github, _sink, row = moved
     _handoff(client, row)
@@ -869,7 +832,7 @@ def test_ready_transition_ci_blocks_both_owner_loss_prechecks_until_readiness_is
                 return await declare_owner_lost(
                     session, row["id"], owner=current.runtime_owner, runtime_epoch=row["epoch"]
                 )
-            return await workitems.request_owner_lost_cancellation(
+            return await request_owner_lost_cancellation(
                 session,
                 work_item_id=row["work_item_id"],
                 request_id=row["id"],
@@ -883,7 +846,7 @@ def test_ready_transition_ci_blocks_both_owner_loss_prechecks_until_readiness_is
         assert isinstance(refused, DispatchConflict), refused
         assert refused.code == "stale_owner"
     else:
-        assert isinstance(refused, workitems.WorkItemConflict), refused
+        assert isinstance(refused, WorkItemConflict), refused
         assert refused.code == "illegal_transition"
     assert _request_state(row) == ("running", None)
     assert _transition(row)["ci_settled_at"] is None
@@ -898,6 +861,6 @@ def test_ready_transition_ci_blocks_both_owner_loss_prechecks_until_readiness_is
     reclaimed = client.portal.call(attempt)
 
     assert isinstance(
-        reclaimed, OwnerLostResult if boundary == "dispatch" else workitems.WorkItemOutcome
+        reclaimed, OwnerLostResult if boundary == "dispatch" else WorkItemOutcome
     ), reclaimed
     assert _request_state(row) == ("cancellation_requested", "owner_lost")

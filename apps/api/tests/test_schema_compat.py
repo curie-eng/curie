@@ -235,12 +235,12 @@ def test_0141_to_0142_preserves_retained_base_pins_and_selection_intent(
     _exec(
         "INSERT INTO curie.work_items "
         "(id, tracker_kind, tracker_host, tracker_scope_id, tracker_issue_id, "
-        "code_host_kind, code_host_host, repository_project_id, agent_id, "
-        "repository_path, conversation_id, version, next_sequence, base_branch, "
+        "code_host_kind, code_host_host, repository_project_id, code_host_installation_id, "
+        "agent_id, repository_path, conversation_id, version, next_sequence, base_branch, "
         "base_source, base_commit, base_resolved_request_id, base_selection_fingerprint, "
         "readmit_base_settle_until, base_requested_branch, base_requested_source) "
         "VALUES (:id, 'github', 'github.com', '101', '7', 'github', 'github.com', "
-        "'101', :agent, 'acme-corp/acme-bot', 'retained-base-example', 4, 2, "
+        "'101', 202, :agent, 'acme-corp/acme-bot', 'retained-base-example', 4, 2, "
         "'main', 'default', :base, :request, 'retained-fingerprint', "
         "'2026-10-28T12:01:00+00:00', 'next', 'label')",
         {"id": item_id, "agent": agent_id, "base": "1" * 40, "request": request_id},

@@ -3936,3 +3936,83 @@ class IdentityConnectToken(Base):
     )
     verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class FactoryBaseTransition(Base):
+    """One durable, leased rewrite and retarget of a factory lineage."""
+
+    __tablename__ = "factory_base_transitions"
+    __table_args__ = (
+        CheckConstraint(
+            "phase IN ('pending','prepared','pushed','retargeted','ci_prepared',"
+            "'ci_pushed','applied','conflict','refused')",
+            name="factory_base_transitions_phase_ck",
+        ),
+        CheckConstraint(
+            "version >= 1 AND attempts >= 0", name="factory_base_transitions_version_ck"
+        ),
+        CheckConstraint(
+            "base_source IN ('label','default')", name="factory_base_transitions_source_ck"
+        ),
+        Index(
+            "uq_factory_base_transitions_active_item",
+            "work_item_id",
+            unique=True,
+            postgresql_where=text("phase NOT IN ('applied','conflict','refused')"),
+        ),
+        Index(
+            "uq_factory_base_transitions_active_lineage",
+            "lineage_id",
+            unique=True,
+            postgresql_where=text("phase NOT IN ('applied','conflict','refused')"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    work_item_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.work_items.id", ondelete="CASCADE")
+    )
+    request_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.execution_requests.id", ondelete="CASCADE")
+    )
+    ci_request_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.execution_requests.id", ondelete="CASCADE")
+    )
+    lineage_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.thread_publication_lineages.id", ondelete="CASCADE")
+    )
+    phase: Mapped[str] = mapped_column(Text, default="pending", server_default="pending")
+    version: Mapped[int] = mapped_column(default=1, server_default="1")
+    owner: Mapped[str | None] = mapped_column(Text, default=None)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    repository_snapshot: Mapped[dict[str, Any] | None] = mapped_column(JSONB, default=None)
+    old_base_ref: Mapped[str] = mapped_column(Text)
+    old_base_sha: Mapped[str] = mapped_column(Text)
+    old_head_sha: Mapped[str] = mapped_column(Text)
+    target_base_ref: Mapped[str] = mapped_column(Text)
+    target_base_sha: Mapped[str] = mapped_column(Text)
+    base_source: Mapped[str] = mapped_column(Text)
+    branch: Mapped[str] = mapped_column(Text)
+    pull_request_number: Mapped[str] = mapped_column(Text)
+    committer_name: Mapped[str] = mapped_column(Text)
+    committer_email: Mapped[str] = mapped_column(Text)
+    committer_time: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    rebased_head_sha: Mapped[str | None] = mapped_column(Text, default=None)
+    verification_head_sha: Mapped[str | None] = mapped_column(Text, default=None)
+    changed_paths: Mapped[list[str]] = mapped_column(JSONB, default=list, server_default="[]")
+    prepared_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    pushed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    retargeted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    ci_pushed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    outcome_ready_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    ci_ready_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    ci_settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    refusal_noticed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    error_code: Mapped[str | None] = mapped_column(Text, default=None)
+    attempts: Mapped[int] = mapped_column(default=0, server_default="0")
+    next_attempt_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )

@@ -23,6 +23,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 from test_factory_base_lifecycle import _item, _labelled, _requests, _train
 from test_factory_terminus import (
+    _acknowledge_publication_history,
     _attach_publication,
     _observe_termination,
     _reconcile,
@@ -48,8 +49,6 @@ def _lineage(number: int) -> dict[str, Any]:
 
 
 def _running_pull(client: Any, github: Any, number: int, pr: int) -> uuid.UUID:
-    from test_factory_base_ci_subject import _acknowledge_publication_history
-
     admitted = _labelled(client, github, number)
     assert admitted.json()["status"] == "factory_admitted", admitted.text
     request_id = _requests(number)[0]["id"]
@@ -464,7 +463,6 @@ def test_a_stale_base_acquisition_cannot_supersede_current_lineage_authority(
     tmp_path: Path,
     authority: str,
 ) -> None:
-    from test_factory_base_ci_subject import _acknowledge_publication_history
     from test_factory_ci_wait import _attach_fix
     from test_factory_terminus import _published_issue
 

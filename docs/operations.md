@@ -1729,33 +1729,26 @@ that choice. The status comment shows a `Base:` line, for example
 ``Base: `next` (from label `base:next`)``, or `(deployment default)` when no label
 chose it.
 
-If the effective base changes while the work has no publication authority, the
-platform cancels the old execution, waits for it to stop, and automatically
-starts fresh work from the new branch. The replacement gets fresh execution
-authority. Selecting the same branch from a different source updates the
-provenance without restarting; movement of the branch tip alone is not a base
-label change.
+If the effective base changes before a PR exists, the platform cancels the old
+execution, waits for it to stop, and automatically starts fresh work from the
+new branch. The replacement gets fresh execution authority. Selecting the same
+branch from a different source updates the provenance without restarting;
+movement of the branch tip alone is not a base label change.
 
-The selected base freezes once review or publication is reserved, an outcome
-awaits delivery, a factory branch has been pushed, or a published head or PR is
-recorded. It also stays fixed when the factory cannot confirm that its branch
-is unpublished. A changed base then produces one visible refusal showing the
-selected base and requested target; it does not cancel current work or change
-the branch or PR target. Existing publication and CI can finish against their
-original head and base.
+After a PR exists, a durable platform operation replays its commits onto the
+new base and validates the replay. It pushes a clean result only if the remote
+PR head still matches the recorded head, then retargets the PR after confirming
+that push. Once the target change is durably confirmed, it appends and pushes a
+distinct empty commit with the same tree. Required CI must pass on that final
+head under the new target, including when no further code changes are needed.
+The empty commit remains in branch history and is an ancestor of later fixes.
+Old approvals and checks do not authorize the new head and base. Durable
+progress lets reconciliation resume after a restart.
 
-A new or readmitted request asking for a different base cannot acquire a
-sandbox. Acquisition is deferred within its existing waiting deadline, and the
-old base is never substituted. Correcting the labels to select the stored base
-clears the refusal and allows acquisition on its recorded exact base commit.
-Reapplying the factory selection label starts its usual settling interval but
-does not bypass the freeze.
-
-This first implementation ships glob policies, settling, claim-time selection,
-and safe restarts before publication. The second stacked change will implement
-ADR 0253's durable rebase and retarget of an existing PR, recovery after partial
-remote writes, and CI on the final head under the new target. Those moves are
-not available yet; the status reports a refusal rather than waiting for one.
+A replay conflict changes neither the remote branch nor the PR target. The
+status comment keeps the conflict visible until the factory selection label is
+reapplied to retry with current labels and remote state. Editing a base label
+alone does not retry a conflicting replay. Other refusals also remain visible.
 
 Explicit checkpoint restoration keeps the checkpoint's original trusted base
 commit and recorded PR target branch. It still checks the current repository

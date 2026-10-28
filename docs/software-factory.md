@@ -138,11 +138,8 @@ provide the equivalent provider-specific steps.
    45-second interval; production can also use authenticated webhooks. By
    default, the factory waits 60 seconds after selection before acquiring a
    sandbox and reads the current `base:<branch>` label then. With no base label
-   it uses the deployment default. Later base changes restart work only while
-   it has no publication authority. Once review or publication is reserved, a
-   factory branch is pushed, or a published head or PR is recorded, a changed
-   base is visibly refused and the selected base stays fixed. Correcting the
-   labels back to that base allows ordinary work to continue; see the
+   it uses the deployment default. Later base changes restart unpublished work
+   or rebase and retarget its PR; see the
    [base selection rules](operations.md#admitting-a-labelled-github-issue).
 3. **Follow the issue status comment.** It shows planning, implementation,
    review, publication, and CI phases. State labels distinguish queued,
@@ -177,11 +174,6 @@ provide the equivalent provider-specific steps.
    completely, admission waits for the next pass. The
    [operations reference](operations.md#admitting-a-labelled-github-issue)
    has the full order.
-
-Base selection is delivered in two stacked changes. This first change supports
-glob policies, the configurable settling interval, claim-time selection, and
-safe restarts before publication. Durable rebase and retargeting of an existing
-PR, with CI on its final head under the new target, follow in the second change.
 
 For operator inspection, `curie cluster work-items --agent dark-factory`
 shows work item outcomes; supply an item ID for detail. This is distinct from

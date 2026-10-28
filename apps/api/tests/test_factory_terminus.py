@@ -30,6 +30,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -1566,6 +1567,54 @@ def _attach_revision_publication(
             await engine.dispose()
 
     asyncio.run(go())
+
+
+def _acknowledge_publication_history(client: Any, published: dict[str, Any]) -> None:
+    from curie_worker.publication_clients import PublicationTranscriptClient
+    from curie_worker.publication_store import PostgresPublicationStore
+
+    publication = _rows(
+        "SELECT id FROM curie.publications WHERE execution_request_id = :id",
+        {"id": published["id"]},
+    )[0]
+
+    async def acknowledge() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        store = PostgresPublicationStore(
+            engine, schema="curie", lease_owner="factory-ci-history"
+        )
+        try:
+            cleanup = await store.claim_pending_cleanup()
+            assert cleanup is not None and cleanup.publication_id == publication["id"]
+            await store.mark_cleanup_completed(cleanup.publication_id)
+            result = await store.pending_result(publication["id"])
+            assert result is not None
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=client.app), base_url="http://api.example.com"
+            ) as state_client:
+                transcript = PublicationTranscriptClient(
+                    api_base_url="http://api.example.com",
+                    api_key=get_settings().api_key,
+                    client=state_client,
+                )
+                await transcript.record_result(
+                    result.agent_id,
+                    result.workspace_conversation_id,
+                    result.publication_id,
+                    f"Published the approved changes: {result.pr_url}",
+                )
+            await store.mark_outcome_history_ready(result.publication_id)
+        finally:
+            await engine.dispose()
+
+    client.portal.call(acknowledge)
+    acknowledged = _rows(
+        "SELECT status, outcome_history_ready_at FROM curie.publications WHERE id = :id",
+        {"id": publication["id"]},
+    )[0]
+    assert acknowledged["status"] == "succeeded"
+    assert acknowledged["outcome_history_ready_at"] is not None
+
 
 
 def _published_issue(client: Any, github: GitHubAPI, sink: _CommentServer) -> tuple[int, int, Any]:

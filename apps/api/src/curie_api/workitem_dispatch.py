@@ -48,7 +48,7 @@ from .models import (
     Agent,
     AgentChannel,
     ExecutionRequest,
-    Publication,
+    FactoryBaseTransition,
     WorkItem,
 )
 from .threadkeys import (
@@ -579,6 +579,20 @@ async def claim_due(
                 WorkItem.id == ExecutionRequest.work_item_id,
                 WorkItem.readmit_request_id.is_not(None),
             ),
+            ~exists().where(
+                FactoryBaseTransition.work_item_id == ExecutionRequest.work_item_id,
+                or_(
+                    FactoryBaseTransition.phase.not_in(("applied", "conflict", "refused")),
+                    and_(
+                        FactoryBaseTransition.phase == "applied",
+                        FactoryBaseTransition.outcome_ready_at.is_(None),
+                    ),
+                    and_(
+                        FactoryBaseTransition.phase.in_(("conflict", "refused")),
+                        FactoryBaseTransition.request_id == ExecutionRequest.id,
+                    ),
+                ),
+            ),
             ExecutionRequest.published_generation.is_distinct_from(
                 ExecutionRequest.dispatch_generation
             ),
@@ -805,6 +819,42 @@ async def _defer_factory_refusal(
     )
 
 
+async def _unsettled_base_transition(
+    session: AsyncSession,
+    work_item: WorkItem,
+    *,
+    base_branch: str | None,
+    base_commit: str | None,
+) -> FactoryBaseTransition | None:
+    from .models import ThreadPublicationLineage
+
+    if work_item.publication_lineage_id is None:
+        return None
+    transition: FactoryBaseTransition | None = await session.scalar(
+        select(FactoryBaseTransition)
+        .join(
+            ThreadPublicationLineage,
+            ThreadPublicationLineage.id == FactoryBaseTransition.lineage_id,
+        )
+        .where(
+            FactoryBaseTransition.work_item_id == work_item.id,
+            FactoryBaseTransition.lineage_id == work_item.publication_lineage_id,
+            FactoryBaseTransition.phase == "applied",
+            FactoryBaseTransition.outcome_ready_at.is_not(None),
+            FactoryBaseTransition.ci_settled_at.is_(None),
+            FactoryBaseTransition.target_base_ref == base_branch,
+            FactoryBaseTransition.target_base_sha == base_commit,
+            ThreadPublicationLineage.head_sha == FactoryBaseTransition.verification_head_sha,
+            ThreadPublicationLineage.base_ref == FactoryBaseTransition.target_base_ref,
+            ThreadPublicationLineage.base_sha == FactoryBaseTransition.target_base_sha,
+        )
+        .order_by(FactoryBaseTransition.applied_at.desc())
+        .limit(1)
+        .with_for_update()
+    )
+    return transition
+
+
 async def acquire(
     session: AsyncSession,
     request_id: uuid.UUID,
@@ -935,6 +985,38 @@ async def acquire(
         if pin_item_id != work_item.id or pin_request_id != request.id:
             await session.rollback()
             return await _refuse(session, "not_dispatchable", request_id=request_id)
+        transition = await _unsettled_base_transition(
+            session,
+            work_item,
+            base_branch=selected_base.branch,
+            base_commit=base_commit,
+        )
+        if transition is not None:
+            prior = await session.get(ExecutionRequest, transition.ci_request_id)
+            if (
+                transition.ci_request_id != work_item.base_resolved_request_id
+                or prior is None
+                or prior.work_item_id != work_item.id
+                or (
+                    prior.id != request.id
+                    and (
+                        prior.sequence >= request.sequence
+                        or prior.status not in ("completed", "failed", "expired", "cancelled")
+                    )
+                )
+            ):
+                return await _defer_factory_refusal(
+                    session,
+                    work_item,
+                    request,
+                    owner=owner,
+                    generation=generation,
+                    refusal="not_dispatchable",
+                )
+            if prior.id != request.id:
+                transition.ci_request_id = request.id
+                transition.ci_ready_at = None
+                transition.version += 1
         if empty_lineage_id is not None:
             from .factory_base_reconcile import _lineage_busy, _lineage_empty
 
@@ -966,6 +1048,25 @@ async def acquire(
         work_item.base_requested_branch, work_item.base_requested_source = None, None
         work_item.version += 1
         await mark_status_comment_stale(session, work_item.id)
+    else:
+        transition = await _unsettled_base_transition(
+            session,
+            work_item,
+            base_branch=work_item.base_branch,
+            base_commit=work_item.base_commit,
+        )
+        if transition is not None and (
+            transition.ci_request_id != request.id
+            or work_item.base_resolved_request_id != request.id
+        ):
+            return await _defer_factory_refusal(
+                session,
+                work_item,
+                request,
+                owner=owner,
+                generation=generation,
+                refusal="not_dispatchable",
+            )
     grant = AcquireGrant(
         generation=generation,
         work_item_id=work_item.id,
@@ -1447,19 +1548,14 @@ async def declare_owner_lost(
         and now < request.execution_deadline
     )
     awaiting_publication = await session.scalar(
-        select(Publication.id)
-        .where(
-            Publication.execution_request_id == request.id,
-            Publication.status.in_((*lifecycle.IN_FLIGHT_PUBLICATION, "succeeded")),
-        )
-        .limit(1)
+        select(~lifecycle.not_awaiting_publication()).where(ExecutionRequest.id == request.id)
     )
     if (
         request.status != "running"
         or request.runtime_owner != owner
         or request.runtime_epoch != runtime_epoch
         or held
-        or awaiting_publication is not None
+        or awaiting_publication
     ):
         return await _refuse(
             session,

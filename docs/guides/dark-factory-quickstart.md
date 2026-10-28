@@ -419,13 +419,10 @@ reads as a single forge configuration document:
    the selection label is applied before the factory reads the current base
    labels at sandbox acquisition. It defaults to 60 seconds; zero is valid.
 
-Base changes automatically restart work only before publication authority
-exists. A reserved review or publication, an outcome awaiting delivery, a pushed
-factory branch, or a recorded head or PR freezes the selected base. The status
-shows the requested target and refusal; correcting labels to the selected base
-allows ordinary work to continue. A request for a different base cannot acquire
-a sandbox or silently use the old base. Durable moves of an existing PR follow
-in the second stacked change; see the
+Base changes restart unpublished work or durably rebase and retarget its PR.
+A clean replay uses an expected-head fence, and required CI runs on a distinct
+same-tree commit pushed after retargeting. Conflicts leave the branch and PR
+target unchanged until the factory label is reapplied; see the
 [base selection rules](../operations.md#admitting-a-labelled-github-issue).
 
 The old `api.githubFactory*` keys are removed. To upgrade a v0.12.5

@@ -1404,9 +1404,8 @@ def test_return_to_the_recorded_base_supersedes_a_pending_move_before_any_push(
 def test_return_to_the_recorded_base_queues_after_preparation_and_eventually_moves_back(
     transition_case: TransitionCase, phase: str
 ) -> None:
-    from curie_api import workitems
     from curie_api.workitem_dispatch import AcquireGrant, DispatchConflict
-    from curie_api.workitems.lifecycle import admit_pending_readmit
+    from curie_api.workitems.lifecycle import WorkItemOutcome, admit_pending_readmit
 
     case = transition_case
     before_lineage = case.identities()[1]
@@ -1442,7 +1441,7 @@ def test_return_to_the_recorded_base_queues_after_preparation_and_eventually_mov
         )
 
     admitted = database(admit_queued)
-    assert isinstance(admitted, workitems.WorkItemOutcome), admitted
+    assert isinstance(admitted, WorkItemOutcome), admitted
     assert admitted.request is not None and admitted.request.id == successor
     assert case.identities()[0]["base_requested_branch"] == "main"
 

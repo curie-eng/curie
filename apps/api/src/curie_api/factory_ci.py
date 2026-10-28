@@ -1,4 +1,4 @@
-"""The factory CI gate: a published request waits on its pull request's CI (#3097).
+"""The factory CI gate: a request waits on its current CI subject (#3097).
 
 A succeeded publication does not end the request. The reconciler hands each
 ``completed`` settlement to ``gate``, which observes the checks and commit
@@ -40,7 +40,7 @@ pure ``decide``:
   never green, and an unreadable base counts every failure as caused.
 
 No network call runs under a row lock. Every write is fenced to the observed
-publication and head (``workitems.lifecycle.settle_ci_verdict`` / ``hold_for_ci_fix``),
+subject and head (``workitems.lifecycle.settle_ci_verdict`` / ``hold_for_ci_fix``),
 and a Valkey claim keeps each round to at most one continuation.
 """
 
@@ -93,7 +93,13 @@ from .forges.types import (
     RerunRecord,
     status_key,
 )
-from .models import ExecutionRequest, Publication, ThreadPublicationLineage, WorkItem
+from .models import (
+    ExecutionRequest,
+    FactoryBaseTransition,
+    Publication,
+    ThreadPublicationLineage,
+    WorkItem,
+)
 
 CI_GRACE_SECONDS = 120
 CI_POLL_SECONDS = 20
@@ -982,13 +988,19 @@ def _check_list(items: Sequence[dict[str, Any]]) -> str:
     return _clip(", ".join(parts), _CHECKS_LINE_MAX)
 
 
-def tried_summary(publications: Iterable[Any], verdict: Verdict, pr_url: str | None) -> str:
+def tried_summary(
+    publications: Iterable[Any],
+    verdict: Verdict,
+    pr_url: str | None,
+    *,
+    baseline_rounds: int = 0,
+) -> str:
     """The final CI notice detail: rounds, what each fix round tried, the checks."""
 
     ordered = sorted(publications, key=lambda p: int(getattr(p, "revision_number", 0) or 0))
-    lines = [f"Rounds: {len(ordered)}"]
+    lines = [f"Rounds: {baseline_rounds + len(ordered)}"]
     tried = []
-    for index, publication in enumerate(ordered, start=1):
+    for index, publication in enumerate(ordered, start=baseline_rounds + 1):
         if index < 2:
             continue
         changed = getattr(publication, "changed_paths", None) or []
@@ -1028,7 +1040,9 @@ class _Facts:
     request: ExecutionRequest
     work_item: WorkItem
     lineage: ThreadPublicationLineage
+    subject: lifecycle.CISubject
     publications: list[Publication]
+    base_transition: FactoryBaseTransition | None
     published_at: datetime
 
 
@@ -1040,13 +1054,21 @@ async def _load(
     if (
         request is None
         or work_item is None
+        or request.work_item_id != work_item.id
+        or request.version != settlement.request_version
+        or work_item.version != settlement.work_item_version
         or request.status != "running"
         or request.execution_deadline is None
         or work_item.publication_lineage_id is None
     ):
         return None
     lineage = await session.get(ThreadPublicationLineage, work_item.publication_lineage_id)
-    if lineage is None:
+    subject = settlement.subject
+    if (
+        lineage is None
+        or lineage.head_sha != subject.head_sha
+        or lineage.base_ref != subject.base_ref
+    ):
         return None
     publications = list(
         (
@@ -1060,21 +1082,50 @@ async def _load(
             )
         ).all()
     )
-    if not publications:
-        return None
-    # ``publications.terminal_at`` is a naive timestamp; read it back as an
-    # aware one through the session time zone it was written in.
-    published_at = await session.scalar(
-        select(
-            cast(
-                func.coalesce(Publication.terminal_at, Publication.created_at),
-                TIMESTAMP(timezone=True),
-            )
-        ).where(Publication.id == publications[-1].id)
+    base_transition = await session.scalar(
+        select(FactoryBaseTransition)
+        .where(
+            FactoryBaseTransition.work_item_id == work_item.id,
+            FactoryBaseTransition.ci_request_id == request.id,
+            FactoryBaseTransition.lineage_id == lineage.id,
+            FactoryBaseTransition.phase == "applied",
+        )
+        .order_by(FactoryBaseTransition.applied_at.desc())
+        .limit(1)
     )
+    if isinstance(subject, lifecycle.PublicationCISubject):
+        if (
+            not publications
+            or publications[-1].id != subject.id
+            or publications[-1].version != subject.version
+            or publications[-1].lineage_id != lineage.id
+        ):
+            return None
+        # Publication timestamps are naive; use the session's stored time zone.
+        published_at = await session.scalar(
+            select(
+                cast(
+                    func.coalesce(Publication.terminal_at, Publication.created_at),
+                    TIMESTAMP(timezone=True),
+                )
+            ).where(Publication.id == subject.id)
+        )
+        changed_paths = tuple(publications[-1].changed_paths)
+    else:
+        if (
+            publications
+            or base_transition is None
+            or base_transition.id != subject.id
+            or base_transition.version != subject.version
+            or not await session.scalar(select(lifecycle.ready_base_transition_exists(request.id)))
+        ):
+            return None
+        published_at = base_transition.ci_pushed_at
+        changed_paths = tuple(base_transition.changed_paths)
     if published_at is None:
         return None
-    return _Facts(request, work_item, lineage, publications, published_at)
+    subject = replace(subject, changed_paths=changed_paths, published_at=published_at)
+    return _Facts(request, work_item, lineage, subject, publications, base_transition, published_at)
 
 
 _RELEASE_CLAIM = """
@@ -1168,7 +1219,8 @@ async def gate(
         return "waiting"
     capabilities = ci_capabilities(code_host.capabilities)
     assert request.execution_deadline is not None
-    round_ = len(facts.publications)
+    baseline_rounds = int(facts.base_transition is not None)
+    round_ = baseline_rounds + len(facts.publications)
     if await valkey.exists(ci_key(request.id, round_ + 1)):
         return "fixing"
     async with sessionmaker() as session:
@@ -1176,9 +1228,11 @@ async def gate(
     due = next_poll.get(request.id)
     if due is not None and now < due:
         return "waiting"
-    latest = facts.publications[-1]
-    observed_sha = lineage.head_sha
+    subject = facts.subject
+    observed_sha = subject.head_sha
     changed_paths = _publication_changed_paths(facts.publications)
+    if facts.base_transition is not None:
+        changed_paths.extend(facts.base_transition.changed_paths)
     changed_python_paths = python_paths(changed_paths)
     # The policy of the binding that chose this repository, on its own code
     # host (#4358 plan D15); a GitHub WorkItem keeps its path-matched entry.
@@ -1246,15 +1300,21 @@ async def gate(
             repository,
             observed_sha,
             diagnostics=capabilities.diagnostics,
-            base_ref=lineage.base_ref,
+            base_ref=subject.base_ref,
             pull_request=(
                 PullRequestRef(repository, str(lineage.pr_number))
                 if lineage.pr_number is not None
                 else None
             ),
         )
-        metadata_only = not latest.changed_paths and latest.base_sha == observed_sha
-        fresh_after = latest.metadata_updated_at if metadata_only else None
+        latest = facts.publications[-1] if facts.publications else None
+        metadata_only = (
+            subject.kind == "publication"
+            and latest is not None
+            and not subject.changed_paths
+            and latest.base_sha == observed_sha
+        )
+        fresh_after = latest.metadata_updated_at if metadata_only and latest is not None else None
         if metadata_only and metadata_ci is None:
             metadata_ci = _recorded_metadata_ci_policy(
                 await valkey.get(f"{ci_key(request.id, round_)}:failing")
@@ -1266,11 +1326,11 @@ async def gate(
         host_required: frozenset[str] | None = None
         if (
             supports(code_host.capabilities, Operation.REQUIRED_CHECKS)
-            and isinstance(lineage.base_ref, str)
-            and lineage.base_ref
+            and isinstance(subject.base_ref, str)
+            and subject.base_ref
         ):
             try:
-                host_required = await code_host.required_checks(repository, lineage.base_ref)
+                host_required = await code_host.required_checks(repository, subject.base_ref)
             except ForgeError as failure:
                 reason = str(failure) or type(failure).__name__.lower()
                 # A permanent required-check failure is immediate. It is not
@@ -1296,6 +1356,15 @@ async def gate(
                 delegated_checks=delegated_checks,
                 host_required_checks=host_required,
             )
+            if subject.kind == "base_transition" and verdict.kind == "no_ci":
+                verdict = Verdict(
+                    kind=(
+                        "timed_out"
+                        if now >= _ci_deadline(facts.published_at, request, settings)
+                        else "pending"
+                    ),
+                    reason="base_transition_checks_missing",
+                )
     if verdict.kind == "pending":
         next_poll[request.id] = now + timedelta(seconds=CI_POLL_SECONDS)
         return "waiting"
@@ -1341,8 +1410,7 @@ async def gate(
             settings,
             request=request,
             work_item=work_item,
-            publication_id=latest.id,
-            head_sha=head_sha,
+            subject=subject,
             round_=round_ + 1,
             text=continuation_text(
                 _issue_url(settings, work_item),
@@ -1369,7 +1437,7 @@ async def gate(
             "merge_conflict": "merge_conflict",
             "pr_closed": "pr_closed",
         }[verdict.kind]
-        text = tried_summary(facts.publications, verdict, pr_url)
+        text = tried_summary(facts.publications, verdict, pr_url, baseline_rounds=baseline_rounds)
     async with sessionmaker() as session:
         result = await lifecycle.settle_ci_verdict(
             session,
@@ -1377,8 +1445,7 @@ async def gate(
             request_id=settlement.request_id,
             expected_work_item_version=settlement.work_item_version,
             expected_request_version=settlement.request_version,
-            expected_publication_id=latest.id,
-            expected_head_sha=head_sha,
+            expected_subject=subject,
             status=status,
             cause=cause,
             detail=text,
@@ -1758,8 +1825,7 @@ async def _continue(
     *,
     request: ExecutionRequest,
     work_item: WorkItem,
-    publication_id: uuid.UUID,
-    head_sha: str,
+    subject: lifecycle.CISubject,
     round_: int,
     text: str,
     owner: str,
@@ -1787,8 +1853,7 @@ async def _continue(
                 work_item_id=work_item.id,
                 request_id=request.id,
                 expected_request_version=request.version,
-                expected_publication_id=publication_id,
-                expected_head_sha=head_sha,
+                expected_subject=subject,
             )
         if not held:
             await valkey.eval(_RELEASE_CLAIM, 1, key, token)

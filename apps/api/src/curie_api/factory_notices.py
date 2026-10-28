@@ -69,6 +69,7 @@ from .github_app import GitHubAppError, GitHubInstallationRefused
 from .models import (
     ExecutionRequest,
     ExecutionRequestPhaseReport,
+    FactoryBaseTransition,
     FactoryStatusComment,
     Publication,
     ThreadPublicationLineage,
@@ -268,8 +269,10 @@ def code_span(value: str) -> str:
     return f"{fence}{padded}{fence}"
 
 
-def render_base_line(work_item: WorkItem, *, restarting: bool = False) -> str | None:
-    """The selected base and any admitted restart or frozen requested base."""
+def render_base_line(
+    work_item: WorkItem, transition: FactoryBaseTransition | None = None
+) -> str | None:
+    """The status comment's ``Base:`` line (ADR 0186), or None on a legacy row."""
 
     if work_item.base_branch is None:
         return None
@@ -280,18 +283,28 @@ def render_base_line(work_item: WorkItem, *, restarting: bool = False) -> str | 
         )
     else:
         line = f"Base: {code_span(work_item.base_branch)} (deployment default)"
-    if (
+    if transition is not None and transition.phase != "applied":
+        line += f" Requested base: {code_span(transition.target_base_ref)}; "
+        if transition.phase in {"conflict", "refused"}:
+            line += f"base change refused ({transition.error_code or transition.phase})."
+            if (
+                work_item.base_requested_branch is not None
+                and work_item.base_requested_branch != transition.target_base_ref
+            ):
+                line += (
+                    f" Current requested base: {code_span(work_item.base_requested_branch)}; "
+                    "apply the factory label again to retry."
+                )
+        else:
+            line += f"base change pending ({transition.phase})."
+    elif (
         work_item.base_requested_branch is not None
         and work_item.base_requested_branch != work_item.base_branch
     ):
-        line += f" Requested base: {code_span(work_item.base_requested_branch)}; "
-        if restarting:
-            line += "waiting for a fresh execution on the requested base."
-        else:
-            line += (
-                "base change refused while publication state is present or uncertain; "
-                "the selected base is unchanged."
-            )
+        line += (
+            f" Requested base: {code_span(work_item.base_requested_branch)}; "
+            "waiting for a fresh execution on the requested base."
+        )
     return line
 
 
@@ -1250,10 +1263,13 @@ async def _render(
     elif request.status in {"waiting", "running", "cancellation_requested"} and pending_count:
         word = "revision" if pending_count == 1 else "revisions"
         waiting_line = f"{pending_count} {word} waiting on this run."
-    restarting_base = work_item.readmit_request_id is not None or (
-        work_item.base_selection_fingerprint is not None
-        and request.status == "waiting"
-        and work_item.base_resolved_request_id != request.id
+    transition = await session.scalar(
+        select(FactoryBaseTransition)
+        .where(
+            FactoryBaseTransition.work_item_id == work_item.id,
+        )
+        .order_by(FactoryBaseTransition.committer_time.desc())
+        .limit(1)
     )
     base = forges_registry(settings).card_base_url
     body = status_body(
@@ -1264,7 +1280,7 @@ async def _render(
         result=result,
         paused_for_upgrade=paused_for_upgrade,
         waiting_line=waiting_line,
-        base_line=render_base_line(work_item, restarting=restarting_base),
+        base_line=render_base_line(work_item, transition),
     )
     if (
         request.status in {"queued", "waiting", "running", "cancellation_requested"}
