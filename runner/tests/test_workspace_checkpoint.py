@@ -725,6 +725,19 @@ def test_checkpoint_refusals(tmp_path: Path) -> None:
             final = await _capture(unsafe_client, unsafe_base)
             assert final["changed_paths"] == ["README.md"]
 
+            # An unchanged gitlink replaced by a file or a symlink is a type
+            # change the capture must refuse, not hide behind the index entry.
+            (unsafe / "sub").rmdir()
+            (unsafe / "sub").write_text("now a file\n")
+            await _refused(unsafe_client, 422, "unsafe_entry", json_body=_request(unsafe_base))
+            (unsafe / "sub").unlink()
+            os.symlink("target.txt", unsafe / "sub")
+            await _refused(unsafe_client, 422, "unsafe_entry", json_body=_request(unsafe_base))
+            (unsafe / "sub").unlink()
+            (unsafe / "sub").mkdir()
+            restored = await _capture(unsafe_client, unsafe_base)
+            assert restored["changed_paths"] == ["README.md"]
+
     anyio.run(go)
 
 
@@ -907,6 +920,26 @@ def test_checkpoint_preserves_git_state(tmp_path: Path, monkeypatch: pytest.Monk
     wrapped_path = _git_wrapper(tmp_path / "bin", subcommand="diff", action=_hang_action(record))
     runner = _boot(tmp_path, "state", repo)
 
+    # Hooks installed after every setup commit, so only the capture could run
+    # one. Each would leave a marker outside the repo and move a ref.
+    hook_marker = tmp_path / "hook-ran"
+    hook = repo / ".git" / "hooks" / "post-index-change"
+    hook.parent.mkdir(exist_ok=True)
+    hook.write_text(
+        "#!/bin/sh\n"
+        f": > {shlex.quote(str(hook_marker))}\n"
+        f"{shlex.quote(REAL_GIT)} update-ref refs/heads/tripwire HEAD\n"
+    )
+    hook.chmod(0o755)
+
+    # A split-index repository: the shared index file must not be rewritten.
+    split = tmp_path / "split-workspace"
+    _simple_repo(split)
+    split_base = _git(split, "rev-parse", "HEAD")
+    _git(split, "config", "core.splitIndex", "true")
+    _git(split, "update-index", "--split-index")
+    split_runner = _boot(tmp_path, "split", split)
+
     async def go() -> None:
         async with _serve(runner) as client:
             before = _git_state(repo)
@@ -914,6 +947,9 @@ def test_checkpoint_preserves_git_state(tmp_path: Path, monkeypatch: pytest.Monk
             success = await _capture(client, base)
             assert "untracked.bin" in success["changed_paths"]
             assert _git_state(repo) == before
+            assert not hook_marker.exists()
+            assert not (repo / ".git" / "refs" / "heads" / "tripwire").exists()
+            assert "tripwire" not in _git(repo, "for-each-ref")
 
             os.symlink("tracked.txt", repo / "newlink")
             await _refused(client, 422, "unsafe_entry", json_body=_request(base))
@@ -933,5 +969,18 @@ def test_checkpoint_preserves_git_state(tmp_path: Path, monkeypatch: pytest.Monk
             assert again["patch_sha256"] == success["patch_sha256"]
             assert again["manifest_sha256"] == success["manifest_sha256"]
             assert _git_state(repo) == before
+            assert not hook_marker.exists()
+            assert "tripwire" not in _git(repo, "for-each-ref")
+
+        async with _serve(split_runner) as split_client:
+            split_before = _git_state(split)
+            shared = [name for name in split_before["contents"] if name.startswith("sharedindex.")]
+            assert shared, "fixture lost its shared index"
+
+            captured = await _capture(split_client, split_base)
+            assert captured["changed_paths"] == ["README.md"]
+            # Same files with the same bytes: no sharedindex.* added or removed.
+            assert _git_state(split) == split_before
 
     anyio.run(go)
+    hook.unlink()
