@@ -497,7 +497,7 @@ async def _observe_base_labels_once(
     if not safe:
         item.base_selection_fingerprint = None
         return None
-    request_id = uuid.uuid5(item.id, f"base:{event_identity or fingerprint}")
+    request_id = uuid.uuid5(item.id, f"base:{previous.id}:{event_identity or fingerprint}")
     item.base_selection_fingerprint = fingerprint
     await session.flush()
     kind, address, conversation = reply_route(registry, item.tracker_issue, item.repository_path)

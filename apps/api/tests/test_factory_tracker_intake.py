@@ -880,12 +880,27 @@ def test_base_poll_reads_active_selection_without_reopening_or_reading_finished_
     intake.poll()
     items = [_work_items(issue)[0] for issue in issues]
     requests = [_requests(item["id"])[0] for item in items]
+    grants = {}
     for index in (0, 1, 3):
         acquired = intake.acquire(requests[index]["id"])
         assert acquired.status_code == 200, acquired.text
+        grants[index] = acquired.json()
+    started = intake.client.post(
+        f"/v1/internal/work-items/requests/{requests[1]['id']}/start",
+        headers={"X-Curie-Worker-Token": get_settings().internal_worker_token},
+        json={
+            "owner": "factory-intake-owner",
+            "generation": grants[1]["generation"],
+            "claim_name": "claim-active-poll",
+            "sandbox_name": "sandbox-active-poll",
+            "context": grants[1]["context"],
+        },
+    )
+    assert started.status_code == 200, started.text
     _execute(
         "UPDATE curie.execution_requests SET status = 'completed', "
-        "started_at = clock_timestamp(), execution_deadline = clock_timestamp() + interval '1 hour', "
+        "started_at = clock_timestamp(), "
+        "execution_deadline = clock_timestamp() + interval '1 hour', "
         "execution_attempts = 1, terminal_at = clock_timestamp(), terminal_cause = 'completed', "
         "acquire_owner = NULL, acquire_expires_at = NULL WHERE id = :id",
         {"id": requests[0]["id"]},
@@ -912,9 +927,11 @@ def test_base_poll_reads_active_selection_without_reopening_or_reading_finished_
         for read in intake.jira.requests[recorded:]
         if read.params.get("fields") == "labels,components"
     ]
-    assert len(label_reads) == 3
-    assert all(not read.path.endswith(f"/issue/{issues[0].id}") for read in label_reads)
+    assert sorted(read.path for read in label_reads) == sorted(
+        f"/rest/api/3/issue/{issue.id}" for issue in issues[1:]
+    )
     assert _requests(items[1]["id"])[0]["id"] == requests[1]["id"]
+    assert _requests(items[1]["id"])[0]["status"] == "running"
     assert _requests(items[2]["id"])[0]["id"] == requests[2]["id"]
     pending = _requests(items[3]["id"])
     assert [row["status"] for row in pending] == ["cancelled", "waiting"]
