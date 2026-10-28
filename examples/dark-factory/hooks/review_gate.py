@@ -452,9 +452,10 @@ def _github_changed_path(workspace: str, deadline: float) -> str | None:
 def fingerprint(workspace: str, deadline: float) -> str | None:
     """A sha256 over the checkout's HEAD, status, diff and untracked files.
 
-    Each untracked path is a length-prefixed name, one mode byte (``x`` when
-    any execute bit is set and ``-`` otherwise), then a length-prefixed body.
-    ``None`` means unverifiable rather than unchanged.
+    Each untracked path is a length-prefixed name, one type byte (``l`` for a
+    symlink, ``f`` for a regular file), one mode byte (``x`` when any execute
+    bit is set and ``-`` otherwise), then a length-prefixed body. ``None``
+    means unverifiable rather than unchanged.
     """
     if not workspace:
         return None
@@ -478,13 +479,21 @@ def fingerprint(workspace: str, deadline: float) -> str | None:
             except OSError:
                 return None
             mode = info.st_mode
-            # Any execute bit is how git records 100755.
-            digest.update(b"x" if mode & 0o111 else b"-")
             if stat.S_ISLNK(mode):
+                kind = b"l"
+            elif stat.S_ISREG(mode):
+                kind = b"f"
+            else:
+                # A fifo or any other type is unverifiable. Do not read it.
+                return None
+            # Any execute bit is how git records 100755.
+            digest.update(kind)
+            digest.update(b"x" if mode & 0o111 else b"-")
+            if kind == b"l":
                 body = os.fsencode(os.readlink(path))
                 digest.update(len(body).to_bytes(8, "big"))
                 digest.update(body)
-            elif stat.S_ISREG(mode):
+            else:
                 size = info.st_size
                 digest.update(size.to_bytes(8, "big"))
                 seen = 0
@@ -499,9 +508,6 @@ def fingerprint(workspace: str, deadline: float) -> str | None:
                             return None
                 if seen != size:
                     return None
-            else:
-                # Framed empty body, unread so a fifo cannot block.
-                digest.update((0).to_bytes(8, "big"))
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
     return digest.hexdigest() if time.monotonic() < deadline else None
