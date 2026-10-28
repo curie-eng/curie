@@ -70,6 +70,7 @@ from ..identity.http_approval_answer import (
     ApprovalAnswer,
     ApprovalSettled,
     answer_http_approval,
+    publish_answered_resume,
 )
 from ..identity_fence import lock_identity_reader
 from ..models import Approval, ApprovalStatus
@@ -587,7 +588,10 @@ async def resolve_approval(
             attributes={"service.name": "curie-api", "operation": "resolve",
                         "outcome": "resolved"},
         )
-        return ApprovalOut.model_validate(resolved)
+        # @spec HTTP-APPROVAL-CONTINUITY-11: only after the acknowledged commit.
+        out = ApprovalOut.model_validate(resolved)
+        await publish_answered_resume(session, resume_queue, resolved)
+        return out
 
     # The route binding is read fresh at resolve time (#420), so revoking an
     # approver takes effect on the next click rather than at the next restart.

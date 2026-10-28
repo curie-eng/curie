@@ -106,7 +106,10 @@ async def seed(
             tenant_id=tenant.id,
             name=f"synthetic-role-{uuid.uuid4()}",
             status=agent_status,
-            approval_routes={"sensitive_tool": {"users": ["U0EXAMPLE1"]}},
+            approval_routes={"sensitive_tool": {
+                "resolution": {"kind": "slack", "address": "C0EXAMPLE"},
+                "approvers": {"users": ["U0EXAMPLE1"]},
+            }},
         )
         s.add(agent)
         if authority:

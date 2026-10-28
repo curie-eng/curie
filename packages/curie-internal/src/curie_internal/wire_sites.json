@@ -24,9 +24,17 @@
       "language": "python",
       "purpose": "Eval job stream publication"
     },
-    "apps/api/src/curie_api/resumequeue.py:ResumeQueue.enqueue:1": {
+    "apps/api/src/curie_api/resumequeue.py:ResumeQueue._append:1": {
       "language": "python",
       "purpose": "Runs enqueue resuming an approved turn"
+    },
+    "apps/api/src/curie_api/resumequeue.py:module:1": {
+      "language": "lua",
+      "purpose": "Guarded selected resume enqueue with sealed context and trace parent, after fence and validity checks"
+    },
+    "apps/api/src/curie_api/resumequeue.py:module:2": {
+      "language": "lua",
+      "purpose": "Guarded selected resume enqueue with sealed context without trace parent, after fence and validity checks"
     },
     "apps/api/src/curie_api/turn_progress.py:module:1": {
       "language": "lua",

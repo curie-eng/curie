@@ -48,11 +48,13 @@ from .github_checks import GitHubStatusReporter
 from .github_review_store import GitHubReviewReconciler
 from .graveyardwatcher import GraveyardWatcher
 from .identity.http_approval import http_expiry_owner
+from .identity.http_approval_answer import approved_resume_authority
 from .identity.http_initializer import (
     configured_http_identity_runtime,
     load_provider_tls_context,
 )
 from .identity.http_invocation import HttpInvocationRuntime
+from .identity.http_resume_publication import http_resume_owner
 from .identity.http_transport import HttpIdentityClient
 from .identity_fence import IdentityFenceMiddleware
 from .k8s import build_lazy_pod_lister, build_lazy_pod_log_reader
@@ -186,6 +188,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         valkey,
         stream=settings.runs_stream,
         dead_letter_stream=settings.resume_dead_letter_stream or settings.dead_letter_stream_name(),
+        # @spec HTTP-APPROVAL-CONTINUITY-8/11: selected resumes are built and
+        # authorized by the API owner; an approved row also needs the preserved
+        # answering actor's fresh approver authority.
+        approvals=http_resume_owner(app.state, approved=approved_resume_authority(app.state)),
     )
     # @spec HTTP-APPROVAL-CONTINUITY-10: the only writer that may expire a selected row.
     app.state.http_approval_expiry = http_expiry_owner(app.state)

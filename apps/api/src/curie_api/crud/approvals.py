@@ -737,11 +737,13 @@ async def list_resolved_unresumed_page(
     resolved_before: datetime,
     limit: int,
     after: tuple[datetime, uuid.UUID] | None = None,
+    sealed: bool = False,
 ) -> list[tuple[uuid.UUID, datetime]]:
-    """One keyed page of owed legacy wakes, never sealed rows.
+    """One keyed page of owed wakes: legacy rows, or with ``sealed`` only sealed ones.
 
-    A sealed row's wake is owed to its own publisher, so it never occupies this
-    batch. @spec HTTP-APPROVAL-CONTINUITY-10.
+    A sealed row's wake is owed to its own publisher, so it never occupies the
+    legacy batch; its publisher reads it through this separate bounded
+    selection. @spec HTTP-APPROVAL-CONTINUITY-10/11.
     """
 
     stmt = select(Approval.id, Approval.resolved_at).where(
@@ -750,7 +752,7 @@ async def list_resolved_unresumed_page(
         Approval.resolved_at.is_not(None),
         Approval.resumed_at.is_(None),
         Approval.resolved_at <= resolved_before,
-        Approval.identity_context.is_(None),
+        Approval.identity_context.is_not(None) if sealed else Approval.identity_context.is_(None),
     )
     if after is not None:
         stmt = stmt.where(

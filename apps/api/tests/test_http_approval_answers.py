@@ -17,9 +17,11 @@ from typing import Any
 
 import pytest
 import redis
+from aci_protocol import QueuedTurn
 from curie_api import agent_role_policy, approval_principal
 from curie_api.config import get_settings
 from curie_api.identity.slack import SlackEvidence
+from curie_api.resumequeue import resume_event_id
 from curie_internal import identity_approval as wire
 from curie_internal import identity_context as codec
 from principal_adoption_support import ISSUER
@@ -65,12 +67,25 @@ def approver_role(case: SimpleNamespace, group: str = GROUP) -> None:
 
 
 @pytest.fixture
-def answer_case(creation_case: SimpleNamespace) -> Iterator[SimpleNamespace]:
-    """@spec HTTP-APPROVAL-CONTINUITY-7/8: a real selected row and a migrated approver role."""
+def answer_case(
+    creation_case: SimpleNamespace, valkey: redis.Redis, runs_stream: str,
+) -> Iterator[SimpleNamespace]:
+    """@spec HTTP-APPROVAL-CONTINUITY-7/8/11: a real selected row and a migrated approver role.
+
+    A committed answer publishes this approval's own resume; nothing else may be
+    appended. It is removed afterwards so the invocation fixture still observes
+    its untouched delivery state.
+    """
     case = creation_case
     case.row = created(case)
     approver_role(case)
+    case.stream_before = valkey.xrange(runs_stream)
     yield case
+    for entry_id, fields in valkey.xrange(runs_stream)[len(case.stream_before):]:
+        assert QueuedTurn.model_validate_json(fields["payload"]).event_id == resume_event_id(
+            case.row["id"],
+        )
+        valkey.xdel(runs_stream, entry_id)
 
 
 def slack_evidence(**changes: Any) -> dict[str, Any]:
@@ -162,7 +177,7 @@ def sealed_actor(case: SimpleNamespace, status: str) -> tuple[dict[str, Any], An
 def test_authenticated_answer_resolves_with_fresh_caller_and_approver_authority(
     answer_case: SimpleNamespace, valkey: redis.Redis, runs_stream: str,
 ) -> None:
-    """@spec HTTP-APPROVAL-CONTINUITY-7/8/9/10: both checks run, actor sealed, wake stays owed."""
+    """@spec HTTP-APPROVAL-CONTINUITY-7/8/9/10/11: both checks run, actor sealed, wake published."""
     case = answer_case
     before = len(case.provider.requests)
     stream = valkey.xrange(runs_stream)
@@ -171,12 +186,13 @@ def test_authenticated_answer_resolves_with_fresh_caller_and_approver_authority(
     assert response.json()["status"] == "approved"
     assert response.json()["resolved_by"] == SENDER
     row, _ = sealed_actor(case, "approved")
-    assert row["resolved_by"] == SENDER and row["resumed_at"] is None
+    assert row["resolved_by"] == SENDER and row["resumed_at"] is not None
     assert [entry["action"] for entry in audits(row["id"])] == ["resolved"]
     purposes = sorted(item["purpose"] for item in case.provider.requests[before:])
-    assert purposes == ["approval", "invocation"]
-    # Resume construction belongs to the core-owned publication path; nothing context-free.
-    assert valkey.xrange(runs_stream) == stream
+    # The answer's two checks, then the core-owned publication's own two.
+    assert purposes == ["approval", "approval", "invocation", "invocation"]
+    added = valkey.xrange(runs_stream)[len(stream):]
+    assert len(added) == 1 and "curie_identity_context_v1" in added[0][1]
     again = resolve(case, *answer(case))
     assert again.status_code == 409, again.text
     assert rows(row["dedupe_key"]) == [row]
@@ -287,7 +303,7 @@ def test_selected_recovery_records_the_authenticated_actor_and_reseals(
     assert response.json()["status"] == "rejected"
     assert response.json()["actor"] == SENDER
     row, _ = sealed_actor(case, "rejected")
-    assert row["resumed_at"] is None
+    assert row["resumed_at"] is not None
     assert [entry["action"] for entry in audits(row["id"])] == ["administratively_recovered"]
     assert replay.status_code == 200, replay.text
     assert replay.json() == response.json()
