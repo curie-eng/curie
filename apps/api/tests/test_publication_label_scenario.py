@@ -106,7 +106,7 @@ def test_publication_labels_chart_schema_shared_vectors(vector: dict[str, Any]) 
         assert result.returncode != 0
         assert "schema" in result.stderr.lower()
         if isinstance(vector["value"], dict):
-            assert vector["key"] in result.stderr
+            assert vector["key"] in result.stderr.replace("~1", "/").replace("~0", "~")
 
 
 def test_publication_labels_chart_reserves_its_environment_variable() -> None:

@@ -28,8 +28,8 @@ pure ``decide``:
   check with no matching run or status on the head stays pending and, at the
   CI deadline, ends ``ci_unverified``. The notice names each check that never
   started and says it may need a trigger the factory does not apply (for
-  example a label). The factory does not apply that trigger. A rules HTTP 404
-  or an empty rules list adds no names. A transient required-check read stays
+  example a label). Publication applies only operator-configured labels. A rules
+  HTTP 404 or an empty rules list adds no names. A transient required-check read stays
   pending until the deadline and then ends ``ci_timeout``. Any other unreadable
   read, including ``github_forbidden``, ends ``ci_unverified`` immediately;
 - a failing check run or commit status whose ``name`` or ``context`` is also

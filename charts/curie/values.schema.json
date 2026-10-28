@@ -315,6 +315,21 @@
           "exclusiveMinimum": 0,
           "description": "Positive cadence in seconds for reconciling accepted GitHub review feedback."
         },
+        "factoryPublicationLabels": {
+          "type": "object",
+          "propertyNames": {
+            "allOf": [
+              {"pattern": "^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*/[A-Za-z0-9._-]+$"},
+              {"pattern": "^[^/]{1,39}/[^/]{1,100}$"},
+              {"not": {"pattern": "/\\.{1,2}$"}}
+            ]
+          },
+          "additionalProperties": {
+            "type": "array",
+            "maxItems": 10,
+            "items": {"type": "string", "minLength": 1, "maxLength": 50}
+          }
+        },
         "githubRepoAllowlist": {
           "type": "array",
           "uniqueItems": true,

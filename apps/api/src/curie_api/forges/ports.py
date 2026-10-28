@@ -257,7 +257,7 @@ class CodeHost(Protocol):
         """Optional: check names the code host requires on ``branch`` before merge.
 
         GitHub unions ruleset contexts and branch protection contexts. Other
-        code hosts declare this unsupported. The factory does not apply labels
+        code hosts declare this unsupported. This read does not apply labels
         or start workflows to make a required check run.
         """
         ...

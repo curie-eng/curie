@@ -13,20 +13,29 @@ No response ever carries a provider payload or a credential.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from collections.abc import Awaitable, Callable
-from typing import NoReturn
+from typing import NoReturn, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+from redis.exceptions import RedisError
 from sqlalchemy import select
 
 from curie_api.crud import publication_queries as crud_publication_queries
 from curie_api.factory_rediscovery import REFUSING, publishing_code_host, rediscover
 from curie_api.forges.errors import ForgeError, NotFound
+from curie_api.forges.github.code_host import GitHubCodeHost
 from curie_api.forges.hosts import resolve_stored
 from curie_api.forges.ports import CodeHost
 from curie_api.forges.trackers import tracker_for_work_item
-from curie_api.forges.types import GITHUB, PullRequest, PullRequestRef, RepositoryRef
+from curie_api.forges.types import (
+    GITHUB,
+    PullRequest,
+    PullRequestRef,
+    PullRequestState,
+    RepositoryRef,
+)
 from curie_api.publication_pulls import (
     PullRequestContract,
     PullRequestRefused,
@@ -59,7 +68,10 @@ router = APIRouter(
     dependencies=[Depends(require_internal_worker_token)],
 )
 
+logger = logging.getLogger(__name__)
+
 _ACTIVE = frozenset({"approved", "launching", "running"})
+_PUBLICATION_LABELS_TTL_S = 30 * 24 * 60 * 60
 
 
 def _refuse(code: str, message: str) -> NoReturn:
@@ -248,6 +260,34 @@ def _no_other_publication(
     return check
 
 
+async def _apply_publication_labels(
+    request: Request,
+    publication: Publication,
+    code_host: CodeHost,
+    repository: RepositoryRef,
+    pull: PullRequest,
+) -> None:
+    if repository.kind != GITHUB or pull.state != PullRequestState.OPEN or pull.draft:
+        return
+    labels = get_settings().factory_publication_labels.get(repository.path.casefold())
+    if not labels:
+        return
+    marker = f"curie:publication-labels:{publication.id}"
+    try:
+        valkey = request.app.state.valkey
+        if await valkey.exists(marker):
+            return
+        await cast(GitHubCodeHost, code_host).add_pull_request_labels(pull.ref, labels)
+        await valkey.set(marker, "1", ex=_PUBLICATION_LABELS_TTL_S)
+    except (ForgeError, RedisError) as exc:
+        logger.warning(
+            "Publication labels failed publication_id=%s repository=%s error=%s",
+            publication.id,
+            repository.path,
+            type(exc).__name__,
+        )
+
+
 @router.post(
     "/{publication_id}/pull-request",
     response_model=PublicationPullRequestOut,
@@ -316,6 +356,7 @@ async def recover_publication_pull_request(
         raise forge_failure(exc) from None
     if pull is None:
         return Response(status_code=204, headers={"Cache-Control": "no-store"})
+    await _apply_publication_labels(request, publication, code_host, repository, pull)
     return _out(pull)
 
 
