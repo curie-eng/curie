@@ -125,7 +125,7 @@ jobs:
         uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
         with:
           version: v0.24.0
-          node_image: kindest/node:v1.31.0
+          node_image: kindest/node:v1.31.4@sha256:2cb39f7295fe7eafee0842b1052a599a4fb0f8bcf3f83d96c7f4864c357c6c30
           install_only: true
       - name: Back off before retrying Install kind and kubectl without creating a cluster
         if: steps.fix-pin-curie.outputs.needs_kind == 'true' && steps.install_kind.outcome == 'failure'
@@ -138,7 +138,7 @@ jobs:
         uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
         with:
           version: v0.24.0
-          node_image: kindest/node:v1.31.0
+          node_image: kindest/node:v1.31.4@sha256:2cb39f7295fe7eafee0842b1052a599a4fb0f8bcf3f83d96c7f4864c357c6c30
           install_only: true
       - name: Download and verify the exact public v0.12.5 factory upgrade assets
         if: steps.fix-pin-curie.outputs.needs_factory_upgrade == 'true'
