@@ -24,6 +24,8 @@ from curie_api.models import (
     ThreadPublicationLineage,
     WorkItem,
 )
+from forge_fakes import factory_wake
+from forge_fakes.github import forges_env_json
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -65,6 +67,7 @@ class TransitionCase:
     request_id: uuid.UUID
     lineage_id: uuid.UUID
     target: str = "main"
+    labels: tuple[str, ...] = ("factory", "base:next")
     state: str = "opened"
     retarget_status: int = 200
     retargets: list[dict[str, Any]] = field(default_factory=list)
@@ -223,7 +226,7 @@ class TransitionCase:
                     "iid": 7,
                     "project_id": 41,
                     "state": "opened",
-                    "labels": ["factory", "base:next"],
+                    "labels": list(self.labels),
                 },
             )
         if path == "/projects/41/issues/7/notes":
@@ -283,7 +286,9 @@ class TransitionCase:
 
 
 @pytest.fixture
-def transition_case(clean_db: None, graph: GitGraph) -> Iterator[TransitionCase]:  # noqa: F811
+def transition_case(
+    clean_db: None, graph: GitGraph, monkeypatch: pytest.MonkeyPatch  # noqa: F811
+) -> Iterator[TransitionCase]:
     from curie_api.models import FactoryBaseTransition
 
     alias = graph.root / "acme-corp"
@@ -322,6 +327,8 @@ def transition_case(clean_db: None, graph: GitGraph) -> Iterator[TransitionCase]
         settings = get_settings().model_copy(
             update={"forges": ForgesConfig.model_validate(document)}
         )
+        monkeypatch.setenv("CURIE_FORGES", forges_env_json(document, graph.root))
+        get_settings.cache_clear()
         case = TransitionCase(
             graph, remote, settings, uuid.uuid4(), uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
         )
@@ -394,7 +401,7 @@ def transition_case(clean_db: None, graph: GitGraph) -> Iterator[TransitionCase]
                 requester="gitlab:31:developer",
                 reply_kind="gitlab",
                 reply_address=REPO,
-                reply_conversation_id=CONVERSATION,
+                reply_conversation_id="issue-7",
             )
             session.add(request)
             await session.flush()
@@ -425,8 +432,11 @@ def transition_case(clean_db: None, graph: GitGraph) -> Iterator[TransitionCase]
 
         database(seed)
         remote.before_receive = case.record_receive
-        yield case
-        graph.assert_clean()
+        try:
+            yield case
+        finally:
+            get_settings.cache_clear()
+            graph.assert_clean()
 
 
 def _prepare(case: TransitionCase) -> Any:
@@ -542,6 +552,124 @@ def test_restart_observes_prior_effect_without_repeating_a_remote_write(
     assert case.remote.pushes == 2
     assert case.retargets == [{"target_branch": "next"}]
     assert case.target == "next"
+
+
+@pytest.mark.parametrize("target", ["next", "main"], ids=["unchanged", "different"])
+def test_observed_selection_in_applied_outcome_gap_preserves_transition_request(
+    transition_case: TransitionCase, target: str
+) -> None:
+    from curie_api.factory_base_reconcile import observe_base_labels
+    from curie_api.workitem_dispatch import (
+        AcquireGrant,
+        DispatchConflict,
+        StartResult,
+        acquire,
+        finish,
+        start,
+    )
+
+    case = transition_case
+    for _ in range(16):
+        case.tick()
+        operation = case.row()
+        assert operation["phase"] not in {"conflict", "refused"}, operation["error_code"]
+        if operation["phase"] == "applied":
+            break
+    else:
+        pytest.fail("healthy durable base move did not reach its applied outcome gap")
+    assert operation["outcome_ready_at"] is None
+    assert operation["request_id"] == case.request_id
+    assert case.identities()[0]["base_selection_fingerprint"] is None
+    case.labels = ("factory", f"base:{target}")
+
+    async def observe(session: AsyncSession) -> None:
+        item = await session.get(WorkItem, case.work_item_id)
+        assert item is not None
+        async with httpx.AsyncClient(transport=httpx.MockTransport(case.api)) as client:
+            await observe_base_labels(
+                session,
+                item=item,
+                labels=set(case.labels),
+                default_branch="main",
+                event_identity=None,
+                settings=case.settings,
+                client=client,
+            )
+        await session.commit()
+
+    async def requests(session: AsyncSession) -> list[tuple[uuid.UUID, str]]:
+        rows = await session.execute(
+            text(
+                "SELECT id, status FROM curie.execution_requests "
+                "WHERE work_item_id = :id ORDER BY sequence"
+            ),
+            {"id": case.work_item_id},
+        )
+        return [(row.id, row.status) for row in rows]
+
+    database(observe)
+    item = case.identities()[0]
+    assert database(requests) == [(case.request_id, "waiting")]
+    assert case.row()["outcome_ready_at"] is None
+    if target != "next":
+        assert item["readmit_request_id"] is not None
+        assert item["readmit_request_id"] != case.request_id
+        assert item["readmit_base_branch"] == target
+        return
+    assert item["readmit_request_id"] is None
+    assert item["readmit_objective"] is None
+
+    case.tick()
+    assert case.row()["outcome_ready_at"] is not None
+    assert database(requests) == [(case.request_id, "waiting")]
+
+    async def execute(session: AsyncSession) -> None:
+        request = await session.get(ExecutionRequest, case.request_id)
+        assert request is not None
+        generation = request.dispatch_generation
+        async with httpx.AsyncClient(transport=httpx.MockTransport(case.api)) as client:
+            acquired = await acquire(
+                session,
+                case.request_id,
+                owner="base-observation-worker",
+                generation=generation,
+                wake=await factory_wake(session, case.request_id),
+                context=None,
+                client=client,
+            )
+        assert isinstance(acquired, AcquireGrant), acquired
+        started = await start(
+            session,
+            case.request_id,
+            owner="base-observation-worker",
+            generation=generation,
+            claim_name="claim-base-observation",
+            sandbox_name="sandbox-base-observation",
+            context=acquired.context,
+        )
+        assert isinstance(started, StartResult), started
+        result = await finish(
+            session,
+            case.request_id,
+            runtime_epoch=started.runtime_epoch,
+            outcome="failed",
+            cause="no_pull_request",
+            detail="No changes needed: repository verification passed on the new base.",
+            ci_fix_round=None,
+        )
+        assert isinstance(result, DispatchConflict), result
+        assert result.code == "publication_pending"
+
+    database(execute)
+    completed = case.row()
+    assert completed["request_id"] == case.request_id
+    assert completed["ci_ready_at"] is not None
+    assert completed["ci_settled_at"] is None
+    assert database(requests) == [(case.request_id, "running")]
+    assert case.identities()[0]["readmit_request_id"] is None
+    assert case.identities()[2] == 0
+    assert case.graph.head() == completed["verification_head_sha"]
+    assert case.remote.pushes == 2
 
 
 def test_restart_before_history_acknowledgement_does_not_duplicate_the_outcome(
