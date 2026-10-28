@@ -520,6 +520,7 @@ class GitHubRepositoryFake:
         self.statuses: dict[str, dict[str, dict[str, Any]]] = {}
         self.default_branch = "main"
         self.writes = 0
+        self.label_requests: list[httpx.Request] = []
         self._event_ids = itertools.count(70001)
         self._comment_ids = itertools.count(80001)
         self._check_ids = itertools.count(90001)
@@ -853,6 +854,9 @@ class GitHubRepositoryFake:
             issue = self.issues[int(matched[1])]
             names = [entry["name"] for entry in issue["labels"]]
             if request.method == "POST":
+                # GitHub labels also address PR numbers through the issues API:
+                # https://docs.github.com/en/rest/issues/labels?apiVersion=2022-11-28#add-labels-to-an-issue
+                self.label_requests.append(request)
                 names.extend(name for name in body["labels"] if name not in names)
             elif matched[2] is not None and unquote(matched[2]) in names:
                 names.remove(unquote(matched[2]))
@@ -870,7 +874,12 @@ class GitHubRepositoryFake:
             if body["head"] not in self.branches or body["base"] not in self.branches:
                 return httpx.Response(422, json={"message": "Validation Failed"})
             number = self._number()
-            self.issues[number] = {"number": number, "state": "open", "pull_request": {}}
+            self.issues[number] = {
+                "number": number,
+                "state": "open",
+                "pull_request": {},
+                "labels": [],
+            }
             self.pulls[number] = {
                 "head": body["head"],
                 "base": body["base"],
