@@ -33,6 +33,7 @@ from .models import (
 from .workitems import lifecycle
 
 _READ_SECONDS = 8.0
+_OBSERVE_ATTEMPTS = 3
 
 
 def _lineage_empty(lineage: ThreadPublicationLineage) -> bool:
@@ -286,12 +287,77 @@ async def observe_base_labels(
     settings: Settings,
     client: httpx.AsyncClient,
 ) -> None:
+    read_deadline = asyncio.get_running_loop().time() + _READ_SECONDS
+    for attempt in range(_OBSERVE_ATTEMPTS):
+        changed_item = await _observe_base_labels_once(
+            session,
+            item=item,
+            labels=labels,
+            default_branch=default_branch,
+            event_identity=event_identity,
+            settings=settings,
+            client=client,
+            read_deadline=read_deadline,
+        )
+        if changed_item is None:
+            return
+        item = changed_item
+        issue, repository, installation = (
+            item.tracker_issue,
+            item.repository,
+            item.code_host_installation_id,
+        )
+        await session.commit()
+        if attempt == _OBSERVE_ATTEMPTS - 1:
+            raise FeedbackUnavailable("base_selection_changed")
+        try:
+            async with asyncio.timeout_at(read_deadline):
+                registry = forges_registry(settings)
+                tracker = tracker_for_work_item(
+                    registry,
+                    client,
+                    issue,
+                    repository,
+                    installation,
+                    timeout_s=_READ_SECONDS,
+                )
+                ticket = await tracker.ticket_labels(issue)
+                host = code_host_for_repository(
+                    registry,
+                    client,
+                    repository,
+                    installations=(
+                        {repository.path: installation} if installation is not None else {}
+                    ),
+                )
+                current_repository = await host.resolve_repository(repository.project_id)
+                if current_repository != repository or current_repository.path != repository.path:
+                    raise Unavailable("repository_identity_changed")
+                labels = set(ticket.labels)
+                default_branch = current_repository.default_branch
+        except (ForgeError, FeedbackUnavailable, TimeoutError):
+            raise FeedbackUnavailable("base_labels_unavailable") from None
+
+
+async def _observe_base_labels_once(
+    session: AsyncSession,
+    *,
+    item: WorkItem,
+    labels: set[str],
+    default_branch: str | None,
+    event_identity: str | None,
+    settings: Settings,
+    client: httpx.AsyncClient,
+    read_deadline: float,
+) -> WorkItem | None:
     from .workitem_dispatch import Admission, readmit
 
     expected_version = item.version
     locked_item = await lifecycle.lock_work_item(session, item.id)
-    if locked_item is None or locked_item.version != expected_version:
+    if locked_item is None:
         return
+    if locked_item.version != expected_version:
+        return locked_item
     item = locked_item
     registry = forges_registry(settings)
     policy = work_item_policy(registry, item.tracker_issue, item.repository)
@@ -368,7 +434,7 @@ async def observe_base_labels(
     remote_absent = lineage_id is None
     if lineage_branch is not None:
         try:
-            async with asyncio.timeout(_READ_SECONDS):
+            async with asyncio.timeout_at(read_deadline):
                 host = code_host_for_repository(
                     registry,
                     client,
@@ -383,14 +449,21 @@ async def observe_base_labels(
     locked_item = await lifecycle.lock_work_item(session, item_id)
     previous = await lifecycle.lock_request(session, work_item_id=item_id, request_id=previous_id)
     now = await lifecycle.database_now(session)
+    if locked_item is None or previous is None:
+        return
     if (
-        locked_item is None
-        or previous is None
-        or locked_item.version != item_version
-        or locked_item.cancelled_at is not None
+        locked_item.version != item_version
         or locked_item.publication_lineage_id != lineage_id
         or previous.version != request_version
         or previous.dispatch_generation != generation
+        or work_item_policy(
+            forges_registry(settings), locked_item.tracker_issue, locked_item.repository
+        )
+        != policy
+    ):
+        return locked_item
+    if (
+        locked_item.cancelled_at is not None
         or (
             previous.status == "waiting"
             and (previous.wait_deadline is None or previous.wait_deadline <= now)
@@ -399,10 +472,6 @@ async def observe_base_labels(
             previous.status == "running"
             and (previous.execution_deadline is None or previous.execution_deadline <= now)
         )
-        or work_item_policy(
-            forges_registry(settings), locked_item.tracker_issue, locked_item.repository
-        )
-        != policy
     ):
         return
     item = locked_item
