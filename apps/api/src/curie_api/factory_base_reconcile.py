@@ -39,7 +39,7 @@ from .workitems import lifecycle
 
 _UNFINISHED = ("pending", "prepared", "pushed", "retargeted", "ci_prepared", "ci_pushed")
 _READ_SECONDS = 8.0
-_LEASE_SECONDS = 90
+_LEASE_SECONDS = 180
 
 
 def transition_blocks() -> Any:
@@ -385,7 +385,7 @@ async def observe_base_labels(
         return
     request_id = uuid.uuid5(item.id, f"base:{event_identity or fingerprint}")
     item.base_selection_fingerprint = fingerprint
-    if moving is not None and moving.phase not in ("pending", "prepared"):
+    if moving is not None and moving.phase != "pending":
         item.readmit_request_id = request_id
         item.readmit_requester = previous.requester or "factory"
         item.readmit_objective = (
@@ -548,6 +548,7 @@ async def _record_phase(
             item.cancelled_at is not None
             and operation.phase in ("pending", "prepared")
             and phase != "refused"
+            and (operation.phase, phase) != ("prepared", "pushed")
         ):
             return False
         changed = await session.scalar(
@@ -580,6 +581,7 @@ async def _read_pull(
     operation: FactoryBaseTransition,
     *,
     heads: tuple[str, ...],
+    earlier_heads: tuple[str, ...],
     bases: tuple[str, ...],
 ) -> Any:
     pull = await host.read_pull_request(PullRequestRef(repository, operation.pull_request_number))
@@ -589,14 +591,24 @@ async def _read_pull(
         or pull.state is not PullRequestState.OPEN
     ):
         raise _Refused("pull_request_not_open")
-    if pull.head_ref != operation.branch or pull.head_sha not in heads:
+    if pull.head_ref != operation.branch:
         raise _Refused("head_changed")
     if pull.base_ref not in bases:
         raise _Refused("base_changed")
+    if await host.branch_head(repository, operation.branch) not in heads:
+        raise _Refused("head_changed")
+    if pull.head_sha not in heads:
+        if pull.head_sha in earlier_heads:
+            raise _PullHeadPending
+        raise _Refused("head_changed")
     return pull
 
 
 class _Refused(Exception):
+    pass
+
+
+class _PullHeadPending(Exception):
     pass
 
 
@@ -780,7 +792,7 @@ async def _advance_transition(
             )
             .limit(1)
         )
-    if stopped and operation.phase in ("pending", "prepared"):
+    if stopped and operation.phase == "pending":
         await _record_phase(
             sessionmaker, operation, phase="refused", error_code="request_not_waiting"
         )
@@ -827,7 +839,6 @@ async def _advance_transition(
         committer_email=operation.committer_email,
         committer_time=operation.committer_time,
         max_seconds=60,
-        max_bytes=1024 * 1024 * 1024,
     )
     try:
         if operation.phase == "conflict":
@@ -850,6 +861,7 @@ async def _advance_transition(
                 repository,
                 operation,
                 heads=(operation.old_head_sha,),
+                earlier_heads=(),
                 bases=(operation.old_base_ref,),
             )
             if not await _owned(sessionmaker, operation):
@@ -870,26 +882,28 @@ async def _advance_transition(
             candidate = operation.rebased_head_sha
             if candidate is None:
                 raise _Refused("candidate_missing")
+            remote = await host.branch_head(repository, operation.branch)
+            if remote not in (operation.old_head_sha, candidate):
+                raise _Refused("head_changed")
+            if stopped and remote == operation.old_head_sha:
+                raise _Refused("request_not_waiting")
             await _read_pull(
                 host,
                 repository,
                 operation,
                 heads=(operation.old_head_sha, candidate),
+                earlier_heads=(),
                 bases=(operation.old_base_ref,),
             )
-            remote = await host.branch_head(repository, operation.branch)
             if remote == operation.old_head_sha:
                 credential = await issue_stored_credential(
                     settings, client, repository=repository, scope=CredentialScope.PUSH
                 )
-                prepared = await factory_rebase.prepare_rebase(snapshot, credential)
-                if prepared.head_sha != candidate:
-                    raise _Refused("candidate_changed")
                 if not await _owned(sessionmaker, operation):
                     return
-                await factory_rebase.push_rebase(snapshot, credential, prepared)
-            elif remote != candidate:
-                raise _Refused("head_changed")
+                await factory_rebase.push_rebase(
+                    snapshot, credential, factory_rebase.PreparedRebase(candidate)
+                )
             if await host.branch_head(repository, operation.branch) != candidate:
                 raise _Refused("head_changed")
             await _record_phase(
@@ -908,6 +922,7 @@ async def _advance_transition(
                 repository,
                 operation,
                 heads=(candidate,),
+                earlier_heads=(operation.old_head_sha,),
                 bases=(operation.old_base_ref, operation.target_base_ref),
             )
             if pull.base_ref != operation.target_base_ref:
@@ -917,7 +932,12 @@ async def _advance_transition(
                     pull.ref, base_ref=operation.target_base_ref, expected_head_sha=candidate
                 )
             await _read_pull(
-                host, repository, operation, heads=(candidate,), bases=(operation.target_base_ref,)
+                host,
+                repository,
+                operation,
+                heads=(candidate,),
+                earlier_heads=(operation.old_head_sha,),
+                bases=(operation.target_base_ref,),
             )
             await _record_phase(
                 sessionmaker,
@@ -931,7 +951,12 @@ async def _advance_transition(
             if candidate is None:
                 raise _Refused("candidate_missing")
             await _read_pull(
-                host, repository, operation, heads=(candidate,), bases=(operation.target_base_ref,)
+                host,
+                repository,
+                operation,
+                heads=(candidate,),
+                earlier_heads=(operation.old_head_sha,),
+                bases=(operation.target_base_ref,),
             )
             credential = await issue_stored_credential(
                 settings, client, repository=repository, scope=CredentialScope.PUSH
@@ -953,6 +978,7 @@ async def _advance_transition(
                 repository,
                 operation,
                 heads=(candidate, verification),
+                earlier_heads=(operation.old_head_sha,),
                 bases=(operation.target_base_ref,),
             )
             remote = await host.branch_head(repository, operation.branch)
@@ -960,12 +986,14 @@ async def _advance_transition(
                 credential = await issue_stored_credential(
                     settings, client, repository=repository, scope=CredentialScope.PUSH
                 )
-                marker = await factory_rebase.prepare_ci_marker(snapshot, credential, candidate)
-                if marker.head_sha != verification:
-                    raise _Refused("candidate_changed")
                 if not await _owned(sessionmaker, operation):
                     return
-                await factory_rebase.push_ci_marker(snapshot, credential, marker, candidate)
+                await factory_rebase.push_ci_marker(
+                    snapshot,
+                    credential,
+                    factory_rebase.PreparedRebase(verification),
+                    candidate,
+                )
             elif remote != verification:
                 raise _Refused("head_changed")
             await _read_pull(
@@ -973,6 +1001,7 @@ async def _advance_transition(
                 repository,
                 operation,
                 heads=(verification,),
+                earlier_heads=(operation.old_head_sha, candidate),
                 bases=(operation.target_base_ref,),
             )
             credential = await issue_stored_credential(
@@ -988,13 +1017,15 @@ async def _advance_transition(
                 error_code=None,
             )
         elif operation.phase == "ci_pushed":
-            if operation.verification_head_sha is None:
+            candidate, verification = operation.rebased_head_sha, operation.verification_head_sha
+            if candidate is None or verification is None:
                 raise _Refused("candidate_missing")
             await _read_pull(
                 host,
                 repository,
                 operation,
-                heads=(operation.verification_head_sha,),
+                heads=(verification,),
+                earlier_heads=(operation.old_head_sha, candidate),
                 bases=(operation.target_base_ref,),
             )
             await _apply_transition(sessionmaker, operation)
@@ -1002,6 +1033,8 @@ async def _advance_transition(
         await _record_phase(
             sessionmaker, operation, phase="refused", error_code="pull_request_missing"
         )
+    except _PullHeadPending:
+        await _record_phase(sessionmaker, operation, error_code="pull_request_head_pending")
     except _Refused as error:
         await _record_phase(sessionmaker, operation, phase="refused", error_code=str(error))
     except (ForgeError, FeedbackUnavailable, TimeoutError):
