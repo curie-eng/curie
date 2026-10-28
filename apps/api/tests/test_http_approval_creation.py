@@ -485,9 +485,12 @@ def test_creation_external_lookup_holds_no_sql_transaction_or_writer_fence(
                     "AND pid<>pg_backend_pid() AND backend_type='client backend' "
                     "AND xact_start IS NOT NULL"
                 ))
+                # Advisory locks are per database and each xdist worker has its own,
+                # so the count is scoped to this request's database.
                 writers = await connection.scalar(text(
                     "SELECT count(*) FROM pg_locks WHERE locktype='advisory' "
-                    "AND granted AND objid=2250220 AND pid<>pg_backend_pid()"
+                    "AND granted AND objid=2250220 AND pid<>pg_backend_pid() "
+                    "AND database=(SELECT oid FROM pg_database WHERE datname=current_database())"
                 ))
                 checks.append((active, writers))
         finally:
