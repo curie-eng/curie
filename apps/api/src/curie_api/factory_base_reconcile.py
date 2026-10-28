@@ -355,7 +355,7 @@ async def _observe_base_labels_once(
     expected_version = item.version
     locked_item = await lifecycle.lock_work_item(session, item.id)
     if locked_item is None:
-        return
+        return None
     if locked_item.version != expected_version:
         return locked_item
     item = locked_item
@@ -386,11 +386,11 @@ async def _observe_base_labels_once(
         await session.commit()
         tracker = tracker_for_work_item(registry, client, issue, repository, installation)
         await factory_base.comment_refusal(tracker.marked_comments, issue, choice)
-        return
+        return None
     if item.cancelled_at is not None or (
         item.trigger_label is not None and item.trigger_label not in labels
     ):
-        return
+        return None
     if choice.branch == item.base_branch:
         changed = (
             item.base_source != choice.source
@@ -405,12 +405,12 @@ async def _observe_base_labels_once(
         if changed:
             item.version += 1
             await mark_status_comment_stale(session, item.id)
-        return
+        return None
     if item.base_branch is None:
-        return
+        return None
     fingerprint = hashlib.sha256(f"{choice.branch}\0{choice.source}".encode()).hexdigest()
     if item.base_selection_fingerprint == fingerprint:
-        return
+        return None
     previous = await session.scalar(
         select(ExecutionRequest)
         .where(ExecutionRequest.work_item_id == item.id)
@@ -418,7 +418,7 @@ async def _observe_base_labels_once(
         .limit(1)
     )
     if previous is None:
-        return
+        return None
     item_id, item_version = item.id, item.version
     previous_id, request_version, generation = (
         previous.id,
@@ -450,7 +450,7 @@ async def _observe_base_labels_once(
     previous = await lifecycle.lock_request(session, work_item_id=item_id, request_id=previous_id)
     now = await lifecycle.database_now(session)
     if locked_item is None or previous is None:
-        return
+        return None
     if (
         locked_item.version != item_version
         or locked_item.publication_lineage_id != lineage_id
@@ -473,7 +473,7 @@ async def _observe_base_labels_once(
             and (previous.execution_deadline is None or previous.execution_deadline <= now)
         )
     ):
-        return
+        return None
     item = locked_item
     lineage = (
         await session.scalar(
@@ -496,7 +496,7 @@ async def _observe_base_labels_once(
     await _record_requested_base(session, item, choice)
     if not safe:
         item.base_selection_fingerprint = None
-        return
+        return None
     request_id = uuid.uuid5(item.id, f"base:{event_identity or fingerprint}")
     item.base_selection_fingerprint = fingerprint
     await session.flush()
@@ -532,6 +532,7 @@ async def _observe_base_labels_once(
             current_item.readmit_base_settle_until = settle_until
         await dispatch.commit()
     await mark_status_comment_stale(session, item.id)
+    return None
 
 
 async def _lineage_busy(session: AsyncSession, lineage_id: uuid.UUID) -> bool:
