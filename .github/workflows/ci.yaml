@@ -3410,7 +3410,7 @@ jobs:
       - name: Run admitted agent runtime regressions
         env:
           CASE_SHARD: ${{ matrix.shard }}/5
-        run: uv run pytest -q -n 0 tools/factory-e2e/tests/test_c4_admitted_agent.py --case-shard "$CASE_SHARD"
+        run: uv run pytest -q -n 0 tools/factory-e2e/tests/test_c4_admitted_agent.py tools/factory-e2e/tests/test_c4_dynamic_base.py --case-shard "$CASE_SHARD"
       - name: Upload the publication failure digest
         if: failure()
         uses: actions/upload-artifact@v7
