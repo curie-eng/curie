@@ -175,18 +175,20 @@ def nochange_ready(run: DynamicKind, ticket: Ticket, transition: dict[str, Any])
     assert run.publication_rows({"id": row["request_id"]}) == [], (
         "a base move fabricated a publication"
     )
-    assert observed_checkout(run, row["verification_head_sha"]) is not None, (
-        "the successor reused the old checkout"
-    )
+    checkout = observed_checkout(run, row["verification_head_sha"])
+    if checkout is None:
+        run.record_nochange_failure(ticket, row, stage="current_checkout")
+    assert checkout is not None, "the successor reused the old checkout"
     preflight = run.sql(
         "SELECT coalesce(json_agg(note::json), '[]'::json) "
         "FROM curie.execution_request_phase_reports "
         f"WHERE execution_request_id='{uuid.UUID(row['request_id'])}' "
         "AND phase='verification_preflight'"
     )
-    assert any(observation.get("outcome") == "passed" for observation in preflight), (
-        "the successor has no fresh repository verification"
-    )
+    preflight_passed = any(observation.get("outcome") == "passed" for observation in preflight)
+    if not preflight_passed:
+        run.record_nochange_failure(ticket, row, stage="verification_preflight")
+    assert preflight_passed, "the successor has no fresh repository verification"
     return row
 
 
@@ -217,6 +219,17 @@ def assert_completed(run: DynamicKind, ticket: Ticket, request_id: str) -> None:
         return row if row["status"] in TERMINAL else None
 
     row = wait(terminal)
+    if row is None or row["status"] != "completed":
+        transition = next(
+            (
+                candidate
+                for candidate in reversed(run.transitions(ticket))
+                if candidate["request_id"] == request_id and candidate["phase"] == "applied"
+            ),
+            None,
+        )
+        if transition is not None:
+            run.record_nochange_failure(ticket, transition, stage="ci_settlement")
     assert row is not None, "fresh final-head green CI did not settle the request"
     assert row["status"] == "completed", f"fresh final-head CI settled {row['status']}"
 
