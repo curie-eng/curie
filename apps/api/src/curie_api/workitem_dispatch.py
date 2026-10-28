@@ -950,6 +950,58 @@ async def acquire(
         if pin_item_id != work_item.id or pin_request_id != request.id:
             await session.rollback()
             return await _refuse(session, "not_dispatchable", request_id=request_id)
+        if work_item.publication_lineage_id is not None:
+            transition = await session.scalar(
+                select(FactoryBaseTransition)
+                .join(
+                    ThreadPublicationLineage,
+                    ThreadPublicationLineage.id == FactoryBaseTransition.lineage_id,
+                )
+                .where(
+                    FactoryBaseTransition.work_item_id == work_item.id,
+                    FactoryBaseTransition.lineage_id == work_item.publication_lineage_id,
+                    FactoryBaseTransition.phase == "applied",
+                    FactoryBaseTransition.outcome_ready_at.is_not(None),
+                    FactoryBaseTransition.ci_settled_at.is_(None),
+                    FactoryBaseTransition.target_base_ref == selected_base.branch,
+                    FactoryBaseTransition.target_base_sha == base_commit,
+                    (
+                        ThreadPublicationLineage.head_sha
+                        == FactoryBaseTransition.verification_head_sha
+                    ),
+                    ThreadPublicationLineage.base_ref == FactoryBaseTransition.target_base_ref,
+                    ThreadPublicationLineage.base_sha == FactoryBaseTransition.target_base_sha,
+                )
+                .order_by(FactoryBaseTransition.applied_at.desc())
+                .limit(1)
+                .with_for_update()
+            )
+            if transition is not None:
+                prior = await session.get(ExecutionRequest, transition.ci_request_id)
+                if (
+                    transition.ci_request_id != work_item.base_resolved_request_id
+                    or prior is None
+                    or prior.work_item_id != work_item.id
+                    or (
+                        prior.id != request.id
+                        and (
+                            prior.sequence >= request.sequence
+                            or prior.status not in ("completed", "failed", "expired", "cancelled")
+                        )
+                    )
+                ):
+                    return await _defer_factory_refusal(
+                        session,
+                        work_item,
+                        request,
+                        owner=owner,
+                        generation=generation,
+                        refusal="not_dispatchable",
+                    )
+                if prior.id != request.id:
+                    transition.ci_request_id = request.id
+                    transition.ci_ready_at = None
+                    transition.version += 1
         if empty_lineage_id is not None:
             lineage = await session.get(ThreadPublicationLineage, empty_lineage_id)
             if lineage is not None:

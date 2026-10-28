@@ -103,14 +103,14 @@ def ready_base_transition_exists(request_id: Any = ExecutionRequest.id) -> Colum
             ThreadPublicationLineage.id == FactoryBaseTransition.lineage_id,
         )
         .where(
-            FactoryBaseTransition.request_id == request_id,
+            FactoryBaseTransition.ci_request_id == request_id,
             FactoryBaseTransition.phase == "applied",
             FactoryBaseTransition.outcome_ready_at.is_not(None),
             FactoryBaseTransition.ci_ready_at.is_not(None),
             FactoryBaseTransition.ci_settled_at.is_(None),
             WorkItem.cancelled_at.is_(None),
             WorkItem.publication_lineage_id == FactoryBaseTransition.lineage_id,
-            WorkItem.base_resolved_request_id == FactoryBaseTransition.request_id,
+            WorkItem.base_resolved_request_id == FactoryBaseTransition.ci_request_id,
             ThreadPublicationLineage.head_sha == FactoryBaseTransition.verification_head_sha,
             ThreadPublicationLineage.base_ref == FactoryBaseTransition.target_base_ref,
             ThreadPublicationLineage.base_sha == FactoryBaseTransition.target_base_sha,
@@ -127,7 +127,7 @@ def ready_base_transition_exists(request_id: Any = ExecutionRequest.id) -> Colum
                 active_move.id != FactoryBaseTransition.id,
             ),
             ~exists().where(
-                Publication.execution_request_id == FactoryBaseTransition.request_id,
+                Publication.execution_request_id == FactoryBaseTransition.ci_request_id,
                 Publication.status.in_(AWAITING_PUBLICATION),
             ),
         )
@@ -175,7 +175,7 @@ async def _applied_base_transition(
         )
         .where(
             FactoryBaseTransition.work_item_id == work_item.id,
-            FactoryBaseTransition.request_id == request.id,
+            FactoryBaseTransition.ci_request_id == request.id,
             FactoryBaseTransition.lineage_id == work_item.publication_lineage_id,
             FactoryBaseTransition.phase == "applied",
             FactoryBaseTransition.outcome_ready_at.is_not(None),
@@ -214,7 +214,7 @@ async def base_transition_round_offset(
         select(FactoryBaseTransition.id)
         .where(
             FactoryBaseTransition.work_item_id == work_item_id,
-            FactoryBaseTransition.request_id == request_id,
+            FactoryBaseTransition.ci_request_id == request_id,
             FactoryBaseTransition.lineage_id == lineage_id,
             FactoryBaseTransition.phase == "applied",
             FactoryBaseTransition.outcome_ready_at.is_not(None),
@@ -1843,6 +1843,7 @@ async def settle_ci_verdict(
                 .where(
                     FactoryBaseTransition.id == expected_subject.id,
                     FactoryBaseTransition.version == expected_subject.version,
+                    FactoryBaseTransition.ci_request_id == request_id,
                 )
                 .values(
                     ci_settled_at=func.clock_timestamp(), version=FactoryBaseTransition.version + 1
@@ -2890,7 +2891,7 @@ async def claim_publication_settlement(
         await session.execute(
             select(ExecutionRequest, WorkItem, FactoryBaseTransition)
             .join(WorkItem, WorkItem.id == ExecutionRequest.work_item_id)
-            .join(FactoryBaseTransition, FactoryBaseTransition.request_id == ExecutionRequest.id)
+            .join(FactoryBaseTransition, FactoryBaseTransition.ci_request_id == ExecutionRequest.id)
             .where(
                 ExecutionRequest.status == "running",
                 ready_base_transition_exists(),

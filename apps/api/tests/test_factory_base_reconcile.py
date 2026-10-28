@@ -416,6 +416,7 @@ def transition_case(
                     id=TRANSITION_ID,
                     work_item_id=item.id,
                     request_id=request.id,
+                    ci_request_id=request.id,
                     lineage_id=lineage.id,
                     phase="pending",
                     version=1,

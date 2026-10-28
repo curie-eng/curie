@@ -3975,6 +3975,9 @@ class FactoryBaseTransition(Base):
     request_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey(f"{SCHEMA}.execution_requests.id", ondelete="CASCADE")
     )
+    ci_request_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.execution_requests.id", ondelete="CASCADE")
+    )
     lineage_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey(f"{SCHEMA}.thread_publication_lineages.id", ondelete="CASCADE")
     )

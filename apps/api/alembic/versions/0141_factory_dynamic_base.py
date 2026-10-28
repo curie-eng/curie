@@ -58,6 +58,12 @@ def upgrade() -> None:
             nullable=False,
         ),
         sa.Column(
+            "ci_request_id",
+            postgresql.UUID(as_uuid=True),
+            sa.ForeignKey("curie.execution_requests.id", ondelete="CASCADE"),
+            nullable=False,
+        ),
+        sa.Column(
             "lineage_id",
             postgresql.UUID(as_uuid=True),
             sa.ForeignKey("curie.thread_publication_lineages.id", ondelete="CASCADE"),

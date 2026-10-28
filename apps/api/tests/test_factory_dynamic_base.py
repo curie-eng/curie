@@ -314,6 +314,7 @@ def test_a_conflict_hold_requires_a_new_factory_application_before_retrying(base
                         id=transition_id,
                         work_item_id=stored.id,
                         request_id=request["id"],
+                        ci_request_id=request["id"],
                         lineage_id=lineage.id,
                         phase="conflict",
                         version=1,

@@ -110,6 +110,7 @@ def _applied_move(
                         id=transition_id,
                         work_item_id=item.id,
                         request_id=request.id,
+                        ci_request_id=request.id,
                         lineage_id=lineage.id,
                         phase="applied",
                         version=1,

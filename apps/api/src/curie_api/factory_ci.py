@@ -1086,7 +1086,7 @@ async def _load(
         select(FactoryBaseTransition)
         .where(
             FactoryBaseTransition.work_item_id == work_item.id,
-            FactoryBaseTransition.request_id == request.id,
+            FactoryBaseTransition.ci_request_id == request.id,
             FactoryBaseTransition.lineage_id == lineage.id,
             FactoryBaseTransition.phase == "applied",
         )

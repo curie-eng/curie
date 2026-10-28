@@ -127,6 +127,14 @@ publication identity and lineage verification boundaries continue to apply.
 
 The new head and base are a new verification identity. Prior approvals and
 verification results cannot authorize publication of the replayed tree.
+The request that authorized the transition remains immutable. CI settlement
+has a separate request owner. If a later factory marking starts a successor
+on the same unsettled head and base, its fenced acquisition transfers CI
+ownership only from an older terminal request of the same work item. That
+transfer clears CI readiness and invalidates earlier observations. The new
+request must hand off its own verification before CI can settle it, including
+when it publishes no revision. A mismatched prior owner refuses acquisition
+instead of dropping the CI requirement.
 Required validation runs after replay, and publication rechecks the current
 head, base and authority through its existing gates. A resumed reconciliation
 checks observed remote progress before advancing its durable state.

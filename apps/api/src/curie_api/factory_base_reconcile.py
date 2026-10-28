@@ -256,6 +256,7 @@ async def resolve_for_acquire(
                 FactoryBaseTransition(
                     work_item_id=item.id,
                     request_id=request.id,
+                    ci_request_id=request.id,
                     lineage_id=lineage.id,
                     old_base_ref=lineage.base_ref or item.base_branch or "",
                     old_base_sha=lineage.base_sha,
