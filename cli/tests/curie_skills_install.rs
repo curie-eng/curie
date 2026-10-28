@@ -83,6 +83,19 @@ fn success(output: &Output) -> Value {
     value
 }
 fn receipts(value: &Value, agent: &str, scope: &str, root: &Path, directory: &str) {
+    let set_schema: Value = serde_json::from_slice(
+        &fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("schema/agent-skills-install.schema.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        jsonschema::validator_for(&set_schema)
+            .unwrap()
+            .is_valid(value),
+        "set receipt schema: {value}"
+    );
     let values = value["skills"]
         .as_array()
         .expect("set receipt contains skills array");
