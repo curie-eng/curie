@@ -12,7 +12,8 @@ holding the model's JSON). The turn's ``event_id`` is deterministic per
 approval, so the worker's done-marker dedupes any double-enqueue.
 
 The queue also remembers, in process, every resume turn whose XADD raised
-(#4016). Every inline wake (resolve, the resolve-path expiry branch, the expiry
+(#4016), or whose committed-row classification raised before any XADD. Every
+inline wake (resolve, the resolve-path expiry branch, the expiry
 sweeper, administrative recovery) passes through ``enqueue``, so this is the
 one seam that observes a wake that did not land. The resume reconciler reads
 that record and re-enqueues those approvals on its next pass instead of waiting
@@ -335,8 +336,10 @@ _SCRIPT_REFUSALS = {
 class ApprovalResumeRefused(RuntimeError):
     """A selected resume was refused before any append; the wake stays owed.
 
-    Denial and unavailability grant nothing and are never recorded as an
-    undelivered append. @spec HTTP-APPROVAL-CONTINUITY-11.
+    Denial and unavailability grant nothing. A refusal from the owner's
+    authorization is never recorded as an undelivered append; ``enqueue``
+    records only a classification lookup that raised, so the reconciler
+    reclassifies the committed row on its next pass. @spec HTTP-APPROVAL-CONTINUITY-11.
     """
 
     def __init__(self, code: str) -> None:
@@ -505,11 +508,20 @@ class ResumeQueue:
         ``delegate=False``: a selected row then refuses rather than running a
         lookup beneath that lock. Every other turn, including a legacy approval's
         resume, keeps the existing single-field layout.
+
+        A classification lookup that raises appends nothing, so the wake is
+        recorded as undelivered exactly as a raised XADD is: the reconciler's
+        next pass reclassifies the committed row and retries it, instead of
+        leaving a legacy wake to the grace horizon.
         @spec HTTP-APPROVAL-CONTINUITY-11.
         """
         resume_approval_id = parse_resume_event_id(turn.event_id)
         if resume_approval_id is not None and self._approvals is not None:
-            committed = await self._approvals.committed(resume_approval_id)
+            try:
+                committed = await self._approvals.committed(resume_approval_id)
+            except Exception:
+                self._record_undelivered(resume_approval_id)
+                raise
             if committed is not None and committed[1]:
                 if not delegate:
                     raise ApprovalResumeRefused("unsupported_resume")

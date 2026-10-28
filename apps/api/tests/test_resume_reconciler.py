@@ -23,10 +23,12 @@ Valkey-specific setup into the shared conftest.
 import asyncio
 import json
 import os
+import socket
 import uuid
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -34,8 +36,14 @@ import redis
 import redis.asyncio as aioredis
 from aci_protocol import STREAM_PAYLOAD_FIELD, QueuedTurn, ReplyHandle
 from curie_api.config import get_settings
+from curie_api.identity.http_resume_publication import http_resume_owner
 from curie_api.models import Approval, ApprovalStatus
-from curie_api.resumequeue import ResumeQueue, approval_trace_context, resume_turn_for
+from curie_api.resumequeue import (
+    ApprovalResumeRefused,
+    ResumeQueue,
+    approval_trace_context,
+    resume_turn_for,
+)
 from curie_api.resumereconciler import ResumeReconciler
 from curie_telemetry import extract_trace_context
 from curie_telemetry.tracing import configure_tracer_provider
@@ -56,6 +64,7 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from sqlalchemy import select, text, update
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -1686,6 +1695,75 @@ def test_successful_resume_enqueue_clears_a_recorded_undelivered_id(
     assert approval_id not in owed_after_success
     assert count == 0
     assert _stream_event_ids(valkey, runs_stream) == [f"approval-{approval_id}-resolved"]
+
+
+def test_failed_resume_classification_is_reenqueued_on_the_next_pass(
+    clean_db: None, valkey: redis.Redis, runs_stream: str
+) -> None:
+    """A legacy resume whose committed-row classification raised is still owed.
+
+    Production wires ``ResumeQueue`` to the API resume owner, whose
+    ``committed`` lookup runs before the XADD. When that lookup's database
+    connection fails (here a real refused connection, as when the API's pool
+    reconnects during a Postgres restart), nothing is appended. The next pass
+    must deliver the wake once the database answers again, as it does for a
+    raised XADD, instead of leaving it to the three-hour grace.
+    """
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        closed_port = probe.getsockname()[1]
+
+    async def steps(
+        sessionmaker: async_sessionmaker[AsyncSession],
+        queue: ResumeQueue,
+        faults: _XaddFaults,
+    ) -> tuple[uuid.UUID, int, frozenset[uuid.UUID], int, datetime | None]:
+        approval_id = await _insert_approval(
+            sessionmaker,
+            status=ApprovalStatus.approved,
+            resolved_at=_naive(0),
+            resumed_at=None,
+        )
+        down = create_async_engine(
+            make_url(get_settings().database_url).set(host="127.0.0.1", port=closed_port),
+            connect_args={"timeout": 5},
+        )
+        state = SimpleNamespace(sessionmaker=async_sessionmaker(down, expire_on_commit=False))
+        owned = ResumeQueue(
+            faults.client, stream=runs_stream, approvals=http_resume_owner(state)
+        )
+        try:
+            with pytest.raises(ApprovalResumeRefused):
+                await _inline_resume(sessionmaker, owned, approval_id)
+        finally:
+            await down.dispose()
+        stranded_len = await faults.client.xlen(runs_stream)
+        owed = owned.undelivered_resumes()
+
+        state.sessionmaker = sessionmaker  # the database answers again
+        reconciler = ResumeReconciler(
+            sessionmaker,
+            owned,
+            interval_seconds=30,
+            grace_seconds=_PRODUCTION_GRACE_SECONDS,
+            batch_limit=100,
+        )
+        count = await reconciler.reconcile_once()
+        return (
+            approval_id, stranded_len, owed, count,
+            await _resumed_at(sessionmaker, approval_id),
+        )
+
+    approval_id, stranded_len, owed, count, resumed_at = _run_async_with_xadd_faults(
+        steps, runs_stream
+    )
+
+    assert stranded_len == 0  # the classification failure appended nothing
+    assert approval_id in owed
+    assert count == 1
+    assert _stream_event_ids(valkey, runs_stream) == [f"approval-{approval_id}-resolved"]
+    assert resumed_at is not None
 
 
 def test_failed_enqueue_of_a_non_resume_turn_records_nothing(
