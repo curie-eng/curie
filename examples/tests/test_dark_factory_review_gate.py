@@ -3201,6 +3201,18 @@ def test_untracked_byte_boundary_cannot_reuse_approval(session: Session) -> None
     assert _saved_state(session)["diff"]["verdict"] is None
 
 
+def test_untracked_symlink_replaced_by_file_cannot_reuse_approval(session: Session) -> None:
+    session.review(PLAN, reply(PLAN, "APPROVE"))
+    p = session.cwd / "p"
+    p.symlink_to("target")
+    session.review(DIFF, reply(DIFF, "APPROVE"))
+    p.unlink()
+    p.write_bytes(b"target")
+    p.chmod(0o755)
+    assert session.pre(PUBLISH)["permissionDecision"] == "deny"
+    assert _saved_state(session)["diff"]["verdict"] is None
+
+
 def test_ignored_publication_content_does_not_invalidate(session: Session) -> None:
     session.review(PLAN, reply(PLAN, "APPROVE"))
     session.review(DIFF, reply(DIFF, "APPROVE"))
