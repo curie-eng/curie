@@ -63,11 +63,7 @@ from .github_factory_events import (
 )
 from .github_review_audit import claim_review_delivery, settle_review_delivery
 from .github_review_events import FeedbackIgnored, FeedbackUnavailable
-from .models import (
-    AgentChannel,
-    ThreadPublicationLineage,
-    WorkItem,
-)
+from .models import AgentChannel, WorkItem
 from .workitem_dispatch import Admission, DispatchConflict
 from .workspace_policy import repository_is_allowed
 
@@ -277,17 +273,6 @@ def admission_result(
     if code in IGNORED:
         return ignored(code)
     return ignored(code)
-
-
-async def _has_open_pr(session: AsyncSession, item: WorkItem) -> bool:
-    if item.publication_lineage_id is None:
-        return False
-    status = await session.scalar(
-        select(ThreadPublicationLineage.status).where(
-            ThreadPublicationLineage.id == item.publication_lineage_id
-        )
-    )
-    return status == "open"
 
 
 def admitting_label(registry: ForgeRegistry, item: WorkItem) -> str | None:

@@ -73,12 +73,11 @@ from .forges.types import (
     MarkedNotice,
     ReplyTarget,
     RepositoryRef,
-    TicketLabels,
     TrackerIssueRef,
 )
 from .github_factory import lock_issue, work_item_for
 from .github_review_events import FeedbackUnavailable
-from .models import FactoryPollCursor, ThreadPublicationLineage, WorkItem
+from .models import FactoryPollCursor, WorkItem
 from .workitem_dispatch import Admission
 
 logger = logging.getLogger(__name__)
@@ -573,17 +572,6 @@ async def _comment(tracker: Tracker, issue: TrackerIssueRef, marker: str, body: 
         raise FeedbackUnavailable("refusal_comment_unavailable") from None
 
 
-async def _has_open_pr(session: AsyncSession, item: WorkItem) -> bool:
-    if item.publication_lineage_id is None:
-        return False
-    status = await session.scalar(
-        select(ThreadPublicationLineage.status).where(
-            ThreadPublicationLineage.id == item.publication_lineage_id
-        )
-    )
-    return status == "open"
-
-
 async def _admit(
     session: AsyncSession,
     scope: _Scope,
@@ -633,7 +621,7 @@ async def _admit(
         await _comment(tracker, issue, REPO_REFUSAL_MARKER, refusal_body(chosen))
         return
     try:
-        connection, code_host, repository = await _chosen_repository(scope, chosen)
+        connection, _, repository = await _chosen_repository(scope, chosen)
     except NotFound:
         await tracker.ticket_labels(issue)
         logger.warning(
@@ -661,15 +649,9 @@ async def _admit(
         label,
         notice,
         surface.agent_id,
-        chosen,
         connection,
-        code_host,
         repository,
-        existing is not None and await _has_open_pr(session, existing),
-        ticket,
     )
-    if admission is None:
-        return
     async with AsyncSession(
         bind=await session.connection(),
         join_transaction_mode="create_savepoint",
@@ -738,13 +720,9 @@ async def _admission(
     label: str,
     notice: MarkedNotice,
     agent_id: uuid.UUID,
-    repo: RepositoryBindingConfig,
     connection: CodeHostConnection,
-    code_host: CodeHost,
     repository: RepositoryRef,
-    has_open_pr: bool,
-    ticket: TicketLabels,
-) -> Admission | None:
+) -> Admission:
     """The admission facts on the chosen repository."""
 
     installation = await connection.installation_for(repository)

@@ -2095,7 +2095,7 @@ async def readmit(
         .with_for_update()
         .limit(1)
     )
-    if moving is not None and moving.phase not in ("pending", "prepared"):
+    if moving is not None and moving.phase != "pending":
         work_item.cancelled_at = None
         work_item.readmit_request_id, work_item.readmit_requester, work_item.readmit_objective = (
             request_id,

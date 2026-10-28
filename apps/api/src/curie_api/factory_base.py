@@ -100,25 +100,6 @@ def choose_base(
     return choice
 
 
-def label_disagreement(
-    labels: set[str],
-    entry: RepositoryBindingConfig | None,
-    default_branch: str | None,
-    recorded: str,
-) -> str | None:
-    """The branch the labels now name when it is not the recorded base.
-
-    The recorded base is kept regardless; this is only what the status comment
-    reports. Two labels name no single branch, so they report nothing.
-    """
-
-    named = _named(labels)
-    if len(named) > 1:
-        return None
-    branch = _single_base(named, entry, default_branch)
-    return branch if branch is not None and branch != recorded else None
-
-
 async def resolve_base(
     *,
     policy: RepositoryBindingConfig | None,
