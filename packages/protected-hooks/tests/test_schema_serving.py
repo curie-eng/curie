@@ -72,7 +72,8 @@ def graph_payload() -> dict[str, Any]:
         # @spec AUTOMATED-REMEDIATION-15: 0138 only widens a CHECK below the floor.
         ("0138", False),
         ("0139", False),
-        ("0141", True),
+        ("0141", False),
+        ("0142", True),
         ("0000", True),
         ("future-expand", True),
     ],

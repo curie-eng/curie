@@ -29,6 +29,7 @@ from test_github_factory_base import (  # noqa: F401
     _execute,
     _execution,
     _label,
+    _open_lineage,
     _work_item,
     base_app,
 )
@@ -516,3 +517,92 @@ def test_a_base_label_waiting_behind_the_first_pin_still_replaces_its_granted_ow
         NEXT_SHA,
     )
     assert _start(client, number, healthy).status_code == 200
+
+
+def test_a_conflict_hold_requires_a_new_factory_application_before_retrying(base_app: Any) -> None:
+    from curie_api.models import FactoryBaseTransition, ThreadPublicationLineage, WorkItem
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+
+    client, api = base_app
+    number = 32008
+    assert _label(client, api, number, "base:next").json()["status"] == "factory_admitted"
+    request = _execution(number)
+    item = _work_item(number)
+    assert item is not None
+    _open_lineage(item["id"])
+    transition_id = uuid.uuid4()
+
+    async def hold() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with AsyncSession(engine) as session:
+                stored = await session.get(WorkItem, item["id"])
+                assert stored is not None
+                lineage = await session.get(ThreadPublicationLineage, stored.publication_lineage_id)
+                assert lineage is not None
+                now = await session.scalar(text("SELECT clock_timestamp()"))
+                stored.base_branch, stored.base_source, stored.base_commit = (
+                    "main",
+                    "default",
+                    MAIN_SHA,
+                )
+                lineage.base_sha = MAIN_SHA
+                session.add(
+                    FactoryBaseTransition(
+                        id=transition_id,
+                        work_item_id=stored.id,
+                        request_id=request["id"],
+                        ci_request_id=request["id"],
+                        lineage_id=lineage.id,
+                        phase="conflict",
+                        version=1,
+                        old_base_ref="main",
+                        old_base_sha=MAIN_SHA,
+                        old_head_sha="3" * 40,
+                        target_base_ref="next",
+                        target_base_sha=NEXT_SHA,
+                        base_source="label",
+                        branch=lineage.branch,
+                        pull_request_number="77",
+                        committer_name="Curie",
+                        committer_email="factory@example.com",
+                        committer_time=now,
+                        error_code="rebase_conflict",
+                        changed_paths=[],
+                    )
+                )
+                await session.commit()
+        finally:
+            await engine.dispose()
+
+    asyncio.run(hold())
+    api.branch_requests.clear()
+    for labels, action, label in [
+        ([LABEL, "base:main"], "labeled", "base:main"),
+        ([LABEL, "base:next"], "unlabeled", "base:main"),
+    ]:
+        api.labels = labels
+        response = _post(client, "issues", _issue_event(action, number, label={"name": label}))
+        assert response.status_code == 200, response.text
+        assert _execution(number)["id"] == request["id"]
+    held = _acquire(client, number)
+    assert held.status_code == 409, held.text
+    assert api.branch_requests == []
+    assert _work_item(number)["base_commit"] == MAIN_SHA
+    api.labels = ["base:next"]
+    removed = _post(client, "issues", _issue_event("unlabeled", number, label={"name": LABEL}))
+    assert removed.status_code == 200, removed.text
+
+    reapplied = _label(client, api, number, "base:next")
+
+    assert reapplied.json()["status"] == "factory_admitted", reapplied.text
+    successor = _execution(number)
+    assert successor["id"] != request["id"]
+    assert successor["status"] == "waiting"
+    transitions = _rows(
+        "SELECT request_id, phase FROM curie.factory_base_transitions WHERE work_item_id = :id",
+        {"id": item["id"]},
+    )
+    assert transitions == [{"request_id": request["id"], "phase": "conflict"}]
+    assert api.branch_requests == []

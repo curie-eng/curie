@@ -63,8 +63,8 @@ CONTRACT = "0041"
 # @spec AGENT-ROLE-PERSISTENCE-V1-9: policy ORM reads require the 0133 column.
 # @spec HTTP-APPROVAL-CONTINUITY-5: approval ORM reads require the 0137 column.
 # @spec HTTP-INVOCATION-EXECUTION-21: Grid reports write the 0139 namespace kind.
-# Factory base selection ORM reads require the 0141 pin and settle columns.
-APP_SCHEMA_MIN = "0141"
+# Factory base transition ORM reads require the 0142 transition table.
+APP_SCHEMA_MIN = "0142"
 REVIEW_SCHEMA_MIN = "0063"
 PREV = "0040"
 
@@ -164,6 +164,7 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0138",
             "0139",
             "0141",
+            "0142",
         } <= pending
         assert not pending & {"0091", "0092", "0093"}
     else:
@@ -193,8 +194,9 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0138",
             "0139",
             "0141",
+            "0142",
         }
-    assert current_revision() == "0141"
+    assert current_revision() == "0142"
     assert sql_rows("SELECT name FROM curie.agents WHERE id=:id", {"id": agent_id}) == [
         ("merge-example",)
     ]
@@ -215,10 +217,79 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
         ("work_items", "base_requested_branch"),
         ("work_items", "base_requested_source"),
         ("execution_requests", "base_settle_until"),
+        ("factory_base_transitions", "ci_request_id"),
         ("remediation_nominations", "execution_code"),
         ("remediation_nominations", "approval_reason"),
     } <= columns
-    assert "factory_base_transitions" not in {table for table, _column in columns}
+
+
+def test_0141_to_0142_preserves_retained_base_pins_and_selection_intent(
+    isolated_migration_db: IsolatedMigrationDb,
+) -> None:
+    isolated_migration_db.at("0141")
+    agent_id, item_id, request_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    _exec(
+        "INSERT INTO curie.agents(id, name) VALUES (:id, 'retained-base-example')",
+        {"id": agent_id},
+    )
+    _exec(
+        "INSERT INTO curie.work_items "
+        "(id, tracker_kind, tracker_host, tracker_scope_id, tracker_issue_id, "
+        "code_host_kind, code_host_host, repository_project_id, agent_id, "
+        "repository_path, conversation_id, version, next_sequence, base_branch, "
+        "base_source, base_commit, base_resolved_request_id, base_selection_fingerprint, "
+        "readmit_base_settle_until, base_requested_branch, base_requested_source) "
+        "VALUES (:id, 'github', 'github.com', '101', '7', 'github', 'github.com', "
+        "'101', :agent, 'acme-corp/acme-bot', 'retained-base-example', 4, 2, "
+        "'main', 'default', :base, :request, 'retained-fingerprint', "
+        "'2026-10-28T12:01:00+00:00', 'next', 'label')",
+        {"id": item_id, "agent": agent_id, "base": "1" * 40, "request": request_id},
+    )
+    _exec(
+        "INSERT INTO curie.execution_requests "
+        "(id, work_item_id, sequence, status, version, execution_attempts, "
+        "wait_deadline, base_settle_until) VALUES "
+        "(:id, :item, 1, 'waiting', 3, 0, '2026-10-28T13:00:00+00:00', "
+        "'2026-10-28T12:01:00+00:00')",
+        {"id": request_id, "item": item_id},
+    )
+    before_item = sql_rows("SELECT * FROM curie.work_items WHERE id = :id", {"id": item_id})
+    before_request = sql_rows(
+        "SELECT * FROM curie.execution_requests WHERE id = :id", {"id": request_id}
+    )
+    before_columns = sql_rows(
+        "SELECT table_name, column_name, data_type, is_nullable "
+        "FROM information_schema.columns WHERE table_schema = 'curie' "
+        "AND table_name IN ('work_items', 'execution_requests') "
+        "ORDER BY table_name, ordinal_position"
+    )
+    assert sql_rows("SELECT to_regclass('curie.factory_base_transitions')") == [(None,)]
+    assert {
+        ("work_items", "base_resolved_request_id"),
+        ("work_items", "base_selection_fingerprint"),
+        ("work_items", "readmit_base_settle_until"),
+        ("work_items", "base_requested_branch"),
+        ("work_items", "base_requested_source"),
+        ("execution_requests", "base_settle_until"),
+    } <= {(row[0], row[1]) for row in before_columns}
+
+    command.upgrade(alembic_config(), "0142")
+
+    assert current_revision() == "0142"
+    assert sql_rows("SELECT * FROM curie.work_items WHERE id = :id", {"id": item_id}) == before_item
+    assert sql_rows(
+        "SELECT * FROM curie.execution_requests WHERE id = :id", {"id": request_id}
+    ) == before_request
+    assert sql_rows(
+        "SELECT table_name, column_name, data_type, is_nullable "
+        "FROM information_schema.columns WHERE table_schema = 'curie' "
+        "AND table_name IN ('work_items', 'execution_requests') "
+        "ORDER BY table_name, ordinal_position"
+    ) == before_columns
+    assert sql_rows("SELECT to_regclass('curie.factory_base_transitions')") == [
+        ("curie.factory_base_transitions",)
+    ]
+    assert sql_rows("SELECT count(*) FROM curie.factory_base_transitions") == [(0,)]
 
 
 def test_planner_refuses_0041_contract_without_forward_only() -> None:
@@ -284,10 +355,11 @@ def test_agent_reads_refuse_the_schema_before_deploy_notification_expand() -> No
     # The directory and connect ORM requires the new identity tables/columns.
     # Migration expand compatibility for older images does not mean this image
     # can serve an older database.
-    # Factory base transition reads require the 0141 columns.
-    for revision in sorted(known - {"0141"}):
+    # Factory base transition reads require the 0142 table.
+    for revision in sorted(known - {"0142"}):
         assert can_serve(revision, window, known) is False
-    assert can_serve("0141", window, known) is True
+    assert can_serve("0141", window, known) is False
+    assert can_serve("0142", window, known) is True
 
 
 def test_planner_refuses_irreversible_before_mutation() -> None:

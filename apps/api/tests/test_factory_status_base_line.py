@@ -1,4 +1,4 @@
-"""The status comment states the selected base and source (ADR 0253)."""
+"""The status comment states the selected base, source and pending move (ADR 0253)."""
 
 # ruff: noqa: F811
 
@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from curie_api.factory_comment_text import marker_for
 from curie_api.factory_notices import FINAL_MARKER, status_body
 from forge_fakes.github_comments import admitted, comments  # noqa: F401  (fixtures)
+from test_factory_base_ci_subject import moved  # noqa: F401
 from test_factory_status_comment import _admit, _execute, _marked
 from test_factory_terminus import _reconcile  # noqa: F401  (fixtures)
 
@@ -151,3 +152,37 @@ def test_a_legacy_work_item_renders_no_base_line(admitted: Any) -> None:  # noqa
 
     (comment,) = _marked(sink, request_id)
     assert "Base:" not in comment["body"]
+
+
+@pytest.mark.parametrize(
+    ("phase", "error", "words"),
+    [
+        ("pending", None, ("pending", "waiting", "requested")),
+        ("pushed", None, ("pushed", "retarget", "moving")),
+        ("conflict", "rebase_conflict", ("conflict", "refused")),
+    ],
+)
+def test_status_renders_the_real_transition_target_and_progress(
+    moved: Any, phase: str, error: str | None, words: tuple[str, ...]
+) -> None:
+    client, _github, sink, row = moved
+    _execute(
+        "UPDATE curie.work_items SET base_branch = 'main', base_source = 'default', "
+        "base_commit = :commit WHERE id = :id",
+        {"id": row["work_item_id"], "commit": "1" * 40},
+    )
+    _execute(
+        "UPDATE curie.factory_base_transitions SET phase = :phase, error_code = :error "
+        "WHERE id = :id",
+        {"id": row["transition_id"], "phase": phase, "error": error},
+    )
+
+    client.portal.call(client.app.state.work_item_reconciler._sync_status_comments)
+
+    (comment,) = _marked(sink, row["id"])
+    body = comment["body"]
+    assert DEFAULT_LINE in body
+    assert "`next`" in body or "`base:next`" in body
+    assert any(word in body.lower() for word in words)
+    assert "the recorded base is kept" not in body
+    assert FINAL_MARKER not in body

@@ -1,4 +1,4 @@
-"""Base relabels preserve existing publication authority until moves are supported."""
+"""Base relabels fence publication authority while restarting on the requested base."""
 
 # ruff: noqa: F811
 
@@ -22,7 +22,6 @@ from forge_fakes.github_comments import _rows, admitted, comments  # noqa: F401
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 from test_factory_base_lifecycle import _item, _labelled, _requests, _train
-from test_factory_status_comment import _marked
 from test_factory_terminus import (
     _attach_publication,
     _observe_termination,
@@ -107,7 +106,7 @@ def _observe_base_label(client: Any, number: int, forge: Any) -> httpx.Response:
     return client.portal.call(exercise)
 
 
-def test_an_open_pull_request_keeps_its_running_request_when_the_base_label_changes(
+def test_an_open_pull_request_stops_its_running_owner_when_the_base_label_changes(
     admitted: Any,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -118,8 +117,6 @@ def test_an_open_pull_request_keeps_its_running_request_when_the_base_label_chan
     number, pr = 32101, 42101
     request_id = _running_pull(client, github, number, pr)
     before_item, before_lineage = _item(number), _lineage(number)
-    client.portal.call(client.app.state.work_item_reconciler._sync_status_comments)
-    sink.requests.clear()
     github.labels = [LABEL, "base:next"]
 
     changed = _post(
@@ -127,42 +124,69 @@ def test_an_open_pull_request_keeps_its_running_request_when_the_base_label_chan
     )
 
     assert changed.status_code == 200, changed.text
-    assert _requests(number) == [{"id": request_id, "status": "running"}]
+    assert _requests(number) == [{"id": request_id, "status": "cancellation_requested"}]
     after_item = _item(number)
     assert tuple(after_item[key] for key in ("base_branch", "base_source", "base_commit")) == tuple(
         before_item[key] for key in ("base_branch", "base_source", "base_commit")
     )
-    assert _lineage(number) == before_lineage
-
-    client.portal.call(client.app.state.work_item_reconciler._sync_status_comments)
-
-    (comment,) = _marked(sink, request_id)
-    base_line = next(line for line in comment["body"].splitlines() if line.startswith("Base:"))
-    assert "`main`" in base_line
-    assert "`next`" in base_line
-    assert "requested" in base_line.lower()
-    assert "refus" in base_line.lower()
-    assert _requests(number) == [{"id": request_id, "status": "running"}]
+    assert _rows(
+        "SELECT base_requested_branch FROM curie.work_items WHERE id = :id",
+        {"id": after_item["id"]},
+    ) == [{"base_requested_branch": "next"}]
     assert _lineage(number) == before_lineage
     assert not any(
         method != "GET" and path == f"/repos/{REPO}/pulls/{pr}"
         for method, path, _body in sink.requests
     )
 
-    github.labels = [LABEL]
-    corrected = _post(
-        client, "issues", _issue_event("unlabeled", number, label={"name": "base:next"})
-    )
-    assert corrected.status_code == 200, corrected.text
-    client.portal.call(client.app.state.work_item_reconciler._sync_status_comments)
+    _observe_termination(client, request_id)
+    _reconcile()
 
-    assert _requests(number) == [{"id": request_id, "status": "running"}]
+    predecessor, successor = _requests(number)
+    assert predecessor == {"id": request_id, "status": "cancelled"}
+    assert successor["id"] != request_id
+    assert successor["status"] == "waiting"
     assert _lineage(number) == before_lineage
-    (comment,) = _marked(sink, request_id)
-    base_line = next(line for line in comment["body"].splitlines() if line.startswith("Base:"))
-    assert "`main`" in base_line
-    assert "`next`" not in base_line
-    assert "refus" not in base_line.lower()
+
+
+def test_a_published_base_returning_to_main_before_restart_keeps_the_latest_selection(
+    admitted: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    client, github, sink = admitted
+    _train(monkeypatch, tmp_path, client)
+    sink.by_path = True
+    number, pr = 32106, 42106
+    request_id = _running_pull(client, github, number, pr)
+    before_lineage = _lineage(number)
+    github.labels = [LABEL, "base:next"]
+    changed = _post(
+        client, "issues", _issue_event("labeled", number, label={"name": "base:next"})
+    )
+    assert changed.status_code == 200, changed.text
+    assert _requests(number) == [{"id": request_id, "status": "cancellation_requested"}]
+
+    github.labels = [LABEL, "base:main"]
+    reverted = _post(
+        client, "issues", _issue_event("labeled", number, label={"name": "base:main"})
+    )
+    assert reverted.status_code == 200, reverted.text
+    _observe_termination(client, request_id)
+    _reconcile()
+    predecessor, successor = _requests(number)
+    assert predecessor == {"id": request_id, "status": "cancelled"}
+    assert successor["status"] == "waiting"
+
+    acquired = _acquire(client, number)
+
+    assert acquired.status_code == 200, acquired.text
+    assert (_item(number)["base_branch"], _item(number)["base_source"]) == ("main", "label")
+    assert _lineage(number) == before_lineage
+    assert not any(
+        method != "GET" and path == f"/repos/{REPO}/pulls/{pr}"
+        for method, path, _body in sink.requests
+    )
 
 
 def test_a_base_relabel_before_publication_still_restarts_and_claims_the_requested_base(
@@ -199,7 +223,7 @@ def test_a_base_relabel_before_publication_still_restarts_and_claims_the_request
 
 
 @pytest.mark.parametrize(("target", "status_code"), [("next", 409), ("main", 200)])
-def test_factory_label_readmission_cannot_repin_an_existing_pull_request(
+def test_factory_label_readmission_preserves_published_pins_while_a_move_is_pending(
     admitted: Any,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -228,27 +252,12 @@ def test_factory_label_readmission_cannot_repin_an_existing_pull_request(
     assert (_item(number)["base_branch"], _item(number)["base_commit"]) == ("main", before_base)
     assert _lineage(number) == before_lineage
     if target == "next":
-        github.labels = [LABEL]
-        corrected = _post(
-            client, "issues", _issue_event("unlabeled", number, label={"name": "base:next"})
-        )
-        assert corrected.status_code == 200, corrected.text
-        assert _requests(number)[-1]["id"] == successor["id"]
-        _execute(
-            "UPDATE curie.execution_requests SET dispatch_not_before = clock_timestamp(), "
-            "published_generation = dispatch_generation WHERE id = :id",
-            {"id": successor["id"]},
-        )
-
-        healthy = _acquire(client, number)
-
-        assert healthy.status_code == 200, healthy.text
-        assert _requests(number)[-1]["id"] == successor["id"]
-        assert (_item(number)["base_branch"], _item(number)["base_commit"]) == (
-            "main",
-            before_base,
-        )
-        assert _lineage(number) == before_lineage
+        assert _rows(
+            "SELECT request_id, phase, target_base_ref FROM curie.factory_base_transitions "
+            "WHERE work_item_id = :id",
+            {"id": _item(number)["id"]},
+        ) == [{"request_id": successor["id"], "phase": "pending", "target_base_ref": "next"}]
+        assert _requests(number)[-1] == successor
 
 
 @pytest.mark.parametrize("publication_wins", [True, False])

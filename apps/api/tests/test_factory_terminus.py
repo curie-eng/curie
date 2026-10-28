@@ -1986,7 +1986,8 @@ def test_a_relabel_revision_on_an_adopted_pull_request_settles_through_the_ci_ga
     assert settled is not None
     assert settled.request_id == second["id"]
     assert settled.cause == "completed"
-    assert settled.publication_id == publication_id
+    assert isinstance(settled.subject, workitems.PublicationCISubject)
+    assert settled.subject.id == publication_id
     assert {row["id"]: row for row in _requests(number)}[second["id"]]["status"] == "running"
 
 
