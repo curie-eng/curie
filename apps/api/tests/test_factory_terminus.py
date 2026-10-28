@@ -1171,7 +1171,9 @@ def _attach_publication(
                     (
                         await conn.execute(
                             text(
-                                "SELECT agent_id, conversation_id, repository_path, version "
+                                "SELECT agent_id, conversation_id, repository_path, version, "
+                                "base_branch, base_commit, code_host_kind, code_host_host, "
+                                "repository_project_id, code_host_installation_id "
                                 "FROM curie.work_items WHERE id = :id"
                             ),
                             {"id": work_item_id},
@@ -1229,9 +1231,11 @@ def _attach_publication(
                         "INSERT INTO curie.thread_publication_lineages "
                         "(id, agent_id, deployment_id, conversation_id, repo_full_name, "
                         "base_sha, branch, pr_number, pr_url, head_sha, status, version, "
-                        "latest_revision) VALUES "
+                        "latest_revision, code_host_kind, code_host_host, repository_project_id, "
+                        "code_host_installation_id, code_host_pr_id, base_ref) VALUES "
                         "(:id, :agent, :deployment, :conversation, :repo, :base, "
-                        ":branch, :pr, :url, :head, 'open', 1, 1)"
+                        ":branch, :pr, :url, :head, 'open', 1, 1, :kind, :host, :project, "
+                        ":installation, :node_id, :base_ref)"
                     ),
                     {
                         "id": lineage_id,
@@ -1239,11 +1243,19 @@ def _attach_publication(
                         "deployment": deployment_id,
                         "conversation": item["conversation_id"],
                         "repo": item["repository_path"],
-                        "base": "0123456789abcdef0123456789abcdef01234567",
+                        "base": item["base_commit"],
                         "branch": f"curie/publication-{lineage_id.hex}",
                         "pr": pr,
                         "url": pr_url,
                         "head": head_sha if pr is not None else None,
+                        "kind": item["code_host_kind"] if pr is not None else None,
+                        "host": item["code_host_host"] if pr is not None else None,
+                        "project": item["repository_project_id"] if pr is not None else None,
+                        "installation": (
+                            item["code_host_installation_id"] if pr is not None else None
+                        ),
+                        "node_id": f"PR_fixture_{work_item_id.hex}" if pr is not None else None,
+                        "base_ref": item["base_branch"] if pr is not None else None,
                     },
                 )
                 await conn.execute(
@@ -1285,7 +1297,7 @@ def _attach_publication(
                         "request_id": request["id"],
                         "repo": item["repository_path"],
                         "status": status,
-                        "base": "0123456789abcdef0123456789abcdef01234567",
+                        "base": item["base_commit"],
                         "channel": item["repository_path"],
                         "result": pr_url,
                     },
