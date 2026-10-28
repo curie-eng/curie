@@ -94,12 +94,21 @@ def started(run: DynamicKind, ticket: Ticket, *, after: str | None = None) -> di
     return row if row and row["started_at"] and row["id"] != after else None
 
 
+def wait_started(
+    run: DynamicKind, ticket: Ticket, *, after: str | None = None
+) -> dict[str, Any] | None:
+    row = wait(lambda: started(run, ticket, after=after))
+    if row is None:
+        run.record_start_failure(ticket)
+    return row
+
+
 def observed_checkout(run: DynamicKind, head: str) -> dict[str, Any] | None:
     return next((row for row in run.model.observations() if row["head"] == head), None)
 
 
 def published(run: DynamicKind, ticket: Ticket) -> tuple[dict[str, Any], dict[str, Any]]:
-    request = wait(lambda: started(run, ticket))
+    request = wait_started(run, ticket)
     assert request is not None, "the selected ticket did not execute"
 
     def ready() -> Any:
@@ -239,7 +248,7 @@ def test_delayed_label_and_pre_pr_change_replace_real_checkout(
     assert first["started_at"] is None
     assert run.item(ticket)["base_resolved_request_id"] is None
     run.label(ticket, "base:next")
-    first = wait(lambda: started(run, ticket))
+    first = wait_started(run, ticket)
     assert first is not None
     item = run.item(ticket)
     assert item["base_branch"] == "next" and item["base_source"] == "label"
@@ -256,7 +265,7 @@ def test_delayed_label_and_pre_pr_change_replace_real_checkout(
 
     run.label(ticket, "base:next", present=False)
     run.label(ticket, "base:main")
-    successor = wait(lambda: started(run, ticket, after=first["id"]))
+    successor = wait_started(run, ticket, after=first["id"])
     assert successor is not None, "pre-PR relabel did not start a fresh request"
     predecessor = request_by_id(run, ticket, first["id"])
     assert predecessor["status"] == "cancelled" and predecessor["teardown_unconfirmed_at"] is None

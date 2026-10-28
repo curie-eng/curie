@@ -15,6 +15,7 @@ import socket
 import sqlite3
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -96,6 +97,24 @@ def dynamic_stub_type(module: Any, *, redact: Any) -> type:
                 db.row_factory = sqlite3.Row
                 rows = db.execute("SELECT * FROM dynamic_events ORDER BY id")
                 return [dict(row) for row in rows if kind is None or row["kind"] == kind]
+
+        def _json(self, handler: Any, status: int, body: Any) -> None:
+            response = body
+            if isinstance(body, dict) and "token" in body:
+                response = {**body, "token": "[REDACTED]"}
+            with self.provider_lock, sqlite3.connect(self._database) as db:
+                db.execute(
+                    "INSERT INTO provider_calls "
+                    "(method, path, http_status, provider_clock, response) VALUES (?, ?, ?, ?, ?)",
+                    (
+                        handler.command,
+                        redact(handler.path),
+                        status,
+                        module._utc(),
+                        redact(json.dumps(response)),
+                    ),
+                )
+            super()._json(handler, status, body)
 
         def git(self, *args: str, **kwargs: Any) -> str:
             return (
@@ -505,6 +524,67 @@ class DynamicKind(AdmittedKind):
             "FROM curie.execution_requests r JOIN curie.work_items w ON w.id=r.work_item_id "
             f"WHERE w.tracker_kind='github' AND w.tracker_issue_id='{int(ticket.number)}'"
         )
+
+    def record_start_failure(self, ticket: Ticket) -> None:
+        evidence: dict[str, Any] = {}
+
+        def capture(name: str, read: Callable[[], Any]) -> None:
+            try:
+                evidence[name] = read()
+            except (KeyError, OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
+                evidence[name] = {"error": type(exc).__name__, "detail": str(exc)}
+
+        capture("current_request", lambda: self.request(ticket))
+        capture("work_item", lambda: self.item(ticket))
+        capture("requests", lambda: self.requests(ticket))
+        capture("transitions", lambda: self.transitions(ticket))
+
+        def provider_calls() -> Any:
+            with self.stub.provider_lock:
+                return self.stub.provider_evidence()
+
+        capture("provider_calls", provider_calls)
+        capture("provider_events", lambda: self.stub.events())
+
+        def pod_status() -> Any:
+            pods = json.loads(
+                self.kubectl("-n", self.namespace, "get", "pods", "-o", "json")
+            )["items"]
+            return [
+                {"name": pod["metadata"]["name"], "status": pod["status"]}
+                for pod in pods
+            ]
+
+        capture("pods", pod_status)
+        for component in ("api", "worker"):
+            capture(
+                component + "_logs",
+                lambda component=component: self.kubectl(
+                    "-n",
+                    self.namespace,
+                    "logs",
+                    f"deployment/curie-{component}",
+                    "--all-containers",
+                    "--tail=2000",
+                )[-32768:],
+            )
+        descriptor = os.open(self.diagnostic_path, os.O_WRONLY | os.O_CREAT, 0o600)
+        os.close(descriptor)
+        self.diagnostic_path.chmod(0o600)
+        with sqlite3.connect(self.diagnostic_path) as db:
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS start_failures ("
+                "id INTEGER PRIMARY KEY, issue_id INTEGER NOT NULL, "
+                "evidence TEXT NOT NULL, recorded_at REAL NOT NULL)"
+            )
+            db.execute(
+                "INSERT INTO start_failures (issue_id, evidence, recorded_at) VALUES (?, ?, ?)",
+                (
+                    ticket.number,
+                    self.redact_model_evidence(json.dumps(evidence)),
+                    time.time(),
+                ),
+            )
 
     def transitions(self, ticket: Ticket) -> list[dict[str, Any]]:
         return self.sql(
