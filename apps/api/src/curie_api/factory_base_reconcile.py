@@ -703,6 +703,7 @@ async def _append_outcome(
         )
         history = row.value if row is not None and isinstance(row.value, list) else []
         if not any(isinstance(entry, dict) and entry.get("id") == marker for entry in history):
+            recorded_at = await lifecycle.database_now(session)
             async with AsyncSession(
                 bind=await session.connection(),
                 join_transaction_mode="create_savepoint",
@@ -715,8 +716,8 @@ async def _append_outcome(
                     item.conversation_id,
                     {
                         "id": marker,
-                        "role": "system",
-                        "content": (
+                        "user": "Platform factory base transition outcome",
+                        "assistant": (
                             "The platform changed the pull request base to "
                             f"{current.target_base_ref} at {current.target_base_sha}; "
                             f"current head is {current.verification_head_sha}. "
@@ -724,6 +725,7 @@ async def _append_outcome(
                             "completing this request. Earlier approvals and verification "
                             "describe the previous tree."
                         ),
+                        "ts": recorded_at.isoformat(),
                     },
                     None,
                 )

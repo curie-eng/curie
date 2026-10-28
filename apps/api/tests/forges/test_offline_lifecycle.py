@@ -49,7 +49,7 @@ import re
 import sys
 import uuid
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -58,7 +58,7 @@ import pytest
 import redis
 from aci_protocol import STREAM_PAYLOAD_FIELD
 from channel_protocol.work_item_events import execute_event_id
-from curie_api import factory_base, factory_notices, workitem_dispatch
+from curie_api import factory_notices, workitem_dispatch
 from curie_api.config import get_settings
 from curie_api.factory_comment_text import marker_for
 from curie_api.factory_notices import FINAL_MARKER
@@ -654,6 +654,12 @@ def _replace_everywhere(monkeypatch: pytest.MonkeyPatch, seams: dict[str, Any]) 
                 monkeypatch.setattr(module, name, replacement)
 
 
+class _LifecycleCodeHost(InMemoryCodeHost):
+    async def resolve_repository(self, project_id: str) -> types.RepositoryRef:
+        repository = await super().resolve_repository(project_id)
+        return replace(repository, default_branch="main")
+
+
 class _JiraPair:
     tracker_kind = types.JIRA_CLOUD
     # The port branch skips an unchanged rendered digest; it does not freeze a
@@ -668,7 +674,7 @@ class _JiraPair:
             kind=types.JIRA_CLOUD, host=JIRA_HOST, scope_id=JIRA_SCOPE, label=LABEL, mention=MENTION
         )
         # A code host with nothing it can rerun: a red check goes straight to a fix round.
-        self.code_host = InMemoryCodeHost(
+        self.code_host = _LifecycleCodeHost(
             kind=types.GITHUB,
             host=github_host(settings),
             capabilities={
@@ -782,16 +788,6 @@ class _JiraPair:
                 self.binding.start_authority, self.issue, actor, tracker=self.tracker
             )
             self.cursor = page.cursor
-            base = await factory_base.resolve_base(
-                policy=forges_registry(get_settings()).binding_repository_policy(
-                    self.binding, self.repository
-                ),
-                labels=set(),
-                default_branch="main",
-                code_host=self.code_host,
-                repository=self.repository,
-            )
-            assert isinstance(base, factory_base.ResolvedBase), base
             return await self._dispatch(
                 Admission(
                     agent_id=agent_id,
@@ -804,7 +800,7 @@ class _JiraPair:
                     objective=self.tracker.issue_url(self.issue),
                     requester=f"{types.JIRA_CLOUD}:{actor.id}:{actor.login}",
                     request_id=notice_request_id(notice),
-                    base=base,
+                    trigger_label=LABEL,
                 ),
                 revision=False,
             )

@@ -288,8 +288,8 @@ class TransitionCase:
 @pytest.fixture
 def transition_case(
     clean_db: None,
-    graph: GitGraph,
-    monkeypatch: pytest.MonkeyPatch,  # noqa: F811
+    graph: GitGraph,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
 ) -> Iterator[TransitionCase]:
     from curie_api.models import FactoryBaseTransition
 

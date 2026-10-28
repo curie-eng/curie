@@ -37,7 +37,7 @@ import pytest
 import redis
 from aci_protocol import STREAM_PAYLOAD_FIELD
 from channel_protocol.work_item_events import execute_event_id
-from curie_api import factory_base, factory_notices, factory_tracker_intake, workitem_dispatch
+from curie_api import factory_notices, factory_tracker_intake, workitem_dispatch
 from curie_api.config import get_settings
 from curie_api.factory_comment_text import marker_for
 from curie_api.factory_notices import FINAL_MARKER
@@ -560,14 +560,6 @@ class BitbucketPair:
                 self.binding.start_authority, self.issue, marked_by, tracker=self.tracker
             ):
                 return None
-            base = await factory_base.resolve_base(
-                policy=self.repo,
-                labels=set(),
-                default_branch=self.repository.default_branch,
-                code_host=self.code_host,
-                repository=self.repository,
-            )
-            assert isinstance(base, factory_base.ResolvedBase), base
             return await self._dispatch(
                 Admission(
                     agent_id=agent_id,
@@ -580,7 +572,7 @@ class BitbucketPair:
                     objective=self.tracker.issue_url(self.issue),
                     requester=f"{types.JIRA_CLOUD}:{marked_by.id}:{marked_by.login}",
                     request_id=notice_request_id(notice),
-                    base=base,
+                    trigger_label=self.tracker.label,
                 ),
                 revision=False,
             )

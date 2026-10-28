@@ -857,7 +857,12 @@ def test_base_policy_comes_from_the_selected_binding(
     assert (item["base_branch"], item["base_source"], item["base_commit"]) == (None, None, None)
     assert item["base_resolved_request_id"] is None
     assert not any("/git/ref/heads/" in call.url.path for call in intake.github.calls)
-    assert _bot_comments(intake, issue) == []
+    if claimed_on is None:
+        [refusal] = _texts(intake, issue)
+        assert "next" in refusal
+        assert "not an allowed base" in refusal
+    else:
+        assert _bot_comments(intake, issue) == []
 
     acquired = intake.acquire(request["id"])
 
@@ -869,9 +874,8 @@ def test_base_policy_comes_from_the_selected_binding(
         assert [(row["id"], row["status"]) for row in _requests(item["id"])] == [
             (request["id"], "waiting")
         ]
-        [refusal] = _texts(intake, issue)
-        assert "next" in refusal
-        assert "not an allowed base" in refusal
+        assert not any("/git/ref/heads/" in call.url.path for call in intake.github.calls)
+        assert _texts(intake, issue) == [refusal]
         refused_again = intake.acquire(request["id"])
         assert refused_again.status_code == 409, refused_again.text
         assert _texts(intake, issue) == [refusal]

@@ -631,6 +631,11 @@ class DynamicKind(AdmittedKind):
             finally:
                 self.deadline = previous_deadline
 
+        def diagnostic_kubectl(*args: str) -> str:
+            return sk.ScriptedRun.command(
+                self, "kubectl", "--context", self.context, *args, timeout=5
+            )
+
         capture("requests", lambda: self.requests(ticket))
         capture("work_item", lambda: self.item(ticket))
         capture("transitions", lambda: self.transitions(ticket))
@@ -652,7 +657,7 @@ class DynamicKind(AdmittedKind):
         for component in ("api", "worker"):
             capture(
                 component + "_logs",
-                lambda component=component: self.kubectl(
+                lambda component=component: diagnostic_kubectl(
                     "-n",
                     self.namespace,
                     "logs",
@@ -670,10 +675,34 @@ class DynamicKind(AdmittedKind):
                 if row.get("runtime_sandbox_name")
             )
         )[:2]
-        for index, sandbox in enumerate(sandboxes):
+        capture(
+            "sandbox_pods",
+            lambda: [
+                {
+                    "name": pod["metadata"]["name"],
+                    "phase": pod.get("status", {}).get("phase"),
+                }
+                for pod in json.loads(
+                    diagnostic_kubectl("-n", self.namespace, "get", "pods", "-o", "json")
+                )["items"]
+                if any(container["name"] == "runner" for container in pod["spec"]["containers"])
+            ],
+        )
+        pods = evidence.get("sandbox_pods")
+        current_names = (
+            {pod["name"] for pod in pods if isinstance(pod, dict)}
+            if isinstance(pods, list)
+            else set()
+        )
+        evidence["absent_recorded_sandboxes"] = [
+            sandbox for sandbox in sandboxes if sandbox not in current_names
+        ]
+        sandboxes = [sandbox for sandbox in sandboxes if sandbox in current_names]
+        sandboxes.extend(sorted(current_names - set(sandboxes)))
+        for index, sandbox in enumerate(sandboxes[:2]):
             capture(
                 f"sandbox_{index}_logs",
-                lambda sandbox=sandbox: self.kubectl(
+                lambda sandbox=sandbox: diagnostic_kubectl(
                     "-n",
                     self.namespace,
                     "logs",
