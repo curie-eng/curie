@@ -66,7 +66,7 @@ impl Fixture {
             .env("HTTP_PROXY", "http://127.0.0.1:9")
             .env("HTTPS_PROXY", "http://127.0.0.1:9")
             .current_dir(cwd)
-            .args(["--json", "skills", "install"])
+            .args(["--json", "factory", "skills", "install"])
             .args(args)
             .output()
             .expect("run candidate curie")

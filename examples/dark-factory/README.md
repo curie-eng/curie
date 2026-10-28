@@ -45,7 +45,7 @@ does not enforce it, and a different bundle can choose differently.
 ## Inspect a pull request locally
 
 The companion `review-pr` skill runs in the human's existing coding agent.
-Install the local Curie skills with `curie skills install --agent codex`, or select
+Install the local Software Factory skills with `curie factory skills install --agent codex`, or select
 `claude-code`, `copilot`, `gemini` or `cursor`. It explains components and calls,
 diff and behavior changes, new and regression tests, and guides local manual
 verification. It can publish approved feedback through existing host tools,
@@ -63,7 +63,7 @@ approved publication and configured-label factory selection. It requires no host
 parser installation, Curie service or container runtime. Repository-specific
 verification uses the repository's own prerequisites and records any missing ones.
 
-Install directly with `curie skills install --agent codex`, or select
+Install directly with `curie factory skills install --agent codex`, or select
 `claude-code`, `copilot`, `gemini` or `cursor`. Add `--global` for personal use
 across repositories, or `--dir DIR` to choose an existing project directory.
 The command is offline and preserves existing local edits. The

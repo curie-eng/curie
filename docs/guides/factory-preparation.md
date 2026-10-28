@@ -29,7 +29,7 @@ For guided preparation, open the repository the factory will change and install
 the skill for your coding agent. With a CLI build containing this command:
 
 ```bash
-curie skills install --agent codex
+curie factory skills install --agent codex
 ```
 
 Bring the existing issue link or make the specification, plan or discussion
@@ -86,7 +86,7 @@ Use a Curie CLI built from this change, or a release that contains it. From the
 repository you want to prepare work for, choose your coding agent:
 
 ```bash
-curie skills install --agent codex
+curie factory skills install --agent codex
 # Or select claude-code, copilot, gemini, or cursor instead.
 ```
 
@@ -103,8 +103,8 @@ The [repository environment guide](factory-environments.md) explains when and
 how administrators use the two environment skills.
 
 ```bash
-curie skills install --agent claude-code --global
-curie skills install --agent cursor --dir /path/to/project --dry-run
+curie factory skills install --agent claude-code --global
+curie factory skills install --agent cursor --dir /path/to/project --dry-run
 ```
 
 Repeating an installation keeps an identical copy. An edited or incomplete copy
@@ -163,7 +163,7 @@ Do not overwrite an existing local skill or draft without reviewing the change.
 Check whether your CLI contains the installer:
 
 ```bash
-curie skills install --help
+curie factory skills install --help
 ```
 
 An older released CLI will report an unknown command. Until a release contains
@@ -173,7 +173,7 @@ two absolute paths with your Curie checkout and the repository you want to work 
 
 ```bash
 cargo run --locked --manifest-path /path/to/curie/cli/Cargo.toml -- \
-  skills install --agent codex --dir /path/to/your/repository
+  factory skills install --agent codex --dir /path/to/your/repository
 ```
 
 The target directory must already exist. Use the client names from the table
@@ -324,7 +324,7 @@ fit the new workflow; installation does not merge or discard them.
 For example, after backing up and moving the existing skill folder:
 
 ```bash
-curie skills install --agent codex
+curie factory skills install --agent codex
 ```
 
 Use the same `--global` or `--dir` scope as the installation being replaced. Keep

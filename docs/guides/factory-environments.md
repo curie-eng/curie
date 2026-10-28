@@ -17,7 +17,7 @@ From the repository checkout, install the four local skills with a Curie CLI
 release that includes them:
 
 ```bash
-curie skills install --agent codex
+curie factory skills install --agent codex
 ```
 
 Choose `claude-code`, `copilot`, `gemini`, or `cursor` instead when that is your

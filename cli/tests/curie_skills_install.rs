@@ -63,12 +63,14 @@ impl Fixture {
             .env("HTTP_PROXY", "http://127.0.0.1:9")
             .env("HTTPS_PROXY", "http://127.0.0.1:9")
             .current_dir(&self.project)
-            .args(["--json", "skills", "install"])
+            .arg("--json")
+            .args(["factory", "skills", "install"])
             .args(args)
             .output()
             .expect("candidate CLI runs")
     }
 }
+
 fn success(output: &Output) -> Value {
     assert!(
         output.status.success(),

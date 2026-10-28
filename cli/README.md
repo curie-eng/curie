@@ -22,7 +22,7 @@ extend the platform's own code.
     - [Bundle packing exclusions](#bundle-packing-exclusions)
     - [Artifact resolution](#artifact-resolution)
   - [Managing secrets](#managing-secrets)
-  - [Installing Curie skills](#installing-curie-skills)
+  - [Installing Software Factory skills](#installing-software-factory-skills)
 - [For contributors](#for-contributors)
   - [`curie install`](#curie-install)
   - [`curie dev`](#curie-dev)
@@ -30,12 +30,12 @@ extend the platform's own code.
   - [Prototyping agents in a source checkout](#prototyping-agents-in-a-source-checkout)
   - [Verify](#verify)
 
-## Installing Curie skills
+## Installing Software Factory skills
 
-Install all bundled Curie workflows into your coding agent with one command:
+Install all bundled Software Factory workflows into your coding agent with one command:
 
 ```bash
-curie skills install --agent codex
+curie factory skills install --agent codex
 ```
 
 Choose `codex`, `claude-code`, `copilot`, `gemini` (Gemini CLI), or `cursor`.

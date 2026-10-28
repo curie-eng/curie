@@ -1051,12 +1051,7 @@ pub(crate) enum Command {
         #[arg(long, global = true, value_name = "NAME")]
         context: Option<String>,
     },
-    /// Install Curie workflows in your existing coding agent.
-    Skills {
-        #[command(subcommand)]
-        action: AgentSkillsAction,
-    },
-    /// Bring up Curie and the dark factory without a webhook or a tunnel.
+    /// Set up a Software Factory or install its local skills.
     Factory {
         #[command(subcommand)]
         action: FactoryAction,
@@ -1395,7 +1390,7 @@ pub(crate) enum Command {
 
 #[derive(Subcommand)]
 pub(crate) enum AgentSkillsAction {
-    /// Install all bundled Curie skills offline, without a running Curie service.
+    /// Install all bundled Software Factory skills offline, without a running Curie service.
     Install {
         /// Coding agent that will discover the skill.
         #[arg(long, value_enum, value_name = "CLIENT")]
@@ -1413,7 +1408,13 @@ pub(crate) enum AgentSkillsAction {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)] // Clap owns the existing wide quickstart arguments; the small skills verb shares this command group.
 pub(crate) enum FactoryAction {
+    /// Install the local Software Factory preparation, review, and admin skills.
+    Skills {
+        #[command(subcommand)]
+        action: AgentSkillsAction,
+    },
     /// Create a cluster when none is targeted, install Curie, register the
     /// GitHub App, and on the second run deploy the published dark factory.
     /// Never opens a browser and never runs gh.

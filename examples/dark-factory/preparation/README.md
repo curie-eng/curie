@@ -2,7 +2,7 @@
 
 The `skills/prepare-factory-ticket` folder contains the text-only preparation
 workflow for a developer's existing coding agent. Install it directly with
-`curie skills install --agent codex` (or `claude-code`, `copilot`,
+`curie factory skills install --agent codex` (or `claude-code`, `copilot`,
 `gemini`, `cursor`). Add `--global` for personal installation across projects.
 The command installs the complete human-facing Curie skill set: this preparation
 workflow, `review-pr`, and the two repository-environment admin skills, with

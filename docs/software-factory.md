@@ -91,14 +91,14 @@ prepare feedback, or use the companion [PR review skill](guides/factory-pr-revie
 Approved feedback can request another factory revision through the configured
 intake. A local review alone does not start implementation.
 
-## Install Curie skills
+## Install Software Factory skills
 
 Use `prepare-factory-ticket` in your local coding agent as the factory readiness
 review and handoff step for existing material. Install the complete set, including
 `review-pr`, once:
 
 ```bash
-curie skills install --agent codex
+curie factory skills install --agent codex
 ```
 
 In Codex, invoke `$prepare-factory-ticket <issue-url>` or give it new feature
@@ -127,7 +127,7 @@ provide the equivalent provider-specific steps.
 
 1. **Prepare a bounded GitHub issue.** Describe the behavior, acceptance criteria,
    and how to verify it. Bring output from your [existing local workflow](#bring-your-existing-local-workflow)
-   to the [preparation skill](#install-curie-skills) for factory readiness review
+   to the [preparation skill](#install-software-factory-skills) for factory readiness review
    and approved handoff, or prepare and select the issue yourself.
    Curie's factory runner takes over after admission. Start with a small change.
    The sandbox receives the

@@ -19,7 +19,7 @@ Install the complete Curie skill set from your project with a CLI build containi
 this command. If you already installed the set, no second installation is needed:
 
 ```bash
-curie skills install --agent codex
+curie factory skills install --agent codex
 ```
 
 For Claude Code, use `--agent claude-code`. Other supported clients are `copilot`,

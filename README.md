@@ -138,7 +138,7 @@ KUBECONFIG="$CURIE_FACTORY_KUBECONFIG" curie factory quickstart \
 preparation skill for your coding agent using a CLI build that contains it:
 
 ```bash
-curie skills install --agent codex
+curie factory skills install --agent codex
 ```
 
 In Codex, invoke `$prepare-factory-ticket <issue-url>`. Answer its questions,
