@@ -192,6 +192,8 @@ internal_router = APIRouter(prefix="/v1/internal/publications", tags=["internal-
 # Code host reasons for a pull request whose facts do not match the request.
 _INVALID_PULL_REASONS = frozenset({"malformed_response", "pull_request_mismatch"})
 _FULL_COMMIT_SHA = re.compile(r"[0-9a-fA-F]{40}")
+# A running request past its lease or deadline; visible to the worker, not retried.
+WORK_ITEM_AUTHORITY_EXPIRED = "publication.work_item_authority_expired"
 _GITHUB_UNAVAILABLE_DETAIL = {
     "code": "publication.github_unavailable",
     "message": (
@@ -668,6 +670,14 @@ async def create_publication(
         ) from exc
     except crud_errors.PublicationReplayConflict as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    except crud_errors.PublicationAuthorityExpired as exc:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            {
+                "code": WORK_ITEM_AUTHORITY_EXPIRED,
+                "message": "the running work item request no longer has publication authority",
+            },
+        ) from exc
     except crud_errors.PublicationLineageConflict as exc:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
