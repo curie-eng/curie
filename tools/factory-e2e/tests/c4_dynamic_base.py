@@ -294,7 +294,7 @@ def dynamic_stub_type(module: Any, *, redact: Any) -> type:
                         "started_at": row["started"],
                         "completed_at": row["completed"],
                         "html_url": self.base_url + "/example-check",
-                        "app": {"id": 51, "slug": "example-ci"},
+                        "app": {"id": 51, "slug": "github-actions"},
                         "output": {"title": "Example CI", "summary": "Exercise dynamic base"},
                     }
                     for i, row in enumerate(records)
