@@ -336,8 +336,10 @@ _SCRIPT_REFUSALS = {
 class ApprovalResumeRefused(RuntimeError):
     """A selected resume was refused before any append; the wake stays owed.
 
-    Denial and unavailability grant nothing and are never recorded as an
-    undelivered append. @spec HTTP-APPROVAL-CONTINUITY-11.
+    Denial and unavailability grant nothing. A refusal from the owner's
+    authorization is never recorded as an undelivered append; ``enqueue``
+    records only a classification lookup that raised, so the reconciler
+    reclassifies the committed row on its next pass. @spec HTTP-APPROVAL-CONTINUITY-11.
     """
 
     def __init__(self, code: str) -> None:
