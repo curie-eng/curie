@@ -765,18 +765,59 @@ def test_retarget_outage_preserves_pushed_progress_until_a_healthy_retry(
     _push(case, prepared, recorded=True)
     case.retarget_status = 503
 
-    case.tick()
+    for _ in range(10):
+        case.tick()
+        row = case.row()
+        assert row["phase"] == "pushed"
+        assert row["rebased_head_sha"] == prepared.head_sha == case.graph.head()
+        assert row["verification_head_sha"] is None
+        assert case.remote.pushes == 1
+        assert case.target == "main"
+        assert case.identities()[1]["base_ref"] == "main"
+        assert not case.retargets
 
-    row = case.row()
-    assert row["phase"] == "pushed"
-    assert row["rebased_head_sha"] == prepared.head_sha == case.graph.head()
-    assert row["verification_head_sha"] is None
-    assert case.remote.pushes == 1
-    assert case.target == "main"
-    assert case.identities()[1]["base_ref"] == "main"
     case.retarget_status = 200
     assert case.finish()["verification_head_sha"] == case.graph.head()
     assert case.remote.pushes == 2
+    assert case.retargets == [{"target_branch": "next"}]
+
+
+@pytest.mark.parametrize("phase", ["prepared", "ci_prepared"])
+def test_push_readback_outage_preserves_the_landed_write_until_a_healthy_retry(
+    transition_case: TransitionCase, phase: str
+) -> None:
+    case = transition_case
+    operation = _reach_phase(case, phase)
+    expected_head = (
+        operation["rebased_head_sha"] if phase == "prepared" else operation["verification_head_sha"]
+    )
+    expected_pushes = 1 if phase == "prepared" else 2
+    before_lineage = case.identities()[1]
+
+    def fail_reads_on_receive() -> None:
+        case.record_receive()
+        case.remote.fail_reads = True
+
+    case.remote.before_receive = fail_reads_on_receive
+    try:
+        case.tick()
+    finally:
+        case.remote.before_receive = case.record_receive
+        case.remote.fail_reads = False
+
+    current = case.row()
+    assert current["phase"] not in {"conflict", "refused", "applied"}, current["error_code"]
+    assert case.graph.head() == expected_head
+    assert case.remote.pushes == expected_pushes
+    assert case.identities()[1] == before_lineage
+
+    applied = case.finish()
+
+    assert case.graph.head() == applied["verification_head_sha"]
+    assert case.identities()[1]["head_sha"] == applied["verification_head_sha"]
+    assert case.identities()[1]["base_ref"] == "next"
+    assert case.remote.pushes == 2
+    assert case.retargets == [{"target_branch": "next"}]
 
 
 @pytest.mark.parametrize("phase", ["pushed", "ci_prepared", "ci_pushed"])

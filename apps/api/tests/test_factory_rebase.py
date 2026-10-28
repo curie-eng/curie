@@ -152,6 +152,7 @@ class GitHttp:
     headers: list[dict[str, str]]
     delay: threading.Event | None
     before_receive: Callable[[], None] | None = None
+    fail_reads: bool = False
 
     @property
     def pushes(self) -> int:
@@ -186,6 +187,9 @@ def git_http(graph: GitGraph, *, delayed: bool = False) -> Iterator[GitHttp]:
             parsed = urlsplit(self.path)
             observed.requests.append((self.command, parsed.path))
             observed.headers.append({key.lower(): value for key, value in self.headers.items()})
+            if self.command == "GET" and observed.fail_reads:
+                self.send_error(503, "Unavailable")
+                return
             if self.command == "POST" and parsed.path.endswith("/git-receive-pack"):
                 if observed.before_receive is not None:
                     observed.before_receive()
