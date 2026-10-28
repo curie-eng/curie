@@ -11,12 +11,14 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from curie_api.config import get_settings
-from forge_fakes.github import LABEL, REPO
+from forge_fakes import factory_wake
+from forge_fakes.github import LABEL, REPO, _issue_event, _post
 from forge_fakes.github_comments import (  # noqa: F401
     HEAD_A,
     HEAD_B,
@@ -43,7 +45,7 @@ from test_factory_ci_wait import (
     _terminal,
 )
 from test_factory_progress import verification
-from test_factory_terminus import _label, _reconcile, _request, _start_running
+from test_factory_terminus import _label, _published_issue, _reconcile, _request, _start_running
 from test_github_factory_base import MAIN_SHA, NEXT_SHA, _open_lineage
 
 pytestmark = pytest.mark.usefixtures("clean_db")
@@ -58,6 +60,9 @@ def _applied_move(
     number: int,
     *,
     paths: tuple[str, ...] = ("src/widget.txt",),
+    request_row: dict[str, Any] | None = None,
+    start_running: bool = True,
+    outcome_ready: bool = True,
 ) -> dict[str, Any]:
     from curie_api.models import (
         ExecutionRequest,
@@ -66,10 +71,13 @@ def _applied_move(
         WorkItem,
     )
 
-    github.labels = [LABEL]
-    _label(client, github, number)
-    row = _request(number)
-    _open_lineage(row["work_item_id"])
+    if request_row is None:
+        github.labels = [LABEL]
+        _label(client, github, number)
+        row = _request(number)
+        _open_lineage(row["work_item_id"])
+    else:
+        row = request_row
     transition_id = uuid.uuid4()
 
     async def seed() -> str:
@@ -81,6 +89,9 @@ def _applied_move(
                 assert item is not None and request is not None
                 lineage = await session.get(ThreadPublicationLineage, item.publication_lineage_id)
                 assert lineage is not None
+                old_base_sha = MAIN_SHA if request_row is None else lineage.base_sha
+                old_head_sha = HEAD_A if request_row is None else lineage.head_sha
+                assert old_base_sha is not None and old_head_sha is not None
                 now = await session.scalar(text("SELECT clock_timestamp()"))
                 item.base_branch = "next"
                 item.base_source = "label"
@@ -93,7 +104,7 @@ def _applied_move(
                 lineage.code_host_host = item.code_host_host
                 lineage.repository_project_id = item.repository_project_id
                 lineage.code_host_installation_id = item.code_host_installation_id
-                lineage.code_host_pr_id = "P0EXAMPLE77"
+                lineage.code_host_pr_id = lineage.code_host_pr_id or "P0EXAMPLE77"
                 session.add(
                     FactoryBaseTransition(
                         id=transition_id,
@@ -103,13 +114,13 @@ def _applied_move(
                         phase="applied",
                         version=1,
                         old_base_ref="main",
-                        old_base_sha=MAIN_SHA,
-                        old_head_sha=HEAD_A,
+                        old_base_sha=old_base_sha,
+                        old_head_sha=old_head_sha,
                         target_base_ref="next",
                         target_base_sha=NEXT_SHA,
                         base_source="label",
                         branch=lineage.branch,
-                        pull_request_number="77",
+                        pull_request_number=str(lineage.pr_number),
                         committer_name="Curie",
                         committer_email="factory@example.com",
                         committer_time=now,
@@ -118,7 +129,7 @@ def _applied_move(
                         changed_paths=list(paths),
                         ci_pushed_at=now,
                         applied_at=now,
-                        outcome_ready_at=now,
+                        outcome_ready_at=now if outcome_ready else None,
                         ci_ready_at=None,
                         ci_settled_at=None,
                     )
@@ -129,7 +140,7 @@ def _applied_move(
             await engine.dispose()
 
     branch = asyncio.run(seed())
-    epoch = _start_running(client, row["id"])
+    epoch = _start_running(client, row["id"]) if start_running else None
     sink.branches["next"] = NEXT_SHA
     sink.pull_script = [
         {
@@ -148,6 +159,134 @@ def _applied_move(
         "epoch": epoch,
         "branch": branch,
     }
+
+
+def _request_state(row: dict[str, Any]) -> tuple[str, str | None]:
+    current = _rows(
+        "SELECT status, terminal_cause FROM curie.execution_requests WHERE id = :id",
+        {"id": row["id"]},
+    )[0]
+    return current["status"], current["terminal_cause"]
+
+
+def _acknowledge_publication_history(client: Any, published: dict[str, Any]) -> None:
+    from curie_worker.publication_clients import PublicationTranscriptClient
+    from curie_worker.publication_store import PostgresPublicationStore
+
+    publication = _rows(
+        "SELECT id FROM curie.publications WHERE execution_request_id = :id",
+        {"id": published["id"]},
+    )[0]
+
+    async def acknowledge() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        store = PostgresPublicationStore(
+            engine, schema="curie", lease_owner="factory-ci-history"
+        )
+        try:
+            cleanup = await store.claim_pending_cleanup()
+            assert cleanup is not None and cleanup.publication_id == publication["id"]
+            await store.mark_cleanup_completed(cleanup.publication_id)
+            result = await store.pending_result(publication["id"])
+            assert result is not None
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=client.app), base_url="http://api.example.com"
+            ) as state_client:
+                transcript = PublicationTranscriptClient(
+                    api_base_url="http://api.example.com",
+                    api_key=get_settings().api_key,
+                    client=state_client,
+                )
+                await transcript.record_result(
+                    result.agent_id,
+                    result.workspace_conversation_id,
+                    result.publication_id,
+                    f"Published the approved changes: {result.pr_url}",
+                )
+            await store.mark_outcome_history_ready(result.publication_id)
+        finally:
+            await engine.dispose()
+
+    client.portal.call(acknowledge)
+    acknowledged = _rows(
+        "SELECT status, outcome_history_ready_at FROM curie.publications WHERE id = :id",
+        {"id": publication["id"]},
+    )[0]
+    assert acknowledged["status"] == "succeeded"
+    assert acknowledged["outcome_history_ready_at"] is not None
+
+
+def _queued_same_base_move(
+    client: Any, github: Any, sink: Any, *, start_running: bool = True
+) -> dict[str, Any]:
+    sink.by_path = True
+    number, _pr, published = _published_issue(client, github, sink)
+    _acknowledge_publication_history(client, published)
+    github.labels = [LABEL, "base:next"]
+    _label(client, github, number)
+    waiting = _rows(
+        "SELECT * FROM curie.execution_requests WHERE work_item_id = :id "
+        "ORDER BY sequence DESC LIMIT 1",
+        {"id": published["work_item_id"]},
+    )[0]
+    assert waiting["status"] == "waiting"
+    move = _applied_move(
+        client,
+        github,
+        sink,
+        number,
+        request_row=waiting,
+        start_running=False,
+        outcome_ready=False,
+    )
+    github.advance_label_event(number)
+    queued = _post(client, "issues", _issue_event("labeled", number, label={"name": LABEL}))
+    assert queued.status_code == 200, queued.text
+    successor = _rows(
+        "SELECT readmit_request_id FROM curie.work_items WHERE id = :id",
+        {"id": move["work_item_id"]},
+    )[0]["readmit_request_id"]
+    assert successor is not None and successor != move["id"]
+    assert _request_state(move) == ("waiting", None)
+
+    _reconcile()
+    assert _transition(move)["outcome_ready_at"] is not None
+    _reconcile()
+
+    requests = _rows(
+        "SELECT id, status FROM curie.execution_requests WHERE work_item_id = :id "
+        "ORDER BY sequence",
+        {"id": move["work_item_id"]},
+    )
+    assert requests == [
+        {"id": published["id"], "status": "completed"},
+        {"id": move["id"], "status": "cancelled"},
+        {"id": successor, "status": "waiting"},
+    ]
+    row = {
+        **move,
+        "id": successor,
+        "move_request_id": move["id"],
+        "publication_request_id": published["id"],
+    }
+    row["epoch"] = _start_running(client, successor) if start_running else None
+    assert _request_state(row) == ("running" if start_running else "waiting", None)
+    item = _rows(
+        "SELECT w.base_branch, w.base_resolved_request_id, l.head_sha "
+        "FROM curie.work_items w JOIN curie.thread_publication_lineages l "
+        "ON l.id = w.publication_lineage_id WHERE w.id = :id",
+        {"id": row["work_item_id"]},
+    )[0]
+    assert item == {
+        "base_branch": "next",
+        "base_resolved_request_id": successor if start_running else move["id"],
+        "head_sha": HEAD_B,
+    }
+    assert _transition(row)["request_id"] == move["id"]
+    assert _transition(row)["ci_settled_at"] is None
+    _no_publications(row)
+    sink.ci_observations.clear()
+    return row
 
 
 @pytest.fixture
@@ -250,6 +389,198 @@ def test_no_change_successor_settles_only_on_its_final_head(moved: Any, verdict:
         if turns:
             assert turns[0]["event_id"] == f"work-item-{row['id']}-ci-2"
             assert HEAD_B in turns[0]["text"]
+
+
+def test_queued_same_base_marking_keeps_pending_final_head_ci_ownership(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    client, github, sink = admitted
+    _train(monkeypatch, tmp_path, client)
+    row = _queued_same_base_move(client, github, sink)
+    sink.ci_scripts = {HEAD_B: [ci_pending()], HEAD_C: [ci_green()]}
+
+    handed_off = _finish(client, row)
+
+    assert handed_off.status_code == 409, handed_off.text
+    assert "publication_pending" in handed_off.text
+    assert _request_state(row) == ("running", None)
+    assert _transition(row)["ci_ready_at"] is not None
+    _no_publications(row)
+    _execute(
+        "UPDATE curie.execution_requests SET runtime_heartbeat_expires_at = "
+        "clock_timestamp() - make_interval(secs => :elapsed) WHERE id = :id",
+        {"id": row["id"], "elapsed": get_settings().work_item_runtime_ttl_seconds + 5},
+    )
+
+    _reconcile()
+    _reconcile()
+
+    assert _request_state(row) == ("running", None)
+    assert _transition(row)["ci_settled_at"] is None
+    assert HEAD_B in sink.ci_observations
+    assert HEAD_C not in sink.ci_observations
+    assert _ci_turns(row["id"]) == []
+    assert str(row["id"]) not in _listed_owner_ids(client)
+    lost = _owner_lost(client, row["id"], row["epoch"])
+    assert lost.status_code == 409, lost.text
+    requests = _rows(
+        "SELECT id FROM curie.execution_requests WHERE work_item_id = :id",
+        {"id": row["work_item_id"]},
+    )
+    assert len(requests) == 3
+    assert _request_state(row) == ("running", None)
+    sink.ci_scripts[HEAD_B] = [ci_green()]
+
+    _reconcile()
+
+    assert _request_state(row) == ("completed", "completed")
+    assert _transition(row)["ci_settled_at"] is not None
+    assert _transition(row)["request_id"] == row["move_request_id"]
+    assert _ci_turns(row["id"]) == []
+    _no_publications(row)
+
+
+def test_queued_same_base_marking_routes_red_final_head_ci_to_its_own_fix(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    client, github, sink = admitted
+    _train(monkeypatch, tmp_path, client)
+    row = _queued_same_base_move(client, github, sink)
+    sink.ci_scripts = {HEAD_B: [ci_failing()], HEAD_C: [ci_green()]}
+
+    handed_off = _finish(client, row)
+
+    assert handed_off.status_code == 409, handed_off.text
+    assert "publication_pending" in handed_off.text
+    assert _request_state(row) == ("running", None)
+    _reconcile()
+    assert _request_state(row) == ("running", None)
+    assert _transition(row)["ci_settled_at"] is None
+    assert HEAD_B in sink.ci_observations
+    assert HEAD_C not in sink.ci_observations
+    turns = _ci_turns(row["id"])
+    assert len(turns) == 1
+    assert turns[0]["event_id"] == f"work-item-{row['id']}-ci-2"
+    assert HEAD_B in turns[0]["text"]
+    assert _ci_turns(row["move_request_id"]) == []
+    _no_publications(row)
+
+    _attach_fix(
+        row["work_item_id"],
+        row["id"],
+        revision=2,
+        head_sha=HEAD_C,
+        title="Repair after the queued base move",
+        paths=["src/widget.txt"],
+        base_sha=NEXT_SHA,
+    )
+    sink.pull_script[0]["head"]["sha"] = HEAD_C
+    fix_finished = _finish(client, row, round_=2)
+    assert fix_finished.status_code == 409, fix_finished.text
+    assert "publication_pending" in fix_finished.text
+    sink.ci_observations.clear()
+
+    _reconcile()
+
+    assert _request_state(row) == ("completed", "completed")
+    assert HEAD_C in sink.ci_observations
+    assert HEAD_B not in sink.ci_observations
+    publications = _rows(
+        "SELECT revision_number, status FROM curie.publications "
+        "WHERE execution_request_id = :id",
+        {"id": row["id"]},
+    )
+    assert publications == [{"revision_number": 2, "status": "succeeded"}]
+    assert _transition(row)["request_id"] == row["move_request_id"]
+    assert len(_ci_turns(row["id"])) == 1
+
+
+def test_queued_same_base_marking_acquisition_defers_until_the_prior_owner_pin_matches(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from curie_api.workitem_dispatch import (
+        AcquireGrant,
+        DispatchConflict,
+        StartResult,
+        acquire,
+        start,
+    )
+
+    client, github, sink = admitted
+    _train(monkeypatch, tmp_path, client)
+    row = _queued_same_base_move(client, github, sink, start_running=False)
+    before = _transition(row)
+    _execute(
+        "UPDATE curie.work_items SET base_resolved_request_id = :request, "
+        "version = version + 1 WHERE id = :id",
+        {"id": row["work_item_id"], "request": row["publication_request_id"]},
+    )
+
+    async def attempt(start_granted: bool) -> tuple[Any, Any, int]:
+        async with client.app.state.sessionmaker() as session:
+            generation = await session.scalar(
+                text("SELECT dispatch_generation FROM curie.execution_requests WHERE id = :id"),
+                {"id": row["id"]},
+            )
+            assert isinstance(generation, int)
+            acquired = await acquire(
+                session,
+                row["id"],
+                owner="factory-owner",
+                generation=generation,
+                wake=await factory_wake(session, row["id"]),
+                context=None,
+                client=client.app.state.http_client,
+            )
+            started = None
+            if start_granted and isinstance(acquired, AcquireGrant):
+                started = await start(
+                    session,
+                    row["id"],
+                    owner="factory-owner",
+                    generation=generation,
+                    claim_name="claim-factory",
+                    sandbox_name="sbx-factory",
+                    context=acquired.context,
+                )
+            return acquired, started, generation
+
+    denied, _started, prior_generation = client.portal.call(attempt, False)
+
+    assert isinstance(denied, DispatchConflict), denied
+    assert denied.code == "not_dispatchable"
+    assert _request_state(row) == ("waiting", None)
+    item = _rows(
+        "SELECT base_resolved_request_id FROM curie.work_items WHERE id = :id",
+        {"id": row["work_item_id"]},
+    )[0]
+    assert item["base_resolved_request_id"] == row["publication_request_id"]
+    after = _transition(row)
+    assert after == before
+
+    _execute(
+        "UPDATE curie.work_items SET base_resolved_request_id = :request, "
+        "version = version + 1 WHERE id = :id",
+        {"id": row["work_item_id"], "request": row["move_request_id"]},
+    )
+    acquired, started, next_generation = client.portal.call(attempt, True)
+
+    assert next_generation > prior_generation
+    assert isinstance(acquired, AcquireGrant), acquired
+    assert isinstance(started, StartResult), started
+    row["epoch"] = started.runtime_epoch
+    assert _request_state(row) == ("running", None)
+    item = _rows(
+        "SELECT base_resolved_request_id FROM curie.work_items WHERE id = :id",
+        {"id": row["work_item_id"]},
+    )[0]
+    assert item["base_resolved_request_id"] == row["id"]
+    assert _transition(row)["request_id"] == row["move_request_id"]
+    handed_off = _finish(client, row)
+    assert handed_off.status_code == 409, handed_off.text
+    assert "publication_pending" in handed_off.text
+    assert _request_state(row) == ("running", None)
+    _no_publications(row)
 
 
 def test_pending_base_move_ci_retains_ownership_after_runtime_heartbeat_lapses(moved: Any) -> None:
