@@ -4,6 +4,8 @@ Date: 2026-09-24
 
 Status: Accepted
 
+Partially superseded by [ADR 0249](0249-a-factory-run-may-take-twelve-hours.md): the 10800 second bounds in its decision 1 and the 10800 second worker delivery budget and runner ceiling bounds are now 43200 seconds. Everything else in this ADR stands.
+
 Partially supersedes [ADR 0162](0162-work-items-own-durable-execution-identity.md):
 the clause that a started `ExecutionRequest` has an execution deadline exactly
 1800 seconds after its start. Everything else in ADR 0162 stands.
