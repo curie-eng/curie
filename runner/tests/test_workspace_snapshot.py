@@ -464,3 +464,31 @@ def test_snapshot_json_never_contains_raw_binary_or_credential_material(snapshot
     assert "Authorization" not in encoded
     assert "GITHUB_TOKEN" not in encoded
     assert "github.com@" not in encoded
+
+
+@pytest.mark.parametrize(
+    ("path", "content"),
+    [
+        ("README.md", "edited after the paths were listed\n"),
+        (".github/workflows/ci.yml", "name: ci\n"),
+        ("late-untracked.txt", "new after the paths were listed\n"),
+    ],
+)
+def test_snapshot_refuses_a_workspace_that_changes_during_capture(
+    snapshot: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: str, content: str
+) -> None:
+    # A write between the capture's git calls would patch a path the disclosed
+    # list omits, or drop a new file entirely; neither may reach an approver.
+    repo, _ = _repo(tmp_path)
+    (repo / "pre.txt").write_text("before capture\n")
+    original = snapshot._untracked_patch
+
+    def write_mid_capture(workspace: Path, paths: tuple[str, ...]) -> bytes:
+        target = repo / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content)
+        return original(workspace, paths)
+
+    monkeypatch.setattr(snapshot, "_untracked_patch", write_mid_capture)
+    with pytest.raises(snapshot.WorkspaceSnapshotError, match="changed during snapshot capture"):
+        snapshot.capture_workspace_snapshot(repo, **TRUSTED)
