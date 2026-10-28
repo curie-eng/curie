@@ -41,6 +41,8 @@ they are not substitutes for a supported quickstart.
   coding agent to clarify intent and save a reviewed draft without a new runtime.
 - [Factory specification contract](guides/factory-specification.md): canonical ticket
   structure and manual coverage and dependency mapping.
+- [Factory repository environments](guides/factory-environments.md): local admin
+  skills for runner image setup and periodic analysis of failed work.
 - [Factory outcomes and costs](guides/measuring-factory-outcomes.md): evaluate
   completed work, estimated spend, and human review effort.
 - [Behavior packs](behavior-packs.md): opt-in greetings, capability tips, and

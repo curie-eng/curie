@@ -95,6 +95,8 @@ Both skills follow the binding's actual GitHub, GitLab, Jira Cloud or Bitbucket
 Cloud/DC provider identities. The selected repository image carries its own
 tool manifest; its digest-pinned binding is operator configuration. Neither
 skill grants new sandbox egress or credentials.
+The [repository environment guide](../../docs/guides/factory-environments.md)
+walks through setup, review, deployment validation, and recurring maintenance.
 
 Deployment readiness stays `unvalidated`, including after developer review,
 publication and selection. After presenting the complete specification, the skill

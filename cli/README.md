@@ -68,8 +68,10 @@ The skills remain separate workflows after installation: use
 `$factory-environment-maintenance <factory>` in Codex. Claude Code uses the
 same names with `/`. The
 [PR review guide](../docs/guides/factory-pr-review.md) covers walkthroughs,
-local tests, approved factory feedback and merging. No second installation
-command is needed. Installation grants no tracker or factory authority.
+local tests, approved factory feedback and merging. The
+[repository environment guide](../docs/guides/factory-environments.md) covers
+the two admin skills. No second installation command is needed. Installation
+grants no tracker or factory authority.
 
 ## Interactive mode
 

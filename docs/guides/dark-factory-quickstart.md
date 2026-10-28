@@ -277,6 +277,11 @@ The cluster factory command performs the same check for its allowlisted reposito
 Without `--app-id`, it prints `toolchain inference skipped: no --app-id`.
 Dry-run describes the inference without reading GitHub.
 
+For a repository-specific image based on issue and PR history, use the local
+[factory environment setup skill](factory-environments.md) before reviewing a
+`--repo-runner` build and binding change. Its companion maintenance skill
+reviews later `needs human` outcomes for image and non-image repairs.
+
 Factory commits are authored by the GitHub App's bot identity. Before any Helm
 call, App setup resolves `<slug>[bot]` through GitHub's user API and configures
 `worker.publication.gitUserName=<slug>[bot]` and

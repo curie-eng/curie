@@ -138,7 +138,7 @@ KUBECONFIG="$CURIE_FACTORY_KUBECONFIG" curie factory quickstart \
 preparation skill for your coding agent using a CLI build that contains it:
 
 ```bash
-curie factory prepare install --agent codex
+curie skills install --agent codex
 ```
 
 In Codex, invoke `$prepare-factory-ticket <issue-url>`. Answer its questions,
@@ -148,6 +148,11 @@ The [preparation guide](docs/guides/factory-preparation.md) covers Claude Code,
 Copilot, Gemini and Cursor, global installation, and source builds when your
 released CLI does not yet include this command. Skill installation does not
 replace the factory setup in steps 1 and 2.
+
+The same command installs the local admin skills for repository runner setup
+and maintenance. The [repository environment guide](docs/guides/factory-environments.md)
+shows how to review issues, PRs, toolchains, and failed factory work before
+changing a repository's sandbox image or configuration.
 
 You can also prepare the issue yourself and add `curie-factory` in GitHub. The
 account adding the label needs write or admin access to the repository.

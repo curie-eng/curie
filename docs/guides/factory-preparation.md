@@ -99,6 +99,9 @@ repository it is the current directory. Use `--dir /path/to/project` to select
 exactly an existing directory, or `--global` to install for your user across
 repositories. `--dir` and `--global` cannot be combined.
 
+The [repository environment guide](factory-environments.md) explains when and
+how administrators use the two environment skills.
+
 ```bash
 curie skills install --agent claude-code --global
 curie skills install --agent cursor --dir /path/to/project --dry-run

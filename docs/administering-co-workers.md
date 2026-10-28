@@ -43,6 +43,12 @@ issues. GitLab uses its own access token. Jira Cloud also needs a dedicated
 factory account, API token and explicit start authority. Follow that pairing's
 credential instructions; a Slack connection does not configure factory intake.
 
+For each factory repository, use the local
+[environment setup and maintenance skills](guides/factory-environments.md) to
+review historical issues and PRs, propose its runner image, and classify later
+failures. The skills present changes for administrator review before the image
+build and binding update.
+
 Follow [Slack setup](your-first-slack-agent.md) and
 [bundle deployment](operations.md#deploying-your-plugin-bundle-onto-the-curie-platform).
 A channel binds one agent; an agent may have multiple bindings. Only one release

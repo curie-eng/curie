@@ -107,6 +107,12 @@ presents the entire specification for review. After review, choose **publish and
 start the factory** to publish through your existing tracker tools and select
 eligible issues with the configured factory label. Reports stay local.
 
+The same install provides `factory-environment-setup` and
+`factory-environment-maintenance` for administrators. Use the
+[repository environment guide](guides/factory-environments.md) to plan a
+repository runner image from issue and PR history, review its build and
+deployment, and periodically classify failed work for targeted repairs.
+
 The [preparation guide](guides/factory-preparation.md) has the installation and
 invocation table for Codex, Claude Code, Copilot, Gemini and Cursor, global
 installation, manual upgrades, and a source build option until the installer is
