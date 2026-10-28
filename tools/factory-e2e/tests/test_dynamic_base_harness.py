@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import importlib.util
 import json
 import ssl
@@ -11,7 +10,6 @@ from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -19,24 +17,9 @@ import httpx  # noqa: E402
 import pytest  # noqa: E402
 from c4_dynamic_base import (  # noqa: E402
     CHANGE,
-    assert_ci_still_owns_request,
     dynamic_model_type,
     dynamic_stub_type,
 )
-
-
-def test_pending_final_head_rejects_old_target_success() -> None:
-    transition = {"request_id": "current", "ci_settled_at": None}
-    assert_ci_still_owns_request({"id": "current", "status": "running"}, transition)
-    with pytest.raises(AssertionError, match="old-target or pending CI"):
-        assert_ci_still_owns_request({"id": "current", "status": "completed"}, transition)
-    with pytest.raises(AssertionError, match="another execution request"):
-        assert_ci_still_owns_request({"id": "old", "status": "running"}, transition)
-    with pytest.raises(AssertionError, match="received a CI settlement"):
-        assert_ci_still_owns_request(
-            {"id": "current", "status": "running"},
-            {**transition, "ci_settled_at": "2026-01-01T00:00:00Z"},
-        )
 
 
 @pytest.fixture
@@ -62,8 +45,8 @@ def reply(model: Any, messages: list[dict[str, Any]]) -> dict[str, Any]:
     ]
 
 
-def test_scripted_nochange_requires_successful_actual_tool_output(model: Any) -> None:
-    model.mode("nochange")
+def test_scripted_hold_records_only_successful_actual_tool_output(model: Any) -> None:
+    model.mode("hold")
     first = [{"role": "user", "content": "Verify the example repository."}]
     response = reply(model, first)
     assert response["stop_reason"] == "tool_use"
@@ -88,7 +71,8 @@ def test_scripted_nochange_requires_successful_actual_tool_output(model: Any) ->
         },
     ]
     verified = reply(model, messages)
-    assert verified["stop_reason"] == "end_turn"
+    assert verified["stop_reason"] == "tool_use"
+    assert verified["content"][0]["input"]["command"] == "sleep 300"
     assert model.observations() == [
         {"tool": tool["id"], "head": "a" * 40, "target": "next", "value": 'VALUE = "factory"'}
     ]
@@ -103,7 +87,7 @@ def test_new_objective_requires_fresh_verification_after_a_completed_turn(
 ) -> None:
     # Anthropic's assistant tool_use and matching user tool_result shapes:
     # https://platform.claude.com/docs/en/agents-and-tools/tool-use/implement-tool-use
-    model.mode("nochange")
+    model.mode("publish")
     earlier = [{"role": "user", "content": "Verify the example repository on its original base."}]
     prior_response = reply(model, earlier)
     assert prior_response["stop_reason"] == "tool_use"
@@ -130,9 +114,31 @@ def test_new_objective_requires_fresh_verification_after_a_completed_turn(
         ]
     )
     prior_final = reply(model, earlier)
+    if not prior_failed:
+        for tool_name in ("Bash", "mcp__curie__publish_changes"):
+            assert prior_final["stop_reason"] == "tool_use"
+            action = prior_final["content"][0]
+            assert action["name"] == tool_name
+            earlier.extend(
+                [
+                    {"role": "assistant", "content": prior_final["content"]},
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": action["id"],
+                                "is_error": False,
+                                "content": "Example repository action completed.",
+                            }
+                        ],
+                    },
+                ]
+            )
+            prior_final = reply(model, earlier)
     assert prior_final["stop_reason"] == "end_turn"
     assert prior_final["content"][0]["text"].startswith(
-        "Could not complete:" if prior_failed else "No changes needed:"
+        "Could not complete:" if prior_failed else "Published the verified example change."
     )
     prior_observations = (
         []
@@ -156,6 +162,7 @@ def test_new_objective_requires_fresh_verification_after_a_completed_turn(
         },
     ]
 
+    model.mode("hold")
     current_response = reply(model, messages)
 
     assert current_response["stop_reason"] == "tool_use"
@@ -184,8 +191,8 @@ def test_new_objective_requires_fresh_verification_after_a_completed_turn(
 
     current_final = reply(model, messages)
 
-    assert current_final["stop_reason"] == "end_turn"
-    assert current_final["content"][0]["text"].startswith("No changes needed:")
+    assert current_final["stop_reason"] == "tool_use"
+    assert current_final["content"][0]["input"]["command"] == "sleep 300"
     assert model.observations() == [
         *prior_observations,
         {
@@ -198,7 +205,7 @@ def test_new_objective_requires_fresh_verification_after_a_completed_turn(
 
 
 def test_unissued_output_does_not_claim_a_checkout_observation(model: Any) -> None:
-    model.mode("nochange")
+    model.mode("hold")
     response = reply(
         model,
         [
@@ -299,94 +306,3 @@ def test_dynamic_python_check_passes_the_factory_ci_gate_only_for_native_ci(
     assert verdict.kind == ("unverified" if unrelated_app else "green"), verdict
     assert checks[0].native is (not unrelated_app)
     assert verdict.reason == ("required_python_ci_unrelated" if unrelated_app else None)
-
-
-@pytest.mark.parametrize("unavailable", [False, True], ids=["permission-refused", "transient"])
-def test_dynamic_native_ci_rerun_distinguishes_permission_refusal_from_provider_outage(
-    dynamic_github: Any, unavailable: bool
-) -> None:
-    from curie_api.forges.github.code_host import GitHubCodeHost
-    from curie_api.forges.types import (
-        CheckState,
-        RepositoryRef,
-        RerunOutcome,
-        failed_native_jobs,
-    )
-
-    # GitHub check URLs identify a check run; the Actions job read resolves its
-    # workflow. A missing Actions permission is definitive, while a 503 retries.
-    # https://docs.github.com/en/rest/checks/runs#list-check-runs-for-a-git-reference
-    # https://docs.github.com/en/rest/actions/workflow-jobs#get-a-job-for-a-workflow-run
-    # https://docs.github.com/en/rest/actions/workflow-runs#re-run-failed-jobs-from-a-workflow-run
-    stub = dynamic_github
-    repo = "acme-corp/acme-bot"
-    head = stub.heads()["next"]
-    stub.check(head, "failure", target="next")
-    if unavailable:
-        stub.control("actions_lookup", "unavailable")
-    responses: list[tuple[str, str, int, str | None]] = []
-
-    class CiCredentials:
-        app_configured = True
-
-        def fresh_installation_token(
-            self, repo_full_name: str, expected_installation_id: int | None = None
-        ) -> tuple[int, str]:
-            assert repo_full_name == repo
-            assert expected_installation_id in (None, 5501)
-            return 5501, "fixture-ci-token"
-
-    async def capture_response(response: httpx.Response) -> None:
-        responses.append(
-            (
-                response.request.method,
-                response.request.url.path,
-                response.status_code,
-                response.headers.get("Retry-After"),
-            )
-        )
-
-    async def rerun() -> Any:
-        async with httpx.AsyncClient(
-            verify=ssl.create_default_context(cafile=str(stub.ca_file)),
-            trust_env=False,
-            event_hooks={"response": [capture_response]},
-        ) as client:
-            host = GitHubCodeHost(
-                client,
-                api_url=stub.base_url + "/api/v3",
-                html_base=stub.base_url,
-                timeout_s=5,
-                credentials=CiCredentials(),
-                installations={repo: 5501},
-            )
-            repository = RepositoryRef("github", urlsplit(stub.base_url).netloc, "4401", repo)
-            rollup = await host.observe_ci(repository, head)
-            assert len(rollup.checks) == 1
-            check = rollup.checks[0]
-            assert check.head_sha == head
-            assert check.state is CheckState.FAILURE
-            assert check.native
-            jobs = failed_native_jobs(rollup.checks)
-            assert len(jobs) == 1
-            assert jobs[0].check_id == check.check_id
-            return await host.rerun_failed(repository, jobs)
-
-    record = asyncio.run(rerun())
-
-    assert record.stopped is (RerunOutcome.RETRY if unavailable else RerunOutcome.REFUSED), record
-    assert record.reason == ("github_error" if unavailable else "github_forbidden")
-    assert record.attempts == ()
-    assert len(record.jobs) == 1
-    job = record.jobs[0]
-    assert job.unit is None
-    assert job.url == f"{stub.base_url}/{repo}/runs/{job.check_id}?check_suite_focus=true"
-    actions = [response for response in responses if "/actions/" in response[1]]
-    assert actions == [
-        (
-            "GET",
-            f"/api/v3/repos/{repo}/actions/jobs/{job.check_id}",
-            503 if unavailable else 403,
-            "30" if unavailable else None,
-        )
-    ]

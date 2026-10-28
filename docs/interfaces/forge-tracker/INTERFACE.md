@@ -76,22 +76,26 @@ marked and described:
 `CodeHost` (`apps/api/src/curie_api/forges/ports.py::CodeHost`) is where code,
 pull requests, CI and review live: `resolve_repository` from an immutable id;
 `credential` for clone or push scope; `branch_head` and `read_commit`;
-`find_pull_request`, `open_pull_request`, `update_pull_request`,
-`retarget_pull_request` and `read_pull_request`; `list_factory_publications`;
+`find_pull_request`, `open_pull_request`, `update_pull_request` and
+`read_pull_request`; `list_factory_publications`;
 `observe_ci` on an exact head; `list_review_feedback` since a cursor and
 `verify_feedback`. Optional:
 `ci_diagnostics`, `rerun_failed`, `user_can_write` and `required_checks`
 (GitHub only among the shipped code hosts; GitLab and both Bitbucket adapters
 raise `Unsupported`).
 
-`retarget_pull_request(ref, *, base_ref, expected_head_sha)` is the mandatory
-operation for changing only an open pull request's base. `update_pull_request`
-continues to change only its title and body. Retargeting verifies the identity,
-unchanged source branch and expected head before and after the update, and
-confirms the new target; an already matching target makes no write. Provider
-read/write/read checks are optimistic. The API's durable base operation uses
-Git `--force-with-lease` with the exact branch and expected head to fence branch
-updates.
+`update_pull_request` changes only the title and body. Current base-label
+reconciliation restarts work only before publication authority exists. A
+stored head or PR, an active publication, a pending outcome, a reserved review,
+or a pushed factory branch freezes the selected base; an unreadable remote
+branch does not prove absence. A request for another base is visibly refused,
+and correcting labels to the selected base allows ordinary acquisition to
+continue without substituting an old base for the requested one.
+
+[ADR 0253](../../adr/0253-factory-base-labels-resolve-at-claim-and-follow-relabels.md)
+also authorizes durable rebase, PR retargeting, and final-head CI ownership.
+Those operations follow in the second stacked change and are not part of the
+current port contract.
 
 `list_factory_publications` returns, as `FactoryPublication` values, every pull
 request in any state that the adapter's own identity opened in the repository

@@ -18,7 +18,6 @@ from sqlalchemy import and_, case, exists, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import aliased
 from sqlalchemy.sql.elements import ColumnElement
 
 from .. import transcripts
@@ -33,7 +32,6 @@ from ..models import (
     Agent,
     Deployment,
     ExecutionRequest,
-    FactoryBaseTransition,
     FactoryStatusComment,
     Publication,
     ThreadPublicationLineage,
@@ -93,135 +91,25 @@ _NO_READMIT: dict[str, Any] = {
 }
 
 
-def ready_base_transition_exists(request_id: Any = ExecutionRequest.id) -> ColumnElement[bool]:
-    active_move = aliased(FactoryBaseTransition)
-    return exists(
-        select(FactoryBaseTransition.id)
-        .join(WorkItem, WorkItem.id == FactoryBaseTransition.work_item_id)
-        .join(
-            ThreadPublicationLineage,
-            ThreadPublicationLineage.id == FactoryBaseTransition.lineage_id,
-        )
-        .where(
-            FactoryBaseTransition.ci_request_id == request_id,
-            FactoryBaseTransition.phase == "applied",
-            FactoryBaseTransition.outcome_ready_at.is_not(None),
-            FactoryBaseTransition.ci_ready_at.is_not(None),
-            FactoryBaseTransition.ci_settled_at.is_(None),
-            WorkItem.cancelled_at.is_(None),
-            WorkItem.publication_lineage_id == FactoryBaseTransition.lineage_id,
-            WorkItem.base_resolved_request_id == FactoryBaseTransition.ci_request_id,
-            ThreadPublicationLineage.head_sha == FactoryBaseTransition.verification_head_sha,
-            ThreadPublicationLineage.base_ref == FactoryBaseTransition.target_base_ref,
-            ThreadPublicationLineage.base_sha == FactoryBaseTransition.target_base_sha,
-            WorkItem.base_branch == FactoryBaseTransition.target_base_ref,
-            WorkItem.base_commit == FactoryBaseTransition.target_base_sha,
-            ~exists().where(
-                active_move.work_item_id == FactoryBaseTransition.work_item_id,
-                or_(
-                    active_move.phase.in_(
-                        ("pending", "prepared", "pushed", "retargeted", "ci_prepared", "ci_pushed")
-                    ),
-                    and_(active_move.phase == "applied", active_move.outcome_ready_at.is_(None)),
-                ),
-                active_move.id != FactoryBaseTransition.id,
-            ),
-            ~exists().where(
-                Publication.execution_request_id == FactoryBaseTransition.ci_request_id,
-                Publication.status.in_(AWAITING_PUBLICATION),
-            ),
-        )
-        .correlate(ExecutionRequest)
-    )
-
-
 def not_awaiting_publication() -> ColumnElement[bool]:
-    return and_(
-        ~exists().where(
-            Publication.execution_request_id == ExecutionRequest.id,
-            Publication.status.in_(AWAITING_PUBLICATION),
-        ),
-        ~ready_base_transition_exists(),
+    # A publication in flight or succeeded hands the request's terminus to the
+    # publication loop and the CI gate, not to runtime owner loss.
+    return ~exists().where(
+        Publication.execution_request_id == ExecutionRequest.id,
+        Publication.status.in_(AWAITING_PUBLICATION),
     )
 
 
 async def _awaits_publication(session: AsyncSession, request_id: uuid.UUID) -> bool:
-    return bool(
-        await session.scalar(
-            select(
-                or_(
-                    exists().where(
-                        Publication.execution_request_id == request_id,
-                        Publication.status.in_(AWAITING_PUBLICATION),
-                    ),
-                    ready_base_transition_exists(request_id),
-                )
-            )
-        )
-    )
-
-
-async def _applied_base_transition(
-    session: AsyncSession, work_item: WorkItem, request: ExecutionRequest, *, ready: bool
-) -> FactoryBaseTransition | None:
-    if work_item.publication_lineage_id is None or work_item.base_resolved_request_id != request.id:
-        return None
-    active_move = aliased(FactoryBaseTransition)
-    transition: FactoryBaseTransition | None = await session.scalar(
-        select(FactoryBaseTransition)
-        .join(
-            ThreadPublicationLineage,
-            ThreadPublicationLineage.id == FactoryBaseTransition.lineage_id,
-        )
+    publication_id = await session.scalar(
+        select(Publication.id)
         .where(
-            FactoryBaseTransition.work_item_id == work_item.id,
-            FactoryBaseTransition.ci_request_id == request.id,
-            FactoryBaseTransition.lineage_id == work_item.publication_lineage_id,
-            FactoryBaseTransition.phase == "applied",
-            FactoryBaseTransition.outcome_ready_at.is_not(None),
-            FactoryBaseTransition.ci_settled_at.is_(None),
-            *((FactoryBaseTransition.ci_ready_at.is_not(None),) if ready else ()),
-            ThreadPublicationLineage.head_sha == FactoryBaseTransition.verification_head_sha,
-            ThreadPublicationLineage.base_ref == FactoryBaseTransition.target_base_ref,
-            ThreadPublicationLineage.base_sha == FactoryBaseTransition.target_base_sha,
-            FactoryBaseTransition.target_base_ref == work_item.base_branch,
-            FactoryBaseTransition.target_base_sha == work_item.base_commit,
-            ~exists().where(
-                active_move.work_item_id == work_item.id,
-                active_move.id != FactoryBaseTransition.id,
-                or_(
-                    active_move.phase.in_(
-                        ("pending", "prepared", "pushed", "retargeted", "ci_prepared", "ci_pushed")
-                    ),
-                    and_(active_move.phase == "applied", active_move.outcome_ready_at.is_(None)),
-                ),
-            ),
-        )
-        .order_by(FactoryBaseTransition.applied_at.desc())
-        .limit(1)
-    )
-    return transition
-
-
-async def base_transition_round_offset(
-    session: AsyncSession,
-    *,
-    work_item_id: uuid.UUID,
-    request_id: uuid.UUID,
-    lineage_id: uuid.UUID | None,
-) -> int:
-    found = await session.scalar(
-        select(FactoryBaseTransition.id)
-        .where(
-            FactoryBaseTransition.work_item_id == work_item_id,
-            FactoryBaseTransition.ci_request_id == request_id,
-            FactoryBaseTransition.lineage_id == lineage_id,
-            FactoryBaseTransition.phase == "applied",
-            FactoryBaseTransition.outcome_ready_at.is_not(None),
+            Publication.execution_request_id == request_id,
+            Publication.status.in_(AWAITING_PUBLICATION),
         )
         .limit(1)
     )
-    return int(found is not None)
+    return publication_id is not None
 
 
 def _base_values(base: ResolvedBase | None) -> dict[str, Any]:
@@ -520,10 +408,7 @@ async def _opened_pull_request(
             Publication.status == "succeeded",
         )
     )
-    return (
-        succeeded is not None
-        or await _applied_base_transition(session, work_item, request, ready=True) is not None
-    )
+    return succeeded is not None
 
 
 async def _publication_owns_terminus(
@@ -548,10 +433,7 @@ async def _publication_owns_terminus(
         )
         .limit(1)
     )
-    return (
-        found is not None
-        or await _applied_base_transition(session, work_item, request, ready=True) is not None
-    )
+    return found is not None
 
 
 async def lock_work_item(session: AsyncSession, work_item_id: uuid.UUID) -> WorkItem | None:
@@ -1548,24 +1430,6 @@ async def terminalize_execution(
         )
     if status == "completed" and not opened:
         return await _conflict(session, "illegal_transition", work_item=work_item, request=request)
-    transition = await _applied_base_transition(session, work_item, request, ready=False)
-    if (
-        transition is not None
-        and status == "failed"
-        and cause.strip() in (*_UNPUBLISHED_CAUSES, "ci_fix_unpublished")
-    ):
-        publications = await session.scalar(
-            select(func.count(Publication.id)).where(
-                Publication.execution_request_id == request.id,
-                Publication.status.in_(AWAITING_PUBLICATION),
-            )
-        )
-        if not publications and ci_fix_round is None:
-            transition.ci_ready_at = now
-            transition.version += 1
-            return await _conflict(
-                session, "publication_pending", work_item=work_item, request=request
-            )
     if status == "failed" and cause.strip() == "ci_fix_unpublished":
         assert ci_fix_round is not None
         # A CI fix turn that ended without a new publication is terminal, unless
@@ -1589,17 +1453,7 @@ async def terminalize_execution(
                 Publication.status == "succeeded",
             )
         )
-        if (
-            in_flight is not None
-            or (succeeded or 0)
-            + await base_transition_round_offset(
-                session,
-                work_item_id=work_item.id,
-                request_id=request.id,
-                lineage_id=work_item.publication_lineage_id,
-            )
-            >= ci_fix_round
-        ):
+        if in_flight is not None or (succeeded or 0) >= ci_fix_round:
             return await _conflict(
                 session, "publication_pending", work_item=work_item, request=request
             )
@@ -1712,67 +1566,31 @@ async def fail_execution(
     )
 
 
-@dataclass(frozen=True)
-class PublicationCISubject:
-    id: uuid.UUID
-    version: int
-    head_sha: str
-    base_ref: str | None
-    changed_paths: tuple[str, ...]
-    published_at: datetime | None
-    kind: Literal["publication"] = "publication"
-
-
-@dataclass(frozen=True)
-class BaseTransitionCISubject:
-    id: uuid.UUID
-    version: int
-    head_sha: str
-    base_ref: str | None
-    changed_paths: tuple[str, ...]
-    published_at: datetime | None
-    kind: Literal["base_transition"] = "base_transition"
-
-
-CISubject = PublicationCISubject | BaseTransitionCISubject
-
-
 async def _ci_fence_holds(
-    session: AsyncSession, work_item: WorkItem, request_id: uuid.UUID, subject: CISubject
+    session: AsyncSession,
+    work_item: WorkItem,
+    request_id: uuid.UUID,
+    publication_id: uuid.UUID,
+    head_sha: str,
 ) -> bool:
+    """True while the CI gate's observation still describes the request (#3097).
+
+    Call with the WorkItem and request locked. The lineage row is locked
+    ``FOR SHARE``, which serializes against a publication advancing its head,
+    so a verdict for an older head can never be written after a newer push.
+    """
+
     if work_item.publication_lineage_id is None:
         return False
-    lineage = await session.scalar(
-        select(ThreadPublicationLineage)
+    lineage_head = await session.scalar(
+        select(ThreadPublicationLineage.head_sha)
         .where(ThreadPublicationLineage.id == work_item.publication_lineage_id)
         .with_for_update(read=True)
     )
-    if (
-        lineage is None
-        or lineage.head_sha != subject.head_sha
-        or lineage.base_ref != subject.base_ref
-    ):
-        return False
-    active = await session.scalar(
-        select(Publication.id)
-        .where(
-            Publication.execution_request_id == request_id,
-            Publication.status.in_(IN_FLIGHT_PUBLICATION),
-        )
-        .limit(1)
-    )
-    moving = await session.scalar(
-        select(FactoryBaseTransition.id)
-        .where(
-            FactoryBaseTransition.work_item_id == work_item.id,
-            FactoryBaseTransition.phase.not_in(("applied", "conflict", "refused")),
-        )
-        .limit(1)
-    )
-    if active is not None or moving is not None:
+    if lineage_head != head_sha:
         return False
     latest = await session.scalar(
-        select(Publication)
+        select(Publication.id)
         .where(
             Publication.execution_request_id == request_id,
             Publication.status == "succeeded",
@@ -1780,19 +1598,17 @@ async def _ci_fence_holds(
         .order_by(Publication.revision_number.desc())
         .limit(1)
     )
-    if isinstance(subject, PublicationCISubject):
-        return latest is not None and latest.id == subject.id and latest.version == subject.version
-    if latest is not None:
+    if latest != publication_id:
         return False
-    request = await session.get(ExecutionRequest, request_id)
-    transition = (
-        await _applied_base_transition(session, work_item, request, ready=True) if request else None
+    in_flight = await session.scalar(
+        select(Publication.id)
+        .where(
+            Publication.execution_request_id == request_id,
+            Publication.status.in_(IN_FLIGHT_PUBLICATION),
+        )
+        .limit(1)
     )
-    return (
-        transition is not None
-        and transition.id == subject.id
-        and transition.version == subject.version
-    )
+    return in_flight is None
 
 
 async def settle_ci_verdict(
@@ -1802,55 +1618,32 @@ async def settle_ci_verdict(
     request_id: uuid.UUID,
     expected_work_item_version: int,
     expected_request_version: int,
-    expected_subject: CISubject,
+    expected_publication_id: uuid.UUID,
+    expected_head_sha: str,
     status: Literal["completed", "failed"],
     cause: str,
     detail: str | None,
 ) -> WorkItemResult:
+    """Write the CI gate's verdict, fenced to the observed publication and head.
+
+    A newer push, a publication in flight, or a moved head returns
+    ``stale_version`` and writes nothing; the next pass observes the new head.
+    """
+
     work_item = await lock_work_item(session, work_item_id)
     request = (
         await lock_request(session, work_item_id=work_item_id, request_id=request_id)
-        if work_item
+        if work_item is not None
         else None
     )
     if (
         work_item is not None
         and request is not None
-        and not await _ci_fence_holds(session, work_item, request_id, expected_subject)
+        and not await _ci_fence_holds(
+            session, work_item, request_id, expected_publication_id, expected_head_sha
+        )
     ):
         return await _conflict(session, "stale_version", work_item=work_item, request=request)
-    if isinstance(expected_subject, BaseTransitionCISubject):
-        async with AsyncSession(
-            bind=await session.connection(),
-            join_transaction_mode="create_savepoint",
-            expire_on_commit=False,
-        ) as settlement:
-            result = await terminalize_execution(
-                settlement,
-                work_item_id=work_item_id,
-                request_id=request_id,
-                expected_work_item_version=expected_work_item_version,
-                expected_request_version=expected_request_version,
-                status=status,
-                cause=cause,
-                detail=detail,
-                ci_fix_round=None,
-                extra_where=(),
-            )
-        if isinstance(result, WorkItemOutcome):
-            await session.execute(
-                update(FactoryBaseTransition)
-                .where(
-                    FactoryBaseTransition.id == expected_subject.id,
-                    FactoryBaseTransition.version == expected_subject.version,
-                    FactoryBaseTransition.ci_request_id == request_id,
-                )
-                .values(
-                    ci_settled_at=func.clock_timestamp(), version=FactoryBaseTransition.version + 1
-                )
-            )
-        await session.commit()
-        return result
     return await terminalize_execution(
         session,
         work_item_id=work_item_id,
@@ -1871,8 +1664,15 @@ async def hold_for_ci_fix(
     work_item_id: uuid.UUID,
     request_id: uuid.UUID,
     expected_request_version: int,
-    expected_subject: CISubject,
+    expected_publication_id: uuid.UUID,
+    expected_head_sha: str,
 ) -> bool:
+    """Hold a running request's lease to its deadline for a CI fix turn (#3097).
+
+    Fenced like ``settle_ci_verdict``: False, with nothing written, when the
+    observed publication or head is no longer current or the deadline passed.
+    """
+
     work_item = await lock_work_item(session, work_item_id)
     if work_item is None:
         await session.commit()
@@ -1882,11 +1682,13 @@ async def hold_for_ci_fix(
         request is None
         or request.version != expected_request_version
         or request.status != "running"
-        or not await _ci_fence_holds(session, work_item, request_id, expected_subject)
+        or not await _ci_fence_holds(
+            session, work_item, request_id, expected_publication_id, expected_head_sha
+        )
     ):
         await session.commit()
         return False
-    changed = await session.scalar(
+    changed_id: uuid.UUID | None = await session.scalar(
         update(ExecutionRequest)
         .where(
             ExecutionRequest.id == request_id,
@@ -1901,7 +1703,7 @@ async def hold_for_ci_fix(
         .returning(ExecutionRequest.id)
     )
     await session.commit()
-    return changed is not None
+    return changed_id is not None
 
 
 def _release_parked_hold() -> ColumnElement[datetime]:
@@ -2079,41 +1881,6 @@ async def readmit(
         )
         return await outcome(session, work_item, predecessor, replayed=True)
     now = await database_now(session)
-    moving = await session.scalar(
-        select(FactoryBaseTransition)
-        .where(
-            FactoryBaseTransition.work_item_id == work_item_id,
-            or_(
-                FactoryBaseTransition.phase.in_(
-                    ("pending", "prepared", "pushed", "retargeted", "ci_prepared", "ci_pushed")
-                ),
-                and_(
-                    FactoryBaseTransition.phase == "applied",
-                    FactoryBaseTransition.outcome_ready_at.is_(None),
-                ),
-            ),
-        )
-        .with_for_update()
-        .limit(1)
-    )
-    if moving is not None and moving.phase != "pending":
-        work_item.cancelled_at = None
-        work_item.readmit_request_id, work_item.readmit_requester, work_item.readmit_objective = (
-            request_id,
-            requester,
-            objective,
-        )
-        work_item.readmit_base_settle_until = base_settle_until
-        work_item.trigger_label = trigger_label
-        work_item.version += 1
-        predecessor = active or await lock_request(
-            session, work_item_id=work_item_id, request_id=moving.request_id
-        )
-        return await outcome(session, work_item, predecessor, replayed=False)
-    if moving is not None:
-        moving.phase, moving.error_code = "refused", "selection_superseded"
-        moving.owner, moving.lease_expires_at = None, None
-        moving.version += 1
     if active is not None and active.status in ("running", "cancellation_requested"):
         if active.status == "running":
             await session.execute(
@@ -2229,27 +1996,7 @@ async def admit_pending_readmit(
     if work_item is None or work_item.readmit_request_id is None:
         await session.commit()
         return None
-    active = await lock_active_request(session, work_item_id)
-    if active is not None and active.status != "waiting":
-        await session.commit()
-        return None
-    moving = await session.scalar(
-        select(FactoryBaseTransition.id)
-        .where(
-            FactoryBaseTransition.work_item_id == work_item_id,
-            or_(
-                FactoryBaseTransition.phase.in_(
-                    ("pending", "prepared", "pushed", "retargeted", "ci_prepared", "ci_pushed")
-                ),
-                and_(
-                    FactoryBaseTransition.phase == "applied",
-                    FactoryBaseTransition.outcome_ready_at.is_(None),
-                ),
-            ),
-        )
-        .limit(1)
-    )
-    if moving is not None:
+    if await lock_active_request(session, work_item_id) is not None:
         await session.commit()
         return None
     request_id = work_item.readmit_request_id
@@ -2268,17 +2015,6 @@ async def admit_pending_readmit(
         # Never commit a request that cannot be dispatched.
         await session.rollback()
         return None
-    if active is not None:
-        active.status, active.terminal_cause = "cancelled", "issue_cancelled"
-        active.terminal_at = await database_now(session)
-        active.acquire_owner, active.acquire_expires_at, active.acquired_generation = (
-            None,
-            None,
-            None,
-        )
-        active.version += 1
-        await session.flush()
-        await _queue_notice(session, work_item, active, detail=None)
     version: int | None = await session.scalar(
         update(WorkItem)
         .where(WorkItem.id == work_item_id)
@@ -2784,7 +2520,7 @@ class PublicationSettlement:
     work_item_version: int
     request_version: int
     cause: str
-    subject: CISubject
+    publication_id: uuid.UUID
 
 
 async def claim_publication_settlement(
@@ -2837,24 +2573,6 @@ async def claim_publication_settlement(
         )
         if active is not None:
             continue
-        moving = await session.scalar(
-            select(FactoryBaseTransition.id)
-            .where(
-                FactoryBaseTransition.work_item_id == work_item.id,
-                or_(
-                    FactoryBaseTransition.phase.in_(
-                        ("pending", "prepared", "pushed", "retargeted", "ci_prepared", "ci_pushed")
-                    ),
-                    and_(
-                        FactoryBaseTransition.phase == "applied",
-                        FactoryBaseTransition.outcome_ready_at.is_(None),
-                    ),
-                ),
-            )
-            .limit(1)
-        )
-        if moving is not None:
-            continue
         if publication.status == "succeeded":
             if not isinstance(pr_url, str) or not pr_url.strip():
                 continue
@@ -2869,55 +2587,6 @@ async def claim_publication_settlement(
             work_item_version=work_item.version,
             request_version=request.version,
             cause=cause,
-            subject=PublicationCISubject(
-                id=publication.id,
-                version=publication.version,
-                head_sha=await session.scalar(
-                    select(ThreadPublicationLineage.head_sha).where(
-                        ThreadPublicationLineage.id == publication.lineage_id
-                    )
-                )
-                or "",
-                base_ref=await session.scalar(
-                    select(ThreadPublicationLineage.base_ref).where(
-                        ThreadPublicationLineage.id == publication.lineage_id
-                    )
-                ),
-                changed_paths=tuple(publication.changed_paths),
-                published_at=publication.terminal_at or publication.updated_at,
-            ),
-        )
-    moves = (
-        await session.execute(
-            select(ExecutionRequest, WorkItem, FactoryBaseTransition)
-            .join(WorkItem, WorkItem.id == ExecutionRequest.work_item_id)
-            .join(FactoryBaseTransition, FactoryBaseTransition.ci_request_id == ExecutionRequest.id)
-            .where(
-                ExecutionRequest.status == "running",
-                ready_base_transition_exists(),
-                *((ExecutionRequest.id.not_in(exclude),) if exclude else ()),
-            )
-            .order_by(ExecutionRequest.updated_at)
-            .limit(20)
-            .with_for_update(skip_locked=True, of=ExecutionRequest)
-        )
-    ).all()
-    for request, item, move in moves:
-        if move.verification_head_sha is None:
-            continue
-        return PublicationSettlement(
-            work_item_id=item.id,
-            request_id=request.id,
-            work_item_version=item.version,
-            request_version=request.version,
-            cause="completed",
-            subject=BaseTransitionCISubject(
-                id=move.id,
-                version=move.version,
-                head_sha=move.verification_head_sha,
-                base_ref=move.target_base_ref,
-                changed_paths=tuple(move.changed_paths),
-                published_at=move.ci_pushed_at or move.applied_at,
-            ),
+            publication_id=publication.id,
         )
     return None

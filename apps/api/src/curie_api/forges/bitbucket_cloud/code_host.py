@@ -35,7 +35,6 @@ from curie_api.forges.capabilities import CODE_HOST_OPERATIONS, Operation, Suppo
 from curie_api.forges.credential_providers import StaticTokenProvider, TokenSnapshot
 from curie_api.forges.errors import Ambiguous, ForgeError, NotFound, Unavailable, Unsupported
 from curie_api.forges.paths import valid_repository_path
-from curie_api.forges.retarget import retarget_checked
 from curie_api.forges.types import (
     Actor,
     CheckSource,
@@ -535,45 +534,6 @@ class BitbucketCloudCodeHost:
             "PUT", self.pull_url(pull_request), what="pull_request", json=change
         )
         return await self._pull(pull_request.repository, payload, conflicted=None)
-
-    async def retarget_pull_request(
-        self,
-        pull_request: PullRequestRef,
-        *,
-        base_ref: str,
-        expected_head_sha: str,
-    ) -> PullRequest:
-        repository = pull_request.repository
-        url = self.pull_url(pull_request)
-
-        async def parse(payload: Mapping[str, Any]) -> PullRequest:
-            if any(
-                _dict(_dict(payload.get(side)).get("repository")).get("uuid")
-                != repository.project_id
-                for side in ("source", "destination")
-            ):
-                raise Unavailable("pull_request_mismatch")
-            return await self._pull(repository, payload, conflicted=None)
-
-        async def read() -> PullRequest:
-            return await parse(await self.read_pull(pull_request))
-
-        async def update() -> PullRequest:
-            payload = await self._http.json(
-                "PUT",
-                url,
-                what="pull_request",
-                json={"destination": {"branch": {"name": base_ref}}},
-            )
-            return await parse(payload)
-
-        return await retarget_checked(
-            pull_request,
-            base_ref=base_ref,
-            expected_head_sha=expected_head_sha,
-            read=read,
-            update=update,
-        )
 
     async def read_pull_request(self, pull_request: PullRequestRef) -> PullRequest:
         """The pull request with its Git mergeability, proven only when the

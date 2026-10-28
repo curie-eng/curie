@@ -74,7 +74,6 @@ RECONCILER_STEPS = (
     "_reconcile_missed_labels",
     "_poll_trackers",
     "_redispatch_lapsed_acquisitions",
-    "_reconcile_base_transitions",
     "_publish_execute_wakes",
 )
 

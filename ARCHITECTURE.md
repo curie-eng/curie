@@ -998,17 +998,28 @@ Not shown above:
 patterns; `defaultBase` is a literal branch name. Even `*` requires an existing
 remote branch, and a missing or disallowed base is never substituted. The
 selection label settling interval is `factory.baseLabelSettleSeconds`
-(`FACTORY_BASE_LABEL_SETTLE_S`), default 60 seconds; zero is valid. Before a PR,
-a changed effective base cancels the old execution and starts fresh only after
-it stops. After a PR, the durable operation in
+(`FACTORY_BASE_LABEL_SETTLE_S`), default 60 seconds; zero is valid. The first
+implementation in
 [`apps/api/src/curie_api/factory_base_reconcile.py`](apps/api/src/curie_api/factory_base_reconcile.py)
-validates a clean rebase, pushes with an expected-head fence, and confirms the
-new head before retargeting. It then pushes a distinct empty commit with the
-same tree so required CI runs on the final head under the new target. That
-commit remains in history as an ancestor of later fixes. A conflict leaves the
-remote branch and target unchanged and stays visible until the selection label
-is reapplied. Explicit restoration keeps ADR 0251's exact checkpoint base and
-target pins.
+cancels the old execution on an effective base change and starts fresh only
+after it stops, provided no publication authority exists. With a lineage,
+restart requires it to be open with no stored head or PR identity, active
+publication, pending outcome, or reserved review, and an absent remote factory
+branch. An unreadable remote branch is not absence.
+
+Once that boundary is crossed, the selected base freezes. Status records the
+requested target and a visible refusal, while existing publication and CI can
+finish against their original head and base. A new or readmitted request for
+another base defers acquisition within its existing waiting deadline; it does
+not use the old base as a substitute. Correcting labels back to the selected
+base clears the refusal and permits acquisition on its recorded exact commit.
+Selecting the same branch from a different source updates provenance without
+restarting, and branch-tip movement alone does not change the pin.
+
+ADR 0253's durable rebase, PR retargeting, recovery after partial remote writes,
+and final-head CI ownership follow in the second stacked change. They are not
+implemented in this first change. Explicit restoration keeps ADR 0251's exact
+checkpoint base and target pins.
 
 **Settlement.** An approval holds the request until its deadline. An unpublished
 turn fails as `early_stop` for no work, `no_pull_request` for a first run without
@@ -1033,7 +1044,8 @@ Status words follow [Clause status](#clause-status), plus two used only here:
 `DIVERGED` means the code differs and no ADR records the change. A Draft ADR
 row describes existing code; it does not accept the ADR. The original evidence
 snapshot is `next` commit `bac88c6ea`, read on 2026-10-02. Base-selection rows
-were refreshed against the ADR 0253 implementation on 2026-10-28.
+describe the first implementation of ADR 0253, with durable published-PR moves
+reserved for the second stacked change.
 
 | ADR | Clause | Status | Evidence and limit |
 | --- | --- | --- | --- |
@@ -1064,9 +1076,10 @@ were refreshed against the ADR 0253 implementation on 2026-10-28.
 | 0174 | An empty snapshot is refused without pending approval | ENFORCED | Runner refusals `body_required`, `stale_context`, `rate_limited`, `no_change`. |
 | 0186 | Base is one `base:` label or the default, from an allowlist | AMENDED | ADR 0253 permits case-sensitive glob patterns and resolves current labels at sandbox acquisition. |
 | 0186 | A bad base is refused with a comment, never substituted | ENFORCED | `factory_base.resolve_base` and `factory_base.comment_refusal`. |
-| 0186 | The base is frozen on the WorkItem | AMENDED | ADR 0253 follows ordinary base relabels; ADR 0251 restoration retains exact checkpoint pins. |
+| 0186 | The base is frozen on the WorkItem | AMENDED | ADR 0253 permits safe restart before publication authority exists. This first implementation freezes later changes; ADR 0251 restoration retains exact checkpoint pins. |
 | 0253 | Current labels select an existing allowed remote branch after settling | ENFORCED | `factory_base_reconcile.resolve_for_acquire` and `workitem_dispatch.acquire`. |
-| 0253 | Relabels restart unpublished work or durably rebase and retarget its PR | ENFORCED | `factory_base_reconcile.observe_base_labels` and `factory_base_reconcile.reconcile_base_transitions`; final CI runs on a distinct commit pushed after retargeting. |
+| 0253 | Relabels restart work without publication authority | ENFORCED | `factory_base_reconcile.observe_base_labels` cancels the old request and waits for termination before replacement. Stored or remote publication state, active publication, pending outcome, and reserved review freeze the selected base with a visible refusal. |
+| 0253 | Published-base changes durably rebase and retarget the same PR | RESERVED | The second stacked change owns the durable move and CI on the final head under the new target. This first implementation refuses the move. |
 | 0187 | Polling is the default, one replica, conditional reads | ENFORCED | `poll_once` holds `pg_try_advisory_lock` and stores ETags and cursors. |
 | 0187 | Polling mode needs no webhook secret | ENFORCED | The factory settings validator requires a secret only in webhook mode. |
 | 0187 | The sandbox holds no GitHub credential | ENFORCED | The `wir` capability is scoped to one request and its issue. |

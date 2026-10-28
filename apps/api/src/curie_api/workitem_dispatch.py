@@ -48,7 +48,6 @@ from .models import (
     Agent,
     AgentChannel,
     ExecutionRequest,
-    FactoryBaseTransition,
     Publication,
     WorkItem,
 )
@@ -580,20 +579,6 @@ async def claim_due(
                 WorkItem.id == ExecutionRequest.work_item_id,
                 WorkItem.readmit_request_id.is_not(None),
             ),
-            ~exists().where(
-                FactoryBaseTransition.work_item_id == ExecutionRequest.work_item_id,
-                or_(
-                    FactoryBaseTransition.phase.not_in(("applied", "conflict", "refused")),
-                    and_(
-                        FactoryBaseTransition.phase == "applied",
-                        FactoryBaseTransition.outcome_ready_at.is_(None),
-                    ),
-                    and_(
-                        FactoryBaseTransition.phase.in_(("conflict", "refused")),
-                        FactoryBaseTransition.request_id == ExecutionRequest.id,
-                    ),
-                ),
-            ),
             ExecutionRequest.published_generation.is_distinct_from(
                 ExecutionRequest.dispatch_generation
             ),
@@ -950,63 +935,25 @@ async def acquire(
         if pin_item_id != work_item.id or pin_request_id != request.id:
             await session.rollback()
             return await _refuse(session, "not_dispatchable", request_id=request_id)
-        if work_item.publication_lineage_id is not None:
-            transition = await session.scalar(
-                select(FactoryBaseTransition)
-                .join(
-                    ThreadPublicationLineage,
-                    ThreadPublicationLineage.id == FactoryBaseTransition.lineage_id,
-                )
-                .where(
-                    FactoryBaseTransition.work_item_id == work_item.id,
-                    FactoryBaseTransition.lineage_id == work_item.publication_lineage_id,
-                    FactoryBaseTransition.phase == "applied",
-                    FactoryBaseTransition.outcome_ready_at.is_not(None),
-                    FactoryBaseTransition.ci_settled_at.is_(None),
-                    FactoryBaseTransition.target_base_ref == selected_base.branch,
-                    FactoryBaseTransition.target_base_sha == base_commit,
-                    (
-                        ThreadPublicationLineage.head_sha
-                        == FactoryBaseTransition.verification_head_sha
-                    ),
-                    ThreadPublicationLineage.base_ref == FactoryBaseTransition.target_base_ref,
-                    ThreadPublicationLineage.base_sha == FactoryBaseTransition.target_base_sha,
-                )
-                .order_by(FactoryBaseTransition.applied_at.desc())
-                .limit(1)
-                .with_for_update()
-            )
-            if transition is not None:
-                prior = await session.get(ExecutionRequest, transition.ci_request_id)
-                if (
-                    transition.ci_request_id != work_item.base_resolved_request_id
-                    or prior is None
-                    or prior.work_item_id != work_item.id
-                    or (
-                        prior.id != request.id
-                        and (
-                            prior.sequence >= request.sequence
-                            or prior.status not in ("completed", "failed", "expired", "cancelled")
-                        )
-                    )
-                ):
-                    return await _defer_factory_refusal(
-                        session,
-                        work_item,
-                        request,
-                        owner=owner,
-                        generation=generation,
-                        refusal="not_dispatchable",
-                    )
-                if prior.id != request.id:
-                    transition.ci_request_id = request.id
-                    transition.ci_ready_at = None
-                    transition.version += 1
         if empty_lineage_id is not None:
-            lineage = await session.get(ThreadPublicationLineage, empty_lineage_id)
-            if lineage is not None:
-                lineage.base_ref, lineage.base_sha = selected_base.branch, selected_base.commit
-                lineage.version += 1
+            from .factory_base_reconcile import _lineage_busy, _lineage_empty
+
+            lineage = await session.scalar(
+                select(ThreadPublicationLineage)
+                .where(ThreadPublicationLineage.id == empty_lineage_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+            if (
+                work_item.publication_lineage_id != empty_lineage_id
+                or lineage is None
+                or not _lineage_empty(lineage)
+                or await _lineage_busy(session, empty_lineage_id)
+            ):
+                await session.rollback()
+                return await _refuse(session, "not_dispatchable", request_id=request_id)
+            lineage.base_ref, lineage.base_sha = selected_base.branch, selected_base.commit
+            lineage.version += 1
         request.base_settle_until = settle_until
         work_item.base_branch, work_item.base_source, work_item.base_commit = (
             selected_base.branch,
@@ -1014,6 +961,7 @@ async def acquire(
             base_commit,
         )
         work_item.base_resolved_request_id = request.id
+        work_item.base_label_ignored = None
         work_item.base_selection_fingerprint = None
         work_item.base_requested_branch, work_item.base_requested_source = None, None
         work_item.version += 1
@@ -1512,7 +1460,6 @@ async def declare_owner_lost(
         or request.runtime_epoch != runtime_epoch
         or held
         or awaiting_publication is not None
-        or await session.scalar(select(lifecycle.ready_base_transition_exists(request.id)))
     ):
         return await _refuse(
             session,

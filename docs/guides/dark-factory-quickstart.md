@@ -406,7 +406,9 @@ reads as a single forge configuration document:
 3. `factory.bindings` join a tracker to repositories. Each entry under
    `repos` has an `alias`, a `codeHost`, a `projectId`, a `path`, optional
    `bases` and `defaultBase`, and an optional `ci` policy (`required` with
-   `key`, `paths` and `pendingKeyPrefix`, and `metadataRerunKeys`).
+   `key`, `paths` and `pendingKeyPrefix`, and `metadataRerunKeys`). `bases`
+   accepts case-sensitive glob patterns such as `release/*`; `defaultBase`
+   remains a literal allowed branch. Every selected branch must exist remotely.
 4. `factory.codeHosts[].egress` and `factory.trackers[].egress` list the CIDRs
    and ports the entry needs. A GitHub entry with none gets the chart's built-in
    GitHub set. `factory.sandboxEgress.<agent>: true` enrolls an agent in that
@@ -416,6 +418,15 @@ reads as a single forge configuration document:
    `api.*` settings. `factory.baseLabelSettleSeconds` controls the wait after
    the selection label is applied before the factory reads the current base
    labels at sandbox acquisition. It defaults to 60 seconds; zero is valid.
+
+Base changes automatically restart work only before publication authority
+exists. A reserved review or publication, an outcome awaiting delivery, a pushed
+factory branch, or a recorded head or PR freezes the selected base. The status
+shows the requested target and refusal; correcting labels to the selected base
+allows ordinary work to continue. A request for a different base cannot acquire
+a sandbox or silently use the old base. Durable moves of an existing PR follow
+in the second stacked change; see the
+[base selection rules](../operations.md#admitting-a-labelled-github-issue).
 
 The old `api.githubFactory*` keys are removed. To upgrade a v0.12.5
 installation configured with `curie cluster factory`, use a CLI containing

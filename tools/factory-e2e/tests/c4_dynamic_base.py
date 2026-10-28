@@ -11,26 +11,16 @@ import io
 import json
 import os
 import re
-import socket
 import sqlite3
 import time
 import uuid
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
 
 import scripted_kind as sk
-from aci_protocol import RUNS_STREAM_DEFAULT, STREAM_PAYLOAD_FIELD
 from c4_admitted_http import tracker_stub_type
 from c4_admitted_kind import REPOSITORY, AdmittedKind, Ticket
-from channel_protocol.work_item_events import ci_event_id, ci_round_key
-from curie_internal.keyspace import (
-    WORK_ITEM_CI_RERUN_PREFIX,
-    WORKER_KEY_PREFIX_DEFAULT,
-    completion_key,
-    done_key,
-)
 
 CHANGE = "dynamic_change.py"
 SETTLE_SECONDS = 15
@@ -43,7 +33,6 @@ def dynamic_stub_type(module: Any, *, redact: Any) -> type:
             super().start()
             with sqlite3.connect(self._database) as db:
                 db.executescript(
-                    "CREATE TABLE dynamic_controls (name TEXT PRIMARY KEY, value TEXT);"
                     "CREATE TABLE dynamic_events (id INTEGER PRIMARY KEY, kind TEXT, "
                     "head TEXT, target TEXT, detail TEXT);"
                     "CREATE TABLE dynamic_checks (head TEXT, name TEXT, state TEXT, "
@@ -74,25 +63,6 @@ def dynamic_stub_type(module: Any, *, redact: Any) -> type:
                 },
             )
             self.commit_branch("next", {"dynamic-target.txt": "next\n"}, parent="main")
-            self.commit_branch(
-                "release/blocked",
-                {
-                    CHANGE: 'VALUE = "target"\n',
-                    "dynamic-target.txt": "blocked\n",
-                },
-                parent="main",
-            )
-
-        def control(self, name: str, value: str | None = None) -> str:
-            with sqlite3.connect(self._database) as db:
-                if value is not None:
-                    db.execute(
-                        "INSERT OR REPLACE INTO dynamic_controls VALUES (?,?)", (name, value)
-                    )
-                row = db.execute(
-                    "SELECT value FROM dynamic_controls WHERE name=?", (name,)
-                ).fetchone()
-            return row[0] if row else ""
 
         def event(self, kind: str, head: str, target: str, detail: str = "") -> None:
             with sqlite3.connect(self._database) as db:
@@ -127,11 +97,6 @@ def dynamic_stub_type(module: Any, *, redact: Any) -> type:
             handler.send_response(status)
             handler.send_header("Content-Type", "application/json")
             handler.send_header("Content-Length", str(len(payload)))
-            path = urlsplit(handler.path).path.removeprefix("/api/v3")
-            if status == 503 and re.fullmatch(
-                r"/(?:repos/acme-corp/acme-bot|repositories/\d+)/actions/jobs/\d+", path
-            ):
-                handler.send_header("Retry-After", "30")
             handler.end_headers()
             handler.wfile.write(payload)
 
@@ -199,16 +164,6 @@ def dynamic_stub_type(module: Any, *, redact: Any) -> type:
                     ),
                 )
 
-        def checks(self, head: str) -> list[dict[str, Any]]:
-            with sqlite3.connect(self._database) as db:
-                db.row_factory = sqlite3.Row
-                return [
-                    dict(row)
-                    for row in db.execute(
-                        "SELECT * FROM dynamic_checks WHERE head=? ORDER BY name", (head,)
-                    )
-                ]
-
         def _git_request(self, handler: Any, path: str, query: str, body: bytes) -> None:
             if not path.endswith("/git-receive-pack"):
                 super()._git_request(handler, path, query, body)
@@ -246,12 +201,6 @@ def dynamic_stub_type(module: Any, *, redact: Any) -> type:
                     target = pull["base"]["ref"] if pull else "main"
                     self.event("push", sha, target, branch)
                     self.check(sha, "queued", target=target)
-                if changed and self.control("lose_push") == "once":
-                    self.control("lose_push", "")
-                    self.event("lost_push_response", changed[0][1], "")
-                    handler.close_connection = True
-                    handler.connection.shutdown(socket.SHUT_RDWR)
-                    return
                 handler.send_response(captured.status)
                 for name, value in captured.response_headers:
                     handler.send_header(name, value)
@@ -263,36 +212,13 @@ def dynamic_stub_type(module: Any, *, redact: Any) -> type:
             if path == prefix or path.startswith(prefix + "/"):
                 path = f"/repos/{REPOSITORY}" + path[len(prefix) :]
             pull_match = re.fullmatch(r"/repos/acme-corp/acme-bot/pulls/(\d+)", path)
-            if method == "PATCH" and pull_match and "base" in body:
-                # GitHub's update-pull endpoint accepts the literal base branch
-                # and returns the unchanged PR identity with refreshed base/head.
-                # https://docs.github.com/en/rest/pulls/pulls#update-a-pull-request
-                with self.provider_lock:
-                    pull = self._get("pull", int(pull_match.group(1)))
-                    if pull is None:
-                        return 404, {"message": "Not Found"}
-                    head = self._ref(pull["head"]["ref"])
-                    target = body["base"]
-                    if self._find_ref(target) is None:
-                        return 422, {"message": "Invalid base"}
-                    self.event("retarget_attempt", head, target)
-                    if self.control("retarget") == "unavailable":
-                        return 503, {"message": "Example provider outage"}
-                    pull["base"] = {**pull["base"], "ref": target}
-                    self._put("pull", pull["number"], pull)
-                    self.event("retarget", head, target)
-                    if self.control("retarget") == "lost_once":
-                        self.control("retarget", "")
-                        return 503, {"message": "Example ambiguous provider response"}
-                    return 200, self._fresh_pull(pull)
+            if method == "PATCH" and pull_match:
+                self.event("pull_edit", "", str(body.get("base", "")))
             if method == "GET" and re.fullmatch(
                 rf"/repos/{REPOSITORY}/actions/jobs/\d+", path
             ):
-                # Actions job reads require Actions permission; this fixture App
-                # has none. An outage remains a transient provider failure.
+                # Actions job reads require permission absent from this fixture App.
                 # https://docs.github.com/en/rest/actions/workflow-jobs#get-a-job-for-a-workflow-run
-                if self.control("actions_lookup") == "unavailable":
-                    return 503, {"message": "Example provider outage"}
                 return 403, {"message": "Resource not accessible by integration"}
             check_match = re.fullmatch(
                 r"/repos/acme-corp/acme-bot/commits/([^/]+)/check-runs", path
@@ -361,8 +287,6 @@ def dynamic_model_type(module: Any) -> type:
                     "CREATE TABLE control (mode TEXT); INSERT INTO control VALUES ('publish');"
                     "CREATE TABLE observations "
                     "(tool TEXT PRIMARY KEY, head TEXT, target TEXT, value TEXT);"
-                    "CREATE TABLE calls (id INTEGER PRIMARY KEY, mode TEXT, failed INTEGER, "
-                    "observed_heads TEXT, tools TEXT, reply TEXT);"
                 )
             self.database.chmod(0o600)
 
@@ -376,12 +300,6 @@ def dynamic_model_type(module: Any) -> type:
             with sqlite3.connect(self.database) as db:
                 db.row_factory = sqlite3.Row
                 return [dict(row) for row in db.execute("SELECT * FROM observations")]
-
-        def call_evidence(self) -> list[dict[str, Any]]:
-            with sqlite3.connect(self.database) as db:
-                db.row_factory = sqlite3.Row
-                rows = db.execute("SELECT * FROM calls ORDER BY id DESC LIMIT 32")
-                return list(reversed([dict(row) for row in rows]))
 
         def _match(self, method: str, path: str, body: bytes) -> dict[str, Any] | None:
             if method != "POST" or path != "/v1/messages":
@@ -493,25 +411,14 @@ def dynamic_model_type(module: Any) -> type:
                         },
                     }
                 ]
-            elif mode == "nochange":
-                content = [
-                    {
-                        "type": "text",
-                        "text": (
-                            "No changes needed: verified the current repository "
-                            "on its selected base."
-                        ),
-                    }
-                ]
             elif not any(tool["id"].startswith("toolu_dynamic_edit_") for tool in tools):
-                value = "factory-fixed" if mode == "fix" else "factory"
                 content = [
                     {
                         "type": "tool_use",
                         "id": "toolu_dynamic_edit_" + uuid.uuid4().hex,
                         "name": "Bash",
                         "input": {
-                            "command": f"printf 'VALUE = \"{value}\"\\n' > {CHANGE} && "
+                            "command": f"printf 'VALUE = \"factory\"\\n' > {CHANGE} && "
                             "python3 -m unittest discover -s unitconv/tests",
                         },
                     }
@@ -530,18 +437,6 @@ def dynamic_model_type(module: Any) -> type:
                 ]
             else:
                 content = [{"type": "text", "text": "Published the verified example change."}]
-            with sqlite3.connect(self.database) as db:
-                db.execute(
-                    "INSERT INTO calls (mode, failed, observed_heads, tools, reply) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (
-                        mode,
-                        int(failed),
-                        json.dumps([observation["head"] for observation in seen][-8:]),
-                        json.dumps([tool["name"] for tool in tools][-16:]),
-                        json.dumps(content),
-                    ),
-                )
             return {
                 "message": {
                     "id": "msg_dynamic_" + uuid.uuid4().hex,
@@ -604,7 +499,6 @@ class DynamicKind(AdmittedKind):
         capture("current_request", lambda: self.request(ticket))
         capture("work_item", lambda: self.item(ticket))
         capture("requests", lambda: self.requests(ticket))
-        capture("transitions", lambda: self.transitions(ticket))
 
         def provider_calls() -> Any:
             with self.stub.provider_lock:
@@ -649,219 +543,6 @@ class DynamicKind(AdmittedKind):
                     time.time(),
                 ),
             )
-
-    def record_nochange_failure(
-        self, ticket: Ticket, transition: dict[str, Any], *, stage: str
-    ) -> None:
-        evidence: dict[str, Any] = {
-            "stage": stage,
-            "expected_transition_id": str(uuid.UUID(transition["id"])),
-            "expected_request_id": str(uuid.UUID(transition["request_id"])),
-        }
-        deadline = time.monotonic() + 30
-
-        def bounded(value: Any) -> Any:
-            if isinstance(value, str):
-                return value[-16384:]
-            if isinstance(value, list):
-                return [bounded(item) for item in value[-32:]]
-            if isinstance(value, dict):
-                return {key: bounded(item) for key, item in value.items()}
-            return value
-
-        def capture(name: str, read: Callable[[], Any]) -> None:
-            if time.monotonic() >= deadline:
-                evidence[name] = {"error": "diagnostic_budget_exhausted"}
-                return
-            previous_deadline = self.deadline
-            self.deadline = min(deadline, time.monotonic() + 5)
-            try:
-                evidence[name] = bounded(read())
-            except Exception as exc:  # noqa: BLE001 - preserve the original timeout assertion
-                evidence[name] = {"error": type(exc).__name__, "detail": str(exc)[:1000]}
-            finally:
-                self.deadline = previous_deadline
-
-        def diagnostic_kubectl(*args: str) -> str:
-            return sk.ScriptedRun.command(
-                self, "kubectl", "--context", self.context, *args, timeout=5
-            )
-
-        def provider_calls() -> list[dict[str, Any]]:
-            calls = self.stub.provider_evidence()
-            actions = [call for call in calls if "/actions/" in call["path"]][-16:]
-            failures = [call for call in calls if call["http_status"] >= 400][-8:]
-            selected = {call["id"]: call for call in [*actions, *failures, *calls[-8:]]}
-            return [selected[key] for key in sorted(selected)]
-
-        request_id = uuid.UUID(evidence["expected_request_id"])
-        fix_event = ci_event_id(request_id, 2)
-        round_key = ci_round_key(request_id, 2)
-
-        def ci_records() -> dict[str, Any]:
-            keys = [
-                round_key,
-                f"{round_key}:enqueued",
-                f"{round_key}:failing",
-                done_key(WORKER_KEY_PREFIX_DEFAULT, fix_event),
-            ]
-            if transition.get("verification_head_sha"):
-                rerun_key = (
-                    f"{WORK_ITEM_CI_RERUN_PREFIX}:{request_id}:"
-                    f"{transition['verification_head_sha']}"
-                )
-                keys.extend((rerun_key, f"{rerun_key}:lock"))
-            return dict(zip(keys, self.valkey("MGET", *keys), strict=True))
-
-        def ci_stream() -> list[dict[str, Any]]:
-            selected = []
-            for stream_id, fields in self.valkey(
-                "XREVRANGE", RUNS_STREAM_DEFAULT, "+", "-", "COUNT", "128"
-            ):
-                payload = json.loads(
-                    dict(zip(fields[::2], fields[1::2], strict=True))[STREAM_PAYLOAD_FIELD]
-                )
-                if payload.get("event_id") == fix_event:
-                    selected.append({
-                        "stream_id": stream_id,
-                        "event_id": fix_event,
-                        "source": payload.get("source"),
-                        "received_at": payload.get("received_at"),
-                        "has_reply_handle": payload.get("reply_handle") is not None,
-                        "text": str(payload.get("text", ""))[:4096],
-                    })
-            return selected
-
-        capture("provider_calls", provider_calls)
-        capture("ci_records", ci_records)
-        capture(
-            "ci_completion",
-            lambda: dict(zip(
-                ("done", "gen", "cause"),
-                self.valkey(
-                    "HMGET", completion_key(WORKER_KEY_PREFIX_DEFAULT, fix_event),
-                    "done", "gen", "cause",
-                ),
-                strict=True,
-            )),
-        )
-        capture("ci_stream", ci_stream)
-        capture("requests", lambda: self.requests(ticket))
-        capture("work_item", lambda: self.item(ticket))
-        capture("transitions", lambda: self.transitions(ticket))
-        capture("model_observations", lambda: self.model.observations())
-        capture("model_calls", lambda: self.model.call_evidence())
-        capture(
-            "current_publications",
-            lambda: self.sql(
-                "SELECT coalesce(json_agg(row_to_json(observation)), '[]'::json) FROM ("
-                "SELECT p.id, p.status, p.revision_number, p.base_sha, p.expected_prior_head, "
-                "l.head_sha AS lineage_head_sha, left(p.error, 2048) AS failure_detail "
-                "FROM curie.publications p "
-                "LEFT JOIN curie.thread_publication_lineages l ON l.id=p.lineage_id "
-                f"WHERE p.execution_request_id='{evidence['expected_request_id']}'::uuid "
-                "ORDER BY p.created_at DESC, p.id DESC LIMIT 16) observation"
-            ),
-        )
-        capture(
-            "phase_reports",
-            lambda: self.sql(
-                "SELECT coalesce(json_agg(row_to_json(observation)), '[]'::json) FROM ("
-                "SELECT p.execution_request_id, p.phase, p.loop_round, p.reported_at, p.note "
-                "FROM curie.execution_request_phase_reports p "
-                "JOIN curie.execution_requests r ON r.id=p.execution_request_id "
-                "JOIN curie.work_items w ON w.id=r.work_item_id "
-                f"WHERE w.tracker_kind='github' AND w.tracker_issue_id='{int(ticket.number)}' "
-                "ORDER BY r.sequence DESC, p.id DESC LIMIT 32) observation"
-            ),
-        )
-        capture("provider_events", lambda: self.stub.events()[-32:])
-        for component in ("api", "worker"):
-            capture(
-                component + "_logs",
-                lambda component=component: diagnostic_kubectl(
-                    "-n",
-                    self.namespace,
-                    "logs",
-                    f"deployment/curie-{component}",
-                    "--all-containers",
-                    "--tail=200",
-                    "--limit-bytes=16384",
-                ),
-            )
-        requests = evidence.get("requests")
-        sandboxes = list(
-            dict.fromkeys(
-                row["runtime_sandbox_name"]
-                for row in reversed(requests if isinstance(requests, list) else [])
-                if row.get("runtime_sandbox_name")
-            )
-        )[:2]
-        capture(
-            "sandbox_pods",
-            lambda: [
-                {
-                    "name": pod["metadata"]["name"],
-                    "phase": pod.get("status", {}).get("phase"),
-                }
-                for pod in json.loads(
-                    diagnostic_kubectl("-n", self.namespace, "get", "pods", "-o", "json")
-                )["items"]
-                if any(container["name"] == "runner" for container in pod["spec"]["containers"])
-            ],
-        )
-        pods = evidence.get("sandbox_pods")
-        current_names = (
-            {pod["name"] for pod in pods if isinstance(pod, dict)}
-            if isinstance(pods, list)
-            else set()
-        )
-        evidence["absent_recorded_sandboxes"] = [
-            sandbox for sandbox in sandboxes if sandbox not in current_names
-        ]
-        sandboxes = [sandbox for sandbox in sandboxes if sandbox in current_names]
-        sandboxes.extend(sorted(current_names - set(sandboxes)))
-        for index, sandbox in enumerate(sandboxes[:2]):
-            capture(
-                f"sandbox_{index}_logs",
-                lambda sandbox=sandbox: diagnostic_kubectl(
-                    "-n",
-                    self.namespace,
-                    "logs",
-                    sandbox,
-                    "--all-containers",
-                    "--tail=200",
-                    "--limit-bytes=16384",
-                ),
-            )
-        try:
-            descriptor = os.open(self.diagnostic_path, os.O_WRONLY | os.O_CREAT, 0o600)
-            os.close(descriptor)
-            self.diagnostic_path.chmod(0o600)
-            with sqlite3.connect(self.diagnostic_path, timeout=1) as db:
-                db.execute(
-                    "CREATE TABLE IF NOT EXISTS nochange_failures ("
-                    "id INTEGER PRIMARY KEY, issue_id INTEGER NOT NULL, "
-                    "evidence TEXT NOT NULL, recorded_at REAL NOT NULL)"
-                )
-                db.execute(
-                    "INSERT INTO nochange_failures (issue_id, evidence, recorded_at) "
-                    "VALUES (?, ?, ?)",
-                    (
-                        ticket.number,
-                        self.redact_model_evidence(json.dumps(evidence)),
-                        time.time(),
-                    ),
-                )
-        except (OSError, sqlite3.Error):
-            print("dynamic-base private timeout diagnostics could not be saved", flush=True)
-
-    def transitions(self, ticket: Ticket) -> list[dict[str, Any]]:
-        return self.sql(
-            "SELECT coalesce(json_agg(row_to_json(t) ORDER BY t.committer_time), '[]'::json) "
-            "FROM curie.factory_base_transitions t JOIN curie.work_items w ON w.id=t.work_item_id "
-            f"WHERE w.tracker_kind='github' AND w.tracker_issue_id='{int(ticket.number)}'"
-        )
 
     def label(self, ticket: Ticket, label: str, *, present: bool = True) -> dict[str, Any]:
         with self.stub.provider_lock:
@@ -912,13 +593,3 @@ def wait(predicate: Any, *, seconds: int = 240) -> Any:
             return result
         time.sleep(1)
     return None
-
-
-def assert_ci_still_owns_request(request: dict[str, Any], transition: dict[str, Any]) -> None:
-    assert request["id"] == transition["request_id"], (
-        "CI observation named another execution request"
-    )
-    assert request["status"] == "running", (
-        "old-target or pending CI completed the no-change successor"
-    )
-    assert transition["ci_settled_at"] is None, "an unsettled final head received a CI settlement"

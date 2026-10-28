@@ -1193,6 +1193,7 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
     runtime_exclusions = {("--ignore", module) for module in KIND_MODULES} | {
         ("--deselect", ADMITTED_AGENT_SELECTOR.split("::", 1)[0]),
         ("--ignore", "tools/factory-e2e/tests/test_c4_tracker_scope.py"),
+        ("--ignore", "tools/factory-e2e/tests/test_c4_dynamic_base.py"),
         ("--ignore", "examples/tests/test_sre_bot_observability_runtime.py"),
         ("--ignore", "tools/factory-e2e/tests/test_c4_dry_run.py"),
         ("--ignore", "tools/ci-retry-gate"),

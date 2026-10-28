@@ -63,7 +63,7 @@ CONTRACT = "0041"
 # @spec AGENT-ROLE-PERSISTENCE-V1-9: policy ORM reads require the 0133 column.
 # @spec HTTP-APPROVAL-CONTINUITY-5: approval ORM reads require the 0137 column.
 # @spec HTTP-INVOCATION-EXECUTION-21: Grid reports write the 0139 namespace kind.
-# Factory base transition ORM reads require the 0141 columns.
+# Factory base selection ORM reads require the 0141 pin and settle columns.
 APP_SCHEMA_MIN = "0141"
 REVIEW_SCHEMA_MIN = "0063"
 PREV = "0040"
@@ -209,10 +209,16 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
         ("execution_requests", "owner_lost_retry"),
         ("execution_requests", "start_deferrals"),
         ("factory_terminal_notices", "sync_owner"),
-        ("factory_base_transitions", "ci_request_id"),
+        ("work_items", "base_resolved_request_id"),
+        ("work_items", "readmit_base_settle_until"),
+        ("work_items", "base_selection_fingerprint"),
+        ("work_items", "base_requested_branch"),
+        ("work_items", "base_requested_source"),
+        ("execution_requests", "base_settle_until"),
         ("remediation_nominations", "execution_code"),
         ("remediation_nominations", "approval_reason"),
     } <= columns
+    assert "factory_base_transitions" not in {table for table, _column in columns}
 
 
 def test_planner_refuses_0041_contract_without_forward_only() -> None:

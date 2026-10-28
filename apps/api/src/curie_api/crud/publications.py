@@ -6,7 +6,7 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 
 from aci_protocol.turn import DEFAULT_IDENTITY, SLACK_KIND, route_identity
-from sqlalchemy import and_, func, or_, select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -22,7 +22,6 @@ from ..models import (
     CredentialRedemptionAuditEntry,
     Deployment,
     ExecutionRequest,
-    FactoryBaseTransition,
     Publication,
     PublicationReviewReservation,
     ThreadPublicationLineage,
@@ -528,37 +527,6 @@ async def create_publication(
             revision_number = lineage.latest_revision + 1
         lineage.latest_revision = revision_number
         lineage.updated_at = func.now()
-
-    moving_base = await session.scalar(
-        select(FactoryBaseTransition.id)
-        .where(
-            FactoryBaseTransition.lineage_id == lineage.id,
-            or_(
-                FactoryBaseTransition.phase.in_(
-                    ("pending", "prepared", "pushed", "retargeted", "ci_prepared", "ci_pushed")
-                ),
-                and_(
-                    FactoryBaseTransition.phase == "applied",
-                    FactoryBaseTransition.outcome_ready_at.is_(None),
-                ),
-                and_(
-                    FactoryBaseTransition.phase.in_(("conflict", "refused")),
-                    FactoryBaseTransition.request_id.in_(
-                        select(ExecutionRequest.id).where(
-                            ExecutionRequest.status.in_(
-                                ("waiting", "running", "cancellation_requested")
-                            )
-                        )
-                    ),
-                ),
-            ),
-        )
-        .limit(1)
-    )
-    if moving_base is not None:
-        raise PublicationLineageConflict(
-            "publication.base_transition_pending", "a base change owns this lineage"
-        )
 
     if (
         auto

@@ -37,7 +37,6 @@ from curie_api.forges.gitlab.transport import (
     encode_segment,
     parse_time,
 )
-from curie_api.forges.retarget import retarget_checked
 from curie_api.forges.types import (
     Actor,
     CiReport,
@@ -377,38 +376,6 @@ class GitLabCodeHost:
             change["description"] = body
         updated = await self._transport.write("PUT", path, json=change)
         return self._pull(pull_request.repository, updated)
-
-    async def retarget_pull_request(
-        self,
-        pull_request: PullRequestRef,
-        *,
-        base_ref: str,
-        expected_head_sha: str,
-    ) -> PullRequest:
-        repository = pull_request.repository
-        path = self._merge_request(pull_request)
-
-        def parse(payload: Mapping[str, Any]) -> PullRequest:
-            if any(
-                type(payload.get(field)) is not int or str(payload[field]) != repository.project_id
-                for field in ("project_id", "source_project_id", "target_project_id")
-            ):
-                raise Unavailable("pull_request_mismatch")
-            return self._pull(repository, payload)
-
-        async def read() -> PullRequest:
-            return parse(await self._transport.get_object(path))
-
-        async def update() -> PullRequest:
-            return parse(await self._transport.write("PUT", path, json={"target_branch": base_ref}))
-
-        return await retarget_checked(
-            pull_request,
-            base_ref=base_ref,
-            expected_head_sha=expected_head_sha,
-            read=read,
-            update=update,
-        )
 
     async def read_pull_request(self, pull_request: PullRequestRef) -> PullRequest:
         payload = await self._transport.get_object(self._merge_request(pull_request))

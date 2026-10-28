@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import uuid
 from collections.abc import Awaitable, Callable, Iterator
-from dataclasses import replace
 from datetime import datetime, timedelta
 from typing import Any
 from uuid import UUID
@@ -3007,28 +3006,24 @@ async def _hold_running_for_ci_fix(session: AsyncSession, facts: Admission) -> N
     assert linked.request is not None
     settlement = await workitems.claim_publication_settlement(session, exclude=frozenset())
     assert settlement is not None and settlement.request_id == facts.request_id
-    assert isinstance(settlement.subject, workitems.PublicationCISubject)
-    subject = settlement.subject
     before = await _request_row(session, facts.request_id)
-    for stale_subject in (
-        replace(subject, head_sha="c3" * 20),
-        replace(subject, version=subject.version + 1),
-    ):
-        stale = await workitems.hold_for_ci_fix(
-            session,
-            work_item_id=row.work_item_id,
-            request_id=facts.request_id,
-            expected_request_version=linked.request.version,
-            expected_subject=stale_subject,
-        )
-        assert stale is False
-        assert dict(await _request_row(session, facts.request_id)) == dict(before)
+    stale = await workitems.hold_for_ci_fix(
+        session,
+        work_item_id=row.work_item_id,
+        request_id=facts.request_id,
+        expected_request_version=linked.request.version,
+        expected_publication_id=publication_id,
+        expected_head_sha="c3" * 20,
+    )
+    assert stale is False
+    assert dict(await _request_row(session, facts.request_id)) == dict(before)
     held = await workitems.hold_for_ci_fix(
         session,
         work_item_id=row.work_item_id,
         request_id=facts.request_id,
         expected_request_version=linked.request.version,
-        expected_subject=subject,
+        expected_publication_id=publication_id,
+        expected_head_sha=head_sha,
     )
     assert held is True
     current = await _request_row(session, facts.request_id)
@@ -3148,15 +3143,24 @@ async def _held_for_ci_fix(session: AsyncSession, agent_id: uuid.UUID) -> Admiss
     await _grant_opened_pull_request(
         session, await workitems.outcome(session, work_item, request), pr=4627
     )
-    settlement = await workitems.claim_publication_settlement(session, exclude=frozenset())
-    assert settlement is not None and settlement.request_id == facts.request_id
-    assert isinstance(settlement.subject, workitems.PublicationCISubject)
+    publication_id, head_sha = (
+        await session.execute(
+            text(
+                "SELECT p.id, l.head_sha FROM curie.publications p "
+                "JOIN curie.thread_publication_lineages l ON l.id = p.lineage_id "
+                "WHERE p.execution_request_id = :id"
+            ),
+            {"id": facts.request_id},
+        )
+    ).one()
+    linked = await _request_row(session, facts.request_id)
     held = await workitems.hold_for_ci_fix(
         session,
-        work_item_id=settlement.work_item_id,
+        work_item_id=linked.work_item_id,
         request_id=facts.request_id,
-        expected_request_version=settlement.request_version,
-        expected_subject=settlement.subject,
+        expected_request_version=linked.version,
+        expected_publication_id=publication_id,
+        expected_head_sha=head_sha,
     )
     assert held is True
     parked = await _request_row(session, facts.request_id)
