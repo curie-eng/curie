@@ -3184,6 +3184,23 @@ def test_unchanged_approved_tree_allowed(session: Session) -> None:
     assert _saved_state(session)["diff"] == approved
 
 
+def test_untracked_byte_boundary_cannot_reuse_approval(session: Session) -> None:
+    session.review(PLAN, reply(PLAN, "APPROVE"))
+    a = session.cwd / "a"
+    b = session.cwd / "b"
+    a.write_bytes(b"")
+    a.chmod(0o644)
+    b.write_bytes(b"b\x00-X")
+    b.chmod(0o644)
+    session.review(DIFF, reply(DIFF, "APPROVE"))
+    a.write_bytes(b"b\x00-")
+    a.chmod(0o644)
+    b.write_bytes(b"X")
+    b.chmod(0o644)
+    assert session.pre(PUBLISH)["permissionDecision"] == "deny"
+    assert _saved_state(session)["diff"]["verdict"] is None
+
+
 def test_ignored_publication_content_does_not_invalidate(session: Session) -> None:
     session.review(PLAN, reply(PLAN, "APPROVE"))
     session.review(DIFF, reply(DIFF, "APPROVE"))
