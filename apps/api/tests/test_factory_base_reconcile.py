@@ -75,6 +75,7 @@ class TransitionCase:
     before_push: list[tuple[dict[str, Any], str]] = field(default_factory=list)
     during_retarget: list[dict[str, Any]] = field(default_factory=list)
     missing_pr: bool = False
+    pull_head_sha: str | None = None
     pause_read: asyncio.Event | None = None
     read_started: asyncio.Event | None = None
 
@@ -208,7 +209,7 @@ class TransitionCase:
                     "target_project_id": 41,
                     "source_branch": BRANCH,
                     "target_branch": self.target,
-                    "sha": self.graph.head(),
+                    "sha": self.pull_head_sha or self.graph.head(),
                     "state": self.state,
                     "title": "Factory change",
                     "description": "Existing publication",
@@ -290,9 +291,11 @@ def transition_case(
     clean_db: None,
     graph: GitGraph,  # noqa: F811
     monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
 ) -> Iterator[TransitionCase]:
     from curie_api.models import FactoryBaseTransition
 
+    wait_expired = getattr(request, "param", None) == "wait_expired"
     alias = graph.root / "acme-corp"
     alias.mkdir()
     (alias / "acme-bot.git").symlink_to(graph.origin, target_is_directory=True)
@@ -398,7 +401,8 @@ def transition_case(
                 work_item_id=item.id,
                 sequence=1,
                 status="waiting",
-                wait_deadline=datetime.now(UTC) + timedelta(hours=1),
+                wait_deadline=datetime.now(UTC)
+                + (timedelta(seconds=-1) if wait_expired else timedelta(hours=1)),
                 objective="Continue after the selected base changes",
                 requester="gitlab:31:developer",
                 reply_kind="gitlab",
@@ -462,6 +466,16 @@ def _retarget(case: TransitionCase, *, recorded: bool) -> None:
     case.retargets.append({"target_branch": "next"})
     if recorded:
         case.update(phase="retargeted", retargeted_at=datetime.now(UTC))
+
+
+def _reach_phase(case: TransitionCase, phase: str) -> dict[str, Any]:
+    for _ in range(8):
+        operation = case.row()
+        if operation["phase"] == phase:
+            return operation
+        assert operation["phase"] not in {"conflict", "refused"}, operation["error_code"]
+        case.tick()
+    pytest.fail(f"healthy durable base move did not reach {phase}")
 
 
 def test_durable_move_commits_each_candidate_before_its_remote_effect_and_keeps_history(
@@ -765,6 +779,70 @@ def test_retarget_outage_preserves_pushed_progress_until_a_healthy_retry(
     assert case.remote.pushes == 2
 
 
+@pytest.mark.parametrize("phase", ["pushed", "ci_prepared", "ci_pushed"])
+def test_lagging_pull_head_retries_until_the_provider_observes_the_pushed_branch(
+    transition_case: TransitionCase, phase: str
+) -> None:
+    case = transition_case
+    operation = _reach_phase(case, phase)
+    case.pull_head_sha = (
+        operation["old_head_sha"] if phase == "pushed" else operation["rebased_head_sha"]
+    )
+    expected_head = (
+        operation["rebased_head_sha"] if phase == "pushed" else operation["verification_head_sha"]
+    )
+    expected_pushes = 1 if phase == "pushed" else 2
+    before_lineage = case.identities()[1]
+
+    for _ in range(2):
+        case.tick()
+        current = case.row()
+        assert current["phase"] not in {"conflict", "refused", "applied"}, current["error_code"]
+        assert case.graph.head() == expected_head
+        assert case.remote.pushes == expected_pushes
+        assert case.identities()[1] == before_lineage
+
+    case.pull_head_sha = None
+    applied = case.finish()
+
+    assert case.graph.head() == applied["verification_head_sha"]
+    assert case.identities()[1]["head_sha"] == applied["verification_head_sha"]
+    assert case.identities()[1]["base_ref"] == "next"
+    assert case.remote.pushes == 2
+    assert case.retargets == [{"target_branch": "next"}]
+
+
+@pytest.mark.parametrize("phase", ["pushed", "ci_prepared", "ci_pushed"])
+@pytest.mark.parametrize("drift", ["pull", "branch"])
+def test_unrelated_heads_after_push_refuse_without_more_remote_writes(
+    transition_case: TransitionCase, phase: str, drift: str
+) -> None:
+    case = transition_case
+    operation = _reach_phase(case, phase)
+    before_head = case.graph.head()
+    before_pushes = case.remote.pushes
+    before_retargets = list(case.retargets)
+    before_lineage = case.identities()[1]
+    if drift == "pull":
+        case.pull_head_sha = case.graph.first
+        expected_head = before_head
+    else:
+        case.pull_head_sha = before_head
+        expected_head = case.graph.commit("human.txt", "new remote owner\n", "Concurrent edit")
+        git(case.graph.writer, "push", "--force", "origin", BRANCH)
+
+    case.tick()
+    case.tick()
+
+    assert case.row()["phase"] == "refused"
+    assert case.row()["error_code"] == "head_changed"
+    assert case.graph.head() == expected_head
+    assert case.remote.pushes == before_pushes
+    assert case.retargets == before_retargets
+    assert case.identities()[1] == before_lineage
+    assert case.row()["rebased_head_sha"] == operation["rebased_head_sha"]
+
+
 def test_unrelated_remote_head_is_refused_without_rewriting_it(
     transition_case: TransitionCase,
 ) -> None:
@@ -877,6 +955,125 @@ def test_stale_inflight_preparation_cannot_commit_or_push(
     assert case.graph.head() == case.graph.source
     assert not case.retargets
     assert case.remote.pushes == 0
+
+
+def test_relabel_during_a_leased_prepared_push_queues_the_successor_without_invalidating_progress(
+    transition_case: TransitionCase,
+) -> None:
+    from curie_api.factory_base_reconcile import observe_base_labels
+
+    case = transition_case
+    prepared = _reach_phase(case, "prepared")
+    observed: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any]]] = []
+
+    async def observe(session: AsyncSession) -> None:
+        item = await session.get(WorkItem, case.work_item_id)
+        assert item is not None
+        async with httpx.AsyncClient(transport=httpx.MockTransport(case.api)) as client:
+            await observe_base_labels(
+                session,
+                item=item,
+                labels=set(case.labels),
+                default_branch="main",
+                event_identity=None,
+                settings=case.settings,
+                client=client,
+            )
+        await session.commit()
+
+    def relabel_before_receive() -> None:
+        case.record_receive()
+        if len(case.before_push) != 1:
+            return
+        before = case.row()
+        case.labels = ("factory", "base:main")
+        database(observe)
+        observed.append((before, case.row(), case.identities()[0]))
+
+    case.remote.before_receive = relabel_before_receive
+    try:
+        case.tick()
+    finally:
+        case.remote.before_receive = case.record_receive
+
+    assert len(observed) == 1
+    before, after, item = observed[0]
+    assert before["phase"] == "prepared"
+    assert before["owner"] is not None
+    assert before["lease_expires_at"] > datetime.now(UTC)
+    assert after["phase"] == "prepared"
+    assert after["owner"] == before["owner"]
+    assert after["version"] == before["version"]
+    assert item["readmit_request_id"] is not None
+    assert item["readmit_request_id"] != case.request_id
+    assert item["readmit_base_branch"] == "main"
+    assert item["readmit_base_source"] == "label"
+    assert case.graph.head() == prepared["rebased_head_sha"]
+    successor = item["readmit_request_id"]
+
+    applied = case.finish()
+
+    assert applied["request_id"] == case.request_id
+    assert applied["target_base_ref"] == "next"
+    assert case.identities()[0]["readmit_request_id"] == successor
+    assert case.identities()[1]["head_sha"] == applied["verification_head_sha"]
+    assert case.remote.pushes == 2
+    assert case.retargets == [{"target_branch": "next"}]
+
+
+@pytest.mark.parametrize(
+    ("stopped", "transition_case"),
+    [("cancelled", None), ("wait_expired", "wait_expired")],
+    indirect=["transition_case"],
+    ids=["cancelled", "wait-expired"],
+)
+@pytest.mark.parametrize("landed", [False, True], ids=["unpushed", "push-unrecorded"])
+def test_stopped_prepared_request_reconciles_only_a_landed_push(
+    transition_case: TransitionCase, stopped: str, landed: bool
+) -> None:
+    case = transition_case
+    prepared = _prepare(case)
+    before_lineage = case.identities()[1]
+    if landed:
+        _push(case, prepared, recorded=False)
+
+    async def stop(session: AsyncSession) -> None:
+        if stopped == "cancelled":
+            item = await session.get(WorkItem, case.work_item_id)
+            assert item is not None
+            item.cancelled_at = datetime.now(UTC)
+            item.version += 1
+        else:
+            request = await session.get(ExecutionRequest, case.request_id)
+            assert request is not None
+            assert request.wait_deadline is not None
+            assert request.wait_deadline < datetime.now(UTC)
+        await session.commit()
+
+    database(stop)
+    assert case.row()["phase"] == "prepared"
+    assert case.graph.head() == (prepared.head_sha if landed else case.graph.source)
+
+    if not landed:
+        case.tick()
+        case.tick()
+        assert case.row()["phase"] == "refused"
+        assert case.row()["error_code"] == "request_not_waiting"
+        assert case.graph.head() == case.graph.source
+        assert case.identities()[1] == before_lineage
+        assert case.target == "main"
+        assert case.remote.pushes == 0
+        assert not case.retargets
+        return
+
+    applied = case.finish()
+
+    assert case.graph.head() == applied["verification_head_sha"]
+    assert case.identities()[1]["head_sha"] == applied["verification_head_sha"]
+    assert case.identities()[1]["base_ref"] == "next"
+    assert case.identities()[0]["base_branch"] == "next"
+    assert case.remote.pushes == 2
+    assert case.retargets == [{"target_branch": "next"}]
 
 
 def test_newer_queued_relabel_cannot_overwrite_a_pushed_operation(
